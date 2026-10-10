@@ -99,6 +99,8 @@ _SUMMARY_TITLES: dict[str, str] = {
     # taint_ruby_traversal / taint_ruby_url (verbatim heredoc ports, bead A2)
     "ruby.taint.path_traversal": "Request-derived path reaches file read/write/serve sink",
     "ruby.taint.outbound_url": "Request-derived URL reaches outbound HTTP client",
+    "ruby.security.dynamic-dispatch": "Request-derived Ruby method dispatch or definition",
+    "ruby.security.sql-injection": "Request-derived SQL reaches ActiveRecord execution",
     # run_async_error_checks (ASYNC_ERROR_SUMMARY)
     "ruby.async.thread-no-rescue": "Thread.new block lacks rescue",
 }
@@ -706,7 +708,15 @@ def main(argv: list[str] | None = None) -> int:
             if recs is None and capturing_sink is not None:
                 recs = capturing_sink.get_for_file(f)
             if recs:
+                # A source-to-execution proof supersedes the same legacy
+                # lexical alert, preserving its public rule ID and one count
+                # on cold scans and cache replay alike.
+                execution_sites = {(row.get('rule'), row.get('line')) for row in recs
+                                   if row.get('extras', {}).get('terminal_sink')}
                 for cached_record in recs:
+                    if ((cached_record.get('rule'), cached_record.get('line')) in execution_sites
+                            and not cached_record.get('extras', {}).get('terminal_sink')):
+                        continue
                     record = dict(cached_record)
                     # Match the cache replay contract: every layer reports the
                     # current input spelling, including detectors that emit a

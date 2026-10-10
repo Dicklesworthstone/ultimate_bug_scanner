@@ -30,6 +30,13 @@ class SwiftToken:
     parts: tuple = ()
 
 
+@dataclass(frozen=True)
+class CallSite:
+    """Keep the whole-expression origin separate from a fluent callee."""
+    expression: SwiftToken
+    callee: SwiftToken | None = None
+
+
 class SwiftLexer:
     def __init__(self, text):
         self.text = text
@@ -629,7 +636,8 @@ class SwiftEngine:
             if any(link in trace.tags for trace in value):
                 state[key] = retag(value, remove=frozenset({link, 'url-host', 'url-scheme'}))
 
-    def call(self, name, receiver, arguments, token, state, bindings, callee_token=None):
+    def call(self, name, receiver, arguments, site, state, bindings):
+        token, callee_token = site.expression, site.callee
         leaf = name.rsplit('.', 1)[-1]
         values = [value for _, value, _ in arguments]
         labeled = {label: value for label, value, _ in arguments if label}
@@ -892,7 +900,7 @@ class SwiftEngine:
                     elif member.value == 'resolvingSymlinksInPath' and not arguments:
                         value = self.member(member.value, value, member, owner_binding)
                     else:
-                        value = self.call(name, value, arguments, tokens[0], state, bindings, member)
+                        value = self.call(name, value, arguments, CallSite(tokens[0], member), state, bindings)
                     cursor = close + 1
                 else:
                     value = self.member(member.value, value, member, owner_binding)
@@ -907,7 +915,7 @@ class SwiftEngine:
                     if len(part) >= 2 and part[1].value == ':' and part[0].kind == 'code':
                         label, argument = part[0].value, part[2:]
                     arguments.append((label, self.expression(argument, state, bindings, depth + 1), argument))
-                value = self.call(name, value, arguments, tokens[0], state, bindings)
+                value = self.call(name, value, arguments, CallSite(tokens[0]), state, bindings)
                 cursor = close + 1
                 continue
             if token.value == '[':

@@ -410,6 +410,7 @@ def run_analyzers(
     sink,
     skip: set[int] | None = None,
     prefilter: Any = None,
+    errors: list[str] | None = None,
 ) -> None:
     """Run registered javascript analyzers (taint, guards, ctcompare, async)."""
     from ubs_core import analyzers  # noqa: F401  (populate registry)
@@ -423,19 +424,27 @@ def run_analyzers(
         if not target_files:
             continue
         ctx = RunContext(lang="javascript", files=target_files)
-        for finding in analyzer.run(ctx):
-            if skip and _record_category(finding) in skip:
-                continue
-            sink.write(json.dumps({
-                "rule": finding.get("rule", ""),
-                "category_id": finding.get("category_id", "js.security"),
-                "path": finding.get("path", ""),
-                "line": int(finding.get("line", 0) or 0),
-                "col": int(finding.get("col", 1) or 1),
-                "severity": finding.get("severity", "warning"),
-                "message": finding.get("message", ""),
-                "suppressed": False,
-            }, ensure_ascii=False) + "\n")
+        try:
+            for finding in analyzer.run(ctx):
+                if skip and _record_category(finding) in skip:
+                    continue
+                sink.write(json.dumps({
+                    "rule": finding.get("rule", ""),
+                    "category_id": finding.get("category_id", "js.security"),
+                    "path": finding.get("path", ""),
+                    "line": int(finding.get("line", 0) or 0),
+                    "col": int(finding.get("col", 1) or 1),
+                    "severity": finding.get("severity", "warning"),
+                    "message": finding.get("message", ""),
+                    "suppressed": False,
+                }, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            if errors is None:
+                raise
+            # Preserve findings already emitted and let the other analyzers
+            # finish. Every exception, including a programming defect, remains
+            # an explicit failed scan; it cannot become a cached clean result.
+            errors.append(f"{analyzer.name}: {type(exc).__name__}: {str(exc)[:350]}")
 
 
 def _expand_module_misses(graph, files, cached_findings, files_to_scan, cache):
@@ -627,7 +636,7 @@ def main(argv: list[str] | None = None) -> int:
         source_files = [path for path in files_to_scan if path.suffix.lower() in suffixes]
         counters = scan_patterns(patterns, source_files, capturing_sink, skip,
                                  prefilter=prefilter_res, defer_global_checks=True)
-        run_analyzers(files_to_scan, capturing_sink, skip, prefilter=prefilter_res)
+        run_analyzers(files_to_scan, capturing_sink, skip, prefilter=prefilter_res, errors=scan_errors)
         if args.ast_rule_dir:
             from ubs_core.js_ast import scan_all
             from ubs_core.js_rules import SEVERITY_MAP

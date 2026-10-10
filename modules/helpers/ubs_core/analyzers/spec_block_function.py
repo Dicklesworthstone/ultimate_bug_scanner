@@ -19,6 +19,7 @@ import re
 from pathlib import Path
 from typing import Iterable, Iterator
 
+from ubs_core.io import source_line
 from ubs_core.registry import Analyzer, RunContext, register
 
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
@@ -176,7 +177,7 @@ def scan_file_findings(path: Path) -> Iterator[tuple[int, int]]:
             kind, is_declaration = classify(''.join(head))
             if is_declaration and stack and stack[-1] == 'cond':
                 decl_line = head_start_line or line_no
-                raw_line = raw_lines[decl_line - 1].strip() if decl_line <= len(raw_lines) else ''
+                raw_line = source_line(raw_lines, decl_line).strip() if decl_line <= len(raw_lines) else ''
                 if 'ubs:ignore' not in raw_line:
                     decl_col = head_start_col or (pos - text.rfind('\n', 0, pos))
                     yield decl_line, decl_col

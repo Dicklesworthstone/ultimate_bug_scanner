@@ -93,7 +93,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="a9c4b6f3220bd76f6a8ecd3715d5d352be5b5038a90a8382dab9df08a24ead87"
+UBS_LIB_CHECKSUM="46a2ca8c849366d80a9946b90f03fbbddad0b517283ebea9f2b11872ea3fa06c"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -129,7 +129,7 @@ if [[ ! -f "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" ]]; then
   echo "✗ ${BASH_SOURCE[0]}: missing ${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh (run 'ubs doctor --fix' or reinstall)" >&2
   exit 2
 fi
-# shellcheck source=lib/ubs-common.sh
+# shellcheck source-path=SCRIPTDIR source=lib/ubs-common.sh
 source "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh"
 ubs_export_locale
 

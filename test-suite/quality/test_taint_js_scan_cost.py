@@ -15,6 +15,7 @@ import gc
 import json
 import os
 import subprocess
+import shutil
 import tempfile
 import time
 import unittest
@@ -479,6 +480,200 @@ class RuleStateTests(unittest.TestCase):
                         if item["line"] == 9:
                             self.assertIn("lib.ts:cleanHtml() -> eval", item["message"], item)
             self.assertEqual(list(taint_js.run(RunContext(lang="javascript", files=[paths[-1]]))), [])
+
+
+class HeapExpansionCostTests(unittest.TestCase):
+    """A small call graph must not expand an unchecked exponential heap."""
+
+    def run(self, result=None):
+        started = time.monotonic()
+        print(f'[{self.id()}] RUN', flush=True)
+        result = super().run(result)
+        failed = any(case is self for case, _ in (*result.failures, *result.errors))
+        print(f'[{self.id()}] {"FAIL" if failed else "PASS"} ({time.monotonic() - started:.3f}s)', flush=True)
+        return result
+
+    @staticmethod
+    def source(depth):
+        lines = ['function leaf(x) { return {value: x, safe: "constant"}; }']
+        for index in range(depth):
+            callee = 'leaf' if index == 0 else f'node{index - 1}'
+            lines.append(f'function node{index}(x) {{ return {{left: {callee}(x), right: {callee}(x)}}; }}')
+        return '\n'.join(lines)
+
+    def test_exponential_factory_heap_is_explicitly_incomplete(self):
+        artifacts = REPO_ROOT / 'test-suite/artifacts/js-heap-expansion'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='case-', dir=artifacts) as scratch:
+            path = Path(scratch) / 'factories.js'
+            path.write_text(self.source(16) + '\nres.send(node15(req.query.value));\n')
+            script = (
+                'import json, sys; from pathlib import Path\n'
+                'from ubs_core.analyzers.taint_js import scan_file_findings\n'
+                'from ubs_core.taint_flow import AnalysisLimit\n'
+                'try:\n'
+                '    list(scan_file_findings(Path(sys.argv[1])))\n'
+                'except AnalysisLimit as exc:\n'
+                '    print(json.dumps({"status": "incomplete", "message": str(exc)}))\n'
+                'else:\n'
+                '    raise AssertionError("unchecked exponential heap returned a complete scan")\n'
+            )
+            result = subprocess.run([sys.executable, '-c', script, str(path)],
+                                    env={**os.environ, 'PYTHONPATH': str(HELPERS_DIR)},
+                                    capture_output=True, text=True, timeout=10)
+            (artifacts / 'stdout.log').write_text(result.stdout)
+            (artifacts / 'stderr.log').write_text(result.stderr)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(report['status'], 'incomplete', report)
+            self.assertIn('factories.js', report['message'])
+            self.assertIn('work limit exceeded', report['message'])
+
+    def test_small_factory_tree_preserves_fields_and_each_sink_domain(self):
+        artifacts = REPO_ROOT / 'test-suite/artifacts/js-heap-expansion'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='small-', dir=artifacts) as scratch:
+            path = Path(scratch) / 'small.js'
+            value = 'tree.left.left.left.left.value'
+            path.write_text(self.source(4) + '\nconst tree = node3(req.query.value);\n'
+                            + f'res.send({value});\neval({value});\nshell.exec({value});\ndb.query({value});\n'
+                            + 'res.send(tree.left.left.left.left.safe);\n')
+            findings = list(taint_js.scan_file_findings(path))
+            self.assertEqual([(rule, line) for rule, line, _col, _trace in findings], [
+                ('js.taint.xss', 7), ('js.taint.eval', 8),
+                ('js.taint.command', 9), ('js.taint.sql', 10),
+            ], findings)
+            self.assertTrue(all('req.query.value' in trace for _rule, _line, _col, trace in findings))
+
+    def test_budget_failure_keeps_findings_from_later_components(self):
+        from ubs_core.taint_flow import AnalysisLimit
+
+        artifacts = REPO_ROOT / 'test-suite/artifacts/js-heap-expansion'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='components-', dir=artifacts) as scratch:
+            root = Path(scratch)
+            bad = root / 'a_bad.js'
+            bad.write_text(self.source(16) + '\nres.send(node15(req.query.value));\n')
+            later = root / 'z_unsafe.js'
+            later.write_text('res.send(req.query.html);\neval(req.query.code);\n')
+            findings = []
+            with self.assertRaises(AnalysisLimit) as raised:
+                findings.extend(taint_js.scan_project_findings([bad, later]))
+            self.assertEqual([(path.name, rule, line) for path, rule, line, _col, _trace in findings], [
+                ('z_unsafe.js', 'js.taint.xss', 1),
+                ('z_unsafe.js', 'js.taint.eval', 2),
+            ], findings)
+            self.assertIn('a_bad.js', str(raised.exception))
+            self.assertIn('work limit exceeded', str(raised.exception))
+
+    def test_budget_failure_keeps_completed_and_later_sink_domains(self):
+        from ubs_core.taint_flow import AnalysisLimit, Budget
+
+        artifacts = REPO_ROOT / 'test-suite/artifacts/js-heap-expansion'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='domains-', dir=artifacts) as scratch:
+            source = Path(scratch) / 'domains.js'
+            source.write_text('db.query(req.query.sql);\nshell.exec(req.query.command);\n'
+                              'eval(req.query.code);\nres.send(req.query.html);\n')
+            # Exercise the real engine and native budget exception while
+            # denying one domain enough work to solve its fixed point.
+            budgets = iter((Budget(), Budget(0), Budget(), Budget()))
+            findings = []
+            with patch.object(taint_js, 'Budget', side_effect=lambda _limit: next(budgets)), \
+                    self.assertRaises(AnalysisLimit) as raised:
+                findings.extend(taint_js.scan_file_findings(source))
+            self.assertEqual([(rule, line) for rule, line, _col, _trace in findings], [
+                ('js.taint.sql', 1), ('js.taint.command', 2), ('js.taint.xss', 4),
+            ], findings)
+            self.assertTrue(all('req.query.' in trace for _rule, _line, _col, trace in findings))
+            self.assertIn('js.taint.eval', str(raised.exception))
+            self.assertIn('work limit exceeded', str(raised.exception))
+
+    def test_component_failures_release_engines_and_bound_diagnostics(self):
+        from ubs_core.taint_flow import AnalysisLimit, Budget
+
+        artifacts = REPO_ROOT / 'test-suite/artifacts/js-heap-expansion'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='aggregate-', dir=artifacts) as scratch:
+            root = Path(scratch)
+            files = [root / f'bad-{index}.js' for index in range(5)] + [root / 'z_unsafe.js']
+            for path in files:
+                path.write_text('res.send(req.query.html);\n')
+            engines = []
+            original_init = taint_js._Engine.__init__
+
+            def track_engine(engine, *args, **kwargs):
+                gc.collect()
+                self.assertTrue(all(ref() is None for ref in engines),
+                                'a failed component retained an engine or exception traceback')
+                original_init(engine, *args, **kwargs)
+                engines.append(weakref.ref(engine))
+
+            budgets = iter([Budget(0) for _ in range(5)] + [Budget()])
+            findings = []
+            with patch.object(taint_js._Engine, '__init__', track_engine), \
+                    patch.object(taint_js, 'Budget', side_effect=lambda _limit: next(budgets)), \
+                    self.assertRaises(AnalysisLimit) as raised:
+                findings.extend(taint_js.scan_project_findings(files))
+            self.assertEqual([(path.name, rule, line) for path, rule, line, _col, _trace in findings],
+                             [('z_unsafe.js', 'js.taint.xss', 1)], findings)
+            message = str(raised.exception)
+            self.assertIn('5 component', message)
+            self.assertIn('2 more failed components', message)
+            self.assertLess(len(message), 2000, message)
+            self.assertIsNone(raised.exception.__cause__)
+            self.assertIsNone(raised.exception.__context__)
+            gc.collect()
+            self.assertTrue(all(ref() is None for ref in engines))
+
+    def _check_cli_budget_error(self, *, bad_first):
+        artifacts = REPO_ROOT / 'test-suite/artifacts/js-heap-expansion-cli' / (
+            'bad-first' if bad_first else 'bad-last')
+        artifacts.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='scan-', dir=artifacts) as scratch:
+            root = Path(scratch)
+            unsafe = root / ('z.js' if bad_first else 'a.js')
+            bad = root / ('a.js' if bad_first else 'z.js')
+            unsafe.write_text('res.send(req.query.html);\n')
+            bad.write_text(self.source(16) + '\nres.send(node15(req.query.value));\n')
+            env = {**os.environ, 'UBS_NO_AUTO_UPDATE': '1', 'UBS_NO_CACHE': '0',
+                   'UBS_CACHE_DIR': str(root / 'scan-cache'), 'UBS_PROFILE': '1'}
+            for attempt in range(2):
+                with self.subTest(attempt=attempt):
+                    result = subprocess.run([str(REPO_ROOT / 'ubs'), str(root), '--only=js',
+                                             '--ci', '--format=json'],
+                                            cwd=root, env=env, capture_output=True, text=True, timeout=30)
+                    (artifacts / f'result-{attempt}.json').write_text(result.stdout)
+                    (artifacts / f'stderr-{attempt}.log').write_text(result.stderr)
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    report = json.loads(result.stdout)
+                    self.assertEqual(report['status'], 'partial', report)
+                    self.assertEqual(report['totals']['files'], 2, report)
+                    self.assertIn('work limit exceeded', result.stdout + result.stderr)
+                    self.assertEqual(report['profile']['cache_hits'], 0, report)
+                    hits = [(Path(item['file']).name, item['rule_id'], item['line'])
+                            for item in report['findings'] if item['rule_id'].startswith('javascript.taint.')]
+                    self.assertEqual(hits, [(unsafe.name, 'javascript.taint.xss', 1)], report)
+            bad.write_text('res.send("safe");\n')
+            result = subprocess.run([str(REPO_ROOT / 'ubs'), str(root), '--only=js',
+                                     '--ci', '--format=json'],
+                                    cwd=root, env=env, capture_output=True, text=True, timeout=30)
+            (artifacts / 'recovered.json').write_text(result.stdout)
+            (artifacts / 'recovered-stderr.log').write_text(result.stderr)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(report['status'], 'ok', report)
+            self.assertEqual(report['failed_modules'], [], report)
+
+    @unittest.skipUnless(shutil.which('ast-grep') or os.environ.get('UBS_AST_GREP_BIN'),
+                         'real meta-runner integration requires ast-grep')
+    def test_cli_budget_error_preserves_findings_and_never_enters_cache(self):
+        self._check_cli_budget_error(bad_first=False)
+
+    @unittest.skipUnless(shutil.which('ast-grep') or os.environ.get('UBS_AST_GREP_BIN'),
+                         'real meta-runner integration requires ast-grep')
+    def test_cli_budget_error_keeps_later_components_and_never_enters_cache(self):
+        self._check_cli_budget_error(bad_first=True)
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "GNU time reports peak RSS in KiB")

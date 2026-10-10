@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck source-path=SCRIPTDIR
 # ═══════════════════════════════════════════════════════════════════════════
 # C/C++ ULTIMATE BUG SCANNER - Industrial-Grade Static Analysis
 # ═══════════════════════════════════════════════════════════════════════════
@@ -15,7 +16,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="8e53a907cc958283066895e2ee8a9bc79ab77063eb6ecc7b62bb67f721025418"
+UBS_LIB_CHECKSUM="46a2ca8c849366d80a9946b90f03fbbddad0b517283ebea9f2b11872ea3fa06c"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -60,6 +61,8 @@ shopt -s extglob
 RED=''; GREEN=''; YELLOW=''; BLUE=''; MAGENTA=''; CYAN=''; WHITE=''; GRAY=''
 BOLD=''; DIM=''; RESET=''
 
+# Invoked by the ERR trap below; ShellCheck does not count trap callbacks.
+# shellcheck disable=SC2329
 on_err() {
   local ec=$?; local cmd=${BASH_COMMAND}; local line=${BASH_LINENO[0]}; local src=${BASH_SOURCE[1]:-${BASH_SOURCE[0]}}
   echo -e "\n${RED}${BOLD}Unexpected error (exit $ec)${RESET} ${DIM}at ${src}:${line}${RESET}\n${DIM}Last command:${RESET} ${WHITE}$cmd${RESET}" >&2

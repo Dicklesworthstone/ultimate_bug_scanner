@@ -277,6 +277,15 @@ def _join_states(*states):
     return result
 
 
+@dataclass(frozen=True)
+class _CallExpression:
+    """Aligned source/masked text and token pairs at an absolute origin."""
+    text: str
+    code: str
+    pairs: dict[int, int]
+    offset: int
+
+
 @dataclass
 class _Scope:
     bindings: dict[str, str] = field(default_factory=dict)
@@ -575,8 +584,9 @@ class _Analysis:
             if target.parameter is not None:
                 self.writes[target.parameter] = _join(self.writes.get(target.parameter, _CLEAN), fact)
 
-    def native_call(self, expr, code, match, pairs, offset, state, scope, *, whole=False):
+    def native_call(self, expression, match, state, scope, *, whole=False):
         """Known result shapes and output-parameter effects, never name-only Decode."""
+        expr, code, pairs, offset = expression.text, expression.code, expression.pairs, expression.offset
         root, member = match.group(1), match.group(2)
         end = pairs.get(match.end() - 1)
         if end is None:
@@ -686,7 +696,7 @@ class _Analysis:
             return tuple(self.value(expr[start:end], offset + start, state, scope) for start, end in parts)
         native = re.match(r'\s*([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?\s*\(', code)
         if native:
-            result = self.native_call(expr, code, native, _pairs(code), offset, state, scope, whole=True)
+            result = self.native_call(_CallExpression(expr, code, _pairs(code), offset), native, state, scope, whole=True)
             if result is not None:
                 return result[1]
         call = re.match(r'\s*([A-Za-z_]\w*)\s*\(', code)
@@ -778,7 +788,7 @@ class _Analysis:
         for match in re.finditer(r'(?<![\w.])([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?\s*\(', code):
             if masked[match.start()].isspace():
                 continue
-            result = self.native_call(expr, code, match, pairs, offset, state, scope)
+            result = self.native_call(_CallExpression(expr, code, pairs, offset), match, state, scope)
             if result is not None:
                 end, values = result
                 facts.extend(values)

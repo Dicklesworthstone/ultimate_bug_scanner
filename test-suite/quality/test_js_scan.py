@@ -111,6 +111,93 @@ class ScanTests(unittest.TestCase):
             self.assertEqual(sink_path.read_text(), "")
 
 
+class AnalyzerFailureTests(unittest.TestCase):
+    def run(self, result=None):
+        started = time.monotonic()
+        print(f'[{self.id()}] RUN', flush=True)
+        result = super().run(result)
+        failed = any(case is self for case, _ in (*result.failures, *result.errors))
+        print(f'[{self.id()}] {"FAIL" if failed else "PASS"} ({time.monotonic() - started:.3f}s)', flush=True)
+        return result
+
+    def setUp(self):
+        artifacts = REPO_ROOT / 'test-suite/artifacts/js-analyzer-failures'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = tempfile.TemporaryDirectory(prefix='case-', dir=artifacts)
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name)
+        self.source = self.root / 'input.js'
+        self.source.write_text('const value = "safe";\n')
+
+    def analyzers(self, failure):
+        from ubs_core.registry import Analyzer
+
+        def record(rule):
+            return {'rule': rule, 'path': str(self.source), 'line': 1, 'col': 1,
+                    'severity': 'critical', 'message': 'Retained independently confirmed finding'}
+
+        def broken(ctx):
+            yield record('javascript.taint.eval')
+            raise failure
+
+        def later(ctx):
+            yield record('javascript.taint.xss')
+
+        return [Analyzer(layer='taint', lang='javascript', name='taint_js', run=broken),
+                Analyzer(layer='guards', lang='javascript', name='failure-control', run=later)]
+
+    def test_failure_retains_prefix_and_runs_other_analyzers(self):
+        from ubs_core import js_scan, registry
+        from ubs_core.taint_flow import AnalysisLimit
+
+        for failure in (AnalysisLimit('analysis is incomplete'), RuntimeError('invalid transfer state')):
+            with self.subTest(failure=type(failure).__name__):
+                sink, errors = io.StringIO(), []
+                with mock.patch.object(registry, 'analyzers_for_lang', return_value=self.analyzers(failure)):
+                    js_scan.run_analyzers([self.source], sink, errors=errors)
+                self.assertEqual([json.loads(line)['rule'] for line in sink.getvalue().splitlines()],
+                                 ['javascript.taint.eval', 'javascript.taint.xss'])
+                self.assertEqual(len(errors), 1, errors)
+                self.assertIn(f'taint_js: {type(failure).__name__}', errors[0])
+                self.assertIn(str(failure), errors[0])
+
+    def test_without_error_collector_failure_still_raises(self):
+        from ubs_core import js_scan, registry
+        from ubs_core.taint_flow import AnalysisLimit
+
+        failure = AnalysisLimit('analysis is incomplete')
+        with mock.patch.object(registry, 'analyzers_for_lang', return_value=self.analyzers(failure)):
+            with self.assertRaises(AnalysisLimit):
+                js_scan.run_analyzers([self.source], io.StringIO())
+
+    def test_analyzer_error_sets_partial_counts_and_refuses_cache(self):
+        from ubs_core import js_scan, registry
+        from ubs_core.cache import ScanCache
+        from ubs_core.taint_flow import AnalysisLimit
+
+        selected = self.root / 'files.list'
+        selected.write_bytes(os.fsencode(self.source) + b'\0')
+        report = self.root / 'result.json'
+        failure = AnalysisLimit('heap work limit exceeded; analysis is incomplete')
+        with mock.patch.object(registry, 'analyzers_for_lang', return_value=self.analyzers(failure)), \
+                mock.patch.object(ScanCache, 'store_scanned_files') as store, \
+                mock.patch.dict(os.environ, {'UBS_CACHE_DIR': str(self.root / 'cache'), 'UBS_NO_CACHE': '0'}):
+            code = js_scan.main([
+                '--files-from', str(selected), '--sink', str(self.root / 'findings.jsonl'),
+                '--json-out', str(report), '--project-dir', str(self.root),
+            ])
+        self.assertEqual(code, 2, report.read_text())
+        doc = json.loads(report.read_text())
+        self.assertEqual(doc['status'], 'partial', doc)
+        self.assertEqual(doc['module_error'], 'ANALYZER_ERROR', doc)
+        self.assertEqual(doc['files'], 1, doc)
+        self.assertEqual(doc['critical'], 2, doc)
+        self.assertIn('heap work limit exceeded', doc['message'])
+        self.assertEqual({item['rule'] for item in doc['findings']},
+                         {'javascript.taint.eval', 'javascript.taint.xss'})
+        store.assert_not_called()
+
+
 @unittest.skipUnless(sys.platform.startswith("linux"), "GNU time reports peak RSS in KiB")
 class TextReportMemoryTests(unittest.TestCase):
     def test_bridge_recounts_400k_records_and_preserves_error_below_64_mib(self) -> None:

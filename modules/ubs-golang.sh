@@ -15,7 +15,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="8e53a907cc958283066895e2ee8a9bc79ab77063eb6ecc7b62bb67f721025418"
+UBS_LIB_CHECKSUM="46a2ca8c849366d80a9946b90f03fbbddad0b517283ebea9f2b11872ea3fa06c"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -51,7 +51,7 @@ if [[ ! -f "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" ]]; then
   echo "✗ ${BASH_SOURCE[0]}: missing ${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh (run 'ubs doctor --fix' or reinstall)" >&2
   exit 2
 fi
-# shellcheck source=lib/ubs-common.sh
+# shellcheck source-path=SCRIPTDIR source=lib/ubs-common.sh
 source "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh"
 shopt -s lastpipe
 shopt -s extglob
@@ -63,6 +63,8 @@ BOLD=""; DIM=""; RESET=""
 VERSION="7.1.4"
 
 # Color-safe error trap (works before colors are initialized)
+# Called indirectly by Bash's ERR trap.
+# shellcheck disable=SC2329
 on_err() {
   local ec=$? cmd=${BASH_COMMAND} line=${BASH_LINENO[0]} src=${BASH_SOURCE[1]:-${BASH_SOURCE[0]}}
   local _RED=${RED:-} _BOLD=${BOLD:-} _RESET=${RESET:-} _DIM=${DIM:-} _WHITE=${WHITE:-}

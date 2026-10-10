@@ -172,7 +172,8 @@ class RedirectEngine(Engine):
             value = self.without_proof(value)
         return value
 
-    def call_sink(self, name, spans, arguments, value, offset, argument_names=(), bindings=None):
+    def call_sink(self, name, call, value, offset, bindings):
+        spans, argument_names, arguments = call.spans, call.names, call.values
         method = name.rsplit('.', 1)[-1]
         target = None
         if method in {'sendRedirect', 'respondRedirect', 'redirect', 'RedirectView'}:

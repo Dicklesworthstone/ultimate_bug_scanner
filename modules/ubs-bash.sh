@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck source-path=SCRIPTDIR
 # UBS module: Bash (bash). Comprehensive static analysis for Bash/POSIX-sh.
 # contract: v2
 if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
@@ -10,7 +11,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="8e53a907cc958283066895e2ee8a9bc79ab77063eb6ecc7b62bb67f721025418"
+UBS_LIB_CHECKSUM="46a2ca8c849366d80a9946b90f03fbbddad0b517283ebea9f2b11872ea3fa06c"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then

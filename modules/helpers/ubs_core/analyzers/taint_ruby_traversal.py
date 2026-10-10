@@ -1,10 +1,11 @@
-"""Scoped Ruby request flow for filesystem paths and outbound URLs.
+"""Scoped Ruby request flow for filesystem paths, outbound URLs and raw SQL.
 
 The two policies share Ruby syntax, local bindings, a finite CFG solver and
 argument-sensitive summaries. Unknown helper names propagate their arguments;
 only the operations and dominating checks in a visible body establish safety.
-Dynamic execution and request-derived state escaping a method are incomplete
-analysis, never evidence that a scan is clean.
+Request-derived execution is a terminal security sink. Static send targets
+reuse ordinary call summaries; unresolved dispatch with request arguments and
+request-derived state escaping a method remain explicit incomplete analysis.
 """
 from __future__ import annotations
 
@@ -46,7 +47,25 @@ SINK_RE = re.compile(
     r'|\brender\s+(?:file|template):',
 )
 PROOF_TAGS = frozenset({'url-host', 'url-scheme', 'contained-path'})
-VALUE_TAGS = PROOF_TAGS | frozenset({'canonical-path', 'parsed-uri', 'basename-path', 'not-dot-name'})
+VALUE_TAGS = PROOF_TAGS | frozenset({'canonical-path', 'parsed-uri', 'basename-path', 'not-dot-name', 'exact-literal', 'sql-bound-value', 'sql-integer-value'})
+PATH_RULE = 'ruby.taint.path_traversal'
+URL_RULE = 'ruby.taint.outbound_url'
+EVAL_RULE = 'ruby.security.eval-family'
+DISPATCH_RULE = 'ruby.security.dynamic-dispatch'
+COMMAND_RULE = 'ruby.security.backticks-interpolated'
+SQL_RULE = 'ruby.security.sql-injection'
+EXECUTION_RULES = frozenset({EVAL_RULE, DISPATCH_RULE, COMMAND_RULE})
+# ActiveRecord::ConnectionAdapters::DatabaseStatements: query text is the
+# first positional operand, independently of log names and value bindings.
+SQL_CONNECTION_ARITIES = {
+    'execute': (1, 2), 'exec_query': (1, 3), 'exec_insert': (1, 5),
+    'exec_update': (1, 3), 'exec_delete': (1, 3),
+    'select_all': (1, 3), 'select_one': (1, 3), 'select_rows': (1, 3),
+    'select_value': (1, 3), 'select_values': (1, 3),
+    'insert': (1, 6), 'create': (1, 6), 'update': (1, 3), 'delete': (1, 3),
+}
+SQL_API_SHAPES = frozenset({'active-record-model', 'active-record-connection',
+                            'active-record-pool', 'active-record-relation', 'arel-sql-literal'})
 RUBY_EXCEPTION_BASES = {
     'Exception': None, 'StandardError': 'Exception', 'RuntimeError': 'StandardError',
     'ArgumentError': 'StandardError', 'TypeError': 'StandardError', 'IOError': 'StandardError',
@@ -347,6 +366,7 @@ class RubyParser:
         self.tokens = RubyLexer(text).scan()
         self.position, self.depth = 0, 0
         self.functions, self.aliases = {}, {}
+        self.class_bases = {}
         self.singleton_scope = False
         body = self.block((), ())
         self.functions[-1] = RubyFunction(-1, '<script>', (), (), body, scope=True)
@@ -626,7 +646,10 @@ class RubyParser:
                     self.singleton_scope = previous
                     return RubyStatement('block', body=body)
                 name = token_text(split_tokens(header, {'<'})[0])
-                child_owner = (*owner, *name.split('::'))
+                child_owner = tuple(name[2:].split('::')) if name.startswith('::') else (*owner, *name.split('::'))
+                bases = split_tokens(header, {'<'})
+                if kind == 'class' and len(bases) == 2:
+                    self.class_bases.setdefault(child_owner, set()).add((owner, token_text(bases[1])))
                 previous = self.singleton_scope
                 self.singleton_scope = False
                 self.separators()
@@ -740,7 +763,8 @@ def tainted(fact):
 
 
 def constant(value, kind='literal'):
-    return frozenset({Trace('constant', (kind, value))})
+    tags = frozenset({'exact-literal'}) if kind in {'literal', 'symbol'} else frozenset()
+    return frozenset({Trace('constant', (kind, value), tags=tags)})
 
 
 def shape(kind, offset):
@@ -768,6 +792,7 @@ class RubyEngine:
         self.lines = [0, *(index + 1 for index, char in enumerate(text) if char == '\n')]
         self.budget, self.graphs = Budget(), {}
         self.contexts, self.summaries = {}, {}
+        self.dispatch_failures = {}
         self.pending_raises = CLEAN
         self.constants = {}
         # Only unconditional, literal constant definitions can be an allowlist
@@ -780,6 +805,27 @@ class RubyEngine:
                 if statement.kind == 'simple' and len(parts) == 2 and len(parts[0]) == 1 and re.fullmatch(r'[A-Z]\w*', parts[0][0].value):
                     key = (function.owner, parts[0][0].value)
                     self.constants[key] = CLEAN if key in self.constants else self.literal_value(parts[1], shared=True)
+        self.constant_definitions = {function.owner for function in self.parser.functions.values()
+                                     if function.scope and function.owner}
+
+        def constant_bindings(statements, owner):
+            for statement in statements:
+                self.budget.spend()
+                parts = split_tokens(statement.tokens, {'=', '||=', '&&='})
+                for lhs in parts[:-1]:
+                    name = token_text(lhs)
+                    if re.fullmatch(r'(?:::)?[A-Z]\w*(?:::[A-Z]\w*)*', name):
+                        definition = tuple(name[2:].split('::')) if name.startswith('::') else (*owner, *name.split('::'))
+                        self.constant_definitions.add(definition)
+                constant_bindings(statement.body, owner)
+                constant_bindings(statement.alternate, owner)
+                for handler in statement.handlers:
+                    constant_bindings(handler.body, owner)
+                constant_bindings(statement.finalizer, owner)
+        for function in self.parser.functions.values():
+            constant_bindings(function.body, function.owner)
+        self.sql_models = {owner for owner in self.constant_definitions | {('ActiveRecord', 'Base')}
+                           if self.active_record_model(owner)}
         self.repeated_sites = set()
 
         def has_retry(statements):
@@ -817,6 +863,167 @@ class RubyEngine:
         line_index = bisect_right(self.lines, offset) - 1
         return Step(str(self.path), line_index + 1, offset - self.lines[line_index] + 1, kind, label[:160])
 
+    def constant_owner(self, name, lexical_owner):
+        """Resolve a selected class name before assigning framework identity."""
+        if name.startswith('::'):
+            return tuple(name[2:].split('::'))
+        parts = tuple(name.split('::'))
+        for count in range(len(lexical_owner), -1, -1):
+            prefix = lexical_owner[:count]
+            if (*prefix, parts[0]) in self.constant_definitions:
+                return (*prefix, *parts)
+        return parts
+
+    def active_record_model(self, owner, seen=frozenset()):
+        self.budget.spend()
+        if owner in seen:
+            return False
+        if owner == ('ActiveRecord', 'Base'):
+            return not any(prefix in self.constant_definitions
+                           for prefix in (('ActiveRecord',), owner))
+        bases = self.parser.class_bases.get(owner, ())
+        if len(bases) != 1:
+            return False
+        lexical, name = next(iter(bases))
+        if not re.fullmatch(r'(?:::)?[A-Z]\w*(?:::[A-Z]\w*)*', name):
+            return False
+        return self.active_record_model(self.constant_owner(name, lexical), seen | {owner})
+
+    def model_ancestors(self, owner):
+        seen = set()
+        while owner not in seen:
+            self.budget.spend()
+            seen.add(owner)
+            yield owner
+            bases = self.parser.class_bases.get(owner, ())
+            if len(bases) != 1:
+                break
+            lexical, name = next(iter(bases))
+            owner = self.constant_owner(name, lexical)
+
+    @staticmethod
+    def without_sql_api(value):
+        # Ordinary calls can return another object. A method on a connection
+        # is not itself a new connection factory, and a name is not API proof.
+        return frozenset(trace for trace in value
+                         if not (trace.kind == 'shape' and trace.key[0] in SQL_API_SHAPES))
+
+    @staticmethod
+    def sql_bound_values(value):
+        # Rails' ToSql visitor quotes ordinary bind values, but visits Arel
+        # nodes (including nodes inside bind arrays) as executable SQL.
+        unresolved_type = any(trace.kind in {'object', 'member'}
+                              and trace.key[0] not in {'string', 'request', 'integer', 'array'}
+                              for trace in value)
+        tag = 'sql-unresolved-value' if unresolved_type else 'sql-bound-value'
+        return frozenset(replace(trace, tags=trace.tags | frozenset({tag}))
+                         if trace.kind in {'source', 'parameter'}
+                         and not {'sql-raw-fragment', 'sql-bound-value'} & trace.tags
+                         else trace for trace in value)
+
+    @staticmethod
+    def invalidate_sql_binding(value):
+        # Losing a value's proven binding does not prove it became raw SQL.
+        # Defer the unresolved quoting context until an actual SQL sink.
+        return frozenset(replace(trace, tags=(trace.tags - frozenset({'sql-bound-value'}))
+                                 | frozenset({'sql-unresolved-value'}))
+                         if 'sql-bound-value' in trace.tags else trace for trace in value)
+
+    def active_record_call(self, name, receiver, arguments, token, state):
+        method = name.rsplit('.', 1)[-1]
+        model = receiver if '.' in name else state.get('self', CLEAN)
+        positional = [value for value in arguments
+                      if not any(trace.kind == 'keyword' for trace in value)]
+        if method in {'connection', 'lease_connection', 'retrieve_connection'} and has_shape(model, 'active-record-model') and not arguments:
+            return self.fresh(shape('active-record-connection', token.start),
+                              'active-record-connection', token.start)
+        if method == 'connection_pool' and has_shape(model, 'active-record-model') and not arguments:
+            return shape('active-record-pool', token.start)
+        if method == 'lease_connection' and has_shape(receiver, 'active-record-pool') and not arguments:
+            return self.fresh(shape('active-record-connection', token.start),
+                              'active-record-connection', token.start)
+        arel_sql = (name in {'Arel.sql', '::Arel.sql'}
+                    and self.constant_owner(name.rsplit('.', 1)[0], self.function.owner) == ('Arel',)
+                    and ('Arel',) not in self.constant_definitions)
+        if arel_sql and positional and has_shape(positional[0], 'arel-sql-literal'):
+            # Arel.sql(SqlLiteral) returns the same object, including when
+            # options were supplied. A new allocation would lose mutations.
+            return positional[0]
+        relation = has_shape(model, 'active-record-model') or has_shape(receiver, 'active-record-relation')
+        connection = has_shape(receiver, 'active-record-connection')
+        if ((connection and method in {'quote', 'quote_string', 'quote_column_name', 'quote_table_name'})
+                or (has_shape(model, 'active-record-model') and method in {
+                    'sanitize_sql', 'sanitize_sql_array', 'sanitize_sql_for_conditions',
+                    'sanitize_sql_for_assignment', 'sanitize_sql_like'})) and arguments:
+            # These operations have different quoting contexts. Without the
+            # enclosing SQL grammar, a quoted fragment is neither proof of
+            # injection nor proof that the complete statement is safe.
+            return self.fresh(retag(self.without_sql_api(join(*arguments)),
+                                    add=frozenset({'sql-unresolved-value'}),
+                                    remove=frozenset({'sql-bound-value', 'sql-raw-fragment'})),
+                              'string', token.start)
+        if method == 'to_sql' and ((connection and 1 <= len(positional) <= 2)
+                                   or (has_shape(receiver, 'active-record-relation') and not arguments)):
+            query = positional[0] if connection else receiver
+            values = self.sql_bound_values(join(*positional[1:])) if connection else CLEAN
+            return self.fresh(retag(self.without_sql_api(join(query, values)),
+                                    remove=frozenset({'sql-raw-fragment'})), 'string', token.start)
+        if (arel_sql and positional) or (relation and method in {'where', 'having'} and arguments):
+            # Rails binds only the values after the SQL template (or the
+            # keyword/hash values). Request data already in that template
+            # remains SQL text, regardless of additional bind arguments.
+            query = positional[0] if positional else CLEAN
+            values = [argument for index, argument in enumerate(arguments)
+                      if not positional or index != arguments.index(positional[0])]
+            if relation and not arel_sql and has_shape(query, 'ruby-hash'):
+                values, query = arguments, CLEAN
+            elif any(trace.kind == 'object' and trace.key[0] == 'array' for trace in query):
+                # A collection joins element provenance and cannot identify
+                # an SQL array's template separately from its bind values.
+                query = retag(query, add=frozenset({'sql-unresolved-value'}))
+            if arel_sql:
+                query = frozenset(replace(trace, tags=trace.tags | frozenset({'sql-raw-fragment'}))
+                                  if trace.kind in {'source', 'parameter'} and 'sql-bound-value' not in trace.tags
+                                  else trace for trace in query)
+            bound = join(*(self.sql_bound_values(value) for value in values))
+            content = self.without_sql_api(join(receiver, query, bound))
+            if relation and not arel_sql:
+                content = join(content, shape('active-record-relation', token.start))
+            elif not any(not any(trace.kind == 'keyword' and trace.key[0] == 'retryable'
+                                 for trace in value) for value in values):
+                content = join(content, shape('arel-sql-literal', token.start))
+            return self.fresh(frozenset(trace for trace in content if trace.kind != 'keyword'),
+                              'sql-query', token.start)
+        if relation and method in {'all', 'limit', 'offset', 'distinct'}:
+            content = join(self.without_sql_api(receiver),
+                           self.sql_bound_values(join(*arguments)),
+                           shape('active-record-relation', token.start))
+            return self.fresh(content, 'sql-query', token.start)
+        if not connection or method not in SQL_CONNECTION_ARITIES:
+            return None
+        minimum, maximum = SQL_CONNECTION_ARITIES[method]
+        if not minimum <= len(positional) <= maximum:
+            self.unresolved_calls.add(
+                f'{self.path}:{self.step(token.start, "call", name).line}: '
+                'Ruby ActiveRecord SQL arguments need a supported positional signature; analysis is incomplete')
+            return CLEAN
+        query = positional[0]
+        if any(trace.kind == 'object' and trace.key[0] == 'array' for trace in query):
+            query = retag(query, add=frozenset({'sql-unresolved-value'}))
+        unbound = frozenset(trace for trace in tainted(query)
+                            if not {'sql-bound-value', 'sql-integer-value'} & trace.tags)
+        unsafe = frozenset(trace for trace in unbound if 'sql-unresolved-value' not in trace.tags)
+        if not unsafe and any('sql-unresolved-value' in trace.tags for trace in unbound):
+            self.unresolved_calls.add(
+                f'{self.path}:{self.step(token.start, "call", name).line}: '
+                'Ruby SQL quoting or array-template context is unresolved; analysis is incomplete')
+        if self.policy == 'path' and unsafe:
+            site = (SQL_RULE, token.start)
+            witness = advance(unsafe, self.step(token.start, 'sink', name + ' SQL query'))
+            self.effects[site] = join(self.effects.get(site, CLEAN), witness)
+        return self.fresh(retag(self.without_sql_api(join(receiver, *arguments)), remove=VALUE_TAGS),
+                          'sql-result', token.start)
+
     def source(self, offset, label):
         value = frozenset({Trace('source', (str(self.path), offset, label), evidence=(self.step(offset, 'source', label),))})
         return self.fresh(value, 'request', offset)
@@ -830,6 +1037,9 @@ class RubyEngine:
         tokens = ungroup(tokens)
         if len(tokens) >= 2 and token_text(tokens[-2:]) == '.freeze':
             tokens = tokens[:-2]
+        if (len(tokens) == 2 and tokens[0].value == ':'
+                and tokens[1].kind in {'code', 'literal'}):
+            return constant(tokens[1].value, 'symbol')
         if len(tokens) == 1:
             token = tokens[0]
             if token.kind in {'literal', 'number'} or token.value in {'nil', 'true', 'false'}:
@@ -908,9 +1118,9 @@ class RubyEngine:
             method = name[5:]
         elif '.' in name:
             receiver, method = name.rsplit('.', 1)
-            if not re.fullmatch(r'[A-Z]\w*(?:::[A-Z]\w*)*', receiver):
+            if not re.fullmatch(r'(?:::)?[A-Z]\w*(?:::[A-Z]\w*)*', receiver):
                 return []
-            owner, singleton = tuple(receiver.split('::')), True
+            owner, singleton = tuple(receiver.removeprefix('::').split('::')), True
         names, pending = {method}, [method]
         while pending:
             for alias in self.parser.aliases.get((owner, singleton, pending.pop()), ()):
@@ -1001,7 +1211,39 @@ class RubyEngine:
                                          or re.fullmatch(r'(?:File|IO)\.(?:read|binread|write|binwrite|open|truncate)', operation))))
         if unsafe:
             label = 'file sink' if self.policy == 'path' else 'outbound URL sink'
-            self.effects[offset] = join(self.effects.get(offset, CLEAN), advance(unsafe, self.step(offset, 'sink', label)))
+            site = (PATH_RULE if self.policy == 'path' else URL_RULE, offset)
+            self.effects[site] = join(self.effects.get(site, CLEAN), advance(unsafe, self.step(offset, 'sink', label)))
+
+    def execution_sink(self, offset, value, rule, operation, state):
+        """Report the known hazard without interpreting attacker-controlled code.
+
+        The path pass owns execution findings so the URL pass cannot double
+        count them. Runtime code and method bodies are outside this terminal
+        boundary, but their result remains untrusted and existing validation
+        proofs cannot survive arbitrary execution in the current context.
+        """
+        if self.policy == 'path':
+            site = (rule, offset)
+            evidence = advance(tainted(value), self.step(offset, 'sink', operation))
+            self.effects[site] = join(self.effects.get(site, CLEAN), evidence)
+        for binding, fact in tuple(state.items()):
+            state[binding] = retag(fact, remove=VALUE_TAGS)
+        return self.fresh(retag(value, remove=VALUE_TAGS), 'unknown', offset)
+
+    def dispatch_target(self, value):
+        """Only a proved, unchanged string/symbol identifies a selected method."""
+        names = {trace.key[1] for trace in value
+                 if trace.kind == 'constant' and trace.key[0] in {'literal', 'symbol'}}
+        if len(names) != 1:
+            return None
+        for trace in value:
+            if (trace.kind == 'constant' and trace.key[0] in {'literal', 'symbol'}
+                    and 'exact-literal' in trace.tags):
+                continue
+            if trace.kind == 'object' and trace.key[0] == 'string':
+                continue
+            return None
+        return next(iter(names))
 
     def mutate(self, previous, value, state, name=None, overwrite=False):
         """Update object aliases; copied data does not imply shared identity.
@@ -1018,6 +1260,8 @@ class RubyEngine:
             and not any(offset in self.repeated_sites for offset in trace.key[2])
             and len(trace.key[2]) < 2 for trace in roots)
         array = any(trace.key[0] == 'array' for trace in roots)
+        if has_shape(previous, 'arel-sql-literal'):
+            value = retag(value, add=frozenset({'sql-raw-fragment'}))
         if array and not overwrite:
             value = frozenset(replace(trace, kind='member') if trace.kind == 'object' else trace
                               for trace in value)
@@ -1027,13 +1271,16 @@ class RubyEngine:
         changed = join(roots, value, CLEAN if overwrite else previous)
 
         def invalidate(fact):
-            fact = retag(fact, remove=VALUE_TAGS)
+            fact = retag(self.invalidate_sql_binding(fact), remove=VALUE_TAGS)
             fact = frozenset(trace for trace in fact if not (
                 trace.kind == 'shape' and trace.key[0] in {'literal-list', 'canonical-path'}))
             if has_shape(previous, 'uri'):
                 fact = retag(join(fact, frozenset(trace for trace in previous
                                                 if trace.kind == 'shape' and trace.key[0] == 'uri')),
                              add=frozenset({'parsed-uri'}))
+            if has_shape(previous, 'arel-sql-literal'):
+                fact = join(fact, frozenset(trace for trace in previous
+                            if trace.kind == 'shape' and trace.key[0] == 'arel-sql-literal'))
             return fact
 
         changed = invalidate(changed)
@@ -1057,7 +1304,21 @@ class RubyEngine:
         return changed
 
     def call(self, name, receiver, arguments, token, state):
+        self.budget.spend()
         candidates = self.candidates(name, len(arguments))
+        models = {trace.key[1] for trace in receiver
+                  if trace.kind == 'shape' and trace.key[0] == 'active-record-model'}
+        framework_models = set()
+        if models:
+            candidates = []
+            for owner in models:
+                for ancestor in self.model_ancestors(owner):
+                    choices = self.candidates('::'.join(ancestor) + '.' + name.rsplit('.', 1)[-1], len(arguments))
+                    if choices:
+                        candidates.extend(choices)
+                        break
+                else:
+                    framework_models.add(owner)
         instances = {trace.key[0] for trace in receiver if trace.kind == 'instance'}
         if instances:
             method = name.rsplit('.', 1)[-1]
@@ -1084,6 +1345,16 @@ class RubyEngine:
                     if index < len(values):
                         self.mutate(values[index], fact, state)
             if matched:
+                if framework_models:
+                    framework_receiver = frozenset(trace for trace in receiver
+                        if trace.kind == 'shape' and trace.key[0] == 'active-record-model'
+                        and trace.key[1] in framework_models)
+                    framework_result = self.active_record_call(name, framework_receiver, arguments, token, state)
+                    if framework_result is None:
+                        framework_result = self.fresh(
+                            retag(self.without_sql_api(join(framework_receiver, *arguments)), remove=VALUE_TAGS),
+                            'unknown', token.start)
+                    returned = join(returned, framework_result)
                 return returned
             if any(tainted(argument) for argument in arguments):
                 raise ValueError('Ruby selected helper arguments could not bind; analysis is incomplete')
@@ -1101,13 +1372,22 @@ class RubyEngine:
                 elif any(tainted(argument) for argument in arguments):
                     raise ValueError('Ruby constructor arguments need visible initialization analysis; analysis is incomplete')
                 return instance
+        sql_result = self.active_record_call(name, receiver, arguments, token, state)
+        if sql_result is not None:
+            return sql_result
         kinds = {trace.key[0] for trace in receiver if trace.kind == 'object'}
-        if kinds and kinds <= {'string', 'request'} and method in {
+        if kinds and kinds <= {'string', 'request'} and method == 'to_i' and len(arguments) <= 1:
+            return self.fresh(retag(value, add=frozenset({'sql-integer-value'}),
+                                    remove=VALUE_TAGS | frozenset({'sql-raw-fragment'})),
+                              'integer', token.start)
+        if (kinds and (kinds <= {'string', 'request'}
+                      or kinds <= {'sql-query'} and has_shape(receiver, 'arel-sql-literal'))) and method in {
                 'upcase', 'downcase', 'capitalize', 'swapcase', 'reverse', 'strip', 'lstrip', 'rstrip',
                 'chop', 'chomp', 'delete', 'delete_prefix', 'delete_suffix', 'sub', 'gsub', 'tr', 'tr_s',
                 'squeeze', 'scrub', 'encode', 'unicode_normalize', 'b', 'center', 'ljust', 'rjust',
                 'dump', 'undump', 'succ', 'next', 'inspect', 'byteslice', 'slice', 'chr', '[]'}:
-            return self.fresh(retag(value, remove=VALUE_TAGS), 'string', token.start)
+            return self.fresh(retag(self.invalidate_sql_binding(self.without_sql_api(value)),
+                                    remove=VALUE_TAGS | frozenset({'sql-raw-fragment'})), 'string', token.start)
         if receiver and (method.endswith('!') or method in {'push', 'append', 'prepend', 'concat', 'replace', 'clear', 'unshift', 'insert', 'update', 'delete', 'delete_at', 'delete_if'}):
             replacement = constant('', 'literal') if method == 'clear' else join(*arguments)
             binding = name.rsplit('.', 1)[0] if '.' in name else ''
@@ -1120,8 +1400,25 @@ class RubyEngine:
         if method in {'[]', 'fetch', 'first', 'last', 'at'} and any(
                 trace.kind == 'object' and trace.key[0] == 'array' for trace in receiver):
             return self.elements(receiver)
-        if method in {'eval', 'instance_eval', 'class_eval', 'module_eval', 'send', 'public_send', '__send__', 'define_method'} and tainted(value):
-            raise ValueError(f'{self.path}:{self.step(token.start, "call", name).line}: Request-derived dynamic Ruby execution needs dispatch analysis; analysis is incomplete')
+        if method in {'send', 'public_send', '__send__'} and arguments:
+            selector, forwarded = arguments[0], arguments[1:]
+            if tainted(selector):
+                return self.execution_sink(token.start, selector, DISPATCH_RULE,
+                                           name + ' request-selected method', state)
+            target = self.dispatch_target(selector)
+            if target is not None:
+                dispatched = name.rsplit('.', 1)[0] + '.' + target if '.' in name else target
+                return self.call(dispatched, receiver, forwarded, token, state)
+            if tainted(join(receiver, *forwarded)):
+                self.unresolved_calls.add(
+                    f'{self.path}:{self.step(token.start, "call", name).line}: '
+                    'Ruby dispatch target is unresolved for request-derived arguments; analysis is incomplete')
+        if method in {'eval', 'instance_eval', 'class_eval', 'module_eval'} and arguments and tainted(arguments[0]):
+            return self.execution_sink(token.start, arguments[0], EVAL_RULE,
+                                       name + ' request-derived code', state)
+        if method == 'define_method' and arguments and tainted(arguments[0]):
+            return self.execution_sink(token.start, arguments[0], DISPATCH_RULE,
+                                       name + ' request-selected definition', state)
         if name == 'Rack::Request.new':
             return shape('request', token.start)
         if method in {'fetch', 'dig', '[]'} and (has_shape(receiver, 'request-params') or has_shape(receiver, 'request-headers') or has_shape(receiver, 'environment')):
@@ -1190,18 +1487,19 @@ class RubyEngine:
         if method in {'freeze', 'itself'}:
             return value
         if method in {'to_s', 'to_str'}:
+            value = retag(self.without_sql_api(value), remove=frozenset({'sql-raw-fragment'}))
             kinds = {trace.key[0] for trace in receiver if trace.kind == 'object'}
             if kinds and kinds <= {'string', 'request'}:
                 return value
             converted = self.fresh(value, 'string', token.start)
-            return converted if kinds and kinds <= {'uri', 'pathname'} else join(value, converted)
+            return converted if kinds and kinds <= {'uri', 'pathname', 'sql-query'} else join(value, converted)
         if method in {'host', 'hostname', 'scheme', 'path', 'query', 'fragment', 'port'}:
             value = retag(value, remove=PROOF_TAGS)
             return join(value, self.fresh(value, 'component', token.start))
         # Unknown calls are not validators. Preserve request dependencies while
         # discarding proofs that their result still has the checked value. An
         # unknown result may borrow an argument or be a newly allocated value.
-        value = retag(value, remove=VALUE_TAGS)
+        value = retag(self.invalidate_sql_binding(self.without_sql_api(value)), remove=VALUE_TAGS)
         return join(value, self.fresh(value, 'unknown', token.start, shallow=True))
 
     def expression(self, tokens, state, depth=0):
@@ -1222,19 +1520,24 @@ class RubyEngine:
         for operators in ({'=>', ':'}, {'||', 'or'}, {'&&', 'and'}, {'==', '!=', '=~', '!~', '<', '>', '<=', '>='}, {'+', '-', '*', '/', '..'}):
             parts = split_tokens(tokens, operators)
             if len(parts) > 1:
-                combined = retag(join(*(self.expression(part, state, depth + 1) for part in parts)), remove=VALUE_TAGS)
+                combined = retag(self.invalidate_sql_binding(join(*(self.expression(part, state, depth + 1) for part in parts))),
+                                 remove=VALUE_TAGS - frozenset({'sql-integer-value'}))
                 if '+' in operators and all(parts):
-                    return self.fresh(combined, 'string', tokens[0].start)
+                    return self.fresh(retag(self.without_sql_api(combined),
+                                            remove=frozenset({'sql-raw-fragment'})), 'string', tokens[0].start)
                 return combined
         value, cursor = CLEAN, 0
         while cursor < len(tokens):
             self.budget.spend()
             token = tokens[cursor]
             if token.kind in {'template', 'dynamic'}:
-                atom = retag(join(*(self.expression(part, state, depth + 1) for part in token.parts)), remove=VALUE_TAGS)
+                atom = retag(self.invalidate_sql_binding(join(*(self.expression(part, state, depth + 1) for part in token.parts))),
+                             remove=VALUE_TAGS - frozenset({'sql-integer-value'}))
                 if token.kind == 'dynamic' and tainted(atom):
-                    raise ValueError('Request-derived Ruby command interpolation needs execution analysis; analysis is incomplete')
-                atom = self.fresh(atom, 'string', token.start)
+                    atom = self.execution_sink(token.start, atom, COMMAND_RULE,
+                                               'request-derived shell command', state)
+                atom = self.fresh(retag(self.without_sql_api(atom),
+                                        remove=frozenset({'sql-raw-fragment'})), 'string', token.start)
                 cursor += 1
                 name = ''
             elif token.kind in {'literal', 'number', 'words', 'regex'}:
@@ -1246,13 +1549,27 @@ class RubyEngine:
                 atom = join(*(self.expression(part, state, depth + 1) for part in split_tokens(tokens[cursor + 1:end], {','})))
                 if token.value in {'[', '{'}:
                     atom = self.collection(atom, token.start)
+                    if token.value == '{':
+                        atom = join(atom, shape('ruby-hash', token.start))
                 cursor, name = end + 1, ''
-            elif re.fullmatch(r'(?:@@?|\$)?[A-Za-z_]\w*[!?]?', token.value):
-                name, cursor = token.value, cursor + 1
+            elif (re.fullmatch(r'(?:@@?|\$)?[A-Za-z_]\w*[!?]?', token.value)
+                  or token.value == '::' and cursor + 1 < len(tokens)
+                  and re.fullmatch(r'[A-Z]\w*', tokens[cursor + 1].value)):
+                if token.value == '::':
+                    name, cursor = '::' + tokens[cursor + 1].value, cursor + 2
+                else:
+                    name, cursor = token.value, cursor + 1
                 while cursor + 1 < len(tokens) and tokens[cursor].value == '::':
                     name += '::' + tokens[cursor + 1].value
                     cursor += 2
-                atom = state.get(name, CLEAN)
+                constant_receiver = (name.removeprefix('::')[0].isupper() and cursor < len(tokens)
+                                     and tokens[cursor].value in {'.', '&.'})
+                atom = state.get(name, CLEAN if constant_receiver
+                                 else shape('unresolved-value', token.start))
+                if name not in state and re.fullmatch(r'(?:::)?[A-Z]\w*(?:::[A-Z]\w*)*', name):
+                    owner = self.constant_owner(name, self.function.owner)
+                    if owner in self.sql_models:
+                        atom = shape('active-record-model', owner)
                 if cursor < len(tokens) and tokens[cursor].value == '(':
                     end = closing_token(tokens, cursor)
                     arguments = self.call_arguments(tokens[cursor + 1:end], state, depth + 1)
@@ -1262,7 +1579,9 @@ class RubyEngine:
                     arguments = self.call_arguments(tokens[cursor:], state, depth + 1)
                     atom = self.call(name, CLEAN, arguments, token, state)
                     cursor = len(tokens)
-                elif name not in state and self.candidates(name, 0):
+                elif name not in state and (self.candidates(name, 0) or (
+                        name in {'connection', 'lease_connection', 'retrieve_connection', 'connection_pool'}
+                        and has_shape(state.get('self', CLEAN), 'active-record-model'))):
                     atom = self.call(name, CLEAN, [], token, state)
             else:
                 cursor += 1
@@ -1298,7 +1617,9 @@ class RubyEngine:
                 else:
                     break
             value = join(value, atom)
-        return value
+        # A keyword label describes this call's argument slot. It is not a
+        # property of the returned value or the next call's positional slot.
+        return frozenset(trace for trace in value if trace.kind != 'keyword')
 
     def proof(self, tokens, truth, state):
         tokens = ungroup(tokens)
@@ -1364,7 +1685,7 @@ class RubyEngine:
             return None
         member = members[-1]
         method = member[0].value
-        if method not in {'map', 'collect', 'each', 'tap', 'then', 'yield_self'}:
+        if method not in {'map', 'collect', 'each', 'tap', 'then', 'yield_self', 'with_connection'}:
             return None
         if len(member) != 1 and token_text(member[1:]) != '()':
             raise ValueError('Ruby block-call arguments need selected iterator binding; analysis is incomplete')
@@ -1685,6 +2006,16 @@ class RubyEngine:
                     not function.scope and not function.singleton and function.name == method
                     and function.owner in instances for function in self.parser.functions.values()):
                 raise ValueError('Overridden Ruby block methods need callback dispatch analysis; analysis is incomplete')
+            if method == 'with_connection':
+                models = {trace.key[1] for trace in value
+                          if trace.kind == 'shape' and trace.key[0] == 'active-record-model'}
+                if any(self.candidates('::'.join(owner) + '.with_connection', 0)
+                       for model in models for owner in self.model_ancestors(model)):
+                    raise ValueError('Overridden Ruby connection callbacks need callback dispatch analysis; analysis is incomplete')
+                if not models and not has_shape(value, 'active-record-pool'):
+                    raise ValueError('Ruby connection callback receiver is unresolved; analysis is incomplete')
+                value = self.fresh(shape('active-record-connection', tokens[0].start),
+                                   'active-record-connection', tokens[0].start)
             state[slot + ':receiver'] = advance(value, self.step(tokens[0].start, 'call', method + '()'))
             state[slot + ':values'] = shape('mapped-list', tokens[0].start)
             return state
@@ -1694,8 +2025,8 @@ class RubyEngine:
             if method in {'map', 'collect', 'each'} and any(
                     trace.kind == 'object' and trace.key[0] == 'array' for trace in value):
                 value = self.elements(value)
-            for name in parameters:
-                state[name] = value
+            for index, name in enumerate(parameters):
+                state[name] = constant('nil', 'code') if method == 'with_connection' and index else value
             for name in locals_:
                 state[name] = constant('nil', 'code')
             state['@result'] = constant('nil', 'code')
@@ -1742,10 +2073,13 @@ class RubyEngine:
             for key, function in contexts:
                 self.budget.spend()
                 self.function, self.effects, self.returned, self.mutations, self.raised = function, {}, CLEAN, {}, CLEAN
+                self.unresolved_calls = set()
                 self.parameter_values = dict(enumerate(key[1]))
                 state = {'@reachable': constant('reachable'),
                          'params': shape('request-params', function.key), 'env': shape('environment', function.key),
                          **{name: shape('request', function.key) for name in ('request', 'req', 'rack_request')}}
+                if function.owner in self.sql_models and (function.singleton or function.scope):
+                    state['self'] = shape('active-record-model', function.owner)
                 for (owner, name), fact in self.constants.items():
                     if function.owner[:len(owner)] == owner:
                         state[name] = fact
@@ -1758,17 +2092,19 @@ class RubyEngine:
                     self.graphs[function.key] = self.graph(function)
                 entry, actions, edges = self.graphs[function.key]
                 solve(entry, state, edges, lambda node, incoming: self.transfer(actions[node], incoming), self.budget)
+                self.dispatch_failures[key] = self.unresolved_calls
                 updated = self.summaries[key].merged(RubySummary(self.returned, self.effects, self.mutations, self.raised))
                 if updated != self.summaries[key]:
                     self.summaries[key], changed = updated, True
             changed = changed or len(contexts) != len(self.contexts)
         effects = {}
         for summary in self.summaries.values():
-            for offset, fact in summary.effects.items():
+            for (rule, offset), fact in summary.effects.items():
                 concrete = frozenset(trace for trace in fact if trace.kind == 'source')
                 if concrete:
                     line = self.step(offset, 'sink', '').line
-                    effects[line] = join(effects.get(line, CLEAN), concrete)
+                    site = (rule, line)
+                    effects[site] = join(effects.get(site, CLEAN), concrete)
         return effects
 
 
@@ -1780,21 +2116,34 @@ def flow_findings(path, policy):
     engine = RubyEngine(path, text, policy)
     lines = text.splitlines()
     suppressions = build_index(text, lang='ruby')
-    rule = 'ruby.taint.path_traversal' if policy == 'path' else 'ruby.taint.outbound_url'
-    for line, fact in sorted(engine.analyze().items()):
+    for (rule, line), fact in sorted(engine.analyze().items()):
         if suppressions.is_suppressed(line, rule):
             continue
         evidence = min((trace.evidence for trace in fact), key=lambda steps: (len(steps), steps))
         route = ' -> '.join(step.label for step in evidence)
-        yield line, f'{source_line(lines, line)}  [{route}]', {
+        extras = {
             'taint_path': [step.record() for step in evidence],
             'source_count': len({trace.key for trace in fact}),
         }
+        if rule in EXECUTION_RULES:
+            extras['terminal_sink'] = True
+            extras['analysis_boundary'] = 'Request-derived execution is reported at this call; runtime code and dispatch bodies are not interpreted.'
+        elif rule == SQL_RULE:
+            extras['query_argument'] = 0
+            extras['analysis_boundary'] = 'Request-derived SQL text reaches a bound ActiveRecord connection; separate value bindings do not sanitize the query text.'
+        yield rule, line, f'{source_line(lines, line)}  [{route}]', extras
+    # A helper may first have an empty summary before the fixed point proves a
+    # constant dispatch target. Check only the final contexts, after yielding
+    # independent findings so genuine incompleteness does not erase evidence.
+    failures = set().union(*engine.dispatch_failures.values())
+    if failures:
+        raise ValueError('; '.join(sorted(failures)))
 
 
 def analyze(path, issues):
-    for line, code, extras in flow_findings(path, 'path'):
-        issues.append((relpath(path), line, code))
+    for rule, line, code, extras in flow_findings(path, 'path'):
+        if rule == PATH_RULE:
+            issues.append((relpath(path), line, code))
 
 
 def _configure(root: Path) -> None:
@@ -1831,16 +2180,16 @@ def run(ctx: RunContext) -> Iterable[dict]:
     for path in ctx.files:
         if not path.is_file() or path.suffix.lower() not in EXTS:
             continue
-        for line_no, code, extras in flow_findings(path, 'path'):
+        for rule, line_no, code, extras in flow_findings(path, 'path'):
             yield {
-                "rule": "ruby.taint.path_traversal",
+                "rule": rule,
                 "path": relpath(path),
                 "line": line_no,
                 "col": 1,
                 "layer": "taint",
                 "lang": "ruby",
                 "severity": "critical",
-                "message": f"{MESSAGE}: {code}",
+                "message": f"{'Request-derived Ruby execution' if rule in EXECUTION_RULES else 'Request-derived SQL reaches ActiveRecord execution' if rule == SQL_RULE else MESSAGE}: {code}",
                 "extras": extras,
             }
 

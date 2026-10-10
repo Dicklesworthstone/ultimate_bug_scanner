@@ -44,7 +44,7 @@ HELPERS_DIR = REPO_ROOT / "modules" / "helpers"
 if str(HELPERS_DIR) not in sys.path:
     sys.path.insert(0, str(HELPERS_DIR))
 
-from ubs_core.io import iter_ndjson_lines, parse_ndjson_lines, read_ndjson  # noqa: E402
+from ubs_core.io import iter_ndjson_lines, parse_ndjson_lines, read_ndjson, source_line  # noqa: E402
 from ubs_core.py_detectors import division, index_arithmetic, io_open_checks, is_literal  # noqa: E402
 from ubs_core.py_detectors import json_loads  # noqa: E402
 from ubs_core.py_detectors import missing_returns  # noqa: E402
@@ -287,6 +287,93 @@ class IndexArithmeticGuardTests(unittest.TestCase):
     def test_guarded_offsets_are_silent(self) -> None:
         self.assertEqual(run_detector(index_arithmetic, {"guarded.py": self.GUARDED}), [])
 
+    def test_terminal_guards_allow_work_before_exiting(self) -> None:
+        for exit_statement in ('return None', 'raise ValueError("bad line")', 'continue', 'break'):
+            with self.subTest(exit_statement=exit_statement):
+                hits = run_detector(index_arithmetic, {"guard.py": f'''
+                    def read(lines, indexes, rejected):
+                        for line in indexes:
+                            if not 0 < line <= len(lines):
+                                rejected.append(line)
+                                {exit_statement}
+                            value = lines[line - 1]
+                '''})
+                self.assertEqual(hits, [])
+
+    def test_nonterminal_guard_and_rebound_index_keep_findings(self) -> None:
+        bodies = (
+            'if not 0 < line <= len(lines):\n    rejected.append(line)',
+            'if not 0 < line <= len(lines):\n    if stop:\n        return None',
+            'if line <= 0:\n    return None\nline = 0',
+            'assert line > 0\nline -= 10',
+            'if line <= 0:\n    return None\nif stop:\n    line = 0',
+        )
+        for body in bodies:
+            with self.subTest(body=body):
+                source = 'def read(lines, line, rejected, stop):\n' + textwrap.indent(body, '    ')
+                source += '\n    return lines[line - 1]\n'
+                hits = run_detector(index_arithmetic, {"rebound.py": source})
+                self.assertEqual(len(hits), 1, hits)
+
+    def test_rebinding_inside_a_guarded_body_or_operand_keeps_findings(self) -> None:
+        sources = (
+            'def read(lines, line):\n    if line > 0:\n        line = 0\n        return lines[line - 1]',
+            'def read(lines, line, stop):\n    if line <= 0:\n        return None\n    if stop:\n        line = 0\n        return lines[line - 1]',
+            'def read(lines):\n    for line, _ in enumerate(lines, 1):\n        line = 0\n        return lines[line - 1]',
+            'def read(lines, line):\n    return line > 0 and (line := 0) == 0 and lines[line - 1]',
+            'def read(lines, line):\n    if line > 0:\n        lines[(line := 0)] += lines[line - 1]',
+            'def read(lines, line, reset):\n    if line <= 0:\n        return None\n    if reset(line := 0):\n        return lines[line - 1]',
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertEqual(len(run_detector(index_arithmetic, {'body.py': source})), 1)
+
+    def test_rebinding_on_an_exiting_branch_does_not_change_the_survivor(self) -> None:
+        hits = run_detector(index_arithmetic, {'survivor.py': '''
+            def read(lines, line, stop):
+                if line > 0:
+                    if stop:
+                        if stop == 2:
+                            line = 0
+                            return None
+                    return lines[line - 1]
+        '''})
+        self.assertEqual(hits, [])
+
+    def test_assignment_rhs_uses_the_guarded_old_index(self) -> None:
+        hits = run_detector(index_arithmetic, {'rhs.py': '''
+            def read(lines, line):
+                if line + 1 < len(lines):
+                    value, line = lines[line + 1], line + 2
+                return value
+        '''})
+        self.assertEqual(hits, [])
+
+    def test_comprehension_guards_follow_evaluation_order(self) -> None:
+        cases = (
+            ('[x[i + 1] for i in range(n) if i + 1 < len(x)]', 0),
+            ('[i for i in range(n) if i + 1 < len(x) if x[i + 1]]', 0),
+            ('[i for i in range(n) if x[i + 1] if i + 1 < len(x)]', 1),
+            ('[j for j in x[i + 1] if i + 1 < len(x)]', 1),
+            ('[j for i in range(n) for j in x[i + 1] if i + 1 < len(x)]', 1),
+            ('[j for i in range(n) if i + 1 < len(x) for j in x[i + 1]]', 0),
+            ('{i: x[i + 1] for i in range(n) if i + 1 < len(x)}', 0),
+            ('(x[i + 1] for i in range(n) if i + 1 < len(x))', 0),
+            ('[x[i - 1] for i, _ in enumerate(x, 1) for i in range(n)]', 1),
+            ('[j for i, _ in enumerate(x, 1) for i in range(n) for j in x[i - 1]]', 1),
+            ('[j for i, _ in enumerate(x, 1) for j in x[i - 1]]', 0),
+            ('[x[i - 1] for i, _ in enumerate(x, 1) if (i := 0) == 0]', 1),
+            ('[i for i, _ in enumerate(x, 1) if (i := 0) or x[i - 1]]', 1),
+            ('[j for i in range(n) if i + 1 < len(x) for j in range(n) if (i := len(x)) or x[i + 1]]', 1),
+        )
+        for expression, expected in cases:
+            with self.subTest(expression=expression):
+                hits = run_detector(index_arithmetic, {"ordered.py": f'''
+                    def read(x, i, n):
+                        return {expression}
+                '''})
+                self.assertEqual(len(hits), expected, (expression, hits))
+
     def test_truthiness_split_only_guards_the_true_branch(self) -> None:
         # `if not i:` proves i == 0 inside its own body — the opposite of a guard.
         hits = run_detector(index_arithmetic, {"branch.py": """
@@ -317,6 +404,53 @@ class IndexArithmeticGuardTests(unittest.TestCase):
                 return idx == 0 or text[idx - 1] != "_"
         """})
         self.assertEqual(len(hits), 1, hits)
+
+    def test_boolean_guards_follow_short_circuit_outcomes(self) -> None:
+        cases = (
+            ('safe-and', 'i + 1 < len(x) and x[i + 1]', 0),
+            ('unsafe-or', 'i + 1 < len(x) or x[i + 1]', 1),
+            ('safe-or', 'i + 1 >= len(x) or x[i + 1]', 0),
+            ('unsafe-and', 'i + 1 >= len(x) and x[i + 1]', 1),
+            ('safe-not', 'not (i + 1 >= len(x)) and x[i + 1]', 0),
+            ('unsafe-negated-or', 'not (i + 1 >= len(x)) or x[i + 1]', 1),
+            ('safe-predecessor', 'i and x[i - 1]', 0),
+            ('unsafe-zero', 'not i and x[i - 1]', 1),
+            ('safe-zero-split', 'i == 0 or x[i - 1]', 0),
+            ('unsafe-zero-split', 'i == 0 and x[i - 1]', 1),
+            ('unsafe-forward-truthiness', 'i and x[i + 1]', 1),
+            ('unsafe-large-predecessor', 'i and x[i - 2]', 1),
+            ('unsafe-large-zero-split', 'i == 0 or x[i - 2]', 1),
+            ('unsafe-nested-or', '(ready or i + 1 < len(x)) and x[i + 1]', 1),
+            ('safe-nested-and', '(ready and i + 1 < len(x)) and x[i + 1]', 0),
+            ('unsafe-false-chain', '0 <= i + 1 < len(x) or x[i + 1]', 1),
+        )
+        for label, expression, expected in cases:
+            with self.subTest(case=label):
+                hits = run_detector(index_arithmetic, {
+                    'boolean.py': f'def probe(x, i, ready):\n    return {expression}\n',
+                })
+                self.assertEqual(len(hits), expected, (expression, hits))
+
+    def test_enclosing_guards_use_the_selected_branch(self) -> None:
+        cases = (
+            ('unsafe-or-body', 'if ready or i + 1 < len(x):\n        return x[i + 1]', 1),
+            ('safe-and-body', 'if ready and i + 1 < len(x):\n        return x[i + 1]', 0),
+            ('unsafe-else', 'if i + 1 < len(x):\n        return None\n    else:\n        return x[i + 1]', 1),
+            ('safe-else', 'if i + 1 >= len(x):\n        return None\n    else:\n        return x[i + 1]', 0),
+            ('safe-ternary', 'return None if i + 1 >= len(x) else x[i + 1]', 0),
+            ('unsafe-ternary', 'return None if i + 1 < len(x) else x[i + 1]', 1),
+            ('unsafe-equality', 'if i == 0:\n        return x[i + 1]', 1),
+            ('unsafe-call-argument', 'if check(i + 1 < len(x)):\n        return x[i + 1]', 1),
+            ('unsafe-early-and', 'if ready and i + 1 >= len(x):\n        return None\n    return x[i + 1]', 1),
+            ('safe-early-or', 'if ready or i + 1 >= len(x):\n        return None\n    return x[i + 1]', 0),
+            ('safe-while', 'while i and x[i - 1]:\n        i -= 1', 0),
+        )
+        for label, body, expected in cases:
+            with self.subTest(case=label):
+                hits = run_detector(index_arithmetic, {
+                    'branch.py': f'def probe(x, i, ready):\n    {body}\n',
+                })
+                self.assertEqual(len(hits), expected, (body, hits))
 
     def test_unguarded_offsets_are_reported(self) -> None:
         hits = run_detector(index_arithmetic, {"unguarded.py": self.UNGUARDED})
@@ -1059,7 +1193,11 @@ class FloatEqualityPrecisionTests(unittest.TestCase):
                 (artifacts / f"{label}-result.json").write_text(result.stdout)
                 (artifacts / f"{label}-stderr.log").write_text(result.stderr)
                 self.assertEqual(result.returncode, 1 if expected else 0, (result.stdout, result.stderr))
-                doc = json.loads(result.stdout)
+                try:
+                    doc = json.loads(result.stdout)
+                except json.JSONDecodeError as exc:
+                    self.fail(f"Notebook CLI returned invalid JSON: {exc}; "
+                              f"stdout={result.stdout!r}; stderr={result.stderr!r}")
                 self.assertEqual(doc["status"], "ok", (result.stdout, result.stderr))
                 self.assertEqual(doc["failed_modules"], [], (result.stdout, result.stderr))
                 hits = [finding for finding in doc.get("findings", [])
@@ -1069,6 +1207,22 @@ class FloatEqualityPrecisionTests(unittest.TestCase):
                 self.assertEqual(doc["totals"]["critical"], 0, (result.stdout, result.stderr))
                 self.assertEqual(doc["totals"]["warning"], expected, (result.stdout, result.stderr))
                 print(f"[{case}] PASS ({time.perf_counter() - started:.3f}s)", flush=True)
+
+
+class SourceLineTests(unittest.TestCase):
+    def test_first_last_and_empty_lines_retain_exact_evidence(self) -> None:
+        lines = ['first\tline', '', 'last\u2028line']
+        self.assertEqual(source_line(lines, 1), lines[0])
+        self.assertEqual(source_line(lines, 2), '')
+        self.assertEqual(source_line(tuple(lines), 3), lines[2])
+
+    def test_invalid_anchors_fail_instead_of_wrapping_or_guessing(self) -> None:
+        for lines, line in ((['first', 'last'], 0), (['first', 'last'], -1),
+                            (['first', 'last'], 3), ([], 1), (['first'], True),
+                            (['first'], 1.0), (['first'], '1')):
+            with self.subTest(lines=lines, line=line):
+                with self.assertRaisesRegex(ValueError, 'analysis is incomplete'):
+                    source_line(lines, line)
 
 
 class NdjsonReaderTests(unittest.TestCase):

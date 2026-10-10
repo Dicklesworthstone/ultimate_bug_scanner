@@ -130,6 +130,288 @@ def check_output_flag_json() -> None:
         report("output_flag_json", ok, f"exit={proc.returncode}", proc)
 
 
+def check_also_reports_same_scan() -> None:
+    """All export formats retain the same findings without invoking modules again."""
+    artifact_root = REPO_ROOT / "test-suite" / "artifacts" / "also-reports"
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix="same-scan-", dir=artifact_root))
+    source = tmp / "source.py"
+    source.write_text("eval(input())\n", encoding="utf-8")  # ubs:ignore[python.taint.eval] Scanned fixture, never executed.
+    proc = run([
+        str(source), "--only=python", "--ci", "--ignore-file=/dev/null", "--format=json",
+        "--also=json:copy.json", "--also", "jsonl:findings.jsonl", "--also=sarif:report.sarif",
+    ], cwd=tmp, env={"UBS_PROFILE": "1", "ENABLE_UV_TOOLS": "0", "UBS_NO_CACHE": "1"})
+    write_case_artifacts("also_reports_same_scan", proc)
+    doc = parse_json_document(proc.stdout)
+    copy = parse_json_document((tmp / "copy.json").read_text(encoding="utf-8"))
+    rows = [parse_json_document(line) for line in (tmp / "findings.jsonl").read_text(encoding="utf-8").splitlines()]
+    sarif = parse_json_document((tmp / "report.sarif").read_text(encoding="utf-8"))
+    expected = Counter(f["fingerprint"] for f in doc["findings"])
+    actual_jsonl = Counter(f["fingerprint"] for f in rows if f["type"] == "finding")
+    actual_sarif = Counter(
+        result["properties"]["fingerprint"]
+        for scan in sarif["runs"] if not scan["tool"]["driver"]["name"].endswith("-ast")
+        for result in scan["results"]
+    )
+    totals = next(row for row in rows if row["type"] == "totals")
+    ok = (
+        proc.returncode == 1 and doc["status"] == "ok" and bool(expected)
+        and "python.taint.eval" in {f["rule_id"] for f in doc["findings"]}
+        and doc == copy and actual_jsonl == expected and actual_sarif == expected
+        and all(row["timestamp"] == doc["timestamp"] for row in rows)
+        and all(totals[key] == doc["totals"][key] for key in ("files", "critical", "warning", "info"))
+        and proc.stderr.count("Finished python (") == 1
+    )
+    report("also_reports_same_scan", ok, f"exit={proc.returncode}; JSON/JSONL/SARIF findings={len(expected)}", proc)
+
+
+def check_also_text_and_baseline() -> None:
+    artifact_root = REPO_ROOT / "test-suite" / "artifacts" / "also-reports"
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix="text-baseline-", dir=artifact_root))
+    source = tmp / "source.py"
+    source.write_text("eval(input())\n", encoding="utf-8")  # ubs:ignore[python.taint.eval] Scanned fixture, never executed.
+    common = [str(source), "--only=python", "--ci", "--ignore-file=/dev/null"]
+    env = {"ENABLE_UV_TOOLS": "0"}
+    original = run([*common, "--also=json:baseline.json"], cwd=tmp, env=env)
+    baseline_text = (tmp / "baseline.json").read_text(encoding="utf-8")
+    first = parse_json_document(baseline_text)
+    filtered = run([
+        *common, "--baseline=baseline.json", "--new-only", "--also=json:filtered.json",
+        "--also=sarif:filtered.sarif", "--also=jsonl:filtered.jsonl",
+    ], cwd=tmp, env=env)
+    write_case_artifacts("also_text_and_baseline", filtered)
+    doc = parse_json_document((tmp / "filtered.json").read_text(encoding="utf-8"))
+    sarif = parse_json_document((tmp / "filtered.sarif").read_text(encoding="utf-8"))
+    rows = [parse_json_document(line) for line in (tmp / "filtered.jsonl").read_text(encoding="utf-8").splitlines()]
+    ok = (
+        original.returncode == 1 and bool(first["findings"]) and "UBS Meta-Runner" in original.stdout
+        and filtered.returncode == 0 and doc["status"] == "ok" and not doc["findings"]
+        and all(not scan["results"] for scan in sarif["runs"])
+        and not any(row["type"] == "finding" for row in rows)
+        and (tmp / "baseline.json").read_text(encoding="utf-8") == baseline_text
+    )
+    report("also_text_and_baseline", ok, f"initial exit={original.returncode}; filtered exit={filtered.returncode}", filtered)
+
+
+def check_also_invalid_destinations() -> None:
+    artifact_root = REPO_ROOT / "test-suite" / "artifacts" / "also-reports"
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix="invalid-", dir=artifact_root))
+    existing = tmp / "existing.json"
+    existing.write_text("previous report\n", encoding="utf-8")
+    alias = tmp / "alias.json"
+    alias.symlink_to(existing)
+    cases = [
+        ["--also"], ["--also=json"], ["--also=json:"], ["--also=json:-"],
+        ["--also=xml:report.xml"],
+        ["--also=json:existing.json", "--also=sarif:./existing.json"],
+        ["--also=json:existing.json", "--also=sarif:alias.json"],
+        ["--output=existing.json", "--also=json:existing.json"],
+    ]
+    failures = []
+    for index, flags in enumerate(cases):
+        proc = run([str(PY_CLEAN), *flags], cwd=tmp)
+        write_case_artifacts(f"also_invalid_destinations_{index}", proc)
+        if proc.returncode != 2 or "--also" not in proc.stderr or "Finished python (" in proc.stderr:
+            failures.append(f"{flags}: exit={proc.returncode}")
+    ok = not failures and existing.read_text(encoding="utf-8") == "previous report\n"
+    report("also_invalid_destinations", ok, "; ".join(failures), proc if not ok else None)
+
+
+def check_also_delivery_and_empty_scan() -> None:
+    artifact_root = REPO_ROOT / "test-suite" / "artifacts" / "also-reports"
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix="delivery-", dir=artifact_root))
+    blocked = tmp / "blocked"
+    blocked.write_text("keep this file\n", encoding="utf-8")
+    directory = tmp / "directory"
+    directory.mkdir()
+    env = {"ENABLE_UV_TOOLS": "0"}
+    proc = run([
+        str(PY_CLEAN), "--only=python", "--ci", "--format=json",
+        "--also=json:blocked/report.json", "--also=sarif:directory", "--also=json:complete.json",
+    ], cwd=tmp, env=env)
+    write_case_artifacts("also_delivery_failure", proc)
+    good = parse_json_document((tmp / "complete.json").read_text(encoding="utf-8"))
+    failed_ok = (
+        proc.returncode == 2 and "--also" in proc.stderr and good["status"] == "ok"
+        and blocked.read_text(encoding="utf-8") == "keep this file\n" and not list(directory.iterdir())
+    )
+    empty = run([
+        str(directory), "--ci", "--format=json", "--also=json:empty.json",
+        "--also=sarif:empty.sarif", "--also=jsonl:empty.jsonl",
+    ], cwd=tmp, env=env)
+    write_case_artifacts("also_empty_scan", empty)
+    doc = parse_json_document((tmp / "empty.json").read_text(encoding="utf-8"))
+    sarif = parse_json_document((tmp / "empty.sarif").read_text(encoding="utf-8"))
+    rows = [parse_json_document(line) for line in (tmp / "empty.jsonl").read_text(encoding="utf-8").splitlines()]
+    empty_ok = (
+        empty.returncode == 3 and doc == parse_json_document(empty.stdout)
+        and doc["result"] == "no-supported-languages" and doc["exit_code"] == 3
+        and sarif["runs"][0]["invocations"][0]["exitCode"] == 3
+        and rows[0]["type"] == "no-supported-languages"
+    )
+    report("also_delivery_and_empty_scan", failed_ok and empty_ok,
+           f"delivery exit={proc.returncode}; empty exit={empty.returncode}", proc if not failed_ok else empty)
+
+
+def also_jq_failure_env(tmp: Path, expression: str) -> dict[str, str]:
+    """Fail one real report-rendering operation after writing a partial result."""
+    real_jq = shutil.which("jq")
+    if real_jq is None:
+        raise RuntimeError("jq is required for report rendering fault injection")
+    bin_dir = tmp / "bin"
+    bin_dir.mkdir()
+    shim = bin_dir / "jq"
+    shim.write_text("#!/usr/bin/env python3\n" + textwrap.dedent('''\
+        import os
+        import sys
+
+        args = sys.argv[1:]
+        expression = os.environ["UBS_TEST_JQ_EXPRESSION"]
+        if (any(arg.endswith("/combined.json") for arg in args)
+                and any(expression in arg for arg in args)):
+            with open(os.environ["UBS_TEST_JQ_FAILURE_LOG"], "a", encoding="utf-8") as log:
+                log.write(expression + "\\n")
+            sys.stdout.write('{"incomplete":')
+            sys.exit(73)
+        real_jq = os.environ["UBS_TEST_REAL_JQ"]
+        os.execv(real_jq, [real_jq, *args])
+        '''), encoding="utf-8")
+    shim.chmod(0o755)
+    return {
+        "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+        "UBS_TEST_REAL_JQ": real_jq,
+        "UBS_TEST_JQ_EXPRESSION": expression,
+        "UBS_TEST_JQ_FAILURE_LOG": str(tmp / "jq-failures.log"),
+        "ENABLE_UV_TOOLS": "0",
+        "UBS_NO_CACHE": "1",
+        "UBS_PROFILE": "0",
+    }
+
+
+def check_also_jsonl_render_failure_preserves_reports() -> None:
+    artifact_root = REPO_ROOT / "test-suite" / "artifacts" / "also-reports"
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    cases = (
+        ("finding", 'type:"finding"', [], False),
+        ("scanner", 'type:"scanner"', [], False),
+        ("totals", 'type:"totals"', [], False),
+        ("summary", 'type:"scanner"', ["--jsonl-summary-only"], False),
+        ("empty_findings", 'type:"finding"', [], True),
+    )
+    for name, expression, flags, clean in cases:
+        tmp = Path(tempfile.mkdtemp(prefix=f"jsonl-failure-{name}-", dir=artifact_root))
+        source = PY_CLEAN
+        if not clean:
+            source = tmp / "source.py"
+            source.write_text("eval(input())\n", encoding="utf-8")  # ubs:ignore[python.taint.eval] Scanned fixture, never executed.
+        existing = tmp / "existing.jsonl"
+        sentinel = "previous complete JSONL report\n"
+        existing.write_text(sentinel, encoding="utf-8")
+        env = also_jq_failure_env(tmp, expression)
+        proc = run([
+            str(source), "--only=python", "--ci", "--ignore-file=/dev/null", "--format=json",
+            *flags, "--also=jsonl:existing.jsonl", "--also=json:complete.json",
+        ], cwd=tmp, env=env)
+        injections = (tmp / "jq-failures.log").read_text(encoding="utf-8").splitlines()
+        doc = parse_json_document(proc.stdout)
+        complete = parse_json_document((tmp / "complete.json").read_text(encoding="utf-8"))
+        ok = (
+            proc.returncode == 2 and injections == [expression]
+            and "Could not render requested --also jsonl report" in proc.stderr
+            and existing.read_text(encoding="utf-8") == sentinel
+            and doc == complete and doc["status"] == "ok"
+            and bool(doc.get("findings", [])) == (not clean)
+        )
+        case_id = f"also_jsonl_render_failure_{name}"
+        write_case_artifacts(case_id, proc, {"injections": injections, "preserved": existing.read_text(encoding="utf-8") == sentinel})
+        report(case_id, ok, f"exit={proc.returncode}; injected failures={len(injections)}", proc)
+
+
+def check_also_json_cache_failure_preserves_reports() -> None:
+    artifact_root = REPO_ROOT / "test-suite" / "artifacts" / "also-reports"
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix="json-cache-failure-", dir=artifact_root))
+    first = tmp / "first.json"
+    second = tmp / "second.json"
+    sentinel = "previous complete JSON report\n"
+    first.write_text(sentinel, encoding="utf-8")
+    second.write_text(sentinel, encoding="utf-8")
+    expression = ". + {profile: $profile"
+    env = {**also_jq_failure_env(tmp, expression), "UBS_PROFILE": "1"}
+    proc = run([
+        str(PY_CLEAN), "--only=python", "--ci", "--format=text",
+        "--also=json:first.json", "--also=json:second.json",
+    ], cwd=tmp, env=env)
+    injections = (tmp / "jq-failures.log").read_text(encoding="utf-8").splitlines()
+    preserved = all(path.read_text(encoding="utf-8") == sentinel for path in (first, second))
+    ok = (
+        proc.returncode == 2 and injections == [expression, expression] and preserved
+        and proc.stderr.count("Could not render requested --also json report") == 2
+        and "UBS Meta-Runner" in proc.stdout
+    )
+    write_case_artifacts("also_json_cache_failure_preserves_reports", proc, {"injections": injections, "preserved": preserved})
+    report("also_json_cache_failure_preserves_reports", ok,
+           f"exit={proc.returncode}; injected failures={len(injections)}; reports preserved={preserved}", proc)
+
+
+def check_also_toon_requires_encoder() -> None:
+    artifact_root = REPO_ROOT / "test-suite" / "artifacts" / "also-reports"
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix="toon-missing-", dir=artifact_root))
+    proc = run([
+        str(PY_CLEAN), "--format=json", "--also=toon:result.toon",
+    ], cwd=tmp, env={"UBS_TEST_FORCE_NO_TOON": "1"})
+    write_case_artifacts("also_toon_requires_encoder", proc)
+    ok = proc.returncode == 2 and not (tmp / "result.toon").exists() and "Finished python (" not in proc.stderr
+    report("also_toon_requires_encoder", ok, f"exit={proc.returncode}", proc)
+
+
+def check_also_partial_scan_keeps_findings() -> None:
+    artifact_root = REPO_ROOT / "test-suite" / "artifacts" / "also-reports"
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix="partial-", dir=artifact_root))
+    source = tmp / "source.py"
+    source.write_text("eval(input())\n", encoding="utf-8")  # ubs:ignore[python.taint.eval] Scanned fixture, never executed.
+    broken = tmp / "broken.py"
+    broken.write_text("def broken(:\n", encoding="utf-8")
+    proc = run([
+        str(source), str(broken), "--only=python", "--ci", "--ignore-file=/dev/null", "--format=json",
+        "--also=json:partial.json", "--also=jsonl:partial.jsonl", "--also=sarif:partial.sarif",
+    ], cwd=tmp, env={"ENABLE_UV_TOOLS": "0", "UBS_NO_CACHE": "1"})
+    write_case_artifacts("also_partial_scan_keeps_findings", proc)
+    doc = parse_json_document(proc.stdout)
+    copy = parse_json_document((tmp / "partial.json").read_text(encoding="utf-8"))
+    rows = [parse_json_document(line) for line in (tmp / "partial.jsonl").read_text(encoding="utf-8").splitlines()]
+    sarif = parse_json_document((tmp / "partial.sarif").read_text(encoding="utf-8"))
+    totals = next(row for row in rows if row["type"] == "totals")
+    ok = (
+        proc.returncode == 2 and doc["status"] == "partial" and bool(doc["failed_modules"])
+        and doc == copy and bool(doc["findings"])
+        and totals["status"] == doc["status"] and totals["failed_modules"] == doc["failed_modules"]
+        and all(invocation["executionSuccessful"] is False
+                for scan in sarif["runs"] for invocation in scan["invocations"])
+    )
+    report("also_partial_scan_keeps_findings", ok, f"exit={proc.returncode}; status={doc.get('status')}", proc)
+
+
+def check_also_toon_round_trip() -> None:
+    artifact_root = REPO_ROOT / "test-suite" / "artifacts" / "also-reports"
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix="toon-", dir=artifact_root))
+    proc = run([
+        str(PY_CLEAN), "--only=python", "--ci", "--format=json", "--also=toon:report.toon",
+    ], cwd=tmp, env={"ENABLE_UV_TOOLS": "0", "UBS_PROFILE": "1"})
+    write_case_artifacts("also_toon_round_trip", proc)
+    encoded = (tmp / "report.toon").read_text(encoding="utf-8")
+    encoder = os.environ.get("TOON_TRU_BIN") or os.environ.get("TOON_BIN") or shutil.which("tru") or "toon"
+    decoded = subprocess.run([encoder, "--decode"], input=encoded, text=True, capture_output=True, timeout=30)  # ubs:ignore[python.taint.command] Fixed encoder invocation, report is stdin.
+    ok = proc.returncode == 0 and decoded.returncode == 0 and parse_json_document(proc.stdout) == parse_json_document(decoded.stdout)
+    report("also_toon_round_trip", ok, f"scan exit={proc.returncode}; decoder exit={decoded.returncode}", proc)
+
+
 def check_rules_dir_custom_rule_in_sarif() -> None:
     with tempfile.TemporaryDirectory(prefix="ubs-rules-") as tmp:
         rules = Path(tmp) / "rules"
@@ -1656,17 +1938,6 @@ def test_skip_polyglot_mapping() -> None:
 check_skip_polyglot_mapping = test_skip_polyglot_mapping
 
 
-def is_build_phase_finding(rule_id: object) -> bool:
-    """Whether a finding is a build-tool diagnostic rather than a code finding.
-
-    These are reported with no file and no line, and they exist only when the
-    build tool recompiled — cargo prints its warnings on a fresh compile and
-    nothing on a cached one. Anything comparing two separate scans has to
-    leave them out, or the build cache decides the result.
-    """
-    return str(rule_id).endswith(".build.phase")
-
-
 def describe_failed_modules(entries: object) -> str:
     """Render a `failed_modules` list the way `ubs` itself explains a partial run.
 
@@ -1711,8 +1982,13 @@ def test_findings_parity_all_langs() -> None:
         cid = c["id"]
         common = ["--ignore-file=/dev/null", target, f"--only={lang}", "--ci"]
 
-        # 1. JSON
-        pj = run([*common, "--format=json"])
+        # One observation, four renderings. External-tool/cache variance can
+        # no longer masquerade as a renderer disagreement (issue #127).
+        export_root = REPO_ROOT / "test-suite" / "artifacts" / "findings-parity-snapshots"
+        export_root.mkdir(parents=True, exist_ok=True)
+        exports = Path(tempfile.mkdtemp(prefix=f"{lang}-", dir=export_root))
+        pj = run([*common, "--format=json", f"--also=jsonl:{exports / 'report.jsonl'}",
+                  f"--also=toon:{exports / 'report.toon'}", f"--also=sarif:{exports / 'report.sarif'}"])
         write_case_artifacts(f"findings-parity-{lang}-json", pj)
         last_proc = pj
         try:
@@ -1747,14 +2023,6 @@ def test_findings_parity_all_langs() -> None:
         if not findings:
             failures.append(f"{lang}: no findings in JSON (findings[] is empty)")
             continue
-        # Same reason as the SARIF identity comparison below: a build-tool
-        # diagnostic exists only when the build tool recompiled, so it is not
-        # stable across the separate scans this check runs per format.
-        findings = [
-            f
-            for f in findings
-            if not is_build_phase_finding(f.get("rule_id", f.get("rule", "")))
-        ]
 
         bad_rules = [f for f in findings if not str(f.get("rule_id", "")).strip()]
         if bad_rules:
@@ -1764,7 +2032,8 @@ def test_findings_parity_all_langs() -> None:
         expected_count = len(findings)
 
         # 2. JSONL
-        pjl = run([*common, "--format=jsonl"])
+        pjl = subprocess.CompletedProcess(pj.args, pj.returncode,
+            (exports / "report.jsonl").read_text(encoding="utf-8"), pj.stderr)
         write_case_artifacts(f"findings-parity-{lang}-jsonl", pjl)
         last_proc = pjl
         jl_lines = [parse_json_document(line) for line in pjl.stdout.splitlines() if line.strip()]
@@ -1772,18 +2041,13 @@ def test_findings_parity_all_langs() -> None:
             line
             for line in jl_lines
             if line.get("type") == "finding"
-            and not is_build_phase_finding(line.get("rule_id", line.get("rule", "")))
         ]
         # Two independent conditions, reported separately. Folding them into
         # one message printed "JSONL finding count 619 != expected 619" when
         # the counts agreed and it was the exit codes that differed, which
         # sends the reader to the renderer instead of to the scan.
         #
-        # This check renders each format from its own scan, so a scan that
-        # fails outright (exit 2 = module/tooling error, seen under heavy
-        # load) shows up here as a format disagreement. Name it for what it
-        # is: 0 and 1 are normal completions, anything else is a run that did
-        # not finish, which is not evidence about the renderers at all.
+        # An incomplete scan is not evidence of a renderer disagreement.
         incomplete = [
             f"{label} (exit {proc.returncode})"
             for label, proc in (("JSON", pj), ("JSONL", pjl))
@@ -1835,18 +2099,15 @@ def test_findings_parity_all_langs() -> None:
             continue
 
         # 3. TOON
-        pt = run([*common, "--format=toon"])
+        pt = subprocess.CompletedProcess(pj.args, pj.returncode,
+            (exports / "report.toon").read_text(encoding="utf-8"), pj.stderr)
         write_case_artifacts(f"findings-parity-{lang}-toon", pt)
         last_proc = pt
         # CLI output is decoder stdin, never a command or shell argument.
         pt_dec = subprocess.run(["toon", "--decode"], input=pt.stdout, capture_output=True, text=True, timeout=30)  # ubs:ignore[python.taint.command]
         try:
             tdoc = json.loads(pt_dec.stdout)
-            t_findings = [
-                f
-                for f in tdoc.get("findings", [])
-                if not is_build_phase_finding(f.get("rule_id", f.get("rule", "")))
-            ]
+            t_findings = tdoc.get("findings", [])
             # Three separate conditions, reported separately. Folded together
             # they all printed as a count mismatch, so a failed decode or a
             # differing exit code read as the TOON renderer losing findings.
@@ -1870,7 +2131,8 @@ def test_findings_parity_all_langs() -> None:
             continue
 
         # 4. SARIF: preserve both provenance runs and every diagnostic identity.
-        ps = run([*common, "--format=sarif"])
+        ps = subprocess.CompletedProcess(pj.args, pj.returncode,
+            (exports / "report.sarif").read_text(encoding="utf-8"), pj.stderr)
         write_case_artifacts(f"findings-parity-{lang}-sarif", ps)
         last_proc = ps
         try:
@@ -1895,33 +2157,17 @@ def test_findings_parity_all_langs() -> None:
             if len(drivers) != len(set(drivers)) or set(drivers) != set(expected_runs):
                 failures.append(f"{lang}: SARIF drivers {drivers} != expected {list(expected_runs)}")
                 continue
-            # Filtered on the same basis as the other three formats, so the
-            # recorded counts describe the same set the comparison used.
+            # Include build-phase records too: each format uses the same scan.
             s_results = [
                 result
                 for item in runs
                 for result in item.get("results", [])
-                if not is_build_phase_finding(result.get("ruleId", ""))
             ]
             for item in runs:
                 driver = item["tool"]["driver"]["name"]
                 expected = Counter()
                 actual = Counter()
                 for finding in expected_runs[driver]:
-                    # Build-phase diagnostics are emitted only when the
-                    # language's build tool actually recompiles: cargo prints
-                    # warnings on a fresh compile and says nothing on a cached
-                    # one. This check runs the scan once per format, and on a
-                    # machine where every repo shares one CARGO_TARGET_DIR the
-                    # cache state flips between those runs, so the same corpus
-                    # yields `rust.build.phase` in one rendering and not
-                    # another. They carry no source location, so they cannot
-                    # be a renderer divergence either — comparing them lets
-                    # cargo's cache decide whether this check passes.
-                    if is_build_phase_finding(
-                        finding.get("rule_id", finding.get("rule", ""))
-                    ):
-                        continue
                     scope = finding.get("scope", "")
                     level = {"critical": "error", "warning": "warning", "info": "note"}[
                         finding["severity"]
@@ -1937,8 +2183,6 @@ def test_findings_parity_all_langs() -> None:
                         if scope in {"project", "project_aggregate"} else None,
                     )] += 1
                 for result in item.get("results", []):
-                    if is_build_phase_finding(result["ruleId"]):
-                        continue
                     locations = result.get("locations", [])
                     if len(locations) > 1:
                         raise ValueError(f"{driver}: unexpected multiple source locations")
@@ -2444,6 +2688,15 @@ def main() -> int:
         check_no_color_strips_ansi,
         check_output_file_positional,
         check_output_flag_json,
+        check_also_reports_same_scan,
+        check_also_text_and_baseline,
+        check_also_invalid_destinations,
+        check_also_delivery_and_empty_scan,
+        check_also_jsonl_render_failure_preserves_reports,
+        check_also_json_cache_failure_preserves_reports,
+        check_also_toon_requires_encoder,
+        check_also_partial_scan_keeps_findings,
+        check_also_toon_round_trip,
         check_rules_dir_custom_rule_in_sarif,
         check_rules_dir_nested_and_yaml_rules_are_loaded,
         check_rules_sources_repeatable_and_env,

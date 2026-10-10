@@ -107,6 +107,71 @@ def operators(language: str) -> tuple[str, ...]:
 
 
 class ScopeMetadataTests(unittest.TestCase):
+    def test_jsx_attributes_do_not_taint_javascript_variables(self) -> None:
+        source = '''function Screen({id, className, copyState}) {
+  const selected = id === "claude";
+  const copied = copyState === "copied";
+  return <div className="panel">
+    <h2 id="network-heading">Public downloads</h2>
+    <p>No credentials or repository ownership needed.</p>
+    <p>{className === "panel" ? "Ready" : "Pending"}</p>
+  </div>;
+}
+'''
+        self.assertEqual(scan_lines('js', source), [])
+
+    def test_jsx_interpolated_assignments_still_taint_real_aliases(self) -> None:
+        source = '''function Screen({authorization, supplied}) {
+  let candidate;
+  const view = <div title={candidate = authorization}>Public content</div>;
+  return candidate === supplied;
+}
+'''
+        self.assertEqual(scan_lines('js', source), [4])
+
+    def test_js_plain_and_conditional_alias_assignments_remain_sensitive(self) -> None:
+        for assignment in ('candidate = authorization;',
+                           'if (ready) candidate = authorization;',
+                           'consume(candidate = authorization);'):
+            source = '\n'.join(['function check(authorization, supplied, ready) {',
+                                'let candidate;', assignment,
+                                'return candidate === supplied;', '}']) + '\n'
+            with self.subTest(assignment=assignment):
+                self.assertEqual(scan_lines('js', source), [4])
+
+    def test_multiline_jsx_attributes_and_expression_assignments(self) -> None:
+        source = '''function Screen({id, className, authorization, supplied}) {
+  let candidate;
+  const view = <Widget
+    id="download-domains"
+    className="public"
+    title={candidate = authorization}
+  >No credentials or ownership needed.</Widget>;
+  const selected = id === "claude";
+  const styled = className === "public";
+  return candidate !== supplied;
+}
+'''
+        self.assertEqual(scan_lines('js', source), [10])
+
+    def test_less_than_does_not_hide_following_secret_assignment(self) -> None:
+        for condition in ('count<limit && ready', 'count < limit', 'a>b && c<d'):
+            source = '\n'.join(['function check(authorization, supplied) {',
+                                'let candidate;', f'if ({condition}) {{',
+                                'candidate = authorization;', '}',
+                                'return candidate === supplied;', '}']) + '\n'
+            with self.subTest(condition=condition):
+                self.assertEqual(scan_lines('js', source), [6])
+
+    def test_timing_safe_alias_comparison_remains_clean(self) -> None:
+        source = '''function check(authorization, supplied) {
+  let candidate;
+  candidate = authorization;
+  return crypto.timingSafeEqual(candidate, supplied);
+}
+'''
+        self.assertEqual(scan_lines('js', source), [])
+
     def test_reported_authorization_scope(self) -> None:
         # The report's exact member/literal inequality, once per language.
         for language in LANGUAGES:

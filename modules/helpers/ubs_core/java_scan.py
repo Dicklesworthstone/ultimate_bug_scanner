@@ -283,7 +283,7 @@ def _record_category(finding: dict) -> int | None:
 
 def run_analyzers(files: Sequence[Path], sink, skip: set[int] | None = None,
                   project_dir: Path | None = None, enable_new: bool = False,
-                  prefilter: Any = None) -> None:
+                  prefilter: Any = None, errors: list[str] | None = None) -> None:
     """Run registered analyzers: java taint pair + kotlin narrowing.
 
     narrowing_kotlin registers under lang="kotlin" while the module's file
@@ -311,28 +311,39 @@ def run_analyzers(files: Sequence[Path], sink, skip: set[int] | None = None,
             if analyzer.layer not in allowed_layers[lang]:
                 if not (enable_new and analyzer.layer == "guards" and lang == "java"):
                     continue
+            if skip and ((analyzer.layer == "taint" and 4 in skip) or
+                         (analyzer.layer == "narrowing" and 1 in skip)):
+                continue
             if prefilter is not None:
                 target_files = prefilter.filter_files_for_analyzer(analyzer.name, files)
             else:
                 target_files = list(files)
             if not target_files:
                 continue
-            ctx = RunContext(lang=lang, files=target_files)
-            for finding in analyzer.run(ctx):
-                if skip and _record_category(finding) in skip:
+            for path in target_files:
+                ctx = RunContext(lang=lang, files=[path])
+                try:
+                    findings = list(analyzer.run(ctx))
+                except (OSError, UnicodeError, ValueError, RecursionError) as exc:
+                    if errors is None:
+                        raise
+                    errors.append(f"{path}: {analyzer.name}: {type(exc).__name__}: {exc}")
                     continue
-                sink.write(json.dumps({
-                    "rule": finding.get("rule", ""),
-                    "category_id": f"java.{_CATEGORY_SLUGS[_record_category(finding)]}"
-                    if _record_category(finding) is not None else finding.get("category_id", "java.security"),
-                    "path": _source_path(str(finding.get("path", ""))),
-                    "line": int(finding.get("line", 0) or 0),
-                    "col": int(finding.get("col", 1) or 1),
-                    "severity": finding.get("severity", "warning"),
-                    "message": finding.get("message", ""),
-                    "suppressed": False,
-                    **({"extras": finding["extras"]} if finding.get("extras") else {}),
-                }, ensure_ascii=False) + "\n")
+                for finding in findings:
+                    if skip and _record_category(finding) in skip:
+                        continue
+                    sink.write(json.dumps({
+                        "rule": finding.get("rule", ""),
+                        "category_id": f"java.{_CATEGORY_SLUGS[_record_category(finding)]}"
+                        if _record_category(finding) is not None else finding.get("category_id", "java.security"),
+                        "path": _source_path(str(finding.get("path", ""))),
+                        "line": int(finding.get("line", 0) or 0),
+                        "col": int(finding.get("col", 1) or 1),
+                        "severity": finding.get("severity", "warning"),
+                        "message": finding.get("message", ""),
+                        "suppressed": False,
+                        **({"extras": finding["extras"]} if finding.get("extras") else {}),
+                    }, ensure_ascii=False) + "\n")
 
 
 def run_detectors(files: Sequence[Path], sink, skip: set[int] | None = None,
@@ -572,6 +583,8 @@ def main(argv: list[str] | None = None) -> int:
 
     from ubs_core.cache import CapturingSink, ScanCache, hash_rules_dir
     from ubs_core.java_detectors.tls_verification import LIMIT_DEFAULTS as TLS_LIMITS
+    from ubs_core.analyzers.taint_java_sql import LIMIT_DEFAULTS as SQL_LIMITS
+    from ubs_core.java_detectors.jwt_verification import LIMIT_DEFAULTS as JWT_LIMITS
 
     cache = ScanCache(
         lang="java",
@@ -581,7 +594,10 @@ def main(argv: list[str] | None = None) -> int:
         extra=(f"new_analyzers={args.enable_new_analyzers};"
                f"custom_rules={hash_rules_dir(args.custom_rules) if args.custom_rules else ''};"
                "tls_policy=" + repr([(name, os.environ.get(name, str(value)))
-                                      for name, value in sorted(TLS_LIMITS.items())])),
+                                      for name, value in sorted(TLS_LIMITS.items())]) + ";sql_policy=" +
+               repr([(name, os.environ.get(name, str(value))) for name, value in sorted(SQL_LIMITS.items())]) +
+               ";jwt_policy=" + repr([(name, os.environ.get(name, str(value)))
+                                        for name, value in sorted(JWT_LIMITS.items())])),
     )
     cached_findings, files_to_scan = cache.partition_files(files)
     suppressions = SourceSuppressions("java")
@@ -605,7 +621,7 @@ def main(argv: list[str] | None = None) -> int:
         run_analyzers(files_to_scan, capturing_sink, skip,
                       project_dir=Path(args.project_dir) if args.project_dir else None,
                       enable_new=args.enable_new_analyzers,
-                      prefilter=prefilter_res)
+                      prefilter=prefilter_res, errors=scan_errors)
         run_detectors(files_to_scan, capturing_sink, skip, errors=scan_errors)
         if args.ast_rule_dir:
             from ubs_core.java_ast import scan_all
@@ -624,6 +640,17 @@ def main(argv: list[str] | None = None) -> int:
         if args.custom_rules:
             from ubs_core.external_tools import scan_custom_rules
             scan_custom_rules(args.custom_rules, files_to_scan, capturing_sink, "java", scan_errors)
+        from ubs_core.analyzers.taint_java_sql import qualify_legacy_records
+        for path in files_to_scan:
+            if path.suffix.lower() != ".java":
+                continue
+            key = str(path.resolve())
+            records = capturing_sink.by_file.get(key, [])
+            try:
+                capturing_sink.by_file[key] = qualify_legacy_records(
+                    path, path.read_text(encoding="utf-8"), records, enabled=4 not in skip)
+            except (OSError, UnicodeError, ValueError, RecursionError) as exc:
+                scan_errors.append(f"{path}: SQL qualification: {exc}")
         # An incomplete analysis must never become the cached answer: the next
         # run would hit the cache and report the findings this one could not
         # produce as a clean, finished scan (#111).

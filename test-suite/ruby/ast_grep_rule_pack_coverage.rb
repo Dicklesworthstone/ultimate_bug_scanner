@@ -27,6 +27,7 @@ class RulePackCoverageController
     http = Net::HTTP.new("example.com", 443)
     http.verify_mode = OpenSSL::SSL::VERIFY_NONE
 
+    method_name = params[:method]
     object.send(method_name, params[:argument])
     ActiveRecord::Base.connection.execute("select * from users where id = #{id}")
     system("rm -rf #{path}")

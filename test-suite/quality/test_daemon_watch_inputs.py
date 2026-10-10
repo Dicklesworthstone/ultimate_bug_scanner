@@ -284,7 +284,7 @@ class DependencyWatchTests(WatchFixture, unittest.TestCase):
         self.assertEqual(first['exit_code'], 0)
         self.assertEqual(latest['exit_code'], 1)
         self.assertGreater(latest['generation'], first['generation'])
-        self.assertEqual(latest['watch_inputs'], ['dependency'])
+        self.assertEqual(latest['watch_inputs'], ['.ubs.json', 'dependency'])
         report = json.loads(latest['stdout'])
         self.assertEqual([item[0] for item in report['files']], [str(self.source)])
         self.assertIn('--profile=strict', report['args'])

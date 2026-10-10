@@ -29,6 +29,7 @@ RULE_ID = "java.security.ssrf-outbound-url"
 CATEGORY = 4
 TITLE = "Request-derived URL reaches outbound HTTP client"
 SEVERITY = "critical"
+FILE_SCOPED = True
 DESCRIPTION = (
     "Validate outbound URLs with explicit scheme and host allow-lists before "
     "building or sending client requests"
@@ -109,12 +110,24 @@ def analyze(path: Path, issues):
     if not ((SOURCE_RE.search(text) or ANNOTATED_PARAM_RE.search(text)) and SINK_RE.search(text)):
         return
     lines = text.splitlines()
+    non_http = frozenset()
+    if path.suffix.lower() == ".java":
+        from ubs_core.analyzers.taint_java_sql import non_http_execute_sites
+        non_http = non_http_execute_sites(text)
+    line_offsets, offset = [], 0
+    for line in text.splitlines(keepends=True):
+        line_offsets.append(offset)
+        offset += len(line)
+    analysis_lines = lines
+    if non_http:
+        from ubs_core.analyzers.taint_java_sql import comment_masked_source
+        analysis_lines = comment_masked_source(text).splitlines()
     tainted = annotated_sources(text, ANNOTATED_PARAM_RE)
     seen = set()
     for idx, _ in enumerate(lines, start=1):
         if has_ignore(lines, idx):
             continue
-        statement = logical_statement(lines, idx).strip()
+        statement = logical_statement(analysis_lines, idx).strip()
         if not statement:
             continue
         assign = ASSIGN_RE.match(statement)
@@ -126,7 +139,22 @@ def analyze(path: Path, issues):
                 tainted[name] = taint
             elif name in tainted and is_safe_expr(rhs, SAFE_EXPR_RE):
                 tainted.pop(name, None)
-        if not SINK_RE.search(statement):
+        candidates = list(SINK_RE.finditer(statement))
+        if not candidates:
+            continue
+        # The legacy generic `.execute` spelling also covers JDBC Statements
+        # and JDK executors. Exclude only an exactly qualified API call; a
+        # neighboring/unknown HTTP call in the same statement still applies.
+        physical = strip_line_comments(analysis_lines[idx - 1])
+        leading = len(physical) - len(physical.lstrip())
+        remaining = []
+        for candidate in candidates:
+            execute = re.search(r"\.\s*execute\s*\(", candidate.group())
+            dot = candidate.start() + execute.start() if execute else -1
+            if 0 <= dot < len(physical.strip()) and line_offsets[idx - 1] + leading + dot in non_http:
+                continue
+            remaining.append(candidate)
+        if not remaining:
             continue
         if is_safe_expr(statement, SAFE_EXPR_RE):
             continue

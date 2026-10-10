@@ -193,6 +193,23 @@ _MISSING = object()  # absent-key sentinel for the state join
 
 
 @dataclass(frozen=True)
+class _CallTarget:
+    """Callable and receiver identities captured before argument evaluation."""
+    binding: object
+    fallback_name: str = ''
+    receiver: Fact = CLEAN
+    references: References = NO_REFERENCES
+
+
+@dataclass(frozen=True)
+class _CallInputs:
+    """Already evaluated arguments; keep keyword facts with their AST nodes."""
+    arguments: list[Fact]
+    keywords: dict[str | None, Fact]
+    keyword_nodes: dict[str | None, ast.AST]
+
+
+@dataclass(frozen=True)
 class _BoundCallable:
     name: str
     references: References
@@ -807,15 +824,52 @@ class _Flow:
             return
         # Most expressions leave the state untouched, and joining the same
         # state twice is idempotent: skip the join when this collector's last
-        # joined state holds exactly the same objects. The collector is only
-        # ever replaced, never mutated in place, so the snapshot recorded on
-        # it stays true for as long as it is the collector.
+        # joined input holds exactly the same objects. The snapshot retains
+        # those objects, including their evidence, independently of mutation
+        # of the live input state.
         accumulated = self.exception_states[-1]
         snapshot = _identity_snapshot(state)
         previous = getattr(accumulated, 'last_joined', None)
         if previous is not None and _same_snapshot(previous, snapshot):
             return
-        joined = _join_states(accumulated, state)
+        if previous is None:
+            joined = _join_states(accumulated, state)
+        else:
+            # This collector is owned exclusively by its active capture; it
+            # is exposed as a completion only after being popped. Its state
+            # already includes every entry in the previous input, so unchanged
+            # entries add nothing. Merge the delta in place instead of copying
+            # and re-joining the complete namespace at every raising expression.
+            joined = accumulated
+            for target, source, index in ((joined, state, 0), (joined.heap, state.heap, 6)):
+                if (previous[index] == snapshot[index]
+                        and all(map(operator.is_, previous[index + 1], snapshot[index + 1]))):
+                    continue
+                before = dict(zip(previous[index], previous[index + 1]))
+                for name, fact in source.items():
+                    if before.get(name, _MISSING) is fact:
+                        continue
+                    joined_fact = target.get(name, _MISSING)
+                    target[name] = fact if joined_fact is _MISSING else join_facts(joined_fact, fact)
+            if not (previous[4] == snapshot[4]
+                    and all(map(operator.is_, previous[5], snapshot[5]))):
+                before = dict(zip(previous[4], previous[5]))
+                for name, refs in state.references.items():
+                    if before.get(name, _MISSING) is not refs:
+                        joined.references[name] = joined.references.get(name, NO_REFERENCES) | refs
+            if not (previous[2] == snapshot[2]
+                    and all(map(operator.is_, previous[3], snapshot[3]))):
+                before = dict(zip(previous[2], previous[3]))
+                for name, binding in state.bindings.items():
+                    if before.get(name, _MISSING) is not binding:
+                        joined.bindings[name] = _join_bindings(
+                            joined.bindings.get(name, _implicit_identity(name)), binding)
+                # Unlike a missing fact/reference, a missing callable binding
+                # contributes the implicit builtin identity. Deletions must
+                # join it even though absent keys do not appear in the input.
+                for name in before.keys() - state.bindings.keys():
+                    joined.bindings[name] = _join_bindings(joined.bindings[name], _implicit_identity(name))
+            joined.mutated.update(state.mutated)
         joined.last_joined = snapshot
         self.exception_states[-1] = joined
 
@@ -1183,7 +1237,8 @@ class _Flow:
             if (owner is self.engine and not isinstance(self.scope, ast.Module)
                     and (name in self.engine.locals.get(self.scope, set())
                          or name in self.engine.closures.get(self.scope, set()))):
-                yield key, frozenset({TaintTrace(name, parameter=key, path=(name,))}), frozenset({key}), _SymbolicValue(key)
+                fact, refs, value = owner.global_symbols[name]
+                yield key, fact, refs, value
             else:
                 refs = namespace.references.get(name, NO_REFERENCES)
                 fact = join_facts(namespace.value(name), state.heap.get(module_ref, CLEAN),
@@ -1500,8 +1555,8 @@ class _Flow:
             branch = state.copy()
             self.expression_bindings.pop(node, None)
             self.expression_references.pop(node, None)
-            result = self.invoke(node, branch, target, fallback_name, receiver,
-                                 receiver_refs, arguments, keywords, keyword_nodes)
+            result = self.invoke(node, branch, _CallTarget(target, fallback_name, receiver, receiver_refs),
+                                 _CallInputs(arguments, keywords, keyword_nodes))
             if branch.reachable:
                 results.append(result)
                 references.append(self.expression_references.get(node, frozenset({node})))
@@ -1522,8 +1577,10 @@ class _Flow:
                     values.pop(original, None)
         return join_facts(*results)
 
-    def invoke(self, node, state, target, fallback_name, receiver, receiver_refs,
-               arguments, keywords, keyword_nodes, *, resumed=None):
+    def invoke(self, node, state, callee, inputs, *, resumed=None):
+        target, fallback_name = callee.binding, callee.fallback_name
+        receiver, receiver_refs = callee.receiver, callee.references
+        arguments, keywords, keyword_nodes = inputs.arguments, inputs.keywords, inputs.keyword_nodes
         if isinstance(target, _BoundClassMethod):
             signature = target.function.args
             positional = [arg.arg for arg in (*signature.posonlyargs, *signature.args)]
@@ -1546,8 +1603,8 @@ class _Flow:
                 # An unbindable invocation does not establish the callee's
                 # clean-return contract. Retain the ordinary opaque-call
                 # provenance rather than binding arguments to wrong slots.
-                return self.invoke(node, state, None, '', target.receiver, target.references,
-                                   arguments, keywords, keyword_nodes)
+                return self.invoke(node, state, _CallTarget(None, receiver=target.receiver, references=target.references),
+                                   inputs)
             # This is a call view, not a second evaluation of the receiver or
             # its arguments. Keep its AST identity fixed across worklist passes
             # and recursive/coroutine summaries just like literal * expansion.
@@ -1564,8 +1621,8 @@ class _Flow:
             self.expression_facts[implicit] = value
             self.expression_references[implicit] = refs
             self.expression_bindings[implicit] = (target.owner if target.valid and not refs & state.mutated else None)
-            result = self.invoke(call, state, target.function, '', CLEAN, NO_REFERENCES,
-                                 [value, *arguments], keywords, keyword_nodes)
+            result = self.invoke(call, state, _CallTarget(target.function),
+                                 _CallInputs([value, *arguments], keywords, keyword_nodes))
             for table in (self.expression_bindings, self.expression_references,
                           self.generator_returns, self.generator_return_references,
                           self.generator_return_bindings):
@@ -1658,8 +1715,8 @@ class _Flow:
             for coroutine in alternatives:
                 branch = state.copy()
                 if isinstance(coroutine, _DeferredCall):
-                    value = self.invoke(node, branch, coroutine.function, '', CLEAN, NO_REFERENCES,
-                                        [], {}, {}, resumed=coroutine)
+                    value = self.invoke(node, branch, _CallTarget(coroutine.function),
+                                        _CallInputs([], {}, {}), resumed=coroutine)
                     binding = self.expression_bindings.get(node)
                     refs = self.expression_references.get(node, NO_REFERENCES)
                 else:
@@ -1685,8 +1742,8 @@ class _Flow:
                 outer = self.pending
                 self.pending = []
                 try:
-                    self.invoke(node, branch, coroutine.function, '', CLEAN, NO_REFERENCES,
-                                [], {}, {}, resumed=coroutine)
+                    self.invoke(node, branch, _CallTarget(coroutine.function),
+                                _CallInputs([], {}, {}), resumed=coroutine)
                     ends = [branch, *(item.state for item in self.pending)]
                 finally:
                     self.pending = outer
@@ -1967,8 +2024,8 @@ class _Flow:
             for target in _binding_choices(self.expression_bindings.get(node.value)):
                 branch = state.copy()
                 if isinstance(target, _DeferredCall):
-                    fact = self.invoke(node, branch, target.function, '', CLEAN, NO_REFERENCES,
-                                       [], {}, {}, resumed=target)
+                    fact = self.invoke(node, branch, _CallTarget(target.function),
+                                       _CallInputs([], {}, {}), resumed=target)
                     binding = self.expression_bindings.get(node)
                     refs = self.expression_references.get(node, NO_REFERENCES)
                 else:
@@ -2555,6 +2612,14 @@ class _Analysis:
                                     for child in ast.walk(generator.target)
                                     if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)}
         self.global_names = self.locals[tree]
+        # Formal globals are lexical constants, not concrete heap facts.
+        # Reusing their immutable traces preserves paths and lets state joins
+        # recognize unchanged globals by identity across fixed-point passes.
+        self.global_symbols = {
+            name: (frozenset({TaintTrace(name, parameter=f'@global:{name}', path=(name,))}),
+                   frozenset({f'@global:{name}'}), _SymbolicValue(f'@global:{name}'))
+            for name in self.global_names
+        }
         self.closures = {}
         for function in self.functions:
             available = set()
@@ -2803,10 +2868,11 @@ class _Analysis:
                 namespace = globals_ if owner is self else owner.globals
                 local = owner.locals[function]
                 flow = _Flow(owner, function)
-                state = _State({name: frozenset({TaintTrace(name, parameter=f'@global:{name}', path=(name,))})
+                state = _State({name: owner.global_symbols[name][0]
                                 for name in owner.global_names if name not in local},
                                {name: target for name, target in namespace.bindings.items() if name not in local})
-                state.references.update({name: frozenset({f'@global:{name}'}) for name in owner.global_names if name not in local})
+                state.references.update({name: owner.global_symbols[name][1]
+                                         for name in owner.global_names if name not in local})
                 for name in local:
                     state.bindings[name] = None
                 arguments = function.args

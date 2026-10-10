@@ -110,7 +110,7 @@ def relpath(path):
         return str(path)
 
 def analyze(path, issues):
-    for line, code, extras in flow_findings(path, 'url'):
+    for rule, line, code, extras in flow_findings(path, 'url'):
         issues.append((relpath(path), line, code))
 
 
@@ -148,7 +148,7 @@ def run(ctx: RunContext) -> Iterable[dict]:
     for path in ctx.files:
         if not path.is_file() or path.suffix.lower() not in EXTS:
             continue
-        for line_no, code, extras in flow_findings(path, 'url'):
+        for rule, line_no, code, extras in flow_findings(path, 'url'):
             yield {
                 "rule": "ruby.taint.outbound_url",
                 "path": relpath(path),

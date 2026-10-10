@@ -25,7 +25,6 @@ from pathlib import Path
 import re
 from typing import Iterator, Sequence
 
-from ubs_core.analyzers.taint_java_traversal import lexical_source
 from ubs_core.io import line_col
 from ubs_core.taint_flow import AnalysisLimit
 
@@ -69,18 +68,26 @@ class Binding:
 
 
 class VerifierSource:
-    def __init__(self, text: str):
+    def __init__(self, text: str, *, max_tokens: int | None = None,
+                 max_nesting: int | None = None, policy: str = "TLS"):
+        # Analyzer auto-registration also imports this frontend. Resolve the
+        # lexer after the class is defined so either import order is valid.
+        from ubs_core.analyzers.taint_java_traversal import lexical_source
+
         self.text = text
         self.code = lexical_source(text, False)
         self.pairs: dict[int, int] = {}
         stack: list[tuple[str, int]] = []
         self.brace_parents: dict[int, int] = {}
         brace_stack: list[int] = []
-        token_limit = _limit("UBS_JAVA_TLS_MAX_TOKENS")
-        nesting_limit = _limit("UBS_JAVA_TLS_MAX_NESTING")
+        token_limit = _limit("UBS_JAVA_TLS_MAX_TOKENS") if max_tokens is None else max_tokens
+        nesting_limit = _limit("UBS_JAVA_TLS_MAX_NESTING") if max_nesting is None else max_nesting
+        if (not isinstance(token_limit, int) or isinstance(token_limit, bool) or token_limit <= 0
+                or not isinstance(nesting_limit, int) or isinstance(nesting_limit, bool) or nesting_limit <= 0):
+            raise AnalysisLimit(f"Java {policy} limits must be positive integers")
         for count, token in enumerate(re.finditer(r"[\w$]+|\S", self.code), 1):
             if count > token_limit:
-                raise AnalysisLimit("Java TLS token budget exceeded")
+                raise AnalysisLimit(f"Java {policy} token budget exceeded")
             value = token.group()
             if value in {"(", "[", "{"}:
                 stack.append((value, token.start()))
@@ -88,16 +95,16 @@ class VerifierSource:
                     self.brace_parents[token.start()] = brace_stack[-1] if brace_stack else -1
                     brace_stack.append(token.start())
                 if len(stack) > nesting_limit:
-                    raise AnalysisLimit("Java TLS nesting budget exceeded")
+                    raise AnalysisLimit(f"Java {policy} nesting budget exceeded")
             elif value in {")", "]", "}"}:
                 if not stack or stack[-1][0] != {")": "(", "]": "[", "}": "{"}[value]:
-                    raise ValueError("Unbalanced Java TLS source")
+                    raise ValueError(f"Unbalanced Java {policy} source")
                 _, opening = stack.pop()
                 self.pairs[opening] = token.start()
                 if value == "}":
                     brace_stack.pop()
         if stack:
-            raise ValueError("Unbalanced Java TLS source")
+            raise ValueError(f"Unbalanced Java {policy} source")
         self.braces = [(low, high) for low, high in self.pairs.items() if self.code[low] == "{"]
         self.brace_starts = sorted(self.brace_parents)
         self.imports: dict[str, str] = {}

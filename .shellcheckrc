@@ -1,0 +1,3 @@
+# Follow the bundled source=lib/ubs-common.sh paths declared by each module.
+# Resolve shared definitions for cross-file analysis; CI also lints lib/*.sh.
+external-sources=true

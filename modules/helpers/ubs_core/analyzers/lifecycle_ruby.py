@@ -100,6 +100,13 @@ class Value:
 UNKNOWN = Value()
 
 
+@dataclass(frozen=True)
+class AcquisitionSite:
+    """The assignment label and diagnostic location of a resource factory."""
+    label: str = ""
+    position: int | None = None
+
+
 class ExpressionSplit(Exception):
     """Request another bounded evaluation of an expression's next choice."""
 
@@ -475,7 +482,7 @@ is an explicit incomplete-analysis error, never a truncated clean result.
         parser.bind_numbered_parameters()
         return statement
 
-    def call(self, name, receiver, arguments, token, state, label="", position=None):
+    def call(self, name, receiver, arguments, token, state, site=AcquisitionSite()):
         if state.flow != "normal":
             return UNKNOWN
         selected = self.selected_call(name, receiver, arguments, state)
@@ -488,7 +495,7 @@ is an explicit incomplete-analysis error, never a truncated clean result.
         if factory in FACTORIES:
             if FACTORIES[factory] == "thread_join" and any(self.references(value, state) for value in arguments):
                 raise ValueError("Ruby resource passed into a Thread needs cross-thread ownership; analysis is incomplete")
-            return self.acquire(factory, token, state, label, position)
+            return self.acquire(factory, token, state, site.label, site.position)
         self.release(receiver, state, method, arguments, token.start)
         if receiver.kind == "resource":
             kind = self.resources[receiver.key][1]
@@ -558,6 +565,7 @@ is an explicit incomplete-analysis error, never a truncated clean result.
         tokens = self.ungroup(tokens)
         if not tokens:
             return UNKNOWN
+        site = AcquisitionSite(label, position)
         # Ruby's word-form operators bind below assignment; && and || bind
         # above it. Each returns the selected operand, not a Boolean merge.
         for operators in ({"or"}, {"and"}):
@@ -660,15 +668,15 @@ is an explicit incomplete-analysis error, never a truncated clean result.
                 if cursor < len(tokens) and tokens[cursor].value == "(":
                     end = self.closing(tokens, cursor)
                     args = self.arguments(tokens[cursor + 1:end], state, depth + 1)
-                    result = self.call(name, UNKNOWN, args, token, state, label, position)
+                    result = self.call(name, UNKNOWN, args, token, state, site)
                     cursor = end + 1
                 elif cursor < len(tokens) and tokens[cursor].value not in {".", "&.", "[", "{", ",", ")", "]", "}"}:
                     args = self.arguments(tokens[cursor:], state, depth + 1)
-                    result = self.call(name, UNKNOWN, args, token, state, label, position)
+                    result = self.call(name, UNKNOWN, args, token, state, site)
                     cursor = len(tokens)
                 elif (name not in state.bindings and name[0].islower()
                       and (cursor == len(tokens) or tokens[cursor].value in {".", "&."})):
-                    result = self.call(name, UNKNOWN, (), token, state, label, position)
+                    result = self.call(name, UNKNOWN, (), token, state, site)
             else:
                 cursor += 1
                 continue
@@ -690,7 +698,7 @@ is an explicit incomplete-analysis error, never a truncated clean result.
                     elif cursor < len(tokens) and tokens[cursor].value not in {".", "&.", "[", "{", ",", ")", "]", "}"}:
                         args = self.arguments(tokens[cursor:], state, depth + 1)
                         cursor = len(tokens)
-                    result = self.call(name, result, args, token, state, label, position)
+                    result = self.call(name, result, args, token, state, site)
                 elif tokens[cursor].value == "{" and result.kind == "resource":
                     # Thread.new {...}.join attaches a block before evaluating
                     # the suffix. The block cannot release creator bindings.

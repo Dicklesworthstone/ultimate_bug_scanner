@@ -10,7 +10,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="8e53a907cc958283066895e2ee8a9bc79ab77063eb6ecc7b62bb67f721025418"
+UBS_LIB_CHECKSUM="46a2ca8c849366d80a9946b90f03fbbddad0b517283ebea9f2b11872ea3fa06c"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -46,7 +46,7 @@ if [[ ! -f "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" ]]; then
   echo "✗ ${BASH_SOURCE[0]}: missing ${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh (run 'ubs doctor --fix' or reinstall)" >&2
   exit 2
 fi
-# shellcheck source=modules/lib/ubs-common.sh
+# shellcheck source-path=SCRIPTDIR source=lib/ubs-common.sh
 source "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh"
 ubs_export_locale
 
@@ -244,6 +244,8 @@ LIST_FILE="$(mktemp 2>/dev/null || mktemp -t ubs-kt-list.XXXXXX)" || { echo "ERR
 SINK_FILE="$(mktemp 2>/dev/null || mktemp -t ubs-kt-sink.XXXXXX)" || { echo "ERROR: cannot allocate temporary findings sink; analysis is incomplete" >&2; exit 2; }
 JSON_TMP="$(mktemp 2>/dev/null || mktemp -t ubs-kt-json.XXXXXX)" || { echo "ERROR: cannot allocate temporary JSON report; analysis is incomplete" >&2; exit 2; }
 TEXT_TMP="$(mktemp 2>/dev/null || mktemp -t ubs-kt-text.XXXXXX)" || { echo "ERROR: cannot allocate temporary text report; analysis is incomplete" >&2; exit 2; }
+# Called indirectly by Bash's EXIT trap.
+# shellcheck disable=SC2329
 cleanup() {
   rm -f "$LIST_FILE" "$SINK_FILE" "$JSON_TMP" "$TEXT_TMP"
 }
@@ -263,6 +265,8 @@ if [[ ! -s "$LIST_FILE" ]]; then
       echo "$empty_json" > "${OUTPUT_FILE:-/dev/stdout}"
       ;;
     sarif)
+      # SARIF's "$schema" key is literal JSON, not a shell variable.
+      # shellcheck disable=SC2016
       echo '{"$schema":"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"ubs-kotlin","version":"0.1.0","rules":[]}},"results":[]}]}' > "${OUTPUT_FILE:-/dev/stdout}"
       ;;
     text)

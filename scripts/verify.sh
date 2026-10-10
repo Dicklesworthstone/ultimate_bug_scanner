@@ -204,6 +204,8 @@ mktemp_dir() {
   (umask 077; mktemp -d "${base%/}/ubs-verify.XXXXXXXX")
 }
 VERIFY_DIR="$(mktemp_dir)" || die 'Could not create private release staging directory'
+# Invoked by the EXIT trap below; ShellCheck does not count trap callbacks.
+# shellcheck disable=SC2329
 cleanup() {
   # Only this invocation's randomly created directory is ever removed.
   [[ -n "${VERIFY_DIR:-}" && "$VERIFY_DIR" != / ]] || return 0

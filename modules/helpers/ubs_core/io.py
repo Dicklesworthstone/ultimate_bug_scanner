@@ -6,10 +6,41 @@ the NDJSON finding sinks.
 """
 from __future__ import annotations
 
+import ast
+from functools import lru_cache
 import json
+import re
 import sys
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Iterable, Iterator, Sequence
+
+
+@lru_cache(maxsize=1)
+def _python_source_lines(source: str) -> tuple[bytes, ...]:
+    # AST columns count UTF-8 bytes. Only CR/LF split Python source lines;
+    # str.splitlines also splits form feeds and Unicode separators.
+    return tuple(match[0].encode("utf-8")
+                 for match in re.finditer(r".*?(?:\r\n|\n|\r|$)", source))
+
+
+def python_source_segment(source: str, node: ast.AST) -> str | None:
+    """Return the unpadded AST segment, retaining at most one source index.
+
+    Match ast.get_source_segment's UTF-8 coordinates and missing-location
+    behavior without splitting the entire source for each expression.
+    """
+    try:
+        if node.end_lineno is None or node.end_col_offset is None:
+            return None
+        start, end = node.lineno - 1, node.end_lineno - 1
+        first, last = node.col_offset, node.end_col_offset
+    except AttributeError:
+        return None
+    lines = _python_source_lines(source)
+    if start == end:
+        return lines[start][first:last].decode("utf-8")
+    return b"".join((lines[start][first:], *lines[start + 1:end],
+                     lines[end][:last])).decode("utf-8")
 
 
 def line_col(text: str, pos: int) -> tuple[int, int]:
@@ -22,6 +53,18 @@ def line_col(text: str, pos: int) -> tuple[int, int]:
     last_newline = text.rfind("\n", 0, pos)
     col = pos + 1 if last_newline == -1 else pos - last_newline
     return line, col
+
+
+def source_line(lines: Sequence[str], line: int) -> str:
+    """Return a one-based source line, rejecting invalid diagnostic anchors.
+
+    In particular, zero must not wrap to the last line as Python's negative
+    indexing would. A bad generated coordinate means analysis is incomplete,
+    rather than a finding whose evidence silently points at another line.
+    """
+    if type(line) is not int or not 0 < line <= len(lines):
+        raise ValueError(f"Invalid source line {line!r} for {len(lines)} lines; analysis is incomplete")
+    return lines[line - 1]
 
 
 def format_location(base: Path | str, path: Path | str, pos: int, text: str) -> str:

@@ -35,6 +35,7 @@ except ImportError:
 
 PROTOCOL = 1
 MAX_REQUEST = 256 * 1024
+MAX_SCAN_CONFIG = 256 * 1024
 MAX_OUTPUT = 8 * 1024 * 1024
 MAX_RESPONSE = 2 * MAX_OUTPUT + 65536
 MAX_SNAPSHOT = 128 * 1024 * 1024
@@ -227,6 +228,38 @@ def validate_scan(root: Path, request: dict) -> tuple[list[Path], list[str]]:
     return selected, options
 
 
+def scan_config_reusable(contents: bytearray) -> bool:
+    """Inspect already guarded policy bytes without following rule directories.
+
+    The scanner owns full schema validation. Custom ast-grep projects can
+    reference further directories, so their complete input graph is unknown
+    here. Explicitly empty UBS_RULES overrides the project's rule selection.
+    """
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('Duplicate configuration key')
+            result[key] = value
+        return result
+
+    def reject_constant(value):
+        raise ValueError(value)
+
+    try:
+        policy = json.loads(contents.decode('utf-8'), object_pairs_hook=unique_object,
+                            parse_constant=reject_constant)
+    except (ValueError, UnicodeError, RecursionError):
+        return False
+    if not isinstance(policy, dict):
+        return False
+    rules = policy.get('rules', [])
+    if not isinstance(rules, list) or len(rules) > 256 \
+            or any(not isinstance(item, str) or not item for item in rules):
+        return False
+    return 'UBS_RULES' in os.environ or not rules
+
+
 def snapshot(root: Path, scanner: Path, *, cancel: threading.Event | None = None) -> str | None:
     """Conservative bounded content snapshot, not an mtime-only clean shortcut.
 
@@ -238,6 +271,8 @@ def snapshot(root: Path, scanner: Path, *, cancel: threading.Event | None = None
     check_cancelled(cancel)
     if os.environ.get('UBS_MODULE_DIR') or os.environ.get('UBS_VERIFIED_ASSET_DIR'):
         return None  # The override can select runtime assets outside this graph.
+    if os.environ.get('UBS_RULES', '').strip(':'):
+        return None  # Custom rules may depend on bytes outside the served root.
     if any(name.startswith('GIT_') for name in os.environ):
         return None  # Git can redirect its index, metadata or config externally.
     if any((parent / '.git').exists() for parent in root.parents):
@@ -366,6 +401,9 @@ def snapshot(root: Path, scanner: Path, *, cancel: threading.Event | None = None
                     git_config = (path.name == '.gitconfig' or path == config / 'git' / 'config'
                                   or path.parent.name == '.git' and path.name in {'config', 'config.worktree'})
                     config_tail = b''
+                    scan_config = bytearray() if path.name == '.ubs.json' else None
+                    if scan_config is not None and info.st_size > MAX_SCAN_CONFIG:
+                        return None
                     descriptor = open_nofollow(path)
                     try:
                         if stamp(os.fstat(descriptor)) != before:
@@ -376,6 +414,10 @@ def snapshot(root: Path, scanner: Path, *, cancel: threading.Event | None = None
                             if total > MAX_SNAPSHOT:
                                 return None
                             digest.update(chunk)
+                            if scan_config is not None:
+                                if len(scan_config) + len(chunk) > MAX_SCAN_CONFIG:
+                                    return None
+                                scan_config.extend(chunk)
                             if git_config:
                                 # Include/exclude targets are outside this
                                 # graph. Keep token matching bounded even for
@@ -388,6 +430,8 @@ def snapshot(root: Path, scanner: Path, *, cancel: threading.Event | None = None
                             return None
                     finally:
                         os.close(descriptor)
+                    if scan_config is not None and not scan_config_reusable(scan_config):
+                        return None
                     digest.update(b'\0')
                 else:
                     return None
@@ -1110,8 +1154,32 @@ class WatchObserver:
         return self.last
 
 
+def watch_config_path(root: Path, names: list[str]) -> str:
+    """Match ordinary CLI policy discovery without watching outside the root."""
+    try:
+        # validate_scan passes each resolved file only once to the runner.
+        # Duplicate names and internal aliases must keep that sole-file anchor.
+        paths = tuple(dict.fromkeys((root / name).resolve() for name in names))
+        selected = paths[0] if len(paths) == 1 else root
+        anchor = selected if selected.is_dir() else selected.parent
+        if not anchor.is_relative_to(root):
+            raise ServiceError('Selected path is outside the served repository')
+        project = anchor
+        for candidate in (anchor, *anchor.parents):
+            if (candidate / '.git').exists():
+                project = candidate
+                break
+        if not project.is_relative_to(root):
+            raise ServiceError(f'Scan configuration is outside the served repository: {project / ".ubs.json"}; '
+                               f'serve the Git worktree root with --repo={project}')
+        return (project / '.ubs.json').relative_to(root).as_posix()
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise ServiceError(f'Cannot discover the watched scan configuration: {exc}') from exc
+
+
 def watch_inputs(root: Path, names: list[str], *, dependencies: tuple[str, ...] = (),
-                 directories: tuple[str, ...] = (), monitor: InotifyEvents | None = None) -> tuple[str, list[str]]:
+                 directories: tuple[str, ...] = (), monitor: InotifyEvents | None = None,
+                 scan_config: str | None = None) -> tuple[str, list[str]]:
     """Observe source files plus optional dependency trees without changing scan scope.
 
     Source paths must stay regular files. Dependency paths may be absent or
@@ -1120,7 +1188,9 @@ def watch_inputs(root: Path, names: list[str], *, dependencies: tuple[str, ...] 
     what to analyze. Bounds or unsafe entries invalidate the entire observation.
     File opens are anchored to the repository descriptor, not a path checked
     before opening. A final metadata pass detects edits during the traversal.
-    This observation is never permission to reuse a scanner result.
+    A selected-file watch also observes its discovered scan configuration.
+    This one internal policy input does not consume the caller's 256 dependency
+    slots. This observation is never permission to reuse a scanner result.
     """
     digest = hashlib.sha256()
     errors = []
@@ -1143,7 +1213,8 @@ def watch_inputs(root: Path, names: list[str], *, dependencies: tuple[str, ...] 
 
     for values, recursive, optional, require_dir in ((names, False, False, False),
                                                     (directories, True, False, True),
-                                                    (dependencies, True, True, False)):
+                                                    (dependencies, True, True, False),
+                                                    ((scan_config,) if scan_config is not None else (), False, True, False)):
         if len(values) > 256:
             raise ServiceError('At most 256 source paths and 256 watch inputs are permitted')
         for name in values:
@@ -1351,25 +1422,36 @@ def watch(root: Path, request: dict, timeout: float, interval: float, debounce: 
     settled_at = 0.0
     names = request['paths']
     project_watch = selection == 'directory'
+    automatic_policy = ()
 
     def read_inputs(monitor):
+        nonlocal automatic_policy
+        policy = watch_config_path(root, names)
+        automatic_policy = (policy,)
         options = {'monitor': monitor} if monitor is not None else {}
         if project_watch:
             # Watch the repository, not only the scan directory. Sibling
             # dependencies and root ignore/config files can affect a scan.
             # Both the root and selected target must remain directories.
-            return watch_inputs(root, [], directories=tuple(dict.fromkeys(('.', *names))),
-                                dependencies=dependencies, **options)
-        if dependencies:
-            options['dependencies'] = dependencies
-        return watch_inputs(root, names, **options)
+            value, errors = watch_inputs(root, [], directories=tuple(dict.fromkeys(('.', *names))),
+                                         dependencies=dependencies, scan_config=policy, **options)
+        else:
+            value, errors = watch_inputs(root, names, dependencies=dependencies, scan_config=policy, **options)
+        current_policy = watch_config_path(root, names)
+        if current_policy != policy:
+            # A Git marker or an internal source link changed the discovery
+            # anchor during this byte pass. Reconcile before another scan.
+            errors = [*errors, 'Scan configuration location changed during observation']
+            value = 'sha256:' + hashlib.sha256(f'{value}\0{current_policy}'.encode()).hexdigest()
+        return value, errors
 
     observer = WatchObserver(read_inputs, backend, reconcile)
 
     def emit(event, **fields):
         print(json.dumps(dict(schema='ubs.watch/1', event=event, generation=generation,
                               source_fingerprint=observed, paths=names, selection=selection,
-                              watch_inputs=('.', *dependencies) if project_watch else dependencies,
+                              watch_inputs=('.', *dependencies) if project_watch
+                              else tuple(dict.fromkeys((*automatic_policy, *dependencies))),
                               observer={'backend': observer.backend, 'reason': observer.reason,
                                         'reconcile_seconds': observer.reconcile, 'byte_passes': observer.byte_passes,
                                         'event_batches': observer.event_batches, 'resyncs': observer.resyncs}, **fields),

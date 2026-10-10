@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 from typing import Iterable
 
+from ubs_core.io import source_line
 from ubs_core.registry import Analyzer, RunContext, register
 from ubs_core.suppression import has_suppression_marker
 from ubs_core.rust_detectors.hardcoded_secrets import (
@@ -439,7 +440,7 @@ def collect_sensitive_vars(lines, stripped_lines, statement_at, line_numbers, se
         for line_no in line_numbers:
             if has_ignore(lines, line_no):
                 continue
-            stripped = stripped_lines[line_no - 1].strip()
+            stripped = source_line(stripped_lines, line_no).strip()
             if not stripped:
                 continue
             statement = statement_at(line_no, 5)
@@ -528,7 +529,7 @@ def scan_file(text: str) -> list[tuple[int, str]]:
         for line_no in scope_lines:
             if has_ignore(lines, line_no, _SUPPRESSION_RULE):
                 continue
-            stripped = stripped_lines[line_no - 1].strip()
+            stripped = source_line(stripped_lines, line_no).strip()
             if not stripped or ("==" not in stripped and "!=" not in stripped):
                 continue
             statement = statement_at(line_no, 8)

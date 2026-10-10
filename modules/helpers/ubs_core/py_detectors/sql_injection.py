@@ -22,6 +22,8 @@ import os
 import re
 from typing import Iterable, Sequence
 
+from ubs_core.io import python_source_segment
+
 RULES = (
     ("py.security.sql-injection", 7,
      "Interpolated SQL reaches execution sink",
@@ -157,7 +159,7 @@ def call_validated_segments(node, text, sanitizers, summaries):
     segments = []
     if is_sanitizer_call(node, sanitizers):
         for argument in list(node.args) + [keyword.value for keyword in node.keywords]:
-            segment = ast.get_source_segment(text, argument)
+            segment = python_source_segment(text, argument)
             if segment:
                 segments.append(segment.strip())
         return segments
@@ -173,7 +175,7 @@ def call_validated_segments(node, text, sanitizers, summaries):
         argument = bound.get(parameter)
         if argument is None:
             continue
-        segment = ast.get_source_segment(text, argument)
+        segment = python_source_segment(text, argument)
         if not segment:
             continue
         segment = segment.strip()
@@ -354,7 +356,7 @@ def string_parts(node):
 
 def literal_sql_text(node, text):
     parts = string_parts(node)
-    segment = ast.get_source_segment(text, node) or ''
+    segment = python_source_segment(text, node) or ''
     return ' '.join(parts + [segment])
 
 
@@ -509,7 +511,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         guarded = self.guarded_tables.get(id(self.func_stack[-1]))
         if not guarded:
             return False
-        segment = ast.get_source_segment(self.text, node)
+        segment = python_source_segment(self.text, node)
         if not segment:
             return False
         at = guarded.get(segment.strip())

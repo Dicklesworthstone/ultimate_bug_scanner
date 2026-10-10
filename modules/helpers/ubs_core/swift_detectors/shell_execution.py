@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from ubs_core.io import source_line
 from ubs_core.swift_detectors._common import rel, should_skip
 
 RULE_ID = "swift.security.shell-exec"
@@ -97,7 +98,7 @@ def collect_findings(ctx):
         for proc_name, proc in processes.items():
             if proc.get('command_mode') and (proc.get('shell') or (proc.get('env') and proc.get('env_shell'))):
                 line_no = proc.get('line', 1)
-                findings.append((rel(path, base), line_no, lines[line_no - 1].strip(), f"Process {proc_name} uses shell -c"))
+                findings.append((rel(path, base), line_no, source_line(lines, line_no).strip(), f"Process {proc_name} uses shell -c"))
     return findings
 
 

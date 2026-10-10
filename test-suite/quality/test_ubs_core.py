@@ -2,6 +2,7 @@
 """Unit tests for ubs_core stdlib helper library (bead A2)."""
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib
 import io
@@ -27,6 +28,7 @@ from ubs_core.io import (
     find_block_end,
     format_location,
     line_col,
+    python_source_segment,
     skip_ws,
 )
 from ubs_core.lexer import (
@@ -223,6 +225,33 @@ print(json.dumps({"source_hash": cache._derive_helper_source_hash(), "cache_key"
 
 
 class UbsCoreIoTests(unittest.TestCase):
+    def test_python_source_segments_match_ast_byte_coordinates(self) -> None:
+        sources = (
+            "é = '💡'; answer = (\n    café[0]\n    + 1\n)\n",
+            "value = 'inside\u2028separator';\fprint(value)\n",
+            "def f():\n\treturn '''one\n two\n three'''\n",
+            "# blank\n\nresult = call(\n    left,\n    right,\n)\n",
+        )
+        for source in sources:
+            for newline in ('\n', '\r\n', '\r'):
+                code = source.replace('\n', newline)
+                with self.subTest(source=source, newline=newline):
+                    for node in ast.walk(ast.parse(code)):
+                        self.assertEqual(python_source_segment(code, node),
+                                         ast.get_source_segment(code, node))
+
+    def test_python_source_segment_missing_locations(self) -> None:
+        self.assertIsNone(python_source_segment('value', ast.Name(id='value')))
+        node = ast.parse('value').body[0]
+        node.end_lineno = None
+        self.assertIsNone(python_source_segment('value', node))
+
+    def test_python_source_segment_cache_does_not_reuse_other_text(self) -> None:
+        node = ast.parse('first = 12').body[0].value
+        for source in ('first = 12', 'other = 34', 'first = 12'):
+            self.assertEqual(python_source_segment(source, node),
+                             ast.get_source_segment(source, node))
+
     def test_line_col_basic(self) -> None:
         text = "hello\nworld\nfoo bar"
         self.assertEqual(line_col(text, 0), (1, 1))
@@ -2690,8 +2719,15 @@ class Second {
         context = f'exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}'
         self.assertEqual(proc.returncode, 2, context)
         report = self.decode_report(proc)
-        self.assertEqual(report['status'], 'error', context)
-        self.assertTrue(report['failed_modules'], context)
+        # The other Java layers ran, but traversal could not model this heap
+        # write. Contract v2 preserves their results as partial, still exit 2.
+        self.assertEqual(report['status'], 'partial', context)
+        self.assertEqual(report['exit_code'], 2, context)
+        self.assertEqual(len(report['failed_modules']), 1, context)
+        failed = report['failed_modules'][0]
+        self.assertEqual(failed['language'], 'java', context)
+        self.assertEqual(failed['status'], 'partial', context)
+        self.assertEqual(failed['module_error'], 'ANALYZER_ERROR', context)
         self.assertIn('heap-state', proc.stdout + proc.stderr, context)
 
     def test_kotlin_top_level_parameter_helpers_execute_with_original_offsets(self):
@@ -2877,8 +2913,13 @@ fun handler(request: jakarta.servlet.http.HttpServletRequest, again: Boolean) {
         context = f'exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}'
         self.assertEqual(proc.returncode, 2, context)
         report = self.decode_report(proc)
-        self.assertEqual(report['status'], 'error', context)
-        self.assertTrue(report['failed_modules'], context)
+        self.assertEqual(report['status'], 'partial', context)
+        self.assertEqual(report['exit_code'], 2, context)
+        self.assertEqual(len(report['failed_modules']), 1, context)
+        failed = report['failed_modules'][0]
+        self.assertEqual(failed['language'], 'java', context)
+        self.assertEqual(failed['status'], 'partial', context)
+        self.assertEqual(failed['module_error'], 'ANALYZER_ERROR', context)
         self.assertIn('field-state', proc.stdout + proc.stderr, context)
 
     def test_existing_fixture_pairs_preserve_bytes_and_findings(self):

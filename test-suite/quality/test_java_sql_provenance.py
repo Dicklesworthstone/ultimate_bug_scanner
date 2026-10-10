@@ -371,7 +371,251 @@ REVIEW_CASES = (
     ''', "HttpExchange exchange")),
 )
 
-ALL_CASES = CASES + REVIEW_CASES
+# A batch executes only the commands queued on that particular JDBC object.
+# Assigning a new query variable, clearing another object, or clearing on just
+# one branch cannot remove a command from the original object's batch. JDBC
+# prepared setters bind values; they never repair already interpolated SQL.
+BATCH_CASES = (
+    Case("batch_raw", handle(f"""
+        String input = {SOURCE};
+        statement.addBatch({UPDATE_QUERY});
+        statement.executeBatch(); // SQL_EXEC
+    """)),
+    Case("batch_large", handle(f"""
+        String input = {SOURCE};
+        statement.addBatch({UPDATE_QUERY});
+        statement.executeLargeBatch(); // SQL_EXEC
+    """)),
+    Case("batch_captured_query", handle(f"""
+        String input = {SOURCE};
+        String query = {UPDATE_QUERY};
+        statement.addBatch(query);
+        query = "update users set enabled=1 where name='fixed'";
+        statement.executeBatch(); // SQL_EXEC
+    """)),
+    Case("batch_literal_reassignment", handle(f"""
+        String query = {SOURCE};
+        query = "update users set enabled=1 where name='fixed'";
+        statement.addBatch(query);
+        statement.executeBatch();
+    """)),
+    Case("batch_static", handle('''
+        statement.addBatch("update users set enabled=1 where name='fixed'");
+        statement.executeBatch();
+    ''')),
+    Case("batch_never_queued", handle(f"""
+        String input = {SOURCE};
+        statement.executeBatch();
+    """)),
+    Case("batch_prepared_unsafe", handle(f"""
+        String input = {SOURCE};
+        try (PreparedStatement statement = connection.prepareStatement({UPDATE_QUERY} + " and id=?")) {{
+            statement.setInt(1, 12);
+            statement.addBatch();
+            statement.executeBatch(); // SQL_EXEC
+        }}
+    """, "HttpExchange exchange, Connection connection")),
+    Case("batch_prepared_bound", handle(f"""
+        String input = {SOURCE};
+        try (PreparedStatement statement = connection.prepareStatement("update users set enabled=1 where name=?")) {{
+            statement.setString(1, input);
+            statement.addBatch();
+            statement.executeBatch();
+        }}
+    """, "HttpExchange exchange, Connection connection")),
+    Case("batch_prepared_never_queued", handle(f"""
+        String input = {SOURCE};
+        try (PreparedStatement statement = connection.prepareStatement({UPDATE_QUERY})) {{
+            statement.executeBatch();
+        }}
+    """, "HttpExchange exchange, Connection connection")),
+    Case("batch_prepared_clear_parameters", handle(f"""
+        String input = {SOURCE};
+        try (PreparedStatement statement = connection.prepareStatement({UPDATE_QUERY})) {{
+            statement.addBatch();
+            statement.clearParameters();
+            statement.executeLargeBatch(); // SQL_EXEC
+        }}
+    """, "HttpExchange exchange, Connection connection")),
+    Case("batch_prepared_cleared", handle(f"""
+        String input = {SOURCE};
+        try (PreparedStatement statement = connection.prepareStatement({UPDATE_QUERY})) {{
+            statement.addBatch();
+            statement.clearBatch();
+            statement.executeBatch();
+        }}
+    """, "HttpExchange exchange, Connection connection")),
+    Case("batch_alias_add", handle(f"""
+        String input = {SOURCE};
+        Statement alias = statement;
+        alias.addBatch({UPDATE_QUERY});
+        statement.executeBatch(); // SQL_EXEC
+    """)),
+    Case("batch_alias_clear", handle(f"""
+        String input = {SOURCE};
+        Statement alias = statement;
+        alias.addBatch({UPDATE_QUERY});
+        statement.clearBatch();
+        alias.executeBatch();
+    """)),
+    Case("batch_unrelated_clear", handle(f"""
+        String input = {SOURCE};
+        statement.addBatch({UPDATE_QUERY});
+        other.clearBatch();
+        statement.executeBatch(); // SQL_EXEC
+    """, "HttpExchange exchange, Statement statement, Statement other")),
+    Case("batch_receiver_reassigned", handle(f"""
+        String input = {SOURCE};
+        try (Statement original = connection.createStatement()) {{
+            Statement statement = original;
+            Statement alias = statement;
+            statement.addBatch({UPDATE_QUERY});
+            try (Statement replacement = connection.createStatement()) {{
+                statement = replacement;
+                statement.clearBatch();
+                alias.executeBatch(); // SQL_EXEC
+            }}
+        }}
+    """, "HttpExchange exchange, Connection connection")),
+    Case("batch_branch_clear", handle(f"""
+        String input = {SOURCE};
+        statement.addBatch({UPDATE_QUERY});
+        if (clear) {{ statement.clearBatch(); }}
+        statement.executeBatch(); // SQL_EXEC
+    """, "HttpExchange exchange, Statement statement, boolean clear")),
+    Case("batch_branch_add", handle(f"""
+        String input = {SOURCE};
+        if (queue) {{ statement.addBatch({UPDATE_QUERY}); }}
+        statement.executeBatch(); // SQL_EXEC
+    """, "HttpExchange exchange, Statement statement, boolean queue")),
+    Case("batch_all_branches_clear", handle(f"""
+        String input = {SOURCE};
+        statement.addBatch({UPDATE_QUERY});
+        if (clear) {{ statement.clearBatch(); }} else {{ statement.clearBatch(); }}
+        statement.executeBatch();
+    """, "HttpExchange exchange, Statement statement, boolean clear")),
+    Case("batch_maybe_alias_clear", handle(f"""
+        String input = {SOURCE};
+        statement.addBatch({UPDATE_QUERY});
+        Statement selected = statement;
+        if (otherSelected) {{ selected = other; }}
+        selected.clearBatch();
+        statement.executeBatch(); // SQL_EXEC
+    """, "HttpExchange exchange, Statement statement, Statement other, boolean otherSelected")),
+    Case("batch_added_after_clear", handle(f"""
+        String input = {SOURCE};
+        statement.clearBatch();
+        statement.addBatch({UPDATE_QUERY});
+        statement.executeBatch(); // SQL_EXEC
+    """)),
+    Case("batch_grouped_receiver", handle(f"""
+        String input = {SOURCE};
+        (statement).addBatch({UPDATE_QUERY});
+        (statement).executeBatch(); // SQL_EXEC
+    """)),
+    Case("batch_query_helper", '''
+        String query(String input) { return "update users set name='" + input + "'"; }
+    ''' + handle(f"""
+        statement.addBatch(query({SOURCE}));
+        statement.executeBatch(); // SQL_EXEC
+    """)),
+    Case("batch_shadowed_statement", '''
+        static class Statement {
+            void addBatch(String text) { }
+            void executeBatch() { }
+        }
+    ''' + handle(f"""
+        String input = {SOURCE};
+        statement.addBatch({UPDATE_QUERY});
+        statement.executeBatch();
+    """)),
+    Case("batch_lexical_decoy", handle('''
+        String documentation = "statement.addBatch(exchange.getRequestURI().getQuery()); statement.executeBatch();";
+        // statement.addBatch(exchange.getRequestURI().getQuery());
+        statement.executeBatch();
+    ''')),
+    Case("batch_success_clears", handle(f"""
+        String input = {SOURCE};
+        statement.addBatch({UPDATE_QUERY});
+        statement.executeBatch(); // SQL_EXEC
+        statement.executeBatch();
+    """)),
+    Case("batch_large_success_clears", handle(f"""
+        String input = {SOURCE};
+        statement.addBatch({UPDATE_QUERY});
+        statement.executeLargeBatch(); // SQL_EXEC
+        statement.executeBatch();
+    """)),
+    Case("batch_callable", handle(f"""
+        String input = {SOURCE};
+        try (java.sql.CallableStatement statement = connection.prepareCall("{{call select_user('" + input + "')}}")) {{
+            statement.addBatch();
+            statement.executeBatch(); // SQL_EXEC
+        }}
+    """, "HttpExchange exchange, Connection connection")),
+    # Held-out controls specified independently during code review.
+    Case("batch_review_distinct_objects", handle(f"""
+        try (Statement first = connection.createStatement(); Statement second = connection.createStatement()) {{
+            first.addBatch({SOURCE});
+            second.addBatch("update users set enabled=1 where name='fixed'");
+            second.executeBatch();
+            first.executeBatch(); // SQL_EXEC
+        }}
+    """, "HttpExchange exchange, Connection connection")),
+    Case("batch_review_identity_swap", handle(f"""
+        statement.addBatch({SOURCE});
+        Statement alias = statement;
+        statement = other;
+        statement.clearBatch();
+        alias.executeLargeBatch(); // SQL_EXEC
+    """, "HttpExchange exchange, Statement statement, Statement other")),
+    Case("batch_review_mixed_queue", handle(f"""
+        statement.addBatch("update users set enabled=1 where name='first'");
+        statement.addBatch({SOURCE});
+        statement.addBatch("update users set enabled=1 where name='last'");
+        statement.executeBatch(); // SQL_EXEC
+    """)),
+    Case("batch_review_loop_queue", handle(f"""
+        int index = 0;
+        while (index < count) {{
+            statement.addBatch({SOURCE});
+            index++;
+        }}
+        statement.executeBatch(); // SQL_EXEC
+    """, "HttpExchange exchange, Statement statement, int count")),
+    Case("batch_review_prepared_requeue", handle(f"""
+        String input = {SOURCE};
+        try (PreparedStatement statement = connection.prepareStatement({UPDATE_QUERY} + " and id=?")) {{
+            statement.setInt(1, 12);
+            statement.addBatch();
+            statement.clearBatch();
+            statement.setString(1, input);
+            statement.addBatch();
+            statement.executeBatch(); // SQL_EXEC
+        }}
+    """, "HttpExchange exchange, Connection connection")),
+    Case("batch_distinct_factory_invocations", '''
+        Statement make(Connection connection) throws SQLException { return connection.createStatement(); }
+    ''' + handle(f"""
+        Statement first = make(connection);
+        Statement second = make(connection);
+        first.addBatch({SOURCE});
+        second.clearBatch();
+        first.executeBatch(); // SQL_EXEC
+    """, "HttpExchange exchange, Connection connection")),
+    Case("batch_factory_argument_alias", '''
+        Statement identity(Statement statement) { return statement; }
+    ''' + handle(f"""
+        try (Statement first = connection.createStatement()) {{
+            Statement alias = identity(first);
+            first.addBatch({SOURCE});
+            alias.clearBatch();
+            first.executeBatch();
+        }}
+    """, "HttpExchange exchange, Connection connection")),
+)
+
+ALL_CASES = CASES + REVIEW_CASES + BATCH_CASES
 BY_NAME = {case.name: case for case in ALL_CASES}
 
 INCOMPLETE_CASES = (
@@ -391,6 +635,78 @@ INCOMPLETE_CASES = (
         String[] queries = new String[] {{ {QUERY} }};
         statement.executeQuery(queries[0]);
     """)),
+    Case("batch_helper_mutation", '''
+        void queue(Statement target, String query) throws SQLException { target.addBatch(query); }
+    ''' + handle(f"""
+        queue(statement, {SOURCE});
+        statement.executeBatch();
+    """)),
+    Case("batch_helper_execution", '''
+        void send(Statement target) throws SQLException { target.executeBatch(); }
+    ''' + handle(f"""
+        statement.addBatch({SOURCE});
+        send(statement);
+    """)),
+    Case("batch_helper_return", '''
+        Statement queue(Connection connection, String query) throws SQLException {
+            Statement statement = connection.createStatement();
+            statement.addBatch(query);
+            return statement;
+        }
+    ''' + handle(f"""
+        Statement statement = queue(connection, {SOURCE});
+        statement.executeBatch();
+    """, "HttpExchange exchange, Connection connection")),
+    Case("batch_catch_clear", handle(f"""
+        statement.addBatch({SOURCE});
+        try {{ statement.clearBatch(); }} catch (SQLException failure) {{
+            java.util.logging.Logger.getLogger("batch").warning(failure.toString());
+        }}
+        statement.executeBatch();
+    """)),
+    Case("batch_finally_clear", handle(f"""
+        statement.addBatch({SOURCE});
+        try {{ statement.clearBatch(); }} finally {{ statement.executeBatch(); }}
+    """)),
+    Case("batch_callback_queue", handle(f"""
+        executor.execute(() -> {{
+            try {{ statement.addBatch({SOURCE}); }} catch (SQLException failure) {{ throw new IllegalStateException(failure); }}
+        }});
+        statement.executeBatch();
+    """, "HttpExchange exchange, Statement statement, java.util.concurrent.Executor executor")),
+    Case("batch_repeated_allocation", handle(f"""
+        for (int i = 0; i < 3; i++) {{
+            Statement statement = connection.createStatement();
+            statement.addBatch({SOURCE});
+            statement.executeBatch();
+        }}
+    """, "HttpExchange exchange, Connection connection")),
+    Case("batch_unresolved_mutation", '''
+        interface BatchOwner { void queue(Statement statement, String query); }
+    ''' + handle(f"""
+        owner.queue(statement, {SOURCE});
+        statement.executeBatch();
+    """, "HttpExchange exchange, Statement statement, BatchOwner owner")),
+    Case("batch_pending_direct_execution", handle(f"""
+        statement.addBatch({SOURCE});
+        statement.executeUpdate("update users set enabled=1 where name='fixed'");
+    """)),
+    Case("batch_pending_helper_execution", '''
+        void send(Statement selected) throws SQLException { selected.executeUpdate("update users set enabled=1"); }
+        void forward(Statement selected) throws SQLException { send(selected); }
+    ''' + handle(f"""
+        statement.addBatch({SOURCE});
+        forward(statement);
+    """)),
+    Case("batch_pending_prepared_helper_execution", '''
+        void send(PreparedStatement selected) throws SQLException { selected.executeUpdate(); }
+    ''' + handle(f"""
+        String input = {SOURCE};
+        try (PreparedStatement statement = connection.prepareStatement({UPDATE_QUERY})) {{
+            statement.addBatch();
+            send(statement);
+        }}
+    """, "HttpExchange exchange, Connection connection")),
 )
 
 
@@ -603,6 +919,13 @@ class JavaSqlPublicTests(unittest.TestCase):
         self.assert_json(result, payload, [row for row in expected if row[0] != repaired.name], files=3)
         self.assert_cache("repair", 2, 1)
 
+    def test_batch_json_and_sarif_exact_execution_sites(self):
+        project, expected = self.fixture(BATCH_CASES)
+        result, payload = self.scan("batch-meta-json", project, meta=True)
+        self.assert_json(result, payload, expected, meta=True, files=len(BATCH_CASES))
+        result, payload = self.scan("batch-module-sarif", project, fmt="sarif")
+        self.assert_sarif(result, payload, expected)
+
     def test_selection_category_and_scoped_suppression(self):
         selected = tuple(BY_NAME[name] for name in ("execute_query", "mixed_placeholder_still_unsafe", "bound_parameters"))
         project, _ = self.fixture(selected)
@@ -668,7 +991,8 @@ class JavaSqlPublicTests(unittest.TestCase):
                   for row in payload["findings"]]
         self.assertEqual(sorted(actual), expected, context)
         self.assertEqual((payload["totals"]["files"], payload["totals"]["critical"],
-                          payload["totals"]["warning"], payload["totals"]["info"]), (3, 1, 0, 0), context)
+                          payload["totals"]["warning"], payload["totals"]["info"]),
+                         (1 + len(INCOMPLETE_CASES), 1, 0, 0), context)
 
 
 if __name__ == "__main__":

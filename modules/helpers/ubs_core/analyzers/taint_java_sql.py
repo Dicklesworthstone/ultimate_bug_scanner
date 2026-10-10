@@ -8,9 +8,13 @@ of request taint is not proof that a legacy concatenation warning is redundant.
 
 The selected surface is Statement execution overloads and PreparedStatement /
 CallableStatement zero-argument execution, with local aliases, factory calls,
-try-with-resources, branches and selected local helper calls. Mutable SQL
-builders, callbacks and SQL-bearing heap state need additional policies and
-retain the frontend's explicit incomplete-analysis result.
+try-with-resources, branches and selected local helper calls. Batch queues are
+attached to the actual statement allocation or parameter, not its variable
+name. addBatch captures query text; clearBatch and successful batch execution
+empty only a definitely selected object's queue. Bound parameter values never
+become query text. Cross-call batch mutation/escape, repeated allocation sites,
+mutable SQL builders, callbacks and SQL-bearing heap state retain an explicit
+incomplete-analysis result until their object effects can be proved.
 """
 from __future__ import annotations
 
@@ -33,7 +37,9 @@ LIMIT_DEFAULTS = {
     "UBS_JAVA_SQL_MAX_NESTING": 192,
     "UBS_JAVA_SQL_MAX_STEPS": 500_000,
 }
-_EXECUTE = frozenset({"execute", "executeQuery", "executeUpdate", "executeLargeUpdate"})
+_BATCH_EXECUTE = frozenset({"executeBatch", "executeLargeBatch"})
+_BATCH_MUTATE = frozenset({"addBatch", "clearBatch"})
+_EXECUTE = frozenset({"execute", "executeQuery", "executeUpdate", "executeLargeUpdate"}) | _BATCH_EXECUTE
 _PREPARED = frozenset({"java.sql.PreparedStatement", "java.sql.CallableStatement"})
 _STATEMENTS = _PREPARED | {"java.sql.Statement"}
 _HTTP = frozenset({"com.sun.net.httpserver.HttpExchange", "com.sun.net.httpserver.HttpsExchange"})
@@ -49,7 +55,10 @@ _OBJECTS = _STATEMENTS | _HTTP | _SERVLET | _SERVLET_HTTP | {"java.sql.Connectio
 _APIS = _OBJECTS | _EXECUTORS | {"java.lang.String", "java.net.URI", "java.lang.Integer", "java.lang.Long"}
 _TYPE_PREFIX = "sql:type:"
 _PREPARED_SQL = "sql:prepared-query"
-_SINK_RE = re.compile(r"\.\s*(?:executeQuery|executeUpdate|executeLargeUpdate|execute)\s*\(")
+_ARGUMENT_OBJECT = "sql:argument-object"
+_SINK_RE = re.compile(r"\.\s*(?:executeQuery|executeUpdate|executeLargeUpdate|executeBatch|executeLargeBatch|execute)\s*\(")
+_BATCH_RE = re.compile(r"\.\s*(?:addBatch|clearBatch|executeBatch|executeLargeBatch)\s*\(")
+_SQL_OPERATION_RE = re.compile(r"\.\s*(?:executeQuery|executeUpdate|executeLargeUpdate|executeBatch|executeLargeBatch|execute|addBatch|clearBatch)\s*\(")
 _SOURCE_RE = re.compile(
     r"\b[A-Za-z_$][\w$]*\s*\.\s*(?P<method>getRequestURI|getRequestHeaders|getParameter|"
     r"getHeader|getQueryString|getPathInfo|getServletPath)\s*\(")
@@ -214,11 +223,18 @@ class JdbcSource(VerifierSource):
                 continue
             opening = match.end() - 1
             arguments = self.code[opening + 1:self.pairs[opening]].strip()
-            if (actual in _PREPARED and arguments) or (actual == "java.sql.Statement" and not arguments):
-                continue
             method = re.search(r"[A-Za-z]+", match.group()).group()
+            if method in _BATCH_EXECUTE:
+                if arguments:
+                    continue
+            elif (actual in _PREPARED and arguments) or (actual == "java.sql.Statement" and not arguments):
+                continue
             sites[match.start()] = (start, actual, method)
         return sites
+
+    def batch_sites(self) -> frozenset[int]:
+        return frozenset(match.start() for match in _BATCH_RE.finditer(self.code)
+                         if self.receiver_type(self.receiver_start(match.start()), match.start()) in _STATEMENTS)
 
 
 def jdbc_execution_sites(text: str) -> dict[int, tuple[int, str, str]]:
@@ -270,7 +286,7 @@ def _data(value):
 
 class SqlEngine(Engine):
     source_re = _SOURCE_RE
-    sink_re = _SINK_RE
+    sink_re = _SQL_OPERATION_RE
     sink_label = "JDBC SQL execution"
     path_constructors = False
 
@@ -279,15 +295,31 @@ class SqlEngine(Engine):
         self.contexts = []
         self.selected_arguments = {}
         selected = source.execution_sites()
+        self.batch_sites = source.batch_sites()
+        self.repeated_allocations = []
         for arrow in re.finditer(r"->", source.code):
             low = source.skip(arrow.end())
             high = source.pairs[low] if source.code[low:low + 1] == "{" else source.expression_end(low, len(source.code))
-            if any(low <= offset < high for offset in selected):
+            if any(low <= offset < high for offset in set(selected) | self.batch_sites):
                 raise ValueError("JDBC execution in a callback needs callback-state analysis; analysis is incomplete")
         super().__init__(path, text)
         self.budget = Budget(limits[2])
         for function in self.parser.functions.values():
+            self._batch_boundaries(function.body)
             function.body = self._resources(function.body)
+
+    def _batch_boundaries(self, statements):
+        for statement in statements:
+            if statement.kind in {"while", "for", "do"}:
+                self.repeated_allocations.append((statement.start, statement.end))
+            if statement.kind == "try" and (len(statement.body) > 1 or statement.otherwise) and any(
+                    statement.start <= offset < statement.end for offset in self.batch_sites):
+                # The shared graph joins normal and exceptional successors.
+                # A clear/execute operation that throws cannot establish the
+                # successful-return queue state on a catch continuation.
+                raise ValueError("JDBC batch operations with catch/finally continuations need exceptional object-state analysis; analysis is incomplete")
+            self._batch_boundaries(statement.body)
+            self._batch_boundaries(statement.otherwise)
 
     def _resources(self, statements):
         output = []
@@ -346,6 +378,10 @@ class SqlEngine(Engine):
         output = CLEAN
         for trace in fact:
             remove, additions, valid = set(), set(), True
+            if self.contexts and trace.kind == "parameter" and _PREPARED_SQL in trace.tags:
+                actual = actuals.get(trace.key, CLEAN)
+                if any(self.contexts[-1][3].get(key) for key in self._batch_keys(actual)):
+                    raise ValueError("Prepared JDBC execution in a helper with queued commands needs batch object-state summaries; analysis is incomplete")
             for tag in trace.tags:
                 if not tag.startswith("sql:raw-receiver:"):
                     continue
@@ -353,6 +389,8 @@ class SqlEngine(Engine):
                 actual = actuals.get((int(owner), int(index)))
                 if actual is None:
                     continue
+                if self.contexts and any(self.contexts[-1][3].get(key) for key in self._batch_keys(actual)):
+                    raise ValueError("JDBC execution in a helper with queued commands needs batch object-state summaries; analysis is incomplete")
                 types = _types(actual) & _STATEMENTS
                 if types and "java.sql.Statement" not in types:
                     valid = False
@@ -383,8 +421,25 @@ class SqlEngine(Engine):
             if exact:
                 selected = exact
         for function, actuals in selected:
+            if any(function.start <= site < function.end for site in self.batch_sites) and any(
+                    _types(value) & _STATEMENTS for value in actuals.values()):
+                raise ValueError("JDBC batch state across a statement helper argument needs object-effect summaries; analysis is incomplete")
+            for key, value in actuals.items():
+                actuals[key] = join(*(retag(frozenset({trace}), add=frozenset({_ARGUMENT_OBJECT}))
+                                     if trace.kind == "jdbc-object" else frozenset({trace}) for trace in value))
             self.selected_arguments[id(self.summaries[function.key])] = actuals
         return selected
+
+    def summary_return(self, fact, offset):
+        # Two invocations of a selected factory create distinct JDBC objects.
+        # A returned argument is an alias and must retain its caller identity.
+        # Keep one finite call-site component rather than growing call strings.
+        output = []
+        for trace in fact:
+            if trace.kind == "jdbc-object" and _ARGUMENT_OBJECT not in trace.tags:
+                trace = replace(trace, key=(*trace.key[:3], offset))
+            output.append(retag(frozenset({trace}), remove=frozenset({_ARGUMENT_OBJECT})))
+        return join(*output)
 
     def guard_facts(self, span):
         return ()
@@ -401,10 +456,44 @@ class SqlEngine(Engine):
                            if tag.startswith(_TYPE_PREFIX) and tag[len(_TYPE_PREFIX):] in _OBJECTS)
         return retag(selected, add=frozenset({_PREPARED_SQL}), remove=remove)
 
+    def _batch_keys(self, receiver):
+        identities = frozenset((trace.kind, trace.key) for trace in receiver
+                               if trace.kind == "jdbc-object" or (
+                                   trace.kind == "parameter" and _types((trace,)) & _STATEMENTS))
+        if any(trace.kind == "jdbc-object" and any(low <= position < high
+                for position in (trace.key[1], *trace.key[3:])
+                for low, high in self.repeated_allocations) for trace in receiver):
+            raise ValueError("JDBC batch receiver from a repeated allocation site needs allocation-state analysis; analysis is incomplete")
+        return frozenset("@sql-batch:" + repr(identity) for identity in identities)
+
+    def _batch_call(self, method, arguments, receiver, types, offset, state):
+        if not types & _STATEMENTS:
+            return
+        if method in _BATCH_EXECUTE | {"clearBatch"} and arguments:
+            return
+        if method == "addBatch" and not ((types & _PREPARED and not arguments) or (
+                "java.sql.Statement" in types and len(arguments) == 1)):
+            return
+        keys = self._batch_keys(receiver)
+        if not keys:
+            raise ValueError("JDBC batch receiver needs resolved object identity; analysis is incomplete")
+        if method == "addBatch":
+            query = self._prepared_query(receiver) if not arguments else _data(arguments[0])
+            query = advance(query, self.step(offset, "batch-add", "addBatch captures SQL"))
+            for key in keys:
+                state[key] = join(state.get(key, CLEAN), query)
+            return
+        if method in _BATCH_EXECUTE:
+            self.record(offset, join(*(state.get(key, CLEAN) for key in keys)))
+        # A may-alias receiver cannot clear every possible object's queue.
+        # JDBC 4.3 section 14.1.2 resets the batch after successful execution.
+        if len(keys) == 1:
+            state.pop(next(iter(keys)), None)
+
     def call_sink(self, name, call, value, offset, bindings):
         arguments = call.values
         method = name.rsplit(".", 1)[-1]
-        if method not in _EXECUTE:
+        if method not in _EXECUTE | _BATCH_MUTATE:
             return False
         if name.startswith("."):
             start = self.jdbc.receiver_start(offset)
@@ -417,6 +506,12 @@ class SqlEngine(Engine):
             state = self.contexts[-1][3]
             receiver, types = self._receiver(root, offset, bindings, state)
             start = offset
+        if method in _BATCH_EXECUTE | _BATCH_MUTATE:
+            self._batch_call(method, arguments, receiver, types, start, self.contexts[-1][3])
+            return False
+        if self.batch_sites and types & _STATEMENTS and any(
+                self.contexts[-1][3].get(key) for key in self._batch_keys(receiver)):
+            raise ValueError("Non-batch JDBC execution with queued commands is implementation-defined; analysis is incomplete")
         if types & _PREPARED and not arguments:
             self.record(start, self._prepared_query(receiver))
         elif "java.sql.Statement" in types and arguments:
@@ -440,7 +535,7 @@ class SqlEngine(Engine):
                 actual = "java.sql.PreparedStatement" if method == "prepareStatement" else "java.sql.CallableStatement"
                 captured = retag(_data(arguments[0]), add=frozenset({_PREPARED_SQL}))
                 return join(self._object(actual, offset), advance(captured, self.step(offset, "prepare", method)))
-        if types & _STATEMENTS and (method in _EXECUTE or method.startswith("set") or
+        if types & _STATEMENTS and (method in _EXECUTE | _BATCH_MUTATE or method.startswith("set") or
                                     method in {"close", "clearParameters", "getWarnings", "clearWarnings"}):
             return CLEAN
         return None
@@ -451,6 +546,8 @@ class SqlEngine(Engine):
         known = self._known_call(method, arguments, value, offset, types)
         if known is not None:
             return known
+        if self.batch_sites and any(_types(argument) & _STATEMENTS for argument in arguments):
+            raise ValueError("JDBC statement passed to an unresolved call may mutate its batch; analysis is incomplete")
         if method in {"parseInt", "parseLong"} and arguments and self.jdbc.resolve_type(root, offset) in {
                 "java.lang.Integer", "java.lang.Long"} and self.jdbc.binding(root.split(".", 1)[0], offset) is None:
             return frozenset({Trace("literal", (str(self.path), offset), evidence=(self.step(offset, "value", "validated integer"),))})
@@ -553,6 +650,14 @@ class SqlEngine(Engine):
                 continue
             value = join(value, frozenset({Trace("unknown", (str(self.path), match.start(), name))}))
         return value
+
+    def transfer(self, action, state):
+        output = super().transfer(action, state)
+        if action[0] == "return" and self.batch_sites:
+            returned = output.get("@return", CLEAN)
+            if any(output.get(key) for key in self._batch_keys(returned)):
+                raise ValueError("Returning a queued JDBC statement needs batch object-state summaries; analysis is incomplete")
+        return output
 
 
 @dataclass(frozen=True)

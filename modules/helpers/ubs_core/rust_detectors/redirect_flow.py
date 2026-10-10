@@ -118,10 +118,13 @@ class Namespace:
 
 _IDENTIFIER = re.compile(r'(?:r#)?[A-Za-z_][A-Za-z_0-9]*')
 _PATH = re.compile(r'(?:r#)?[A-Za-z_][A-Za-z_0-9]*(?:\s*(?:::|\.)\s*(?:r#)?[A-Za-z_][A-Za-z_0-9]*)*')
+_DEFAULT_STEPS = object()
 
 
 class Source:
-    def __init__(self, text, *, max_steps=500_000, raw=None):
+    def __init__(self, text, *, max_steps=_DEFAULT_STEPS, raw=None):
+        if max_steps is _DEFAULT_STEPS:
+            max_steps = min(5_000_000, max(500_000, len(text)))
         self.budget = Budget(max_steps)
         self.budget.spend(len(text) // 64 + 1)
         self.text = text
@@ -349,8 +352,8 @@ class Source:
                 names.append(name)
         return tuple(names)
 
-    def condition_opening(self, start, end):
-        """Skip struct-pattern braces in `let` chains before the body brace."""
+    def condition_opening(self, start, end, *, skip_control_expressions=False):
+        """Find a body after let patterns and optional header expressions."""
         pos = start
         while pos < end:
             self.budget.spend()
@@ -358,6 +361,27 @@ class Source:
             if token and token.group() == 'let':
                 equal = self.next_boundary(token.end(), end, '=')
                 pos = equal + 1
+            elif skip_control_expressions and token and token.group() == 'match':
+                # An unparenthesized match is a legal for-loop iterator. Its
+                # arms belong to the iterator expression, before the loop body.
+                opening = self.condition_opening(token.end(), end, skip_control_expressions=True)
+                if opening not in self.pairs or self.pairs[opening] >= end:
+                    raise ValueError('Malformed Rust match iterator; redirect analysis is incomplete')
+                pos = self.pairs[opening] + 1
+            elif skip_control_expressions and token and token.group() == 'if':
+                opening = self.condition_opening(token.end(), end, skip_control_expressions=True)
+                if opening not in self.pairs or self.pairs[opening] >= end:
+                    raise ValueError('Malformed Rust if header; redirect analysis is incomplete')
+                pos = self.skip(self.pairs[opening] + 1, end)
+                while re.match(r'else\b', self.code[pos:end]):
+                    pos = self.skip(pos + 4, end)
+                    if re.match(r'if\b', self.code[pos:end]):
+                        opening = self.condition_opening(pos + 2, end, skip_control_expressions=True)
+                    else:
+                        opening = pos
+                    if opening not in self.pairs or self.code[opening] != '{' or self.pairs[opening] >= end:
+                        raise ValueError('Malformed Rust else header; redirect analysis is incomplete')
+                    pos = self.skip(self.pairs[opening] + 1, end)
             elif self.code[pos] == '{':
                 return pos
             elif pos in self.pairs:
@@ -766,10 +790,25 @@ class Flow:
                 if declaration:
                     lhs = src.code[lhs_begin:colon].strip()
                 initializer, _ = src.trim(equal + 1, finish)
-                # An unparenthesized if-expression owns its `else`; a let-else
-                # initializer ending in `}` must itself be parenthesized.
-                otherwise = (src.keyword(equal + 1, finish, 'else')
-                             if declaration and not re.match(r'if\b', src.code[initializer:finish]) else finish)
+                # Skip complete initializer branches, including infix if
+                # expressions, before looking for a statement-level let-else.
+                otherwise = finish
+                cursor = initializer
+                while declaration and cursor < finish:
+                    src.budget.spend()
+                    if cursor in src.pairs:
+                        cursor = src.pairs[cursor] + 1
+                        continue
+                    token = _IDENTIFIER.match(src.code, cursor)
+                    if token is None:
+                        cursor += 1
+                    elif token.group() == 'if':
+                        cursor = self.branch_end(cursor, finish)
+                    elif token.group() == 'else':
+                        otherwise = cursor
+                        break
+                    else:
+                        cursor = token.end()
                 value = self.expr(equal + 1, otherwise, state)
                 if otherwise < finish and state.reachable:
                     opening = src.skip(otherwise + 4, finish)
@@ -853,7 +892,7 @@ class Flow:
 
     def match(self, start, end, state):
         src = self.source
-        opening = src.next_boundary(start + 5, end, '{')
+        opening = src.condition_opening(start + 5, end, skip_control_expressions=True)
         if opening not in src.pairs or src.pairs[opening] > end:
             raise ValueError('Malformed Rust match; redirect analysis is incomplete')
         close = src.pairs[opening]
@@ -929,12 +968,17 @@ class Flow:
     def loop(self, start, end, state, kind):
         src = self.source
         iterator = src.keyword(start + 3, end, 'in') if kind == 'for' else None
-        opening = (src.next_boundary(iterator + 2, end, '{') if iterator is not None else
+        opening = (src.condition_opening(iterator + 2, end, skip_control_expressions=True) if iterator is not None else
                    src.condition_opening(start + len(kind), end))
         if opening not in src.pairs:
             return end, state, CLEAN
         close = src.pairs[opening]
         entry = state.copy()
+        # Rust evaluates the iterator once, including when it yields no items.
+        # Its effects precede both the zero-iteration path and every loop head.
+        iterator_value = self.expr(iterator + 2, opening, entry) if kind == 'for' and iterator < opening else CLEAN
+        if not entry.reachable:
+            return close + 1, None, CLEAN
         head = entry.copy()
         completed = []
         values = CLEAN
@@ -951,10 +995,9 @@ class Flow:
                 completed.append(zero)
             first_exit = len(self.exits)
             if kind == 'for' and iterator < opening:
-                value = self.expr(iterator + 2, opening, body)
                 for name in src.pattern_names(start + 3, iterator):
                     shadows[name] = self.snapshot(body, name)
-                    body.assign(name, value)
+                    body.assign(name, iterator_value)
             normal, _ = self.block(opening + 1, close, body) if body is not None else (None, CLEAN)
             exits = self.exits[first_exit:]
             del self.exits[first_exit:]
@@ -1127,6 +1170,11 @@ class Flow:
         while pos < end and state.reachable:
             src.budget.spend()
             char = src.code[pos]
+            if re.compile(r'if\b').match(src.code, pos, end):
+                pos, normal, receiver = self.branch(pos, end, state)
+                state.replace(normal)
+                result = join(result, receiver)
+                continue
             if char in '([' and pos in src.pairs:
                 close = src.pairs[pos]
                 if close >= end:

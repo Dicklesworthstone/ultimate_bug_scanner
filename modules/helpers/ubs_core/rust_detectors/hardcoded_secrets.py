@@ -141,18 +141,22 @@ def strip_comments(line: str) -> str:
 
 def statement_from(lines, start_idx, max_lines=10):
     parts = []
+    origins = []
+    offset = 0
     balance = 0
     for idx in range(start_idx, min(len(lines), start_idx + max_lines)):
         current = strip_comments(lines[idx]).strip()
         if not current:
             continue
+        origins.append((offset, idx))
         parts.append(current)
+        offset += len(current) + 1
         balance += current.count('(') + current.count('{') - current.count(')') - current.count('}')
         if balance <= 0 and (
             current.endswith(';') or current.endswith(',') or current.endswith('}') or current == '}'
         ):
             break
-    return ' '.join(parts)
+    return ' '.join(parts), origins
 
 
 def source_line(lines, line_no):
@@ -219,23 +223,48 @@ def direct_risky_literal(expr: str) -> str:
     return token if risky_literal(token) else ''
 
 
-def assignment_literal(statement: str) -> bool:
-    for regex in (DECL_RE, FIELD_RE):
-        for match in regex.finditer(statement):
-            if is_sensitive_name(match.group(1)) and direct_risky_literal(match.group(2)):
-                return True
-    for match in INSERT_RE.finditer(statement):
-        if is_sensitive_name(unquote_literal(match.group(1))) and direct_risky_literal(match.group(2)):
-            return True
+def metadata_literal(name: str, token: str) -> bool:
+    """A locator-shaped value assigned to a locator field is public metadata.
+
+    Neither a reassuring field name nor a locator-shaped secret alone is
+    sufficient. Environment fallbacks never enter this classification.
+    """
+    normalized = normalize_name(name)
+    value = unquote_literal(token)
+    if normalized == 'credential_handle' or normalized.endswith('_credential_handle'):
+        return bool(re.fullmatch(r'cred_[a-z][a-z0-9]*(?:_[a-z0-9]+)+', value))
+    if normalized.endswith('_env_var'):
+        return bool(re.fullmatch(r'[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+', value))
+    if normalized in {'secret_label', 'credential_ref', 'credential_reference'} or normalized.endswith(
+        ('_secret_label', '_credential_ref', '_credential_reference')
+    ):
+        return bool(re.fullmatch(r'credential-ref:[a-z][a-z0-9_.-]*/[a-z][a-z0-9_./-]*', value))
     return False
 
 
-def env_fallback_literal(statement: str) -> bool:
+def assignment_literal_offset(statement: str) -> int | None:
+    offsets = []
+    for regex in (DECL_RE, FIELD_RE):
+        for match in regex.finditer(statement):
+            token = direct_risky_literal(match.group(2))
+            if is_sensitive_name(match.group(1)) and token and not metadata_literal(match.group(1), token):
+                offsets.append(match.start(1))
+    for match in INSERT_RE.finditer(statement):
+        name = unquote_literal(match.group(1))
+        token = direct_risky_literal(match.group(2))
+        if is_sensitive_name(name) and token and not metadata_literal(name, token):
+            offsets.append(match.start(1))
+    return min(offsets) if offsets else None
+
+
+def env_fallback_literal_offset(statement: str) -> int | None:
     match = ENV_CALL_RE.search(statement)
     if not match or not is_sensitive_name(unquote_literal(match.group(1))):
-        return False
+        return None
     suffix = statement[match.end():]
-    return bool(re.search(r'\.unwrap_or(?:_else)?\s*\(', suffix) and first_risky_literal(suffix))
+    if re.search(r'\.unwrap_or(?:_else)?\s*\(', suffix) and first_risky_literal(suffix):
+        return match.start()
+    return None
 
 
 def analyze(path: Path, base_dir: Path, issues):
@@ -249,11 +278,20 @@ def analyze(path: Path, base_dir: Path, issues):
             continue
         if not (is_sensitive_name(stripped) or ENV_CALL_RE.search(stripped)):
             continue
-        statement = statement_from(lines, idx)
+        statement, origins = statement_from(lines, idx)
         if not statement or has_suppression_marker(statement, RULE_ID):
             continue
-        if assignment_literal(statement) or env_fallback_literal(statement):
-            issues.append((relpath(path, base_dir), idx + 1, 1, source_line(lines, idx + 1)))
+        offsets = [offset for offset in (
+            assignment_literal_offset(statement), env_fallback_literal_offset(statement)
+        ) if offset is not None]
+        if offsets:
+            # Lookahead can begin on a function or control header. Report the
+            # actual matched target, so revisiting it dedupes at its real line.
+            offset = min(offsets)
+            issue_idx = max(origin_idx for start, origin_idx in origins if start <= offset)
+            if not has_ignore(lines, issue_idx):
+                issues.append((relpath(path, base_dir), issue_idx + 1, 1,
+                               source_line(lines, issue_idx + 1)))
 
 
 def find(files: Sequence[Path], root: Path | None = None) -> Iterator[tuple[Path, int, int, str]]:

@@ -101,6 +101,40 @@ class SourceTests(SourceCase):
     def test_else_if_branch_result(self):
         self.count(f'let target=if a {{ "/a" }} else if b {{ {SOURCE} }} else {{ "/b" }}; Redirect::to(target)')
 
+    def test_infix_if_initializer_owns_its_else(self):
+        self.count('let y=year-if month<=2 {1} else {0}; Redirect::to("/");', 0)
+        self.count(f'let target="/prefix" + if flag {{{SOURCE}}} else {{"/safe"}}; Redirect::to(target);')
+        self.count(f'let target="/prefix" + if flag {{"/a"}} else if other {{{SOURCE}}} else {{"/b"}}; Redirect::to(target);')
+
+    def test_inline_if_joins_outer_assignments_in_both_branch_orders(self):
+        for left, right, expected in (
+            ('0', 'target="/safe";1', 1),
+            ('target="/safe";0', '1', 1),
+            ('target="/a";0', 'target="/b";1', 0),
+        ):
+            with self.subTest(left=left, right=right):
+                self.count(f'let mut target={SOURCE}; let ignored; ignored=0 + if flag {{{left}}} else {{{right}}}; Redirect::to(target);', expected)
+        self.count(f'let mut target={SOURCE}; let ignored; ignored=0 + if flag {{target="/a";0}} else if other {{1}} else {{target="/b";2}}; Redirect::to(target);')
+
+    def test_inline_if_preserves_new_taint_in_either_branch(self):
+        for left, right in (
+            (f'target={SOURCE};0', 'target="/b";1'),
+            ('target="/b";0', f'target={SOURCE};1'),
+        ):
+            with self.subTest(left=left):
+                self.count(f'let mut target="/a"; let ignored; ignored=0 + if flag {{{left}}} else {{{right}}}; Redirect::to(target);')
+
+    def test_inline_if_divergent_assignment_does_not_reach_continuation(self):
+        self.count(f'let mut target="/a"; let ignored; ignored=0 + if flag {{target={SOURCE};return Redirect::to("/");}} else {{1}}; Redirect::to(target);', 0)
+
+    def test_parenthesized_if_let_else_keeps_its_failure_contract(self):
+        initializer = f'(if flag {{Some({SOURCE})}} else {{None}})'
+        self.count(f'let Some(target)={initializer} else {{return Redirect::to("/");}}; Redirect::to(target);')
+        with self.assertRaisesRegex(ValueError, 'let-else must diverge'):
+            self.count(f'let Some(target)={initializer} else {{log("missing");}}; Redirect::to(target);')
+        with self.assertRaisesRegex(ValueError, 'Malformed Rust let-else'):
+            self.count(f'let Some(target)={initializer} else ; Redirect::to(target);')
+
     def test_early_return_excludes_dead_sink(self):
         self.count(f'let target={SOURCE}; return Redirect::to("/safe"); Redirect::to(target);', 0)
 
@@ -420,6 +454,101 @@ class SummaryTests(SourceCase):
             self.assertEqual(next(findings)[:3], (path, 1, 1))
             with self.assertRaisesRegex(OSError, 'Cannot read Rust redirect input'):
                 next(findings)
+
+
+class DefaultBudgetTests(SourceCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.large_prefix = ''.join(
+            f'fn independent_helper_{number}(value: usize) -> usize {{ value + 1 }}\n'
+            for number in range(40_000)
+        )
+
+    def scan(self, code):
+        artifacts = ROOT / 'test-suite' / 'artifacts'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='rust-redirect-budget-', dir=artifacts) as tmp:
+            path = Path(tmp) / 'handler.rs'
+            path.write_text(code, encoding='utf-8')
+            return list(open_redirect.find([path]))
+
+    def test_large_clean_source_completes_after_fixed_budget_exhaustion(self):
+        code = self.large_prefix + f'fn handler(params: Params) {{ let target={SOURCE}; Redirect::to("/"); }}\n'
+        with self.assertRaisesRegex(AnalysisLimit, 'work limit.*incomplete'):
+            Source(code, max_steps=500_000).solve()
+        self.assertEqual(self.scan(code), [])
+
+    def test_large_tuple_and_multiline_header_flows_retain_exact_findings(self):
+        code = self.large_prefix + f'''fn handler(params: Params, response: Response) {{
+    let target={SOURCE};
+    response.insert_header((
+        "Location",
+        target,
+    ));
+    response.header(
+        "Location",
+        target,
+    );
+}}
+'''
+        with self.assertRaisesRegex(AnalysisLimit, 'work limit.*incomplete'):
+            Source(code, max_steps=500_000).solve()
+        findings = self.scan(code)
+        self.assertEqual([row[1] for row in findings], [40_003, 40_007])
+        self.assertTrue(all('params.get("next") -> redirect' in row[3] for row in findings), findings)
+
+    def test_default_floor_and_ceiling_preserve_explicit_budget_values(self):
+        self.assertEqual(Source('').budget.remaining, 499_999)
+        text = ' ' * 5_000_001
+        source = Source(text)
+        self.assertEqual(source.budget.remaining, 5_000_000 - len(text) // 64 - 1)
+        self.assertEqual(source.solve(), {})  # Size alone cannot refuse bounded analysis.
+        self.assertEqual(Source('', max_steps=5_000_001).budget.remaining, 5_000_000)
+        with self.assertRaises(TypeError):
+            Source('', max_steps=None)
+
+    @staticmethod
+    def exhausting_source():
+        comparisons = ', '.join(['x < y'] * 2500)
+        return ' ' * 5_000_001 + f'fn handler(params: Params) {{let flags=[{comparisons}]; Redirect::to({SOURCE});}}'
+
+    def test_exhausted_default_tiny_budget_and_deep_malformed_input_remain_incomplete(self):
+        with self.assertRaisesRegex(AnalysisLimit, 'work limit.*incomplete'):
+            Source(self.exhausting_source()).solve()
+        with self.assertRaisesRegex(AnalysisLimit, 'work limit.*incomplete'):
+            Source(f'fn handler() {{ Redirect::to({SOURCE}); }}', max_steps=0).solve()
+        with self.assertRaisesRegex(AnalysisLimit, 'nesting limit.*incomplete'):
+            Source('(' * 129 + ')' * 129).solve()
+        with self.assertRaisesRegex(ValueError, 'Unbalanced.*incomplete'):
+            Source('fn handler() { (] }').solve()
+
+    def test_exhausted_native_scans_remain_partial_on_repeated_cache_enabled_runs(self):
+        artifacts = ROOT / 'test-suite' / 'artifacts'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='rust-redirect-budget-native-', dir=artifacts) as tmp:
+            root = Path(tmp)
+            target = root / 'exhausted.rs'
+            target.write_text(self.exhausting_source(), encoding='utf-8')
+            inputs, report = root / 'inputs', root / 'report.json'
+            inputs.write_bytes(os.fsencode(target) + b'\0')
+            command = [sys.executable, '-m', 'ubs_core.rust_scan', '--files-from', str(inputs),
+                       '--sink', str(root / 'findings.ndjson'),
+                       '--project-dir', str(root), '--json-out', str(report), '--quiet',
+                       '--skip-type-narrowing', '--skip', ','.join(str(n) for n in range(1, 25) if n != 8)]
+            env = {**os.environ, 'PYTHONPATH': str(ROOT / 'modules' / 'helpers'),
+                   'PYTHONDONTWRITEBYTECODE': '1', 'UBS_NO_CACHE': '0', 'UBS_CACHE_DIR': str(root / 'cache')}
+            for attempt in range(2):
+                result = subprocess.run(command, cwd=root, env=env, text=True,
+                                        capture_output=True, timeout=90)
+                print(result.stdout, end='', flush=True)
+                print(result.stderr, end='', file=sys.stderr, flush=True)
+                self.assertEqual(result.returncode, 2, (attempt, result.stdout, result.stderr))
+                payload = json.loads(report.read_text(encoding='utf-8'))
+                print(json.dumps({'attempt': attempt, 'exit_code': result.returncode, **payload}), flush=True)
+                self.assertEqual((payload['status'], payload['module_error']), ('partial', 'ANALYZER_ERROR'))
+                self.assertIn('open_redirect', payload['message'])
+                self.assertIn('work limit exceeded', payload['message'])
+                self.assertEqual(payload['extras']['profile']['cache_hits'], 0)
 
 
 class QualifiedHelperTests(SourceCase):
@@ -1042,6 +1171,41 @@ class PatternFlowTests(SourceCase):
     def test_for_destructuring_binds_iterator_values(self):
         self.count(f'for (key, target) in {SOURCE} {{Redirect::to(target);}}')
 
+    def test_for_match_iterator_keeps_tainted_and_clean_arms(self):
+        for left, right, expected in (
+            (SOURCE, '["/"]', 1),
+            ('["/"]', SOURCE, 1),
+            ('["/a"]', '["/b"]', 0),
+        ):
+            for suffix in ('', '.into_iter()'):
+                with self.subTest(left=left, right=right, suffix=suffix):
+                    self.count(f'for target in match flag {{true => {left}, false => {right}}}{suffix} {{Redirect::to(target);}}', expected)
+
+    def test_for_match_iterator_preserves_outer_assignments(self):
+        self.count(f'let mut target="/"; for ignored in match flag {{true => {{target={SOURCE}; [0]}}, false => [0]}} {{}} Redirect::to(target);')
+        self.count(f'let mut target={SOURCE}; for ignored in match flag {{true => {{target="/a"; [0]}}, false => {{target="/b"; [0]}}}} {{}} Redirect::to(target);', 0)
+
+    def test_for_match_iterator_is_evaluated_once(self):
+        self.count(f'let mut next="/"; for target in match flag {{true => next, false => "/"}} {{next={SOURCE}; Redirect::to(target);}}', 0)
+
+    def test_for_helper_iterator_waits_for_return_summary(self):
+        helper = f'fn items(params: Params) -> Values {{{SOURCE}}}'
+        handler = 'fn handler(params: Params) {for target in items(params) {Redirect::to(target);}}'
+        for definitions in ((helper, handler), (handler, helper)):
+            with self.subTest(definitions=definitions):
+                self.assertEqual(len(self.scan('\n'.join(definitions))), 1)
+        self.count('fn items() -> Values {loop {}} for target in items() {Redirect::to(params.get("next"));}', 0)
+
+    def test_match_if_subject_keeps_all_branch_values(self):
+        for left, right, expected in (
+            (SOURCE, '"/"', 1),
+            ('"/"', SOURCE, 1),
+            ('"/a"', '"/b"', 0),
+        ):
+            with self.subTest(left=left, right=right):
+                self.count(f'let target=match if flag {{{left}}} else {{{right}}} {{value => value}}; Redirect::to(target);', expected)
+                self.count(f'for target in match if flag {{{left}}} else if other {{"/"}} else {{{right}}} {{value => value}} {{Redirect::to(target);}}', expected)
+
     def test_binding_capitalization_is_not_a_sanitizer(self):
         self.count(f'let Target={SOURCE}; Redirect::to(Target);')
         self.count(f'if let Some(Target)={SOURCE} {{Redirect::to(Target);}}')
@@ -1124,7 +1288,15 @@ class RealScannerTests(SourceCase):
                 ('match', f'match {SOURCE} {{Some(target) => Redirect::to(target), _ => Redirect::to("/")}}', True),
                 ('if-let', f'if let Some(target)={SOURCE} {{Redirect::to(target);}}', True),
                 ('let-else', f'let Some(target)={SOURCE} else {{return;}}; Redirect::to(target);', True),
+                ('infix-if', f'let target="/prefix" + if flag {{{SOURCE}}} else {{"/safe"}}; Redirect::to(target);', True),
+                ('date-if', 'let y=year-if month<=2 {1} else {0}; Redirect::to("/");', False),
+                ('infix-if-join', f'let mut target={SOURCE}; let ignored; ignored=0 + if flag {{0}} else {{target="/safe";1}}; Redirect::to(target);', True),
+                ('infix-if-clean', f'let mut target={SOURCE}; let ignored; ignored=0 + if flag {{target="/a";0}} else {{target="/b";1}}; Redirect::to(target);', False),
                 ('match-clean', f'let target=match {SOURCE} {{Some(_) => "/one", None => "/two"}}; Redirect::to(target);', False),
+                ('for-match', f'for target in match flag {{true => {SOURCE}, false => ["/"]}} {{Redirect::to(target);}}', True),
+                ('for-match-clean', 'for target in match flag {true => ["/a"], false => ["/b"]} {Redirect::to(target);}', False),
+                ('match-if', f'let target=match if flag {{{SOURCE}}} else {{"/"}} {{value => value}}; Redirect::to(target);', True),
+                ('match-if-clean', 'let target=match if flag {"/a"} else {"/b"} {value => value}; Redirect::to(target);', False),
                 ('local-guard-incomplete', f'let target={SOURCE}; if !(target.starts_with("/") && !target.starts_with("//")) {{return;}} Redirect::to(target);', True),
                 ('local-guard-strong', f'let target={SOURCE}; if !({LOCAL_GUARD}) {{return;}} Redirect::to(target);', False),
                 ('external-custom-predicate', f'let target={SOURCE}; if !is_local_redirect(target) {{return;}} Redirect::to(target);', True),

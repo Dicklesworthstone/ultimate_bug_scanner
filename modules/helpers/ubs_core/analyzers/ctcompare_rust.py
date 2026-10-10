@@ -17,6 +17,9 @@ from typing import Iterable
 
 from ubs_core.registry import Analyzer, RunContext, register
 from ubs_core.suppression import has_suppression_marker
+from ubs_core.rust_detectors.hardcoded_secrets import (
+    ENV_CALL_RE, STRING_RE, direct_risky_literal, metadata_literal, unquote_literal,
+)
 
 _SUPPRESSION_RULE = "rust.security.constant-time-compare"
 
@@ -73,6 +76,10 @@ metadata_terms = {
 nullish_re = re.compile(r'^(?:None|Some\s*\([^)]*\)|Ok\s*\([^)]*\)|Err\s*\([^)]*\)|true|false|0|1|""|b""|\[\])$')
 shape_re = re.compile(r"\b(?:len|is_empty|capacity)\s*\(|\.(?:len|is_empty|capacity)\s*\(")
 pure_string_literal_re = re.compile(r'^\s*(?:"(?:\\.|[^"\\])*"|r#*"[^"]*"#*|b"(?:\\.|[^"\\])*")\s*$')
+key_lookup_re = re.compile(
+    r'(?:\.\s*get(?:_mut)?\s*\(\s*|(?:[A-Za-z_][A-Za-z0-9_]*|\)|\])\s*\[\s*)'
+    r'(' + STRING_RE.pattern + r')'
+)
 keywords = {
     "if", "while", "match", "return", "let", "mut", "const", "static", "true",
     "false", "None", "Some", "Ok", "Err", "self", "Self", "crate", "super",
@@ -178,35 +185,74 @@ def split_identifier_terms(text: str) -> str:
     return text
 
 
-def is_sensitive_text(text: str) -> bool:
-    terms = re.findall(r"[a-z0-9]+", split_identifier_terms(text).lower())
-    for idx, term in enumerate(terms):
-        if term in strong_terms:
-            follower = terms[idx + 1] if idx + 1 < len(terms) else ""
-            if follower not in metadata_terms:
-                return True
+def is_sensitive_text(text: str, public_metadata=()) -> bool:
+    # Qualifiers belong to one identifier, never to an unrelated callee or
+    # argument. Literal error codes and labels are not operand identities.
+    structural = blank_string_literals(text)
+    for match in identifier_re.finditer(structural):
+        identifier = match.group(0)
+        prefix = structural[:match.start()].rstrip()
+        if identifier in public_metadata and not prefix.endswith((".", "::")):
             continue
-        if term in weak_terms and any(
-            other_idx != idx and other in qualifier_terms
-            for other_idx, other in enumerate(terms)
-        ):
-            return True
+        terms = re.findall(r"[a-z0-9]+", split_identifier_terms(identifier).lower())
+        for idx, term in enumerate(terms):
+            if term in strong_terms:
+                follower = terms[idx + 1] if idx + 1 < len(terms) else ""
+                if follower not in metadata_terms:
+                    return True
+                continue
+            if term in weak_terms and any(
+                other_idx != idx and other in qualifier_terms
+                for other_idx, other in enumerate(terms)
+            ):
+                return True
     return False
 
 
-def is_sensitive_operand_text(text: str) -> bool:
+def is_sensitive_lookup(text: str) -> bool:
+    structural = blank_string_literals(text)
+    for lookup in (ENV_CALL_RE, key_lookup_re):
+        for match in lookup.finditer(text):
+            # Recognized source calls retain their credential key's meaning.
+            # Lookup-shaped text inside a literal is still ordinary text.
+            if not structural[match.start():match.start(1)].strip():
+                continue
+            name = unquote_literal(match.group(1))
+            if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_-]*', name) and is_sensitive_text(name):
+                return True
+    return False
+
+
+def is_sensitive_operand_text(text: str, public_metadata=()) -> bool:
     stripped = text.strip()
     if pure_string_literal_re.match(stripped):
         return False
-    return is_sensitive_text(stripped)
+    return is_sensitive_lookup(stripped) or is_sensitive_text(stripped, public_metadata)
 
 
 def operand_identifiers(operand: str):
     return {
         token
-        for token in identifier_re.findall(operand)
+        for token in identifier_re.findall(blank_string_literals(operand))
         if token not in keywords
     }
+
+
+def assignment_match(statement: str):
+    """Keep the raw match only when its assignment operator is outside literals."""
+    match = assign_re.match(statement)
+    if not match:
+        return None
+    operator_index = match.start("rhs") - 1
+    while operator_index >= 0 and statement[operator_index].isspace():
+        operator_index -= 1
+    if (
+        operator_index < 0
+        or statement[operator_index] != "="
+        or blank_string_literals(statement)[operator_index] != "="
+    ):
+        return None
+    return match
 
 
 def clean_operand_text(operand: str) -> str:
@@ -215,7 +261,7 @@ def clean_operand_text(operand: str) -> str:
     # In `let secret_matches = actual == expected`, the destination is a
     # boolean binding, not part of the equality's left operand. This also
     # keeps a previously tainted discard binding (`let _ = ...`) out of it.
-    assignment = assign_re.match(clean)
+    assignment = assignment_match(clean)
     if assignment:
         clean = assignment.group("rhs").strip()
     clean = re.split(r"\s*(?:&&|\|\||[;{])", clean, maxsplit=1)[0].strip()
@@ -256,7 +302,7 @@ def source_line(lines, line_no):
 def blank_string_literals(text: str) -> str:
     """Comment-stripped text with string/char literal CONTENT blanked out.
 
-    Used only for structural brace counting and `fn` detection, so the result
+    Used for structural brace, function, identifier and source detection. It
     keeps the original length and every non-literal character in place: a `{`
     inside `"{}"` or `'{'` must not open a scope.
     """
@@ -353,7 +399,32 @@ def function_owner_by_line(stripped_lines):
     return owner
 
 
-def collect_sensitive_vars(lines, stripped_lines, statement_at, line_numbers, seeded=()):
+def collect_public_metadata_vars(statement_at, line_numbers, seeded=()):
+    public = set(seeded)
+    unproven = set()
+    for line_no in line_numbers:
+        statement = statement_at(line_no, 5)
+        if fn_decl_re.search(statement):
+            signature = statement.split("{", 1)[0]
+            for parameter in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*:(?!:)", signature):
+                name = parameter.group(1)
+                unproven.add(name)
+                public.discard(name)
+        match = assignment_match(statement)
+        if match:
+            name = match.group("lhs")
+            if metadata_literal(name, direct_risky_literal(match.group("rhs"))):
+                public.add(name)
+            else:
+                # This analysis exempts names for a whole scope. Any
+                # unproven write revokes that proof regardless of order;
+                # a later locator must never hide an earlier secret.
+                unproven.add(name)
+                public.discard(name)
+    return public - unproven
+
+
+def collect_sensitive_vars(lines, stripped_lines, statement_at, line_numbers, seeded=(), public_metadata=()):
     """Taint set for ONE scope, seeded from the enclosing (module) scope.
 
     Iterated to a fixpoint so alias chains stay order-independent inside the
@@ -374,7 +445,7 @@ def collect_sensitive_vars(lines, stripped_lines, statement_at, line_numbers, se
             statement = statement_at(line_no, 5)
             if not statement or safe_compare_re.search(statement):
                 continue
-            match = assign_re.match(statement)
+            match = assignment_match(statement)
             if not match:
                 continue
             name = match.group("lhs")
@@ -382,8 +453,8 @@ def collect_sensitive_vars(lines, stripped_lines, statement_at, line_numbers, se
                 continue
             rhs = match.group("rhs")
             if (
-                is_sensitive_text(name)
-                or is_sensitive_operand_text(rhs)
+                is_sensitive_text(name, public_metadata)
+                or is_sensitive_operand_text(rhs, public_metadata)
                 or (operand_identifiers(rhs) & sensitive)
             ):
                 sensitive.add(name)
@@ -393,13 +464,13 @@ def collect_sensitive_vars(lines, stripped_lines, statement_at, line_numbers, se
     return sensitive
 
 
-def operand_is_sensitive(operand: str, sensitive_vars) -> bool:
-    if is_sensitive_operand_text(operand):
+def operand_is_sensitive(operand: str, sensitive_vars, public_metadata=()) -> bool:
+    if is_sensitive_operand_text(operand, public_metadata):
         return True
     return bool(operand_identifiers(operand) & sensitive_vars)
 
 
-def unsafe_secret_compare(statement: str, sensitive_vars) -> bool:
+def unsafe_secret_compare(statement: str, sensitive_vars, public_metadata=()) -> bool:
     if safe_compare_re.search(statement) or has_suppression_marker(statement, _SUPPRESSION_RULE):
         return False
     for clause in re.split(r"\s*(?:&&|\|\|)\s*", statement):
@@ -410,7 +481,11 @@ def unsafe_secret_compare(statement: str, sensitive_vars) -> bool:
         right = clean_operand_text(match.group("right"))
         if operand_is_nullish_or_shape_check(left) or operand_is_nullish_or_shape_check(right):
             continue
-        if operand_is_sensitive(left, sensitive_vars) or operand_is_sensitive(right, sensitive_vars):
+        # Cleaning removes trailing parentheses; source lookup recognition
+        # needs the original call delimiter, including for direct env macros.
+        if is_sensitive_lookup(match.group("left")) or is_sensitive_lookup(match.group("right")):
+            return True
+        if operand_is_sensitive(left, sensitive_vars, public_metadata) or operand_is_sensitive(right, sensitive_vars, public_metadata):
             return True
     return False
 
@@ -436,14 +511,19 @@ def scan_file(text: str) -> list[tuple[int, str]]:
         scopes.setdefault(owner[line_no], []).append(line_no)
     # Module-scope taint (a `static API_SECRET`, a `const HMAC_KEY`) seeds every
     # function; a function's own locals stay inside it.
-    module_sensitive = collect_sensitive_vars(lines, stripped_lines, statement_at, scopes.get(0, ()))
+    module_public = collect_public_metadata_vars(statement_at, scopes.get(0, ()))
+    module_sensitive = collect_sensitive_vars(lines, stripped_lines, statement_at, scopes.get(0, ()),
+                                              public_metadata=module_public)
     found: list[tuple[int, str]] = []
     seen: set[int] = set()
     for scope_id, scope_lines in scopes.items():
+        public_metadata = (module_public if scope_id == 0 else
+                           collect_public_metadata_vars(statement_at, scope_lines, module_public))
         sensitive_vars = (
             module_sensitive
             if scope_id == 0
-            else collect_sensitive_vars(lines, stripped_lines, statement_at, scope_lines, module_sensitive)
+            else collect_sensitive_vars(lines, stripped_lines, statement_at, scope_lines, module_sensitive,
+                                        public_metadata)
         )
         for line_no in scope_lines:
             if has_ignore(lines, line_no, _SUPPRESSION_RULE):
@@ -452,7 +532,7 @@ def scan_file(text: str) -> list[tuple[int, str]]:
             if not stripped or ("==" not in stripped and "!=" not in stripped):
                 continue
             statement = statement_at(line_no, 8)
-            if not statement or not unsafe_secret_compare(statement, sensitive_vars):
+            if not statement or not unsafe_secret_compare(statement, sensitive_vars, public_metadata):
                 continue
             if line_no in seen:
                 continue

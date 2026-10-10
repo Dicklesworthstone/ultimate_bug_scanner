@@ -47,6 +47,7 @@ from ubs_core.py_patterns.security_rg import PATTERNS  # noqa: E402
 from ubs_core.py_rules import _RULES  # noqa: E402
 from ubs_core.py_scan import iter_matches  # noqa: E402
 from ubs_core.rust_detectors import jwt_verification  # noqa: E402
+from ubs_core.rust_detectors import hardcoded_secrets as rust_hardcoded_secrets  # noqa: E402
 from ubs_core.rust_detectors import security_randomness  # noqa: E402
 from ubs_core.rust_detectors import (  # noqa: E402
     archive_entry_path, host_header_url, open_redirect, request_regex, request_url,
@@ -1087,6 +1088,46 @@ class RustPanicContextTests(unittest.TestCase):
         self.assertEqual(len(hits), 2)
         self.assertTrue(all(hit["severity"] == "critical" for hit in hits))
 
+    def test_proven_test_scopes_warn_but_shared_unknown_and_boundary_sites_stay_critical(self) -> None:
+        target = self.package("scoped", source="src/lib.rs")
+        source = '''fn production() { panic!("runtime"); } // critical
+#[cfg(test)]
+mod checks {
+    fn helper() { panic!("unit helper"); } // warning
+}
+#[cfg(all(test, feature = "wire"))]
+fn gated() { panic!("test-only cfg"); } // warning
+#[test]
+fn unit() { panic!("unit runner"); } // warning
+#[cfg(any(test, unix))]
+fn shared() { panic!("also runtime"); } // critical
+#[custom::test]
+fn unknown() { panic!("unproven runner"); } // critical
+#[cfg(test)] fn one() { panic!("boundary test"); } fn two() { panic!("boundary runtime"); } // critical
+#[cfg(test)]
+mod incomplete {
+    fn unknown() { panic!("unclosed scope"); } // critical
+'''
+        target.write_text(source, encoding="utf-8")
+        code, doc = self.scan([target])
+        hits = [hit for hit in doc["findings"] if hit["rule"] == "rust.ownership.panic-macro"]
+        expected = [(number, line.rsplit("// ", 1)[1])
+                    for number, line in enumerate(source.splitlines(), 1) if "panic!" in line]
+        expected.append((14, "critical"))  # Both sites on the mixed boundary stay visible.
+        self.assertEqual(code, 1)
+        self.assertEqual(sorted((hit["line"], hit["severity"]) for hit in hits), sorted(expected))
+        self.assertEqual((doc["critical"], doc["warning"]), (6, 3))
+        self.assertEqual(self.scan([target], fail_on_warning=True)[0], 1)
+
+    def test_all_test_only_panic_sites_still_fail_warning_gate(self) -> None:
+        target = self.package("all_scoped", source="src/lib.rs")
+        target.write_text('#[cfg(test)]\nmod checks {\n    fn helper() { panic!("failure path"); }\n}\n',
+                          encoding="utf-8")
+        code, doc = self.scan([target])
+        self.assertEqual((code, doc["critical"], doc["warning"]), (0, 0, 1))
+        self.assertEqual(doc["findings"][0]["severity"], "warning")
+        self.assertEqual(self.scan([target], fail_on_warning=True)[0], 1)
+
     def test_missing_toml_parser_keeps_critical(self) -> None:
         target = self.package("native")
         code, doc = self.scan([target], without_tomllib=True)
@@ -1714,6 +1755,116 @@ class ConstantTimeCompareDigestRoleTests(unittest.TestCase):
                 fixture.verify_public_fixture(root)
 
 
+class RustPublicCredentialMetadataTests(unittest.TestCase):
+    """Public locator labels and material values are different evidence classes."""
+
+    CLEAN = '''const SEARCH_API_KEY_CREDENTIAL_HANDLE: &str = "cred_search_api_key";
+const SEARCH_CREDENTIAL_ENV_VAR: &str = "SEARCH_API_KEY";
+const CLIENT_SECRET_ENV_VAR: &str = "SEARCH_CLIENT_SECRET";
+fn catalogue() {
+    let secret_label = "credential-ref:catalog/live_api_key";
+    let credential_ref = "credential-ref:catalog/client_secret";
+    settings.insert("credential_handle", "cred_search_api_key");
+}
+'''
+    MATERIAL = '''const SEARCH_API_KEY_CREDENTIAL_HANDLE: &str = "sk_live_abc123xyz";
+const SEARCH_CREDENTIAL_ENV_VAR: &str = "actual-secret-credential";
+const CLIENT_SECRET_ENV_VAR: &str = "literal-password-value";
+fn catalogue() {
+    let secret_label = "literal-secret-value";
+    let credential_ref = "literal-token-value";
+    settings.insert("credential_handle", "literal-token-value");
+    let password = "credential-ref:catalog/client_secret";
+    let auth_token = "ABC12345SECRET67890";
+    let token = "opaque-continuation-value";
+    let credential_handle = std::env::var("AUTH_TOKEN").unwrap_or("live-default-token".to_owned());
+}
+'''
+
+    def setUp(self) -> None:
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        self.scratch = tempfile.TemporaryDirectory(prefix="rust-credential-metadata-", dir=artifacts)
+        self.addCleanup(self.scratch.cleanup)
+        self.root = Path(self.scratch.name)
+
+    def test_metadata_requires_both_a_locator_target_and_a_locator_literal(self) -> None:
+        clean = self.root / "metadata.rs"
+        material = self.root / "material.rs"
+        clean.write_text(self.CLEAN, encoding="utf-8")
+        material.write_text(self.MATERIAL, encoding="utf-8")
+        self.assertEqual(list(rust_hardcoded_secrets.find([clean], self.root)), [])
+        self.assertEqual([hit[1] for hit in rust_hardcoded_secrets.find([material], self.root)],
+                         [1, 2, 3, 5, 6, 7, 8, 9, 10, 11])
+
+    def test_credential_locations_point_to_material_not_enclosing_headers(self) -> None:
+        source = '''fn access_token_loader() {
+    let access_token = "credential-material-731-retain";
+}
+fn api_token_cache() {
+    if let Ok(mut cache) = token_cache.lock() {
+        *cache = Some(Token {
+            access_token: "credential-material-731-retain".to_owned(),
+            id: 1,
+            refresh_token: "credential-material-732-retain".to_owned(),
+        });
+    }
+    let password =
+        "credential-material-733-retain";
+}
+'''
+        material = self.root / "material_locations.rs"
+        material.write_text(source, encoding="utf-8")
+        findings = list(rust_hardcoded_secrets.find([material], self.root))
+        self.assertEqual([hit[1] for hit in findings], [2, 7, 9, 12])
+        self.assertEqual([hit[3] for hit in findings],
+                         [source.splitlines()[index - 1].strip() for index in [2, 7, 9, 12]])
+        code, doc = RustPanicContextTests.scan(self, [material], categories=(8,), ast=False)
+        hits = [hit for hit in doc["findings"] if hit["rule"] == "rust.security.hardcoded-secrets"]
+        self.assertEqual(code, 1)
+        self.assertEqual(doc["status"], "ok")
+        self.assertEqual([hit["line"] for hit in hits], [2, 7, 9, 12])
+        self.assertTrue(all(hit["severity"] == "critical" for hit in hits), hits)
+
+    def test_multiline_env_fallback_location_retains_the_critical_default(self) -> None:
+        source = '''fn access_token_fallback() -> String {
+    let value =
+        std::env::var("ACCESS_TOKEN")
+            .unwrap_or("credential-material-734-retain".to_owned());
+    value
+}
+'''
+        material = self.root / "env_fallback_location.rs"
+        material.write_text(source, encoding="utf-8")
+        findings = list(rust_hardcoded_secrets.find([material], self.root))
+        self.assertEqual([hit[1] for hit in findings], [3])
+        self.assertEqual(findings[0][3], source.splitlines()[2].strip())
+
+    def test_dynamic_credentials_without_a_literal_fallback_remain_clean(self) -> None:
+        source = '''fn access_token_loader() -> Result<String, Error> {
+    let access_token = std::env::var("ACCESS_TOKEN")?;
+    Ok(access_token)
+}
+'''
+        clean = self.root / "dynamic_credentials.rs"
+        clean.write_text(source, encoding="utf-8")
+        self.assertEqual(list(rust_hardcoded_secrets.find([clean], self.root)), [])
+
+    def test_public_scanner_keeps_material_values_critical(self) -> None:
+        clean = self.root / "metadata.rs"
+        material = self.root / "material.rs"
+        clean.write_text(self.CLEAN, encoding="utf-8")
+        material.write_text(self.MATERIAL, encoding="utf-8")
+        code, doc = RustPanicContextTests.scan(self, [clean, material], categories=(8,), ast=False)
+        hits = [hit for hit in doc["findings"] if hit["rule"] == "rust.security.hardcoded-secrets"]
+        self.assertEqual(code, 1)
+        self.assertEqual(doc["status"], "ok")
+        self.assertEqual([hit["line"] for hit in hits], [1, 2, 3, 5, 6, 7, 8, 9, 10, 11])
+        self.assertTrue(all(hit["severity"] == "critical" and Path(hit["path"]) == material
+                            for hit in hits), hits)
+        self.assertEqual(RustPanicContextTests.scan(self, [clean], categories=(8,), ast=False)[0], 0)
+
+
 class RustComparisonBoundaryTests(unittest.TestCase):
     """Namespace arms and boolean destinations are not secret operands."""
 
@@ -1794,6 +1945,173 @@ fn timing_safe(expected_signature: &[u8], provided: &[u8]) -> bool {
 
     def test_real_restore_match_arm_does_not_taint_namespace(self) -> None:
         self.assertEqual(ctcompare_rust.scan_file(self.RESTORE), [])
+
+    def test_quoted_equals_fields_do_not_seed_or_revoke_module_taint(self) -> None:
+        literals = (
+            ("ordinary", "&'static str", '"KEY=VALUE credential secret"'),
+            ("byte", "&'static [u8]", 'b"KEY=VALUE credential secret"'),
+            ("raw", "&'static str", 'r#"KEY=VALUE credential secret"#'),
+            ("character", "char", "'='"),
+        )
+        for kind, field_type, literal in literals:
+            with self.subTest(kind=kind):
+                source = f'''struct Help {{
+    summary: {field_type},
+    usage: {field_type},
+    credential_handle: {field_type},
+}}
+const credential_handle: &str = "cred_provider_runtime";
+const HELP: Help = Help {{
+    summary: {literal},
+    usage: {literal},
+    credential_handle: {literal},
+}};
+fn ordinary(summary: u64, usage: u64, expected_rows: u64, supplied: &str) {{
+    let accounted = summary;
+    summary != expected_rows;
+    accounted != expected_rows;
+    usage != expected_rows;
+    credential_handle == supplied;
+}}
+'''
+                self.assertEqual(ctcompare_rust.scan_file(source), [])
+                field = f"summary: {literal}"
+                self.assertEqual(ctcompare_rust.clean_operand_text(field), field)
+
+    def test_real_assignments_keep_secret_literal_and_lookup_rhs(self) -> None:
+        source = '''const SERVER_SECRET: &str = "credential=material-retained";
+static PRIVATE_TOKEN: &str = r#"token=material-retained"#;
+fn verify(payload: Value, supplied: &str, ordinary: &str) {
+    SERVER_SECRET != supplied; // expect: module-secret
+    PRIVATE_TOKEN == supplied; // expect: module-token
+    let typed_alias: &str = SERVER_SECRET;
+    typed_alias == supplied; // expect: typed-alias
+    let typed_env: String = std::env::var("AUTH_TOKEN").unwrap();
+    typed_env == supplied; // expect: typed-env-alias
+    let mut reassigned = ordinary.to_owned();
+    reassigned = std::env::var("AUTH_TOKEN").unwrap();
+    reassigned != supplied; // expect: reassigned-env
+    let field = payload["auth_token"].as_str().unwrap();
+    field != supplied; // expect: indexed-alias
+    let keyed = payload.get("api_key").and_then(Value::as_str).unwrap();
+    keyed == supplied; // expect: keyed-alias
+    std::env::var("API_KEY").unwrap() != supplied; // expect: direct-env
+    payload["auth_token"].as_str().unwrap() != supplied; // expect: direct-index
+    let credential_handle = std::env::var("REAL_SECRET").unwrap();
+    let alias = credential_handle.as_str();
+    alias == supplied; // expect: late-locator-alias
+    let credential_handle = "cred_provider_runtime";
+}
+'''
+        expected = self.expected_sites(source)
+        self.assertEqual(len(expected), 10)
+        self.assertEqual(ctcompare_rust.scan_file(source), expected)
+
+    def test_public_operands_do_not_combine_into_secret_vocabulary(self) -> None:
+        operands = ("PUBLIC_API_PROFILE", "hex::encode(Sha256::digest(profile_bytes))")
+        for operand in operands:
+            self.assertFalse(ctcompare_rust.is_sensitive_operand_text(operand), operand)
+        self.assertFalse(ctcompare_rust.is_sensitive_operand_text(
+            "hex::encode(Sha256::digest(PUBLIC_API_PROFILE))"))
+        source = '''const SEARCH_API_KEY_CREDENTIAL_HANDLE: &str = "cred_search_api_key";
+fn integrity(manifest: Manifest, refusal_code: &str, requirement: Requirement) {
+    hex::encode(Sha256::digest(PUBLIC_API_PROFILE)) != manifest.content_hash_sha256;
+    match mode {
+        Mode::Live if refusal_code == "provider.credential_missing" => {}
+        _ if entitlement_state == "missing" => "provider.credential_missing",
+    }
+    requirement.handle_key == SEARCH_API_KEY_CREDENTIAL_HANDLE;
+    output.error_code.as_deref() == Some("provider.credential_missing");
+    value.missing_requirements == vec!["ApiKey".to_owned()];
+}
+'''
+        self.assertEqual(ctcompare_rust.scan_file(source), [])
+
+    def test_metadata_names_do_not_hide_material_or_keyed_digests(self) -> None:
+        source = '''fn verify(auth_token: &str, expected_signature: &str, supplied: &str) {
+    auth_token == supplied;
+    expected_signature != supplied;
+    let credential_handle = auth_token;
+    credential_handle == supplied;
+    let secret_label = load_secret();
+    secret_label != supplied;
+    let expected = hex::encode(Sha256::digest(auth_token));
+    expected == supplied;
+    hmac.finalize().into_bytes() == supplied;
+}
+'''
+        self.assertEqual([line for line, _ in ctcompare_rust.scan_file(source)], [2, 3, 5, 7, 9, 10])
+
+    def test_secret_lookup_literals_taint_direct_values_and_aliases_but_public_keys_do_not(self) -> None:
+        secret = '''fn verify(payload: Value, supplied: &str) {
+    let candidate = std::env::var("AUTH_TOKEN").unwrap();
+    candidate == supplied;
+    env::var("API_KEY").unwrap() != supplied;
+    option_env!("CLIENT_SECRET") == supplied;
+    let field = payload["auth_token"].as_str();
+    field == supplied;
+    payload.get("api_key") != supplied;
+    let key = payload.get("password");
+    key == supplied;
+}
+'''
+        public = '''fn verify(payload: Value, supplied: &str) {
+    let candidate = std::env::var("PUBLIC_API_PROFILE").unwrap();
+    candidate == supplied;
+    env::var("PUBLIC_PROVIDER_CODE").unwrap() != supplied;
+    payload["profile_name"].as_str() == supplied;
+    payload.get("profile_name") != supplied;
+    payload.get("provider.credential_missing") == supplied;
+    let message = r#"payload["auth_token"] std::env::var("AUTH_TOKEN")"#;
+    message == supplied;
+    let wrapped = Some("provider.credential_missing");
+    wrapped == supplied;
+}
+'''
+        self.assertEqual([line for line, _ in ctcompare_rust.scan_file(secret)], [3, 4, 5, 7, 8, 10])
+        self.assertEqual(ctcompare_rust.scan_file(public), [])
+
+    def test_locator_proof_does_not_transfer_to_members_parameters_or_reassignments(self) -> None:
+        source = '''const SEARCH_API_KEY_CREDENTIAL_HANDLE: &str = "cred_search_api_key";
+fn public(requirement: Requirement) {
+    requirement.handle_key == SEARCH_API_KEY_CREDENTIAL_HANDLE;
+}
+fn members(request: Request, supplied: &str) {
+    request.SEARCH_API_KEY_CREDENTIAL_HANDLE == supplied;
+    other::SEARCH_API_KEY_CREDENTIAL_HANDLE != supplied;
+}
+fn parameter(SEARCH_API_KEY_CREDENTIAL_HANDLE: &str, supplied: &str) {
+    SEARCH_API_KEY_CREDENTIAL_HANDLE == supplied;
+}
+fn reassignment(supplied: &str) {
+    let SEARCH_API_KEY_CREDENTIAL_HANDLE = read_value();
+    SEARCH_API_KEY_CREDENTIAL_HANDLE == supplied;
+}
+'''
+        self.assertEqual([line for line, _ in ctcompare_rust.scan_file(source)], [6, 7, 10, 14])
+
+    def test_locator_writes_never_hide_unproven_bindings_in_either_order(self) -> None:
+        secret = '    let credential_handle = std::env::var("REAL_SECRET").unwrap();\n'
+        locator = '    let credential_handle = "cred_provider_runtime";\n'
+        compare = '    if credential_handle == supplied { grant(); }\n'
+        alias = '    let candidate = credential_handle;\n    if candidate == supplied { grant(); }\n'
+        cases = (
+            ("late shadow", secret + compare + locator, [3]),
+            ("early locator", locator + secret + compare, [4]),
+            ("late shadow alias", secret + alias + locator, [4]),
+            ("early locator alias", locator + secret + alias, [5]),
+            ("late reassignment", secret.replace("let ", "let mut ") + compare
+             + '    credential_handle = "cred_provider_runtime";\n', [3]),
+            ("early reassignment", locator.replace("let ", "let mut ")
+             + '    credential_handle = std::env::var("REAL_SECRET").unwrap();\n' + compare, [4]),
+        )
+        for name, body, expected in cases:
+            with self.subTest(order=name):
+                source = "fn verify(supplied: &str) {\n" + body + "}\n"
+                self.assertEqual([line for line, _ in ctcompare_rust.scan_file(source)], expected)
+        parameter = ('fn verify(credential_handle: &str, supplied: &str) {\n'
+                     + compare + locator + '}\n')
+        self.assertEqual([line for line, _ in ctcompare_rust.scan_file(parameter)], [2])
 
     def test_real_aliases_operands_neighbors_and_function_shadowing(self) -> None:
         expected = self.expected_sites(self.COMPARISONS)

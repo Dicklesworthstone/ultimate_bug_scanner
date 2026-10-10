@@ -1551,12 +1551,13 @@ def cat_1(scan: Scan, r: Renderer, narrowing: list[Hit], narrowing_skip_note: st
         r.finding("good", 0, "No unwrap/expect detected")
     r.subheader("panic!/unreachable!/todo!/unimplemented!")
     panics = scan.ast_hits(["panic"])
-    integration_panics = [hit for hit in panics if hit.path in scan.integration_test_roots]
-    production_panics = [hit for hit in panics if hit.path not in scan.integration_test_roots]
+    test_panics = [hit for hit in panics if hit.path in scan.integration_test_roots
+                   or scan.test_scope_index(hit.path).contains(hit.line, hit.col)]
+    production_panics = [hit for hit in panics if hit not in test_panics]
     _sub(scan, r, production_panics, "rust.ownership.panic-macro", 1,
          "critical", "panic! macro(s) present", "Avoid panic! in library code", 5)
-    _sub(scan, r, integration_panics, "rust.ownership.panic-macro", 1,
-         "warning", "panic! in Cargo integration-test source",
+    _sub(scan, r, test_panics, "rust.ownership.panic-macro", 1,
+         "warning", "panic! in provably test-only source",
          "Retained test failure path; review test intent and ensure the source is not reused in production", 5)
     if not panics:
         r.finding("good", 0, "No panic! macros")

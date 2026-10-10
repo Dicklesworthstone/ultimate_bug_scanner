@@ -27,6 +27,8 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Fixed
 
+- JavaScript analyzer exceptions preserve findings already emitted, continue the remaining registered analyzers, and produce explicit partial results with accurate file counts. Incomplete scans are never saved as successful cache entries; direct callers without an error collector still receive the exception.
+
 - Parallel Python detector results use newline-delimited JSON boundaries, preserving findings whose messages contain Unicode line-separator characters in the capture and cache pipeline.
 - Python index guards follow the actual short-circuit and branch outcomes: an unsafe `or` alternative or false branch can no longer borrow a bound from an unrelated true case, while bounded `or`, negated comparisons and truthy predecessor loops avoid false findings. Equality-to-zero splits only protect a one-step predecessor; severity thresholds are unchanged.
 - Python detector passes now honor parallel jobs using bounded worker processes (auto uses up to four workers). Each detector still sees the entire selected project, preserving project-wide severity thresholds, deterministic record ordering, partial-failure diagnostics, and cache admission; small scans and explicit single-worker runs stay serial.

@@ -3072,8 +3072,45 @@ class _Engine:
                     result = _join(result, resolved)
         return result
 
-    def findings(self):
+    def rule_findings(self, rule):
+        """Publish a rule's evidence only after its fixed point is resolved."""
         found = {}
+        while self.pending:
+            self.budget.spend()
+            task = self.pending.popleft()
+            self.queued.discard(task)
+            self.current_task = task
+            if isinstance(task, _HeapCall):
+                result = self.analyze_heap(task)
+                if task.result != result:
+                    task.result = result
+                    for reader in task.readers:
+                        self.enqueue(reader)
+                continue
+            scope = task
+            before = self.final_states.get((scope, rule))
+            summary = self.analyze(scope, rule)
+            if (self.summaries.get((scope, rule)) != summary or
+                    (scope in self.module_roots and before != self.final_states.get((scope, rule)))):
+                self.summaries[(scope, rule)] = summary
+                for caller in self.dependents[(scope, rule)]:
+                    self.enqueue(caller)
+        self.current_task = None
+        for scope in self.scopes:
+            for (location, label), fact in self.summaries[(scope, rule)][1].items():
+                if self.dependents[(scope, rule)]:
+                    # Known call sites already instantiated captures at
+                    # their program points. Rebinding them to end-of-scope
+                    # values here would taint calls that happened earlier.
+                    fact = frozenset(trace for trace in fact if trace.origin[0] == 'source')
+                concrete = self.concrete(fact, rule)
+                if concrete:
+                    key = (location, rule, label)
+                    found[key] = _join(found.get(key, frozenset()), concrete)
+        return found
+
+    def findings(self):
+        found, failures = {}, []
         active_rules = {rule for rule, _label in self.call_sinks.values()}
         active_rules.update(rule for _location, _expr_start, rule, _label in self.write_sinks)
         for rule in KIND_BY_RULE:
@@ -3081,48 +3118,27 @@ class _Engine:
                 continue
             self.budget = Budget(self.work_limit)
             self.pending, self.queued = deque(reversed(self.scopes)), set(self.scopes)
-            while self.pending:
-                self.budget.spend()
-                task = self.pending.popleft()
-                self.queued.discard(task)
-                self.current_task = task
-                if isinstance(task, _HeapCall):
-                    result = self.analyze_heap(task)
-                    if task.result != result:
-                        task.result = result
-                        for reader in task.readers:
-                            self.enqueue(reader)
-                    continue
-                scope = task
-                before = self.final_states.get((scope, rule))
-                summary = self.analyze(scope, rule)
-                if (self.summaries.get((scope, rule)) != summary or
-                        (scope in self.module_roots and before != self.final_states.get((scope, rule)))):
-                    self.summaries[(scope, rule)] = summary
-                    for caller in self.dependents[(scope, rule)]:
-                        self.enqueue(caller)
-            self.current_task = None
-            for scope in self.scopes:
-                for (location, label), fact in self.summaries[(scope, rule)][1].items():
-                    if self.dependents[(scope, rule)]:
-                        # Known call sites already instantiated captures at
-                        # their program points. Rebinding them to end-of-scope
-                        # values here would taint calls that happened earlier.
-                        fact = frozenset(trace for trace in fact if trace.origin[0] == 'source')
-                    concrete = self.concrete(fact, rule)
-                    if concrete:
-                        key = (location, rule, label)
-                        found[key] = _join(found.get(key, frozenset()), concrete)
-            # Every summary, final state and heap-call context belongs to this
-            # rule. Concrete source traces no longer need its flow states;
-            # retain only those findings while solving the next rule.
-            self.summaries.clear()
-            self.final_states.clear()
-            self.dependents.clear()
-            self.heap_calls.clear()
+            try:
+                found.update(self.rule_findings(rule))
+            except AnalysisLimit as exc:
+                # A failed rule contributes no provisional fixed-point facts.
+                # Text alone cannot retain its exception traceback and heap.
+                failures.append(f'{rule}: {str(exc)[:180]}')
+            finally:
+                # Each domain is independent. Release completed or unfinished
+                # flow states before giving the next rule a fresh work budget.
+                self.current_task = None
+                self.pending.clear()
+                self.queued.clear()
+                self.summaries.clear()
+                self.final_states.clear()
+                self.dependents.clear()
+                self.heap_calls.clear()
         for (location, rule, label), fact in sorted(found.items()):
             trace = min(fact, key=lambda item: (len(item.path), item.path))
             yield location, rule, format_path(trace.path, label)
+        if failures:
+            raise AnalysisLimit('Unfinished taint rules: ' + '; '.join(failures))
 
 
 def analyze_file(path, issues):
@@ -3182,6 +3198,7 @@ def scan_project_findings(files):
     """Resolve only selected modules; findings retain original file offsets."""
     from ubs_core.js_modules import ModuleGraph
     graph = ModuleGraph(files)
+    failures, failed_components = [], 0
     for modules in graph.components():
         engine = _Engine('', '', graph, modules)
         try:
@@ -3198,10 +3215,12 @@ def scan_project_findings(files):
                 # line_starts lists begin with offset 0 <= offset, so line >= 1 — ubs:ignore[py.collections.index-arithmetic]
                 yield module.path, rule, line, offset - lines[line - 1] + 1, path_desc
         except AnalysisLimit as exc:
-            selected = ', '.join(str(module.path) for module in modules[:3])
-            if len(modules) > 3:
-                selected += f', and {len(modules) - 3} more files'
-            raise AnalysisLimit(f'JavaScript taint in {selected[:240]}: {exc}') from exc
+            failed_components += 1
+            if len(failures) < 3:
+                selected = ', '.join(str(module.path) for module in modules[:3])
+                if len(modules) > 3:
+                    selected += f', and {len(modules) - 3} more files'
+                failures.append(f'{selected[:240]}: {str(exc)[:300]}')
         finally:
             # No import edge crosses a component boundary. Retaining these
             # roots on the project graph kept every completed component's
@@ -3210,6 +3229,12 @@ def scan_project_findings(files):
             for module in modules:
                 module.root = None
             del engine
+    if failed_components:
+        omitted = (f'; and {failed_components - len(failures)} more failed components'
+                   if failed_components > len(failures) else '')
+        raise AnalysisLimit(
+            f'JavaScript taint analysis is incomplete in {failed_components} component(s): '
+            + '; '.join(failures) + omitted)
 
 
 def run(ctx: RunContext) -> Iterable[dict]:

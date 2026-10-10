@@ -30,6 +30,8 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Fixed
 
+- Continue bounded JavaScript taint analysis across independent sink domains and selected import components. Preserve findings from resolved domains, release failed analysis state before continuing, and report a bounded aggregate incomplete result after emitting retained findings. Partial runs remain excluded from the scan cache.
+
 - Request-controlled Ruby eval-family calls, dynamic method selectors, and shell interpolation produce critical execution findings with source evidence. Static string and symbol selectors follow ordinary call analysis only while their literal identity remains unchanged; unresolved dispatch remains explicit partial analysis. Runtime execution invalidates validation proofs, and matching lexical alerts are qualified into one counted finding across cold scans, cache replay, JSON, and SARIF.
 
 - Bound JavaScript taint heap work per sink domain and selected import component, including copies, state joins, allocation translation, and materialization. Pathological expansion produces explicit incomplete analysis with retained findings instead of consuming unbounded time and memory; ordinary field-sensitive and sink-free analyses retain their behavior.

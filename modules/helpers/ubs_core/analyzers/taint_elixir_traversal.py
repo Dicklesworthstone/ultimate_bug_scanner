@@ -1,4 +1,4 @@
-"""Scoped Elixir request flow for file paths and redirect policies (mj1j.10).
+"""Scoped Elixir request flow for paths, redirects and raw Ecto SQL.
 
 Selected same-module clauses, immutable rebinding, tuples, pipelines and
 branch expressions share finite taint facts and bounded worklists. Validation
@@ -18,6 +18,10 @@ from typing import Iterable
 from ubs_core.registry import Analyzer, RunContext, register
 from ubs_core.suppression import build_index
 from ubs_core.taint_flow import AnalysisLimit, Budget, CLEAN, Fact, Step, Trace, advance, join
+
+SQL_RULE = 'ex.security.sql-interpolation'
+SQL_CALLS = frozenset({'query', 'query!', 'query_many', 'query_many!'})
+SQL_ADAPTERS = frozenset({'Ecto.Adapters.Postgres', 'Ecto.Adapters.MyXQL', 'Ecto.Adapters.Tds'})
 
 
 class ElixirSyntaxError(ValueError):
@@ -492,6 +496,7 @@ class Function:
     attributes: tuple = ()
     aliases: tuple = ()
     imports: tuple = ()
+    sql_imports: tuple = ()
 
 
 class ElixirEngine:
@@ -510,6 +515,8 @@ class ElixirEngine:
         self.attributes: dict[str, dict[str, Value]] = {}
         self.aliases: dict[str, dict[str, str]] = {}
         self.imports: dict[str, dict[str, str]] = {}
+        self.sql_imports: dict[str, dict[tuple[str, int], str]] = {}
+        self.sql_repositories: set[str] = set()
         self.effects: dict[tuple[int, int], Fact] = {}
         self.owner, self.context, self.call_stack = '', (), []
         self.function_scope: Function | None = None
@@ -571,6 +578,7 @@ class ElixirEngine:
         self.attributes.setdefault(owner, {})
         self.aliases.setdefault(owner, {})
         self.imports.setdefault(owner, {})
+        self.sql_imports.setdefault(owner, {})
         statements = []
         for expr in block.args:
             if expr.kind == 'module':
@@ -582,7 +590,7 @@ class ElixirEngine:
                 name, parameters, guard, body = expr.args
                 function = Function(owner, name, parameters, guard, body, expr.token, expr.value == 'def',
                                     tuple(self.attributes[owner].items()), tuple(self.aliases[owner].items()),
-                                    tuple(self.imports[owner].items()))
+                                    tuple(self.imports[owner].items()), tuple(self.sql_imports[owner].items()))
                 self.functions.setdefault((owner, name, len(parameters)), []).append(function)
                 required = len(parameters)
                 for parameter in reversed(parameters):
@@ -607,9 +615,13 @@ class ElixirEngine:
                             short = Parser.name(option.args[0])
                     self.aliases[owner][short] = name
                 elif directive == 'use':
-                    raise ElixirSyntaxError(f'Elixir use macro expansion at line {expr.token.line}; analysis is incomplete')
+                    if not self.register_sql_repository(expr, owner):
+                        raise ElixirSyntaxError(f'Elixir use macro expansion at line {expr.token.line}; analysis is incomplete')
                 elif directive == 'import' and len(expr.args) >= 2:
                     imported = Parser.name(expr.args[1])
+                    if self.policy == 'sql' and self.module_in_scope(imported, owner) == 'Ecto.Adapters.SQL':
+                        self.register_sql_import(expr, owner)
+                        continue
                     if imported not in {'Plug.Conn', 'Phoenix.Controller', 'Kernel'}:
                         selected = [option for option in expr.args[2:] if option.kind == 'pair' and option.value == 'only']
                         if selected and selected[0].args[0].kind == 'list':
@@ -628,6 +640,47 @@ class ElixirEngine:
                               'socket': Value('conn', identity=(owner, 'socket'))})
             self.sequence(Expr('block', block.token, args=tuple(statements)), seed)
             self.owner = previous
+
+    def module_in_scope(self, name, owner):
+        """Resolve a compile-time directive in its lexical module scope."""
+        if name == '__MODULE__':
+            return owner
+        if name.startswith('Elixir.'):
+            return name[7:]
+        first, *rest = name.split('.')
+        return '.'.join((self.aliases.get(owner, {}).get(first, first), *rest))
+
+    def register_sql_repository(self, expr, owner):
+        if self.policy != 'sql' or len(expr.args) < 2:
+            return False
+        if self.module_in_scope(Parser.name(expr.args[1]), owner) != 'Ecto.Repo':
+            return False
+        # Only the documented SQL adapters establish the injected raw-query
+        # methods. Unknown use macros and dynamic adapter options remain partial.
+        options = list(expr.args[2:])
+        if len(options) == 1 and options[0].kind == 'list':
+            options = list(options[0].args)
+        settings = {item.value: item.args[0] for item in options if item.kind == 'pair'}
+        adapter = settings.get('adapter')
+        otp_app = settings.get('otp_app')
+        if (adapter is None or otp_app is None or otp_app.kind != 'atom'
+                or self.module_in_scope(Parser.name(adapter), owner) not in SQL_ADAPTERS):
+            return False
+        self.sql_repositories.add(owner)
+        return True
+
+    def register_sql_import(self, expr, owner):
+        selected = {(name, arity) for name in SQL_CALLS | {'stream'} for arity in (2, 3, 4)}
+        for option in expr.args[2:]:
+            if option.kind != 'pair' or option.value not in {'only', 'except'}:
+                continue
+            members = option.args[0]
+            if members.kind != 'list':
+                raise ElixirSyntaxError(f'Dynamic Elixir SQL import at line {expr.token.line}; analysis is incomplete')
+            pairs = {(item.value, int(item.args[0].value)) for item in members.args
+                     if item.kind == 'pair' and item.args[0].kind == 'number'}
+            selected = selected & pairs if option.value == 'only' else selected - pairs
+        self.sql_imports[owner].update((key, 'Ecto.Adapters.SQL') for key in selected)
 
     def resolve_module(self, name):
         if name == '__MODULE__':
@@ -690,7 +743,10 @@ class ElixirEngine:
                       for token, dot, next_token, following in
                       zip(executable_tokens, executable_tokens[1:], executable_tokens[2:], executable_tokens[3:]))
         request_sinks = {'redirect', 'put_resp_header', 'send_file', 'send_download'}
-        if (not names & sources and not names & request_sinks) or (not names & sinks and not dynamic):
+        if self.policy == 'sql':
+            if not names & (SQL_CALLS | {'stream', 'apply'}) and not dynamic:
+                return {}
+        elif (not names & sources and not names & request_sinks) or (not names & sinks and not dynamic):
             return {}
         program = Parser(self.tokens, self.budget).block()
         self.register_block(program)
@@ -715,7 +771,16 @@ class ElixirEngine:
             return [(state, Value('nil'))]
         if kind in {'string', 'atom', 'number', 'literal'}:
             if expr.args:
-                return [(after, self.derive(expr, values, 'string')) for after, values in self.values(expr.args, state)]
+                results = []
+                for after, values in self.values(expr.args, state):
+                    if self.policy == 'sql':
+                        # Integer interpolation renders decimal digits. The
+                        # same integer inside iodata is a raw byte, so retain
+                        # its provenance everywhere except this string context.
+                        values = tuple(replace(value, fact=CLEAN) if value.kind == 'number' else value
+                                       for value in values)
+                    results.append((after, self.derive(expr, values, 'string')))
+                return results
             literal = int(expr.value.replace('_', '')) if kind == 'number' else expr.value
             value_kind = {'true': 'bool', 'false': 'bool', 'nil': 'nil'}.get(expr.value, kind) if kind == 'literal' else kind
             if value_kind == 'bool':
@@ -778,7 +843,7 @@ class ElixirEngine:
                 if expr.value in {'not', '!'}:
                     results.append((after, Value('test', test=('not', value))))
                 elif expr.value == '-' and value.kind == 'number':
-                    results.append((after, replace(value, literal=-value.literal)))
+                    results.append((after, replace(value, literal=-value.literal if value.literal is not None else None)))
                 else:
                     results.append((after, value))
             return results
@@ -865,7 +930,10 @@ class ElixirEngine:
                 literal = first.literal + second.literal if isinstance(first.literal, str) and isinstance(second.literal, str) and not first.fact and not second.fact else None
                 results.append((after, self.derive(expr, values, 'concat', literal, values)))
             elif expr.value in {'+', '-'} and first.kind == second.kind == 'number':
-                results.append((after, Value('number', first.literal + second.literal if expr.value == '+' else first.literal - second.literal)))
+                literal = None
+                if first.literal is not None and second.literal is not None:
+                    literal = first.literal + second.literal if expr.value == '+' else first.literal - second.literal
+                results.append((after, self.derive(expr, values, 'number', literal)))
             else:
                 results.append((after, self.derive(expr, values)))
         return results
@@ -1176,6 +1244,11 @@ class ElixirEngine:
         checks = state.checks.get(value.identity, frozenset())
         if any(check[0] == 'literal' for check in checks):
             return True
+        if self.policy == 'sql':
+            # Exact literal equality can constrain a source. URL/path checks,
+            # basename transforms and the presence of bind arguments cannot.
+            return bool(value.fact) and all(any(check[0] == 'literal' for check in
+                       state.checks.get(trace.key, frozenset())) for trace in value.fact)
         if self.policy == 'path':
             return any(check[0] == 'bounded' for check in checks) or (file_leaf and value.kind in {'basename', 'basename_join'})
         prohibited = {'\\', '\r', '\n', '\t'}
@@ -1203,6 +1276,31 @@ class ElixirEngine:
                 options.extend(value.items)
         keywords = {value.literal: value.items[0] for value in options}
         positional = tuple(value for value in args if value.kind != 'pair')
+        if self.policy == 'sql':
+            arity = len(positional) + any(value.kind == 'pair' for value in args)
+            sql_module = module
+            if not qualified:
+                imports = dict(self.function_scope.sql_imports) if self.function_scope is not None else self.sql_imports.get(self.owner, {})
+                sql_module = imports.get((name, arity), '')
+            direct = sql_module == 'Ecto.Adapters.SQL' and sql_module not in self.attributes
+            repository = sql_module in self.sql_repositories
+            if (direct or repository) and name in SQL_CALLS | {'stream'}:
+                position = 1 if direct else 0
+                if not position + 1 <= arity <= position + 3 or len(positional) <= position:
+                    raise ElixirSyntaxError(f'Unresolved Ecto SQL arity at line {expr.token.line}; analysis is incomplete')
+                query = positional[position]
+                if name == 'stream':
+                    if query.fact:
+                        raise ElixirSyntaxError(f'Lazy Ecto SQL stream needs consumption analysis at line {expr.token.line}; analysis is incomplete')
+                else:
+                    self.sink(expr, query, state, f'{sql_module}.{name}')
+                # SQL result rows are not the query operand or its parameters.
+                return [(state, Value(identity=self.identity(expr)))]
+            if canonical == 'String.to_integer' and module not in self.attributes and len(positional) in {1, 2}:
+                # A successful conversion yields an integer; a failed one raises.
+                # Preserve byte provenance for iodata; rendering the number as
+                # decimal text is handled only by actual string interpolation.
+                return [(state, self.derive(expr, positional, 'number'))]
         imported = dict(self.function_scope.imports) if self.function_scope is not None else self.imports.get(self.owner, {})
         if not qualified and (name in imported or '*' in imported):
             raise ElixirSyntaxError(f'Unresolved imported Elixir call {name} at line {expr.token.line}; analysis is incomplete')
@@ -1362,10 +1460,12 @@ def flow_findings(path: Path, policy: str, budget: Budget | None = None):
     engine = ElixirEngine(path, text, policy, budget)
     lines = text.splitlines()
     suppressions = build_index(text, lang='elixir')
-    rule = 'elixir.taint.request_path_traversal' if policy == 'path' else 'elixir.taint.open_redirect'
+    rule = {'path': 'elixir.taint.request_path_traversal',
+            'redirect': 'elixir.taint.open_redirect', 'sql': SQL_RULE}[policy]
     # The shell modules shipped these scoped annotation IDs before the core
     # analyzer IDs. Preserve only the matching alias, at the actual sink.
-    legacy_rule = 'ex.request-path-traversal' if policy == 'path' else 'ex.request-open-redirect'
+    legacy_rule = {'path': 'ex.request-path-traversal',
+                   'redirect': 'ex.request-open-redirect', 'sql': SQL_RULE}[policy]
     incomplete = None
     try:
         effects = engine.analyze()
@@ -1434,6 +1534,26 @@ def run(ctx: RunContext) -> Iterable[dict]:
                 "message": f"{_MESSAGE} ({code})",
                 "extras": extras,
             }
+
+
+def run_sql(ctx: RunContext) -> Iterable[dict]:
+    """Selected raw Ecto SQL APIs, with independent SQL and bind operands.
+
+    Request provenance follows the existing Plug/Phoenix conventions: explicit
+    connection members, request-map patterns, and params/query_params bindings.
+    SQL adapters, imports and same-file repository declarations establish sinks.
+    """
+    if not ctx.rule_enabled(SQL_RULE):
+        return
+    for path in ctx.files:
+        if path.suffix.lower() not in EXTS:
+            continue
+        for line, col, code, extras in flow_findings(path, 'sql'):
+            yield {'rule': SQL_RULE, 'category_id': 'elixir.security',
+                   'path': str(path.resolve()), 'line': line, 'col': col,
+                   'layer': 'taint', 'lang': 'elixir', 'severity': 'critical',
+                   'message': f'Request-derived SQL reaches Ecto execution ({code})',
+                   'extras': extras}
 
 
 def _selftest_direct_traversal(tmp_prefix: str = "ubs_core_taint_elixir_trav_") -> None:
@@ -1538,3 +1658,4 @@ SELF_TESTS: tuple[tuple[str, callable], ...] = (
 )
 
 register(Analyzer(layer="taint", lang="elixir", name="taint_elixir_traversal", run=run, selftests=SELF_TESTS))
+register(Analyzer(layer="taint", lang="elixir", name="taint_elixir_sql", run=run_sql))

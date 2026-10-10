@@ -95,6 +95,7 @@ _SECTION_HEADERS = {
 _SUMMARY_TITLES: dict[str, str] = {
     "elixir.taint.request_path_traversal": "Request-derived path reaches file read/write/serve sink",
     "elixir.taint.open_redirect": "Unvalidated redirect from request data",
+    "ex.security.sql-interpolation": "Possible SQL injection in Ecto fragments/queries",
 }
 
 
@@ -207,6 +208,11 @@ def count_regex(regex: re.Pattern[str], texts: dict[Path, str], file_regex) -> i
 
 def pattern_hits(pattern: Pattern, texts: dict[Path, str]) -> list[tuple[Path, int, str]]:
     """The main-pattern hit list: components sum, plain patterns dedupe."""
+    if pattern.rule_id == "ex.security.sql-interpolation":
+        # Raw Ecto SQL now uses native query-operand provenance, retaining this
+        # public ID. Keep the separate legacy fragment check until its macro
+        # semantics are modeled; it must not duplicate raw-query findings.
+        return distinct_lines(pattern.regex, texts, pattern, apply_output_filters=True)
     hits: list[tuple[Path, int, str]] = []
     if pattern.components:
         for component in pattern.components:

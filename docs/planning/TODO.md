@@ -64,6 +64,7 @@ The user requested implementation of the reality-check plan and all remaining Be
 ### Broader high-value detector families
 
 - [ ] `mj1j.21/.22`: selected JDBC/Kotlin, ActiveRecord, Dapper and Ecto SQL provenance/actual parameter binding; interpolated-query negatives and genuine bound-query controls.
+  - 2026-10-10: bounded raw Ecto SQL execution now follows request provenance through aliases, local helpers, iodata and branch joins; actual same-file SQL-backed repositories and selected imports are supported. Independent unsafe/bound-value controls precede implementation. Lazy stream consumption, query macros, external repository resolution, Kotlin/JDBC and Dapper remain open; this slice does not close the umbrella.
 - [ ] `mj1j.23/.24`: framework-identified explicit TLS/JWT/CORS/cookie/CSRF/output hazards for Spring/Ktor/Rails/ASP.NET/Phoenix; unresolved config stays unknown.
 - [ ] `mj1j.25/.26`: configured client deadlines and inherited cancellation context; bounded APIs, ownership and safe defaults; no missing-timeout-token heuristic.
 - [ ] `mj1j.27/.28`: actual crypto/comparator API identity and secret context; public tokens/checksums, shadowed functions and strong alternatives remain clean.

@@ -262,6 +262,55 @@ class LoopStateConvergenceTests(unittest.TestCase):
                     ["js.taint.xss", 8], ["js.taint.xss", 12],
                 ], source + "\n" + result.stdout + result.stderr)
 
+    def test_side_effecting_condition_converges_with_post_condition_exit_state(self) -> None:
+        cases = {
+            "cleaning-condition": (
+                "let value = req.query.html;\n"
+                "function clean() {\n"
+                "  value = 'safe';\n"
+                "  return false;\n"
+                "}\n"
+                "while (clean()) {}\n"
+                "res.send(value);\n",
+                [],
+            ),
+            "tainting-condition": (
+                "let value = 'safe';\n"
+                "function dirty() {\n"
+                "  value = req.query.html;\n"
+                "  return false;\n"
+                "}\n"
+                "while (dirty()) {}\n"
+                "res.send(value);\n",
+                [["js.taint.xss", 7]],
+            ),
+        }
+        with tempfile.TemporaryDirectory(prefix="c6-loop-condition-") as tmp:
+            path = Path(tmp) / "condition.js"
+            env = dict(os.environ, PYTHONPATH=str(HELPERS_DIR))
+            command = [
+                sys.executable,
+                "-c",
+                "import json, sys; from pathlib import Path; "
+                "from ubs_core.analyzers.taint_js import scan_file_findings; "
+                "print(json.dumps([(rule, line) for rule, line, _, _ "
+                "in scan_file_findings(Path(sys.argv[1]))]))",
+                str(path),
+            ]
+            for label, (source, expected) in cases.items():
+                with self.subTest(case=label):
+                    path.write_text(source, encoding="utf-8")
+                    try:
+                        result = subprocess.run(
+                            command, capture_output=True, text=True, env=env, timeout=10)
+                    except subprocess.TimeoutExpired as exc:
+                        self.fail(
+                            f"{label} did not converge: {source}\n"
+                            f"stdout={exc.stdout!r}\nstderr={exc.stderr!r}")
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(json.loads(result.stdout), expected,
+                                     source + "\n" + result.stdout + result.stderr)
+
 
 class CallStateLifetimeTests(unittest.TestCase):
     def test_finished_call_flows_release_without_cyclic_collection(self) -> None:

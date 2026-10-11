@@ -2386,14 +2386,24 @@ class _Flow:
             if self.scope.code[condition[0]:condition[1]].strip() == 'false':
                 self.breaks, self.continues = outer_breaks, outer_continues
                 return self.restore(_join_states(current, *exits), outer, loop_names)
+            condition_exit = current
             while True:
                 self.breaks, self.continues = [], []
+                # The loop-head approximant and the post-condition store are
+                # different program points. Evaluating a condition directly
+                # into `current` lets a strong update (for example a helper
+                # that cleans a captured value) fight the entry join forever:
+                # the condition clears it, then the join restores it before
+                # comparing against the cleared state. Keep the head monotone
+                # and carry the condition's side effects only along paths that
+                # actually evaluate it.
+                condition_state = current.copy()
                 try:
-                    self.value(*condition, current)
+                    self.value(*condition, condition_state)
                 except _NoNormalCompletion:
                     self.breaks, self.continues = outer_breaks, outer_continues
                     return self.restore(_join_states(*exits), outer, loop_names)
-                body_state = current.copy()
+                body_state = condition_state.copy()
                 if iteration:
                     names, left, right = iteration
                     fact = self.value(left, right, body_state)
@@ -2414,10 +2424,11 @@ class _Flow:
                 # alternating forever between populated and empty heaps.
                 merged = _join_states(entry, current, after)
                 if merged == current:
+                    condition_exit = condition_state
                     break
                 current = merged
             self.breaks, self.continues = outer_breaks, outer_continues
-            return self.restore(_join_states(current, *exits), outer, loop_names)
+            return self.restore(_join_states(condition_exit, *exits), outer, loop_names)
         if node.kind == 'return':
             value = self.value(node.start, node.end, state)
             self.returns.append((value, state.copy()))

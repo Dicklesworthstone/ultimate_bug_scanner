@@ -2355,11 +2355,24 @@ class _Flow:
             outer = state.copy()
             loop_names = set()
             iteration = None
+            mandatory_iteration = False
             if node.kind == 'for' and len(header) == 1:
-                iterator = re.match(r'\s*(?:(const|let|var)\s+)?(.+?)\s+(?:of|in)\s+(.+)',
+                iterator = re.match(r'\s*(?:(const|let|var)\s+)?(.+?)\s+(of|in)\s+(.+)',
                                     self.engine.text[node.start:node.end], re.S)
                 if iterator:
-                    iteration = (_binding_names(iterator.group(2)), node.start + iterator.start(3), node.end)
+                    iteration = (_binding_names(iterator.group(2)), node.start + iterator.start(4), node.end)
+                    # A plain non-empty array literal makes for...of execute at
+                    # least once on every normal path. Do not retain a
+                    # zero-iteration state that can erase a closure assigned
+                    # in that guaranteed first iteration. Spread-only arrays
+                    # remain unknown because the spread can be empty.
+                    iterable = self.scope.code[iteration[1]:iteration[2]].strip()
+                    mandatory_iteration = (
+                        iterator.group(3) == 'of'
+                        and iterable.startswith('[') and iterable.endswith(']')
+                        and bool(iterable[1:-1].strip())
+                        and not iterable[1:-1].lstrip().startswith('...')
+                    )
                     if iterator.group(1) in {'const', 'let'}:
                         loop_names.update(iteration[0])
             if node.kind == 'for' and len(header) == 3:
@@ -2374,14 +2387,24 @@ class _Flow:
             outer_breaks, outer_continues = self.breaks, self.continues
             exits = []
             entry, current = state.copy(), state.copy()
-            if node.kind == 'do':
+            if node.kind == 'do' or mandatory_iteration:
                 self.breaks, self.continues = [], []
+                if mandatory_iteration:
+                    names, left, right = iteration
+                    fact = self.value(left, right, current)
+                    for name in names:
+                        if name in loop_names:
+                            current.owners[name] = self.engine.binding(self.scope, name, node.start)
+                        self.assign(name, fact, current, node.start)
                 current = self.block(node.body, current)
                 exits.extend(self.breaks)
                 current = _join_states(current, *self.continues)
                 if current is None:
                     self.breaks, self.continues = outer_breaks, outer_continues
                     return self.restore(_join_states(*exits), outer, loop_names)
+                # Both do...while and a definitely non-empty for...of have
+                # already executed their mandatory first body. Subsequent
+                # fixed-point iterations start from that post-body state.
                 entry = current.copy()
             if self.scope.code[condition[0]:condition[1]].strip() == 'false':
                 self.breaks, self.continues = outer_breaks, outer_continues

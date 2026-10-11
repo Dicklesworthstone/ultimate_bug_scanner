@@ -311,6 +311,39 @@ class LoopStateConvergenceTests(unittest.TestCase):
                     self.assertEqual(json.loads(result.stdout), expected,
                                      source + "\n" + result.stdout + result.stderr)
 
+    def test_nonempty_for_of_keeps_escaping_closure_binding(self) -> None:
+        cases = {
+            "request-value": ("req.query.html", [["js.taint.xss", 5]]),
+            "clean-value": ("'safe'", []),
+        }
+        with tempfile.TemporaryDirectory(prefix="c6-for-of-closure-") as tmp:
+            path = Path(tmp) / "escape.js"
+            env = dict(os.environ, PYTHONPATH=str(HELPERS_DIR))
+            command = [
+                sys.executable,
+                "-c",
+                "import json, sys; from pathlib import Path; "
+                "from ubs_core.analyzers.taint_js import scan_file_findings; "
+                "print(json.dumps([(rule, line) for rule, line, _, _ "
+                "in scan_file_findings(Path(sys.argv[1]))]))",
+                str(path),
+            ]
+            for label, (value, expected) in cases.items():
+                with self.subTest(case=label):
+                    source = (
+                        "let read;\n"
+                        f"for (const value of [{value}]) {{\n"
+                        "  read = () => value;\n"
+                        "}\n"
+                        "res.send(read());\n"
+                    )
+                    path.write_text(source, encoding="utf-8")
+                    result = subprocess.run(
+                        command, capture_output=True, text=True, env=env, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(json.loads(result.stdout), expected,
+                                     source + "\n" + result.stdout + result.stderr)
+
 
 class CallStateLifetimeTests(unittest.TestCase):
     def test_finished_call_flows_release_without_cyclic_collection(self) -> None:

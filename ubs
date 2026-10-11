@@ -8247,12 +8247,14 @@ write_jsonl_summary(){
     if jq -e '((.findings // []) | length) > 0' "$COMBINED_JSON_FILE" >/dev/null 2>&1; then
       jq -c --arg project "$SOURCE_PROJECT_DIR" --arg ts "$ts" '
         .findings[] |
-        {type:"finding", project:$project, timestamp:$ts, language:.lang,
-         rule_id:.rule_id, category_id:.category_id, severity:.severity,
-         confidence:.confidence, file:.file, line:.line, col:.col,
-         message:.message, remediation:.remediation, fix:.fix,
-         fingerprint:.fingerprint, suppressed:.suppressed,
-         title:(.message // .rule_id), count:1}
+        ({type:"finding", project:$project, timestamp:$ts, language:.lang,
+          rule_id:.rule_id, category_id:.category_id, severity:.severity,
+          confidence:.confidence, file:.file, line:.line, col:.col,
+          message:.message, remediation:.remediation, fix:.fix,
+          fingerprint:.fingerprint, suppressed:.suppressed,
+          title:(.message // .rule_id),
+          count:(if has("count") then .count else 1 end)}
+         + (if has("scope") then {scope:.scope} else {} end))
       ' "$COMBINED_JSON_FILE" >"$tmp" 2>/dev/null || return 1
     else
       jq -c --arg project "$SOURCE_PROJECT_DIR" --arg ts "$ts" '

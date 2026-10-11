@@ -2098,6 +2098,38 @@ def test_findings_parity_all_langs() -> None:
             failures.append(f"{lang}: JSONL finding count {len(jl_findings)} != expected {expected_count}")
             continue
 
+        # Record counts alone cannot prove format parity: project diagnostics
+        # intentionally carry count=0, aggregates can carry count>1, and scope
+        # distinguishes those records from source occurrences. Preserve the
+        # JSON semantics exactly while allowing JSONL's documented default of
+        # count=1 only when the source finding omitted count entirely.
+        def jsonl_identity(finding):
+            return (
+                finding.get("rule_id", finding.get("rule", "")),
+                finding.get("file", finding.get("path", "")),
+                finding.get("line"),
+                finding.get("col"),
+                finding.get("severity"),
+                finding.get("message"),
+                finding.get("fingerprint"),
+                "scope" in finding,
+                finding.get("scope"),
+                finding["count"] if "count" in finding else 1,
+            )
+
+        expected_jsonl = Counter(jsonl_identity(finding) for finding in findings)
+        actual_jsonl = Counter(jsonl_identity(finding) for finding in jl_findings)
+        if actual_jsonl != expected_jsonl:
+            missing = expected_jsonl - actual_jsonl
+            extra = actual_jsonl - expected_jsonl
+            failures.append(
+                f"{lang}: JSONL semantic identity mismatch "
+                f"(missing={sum(missing.values())}, extra={sum(extra.values())}); "
+                f"missing samples={list(missing.items())[:3]!r}; "
+                f"extra samples={list(extra.items())[:3]!r}"
+            )
+            continue
+
         # 3. TOON
         pt = subprocess.CompletedProcess(pj.args, pj.returncode,
             (exports / "report.toon").read_text(encoding="utf-8"), pj.stderr)

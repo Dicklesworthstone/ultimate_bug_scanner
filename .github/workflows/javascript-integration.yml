@@ -1,0 +1,76 @@
+name: JavaScript Current Integration
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - modules/helpers/ubs_core/analyzers/taint_js.py
+      - modules/helpers/ubs_core/js_modules.py
+      - modules/helpers/ubs_core/taint_flow.py
+      - test-suite/js/test_taint*.py
+      - .github/workflows/javascript-integration.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  current-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      UBS_NO_AUTO_UPDATE: '1'
+      UBS_TAINT_E2E: '1'
+      UBS_HEAP_E2E: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Retain exact source and file identities
+        run: |
+          git rev-parse HEAD > "$RUNNER_TEMP/js-current-head.txt"
+          git ls-files -s > "$RUNNER_TEMP/js-current-index.txt"
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/js-current-source.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: javascript-current-source
+          path: ${{ runner.temp }}/js-current-*
+          retention-days: 7
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install native scanner dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep rsync shellcheck
+          npm install --global @ast-grep/cli typescript@5.8.3
+      - name: Verify committed integrity
+        run: |
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          python3 scripts/update_checksums.py
+          git diff --exit-code
+      - name: Run actual committed source and module regressions
+        run: |
+          command -v ast-grep
+          command -v node
+          command -v tsc
+          python3 -m unittest discover -s test-suite/js -p 'test_taint*.py' -v
+          python3 -m unittest discover -s test-suite/quality -p '*js*.py' -v
+          python3 test-suite/shareable/test_contract_checksums.py
+          python3 test-suite/shareable/test_helper_python_floor.py -v
+          shellcheck -S warning ubs modules/ubs-*.sh scripts/new-module.sh
+          git diff --exit-code
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: javascript-current-reports
+          path: |
+            test-suite/artifacts/javascript-callbacks/
+            test-suite/artifacts/javascript-heap-shapes/
+            test-suite/artifacts/javascript-call-completions/
+            test-suite/artifacts/javascript-modules/
+            test-suite/artifacts/javascript-commonjs/
+            test-suite/artifacts/javascript-heap/
+          retention-days: 7

@@ -7,6 +7,7 @@ on:
       - test-suite/patches/typescript-module-assignments.patch.xz
       - test-suite/patches/typescript-module-objects.patch
       - test-suite/patches/typescript-method-receivers.patch.xz
+      - test-suite/patches/javascript-namespace-receivers.patch.xz
       - .github/workflows/typescript-module-assignments.yml
   workflow_dispatch:
 
@@ -98,6 +99,26 @@ jobs:
           expected = {'modules/helpers/ubs_core/analyzers/taint_js.py':'235de180a7ec2d09b8b82c89ab9bb0c184b07546',
                       'modules/helpers/ubs_core/js_modules.py':'1ad147dafb5cb6b0509c1703b6773ea701f8b92b',
                       'test-suite/quality/test_taint_ts_module_assignments.py':'9bc922f343d7419f12db5896da00390eecf095d0'}
+          for path, sha in expected.items():
+              assert subprocess.check_output(['git','hash-object',path],text=True).strip() == sha, path
+          PY
+          python3 scripts/update_checksums.py
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          git diff --check
+      - name: Apply live namespace receiver semantics without changing source selection
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import lzma
+          from pathlib import Path
+          import subprocess
+          patch = lzma.decompress(Path('test-suite/patches/javascript-namespace-receivers.patch.xz').read_bytes())
+          assert hashlib.sha256(patch).hexdigest() == 'b4091bc4903902dfc75cbfca38b61e37bfbae0d64bbedc4eac726ecda746e2ed'
+          subprocess.run(['git','apply','--check','-'],input=patch,check=True)
+          subprocess.run(['git','apply','-'],input=patch,check=True)
+          expected = {'modules/helpers/ubs_core/analyzers/taint_js.py':'f3199145ccf7a43b6b40010888e10fa7a4f56b01',
+                      'test-suite/quality/test_taint_ts_module_assignments.py':'785f40c0dcb596ae94ab1b082ea78078ac59743c'}
           for path, sha in expected.items():
               assert subprocess.check_output(['git','hash-object',path],text=True).strip() == sha, path
           PY

@@ -13,7 +13,7 @@ diff --git a/modules/helpers/ubs_core/js_modules.py b/modules/helpers/ubs_core/j
                      self.commonjs = 'unknown' if members is None else 'object'
                  if members is not None:
                      self.commonjs_deferred = True
-@@ -226,6 +227,38 @@
+@@ -226,20 +227,74 @@
                      self.commonjs_exports.append((start, begin, end, members))
          self.code = ''.join(out)
  
@@ -51,22 +51,48 @@ diff --git a/modules/helpers/ubs_core/js_modules.py b/modules/helpers/ubs_core/j
 +
      def commonjs_object_members(self, code, begin, end):
          """A complete static object interface, or no proven member interface."""
-         from ubs_core.analyzers.taint_js import _chunks
-@@ -234,10 +267,11 @@
+-        from ubs_core.analyzers.taint_js import _chunks
++        from ubs_core.analyzers.taint_js import _chunks, _pairs, _signature_body
++        pairs = _pairs(code)
+         members = []
+         for left, right in _chunks(code, begin + 1, end - 1):
              if not self.text[left:right].strip():
                  continue
              _, colon = next(_chunks(code, left, right, ':'))
 -            name = self.text[left:colon].strip()
 -            if re.fullmatch(_IDENTIFIER, name) is None or name == 'default':
 +            name = self.commonjs_member_name(self.text[left:colon], colon == right)
++            method_value = False
++            if name is None:
++                # A synchronous data method is a callable value, not a call
++                # executed while constructing the export object. Keep its
++                # entire original span so the engine can select the existing
++                # lexical function scope and instantiate its body at calls.
++                method = re.match(r'\s*(' + _IDENTIFIER + r')\s*\(', code[left:right])
++                if method is None:
++                    return None
++                name = method.group(1)
++                closing = pairs.get(left + method.end() - 1)
++                body = _signature_body(code, pairs, closing) if closing is not None else None
++                finish = pairs.get(body) if body is not None else None
++                if (name in {'if', 'for', 'while', 'switch', 'catch', 'with', 'function'}
++                        or finish is None or finish >= right or code[finish + 1:right].strip()
++                        or re.search(r'\b(?:this|super|arguments)\b', code[left:finish + 1])):
++                    # Implicit invocation inputs need receiver/arguments-aware
++                    # dispatch. Never lose them and select a clean summary.
++                    return None
++                method_value = True
 +            if name is None or name in {'default', '__proto__'}:
                  # Spreads/computed keys may replace an earlier member. Do not
                  # publish a partial clean interface or infer default interop.
 +                # __proto__ initializer semantics are not ordinary own fields.
                  return None
-             value_start = colon + 1 if colon < right else left
+-            value_start = colon + 1 if colon < right else left
++            value_start = left if method_value or colon == right else colon + 1
              members.append((name, '@cjs.' + name, value_start, right))
-@@ -391,11 +425,11 @@
+         return members
+ 
+@@ -391,11 +446,11 @@
                  key = '@cjs.' + name
                  exports[name] = (None, key)
                  records.append((start, rhs, end, [(name, key, rhs, end)]))
@@ -83,7 +109,7 @@ diff --git a/modules/helpers/ubs_core/js_modules.py b/modules/helpers/ubs_core/j
 diff --git a/test-suite/quality/test_taint_ts_module_assignments.py b/test-suite/quality/test_taint_ts_module_assignments.py
 --- a/test-suite/quality/test_taint_ts_module_assignments.py
 +++ b/test-suite/quality/test_taint_ts_module_assignments.py
-@@ -257,6 +257,14 @@
+@@ -257,6 +257,22 @@
               'res.send(value.clean(req.query.html));', None),
              ('shared-object', 'export = {html:"safe"};',
               'value.html=req.query.html; res.send(value.html);', ('app.cts', 'xss')),
@@ -95,10 +121,18 @@ diff --git a/test-suite/quality/test_taint_ts_module_assignments.py b/test-suite
 +             'res.send(value.read(req.query.html));', None),
 +            ('literal-snapshot', 'export = {"html": req.query.html};',
 +             'const raw=value.html; value.html="safe"; res.send(raw);', ('app.cts', 'xss')),
++            ('method-source', 'export = {read() { return req.query.html; }};',
++             'res.send(value.read());', ('app.cts', 'xss')),
++            ('method-sink', 'export = {send(x) { res.send(x); }};',
++             'value.send(req.query.html);', ('lib.cts', 'xss')),
++            ('method-clean', 'export = {clean(x) { return "safe"; }};',
++             'res.send(value.clean(req.query.html));', None),
++            ('method-write', 'export = {fill(box, x) { box.html=x; }};',
++             'const box={}; value.fill(box, req.query.html); res.send(box.html);', ('app.cts', 'xss')),
          ]
          for name, library, caller, expected in cases:
              with self.subTest(case=name), tempfile.TemporaryDirectory(prefix='ubs-ts-assignment-e2e-') as tmp:
-@@ -403,6 +411,97 @@
+@@ -403,6 +419,204 @@
          def check(graph, modules):
              self.assertIsNone(graph.exported(modules['lib.cts'], 'default'))
          self.graph({'lib.cts': 'export = clean;'}, check)
@@ -159,6 +193,99 @@ diff --git a/test-suite/quality/test_taint_ts_module_assignments.py b/test-suite
 +                self.graph({'lib.cts': 'function clean(x){return "safe";} export = ' + expression + ';'},
 +                           lambda graph, modules: self.assertIsNone(graph.exported(modules['lib.cts'], '@require')))
 +
++    def test_method_export_connects_returned_source(self):
++        self.scan({'lib.cts': 'export = {read() { return req.query.html; }};',
++                   'app.cts': 'import api = require("./lib.cjs");\nres.send(api.read());'},
++                  [('app.cts', 2, 'javascript.taint.xss')])
++
++    def test_method_export_connects_parameter_sink(self):
++        self.scan({'lib.cts': 'export = {send(value) { res.send(value); }};',
++                   'app.cts': 'import api = require("./lib.cjs");\napi.send(req.query.html);'},
++                  [('lib.cts', 1, 'javascript.taint.xss')])
++
++    def test_method_export_keeps_constant_return_clean(self):
++        self.scan({'lib.cts': 'export = {clean(value) { return "safe"; }};',
++                   'app.cts': 'import api = require("./lib.cjs");\nres.send(api.clean(req.query.html));'}, [])
++
++    def test_method_export_preserves_parameter_and_caller_isolation(self):
++        self.scan({'lib.cts': 'export = {identity(value) { return value; }};',
++                   'app.cts': 'import api = require("./lib.cjs");\n'
++                              'const raw=api.identity(req.query.html);\n'
++                              'const clean=api.identity("safe");\nres.send(clean);\nres.send(raw);'},
++                  [('app.cts', 5, 'javascript.taint.xss')])
++
++    def test_method_export_reads_captured_module_state(self):
++        self.scan({'lib.cts': 'let html="safe";\nexport = {read() { return html; }};\n'
++                             'html=req.query.html;',
++                   'app.cts': 'import api = require("./lib.cjs");\nres.send(api.read());'},
++                  [('app.cts', 2, 'javascript.taint.xss')])
++
++    def test_method_export_calls_helpers_and_preserves_domains(self):
++        self.scan({'lib.cts': 'function escape(x) { return DOMPurify.sanitize(x); }\n'
++                             'export = {read(value) { return escape(value); }};',
++                   'app.cts': 'import api = require("./lib.cjs");\n'
++                              'res.send(api.read(req.query.html));\neval(api.read(req.query.html));'},
++                  [('app.cts', 3, 'javascript.taint.eval')])
++
++    def test_commonjs_destructured_method_uses_its_body(self):
++        self.scan({'lib.cjs': 'module.exports = {read() { return req.query.html; }};',
++                   'app.cjs': 'const {read: load} = require("./lib.cjs");\nres.send(load());'},
++                  [('app.cjs', 2, 'javascript.taint.xss')])
++
++    def test_method_export_carries_default_and_return_type(self):
++        self.scan({'lib.cts': 'export = {read(value: string = req.query.html): string { return value; }};',
++                   'app.cts': 'import api = require("./lib.cjs");\n'
++                              'res.send(api.read("safe"));\nres.send(api.read());'},
++                  [('app.cts', 3, 'javascript.taint.xss')])
++
++    def test_method_export_keeps_original_multiline_sink_location(self):
++        findings = self.scan({'lib.cts': 'export = {\n  send(value) {\n    res.send(value);\n  }\n};',
++                              'app.cts': 'import api = require("./lib.cjs");\napi.send(req.query.html);'},
++                             [('lib.cts', 3, 'javascript.taint.xss')])
++        self.assertEqual(findings[0]['col'], 5)
++
++    def test_method_export_overwrite_does_not_keep_clean_summary(self):
++        self.scan({'lib.cts': 'export = {read(value) { return "safe"; }};',
++                   'app.cts': 'import api = require("./lib.cjs");\n'
++                              'api.read=external;\nres.send(api.read(req.query.html));'},
++                  [('app.cts', 3, 'javascript.taint.xss')])
++
++    def test_method_export_requires_complete_supported_definition(self):
++        for member in ('read() { return this.html; }', 'read() { return super.read(); }',
++                       'read() { return arguments[0]; }',
++                       'get read() { return "safe"; }', 'async read() { return "safe"; }',
++                       '*read() { return "safe"; }', '[key]() { return "safe"; }',
++                       'read() { return "safe"; } extra', 'read<T>() { return "safe"; }'):
++            with self.subTest(member=member):
++                self.graph({'lib.cts': 'export = {clean: value => "safe", ' + member + '};'},
++                           lambda graph, modules: self.assertIsNone(graph.exported(modules['lib.cts'], '@require')))
++
++    def test_method_export_duplicate_keys_keep_last_value(self):
++        self.scan({'lib.cjs': 'module.exports = {read() { return req.query.html; }, read: () => "safe"};',
++                   'app.cjs': 'const api=require("./lib.cjs");\nres.send(api.read());'}, [])
++        self.scan({'lib.cjs': 'module.exports = {read: () => "safe", read() { return req.query.html; }};',
++                   'app.cjs': 'const api=require("./lib.cjs");\nres.send(api.read());'},
++                  [('app.cjs', 2, 'javascript.taint.xss')])
++
++    def test_method_export_preserves_borrowed_object_writes(self):
++        self.scan({'lib.cts': 'export = {fill(box, x) { box.html=x; }};',
++                   'app.cts': 'import api = require("./lib.cjs");\nconst box={};\n'
++                              'api.fill(box, req.query.html);\nres.send(box.html);'},
++                  [('app.cts', 4, 'javascript.taint.xss')])
++
++    def test_method_export_returns_distinct_objects(self):
++        self.scan({'lib.cts': 'export = {make(x) { return {html:x}; }};',
++                   'app.cts': 'import api = require("./lib.cjs");\n'
++                              'const raw=api.make(req.query.html);\nconst clean=api.make("safe");\n'
++                              'res.send(clean.html);\nres.send(raw.html);'},
++                  [('app.cts', 5, 'javascript.taint.xss')])
++
++    def test_method_export_preserves_thrown_payload(self):
++        self.scan({'lib.cts': 'export = {read() { throw req.query.html; }};',
++                   'app.cts': 'import api = require("./lib.cjs");\n'
++                              'try { api.read(); } catch (error) { res.send(error); }'},
++                  [('app.cts', 2, 'javascript.taint.xss')])
++
 +    @unittest.skipUnless(shutil.which('tsc') and shutil.which('node'), 'TypeScript compiler and Node required')
 +    def test_literal_interfaces_match_compiler_and_node(self):
 +        cases = [
@@ -166,6 +293,20 @@ diff --git a/test-suite/quality/test_taint_ts_module_assignments.py b/test-suite
 +            ('export = ({["read"]: (_x: string) => "safe"});', 'res.send(api.read(req.query.html));', False),
 +            ('export = ({"html": req.query.html, "clean":"safe"});', 'res.send(api.clean);', False),
 +            ('export = (({html:req.query.html}));', 'res.send(api.html);', True),
++            ('export = {read() { return req.query.html; }};', 'res.send(api.read());', True),
++            ('export = {clean(_x: string) { return "safe"; }};',
++             'res.send(api.clean(req.query.html));', False),
++            ('export = {identity(x: string) { return x; }};',
++             'res.send(api.identity(req.query.html));', True),
++            ('let html="safe"; export = {read() { return html; }}; html=req.query.html;',
++             'res.send(api.read());', True),
++            ('export = {read(x: string = req.query.html): string { return x; }};',
++             'res.send(api.read());', True),
++            ('export = {send(x: string) { res.send(x); }};', 'api.send(req.query.html);', True),
++            ('export = {make(x: string) { return {html:x}; }};',
++             'res.send(api.make(req.query.html).html);', True),
++            ('export = {read() { throw req.query.html; }};',
++             'try { api.read(); } catch (error) { res.send(error); }', True),
 +        ]
 +        declaration = ('declare const req: {query: {html: string}};\n'
 +                       'declare const res: {send(value: unknown): void};\n')

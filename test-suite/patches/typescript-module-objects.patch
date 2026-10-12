@@ -1,0 +1,198 @@
+diff --git a/modules/helpers/ubs_core/js_modules.py b/modules/helpers/ubs_core/js_modules.py
+--- a/modules/helpers/ubs_core/js_modules.py
++++ b/modules/helpers/ubs_core/js_modules.py
+@@ -214,8 +214,9 @@
+             if not unsupported:
+                 start, begin, end = export_assignments[0]
+                 members = [(None, '@cjs.value', begin, end)]
+-                if code[begin:begin + 1] == '{' and pairs.get(begin) == end - 1:
+-                    members = self.commonjs_object_members(code, begin, end)
++                bounds = self.commonjs_object_bounds(code, pairs, begin, end)
++                if bounds is not None:
++                    members = self.commonjs_object_members(code, *bounds)
+                     self.commonjs = 'unknown' if members is None else 'object'
+                 if members is not None:
+                     self.commonjs_deferred = True
+@@ -226,6 +227,38 @@
+                     self.commonjs_exports.append((start, begin, end, members))
+         self.code = ''.join(out)
+ 
++    @staticmethod
++    def commonjs_object_bounds(code, pairs, begin, end):
++        """Peel only complete parentheses, not commas/calls/other expressions."""
++        while True:
++            while begin < end and code[begin].isspace():
++                begin += 1
++            while end > begin and code[end - 1].isspace():
++                end -= 1
++            if code[begin:begin + 1] != '(' or pairs.get(begin) != end - 1:
++                break
++            begin, end = begin + 1, end - 1
++        if code[begin:begin + 1] == '{' and pairs.get(begin) == end - 1:
++            return begin, end
++        return None
++
++    @staticmethod
++    def commonjs_member_name(raw, shorthand):
++        """Normalize proven data keys without evaluating computed expressions."""
++        raw = raw.strip()
++        if re.fullmatch(_IDENTIFIER, raw):
++            return raw
++        if shorthand:
++            return None  # Quoted and computed names require a value.
++        if raw.startswith('[') and raw.endswith(']'):
++            raw = raw[1:-1].strip()
++            if re.fullmatch(_IDENTIFIER, raw):
++                return None  # [name] reads a variable; it is not the key 'name'.
++        match = re.fullmatch(r"'([^'\\\r\n]*)'|\"([^\"\\\r\n]*)\"", raw)
++        if match is not None:
++            return match.group(1) if match.group(1) is not None else match.group(2)
++        return raw if re.fullmatch(r'0|[1-9][0-9]*', raw) else None
++
+     def commonjs_object_members(self, code, begin, end):
+         """A complete static object interface, or no proven member interface."""
+         from ubs_core.analyzers.taint_js import _chunks
+@@ -234,10 +267,11 @@
+             if not self.text[left:right].strip():
+                 continue
+             _, colon = next(_chunks(code, left, right, ':'))
+-            name = self.text[left:colon].strip()
+-            if re.fullmatch(_IDENTIFIER, name) is None or name == 'default':
++            name = self.commonjs_member_name(self.text[left:colon], colon == right)
++            if name is None or name in {'default', '__proto__'}:
+                 # Spreads/computed keys may replace an earlier member. Do not
+                 # publish a partial clean interface or infer default interop.
++                # __proto__ initializer semantics are not ordinary own fields.
+                 return None
+             value_start = colon + 1 if colon < right else left
+             members.append((name, '@cjs.' + name, value_start, right))
+@@ -391,11 +425,11 @@
+                 key = '@cjs.' + name
+                 exports[name] = (None, key)
+                 records.append((start, rhs, end, [(name, key, rhs, end)]))
+-            elif code[rhs:rhs + 1] == '{' and pairs.get(rhs) == end - 1:
++            elif (bounds := self.commonjs_object_bounds(code, pairs, rhs, end)) is not None:
+                 if records:
+                     unsupported = True  # old exports aliases may be detached
+                 kind = 'object'
+-                members = self.commonjs_object_members(code, rhs, end)
++                members = self.commonjs_object_members(code, *bounds)
+                 if members is None:
+                     unsupported = True
+                     members = []
+diff --git a/test-suite/quality/test_taint_ts_module_assignments.py b/test-suite/quality/test_taint_ts_module_assignments.py
+--- a/test-suite/quality/test_taint_ts_module_assignments.py
++++ b/test-suite/quality/test_taint_ts_module_assignments.py
+@@ -257,6 +257,14 @@
+              'res.send(value.clean(req.query.html));', None),
+             ('shared-object', 'export = {html:"safe"};',
+              'value.html=req.query.html; res.send(value.html);', ('app.cts', 'xss')),
++            ('literal-source', 'export = (({"read": () => req.query.html}));',
++             'res.send(value.read());', ('app.cts', 'xss')),
++            ('computed-source', 'export = {["read"]: () => req.query.html};',
++             'res.send(value.read());', ('app.cts', 'xss')),
++            ('literal-clean', 'export = ({"read": _x => "safe"});',
++             'res.send(value.read(req.query.html));', None),
++            ('literal-snapshot', 'export = {"html": req.query.html};',
++             'const raw=value.html; value.html="safe"; res.send(raw);', ('app.cts', 'xss')),
+         ]
+         for name, library, caller, expected in cases:
+             with self.subTest(case=name), tempfile.TemporaryDirectory(prefix='ubs-ts-assignment-e2e-') as tmp:
+@@ -403,6 +411,97 @@
+         def check(graph, modules):
+             self.assertIsNone(graph.exported(modules['lib.cts'], 'default'))
+         self.graph({'lib.cts': 'export = clean;'}, check)
++
++    def test_static_quoted_and_computed_export_keys(self):
++        for key in ('"read"', "'read'", '["read"]', "['read']"):
++            with self.subTest(key=key):
++                self.scan({'lib.cts': 'export = {' + key + ': () => req.query.html};',
++                           'app.cts': 'import api = require("./lib.cjs");\nres.send(api.read());'},
++                          [('app.cts', 2, 'javascript.taint.xss')])
++
++    def test_literal_export_fields_preserve_exact_projection(self):
++        self.scan({'lib.cts': 'export = {"html":req.query.html, ["other"]:"safe"};',
++                   'app.cts': 'import api = require("./lib.cjs");\n'
++                              'res.send(api.other);\nres.send(api.html);'},
++                  [('app.cts', 3, 'javascript.taint.xss')])
++
++    def test_parenthesized_export_object_preserves_callables(self):
++        for expression in ('({read: () => req.query.html})',
++                           '(( /* comment */ {read: () => req.query.html} ))'):
++            with self.subTest(expression=expression):
++                self.scan({'lib.cts': 'export = ' + expression + ';',
++                           'app.cts': 'import api = require("./lib.cjs");\nres.send(api.read());'},
++                          [('app.cts', 2, 'javascript.taint.xss')])
++
++    def test_commonjs_literal_interface_is_shared_with_typescript(self):
++        self.scan({'lib.cjs': 'module.exports = (({"read": () => req.query.html}));',
++                   'app.cjs': 'const {read: load} = require("./lib.cjs");\nres.send(load());'},
++                  [('app.cjs', 2, 'javascript.taint.xss')])
++
++    def test_commonjs_literal_field_overwrite_preserves_snapshot(self):
++        self.scan({'lib.cjs': 'module.exports = {"html": req.query.html};',
++                   'app.cts': 'import api = require("./lib.cjs");\nconst raw=api.html;\n'
++                              'api.html="safe";\nres.send(api.html);\nres.send(raw);'},
++                  [('app.cts', 5, 'javascript.taint.xss')])
++
++    def test_static_literal_export_keys_do_not_create_clean_guarantees(self):
++        self.scan({'lib.cts': 'export = {"read": x => x};',
++                   'app.cts': 'import api = require("./lib.cjs");\nres.send(api.read(req.query.html));'},
++                  [('app.cts', 2, 'javascript.taint.xss')])
++        self.scan({'lib.cts': 'export = {"read": x => "safe"};',
++                   'app.cts': 'import api = require("./lib.cjs");\nres.send(api.read(req.query.html));'}, [])
++
++    def test_duplicate_normalized_export_keys_use_last_value(self):
++        self.scan({'lib.cjs': 'module.exports = {read: () => req.query.html, "read": () => "safe"};',
++                   'app.cjs': 'const api=require("./lib.cjs");\nres.send(api.read());'}, [])
++        self.scan({'lib.cjs': 'module.exports = {"read": () => "safe", read: () => req.query.html};',
++                   'app.cjs': 'const api=require("./lib.cjs");\nres.send(api.read());'},
++                  [('app.cjs', 2, 'javascript.taint.xss')])
++
++    def test_dynamic_and_prototype_keys_never_form_a_partial_clean_interface(self):
++        for expression in ('({read: clean, [key]: external})',
++                           '({read: clean, __proto__: external})',
++                           '({read: clean, "__proto__": external})',
++                           '({read: clean, ...external})',
++                           '({read: clean, [makeKey()]: external})'):
++            with self.subTest(expression=expression):
++                self.graph({'lib.cts': 'function clean(x){return "safe";} export = ' + expression + ';'},
++                           lambda graph, modules: self.assertIsNone(graph.exported(modules['lib.cts'], '@require')))
++
++    @unittest.skipUnless(shutil.which('tsc') and shutil.which('node'), 'TypeScript compiler and Node required')
++    def test_literal_interfaces_match_compiler_and_node(self):
++        cases = [
++            ('export = ({"read": () => req.query.html});', 'res.send(api.read());', True),
++            ('export = ({["read"]: (_x: string) => "safe"});', 'res.send(api.read(req.query.html));', False),
++            ('export = ({"html": req.query.html, "clean":"safe"});', 'res.send(api.clean);', False),
++            ('export = (({html:req.query.html}));', 'res.send(api.html);', True),
++        ]
++        declaration = ('declare const req: {query: {html: string}};\n'
++                       'declare const res: {send(value: unknown): void};\n')
++        with tempfile.TemporaryDirectory(prefix='ubs-ts-literal-oracle-') as tmp:
++            root = Path(tmp)
++            paths, groups = [], []
++            for number, (library, caller, expected) in enumerate(cases):
++                group = self.write(root, {f'case{number}/lib.cts': declaration + library,
++                                         f'case{number}/app.cts': declaration +
++                                         'import api = require("./lib.cjs");\n' + caller})
++                paths.extend(group)
++                groups.append((group, expected))
++            result = subprocess.run(['tsc', '--module', 'nodenext', '--target', 'es2020',
++                                     '--outDir', str(root/'out'), *map(str, paths)],
++                                    capture_output=True, text=True, timeout=30)
++            self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
++            for number, (group, expected) in enumerate(groups):
++                with self.subTest(case=number):
++                    bootstrap = root/f'out/case{number}/observe.cjs'
++                    bootstrap.write_text('global.req={query:{html:"unsafe-token"}};\n'
++                                         'global.res={send(value){console.log(JSON.stringify(value));}};\n'
++                                         'require("./app.cjs");\n', encoding='utf-8')
++                    executed = subprocess.run(['node', str(bootstrap)], capture_output=True, text=True, timeout=10)
++                    self.assertEqual(executed.returncode, 0, executed.stderr)
++                    self.assertEqual(json.loads(executed.stdout) == 'unsafe-token', expected)
++                    findings = list(taint_js.run(RunContext(lang='javascript', files=group)))
++                    self.assertEqual([f['rule'] for f in findings], ['javascript.taint.xss'] if expected else [])
+ 
+     @unittest.skipUnless(shutil.which('tsc') and shutil.which('node'), 'TypeScript compiler and Node required')
+     def test_export_assignment_order_matches_independent_compiler_output(self):

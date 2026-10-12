@@ -6,6 +6,7 @@ on:
     paths:
       - test-suite/patches/typescript-module-assignments.patch.xz
       - test-suite/patches/typescript-module-objects.patch
+      - test-suite/patches/typescript-method-receivers.patch.xz
       - .github/workflows/typescript-module-assignments.yml
   workflow_dispatch:
 
@@ -71,13 +72,14 @@ jobs:
           result = unittest.TextTestRunner(verbosity=2).run(suite)
           assert len(result.failures) == 3 and not result.errors and not result.skipped, result
           PY
-      - name: Apply both reviewed interface stages and rebuild current integrity
+      - name: Apply reviewed interface and receiver stages and rebuild current integrity
         run: |
           git apply --include=modules/helpers/ubs_core/js_modules.py --include=modules/helpers/ubs_core/analyzers/taint_js.py "$RUNNER_TEMP/ts-assignments.patch"
           test "$(git hash-object modules/helpers/ubs_core/js_modules.py)" = 655db0dc63f9dca9d614eb0a78420881120db658
           test "$(git hash-object test-suite/quality/test_taint_ts_module_assignments.py)" = 3eb4992a35cc8e86607b164f19c4ee12189654ed
           python3 - <<'PY'
           import hashlib
+          import lzma
           from pathlib import Path
           import subprocess
           patch = Path('test-suite/patches/typescript-module-objects.patch').read_bytes()
@@ -87,6 +89,15 @@ jobs:
           expected = {'modules/helpers/ubs_core/analyzers/taint_js.py':'9c3422c89048ee444a4ffaaaedde0b86579b2035',
                       'modules/helpers/ubs_core/js_modules.py':'764207cc4ba0693eb84eedc33504c0299f8c5d42',
                       'test-suite/quality/test_taint_ts_module_assignments.py':'21151e97f3030457875ef7aa3f77c5d4d5edbb37'}
+          for path, sha in expected.items():
+              assert subprocess.check_output(['git','hash-object',path],text=True).strip() == sha, path
+          patch = lzma.decompress(Path('test-suite/patches/typescript-method-receivers.patch.xz').read_bytes())
+          assert hashlib.sha256(patch).hexdigest() == '946ec951493a73f2b7f7aa52f079722e7a098419570aa3ebfb32418762f44764'
+          subprocess.run(['git','apply','--check','-'],input=patch,check=True)
+          subprocess.run(['git','apply','-'],input=patch,check=True)
+          expected = {'modules/helpers/ubs_core/analyzers/taint_js.py':'235de180a7ec2d09b8b82c89ab9bb0c184b07546',
+                      'modules/helpers/ubs_core/js_modules.py':'1ad147dafb5cb6b0509c1703b6773ea701f8b92b',
+                      'test-suite/quality/test_taint_ts_module_assignments.py':'9bc922f343d7419f12db5896da00390eecf095d0'}
           for path, sha in expected.items():
               assert subprocess.check_output(['git','hash-object',path],text=True).strip() == sha, path
           PY

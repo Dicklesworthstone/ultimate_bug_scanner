@@ -1,0 +1,163 @@
+name: TypeScript Module Assignments
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - test-suite/patches/typescript-module-assignments.patch.xz
+      - .github/workflows/typescript-module-assignments.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  module-assignments:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # Publish verified immutable objects only; ref updates remain explicit.
+    permissions:
+      contents: write
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      UBS_NO_AUTO_UPDATE: '1'
+      UBS_TAINT_E2E: '1'
+      UBS_HEAP_E2E: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Retain exact current source for independent reproduction
+        run: |
+          git archive --format=tar.gz -o "$RUNNER_TEMP/ts-assignment-source.tar.gz" HEAD
+          git rev-parse HEAD > "$RUNNER_TEMP/ts-assignment-source-head.txt"
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: typescript-assignment-current-source
+          path: ${{ runner.temp }}/ts-assignment-source*
+          retention-days: 7
+      - name: Apply only tests and reproduce current-engine detection gaps
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import lzma
+          import os
+          from pathlib import Path
+          import subprocess
+          expected = {'modules/helpers/ubs_core/analyzers/taint_js.py':'5204d6753adc1a47f9336a5baeee1e826d89c878',
+                      'modules/helpers/ubs_core/js_modules.py':'524fc9f292258f96d89ab5dbd1ae5875585556f3'}
+          for path, sha in expected.items():
+              assert subprocess.check_output(['git','hash-object',path],text=True).strip() == sha, path
+          patch = lzma.decompress(Path('test-suite/patches/typescript-module-assignments.patch.xz').read_bytes())
+          assert hashlib.sha256(patch).hexdigest() == 'c87483898a61440d1e05156fa192d0852dd38164af25d57bc03640912206e03d'
+          Path(os.environ['RUNNER_TEMP'],'ts-assignments.patch').write_bytes(patch)
+          subprocess.run(['git','apply','--check','-'],input=patch,check=True)
+          subprocess.run(['git','apply','--include=test-suite/quality/test_taint_ts_module_assignments.py','-'],input=patch,check=True)
+          PY
+          python3 - <<'PY'
+          import importlib.util
+          import unittest
+          path = 'test-suite/quality/test_taint_ts_module_assignments.py'
+          spec = importlib.util.spec_from_file_location('ts_assignment_regressions',path)
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          names = ('test_import_assignment_connects_source_return',
+                   'test_export_assignment_reads_the_end_of_module_binding',
+                   'test_exported_object_callable_members_are_resolved')
+          suite = unittest.TestSuite(module.TypeScriptModuleAssignments(name) for name in names)
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          assert len(result.failures) == 3 and not result.errors and not result.skipped, result
+          PY
+      - name: Apply implementation and rebuild complete current integrity chain
+        run: |
+          git apply --include=modules/helpers/ubs_core/js_modules.py --include=modules/helpers/ubs_core/analyzers/taint_js.py "$RUNNER_TEMP/ts-assignments.patch"
+          test "$(git hash-object modules/helpers/ubs_core/js_modules.py)" = 655db0dc63f9dca9d614eb0a78420881120db658
+          test "$(git hash-object test-suite/quality/test_taint_ts_module_assignments.py)" = 3eb4992a35cc8e86607b164f19c4ee12189654ed
+          python3 scripts/update_checksums.py
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          git diff --check
+      - name: Install actual scanner and independent compiler controls
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep rsync shellcheck
+          npm install --global @ast-grep/cli typescript@5.8.3
+      - name: Validate module assignments and existing cross-file cases without skips
+        run: |
+          python3 - <<'PY'
+          import importlib.util
+          import unittest
+          for path in ('test-suite/quality/test_taint_ts_module_assignments.py',
+                       'test-suite/quality/test_taint_js_modules.py',
+                       'test-suite/quality/test_taint_js_commonjs.py'):
+              spec = importlib.util.spec_from_file_location('regressions',path)
+              module = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(module)
+              result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromModule(module))
+              assert result.wasSuccessful() and not result.skipped, (path,result.failures,result.errors,result.skipped)
+              print('TS_ASSIGNMENT_TEST_PASS',path,result.testsRun,flush=True)
+          PY
+      - name: Preserve current analyzer and installation contracts
+        run: |
+          python3 -m unittest discover -s test-suite/quality -p 'test_taint_js_value_kinds.py' -v
+          python3 -m unittest discover -s test-suite/quality -p 'test_taint_js_property_names.py' -v
+          python3 -m unittest discover -s test-suite/quality -p 'test_taint_js_scan_cost.py' -v
+          python3 -m unittest discover -s test-suite/shareable -p 'test_contract_checksums.py' -v
+          for file in ubs modules/ubs-*.sh modules/lib/ubs-common.sh scripts/new-module.sh; do bash -n "$file"; done
+      - name: Retain and publish only verified immutable runtime objects
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import tarfile
+          import urllib.request
+          added = 'test-suite/quality/test_taint_ts_module_assignments.py'
+          changed = sorted(set(subprocess.check_output(['git','diff','--name-only'],text=True).splitlines()) | {added})
+          required = {added,'modules/helpers/ubs_core/js_modules.py','modules/helpers/ubs_core/analyzers/taint_js.py'}
+          allowed = required | {'ubs','SHA256SUMS','modules/lib/ubs-common.sh','scripts/new-module.sh'}
+          allowed.update(str(p) for p in Path('modules').glob('ubs-*.sh'))
+          assert required <= set(changed) <= allowed, changed
+          before = {name:Path(name).read_bytes() for name in changed}
+          subprocess.run(['python3','scripts/update_checksums.py'],check=True)
+          assert changed == sorted(set(subprocess.check_output(['git','diff','--name-only'],text=True).splitlines()) | {added})
+          assert all(Path(name).read_bytes() == data for name,data in before.items())
+          for command in (['./scripts/verify_checksums.sh'],['./scripts/verify_sha256sums.sh'],['git','diff','--check']):
+              subprocess.run(command,check=True)
+          manifest = []
+          with tarfile.open(Path(os.environ['RUNNER_TEMP'],'ts-assignment-verified.tar.gz'),'w:gz') as archive:
+              for name,data in before.items():
+                  sha = hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
+                  mode = '100755' if Path(name).stat().st_mode & 0o111 else '100644'
+                  manifest.append({'path':name,'sha':sha,'mode':mode})
+                  archive.add(name,arcname=name)
+          Path(os.environ['RUNNER_TEMP'],'ts-assignment-verified.json').write_text(json.dumps(manifest,indent=2))
+          for entry in manifest:
+              request = urllib.request.Request('https://api.github.com/repos/'+os.environ['GH_REPO']+'/git/blobs',
+                  data=json.dumps({'encoding':'base64','content':base64.b64encode(before[entry['path']]).decode('ascii')}).encode(),
+                  headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Content-Type':'application/json','Accept':'application/vnd.github+json'})
+              with urllib.request.urlopen(request,timeout=90) as response:
+                  result = json.load(response)
+              assert result['sha'] == entry['sha']
+              print('TS_ASSIGNMENT_OBJECT',entry['path'],entry['sha'],entry['mode'],flush=True)
+          print('TS_ASSIGNMENT_BASE',subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: typescript-module-assignment-validation
+          path: |
+            ${{ runner.temp }}/ts-assignment-verified*
+            test-suite/artifacts/
+          retention-days: 7

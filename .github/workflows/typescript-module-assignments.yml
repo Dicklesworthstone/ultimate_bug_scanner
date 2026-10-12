@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - test-suite/patches/typescript-module-assignments.patch.xz
+      - test-suite/patches/typescript-module-objects.patch
       - .github/workflows/typescript-module-assignments.yml
   workflow_dispatch:
 
@@ -15,9 +16,6 @@ jobs:
   module-assignments:
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    # Publish verified immutable objects only; ref updates remain explicit.
-    permissions:
-      contents: write
     env:
       PYTHONDONTWRITEBYTECODE: '1'
       UBS_NO_AUTO_UPDATE: '1'
@@ -73,11 +71,25 @@ jobs:
           result = unittest.TextTestRunner(verbosity=2).run(suite)
           assert len(result.failures) == 3 and not result.errors and not result.skipped, result
           PY
-      - name: Apply implementation and rebuild complete current integrity chain
+      - name: Apply both reviewed interface stages and rebuild current integrity
         run: |
           git apply --include=modules/helpers/ubs_core/js_modules.py --include=modules/helpers/ubs_core/analyzers/taint_js.py "$RUNNER_TEMP/ts-assignments.patch"
           test "$(git hash-object modules/helpers/ubs_core/js_modules.py)" = 655db0dc63f9dca9d614eb0a78420881120db658
           test "$(git hash-object test-suite/quality/test_taint_ts_module_assignments.py)" = 3eb4992a35cc8e86607b164f19c4ee12189654ed
+          python3 - <<'PY'
+          import hashlib
+          from pathlib import Path
+          import subprocess
+          patch = Path('test-suite/patches/typescript-module-objects.patch').read_bytes()
+          assert hashlib.sha256(patch).hexdigest() == 'c22b065028ef53586d5cff6fa210caf1aad7588232ab04e25344762fcee5197e'
+          subprocess.run(['git','apply','--check','-'],input=patch,check=True)
+          subprocess.run(['git','apply','-'],input=patch,check=True)
+          expected = {'modules/helpers/ubs_core/analyzers/taint_js.py':'9c3422c89048ee444a4ffaaaedde0b86579b2035',
+                      'modules/helpers/ubs_core/js_modules.py':'764207cc4ba0693eb84eedc33504c0299f8c5d42',
+                      'test-suite/quality/test_taint_ts_module_assignments.py':'21151e97f3030457875ef7aa3f77c5d4d5edbb37'}
+          for path, sha in expected.items():
+              assert subprocess.check_output(['git','hash-object',path],text=True).strip() == sha, path
+          PY
           python3 scripts/update_checksums.py
           ./scripts/verify_checksums.sh
           ./scripts/verify_sha256sums.sh
@@ -109,20 +121,15 @@ jobs:
           python3 -m unittest discover -s test-suite/quality -p 'test_taint_js_scan_cost.py' -v
           python3 -m unittest discover -s test-suite/shareable -p 'test_contract_checksums.py' -v
           for file in ubs modules/ubs-*.sh modules/lib/ubs-common.sh scripts/new-module.sh; do bash -n "$file"; done
-      - name: Retain and publish only verified immutable runtime objects
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
+      - name: Retain verified runtime bytes without repository writes
         run: |
           python3 - <<'PY'
-          import base64
           import hashlib
           import json
           import os
           from pathlib import Path
           import subprocess
           import tarfile
-          import urllib.request
           added = 'test-suite/quality/test_taint_ts_module_assignments.py'
           changed = sorted(set(subprocess.check_output(['git','diff','--name-only'],text=True).splitlines()) | {added})
           required = {added,'modules/helpers/ubs_core/js_modules.py','modules/helpers/ubs_core/analyzers/taint_js.py'}
@@ -143,14 +150,6 @@ jobs:
                   manifest.append({'path':name,'sha':sha,'mode':mode})
                   archive.add(name,arcname=name)
           Path(os.environ['RUNNER_TEMP'],'ts-assignment-verified.json').write_text(json.dumps(manifest,indent=2))
-          for entry in manifest:
-              request = urllib.request.Request('https://api.github.com/repos/'+os.environ['GH_REPO']+'/git/blobs',
-                  data=json.dumps({'encoding':'base64','content':base64.b64encode(before[entry['path']]).decode('ascii')}).encode(),
-                  headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Content-Type':'application/json','Accept':'application/vnd.github+json'})
-              with urllib.request.urlopen(request,timeout=90) as response:
-                  result = json.load(response)
-              assert result['sha'] == entry['sha']
-              print('TS_ASSIGNMENT_OBJECT',entry['path'],entry['sha'],entry['mode'],flush=True)
           print('TS_ASSIGNMENT_BASE',subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),flush=True)
           PY
       - uses: actions/upload-artifact@v4

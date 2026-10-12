@@ -5,100 +5,88 @@ on:
     branches: ["main"]
     paths:
       - "ubs"
+      - "ubs-daemon"
       - "install.sh"
       - "SHA256SUMS"
+      - "modules/**"
+      - "scripts/new-module.sh"
+      - "scripts/update_checksums.py"
+      - "scripts/update_checksums.sh"
+      - "scripts/update_sha256sums.sh"
+      - ".github/workflows/checksum-sync.yml"
   pull_request:
     paths:
       - "ubs"
+      - "ubs-daemon"
       - "install.sh"
       - "SHA256SUMS"
+      - "modules/**"
+      - "scripts/new-module.sh"
+      - "scripts/update_checksums.py"
+      - "scripts/update_checksums.sh"
+      - "scripts/update_sha256sums.sh"
+      - ".github/workflows/checksum-sync.yml"
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: checksum-sync-${{ github.ref_name }}
-  cancel-in-progress: true
+  group: checksum-sync-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  sync-checksums:
+  verify:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v7
         with:
-          # Need write access for auto-commit on push to main
-          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: false
+      - name: Verify submitted checksums before regeneration
+        run: |
+          bash scripts/verify_checksums.sh
+          bash scripts/verify_sha256sums.sh
+      - name: Require canonical generation to leave the tree unchanged
+        run: |
+          bash scripts/update_checksums.sh
+          bash scripts/update_sha256sums.sh
+          git diff --exit-code
+
+  sync:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Take the current branch, not an older queued push's tree. A later
+          # concurrent push is still protected by git's fast-forward check.
+          ref: main
           fetch-depth: 1
-
-      - name: Compute current checksums
-        id: compute
+      - name: Regenerate the complete integrity dependency graph
         run: |
-          # Compute actual checksums for both files
-          ACTUAL_UBS=$(sha256sum ubs | awk '{print $1}')
-          ACTUAL_INSTALL=$(sha256sum install.sh | awk '{print $1}')
-
-          # Extract expected checksums (grep for specific file to avoid multi-line issues)
-          EXPECTED_UBS=$(grep '  ubs$' SHA256SUMS 2>/dev/null | awk '{print $1}' || echo "")
-          EXPECTED_INSTALL=$(grep '  install.sh$' SHA256SUMS 2>/dev/null | awk '{print $1}' || echo "")
-
-          echo "actual_ubs=$ACTUAL_UBS" >> "$GITHUB_OUTPUT"
-          echo "actual_install=$ACTUAL_INSTALL" >> "$GITHUB_OUTPUT"
-          echo "expected_ubs=$EXPECTED_UBS" >> "$GITHUB_OUTPUT"
-          echo "expected_install=$EXPECTED_INSTALL" >> "$GITHUB_OUTPUT"
-
-          # Check if both match
-          if [[ "$ACTUAL_UBS" == "$EXPECTED_UBS" && "$ACTUAL_INSTALL" == "$EXPECTED_INSTALL" ]]; then
-            echo "match=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::SHA256SUMS is up to date"
-          else
-            echo "match=false" >> "$GITHUB_OUTPUT"
-            if [[ "$ACTUAL_UBS" != "$EXPECTED_UBS" ]]; then
-              echo "::warning::ubs checksum mismatch (expected $EXPECTED_UBS, actual $ACTUAL_UBS)"
-            fi
-            if [[ "$ACTUAL_INSTALL" != "$EXPECTED_INSTALL" ]]; then
-              echo "::warning::install.sh checksum mismatch (expected $EXPECTED_INSTALL, actual $ACTUAL_INSTALL)"
-            fi
+          bash scripts/update_checksums.sh
+          bash scripts/update_sha256sums.sh
+          bash scripts/verify_checksums.sh
+          bash scripts/verify_sha256sums.sh
+      - name: Publish generated pins without overwriting concurrent work
+        run: |
+          set -euo pipefail
+          git add -- ubs SHA256SUMS modules/lib/ubs-common.sh modules/ubs-*.sh scripts/new-module.sh
+          if git diff --cached --quiet; then
+            echo 'All verified-asset and release checksums are current.'
+            exit 0
           fi
-
-      - name: Verify checksums (PR only)
-        if: github.event_name == 'pull_request' && steps.compute.outputs.match == 'false'
-        run: |
-          echo "::error::SHA256SUMS does not match current files!"
-          echo ""
-          echo "ubs checksum:"
-          echo "  Expected: ${{ steps.compute.outputs.expected_ubs }}"
-          echo "  Actual:   ${{ steps.compute.outputs.actual_ubs }}"
-          echo ""
-          echo "install.sh checksum:"
-          echo "  Expected: ${{ steps.compute.outputs.expected_install }}"
-          echo "  Actual:   ${{ steps.compute.outputs.actual_install }}"
-          echo ""
-          echo "Please run: ./scripts/update_checksums.sh"
-          exit 1
-
-      - name: Auto-update SHA256SUMS (push to main only)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.compute.outputs.match == 'false'
-        run: |
-          # Create SHA256SUMS with both entries (install.sh first, then ubs)
-          echo "${{ steps.compute.outputs.actual_install }}  install.sh" > SHA256SUMS
-          echo "${{ steps.compute.outputs.actual_ubs }}  ubs" >> SHA256SUMS
-          echo "Updated SHA256SUMS:"
-          cat SHA256SUMS
-
-      - name: Commit and push updated checksums
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.compute.outputs.match == 'false'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add SHA256SUMS
-          git commit -m "chore(checksum): auto-update SHA256SUMS [skip ci]
-
-          Updated checksums:
-            install.sh: ${{ steps.compute.outputs.actual_install }}
-            ubs: ${{ steps.compute.outputs.actual_ubs }}
-
-          This commit was automatically generated by the checksum-sync workflow."
-          git push
+          # No generator is allowed to leave unstaged edits outside its
+          # declared outputs. Do not blindly stage source or tracker files.
+          git diff --exit-code
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git commit -m 'chore(checksum): synchronize verified asset graph [skip ci]'
+          # Reject a moved main rather than force-pushing or reusing hashes
+          # computed for different source bytes. A newer push queues its run.
+          git push origin HEAD:refs/heads/main

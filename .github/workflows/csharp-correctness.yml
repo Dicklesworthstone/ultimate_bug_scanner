@@ -5,7 +5,7 @@ on:
     branches: [main]
     paths:
       - .github/workflows/csharp-correctness.yml
-      - test-suite/quality/test_csharp_correctness.py
+      - test-suite/quality/csharp_correctness_candidate.py
       - test-suite/quality/test_csharp_result_receivers.py
       - test-suite/quality/fixtures/csharp-correctness-candidate.json
       - modules/helpers/ubs_core/csharp_patterns/**
@@ -97,7 +97,7 @@ jobs:
           UBS_CSHARP_CORRECTNESS_PUBLIC: '1'
         run: |
           python3 test-suite/quality/test_csharp_result_receivers.py -v
-          python3 test-suite/quality/test_csharp_correctness.py -v
+          python3 test-suite/quality/csharp_correctness_candidate.py -v
       - name: Existing CSharp SQL and request dataflow regressions
         env:
           UBS_CSHARP_SQL_PUBLIC: '1'

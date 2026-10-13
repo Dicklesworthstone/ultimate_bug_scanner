@@ -357,7 +357,7 @@ Options:
   --strict-gitignore           Respect .gitignore (and git check-ignore when rg missing)
 
   --only=1,2,3                 Run only these categories
-  --skip=4,9                   Skip these categories
+  --skip=4,9                   Skip categories
   --list-categories            Print category list and exit
 
   --rules=DIR[,DIR]            Extra ast-grep rule directories
@@ -466,7 +466,7 @@ parse_args() {
 # ── Legacy-parity bridge: record-less headers + summary json + exit code ────
 run_v2_legacy_parity_bridges_csharp(){
   local sink="$1" list_file="$2" scan_exit="$3" text_out="${4:-}" skip_csv="${5:-}" ast_ran="${6:-0}"
-  local files_n bridge_rc=0
+  local files_n bridge_rc=0 status_file="${7:-}"
   files_n="$(tr -dc '\0' <"$list_file" 2>/dev/null | wc -c)"
   local helpers_dir=""
   ubs_resolve_helpers_dir helpers_dir || helpers_dir="$SCRIPT_DIR/helpers"
@@ -475,15 +475,16 @@ run_v2_legacy_parity_bridges_csharp(){
     "$CI_MODE" "$FORMAT" "${SUMMARY_JSON:-}" \
     "${HAS_RG:-0}" "${HAS_AST_GREP:-0}" "${HAS_DOTNET:-0}" "${STRICT_GITIGNORE:-0}" \
     "$VERSION" "$NO_DOTNET" "$NO_DOTNET_FORMAT" \
-    "${ast_ran:-0}" <<'PYV2BRIDGE' || bridge_rc=$?
+    "${ast_ran:-0}" "$status_file" <<'PYV2BRIDGE' || bridge_rc=$?
 import datetime
 import json
 import os
 import sys
+from ubs_core.csharp_scan import read_execution_status
 
 (sink_path, text_out, files_raw, scan_exit_raw, skip_csv, fow_raw, fcrit_raw,
  fwarn_raw, ci_raw, fmt, summary_json, has_rg, has_ast, has_dotnet,
- strict_gi, version, no_dotnet, no_dotnet_format, ast_ran) = sys.argv[1:20]
+ strict_gi, version, no_dotnet, no_dotnet_format, ast_ran, status_file) = sys.argv[1:21]
 files_n = int(files_raw or 0)
 scan_exit = int(scan_exit_raw or 0)
 fail_on_warning = fow_raw == "1"
@@ -560,11 +561,7 @@ doc = {
     "findings": records,
 }
 if scan_exit not in (0, 1):
-    doc["module_error"] = "ANALYZER_ERROR"
-    doc["message"] = (
-        "C# analysis did not complete: an analysis layer failed; see this "
-        "module's stderr for which one"
-    )
+    doc.update(read_execution_status(status_file, scan_exit))
 if summary_json:
     try:
         with open(summary_json, "w", encoding="utf-8") as fh:
@@ -641,6 +638,8 @@ if as_text:
         elif num == 19 and resource_lifecycle == "clean":
             emit(f"{ok_icon} No obvious disposable/resource leaks detected by helper.")
     emit("")
+    if scan_exit not in (0, 1):
+        emit(f"Partial: [{doc['module_error']}] {doc['message']}")
     emit("Summary Statistics:")
     emit(f"  Files scanned: {files_n}")
     emit(f"  Critical issues: {counts['critical']}")
@@ -673,6 +672,9 @@ PYV2BRIDGE
 # ── Contract-v2 scan: ONE list, ONE orchestrator, optional ast-grep pack ────
 run_contract_v2_csharp(){
   local list_file sink exit_code=0 text_out="" ast_rule_dir=""
+  # The invocation-private directory prevents another run's status from
+  # being trusted after a crash. The existing EXIT cleanup owns this file.
+  local status_file="$TMP_DIR/execution.status.json"
   list_file="$(mktemp 2>/dev/null || mktemp -t ubs-csharpv2-list.XXXXXX)" || { echo "ERROR: cannot allocate temporary file list; analysis is incomplete" >&2; return 2; }
   sink="$(mktemp 2>/dev/null || mktemp -t ubs-csharpv2-sink.XXXXXX)" || { echo "ERROR: cannot allocate temporary findings sink; analysis is incomplete" >&2; return 2; }
   local helpers_dir=""
@@ -718,7 +720,7 @@ generate(Path(os.environ["UBS_CONTRACT_V2_CSHARP_AST_DIR"]), Path(user) if user 
       cp "$ast_rule_dir"/rules/*.yml "$DUMP_RULES_DIR/" 2>/dev/null || true
     fi
   fi
-  local -a scan_args=(--files-from "$list_file" --sink "$sink" --project-dir "$PROJECT_DIR" \
+  local -a scan_args=(--files-from "$list_file" --sink "$sink" --status-out "$status_file" --project-dir "$PROJECT_DIR" \
     --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}" --version "$VERSION" --detail-limit "$DETAIL_LIMIT")
   [[ -n "$v2_skip" ]] && scan_args+=(--skip "$v2_skip")
   [[ -n "$ast_rule_dir" ]] && scan_args+=(--ast-rule-dir "$ast_rule_dir")
@@ -736,7 +738,7 @@ generate(Path(os.environ["UBS_CONTRACT_V2_CSHARP_AST_DIR"]), Path(user) if user 
     PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" \
     python3 -m ubs_core.csharp_scan "${scan_args[@]}" || exit_code=$?
   run_v2_legacy_parity_bridges_csharp "$sink" "$list_file" "$exit_code" "$text_out" \
-    "$v2_skip" "$v2_ast_ran" || exit_code=$?
+    "$v2_skip" "$v2_ast_ran" "$status_file" || exit_code=$?
   if [[ -n "$text_out" ]]; then
     cat "$text_out" 2>/dev/null || true
     rm -f "$text_out" 2>/dev/null || true

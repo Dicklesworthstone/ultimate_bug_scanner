@@ -50,8 +50,9 @@ CONTEXT = "Microsoft.AspNetCore.Http.HttpContext"
 CONTROLLERS = frozenset({"Microsoft.AspNetCore.Mvc.ControllerBase", "Microsoft.AspNetCore.Mvc.Controller"})
 MAPPER = "Dapper.SqlMapper"
 COMMAND = "Dapper.CommandDefinition"
+MAIL_ADDRESS = "System.Net.Mail.MailAddress"
 KNOWN_TYPES = CONNECTIONS | CONTROLLERS | frozenset({
-    REQUEST, CONTEXT, MAPPER, COMMAND, "System.Type", "System.String",
+    REQUEST, CONTEXT, MAPPER, COMMAND, MAIL_ADDRESS, "System.Type", "System.String",
     "System.Object", "System.Boolean", "System.Int32", "System.Int64", "System.Data.CommandType",
 })
 PRIMITIVES = {"string": "System.String", "object": "System.Object", "bool": "System.Boolean",
@@ -346,6 +347,70 @@ class DapperFlow(CSharpFlow):
     def intrinsic_value(self, name, args, state, bindings, position):
         return api_fact("System.Type") if name == "typeof" else CLEAN
 
+    def sql_inert_mail_discard(self, call):
+        """Prove the selected BCL parse has no SQL or mutable-output effects.
+
+        The two-argument MailAddress.TryCreate overload accepts a string and
+        writes a MailAddress. With a true discard, only its Boolean result
+        escapes. This is not a general TryCreate sanitizer: argument evaluation
+        has already run, original input provenance is unchanged, and dynamic
+        dispatch, implicit conversions and output storage remain unsupported.
+        """
+        raw = self.raw_name(call.position, call.name)
+        qualifier, dot, method = raw.rpartition(".")
+        if not dot or method != "TryCreate" or len(call.args) != 2:
+            return False
+        # Generic syntax would denote a different (unmodeled) overload.
+        if self.code[call.name_end:call.opening].strip():
+            return False
+        if self.types.resolve(qualifier, call.position) != MAIL_ADDRESS:
+            return False
+        root = call.name.split(".")[0]
+        if not raw.startswith("global::"):
+            if root in call.bindings:
+                return False
+            # The CFG tracks local storage, not fields. A field named after
+            # an imported type/alias must not be mistaken for a static call.
+            without_imports = re.sub(
+                r"\b(?:global\s+)?using\s+(?:static\s+)?(?:@?\w+\s*=\s*)?[\w@.:]+\s*;",
+                "", self.code)
+            if re.search(r"(?:\b[\w@.<>:\[\]?]+\s+|,\s*)@?" + re.escape(root)
+                         + r"\s*(?:[=;,(){]|=>)", without_imports):
+                return False
+            if (any(item.static for item in self.types.visible_imports(call.position))
+                    or re.search(r"[<,]\s*@?" + re.escape(root) + r"\s*[,>]", self.code)):
+                return False
+        slots = {}
+        for index, (keyword, low, high) in enumerate(call.args):
+            slot = keyword if keyword is not None else ("address", "result")[index]
+            if slot not in {"address", "result"} or slot in slots:
+                return False
+            slots[slot] = index
+        if set(slots) != {"address", "result"}:
+            return False
+        _, low, high = call.args[slots["result"]]
+        if not re.fullmatch(r"\s*out\s+_\s*", self.code[low:high]) or "_" in call.bindings:
+            return False
+        # C# resolves out _ to a field/local when one exists. Declarations in
+        # this source, partial declarations and inherited members prevent a
+        # proof that it is a discard. Reject rather than erase unknown writes.
+        non_discards = re.sub(r"\bout\s+_(?!\w)", "", self.code)
+        if re.search(r"(?<![\w@])@?_\b", non_discards):
+            return False
+        if re.search(r"\bpartial\b", self.code):
+            return False
+        if any(scope.kind != "namespace" and scope.start < call.position < scope.end
+               and ":" in scope.bases for scope in self.types.scopes):
+            return False
+        index = slots["address"]
+        _, low, high = call.args[index]
+        code = self.code[low:high].strip()
+        original = self.text[low:high].strip()
+        literal = code == "0" and bool(re.match(r'(?:\$+@?|@\$?)?"', original))
+        return (literal or code == "null"
+                or (bool(re.fullmatch(r"@?\w+", code))
+                    and identities(call.values[index]) == {"System.String"}))
+
     def selected_call(self, call):
         """Return the SQL slot only after resolving receiver, overload and mode."""
         name, args, values, receiver = call.name, call.args, call.values, call.receiver
@@ -455,6 +520,8 @@ class DapperFlow(CSharpFlow):
         if raw in {"string.Format", "System.String.Format", "global::System.String.Format",
                    "string.Concat", "System.String.Concat", "global::System.String.Concat"}:
             return provenance(join(*values))
+        if self.sql_inert_mail_discard(call):
+            return CLEAN
         if any(re.match(r"\s*(?:ref|out)\b", self.code[low:high]) for _, low, high in args):
             self.incomplete(position, "Unresolved ref/out call effects require cross-file analysis")
         elif (identities(join(receiver, *values)) & (CONNECTIONS | {REQUEST, CONTEXT})
@@ -508,7 +575,7 @@ class DapperFlow(CSharpFlow):
             raise
         issues = sorted(set().union(*self.context_issues.values())) if self.context_issues else []
         if issues:
-            raise ValueError("C# SQL analysis is incomplete: " + "; ".join(issues[:12]))
+            raise AnalysisLimit("C# SQL analysis is incomplete: " + "; ".join(issues[:12]))
 
 
 def scan_file_findings(path: Path) -> Iterable[dict]:
@@ -516,18 +583,24 @@ def scan_file_findings(path: Path) -> Iterable[dict]:
     # Unrelated ASP.NET calls cannot create SQL effects when there is no SQL
     # execution demand. The second pass excludes comment/string decoys while
     # retaining executable interpolation holes and every selected call family.
-    if not SQL_CALL.search(text) or not SQL_CALL.search(masked_source(text)):
+    if not SQL_CALL.search(text):
         return
+    # Configuration and file access are infrastructure failures. Source
+    # syntax, supported semantics and bounded analysis are coverage failures.
     limits = policy_limits()
     suppressions = SourceSuppressions("csharp")
     try:
+        if not SQL_CALL.search(masked_source(text)):
+            return
         flow = DapperFlow(path, text, limits)
-    except RecursionError as exc:
-        raise AnalysisLimit("C# SQL parser recursion limit exceeded; analysis is incomplete") from exc
-    for finding in flow.analyze():
-        if not suppressions.is_suppressed(path, finding["line"], RULE):
-            finding.update(category=8, category_id="csharp.security", layer="taint", language="csharp")
-            yield finding
+        for finding in flow.analyze():
+            if not suppressions.is_suppressed(path, finding["line"], RULE):
+                finding.update(category=8, category_id="csharp.security", layer="taint", language="csharp")
+                yield finding
+    except AnalysisLimit:
+        raise
+    except (ValueError, RecursionError) as exc:
+        raise AnalysisLimit(f"C# SQL semantic coverage is incomplete: {exc}") from exc
 
 
 def run(ctx: RunContext) -> Iterable[dict]:

@@ -7,17 +7,20 @@ on:
       - .github/workflows/csharp-correctness.yml
       - test-suite/quality/csharp_correctness_candidate.py
       - test-suite/quality/test_csharp_result_receivers.py
-      - test-suite/quality/fixtures/csharp-correctness-candidate.json
+      - test-suite/quality/test_csharp_sql.py
+      - test-suite/quality/test_taint_csharp_dataflow.py
+      - test-suite/csharp/**
       - modules/helpers/ubs_core/csharp_patterns/**
       - modules/helpers/ubs_core/csharp_scan.py
-      - modules/helpers/ubs_core/analyzers/taint_csharp_sql.py
+      - modules/helpers/ubs_core/analyzers/taint_csharp_*.py
+      - modules/helpers/ubs_core/taint_flow.py
+      - modules/helpers/ubs_core/suppression.py
+      - modules/helpers/ubs_core/lexer.py
       - modules/ubs-csharp.sh
       - ubs
   workflow_dispatch:
-  # An explicitly requested rerun starts validation of current immutable main;
-  # no artifacts, scripts or code from the triggering run are consumed.
   workflow_run:
-    workflows: [JavaScript Module Taint]
+    workflows: [JavaScript Captured Writes]
     types: [in_progress]
     branches: [main]
 
@@ -28,10 +31,10 @@ jobs:
   correctness:
     if: >-
       github.event_name != 'workflow_run' ||
-      (github.event.workflow_run.id == 37832176871 &&
+      (github.event.workflow_run.id == 37832177573 &&
        github.event.workflow_run.run_attempt > 1 &&
        github.event.workflow_run.head_repository.full_name == github.repository)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 25
     permissions:
       contents: write
@@ -43,40 +46,98 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          # A workflow_run rerun validates immutable current main, never the
+          # triggering run's source, artifacts, commands or credentials.
           ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - name: Apply the exact reviewed candidate without committing it
-        id: candidate
+      - name: Prepare the remaining reviewed runner integration
         run: |
-          python3 - <<'PY'
-          import json, os, subprocess
-          from pathlib import Path
-          candidate = Path('test-suite/quality/fixtures/csharp-correctness-candidate.json')
-          if not candidate.exists():
-              with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-                  output.write('applied=false\n')
-              raise SystemExit(0)
-          edits = json.loads(candidate.read_text())['edits']
-          allowed = {'ubs', 'modules/ubs-csharp.sh',
-                     'modules/helpers/ubs_core/csharp_scan.py',
-                     'modules/helpers/ubs_core/csharp_patterns/_table.py',
-                     'modules/helpers/ubs_core/csharp_patterns/concurrency.py',
-                     'modules/helpers/ubs_core/analyzers/taint_csharp_sql.py'}
-          assert set(edits) == allowed, set(edits)
-          for name, changes in edits.items():
-              path = Path(name)
-              text = path.read_text()
-              for edit in changes:
-                  assert text.count(edit['old']) == edit['count'], (name, edit['old'])
-                  text = text.replace(edit['old'], edit['new'])
-              path.write_text(text)
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              output.write('applied=true\n')
-          print('CANDIDATE_BASE', subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip())
-          PY
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/csharp-runner.patch" <<'PATCH'
+          diff --git a/ubs b/ubs
+          --- a/ubs
+          +++ b/ubs
+          @@ -8049,12 +8049,13 @@
+             jq -c --arg status "$run_status" --argjson failed "$failed" \
+                   --arg reason "$reason" --arg message "$message" \
+                   --argjson exit_code "$exit_code" \
+          -        --argjson env_error "${HAS_ENV_ERROR:-0}" '
+          +        --argjson env_error "${HAS_ENV_ERROR:-0}" --argjson analysis_error "${HAS_ANALYSIS_ERROR:-0}" '
+               . + {status: $status, failed_modules: $failed}
+               + (if $reason == "" then {}
+                  else {reason: $reason, message: $message}
+                       + (if $exit_code == null then {} else {exit_code: $exit_code} end)
+          -            + (if $env_error == 1 then {error: "environment"} else {} end)
+          +            + (if $env_error == 1 then {error: "environment"}
+          +               elif $analysis_error == 1 then {error: "analysis"} else {} end)
+                  end)
+             ' "$COMBINED_JSON_FILE" >"$COMBINED_JSON_FILE.qualified" 2>/dev/null \
+               && mv "$COMBINED_JSON_FILE.qualified" "$COMBINED_JSON_FILE"
+          @@ -8712,9 +8713,28 @@
+               USABLE_SCANNERS="${USABLE_SCANNERS:-0}"
+             fi
+           fi
+          -# A module that exited 2 is an environment/tooling failure rather than a
+          -# code-quality result; it does not change what the healthy modules found, but
+          -# the run is incomplete either way.
+          +# Exit 2 also covers explicit semantic limits. Preserve incompleteness and
+          +# evidence, but do not tell users to repair their tools for missing coverage.
+          +# Text-mode modules carry this same identity in their Partial: [CODE] marker.
+          +# Missing/invalid reports and any infrastructure failure remain failures.
+          +HAS_ANALYSIS_ERROR=0
+          +if need_cmd jq; then
+          +  HAS_ANALYSIS_ERROR="$(printf '%s' "$FAILED_MODULES_JSON" | jq -r 'if length > 0 and all(.[]; .status == "partial" and .module_error == "ANALYSIS_INCOMPLETE") then 1 else 0 end' 2>/dev/null || echo 0)"
+          +  # Only reclassify failures with a named module and its explicit report.
+          +  # An infrastructure failure without such evidence must retain its identity.
+          +  if [[ ${#ENV_ERROR_LANGS[@]} -gt 0 ]]; then
+          +    actual_env_errors=()
+          +    for L in "${ENV_ERROR_LANGS[@]}"; do
+          +      if ! jq -e '.status == "partial" and .module_error == "ANALYSIS_INCOMPLETE"' "$TMPDIR_RUN/$L.json" >/dev/null 2>&1; then
+          +        actual_env_errors+=("$L")
+          +      fi
+          +    done
+          +    ENV_ERROR_LANGS=("${actual_env_errors[@]}")
+          +    HAS_ENV_ERROR=0
+          +    [[ ${#ENV_ERROR_LANGS[@]} -eq 0 ]] || HAS_ENV_ERROR=1
+          +  fi
+          +fi
+          +# Other abnormal outcomes retain the existing execution-failure identity.
+           if [[ "$HAS_ENV_ERROR" -eq 1 && "$RUN_STATUS" == "ok" ]]; then
+             RUN_STATUS="partial"
+           fi
+          @@ -8768,7 +8788,9 @@
+           
+           incomplete_run_reason(){
+             if [[ "${FINDINGS_MERGE_FAILED:-0}" -eq 1 ]]; then printf 'findings-merge-failed'; return; fi
+          -  if [[ "${HAS_ENV_ERROR:-0}" -eq 1 ]]; then printf 'module-failed'; else printf 'module-incomplete'; fi
+          +  if [[ "${HAS_ENV_ERROR:-0}" -eq 1 ]]; then printf 'module-failed'
+          +  elif [[ "${HAS_ANALYSIS_ERROR:-0}" -eq 1 ]]; then printf 'analysis-incomplete'
+          +  else printf 'module-incomplete'; fi
+           }
+           
+           incomplete_run_message(){
+          @@ -8778,6 +8800,8 @@
+             fi
+             if [[ "${HAS_ENV_ERROR:-0}" -eq 1 ]]; then
+               printf 'One or more scanner modules could not run (tooling/dependency problem, not a code-quality failure): %s' "${ENV_ERROR_LANGS[*]}"
+          +  elif [[ "${HAS_ANALYSIS_ERROR:-0}" -eq 1 ]]; then
+          +    printf 'Semantic analysis coverage is incomplete; supported findings are preserved, but unsupported code was not proven safe'
+             else
+               printf 'One or more scanner modules did not complete; this result covers only the languages that finished'
+             fi
+          PATCH
+          # Exact contextual application only. Already-integrated source is
+          # validated normally; conflicting source is not guessed or replaced.
+          if git apply --reverse --check "$RUNNER_TEMP/csharp-runner.patch" 2>/dev/null; then
+            echo 'Runner integration is already present.'
+          else
+            git apply --check "$RUNNER_TEMP/csharp-runner.patch"
+            git apply "$RUNNER_TEMP/csharp-runner.patch"
+          fi
+          git rev-parse HEAD > "$RUNNER_TEMP/csharp-source-base.txt"
       - name: Install real scanner dependencies
         run: |
           sudo apt-get update
@@ -92,30 +153,31 @@ jobs:
           bash -n ubs
           bash -n modules/ubs-csharp.sh
           shellcheck -S warning ubs modules/ubs-csharp.sh
+          git diff --binary > "$RUNNER_TEMP/csharp-tested.patch"
       - name: Receiver classification and both public issue reproductions
         env:
           UBS_CSHARP_CORRECTNESS_PUBLIC: '1'
         run: |
-          python3 test-suite/quality/test_csharp_result_receivers.py -v
-          python3 test-suite/quality/csharp_correctness_candidate.py -v
+          set -o pipefail
+          python3 test-suite/quality/test_csharp_result_receivers.py -v 2>&1 | tee "$RUNNER_TEMP/csharp-receivers.log"
+          python3 test-suite/quality/csharp_correctness_candidate.py -v 2>&1 | tee "$RUNNER_TEMP/csharp-contracts.log"
       - name: Existing CSharp SQL and request dataflow regressions
         env:
           UBS_CSHARP_SQL_PUBLIC: '1'
         run: |
-          python3 test-suite/quality/test_csharp_sql.py -v
-          python3 -m unittest discover -s test-suite/quality -p test_taint_csharp_dataflow.py -v
-          python3 -m unittest discover -s test-suite/csharp/tests -p 'test_*.py' -v
-      - name: Confirm deterministic integrity after real scanner execution
+          set -o pipefail
+          python3 test-suite/quality/test_csharp_sql.py -v 2>&1 | tee "$RUNNER_TEMP/csharp-sql.log"
+          python3 -m unittest discover -s test-suite/quality -p test_taint_csharp_dataflow.py -v 2>&1 | tee "$RUNNER_TEMP/csharp-flow.log"
+          python3 -m unittest discover -s test-suite/csharp/tests -p 'test_*.py' -v 2>&1 | tee "$RUNNER_TEMP/csharp-existing.log"
+      - name: Require immutable tested bytes and deterministic integrity
         run: |
-          git diff --binary > "$RUNNER_TEMP/csharp-before.patch"
           python3 scripts/update_checksums.py
           ./scripts/update_sha256sums.sh
           git diff --binary > "$RUNNER_TEMP/csharp-after.patch"
-          cmp "$RUNNER_TEMP/csharp-before.patch" "$RUNNER_TEMP/csharp-after.patch"
+          cmp "$RUNNER_TEMP/csharp-tested.patch" "$RUNNER_TEMP/csharp-after.patch"
           ./scripts/verify_checksums.sh
           ./scripts/verify_sha256sums.sh
-      - name: Stage verified Git blobs only; publishing remains an explicit connector operation
-        if: steps.candidate.outputs.applied == 'true'
+      - name: Stage verified blobs for explicit publication to main
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -124,15 +186,10 @@ jobs:
           from pathlib import Path
           def git(*args):
               return subprocess.check_output(['git', *args], text=True).strip()
-          paths = git('diff', '--name-only').splitlines()
-          allowed = {'ubs', 'SHA256SUMS', 'scripts/new-module.sh', 'modules/lib/ubs-common.sh',
-                     'modules/helpers/ubs_core/csharp_scan.py',
-                     'modules/helpers/ubs_core/csharp_patterns/_table.py',
-                     'modules/helpers/ubs_core/csharp_patterns/concurrency.py',
-                     'modules/helpers/ubs_core/analyzers/taint_csharp_sql.py'}
+          allowed = {'ubs', 'SHA256SUMS', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh'}
           allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
+          paths = git('diff', '--name-only').splitlines()
           assert set(paths) <= allowed, set(paths) - allowed
-          assert {'ubs', 'SHA256SUMS', 'modules/helpers/ubs_core/analyzers/taint_csharp_sql.py'} <= set(paths), paths
           manifest = {'base': git('rev-parse', 'HEAD'), 'files': []}
           for name in paths:
               data = Path(name).read_bytes()
@@ -144,19 +201,24 @@ jobs:
               with urllib.request.urlopen(request, timeout=60) as response:
                   sha = json.load(response)['sha']
               assert sha == hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-              mode = git('ls-files', '-s', '--', name).split()[0]
-              item = {'path':name, 'mode':mode, 'type':'blob', 'sha':sha,
-                      'old_sha':git('rev-parse', 'HEAD:' + name)}
+              item = {'path':name, 'mode':git('ls-files', '-s', '--', name).split()[0],
+                      'type':'blob', 'sha':sha, 'old_sha':git('rev-parse', 'HEAD:' + name)}
               manifest['files'].append(item)
               print('CSHARP_VERIFIED_BLOB ' + json.dumps(item), flush=True)
           Path(os.environ['RUNNER_TEMP'], 'csharp-verified-blobs.json').write_text(json.dumps(manifest, indent=2))
           print('CSHARP_VERIFIED_BASE ' + manifest['base'], flush=True)
           PY
+      - name: Preserve exact source and test evidence
+        if: always()
+        run: |
+          git status --short > "$RUNNER_TEMP/csharp-source-status.txt"
+          git ls-files -s > "$RUNNER_TEMP/csharp-source-index.txt"
+          git ls-files -z | tar --null -T - -czf "$RUNNER_TEMP/csharp-source.tar.gz"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: csharp-correctness-evidence
+          retention-days: 7
           path: |
-            ${{ runner.temp }}/csharp-*.patch
-            ${{ runner.temp }}/csharp-verified-blobs.json
+            ${{ runner.temp }}/csharp-*
             test-suite/artifacts/dapper-independent

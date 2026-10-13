@@ -15,6 +15,9 @@ First published release since v5.4.17. It includes everything under the git-only
 ### Known issues
 
 - **Elixir scans can end partial (exit 2) where v5.4.17 exited 0** (#168). A public function that calls `apply/2,3`, or a file that runs SQL (`Ecto.Adapters.SQL`, a `Repo` query) and also calls `Code.eval_*` or passes a callback to a function the engine does not model (`spawn`, `Task.async`, `Enum.reduce`, ...), makes the Elixir module report "analysis incomplete". Findings are still reported. `UBS_ALLOW_PARTIAL=1` returns the findings exit code (0 or 1) instead of 2. The engine treats such calls as unknown execution on purpose; #168 proposes treating calls that no request data reaches as opaque.
+- **C# scans can end partial (exit 2) where v5.4.17 exited 0** (#171). In a file that contains a SQL sink, a `ref`/`out` call the C# SQL engine cannot resolve (`MailAddress.TryCreate(raw, out _)`, a cross-file helper, Dapper dispatch) makes the C# module report "analysis incomplete", even when the SQL is parameterized and the call is unrelated. The run reports `error: environment`, but `ubs doctor` has nothing to fix. Findings are still reported; `UBS_ALLOW_PARTIAL=1` returns the findings exit code. Same mechanism as the Elixir case above.
+- **Concurrent scans can fail with "extracted ast-grep did not execute correctly"** (#170, also in v5.4.17). When `ast-grep` is not on `PATH`, every run re-extracts the cached ast-grep binary over itself, so a scan that starts while another is extracting can execute a half-written file and exit 2. Putting an `ast-grep` binary on `PATH` avoids the cache.
+- **C# `cs.pattern.blocking-result` reports any `.Result`** (#169, also in v5.4.17): a record or tuple member named `Result`, and comments, are reported as critical blocking calls, not only `Task.Result`.
 
 ### Changed
 

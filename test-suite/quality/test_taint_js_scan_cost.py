@@ -33,6 +33,21 @@ from ubs_core.analyzers import taint_js  # noqa: E402
 from ubs_core.registry import RunContext  # noqa: E402
 
 
+def gnu_time() -> str:
+    """GNU time from PATH; the peak-RSS checks need its `-f %M -o FILE` (issue #166).
+
+    A missing or non-GNU `time` fails the test by name. Nothing is skipped
+    and no RSS figure is substituted.
+    """
+    found = shutil.which("time")
+    if found is None:
+        raise AssertionError("GNU time is not on PATH; the peak-RSS checks need `time -f %M -o FILE`")
+    probe = subprocess.run([found, "--version"], capture_output=True, text=True, timeout=10)
+    if "GNU" not in probe.stdout + probe.stderr:
+        raise AssertionError(f"{found} is not GNU time; the peak-RSS checks need `time -f %M -o FILE`")
+    return found
+
+
 class RouteParamObjectTests(unittest.TestCase):
     def test_accepts_the_same_forms(self) -> None:
         for expr in ("params", "  params  ", "(params)", "( params )", "await params",
@@ -791,7 +806,7 @@ class SinkFreeComponentCostTests(unittest.TestCase):
                 env = dict(os.environ, PYTHONPATH=str(HELPERS_DIR))
                 peak = artifacts / "peak-rss-kib.txt"
                 result = subprocess.run(
-                    ["/usr/bin/time", "-f", "%M", "-o", str(peak), sys.executable,
+                    [gnu_time(), "-f", "%M", "-o", str(peak), sys.executable,
                      "-c", script, str(root)],
                     cwd=root, env=env, capture_output=True, text=True, timeout=60,
                 )
@@ -855,7 +870,7 @@ class ProjectMemoryTests(unittest.TestCase):
                 with (artifacts / "result.json").open("w", encoding="utf-8") as stdout, \
                         (artifacts / "stderr.log").open("w", encoding="utf-8") as stderr:
                     result = subprocess.run(
-                        ["/usr/bin/time", "-f", "%M", "-o", str(peak),
+                        [gnu_time(), "-f", "%M", "-o", str(peak),
                          str(REPO_ROOT / "ubs"), str(sources), "--only=js", "--ci", "--format=json"],
                         cwd=root, env=env, stdout=stdout, stderr=stderr, timeout=300,
                     )

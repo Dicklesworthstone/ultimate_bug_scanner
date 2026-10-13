@@ -31,6 +31,21 @@ from ubs_core.js_scan import (  # noqa: E402
 )
 
 
+def gnu_time() -> str:
+    """GNU time from PATH; the peak-RSS checks need its `-f %M -o FILE` (issue #166).
+
+    A missing or non-GNU `time` fails the test by name. Nothing is skipped
+    and no RSS figure is substituted.
+    """
+    found = shutil.which("time")
+    if found is None:
+        raise AssertionError("GNU time is not on PATH; the peak-RSS checks need `time -f %M -o FILE`")
+    probe = subprocess.run([found, "--version"], capture_output=True, text=True, timeout=10)
+    if "GNU" not in probe.stdout + probe.stderr:
+        raise AssertionError(f"{found} is not GNU time; the peak-RSS checks need `time -f %M -o FILE`")
+    return found
+
+
 def _pat(**overrides) -> Pattern:
     fields = dict(
         category=11,
@@ -231,7 +246,7 @@ class TextReportMemoryTests(unittest.TestCase):
                 # Exercise the production bridge independently of the scanner:
                 # it must retain findings and the scanner's incomplete exit.
                 result = subprocess.run(
-                    ["/usr/bin/time", "-f", "%M", "-o", str(peak),
+                    [gnu_time(), "-f", "%M", "-o", str(peak),
                      "bash", str(script), str(sink), str(files), "2", str(text_out)],
                     cwd=root, env=env, capture_output=True, text=True, timeout=60,
                 )
@@ -290,7 +305,7 @@ class TextReportMemoryTests(unittest.TestCase):
                 env = os.environ.copy()
                 env["PYTHONPATH"] = str(HELPERS_DIR)
                 result = subprocess.run(
-                    ["/usr/bin/time", "-f", "%M", "-o", str(peak), sys.executable,
+                    [gnu_time(), "-f", "%M", "-o", str(peak), sys.executable,
                      "-c", script, str(sink), str(report)],
                     cwd=root, env=env, capture_output=True, text=True, timeout=60,
                 )
@@ -357,7 +372,7 @@ class JsonReportMemoryTests(unittest.TestCase):
             )
             env = dict(os.environ, PYTHONPATH=str(HELPERS_DIR))
             result = subprocess.run(
-                ["/usr/bin/time", "-f", "%M", "-o", str(peak), sys.executable,
+                [gnu_time(), "-f", "%M", "-o", str(peak), sys.executable,
                  "-c", script, str(report)],
                 cwd=root, env=env, capture_output=True, text=True, timeout=60,
             )

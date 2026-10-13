@@ -1,10 +1,15 @@
 {
   "checks": [
     {
-      "args": ["--format=sarif"],
+      "args": [
+        "--format=sarif"
+      ],
       "driver_rule_count": 0,
       "driver_rule_ids": [],
-      "expected_rule_ids": ["js.eval-call", "js.innerHTML-assign"],
+      "expected_rule_ids": [
+        "js.eval-call",
+        "js.innerHTML-assign"
+      ],
       "fixture": "test-suite/js/buggy/security.js",
       "label": "js-rule-pack",
       "module": "ubs-js.sh",
@@ -21,10 +26,14 @@
       "sarif_runs": 1
     },
     {
-      "args": ["--format=sarif"],
+      "args": [
+        "--format=sarif"
+      ],
       "driver_rule_count": 0,
       "driver_rule_ids": [],
-      "expected_rule_ids": ["go.exec-sh-c"],
+      "expected_rule_ids": [
+        "go.exec-sh-c"
+      ],
       "fixture": "test-suite/golang/buggy/security_sql.go",
       "label": "go-rule-pack",
       "module": "ubs-golang.sh",
@@ -41,7 +50,11 @@
       "sarif_runs": 1
     },
     {
-      "args": ["--format=sarif", "--no-dotnet", "--only=17"],
+      "args": [
+        "--format=sarif",
+        "--no-dotnet",
+        "--only=17"
+      ],
       "driver_rule_count": 0,
       "driver_rule_ids": [],
       "expected_rule_ids": [
@@ -103,7 +116,10 @@
       "sarif_runs": 1
     },
     {
-      "args": ["--no-cargo", "--format=sarif"],
+      "args": [
+        "--no-cargo",
+        "--format=sarif"
+      ],
       "driver_rule_count": 0,
       "driver_rule_ids": [],
       "expected_rule_ids": [
@@ -222,7 +238,9 @@
       "sarif_runs": 1
     },
     {
-      "args": ["--format=sarif"],
+      "args": [
+        "--format=sarif"
+      ],
       "driver_rule_count": 0,
       "driver_rule_ids": [],
       "expected_rule_ids": [
@@ -252,7 +270,7 @@
       "fixture": "test-suite/swift/ast_grep_rule_pack_coverage.swift",
       "label": "swift-rule-pack",
       "module": "ubs-swift.sh",
-      "result_count": 43,
+      "result_count": 42,
       "result_rule_ids": [
         "swift.abort-call",
         "swift.assertion-failure",
@@ -269,7 +287,6 @@
         "swift.force-cast",
         "swift.force-try",
         "swift.keyed-unarchiver",
-        "swift.lifecycle.timer",
         "swift.lifecycle.urlsession_task",
         "swift.md5-digest",
         "swift.memory.timers",
@@ -297,7 +314,9 @@
       "sarif_runs": 1
     },
     {
-      "args": ["--format=sarif"],
+      "args": [
+        "--format=sarif"
+      ],
       "driver_rule_count": 0,
       "driver_rule_ids": [],
       "expected_rule_ids": [
@@ -368,7 +387,10 @@
       "sarif_runs": 1
     },
     {
-      "args": ["--format=sarif", "--no-build"],
+      "args": [
+        "--format=sarif",
+        "--no-build"
+      ],
       "driver_rule_count": 0,
       "driver_rule_ids": [],
       "expected_rule_ids": [
@@ -451,7 +473,10 @@
       "sarif_runs": 1
     },
     {
-      "args": ["--format=sarif", "--no-mix"],
+      "args": [
+        "--format=sarif",
+        "--no-mix"
+      ],
       "driver_rule_count": 0,
       "driver_rule_ids": [],
       "expected_rule_ids": [
@@ -527,14 +552,19 @@
   ],
   "corpus_checks": [
     {
-      "args": ["--format=sarif"],
+      "args": [
+        "--format=sarif"
+      ],
       "driver_rule_count": 0,
       "driver_rule_ids": [],
-      "expected_rule_ids": ["js.eval-call", "js.innerHTML-assign"],
+      "expected_rule_ids": [
+        "js.eval-call",
+        "js.innerHTML-assign"
+      ],
       "fixture": "test-suite/js",
       "label": "js-rule-pack",
       "module": "ubs-js.sh",
-      "result_count": 1018,
+      "result_count": 1015,
       "result_rule_ids": [
         "javascript.ctcompare.unsafe_secret_compare",
         "javascript.guards.deep_unguarded_chain",
@@ -653,10 +683,14 @@
       "sarif_runs": 1
     },
     {
-      "args": ["--format=sarif"],
+      "args": [
+        "--format=sarif"
+      ],
       "driver_rule_count": 0,
       "driver_rule_ids": [],
-      "expected_rule_ids": ["go.exec-sh-c"],
+      "expected_rule_ids": [
+        "go.exec-sh-c"
+      ],
       "fixture": "test-suite/golang",
       "label": "go-rule-pack",
       "module": "ubs-golang.sh",
@@ -731,7 +765,11 @@
       "sarif_runs": 1
     },
     {
-      "args": ["--format=sarif", "--no-dotnet", "--only=17"],
+      "args": [
+        "--format=sarif",
+        "--no-dotnet",
+        "--only=17"
+      ],
       "driver_rule_count": 0,
       "driver_rule_ids": [],
       "expected_rule_ids": [
@@ -793,7 +831,10 @@
       "sarif_runs": 1
     },
     {
-      "args": ["--no-cargo", "--format=sarif"],
+      "args": [
+        "--no-cargo",
+        "--format=sarif"
+      ],
       "driver_rule_count": 0,
       "driver_rule_ids": [],
       "expected_rule_ids": [
@@ -831,7 +872,7 @@
       "fixture": "test-suite/rust",
       "label": "rust-rule-pack",
       "module": "ubs-rust.sh",
-      "result_count": 644,
+      "result_count": 642,
       "result_rule_ids": [
         "rust.allocation.format-literal",
         "rust.allocation.to-owned-to-string",
@@ -935,7 +976,9 @@
       "sarif_runs": 1
     },
     {
-      "args": ["--format=sarif"],
+      "args": [
+        "--format=sarif"
+      ],
       "driver_rule_count": 0,
       "driver_rule_ids": [],
       "expected_rule_ids": [
@@ -965,7 +1008,7 @@
       "fixture": "test-suite/swift",
       "label": "swift-rule-pack",
       "module": "ubs-swift.sh",
-      "result_count": 195,
+      "result_count": 196,
       "result_rule_ids": [
         "swift.abort-call",
         "swift.assertion-failure",
@@ -1025,7 +1068,9 @@
       "sarif_runs": 1
     },
     {
-      "args": ["--format=sarif"],
+      "args": [
+        "--format=sarif"
+      ],
       "driver_rule_count": 0,
       "driver_rule_ids": [],
       "expected_rule_ids": [
@@ -1096,7 +1141,10 @@
       "sarif_runs": 1
     },
     {
-      "args": ["--format=sarif", "--no-build"],
+      "args": [
+        "--format=sarif",
+        "--no-build"
+      ],
       "driver_rule_count": 0,
       "driver_rule_ids": [],
       "expected_rule_ids": [
@@ -1181,7 +1229,10 @@
       "sarif_runs": 1
     },
     {
-      "args": ["--format=sarif", "--no-mix"],
+      "args": [
+        "--format=sarif",
+        "--no-mix"
+      ],
       "driver_rule_count": 0,
       "driver_rule_ids": [],
       "expected_rule_ids": [
@@ -1215,7 +1266,7 @@
       "fixture": "test-suite/elixir",
       "label": "elixir-rule-pack",
       "module": "ubs-elixir.sh",
-      "result_count": 299,
+      "result_count": 311,
       "result_rule_ids": [
         "elixir.binary-to-term-unsafe",
         "elixir.code-eval-file",
@@ -1248,7 +1299,6 @@
         "ex.archive-extraction.path",
         "ex.debug.io-inspect",
         "ex.header-injection.response",
-        "ex.io.port-open-unmatched",
         "ex.match.unguarded-heads",
         "ex.otp.process-exit-kill",
         "ex.otp.spawn-usage",
@@ -1259,6 +1309,7 @@
         "ex.security.code-eval",
         "ex.security.shell-exec-critical",
         "ex.security.shell-exec-review",
+        "ex.security.sql-interpolation",
         "ex.security.string-to-atom",
         "ex.security.weak-hash",
         "ex.ssrf.outbound-url"
@@ -1269,7 +1320,9 @@
   "list_rule_validation": [
     {
       "label": "js-rule-pack",
-      "list_args": ["--list-rules"],
+      "list_args": [
+        "--list-rules"
+      ],
       "module": "ubs-js.sh",
       "rule_count": 37,
       "rule_ids": [
@@ -1314,7 +1367,9 @@
     },
     {
       "label": "go-rule-pack",
-      "list_args": ["--list-rules"],
+      "list_args": [
+        "--list-rules"
+      ],
       "module": "ubs-golang.sh",
       "rule_count": 65,
       "rule_ids": [
@@ -1387,7 +1442,9 @@
     },
     {
       "label": "csharp-rule-pack",
-      "list_args": ["--list-rules"],
+      "list_args": [
+        "--list-rules"
+      ],
       "module": "ubs-csharp.sh",
       "rule_count": 24,
       "rule_ids": [
@@ -1419,7 +1476,10 @@
     },
     {
       "label": "rust-rule-pack",
-      "list_args": ["--no-cargo", "--list-rules"],
+      "list_args": [
+        "--no-cargo",
+        "--list-rules"
+      ],
       "module": "ubs-rust.sh",
       "rule_count": 151,
       "rule_ids": [
@@ -1578,7 +1638,9 @@
     },
     {
       "label": "swift-rule-pack",
-      "list_args": ["--list-rules"],
+      "list_args": [
+        "--list-rules"
+      ],
       "module": "ubs-swift.sh",
       "rule_count": 22,
       "rule_ids": [
@@ -1608,7 +1670,9 @@
     },
     {
       "label": "ruby-rule-pack",
-      "list_args": ["--list-rules"],
+      "list_args": [
+        "--list-rules"
+      ],
       "module": "ubs-ruby.sh",
       "rule_count": 29,
       "rule_ids": [
@@ -1645,7 +1709,9 @@
     },
     {
       "label": "java-rule-pack",
-      "list_args": ["--list-rules"],
+      "list_args": [
+        "--list-rules"
+      ],
       "module": "ubs-java.sh",
       "rule_count": 37,
       "rule_ids": [
@@ -1690,7 +1756,9 @@
     },
     {
       "label": "elixir-rule-pack",
-      "list_args": ["--list-rules"],
+      "list_args": [
+        "--list-rules"
+      ],
       "module": "ubs-elixir.sh",
       "rule_count": 26,
       "rule_ids": [
@@ -1725,12 +1793,18 @@
   ],
   "per_rule_validation": [
     {
-      "dump_args": ["--dump-rules={rules_dir}"],
+      "dump_args": [
+        "--dump-rules={rules_dir}"
+      ],
       "fixture": "test-suite/js/buggy/security.js",
       "generated_corpus_check": {
-        "config": ["sgconfig-javascript.yml", "sgconfig-typescript.yml", "sgconfig-tsx.yml"],
+        "config": [
+          "sgconfig-javascript.yml",
+          "sgconfig-typescript.yml",
+          "sgconfig-tsx.yml"
+        ],
         "fixture": "test-suite/js",
-        "result_count": 202,
+        "result_count": 199,
         "result_rule_ids": [
           "js.async.await-no-try",
           "js.async.dangling-promise",
@@ -2420,7 +2494,9 @@
       ]
     },
     {
-      "dump_args": ["--dump-rules={rules_dir}"],
+      "dump_args": [
+        "--dump-rules={rules_dir}"
+      ],
       "fixture": "test-suite/golang/buggy/security_sql.go",
       "label": "go-rule-pack",
       "module": "ubs-golang.sh",
@@ -3209,7 +3285,10 @@
       ]
     },
     {
-      "dump_args": ["--dump-rules={rules_dir}", "--no-dotnet"],
+      "dump_args": [
+        "--dump-rules={rules_dir}",
+        "--no-dotnet"
+      ],
       "fixture": "test-suite/csharp/buggy/AstRulePackBuggy.cs",
       "label": "csharp-rule-pack",
       "module": "ubs-csharp.sh",
@@ -3362,7 +3441,11 @@
       ]
     },
     {
-      "dump_args": ["--no-cargo", "--dump-rules={rules_dir}", "--list-rules"],
+      "dump_args": [
+        "--no-cargo",
+        "--dump-rules={rules_dir}",
+        "--list-rules"
+      ],
       "fixture": "test-suite/rust/buggy/ast_grep_rule_pack_coverage.rs",
       "generated_corpus_check": {
         "config": "sgconfig-rust.yml",
@@ -4435,7 +4518,9 @@
       ]
     },
     {
-      "dump_args": ["--dump-rules={rules_dir}"],
+      "dump_args": [
+        "--dump-rules={rules_dir}"
+      ],
       "fixture": "test-suite/swift/ast_grep_rule_pack_coverage.swift",
       "generated_corpus_check": {
         "config": "sgconfig-swift.yml",
@@ -4605,7 +4690,9 @@
       ]
     },
     {
-      "dump_args": ["--dump-rules={rules_dir}"],
+      "dump_args": [
+        "--dump-rules={rules_dir}"
+      ],
       "fixture": "test-suite/ruby/ast_grep_rule_pack_coverage.rb",
       "label": "ruby-rule-pack",
       "module": "ubs-ruby.sh",
@@ -4788,7 +4875,10 @@
       ]
     },
     {
-      "dump_args": ["--dump-rules={rules_dir}", "--no-build"],
+      "dump_args": [
+        "--dump-rules={rules_dir}",
+        "--no-build"
+      ],
       "fixture": "test-suite/java/ast_grep_rule_pack_coverage.java",
       "label": "java-rule-pack",
       "module": "ubs-java.sh",
@@ -5019,7 +5109,10 @@
       ]
     },
     {
-      "dump_args": ["--dump-rules={rules_dir}", "--no-mix"],
+      "dump_args": [
+        "--dump-rules={rules_dir}",
+        "--no-mix"
+      ],
       "fixture": "test-suite/elixir/ast_grep_rule_pack_coverage.ex",
       "generated_corpus_check": {
         "config": "sgconfig-elixir.yml",

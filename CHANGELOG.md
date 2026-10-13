@@ -45,6 +45,7 @@ First published release since v5.4.17. It includes everything under the git-only
 
 ### Fixed
 
+- `react.list-missing-key` now checks JSX list roots instead of every static self-closing element. It recognizes paired roots and fragments, actual `key` attributes, and inline `map`, `flatMap` and `Array.from` mapper returns. Nested children, unrelated callback arguments and local JSX values no longer produce missing-key findings. The rule ID and warning severity are unchanged; TSX and JSX regression scans cover both intended clean cases and real missing keys.
 - `py.io.open-no-encoding` no longer fires on a callee whose name merely ends in "open" (#167). `subprocess.Popen(...)`, `urlopen(...)`, `os.popen(...)` and `os.fdopen(...)` matched the `open(` substring and were reported as text-mode file opens. The rule now requires `open(...)` itself or an `.open(...)` method.
 - A JavaScript `for...of` over a non-empty array literal runs its first iteration, so request data captured by a closure assigned inside the loop is no longer reported clean (#163).
 - A JavaScript loop whose condition has side effects reaches a fixed point instead of exhausting the taint budget (#164).

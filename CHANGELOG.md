@@ -10,6 +10,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+_No changes yet._
+
+---
+
+## [v5.5.0] - 2026-10-13 [Release]
+
 First published release since v5.4.17. It includes everything under the git-only tags v5.4.18 and v5.4.19 below, which never had release assets, and the work that moved `VERSION` from 5.4.20 to 5.4.40 on `main` without a tag. Installs that update through `ubs --update` or the installer go from v5.4.17 straight to this version.
 
 ### Known issues

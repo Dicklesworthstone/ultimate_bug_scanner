@@ -679,7 +679,9 @@ class ScanConfigWatchTests(ScanConfigFixture, unittest.TestCase):
             transitions = iter((
                 lambda: self.config({"skip": [7]}, root=nested),
                 lambda: self.config({"skip": []}, root=nested),
-                lambda: config.rename(self.work / "saved-nested-policy.json"),
+                # This project lives under TMPDIR, which may be another
+                # filesystem than the artifacts dir; rename(2) would fail there.
+                lambda: shutil.move(config, self.work / "saved-nested-policy.json"),
                 lambda: self.git("init", "-q", "-b", "main"),
                 lambda: self.config({"skip": []}),
             ))

@@ -1163,7 +1163,11 @@ def watch_config_path(root: Path, names: list[str]) -> str:
         selected = paths[0] if len(paths) == 1 else root
         anchor = selected if selected.is_dir() else selected.parent
         if not anchor.is_relative_to(root):
-            raise ServiceError('Selected path is outside the served repository')
+            # A watched path replaced by a link out of the repository is an
+            # invalid input: watch_inputs reports it and the watch continues.
+            # Policy discovery stays inside the served root instead of
+            # ending the watch.
+            anchor = root
         project = anchor
         for candidate in (anchor, *anchor.parents):
             if (candidate / '.git').exists():

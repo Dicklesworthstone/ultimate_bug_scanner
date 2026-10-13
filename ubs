@@ -31,7 +31,7 @@ trap '' SIGPIPE 2>/dev/null || true
 UBS_VERSION="5.4.40"
 # The optional service is a release executable, not a command trusted via PATH.
 # scripts/update_checksums.py keeps this pin in sync with ubs-daemon.
-UBS_DAEMON_SHA256="cf7f4bc306b71fb786083c2b1ece758ae4d7e89677564b101d3cd5e917a7730b"
+UBS_DAEMON_SHA256="617d8d283c2caac455991cff4ef67b7e36be9933e989130bdeae0e935b30e8a0"
 
 # Route service commands before scan setup, dependency probes or self-updates.
 # Execute the exact bytes checked below, not a path that can change after hashing.

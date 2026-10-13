@@ -181,6 +181,28 @@ def swift_close(tokens, start):
     raise ValueError('Unbalanced Swift delimiters; analysis is incomplete')
 
 
+def swift_validated_tokens(text):
+    """Always validate lexical structure before deciding a policy is inapplicable."""
+    tokens = SwiftLexer(text).scan()
+    swift_validate_structure(tokens)
+    return tokens
+
+
+def swift_validate_structure(tokens):
+    cursor = 0
+    while cursor < len(tokens):
+        token = tokens[cursor]
+        if token.kind == 'code' and token.value in {'(', '[', '{'}:
+            cursor = swift_close(tokens, cursor)
+        elif token.kind == 'code' and token.value in {')', ']', '}'}:
+            raise ValueError('Unbalanced Swift delimiters; analysis is incomplete')
+        cursor += 1
+    # Do not miss a template nested inside an already balanced outer group.
+    for token in tokens:
+        for part in token.parts:
+            swift_validate_structure(part)
+
+
 def swift_parts(tokens, separators, generics=False):
     result, start, cursor, angles = [], 0, 0, 0
     while cursor < len(tokens):
@@ -225,19 +247,12 @@ class SwiftFunction:
     body: tuple = ()
     static: bool = False
     return_type: str = ''
+    parameter_attributes: tuple = ()
 
 
 class SwiftParser:
-    def __init__(self, text):
-        self.tokens = SwiftLexer(text).scan()
-        cursor = 0
-        while cursor < len(self.tokens):
-            token = self.tokens[cursor]
-            if token.kind == 'code' and token.value in {'(', '[', '{'}:
-                cursor = swift_close(self.tokens, cursor)
-            elif token.kind == 'code' and token.value in {')', ']', '}'}:
-                raise ValueError('Unbalanced Swift delimiters; analysis is incomplete')
-            cursor += 1
+    def __init__(self, text, tokens=None):
+        self.tokens = swift_validated_tokens(text) if tokens is None else tokens
         self.functions, self.types, self.extensions, self.final_types = {}, set(), set(), set()
         body = self.block(self.tokens, (), (), declarations=True)
         self.functions[-1] = SwiftFunction(-1, '<script>', (), (), (), body)
@@ -296,7 +311,7 @@ class SwiftParser:
                 if opening >= len(tokens) or tokens[opening].value != '(':
                     raise ValueError('Unsupported Swift function declaration; analysis is incomplete')
                 close = swift_close(tokens, opening)
-                parameters = []
+                parameters, parameter_attributes = [], []
                 for part in swift_parts(tokens[opening + 1:close], {','}, generics=True):
                     part = swift_ungroup(part)
                     if not part:
@@ -304,13 +319,25 @@ class SwiftParser:
                     pieces = swift_parts(part, {':'})
                     if len(pieces) != 2:
                         raise ValueError('Unsupported Swift parameter binding; analysis is incomplete')
-                    names = [item.value for item in pieces[0] if item.kind == 'code']
+                    label_tokens, attribute_end = pieces[0], 0
+                    while attribute_end < len(label_tokens) and label_tokens[attribute_end].value == '@':
+                        attribute_end += 1
+                        if attribute_end == len(label_tokens) or not re.fullmatch(r'[A-Za-z_]\w*', label_tokens[attribute_end].value):
+                            raise ValueError('Unsupported Swift parameter attribute; analysis is incomplete')
+                        attribute_end += 1
+                        while attribute_end + 1 < len(label_tokens) and label_tokens[attribute_end].value == '.':
+                            attribute_end += 2
+                        if attribute_end < len(label_tokens) and label_tokens[attribute_end].value == '(':
+                            attribute_end = swift_close(label_tokens, attribute_end) + 1
+                    attributes = swift_text(label_tokens[:attribute_end])
+                    names = [item.value for item in label_tokens[attribute_end:] if item.kind == 'code']
                     if not 1 <= len(names) <= 2:
                         raise ValueError('Unsupported Swift parameter labels; analysis is incomplete')
                     default = swift_parts(pieces[1], {'='})
                     declaration = swift_text(default[0])
                     parameters.append((names[-1], '' if names[0] == '_' else names[0], declaration,
                                        default[1] if len(default) == 2 else ()))
+                    parameter_attributes.append(attributes)
                 body_start = close + 1
                 while body_start < len(tokens) and tokens[body_start].value not in {'{', ';'}:
                     body_start += 1
@@ -320,7 +347,8 @@ class SwiftParser:
                 finish = swift_close(tokens, body_start)
                 key = tokens[head].start
                 function = SwiftFunction(key, name, owner, scope, tuple(parameters),
-                                         static=any(token.value in {'static', 'class'} for token in tokens[start:head]))
+                                         static=any(token.value in {'static', 'class'} for token in tokens[start:head]),
+                                         parameter_attributes=tuple(parameter_attributes))
                 result_type = swift_parts(tokens[close + 1:body_start], {'->'})
                 if len(result_type) == 2:
                     function.return_type = swift_text(swift_ungroup(result_type[1]))
@@ -480,6 +508,37 @@ def swift_source_tokens(tokens):
     return False
 
 
+def swift_flow_obligation(tokens):
+    """Conservative syntax witnesses for this frontend's source/sink policies.
+
+    Bare identifiers named `req`/`request` are only *possible* source roots;
+    ordinary clients also use them for UUIDs or task handles. In the absence
+    of any modeled source operation OR sink anywhere in the file, these two
+    request-flow policies have nothing to classify. Keep request type/direct
+    member spellings and all sink families as activators, even when an
+    unrelated declaration uses the same name. This deliberately prefers an
+    incomplete result over guessing when relevant unsupported syntax remains.
+    """
+    witnesses = {
+        'Request',
+        'filename', 'fileName', 'originalFilename', 'originalFileName',
+        'redirect', 'Response', 'HTTPResponse', 'HTTPHeaders', 'add', 'replaceOrAdd',
+        'contentsOf', 'contentsOfFile', 'FileHandle', 'FileManager',
+        'sendFile', 'streamFile', 'readFile', 'serveFile', 'writeFile', 'file', 'write',
+    }
+    code = [token.value for token in tokens if token.kind == 'code' and token.value != '\n']
+    request_members = {'query', 'parameters', 'params', 'headers', 'content', 'url', 'uri'}
+    if any(code[index] in {'req', 'request'} and code[index + 1] == '.' and code[index + 2] in request_members
+           for index in range(len(code) - 2)):
+        return True
+    for token in tokens:
+        if token.kind == 'code' and (token.value in witnesses or token.value.lower() == 'headers'):
+            return True
+        if any(swift_flow_obligation(part) for part in token.parts):
+            return True
+    return False
+
+
 def swift_statement_tokens(statements):
     for statement in statements:
         if statement.kind == 'definition':
@@ -539,6 +598,8 @@ class SwiftEngine:
             tags=frozenset({'swift-string'}), evidence=(self.step(offset, 'source', label),))})
 
     def context(self, function, arguments, entry=False):
+        if any(function.parameter_attributes):
+            raise ValueError('Swift attributed parameters need transformation analysis; analysis is incomplete')
         key = function.key, arguments, entry
         if key not in self.contexts:
             self.budget.spend()
@@ -1274,13 +1335,14 @@ def file_url_read_offsets(path, text):
 
 
 def flow_findings(path, text, policy='path'):
-    parser = SwiftParser(text)
+    tokens = swift_validated_tokens(text)
     # Lexing and delimiter validation still run on every selected source.
     # With no selected request source, there is no source-to-sink obligation
     # for these two policies; unrelated Swift closure/actor syntax belongs to
     # its own analyzer rather than being misreported as a failed taint pass.
-    if not swift_source_tokens(parser.tokens):
+    if not swift_source_tokens(tokens) or not swift_flow_obligation(tokens):
         return []
+    parser = SwiftParser(text, tokens)
     engine = SwiftEngine(path, text, policy, parser)
     rule = 'swift.taint.request_open_redirect' if policy == 'redirect' else 'swift.taint.request_path_traversal'
     suppression = SourceSuppressions('swift')

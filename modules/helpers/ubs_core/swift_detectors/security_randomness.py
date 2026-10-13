@@ -215,7 +215,18 @@ def unsafe_source(statement: str, insecure_rng_vars: set, sensitive: bool):
         if re.search(rf'\b{re.escape(name)}\s*\.\s*(?:next|nextInt|nextUniform|nextBool)\s*\(', visible):
             return f'{name}.next(...)'
     predictable = PREDICTABLE_SOURCE_RE.search(visible)
-    if predictable and (sensitive or TOKEN_MATERIAL_RE.search(visible) or SECURITY_CONTEXT_RE.search(visible)):
+    # A security-related function name does not make an explicitly discarded
+    # calendar query credential generation. Retain the original conservative
+    # behavior for every other shape, including tuple/subscript assignments,
+    # unknown helper calls and values that may escape through nested scopes.
+    # Even a discard stays suspicious when the expression names security
+    # material, converts bytes/strings, or contains a return.
+    incidental_discard = (re.match(r'^\s*_\s*=(?!=)', visible)
+                          and not re.search(r'[{};]', visible)
+                          and not SECURITY_CONTEXT_RE.search(context_search_text(statement))
+                          and not TOKEN_MATERIAL_RE.search(statement)
+                          and not re.search(r'\breturn\b', visible))
+    if predictable and not incidental_discard and (sensitive or TOKEN_MATERIAL_RE.search(visible) or SECURITY_CONTEXT_RE.search(visible)):
         return predictable.group(0).strip()
     return None
 

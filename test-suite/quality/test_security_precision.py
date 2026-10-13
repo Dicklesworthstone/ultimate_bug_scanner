@@ -33,6 +33,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HELPERS_DIR = REPO_ROOT / "modules" / "helpers"
@@ -54,9 +55,134 @@ from ubs_core.rust_detectors import (  # noqa: E402
     response_header, sql_injection,
 )
 from ubs_core import rust_rules  # noqa: E402
+from ubs_core.swift_detectors import security_randomness as swift_randomness  # noqa: E402
 
 JS_SECURITY = REPO_ROOT / "test-suite" / "js" / "security"
 PY_SECURITY = REPO_ROOT / "test-suite" / "python" / "security"
+
+
+class SwiftPredictableMaterialTests(unittest.TestCase):
+    """Clock reads are not tokens; predictable credential material still is."""
+
+    def findings(self, source):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "Example.swift"
+            path.write_text(source)
+            return swift_randomness.collect_findings(SimpleNamespace(project_dir=path.parent, files=[path]))
+
+    def test_discarded_calendar_argument_in_security_function_is_not_material(self):
+        source = """func rejectsInvalidBearer() async throws {
+    _ = try await api.load(.month(containing: Date()))
+}
+"""
+        self.assertEqual(self.findings(source), [])
+
+    def test_predictable_sources_still_reach_security_destinations(self):
+        for expression in ("Date()", "Date.now", "NSDate()", "Date().timeIntervalSince1970",
+                           "DispatchTime.now().uptimeNanoseconds", "ProcessInfo.processInfo.processIdentifier",
+                           "ObjectIdentifier(instance).hashValue", "CFAbsoluteTimeGetCurrent()"):
+            with self.subTest(expression=expression):
+                source = f"func createValue() {{\n    let bearerToken = {expression}\n}}\n"
+                self.assertEqual([row[1] for row in self.findings(source)], [2])
+
+    def test_security_return_and_materialization_remain_suspicious(self):
+        for expression in ('return "reset-\\(Date().timeIntervalSince1970)"',
+                           'return Date()', 'return String(Date().timeIntervalSince1970)',
+                           'let value = SHA256.hash(data: Data(Date().description.utf8))'):
+            with self.subTest(expression=expression):
+                self.assertEqual([row[1] for row in self.findings(f"func resetToken() {{\n    {expression}\n}}\n")], [2])
+
+    def test_source_stays_reported_before_alias_conversion_and_return(self):
+        source = """func resetToken() -> String {
+    let observed = Date()
+    let copied = observed
+    let material = String(copied)
+    return material
+}
+"""
+        self.assertEqual([row[1] for row in self.findings(source)], [2])
+
+    def test_source_stays_reported_before_helper_return(self):
+        source = """func sessionToken() -> String {
+    let observed = Date()
+    return encode(observed)
+}
+"""
+        self.assertEqual([row[1] for row in self.findings(source)], [2])
+
+    def test_named_source_stays_reported_across_nested_function_uncertainty(self):
+        source = """func sessionToken() -> String {
+    let observed = Date()
+    func identity(_ x: String) -> String { return x }
+    return encode(observed)
+}
+"""
+        self.assertEqual([row[1] for row in self.findings(source)], [2])
+
+    def test_named_timing_value_keeps_conservative_security_context_warning(self):
+        source = """func rejectsInvalidBearer() async throws {
+    let started = Date()
+    recordElapsed(started)
+}
+"""
+        self.assertEqual([row[1] for row in self.findings(source)], [2])
+
+    def test_conditional_overwrite_does_not_erase_predictable_origin(self):
+        source = """func sessionToken() -> String {
+    var observed = Date()
+    if condition { observed = secureValue() }
+    return encode(observed)
+}
+"""
+        self.assertEqual([row[1] for row in self.findings(source)], [2])
+
+    def test_later_and_conditional_assignments_retain_predictable_origins(self):
+        for assignment in ('observed = Date()', 'if condition { observed = Date() }',
+                           'observed += Date().timeIntervalSince1970'):
+            with self.subTest(assignment=assignment):
+                source = f"""func sessionToken() -> String {{
+    var observed = initialValue()
+    {assignment}
+    return encode(observed)
+}}
+"""
+                self.assertEqual([row[1] for row in self.findings(source)], [3])
+
+    def test_predictable_alias_does_not_leak_into_sibling_function(self):
+        source = """func observe() {
+    let observed = Date()
+}
+func sessionToken() -> String {
+    let observed = secureToken()
+    return observed
+}
+"""
+        self.assertEqual(self.findings(source), [])
+
+    def test_tuple_subscript_and_unknown_helpers_keep_baseline_warnings(self):
+        for statement in ('let (observed, spare) = (Date(), 0)',
+                          'state[0] = Date()', 'seed(Date())',
+                          'recordElapsed(Date().timeIntervalSince(started))'):
+            with self.subTest(statement=statement):
+                source = f"func sessionToken() {{\n    {statement}\n}}\n"
+                self.assertEqual([row[1] for row in self.findings(source)], [2])
+
+    def test_discarded_security_material_remains_suspicious(self):
+        for statement in ('_ = String(Date().timeIntervalSince1970)',
+                          '_ = bearerToken(Date())',
+                          '_ = build { return Date() }',
+                          '_ = build { state[0] = Date() }',
+                          '_ = read(); state[0] = Date()',
+                          '_ = "value-\\(Date().timeIntervalSince1970)"'):
+            with self.subTest(statement=statement):
+                source = f"func sessionToken() {{\n    {statement}\n}}\n"
+                self.assertEqual([row[1] for row in self.findings(source)], [2])
+
+    def test_existing_weak_random_fixtures_remain_effective(self):
+        buggy = REPO_ROOT / "test-suite/swift/security_randomness_buggy/Tokens.swift"
+        clean = REPO_ROOT / "test-suite/swift/security_randomness_clean/Tokens.swift"
+        self.assertEqual([row[1] for row in self.findings(buggy.read_text())], [5, 9, 13, 14, 18, 22, 23])
+        self.assertEqual(self.findings(clean.read_text()), [])
 
 
 class JavaRulePrecisionTests(unittest.TestCase):

@@ -705,6 +705,120 @@ class SwiftScopedFlowTests(unittest.TestCase):
             with self.subTest(source=source), self.assertRaisesRegex(ValueError, 'incomplete'):
                 self.check(source)
 
+    def test_unrelated_client_task_and_result_builder_have_no_request_obligation(self):
+        # Real frontend syntax, no modeled incoming-request operation or sink.
+        # The variable name is deliberately a conservative source sentinel.
+        for policy in ('path', 'redirect'):
+            with self.subTest(policy=policy):
+                self.check('''
+                    struct Panel {
+                        func section<Content>(@ViewBuilder content: () -> Content) -> Content { content() }
+                        func refresh() async {
+                            let request = UUID()
+                            let work = Task { await fetch() }
+                            await withTaskCancellationHandler {
+                                await work.value
+                            } onCancel: { work.cancel() }
+                        }
+                    }
+                ''', policy=policy, suffix=policy)
+
+    def test_unrelated_parameter_attribute_does_not_hide_a_real_sink(self):
+        for attribute in ('@ViewBuilder', '@UI.ViewBuilder', '@Builder(mode: .plain)'):
+            with self.subTest(attribute=attribute):
+                self.check('''
+                    func panel<Content>(%s content: () -> Content) -> Content { content() }
+                    func handle(req: Request) -> Response {
+                        return req.redirect(to: req.query["next"] ?? "/")
+                    }
+                ''' % attribute, (3,), suffix=str(len(attribute)))
+
+    def test_selected_parameter_transform_is_not_assumed_transparent(self):
+        for source in ('''
+            func transform(@Wrapped value: String) -> String { value }
+            func handle(req: Request) -> Response {
+                return req.redirect(to: transform(value: req.query["next"] ?? "/"))
+            }
+        ''', '''
+            func handle(@Wrapped input: Request) -> Response {
+                return input.redirect(to: input.query["next"] ?? "/")
+            }
+        '''):
+            with self.subTest(source=source), self.assertRaisesRegex(ValueError, 'attributed parameters.*incomplete'):
+                self.check(source)
+
+    def test_actual_source_without_sink_remains_conservatively_incomplete(self):
+        # Keep the old fail-closed boundary for actual incoming request state.
+        with self.assertRaisesRegex(ValueError, 'closure.*incomplete'):
+            self.check('''
+                func handle(input: Request) {
+                    let work = Task { consume(input.query["next"]) }
+                }
+            ''')
+
+    def test_sink_hidden_in_interpolation_or_alias_is_not_filtered_out(self):
+        sources = (r'''
+            func handle(req: Request) -> String {
+                return "\(Response.redirect(to: req.query["next"] ?? "/"))"
+            }
+        ''', '''
+            func handle(req: Request) -> Response {
+                let input = req
+                let target = input.query["next"] ?? "/"
+                return dispatch(target)
+            }
+            func dispatch(_ target: String) -> Response {
+                return Response.redirect(to: target)
+            }
+        ''')
+        for index, (source, lines) in enumerate(zip(sources, ((2,), (7,)))):
+            with self.subTest(index=index):
+                self.check(source, lines, suffix=str(index))
+
+    def test_nested_literal_interpolation_still_activates_relevant_failure(self):
+        with self.assertRaisesRegex(ValueError, 'closure.*incomplete'):
+            self.check(r'''
+                func handle(req: Request) -> String {
+                    return "outer \("inner \(Task { Response.redirect(to: req.query["next"] ?? "/") })")"
+                }
+            ''')
+
+    def test_unrelated_unsupported_closure_with_a_sink_is_still_incomplete(self):
+        with self.assertRaisesRegex(ValueError, 'closure.*incomplete'):
+            self.check('''
+                func load() {
+                    let request = UUID()
+                    Task { consume(request) }
+                }
+                func output(_ target: String) -> Response {
+                    return Response.redirect(to: target)
+                }
+            ''')
+
+    def test_all_modeled_sink_families_keep_unknown_capture_fail_closed(self):
+        calls = (
+            'Response.redirect(to: request)',
+            'HTTPResponse(headers: ["Location": request])',
+            'HTTPHeaders([("Location", request)])',
+            'headers.add(name: "Location", value: request)',
+            'headers.replaceOrAdd(name: .location, value: request)',
+            'headers["Location"] = request',
+            'String(contentsOf: request)', 'Data(contentsOfFile: request)',
+            'FileHandle(forReadingFrom: request)',
+            'FileManager.default.removeItem(atPath: request)',
+            'sendFile(request)', 'streamFile(at: request)', 'readFile(path: request)',
+            'serveFile(request)', 'writeFile(request)', 'file(request)', 'body.write(to: request)',
+        )
+        for index, call in enumerate(calls):
+            with self.subTest(call=call), self.assertRaisesRegex(ValueError, 'closure.*incomplete'):
+                self.check('func work() { let request = UUID(); Task { %s } }' % call,
+                           suffix=str(index))
+
+    def test_malformed_interpolation_is_not_a_source_free_clean_result(self):
+        for source in (r'func title() { print("\(broken[)") }', r'let x = "\( { )"'):
+            with self.subTest(source=source), self.assertRaisesRegex(ValueError, 'incomplete'):
+                self.check(source)
+
     def test_nested_delimiter_budget_is_not_clean(self):
         source = 'func handle(req: Request) { let value = ' + '(' * 130 + 'req.query["next"]' + ')' * 130 + ' }'
         with self.assertRaises(AnalysisLimit):

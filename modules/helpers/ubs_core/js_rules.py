@@ -386,12 +386,115 @@ message: "useEffect without cleanup may leak subscriptions or timers"
         "react-missing-key",
         r'''id: react.list-missing-key
 language: tsx
+utils:
+  jsx-key-attribute:
+    kind: jsx_attribute
+    regex: "^key(?:\\s*=|$)"
+  jsx-has-key:
+    any:
+      - has:
+          matches: jsx-key-attribute
+      - has:
+          kind: jsx_opening_element
+          has:
+            matches: jsx-key-attribute
+  # Stop at a value's owner, rather than at a fixed set of transparent
+  # expression wrappers. This also admits TS casts without putting TS-only
+  # node kinds into the generated JavaScript variant.
+  jsx-value-boundary:
+    any:
+      - kind: jsx_element
+      - kind: jsx_self_closing_element
+      - kind: jsx_expression
+      - kind: array
+      - kind: pair
+      - kind: arguments
+      - kind: formal_parameters
+      - kind: assignment_pattern
+      - kind: assignment_expression
+      - kind: variable_declarator
+      - kind: arrow_function
+      - kind: function_expression
+      - kind: function_declaration
+      - kind: method_definition
+      - kind: return_statement
+      - kind: statement_block
+      - kind: expression_statement
+      - kind: member_expression
+      - kind: subscript_expression
+      - kind: template_substitution
+  jsx-mapping-argument:
+    any:
+      - all:
+          - nthChild:
+              position: 1
+              ofRule:
+                not:
+                  kind: comment
+          - inside:
+              kind: arguments
+              inside:
+                kind: call_expression
+                has:
+                  field: function
+                  kind: member_expression
+                  has:
+                    field: property
+                    regex: "^(map|flatMap)$"
+      - all:
+          - nthChild:
+              position: 2
+              ofRule:
+                not:
+                  kind: comment
+          - inside:
+              kind: arguments
+              inside:
+                kind: call_expression
+                has:
+                  field: function
+                  pattern: Array.from
+  jsx-list-callback:
+    all:
+      - any:
+          - kind: arrow_function
+          - kind: function_expression
+      - any:
+          - matches: jsx-mapping-argument
+          - inside:
+              kind: parenthesized_expression
+              matches: jsx-mapping-argument
+              stopBy:
+                not:
+                  kind: parenthesized_expression
 rule:
   all:
-    - kind: jsx_self_closing_element
-    - pattern: <$COMP $$$ />
+    - any:
+        - kind: jsx_self_closing_element
+        - kind: jsx_element
     - not:
-        regex: "key\\s*="
+        matches: jsx-has-key
+    - any:
+        - inside:
+            kind: array
+            stopBy:
+              matches: jsx-value-boundary
+        - inside:
+            matches: jsx-list-callback
+            stopBy:
+              matches: jsx-value-boundary
+        - inside:
+            kind: return_statement
+            stopBy:
+              matches: jsx-value-boundary
+            inside:
+              matches: jsx-list-callback
+              stopBy:
+                any:
+                  - kind: arrow_function
+                  - kind: function_expression
+                  - kind: function_declaration
+                  - kind: method_definition
 severity: warning
 message: "JSX list item missing key prop"
 ''',

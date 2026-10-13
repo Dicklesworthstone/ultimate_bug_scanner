@@ -272,6 +272,99 @@ class MapTests(unittest.TestCase):
 
 @unittest.skipIf(shutil.which("ast-grep") is None, "ast-grep not installed")
 class ScanSmokeTests(unittest.TestCase):
+    def test_react_missing_keys_are_list_roots(self) -> None:
+        # Scan real generated rules, not a Python approximation of their AST
+        # semantics. Exact matched nodes also reject duplicate/nested findings.
+        cases = [
+            ("static self-closing", "const view = <Icon />;", []),
+            ("static paired", "const view = <div><Icon /></div>;", []),
+            ("ordinary return", "function View() { return <Icon />; }", []),
+            ("object icon", "const cards = [{ icon: <Icon /> }];", []),
+            ("object callback", "rows.map(row => ({ icon: <Icon /> }));", []),
+            ("other iterator", "rows.forEach(row => <Row />);", []),
+            ("outside callback", "rows.map(row => row); const view = <Icon />;", []),
+            ("self-closing map", "rows.map(row => <Row />);", ["<Row />"]),
+            ("paired map", "rows.map(row => <Row>{row.name}</Row>);", ["<Row>{row.name}</Row>"]),
+            ("parenthesized map", "rows.map(row => (<Row />));", ["<Row />"]),
+            ("block return", "rows.map(row => { return <Row />; });", ["<Row />"]),
+            ("function return", "rows.map(function(row) { return <Row />; });", ["<Row />"]),
+            ("conditional return", "rows.map(row => { if (row.ready) { return <Row />; } return null; });", ["<Row />"]),
+            ("expression branches", "rows.map(row => row.ready ? <Ready /> : <Waiting />);", ["<Ready />", "<Waiting />"]),
+            ("logical return", "rows.map(row => row.ready && <Row />);", ["<Row />"]),
+            ("flatMap", "rows.flatMap(row => <Row />);", ["<Row />"]),
+            ("literal self-closing", "const views = [<Row />];", ["<Row />"]),
+            ("literal paired", "const views = [<Row>text</Row>];", ["<Row>text</Row>"]),
+            ("array branches", "const views = [ready ? <Ready /> : <Waiting />];", ["<Ready />", "<Waiting />"]),
+            ("keyed self-closing", "rows.map(row => <Row key={row.id} />);", []),
+            ("keyed paired", "rows.map(row => <Row key={row.id}><Icon /></Row>);", []),
+            ("keyed array", "const views = [<Row key='row'><Icon /></Row>];", []),
+            ("keyed fragment", "rows.map(row => <Fragment key={row.id}><Icon /></Fragment>);", []),
+            ("fragment root", "rows.map(row => <><Icon /><Text /></>);", ["<><Icon /><Text /></>"]),
+            ("array fragment", "const views = [<><Icon /></>];", ["<><Icon /></>"]),
+            ("nested key", "rows.map(row => <Row><Icon key={row.id} /></Row>);", ["<Row><Icon key={row.id} /></Row>"]),
+            ("monkey prop", "rows.map(row => <Row monkey={row.id} />);", ["<Row monkey={row.id} />"]),
+            ("key text", "rows.map(row => <Row caption='key=' />);", ["<Row caption='key=' />"]),
+            ("multiline key", "rows.map(row => <Row key\n = {row.id} />);", []),
+            ("local static value", "rows.map(row => { const icon = <Icon />; return <Row />; });", ["<Row />"]),
+            ("nested helper", "rows.map(row => { function helper() { return <Icon />; } return <Row />; });", ["<Row />"]),
+            ("nested arrow", "rows.map(row => { const helper = () => <Icon />; return <Row />; });", ["<Row />"]),
+            ("nested keyed list", "rows.map(row => <Row key={row.id}>{row.parts.map(part => <Part />)}</Row>);", ["<Part />"]),
+            ("callback this arg", "rows.map(row => row, () => <Unused />);", []),
+            ("Array.from", "Array.from(rows, row => <Row />);", ["<Row />"]),
+            ("mapping comments", "rows.map(/* mapper */ row => <Row />);", ["<Row />"]),
+            ("factory comments", "Array.from(/* source */ rows, /* mapper */ row => <Row />);", ["<Row />"]),
+            ("parenthesized callback", "rows.map((row => <Row />));", ["<Row />"]),
+            ("wrapped this arg", "rows.map(row => row, (() => <Unused />));", []),
+            ("factory this arg", "Array.from(rows, row => row, () => <Unused />);", []),
+            ("unused expression", "rows.map(row => { <Unused />; return <Row />; });", ["<Row />"]),
+            ("callback parameter", "rows.map((row = <Unused />) => null);", []),
+            ("attribute child", "rows.map(row => <Row key={row.id} icon={<Icon />} />);", []),
+            ("value call", "rows.map(row => wrap(<Icon />));", []),
+        ]
+        tmp = Path(tempfile.mkdtemp(prefix="ubs-react-key-scan-"))
+        try:
+            rule_dir = tmp / "pack"
+            generate(rule_dir)
+            for extension, rule_file in (
+                ("tsx", "react-missing-key.yml"),
+                ("jsx", "react-missing-key.javascript.yml"),
+            ):
+                for name, source, expected in cases:
+                    with self.subTest(grammar=extension, case=name):
+                        fixture = tmp / f"sample.{extension}"
+                        fixture.write_text(source, encoding="utf-8")
+                        proc = subprocess.run(
+                            ["ast-grep", "scan", "--rule", str(rule_dir / "rules" / rule_file),
+                             "--json=stream", str(fixture)],
+                            capture_output=True, text=True, timeout=120,
+                        )
+                        self.assertIn(proc.returncode, (0, 1), proc.stderr)
+                        records = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+                        self.assertEqual([record["ruleId"] for record in records],
+                                         ["react.list-missing-key"] * len(expected))
+                        self.assertEqual([record["text"] for record in records], expected)
+            # Transparent TypeScript wrappers must retain the same positive
+            # behavior without introducing invalid node kinds in the JSX pack.
+            for source in (
+                "rows.map(row => <Row /> as JSX.Element);",
+                "rows.map(row => (<Row /> satisfies JSX.Element));",
+                "rows.map(row => <Row />!);",
+            ):
+                with self.subTest(grammar="tsx", wrapper=source):
+                    fixture = tmp / "wrapper.tsx"
+                    fixture.write_text(source, encoding="utf-8")
+                    proc = subprocess.run(
+                        ["ast-grep", "scan", "--rule", str(rule_dir / "rules/react-missing-key.yml"),
+                         "--json=stream", str(fixture)],
+                        capture_output=True, text=True, timeout=120,
+                    )
+                    self.assertIn(proc.returncode, (0, 1), proc.stderr)
+                    records = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+                    self.assertEqual([record["ruleId"] for record in records], ["react.list-missing-key"])
+                    self.assertEqual([record["text"] for record in records], ["<Row />"])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_sgconfigs_load_and_match(self) -> None:
         tmp = Path(tempfile.mkdtemp(prefix="ubs-js-rules-scan-"))
         try:

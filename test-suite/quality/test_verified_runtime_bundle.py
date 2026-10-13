@@ -293,7 +293,9 @@ if os.environ.get('LATE_OUTPUT'): pathlib.Path(os.environ['LATE_OUTPUT']).write_
         shutil.copytree(ROOT / 'modules', self.origin / 'modules', dirs_exist_ok=True)
         self.seal()
         result = self.run_verify()
-        self.assertIn('Runtime verified: 12 modules,', result.stdout)
+        # Every language module in the checkout (13 since the PHP module).
+        modules = len(list((ROOT / 'modules').glob('ubs-*.sh')))
+        self.assertIn(f'Runtime verified: {modules} modules,', result.stdout)
 
     def export(self, output, expected=0, extra=()):
         result = subprocess.run(['bash', str(VERIFY), '--version', self.version,

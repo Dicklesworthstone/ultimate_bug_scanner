@@ -303,7 +303,10 @@ class ResourceHelperTests(unittest.TestCase):
         kinds = {kind for _, kind, _ in entries}
         self.assertIn("urlsession_task", kinds)
         self.assertIn("timer", kinds)
-        self.assertIn("file_handle", kinds)
+        # FileHandle(forWritingTo:) owns its descriptor and closes it in deinit,
+        # so the lifecycle helper deliberately reports no obligation for it
+        # (57862b4e; its own selftest pins the same).
+        self.assertNotIn("file_handle", kinds)
         self.assertIn("cadisplaylink", kinds)
 
     def test_swift_helper_respects_cleanup(self) -> None:

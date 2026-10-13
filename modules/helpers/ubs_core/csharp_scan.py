@@ -30,7 +30,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 from ubs_core.io import read_ndjson
 from ubs_core.suppression import SourceSuppressions
 
@@ -141,6 +141,7 @@ class Pattern:
     exclude_regex: object | None = None  # legacy `grep -v` post-filter
     gate_regex: object | None = None  # legacy project-wide precondition
     needs_no_ast: bool = False  # legacy skipped when the ast-grep pack ran
+    line_matches: Callable[[str], set[int]] | None = None
 
     @classmethod
     def from_row(cls, row) -> "Pattern":
@@ -149,6 +150,7 @@ class Pattern:
             label=row.label, text=row.text, regex=row.regex,
             severity=row.severity, exclude_regex=row.exclude_regex,
             gate_regex=row.gate_regex, needs_no_ast=row.needs_no_ast,
+            line_matches=getattr(row, "line_matches", None),
         )
 
 
@@ -201,10 +203,14 @@ def scan_patterns(
         for path, text in texts.items():
             if prefilter is not None and pattern.rule_id not in prefilter.candidate_rules_for(path):
                 continue
+            source_lines = pattern.line_matches(text) if pattern.line_matches else None
             for line_no, line_text in enumerate(text.splitlines(), start=1):
                 if suppressions.is_suppressed(path, line_no, pattern.rule_id):
                     continue
-                if not pattern.regex.search(line_text):
+                if source_lines is not None:
+                    if line_no not in source_lines:
+                        continue
+                elif not pattern.regex.search(line_text):
                     continue
                 if pattern.exclude_regex is not None and pattern.exclude_regex.search(
                     f"{path}:{line_no}:{line_text}"
@@ -304,7 +310,8 @@ def run_detectors(files: Sequence, sink, skip: set, base_dir: Path) -> None:
 
 def run_analyzers(files: Sequence, sink, skip: set, base_dir: Path,
                   enable_new: bool = False, prefilter: Any = None,
-                  errors: list[str] | None = None) -> None:
+                  errors: list[str] | None = None,
+                  semantic_errors: list[str] | None = None) -> None:
     """Run the registered csharp analyzers (taint, lifecycle, narrowing, async).
 
     Security taint checks run in ordinary scans, with category filtering
@@ -315,6 +322,7 @@ def run_analyzers(files: Sequence, sink, skip: set, base_dir: Path,
     """
     from ubs_core import analyzers  # noqa: F401  (populate registry)
     from ubs_core.registry import RunContext, analyzers_for_lang
+    from ubs_core.taint_flow import AnalysisLimit
 
     skip_narrowing = os.environ.get("UBS_SKIP_TYPE_NARROWING", "0") == "1"
     for analyzer in analyzers_for_lang("csharp"):
@@ -340,7 +348,10 @@ def run_analyzers(files: Sequence, sink, skip: set, base_dir: Path,
                     if errors is None:
                         raise
                     location = f"{batch[0]}: " if per_file else ""
-                    errors.append(f"{location}{analyzer.name}: {exc}")
+                    problem = f"{location}{analyzer.name}: {exc}"
+                    errors.append(problem)
+                    if semantic_errors is not None and isinstance(exc, (AnalysisLimit, RecursionError)):
+                        semantic_errors.append(problem)
         for finding in checked_findings():
             rule = _ASYNC_RULE_REMAP.get(str(finding.get("rule", "")), str(finding.get("rule", "")))
             if skip_narrowing and rule.startswith("csharp.narrowing."):
@@ -524,10 +535,70 @@ def _skip_set(args) -> set:
     return {int(part) for part in (args.skip or "").split(",") if part.strip().isdigit()}
 
 
+def execution_status(exit_code: int, errors: list[str], semantic_errors: list[str]) -> dict:
+    """Keep semantic coverage limits distinct from failed analysis machinery.
+
+    Both are incomplete and exit 2. Infrastructure takes precedence when a
+    run encounters both; finding counts never make a partial scan complete.
+    """
+    result = {"status": "partial" if errors else "ok", "exit_code": exit_code}
+    if errors:
+        semantic_only = len(semantic_errors) == len(errors)
+        result.update(
+            exit_code=2,
+            error="analysis" if semantic_only else "environment",
+            reason="analysis-incomplete" if semantic_only else "module-failed",
+            module_error="ANALYSIS_INCOMPLETE" if semantic_only else "ANALYZER_ERROR",
+            message=("C# semantic coverage is incomplete: " if semantic_only else
+                     "C# analysis infrastructure failed: ") + "; ".join(errors[:5]),
+            errors=errors[:5],
+        )
+    return result
+
+
+def read_execution_status(path: str, scan_exit: int) -> dict:
+    """Read only a completed, internally consistent producer status record.
+
+    The shell bridge supplies an invocation-private path. Missing, truncated,
+    inconsistent or stale status cannot relabel a crash as a semantic limit.
+    """
+    if scan_exit in (0, 1):
+        return {}
+    fallback = {
+        "status": "partial", "error": "environment", "reason": "module-failed",
+        "module_error": "ANALYZER_ERROR",
+        "message": "C# analysis layer failed; see this module's stderr",
+    }
+    try:
+        with open(path, encoding="utf-8") as stream:
+            result = json.load(stream)
+    except (OSError, ValueError):
+        return fallback
+    if not isinstance(result, dict) or scan_exit != 2:
+        return fallback
+    identity = {
+        "ANALYSIS_INCOMPLETE": ("analysis", "analysis-incomplete"),
+        "ANALYZER_ERROR": ("environment", "module-failed"),
+    }
+    code = result.get("module_error")
+    expected = identity.get(code) if isinstance(code, str) else None
+    errors = result.get("errors")
+    if (expected is None or result.get("status") != "partial"
+            or type(result.get("exit_code")) is not int or result["exit_code"] != scan_exit
+            or (result.get("error"), result.get("reason")) != expected
+            or not isinstance(result.get("message"), str)
+            or not isinstance(errors, list) or not errors
+            or not all(isinstance(error, str) for error in errors)):
+        return fallback
+    return {key: result[key] for key in
+            ("status", "error", "reason", "module_error", "message", "errors")}
+
+
 def main(argv: list | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python3 -m ubs_core.csharp_scan")
     parser.add_argument("--files-from", default="-", help="NUL-separated file list ('-' = stdin)")
     parser.add_argument("--sink", required=True, help="NDJSON findings sink path")
+    parser.add_argument("--status-out", default="", help="write structured execution/coverage status")
     parser.add_argument("--project-dir", default="", help="project path (file or dir); base for relative sink paths")
     parser.add_argument("--skip", default="", help="comma-separated category numbers to skip")
     parser.add_argument("--ast-rule-dir", default="", help="consolidated ast-grep rule dir (sgconfig-csharp.yml + manifest.json)")
@@ -542,6 +613,14 @@ def main(argv: list | None = None) -> int:
     parser.add_argument("--enable-new-analyzers", action="store_true",
                         help="run analyzers with no legacy counterpart (guards_csharp)")
     args = parser.parse_args(argv)
+    if args.status_out:
+        # Invalidate a previous report before any work. A crash or an early
+        # return must not reuse an earlier semantic-only status.
+        try:
+            Path(args.status_out).write_text("{}\n", encoding="utf-8")
+        except OSError as exc:
+            sys.stderr.write(f"ubs-csharp: cannot initialize execution status: {exc}\n")
+            return 2
 
     if args.files_from in ("-", ""):
         data = sys.stdin.buffer.read()
@@ -582,6 +661,7 @@ def main(argv: list | None = None) -> int:
     # Every analysis layer that could not complete appends here, so a scan that
     # did not finish is never reported as a finished one (#111).
     scan_errors: list[str] = []
+    semantic_errors: list[str] = []
     if files_to_scan:
         from ubs_core.csharp_rules import _RULES
         from ubs_core.registry import analyzers_for_lang
@@ -615,7 +695,7 @@ def main(argv: list | None = None) -> int:
         scan_patterns(patterns, texts, capturing_sink, skip, phase=0, prefilter=prefilter_res)
         run_detectors(files_to_scan, capturing_sink, skip, base_dir)
         run_analyzers(files_to_scan, capturing_sink, skip, base_dir, enable_new=args.enable_new_analyzers,
-                      prefilter=prefilter_res, errors=scan_errors)
+                      prefilter=prefilter_res, errors=scan_errors, semantic_errors=semantic_errors)
         if args.ast_rule_dir:
             from ubs_core.csharp_ast import scan_all
             from ubs_core.csharp_rules import CATEGORY_MAP, SEVERITY_MAP
@@ -711,7 +791,8 @@ def main(argv: list | None = None) -> int:
         render_text(args, ast_ran, patterns)
 
     stderr_summary = {"counters": counters, "patterns": len(patterns), "ast": ast_ran,
-                      "prefilter": prefilter_res.to_dict()}
+                      "prefilter": prefilter_res.to_dict(),
+                      **execution_status(exit_code, scan_errors, semantic_errors)}
     if scan_errors:
         # The detail belongs where the meta-runner already surfaces module
         # stderr; the summary document carries the status and the error class.
@@ -719,6 +800,12 @@ def main(argv: list | None = None) -> int:
         for problem in scan_errors:
             sys.stderr.write(f"ubs-csharp: analysis incomplete: {problem}\n")
     sys.stderr.write(json.dumps(stderr_summary) + "\n")
+    if args.status_out:
+        try:
+            Path(args.status_out).write_text(json.dumps(stderr_summary) + "\n", encoding="utf-8")
+        except OSError as exc:
+            sys.stderr.write(f"ubs-csharp: cannot write execution status: {exc}\n")
+            return 2
     return exit_code
 
 

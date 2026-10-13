@@ -7,7 +7,7 @@ orchestrator from a pattern module would be circular.
 from __future__ import annotations
 
 import re
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 
 
 class P(NamedTuple):
@@ -21,3 +21,4 @@ class P(NamedTuple):
     exclude_regex: re.Pattern[str] | None = None  # legacy `grep -v` post-filter
     gate_regex: re.Pattern[str] | None = None  # legacy project-wide precondition
     needs_no_ast: bool = False  # legacy skips when the ast-grep pack ran (cat 20)
+    line_matches: Callable[[str], set[int]] | None = None

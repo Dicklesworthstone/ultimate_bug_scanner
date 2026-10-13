@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 
 from ubs_core.csharp_patterns._table import P
+from ubs_core.csharp_patterns._result import possible_result_lines, task_result_lines
 
 PATTERNS = [
     # ── cat 2 ──
@@ -41,8 +42,18 @@ PATTERNS = [
         category=3, rule_id="cs.pattern.blocking-result", seq=140,
         label=".Result",
         text="Blocking on Task via .Result ({n}) - deadlock risk",
-        regex=re.compile(r'\.Result\b'),
+        # Candidate token only: the source matcher establishes receiver types.
+        regex=re.compile(r'\bResult\b'),
         severity="critical",
+        line_matches=task_result_lines,
+    ),
+    P(
+        category=3, rule_id="cs.pattern.possible-blocking-result", seq=145,
+        label="Possible Task.Result (receiver type unresolved)",
+        text="Possible synchronous .Result access ({n}) - receiver type unresolved; verify before blocking",
+        regex=re.compile(r'\bResult\b'),
+        severity="warning",
+        line_matches=possible_result_lines,
     ),
     P(
         category=3, rule_id="cs.pattern.blocking-wait", seq=150,

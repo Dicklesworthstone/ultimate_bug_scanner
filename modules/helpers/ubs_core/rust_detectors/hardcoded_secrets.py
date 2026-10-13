@@ -232,9 +232,9 @@ def metadata_literal(name: str, token: str) -> bool:
     normalized = normalize_name(name)
     value = unquote_literal(token)
     if normalized == 'credential_handle' or normalized.endswith('_credential_handle'):
-        return bool(re.fullmatch(r'cred_[a-z][a-z0-9]*(?:_[a-z0-9]+)+', value))
+        return bool(re.fullmatch(r'cred_[a-z][a-z0-9]*(?:_[a-z0-9]+)+', value))  # ubs:ignore[py.regex.nested-quantifiers] — "_" separator is outside the class, verified linear
     if normalized.endswith('_env_var'):
-        return bool(re.fullmatch(r'[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+', value))
+        return bool(re.fullmatch(r'[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+', value))  # ubs:ignore[py.regex.nested-quantifiers] — "_" separator is outside the class, verified linear
     if normalized in {'secret_label', 'credential_ref', 'credential_reference'} or normalized.endswith(
         ('_secret_label', '_credential_ref', '_credential_reference')
     ):

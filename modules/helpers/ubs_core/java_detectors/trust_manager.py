@@ -260,6 +260,7 @@ class TrustSource:
             cast = self.code[low + 1:closing]
             if closing < high - 1 and re.fullmatch(rf"\s*{_QUALIFIED}(?:\s*\[\s*\])*\s*", cast):
                 return self.exposes_array(closing + 1, high, position, array)
+        # every repetition needs a literal "[" and "]" that \s cannot match — ubs:ignore[py.regex.nested-quantifiers] disjoint separator, verified linear
         container = re.match(rf"new\s+{_QUALIFIED}(?:\s*\[\s*\])+\s*\{{", self.code[low:high])
         if container:
             opening = low + container.end() - 1
@@ -279,6 +280,7 @@ class TrustSource:
                 while receiver_end and self.code[receiver_end - 1].isspace():
                     receiver_end -= 1
                 if self.code[receiver_end - 1:receiver_end] == ")":
+                    # reverse_pairs is a dict; the source rejects unbalanced input, so this ")" has an entry — ubs:ignore[py.collections.index-arithmetic]
                     receiver_start = self.reverse_pairs[receiver_end - 1]
                 else:
                     receiver_start = receiver_end

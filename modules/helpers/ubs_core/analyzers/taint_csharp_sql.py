@@ -346,8 +346,10 @@ class DapperFlow(CSharpFlow):
     def intrinsic_value(self, name, args, state, bindings, position):
         return api_fact("System.Type") if name == "typeof" else CLEAN
 
-    def selected_call(self, name, args, values, receiver, bindings, position, opening, name_end):
+    def selected_call(self, call):
         """Return the SQL slot only after resolving receiver, overload and mode."""
+        name, args, values, receiver = call.name, call.args, call.values, call.receiver
+        bindings, position, opening, name_end = call.bindings, call.position, call.opening, call.name_end
         if position in self.ambiguous_extensions:
             return None
         method = name.split(".")[-1]
@@ -432,8 +434,9 @@ class DapperFlow(CSharpFlow):
                 return None
         return slots["sql"]
 
-    def call_value(self, name, canonical_name, args, values, receiver, state,
-                   bindings, position, opening, name_end):
+    def call_value(self, call):
+        name, args, values, receiver = call.name, call.args, call.values, call.receiver
+        state, bindings, position = call.state, call.bindings, call.position
         raw = self.raw_name(position, name)
         constructor = bool(re.search(r"\bnew\s*$", self.code[max(0, position - 12):position]))
         if constructor:
@@ -459,10 +462,9 @@ class DapperFlow(CSharpFlow):
             self.incomplete(position, "Unresolved external call effects require cross-file analysis")
         return provenance(join(receiver, source, *values))
 
-    def call_sink_facts(self, name, canonical_name, args, values, receiver, state,
-                        bindings, position, opening, name_end):
-        index = self.selected_call(name, args, values, receiver, bindings, position, opening, name_end)
-        return [(index, provenance(values[index]))] if index is not None else []
+    def call_sink_facts(self, call):
+        index = self.selected_call(call)
+        return [(index, provenance(call.values[index]))] if index is not None else []
 
     def analyze_function(self, function, context):
         self.current_issues = set()

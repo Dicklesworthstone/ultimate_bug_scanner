@@ -341,6 +341,7 @@ class JwtSource:
         if prefix_end == low:
             owner = self.static_owner(method, low)
             receiver = Value("class:" + owner) if owner else _UNKNOWN
+        # prefix_end > low >= 0 on this branch — ubs:ignore[py.collections.index-arithmetic]
         elif self.code[prefix_end - 1] == ".":
             receiver = self.value(low, prefix_end - 1, position, seen, depth + 1)
         else:

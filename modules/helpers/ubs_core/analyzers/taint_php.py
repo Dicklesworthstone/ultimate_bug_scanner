@@ -221,6 +221,7 @@ class Engine:
 
     def location(self, token: Token) -> tuple[int, int]:
         line = bisect_right(self.line_starts, token.start)
+        # self.line_starts[0] == 0 <= token.start, so line >= 1 — ubs:ignore[py.collections.index-arithmetic]
         return line, token.start - self.line_starts[line - 1] + 1
 
     def step(self, token: Token, kind: str, label: str) -> Step:
@@ -896,8 +897,8 @@ class Engine:
             try:
                 operations = {"|": lambda: a | b, "&": lambda: a & b, "^": lambda: a ^ b,
                               "+": lambda: a + b, "-": lambda: a - b, "*": lambda: a * b,
-                              "===": lambda: type(a) is type(b) and a == b,
-                              "!==": lambda: type(a) is not type(b) or a != b,
+                              "===": lambda: type(a) is type(b) and a == b,  # ubs:ignore[py.comparison.type-equality,py.type-equality] - PHP === needs the exact type: 1 === 1.0 is false
+                              "!==": lambda: type(a) is not type(b) or a != b,  # ubs:ignore[py.comparison.type-equality,py.type-equality] - the negation of === above
                               "<": lambda: a < b, ">": lambda: a > b,
                               "<=": lambda: a <= b, ">=": lambda: a >= b}
                 if operation in operations:

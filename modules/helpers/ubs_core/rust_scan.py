@@ -718,6 +718,7 @@ def build_test_scope_index(text: str) -> TestScopeIndex:
                     start_line = get_line(attr_start)
                     end_line = get_line(item_end - 1)
 
+                    # line_starts[0] == 0 <= attr_start, so start_line >= 1 — ubs:ignore[py.collections.index-arithmetic]
                     line_start_char = line_starts[start_line - 1]
                     line_end_char = line_starts[end_line] if end_line < len(line_starts) else len(text)
 

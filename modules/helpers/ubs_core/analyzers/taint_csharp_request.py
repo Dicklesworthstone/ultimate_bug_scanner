@@ -120,6 +120,7 @@ def masked_source(text: str, depth: int = 0) -> str:
             out[index] = "0"  # Retain an inert expression, not empty syntax.
             for start, stop in holes:
                 out[start:stop] = masked_source(text[start:stop], depth + 1)
+                # literal() returns a hole from just after its "{" to its "}", both inside the text — ubs:ignore[py.collections.index-arithmetic]
                 out[start - 1], out[stop] = "(", ")"
             index = end
         elif text[index] == "#" and not text[text.rfind("\n", 0, index) + 1:index].strip():
@@ -430,6 +431,21 @@ class Summary:
         return Summary(join(self.returned, other.returned), effects, outputs)
 
 
+@dataclass
+class Call:
+    """One call site as the policy hooks receive it."""
+    name: str
+    canonical_name: str
+    args: list[tuple[str | None, int, int]]
+    values: list[Fact]
+    receiver: Fact
+    state: State
+    bindings: dict[str, str]
+    position: int
+    opening: int
+    name_end: int
+
+
 class CSharpFlow:
     rule = RULE
     message = MESSAGE
@@ -462,6 +478,7 @@ class CSharpFlow:
 
     def step(self, offset, kind, label):
         line = bisect_right(self.lines, offset)
+        # self.lines[0] == 0 <= offset, so line >= 1 — ubs:ignore[py.collections.index-arithmetic]
         return Step(str(self.path), line, offset - self.lines[line - 1] + 1, kind, label[:160])
 
     def declare(self, scope, span, *, declarator=False):
@@ -770,13 +787,11 @@ class CSharpFlow:
     def intrinsic_value(self, name, args, state, bindings, position):
         return CLEAN
 
-    def call_value(self, name, canonical_name, args, values, receiver, state,
-                   bindings, position, opening, name_end):
-        return self.external_value(canonical_name, values, receiver)
+    def call_value(self, call):
+        return self.external_value(call.canonical_name, call.values, call.receiver)
 
-    def call_sink_facts(self, name, canonical_name, args, values, receiver, state,
-                        bindings, position, opening, name_end):
-        return [(index, values[index]) for index in self.sink_arguments(canonical_name, args)]
+    def call_sink_facts(self, call):
+        return [(index, call.values[index]) for index in self.sink_arguments(call.canonical_name, call.args)]
 
     def evaluate(self, start, end, state, bindings, depth=0):
         self.budget.spend()
@@ -855,8 +870,9 @@ class CSharpFlow:
                                 # A local named File or Path is not a proof of
                                 # System.IO type identity.
                                 canonical_name = "<instance>." + canonical_name
-                            value = self.call_value(name, canonical_name, args, values, receiver,
-                                                    state, bindings, position, following, stop)
+                            call = Call(name, canonical_name, args, values, receiver,
+                                        state, bindings, position, following, stop)
+                            value = self.call_value(call)
                             if self.is_source(name):
                                 value = join(value, self.source_fact(position, name))
                             if name.endswith(".TryGetValue") and self.is_source(name):
@@ -876,9 +892,7 @@ class CSharpFlow:
                                     cell = bindings.get(output.group(1).lstrip("@")) if output else None
                                     if cell:
                                         state[cell] = join(state.get(cell, CLEAN), retag(all_values, remove=CANONICAL))
-                            for index, source in self.call_sink_facts(name, canonical_name, args, values,
-                                                                      receiver, state, bindings, position,
-                                                                      following, stop):
+                            for index, source in self.call_sink_facts(call):
                                 fact = advance(source, self.step(position, "sink", canonical_name))
                                 if fact:
                                     key = (position, canonical_name)

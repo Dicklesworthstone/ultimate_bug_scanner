@@ -514,6 +514,7 @@ class NullFlow:
                 index = finish + 1
                 continue
             assertion = re.match(r"([A-Za-z_]\w*)\s*!!", self.code[index:end])
+            # the lookbehind runs only when index != start, and index never goes below start — ubs:ignore[py.collections.index-arithmetic]
             if assertion and (index == start or self.code[index - 1] not in "." and not (self.code[index - 1].isalnum() or self.code[index - 1] == "_")):
                 name = assertion.group(1)
                 key = self.key(name, index)

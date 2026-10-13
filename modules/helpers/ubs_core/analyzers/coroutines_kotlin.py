@@ -331,8 +331,10 @@ class KotlinCoroutines:
                 low = scope if scope < 0 or scope in self.classes else index + 1
                 self.add_binding(self.value(index + 1), index + 1, low, self.scopes[scope], type_name)
             elif token.value == "catch" and self.value(index + 1) == "(":
+                # pairs is a dict; delimiter_pairs rejects unbalanced source, so this "(" has an entry — ubs:ignore[py.collections.index-arithmetic]
                 closing = self.pairs[index + 1]
                 if self.identifier(index + 2) and self.value(index + 3) == ":" and self.value(closing + 1) == "{":
+                    # the token at closing + 1 was just tested to be "{", which always has a pair — ubs:ignore[py.collections.index-arithmetic]
                     self.add_binding(self.value(index + 2), index + 2, closing + 1, self.pairs[closing + 1] + 1,
                                      self.path(index + 4, closing))
         # Explicit lambda parameters shadow imported APIs inside the lambda.
@@ -474,6 +476,7 @@ class KotlinCoroutines:
             closing = self.pairs[start]
             return Statement(start, closing + 1, "block", self.statements(start + 1, closing))
         if value in {"if", "while", "for"} and self.value(start + 1) == "(":
+            # pairs is a dict and the token at start + 1 was just tested to be "(" — ubs:ignore[py.collections.index-arithmetic]
             following = self.pairs[start + 1] + 1
             body = self.statement(following, end)
             finish, alternate = body.end, ()
@@ -590,6 +593,7 @@ class KotlinCoroutines:
             if self.value(index) == "{":
                 index = self.pairs[index] + 1
                 continue
+            # every repetition ends in a literal "." that \w cannot match — ubs:ignore[py.regex.nested-quantifiers] disjoint separator, verified linear
             if (self.value(index) == "="
                     and re.fullmatch(r"(?:[A-Za-z_]\w*\.)+[A-Za-z_]\w*", self.path(start, index))
                     and self.plain_alias(index + 1, end, aliases)):
@@ -616,6 +620,7 @@ class KotlinCoroutines:
         for index, token in enumerate(self.tokens):
             if token.value != "catch" or self.value(index + 1) != "(" or not self.context(index).suspend:
                 continue
+            # pairs is a dict and the token at index + 1 was just tested to be "(" — ubs:ignore[py.collections.index-arithmetic]
             closing = self.pairs[index + 1]
             if not self.identifier(index + 2) or self.value(index + 3) != ":" or self.value(closing + 1) != "{":
                 raise ValueError("Unsupported Kotlin catch parameter; analysis is incomplete")

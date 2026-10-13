@@ -262,6 +262,7 @@ class Source:
 
     def step(self, pos, kind, label):
         line = bisect_right(self.lines, pos)
+        # self.lines[0] == 0 <= pos, so line >= 1 — ubs:ignore[py.collections.index-arithmetic]
         return Step('', line, pos - self.lines[line - 1] + 1, kind, label)
 
     def origin(self, pos, label):
@@ -653,9 +654,11 @@ def scan_file(path: Path, *, max_steps: int = 2_000_000):
         trace = min(facts, key=lambda t: (len(t.evidence), t.evidence, t.key))
         labels = [step.label for step in trace.evidence]
         labels.append('SQL execution')
+        # starts[0] == 0 <= site < len(text), so line is between 1 and the line count — ubs:ignore[py.collections.index-arithmetic]
         sample = lines[line - 1].strip().replace('\t', ' ')
         records.append({
             'rule': RULE_ID, 'path': str(path), 'line': line,
+            # same bound as the sample line above — ubs:ignore[py.collections.index-arithmetic]
             'col': site - starts[line - 1] + 1, 'severity': SEVERITY,
             'message': TITLE, 'sample': f"{sample}  [{' -> '.join(labels)}]",
             'source_count': len(facts),

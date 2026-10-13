@@ -843,8 +843,10 @@ class _Flow:
             joined = accumulated
             for target, source, index in ((joined, state, 0), (joined.heap, state.heap, 6)):
                 if (previous[index] == snapshot[index]
+                        # _identity_snapshot returns nine entries and index is 0 or 6 — ubs:ignore[py.collections.index-arithmetic]
                         and all(map(operator.is_, previous[index + 1], snapshot[index + 1]))):
                     continue
+                # same nine-entry snapshot, index is 0 or 6 — ubs:ignore[py.collections.index-arithmetic]
                 before = dict(zip(previous[index], previous[index + 1]))
                 for name, fact in source.items():
                     if before.get(name, _MISSING) is fact:

@@ -10,7 +10,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
-First published release since v5.4.17. It includes everything under the git-only tags v5.4.18 and v5.4.19 below, which never had release assets, and the work that moved `VERSION` from 5.4.20 to 5.4.39 on `main` without a tag. Installs that update through `ubs --update` or the installer go from v5.4.17 straight to this version.
+First published release since v5.4.17. It includes everything under the git-only tags v5.4.18 and v5.4.19 below, which never had release assets, and the work that moved `VERSION` from 5.4.20 to 5.4.40 on `main` without a tag. Installs that update through `ubs --update` or the installer go from v5.4.17 straight to this version.
+
+### Known issues
+
+- **Elixir scans can end partial (exit 2) where v5.4.17 exited 0** (#168). A public function that calls `apply/2,3`, or a file that runs SQL (`Ecto.Adapters.SQL`, a `Repo` query) and also calls `Code.eval_*` or passes a callback to a function the engine does not model (`spawn`, `Task.async`, `Enum.reduce`, ...), makes the Elixir module report "analysis incomplete". Findings are still reported. `UBS_ALLOW_PARTIAL=1` returns the findings exit code (0 or 1) instead of 2. The engine treats such calls as unknown execution on purpose; #168 proposes treating calls that no request data reaches as opaque.
+
+### Changed
 
 - Preserve Swift SDK and Elixir Mix task argument boundaries in optional analyzer calls. Follow the actual bundled library during ShellCheck, retain trap callbacks with function-local annotations, and remove unused private helpers; lint severity gates remain unchanged.
 - Simplify analyzer call contracts: preserve source spans with evaluated arguments and named labels, capture Python callable/receiver identity separately from argument inputs, and keep fluent Swift call locations distinct. Remove unused C++ callback inputs; resource acquisition labels and Go decoder expression coordinates remain paired with their source locations.
@@ -56,7 +62,7 @@ First published release since v5.4.17. It includes everything under the git-only
 - Python analysis fails closed when it is incomplete or when a source file changes during the scan, and source suppressions are honored in every output format.
 - The Swift and Elixir drivers keep the findings they have and report an incomplete scan instead of a clean one.
 - The scanner and the daemon are distributed from the same verified generation, and the helper, shared-library, module and release checksum tables are regenerated together.
-- The repository's own scan (`./ubs . --ci --fail-on-warning`, which `scripts/cut-release.sh` requires) is clean again. Analyzer code added since v5.4.19 had raised 29 warnings in four rule families, which is why no version after v5.4.19 could be cut. The C# flow policy hooks take one `Call` record instead of nine or ten positional parameters; the index and regex sites were each checked and carry the reason next to a rule-scoped marker; the comment in `scripts/check_docs_claims.py` no longer quotes a regex that the rule read as code.
+- The repository's own scan (`./ubs . --ci --fail-on-warning`, which `scripts/cut-release.sh` requires) is clean again. Analyzer code added since v5.4.19 had raised 29 warnings in four rule families, which is why no version after v5.4.19 could be cut. The C# flow policy hooks take one `Call` record instead of nine or ten positional parameters; the 16 index sites and 5 regex sites were each verified before a rule-scoped marker with the reason was added (index bounds checked against how each table or pair map is built; each regex ran in under a millisecond on 20,000-character adversarial input), so none is a blanket suppression; the comment in `scripts/check_docs_claims.py` no longer quotes a regex that the rule read as code.
 - The `csharp-dapper-clean` and `elixir-callback-sql-clean` manifest cases forbid their rule ids, so the rule-coverage golden has no weak cases; the golden is regenerated for the four new cases.
 - The peak-RSS tests find GNU `time` through `PATH` instead of the fixed `/usr/bin/time`, and fail by name when it is missing or not GNU time (#166, the `time` half; the long socket-path half is still open).
 - Continue bounded JavaScript taint analysis across independent sink domains and selected import components. Preserve findings from resolved domains, release failed analysis state before continuing, and report a bounded aggregate incomplete result after emitting retained findings. Partial runs remain excluded from the scan cache.

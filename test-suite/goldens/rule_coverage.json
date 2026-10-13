@@ -1,10 +1,10 @@
 {
   "all_language_expectation_strength_scopes": {
     "all": {
-      "buggy_cases_with_required_substrings": 154,
-      "case_count": 308,
-      "clean_cases_with_forbidden_substrings": 154,
-      "strict_zero_clean_cases": 154,
+      "buggy_cases_with_required_substrings": 156,
+      "case_count": 312,
+      "clean_cases_with_forbidden_substrings": 156,
+      "strict_zero_clean_cases": 156,
       "weak_case_count": 0,
       "weak_cases": []
     },
@@ -27,9 +27,9 @@
   },
   "clean_fuzz_budget_scopes": {
     "all": {
-      "case_count": 186,
+      "case_count": 188,
       "default_iterations": 3,
-      "default_transformed_scan_count": 558
+      "default_transformed_scan_count": 564
     },
     "campaign": {
       "case_count": 99,
@@ -78,14 +78,14 @@
     "csharp": {
       "buggy_cases_with_required_substrings": 6,
       "clean_cases_with_forbidden_substrings": 6,
-      "security_pairs": 6,
-      "strict_zero_clean_cases": 6
+      "security_pairs": 7,
+      "strict_zero_clean_cases": 7
     },
     "elixir": {
       "buggy_cases_with_required_substrings": 8,
       "clean_cases_with_forbidden_substrings": 8,
-      "security_pairs": 8,
-      "strict_zero_clean_cases": 8
+      "security_pairs": 9,
+      "strict_zero_clean_cases": 9
     },
     "golang": {
       "buggy_cases_with_required_substrings": 18,
@@ -154,6 +154,8 @@
           "cpp-ssrf-clean",
           "csharp-archive-extraction-buggy",
           "csharp-archive-extraction-clean",
+          "csharp-dapper-buggy",
+          "csharp-dapper-clean",
           "csharp-header-injection-buggy",
           "csharp-header-injection-clean",
           "csharp-open-redirect-buggy",
@@ -178,6 +180,8 @@
           "elixir-security-command-clean",
           "elixir-security-randomness-buggy",
           "elixir-security-randomness-clean",
+          "elixir-callback-sql-buggy",
+          "elixir-callback-sql-clean",
           "elixir-ssrf-buggy",
           "elixir-ssrf-clean",
           "golang-archive-extraction-buggy",
@@ -712,8 +716,8 @@
           "rust-type-narrowing-clean"
         ]
       },
-      "case_count": 371,
-      "transformed_scan_count": 568
+      "case_count": 375,
+      "transformed_scan_count": 572
     },
     "campaign": {
       "by_transform": {
@@ -1286,6 +1290,20 @@
       "slug": "archive_extraction"
     },
     {
+      "buggy_case": "csharp-dapper-buggy",
+      "buggy_min_critical": 3,
+      "buggy_min_warning": 0,
+      "buggy_path": "test-suite/csharp/security/DapperSqlBuggy.cs",
+      "buggy_require_count": 0,
+      "clean_case": "csharp-dapper-clean",
+      "clean_forbid_count": 0,
+      "clean_max_critical": 0,
+      "clean_max_warning": 0,
+      "clean_path": "test-suite/csharp/security/DapperSqlClean.cs",
+      "language": "csharp",
+      "slug": "dapper_sql"
+    },
+    {
       "buggy_case": "csharp-header-injection-buggy",
       "buggy_min_critical": 1,
       "buggy_min_warning": 0,
@@ -1452,6 +1470,20 @@
       "clean_path": "test-suite/elixir/clean/security_randomness.ex",
       "language": "elixir",
       "slug": "security-randomness"
+    },
+    {
+      "buggy_case": "elixir-callback-sql-buggy",
+      "buggy_min_critical": 3,
+      "buggy_min_warning": 0,
+      "buggy_path": "test-suite/elixir/callbacks/sql_buggy.ex",
+      "buggy_require_count": 0,
+      "clean_case": "elixir-callback-sql-clean",
+      "clean_forbid_count": 0,
+      "clean_max_critical": 0,
+      "clean_max_warning": 0,
+      "clean_path": "test-suite/elixir/callbacks/sql_clean.ex",
+      "language": "elixir",
+      "slug": "sql"
     },
     {
       "buggy_case": "elixir-ssrf-buggy",
@@ -3354,6 +3386,7 @@
         "cpp-security-randomness-clean",
         "cpp-ssrf-clean",
         "csharp-archive-extraction-clean",
+        "csharp-dapper-clean",
         "csharp-header-injection-clean",
         "csharp-open-redirect-clean",
         "csharp-random-security-clean",
@@ -3366,6 +3399,7 @@
         "elixir-request-path-traversal-clean",
         "elixir-security-command-clean",
         "elixir-security-randomness-clean",
+        "elixir-callback-sql-clean",
         "elixir-ssrf-clean",
         "golang-archive-extraction-clean",
         "golang-constant-time-compare-clean",
@@ -3549,6 +3583,8 @@
         "cpp-ssrf-clean",
         "csharp-archive-extraction-buggy",
         "csharp-archive-extraction-clean",
+        "csharp-dapper-buggy",
+        "csharp-dapper-clean",
         "csharp-header-injection-buggy",
         "csharp-header-injection-clean",
         "csharp-open-redirect-buggy",
@@ -3573,6 +3609,8 @@
         "elixir-security-command-clean",
         "elixir-security-randomness-buggy",
         "elixir-security-randomness-clean",
+        "elixir-callback-sql-buggy",
+        "elixir-callback-sql-clean",
         "elixir-ssrf-buggy",
         "elixir-ssrf-clean",
         "golang-archive-extraction-buggy",
@@ -4286,6 +4324,8 @@
       "cpp-ssrf-clean",
       "csharp-archive-extraction-buggy",
       "csharp-archive-extraction-clean",
+      "csharp-dapper-buggy",
+      "csharp-dapper-clean",
       "csharp-header-injection-buggy",
       "csharp-header-injection-clean",
       "csharp-open-redirect-buggy",
@@ -4310,6 +4350,8 @@
       "elixir-security-command-clean",
       "elixir-security-randomness-buggy",
       "elixir-security-randomness-clean",
+      "elixir-callback-sql-buggy",
+      "elixir-callback-sql-clean",
       "elixir-ssrf-buggy",
       "elixir-ssrf-clean",
       "golang-archive-extraction-buggy",

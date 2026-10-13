@@ -6,8 +6,8 @@ and the per-group severity/summary/remediation metadata maps (96-202).
 
 ``generate(rule_dir, user_rules_dir=None)`` writes::
 
-    <rule_dir>/rules/*.yml   the 37 base rules (byte-identical to the legacy
-                             heredocs) plus one file per language variant;
+    <rule_dir>/rules/*.yml   the 37 built-in base rules, derived from the legacy
+                             pack and corrected here, plus language variants;
                              variants keep the base rule's id (GH #93) and
                              differ only in the rewritten `language:` line
     <rule_dir>/sgconfig-javascript.yml   one config per grammar, each listing
@@ -195,7 +195,7 @@ def _retarget(rule_text: str, source: str, target: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Base rule pack — verbatim heredoc bodies of write_ast_rules (3134-3624).
+# Base rule pack — derived from write_ast_rules (3134-3624), with corrections.
 # (file stem, YAML text)
 # ─────────────────────────────────────────────────────────────────────────────
 _RULES: tuple[tuple[str, str], ...] = (
@@ -398,6 +398,26 @@ utils:
           kind: jsx_opening_element
           has:
             matches: jsx-key-attribute
+  # These expressions are evaluated but their JSX value is discarded.
+  # Keeping this local to the owning expression preserves inner mapped lists.
+  jsx-discarded-value:
+    any:
+      - inside:
+          kind: ternary_expression
+          field: condition
+      - inside:
+          kind: binary_expression
+          field: left
+          pattern: $LEFT && $RIGHT
+      - all:
+          - inside:
+              kind: sequence_expression
+          - precedes:
+              not:
+                kind: comment
+              stopBy:
+                not:
+                  kind: comment
   # Stop at a value's owner, rather than at a fixed set of transparent
   # expression wrappers. This also admits TS casts without putting TS-only
   # node kinds into the generated JavaScript variant.
@@ -423,6 +443,15 @@ utils:
       - kind: member_expression
       - kind: subscript_expression
       - kind: template_substitution
+      - kind: unary_expression
+      - all:
+          - kind: binary_expression
+          - not:
+              any:
+                - pattern: $LEFT && $RIGHT
+                - pattern: $LEFT || $RIGHT
+                - pattern: $LEFT ?? $RIGHT
+      - matches: jsx-discarded-value
   jsx-mapping-argument:
     any:
       - all:
@@ -474,6 +503,8 @@ rule:
         - kind: jsx_element
     - not:
         matches: jsx-has-key
+    - not:
+        matches: jsx-discarded-value
     - any:
         - inside:
             kind: array

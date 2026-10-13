@@ -217,7 +217,10 @@ class UserRuleTests(unittest.TestCase):
 
     def test_user_rules_are_scheduled_once_in_isolated_config(self) -> None:
         config = (self.rule_dir / "sgconfig-custom.yml").read_text(encoding="utf-8")
-        paths = json.loads(config.removeprefix("ruleDirs: "))
+        try:
+            paths = json.loads(config.removeprefix("ruleDirs: "))
+        except ValueError as exc:
+            self.fail(f"generate() wrote non-JSON ruleDirs paths: {exc}")
         self.assertEqual(paths, ["rules/custom/my-rule.yml", "rules/custom/sub/deep.yml",
                                  "rules/custom/ts-rule.yml"])
         for grammar in GRAMMARS:
@@ -320,6 +323,19 @@ class ScanSmokeTests(unittest.TestCase):
             ("callback parameter", "rows.map((row = <Unused />) => null);", []),
             ("attribute child", "rows.map(row => <Row key={row.id} icon={<Icon />} />);", []),
             ("value call", "rows.map(row => wrap(<Icon />));", []),
+            ("discarded comma", "rows.map(row => (<Unused />, <Row />));", ["<Row />"]),
+            ("wrapped comma", "rows.map(row => ((<Unused />), (<Row />)));", ["<Row />"]),
+            ("comma comments", "rows.map(row => (<Unused />, /* next */ <Row />));", ["<Row />"]),
+            ("condition value", "rows.map(row => <Unused /> ? <Row /> : null);", ["<Row />"]),
+            ("wrapped condition", "rows.map(row => (<Unused />) ? <Row /> : null);", ["<Row />"]),
+            ("logical left", "rows.map(row => <Unused /> && <Row />);", ["<Row />"]),
+            ("logical or", "rows.map(row => <Row /> || null);", ["<Row />"]),
+            ("nullish fallback", "rows.map(row => row.view ?? <Row />);", ["<Row />"]),
+            ("comparison operand", "rows.map(row => <Unused /> === row);", []),
+            ("coerced operand", "rows.map(row => <Unused /> + row);", []),
+            ("unary operand", "rows.map(row => !<Unused />);", []),
+            ("array operand", "const views = [<Unused /> === selected];", []),
+            ("inner mapped condition", "rows.map(row => parts.map(part => <Part />) ? <Row /> : null);", ["<Part />", "<Row />"]),
         ]
         tmp = Path(tempfile.mkdtemp(prefix="ubs-react-key-scan-"))
         try:
@@ -339,7 +355,10 @@ class ScanSmokeTests(unittest.TestCase):
                             capture_output=True, text=True, timeout=120,
                         )
                         self.assertIn(proc.returncode, (0, 1), proc.stderr)
-                        records = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+                        try:
+                            records = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+                        except ValueError as exc:
+                            self.fail(f"ast-grep --json=stream emitted invalid JSON: {exc}")
                         self.assertEqual([record["ruleId"] for record in records],
                                          ["react.list-missing-key"] * len(expected))
                         self.assertEqual([record["text"] for record in records], expected)
@@ -359,7 +378,10 @@ class ScanSmokeTests(unittest.TestCase):
                         capture_output=True, text=True, timeout=120,
                     )
                     self.assertIn(proc.returncode, (0, 1), proc.stderr)
-                    records = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+                    try:
+                        records = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+                    except ValueError as exc:
+                        self.fail(f"ast-grep --json=stream emitted invalid JSON: {exc}")
                     self.assertEqual([record["ruleId"] for record in records], ["react.list-missing-key"])
                     self.assertEqual([record["text"] for record in records], ["<Row />"])
         finally:

@@ -52,6 +52,7 @@ from ubs_core.py_detectors import sql_injection  # noqa: E402
 from ubs_core.py_patterns.debug_typing import PATTERNS as DEBUG_PATTERNS  # noqa: E402
 from ubs_core.py_patterns.flow import PATTERNS as FLOW_PATTERNS  # noqa: E402
 from ubs_core.py_patterns.foundations import PATTERNS as FOUNDATION_PATTERNS  # noqa: E402
+from ubs_core.py_patterns.io_files import PATTERNS as IO_PATTERNS  # noqa: E402
 from ubs_core.py_patterns.quality import PATTERNS as QUALITY_PATTERNS  # noqa: E402
 from ubs_core.py_patterns.security_rg import PATTERNS as SECURITY_PATTERNS  # noqa: E402
 from ubs_core.py_scan import scan_patterns  # noqa: E402
@@ -59,7 +60,7 @@ from ubs_core.py_scan import scan_patterns  # noqa: E402
 
 def pattern(rule_id: str):
     for group in (DEBUG_PATTERNS, FLOW_PATTERNS, FOUNDATION_PATTERNS,
-                  QUALITY_PATTERNS, SECURITY_PATTERNS):
+                  IO_PATTERNS, QUALITY_PATTERNS, SECURITY_PATTERNS):
         for entry in group:
             if entry.rule_id == rule_id:
                 return entry
@@ -754,6 +755,37 @@ class OpenMissingWithTests(unittest.TestCase):
 
 
 # ─────────────────────── json.loads without a handler ───────────────────────
+class OpenNoEncodingCalleeTests(unittest.TestCase):
+    """py.io.open-no-encoding is about open(), not names ending in "open" (#167)."""
+
+    def test_callees_that_end_in_open_are_not_file_opens(self) -> None:
+        records = run_patterns("py.io.open-no-encoding", {"p.py": '''
+            import os
+            import subprocess
+            from urllib.request import urlopen
+
+            def run(argv, url, fd):
+                with open("out.log", "w", encoding="utf-8") as out:
+                    proc = subprocess.Popen(argv, stdout=out)
+                body = urlopen(url)
+                pipe = os.popen("ls")
+                handle = os.fdopen(fd)
+                return proc.wait(), body, pipe, handle
+        '''})
+        self.assertEqual(records, [])
+
+    def test_open_and_open_methods_without_encoding_are_still_reported(self) -> None:
+        records = run_patterns("py.io.open-no-encoding", {"o.py": '''
+            import pathlib
+
+            def read(path):
+                first = open(path).read()
+                second = pathlib.Path(path).open().read()
+                return first, second
+        '''})
+        self.assertEqual(sorted(record["line"] for record in records), [5, 6], records)
+
+
 class JsonLoadsGuardTests(unittest.TestCase):
     """`py.parsing.json-loads-no-try` after the #109 §3 deduplication.
 

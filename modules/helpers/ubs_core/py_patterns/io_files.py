@@ -21,7 +21,9 @@ PATTERNS: list[Pattern] = [
         rule_id="py.io.open-no-encoding",
         title="open() missing encoding",
         # legacy post-filter: `grep -v "encoding[[:space:]]*="`.
-        regex=re.compile(r"open\([^)]*\)"),
+        # The callee is `open` or a `.open` method, not a name that ends in
+        # "open" such as `subprocess.Popen` or `urlopen` (issue #167).
+        regex=re.compile(r"(?<![A-Za-z0-9_])open\([^)]*\)"),
         thresholds=((0, "info"),),
         exclude_regex=re.compile(r"encoding[ \t]*="),
     ),

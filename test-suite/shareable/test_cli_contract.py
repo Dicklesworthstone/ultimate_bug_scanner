@@ -637,6 +637,7 @@ _EVERY_MODULE_RULES = {
     "cpp": ("cpp", "printf($$$A)", "a.cpp", '#include <cstdio>\nint main() { printf("x"); return 0; }\n'),
     "elixir": ("elixir", "IO.puts($$$A)", "a.ex", 'defmodule A do\n  def f, do: IO.puts("x")\nend\n'),
     "bash": ("bash", "echo $$$A", "a.sh", "#!/usr/bin/env bash\necho hi\n"),
+    "php": ("php", "printf($$$A)", "a.php", '<?php\nprintf("x");\n'),
 }
 
 
@@ -1499,6 +1500,9 @@ def check_robot_docs_flags_parse() -> None:
         "message: flag parser fixture\nrule:\n  pattern: print($VALUE)\n",
         encoding="utf-8",
     )
+    # The documented --config example names ./ci.ubs.json; give it an empty,
+    # valid policy so the example parses as documented.
+    (scratch / "ci.ubs.json").write_text("{}\n", encoding="utf-8")
     for flag in doc["commands"]["flags"]:
         example = flag["example"]
         if flag["name"] in ("--update", "--update-modules"):

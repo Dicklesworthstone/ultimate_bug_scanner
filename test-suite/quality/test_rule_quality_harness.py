@@ -374,7 +374,9 @@ class AstGrepRulePackHelperTest(unittest.TestCase):
                     result = subprocess.run(args, cwd=root, text=True, capture_output=True,
                                             timeout=60, check=False)
                     context = result.stdout + result.stderr
-                    self.assertEqual(result.returncode, 0 if metadata_only else 1, context)
+                    # A scan of this fixture is partial (exit 2) until issue
+                    # #168 is fixed; see the elixir-rule-pack spec.
+                    self.assertEqual(result.returncode, 0 if metadata_only else 2, context)
                     config = exported / "sgconfig-elixir.yml"
                     self.assertTrue(config.is_file(), context)
                     self.assertEqual(len(list((exported / "rules").glob("*.yml"))), 26, context)

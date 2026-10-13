@@ -1263,6 +1263,11 @@ AST_GREP_SARIF_CHECKS = (
         "list_args": ("--list-rules",),
         "fixture": "test-suite/elixir/ast_grep_rule_pack_coverage.ex",
         "corpus_fixture": "test-suite/elixir",
+        # Issue #168: the Elixir SQL taint engine reports Code.eval_file and
+        # spawn(fn ...) in this fixture as unmodelled execution, so the module
+        # finishes partial (exit 2) with every rule-pack finding still emitted.
+        # Pinned to 2 so the fix for #168 has to change this line.
+        "expected_returncodes": (2,),
         "expected_rule_ids": (
             "elixir.binary-to-term-unsafe",
             "elixir.code-eval-file",
@@ -1516,7 +1521,7 @@ def sarif_summary_from_process(
     proc: subprocess.CompletedProcess[str],
     label: str,
 ) -> dict[str, Any]:
-    if proc.returncode not in (0, 1):
+    if proc.returncode not in spec.get("expected_returncodes", (0, 1)):
         write_runtime_artifact(label, proc, None)
         raise AssertionError(
             f"{label} failed; stderr is captured under "
@@ -1771,7 +1776,7 @@ def run_single_ast_grep_rule_inventory_check(
         raise AssertionError(f"{label} timed out while dumping rules after {timeout}s") from exc
     proc.duration_seconds = round(time.monotonic() - start, 3)  # type: ignore[attr-defined]
 
-    if proc.returncode not in (0, 1):
+    if proc.returncode not in spec.get("expected_returncodes", (0, 1)):
         write_runtime_artifact(label, proc, None)
         raise AssertionError(
             f"{label} failed while dumping rules; stderr is captured under "

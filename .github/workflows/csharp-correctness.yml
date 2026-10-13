@@ -1,0 +1,162 @@
+name: CSharp correctness
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/csharp-correctness.yml
+      - test-suite/quality/test_csharp_correctness.py
+      - test-suite/quality/test_csharp_result_receivers.py
+      - test-suite/quality/fixtures/csharp-correctness-candidate.json
+      - modules/helpers/ubs_core/csharp_patterns/**
+      - modules/helpers/ubs_core/csharp_scan.py
+      - modules/helpers/ubs_core/analyzers/taint_csharp_sql.py
+      - modules/ubs-csharp.sh
+      - ubs
+  workflow_dispatch:
+  # An explicitly requested rerun starts validation of current immutable main;
+  # no artifacts, scripts or code from the triggering run are consumed.
+  workflow_run:
+    workflows: [JavaScript Module Taint]
+    types: [in_progress]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  correctness:
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.id == 37832176871 &&
+       github.event.workflow_run.run_attempt > 1 &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      UBS_NO_AUTO_UPDATE: '1'
+      UBS_ENABLE_AUTO_UPDATE: '0'
+      ENABLE_UV_TOOLS: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Apply the exact reviewed candidate without committing it
+        id: candidate
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          candidate = Path('test-suite/quality/fixtures/csharp-correctness-candidate.json')
+          if not candidate.exists():
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+                  output.write('applied=false\n')
+              raise SystemExit(0)
+          edits = json.loads(candidate.read_text())['edits']
+          allowed = {'ubs', 'modules/ubs-csharp.sh',
+                     'modules/helpers/ubs_core/csharp_scan.py',
+                     'modules/helpers/ubs_core/csharp_patterns/_table.py',
+                     'modules/helpers/ubs_core/csharp_patterns/concurrency.py',
+                     'modules/helpers/ubs_core/analyzers/taint_csharp_sql.py'}
+          assert set(edits) == allowed, set(edits)
+          for name, changes in edits.items():
+              path = Path(name)
+              text = path.read_text()
+              for edit in changes:
+                  assert text.count(edit['old']) == edit['count'], (name, edit['old'])
+                  text = text.replace(edit['old'], edit['new'])
+              path.write_text(text)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('applied=true\n')
+          print('CANDIDATE_BASE', subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip())
+          PY
+      - name: Install real scanner dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq ripgrep rsync shellcheck
+          npm install --global @ast-grep/cli@0.45.3
+      - name: Generate and verify the complete integrity chain
+        run: |
+          python3 scripts/update_checksums.py
+          ./scripts/update_sha256sums.sh
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          git diff --check
+          bash -n ubs
+          bash -n modules/ubs-csharp.sh
+          shellcheck -S warning ubs modules/ubs-csharp.sh
+      - name: Receiver classification and both public issue reproductions
+        env:
+          UBS_CSHARP_CORRECTNESS_PUBLIC: '1'
+        run: |
+          python3 test-suite/quality/test_csharp_result_receivers.py -v
+          python3 test-suite/quality/test_csharp_correctness.py -v
+      - name: Existing CSharp SQL and request dataflow regressions
+        env:
+          UBS_CSHARP_SQL_PUBLIC: '1'
+        run: |
+          python3 test-suite/quality/test_csharp_sql.py -v
+          python3 -m unittest discover -s test-suite/quality -p test_taint_csharp_dataflow.py -v
+          python3 -m unittest discover -s test-suite/csharp/tests -p 'test_*.py' -v
+      - name: Confirm deterministic integrity after real scanner execution
+        run: |
+          git diff --binary > "$RUNNER_TEMP/csharp-before.patch"
+          python3 scripts/update_checksums.py
+          ./scripts/update_sha256sums.sh
+          git diff --binary > "$RUNNER_TEMP/csharp-after.patch"
+          cmp "$RUNNER_TEMP/csharp-before.patch" "$RUNNER_TEMP/csharp-after.patch"
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+      - name: Stage verified Git blobs only; publishing remains an explicit connector operation
+        if: steps.candidate.outputs.applied == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import base64, hashlib, json, os, subprocess, urllib.request
+          from pathlib import Path
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+          paths = git('diff', '--name-only').splitlines()
+          allowed = {'ubs', 'SHA256SUMS', 'scripts/new-module.sh', 'modules/lib/ubs-common.sh',
+                     'modules/helpers/ubs_core/csharp_scan.py',
+                     'modules/helpers/ubs_core/csharp_patterns/_table.py',
+                     'modules/helpers/ubs_core/csharp_patterns/concurrency.py',
+                     'modules/helpers/ubs_core/analyzers/taint_csharp_sql.py'}
+          allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
+          assert set(paths) <= allowed, set(paths) - allowed
+          assert {'ubs', 'SHA256SUMS', 'modules/helpers/ubs_core/analyzers/taint_csharp_sql.py'} <= set(paths), paths
+          manifest = {'base': git('rev-parse', 'HEAD'), 'files': []}
+          for name in paths:
+              data = Path(name).read_bytes()
+              payload = json.dumps({'encoding':'base64', 'content':base64.b64encode(data).decode()}).encode()
+              request = urllib.request.Request(
+                  'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + '/git/blobs',
+                  data=payload, method='POST', headers={'Authorization':'Bearer ' + os.environ['GH_TOKEN'],
+                  'Accept':'application/vnd.github+json', 'Content-Type':'application/json'})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  sha = json.load(response)['sha']
+              assert sha == hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+              mode = git('ls-files', '-s', '--', name).split()[0]
+              item = {'path':name, 'mode':mode, 'type':'blob', 'sha':sha,
+                      'old_sha':git('rev-parse', 'HEAD:' + name)}
+              manifest['files'].append(item)
+              print('CSHARP_VERIFIED_BLOB ' + json.dumps(item), flush=True)
+          Path(os.environ['RUNNER_TEMP'], 'csharp-verified-blobs.json').write_text(json.dumps(manifest, indent=2))
+          print('CSHARP_VERIFIED_BASE ' + manifest['base'], flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: csharp-correctness-evidence
+          path: |
+            ${{ runner.temp }}/csharp-*.patch
+            ${{ runner.temp }}/csharp-verified-blobs.json
+            test-suite/artifacts/dapper-independent

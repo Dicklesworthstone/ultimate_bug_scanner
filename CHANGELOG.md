@@ -10,6 +10,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+_No changes yet._
+
+---
+
+## [v5.5.1] - 2026-10-14 [Release]
+
 ### Fixed
 
 - **Scans no longer spawn ast-grep without end when the installer placed ast-grep's `sg` launcher as `ast-grep`.** ast-grep's release archives contain the real `ast-grep` and `sg`, which recent ast-grep releases turned into a small deprecation launcher that runs `ast-grep` from `PATH`. When `ast-grep` was not installed, `install.sh` (v5.4.16 to v5.5.0) unpacked the 0.45.3 archive and installed whichever of the two `find` listed first as `~/.local/bin/ast-grep`. When that was the launcher, it ran itself recursively: a single-file Python scan timed out after 300 s with thousands of short-lived processes, and in a 4 GiB container the kernel killed ast-grep and everything after it. The installer now installs only the member named `ast-grep`, and treats a launcher already on `PATH` as missing, so re-running it repairs the install. The runner recognises the launcher from its bytes, without executing it, and for that run puts a verified ast-grep (another one on `PATH`, or its own tool cache) ahead of it on `PATH`, so no language module runs the launcher; it warns once per run and points at `install.sh` for the repair. Before, only JavaScript scans resolved a verified ast-grep, so every other module ran whatever `ast-grep` was first on `PATH`.

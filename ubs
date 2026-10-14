@@ -28,7 +28,7 @@ set -Eeuo pipefail
 shopt -s lastpipe || true
 trap '' SIGPIPE 2>/dev/null || true
 
-UBS_VERSION="5.4.42"
+UBS_VERSION="5.5.1"
 # The optional service is a release executable, not a command trusted via PATH.
 # scripts/update_checksums.py keeps this pin in sync with ubs-daemon.
 UBS_DAEMON_SHA256="617d8d283c2caac455991cff4ef67b7e36be9933e989130bdeae0e935b30e8a0"
@@ -2177,7 +2177,7 @@ cat <<'JSON'
         "required": ["language", "files", "critical", "warning", "info"],
         "properties": {
           "language": {"type": "string"},
-          "status": {"enum": ["ok", "timeout", "error"]},
+          "status": {"enum": ["ok", "timeout", "error", "partial"]},
           "files": {"$ref": "#/$defs/count"},
           "critical": {"$ref": "#/$defs/count"},
           "warning": {"$ref": "#/$defs/count"},
@@ -2211,8 +2211,8 @@ cat <<'JSON'
           "timestamp": {"type": "string"},
           "status": {"enum": ["ok", "partial", "error"], "description": "ok = every requested scanner completed; partial = the scan is incomplete but something usable came back; error = a module could not run at all (exit 2) and no other scanner produced a result"},
           "failed_modules": {"type": "array", "items": {"$ref": "#/$defs/failed_module"}},
-          "error": {"enum": ["environment"], "description": "present when a scanner module exited 2 (a tooling/dependency failure, not a code-quality result)"},
-          "reason": {"type": "string", "description": "module-failed | module-incomplete; present when status is not ok"},
+          "error": {"enum": ["environment", "analysis"], "description": "environment = tooling/dependency failure; analysis = explicit incomplete semantic coverage; both retain exit 2"},
+          "reason": {"type": "string", "description": "module-failed | module-incomplete | analysis-incomplete; present when status is not ok"},
           "exit_code": {"const": 2, "description": "the exit status that accompanies an incomplete run; omitted under UBS_ALLOW_PARTIAL=1"},
           "message": {"type": "string", "description": "present when status is not ok"},
           "scanners": {"type": "array", "items": {"$ref": "#/$defs/scanner"}},
@@ -2289,7 +2289,7 @@ cat <<'JSON'
           "type": {"const": "scanner"},
           "project": {"type": "string"},
           "language": {"type": "string"},
-          "status": {"enum": ["ok", "timeout", "error"]},
+          "status": {"enum": ["ok", "timeout", "error", "partial"]},
           "files": {"$ref": "#/$defs/count"},
           "critical": {"$ref": "#/$defs/count"},
           "warning": {"$ref": "#/$defs/count"},
@@ -2305,6 +2305,10 @@ cat <<'JSON'
           "project": {"type": "string"},
           "status": {"enum": ["ok", "partial", "error"]},
           "failed_modules": {"type": "array"},
+          "error": {"enum": ["environment", "analysis"]},
+          "reason": {"type": "string"},
+          "exit_code": {"const": 2},
+          "message": {"type": "string"},
           "files": {"$ref": "#/$defs/count"},
           "critical": {"$ref": "#/$defs/count"},
           "warning": {"$ref": "#/$defs/count"},
@@ -8049,12 +8053,13 @@ qualify_combined_json(){
   jq -c --arg status "$run_status" --argjson failed "$failed" \
         --arg reason "$reason" --arg message "$message" \
         --argjson exit_code "$exit_code" \
-        --argjson env_error "${HAS_ENV_ERROR:-0}" '
+        --argjson env_error "${HAS_ENV_ERROR:-0}" --argjson analysis_error "${HAS_ANALYSIS_ERROR:-0}" '
     . + {status: $status, failed_modules: $failed}
     + (if $reason == "" then {}
        else {reason: $reason, message: $message}
             + (if $exit_code == null then {} else {exit_code: $exit_code} end)
-            + (if $env_error == 1 then {error: "environment"} else {} end)
+            + (if $env_error == 1 then {error: "environment"}
+               elif $analysis_error == 1 then {error: "analysis"} else {} end)
        end)
   ' "$COMBINED_JSON_FILE" >"$COMBINED_JSON_FILE.qualified" 2>/dev/null \
     && mv "$COMBINED_JSON_FILE.qualified" "$COMBINED_JSON_FILE"
@@ -8284,6 +8289,7 @@ write_jsonl_summary(){
     {type:"totals", project:$project, status:(.status // "ok"), failed_modules:(.failed_modules // []),
      files:(.totals.files//0), critical:(.totals.critical//0),
      warning:(.totals.warning//0), info:(.totals.info//0), timestamp:(.timestamp // $ts)}
+    + ({error, reason, exit_code, message} | with_entries(select(.value != null)))
   ' "$COMBINED_JSON_FILE" >>"$tmp" || return 1
 
   if [[ -n "$dest" ]]; then
@@ -8712,9 +8718,28 @@ if need_cmd jq; then
     USABLE_SCANNERS="${USABLE_SCANNERS:-0}"
   fi
 fi
-# A module that exited 2 is an environment/tooling failure rather than a
-# code-quality result; it does not change what the healthy modules found, but
-# the run is incomplete either way.
+# Exit 2 also covers explicit semantic limits. Preserve incompleteness and
+# evidence, but do not tell users to repair their tools for missing coverage.
+# Text-mode modules carry this same identity in their Partial: [CODE] marker.
+# Missing/invalid reports and any infrastructure failure remain failures.
+HAS_ANALYSIS_ERROR=0
+if need_cmd jq; then
+  HAS_ANALYSIS_ERROR="$(printf '%s' "$FAILED_MODULES_JSON" | jq -r 'if length > 0 and all(.[]; .status == "partial" and .module_error == "ANALYSIS_INCOMPLETE") then 1 else 0 end' 2>/dev/null || echo 0)"
+  # Only reclassify failures with a named module and its explicit report.
+  # An infrastructure failure without such evidence must retain its identity.
+  if [[ ${#ENV_ERROR_LANGS[@]} -gt 0 ]]; then
+    actual_env_errors=()
+    for L in "${ENV_ERROR_LANGS[@]}"; do
+      if ! jq -e '.status == "partial" and .module_error == "ANALYSIS_INCOMPLETE"' "$TMPDIR_RUN/$L.json" >/dev/null 2>&1; then
+        actual_env_errors+=("$L")
+      fi
+    done
+    ENV_ERROR_LANGS=("${actual_env_errors[@]}")
+    HAS_ENV_ERROR=0
+    [[ ${#ENV_ERROR_LANGS[@]} -eq 0 ]] || HAS_ENV_ERROR=1
+  fi
+fi
+# Other abnormal outcomes retain the existing execution-failure identity.
 if [[ "$HAS_ENV_ERROR" -eq 1 && "$RUN_STATUS" == "ok" ]]; then
   RUN_STATUS="partial"
 fi
@@ -8768,7 +8793,9 @@ env_error_langs_json(){
 
 incomplete_run_reason(){
   if [[ "${FINDINGS_MERGE_FAILED:-0}" -eq 1 ]]; then printf 'findings-merge-failed'; return; fi
-  if [[ "${HAS_ENV_ERROR:-0}" -eq 1 ]]; then printf 'module-failed'; else printf 'module-incomplete'; fi
+  if [[ "${HAS_ENV_ERROR:-0}" -eq 1 ]]; then printf 'module-failed'
+  elif [[ "${HAS_ANALYSIS_ERROR:-0}" -eq 1 ]]; then printf 'analysis-incomplete'
+  else printf 'module-incomplete'; fi
 }
 
 incomplete_run_message(){
@@ -8778,6 +8805,8 @@ incomplete_run_message(){
   fi
   if [[ "${HAS_ENV_ERROR:-0}" -eq 1 ]]; then
     printf 'One or more scanner modules could not run (tooling/dependency problem, not a code-quality failure): %s' "${ENV_ERROR_LANGS[*]}"
+  elif [[ "${HAS_ANALYSIS_ERROR:-0}" -eq 1 ]]; then
+    printf 'Semantic analysis coverage is incomplete; supported findings are preserved, but unsupported code was not proven safe'
   else
     printf 'One or more scanner modules did not complete; this result covers only the languages that finished'
   fi

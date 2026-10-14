@@ -92,6 +92,110 @@ def _closed_names(scope: ast.AST) -> set[str]:
     return closed
 
 
+def _exitstack_descriptors(tree: ast.AST) -> tuple[set[int], set[int]]:
+    """Exact stdlib ExitStack ownership of integer os.open descriptors.
+
+    Integers cannot supply .close(). Registering os.close with a live stack
+    immediately after allocation transfers ownership on every later exit.
+    Require resolved imports and no manager escape or rebinding; an arbitrary
+    callback method, unclosed descriptor or shadowed API establishes nothing.
+    """
+    nodes = tuple(ast.walk(tree))
+    parents = {child: parent for parent in nodes for child in ast.iter_child_nodes(parent)}
+    aliases: dict[str, str] = {}
+    for node in nodes:
+        if isinstance(node, ast.Import):
+            for name in node.names:
+                if name.name in {'os', 'contextlib'}:
+                    aliases[name.asname or name.name] = name.name
+        elif isinstance(node, ast.ImportFrom) and node.module in {'os', 'contextlib'}:
+            for name in node.names:
+                if name.name in {'open', 'close', 'ExitStack'}:
+                    aliases[name.asname or name.name] = f'{node.module}.{name.name}'
+
+    def root_name(node):
+        while isinstance(node, ast.Attribute):
+            node = node.value
+        return node.id if isinstance(node, ast.Name) else ''
+
+    invalid = set()
+    for node in nodes:
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            invalid.add(node.id)
+        elif isinstance(node, ast.arg):
+            invalid.add(node.arg)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            invalid.add(node.name)
+        elif isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            invalid.add(root_name(node))
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in {
+                'exec', 'eval', 'globals', 'locals', 'vars'}:
+            invalid.update(aliases)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for name in node.names:
+                local = name.asname or name.name.split('.')[0]
+                actual = name.name if isinstance(node, ast.Import) else f'{node.module}.{name.name}'
+                if local in aliases and aliases[local] != actual:
+                    invalid.add(local)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in aliases:
+            identity = aliases[node.id]
+            parent = parents.get(node)
+            if identity in {'os', 'contextlib'} and not (
+                    isinstance(parent, ast.Attribute) and parent.value is node):
+                invalid.add(node.id)
+            elif identity == 'contextlib.ExitStack' and not (
+                    isinstance(parent, ast.Call) and parent.func is node):
+                invalid.add(node.id)
+    aliases = {name: value for name, value in aliases.items() if name not in invalid}
+
+    def qualified(node):
+        if isinstance(node, ast.Name):
+            return aliases.get(node.id, '')
+        if isinstance(node, ast.Attribute):
+            base = qualified(node.value)
+            return f'{base}.{node.attr}' if base else ''
+        return ''
+
+    descriptors = {id(node) for node in nodes if isinstance(node, ast.Call)
+                   and qualified(node.func) == 'os.open'}
+    managed = set()
+    for node in nodes:
+        if not isinstance(node, ast.With) or len(node.items) != 1:
+            continue
+        for item in node.items:
+            if not (isinstance(item.context_expr, ast.Call)
+                    and qualified(item.context_expr.func) == 'contextlib.ExitStack'
+                    and not item.context_expr.args and not item.context_expr.keywords
+                    and isinstance(item.optional_vars, ast.Name)):
+                continue
+            manager = item.optional_vars.id
+            callbacks = [child.value for child in node.body if isinstance(child, ast.Expr)
+                         and isinstance(child.value, ast.Call)
+                         and isinstance(child.value.func, ast.Attribute)
+                         and isinstance(child.value.func.value, ast.Name)
+                         and child.value.func.value.id == manager
+                         and child.value.func.attr == 'callback']
+            uses = {id(call.func.value) for call in callbacks}
+            # A popped/escaped/reassigned manager can abandon its callbacks.
+            if any(isinstance(child, ast.Name) and child.id == manager and id(child) not in uses
+                   for statement in node.body for child in ast.walk(statement)):
+                continue
+            for allocation, registration in zip(node.body, node.body[1:]):
+                if not (isinstance(allocation, ast.Assign) and len(allocation.targets) == 1
+                        and isinstance(allocation.targets[0], ast.Name)
+                        and isinstance(allocation.value, ast.Call)
+                        and qualified(allocation.value.func) == 'os.open'
+                        and isinstance(registration, ast.Expr) and registration.value in callbacks):
+                    continue
+                call = registration.value
+                if (len(call.args) == 2 and not call.keywords
+                        and qualified(call.args[0]) == 'os.close'
+                        and isinstance(call.args[1], ast.Name)
+                        and call.args[1].id == allocation.targets[0].id):
+                    managed.add(id(allocation.value))
+    return descriptors, managed
+
+
 def _managed(node: ast.Call, parents: dict[ast.AST, ast.AST],
              with_contexts: set[int], closed: set[str]) -> bool:
     # Inside a `with` context expression (possibly wrapped in closing(...)).
@@ -146,9 +250,12 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
                 for item in node.items:
                     with_contexts.add(id(item.context_expr))
         closed = _closed_names(tree)
+        descriptors, managed_descriptors = _exitstack_descriptors(tree)
         seen: set[int] = set()  # legacy counted matching LINES, not calls
         for node in ast.walk(tree):
-            if not _is_open_call(node):
+            if not _is_open_call(node) and id(node) not in descriptors:
+                continue
+            if id(node) in managed_descriptors:
                 continue
             if _managed(node, parents, with_contexts, closed):
                 continue

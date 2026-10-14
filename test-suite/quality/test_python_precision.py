@@ -753,6 +753,46 @@ class OpenMissingWithTests(unittest.TestCase):
         '''})
         self.assertEqual(len(hits), 2, hits)
 
+    def test_exitstack_owns_the_exact_os_descriptor(self) -> None:
+        for imports, allocation, close, stack in (
+            ('import os, contextlib', 'os.open', 'os.close', 'contextlib.ExitStack'),
+            ('import os as posix\nimport contextlib as contexts',
+             'posix.open', 'posix.close', 'contexts.ExitStack'),
+            ('from os import open as allocate, close as release\nfrom contextlib import ExitStack as Stack',
+             'allocate', 'release', 'Stack'),
+        ):
+            source = (imports + '\ndef operation(path):\n'
+                      f'    with {stack}() as resources:\n'
+                      f'        descriptor = {allocation}(path, 0)\n'
+                      f'        resources.callback({close}, descriptor)\n'
+                      '        perform_operation(descriptor)\n')
+            with self.subTest(imports=imports):
+                self.assertEqual(run_detector(io_open_checks, {'owned.py': source}), [])
+                unowned = source.replace(f'        resources.callback({close}, descriptor)\n', '')
+                self.assertEqual(len(run_detector(io_open_checks, {'unowned.py': unowned})), 1)
+
+    def test_exitstack_descriptor_requires_real_unescaped_ownership(self) -> None:
+        original = ('import os, contextlib\ndef operation(path):\n'
+                    '    with contextlib.ExitStack() as resources:\n'
+                    '        descriptor = os.open(path, 0)\n'
+                    '        resources.callback(os.close, descriptor)\n')
+        for source in (
+            original.replace('contextlib.ExitStack()', 'unknown_stack()'),
+            original.replace('callback(os.close, descriptor)', 'callback(unknown_close, descriptor)'),
+            original.replace('callback(os.close, descriptor)', 'callback(os.close, other_descriptor)'),
+            original + '        resources.pop_all()\n',
+            original + '        escape(resources)\n',
+            original.replace('def operation(path):', 'def operation(path, contextlib):'),
+            original.replace('def operation(path):', 'contextlib = unknown\ndef operation(path):'),
+            original.replace('def operation(path):', 'os.close = unknown_close\ndef operation(path):'),
+            original.replace('def operation(path):', 'modify_module(os)\ndef operation(path):'),
+            original.replace('contextlib.ExitStack() as resources:',
+                             'contextlib.ExitStack() as resources, unknown_stack() as resources:'),
+            original.replace('        resources.callback', '        may_raise()\n        resources.callback'),
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(len(run_detector(io_open_checks, {'unsafe.py': source})), 1)
+
 
 # ─────────────────────── json.loads without a handler ───────────────────────
 class OpenNoEncodingCalleeTests(unittest.TestCase):

@@ -10,10 +10,19 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+_No changes yet._
+
+---
+
+## [v5.5.2] - 2026-10-14 [Tag]
+
+Signed release assets and cloud mirror promotion await completion of native Cargo validation; the source tag is not a published binary release.
+
 ### Fixed
 
 - Python SSRF taint analysis recognizes terminating local URL guards that resolve the stdlib parser and require HTTPS plus membership in a literal, non-escaping host allow-list. Unsafe alternate branches, mutable allow-lists, parser shadowing, reassigned destinations and unrelated sanitizer domains retain their findings.
 - Doctor repair tests package epoch-dated prebuilt ast-grep binaries with ZIP's minimum representable timestamp, preserving exact binary bytes and the original repair/checksum assertions. JavaScript precision fixtures now contain executable float comparisons instead of relying on comment text to meet the existing warning threshold.
+- Release-generation preparation closes descriptors when a directory cannot become a buffered stream, keeps descriptor ownership explicit and delimits download URL arguments. The file-ownership detector recognizes exact stdlib `ExitStack.callback(os.close, fd)` registration; unclosed descriptors, wrong closers, reassigned/shadowed APIs and escaped stacks still warn.
 - JSONL finding, scanner and totals records use one combined-scan timestamp, matching same-scan exports across second boundaries. Original module timestamps remain available as scanner_timestamp; legacy finding timestamps are retained separately. Summary-only scanner records preserve their coverage status.
 - Rust compiler diagnostics retain coded and ANSI-colored errors as findings. Unavailable Cargo/RCH phases remain partial, and their reports preserve the actionable transport/admission summary instead of a trailing colored tracing frame.
 - Preserve the published v5.5.1 protections against ast-grep launcher recursion and obsolete installed contracts alongside the newer scanner changes. Failure to create the launcher isolation path now refuses the scan before any module runs; the fallback diagnostic does not interpret launcher filenames as shell code.

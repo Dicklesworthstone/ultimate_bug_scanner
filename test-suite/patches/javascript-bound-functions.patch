@@ -1,0 +1,451 @@
+diff --git a/modules/helpers/ubs_core/analyzers/taint_js.py b/modules/helpers/ubs_core/analyzers/taint_js.py
+index f319914..479c150 100644
+--- a/modules/helpers/ubs_core/analyzers/taint_js.py
++++ b/modules/helpers/ubs_core/analyzers/taint_js.py
+@@ -803,6 +803,15 @@ class _Scope:
+     lexical_this: bool = False
+ 
+ 
++@dataclass(frozen=True)
++class _BoundTarget:
++    """An invocation snapshot of an ordinary bound function's internal slots."""
++
++    target: _Scope
++    receiver: object
++    arguments: tuple
++
++
+ # Slots reduce the retained statement graph on runtimes whose dataclasses
+ # support them; Python 3.9 uses the same generated behavior without slots.
+ @dataclass(**({'slots': True} if sys.version_info >= (3, 10) else {}))
+@@ -1454,7 +1463,8 @@ class _Flow:
+             if key == 'length' and ref in state.array_lengths:
+                 continue  # array length is a count, not attacker-provided text
+             if key is None:
+-                result = _join(result, *slots.values())
++                result = _join(result, *(value for name, value in slots.items()
++                                         if name is None or isinstance(name, str)))
+             else:
+                 result = _join(result, slots.get(key, frozenset()), slots.get(None, frozenset()))
+         return result
+@@ -1696,6 +1706,7 @@ class _Flow:
+             for source in facts[1:]:
+                 refs = _refs(source)
+                 keys = set().union(*(state.heap.get(ref, {}).keys() for ref in refs))
++                keys = {key for key in keys if key is None or isinstance(key, str)}
+                 for key in keys:
+                     incoming = self.property(source, key, state)
+                     # Missing keys on an alternative source must retain the
+@@ -1810,8 +1821,8 @@ class _Flow:
+             return self.engine.call_target(self.scope, name, state, self.rule)
+         return None
+ 
+-    def bind(self, callee, arguments, ranges, state, receiver=frozenset()):
+-        actual, uncertain = [], None
++    def bind(self, callee, arguments, ranges, state, receiver=frozenset(), prefix=()):
++        actual, uncertain = list(prefix), None
+ 
+         def expand(fact, left, right):
+             nonlocal uncertain
+@@ -1878,7 +1889,8 @@ class _Flow:
+ 
+         for index, (names, rest, default) in enumerate(callee.params):
+             incoming = _join(*(fact for fact, _ in actual[index:])) if rest else (actual[index][0] if index < len(actual) else frozenset())
+-            missing = index >= len(actual) or actual[index][1]
++            missing = index >= len(actual) or actual[index][1] is not False
++            optional_default = index < len(actual) and actual[index][1] is None
+             if uncertain is not None and index >= uncertain:
+                 incoming = _join(incoming, *(fact for fact, _ in actual[uncertain:]))
+                 missing = True
+@@ -1895,7 +1907,7 @@ class _Flow:
+                 for name in bound:
+                     default_state.owners[name] = self.engine.binding(callee, name)
+                 default_flow.pairs.update(_pairs(callee.code, *default))
+-                bypass = default_state.copy() if uncertain is not None and index >= uncertain else None
++                bypass = default_state.copy() if optional_default or (uncertain is not None and index >= uncertain) else None
+                 default_fact, evaluated = default_flow.branch_value(*default, default_state)
+                 if evaluated is None and bypass is None:
+                     complete_defaults(normal=False)
+@@ -1910,6 +1922,44 @@ class _Flow:
+         complete_defaults()
+         return bound
+ 
++    def bound_value(self, target, actual, state, location):
++        """Binding saves values; it never runs the target body or defaults.
++
++        The allocation and its argument/receiver slots travel through ordinary
++        heap summaries, preserving object aliases and distinct factory calls.
++        Target identity is immutable metadata, not request taint or code to run.
++        """
++        receiver = actual[0][0] if actual else frozenset()
++        arguments = tuple(actual[1:])
++        if isinstance(target, _BoundTarget):
++            receiver = target.receiver  # Rebinding never replaces bound this.
++            arguments = (*target.arguments, *arguments)
++            target = target.target
++        flags = tuple(missing for _value, missing in arguments)
++        marker = ('bound-function', target, flags)
++        ref = (self.scope, location, frozenset((marker,)))
++        # Tuple keys are private analysis slots, not JavaScript own properties.
++        slots = {(_BoundTarget, 'receiver'): receiver}
++        slots.update(((_BoundTarget, index), value) for index, (value, _missing) in enumerate(arguments))
++        previous = state.heap.get(ref)
++        if previous is not None:
++            state.weak_refs.add(ref)
++            slots = {key: _join(previous.get(key, frozenset()), slots.get(key, frozenset()))
++                     for key in previous.keys() | slots.keys()}
++        state.heap[ref] = slots
++        return _Fact(refs=(ref,))
++
++    def bound_argument_missing(self, start, end, fact):
++        """Defined, undefined, or unknown; bottom alone proves neither."""
++        raw = self.engine.text[start:end].strip()
++        if raw in {'undefined', 'void 0'}:
++            return True
++        if (_refs(fact) and not frozenset(fact)) or raw in {'true', 'false', 'null'}:
++            return False
++        if re.fullmatch(r"(?:\d+(?:\.\d+)?|\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*')", raw, re.S):
++            return False
++        return None
++
+     def substitute(self, fact, callee, bound, state):
+         result = frozenset()
+         for trace in fact:
+@@ -2048,8 +2098,24 @@ class _Flow:
+             # rebind a function or sanitizer for *later* calls, not this one.
+             callee_name = re.sub(r'\s+', '', match.group(1))
+             callee = self.engine.call_target(self.scope, callee_name, state, self.rule)
++            binding_target = None
++            if callee_name.endswith('.bind'):
++                binding_target = self.engine.call_target(self.scope, callee_name[:-5], state, self.rule)
++                if not isinstance(binding_target, (_Scope, _BoundTarget)):
++                    binding_target = None
++                elif not self.engine.native_bind:
++                    raise AnalysisLimit('Function.bind native identity is not proven')
++            prefix = ()
+             this_value = frozenset()
+-            if isinstance(callee, _Scope) and not callee.lexical_this and '.' in callee_name:
++            if isinstance(callee, _BoundTarget):
++                if re.match(r'new\s', code[match_start:opening]):
++                    raise AnalysisLimit('Bound-function construction is not modeled')
++                for key in self.engine.capture_keys[callee.target]:
++                    if (key[0].parent is not None and key not in state.cells
++                            and not (state.owners.get(key[2]) == key and key[2] in state)):
++                        raise AnalysisLimit('Escaped bound-function lexical environment is not modeled')
++                prefix, this_value, callee = callee.arguments, callee.receiver, callee.target
++            elif isinstance(callee, _Scope) and not callee.lexical_this and '.' in callee_name:
+                 receiver_name = callee_name.rsplit('.', 1)[0]
+                 names = receiver_name.split('.')
+                 this_value = self.reference(names[0], state)
+@@ -2061,6 +2127,17 @@ class _Flow:
+             if self.engine.relative_import(self.scope, receiver):
+                 binding = None
+             argument_facts = [self.value(left, right, state) for left, right in arguments]
++            if binding_target is not None:
++                if any(code[left:right].lstrip().startswith('...') for left, right in arguments):
++                    raise AnalysisLimit('Bound-function spread argument expansion is not modeled')
++                actual = tuple((fact, self.bound_argument_missing(left, right, fact))
++                               for fact, (left, right) in zip(argument_facts, arguments))
++                facts.append(self.bound_value(binding_target, actual, state, match_start))
++                remainder[match_start - start:closing + 1 - start] = [' '] * (closing + 1 - match_start)
++                source_remainder[match_start - start:closing + 1 - start] = [' '] * (closing + 1 - match_start)
++                cursor = closing + 1
++                sole_local_call = code[start:match_start].strip() == '' and cursor == end
++                continue
+             if isinstance(callee, _Scope) and callee.generator:
+                 # A generator call creates an iterator; it does not execute
+                 # the body. Iterator advancement is outside this call model.
+@@ -2072,7 +2149,7 @@ class _Flow:
+                 self.engine.dependents[(callee, self.rule)].add(self.scope)
+                 throw_count = len(self.throws)
+                 try:
+-                    bound = self.bind(callee, argument_facts, arguments, state, this_value)
++                    bound = self.bind(callee, argument_facts, arguments, state, this_value, prefix)
+                 except _NoNormalCompletion:
+                     if not deferred:
+                         raise
+@@ -2548,6 +2625,16 @@ class _Engine:
+                 offset = module.end + 3
+             text, code = ''.join(chunks), ''.join(masks)
+         self.text, self.code = text, code
++        # A possibly replaced native cannot supply a clean-result guarantee.
++        # This component-wide proof is conservative; descriptor/proxy and
++        # prototype alias semantics require a separate identity model.
++        bind_mutation = re.compile(
++            r'(?:\.\s*bind\s*(?:=(?!=)|\?\?=|\|\|=|&&=)|'
++            r'\[\s*[\'\"]bind[\'\"]\s*\]\s*=|'
++            r'\bFunction\s*\.\s*prototype|'
++            r'\b(?:Object|Reflect)\s*\.\s*(?:defineProperty|defineProperties|setPrototypeOf))')
++        self.native_bind = not any(code[match.start()] == text[match.start()]
++                                   for match in bind_mutation.finditer(text))
+         # Allocation-site contexts are finite but their heap shapes can grow
+         # exponentially through a small chain of binary factories. Count the
+         # actual copied/traversed facts as well as transfers. Larger selected
+@@ -2678,7 +2765,7 @@ class _Engine:
+             if not changed:
+                 break
+         self.heap_scopes = {scope for scope in self.functions
+-                            if re.search(r'[\[{]', scope.code[scope.body_start:scope.body_end])}
++                            if re.search(r'[\[{]|\.\s*bind\s*\(', scope.code[scope.body_start:scope.body_end])}
+         # Factories hidden behind ordinary local wrappers still need an object
+         # result. This set only grows over the finite set of lexical functions.
+         while True:
+@@ -2869,6 +2956,12 @@ class _Engine:
+     def call_target(self, scope, name, state, rule):
+         parts = name.split('.')
+         local = self.lexical_binding(scope, parts[0])
++        saved = state.get(parts[0], state.cells.get(local, frozenset()))
++        for part in parts[1:]:
++            saved = _join(*(state.heap.get(ref, {}).get(part, frozenset()) for ref in _refs(saved)))
++        bound = self.bound_target(saved, state)
++        if bound is not None:
++            return bound
+         if (local[0], parts[0]) in self.commonjs_locals and parts[0] not in state.bindings:
+             # An independently analyzed closure may read its defining module's
+             # require snapshot. Concrete calls already provide current cells.
+@@ -2909,11 +3002,39 @@ class _Engine:
+             if task is not None:
+                 self.dependents[(owner, rule)].add(task)
+             source = self.final_states.get((owner, rule))
++            imported = self.import_value(key, state, rule)
++            bound = self.bound_target(imported, state) if imported is not None else None
++            if bound is not None:
++                return bound
+             return source.bindings.get(local) if source is not None else None
+         if len(parts) == 1:
+             return state.bindings.get(name) if name in state.bindings else self.lookup(scope, name)
+         return None
+ 
++    @staticmethod
++    def bound_target(value, state):
++        refs = _refs(value)
++        if not refs:
++            return None
++        if frozenset(value) or len(refs) != 1:
++            if any(len(ref) >= 3 and isinstance(ref[2], frozenset) and
++                   any(isinstance(item, tuple) and item[0] == 'bound-function' for item in ref[2])
++                   for ref in refs):
++                raise AnalysisLimit('Ambiguous bound-function targets require separate call paths')
++            return None
++        ref = next(iter(refs))
++        if len(ref) < 3 or not isinstance(ref[2], frozenset):
++            return None
++        markers = [item for item in ref[2] if isinstance(item, tuple)
++                   and len(item) == 3 and item[0] == 'bound-function']
++        if len(markers) != 1:
++            return None
++        _kind, target, flags = markers[0]
++        slots = state.heap.get(ref, {})
++        return _BoundTarget(target, slots.get((_BoundTarget, 'receiver'), frozenset()),
++                            tuple((slots.get((_BoundTarget, i), frozenset()), missing)
++                                  for i, missing in enumerate(flags)))
++
+     def enqueue(self, task):
+         if task not in self.queued:
+             self.queued.add(task)
+diff --git a/test-suite/quality/test_taint_ts_module_assignments.py b/test-suite/quality/test_taint_ts_module_assignments.py
+index 785f40c..68c7a7c 100644
+--- a/test-suite/quality/test_taint_ts_module_assignments.py
++++ b/test-suite/quality/test_taint_ts_module_assignments.py
+@@ -20,6 +20,201 @@ from ubs_core.registry import RunContext
+ 
+ 
+ class TypeScriptModuleAssignments(unittest.TestCase):
++    def test_bound_replaced_native_is_not_trusted(self):
++        from ubs_core.taint_flow import AnalysisLimit
++        for assignment in ('id.bind=external;', 'id["bind"]=external;',
++                           'Function.prototype.bind=external;'):
++            with self.subTest(assignment=assignment), self.assertRaises(AnalysisLimit):
++                self.scan({'app.js':'function id(x){return "safe";} '+assignment+
++                                     'const b=id.bind(null,req.query.html); res.send(b());'}, [])
++
++    def test_bound_mutation_looking_string_is_inert(self):
++        self.scan({'app.js':'const example="Function.prototype.bind=external";\n'
++                             'function id(x){return x;} const b=id.bind(null,req.query.html);\nres.send(b());'},
++                  [('app.js',3,'javascript.taint.xss')])
++
++    def test_bound_internal_slots_are_not_public_properties(self):
++        self.scan({'app.js': 'function id(x){return x;}\nconst b=id.bind(null,req.query.html);\n'
++                             'b[0]="safe"; b["@receiver"]={html:"safe"};\nres.send(b());'},
++                  [('app.js',4,'javascript.taint.xss')])
++
++    def test_bound_internal_arguments_are_not_enumerable(self):
++        self.scan({'app.js': 'function id(x){return x;}\nconst b=id.bind(null,req.query.html);\n'
++                             'const obj=Object.assign({},b);\nres.send(obj);'}, [])
++
++    def test_bound_ambiguous_target_is_not_a_false_clean(self):
++        from ubs_core.taint_flow import AnalysisLimit
++        with self.assertRaises(AnalysisLimit):
++            self.scan({'app.js': 'function a(){return req.query.html;} function b(){return "safe";}\n'
++                                 'const f=flag?a.bind(null):b.bind(null);\nres.send(f());'}, [])
++
++    def test_bound_constructor_is_explicitly_incomplete(self):
++        from ubs_core.taint_flow import AnalysisLimit
++        with self.assertRaises(AnalysisLimit):
++            self.scan({'app.js': 'function C(x){this.html=x;} const B=C.bind({html:"safe"},req.query.html);\n'
++                                 'res.send(new B());'}, [])
++
++    def test_bound_escaped_capture_is_not_lost_as_clean(self):
++        from ubs_core.taint_flow import AnalysisLimit
++        with self.assertRaises(AnalysisLimit):
++            self.scan({'app.js': 'function make(x){function read(){return x;} return read.bind(null);}\n'
++                                 'const f=make(req.query.html);\nres.send(f());'}, [])
++
++    def test_bound_unknown_value_keeps_default_alternative(self):
++        self.scan({'app.js': 'function read(x=req.query.html){return x;}\n'
++                             'const b=read.bind(null,external);\nres.send(b());'},
++                  [('app.js',3,'javascript.taint.xss')])
++
++    def test_bound_known_value_does_not_execute_default(self):
++        self.scan({'app.js': 'function read(x=req.query.html){return x;}\n'
++                             'const b=read.bind(null,"safe");\nres.send(b());'}, [])
++
++    def test_bound_callback_uses_saved_argument(self):
++        self.scan({'app.js': 'function id(x){return x;}\n'
++                             'const b=id.bind(null,req.query.html);\nres.send(b());'},
++                  [('app.js', 3, 'javascript.taint.xss')])
++
++    def test_bound_callback_keeps_clean_result(self):
++        self.scan({'app.js': 'function clean(x){return "safe";}\n'
++                             'const b=clean.bind(null,req.query.html);\nres.send(b());'}, [])
++
++    def test_bound_callback_does_not_execute_at_binding(self):
++        self.scan({'app.js': 'function send(x){res.send(x);}\n'
++                             'const b=send.bind(null,req.query.html);'}, [])
++
++    def test_bound_callback_connects_parameter_sink(self):
++        self.scan({'app.js': 'function send(x){res.send(x);}\n'
++                             'const b=send.bind(null,req.query.html);\nb();'},
++                  [('app.js', 1, 'javascript.taint.xss')])
++
++    def test_bound_callback_uses_saved_receiver(self):
++        self.scan({'app.js': 'function read(){return this.html;}\n'
++                             'const b=read.bind({html:req.query.html});\nres.send(b());'},
++                  [('app.js', 3, 'javascript.taint.xss')])
++
++    def test_bound_receiver_remains_live_object(self):
++        self.scan({'app.js': 'function read(){return this.html;}\n'
++                             'const obj={html:"safe"}; const b=read.bind(obj);\n'
++                             'obj.html=req.query.html;\nres.send(b());'},
++                  [('app.js', 4, 'javascript.taint.xss')])
++
++    def test_bound_receiver_cleanup_is_definite(self):
++        self.scan({'app.js': 'function read(){return this.html;}\n'
++                             'const obj={html:req.query.html}; const b=read.bind(obj);\n'
++                             'obj.html="safe";\nres.send(b());'}, [])
++
++    def test_bound_partial_arguments_precede_call_arguments(self):
++        self.scan({'app.js': 'function second(a,b){return b;}\n'
++                             'const b=second.bind(null,"safe");\nres.send(b(req.query.html));'},
++                  [('app.js', 3, 'javascript.taint.xss')])
++        self.scan({'app.js': 'function first(a,b){return a;}\n'
++                             'const b=first.bind(null,"safe");\nres.send(b(req.query.html));'}, [])
++
++    def test_rebinding_preserves_original_receiver(self):
++        self.scan({'app.js': 'function read(){return this.html;}\n'
++                             'const b=read.bind({html:req.query.html});\n'
++                             'const c=b.bind({html:"safe"});\nres.send(c());'},
++                  [('app.js', 4, 'javascript.taint.xss')])
++
++    def test_rebinding_appends_arguments_in_order(self):
++        self.scan({'app.js': 'function third(a,b,c){return c;}\n'
++                             'const b=third.bind(null,"safe");\n'
++                             'const c=b.bind(null,"safe");\nres.send(c(req.query.html));'},
++                  [('app.js', 4, 'javascript.taint.xss')])
++
++    def test_bound_default_only_executes_when_called(self):
++        self.scan({'app.js': 'function send(x=req.query.html){res.send(x);}\n'
++                             'const b=send.bind(null);'}, [])
++        self.scan({'app.js': 'function send(x=req.query.html){res.send(x);}\n'
++                             'const b=send.bind(null);\nb();'},
++                  [('app.js', 1, 'javascript.taint.xss')])
++
++    def test_bound_undefined_preserves_default_trigger(self):
++        self.scan({'app.js': 'function read(x=req.query.html){return x;}\n'
++                             'const b=read.bind(null,undefined);\nres.send(b());'},
++                  [('app.js', 3, 'javascript.taint.xss')])
++
++    def test_bound_scalar_is_snapshot_and_object_is_shared(self):
++        self.scan({'app.js': 'function id(x){return x;}\nconst obj={html:req.query.html};\n'
++                             'const b=id.bind(null,obj.html);\nobj.html="safe";\nres.send(b());'},
++                  [('app.js', 5, 'javascript.taint.xss')])
++        self.scan({'app.js': 'function read(x){return x.html;}\nconst obj={html:"safe"};\n'
++                             'const b=read.bind(null,obj);\nobj.html=req.query.html;\nres.send(b());'},
++                  [('app.js', 5, 'javascript.taint.xss')])
++
++    def test_bound_factory_calls_keep_arguments_separate(self):
++        self.scan({'app.js': 'function id(x){return x;} function make(x){return id.bind(null,x);}\n'
++                             'const raw=make(req.query.html); const clean=make("safe");\n'
++                             'res.send(clean());\nres.send(raw());'},
++                  [('app.js', 4, 'javascript.taint.xss')])
++
++    def test_bound_callback_passes_through_helper(self):
++        self.scan({'app.js': 'function read(x){return x;} function invoke(cb){return cb();}\n'
++                             'const b=read.bind(null,req.query.html);\nres.send(invoke(b));'},
++                  [('app.js', 3, 'javascript.taint.xss')])
++
++    def test_bound_callback_keeps_function_snapshot(self):
++        self.scan({'app.js': 'function read(){return req.query.html;}\nconst b=read.bind(null);\n'
++                             'read=external;\nres.send(b());'},
++                  [('app.js', 4, 'javascript.taint.xss')])
++
++    def test_bound_callback_observes_current_global_capture(self):
++        self.scan({'app.js': 'let html="safe"; function read(){return html;}\n'
++                             'const b=read.bind(null);\nhtml=req.query.html;\nres.send(b());'},
++                  [('app.js', 4, 'javascript.taint.xss')])
++
++    def test_bound_callback_preserves_mutation_and_clean_overwrite(self):
++        self.scan({'app.js': 'function fill(x){this.html=x;}\nconst obj={};\n'
++                             'const b=fill.bind(obj);\nb(req.query.html);\nres.send(obj.html);'},
++                  [('app.js', 5, 'javascript.taint.xss')])
++        self.scan({'app.js': 'function clear(){this.html="safe";}\nconst obj={html:req.query.html};\n'
++                             'const b=clear.bind(obj);\nb();\nres.send(obj.html);'}, [])
++
++    def test_bound_callback_preserves_exception_payload(self):
++        self.scan({'app.js': 'function fail(x){throw x;}\n'
++                             'const b=fail.bind(null,req.query.html);\n'
++                             'try { b(); } catch (e) { res.send(e); }'},
++                  [('app.js', 3, 'javascript.taint.xss')])
++
++    def test_bound_callback_preserves_domain_specific_sanitizer(self):
++        self.scan({'app.js': 'function escape(x){return DOMPurify.sanitize(x);}\n'
++                             'const b=escape.bind(null,req.query.html);\nres.send(b());\neval(b());'},
++                  [('app.js', 4, 'javascript.taint.eval')])
++
++    def test_bound_callback_from_esm_export(self):
++        self.scan({'lib.mjs': 'function id(x){return x;} export const handler=id.bind(null,req.query.html);',
++                   'app.mjs': 'import {handler} from "./lib.mjs";\nres.send(handler());'},
++                  [('app.mjs', 2, 'javascript.taint.xss')])
++
++    def test_bound_callback_created_from_imported_method(self):
++        self.scan({'lib.cts': 'export = {read(x){return this.html+x;}};',
++                   'app.cts': 'import api = require("./lib.cjs");\n'
++                              'const b=api.read.bind({html:req.query.html},"safe");\nres.send(b());'},
++                  [('app.cts', 3, 'javascript.taint.xss')])
++
++    @unittest.skipUnless(shutil.which('node'), 'Node required')
++    def test_bound_functions_match_independent_node(self):
++        cases = [
++            ('function id(x){return x;} const b=id.bind(null,req.query.html); res.send(b());', True),
++            ('function clean(x){return "safe";} const b=clean.bind(null,req.query.html); res.send(b());', False),
++            ('function read(){return this.html;} const b=read.bind({html:req.query.html}); res.send(b());', True),
++            ('function send(x){res.send(x);} const b=send.bind(null,req.query.html);', False),
++            ('function read(){return this.html;} const b=read.bind({html:req.query.html}); const c=b.bind({html:"safe"}); res.send(c());', True),
++            ('function first(a,b){return a;} const b=first.bind(null,"safe"); res.send(b(req.query.html));', False),
++            ('function read(x=req.query.html){return x;} const b=read.bind(null,undefined); res.send(b());', True),
++            ('function read(x){return x.html;} const obj={html:"safe"}; const b=read.bind(null,obj); obj.html=req.query.html; res.send(b());', True),
++            ('function clear(){this.html="safe";} const obj={html:req.query.html}; const b=clear.bind(obj); b(); res.send(obj.html);', False),
++            ('function fail(x){throw x;} const b=fail.bind(null,req.query.html); try {b();} catch(e){res.send(e);}', True),
++        ]
++        prelude = ('const req={query:{html:"unsafe-token"}}; const seen=[];'
++                   'const res={send(x){seen.push(x);}};')
++        for code, expected in cases:
++            with self.subTest(code=code):
++                observed = subprocess.run(['node','-e',prelude+code+';console.log(JSON.stringify(seen));'],
++                                          capture_output=True,text=True,timeout=10,check=True)
++                self.assertEqual('unsafe-token' in json.loads(observed.stdout), expected)
++                self.scan({'app.js':code}, [('app.js',1,'javascript.taint.xss')] if expected else [])
++
+     def test_namespace_receiver_reads_exported_binding(self):
+         self.scan({'lib.mjs': 'export const html=req.query.html; export function read(){return this.html;}',
+                    'app.mjs': 'import * as api from "./lib.mjs";\nres.send(api.read());'},

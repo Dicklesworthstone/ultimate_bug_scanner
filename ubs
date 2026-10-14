@@ -4846,37 +4846,54 @@ ensure_toon_tool_cache(){
     echo "$bin_path"
     return 0
   fi
-  if ! ( need_cmd curl || need_cmd wget ); then
-    say_err "${RED}${X}${RESET} Environment error: need curl or wget to provision the toon encoder"
-    return 1
-  fi
   if ! checksum_tool_name >/dev/null 2>&1; then
     say_err "${RED}${X}${RESET} Environment error: need sha256sum, shasum, or openssl to verify the toon encoder download"
     return 1
   fi
   ensure_dir "$tool_root" || return 1
-  [[ "${QUIET:-0}" -eq 0 ]] && say_err "${DIM}${INFO}${RESET} Downloading toon_rust ${TOON_VERSION} (${asset})..."
-  (
-    tmp="$(mktemp "$tool_root/.ubs-toon.XXXXXX")" || exit 1
-    trap 'rm -f -- "$tmp"' EXIT
-    trap 'exit 1' HUP INT TERM
-    if ! download_url_to_file "$url" "$tmp"; then
-      say_err "${RED}${X}${RESET} failed to download the toon encoder: $url"
-      exit 1
+
+  # A verified archive is sufficient to repair a missing/corrupt executable.
+  # Do not require network access or rewrite an immutable cache entry.
+  local need_download=1 current_sha
+  if [[ -f "$archive" ]]; then
+    if ! sha256_into current_sha "$archive"; then
+      say_err "${RED}${X}${RESET} cannot verify cached toon archive: ${SHA256_ERR}"
+      return 2
     fi
-    if ! sha256_into sha "$tmp"; then
-      say_err "${RED}${X}${RESET} cannot verify the toon encoder download: ${SHA256_ERR}; nothing installed"
-      exit 2
+    if [[ "$current_sha" == "$expected" ]]; then
+      need_download=0
     fi
-    if [[ "$sha" != "$expected" ]]; then
-      say_err "${RED}${X}${RESET} toon encoder checksum mismatch for ${asset}; nothing installed"
-      say_err "${DIM}Expected: ${expected}${RESET}"
-      say_err "${DIM}Got:      ${sha}${RESET}"
-      exit 1
+  fi
+
+  if [[ "$need_download" -eq 1 ]]; then
+    if ! ( need_cmd curl || need_cmd wget ); then
+      say_err "${RED}${X}${RESET} Environment error: cached toon archive is missing or invalid and curl/wget is unavailable"
+      return 1
     fi
-    [[ ! -d "$archive" ]] || exit 1
-    mv -f -- "$tmp" "$archive" || exit 1
-  ) || return $?
+    [[ "${QUIET:-0}" -eq 0 ]] && say_err "${DIM}${INFO}${RESET} Downloading toon_rust ${TOON_VERSION} (${asset})..."
+    (
+      tmp="$(mktemp "$tool_root/.ubs-toon.XXXXXX")" || exit 1
+      trap 'rm -f -- "$tmp"' EXIT
+      trap 'exit 1' HUP INT TERM
+      if ! download_url_to_file "$url" "$tmp"; then
+        say_err "${RED}${X}${RESET} failed to download the toon encoder: $url"
+        exit 1
+      fi
+      if ! sha256_into sha "$tmp"; then
+        say_err "${RED}${X}${RESET} cannot verify the toon encoder download: ${SHA256_ERR}; nothing installed"
+        exit 2
+      fi
+      if [[ "$sha" != "$expected" ]]; then
+        say_err "${RED}${X}${RESET} toon encoder checksum mismatch for ${asset}; nothing installed"
+        say_err "${DIM}Expected: ${expected}${RESET}"
+        say_err "${DIM}Got:      ${sha}${RESET}"
+        exit 1
+      fi
+      [[ ! -d "$archive" ]] || exit 1
+      mv -f -- "$tmp" "$archive" || exit 1
+    ) || return $?
+  fi
+
   install_tool_cache_binary "$archive" "${bin_path##*/}" "$bin_path" looks_like_toon_rust_encoder || return $?
   echo "$bin_path"
 }
@@ -4906,16 +4923,11 @@ ensure_ast_grep(){
     say_err "${RED}${X}${RESET} Environment error: no ast-grep asset configured for $target"
     return 1
   fi
-  if ! ( need_cmd curl || need_cmd wget ); then
-    say_err "${RED}${X}${RESET} Environment error: need curl or wget to auto-provision ast-grep"
-    return 1
-  fi
+  # A warm cache only needs the checksum tool: downloader/extractor dependencies
+  # are required lazily by ensure_ast_grep_tool_cache when it actually has to
+  # fetch or repair bytes. This keeps verified offline caches usable.
   if ! checksum_tool_name >/dev/null 2>&1; then
     say_err "${RED}${X}${RESET} Environment error: need sha256sum, shasum, or openssl to verify ast-grep downloads"
-    return 1
-  fi
-  if ! ( need_cmd python3 || need_cmd unzip ); then
-    say_err "${RED}${X}${RESET} Environment error: need python3 or unzip to extract ast-grep tool cache"
     return 1
   fi
 

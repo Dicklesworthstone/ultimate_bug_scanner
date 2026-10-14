@@ -49,8 +49,10 @@ def function(name: str, optional: bool = False) -> str:
 
 FUNCTIONS = "\n".join(function(name) for name in (
     "checksum_tool_name", "compute_sha256", "sha256_into",
-    "download_url_to_file", "extract_zip_member", "verify_ast_grep_bin",
-    "looks_like_toon_rust_encoder", "ensure_ast_grep_tool_cache", "ensure_toon_tool_cache",
+    "find_ast_grep_in_path", "download_url_to_file", "extract_zip_member",
+    "verify_ast_grep_bin", "looks_like_toon_rust_encoder",
+    "ensure_ast_grep_tool_cache", "ensure_toon_tool_cache",
+    "ast_grep_cached_bin_path", "ensure_ast_grep",
 )) + function("install_tool_cache_binary", optional=True)
 
 
@@ -366,6 +368,57 @@ sys.exit(p.wait())
         self.assertEqual(fingerprint(self.toon_bin()), before)
         self.assert_clean()
 
+
+    def test_warm_ast_cache_needs_no_downloader_or_extractor(self):
+        self.seed_ast()
+        before = fingerprint(self.ast_bin)
+        self.env["UBS_TEST_NO_PATH_AST_GREP"] = "1"
+        self.overrides = r'''
+need_cmd(){
+  case "$1" in
+    curl|wget|python3|unzip) return 1;;
+    *) command -v "$1" >/dev/null 2>&1;;
+  esac
+}
+'''
+        result = self.run_tool("ensure_ast_grep")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(fingerprint(self.ast_bin), before, "CACHE_REWRITTEN")
+        self.assert_clean()
+
+    def test_ast_repair_uses_verified_archive_offline(self):
+        self.seed_ast(b"broken old executable\n")
+        self.env["UBS_TEST_NO_PATH_AST_GREP"] = "1"
+        self.overrides = r'''
+need_cmd(){
+  case "$1" in
+    curl|wget) return 1;;
+    *) command -v "$1" >/dev/null 2>&1;;
+  esac
+}
+'''
+        result = self.run_tool("ensure_ast_grep")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.ast_bin.read_bytes(), self.binary)
+        self.assert_clean()
+
+    def test_toon_repair_uses_verified_archive_offline(self):
+        path = self.toon_bin()
+        self.seed(path, b"broken old toon\n")
+        archive = path.parent / self.toon_asset
+        shutil.copyfile(self.mirror / self.toon_asset, archive)
+        self.overrides = r'''
+need_cmd(){
+  case "$1" in
+    curl|wget) return 1;;
+    *) command -v "$1" >/dev/null 2>&1;;
+  esac
+}
+'''
+        result = self.run_tool("ensure_toon_tool_cache")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(path.read_bytes(), self.binary)
+        self.assert_clean()
 
 @unittest.skipUnless(INTEGRATION, "pass --integration and UBS_CACHE_TEST_AST_ARCHIVE for real scans")
 class ParallelScans(unittest.TestCase):

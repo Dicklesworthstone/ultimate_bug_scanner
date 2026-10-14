@@ -127,7 +127,7 @@ int main(int argc, char **argv) {
 ''')
         compiler = shutil.which("cc")
         if not compiler:
-            raise RuntimeError("cc is required for the native executable regression")
+            raise unittest.SkipTest("cc is required for the native executable regression")
         subprocess.run([compiler, str(root / "tool.c"), "-o", str(root / "tool")], check=True)
         cls.binary = (root / "tool").read_bytes() + b"UBS-CACHE-PADDING\n" * 32768
 

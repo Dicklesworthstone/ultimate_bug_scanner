@@ -14,6 +14,19 @@
 # so it works even under the stock /bin/bash.
 # ─────────────────────────────────────────────────────────────────────────────
 if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+  # cron and launchd run jobs with PATH=/usr/bin:/bin, so `env bash` finds the
+  # stock 3.2 even where a modern bash is installed (the nightly
+  # `ubs --update` cron entry failed this way). Re-exec under it when found.
+  if [ -f "$0" ]; then
+    # shellcheck disable=SC2046  # word-split the PATH lookups on purpose
+    for _ubs_bash in /opt/homebrew/bin/bash /usr/local/bin/bash /home/linuxbrew/.linuxbrew/bin/bash $(type -ap bash 2>/dev/null); do
+      [ -x "$_ubs_bash" ] && [ "$_ubs_bash" != "${BASH:-}" ] || continue
+      # shellcheck disable=SC2016  # expanded by the candidate bash
+      if [ "$("$_ubs_bash" -c 'echo "${BASH_VERSINFO[0]}"' 2>/dev/null)" -ge 4 ] 2>/dev/null; then
+        exec "$_ubs_bash" "$0" "$@"
+      fi
+    done
+  fi
   echo "ERROR: UBS requires bash >= 4.0 (you have ${BASH_VERSION:-unknown})." >&2
   echo "" >&2
   echo "macOS ships bash 3.2 due to licensing.  Install a modern bash with:" >&2

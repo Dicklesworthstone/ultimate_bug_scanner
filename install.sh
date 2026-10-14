@@ -899,15 +899,51 @@ get_rc_file() {
   esac
 }
 
+# ast-grep's release archives also ship `sg`, which recent releases turned into
+# a small deprecation launcher: it prints a banner and runs `ast-grep` from
+# PATH. Installed under the name `ast-grep` it finds itself and runs itself
+# recursively until the machine runs out of processes or memory. Recognise it
+# from its bytes, without ever executing it (the real binary is tens of MB).
+is_ast_grep_launcher() {
+  local bin="$1" size
+  [ -f "$bin" ] || return 1
+  size="$(wc -c < "$bin" 2>/dev/null | tr -d ' ')"
+  [ -n "$size" ] && [ "$size" -lt 8388608 ] || return 1
+  # The backticks are literal bytes of the launcher's banner, not a substitution.
+  # shellcheck disable=SC2016
+  LC_ALL=C grep -q -a -F 'is deprecated. Use `ast-grep` instead' "$bin" 2>/dev/null
+}
+
+AST_GREP_LAUNCHER_WARNED=0
 check_ast_grep() {
-  if command -v ast-grep >/dev/null 2>&1; then
+  local candidate
+  if candidate="$(command -v ast-grep 2>/dev/null)"; then
+    if is_ast_grep_launcher "$candidate"; then
+      # A launcher left by an earlier install is not ast-grep: report it once
+      # and let the caller install the real binary over it.
+      if [ "${AST_GREP_LAUNCHER_WARNED:-0}" -eq 0 ]; then
+        warn "$candidate is ast-grep's deprecated \`sg\` launcher, not ast-grep (it would run itself recursively); replacing it"
+        AST_GREP_LAUNCHER_WARNED=1
+      fi
+      return 1
+    fi
     return 0
   fi
-  # Verify 'sg' is actually ast-grep, not the Unix newgrp command
-  if command -v sg >/dev/null 2>&1 && sg --version 2>&1 | grep -qi "ast-grep"; then
+  # Verify 'sg' is actually ast-grep, not the Unix newgrp command or the launcher
+  if candidate="$(command -v sg 2>/dev/null)" && ! is_ast_grep_launcher "$candidate" \
+      && sg --version 2>&1 | grep -qi "ast-grep"; then
     return 0
   fi
   return 1
+}
+
+# The real ast-grep executable in an extracted release archive: only the member
+# named ast-grep (ast-grep.exe on Windows), never the `sg` launcher.
+select_ast_grep_member() {
+  local extract_dir="$1" candidate
+  candidate="$(find "$extract_dir" \( -name "ast-grep" -o -name "ast-grep.exe" \) -type f 2>/dev/null | head -1)"
+  [ -n "$candidate" ] && [ -f "$candidate" ] && ! is_ast_grep_launcher "$candidate" || return 1
+  printf '%s\n' "$candidate"
 }
 
 install_ast_grep() {
@@ -1328,7 +1364,7 @@ PY
         fi
 
         local sg_binary
-        sg_binary=$(find "$extract_dir" \( -name "ast-grep" -o -name "ast-grep.exe" -o -name "sg" -o -name "sg.exe" \) -type f 2>/dev/null | head -1)
+        sg_binary="$(select_ast_grep_member "$extract_dir")" || sg_binary=""
         if [ -n "$sg_binary" ] && [ -f "$sg_binary" ]; then
           chmod +x "$sg_binary" 2>/dev/null
           local target_bin="$install_dir/ast-grep"

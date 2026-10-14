@@ -18,6 +18,7 @@ import tempfile
 import textwrap
 from collections import Counter
 from pathlib import Path
+from urllib.parse import unquote
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 UBS = REPO_ROOT / "ubs"
@@ -2278,8 +2279,12 @@ def test_findings_parity_all_langs() -> None:
                     location = locations[0]["physicalLocation"] if locations else {}
                     region = location.get("region", {})
                     properties = result.get("properties", {})
+                    uri = location.get("artifactLocation", {}).get("uri", "")
+                    # Compare native source identity across formats. SARIF
+                    # encodes paths as URI references; JSON retains filenames.
+                    path = str(Path.from_uri(uri)) if uri.startswith("file:") else unquote(uri)
                     actual[(
-                        result["ruleId"], location.get("artifactLocation", {}).get("uri", ""),
+                        result["ruleId"], path,
                         region.get("startLine", 0), region.get("startColumn", 0),
                         result["level"], result["message"]["text"],
                         properties.get("scope", ""), properties.get("count"),

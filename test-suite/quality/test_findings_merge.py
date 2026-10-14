@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
@@ -369,6 +370,50 @@ class FindingsMergeTests(unittest.TestCase):
         self.assertEqual(res["locations"][0]["physicalLocation"]["region"]["startLine"], 10)
         self.assertTrue(res["locations"][0]["properties"]["permalink"].startswith("https://github.com/repo/blob/sha/"))
 
+    def test_to_sarif_encodes_source_paths_in_findings_and_code_flows(self) -> None:
+        cases = [
+            ("src/plain.py", "src/plain.py"),
+            ("src/a b#c?.py", "src/a%20b%23c%3F.py"),
+            ("src/100%20.py", "src/100%2520.py"),
+            ("src/caf\u00e9.py", "src/caf%C3%A9.py"),
+            (" leading/trailing .py ", "%20leading/trailing%20.py%20"),
+            ("src/tab\tline\n.py", "src/tab%09line%0A.py"),
+            ("name:part.py", "name%3Apart.py"),
+            ("../src/a#b.py", "../src/a%23b.py"),
+            ("file:///src/a%20b%23c.py", "file:///src/a%20b%23c.py"),
+        ]
+        if os.name == "nt":
+            cases.extend([
+                (r"C:\source dir\a#b.py", "file:///C:/source%20dir/a%23b.py"),
+                (r"src\a#b.py", "src/a%23b.py"),
+            ])
+        else:
+            cases.extend([
+                ("/source dir/a#b.py", "file:///source%20dir/a%23b.py"),
+                (r"src/a\b.py", "src/a%5Cb.py"),
+                ("src/byte\udcff.py", "src/byte%FF.py"),
+            ])
+        for path, expected in cases:
+            with self.subTest(path=path):
+                doc = {"findings": [{
+                    "lang": "python", "rule_id": "python.test", "severity": "warning",
+                    "file": path, "line": 7, "col": 3, "message": "source path",
+                    "fingerprint": "unchanged-fingerprint",
+                    "extras": {"taint_path": [{
+                        "path": path, "line": 2, "col": 1,
+                        "kind": "source", "label": "source",
+                    }]},
+                }]}
+                original = deepcopy(doc)
+                result = to_sarif(doc)["runs"][0]["results"][0]
+                primary = result["locations"][0]["physicalLocation"]
+                flow = result["codeFlows"][0]["threadFlows"][0]["locations"][0]
+                self.assertEqual(primary["artifactLocation"]["uri"], expected)
+                self.assertEqual(flow["location"]["physicalLocation"]["artifactLocation"]["uri"], expected)
+                self.assertEqual(primary["region"], {"startLine": 7, "startColumn": 3})
+                self.assertEqual(result["partialFingerprints"], {"ubs/v1": "unchanged-fingerprint"})
+                self.assertEqual(doc, original)
+
     def test_swift_project_notes_survive_direct_and_merged_sarif(self) -> None:
         from ubs_core.swift_patterns.foundations import PATTERNS
         from ubs_core.swift_patterns.misc_cats import _packaging
@@ -464,7 +509,7 @@ class FindingsMergeTests(unittest.TestCase):
                                 self.assertEqual(result["level"], "note")
                                 self.assertNotIn("scope", result["properties"])
                                 physical = result["locations"][0]["physicalLocation"]
-                                self.assertEqual(physical["artifactLocation"]["uri"], str(source))
+                                self.assertEqual(physical["artifactLocation"]["uri"], source.as_uri())
                                 self.assertEqual(physical["region"],
                                                  {"startLine": 1, "startColumn": 1})
 
@@ -493,7 +538,7 @@ class FindingsMergeTests(unittest.TestCase):
             self.assertNotIn("kind", result)
             self.assertNotIn("scope", result["properties"])
             physical = result["locations"][0]["physicalLocation"]
-            self.assertEqual(physical["artifactLocation"]["uri"], str(source))
+            self.assertEqual(physical["artifactLocation"]["uri"], source.as_uri())
             self.assertEqual(physical["region"], {"startLine": 1, "startColumn": 1})
 
             # A retained source info occurrence still counts when a zero-count
@@ -587,7 +632,7 @@ class FindingsMergeTests(unittest.TestCase):
                         self.assertEqual(result["level"], "note")
                         self.assertNotIn("scope", result["properties"])
                         physical = result["locations"][0]["physicalLocation"]
-                        self.assertEqual(physical["artifactLocation"]["uri"], str(first))
+                        self.assertEqual(physical["artifactLocation"]["uri"], first.as_uri())
                         self.assertEqual(physical["region"], {"startLine": 6, "startColumn": 1})
 
             check_sarif({"language": "swift", "findings": records}, [record["rule"] for record in records])
@@ -790,7 +835,7 @@ class FindingsMergeTests(unittest.TestCase):
             self.assertEqual(result["ruleId"], "rb.nil-eq.eq")
             self.assertEqual(result["level"], "warning")
             location = result["locations"][0]["physicalLocation"]
-            self.assertEqual(location["artifactLocation"]["uri"], str(source))
+            self.assertEqual(location["artifactLocation"]["uri"], source.as_uri())
             self.assertEqual(location["region"], {"startLine": 1, "startColumn": 1})
             self.assertEqual(runs["ubs-ruby-ast"]["versionControlProvenance"][0]["revisionId"], "revision")
 
@@ -910,6 +955,31 @@ class FindingsMergeTests(unittest.TestCase):
 
 class FindingsMergeFailureIntegrationTests(unittest.TestCase):
     """Drive the real runner with a module whose ledger fails validation."""
+
+    def test_public_sarif_encodes_paths_without_changing_json_or_fingerprints(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ubs-sarif-path-") as tmp:
+            root = Path(tmp).resolve()
+            source = root / "source #100%.py"
+            source.write_text("value = eval(input())\n", encoding="utf-8")
+            env = {**os.environ, "NO_COLOR": "1", "UBS_NO_AUTO_UPDATE": "1",
+                   "UBS_ENABLE_AUTO_UPDATE": "0", "UBS_NO_CACHE": "1", "UBS_ALLOW_PARTIAL": "0"}
+            reports = {}
+            for output_format in ("json", "sarif"):
+                proc = subprocess.run(
+                    [str(REPO_ROOT / "ubs"), "--ci", "--only=python",
+                     "--format=" + output_format, "--", str(source)],
+                    cwd=root, env=env, capture_output=True, text=True, timeout=120, check=False,
+                )
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                reports[output_format] = json.loads(proc.stdout)
+            finding = next(f for f in reports["json"]["findings"] if f["rule_id"] == "python.taint.eval")
+            result = next(f for run in reports["sarif"]["runs"] for f in run["results"]
+                          if f["ruleId"] == "python.taint.eval")
+            self.assertEqual(finding["file"], str(source))
+            physical = result["locations"][0]["physicalLocation"]
+            self.assertEqual(physical["artifactLocation"]["uri"], source.as_uri())
+            self.assertEqual(physical["region"]["startLine"], finding["line"])
+            self.assertEqual(result["partialFingerprints"]["ubs/v1"], finding["fingerprint"])
 
     def test_default_text_baseline_filters_existing_bugs_and_keeps_new_ones(self) -> None:
         started = time.monotonic()

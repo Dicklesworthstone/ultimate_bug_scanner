@@ -1261,7 +1261,7 @@ class SwiftLifecycleBindings(LoggedCase):
                                     if f.get('level') in {'error', 'warning'}]
                         actual = sorted((f['ruleId'], f['locations'][0]['physicalLocation']['region']['startLine'])
                                         for f in findings)
-                        self.assertTrue(all(Path(f['locations'][0]['physicalLocation']['artifactLocation']['uri']) == target
+                        self.assertTrue(all(f['locations'][0]['physicalLocation']['artifactLocation']['uri'] == target.as_uri()
                                             for f in findings), context)
                     self.assertEqual(actual, public_expected, context)
                     print(f'[swift-lifecycle-{label}] PASS ({time.monotonic() - started:.3f}s)', flush=True)

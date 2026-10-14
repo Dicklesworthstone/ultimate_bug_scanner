@@ -1126,9 +1126,8 @@ class ElixirLifecycleTests(unittest.TestCase):
                              row['locations'][0]['physicalLocation']['region']['startColumn'])
                             for row in records)
             self.assertTrue(all(row['level'] == 'warning' for row in records), context)
-            from urllib.parse import unquote
-            self.assertTrue(all(Path(unquote(row['locations'][0]['physicalLocation']
-                                             ['artifactLocation']['uri'])) == target for row in records), context)
+            self.assertTrue(all(row['locations'][0]['physicalLocation']['artifactLocation']['uri']
+                                == target.as_uri() for row in records), context)
             invocations = [item for run in payload['runs'] for item in run.get('invocations', [])]
             # Successful module SARIF may omit the optional invocations array;
             # the real process exit and complete result set are checked above.

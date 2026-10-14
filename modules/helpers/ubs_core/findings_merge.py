@@ -23,6 +23,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import quote
 
 SCANNER_SUMMARY_KEYS = {"language", "project", "files", "critical", "warning", "info", "timestamp", "status", "version"}
 
@@ -779,6 +780,18 @@ def merge(
     return count
 
 
+def _artifact_uri(path: str) -> str:
+    """Encode native paths at the SARIF boundary without resolving symlinks."""
+    if path.startswith("file://"):
+        return path
+    native_path = Path(path)
+    if native_path.is_absolute():
+        return native_path.as_uri()
+    # A colon in the first segment must not become a URI scheme. Percent signs
+    # are filename data here, unlike the already-encoded file URIs above.
+    return quote(path.replace(os.sep, "/"), safe="/", errors="surrogateescape")
+
+
 def to_sarif(
     doc: dict,
     *,
@@ -880,7 +893,7 @@ def to_sarif(
                     col_no = 1
                 loc: dict = {
                     "physicalLocation": {
-                        "artifactLocation": {"uri": file_path},
+                        "artifactLocation": {"uri": _artifact_uri(file_path)},
                         "region": {
                             "startLine": line_no,
                             "startColumn": col_no,
@@ -918,7 +931,7 @@ def to_sarif(
                                 or not isinstance(step.get("label"), str)):
                             raise ValueError("taint_path contains an invalid evidence step")
                         locations.append({"executionOrder": order, "kinds": [step["kind"]], "location": {
-                            "physicalLocation": {"artifactLocation": {"uri": step["path"]},
+                            "physicalLocation": {"artifactLocation": {"uri": _artifact_uri(step["path"])},
                                                  "region": {"startLine": step["line"], "startColumn": step["col"]}},
                             "message": {"text": step["kind"] + ": " + step["label"]}}})
                     if locations:

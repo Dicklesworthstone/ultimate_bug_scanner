@@ -981,6 +981,54 @@ class LooseEqualityCodeOnlyTests(unittest.TestCase):
         self.assertEqual(self.lines(src), [1, 5])
 
 
+class OperatorRulesCodeOnlyTests(unittest.TestCase):
+    """Bead a1oa: the operator rules in eq_regex_dom read executable code only,
+    like loose-equality (GH #157). Thresholds are zeroed so single lines show;
+    regex, exclusions and code_only are the shipped pattern's."""
+
+    def lines(self, rule_id: str, src: str) -> list[int]:
+        import dataclasses
+        patterns = [dataclasses.replace(p, thresholds=((0, "info"),))
+                    for p in load_patterns() if p.rule_id == rule_id]
+        self.assertEqual(len(patterns), 1)
+        self.assertTrue(patterns[0].code_only)
+        with tempfile.TemporaryDirectory(prefix="ubs-a1oa-") as tmp:
+            path = Path(tmp) / "ops.ts"
+            path.write_text(src, encoding="utf-8")
+            sink = io.StringIO()
+            scan_patterns(patterns, [path], sink, skip=set())
+        return [json.loads(line)["line"] for line in sink.getvalue().splitlines()]
+
+    def test_bitwise_ops(self) -> None:
+        src = "\n".join([
+            "const url = '/api?a=1&b=2';",       # `&` in a string
+            "const re = /^\\s*private/;",         # `^` anchor in a regex literal
+            "// flags & MASK",                    # comment
+            "const t = `x ^ y`;",                 # template text
+            "const m = flags & MASK;",            # 5: real bitwise and
+            "const s = `${a ^ b}`;",              # 6: interpolation is code
+            "const k = x << 2; // shift",         # 7: code before a trailing comment
+            "if (a && b) {}",                     # logical and: still excluded
+        ]) + "\n"
+        self.assertEqual(self.lines("js.equality.bitwise-ops", src), [5, 6, 7])
+
+    def test_float_equality(self) -> None:
+        src = "\n".join([
+            "log('x == 0.5');",                   # string
+            "// if (x === 0.1)",                  # comment
+            "if (ratio === 0.1) {}",              # 3
+        ]) + "\n"
+        self.assertEqual(self.lines("js.equality.float-equality", src), [3])
+
+    def test_modulo_variable(self) -> None:
+        src = "\n".join([
+            "printf('%d items', n);",             # format specifier in a string
+            "const s = `${pct}%s`;",              # template text after the interpolation
+            "const r = total % count;",           # 3
+        ]) + "\n"
+        self.assertEqual(self.lines("js.equality.modulo-variable", src), [3])
+
+
 class AnalyzerCategoryTests(unittest.TestCase):
     """GH #134: analyzer findings must resolve to the category number that
     --skip and the text renderer use, whatever prefix their rule id carries."""

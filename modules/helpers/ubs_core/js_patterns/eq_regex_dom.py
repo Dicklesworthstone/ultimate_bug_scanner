@@ -55,6 +55,7 @@ PATTERNS: list[Pattern] = [
         title="Floating-point equality comparison",
         regex=re.compile(r"(===|==)\s*[0-9]+\.[0-9]+"),
         thresholds=((3, "warning"),),
+        code_only=True,  # `'== 0.5'` in a string or comment is not a comparison
     ),
     Pattern(
         category=2,
@@ -63,6 +64,7 @@ PATTERNS: list[Pattern] = [
         # rg FALLBACK variant; upstream is ast-grep-primary ($L % $R).
         regex=re.compile(r"%\s*[A-Za-z_][A-Za-z0-9_]*"),
         thresholds=((10, "info"),),
+        code_only=True,  # printf-style `'%d items'` is text, not a modulo
     ),
     Pattern(
         category=2,
@@ -70,7 +72,12 @@ PATTERNS: list[Pattern] = [
         title="Bitwise operations detected - ensure integer inputs",
         regex=re.compile(r"(^|[^<])<<([^<]|$)|(^|[^>])>>([^>]|$)|\&|\^"),
         thresholds=((0, "info"),),
-        exclude_regex=re.compile(r"//|&&|\|\||/\*"),
+        # Comments, strings and regex literals are blanked, so `^` anchors,
+        # `&` in URLs and `// a & b` no longer count; the legacy `//` / `/*`
+        # line exclusions that stood in for that are gone. `&&` / `||` lines
+        # stay excluded: the regex's `\&` would read them as bitwise.
+        exclude_regex=re.compile(r"&&|\|\|"),
+        code_only=True,
     ),
     # ── Category 15: Regex & String Safety ──
     Pattern(

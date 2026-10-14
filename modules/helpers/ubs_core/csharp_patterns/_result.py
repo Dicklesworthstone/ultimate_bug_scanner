@@ -160,12 +160,14 @@ class ResultIndex:
                 while cursor < len(self.tokens) and self.value(cursor) not in {">", ";", "{"}:
                     cursor += 1
                 cursor += self.value(cursor) == ">"
+            primary_parameters = []
             if self.value(cursor) == "(" and cursor in self.pairs:
                 for low, high in self.split(cursor + 1, self.pairs[cursor]):
                     item = self.declaration(low, high)
                     if item:
                         member, spelling = item
                         self.member(name, member, spelling)
+                        primary_parameters.append((member, spelling))
                 cursor = self.pairs[cursor] + 1
             bases = self.value(cursor) == ":"
             while cursor < len(self.tokens) and self.value(cursor) not in {"{", ";"}:
@@ -178,6 +180,14 @@ class ResultIndex:
                 body = (cursor, self.pairs[cursor])
                 self.type_bodies.append(body)
                 self.type_names[body] = "local:" + name if safe else _UNKNOWN
+                # C# 12 primary-constructor parameters are lexical values
+                # throughout the instance type body. Without these bindings a
+                # parameter named Task/ValueTask is mistaken for the BCL type,
+                # while a real Task-valued parameter is downgraded to unknown.
+                self.bindings.extend(
+                    Binding(member, spelling, body[0], body[1], name_index)
+                    for member, spelling in primary_parameters
+                )
 
     def _methods(self) -> None:
         for opening, closing in sorted(self.pairs.items()):

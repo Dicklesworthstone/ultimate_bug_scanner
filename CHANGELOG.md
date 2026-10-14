@@ -10,11 +10,42 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+### Fixed
+
+- Python SSRF taint analysis recognizes terminating local URL guards that resolve the stdlib parser and require HTTPS plus membership in a literal, non-escaping host allow-list. Unsafe alternate branches, mutable allow-lists, parser shadowing, reassigned destinations and unrelated sanitizer domains retain their findings.
+- Doctor repair tests package epoch-dated prebuilt ast-grep binaries with ZIP's minimum representable timestamp, preserving exact binary bytes and the original repair/checksum assertions. JavaScript precision fixtures now contain executable float comparisons instead of relying on comment text to meet the existing warning threshold.
+- JSONL finding, scanner and totals records use one combined-scan timestamp, matching same-scan exports across second boundaries. Original module timestamps remain available as scanner_timestamp; legacy finding timestamps are retained separately. Summary-only scanner records preserve their coverage status.
+- Rust compiler diagnostics retain coded and ANSI-colored errors as findings. Unavailable Cargo/RCH phases remain partial, and their reports preserve the actionable transport/admission summary instead of a trailing colored tracing frame.
+- Preserve the published v5.5.1 protections against ast-grep launcher recursion and obsolete installed contracts alongside the newer scanner changes. Failure to create the launcher isolation path now refuses the scan before any module runs; the fallback diagnostic does not interpret launcher filenames as shell code.
+- Carry explicit incomplete semantic coverage through the shipped meta-runner as `analysis` / `analysis-incomplete`, retaining exit 2, partial status and supported findings. Tooling failures still take precedence. JSONL totals retain the same failure identity as JSON, and JSON/JSONL schemas accept partial scanner reports.
+- Python opaque import cycles preserve callback ownership instead of re-solving foreign functions against the cycle's globals. This prevents an unrelated cycle from overwriting a helper summary and hiding a later unsafe command flow. Immutable AST and lexical-scope walks are reused during preparation; selected files, import opacity, fixed-point rules and timeout limits are unchanged.
+- JavaScript operator checks use executable source, preserving real operations and template interpolations while excluding strings, comments and regular expressions. The strict corpus snapshot excludes six former bitwise findings on regex/string bytes; all other 1,009 records and generated rule coverage remain unchanged.
+
+---
+
+## [v5.5.1] - 2026-10-14 [Release]
+
+### Fixed
+
+- **Scans no longer spawn ast-grep without end when the installer placed ast-grep's `sg` launcher as `ast-grep`.** ast-grep's release archives contain the real `ast-grep` and `sg`, which recent ast-grep releases turned into a small deprecation launcher that runs `ast-grep` from `PATH`. When `ast-grep` was not installed, `install.sh` (v5.4.16 to v5.5.0) unpacked the 0.45.3 archive and installed whichever of the two `find` listed first as `~/.local/bin/ast-grep`. When that was the launcher, it ran itself recursively: a single-file Python scan timed out after 300 s with thousands of short-lived processes, and in a 4 GiB container the kernel killed ast-grep and everything after it. The installer now installs only the member named `ast-grep`, and treats a launcher already on `PATH` as missing, so re-running it repairs the install. The runner recognises the launcher from its bytes, without executing it, and for that run puts a verified ast-grep (another one on `PATH`, or its own tool cache) ahead of it on `PATH`, so no language module runs the launcher; it warns once per run and points at `install.sh` for the repair. Before, only JavaScript scans resolved a verified ast-grep, so every other module ran whatever `ast-grep` was first on `PATH`.
+- **`ubs --update` from v5.4.x no longer leaves every scan refusing** (#174). The updater replaces the runner and its daemon companion but not the cached `contract.json`, so the first scan after updating from v5.4.x failed closed with "contract.json failed verification (checksum mismatch …); refusing to scan" until `ubs doctor --fix`. A cached contract that is byte for byte one of the contracts earlier releases shipped (v5.4.0 through v5.4.19) is now refreshed from this release and verified against this runner's pin before the scan continues. Any other mismatch is still fatal and the cached file is kept for inspection (#129), as is a refresh that cannot be downloaded or does not verify. A contract in a checkout is never refreshed.
+
+### Known issues
+
+The known issues of v5.5.0 are unchanged: Elixir (#168) and C# (#171) scans can end partial where v5.4.17 exited 0, concurrent first scans can race on the ast-grep tool cache (#170), and `cs.pattern.blocking-result` reports any `.Result` (#169).
+
+---
+
+## [v5.5.0] - 2026-10-13 [Release]
+
 First published release since v5.4.17. It includes everything under the git-only tags v5.4.18 and v5.4.19 below, which never had release assets, and the work that moved `VERSION` from 5.4.20 to 5.4.40 on `main` without a tag. Installs that update through `ubs --update` or the installer go from v5.4.17 straight to this version.
 
 ### Known issues
 
 - **Elixir scans can end partial (exit 2) where v5.4.17 exited 0** (#168). A public function that calls `apply/2,3`, or a file that runs SQL (`Ecto.Adapters.SQL`, a `Repo` query) and also calls `Code.eval_*` or passes a callback to a function the engine does not model (`spawn`, `Task.async`, `Enum.reduce`, ...), makes the Elixir module report "analysis incomplete". Findings are still reported. `UBS_ALLOW_PARTIAL=1` returns the findings exit code (0 or 1) instead of 2. The engine treats such calls as unknown execution on purpose; #168 proposes treating calls that no request data reaches as opaque.
+- **C# scans can end partial (exit 2) where v5.4.17 exited 0** (#171). In a file that contains a SQL sink, a `ref`/`out` call the C# SQL engine cannot resolve (`MailAddress.TryCreate(raw, out _)`, a cross-file helper, Dapper dispatch) makes the C# module report "analysis incomplete", even when the SQL is parameterized and the call is unrelated. The run reports `error: environment`, but `ubs doctor` has nothing to fix. Findings are still reported; `UBS_ALLOW_PARTIAL=1` returns the findings exit code. Same mechanism as the Elixir case above.
+- **Concurrent scans can fail with "extracted ast-grep did not execute correctly"** (#170, also in v5.4.17). When `ast-grep` is not on `PATH`, every run re-extracts the cached ast-grep binary over itself, so a scan that starts while another is extracting can execute a half-written file and exit 2. Putting an `ast-grep` binary on `PATH` avoids the cache.
+- **C# `cs.pattern.blocking-result` reports any `.Result`** (#169, also in v5.4.17): a record or tuple member named `Result`, and comments, are reported as critical blocking calls, not only `Task.Result`.
 
 ### Changed
 
@@ -51,8 +82,6 @@ First published release since v5.4.17. It includes everything under the git-only
 
 ### Fixed
 
-- Carry explicit incomplete semantic coverage through the shipped meta-runner as `analysis` / `analysis-incomplete`, retaining exit 2, partial status and supported findings. Tooling failures still take precedence. JSONL totals retain the same failure identity as JSON, and JSON/JSONL schemas accept partial scanner reports.
-- Python opaque import cycles preserve callback ownership instead of re-solving foreign functions against the cycle's globals. This prevents an unrelated cycle from overwriting a helper summary and hiding a later unsafe command flow. Immutable AST and lexical-scope walks are reused during preparation; selected files, import opacity, fixed-point rules and timeout limits are unchanged.
 - `react.list-missing-key` now checks JSX list roots instead of every static self-closing element. It recognizes paired roots and fragments, actual `key` attributes, and inline `map`, `flatMap` and `Array.from` mapper returns. Nested children, unrelated callback arguments and local JSX values no longer produce missing-key findings. The rule ID and warning severity are unchanged; TSX and JSX regression scans cover both intended clean cases and real missing keys.
 - `py.io.open-no-encoding` no longer fires on a callee whose name merely ends in "open" (#167). `subprocess.Popen(...)`, `urlopen(...)`, `os.popen(...)` and `os.fdopen(...)` matched the `open(` substring and were reported as text-mode file opens. The rule now requires `open(...)` itself or an `.open(...)` method.
 - A JavaScript `for...of` over a non-empty array literal runs its first iteration, so request data captured by a closure assigned inside the loop is no longer reported clean (#163).

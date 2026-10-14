@@ -839,6 +839,83 @@ class _Flow:
         self.comprehension_budget = 64
         self.comprehension_environments = []
 
+    def refine_url_guard(self, test, state, truth):
+        """Recognize an exact, terminating local URL allow-list predicate.
+
+        A helper's name is never a sanitizer. Its body must parse the tested
+        argument with the resolved stdlib urlparse and require both HTTPS and
+        membership in a literal host set that cannot be mutated or escape.
+        Only the successful branch receives the SSRF-specific fact.
+        """
+        if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+            return self.refine_url_guard(test.operand, state, not truth)
+        if not (truth and isinstance(test, ast.Call) and len(test.args) == 1
+                and not test.keywords and isinstance(test.args[0], ast.Name)):
+            return
+        choices = _binding_choices(self.expression_bindings.get(test.func))
+        if len(choices) != 1:
+            return
+        function = next(iter(choices))
+        if (not isinstance(function, ast.FunctionDef) or function.decorator_list
+                or function not in self.engine.functions):
+            return
+        args = function.args
+        parameters = [*args.posonlyargs, *args.args]
+        if (len(parameters) != 1 or args.vararg or args.kwarg or args.kwonlyargs
+                or args.defaults):
+            return
+        parameter = parameters[0].arg
+        body = list(function.body)
+        if body and isinstance(body[0], ast.If):
+            guard = body.pop(0)
+            if not (isinstance(guard.test, ast.UnaryOp) and isinstance(guard.test.op, ast.Not)
+                    and isinstance(guard.test.operand, ast.Name) and guard.test.operand.id == parameter
+                    and not guard.orelse and len(guard.body) == 1
+                    and isinstance(guard.body[0], ast.Return)
+                    and isinstance(guard.body[0].value, ast.Constant)
+                    and guard.body[0].value.value is False):
+                return
+        if not (len(body) == 2 and isinstance(body[0], ast.Assign)
+                and len(body[0].targets) == 1 and isinstance(body[0].targets[0], ast.Name)
+                and isinstance(body[1], ast.Return)):
+            return
+        parsed = body[0].targets[0].id
+        parser = body[0].value
+        if not (parsed != parameter and isinstance(parser, ast.Call)
+                and isinstance(parser.func, ast.Name) and parser.func.id not in {parsed, parameter}
+                and _qualified(parser.func, state.bindings) == 'urllib.parse.urlparse'
+                and _qualified(parser.func, self.engine.globals.bindings) == 'urllib.parse.urlparse'
+                and len(parser.args) == 1 and not parser.keywords
+                and isinstance(parser.args[0], ast.Name) and parser.args[0].id == parameter):
+            return
+        condition = body[1].value
+        if not (isinstance(condition, ast.BoolOp) and isinstance(condition.op, ast.And)
+                and len(condition.values) == 2):
+            return
+        checked = set()
+        for comparison in condition.values:
+            if not (isinstance(comparison, ast.Compare) and len(comparison.ops) == 1
+                    and isinstance(comparison.left, ast.Attribute)
+                    and isinstance(comparison.left.value, ast.Name)
+                    and comparison.left.value.id == parsed):
+                return
+            operand = comparison.comparators[0]
+            if (comparison.left.attr == 'scheme' and isinstance(comparison.ops[0], ast.Eq)
+                    and isinstance(operand, ast.Constant) and operand.value == 'https'):
+                checked.add('scheme')
+            elif (comparison.left.attr == 'hostname' and isinstance(comparison.ops[0], ast.In)
+                    and isinstance(operand, ast.Name) and operand.id in self.engine.url_allowlists
+                    and operand.id not in {parsed, parameter}):
+                checked.add('hostname')
+            else:
+                return
+        name = test.args[0].id
+        # Do not certify a mutable object's heap or unrelated aliases. A later
+        # assignment or heap mutation still introduces its unsanitized facts.
+        if checked == {'scheme', 'hostname'} and not any(
+                state.heap.get(ref, CLEAN) for ref in state.references.get(name, NO_REFERENCES)):
+            state[name] = _sanitize(state.value(name), 'ssrf')
+
     def possible_exception(self, state):
         if not (state.reachable and self.exception_states):
             return
@@ -2469,7 +2546,10 @@ class _Flow:
             return None
         elif isinstance(node, ast.If):
             self.expr(node.test, state)
-            return _join_states(self.block(node.body, state.copy()), self.block(node.orelse, state.copy()))
+            yes, no = state.copy(), state.copy()
+            self.refine_url_guard(node.test, yes, True)
+            self.refine_url_guard(node.test, no, False)
+            return _join_states(self.block(node.body, yes), self.block(node.orelse, no))
         elif isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
             return self.loop(node, state)
         elif isinstance(node, ast.Break):
@@ -2647,6 +2727,34 @@ class _Analysis:
         # analyzed, without providing new information.
         nodes = tuple(ast.walk(tree))
         self.parents = {child: parent for parent in nodes for child in ast.iter_child_nodes(parent)}
+        # A literal allow-list is a proof only if every other use is exact
+        # membership testing. Rebinding, mutation, aliasing or passing the set
+        # to an opaque call invalidates it throughout this conservative model.
+        self.url_allowlists = set()
+        for statement in tree.body:
+            if not (isinstance(statement, ast.Assign) and len(statement.targets) == 1
+                    and isinstance(statement.targets[0], ast.Name)
+                    and isinstance(statement.value, (ast.Set, ast.Tuple, ast.List))
+                    and statement.value.elts and all(isinstance(item, ast.Constant)
+                        and isinstance(item.value, str) and item.value
+                        for item in statement.value.elts)):
+                continue
+            target = statement.targets[0]
+            uses = [node for node in nodes if isinstance(node, ast.Name) and node.id == target.id
+                    and node is not target]
+            rebound = any(
+                isinstance(node, ast.arg) and node.arg == target.id
+                or isinstance(node, (ast.Import, ast.ImportFrom)) and any(
+                    (alias.asname or alias.name.split('.')[0]) == target.id for alias in node.names)
+                or isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id in {'exec', 'eval', 'globals', 'locals', 'vars'}
+                for node in nodes)
+            if not rebound and uses and all(isinstance(node.ctx, ast.Load)
+                    and isinstance(self.parents.get(node), ast.Compare)
+                    and len(self.parents[node].ops) == 1
+                    and isinstance(self.parents[node].ops[0], ast.In)
+                    and self.parents[node].comparators == [node] for node in uses):
+                self.url_allowlists.add(target.id)
         self.call_sites = {node: _expanded_call(node) for node in nodes if isinstance(node, ast.Call)}
         self.imports = tuple(node for node in nodes if isinstance(node, (ast.Import, ast.ImportFrom)))
         self.method_calls = {}

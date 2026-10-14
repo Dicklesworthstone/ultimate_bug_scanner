@@ -165,6 +165,59 @@ def check_also_reports_same_scan() -> None:
     report("also_reports_same_scan", ok, f"exit={proc.returncode}; JSON/JSONL/SARIF findings={len(expected)}", proc)
 
 
+def check_jsonl_snapshot_timestamps() -> None:
+    """Real JSONL renderer retains one snapshot time and module provenance."""
+    source = UBS.read_text(encoding="utf-8")
+    marker = 'write_jsonl_summary(){\n'
+    assert source.count(marker) == 1
+    start = source.index(marker)
+    renderer = source[start:source.index('\n}\n', start) + 3]
+    with tempfile.TemporaryDirectory(prefix='ubs-jsonl-snapshot-') as directory:
+        root = Path(directory)
+        driver = root / 'render.sh'
+        driver.write_text(
+            '#!/usr/bin/env bash\nset -Eeuo pipefail\n'
+            'generate_combined_json(){ return 0; }\n'
+            'need_cmd(){ command -v "$1" >/dev/null; }\n'
+            + renderer + '\nwrite_jsonl_summary ""\n', encoding='utf-8',
+        )
+        snapshot = '2030-01-01T00:00:01Z'
+        module_time = '2030-01-01T00:00:00Z'
+        finding = {'lang': 'python', 'severity': 'critical', 'message': 'unsafe',
+                   'title': 'unsafe', 'count': 1, 'timestamp': module_time,
+                   'fingerprint': 'same-finding'}
+        scanner = {'language': 'python', 'status': 'partial', 'files': 1,
+                   'critical': 1, 'warning': 0, 'info': 0,
+                   'timestamp': module_time, 'findings': [finding]}
+        combined = {'project': str(root), 'timestamp': snapshot, 'status': 'partial',
+                    'failed_modules': [{'language': 'python', 'status': 'partial'}],
+                    'scanners': [scanner], 'findings': [finding],
+                    'totals': {'files': 1, 'critical': 1, 'warning': 0, 'info': 0}}
+        for detail, legacy in ((1, False), (0, False), (1, True)):
+            document = dict(combined)
+            if legacy:
+                document['findings'] = []
+            data_file = root / 'combined.json'
+            data_file.write_text(json.dumps(document), encoding='utf-8')
+            env = os.environ.copy()
+            env.update({'TMPDIR_RUN': str(root), 'COMBINED_JSON_FILE': str(data_file),
+                        'SOURCE_PROJECT_DIR': str(root), 'JSONL_DETAIL': str(detail)})
+            proc = subprocess.run(['bash', '--', str(driver)], env=env,
+                                  capture_output=True, text=True, timeout=30)
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+            rows = [parse_json_document(line) for line in proc.stdout.splitlines()]
+            assert rows and all(row['timestamp'] == snapshot for row in rows), rows
+            summary = next(row for row in rows if row['type'] == 'scanner')
+            assert summary['status'] == 'partial', summary
+            assert summary['scanner_timestamp'] == module_time, summary
+            assert rows[-1]['type'] == 'totals' and rows[-1]['critical'] == 1, rows
+            if detail:
+                record = next(row for row in rows if row['type'] == 'finding')
+                assert record['fingerprint'] == finding['fingerprint'], record
+                assert record['finding_timestamp'] == module_time, record
+    report('jsonl_snapshot_timestamps', True, 'detailed/summary/legacy share one snapshot; provenance retained')
+
+
 def check_also_text_and_baseline() -> None:
     artifact_root = REPO_ROOT / "test-suite" / "artifacts" / "also-reports"
     artifact_root.mkdir(parents=True, exist_ok=True)
@@ -645,7 +698,7 @@ def check_rules_every_module_reports_custom_rules() -> None:
     # A10: java, rust, ruby, kotlin, cpp and go used to drop --rules entirely
     # while reporting status ok. Every module must report a matching project
     # rule, top-level or nested, with its authored severity.
-    contract = json.loads((REPO_ROOT / "modules" / "contract.json").read_text(encoding="utf-8"))
+    contract = parse_json_document((REPO_ROOT / "modules" / "contract.json").read_text(encoding="utf-8"))
     missing = set(contract["modules"]) - set(_EVERY_MODULE_RULES)
     report("rules_every_module_covered", not missing, f"uncovered={sorted(missing)}")
     for lang, (grammar, pattern, name, source) in _EVERY_MODULE_RULES.items():
@@ -2418,8 +2471,18 @@ def test_doctor_fix_restores_assets() -> None:
 
         zip_name = f"app-{target}.zip"
         zip_path = ast_dir / zip_name
-        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            zf.write(real_ag, arcname="ast-grep")
+        # Deterministic prebuilt bundles use Unix-epoch mtimes, which ZIP cannot
+        # encode. Exercise that real input on a private copy, never retime the
+        # installed binary. Clamp ZIP metadata while preserving its exact bytes.
+        fixture_ag = ast_dir / "ast-grep"
+        shutil.copyfile(real_ag, fixture_ag)
+        os.utime(fixture_ag, (0, 0))
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED,
+                             strict_timestamps=False) as zf:
+            zf.write(fixture_ag, arcname="ast-grep")
+        with zipfile.ZipFile(zip_path) as zf:
+            assert zf.read("ast-grep") == Path(real_ag).read_bytes()
+            assert zf.getinfo("ast-grep").date_time == (1980, 1, 1, 0, 0, 0)
         ag_zip_sha256 = hashlib.sha256(zip_path.read_bytes()).hexdigest()
 
         sandbox_modules = tmp / "sandbox_modules"
@@ -2725,6 +2788,7 @@ def main() -> int:
         check_output_file_positional,
         check_output_flag_json,
         check_also_reports_same_scan,
+        check_jsonl_snapshot_timestamps,
         check_also_text_and_baseline,
         check_also_invalid_destinations,
         check_also_delivery_and_empty_scan,

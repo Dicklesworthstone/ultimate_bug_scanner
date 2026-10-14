@@ -5,8 +5,9 @@ The unit cases use native executable fixtures, the real provisioning functions
 read from ubs, and slow extraction to make torn writes observable. --integration
 also runs real, uncached JS/TS scans using the pinned ast-grep release supplied
 by UBS_CACHE_TEST_AST_ARCHIVE (not a fake scanner). All scratch data is outside
-the checkout. UBS_CACHE_TEST_RUNNER selects an unmodified runner for negative
-controls; no implementation is copied into this test.
+the checkout. Run this test from the chosen candidate or incumbent checkout;
+the exercised runner is always that checkout's ubs, never an environment-selected
+executable. No implementation is copied into this test.
 """
 from __future__ import annotations
 
@@ -29,7 +30,9 @@ import unittest
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-RUNNER = Path(os.environ.get("UBS_CACHE_TEST_RUNNER", ROOT / "ubs")).resolve()
+if "UBS_CACHE_TEST_RUNNER" in os.environ:
+    raise RuntimeError("Run the test from the chosen checkout instead of setting UBS_CACHE_TEST_RUNNER")
+RUNNER = ROOT / "ubs"
 SOURCE = RUNNER.read_text()
 TARGET = "x86_64-unknown-linux-gnu"
 AST_ASSET = f"app-{TARGET}.zip"
@@ -53,7 +56,7 @@ FUNCTIONS = "\n".join(function(name) for name in (
     "verify_ast_grep_bin", "looks_like_toon_rust_encoder",
     "ensure_ast_grep_tool_cache", "ensure_toon_tool_cache",
     "ast_grep_cached_bin_path", "ensure_ast_grep",
-)) + function("install_tool_cache_binary", optional=True)
+)) + function("install_tool_cache_binary", optional=True) + function("is_ast_grep_launcher", optional=True)
 
 
 def fingerprint(path: Path) -> tuple[int, int, int, int]:
@@ -128,7 +131,7 @@ int main(int argc, char **argv) {
         compiler = shutil.which("cc")
         if not compiler:
             raise RuntimeError("cc is required for the native executable regression")
-        subprocess.run([compiler, str(root / "tool.c"), "-o", str(root / "tool")], check=True)
+        subprocess.run([compiler, str(root / "tool.c"), "-o", str(root / "tool")], check=True, timeout=120)
         cls.binary = (root / "tool").read_bytes() + b"UBS-CACHE-PADDING\n" * 32768
 
     def setUp(self):
@@ -462,7 +465,7 @@ class ParallelScans(unittest.TestCase):
 
                     def scan(i):
                         project = projects[i % len(projects)]
-                        return subprocess.run(["bash", str(RUNNER), "--only=js", "--format=json",
+                        return subprocess.run(["bash", "--", str(RUNNER), "--only=js", "--format=json",
                                                "--ci", "--no-cache", "--no-auto-update", "."],
                                               cwd=project, env=env, capture_output=True,
                                               text=True, timeout=180)
@@ -475,7 +478,10 @@ class ParallelScans(unittest.TestCase):
                     for i, result in enumerate(results):
                         self.assertEqual(result.returncode, 0,
                                          f"{state} scan {i}: {result.stderr}\n{result.stdout}")
-                        report = json.loads(result.stdout)
+                        try:
+                            report = json.loads(result.stdout)
+                        except json.JSONDecodeError as exc:
+                            self.fail(f'Invalid real scan JSON: {exc}\n{result.stdout}\n{result.stderr}')
                         self.assertTrue(report.get("scanners"), report)
                         self.assertNotEqual(report.get("status"), "partial", report)
                     self.assertEqual(path.read_bytes(), binary)

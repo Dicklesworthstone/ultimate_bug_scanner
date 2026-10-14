@@ -564,7 +564,7 @@
       "fixture": "test-suite/js",
       "label": "js-rule-pack",
       "module": "ubs-js.sh",
-      "result_count": 1015,
+      "result_count": 1009,
       "result_rule_ids": [
         "javascript.ctcompare.unsafe_secret_compare",
         "javascript.guards.deep_unguarded_chain",

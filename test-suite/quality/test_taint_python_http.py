@@ -127,6 +127,91 @@ class HTTPDestinationTests(SourceTest):
             with self.subTest(expression=expression):
                 self.assert_rules(f'import requests, html, shlex, urllib.parse\nrequests.get({expression})\n', 'ssrf')
 
+    @staticmethod
+    def url_guard_source(condition='parsed.scheme == "https" and parsed.hostname in HOSTS'):
+        return f'''import requests
+from urllib.parse import urlparse
+HOSTS = {{"api.example.com", "images.example.com"}}
+def approved(target):
+    if not target:
+        return False
+    parsed = urlparse(target)
+    return {condition}
+'''
+
+    def test_exact_url_guard_and_terminating_validator(self):
+        source = self.url_guard_source()
+        self.assert_rules(source + '''
+target = input()
+if not approved(target):
+    raise ValueError("blocked")
+requests.get(target)
+''')
+        self.assert_rules(source + '''
+def validate(target):
+    if not approved(target):
+        raise ValueError("blocked")
+    return target
+def forward(target):
+    return validate(target)
+requests.get(forward(input()))
+''')
+        self.assert_rules(source + '''
+target = input()
+if approved(target):
+    requests.get(target)
+''')
+
+    def test_url_guard_requires_both_exact_checks_and_a_real_parser(self):
+        suffix = '''
+target = input()
+if not approved(target):
+    raise ValueError("blocked")
+requests.get(target)
+'''
+        for condition in (
+            'parsed.scheme == "http" and parsed.hostname in HOSTS',
+            'parsed.scheme == "https" or parsed.hostname in HOSTS',
+            'parsed.scheme == "https" and parsed.hostname not in HOSTS',
+            'parsed.scheme == "https" and parsed.hostname.startswith("api.example.com")',
+            'parsed.hostname in HOSTS',
+        ):
+            with self.subTest(condition=condition):
+                self.assert_rules(self.url_guard_source(condition) + suffix, 'ssrf')
+        for alteration in (
+            '\nHOSTS.add(input())\n',
+            '\nHOSTS = {input()}\n',
+            '\nother = HOSTS\nother.add(input())\n',
+            '\nopaque(HOSTS)\n',
+            '\nfrom config import HOSTS\n',
+            '\nimport config as HOSTS\n',
+            '\nglobals()["HOSTS"] = {input()}\n',
+            '\nurlparse = unknown_parser\n',
+            '\ndef approved(target):\n    return True\n',
+        ):
+            with self.subTest(alteration=alteration):
+                self.assert_rules(self.url_guard_source() + alteration + suffix, 'ssrf')
+        self.assert_rules(self.url_guard_source() + '''
+urlparse = unknown_parser
+def forward(urlparse):
+    target = input()
+    if not approved(target):
+        raise ValueError("blocked")
+    requests.get(target)
+from urllib.parse import urlparse as stdlib_parser
+forward(stdlib_parser)
+''', 'ssrf')
+
+    def test_url_guard_is_branch_value_and_domain_specific(self):
+        for continuation, rule in (
+            ('if not approved(target):\n    pass\nrequests.get(target)\n', 'ssrf'),
+            ('if not approved(target):\n    raise ValueError()\ntarget = input()\nrequests.get(target)\n', 'ssrf'),
+            ('try:\n    if not approved(target):\n        raise ValueError()\nexcept ValueError:\n    pass\nrequests.get(target)\n', 'ssrf'),
+            ('if not approved(target):\n    raise ValueError()\neval(target)\n', 'eval'),
+        ):
+            with self.subTest(continuation=continuation):
+                self.assert_rules(self.url_guard_source() + '\ntarget = input()\n' + continuation, rule)
+
     def test_async_execution_and_framework_inputs(self):
         self.assert_rules('''
             import requests, asyncio
@@ -209,7 +294,11 @@ class HTTPDestinationTests(SourceTest):
                     (artifacts / f'{tag}.stdout.log').write_text(result.stdout, encoding='utf-8')
                     (artifacts / f'{tag}.stderr.log').write_text(result.stderr, encoding='utf-8')
                     self.assertIn(result.returncode, (0, 1), result.stdout + result.stderr)
-                    report = json.loads(result.stdout)
+                    try:
+                        report = json.loads(result.stdout)
+                    except json.JSONDecodeError as exc:
+                        self.fail(f'Invalid {output} report at {exc.lineno}:{exc.colno}: {exc.msg}; '
+                                  f'exit={result.returncode}; stderr={result.stderr}')
                     self.assertEqual(bool(set(ids(report)) & {'python.taint.ssrf', 'py.taint.ssrf'}),
                                      unsafe, result.stdout + result.stderr)
                     if unsafe:

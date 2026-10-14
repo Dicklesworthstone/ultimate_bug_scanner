@@ -106,19 +106,19 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='5df22a67040f75a4ea51ac43866cb476342bfc3d37876f9289bd199809d02ddf'
-  [cpp]='84c045d14d2c0cee436b508e14859ec6c80f006043f8a2c8a0f46473ef96d9ed'
-  [csharp]='d735f33a4a730460140044f80e33c25685bf998006d8ba48141769d32cc71772'
-  [elixir]='0a02976f7065d4d27be710c8fe1c31823ec4f36a9883a2c4351fe1d521c3dc25'
-  [golang]='4f01e20188ef803f6e628705c62b5421837c86ef0a7f38d3df5790d9a10b7e07'
-  [java]='024e7654de35806e96a9315b50cd005a2c2181770000cbfba12366cce9d7579a'
-  [js]='250d42533c8e22a9cd1d43388b764611fb6aaf28879ad30402228390b64ef0b9'
-  [kotlin]='1e530bc4d60e7d93c02b2f674b7cbf8b37b7dbb991b67d2f4fb97657f374d028'
-  [php]='d7b55b1ef28bb087401c8ac8cd7b06eb886d4ef826a16fb2bff8c1fe5ec267f5'
-  [python]='d464fd8aaa175ce5acda90dddaa61d5524d327cac40a0ac4811aa0d0673b84c4'
-  [ruby]='b660d3c01e0d5405c37f5b3a61bcfac1c816d3e4ef3273f9dc67fb55cfe0f818'
-  [rust]='833818df4d4d33e2c38720376d68e82741706d78e8f6f72389b4d7f7b165b76c'
-  [swift]='c22d016884ab946b6712ed4f9e7197fa723f55a5e81856e669eca99ba71317d9'
+  [bash]='ffb07731c68f5c3e32e8cf915a327583252e9c60058b96b83e66a93298ee1d60'
+  [cpp]='970e9beac1b236509a7ff6ee6cd4dec630595f23b2d45960ea706377439434ba'
+  [csharp]='ecfddc0fde39c1ff7df7c97d4f182fb23cd997b5f49bde006b1d878641426d4e'
+  [elixir]='02d30956a835de7613fa3eb161def56ca1103994422252311e32dcda473b6a84'
+  [golang]='c034ae5ec0946bf67d2e213e81d035ae5a1f13a1dd171b71a13c5bd570571fe3'
+  [java]='f535d9d4dcefa365f32a2d9a086543bad4c0d95953dfa493a38d255233940ab3'
+  [js]='39c9e9bc7128177897d4344222a44c95fa1bf3ba66662c9fd5376b7951c39d1f'
+  [kotlin]='b0e946c5495e9859956e5d8118001356efd55f8e62af376c997f65d16cdfa411'
+  [php]='ffdf935d008101a4e3be8d48cade9369e2db721d53a3a5532f834523659d78ea'
+  [python]='253b7cc1ddf2fda84dea0e85261797ac68d81615dd24f16f5147d10723d0c485'
+  [ruby]='71b4e38e556957c692c568cdff52a2c15d31e2ba43c957ea5ff3cf6eee036cab'
+  [rust]='779d9eeacaaa4b9a82fefd3e99d606a2ec78ebb981780a7bd2d5796b75ee5be9'
+  [swift]='0330af3a2b02b2ea96a9d3a5822ee9c8626c368ad3a37bc6e181884c94906a9b'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -225,7 +225,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/analyzers/taint_java_traversal.py']='672c32b6cfb1331a7f263f63f68ce288dab554c13f0bc7692428d90da734a686'
   ['helpers/ubs_core/analyzers/taint_js.py']='eac0ebe310e8510ce1da45a056e7badfb3812478bbe35b594239fc7a602db5ba'
   ['helpers/ubs_core/analyzers/taint_php.py']='506e9efb9d671e74d056e4131c21d12cfad6a1446bc9e0a5cef7b218d13a0fbc'
-  ['helpers/ubs_core/analyzers/taint_py.py']='50051f2be35058e6929a2b93d80d5645f2c613ca89269d724cb81e47e5f0231d'
+  ['helpers/ubs_core/analyzers/taint_py.py']='ca5f98f4f9347f8f85865fe53059b2b09aab124879274267212bec726bd8b194'
   ['helpers/ubs_core/analyzers/taint_ruby_traversal.py']='e7d045381986c8370b0c00c544e2d40f9b354a373a408209588489c933758aab'
   ['helpers/ubs_core/analyzers/taint_ruby_url.py']='c7e98db31c900d364f427aa65bc2ff3bb62a8a28f05b7dd78357b6f6a51a7a84'
   ['helpers/ubs_core/analyzers/taint_rust.py']='920988d1dd05014915d79e22127535735db0dee0ae25448f57cab89451fb4987'
@@ -489,7 +489,23 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='b506f2f01c92fba09f5a684a24cdc124097b4760719f928e22f64fdf3bdcb246'
   ['helpers/ubs_core/taint_flow.py']='828316f978026b562f13a62e86abfefa83e5dfc802cc97151ecda6de107e16f2'
-  ['lib/ubs-common.sh']='39dffce6821e97cb0a6d78747371aeecf42b3193a48837205340b3acce17403c'
+  ['lib/ubs-common.sh']='a8066914af11052758326ad6b24a68dc3da665b5757d918c655fbb4e8cf79eda'
+)
+
+# contract.json as shipped by earlier releases (sha256 -> first tag), kept out
+# of the generated blocks above on purpose. A cached contract with one of these
+# digests is a genuine but superseded asset: `ubs --update` from 5.4.x replaces
+# the runner but not the cached contract (issue #174). ensure_detection_contract
+# refreshes exactly these from this release; any other mismatch is corruption
+# and stays fatal (issue #129). Add the outgoing digest whenever a release
+# changes modules/contract.json.
+declare -A SUPERSEDED_CONTRACT_SHA256=(
+  ['3574a95ca7ad84ded4d8ebd3de28279e1cf340b42f2284f20b19b3750e318d92']='v5.4.0'
+  ['7319b2e5e085d0dd2434e5114291b2dee9fbbb96e2cfe02027eb263abcb06ac3']='v5.4.1'
+  ['6c3d565fd2d58b7797919a30284db35aa9385a75ba0c053c9b5fc64927a8f9ba']='v5.4.6'
+  ['636e49c1f9b0636e9fe5d2692252575ba9536ab81e4ee339d0d68686a318a746']='v5.4.8'
+  ['93cd47cd7142c954c4d6a34a62e6786d1512762b9352098000c8415c86912203']='v5.4.10'
+  ['406ecd66239cf0c23b2611c98bf1732114934e416c60d0edac6e20ca716129f8']='v5.4.16'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2278,7 +2294,9 @@ cat <<'JSON'
           "count": {"$ref": "#/$defs/count"},
           "title": {"type": "string"},
           "description": {"type": "string"},
-          "samples": {"type": "array"}
+          "samples": {"type": "array"},
+          "timestamp": {"type": "string", "description": "Combined scan snapshot timestamp."},
+          "finding_timestamp": {"type": "string", "description": "Original finding timestamp when supplied by its module."}
         },
         "additionalProperties": true
       },
@@ -2294,7 +2312,8 @@ cat <<'JSON'
           "critical": {"$ref": "#/$defs/count"},
           "warning": {"$ref": "#/$defs/count"},
           "info": {"$ref": "#/$defs/count"},
-          "timestamp": {"type": "string"}
+          "timestamp": {"type": "string"},
+          "scanner_timestamp": {"type": "string", "description": "Original module timestamp; timestamp identifies the combined scan snapshot."}
         }
       },
       "totals_line": {
@@ -4947,9 +4966,28 @@ ast_grep_cached_bin_path(){
   echo "$TOOLS_DIR/ast-grep/${AST_GREP_VERSION}/${target}/${bin_name}"
 }
 
+# ast-grep's release archives also ship `sg`, which recent releases turned into
+# a small deprecation launcher: it prints a banner and runs `ast-grep` from
+# PATH. An installer that placed it under the name `ast-grep` (install.sh up to
+# 5.5.0 took whichever member `find` listed first) leaves a binary that runs
+# itself recursively: thousands of processes and an OOM on every scan.
+# Recognise it from its bytes, before executing anything (the real binary is
+# tens of MB and does not carry the banner).
+is_ast_grep_launcher(){
+  local bin="$1" size
+  [[ -f "$bin" ]] || return 1
+  size="$(wc -c < "$bin" 2>/dev/null | tr -d ' ')"
+  [[ -n "$size" && "$size" -lt 8388608 ]] || return 1
+  # The backticks are literal bytes of the launcher's banner, not a substitution.
+  # shellcheck disable=SC2016
+  LC_ALL=C grep -q -a -F 'is deprecated. Use `ast-grep` instead' "$bin" 2>/dev/null
+}
+
 verify_ast_grep_bin(){
   local bin="$1"
   [[ -n "$bin" && -x "$bin" ]] || return 1
+  # Never run the launcher: the --version probe below would already recurse.
+  is_ast_grep_launcher "$bin" && return 1
   "$bin" --version 2>&1 | grep -qi "ast-grep" || return 1
   "$bin" scan -h >/dev/null 2>&1 || return 1
 
@@ -4975,6 +5013,30 @@ verify_ast_grep_bin(){
 
   [[ -n "$tmpdir" && "$tmpdir" != "/" ]] && rm -rf "$tmpdir" 2>/dev/null || true
   return 1
+}
+
+# Modules and helpers resolve `ast-grep` through PATH (`command -v ast-grep`,
+# then the name itself). When that is the `sg` launcher (see
+# is_ast_grep_launcher), every module would run it and recurse, so the runner
+# shadows it for the whole run: a verified ast-grep (another PATH entry or the
+# tool cache) is linked first on PATH and exported; without one, a stub that
+# fails fast takes its place. No module ever executes the launcher.
+shadow_ast_grep_launcher(){
+  local candidate shim
+  candidate="$(command -v ast-grep 2>/dev/null)" || return 0
+  is_ast_grep_launcher "$candidate" || return 0
+  ensure_tmpdir_run || return 1
+  shim="$TMPDIR_RUN/ast-grep-path"
+  mkdir -p "$shim" || return 1
+  say_err "${YELLOW}${WARN}${RESET} $candidate is ast-grep's deprecated \`sg\` launcher, not ast-grep (it runs itself recursively); this run uses a verified ast-grep instead. Repair: re-run install.sh"
+  if ensure_ast_grep; then
+    ln -sf "$AST_GREP_BIN" "$shim/ast-grep" || return 1
+    export UBS_AST_GREP_BIN="$AST_GREP_BIN"
+  else
+    printf '%s\n' '#!/bin/sh' 'echo "ast-grep unavailable: PATH entry is the sg launcher; re-run install.sh" >&2' 'exit 127' > "$shim/ast-grep" || return 1
+    chmod 0755 "$shim/ast-grep" || return 1
+  fi
+  export PATH="$shim:$PATH"
 }
 
 apply_inline_suppressions(){
@@ -6129,7 +6191,28 @@ ensure_detection_contract(){
     return 2
   fi
   if ! verify_helper_checksum "$rel" "$snapshot"; then
-    say_err "${RED}$X contract.json failed verification (${VERIFY_HELPER_ERR}); refusing to scan${RESET}"
+    # Issue #174: a cached contract that is byte for byte an earlier release's
+    # was left behind by an updater that replaced only the runner. Refresh it
+    # from this release and verify the download against this runner's pin;
+    # unknown bytes (or a failed refresh) still refuse to scan (issue #129).
+    local mismatch_err="${VERIFY_HELPER_ERR}" cached_sha="" superseded=""
+    if [[ "$path" == "$MODULE_DIR/$rel" ]] && ! is_checkout_helper "$path" \
+        && sha256_into cached_sha "$snapshot"; then
+      superseded="${SUPERSEDED_CONTRACT_SHA256[$cached_sha]:-}"
+    fi
+    if [[ -n "$superseded" ]]; then
+      say_err "${YELLOW}${WARN}${RESET} cached contract.json is the ${superseded} release's (left by an update that replaced only the runner); refreshing it for v${UBS_VERSION}..."
+      VERIFY_HELPER_ERR=""
+      if download_helper_asset "$rel" "$path" && cp "$path" "$snapshot" \
+          && verify_helper_checksum "$rel" "$snapshot"; then
+        DETECTION_CONTRACT_FILE="$snapshot"
+        return 0
+      fi
+      say_err "${RED}$X contract.json could not be refreshed for v${UBS_VERSION} (${VERIFY_HELPER_ERR:-download failed}); refusing to scan${RESET}"
+      say_err "${DIM}  Fix installed assets: ubs doctor --fix${RESET}"
+      return 2
+    fi
+    say_err "${RED}$X contract.json failed verification (${mismatch_err}); refusing to scan${RESET}"
     say_err "${DIM}  Fix installed assets: ubs doctor --fix; after checkout edits: ./scripts/update_checksums.sh${RESET}"
     return 2
   fi
@@ -8321,24 +8404,29 @@ write_jsonl_summary(){
           fingerprint:.fingerprint, suppressed:.suppressed,
           title:(.message // .rule_id),
           count:(if has("count") then .count else 1 end)}
-         + (if has("scope") then {scope:.scope} else {} end))
+         + (if has("scope") then {scope:.scope} else {} end)
+         + (if .timestamp != null then {finding_timestamp:.timestamp} else {} end))
       ' "$COMBINED_JSON_FILE" >"$tmp" 2>/dev/null || return 1
     else
       jq -c --arg project "$SOURCE_PROJECT_DIR" --arg ts "$ts" '
         .scanners[] as $s |
         (($s.findings // [])[]) |
         {type:"finding", project:$project, language:$s.language} + .
+        + (if .timestamp != null then {finding_timestamp:.timestamp} else {} end)
+        + {timestamp:$ts}
       ' "$COMBINED_JSON_FILE" >"$tmp" 2>/dev/null || return 1
     fi
 
     # Also emit scanner summaries
     jq -c --arg project "$SOURCE_PROJECT_DIR" --arg ts "$ts" '
-      .scanners[] | {type:"scanner", project:$project, language, status:(.status // "ok"), files, critical, warning, info, timestamp:(.timestamp // $ts)}
+      .scanners[] | {type:"scanner", project:$project, language, status:(.status // "ok"), files, critical, warning, info, timestamp:$ts}
+      + (if .timestamp != null then {scanner_timestamp:.timestamp} else {} end)
     ' "$COMBINED_JSON_FILE" >>"$tmp" || return 1
   else
     # Summary-only mode (legacy behavior)
     jq -c --arg project "$SOURCE_PROJECT_DIR" --arg ts "$ts" '
-      .scanners[] | {type:"scanner", project:$project, language, files, critical, warning, info, timestamp:(.timestamp // $ts)}
+      .scanners[] | {type:"scanner", project:$project, language, status:(.status // "ok"), files, critical, warning, info, timestamp:$ts}
+      + (if .timestamp != null then {scanner_timestamp:.timestamp} else {} end)
     ' "$COMBINED_JSON_FILE" >"$tmp" || return 1
   fi
 
@@ -8575,6 +8663,14 @@ PYPOLICY
 fi
 export UBS_SCAN_CONFIG_POLICY
 unset _policy_args _policy_lang
+
+# Never let a module run ast-grep's `sg` launcher (shadow_ast_grep_launcher).
+if ! shadow_ast_grep_launcher; then
+  emit_error_envelope "environment" "error" "ast-grep-launcher" \
+    "Could not isolate ast-grep's recursive sg launcher; refusing to execute modules" \
+    '"failed_modules":[]'
+  exit 2
+fi
 
 # Ensure ast-grep is available for JS/TS runs (tool-cache auto-provisioning).
 if [[ " ${langs[*]} " == *" js "* ]]; then

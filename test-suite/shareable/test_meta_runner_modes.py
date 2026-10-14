@@ -78,6 +78,12 @@ def check_rust_cargo_phases(tmpdir: Path) -> None:
     sentinel.write_text(
         "#!/usr/bin/env bash\n"
         "printf 'cargo %s cwd=%s\\n' \"$*\" \"$PWD\" >> \"${SENTINEL_LOG:?}\"\n"
+        'if [[ -n "${SENTINEL_DIAGNOSTICS:-}" ]]; then\n'
+        '  case "$1" in\n'
+        '    clippy|check|test) printf "%s\\n" "$SENTINEL_DIAGNOSTICS" >&2;;\n'
+        '    *) exit 0;;\n'
+        '  esac\n'
+        'fi\n'
         "exit \"${SENTINEL_EXIT:-0}\"\n"
     )
     sentinel.chmod(0o755)
@@ -169,7 +175,54 @@ def check_rust_cargo_phases(tmpdir: Path) -> None:
     assert "exit 103" in out, out
     assert "cargo check could not run" in out, out
     assert "Partial: [CARGO_UNAVAILABLE]" in out, out
+    assert "Not evaluated: cargo check" in out, out
+    assert "Not evaluated: cargo checkcargo check" not in out, out
     assert "CRITICAL" not in out.split("cargo check could not run", 1)[1].split("\n", 3)[0], out
+
+    # An actual compiler diagnostic remains a finding with the same identity
+    # when Cargo/RCH colors its output; an unrecognized wrapper failure above
+    # still stays partial. The full CLI must agree across its report formats.
+    for diagnostics in (
+        'error[E0512]: cannot transmute between types of different sizes\n'
+        'error: could not compile sentinel_crate\nwarning: build failed',
+        '\x1b[1m\x1b[91merror[E0512]\x1b[0m\x1b[1m: cannot transmute between types of different sizes\x1b[0m\n'
+        '\x1b[1m\x1b[91merror\x1b[0m\x1b[1m: could not compile sentinel_crate\x1b[0m\n'
+        '\x1b[1m\x1b[33mwarning\x1b[0m\x1b[1m: build failed\x1b[0m',
+    ):
+        result, calls = scan(['--format=json', str(proj)], {
+            'SENTINEL_EXIT': '101', 'SENTINEL_DIAGNOSTICS': diagnostics,
+        })
+        assert result.returncode == 1, result.stdout + result.stderr
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise AssertionError(f'Rust compiler scan emitted invalid JSON: {exc}') from exc
+        assert payload['status'] == 'ok', payload
+        assert payload['failed_modules'] == [], payload
+        assert payload['totals']['critical'] >= 6, payload
+        assert payload['totals']['warning'] >= 3, payload
+        assert 'cargo clippy' in calls and 'cargo check' in calls and 'cargo test --no-run' in calls, calls
+        assert not any('could not run' in f.get('message', '') for f in payload['findings']), payload
+
+    # A real RCH failure summary may be followed by colored tracing frames.
+    # Preserve its useful cause without treating refused compilation as clean.
+    result, calls = scan(['--format=json', str(proj)], {
+        'SENTINEL_EXIT': '103',
+        'SENTINEL_DIAGNOSTICS':
+            '\x1b[31m[RCH] remote hz4 failed [RCH-E104] SSH command timed out (no local fallback)\x1b[0m\n'
+            '\x1b[2;3mat\x1b[0m rch/src/hook.rs:4623 \x1b[2;3mon\x1b[0m ThreadId(1)',
+    })
+    assert result.returncode == 2, result.stdout + result.stderr
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise AssertionError(f'RCH refusal scan emitted invalid JSON: {exc}') from exc
+    assert payload['status'] == 'partial', payload
+    failure = payload['failed_modules'][0]
+    assert failure['module_error'] == 'CARGO_UNAVAILABLE', failure
+    assert '[RCH-E104] SSH command timed out' in failure['message'], failure
+    assert 'hook.rs:4623' not in failure['message'] and '\x1b' not in failure['message'], failure
+    assert 'cargo clippy' in calls and 'cargo check' in calls and 'cargo test --no-run' in calls, calls
 
 
 def check_no_supported_languages(tmpdir: Path) -> None:
@@ -420,7 +473,10 @@ def check_staged_rsync_diagnostics(tmpdir: Path) -> None:
         assert result.returncode == 0, output
         assert "Failed to prepare shadow workspace" not in output, output
         assert "Scanning shadow workspace" in output, output
-        document = json.loads(result.stdout)
+        try:
+            document = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise AssertionError(f'Index scan emitted invalid JSON: {exc}\n{output}') from exc
         assert document["status"] == "ok", output
         assert document["totals"]["files"] == 1, output
 
@@ -754,7 +810,7 @@ def check_inline_suppression_alias_shell_guard(tmpdir: Path) -> None:
         # This makes a missing helper import or premature shell passthrough
         # fail the positive suppression controls rather than pass vacuously.
         result = subprocess.run(
-            ["bash", str(wrapper), str(REPO_ROOT / "modules"), str(source)],
+            ["bash", "--", str(wrapper), str(REPO_ROOT / "modules"), str(source)],
             input=module.stdout, cwd=root, env=env, capture_output=True, text=True,
             check=False, timeout=30,
         )

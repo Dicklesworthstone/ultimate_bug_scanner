@@ -20,6 +20,8 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 UBS_BIN = REPO_ROOT / "ubs"
+# modules/contract.json exactly as v5.4.17 shipped it (sha256 406ecd66...).
+OLDER_CONTRACT = Path(__file__).resolve().parent / "fixtures" / "contract-v5.4.17.json"
 
 FETCH_SHIM = r'''#!/usr/bin/env python3
 import os
@@ -190,6 +192,32 @@ class InstalledContract(unittest.TestCase):
                 "UBS_REPO_RAW_BASE": base.as_uri(), "UBS_ALLOW_UNVERIFIED_HELPERS": "1",
             }))
             self.assertEqual((self.cache / "contract.json").read_bytes(), damaged)
+
+    def test_contract_left_by_an_earlier_release_is_refreshed(self) -> None:
+        # Issue #174: `ubs --update` from 5.4.x replaces the runner but leaves
+        # the cached contract of the old release; the first scan refreshes it.
+        older = OLDER_CONTRACT.read_bytes()
+        self.assertNotEqual(older, self.contract)
+        (self.cache / "contract.json").write_bytes(older)
+        result = self.run_ubs(str(self.target))
+        self.scanned_rust(result)
+        self.assertIn("is the v5.4.16 release's", result.stderr)
+        self.assertEqual((self.cache / "contract.json").read_bytes(), self.contract)
+        self.scanned_rust(self.run_ubs(str(self.target), extra_env={
+            "UBS_REPO_RAW_BASE": (self.root / "offline").as_uri(),
+        }))
+
+    def test_earlier_release_contract_fails_closed_when_it_cannot_be_refreshed(self) -> None:
+        older = OLDER_CONTRACT.read_bytes()
+        (self.cache / "contract.json").write_bytes(older)
+        self.rejected(self.run_ubs(str(self.target), extra_env={
+            "UBS_REPO_RAW_BASE": (self.root / "offline").as_uri(),
+        }))
+        self.assertEqual((self.cache / "contract.json").read_bytes(), older)
+        for source in self.contract_sources:
+            source.write_bytes(b'{"modules":{}}\n')
+        self.rejected(self.run_ubs(str(self.target)))
+        self.assertEqual((self.cache / "contract.json").read_bytes(), older)
 
     def test_corrupt_downloads_and_empty_payloads_fail_closed(self) -> None:
         for damaged in (b'{"modules":{}}\n', b''):

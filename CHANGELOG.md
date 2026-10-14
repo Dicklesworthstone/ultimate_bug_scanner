@@ -10,7 +10,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
-_No changes yet._
+### Fixed
+
+- **`ubs --update` from v5.4.x no longer leaves every scan refusing** (#174). The updater replaces the runner and its daemon companion but not the cached `contract.json`, so the first scan after updating from v5.4.x failed closed with "contract.json failed verification (checksum mismatch …); refusing to scan" until `ubs doctor --fix`. A cached contract that is byte for byte one of the contracts earlier releases shipped (v5.4.0 through v5.4.19) is now refreshed from this release and verified against this runner's pin before the scan continues. Any other mismatch is still fatal and the cached file is kept for inspection (#129), as is a refresh that cannot be downloaded or does not verify. A contract in a checkout is never refreshed.
+
+### Known issues
+
+The known issues of v5.5.0 are unchanged: Elixir (#168) and C# (#171) scans can end partial where v5.4.17 exited 0, concurrent first scans can race on the ast-grep tool cache (#170), and `cs.pattern.blocking-result` reports any `.Result` (#169).
 
 ---
 

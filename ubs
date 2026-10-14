@@ -491,6 +491,22 @@ declare -A HELPER_CHECKSUMS=(
   ['lib/ubs-common.sh']='bebdcd093d47ca592788ca0bd5d818e2c0d294be94d538e87a94ede178f20083'
 )
 
+# contract.json as shipped by earlier releases (sha256 -> first tag), kept out
+# of the generated blocks above on purpose. A cached contract with one of these
+# digests is a genuine but superseded asset: `ubs --update` from 5.4.x replaces
+# the runner but not the cached contract (issue #174). ensure_detection_contract
+# refreshes exactly these from this release; any other mismatch is corruption
+# and stays fatal (issue #129). Add the outgoing digest whenever a release
+# changes modules/contract.json.
+declare -A SUPERSEDED_CONTRACT_SHA256=(
+  ['3574a95ca7ad84ded4d8ebd3de28279e1cf340b42f2284f20b19b3750e318d92']='v5.4.0'
+  ['7319b2e5e085d0dd2434e5114291b2dee9fbbb96e2cfe02027eb263abcb06ac3']='v5.4.1'
+  ['6c3d565fd2d58b7797919a30284db35aa9385a75ba0c053c9b5fc64927a8f9ba']='v5.4.6'
+  ['636e49c1f9b0636e9fe5d2692252575ba9536ab81e4ee339d0d68686a318a746']='v5.4.8'
+  ['93cd47cd7142c954c4d6a34a62e6786d1512762b9352098000c8415c86912203']='v5.4.10'
+  ['406ecd66239cf0c23b2611c98bf1732114934e416c60d0edac6e20ca716129f8']='v5.4.16'
+)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Capabilities & helpers (must be defined before first use)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -6065,7 +6081,28 @@ ensure_detection_contract(){
     return 2
   fi
   if ! verify_helper_checksum "$rel" "$snapshot"; then
-    say_err "${RED}$X contract.json failed verification (${VERIFY_HELPER_ERR}); refusing to scan${RESET}"
+    # Issue #174: a cached contract that is byte for byte an earlier release's
+    # was left behind by an updater that replaced only the runner. Refresh it
+    # from this release and verify the download against this runner's pin;
+    # unknown bytes (or a failed refresh) still refuse to scan (issue #129).
+    local mismatch_err="${VERIFY_HELPER_ERR}" cached_sha="" superseded=""
+    if [[ "$path" == "$MODULE_DIR/$rel" ]] && ! is_checkout_helper "$path" \
+        && sha256_into cached_sha "$snapshot"; then
+      superseded="${SUPERSEDED_CONTRACT_SHA256[$cached_sha]:-}"
+    fi
+    if [[ -n "$superseded" ]]; then
+      say_err "${YELLOW}${WARN}${RESET} cached contract.json is the ${superseded} release's (left by an update that replaced only the runner); refreshing it for v${UBS_VERSION}..."
+      VERIFY_HELPER_ERR=""
+      if download_helper_asset "$rel" "$path" && cp "$path" "$snapshot" \
+          && verify_helper_checksum "$rel" "$snapshot"; then
+        DETECTION_CONTRACT_FILE="$snapshot"
+        return 0
+      fi
+      say_err "${RED}$X contract.json could not be refreshed for v${UBS_VERSION} (${VERIFY_HELPER_ERR:-download failed}); refusing to scan${RESET}"
+      say_err "${DIM}  Fix installed assets: ubs doctor --fix${RESET}"
+      return 2
+    fi
+    say_err "${RED}$X contract.json failed verification (${mismatch_err}); refusing to scan${RESET}"
     say_err "${DIM}  Fix installed assets: ubs doctor --fix; after checkout edits: ./scripts/update_checksums.sh${RESET}"
     return 2
   fi

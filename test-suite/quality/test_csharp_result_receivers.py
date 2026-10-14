@@ -99,6 +99,15 @@ record Task<T>(T Result);
 class C { int M(Task<int> t) => t.Result; }'''
         self.assertEqual((set(), set()), result_lines(source))
 
+    def test_primary_constructor_parameters_shadow_types_and_keep_task_identity(self):
+        source = '''using System.Threading.Tasks;
+record Outcome(string Result);
+class C(Outcome Task, Task<int> work) {
+string Safe() => Task.Result;
+int Blocking() => work.Result;
+}'''
+        self.assertEqual(({5}, set()), result_lines(source))
+
     def test_unknown_receiver_is_not_silently_clean(self):
         source = 'class C { object M(dynamic value) => value.Result; }'
         self.assertEqual((set(), {1}), result_lines(source))

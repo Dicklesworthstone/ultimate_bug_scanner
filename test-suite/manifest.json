@@ -4,8 +4,7 @@
     "ubs_bin": "../ubs",
     "args": ["--ci"],
     "env": {
-      "NO_COLOR": "1",
-      "RCH_CARGO_WRAPPER_BYPASS": "1"
+      "NO_COLOR": "1"
     },
     "artifacts_dir": "artifacts"
   },

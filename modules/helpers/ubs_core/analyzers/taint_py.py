@@ -2744,8 +2744,12 @@ class _Analysis:
                     and node is not target]
             rebound = any(
                 isinstance(node, ast.arg) and node.arg == target.id
+                or _pattern_capture(node) == target.id
+                or isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+                                     ast.ExceptHandler)) and node.name == target.id
                 or isinstance(node, (ast.Import, ast.ImportFrom)) and any(
-                    (alias.asname or alias.name.split('.')[0]) == target.id for alias in node.names)
+                    alias.name == '*' or (alias.asname or alias.name.split('.')[0]) == target.id
+                    for alias in node.names)
                 or isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                     and node.func.id in {'exec', 'eval', 'globals', 'locals', 'vars'}
                 for node in nodes)

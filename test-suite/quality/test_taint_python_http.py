@@ -212,6 +212,46 @@ forward(stdlib_parser)
             with self.subTest(continuation=continuation):
                 self.assert_rules(self.url_guard_source() + '\ntarget = input()\n' + continuation, rule)
 
+    def test_url_guard_rejects_non_assignment_allowlist_bindings(self):
+        suffix = '''
+target = input()
+if not approved(target):
+    raise ValueError("blocked")
+requests.get(target)
+'''
+        # These binding targets are strings in the AST, not Name(Store)
+        # nodes. Each can replace the literal allow-list with an arbitrary
+        # iterable while keeping the guard's exact spelling unchanged.
+        for binding in (
+            'match {input()}:\n    case HOSTS:\n        pass\n',
+            'match [{input()}]:\n    case [HOSTS]:\n        pass\n',
+            'match [input()]:\n    case [*HOSTS]:\n        pass\n',
+            'match {input(): True}:\n    case {**HOSTS}:\n        pass\n',
+            '''class EveryHost(type):
+    def __contains__(cls, hostname):
+        return True
+class HOSTS(metaclass=EveryHost):
+    pass
+''',
+            'from configuration import *\n',
+        ):
+            with self.subTest(binding=binding):
+                self.assert_rules(self.url_guard_source() + binding + suffix, 'ssrf')
+        # Exception targets are another string-valued lexical binding. Keep
+        # the request inside the handler, before Python clears that target.
+        self.assert_rules(self.url_guard_source() + '''
+class HostFailure(Exception):
+    def __contains__(self, hostname):
+        return True
+try:
+    raise HostFailure(input())
+except HostFailure as HOSTS:
+    target = input()
+    if not approved(target):
+        raise ValueError("blocked")
+    requests.get(target)
+''', 'ssrf')
+
     def test_async_execution_and_framework_inputs(self):
         self.assert_rules('''
             import requests, asyncio
@@ -280,17 +320,28 @@ forward(stdlib_parser)
                     yield from ids(item)
         artifacts = ROOT / 'test-suite' / 'artifacts' / 'python-http-taint'
         artifacts.mkdir(parents=True, exist_ok=True)
+        guarded_request = '''target = input()
+if not approved(target):
+    raise ValueError("blocked")
+requests.get(target)
+'''
+        cases = (
+            ('safe', False, 'import requests\nrequests.post("https://example.invalid", data=input())\n'),
+            ('unsafe', True, 'import requests\nrequests.post(input(), data=input())\n'),
+            ('guard-literal', False, self.url_guard_source() + guarded_request),
+            ('guard-match', True, self.url_guard_source() +
+             'match {input()}:\n    case HOSTS:\n        pass\n' + guarded_request),
+        )
         with tempfile.TemporaryDirectory(prefix='ubs-http-cli-') as temporary:
             path = Path(temporary, 'view.py')
-            for unsafe in (False, True):
-                destination = 'input()' if unsafe else '"https://example.invalid"'
-                path.write_text(f'import requests\nrequests.post({destination}, data=input())\n', encoding='utf-8')
+            for case_name, unsafe, source in cases:
+                path.write_text(source, encoding='utf-8')
                 for output in ('json', 'sarif'):
                     result = subprocess.run([str(ROOT / 'ubs'), '--ci', '--no-auto-update', '--no-color',
                                              '--only=python', f'--format={output}', str(path)],
                                             capture_output=True, text=True, timeout=120,
                                             env={**os.environ, 'UBS_NO_AUTO_UPDATE': '1'})
-                    tag = f'{"unsafe" if unsafe else "safe"}-{output}'
+                    tag = f'{case_name}-{output}'
                     (artifacts / f'{tag}.stdout.log').write_text(result.stdout, encoding='utf-8')
                     (artifacts / f'{tag}.stderr.log').write_text(result.stderr, encoding='utf-8')
                     self.assertIn(result.returncode, (0, 1), result.stdout + result.stderr)

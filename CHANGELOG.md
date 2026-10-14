@@ -14,6 +14,16 @@ _No changes yet._
 
 ---
 
+## [v5.5.3] - 2026-10-14 [Tag]
+
+Signed release assets and cloud mirror promotion await completion of native Cargo validation; the source tag is not a published binary release.
+
+### Fixed
+
+- Python URL guards reject host allow-lists rebound by pattern captures, class/function definitions, exception targets or wildcard imports. These bindings do not have ordinary assignment nodes and could previously hide an arbitrary outbound request after an apparently exact HTTPS/host check. Literal, unchanged allow-lists still pass; real JSON/SARIF scans preserve the unsafe request's SSRF finding and failure status.
+
+---
+
 ## [v5.5.2] - 2026-10-14 [Tag]
 
 Signed release assets and cloud mirror promotion await completion of native Cargo validation; the source tag is not a published binary release.

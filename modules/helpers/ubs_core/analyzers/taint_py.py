@@ -66,7 +66,21 @@ SANITIZERS = {
     'shlex.quote': 'command',
 }
 
-KIND_BY_RULE = {f'py.taint.{kind}': kind for kind in ('xss', 'sql', 'command', 'eval')}
+KIND_BY_RULE = {f'py.taint.{kind}': kind for kind in ('xss', 'sql', 'command', 'eval', 'ssrf')}
+
+# These are resolved import identities, not method-name heuristics. A mapping
+# lookup or an unrelated object's get() must never acquire an HTTP contract.
+# request()/stream() take a method before their URL; convenience calls do not.
+# Bodies, query parameters, headers and authentication are not URL operands.
+_HTTP_URL_POSITIONS = {
+    **{f'{module}.{method}': 0
+       for module in ('requests', 'requests.api', 'httpx')
+       for method in ('get', 'post', 'put', 'patch', 'delete', 'head', 'options')},
+    'requests.request': 1,
+    'requests.api.request': 1,
+    'httpx.request': 1,
+    'httpx.stream': 1,
+}
 
 
 _PARAMETER_MARKERS = {
@@ -637,6 +651,10 @@ def _qualified(node: ast.AST, aliases: dict[str, object]) -> str:
                            'subprocess', 'os', 'asyncio', 'builtins', 'eval', 'exec', 'input', 'raw_input',
                            'render_template', 'render_template_string', 'HttpResponse', 'Response'}:
                 return ''
+        # HTTP names are not legacy implicit identities. Once a real import
+        # is absent or shadowed, spelling alone cannot restore a network API.
+        if node.id in {'requests', 'httpx'}:
+            return ''
         return node.id
     if isinstance(node, ast.Attribute):
         base = _qualified(node.value, aliases)
@@ -1793,6 +1811,24 @@ class _Flow:
         elif leaf in {'execute', 'executemany', 'text'} and name.split('.')[0] in {'cursor', 'session', 'conn', 'engine', 'db'}:
             query = source_argument('sql', 'query', 'statement', 'operation')
             self.effect('sql', node, 'SQL engine execute' if name.split('.')[0] in {'engine', 'db'} else 'SQL execute', query)
+        elif name in _HTTP_URL_POSITIONS:
+            position = _HTTP_URL_POSITIONS[name]
+            # The call view already expands literal *lists and *tuples. An
+            # opaque expansion before the URL can shift later arguments, so
+            # retain every possible URL rather than trusting the old offset.
+            # An expansion after an explicit URL cannot change that operand.
+            star = next((index for index, argument in enumerate(node.args)
+                         if index <= position and isinstance(argument, ast.Starred)), None)
+            if star is not None:
+                destination = join_facts(*arguments[star:], keywords.get('url', CLEAN),
+                                         keywords.get(None, CLEAN))
+            elif len(arguments) > position:
+                destination = arguments[position]
+            else:
+                destination = join_facts(keywords.get('url', CLEAN), keywords.get(None, CLEAN))
+            # Share the site key across callable alternatives: a joined
+            # requests.get/httpx.get target is one reachable network sink.
+            self.effect('ssrf', node, 'HTTP request URL', destination)
         elif name in {'subprocess.run', 'subprocess.Popen', 'subprocess.call', 'subprocess.check_output', 'subprocess.check_call'}:
             command_fact = source_argument('args')
             command_node = node.args[0] if node.args else keyword_nodes.get('args')
@@ -3305,6 +3341,7 @@ _SEVERITY = {
     "sql": "critical",
     "command": "critical",
     "eval": "critical",
+    "ssrf": "critical",
 }
 
 _MESSAGE = {
@@ -3312,6 +3349,7 @@ _MESSAGE = {
     "sql": "User input flows into SQL execute() without parameters",
     "command": "User input reaches subprocess/os.system",
     "eval": "User input flows into eval/exec",
+    "ssrf": "User input controls an outbound HTTP request URL (possible SSRF)",
 }
 
 

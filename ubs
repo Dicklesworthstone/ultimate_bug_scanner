@@ -4899,9 +4899,28 @@ ast_grep_cached_bin_path(){
   echo "$TOOLS_DIR/ast-grep/${AST_GREP_VERSION}/${target}/${bin_name}"
 }
 
+# ast-grep's release archives also ship `sg`, which recent releases turned into
+# a small deprecation launcher: it prints a banner and runs `ast-grep` from
+# PATH. An installer that placed it under the name `ast-grep` (install.sh up to
+# 5.5.0 took whichever member `find` listed first) leaves a binary that runs
+# itself recursively: thousands of processes and an OOM on every scan.
+# Recognise it from its bytes, before executing anything (the real binary is
+# tens of MB and does not carry the banner).
+is_ast_grep_launcher(){
+  local bin="$1" size
+  [[ -f "$bin" ]] || return 1
+  size="$(wc -c < "$bin" 2>/dev/null | tr -d ' ')"
+  [[ -n "$size" && "$size" -lt 8388608 ]] || return 1
+  # The backticks are literal bytes of the launcher's banner, not a substitution.
+  # shellcheck disable=SC2016
+  LC_ALL=C grep -q -a -F 'is deprecated. Use `ast-grep` instead' "$bin" 2>/dev/null
+}
+
 verify_ast_grep_bin(){
   local bin="$1"
   [[ -n "$bin" && -x "$bin" ]] || return 1
+  # Never run the launcher: the --version probe below would already recurse.
+  is_ast_grep_launcher "$bin" && return 1
   "$bin" --version 2>&1 | grep -qi "ast-grep" || return 1
   "$bin" scan -h >/dev/null 2>&1 || return 1
 
@@ -4927,6 +4946,30 @@ verify_ast_grep_bin(){
 
   [[ -n "$tmpdir" && "$tmpdir" != "/" ]] && rm -rf "$tmpdir" 2>/dev/null || true
   return 1
+}
+
+# Modules and helpers resolve `ast-grep` through PATH (`command -v ast-grep`,
+# then the name itself). When that is the `sg` launcher (see
+# is_ast_grep_launcher), every module would run it and recurse, so the runner
+# shadows it for the whole run: a verified ast-grep (another PATH entry or the
+# tool cache) is linked first on PATH and exported; without one, a stub that
+# fails fast takes its place. No module ever executes the launcher.
+shadow_ast_grep_launcher(){
+  local candidate shim
+  candidate="$(command -v ast-grep 2>/dev/null)" || return 0
+  is_ast_grep_launcher "$candidate" || return 0
+  ensure_tmpdir_run
+  shim="$TMPDIR_RUN/ast-grep-path"
+  mkdir -p "$shim" || return 1
+  say_err "${YELLOW}${WARN}${RESET} $candidate is ast-grep's deprecated \`sg\` launcher, not ast-grep (it runs itself recursively); this run uses a verified ast-grep instead. Repair: re-run install.sh"
+  if ensure_ast_grep; then
+    ln -sf "$AST_GREP_BIN" "$shim/ast-grep" || return 1
+    export UBS_AST_GREP_BIN="$AST_GREP_BIN"
+  else
+    printf '#!/bin/sh\necho "ast-grep unavailable: %s is the sg launcher; re-run install.sh" >&2\nexit 127\n' "$candidate" > "$shim/ast-grep" || return 1
+    chmod 0755 "$shim/ast-grep" || return 1
+  fi
+  export PATH="$shim:$PATH"
 }
 
 apply_inline_suppressions(){
@@ -8546,6 +8589,9 @@ PYPOLICY
 fi
 export UBS_SCAN_CONFIG_POLICY
 unset _policy_args _policy_lang
+
+# Never let a module run ast-grep's `sg` launcher (shadow_ast_grep_launcher).
+shadow_ast_grep_launcher || say_err "${YELLOW}${WARN}${RESET} could not shadow the ast-grep launcher on PATH"
 
 # Ensure ast-grep is available for JS/TS runs (tool-cache auto-provisioning).
 if [[ " ${langs[*]} " == *" js "* ]]; then

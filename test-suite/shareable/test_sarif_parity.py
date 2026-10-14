@@ -48,6 +48,8 @@ def audit(lang: str) -> dict:
     row = {"lang": lang, "json_exit": jp.returncode, "sarif_exit": sp.returncode}
     try:
         doc = json.loads(jp.stdout)
+        if jp.returncode not in (0, 1) or doc.get("status") != "ok" or doc.get("failed_modules"):
+            row["error"] = f"json scan incomplete: exit={jp.returncode}, status={doc.get('status')!r}"
         scanner = next((s for s in doc.get("scanners", []) if s.get("language") == lang), {})
         findings = scanner.get("findings", []) or []
         row["json_occurrences"] = sum(int(f.get("count", 0) or 0) for f in findings)
@@ -57,6 +59,8 @@ def audit(lang: str) -> dict:
         row["error"] = f"json: {exc}"
     try:
         sarif = json.loads(sp.stdout)
+        if sp.returncode not in (0, 1):
+            row["error"] = (row.get("error", "") + f" sarif scan incomplete: exit={sp.returncode}").strip()
         results = [r for run_ in sarif.get("runs", []) for r in run_.get("results", []) or []]
         row["sarif_results"] = len(results)
         row["sarif_rules"] = len({r.get("ruleId") for r in results})
@@ -73,12 +77,19 @@ def main(argv: list[str]) -> int:
         elif arg.startswith("--assert="):
             strict_langs = {x for x in arg.split("=", 1)[1].split(",") if x}
     langs = [a for a in argv if not a.startswith("--")] or LANGS
+    if strict_langs is not None and strict_langs - set(langs):
+        missing = ", ".join(sorted(strict_langs - set(langs)))
+        print(f"[sarif-parity] FAIL — asserted languages were not selected: {missing}")
+        return 1
     failures = 0
     print(f"{'lang':8} {'json_occ':>8} {'json_smp':>8} {'sarif':>6}  verdict")
     for lang in langs:
         row = audit(lang)
         if "skipped" in row:
-            print(f"[sarif-parity:{lang}] INFO skipped — {row['skipped']}")
+            strict = strict_langs is not None and lang in strict_langs
+            print(f"[sarif-parity:{lang}] {'FAIL' if strict else 'INFO'} skipped — {row['skipped']}")
+            if strict:
+                failures += 1
             continue
         if "error" in row:
             print(f"[sarif-parity:{lang}] FAIL — {row['error']}")

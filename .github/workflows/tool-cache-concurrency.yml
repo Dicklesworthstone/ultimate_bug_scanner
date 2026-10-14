@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
   workflow_run:
     workflows: [Python Framework Taint]
-    types: [completed]
+    types: [in_progress]
     branches: [main]
 
 permissions:
@@ -53,7 +53,6 @@ jobs:
     if: >-
       github.event_name == 'workflow_run' &&
       github.event.workflow_run.id == 37832177124 &&
-      github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.head_repository.full_name == github.repository
     permissions:
       contents: write
@@ -62,7 +61,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: 6350e82a0cddf698ae02f6b7b3d2e749c84cbf1b
+          # The triggering run only starts validation. Its source, commands,
+          # artifacts and credentials are never consumed by this job.
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: astral-sh/setup-uv@v10
         with:
@@ -72,22 +73,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends gcc jq ripgrep unzip xz-utils shellcheck
           uv sync --locked --python 3.14
-      - name: Require the original-code negative control
+      - name: Prepare the reviewed cache publication fix
         run: |
-          test "$(git hash-object ubs)" = f7d4d0804f675ec4806df3c6128ef2a9ac9b9c55
-          if uv run --frozen python test-suite/test_tool_cache_concurrency.py CacheTests.test_warm_ast_cache_is_read_only >"$RUNNER_TEMP/issue-170-original.log" 2>&1; then
-            cat "$RUNNER_TEMP/issue-170-original.log"
-            echo 'Original source unexpectedly passed the read-only cache regression' >&2
-            exit 1
-          fi
-          cat "$RUNNER_TEMP/issue-170-original.log"
-          grep -q 'CACHE_REWRITTEN' "$RUNNER_TEMP/issue-170-original.log"
-      - name: Apply the reviewed production fix to the pinned source
-        run: |
-          cat >"$RUNNER_TEMP/issue-170.patch" <<'PATCH'
+          set -euo pipefail
+          git rev-parse HEAD > "$RUNNER_TEMP/issue-170-base.txt"
+          cat > "$RUNNER_TEMP/issue-170.patch" <<'PATCH'
+          diff --git a/ubs b/ubs
           --- a/ubs
           +++ b/ubs
-          @@ -2,11 +2,11 @@
+          @@ -4662,11 +4662,11 @@
              local url="$1" dest="$2"
              if need_cmd curl; then
                curl -fsSL "$url" -o "$dest"
@@ -101,7 +95,7 @@ jobs:
              fi
              return 1
            }
-          @@ -31,11 +31,56 @@
+          @@ -4691,9 +4691,56 @@
              fi
              if need_cmd unzip; then
                unzip -p "$zip_path" "$member" >"$out_path"
@@ -109,8 +103,8 @@ jobs:
           +    return $?
              fi
              return 1
-           }
-           
+          +}
+          +
           +# Never extract over an executable another scan may be running (GH #170).
           +# A private directory beside the destination keeps the final rename on one
           +# filesystem and preserves the .exe suffix on Windows. The subshell owns its
@@ -144,7 +138,9 @@ jobs:
           +    if [[ -x "$bin_path" ]] && "$verifier" "$bin_path"; then
           +      exit 0
           +    fi
-          +    if ! mv -f -- "$staged" "$bin_path"; then
+          +    # Two-operand mv treats a directory destination as a container rather
+          +    # than replacing the public executable name. Never report that as success.
+          +    if [[ -d "$bin_path" ]] || ! mv -f -- "$staged" "$bin_path"; then
           +      # On platforms that reject replacing an executing binary, a peer's
           +      # already-published, usable copy is still a successful installation.
           +      if [[ -x "$bin_path" ]] && "$verifier" "$bin_path"; then
@@ -154,12 +150,10 @@ jobs:
           +      exit 1
           +    fi
           +  )
-          +}
-          +
+           }
+           
            ensure_ast_grep_tool_cache(){
-             local target expected asset url tool_root zip_path bin_name bin_path
-             target="$(ast_grep_target_triple)" || return 1
-          @@ -70,38 +115,42 @@
+          @@ -4730,38 +4777,43 @@
              if [[ "$need_download" -eq 1 ]]; then
                [[ "${QUIET:-0}" -eq 0 ]] && say_err "${DIM}${INFO}${RESET} Downloading ast-grep ${AST_GREP_VERSION} (${target})..."
                local tmp_zip
@@ -185,16 +179,11 @@ jobs:
                  say_err "${RED}${X}${RESET} ast-grep checksum mismatch for ${asset}"
                  say_err "${DIM}Expected: ${expected}${RESET}"
                  say_err "${DIM}Got:      ${sha}${RESET}"
-          +      rm -f -- "$tmp_zip"
-          +      return 1
-          +    fi
-          +    if ! mv -f -- "$tmp_zip" "$zip_path"; then
-          +      rm -f -- "$tmp_zip"
-                 return 1
-               fi
+          -      return 1
+          -    fi
           -    mv "$tmp_zip" "$zip_path"
-             fi
-           
+          -  fi
+          -
           -  if ! extract_zip_member "$zip_path" "$bin_name" "$bin_path"; then
           -    say_err "${RED}${X}${RESET} failed to extract ${bin_name} from ${zip_path}"
           -    return 1
@@ -203,17 +192,28 @@ jobs:
           -  if ! verify_ast_grep_bin "$bin_path"; then
           -    say_err "${RED}${X}${RESET} extracted ast-grep did not execute correctly: $bin_path"
           -    return 1
+          -  fi
+          +      rm -f -- "$tmp_zip"
+          +      return 1
+          +    fi
+          +    if [[ -d "$zip_path" ]] || ! mv -f -- "$tmp_zip" "$zip_path"; then
+          +      say_err "${RED}${X}${RESET} failed to install ast-grep archive: $zip_path"
+          +      rm -f -- "$tmp_zip"
+          +      return 1
+          +    fi
+          +  fi
+          +
           +  # Keep the archive-integrity gate above this fast path. A valid warm cache
           +  # is read-only: do not truncate, chmod, unlink or replace its executable.
           +  if verify_ast_grep_bin "$bin_path"; then
           +    echo "$bin_path"
           +    return 0
-             fi
+          +  fi
           +  install_tool_cache_binary "$zip_path" "$bin_name" "$bin_path" verify_ast_grep_bin || return $?
              echo "$bin_path"
            }
            
-          @@ -135,7 +184,7 @@
+          @@ -4795,7 +4847,7 @@
              fi
              ensure_dir "$tool_root"
              [[ "${QUIET:-0}" -eq 0 ]] && say_err "${DIM}${INFO}${RESET} Downloading toon_rust ${TOON_VERSION} (${asset})..."
@@ -222,7 +222,7 @@ jobs:
              if ! download_url_to_file "$url" "$tmp"; then
                say_err "${RED}${X}${RESET} failed to download the toon encoder: $url"
                rm -f "$tmp" 2>/dev/null
-          @@ -153,18 +202,10 @@
+          @@ -4813,18 +4865,11 @@
                rm -f "$tmp" 2>/dev/null
                return 1
              fi
@@ -237,23 +237,106 @@ jobs:
           -  if ! looks_like_toon_rust_encoder "$bin_path"; then
           -    say_err "${RED}${X}${RESET} extracted toon encoder did not identify itself as toon_rust: $bin_path"
           -    rm -f "$bin_path" 2>/dev/null
-          +  if ! mv -f -- "$tmp" "$archive"; then
+          -    return 1
+          -  fi
+          +  if [[ -d "$archive" ]] || ! mv -f -- "$tmp" "$archive"; then
+          +    say_err "${RED}${X}${RESET} failed to install toon archive: $archive"
           +    rm -f -- "$tmp"
-               return 1
-             fi
+          +    return 1
+          +  fi
           +  install_tool_cache_binary "$archive" "${bin_path##*/}" "$bin_path" looks_like_toon_rust_encoder || return $?
              echo "$bin_path"
            }
+          
+          diff --git a/test-suite/test_tool_cache_concurrency.py b/test-suite/test_tool_cache_concurrency.py
+          --- a/test-suite/test_tool_cache_concurrency.py
+          +++ b/test-suite/test_tool_cache_concurrency.py
+          @@ -364,6 +364,61 @@
+                  self.assertNotEqual(result.returncode, 0)
+                  self.assertIn("checksum mismatch", result.stderr)
+                  self.assertEqual(fingerprint(self.toon_bin()), before)
+          +        self.assert_clean()
+          +
+          +    def test_failed_download_with_complete_bytes_is_not_published(self):
+          +        # A transfer can write every byte and still report a failure. The
+          +        # caller's conditional disables errexit, so its status must propagate.
+          +        self.overrides = '\ncurl(){ command curl "$@"; return 23; }\n'
+          +        for tool, path, asset in (
+          +            ("ensure_ast_grep_tool_cache", self.ast_bin, AST_ASSET),
+          +            ("ensure_toon_tool_cache", self.toon_bin(), self.toon_asset),
+          +        ):
+          +            with self.subTest(tool=tool):
+          +                self.seed(path, b"existing broken executable\n")
+          +                before = fingerprint(path)
+          +                result = self.run_tool(tool)
+          +                self.assertNotEqual(result.returncode, 0)
+          +                self.assertEqual(fingerprint(path), before)
+          +                self.assertFalse((path.parent / asset).exists())
+          +                self.assert_clean()
+          +
+          +    def test_binary_destination_directory_is_not_success(self):
+          +        for tool, path in (
+          +            ("ensure_ast_grep_tool_cache", self.ast_bin),
+          +            ("ensure_toon_tool_cache", self.toon_bin()),
+          +        ):
+          +            with self.subTest(tool=tool):
+          +                path.mkdir(parents=True)
+          +                marker = path / "keep"
+          +                marker.write_text("do not change")
+          +                result = self.run_tool(tool)
+          +                self.assertNotEqual(result.returncode, 0,
+          +                                    "mv treated the executable name as a directory")
+          +                self.assertEqual(list(path.iterdir()), [marker])
+          +                self.assertEqual(marker.read_text(), "do not change")
+          +                self.assert_clean()
+          +
+          +    def test_archive_destination_directory_fails_closed(self):
+          +        # A successful mv INTO a directory is not publication AT the archive
+          +        # name. In particular a usable binary must not hide this failed gate.
+          +        self.seed(self.ast_bin, self.binary)
+          +        before = fingerprint(self.ast_bin)
+          +        self.ast_zip.mkdir()
+          +        result = self.run_tool("ensure_ast_grep_tool_cache")
+          +        self.assertNotEqual(result.returncode, 0)
+          +        self.assertEqual(fingerprint(self.ast_bin), before)
+          +        self.assertEqual(list(self.ast_zip.iterdir()), [])
+          +        self.assert_clean()
+          +
+          +    def test_archive_publish_failure_does_not_reuse_unverified_cache(self):
+          +        self.seed(self.ast_bin, self.binary)
+          +        before = fingerprint(self.ast_bin)
+          +        self.overrides = '\nmv(){ return 1; }\n'
+          +        result = self.run_tool("ensure_ast_grep_tool_cache")
+          +        self.assertNotEqual(result.returncode, 0)
+          +        self.assertEqual(fingerprint(self.ast_bin), before)
+          +        self.assertFalse(self.ast_zip.exists())
+                   self.assert_clean()
+           
+           
           PATCH
-          git apply --check "$RUNNER_TEMP/issue-170.patch"
-          git apply "$RUNNER_TEMP/issue-170.patch"
+          if git apply --reverse --check "$RUNNER_TEMP/issue-170.patch" 2>/dev/null; then
+            echo 'Production fix is already integrated; validating committed bytes.'
+          else
+            git apply --check "$RUNNER_TEMP/issue-170.patch"
+            # A native executable held open reliably reproduces ETXTBSY on
+            # the original runner. This is not a timing-only negative control.
+            if uv run --frozen python test-suite/test_tool_cache_concurrency.py CacheTests.test_warm_running_native_binary_is_reused > "$RUNNER_TEMP/issue-170-original.log" 2>&1; then
+              cat "$RUNNER_TEMP/issue-170-original.log"
+              echo 'Original source unexpectedly passed the running-executable regression' >&2
+              exit 1
+            fi
+            cat "$RUNNER_TEMP/issue-170-original.log"
+            grep -q 'failed to extract' "$RUNNER_TEMP/issue-170-original.log"
+            git apply "$RUNNER_TEMP/issue-170.patch"
+          fi
           ./scripts/update_sha256sums.sh
           git diff --check
-          git diff --stat
-      - name: Validate the production candidate and supply chain
+          git diff --binary > "$RUNNER_TEMP/issue-170-tested.patch"
+      - name: Validate the exact candidate and supply chain
         env:
           UBS_NO_AUTO_UPDATE: "1"
         run: |
+          set -euo pipefail
           bash -n ubs
           shellcheck ubs
           ./scripts/verify_checksums.sh
@@ -261,7 +344,11 @@ jobs:
           curl --fail --location --retry 3 --output "$RUNNER_TEMP/ast-grep.zip" https://github.com/ast-grep/ast-grep/releases/download/0.45.3/app-x86_64-unknown-linux-gnu.zip
           echo 'f8ac830881339d1edee6b2652f54798c0f4da5a827f2db38a08ee31117783ce8  '"$RUNNER_TEMP/ast-grep.zip" | sha256sum --check
           UBS_CACHE_TEST_AST_ARCHIVE="$RUNNER_TEMP/ast-grep.zip" uv run --frozen python test-suite/test_tool_cache_concurrency.py --integration 2>&1 | tee "$RUNNER_TEMP/issue-170-candidate.log"
-      - name: Stage validated immutable blobs without moving any branch
+          ./scripts/update_sha256sums.sh
+          git diff --binary > "$RUNNER_TEMP/issue-170-after.patch"
+          cmp "$RUNNER_TEMP/issue-170-tested.patch" "$RUNNER_TEMP/issue-170-after.patch"
+          ./scripts/verify_sha256sums.sh
+      - name: Stage tested immutable blobs without moving any branch
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -271,10 +358,18 @@ jobs:
           import json
           import os
           from pathlib import Path
+          import subprocess
           import urllib.request
 
-          manifest = {'base': '6350e82a0cddf698ae02f6b7b3d2e749c84cbf1b', 'files': {}}
-          for name in ('ubs', 'SHA256SUMS'):
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+
+          paths = git('diff', '--name-only').splitlines()
+          allowed = {'ubs', 'SHA256SUMS', 'test-suite/test_tool_cache_concurrency.py'}
+          if not set(paths) <= allowed:
+              raise SystemExit('Unexpected changed paths: ' + repr(paths))
+          manifest = {'base': git('rev-parse', 'HEAD'), 'files': []}
+          for name in paths:
               data = Path(name).read_bytes()
               body = json.dumps({'encoding': 'base64', 'content': base64.b64encode(data).decode('ascii')}).encode()
               request = urllib.request.Request(
@@ -285,23 +380,32 @@ jobs:
                       'Content-Type': 'application/json'})
               with urllib.request.urlopen(request, timeout=60) as response:
                   sha = json.load(response)['sha']
-              local_sha = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-              if sha != local_sha:
+              expected = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+              if sha != expected:
                   raise SystemExit('Git blob digest mismatch: ' + name)
-              manifest['files'][name] = {'sha': sha, 'sha256': hashlib.sha256(data).hexdigest(), 'size': len(data)}
+              item = {'path': name, 'mode': git('ls-files', '-s', '--', name).split()[0],
+                      'type': 'blob', 'sha': sha, 'old_sha': git('rev-parse', 'HEAD:' + name),
+                      'sha256': hashlib.sha256(data).hexdigest(), 'size': len(data)}
+              manifest['files'].append(item)
+              print('CACHE_VERIFIED_BLOB ' + json.dumps(item), flush=True)
           output = Path(os.environ['RUNNER_TEMP']) / 'issue-170-blobs.json'
           output.write_text(json.dumps(manifest, indent=2) + '\n')
-          print(output.read_text())
+          print('CACHE_VERIFIED_BASE ' + manifest['base'], flush=True)
           PY
+      - name: Preserve source and test evidence
+        if: always()
+        run: |
+          git status --short > "$RUNNER_TEMP/issue-170-status.txt"
+          git ls-files -z | tar --null -T - -czf "$RUNNER_TEMP/issue-170-source.tar.gz"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: issue-170-production-candidate
-          retention-days: 1
+          retention-days: 7
           path: |
-            ${{ runner.temp }}/issue-170-original.log
-            ${{ runner.temp }}/issue-170-candidate.log
+            ${{ runner.temp }}/issue-170-*.log
+            ${{ runner.temp }}/issue-170-*.txt
             ${{ runner.temp }}/issue-170-blobs.json
-            ${{ runner.temp }}/issue-170.patch
-            ubs
-            SHA256SUMS
+            ${{ runner.temp }}/issue-170*.patch
+            ${{ runner.temp }}/issue-170-source.tar.gz
+            ${{ runner.temp }}/ast-grep.zip

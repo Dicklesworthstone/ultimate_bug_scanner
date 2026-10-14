@@ -819,7 +819,7 @@ class AnalysisBoundaryTests(unittest.TestCase):
             self.assertEqual(result['properties']['extras'], finding['extras'])
             for original, location in zip(evidence, locations):
                 physical = location['location']['physicalLocation']
-                self.assertEqual(physical['artifactLocation']['uri'], original['path'])
+                self.assertEqual(physical['artifactLocation']['uri'], Path(original['path']).as_uri())
                 self.assertEqual(physical['region']['startLine'], original['line'])
                 self.assertEqual(physical['region']['startColumn'], original['col'])
 

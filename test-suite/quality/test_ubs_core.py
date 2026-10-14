@@ -1433,7 +1433,7 @@ class StructuredSourceIdentityTests(unittest.TestCase):
                             self.assertEqual(result["level"], "note" if rule == task_rule else "warning", result)
                             self.assertEqual(len(result["locations"]), 1, result)
                             location = result["locations"][0]["physicalLocation"]
-                            self.assertEqual(location["artifactLocation"]["uri"], str(source), result)
+                            self.assertEqual(location["artifactLocation"]["uri"], source.as_uri(), result)
                             self.assertEqual(location["region"]["startLine"], line, result)
                             self.assertEqual(location["region"]["startColumn"], column, result)
                 return sorted(records, key=lambda record: json.dumps(record, sort_keys=True))
@@ -1542,7 +1542,7 @@ class StructuredSourceIdentityTests(unittest.TestCase):
                         self.assertEqual(result["level"], "note", result)
                         self.assertEqual(len(result["locations"]), 1, result)
                         location = result["locations"][0]["physicalLocation"]
-                        self.assertEqual(location["artifactLocation"]["uri"], str(balance), result)
+                        self.assertEqual(location["artifactLocation"]["uri"], balance.as_uri(), result)
                         self.assertEqual((location["region"]["startLine"], location["region"]["startColumn"]),
                                          (task_line, 1), result)
                 return sorted(records, key=lambda record: json.dumps(record, sort_keys=True))
@@ -1695,7 +1695,7 @@ class RustSqlSourceTests(unittest.TestCase):
                         physical = result["locations"][0]["physicalLocation"]
                         actual.append((result["ruleId"], physical["artifactLocation"]["uri"],
                                        physical["region"]["startLine"], physical["region"]["startColumn"], result["level"]))
-                    self.assertCountEqual(actual, [(rule, path, line, col, "error")
+                    self.assertCountEqual(actual, [(rule, Path(path).as_uri(), line, col, "error")
                                                    for rule, path, line, col, _severity in wanted], context)
                 return sorted(records, key=lambda record: json.dumps(record, sort_keys=True))
 
@@ -1934,7 +1934,7 @@ fn probe_text_version(client: &Client, url: &str) {
                             physical = result["locations"][0]["physicalLocation"]
                             actual.append((result["ruleId"], physical["artifactLocation"]["uri"],
                                            physical["region"]["startLine"], physical["region"]["startColumn"], result["level"]))
-                        self.assertCountEqual(actual, [(rule, path, line, col, "error")
+                        self.assertCountEqual(actual, [(rule, Path(path).as_uri(), line, col, "error")
                                                        for rule, path, line, col, _severity in wanted], context)
                     return sorted(records, key=lambda record: json.dumps(record, sort_keys=True))
 
@@ -2548,7 +2548,7 @@ fun handler(request: Request) {
                 for location, step in zip(locations, steps):
                     physical = location['location']['physicalLocation']
                     self.assertEqual(location['kinds'], [step['kind']], context)
-                    self.assertEqual(physical['artifactLocation']['uri'], step['path'], context)
+                    self.assertEqual(physical['artifactLocation']['uri'], Path(step['path']).as_uri(), context)
                     self.assertEqual(physical['region'],
                                      {'startLine': step['line'], 'startColumn': step['col']}, context)
 
@@ -3762,7 +3762,7 @@ String inert="response.sendRedirect(request.getParameter(x))";
                                 for location, step in zip(locations, extras['taint_path']):
                                     physical = location['location']['physicalLocation']
                                     self.assertEqual(location['kinds'], [step['kind']], context)
-                                    self.assertEqual(physical['artifactLocation']['uri'], step['path'], context)
+                                    self.assertEqual(physical['artifactLocation']['uri'], Path(step['path']).as_uri(), context)
                                     self.assertEqual(physical['region'], {'startLine': step['line'], 'startColumn': step['col']}, context)
                         self.assertEqual(len(found), len(expected), context)
                         self.assertEqual(actual, expected, context)

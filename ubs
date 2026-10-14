@@ -4668,11 +4668,11 @@ download_url_to_file(){
   local url="$1" dest="$2"
   if need_cmd curl; then
     curl -fsSL "$url" -o "$dest"
-    return 0
+    return $?
   fi
   if need_cmd wget; then
     wget -q "$url" -O "$dest"
-    return 0
+    return $?
   fi
   return 1
 }
@@ -4697,9 +4697,61 @@ PY
   fi
   if need_cmd unzip; then
     unzip -p "$zip_path" "$member" >"$out_path"
-    return 0
+    return $?
   fi
   return 1
+}
+
+# Never extract over an executable another scan may be running (GH #170).
+# A private directory beside the destination keeps publication on one filesystem
+# and preserves the .exe suffix on Windows. Only validated candidates are renamed
+# into the public path; cleanup must never unlink a peer's published executable.
+install_tool_cache_binary(){
+  local archive="$1" member="$2" bin_path="$3" verifier="$4"
+  local stage staged
+  (
+    stage="$(mktemp -d "${bin_path%/*}/.ubs-tool.XXXXXX")" || exit 1
+    staged="$stage/${bin_path##*/}"
+    # These traps belong to this subshell, not the runner or another installer.
+    trap 'rm -f -- "$staged"; rmdir -- "$stage"' EXIT
+    trap 'exit 1' HUP INT TERM
+    if [[ "$archive" == *.zip ]]; then
+      extract_zip_member "$archive" "$member" "$staged" || {
+        say_err "${RED}${X}${RESET} failed to extract ${member} from ${archive}"
+        exit 1
+      }
+    else
+      # Stream the selected member, never extract tar paths into the live cache.
+      tar -xOf "$archive" "$member" >"$staged" 2>/dev/null || {
+        say_err "${RED}${X}${RESET} failed to extract ${member} from ${archive}"
+        exit 1
+      }
+    fi
+    chmod 755 "$staged" || exit 1
+    if ! "$verifier" "$staged"; then
+      say_err "${RED}${X}${RESET} extracted ${member} did not execute correctly: $staged"
+      exit 1
+    fi
+    # A peer may have published its independently validated copy in the meantime.
+    if [[ -x "$bin_path" ]] && "$verifier" "$bin_path"; then
+      exit 0
+    fi
+    # Portable mv treats a directory (including a symlink to one) as a container,
+    # not a replacement target. Refuse it instead of reporting a bogus install.
+    if [[ -d "$bin_path" ]]; then
+      say_err "${RED}${X}${RESET} refusing directory at executable path: $bin_path"
+      exit 1
+    fi
+    if ! mv -f -- "$staged" "$bin_path"; then
+      # Windows may reject replacing an executing file. A valid peer's published
+      # copy is sufficient; never unlink it or write over it to force replacement.
+      if [[ -x "$bin_path" ]] && "$verifier" "$bin_path"; then
+        exit 0
+      fi
+      say_err "${RED}${X}${RESET} failed to install ${member}: $bin_path"
+      exit 1
+    fi
+  )
 }
 
 ensure_ast_grep_tool_cache(){
@@ -4719,7 +4771,7 @@ ensure_ast_grep_tool_cache(){
   fi
   bin_path="$tool_root/$bin_name"
 
-  ensure_dir "$tool_root"
+  ensure_dir "$tool_root" || return 1
 
   local need_download=0
   if [[ ! -f "$zip_path" ]]; then
@@ -4735,39 +4787,42 @@ ensure_ast_grep_tool_cache(){
 
   if [[ "$need_download" -eq 1 ]]; then
     [[ "${QUIET:-0}" -eq 0 ]] && say_err "${DIM}${INFO}${RESET} Downloading ast-grep ${AST_GREP_VERSION} (${target})..."
-    local tmp_zip
-    tmp_zip="$(mktemp -t ubs-ast-grep.XXXXXX 2>/dev/null || mktemp "${TMPDIR:-/tmp}/ubs-ast-grep.XXXXXX" 2>/dev/null)" || {
-      say_err "${RED}$X failed to create temp file for module download${RESET}"
-      return 1
-    }
-    if ! download_url_to_file "$url" "$tmp_zip"; then
-      say_err "${RED}${X}${RESET} failed to download ast-grep: $url"
-      say_err "${DIM}Install ast-grep manually (https://ast-grep.github.io/) or re-run install.sh.${RESET}"
-      return 1
-    fi
-    local sha
-    if ! sha256_into sha "$tmp_zip"; then
-      say_err "${RED}${X}${RESET} cannot verify ast-grep download: ${SHA256_ERR}"
-      return 2
-    fi
-    if [[ "$sha" != "$expected" ]]; then
-      say_err "${RED}${X}${RESET} ast-grep checksum mismatch for ${asset}"
-      say_err "${DIM}Expected: ${expected}${RESET}"
-      say_err "${DIM}Got:      ${sha}${RESET}"
-      return 1
-    fi
-    mv "$tmp_zip" "$zip_path"
+    local tmp_zip sha
+    (
+      # Same-filesystem publication also prevents torn reads of the archive.
+      tmp_zip="$(mktemp "$tool_root/.ubs-ast-grep.XXXXXX")" || {
+        say_err "${RED}$X failed to create temp file for ast-grep download${RESET}"
+        exit 1
+      }
+      trap 'rm -f -- "$tmp_zip"' EXIT
+      trap 'exit 1' HUP INT TERM
+      if ! download_url_to_file "$url" "$tmp_zip"; then
+        say_err "${RED}${X}${RESET} failed to download ast-grep: $url"
+        say_err "${DIM}Install ast-grep manually (https://ast-grep.github.io/) or re-run install.sh.${RESET}"
+        exit 1
+      fi
+      if ! sha256_into sha "$tmp_zip"; then
+        say_err "${RED}${X}${RESET} cannot verify ast-grep download: ${SHA256_ERR}"
+        exit 2
+      fi
+      if [[ "$sha" != "$expected" ]]; then
+        say_err "${RED}${X}${RESET} ast-grep checksum mismatch for ${asset}"
+        say_err "${DIM}Expected: ${expected}${RESET}"
+        say_err "${DIM}Got:      ${sha}${RESET}"
+        exit 1
+      fi
+      [[ ! -d "$zip_path" ]] || exit 1
+      mv -f -- "$tmp_zip" "$zip_path" || exit 1
+    ) || return $?
   fi
 
-  if ! extract_zip_member "$zip_path" "$bin_name" "$bin_path"; then
-    say_err "${RED}${X}${RESET} failed to extract ${bin_name} from ${zip_path}"
-    return 1
+  # Keep the archive-integrity gate above the fast path. A verified warm cache
+  # must remain read-only, including its inode, permissions and timestamps.
+  if verify_ast_grep_bin "$bin_path"; then
+    echo "$bin_path"
+    return 0
   fi
-  chmod +x "$bin_path" 2>/dev/null || true
-  if ! verify_ast_grep_bin "$bin_path"; then
-    say_err "${RED}${X}${RESET} extracted ast-grep did not execute correctly: $bin_path"
-    return 1
-  fi
+  install_tool_cache_binary "$zip_path" "$bin_name" "$bin_path" verify_ast_grep_bin || return $?
   echo "$bin_path"
 }
 
@@ -4799,39 +4854,30 @@ ensure_toon_tool_cache(){
     say_err "${RED}${X}${RESET} Environment error: need sha256sum, shasum, or openssl to verify the toon encoder download"
     return 1
   fi
-  ensure_dir "$tool_root"
+  ensure_dir "$tool_root" || return 1
   [[ "${QUIET:-0}" -eq 0 ]] && say_err "${DIM}${INFO}${RESET} Downloading toon_rust ${TOON_VERSION} (${asset})..."
-  tmp="$(mktemp -t ubs-toon.XXXXXX 2>/dev/null || mktemp "${TMPDIR:-/tmp}/ubs-toon.XXXXXX" 2>/dev/null)" || return 1
-  if ! download_url_to_file "$url" "$tmp"; then
-    say_err "${RED}${X}${RESET} failed to download the toon encoder: $url"
-    rm -f "$tmp" 2>/dev/null
-    return 1
-  fi
-  if ! sha256_into sha "$tmp"; then
-    say_err "${RED}${X}${RESET} cannot verify the toon encoder download: ${SHA256_ERR}; nothing installed"
-    rm -f "$tmp" 2>/dev/null
-    return 2
-  fi
-  if [[ "$sha" != "$expected" ]]; then
-    say_err "${RED}${X}${RESET} toon encoder checksum mismatch for ${asset}; nothing installed"
-    say_err "${DIM}Expected: ${expected}${RESET}"
-    say_err "${DIM}Got:      ${sha}${RESET}"
-    rm -f "$tmp" 2>/dev/null
-    return 1
-  fi
-  mv "$tmp" "$archive"
-  rm -f "$bin_path" 2>/dev/null
-  if [[ "$asset" == *.zip ]]; then
-    extract_zip_member "$archive" "toon.exe" "$bin_path" || { say_err "${RED}${X}${RESET} failed to extract toon.exe from ${archive}"; return 1; }
-  else
-    ( cd "$tool_root" && tar -xf "$archive" toon 2>/dev/null ) || { say_err "${RED}${X}${RESET} failed to extract toon from ${archive}"; return 1; }
-  fi
-  chmod +x "$bin_path" 2>/dev/null || true
-  if ! looks_like_toon_rust_encoder "$bin_path"; then
-    say_err "${RED}${X}${RESET} extracted toon encoder did not identify itself as toon_rust: $bin_path"
-    rm -f "$bin_path" 2>/dev/null
-    return 1
-  fi
+  (
+    tmp="$(mktemp "$tool_root/.ubs-toon.XXXXXX")" || exit 1
+    trap 'rm -f -- "$tmp"' EXIT
+    trap 'exit 1' HUP INT TERM
+    if ! download_url_to_file "$url" "$tmp"; then
+      say_err "${RED}${X}${RESET} failed to download the toon encoder: $url"
+      exit 1
+    fi
+    if ! sha256_into sha "$tmp"; then
+      say_err "${RED}${X}${RESET} cannot verify the toon encoder download: ${SHA256_ERR}; nothing installed"
+      exit 2
+    fi
+    if [[ "$sha" != "$expected" ]]; then
+      say_err "${RED}${X}${RESET} toon encoder checksum mismatch for ${asset}; nothing installed"
+      say_err "${DIM}Expected: ${expected}${RESET}"
+      say_err "${DIM}Got:      ${sha}${RESET}"
+      exit 1
+    fi
+    [[ ! -d "$archive" ]] || exit 1
+    mv -f -- "$tmp" "$archive" || exit 1
+  ) || return $?
+  install_tool_cache_binary "$archive" "${bin_path##*/}" "$bin_path" looks_like_toon_rust_encoder || return $?
   echo "$bin_path"
 }
 

@@ -13,6 +13,8 @@ on:
       - test-suite/patches/javascript-bound-choices.patch.xz
       - test-suite/patches/javascript-bound-captures.patch.xz
       - test-suite/patches/javascript-bound-constructors.patch.xz
+      - test-suite/patches/javascript-arguments-objects.patch.xz
+      - test-suite/patches/javascript-arguments-forwarding.patch.xz
       - .github/workflows/typescript-module-assignments.yml
   workflow_dispatch:
 
@@ -171,6 +173,40 @@ jobs:
                           'test-suite/quality/test_taint_ts_module_assignments.py':test_sha}
               for path, sha in expected.items():
                   assert subprocess.check_output(['git','hash-object',path],text=True).strip() == sha, path
+          PY
+          python3 scripts/update_checksums.py
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          git diff --check
+      - name: Apply invocation argument objects and variadic forwarding
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import lzma
+          from pathlib import Path
+          import subprocess
+          stages = (
+              ('javascript-arguments-objects.patch.xz',
+               'fb1cd5a32030ab4c5c915f3ff08e2f317e7f447a878a23117e6c97d47fbbf515',
+               'b679c380bfd20494875799bc8ec0493f15d996a5',
+               'e960815741f826e45af8b2fbb711f357e61026e9',
+               '1ad147dafb5cb6b0509c1703b6773ea701f8b92b'),
+              ('javascript-arguments-forwarding.patch.xz',
+               '23062e2e41a5a5c090958b5b548edde336af179cb91018a39685716015dd78ed',
+               'a5adede485597d852fbbfa80103b367b060eea55',
+               '857623b11d7b9e85791c9f6c6ce4a54c55a84ad0',
+               '7ae9eb30c11febde6b4f0720e01380ea54d22bf7'),
+          )
+          for name, digest, source_sha, test_sha, parser_sha in stages:
+              patch = lzma.decompress(Path('test-suite/patches', name).read_bytes())
+              assert hashlib.sha256(patch).hexdigest() == digest, name
+              subprocess.run(['git', 'apply', '--check', '-'], input=patch, check=True)
+              subprocess.run(['git', 'apply', '-'], input=patch, check=True)
+              expected = {'modules/helpers/ubs_core/analyzers/taint_js.py': source_sha,
+                          'test-suite/quality/test_taint_ts_module_assignments.py': test_sha,
+                          'modules/helpers/ubs_core/js_modules.py': parser_sha}
+              for path, sha in expected.items():
+                  assert subprocess.check_output(['git', 'hash-object', path], text=True).strip() == sha, path
           PY
           python3 scripts/update_checksums.py
           ./scripts/verify_checksums.sh

@@ -1,0 +1,81 @@
+name: Release Upgrade Regression
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ubs
+      - install.sh
+      - modules/**
+      - test-suite/shareable/test_installed_contract.py
+      - .github/workflows/release-upgrade.yml
+  pull_request:
+    paths:
+      - ubs
+      - install.sh
+      - modules/**
+      - test-suite/shareable/test_installed_contract.py
+      - .github/workflows/release-upgrade.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  installed-contract:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      UBS_NO_AUTO_UPDATE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install scanner dependencies
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then
+            brew install bash jq ripgrep rsync shellcheck minisign
+            echo "$(brew --prefix bash)/bin" >> "$GITHUB_PATH"
+            echo 'TMPDIR=/private/tmp' >> "$GITHUB_ENV"
+          else
+            sudo apt-get update
+            sudo apt-get install -y jq ripgrep rsync shellcheck minisign
+          fi
+      - name: Test installed contract verification and repair
+        run: python3 test-suite/shareable/test_installed_contract.py -v
+
+  # Retain source inputs while developing the historical upgrade regression.
+  # This read-only job never changes repository branches, tags, or releases.
+  upgrade-inputs:
+    if: github.event_name == 'push' && contains(github.event.head_commit.message, 'validate release upgrade environments')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Capture current and historical release inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/upgrade-inputs/release-v5.4.17"
+          git rev-parse HEAD > "$RUNNER_TEMP/upgrade-inputs/main-sha.txt"
+          git ls-files -s > "$RUNNER_TEMP/upgrade-inputs/main-index.txt"
+          git archive HEAD | gzip > "$RUNNER_TEMP/upgrade-inputs/main.tar.gz"
+          git archive v5.4.17 | gzip > "$RUNNER_TEMP/upgrade-inputs/v5.4.17.tar.gz"
+          gh release download v5.4.17 --dir "$RUNNER_TEMP/upgrade-inputs/release-v5.4.17" --pattern ubs --pattern install.sh --pattern SHA256SUMS --pattern SHA256SUMS.minisig
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-upgrade-inputs
+          path: ${{ runner.temp }}/upgrade-inputs/
+          retention-days: 3

@@ -10,6 +10,9 @@ on:
       - test-suite/patches/javascript-namespace-receivers.patch.xz
       - test-suite/patches/javascript-bound-functions.patch
       - test-suite/patches/javascript-bound-arguments.patch.xz
+      - test-suite/patches/javascript-bound-choices.patch.xz
+      - test-suite/patches/javascript-bound-captures.patch.xz
+      - test-suite/patches/javascript-bound-constructors.patch.xz
       - .github/workflows/typescript-module-assignments.yml
   workflow_dispatch:
 
@@ -144,6 +147,18 @@ jobs:
                'e2c0e36d07498bd89708b7a3cf87f2e7a589b3894c52cabc2ade69c2afd5659f',
                '7cc57de24ebddc2999ec65e97de2b612d2f76239',
                'a74afa7436e3f3c85986b8ff738e9e188183549c'),
+              ('javascript-bound-choices.patch.xz',
+               '6bcb497043af6ba89390cb79beeb7c50085fbbc3e01c1c472eb1dcb9c2ec18aa',
+               '582368ee0f7db134cd62bfeaea2739cab230db1e',
+               '97a83097ab51d4d495171fb8aa207797305eed27'),
+              ('javascript-bound-captures.patch.xz',
+               'ddf943d2a7da71244ff5ea6785d45570447be9028ae026fd6a2c1d36014e6399',
+               'aa0ab89bb5d679d40ac39d83a1f350190f06fde2',
+               'f68fef27a0f0636d8f4cc4bbe8bbc13839e46b02'),
+              ('javascript-bound-constructors.patch.xz',
+               '78b2b4ddd21e255509890d79d1466eb4961e8da6653317ff774841d33339412e',
+               '2aaac847b19822d29aa8ab799c2aaa67635827e9',
+               'f3fda85d59738dd9cf338c0d2d36a9a26de7eff7'),
           )
           for name, digest, source_sha, test_sha in stages:
               patch = Path('test-suite/patches', name).read_bytes()

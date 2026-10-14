@@ -9,6 +9,7 @@ reuse disabled, and the cross-module shapes must report the known flow.
 """
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 import sys
 import tempfile
@@ -210,6 +211,110 @@ class WorklistReuseTests(unittest.TestCase):
                 files.append(path)
             return sorted((str(path.relative_to(root)), rule, line, column, description)
                           for path, rule, line, column, description in taint_py._Project(files, root).findings())
+
+    def test_prepared_syntax_preserves_child_scopes_and_deferred_imports(self):
+        tree = ast.parse('''
+import os as system
+def outer(value):
+    global external
+    def child():
+        nonlocal value
+        yield value
+    external = [value for value in value if (seen := value)]
+    return lambda: value
+class Factory:
+    import builtins as builtins_alias
+    def method(self):
+        from mod import callback
+        return callback
+''')
+        engine = taint_py._Analysis(tree)
+        outer = tree.body[1]
+        child = outer.body[1]
+        callback = outer.body[-1].value
+        factory = tree.body[2]
+        method = factory.body[1]
+        comprehension = outer.body[2].value
+        self.assertEqual(engine.locals[tree], {'system', 'outer', 'Factory'})
+        self.assertEqual(engine.locals[outer], {'value', 'child', 'seen'})
+        self.assertEqual(engine.locals[child], set())
+        self.assertEqual(engine.locals[method], {'self', 'callback'})
+        self.assertEqual(engine.locals[comprehension], {'value'})
+        self.assertEqual(engine.generators, {child})
+        self.assertIs(engine.enclosing(callback), outer)
+        self.assertIs(engine.enclosing(method), factory)
+        self.assertEqual([node.module if isinstance(node, ast.ImportFrom) else node.names[0].name
+                          for node in engine.imports], ['os', 'builtins', 'mod'])
+        self.assertEqual(engine.functions, [node for node in ast.walk(tree)
+                         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))])
+
+    def test_prepared_scopes_keep_closure_flow_through_shadowing_comprehension(self):
+        for actual, expected in [('input()', {('app.py', 7)}), ('"safe"', set())]:
+            with self.subTest(actual=actual):
+                findings = self.scan({'app.py': f'''
+import os
+def outer(value):
+    def child():
+        return value
+    values = [child() for value in ("safe",)]
+    return values
+os.system(outer({actual})[0])
+'''})
+                self.assertEqual({(path, line) for path, _, line, _, _ in findings}, expected, findings)
+
+    def test_opaque_import_cycle_does_not_reassign_foreign_callback_jobs(self):
+        sources = {
+            'a_helpers.py': 'def apply(callback, value):\n    return callback(value)\n',
+            'b_app.py': '''
+import os
+from a_helpers import apply
+def relay(value):
+    return value
+os.system(apply(relay, input()))
+''',
+            'z_left.py': 'import z_right\nflag = unknown()\ndef left(value):\n    return value\n',
+            'z_right.py': 'import z_left\nflag = unknown()\ndef right(value):\n    return value\n',
+        }
+        initialize = taint_py._Flow.__init__
+        misplaced = []
+
+        def check_owner(flow, engine, scope):
+            if (engine is not None and engine.project is None
+                    and isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+                    and scope not in engine.functions):
+                misplaced.append(getattr(scope, 'name', '<lambda>'))
+            initialize(flow, engine, scope)
+
+        with patch.object(taint_py._Flow, '__init__', check_owner):
+            findings = self.scan(sources)
+        self.assertEqual({(path, line) for path, _, line, _, _ in findings}, {('b_app.py', 5)}, findings)
+        self.assertEqual(misplaced, [], 'Opaque imports must not change a function\'s defining module')
+
+    def test_opaque_cycle_cannot_erase_a_prior_callable_summary(self):
+        for source, expected in [('input()', {('b_app.py', 6), ('zz_observe.py', 5)}),
+                                 ('"safe"', set())]:
+            with self.subTest(source=source):
+                findings = self.scan({
+                    'a_helpers.py': 'def apply(callback, value):\n    return callback(value)\n',
+                    'b_app.py': f'''
+import os
+from a_helpers import apply
+q = {source}
+def relay(value):
+    return q
+os.system(apply(relay, "safe"))
+''',
+                    'z_left.py': 'import z_right\nflag = unknown()\n',
+                    'z_right.py': 'import z_left\nflag = unknown()\n',
+                    'zz_observe.py': '''
+import os
+from a_helpers import apply
+from b_app import relay
+import z_left
+os.system(apply(relay, "safe"))
+''',
+                })
+                self.assertEqual({(path, line) for path, _, line, _, _ in findings}, expected, findings)
 
     def test_reuse_matches_a_full_re_solve(self):
         for name, sources in SHAPES.items():

@@ -682,16 +682,18 @@ def _pattern_capture(node):
     return None
 
 
-def _local_names(scope) -> set[str]:
+def _local_names(scope, nodes=None) -> set[str]:
+    if nodes is None:
+        nodes = tuple(_scope_nodes(scope))
     names = set()
     # Iteration targets belong to the comprehension, not its containing
     # function/module. Walrus targets still belong to the containing scope.
     comprehension_targets = {
-        child for node in _scope_nodes(scope)
+        child for node in nodes
         if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp))
         for generator in node.generators for child in ast.walk(generator.target)
     }
-    for node in _scope_nodes(scope):
+    for node in nodes:
         if (isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del))
                 and node not in comprehension_targets):
             names.add(node.id)
@@ -705,7 +707,7 @@ def _local_names(scope) -> set[str]:
         args = scope.args
         names.update(arg.arg for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs))
         names.update(arg.arg for arg in (args.vararg, args.kwarg) if arg is not None)
-        for node in _scope_nodes(scope):
+        for node in nodes:
             if isinstance(node, (ast.Global, ast.Nonlocal)):
                 names.difference_update(node.names)
     return names
@@ -2623,6 +2625,7 @@ class _Analysis:
     def __init__(self, tree, project=None):
         self.tree = tree
         self.project = project
+        self.function_owners = {}
         self.globals = _State()
         self.summaries = {}
         self.defaults = {}
@@ -2637,14 +2640,25 @@ class _Analysis:
         self.default_bindings = {}
         self.class_members = {}
         self.class_callables = {}
-        self.parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
-        self.call_sites = {node: _expanded_call(node) for node in ast.walk(tree) if isinstance(node, ast.Call)}
+        # The syntax tree is immutable during analysis. Build its structural
+        # tables from one breadth-first walk; scope bodies likewise need only
+        # one walk for local names and generator classification. Rewalking all
+        # selected source here adds substantial setup cost before any flow is
+        # analyzed, without providing new information.
+        nodes = tuple(ast.walk(tree))
+        self.parents = {child: parent for parent in nodes for child in ast.iter_child_nodes(parent)}
+        self.call_sites = {node: _expanded_call(node) for node in nodes if isinstance(node, ast.Call)}
+        self.imports = tuple(node for node in nodes if isinstance(node, (ast.Import, ast.ImportFrom)))
         self.method_calls = {}
-        self.functions = [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))]
-        self.generators = {function for function in self.functions
-                           if any(isinstance(node, (ast.Yield, ast.YieldFrom)) for node in _scope_nodes(function))}
-        self.locals = {scope: _local_names(scope) for scope in [tree, *self.functions]}
-        for node in ast.walk(tree):
+        self.functions = [node for node in nodes if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))]
+        self.generators = set()
+        self.locals = {}
+        for scope in [tree, *self.functions]:
+            body = tuple(_scope_nodes(scope))
+            self.locals[scope] = _local_names(scope, body)
+            if scope is not tree and any(isinstance(node, (ast.Yield, ast.YieldFrom)) for node in body):
+                self.generators.add(scope)
+        for node in nodes:
             if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
                 self.locals[node] = {child.id for generator in node.generators
                                     for child in ast.walk(generator.target)
@@ -2668,7 +2682,11 @@ class _Analysis:
             self.closures[function] = available - self.locals[function]
 
     def owner(self, function):
-        return self.project.owners.get(function, self) if self.project is not None else self
+        # An opaque import cycle disables the project resolver, not lexical
+        # ownership. Shared callback jobs must still use their defining
+        # module; otherwise every later cycle re-solves foreign functions
+        # against its own globals and overwrites their summaries.
+        return self.function_owners.get(function, self)
 
     @staticmethod
     def plain_class(node, state):
@@ -3025,6 +3043,8 @@ class _Project:
             self.namespaces.add(key)
             self.namespaces.update(parent for parent in key.parents if parent.is_relative_to(self.root))
         self.owners = {function: engine for _, _, engine, _ in self.sources for function in engine.functions}
+        for _, _, engine, _ in self.sources:
+            engine.function_owners = self.owners
         self.module_references = {'@module:' + str(key) for key in self.namespaces}
         # AST-keyed metadata is safe to share. Module variable namespaces and
         # framework entrypoint bindings remain separate per defining module.
@@ -3060,9 +3080,7 @@ class _Project:
 
     def dependencies(self, engine):
         dependencies = set()
-        for node in ast.walk(engine.tree):
-            if not isinstance(node, (ast.Import, ast.ImportFrom)):
-                continue
+        for node in engine.imports:
             names = ([node.module or '', *('.'.join(filter(None, (node.module, alias.name)))
                       for alias in node.names if alias.name != '*')]
                      if isinstance(node, ast.ImportFrom) else [alias.name for alias in node.names])

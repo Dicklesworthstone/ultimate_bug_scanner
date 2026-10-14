@@ -16,8 +16,9 @@
 if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
   # cron and launchd run jobs with PATH=/usr/bin:/bin, so `env bash` finds the
   # stock 3.2 even where a modern bash is installed (the nightly
-  # `ubs --update` cron entry failed this way). Re-exec under it when found.
-  if [ -f "$0" ]; then
+  # `ubs --update` cron entry failed this way). Re-exec under it when found;
+  # UBS_NO_BASH_REEXEC=1 keeps the refusal below (CI asserts both paths).
+  if [ -f "$0" ] && [ -z "${UBS_NO_BASH_REEXEC:-}" ]; then
     # shellcheck disable=SC2046  # word-split the PATH lookups on purpose
     for _ubs_bash in /opt/homebrew/bin/bash /usr/local/bin/bash /home/linuxbrew/.linuxbrew/bin/bash $(type -ap bash 2>/dev/null); do
       [ -x "$_ubs_bash" ] && [ "$_ubs_bash" != "${BASH:-}" ] || continue

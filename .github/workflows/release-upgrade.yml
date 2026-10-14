@@ -7,6 +7,9 @@ on:
       - ubs
       - install.sh
       - modules/**
+      - scripts/release_generation.py
+      - scripts/embed_release_generation.py
+      - test-suite/shareable/test_*generation.py
       - test-suite/shareable/test_installed_contract.py
       - .github/workflows/release-upgrade.yml
   pull_request:
@@ -14,15 +17,22 @@ on:
       - ubs
       - install.sh
       - modules/**
+      - scripts/release_generation.py
+      - scripts/embed_release_generation.py
+      - test-suite/shareable/test_*generation.py
       - test-suite/shareable/test_installed_contract.py
       - .github/workflows/release-upgrade.yml
   workflow_dispatch:
+  workflow_run:
+    workflows: [JavaScript Heap Taint]
+    types: [completed]
 
 permissions:
   contents: read
 
 jobs:
   installed-contract:
+    if: github.event_name != 'workflow_run'
     strategy:
       fail-fast: false
       matrix:
@@ -52,15 +62,16 @@ jobs:
       - name: Test installed contract verification and repair
         run: python3 test-suite/shareable/test_installed_contract.py -v
 
-  # Retain source inputs while developing the historical upgrade regression.
-  # This read-only job never changes repository branches, tags, or releases.
+  # Read-only diagnostic input capture. No artifacts from the triggering run
+  # are consumed and no repository ref, issue, or release is modified.
   upgrade-inputs:
-    if: github.event_name == 'push' && contains(github.event.head_commit.message, 'validate release upgrade environments')
+    if: github.event_name == 'workflow_run' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: main
           persist-credentials: false
           fetch-depth: 0
       - name: Capture current and historical release inputs
@@ -73,7 +84,7 @@ jobs:
           git ls-files -s > "$RUNNER_TEMP/upgrade-inputs/main-index.txt"
           git archive HEAD | gzip > "$RUNNER_TEMP/upgrade-inputs/main.tar.gz"
           git archive v5.4.17 | gzip > "$RUNNER_TEMP/upgrade-inputs/v5.4.17.tar.gz"
-          gh release download v5.4.17 --dir "$RUNNER_TEMP/upgrade-inputs/release-v5.4.17" --pattern ubs --pattern install.sh --pattern SHA256SUMS --pattern SHA256SUMS.minisig
+          gh release download v5.4.17 --dir "$RUNNER_TEMP/upgrade-inputs/release-v5.4.17" --pattern ubs --pattern SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: release-upgrade-inputs

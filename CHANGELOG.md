@@ -10,7 +10,15 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
-_No changes yet._
+### Fixed
+
+- JavaScript taint summaries now widen recursive calls per recursion entry, so
+  recursive interpreters converge without mixing unrelated callers' heap
+  allocations. Adapted tryingET's proposed fix for #180, with regressions for
+  recursive copying, deep cloning, shared mutations and clean caller isolation.
+- Nested heap-returning functions capture unassigned formal parameters, fixing
+  the related `get()` false negative. State inequality now includes heap and
+  captured-cell changes when scheduling dependent summaries.
 
 ---
 

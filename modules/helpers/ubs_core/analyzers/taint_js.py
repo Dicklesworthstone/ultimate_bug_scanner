@@ -34,6 +34,14 @@ BASE_DIR: Path = Path()
 SKIP_DIRS = {'.git', '.hg', '.svn', '.venv', 'node_modules', '.next', '.nuxt', '.cache', 'dist', 'build', 'coverage', 'tmp', '.turbo'}
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.mts', '.cts'}
 PATH_LIMIT = 5
+# Marks the call-site set of an allocation that came back through a widened
+# summary (_Engine.heap_call): one weak object per allocation site and entry
+# into a recursion, instead of one per subset of call sites.
+WIDENED = '<widened>'
+
+
+def _collapsed(ref):
+    return len(ref) > 2 and any(isinstance(site, tuple) and site[:1] == (WIDENED,) for site in ref[2])
 ROUTE_PARAM_FIELDS = r"(?:id|slug|user|username|email|name|status|tenant|account|role|filter|search|sort|limit|offset|where|order|table|column)"
 # Each whitespace run has exactly one owner: `\s*\(?\s*` split a run of N
 # blanks N ways on every failed match, and callers pass expressions whose
@@ -686,6 +694,9 @@ class _State(dict):
                 and self.weak_refs == other.weak_refs and self.array_lengths == other.array_lengths
                 and self.written_cells == other.written_cells)
 
+    def __ne__(self, other):
+        return not self == other
+
 
 def _cell_input(key):
     return frozenset({_Trace(('capture', key), (key[2],))})
@@ -839,6 +850,9 @@ class _HeapCall:
     incoming: _State
     ancestors: frozenset
     result: object = None
+    widened: bool = False
+    superseded: bool = False
+    root: object = None
     readers: set = field(default_factory=set)
 
 
@@ -2538,6 +2552,7 @@ class _Engine:
         self.summaries, self.final_states = {}, {}
         self.dependents = defaultdict(set)
         self.heap_calls = {}
+        self.widened_calls, self.exact_calls, self.recursive = {}, defaultdict(list), set()
         self.current_task = None
         self.pending, self.queued = deque(), set()
         self.binding_regions = {}
@@ -2784,7 +2799,11 @@ class _Engine:
         while parent is not None:
             ancestors.add(parent)
             parent = parent.parent
-        state.cells = {key: value for key, value in incoming.cells.items()
+        # Formal parameters initially live in the visible-name map, before
+        # any assignment creates a cell. Nested heap calls must capture their
+        # current values too, including clean values that kill symbolic taint.
+        available = incoming.cells.keys() | incoming.owners.values()
+        state.cells = {key: _cell_value(key, incoming) for key in available
                        if key[0] in ancestors and key in self.capture_keys[callee]}
         for name, key in incoming.owners.items():
             if key in state.cells and self.binding(callee, name) == key:
@@ -2812,40 +2831,110 @@ class _Engine:
         Distinct inner allocations must not merge at an outer return, while
         recursion must not create an unbounded call-history tuple. A collapsed
         allocation is weak; recursive array lengths widen rather than growing.
+
+        Once a callee calls itself, a call to it from outside its recursion gets
+        a widened summary of its own, keyed by that call site and its caller;
+        the recursive calls and every call made inside that summary share it
+        (one per callee). Its input is the join of all inputs it has seen and
+        only grows, so recursion converges, every actual input stays covered,
+        so no taint is dropped, and distinct outside callers stay apart. Each
+        fresh object a recursive interpreter appends to a captured array
+        otherwise comes back under a new subset of call sites, and almost every
+        recursive call met a new heap.
         """
         task = self.current_task
         ancestors = task.ancestors if isinstance(task, _HeapCall) else frozenset((task,))
         incoming = self.heap_input(callee, bound, state, callee in ancestors)
-        signature = (callee, rule, location, frozenset(bound.items()),
-                     frozenset(incoming.cells.items()), frozenset(incoming.bindings.items()),
-                     frozenset((ref, frozenset(slots.items())) for ref, slots in incoming.heap.items()),
-                     frozenset(incoming.weak_refs), frozenset(incoming.array_lengths.items()))
-        context = self.heap_calls.get(signature)
-        if context is None:
-            context = _HeapCall(callee, rule, location, dict(bound), incoming,
-                                ancestors | {callee})
-            self.heap_calls[signature] = context
-            self.enqueue(context)
+        if getattr(task, 'widened', False):
+            context = self.widened_call(callee, rule, task.root, location, bound, incoming, ancestors | {callee})
+        elif callee in ancestors or (callee, rule) in self.recursive:
+            if (callee, rule) not in self.recursive:
+                # Its exact summaries so far were entries into a recursion:
+                # their callers re-run and enter through a widened summary.
+                self.recursive.add((callee, rule))
+                for old in self.exact_calls.pop((callee, rule), []):
+                    old.superseded = True
+                    for reader in old.readers:
+                        self.enqueue(reader)
+            context = self.widened_call(callee, rule, (location, task), location, bound, incoming,
+                                        ancestors | {callee})
+        else:
+            signature = (callee, rule, location, frozenset(bound.items()),
+                         frozenset(incoming.cells.items()), frozenset(incoming.bindings.items()),
+                         frozenset((ref, frozenset(slots.items())) for ref, slots in incoming.heap.items()),
+                         frozenset(incoming.weak_refs), frozenset(incoming.array_lengths.items()))
+            context = self.heap_calls.get(signature)
+            if context is None:
+                context = _HeapCall(callee, rule, location, dict(bound), incoming,
+                                    ancestors | {callee})
+                self.heap_calls[signature] = context
+                self.exact_calls[(callee, rule)].append(context)
+                self.enqueue(context)
+        # Borrowed means borrowed by this caller: a joined widened input also
+        # holds the callee's own allocations from its recursive calls.
         context.readers.add(task)
         if context.result is None:
             return frozenset(), {}, False, frozenset(), None
         returned, effects, writes, output, thrown, throw_writes, exceptional = context.result
+        widened = context.root if context.widened else None
         label = self.call_label(callee)
         thrown_value, thrown_state = frozenset(), None
         if exceptional is not None:
             thrown_state = state.copy()
-            thrown_value = self.apply_heap_output(incoming, thrown_state, exceptional, throw_writes, thrown, location)
+            thrown_value = self.apply_heap_output(incoming, thrown_state, exceptional, throw_writes, thrown, location,
+                                                  widened=widened)
         result = frozenset()
         if output is not None:
-            result = self.apply_heap_output(incoming, state, output, writes, returned, location)
+            result = self.apply_heap_output(incoming, state, output, writes, returned, location,
+                                            widened=widened)
         return (_step(result, label), {key: _step(fact, label) for key, fact in effects.items()},
                 output is not None, _step(thrown_value, label), thrown_state)
 
-    def apply_heap_output(self, incoming, state, output, writes, returned, location):
+    def widened_call(self, callee, rule, root, location, bound, incoming, ancestors):
+        """The widened summary of a callee within one entry into a recursion; re-solved as its input grows.
+
+        Its output allocations collapse (apply_heap_output), so the call site
+        no longer matters for them, and recursive calls through different sites
+        meet in one summary instead of chasing each other.
+        """
+        key = (callee, rule, root)
+        context = self.widened_calls.get(key)
+        if context is None:
+            incoming.array_lengths = dict.fromkeys(incoming.array_lengths)
+            context = _HeapCall(callee, rule, location, dict(bound), incoming, ancestors,
+                                widened=True, root=root)
+            self.widened_calls[key] = context
+            self.enqueue(context)
+            return context
+        joined_bound = {name: _join(context.bound.get(name, frozenset()), bound.get(name, frozenset()))
+                        for name in context.bound.keys() | bound.keys()}
+        joined = _join_states(context.incoming, incoming)
+        # Lengths that differ become unknown anyway; unknown from the start
+        # saves the re-solves of a length counting up through the fixed point.
+        joined.array_lengths = dict.fromkeys(joined.array_lengths)
+        # `==`, not `!=`: _State defines __eq__ only, and dict.__ne__ would
+        # compare the names alone and miss a change in the heap or the cells.
+        if (joined_bound != context.bound or not joined == context.incoming
+                or not ancestors <= context.ancestors):
+            context.bound, context.incoming = joined_bound, joined
+            context.ancestors = context.ancestors | ancestors
+            self.enqueue(context)
+        return context
+
+    def apply_heap_output(self, incoming, state, output, writes, returned, location, *, widened=None):
         self.budget.spend(1 + _heap_work(output.heap))
-        renamed = {ref: ref if ref in incoming.heap else
-                   (*ref[:2], (ref[2] if len(ref) > 2 else frozenset()) | {location})
-                   for ref in output.heap}
+
+        def fresh(ref):
+            if _collapsed(ref):
+                return ref
+            if widened is not None:
+                # Every object a widened summary returns from this allocation
+                # site is one weak object per entry into the recursion: writes
+                # join, reads see all of them, other entries keep their own.
+                return (*ref[:2], frozenset({(WIDENED, widened)}))
+            return (*ref[:2], (ref[2] if len(ref) > 2 else frozenset()) | {location})
+
+        renamed = {ref: ref if ref in incoming.heap else fresh(ref) for ref in output.heap}
 
         def translate(fact):
             return _Fact(fact, (renamed.get(ref, ref) for ref in _refs(fact)))
@@ -2864,7 +2953,7 @@ class _Engine:
                 previous = state.heap[new]
                 slots = {key: _join(previous.get(key, frozenset()), slots.get(key, frozenset()))
                          for key in previous.keys() | slots.keys()}
-            collapsed = len(originals) > 1 or collision
+            collapsed = len(originals) > 1 or collision or _collapsed(new)
             if collapsed or any(old in output.weak_refs for old in originals):
                 state.weak_refs.add(new)
             state.heap[new] = slots
@@ -3115,6 +3204,8 @@ class _Engine:
             self.queued.discard(task)
             self.current_task = task
             if isinstance(task, _HeapCall):
+                if task.superseded:
+                    continue
                 result = self.analyze_heap(task)
                 if task.result != result:
                     task.result = result
@@ -3168,6 +3259,9 @@ class _Engine:
                 self.final_states.clear()
                 self.dependents.clear()
                 self.heap_calls.clear()
+                self.widened_calls.clear()
+                self.exact_calls.clear()
+                self.recursive.clear()
         for (location, rule, label), fact in sorted(found.items()):
             trace = min(fact, key=lambda item: (len(item.path), item.path))
             yield location, rule, format_path(trace.path, label)

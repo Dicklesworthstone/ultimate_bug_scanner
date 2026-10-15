@@ -45,6 +45,45 @@ class HeapTaintTests(unittest.TestCase):
     def test_write_through_alias_reaches_original(self):
         self.scan('const box = {}; const alias = box; alias.html = req.query.html; res.send(box.html);', 'xss')
 
+    def test_nested_factory_captures_unassigned_parameter(self):
+        factory = ('function simulate(label) { function get() { return { note: label }; } '
+                   'return get(); }\n')
+        self.scan(factory + 'res.send(simulate(req.query.label).note);', 'xss')
+        for first, second, sink, rules in (
+            ('req.query.label', '"safe"', 'a', ('xss',)),
+            ('req.query.label', '"safe"', 'b', ()),
+            ('"safe"', 'req.query.label', 'a', ()),
+            ('"safe"', 'req.query.label', 'b', ('xss',)),
+        ):
+            with self.subTest(first=first, second=second, sink=sink):
+                self.scan(factory + f'const a = simulate({first}); const b = simulate({second}); '
+                          f'res.send({sink}.note);', *rules)
+
+    def test_recursive_nested_factory_preserves_captured_parameter(self):
+        self.scan('function simulate(label) { function get(n) { '
+                  'if (n > 0) return get(n - 1); return { note: label, kind: "safe" }; } '
+                  'return get(3); } const a = simulate(req.query.label); '
+                  'const b = simulate("safe"); res.send(a.note); res.send(b.note); res.send(a.kind);', 'xss')
+
+    def test_mutual_recursion_preserves_borrowed_heap_mutations(self):
+        source = ('function first(box, n) { if (n > 0) second(box, n - 1); '
+                  'else box.html = box.input; } '
+                  'function second(box, n) { first(box, n); } '
+                  'const a = { input: req.query.x }; const b = { input: "safe" }; '
+                  'first(a, 3); first(b, 3); ')
+        self.scan(source + 'res.send(a.html);', 'xss')
+        self.scan(source + 'res.send(b.html);')
+
+    def test_state_inequality_includes_heap_and_captured_cells(self):
+        before = taint._State()
+        after = before.copy()
+        after.heap[('allocation', 1)] = {'html': frozenset()}
+        self.assertNotEqual(before, after)
+        self.assertFalse(before == after)
+        after = before.copy()
+        after.cells[('scope', 1, 'label')] = frozenset()
+        self.assertNotEqual(before, after)
+
     def test_write_through_original_reaches_alias(self):
         self.scan('const box = {}; const alias = box; box.html = req.query.html; res.send(alias.html);', 'xss')
 

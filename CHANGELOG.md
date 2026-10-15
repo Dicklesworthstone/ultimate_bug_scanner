@@ -14,9 +14,7 @@ _No changes yet._
 
 ---
 
-## [v5.5.3] - 2026-10-14 [Tag]
-
-Signed release assets and cloud mirror promotion await completion of native Cargo validation; the source tag is not a published binary release.
+## [v5.5.3] - 2026-10-14 [Release]
 
 ### Fixed
 
@@ -26,7 +24,7 @@ Signed release assets and cloud mirror promotion await completion of native Carg
 
 ## [v5.5.2] - 2026-10-14 [Tag]
 
-Signed release assets and cloud mirror promotion await completion of native Cargo validation; the source tag is not a published binary release.
+Included in the v5.5.3 release.
 
 ### Fixed
 

@@ -38,7 +38,11 @@ class RecursiveContextIsolationTests(unittest.TestCase):
             except subprocess.TimeoutExpired as exc:
                 self.fail(f'recursive analysis did not converge\n{source}\n{exc}')
         self.assertEqual(result.returncode, 0, source + result.stdout + result.stderr)
-        findings = json.loads(result.stdout)
+        try:
+            findings = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            self.fail(f'invalid recursive-analysis JSON: {exc}\n{source}\n'
+                      f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}')
         lines = source.splitlines()
         wanted = sorted((rule, next(i for i, line in enumerate(lines, 1)
                                    if '// ' + marker in line))

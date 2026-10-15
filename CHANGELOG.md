@@ -10,12 +10,31 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+_No changes yet._
+
+---
+
+## [v5.5.4] - 2026-10-15 [Tag]
+
+Git-only source delivery; signed release assets and installed-tool upgrades are separate.
+
 ### Fixed
 
+- Swift request-flow analysis distinguishes filename argument labels, such as
+  `IntentFile(filename: name)`, from untrusted filename values. Clean App Intents
+  exports no longer activate unrelated unsupported closure analysis. Actual
+  upload members, request inputs, interpolations, dictionary keys and ternary
+  values retain their conservative source classification and fail-closed behavior.
+- Malformed internal exclusion-policy JSON fails with an explicit scanner-policy
+  diagnostic and retains its decoding cause; it is never replaced with an empty
+  policy. Valid project-anchored exclusions retain their original scope.
 - JavaScript taint summaries now widen recursive calls per recursion entry, so
   recursive interpreters converge without mixing unrelated callers' heap
   allocations. Adapted tryingET's proposed fix for #180, with regressions for
   recursive copying, deep cloning, shared mutations and clean caller isolation.
+- Helper calls inside recursive summaries retain caller and call-site isolation.
+  Escaping catch-rest and CommonJS allocations preserve their tagged identities,
+  avoiding analyzer crashes and unrelated clean/tainted value mixing.
 - Nested heap-returning functions capture unassigned formal parameters, fixing
   the related `get()` false negative. State inequality now includes heap and
   captured-cell changes when scheduling dependent summaries.

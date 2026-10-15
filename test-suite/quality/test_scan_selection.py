@@ -29,6 +29,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 UBS = REPO_ROOT / "ubs"
@@ -231,6 +232,26 @@ class IgnoreMatcherParityTest(unittest.TestCase):
         matcher = self.ubs_ignore.IgnoreMatcher("")
         for rel in self.all_files:
             self.assertFalse(matcher.excluded(rel))
+
+    def test_invalid_config_json_fails_closed_with_policy_context(self) -> None:
+        for policy in ("{", '{"root":', '{"root":"/project","patterns":[]} trailing'):
+            with self.subTest(policy=policy), patch.dict(
+                    os.environ, {"UBS_SCAN_CONFIG_EXCLUDES": policy}):
+                with self.assertRaisesRegex(ValueError, "Invalid scanner exclusion policy") as failure:
+                    self.ubs_ignore.IgnoreMatcher("", root=self.root)
+                self.assertIsInstance(failure.exception.__cause__, json.JSONDecodeError)
+
+    def test_valid_config_json_preserves_project_anchoring(self) -> None:
+        policy = json.dumps({"root": str(self.root), "patterns": ["/ignored/**"]})
+        with patch.dict(os.environ, {"UBS_SCAN_CONFIG_EXCLUDES": policy}):
+            matcher = self.ubs_ignore.IgnoreMatcher("", root=self.root)
+            self.assertTrue(matcher.excluded("ignored/bad.py"))
+            self.assertFalse(matcher.excluded("nested/ignored/keep.py"))
+            self.assertFalse(matcher.excluded("keep.py"))
+            narrow = self.ubs_ignore.IgnoreMatcher("", root=self.root / "ignored")
+            self.assertTrue(narrow.excluded("bad.py"))
+            external = self.ubs_ignore.IgnoreMatcher("", root=self.root.parent / "external")
+            self.assertFalse(external.excluded("ignored/bad.py"))
 
     def test_degenerate_patterns_do_not_raise(self) -> None:
         # rg refuses these outright — an empty glob, or an unclosed character
@@ -617,6 +638,13 @@ class PostprocessStreamingTests(unittest.TestCase):
                          f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}")
         return result
 
+    def parse_report(self, text, source):
+        """Fail with the report identity when a subprocess emits invalid JSON."""
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as exc:
+            self.fail(f"Invalid JSON report {source}: {exc}")
+
     def test_stream_preserves_counts_partial_paths_suppression_and_permalinks(self) -> None:
         workspace = self.root / "workspace"
         workspace.mkdir()
@@ -646,7 +674,7 @@ class PostprocessStreamingTests(unittest.TestCase):
             "py.example visible\n", f"py.example visible ({blob}/sample.py#L2)\n"
         )
         self.assertEqual(self.text.read_text(encoding="utf-8"), expected)
-        self.assertEqual(json.loads(self.summary.read_text(encoding="utf-8")), {
+        self.assertEqual(self.parse_report(self.summary.read_text(encoding="utf-8"), self.summary), {
             "language": "python", "project": str(self.project), "files": 9,
             "critical": 3, "warning": 2, "info": 1, "timestamp": "fixed",
             "status": "partial", "module_error": "AST_UNAVAILABLE",
@@ -690,7 +718,9 @@ class PostprocessStreamingTests(unittest.TestCase):
         self.summary.write_text('{"files":1,"critical":0,"warning":3,"info":0}',
                                 encoding="utf-8")
         self.process("json", **{"single-file": source})
-        restored = [json.loads(line) for line in self.findings.read_text(encoding="utf-8").splitlines()]
+        restored = [self.parse_report(line, f"{self.findings}:{number}")
+                    for number, line in enumerate(
+                        self.findings.read_text(encoding="utf-8").splitlines(), start=1)]
         self.assertEqual([record["path"] for record in restored],
                          ['nested/quoted"name.py', 'nested/quoted"name.py', "other.py"])
         self.assertEqual(restored[0]["message"], records[0]["message"])
@@ -750,7 +780,7 @@ class PostprocessStreamingTests(unittest.TestCase):
                 return hashlib.file_digest(stream, "sha256").hexdigest()
 
         self.assertEqual(digest(self.raw), digest(self.text))
-        doc = json.loads(self.summary.read_text(encoding="utf-8"))
+        doc = self.parse_report(self.summary.read_text(encoding="utf-8"), self.summary)
         self.assertEqual((doc["files"], doc["critical"], doc["warning"], doc["info"]),
                          (1, 0, 400000, 0))
 
@@ -767,7 +797,7 @@ class PostprocessStreamingTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}")
         self.assertLess(int(peak.read_text()), 128 * 1024)
         self.assertEqual(digest(self.findings), expected_digest)
-        self.assertEqual(json.loads(self.summary.read_text(encoding="utf-8")), doc)
+        self.assertEqual(self.parse_report(self.summary.read_text(encoding="utf-8"), self.summary), doc)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 """GH #180: recursive summary isolation across callers, effects and rules."""
 from __future__ import annotations
 
+from collections import deque
 import itertools
 import json
 import os
@@ -163,6 +164,196 @@ res.send(box.html); // sanitized-xss
 // An HTML sanitizer must not remove code-injection taint.
 eval(box.html); // eval
 ''', [('js.taint.eval', 'eval')])
+
+
+class RecursiveHeapTransferTests(unittest.TestCase):
+    """Check complete origin sets and heap identities, not one chosen witness."""
+
+    @classmethod
+    def setUpClass(cls):
+        if str(HELPERS) not in sys.path:
+            sys.path.insert(0, str(HELPERS))
+        from ubs_core.analyzers import taint_js
+        cls.js = taint_js
+
+    def setUp(self):
+        js = self.js
+        self.engine = js._Engine.__new__(js._Engine)
+        self.engine.budget = js.Budget()
+        self.engine.widened_calls = {}
+        self.engine.pending = deque()
+        self.engine.queued = set()
+        self.scope = object()
+        self.root = (17, object())
+        self.first = js._Fact([js._Trace(('source', 'first'), ('req.query.first',))])
+        self.second = js._Fact([js._Trace(('source', 'second'), ('req.query.second',))])
+        self.clean = js._Fact()
+
+    def origins(self, fact):
+        return {trace.origin for trace in fact}
+
+    def test_widened_allocation_histories_remain_bounded_and_keep_every_source(self):
+        js = self.js
+        state, incoming = js._State(), js._State()
+        expected = None
+        for index in range(1024):
+            ref = ('factory', 70, frozenset({index, index + 1}))
+            value = (self.first, self.second, self.clean)[index % 3]
+            output = js._HeapOutput({ref: {'html': value, 'kind': self.clean}}, set(), {})
+            returned = self.engine.apply_heap_output(
+                incoming, state, output, {}, js._Fact(refs=[ref]), index, widened=self.root)
+            if expected is None:
+                expected = returned
+            self.assertEqual(returned, expected)
+            self.assertEqual(len(state.heap), 1)
+        ref, = js._refs(expected)
+        self.assertEqual(self.origins(state.heap[ref]['html']),
+                         {('source', 'first'), ('source', 'second')})
+        self.assertFalse(state.heap[ref]['kind'])
+        self.assertEqual(state.weak_refs, {ref})
+        # This is a deterministic work bound, not an elapsed-time or RSS claim.
+        self.assertGreater(self.engine.budget.remaining, 490_000)
+
+    def test_widened_entries_do_not_share_fresh_allocations_or_sources(self):
+        js = self.js
+        state, incoming = js._State(), js._State()
+        allocation = ('factory', 70)
+        references = []
+        for root, value in ((self.root, self.first), ((18, object()), self.clean)):
+            output = js._HeapOutput({allocation: {'html': value}}, set(), {})
+            returned = self.engine.apply_heap_output(
+                incoming, state, output, {}, js._Fact(refs=[allocation]), 23, widened=root)
+            ref, = js._refs(returned)
+            references.append(ref)
+        dirty, clean = references
+        self.assertNotEqual(dirty, clean)
+        self.assertEqual(set(state.heap), {dirty, clean})
+        self.assertEqual(self.origins(state.heap[dirty]['html']), {('source', 'first')})
+        self.assertFalse(state.heap[clean]['html'])
+        self.assertEqual(state.weak_refs, {dirty, clean})
+
+    def test_borrowed_mutations_keep_aliases_and_translate_fresh_children(self):
+        js = self.js
+        borrowed, fresh = ('caller', 11), ('callee', 29)
+        incoming = js._State({'alias': js._Fact(refs=[borrowed])})
+        incoming.heap[borrowed] = {'html': self.clean}
+        before = incoming.copy()
+        state = incoming.copy()
+        output = js._HeapOutput({
+            borrowed: {'html': self.first, 'child': js._Fact(refs=[fresh])},
+            fresh: {'html': self.second},
+        }, set(), {})
+        result = self.engine.apply_heap_output(
+            incoming, state, output, {}, js._Fact(refs=[borrowed]), 31, widened=self.root)
+        self.assertEqual(js._refs(result), {borrowed})
+        self.assertEqual(js._refs(state['alias']), {borrowed})
+        child, = js._refs(state.heap[borrowed]['child'])
+        self.assertNotEqual(child, fresh)
+        self.assertEqual(self.origins(state.heap[borrowed]['html']), {('source', 'first')})
+        self.assertEqual(self.origins(state.heap[child]['html']), {('source', 'second')})
+        self.assertNotIn(borrowed, state.weak_refs)
+        self.assertIn(child, state.weak_refs)
+        self.assertEqual(incoming, before)
+        self.assertEqual(js._refs(output.heap[borrowed]['child']), {fresh})
+
+    def test_fresh_cycles_and_captured_writes_use_the_same_translation(self):
+        js = self.js
+        outer = object()
+        cell = (outer, 0, 'result')
+        allocation = ('factory', 70)
+        value = js._Fact(refs=[allocation])
+        incoming, state = js._State(), js._State()
+        output = js._HeapOutput({allocation: {'self': value, 'html': self.first}}, set(), {})
+        returned = self.engine.apply_heap_output(
+            incoming, state, output, {cell: value}, value, 31, widened=self.root)
+        ref, = js._refs(returned)
+        self.assertEqual(js._refs(state.heap[ref]['self']), {ref})
+        self.assertEqual(js._refs(state.cells[cell]), {ref})
+        self.assertEqual(js._refs(state['result']), {ref})
+        self.assertEqual(state.owners['result'], cell)
+        self.assertIn(cell, state.written_cells)
+        self.assertEqual(self.origins(state.heap[ref]['html']), {('source', 'first')})
+        self.assertEqual(set(state.heap), {ref})
+
+    def test_captured_write_does_not_overwrite_a_shadowing_local(self):
+        js = self.js
+        captured, local = (object(), 0, 'label'), (object(), 1, 'label')
+        state = js._State({'label': self.clean})
+        state.owners['label'] = local
+        output = js._HeapOutput({}, set(), {})
+        self.engine.apply_heap_output(
+            js._State(), state, output, {captured: self.first}, self.clean, 31,
+            widened=self.root)
+        self.assertEqual(self.origins(state.cells[captured]), {('source', 'first')})
+        self.assertFalse(state['label'])
+        self.assertEqual(state.owners['label'], local)
+        self.assertEqual(state.written_cells, {captured})
+
+    def test_normal_and_exceptional_transfers_do_not_share_mutable_state(self):
+        js = self.js
+        borrowed = ('caller', 11)
+        incoming = js._State()
+        incoming.heap[borrowed] = {'html': self.clean}
+        normal, exceptional = incoming.copy(), incoming.copy()
+        for state, value in ((normal, self.first), (exceptional, self.second)):
+            output = js._HeapOutput({borrowed: {'html': value}}, set(), {})
+            self.engine.apply_heap_output(
+                incoming, state, output, {}, self.clean, 31, widened=self.root)
+        self.assertEqual(self.origins(normal.heap[borrowed]['html']), {('source', 'first')})
+        self.assertEqual(self.origins(exceptional.heap[borrowed]['html']), {('source', 'second')})
+        self.assertFalse(incoming.heap[borrowed]['html'])
+        self.assertIsNot(normal.heap[borrowed], exceptional.heap[borrowed])
+
+    def test_heap_and_cell_only_input_growth_requeues_but_stable_input_does_not(self):
+        js = self.js
+        ref, cell = ('caller', 11), (object(), 0, 'label')
+        incoming = js._State()
+        incoming.heap[ref] = {'html': self.clean}
+        incoming.cells[cell] = self.clean
+        bound = {'box': js._Fact(refs=[ref])}
+        ancestors = frozenset({self.scope})
+        context = self.engine.widened_call(
+            self.scope, 'js.taint.xss', self.root, 31, bound, incoming, ancestors)
+        for changed in ('heap', 'cell'):
+            with self.subTest(changed=changed):
+                self.engine.pending.clear()
+                self.engine.queued.clear()
+                incoming = incoming.copy()
+                if changed == 'heap':
+                    incoming.heap[ref]['html'] = self.first
+                else:
+                    incoming.cells[cell] = self.second
+                again = self.engine.widened_call(
+                    self.scope, 'js.taint.xss', self.root, 32, bound, incoming, ancestors)
+                self.assertIs(again, context)
+                self.assertEqual(list(self.engine.pending), [context])
+        self.assertEqual(self.origins(context.incoming.heap[ref]['html']), {('source', 'first')})
+        self.assertEqual(self.origins(context.incoming.cells[cell]), {('source', 'second')})
+        self.engine.pending.clear()
+        self.engine.queued.clear()
+        self.engine.widened_call(
+            self.scope, 'js.taint.xss', self.root, 33, bound, incoming, ancestors)
+        self.assertFalse(self.engine.pending)
+        self.assertFalse(self.engine.queued)
+        self.assertEqual(len(self.engine.widened_calls), 1)
+
+    def test_recursive_array_lengths_widen_and_rule_domains_remain_separate(self):
+        js = self.js
+        ref = ('caller', 11)
+        contexts = []
+        for rule, value in (('js.taint.xss', self.clean), ('js.taint.eval', self.first)):
+            incoming = js._State()
+            incoming.heap[ref] = {'0': value}
+            incoming.array_lengths[ref] = 1
+            context = self.engine.widened_call(
+                self.scope, rule, self.root, 31, {'array': js._Fact(refs=[ref])},
+                incoming, frozenset({self.scope}))
+            contexts.append(context)
+            self.assertIsNone(context.incoming.array_lengths[ref])
+        self.assertIsNot(contexts[0], contexts[1])
+        self.assertFalse(contexts[0].incoming.heap[ref]['0'])
+        self.assertEqual(self.origins(contexts[1].incoming.heap[ref]['0']), {('source', 'first')})
+        self.assertEqual(len(self.engine.widened_calls), 2)
 
 
 if __name__ == '__main__':

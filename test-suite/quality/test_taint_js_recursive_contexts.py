@@ -165,6 +165,147 @@ res.send(box.html); // sanitized-xss
 eval(box.html); // eval
 ''', [('js.taint.eval', 'eval')])
 
+    def test_helpers_inside_one_recursion_keep_each_source_and_clean_call(self):
+        declarations = {
+            'first': 'const first = wrap(req.query.first);',
+            'second': 'const second = wrap(req.query.second);',
+            'clean': 'const clean = wrap("safe");',
+        }
+        # The same inner mk() site is reached through three calls to wrap()
+        # INSIDE one widened entry, not through three outside recursion roots.
+        for order in itertools.permutations(declarations):
+            with self.subTest(order=order):
+                traces = self.scan('''
+function mk(value) { return {html: value, kind: "constant"}; }
+function wrap(value) { return mk(value); }
+function walk(n) {
+  if (n > 0) walk(n - 1);
+''' + '\n'.join(declarations[key] for key in order) + '''
+  res.send(first.html); // first
+  res.send(second.html); // second
+  res.send(clean.html); // clean
+  res.send(first.kind); // constant
+}
+walk(3);
+''', [('js.taint.xss', 'first'), ('js.taint.xss', 'second')])
+                for key, other in (('first', 'second'), ('second', 'first')):
+                    self.assertIn('req.query.' + key, traces[key])
+                    self.assertNotIn('req.query.' + other, traces[key])
+
+    def test_mutual_recursion_preserves_helper_borrowed_mutations(self):
+        self.scan('''
+function set(box, value) { box.html = value; }
+function left(n) {
+  if (n > 0) right(n - 1);
+  const dirty = {html: "safe"};
+  const clean = {html: "safe"};
+  const alias = dirty;
+  set(dirty, req.query.html);
+  set(clean, "safe");
+  res.send(alias.html); // dirty
+  res.send(clean.html); // clean
+}
+function right(n) { left(n); }
+left(3);
+''', [('js.taint.xss', 'dirty')])
+
+    def test_helper_exceptions_inside_recursion_do_not_taint_clean_catch(self):
+        self.scan('''
+function reject(value) { throw {html: value, kind: "constant"}; }
+function walk(n) {
+  if (n > 0) walk(n - 1);
+  try { reject(req.query.html); }
+  catch (error) {
+    res.send(error.html); // dirty
+    res.send(error.kind); // constant
+  }
+  try { reject("safe"); }
+  catch (error) { res.send(error.html); } // clean
+}
+walk(3);
+''', [('js.taint.xss', 'dirty')])
+
+    def test_helpers_inside_recursion_preserve_rule_specific_sanitization(self):
+        self.scan('''
+function mk(value) { return {html: value}; }
+function walk(n) {
+  if (n > 0) walk(n - 1);
+  const dirty = mk(req.query.html);
+  const clean = mk(DOMPurify.sanitize(req.query.html));
+  res.send(dirty.html); // dirty
+  res.send(clean.html); // sanitized
+  eval(clean.html); // eval
+}
+walk(3);
+''', [('js.taint.xss', 'dirty'), ('js.taint.eval', 'eval')])
+
+    def test_catch_rest_return_keeps_fields_and_callers_without_crashing(self):
+        for recurse in ('', 'if (n > 0) return unwrap(box, n - 1);'):
+            with self.subTest(recursive=bool(recurse)):
+                self.scan('''
+function unwrap(box, n) {
+''' + recurse + '''
+  try { throw box; }
+  catch ({skip, ...rest}) { return rest; }
+}
+const a = unwrap({skip: "safe", html: req.query.html, kind: "constant"}, 3);
+const b = unwrap({skip: req.query.secret, html: "safe", kind: "constant"}, 3);
+res.send(a.html); // dirty
+res.send(a.kind); // constant
+res.send(b.html); // clean
+res.send(b.skip); // excluded
+''', [('js.taint.xss', 'dirty')])
+
+    def test_catch_array_rest_escapes_through_recursive_wrappers(self):
+        self.scan('''
+function tail(values) {
+  try { throw values; }
+  catch ([skip, ...rest]) { return rest; }
+}
+function walk(n) {
+  if (n > 0) walk(n - 1);
+  const a = tail(["skip", req.query.html]);
+  const b = tail([req.query.secret, "safe"]);
+  res.send(a[0]); // dirty
+  res.send(b[0]); // clean
+  res.send(a.length); // count
+}
+walk(3);
+''', [('js.taint.xss', 'dirty')])
+
+    def test_catch_rest_preserves_nested_alias_mutation(self):
+        self.scan('''
+function unwrap(box) {
+  try { throw box; } catch ({skip, ...rest}) { return rest; }
+}
+const nested = {html: "safe"};
+const result = unwrap({skip: req.query.secret, nested: nested});
+nested.html = req.query.html;
+res.send(result.nested.html); // dirty
+res.send(result.skip); // excluded
+''', [('js.taint.xss', 'dirty')])
+
+    def test_recursive_clones_called_inside_recursion_keep_callers_separate(self):
+        self.scan('''
+function clone(o) {
+  if (Array.isArray(o)) return o.map(clone);
+  if (o && typeof o === "object") {
+    const result = {};
+    for (const key of Object.keys(o)) result[key] = clone(o[key]);
+    return result;
+  }
+  return o;
+}
+function walk(n) {
+  if (n > 0) walk(n - 1);
+  const dirty = clone({html: req.query.html});
+  const clean = clone({html: "safe"});
+  res.send(dirty.html); // dirty
+  res.send(clean.html); // clean
+}
+walk(3);
+''', [('js.taint.xss', 'dirty')])
+
 
 class RecursiveHeapTransferTests(unittest.TestCase):
     """Check complete origin sets and heap identities, not one chosen witness."""
@@ -354,6 +495,86 @@ class RecursiveHeapTransferTests(unittest.TestCase):
         self.assertFalse(contexts[0].incoming.heap[ref]['0'])
         self.assertEqual(self.origins(contexts[1].incoming.heap[ref]['0']), {('source', 'first')})
         self.assertEqual(len(self.engine.widened_calls), 2)
+
+    def test_backedges_reuse_ancestors_but_sibling_helpers_remain_distinct(self):
+        js = self.js
+        rule = 'js.taint.xss'
+        helper = object()
+        ancestors = frozenset({self.scope})
+        root = self.engine.widened_call(
+            self.scope, rule, self.root, 31, {}, js._State(), ancestors)
+        first = self.engine.widened_call(
+            helper, rule, self.root, 40, {'value': self.first}, js._State(),
+            ancestors | {helper}, caller=root)
+        second = self.engine.widened_call(
+            helper, rule, self.root, 41, {'value': self.clean}, js._State(),
+            ancestors | {helper}, caller=root)
+        self.assertIsNot(first, second)
+        self.assertEqual(self.origins(first.bound['value']), {('source', 'first')})
+        self.assertFalse(second.bound['value'])
+        for location in range(1024):
+            again = self.engine.widened_call(
+                self.scope, rule, self.root, location, {}, js._State(),
+                ancestors | {helper}, caller=first)
+            self.assertIs(again, root)
+        self.assertEqual(len(self.engine.widened_calls), 3)
+        self.assertIs(first.widened_parent, root)
+        self.assertIsNone(root.widened_parent)
+
+    def test_tagged_allocation_sites_keep_discriminators_and_finite_histories(self):
+        js = self.js
+        for widened in (None, self.root):
+            with self.subTest(widened=widened is not None):
+                state = js._State()
+                refs = [('factory', 70), ('factory', 70, 'catch-rest'),
+                        ('factory', 70, 'commonjs')]
+                output = js._HeapOutput({ref: {'html': value}
+                                        for ref, value in zip(refs, (self.first, self.clean, self.second))},
+                                       set(), {})
+                result = self.engine.apply_heap_output(
+                    js._State(), state, output, {}, js._Fact(refs=refs), 17, widened=widened)
+                self.assertEqual(len(js._refs(result)), 3)
+                self.assertEqual(len(state.heap), 3)
+                self.assertEqual({ref[:-1] for ref in state.heap}, set(refs))
+                for ref in state.heap:
+                    self.assertIsInstance(ref[-1], frozenset)
+                    self.assertEqual(js._collapsed(ref), widened is not None)
+                again = self.engine.apply_heap_output(
+                    js._State(), js._State(),
+                    js._HeapOutput(state.heap, state.weak_refs, state.array_lengths),
+                    {}, result, 19, widened=widened)
+                self.assertEqual({ref[:-1] for ref in js._refs(again)}, set(refs))
+                if widened is not None:
+                    self.assertEqual(again, result)
+                else:
+                    self.assertTrue(all(ref[-1] == {17, 19} for ref in js._refs(again)))
+
+    def test_full_solver_keeps_all_helper_source_origins_separate(self):
+        js = self.js
+        source = '''function mk(value) { return {html: value}; }
+function wrap(value) { return mk(value); }
+function walk(n) {
+  if (n > 0) walk(n - 1);
+  const a = wrap(req.query.first);
+  const b = wrap(req.query.second);
+  const c = wrap("safe");
+  res.send(a.html);
+  res.send(b.html);
+  res.send(c.html);
+}
+walk(3);
+'''
+        engine = js._Engine(*js.lexical_views(source))
+        engine.budget = js.Budget(engine.work_limit)
+        engine.pending, engine.queued = deque(reversed(engine.scopes)), set(engine.scopes)
+        found = engine.rule_findings('js.taint.xss')
+        by_line = {source[:location].count('\n') + 1: self.origins(fact)
+                   for (location, _rule, _label), fact in found.items()}
+        self.assertEqual(by_line, {
+            8: {('source', 'req.query.first')},
+            9: {('source', 'req.query.second')},
+        })
+        self.assertGreater(engine.budget.remaining, 0)
 
 
 if __name__ == '__main__':

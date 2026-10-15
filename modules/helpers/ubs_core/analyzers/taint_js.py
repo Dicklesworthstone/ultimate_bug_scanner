@@ -35,13 +35,14 @@ SKIP_DIRS = {'.git', '.hg', '.svn', '.venv', 'node_modules', '.next', '.nuxt', '
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.mts', '.cts'}
 PATH_LIMIT = 5
 # Marks the call-site set of an allocation that came back through a widened
-# summary (_Engine.heap_call): one weak object per allocation site and entry
+# summary (_Engine.heap_call): one weak object per allocation site and context
 # into a recursion, instead of one per subset of call sites.
 WIDENED = '<widened>'
 
 
 def _collapsed(ref):
-    return len(ref) > 2 and any(isinstance(site, tuple) and site[:1] == (WIDENED,) for site in ref[2])
+    return (len(ref) > 2 and isinstance(ref[-1], frozenset)
+            and any(isinstance(site, tuple) and site[:1] == (WIDENED,) for site in ref[-1]))
 ROUTE_PARAM_FIELDS = r"(?:id|slug|user|username|email|name|status|tenant|account|role|filter|search|sort|limit|offset|where|order|table|column)"
 # Each whitespace run has exactly one owner: `\s*\(?\s*` split a run of N
 # blanks N ways on every failed match, and callers pass expressions whose
@@ -853,6 +854,7 @@ class _HeapCall:
     widened: bool = False
     superseded: bool = False
     root: object = None
+    widened_parent: object = None
     readers: set = field(default_factory=set)
 
 
@@ -2834,10 +2836,11 @@ class _Engine:
 
         Once a callee calls itself, a call to it from outside its recursion gets
         a widened summary of its own, keyed by that call site and its caller;
-        the recursive calls and every call made inside that summary share it
-        (one per callee). Its input is the join of all inputs it has seen and
-        only grows, so recursion converges, every actual input stays covered,
-        so no taint is dropped, and distinct outside callers stay apart. Each
+        recursive backedges share their ancestor's summary, while acyclic
+        helper calls keep their caller and call site. Inputs only grow by
+        joining, and a widened parent chain never repeats a callee, so call
+        depth cannot create unbounded contexts. Distinct helper calls must
+        not mix clean and tainted values even inside the same recursion. Each
         fresh object a recursive interpreter appends to a captured array
         otherwise comes back under a new subset of call sites, and almost every
         recursive call met a new heap.
@@ -2846,7 +2849,8 @@ class _Engine:
         ancestors = task.ancestors if isinstance(task, _HeapCall) else frozenset((task,))
         incoming = self.heap_input(callee, bound, state, callee in ancestors)
         if getattr(task, 'widened', False):
-            context = self.widened_call(callee, rule, task.root, location, bound, incoming, ancestors | {callee})
+            context = self.widened_call(callee, rule, task.root, location, bound, incoming,
+                                        ancestors | {callee}, caller=task)
         elif callee in ancestors or (callee, rule) in self.recursive:
             if (callee, rule) not in self.recursive:
                 # Its exact summaries so far were entries into a recursion:
@@ -2876,7 +2880,9 @@ class _Engine:
         if context.result is None:
             return frozenset(), {}, False, frozenset(), None
         returned, effects, writes, output, thrown, throw_writes, exceptional = context.result
-        widened = context.root if context.widened else None
+        # Allocation identities must preserve the same distinctions as inputs;
+        # sharing the outer root here would merge separate helper results again.
+        widened = context if context.widened else None
         label = self.call_label(callee)
         thrown_value, thrown_state = frozenset(), None
         if exceptional is not None:
@@ -2890,30 +2896,37 @@ class _Engine:
         return (_step(result, label), {key: _step(fact, label) for key, fact in effects.items()},
                 output is not None, _step(thrown_value, label), thrown_state)
 
-    def widened_call(self, callee, rule, root, location, bound, incoming, ancestors):
-        """The widened summary of a callee within one entry into a recursion; re-solved as its input grows.
+    def widened_call(self, callee, rule, root, location, bound, incoming, ancestors, *, caller=None):
+        """Join backedges into an ancestor; keep acyclic helper contexts separate.
 
-        Its output allocations collapse (apply_heap_output), so the call site
-        no longer matters for them, and recursive calls through different sites
-        meet in one summary instead of chasing each other.
+        The parent chain contains each callee at most once. Recursion through
+        any number of call sites therefore closes a finite cycle rather than
+        extending the context. Sibling helpers, including shared inner sites
+        reached through different wrappers, retain distinct inputs and objects.
         """
-        key = (callee, rule, root)
-        context = self.widened_calls.get(key)
+        context = caller
+        while context is not None:
+            self.budget.spend()
+            if context.scope is callee and context.rule == rule:
+                break
+            context = context.widened_parent
         if context is None:
-            incoming.array_lengths = dict.fromkeys(incoming.array_lengths)
-            context = _HeapCall(callee, rule, location, dict(bound), incoming, ancestors,
-                                widened=True, root=root)
-            self.widened_calls[key] = context
-            self.enqueue(context)
-            return context
+            key = (callee, rule, root) if caller is None else (callee, rule, root, caller, location)
+            context = self.widened_calls.get(key)
+            if context is None:
+                incoming.array_lengths = dict.fromkeys(incoming.array_lengths)
+                context = _HeapCall(callee, rule, location, dict(bound), incoming, ancestors,
+                                    widened=True, root=root, widened_parent=caller)
+                self.widened_calls[key] = context
+                self.enqueue(context)
+                return context
         joined_bound = {name: _join(context.bound.get(name, frozenset()), bound.get(name, frozenset()))
                         for name in context.bound.keys() | bound.keys()}
         joined = _join_states(context.incoming, incoming)
         # Lengths that differ become unknown anyway; unknown from the start
         # saves the re-solves of a length counting up through the fixed point.
         joined.array_lengths = dict.fromkeys(joined.array_lengths)
-        # `==`, not `!=`: _State defines __eq__ only, and dict.__ne__ would
-        # compare the names alone and miss a change in the heap or the cells.
+        # Include heap/cell-only growth, not just changes to visible names.
         if (joined_bound != context.bound or not joined == context.incoming
                 or not ancestors <= context.ancestors):
             context.bound, context.incoming = joined_bound, joined
@@ -2927,12 +2940,18 @@ class _Engine:
         def fresh(ref):
             if _collapsed(ref):
                 return ref
+            # Tagged sites (catch-rest and CommonJS namespaces) have a string
+            # discriminator. Only a trailing frozenset is a call history; keep
+            # the entire allocation site rather than dropping its discriminator.
+            has_history = len(ref) > 2 and isinstance(ref[-1], frozenset)
+            site = ref[:-1] if has_history else ref
+            history = ref[-1] if has_history else frozenset()
             if widened is not None:
                 # Every object a widened summary returns from this allocation
-                # site is one weak object per entry into the recursion: writes
-                # join, reads see all of them, other entries keep their own.
-                return (*ref[:2], frozenset({(WIDENED, widened)}))
-            return (*ref[:2], (ref[2] if len(ref) > 2 else frozenset()) | {location})
+                # site is one weak object per summary: writes join, reads see
+                # all iterations, and unrelated helper calls keep their own.
+                return (*site, frozenset({(WIDENED, widened)}))
+            return (*site, history | {location})
 
         renamed = {ref: ref if ref in incoming.heap else fresh(ref) for ref in output.heap}
 

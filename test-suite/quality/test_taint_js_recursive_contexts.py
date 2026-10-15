@@ -310,6 +310,89 @@ function walk(n) {
 walk(3);
 ''', [('js.taint.xss', 'dirty')])
 
+    def test_nested_defaults_capture_unassigned_formals_without_mixing_callers(self):
+        helpers = (
+            'function get(value = label) { return {note: value}; }',
+            'function get(value = {note: label}) { return value; }',
+            'function get(n = 3, value = label) { '
+            'if (n > 0) return get(n - 1, value); return {note: value}; }',
+        )
+        callers = (
+            'const dirty = factory(req.query.label);',
+            'const clean = factory("safe");',
+        )
+        for helper in helpers:
+            for order in (callers, callers[::-1]):
+                with self.subTest(helper=helper, order=order):
+                    self.scan('function factory(label) { ' + helper + ' return get(); }\n'
+                              + '\n'.join(order) + '\n'
+                              'res.send(dirty.note); // dirty\n'
+                              'res.send(clean.note); // clean\n', [('js.taint.xss', 'dirty')])
+
+    def test_nested_defaults_respect_explicit_arguments_and_prior_formal_shadowing(self):
+        for helper, call in (
+            ('function get(value = label) { return {note: value}; }', 'get("safe")'),
+            ('function get(label = "safe", value = label) { return {note: value}; }', 'get()'),
+        ):
+            with self.subTest(helper=helper):
+                self.scan('function factory(label) { ' + helper + ' return ' + call + '; }\n'
+                          'res.send(factory(req.query.label).note); // clean\n', [])
+
+    def test_nested_default_heap_reads_observe_borrowed_mutations(self):
+        self.scan('''
+function factory(box) {
+  function get(value = box) { return {note: value.html}; }
+  const before = get();
+  box.html = req.query.html;
+  const after = get();
+  res.send(before.note); // clean
+  return after;
+}
+const box = {html: "safe"};
+const result = factory(box);
+res.send(result.note); // result
+res.send(box.html); // borrowed
+''', [('js.taint.xss', 'result'), ('js.taint.xss', 'borrowed')])
+
+    def test_recursive_defaults_keep_source_provenance_and_sanitizer_domains(self):
+        traces = self.scan('''
+function factory(label) {
+  function get(n = 3, box = {html: label, kind: "constant"}) {
+    if (n > 0) return get(n - 1, box);
+    return box;
+  }
+  return get();
+}
+const a = factory(req.query.first);
+const b = factory(req.query.second);
+const clean = factory(DOMPurify.sanitize(req.query.third));
+res.send(a.html); // first
+res.send(b.html); // second
+res.send(clean.html); // clean
+res.send(a.kind); // constant
+eval(clean.html); // eval
+''', [('js.taint.xss', 'first'), ('js.taint.xss', 'second'), ('js.taint.eval', 'eval')])
+        for marker, source in (('first', 'first'), ('second', 'second'), ('eval', 'third')):
+            self.assertIn('req.query.' + source, traces[marker])
+            for other in {'first', 'second', 'third'} - {source}:
+                self.assertNotIn('req.query.' + other, traces[marker])
+
+    def test_throwing_default_initializer_preserves_captured_values_and_clean_callers(self):
+        self.scan('''
+function factory(label) {
+  function reject() { throw {html: label, kind: "constant"}; }
+  function get(value = reject()) { return value; }
+  return get();
+}
+try { factory(req.query.html); }
+catch (error) {
+  res.send(error.html); // dirty
+  res.send(error.kind); // constant
+}
+try { factory("safe"); }
+catch (error) { res.send(error.html); } // clean
+''', [('js.taint.xss', 'dirty')])
+
 
 class RecursiveHeapTransferTests(unittest.TestCase):
     """Check complete origin sets and heap identities, not one chosen witness."""

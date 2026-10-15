@@ -1848,7 +1848,12 @@ class _Flow:
                     default_flow = _Flow(self.engine, callee, self.rule)
                     default_flow.parameter_context = True
                     default_state = _State(budget=self.engine.budget)
-                    default_state.cells = dict(state.cells)
+                    # Unassigned caller formals live only in the visible-name
+                    # map. Snapshot their current lexical values for nested
+                    # defaults, including clean values and borrowed objects.
+                    # Earlier callee formals below still shadow these cells.
+                    available = state.cells.keys() | state.owners.values()
+                    default_state.cells = {key: _cell_value(key, state) for key in available}
                     default_state.heap = {ref: dict(slots) for ref, slots in state.heap.items()}
                     default_state.weak_refs = set(state.weak_refs)
                     default_state.array_lengths = dict(state.array_lengths)
@@ -1872,7 +1877,10 @@ class _Flow:
         return bound
 
     def substitute(self, fact, callee, bound, state):
-        result = frozenset()
+        # Default initializers run against the caller's heap. Their returned,
+        # thrown and captured-write values can carry real object identities,
+        # unlike the already-materialized ordinary scalar summaries.
+        result = _Fact(refs=_refs(fact))
         for trace in fact:
             if trace.origin[0] == 'capture':
                 incoming = _cell_value(trace.origin[1], state)
@@ -2627,15 +2635,20 @@ class _Engine:
                     changed = True
             if not changed:
                 break
-        self.heap_scopes = {scope for scope in self.functions
-                            if re.search(r'[\[{]', scope.code[scope.body_start:scope.body_end])}
+        self.heap_scopes = {
+            scope for scope in self.functions
+            if any(re.search(r'[\[{]', scope.code[left:right])
+                   for left, right in [(scope.body_start, scope.body_end),
+                                       *(default for _, _, default in scope.params
+                                         if default is not None)])
+        }
         # Factories hidden behind ordinary local wrappers still need an object
-        # result. This set only grows over the finite set of lexical functions.
+        # result, including allocations/throws in parameter initializers. The
+        # capture graph already includes those calls and named arrow helpers.
+        # This set only grows over the finite set of lexical functions.
         while True:
             added = {scope for scope in self.functions if scope not in self.heap_scopes
-                     and any(self.lookup(scope, match.group(1)) in self.heap_scopes
-                             for match in re.finditer(r'\b([A-Za-z_$][\w$]*)\s*\(',
-                                                      scope.code[scope.body_start:scope.body_end]))}
+                     and self.local_targets[scope] & self.heap_scopes}
             if not added:
                 break
             self.heap_scopes.update(added)

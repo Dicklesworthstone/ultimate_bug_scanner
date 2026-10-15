@@ -15,7 +15,9 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'modules/helpers'))
-from ubs_core.analyzers.taint_swift_traversal import file_url_read_offsets, flow_findings
+from ubs_core.analyzers.taint_swift_traversal import (
+    file_url_read_offsets, flow_findings, swift_source_tokens, swift_validated_tokens,
+)
 from ubs_core.taint_flow import AnalysisLimit
 
 
@@ -755,6 +757,63 @@ class SwiftScopedFlowTests(unittest.TestCase):
                     let work = Task { consume(input.query["next"]) }
                 }
             ''')
+
+    def test_file_export_argument_labels_are_not_incoming_sources(self):
+        for label in ('filename', 'fileName', 'originalFilename', 'originalFileName'):
+            for arguments in (f'{label}: name, data: data', f'data: data, {label}\n/* label */ : name'):
+                for policy in ('path', 'redirect'):
+                    with self.subTest(label=label, arguments=arguments, policy=policy):
+                        self.check('''
+                            func export() async throws -> IntentFile {
+                                let snapshot = try await MainActor.run { try latestSnapshot() }
+                                let data = encode(snapshot)
+                                let name = exportName(snapshot)
+                                return IntentFile(%s)
+                            }
+                        ''' % arguments, policy=policy,
+                                   suffix=f'-{label}-{len(arguments)}-{policy}')
+
+    def test_filename_labels_do_not_hide_real_member_sources(self):
+        for label in ('filename', 'fileName', 'originalFilename', 'originalFileName'):
+            for policy, sink in (('path', 'String(contentsOfFile: target)'),
+                                 ('redirect', 'Response.redirect(to: target)')):
+                with self.subTest(label=label, policy=policy):
+                    self.check('''
+                        func forward(filename target: String) {
+                            %s
+                        }
+                        func handle(upload: Upload) {
+                            forward(filename: upload.%s)
+                        }
+                    ''' % (sink, label), (2,), policy=policy, suffix=f'-{label}-{policy}')
+
+    def test_actual_filename_capture_remains_explicitly_incomplete(self):
+        sources = (
+            'Task { IntentFile(filename: upload.filename) }',
+            r'Task { IntentFile(filename: "copy-\(upload.fileName)") }',
+            'Task { IntentFile(filename: req.query["name"]) }',
+        )
+        for index, expression in enumerate(sources):
+            for policy in ('path', 'redirect'):
+                with self.subTest(expression=expression, policy=policy), self.assertRaisesRegex(ValueError, 'closure.*incomplete'):
+                    self.check('func handle(upload: Upload) { %s }' % expression,
+                               policy=policy, suffix=f'-{index}-{policy}')
+
+    def test_filename_source_witness_requires_proven_label_position(self):
+        # A colon alone is not evidence of an argument label: dictionary keys,
+        # ternary values and member values must stay conservative witnesses.
+        for source in ('output([filename: value])', 'output(flag ? filename : value)',
+                       'output(filename: upload.filename)', 'output(filename: upload?.filename)',
+                       r'output(filename: "copy-\(upload.filename)")',
+                       'output(filename: req.query["name"])'):
+            with self.subTest(source=source):
+                self.assertTrue(swift_source_tokens(swift_validated_tokens(source)))
+        for source in ('output(filename: "safe.csv")',
+                       'output(data: bytes, filename /* label */\n: "safe.csv")',
+                       r'print("\(output(filename: "safe.csv"))")'):
+            with self.subTest(source=source):
+                # The function also receives a generator when selecting bodies.
+                self.assertFalse(swift_source_tokens(iter(swift_validated_tokens(source))))
 
     def test_sink_hidden_in_interpolation_or_alias_is_not_filtered_out(self):
         sources = (r'''

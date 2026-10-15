@@ -500,9 +500,31 @@ def swift_has_shape(fact, name):
 
 
 def swift_source_tokens(tokens):
-    for token in tokens:
-        if token.kind == 'code' and token.value in {'Request', 'req', 'request', 'filename', 'fileName', 'originalFilename', 'originalFileName'}:
-            return True
+    # A filename *value/member* may be incoming upload data; the argument label
+    # in IntentFile(filename: name) is not a value at all. Only exclude a proven
+    # parenthesized label position, retaining dictionary keys, ternary values,
+    # member access and interpolation as conservative source witnesses.
+    tokens = tuple(token for token in tokens if token.kind != 'code' or token.value != '\n')
+    delimiters = []
+    closing = {')': '(', ']': '[', '}': '{'}
+    for index, token in enumerate(tokens):
+        if token.kind == 'code':
+            if token.value in {'Request', 'req', 'request'}:
+                return True
+            if token.value in {'filename', 'fileName', 'originalFilename', 'originalFileName'}:
+                previous = tokens[index - 1] if index else None
+                following = tokens[index + 1] if index + 1 < len(tokens) else None
+                is_label = (
+                    delimiters and delimiters[-1] == '('
+                    and previous is not None and previous.kind == 'code' and previous.value in {'(', ','}
+                    and following is not None and following.kind == 'code' and following.value == ':'
+                )
+                if not is_label:
+                    return True
+            if token.value in {'(', '[', '{'}:
+                delimiters.append(token.value)
+            elif token.value in closing and delimiters and delimiters[-1] == closing[token.value]:
+                delimiters.pop()
         if any(swift_source_tokens(part) for part in token.parts):
             return True
     return False

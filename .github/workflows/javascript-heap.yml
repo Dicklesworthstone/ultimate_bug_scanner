@@ -52,11 +52,12 @@ jobs:
       - name: Install actual scanner dependencies before Bash integrity gates
         run: |
           if [ "$RUNNER_OS" = macOS ]; then
-            brew install bash jq ripgrep shellcheck
+            brew install bash jq ripgrep shellcheck gnu-time
             echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+            echo "$(brew --prefix gnu-time)/libexec/gnubin" >> "$GITHUB_PATH"
           else
             sudo apt-get update
-            sudo apt-get install -y bash jq ripgrep rsync shellcheck
+            sudo apt-get install -y bash jq ripgrep rsync shellcheck time
           fi
           npm install --global @ast-grep/cli
       - name: Verify the committed production integrity chain
@@ -65,7 +66,7 @@ jobs:
           ./scripts/verify_checksums.sh
           ./scripts/verify_sha256sums.sh
           git diff --check
-      - name: Run 119 heap tests including 16 real scanner and 21 Node scenarios
+      - name: Run every discovered heap regression with real scanner dependencies
         run: |
           command -v ast-grep
           command -v node
@@ -76,11 +77,16 @@ jobs:
           spec = importlib.util.spec_from_file_location('heap_regressions', path)
           module = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(module)
-          result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromModule(module))
-          assert result.testsRun == 119, result.testsRun
+          suite = unittest.defaultTestLoader.loadTestsFromModule(module)
+          expected = suite.countTestCases()
+          assert expected >= 119, f'heap tests disappeared: {expected}'
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          assert result.testsRun == expected, (result.testsRun, expected)
           assert result.wasSuccessful() and not result.skipped, (result.failures, result.errors, result.skipped)
           print('JS_HEAP_TESTS_PASS', result.testsRun, flush=True)
           PY
+      - name: Run recursive caller isolation, exceptions, cycles and sanitizer regressions
+        run: python3 test-suite/quality/test_taint_js_recursive_contexts.py -v
       - name: Run existing production taint and JavaScript quality suites
         run: |
           python3 test-suite/js/test_taint_domains.py
@@ -99,5 +105,9 @@ jobs:
         if: always()
         with:
           name: javascript-heap-validation
-          path: test-suite/artifacts/javascript-heap/
+          path: |
+            test-suite/artifacts/javascript-heap/
+            test-suite/artifacts/js-recursive-interpreter/
+            test-suite/artifacts/js-heap-expansion/
+            test-suite/artifacts/c6-*/
           retention-days: 3

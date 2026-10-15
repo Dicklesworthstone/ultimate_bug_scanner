@@ -467,6 +467,24 @@ class SwiftParser:
         return binding[0].value, (binding[0],), parts[1], operator, declaration
 
     @staticmethod
+    def iteration_names(tokens, depth=0):
+        """Bind only identifier/wildcard tuple patterns, never case/cast patterns."""
+        if depth > 64:
+            raise AnalysisLimit('Swift iteration pattern nesting limit exceeded; analysis is incomplete')
+        tokens = tuple(token for token in tokens if token.kind != 'code' or token.value != '\n')
+        if (len(tokens) == 1 and tokens[0].kind == 'code'
+                and re.fullmatch(r'[A-Za-z_]\w*', tokens[0].value)
+                and tokens[0].value not in {'case', 'let', 'var', 'await', 'try', 'in', 'where',
+                                            'self', 'super', 'true', 'false', 'nil'}):
+            return () if tokens[0].value == '_' else tokens
+        if tokens and tokens[0].value == '(' and swift_close(tokens, 0) == len(tokens) - 1:
+            names = tuple(name for part in swift_parts(tokens[1:-1], {','})
+                          for name in SwiftParser.iteration_names(part, depth + 1))
+            if len({name.value for name in names}) == len(names):
+                return names
+        raise ValueError('Swift iteration binding needs pattern analysis; analysis is incomplete')
+
+    @staticmethod
     def uninitialized(tokens):
         tokens = swift_ungroup(tokens)
         if (len(tokens) >= 3 and tokens[0].value in {'let', 'var'}
@@ -553,9 +571,16 @@ def swift_flow_obligation(tokens):
     if any(code[index] in {'req', 'request'} and code[index + 1] == '.' and code[index + 2] in request_members
            for index in range(len(code) - 2)):
         return True
-    for token in tokens:
-        if token.kind == 'code' and (token.value in witnesses or token.value.lower() == 'headers'):
+    for index, value in enumerate(code):
+        # A collection append's argument label is not Foundation's URL reader.
+        # Actual reads elsewhere and request member/type witnesses still activate
+        # analysis, including a read nested inside the appended expression.
+        if (value == 'contentsOf' and index >= 3 and index + 1 < len(code)
+                and code[index - 3:index] == ['.', 'append', '('] and code[index + 1] == ':'):
+            continue
+        if value in witnesses or value.lower() == 'headers':
             return True
+    for token in tokens:
         if any(swift_flow_obligation(part) for part in token.parts):
             return True
     return False
@@ -876,6 +901,12 @@ class SwiftEngine:
             tokens = tokens[1:]
         if not tokens:
             return CLEAN
+        components = swift_parts(tokens, {','})
+        if len(components) > 1:
+            # Preserve all tuple dependencies, including request-object shapes.
+            # Iteration projection below deliberately drops validation facts;
+            # these joined components are not positional proof of a safe value.
+            return join(*(self.expression(part, state, bindings, depth + 1) for part in components))
         ternary = swift_parts(tokens, {'?'})
         if len(ternary) == 2:
             branches = swift_parts(ternary[1], {':'})
@@ -1211,14 +1242,20 @@ class SwiftEngine:
                     following = loop
                 elif kind == 'for':
                     parts = swift_parts(tokens, {'in'})
-                    names = swift_ungroup(parts[0])
-                    if len(parts) != 2 or len(names) != 1 or names[0].kind != 'code':
+                    if len(parts) != 2:
                         raise ValueError('Swift iteration binding needs pattern analysis; analysis is incomplete')
+                    names = self.parser.iteration_names(parts[0])
+                    sequence = swift_parts(parts[1], {'where'})
+                    if len(sequence) > 2 or not all(swift_ungroup(part) for part in sequence):
+                        raise ValueError('Swift iteration filter needs condition analysis; analysis is incomplete')
                     inner = dict(local)
-                    inner[names[0].value] = names[0].value + '@' + str(names[0].start)
+                    for name in names:
+                        inner[name.value] = name.value + '@' + str(name.start)
                     loop = node('branch')
                     body = block(statement.body, loop, inner, following, loop)
-                    bound = node('element', parts[1], inner, (body,), names[0].value, reads=local)
+                    if len(sequence) == 2:
+                        body = condition(sequence[1], body, loop, inner)
+                    bound = node('element', sequence[0], inner, (body,), tuple(name.value for name in names), reads=local)
                     edges[loop] = (bound, following)
                     following = loop
                 elif kind in {'break', 'continue'}:
@@ -1252,7 +1289,14 @@ class SwiftEngine:
             raise ValueError('Unsupported Swift control flow or closure; analysis is incomplete')
         if kind == 'element':
             value = self.expression(tokens, state, reads)
-            state[bindings[extra]] = advance(value, self.step(tokens[0].start, 'assign', extra))
+            # Components conservatively inherit every element dependency, but
+            # never a collection/other component's validation. Request shapes
+            # must survive so destructured request.query remains a source.
+            requests = frozenset(trace for trace in value if trace.kind == 'shape'
+                and trace.key[0] in {'request', 'request-collection', 'request-content'})
+            value = join(self.forget(value), requests)
+            for name in extra:
+                state[bindings[name]] = advance(value, self.step(tokens[0].start, 'assign', name))
             return state
         if kind == 'optional-shorthand':
             name = tokens[1].value

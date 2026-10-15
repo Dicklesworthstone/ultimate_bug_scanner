@@ -93,7 +93,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="503e970c0e1c9f171d54dbbbe1e87ef6674556ba919b8dbe681c14cdc8bff33f"
+UBS_LIB_CHECKSUM="af77bed7f66e38c5989cd12c18f0d00f3fecfa07cf7385ed2c764b77a60ca087"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then

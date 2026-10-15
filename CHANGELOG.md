@@ -14,6 +14,26 @@ _No changes yet._
 
 ---
 
+## [v5.5.5] - 2026-10-15 [Tag]
+
+Git-only source delivery; signed release assets and installed-tool upgrades are separate.
+
+### Fixed
+
+- Swift request-flow analysis supports identifier and wildcard tuple bindings in
+  `for` loops, including nested tuples, lexical shadowing and `where` filters.
+  Each component conservatively inherits the sequence's dependencies without
+  borrowing another component's validation; request-object identity survives
+  destructuring. This may overreport a clean sibling of a tainted component.
+  Unsupported case, cast and optional patterns still fail closed.
+- Collection `append(contentsOf:)` labels no longer activate unrelated
+  file-reading analysis. Real file reads and request inputs, including nested
+  reads in the appended expression, retain their analysis obligations.
+- JavaScript nested default captures and heap completions retain their
+  dependencies through recursive function summaries.
+
+---
+
 ## [v5.5.4] - 2026-10-15 [Tag]
 
 Git-only source delivery; signed release assets and installed-tool upgrades are separate.

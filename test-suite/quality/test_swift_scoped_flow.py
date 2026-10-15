@@ -58,6 +58,132 @@ class SwiftScopedFlowTests(unittest.TestCase):
             }
         ''', (3,))
 
+    def test_tuple_loop_propagates_each_component_to_sinks(self):
+        for policy, sink in (('path', 'String(contentsOfFile: target)'),
+                             ('redirect', 'req.redirect(to: target)')):
+            for value in ('(req.query["next"], "safe")', '("safe", req.query["next"])'):
+                with self.subTest(policy=policy, value=value):
+                    self.check('''
+                        func handle(req: Request) {
+                            for (target, other) in [%s] {
+                                _ = %s
+                            }
+                        }
+                    ''' % (value, sink), (3,), policy, str(len(value)))
+
+    def test_nested_tuple_loop_and_wildcards_preserve_sources(self):
+        self.check('''
+            func handle(req: Request) {
+                for (_, (target, _)) in [(0, (req.query["next"], 1))] {
+                    _ = req.redirect(to: target)
+                }
+            }
+        ''', (3,))
+
+    def test_tuple_loop_preserves_request_object_shape(self):
+        self.check('''
+            func handle(req: Request) {
+                for (input, _) in [(req, 0)] {
+                    _ = input.redirect(to: input.query["next"])
+                }
+            }
+        ''', (3,))
+
+    def test_tuple_loop_shadowing_does_not_leak(self):
+        self.check('''
+            func handle(req: Request) {
+                let target = req.query["next"]
+                for (target, _) in [("/fixed", 0)] {
+                    _ = req.redirect(to: target)
+                }
+                _ = req.redirect(to: target)
+            }
+        ''', (6,))
+
+    def test_tuple_loop_reads_sequence_before_binding_names(self):
+        self.check('''
+            func handle(req: Request) {
+                let target = [(req.query["next"], 0)]
+                for (target, _) in target {
+                    _ = req.redirect(to: target)
+                }
+            }
+        ''', (4,))
+
+    def test_tuple_loop_break_continue_and_outer_write(self):
+        self.check('''
+            func handle(req: Request) {
+                var output = "/fixed"
+                for (target, _) in [(req.query["next"], 0)] {
+                    if flag { continue }
+                    output = target
+                    break
+                    _ = req.redirect(to: target)
+                }
+                _ = req.redirect(to: output)
+            }
+        ''', (9,))
+
+    def test_tuple_loop_where_validation_is_binding_local(self):
+        self.check(f'''
+            func handle(req: Request) {{
+                for (target, other) in [(req.query["next"] ?? "/", "/fixed")] where {LOCAL} {{
+                    _ = req.redirect(to: target)
+                    _ = req.redirect(to: other)
+                }}
+            }}
+        ''', (4,))
+
+    def test_tuple_loop_all_discard_still_evaluates_sequence(self):
+        self.check('''
+            func handle(req: Request) {
+                for (_, _) in [(req.redirect(to: req.query["next"]), 0)] {}
+            }
+        ''', (2,))
+
+    def test_tuple_loop_clean_and_zero_iteration_path(self):
+        self.check('''
+            func handle(req: Request) {
+                var output = req.query["next"]
+                for (a, (b, _)) in [("/a", ("/b", 0))] {
+                    _ = req.redirect(to: a)
+                    _ = req.redirect(to: b)
+                    output = "/fixed"
+                }
+                _ = req.redirect(to: output)
+            }
+        ''', (8,))
+
+    def test_unsupported_loop_patterns_remain_incomplete(self):
+        for pattern in ('case let (a, b)', '(a, a)', '(a, b?)', '(a, b) as Pair'):
+            with self.subTest(pattern=pattern), self.assertRaisesRegex(ValueError, 'iteration binding.*incomplete'):
+                self.check('func handle(req: Request) { for %s in values { _ = req.redirect(to: req.query["next"]) } }' % pattern)
+
+    def test_append_contents_label_is_not_a_file_read_obligation(self):
+        for policy in ('path', 'redirect'):
+            self.check('''
+                func detect() {
+                    let values = requests.map { request in request.result }
+                    for (evidence, box) in values { record(evidence, box) }
+                    output.append(contentsOf: values)
+                }
+            ''', policy=policy, suffix=policy)
+
+    def test_append_does_not_hide_actual_request_or_file_read(self):
+        self.check('''
+            func handle(req: Request) {
+                output.append(contentsOf: ["fixed"])
+                _ = String(contentsOfFile: req.query["path"])
+            }
+        ''', (3,), 'path')
+        with self.assertRaisesRegex(ValueError, 'closure.*incomplete'):
+            self.check('''
+                func handle(req: Request) {
+                    let work = Task { consume(req.query["path"]) }
+                    output.append(contentsOf: ["fixed"])
+                }
+            ''')
+
     def test_if_optional_binding(self):
         self.check('''
             func handle(req: Request) -> Response {

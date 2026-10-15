@@ -10,7 +10,10 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
-_No changes yet._
+### Fixed
+
+- JavaScript taint analysis reuses scalar helper summaries inside allocating callers without copying unrelated heap state. Heap callers are revisited when those summaries change; captured objects and object arguments retain their contextual analysis.
+- Components proven to contain no modeled taint source avoid unnecessary heap expansion. The proof checks every selected module using the analyzer's source patterns and parsed parameter origins; source-bearing components retain the same analysis and work limits.
 
 ---
 

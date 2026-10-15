@@ -579,6 +579,60 @@ class RuleStateTests(unittest.TestCase):
             self.assertEqual(list(taint_js.run(RunContext(lang="javascript", files=[paths[-1]]))), [])
 
 
+class ScalarHelperContextTests(unittest.TestCase):
+    def engine(self, root, source):
+        from ubs_core.js_modules import ModuleGraph
+        path = Path(root) / "handler.js"
+        path.write_text(source, encoding="utf-8")
+        graph = ModuleGraph([path])
+        return taint_js._Engine("", "", graph, next(iter(graph.components())))
+
+    def test_scalar_chain_keeps_all_sinks_with_bounded_work(self):
+        # A generic family of request handlers, with sixteen scalar calls
+        # inside an allocating helper. The previous dispatch spent 211,437
+        # units on 40 findings; scalar summaries need about 30,000. The bound
+        # measures actual charged work, not wall time or a changed engine cap.
+        source = "function keep(value) { return value; }\n"
+        source += "function build(value) { const spare={};\n"
+        source += "\n".join(f"const v{i}=keep({('value' if i == 0 else f'v{i-1}')});"
+                            for i in range(16))
+        source += "\nreturn v15; }\n"
+        source += "\n".join(
+            f"function handler{i}(req,res) {{ const local={{}}; res.send(build(req.query.value)); }}"
+            for i in range(40))
+        with tempfile.TemporaryDirectory(prefix="ubs-scalar-context-") as root:
+            engine = self.engine(root, source)
+            findings = list(engine.findings())
+        self.assertEqual(Counter(row[1] for row in findings), {"js.taint.xss": 40})
+        self.assertEqual(len({row[0] for row in findings}), 40)
+        self.assertLess(engine.work_limit - engine.budget.remaining, 100_000)
+
+    def test_scalar_capture_return_and_throw_preserve_tainted_and_clean_calls(self):
+        import itertools
+        families = (
+            ("function scalar(x) { return next(x); }", "function next(x) { return x; }",
+             "function make(x) { return {html:scalar(x)}; }"),
+            ("function scalar(x) { throw next(x); }", "function next(x) { return x; }",
+             "function make(x) { try { scalar(x); } catch (e) { return {html:e}; } }"),
+            ("function scalar(x) { return next(x); }", "function next(x) { return cap; }",
+             "function make(x) { cap=x; return {html:scalar(x)}; }"),
+            ("function scalar(x) { return x; }", "function next(x) { return scalar(x); }",
+             "function make(x) { return {html:next(x)}; }"),
+        )
+        with tempfile.TemporaryDirectory(prefix="ubs-scalar-order-") as root:
+            for family in families:
+                for order in itertools.permutations(family):
+                    for argument, expected in (("req.query.html", 1), ('"safe"', 0)):
+                        with self.subTest(order=order, argument=argument):
+                            source = 'let cap="safe";\n' + "\n".join(order)
+                            source += f"\nres.send(make({argument}).html);"
+                            engine = self.engine(root, source)
+                            self.assertTrue(engine.call_sinks)
+                            findings = list(engine.findings())
+                            self.assertEqual(Counter(row[1] for row in findings),
+                                             Counter({"js.taint.xss": expected}) if expected else Counter())
+
+
 class HeapExpansionCostTests(unittest.TestCase):
     """A small call graph must not expand an unchecked exponential heap."""
 
@@ -597,6 +651,46 @@ class HeapExpansionCostTests(unittest.TestCase):
             callee = 'leaf' if index == 0 else f'node{index - 1}'
             lines.append(f'function node{index}(x) {{ return {{left: {callee}(x), right: {callee}(x)}}; }}')
         return '\n'.join(lines)
+
+    def test_source_free_factory_component_does_not_expand_the_heap(self):
+        # Source-free is a proof over every selected module, not an assumption
+        # that test files, SQL adapters or constant-looking callees are safe.
+        with tempfile.TemporaryDirectory(prefix='source-free-factories-') as scratch:
+            root = Path(scratch)
+            library = root / 'library.js'
+            library.write_text(self.source(16) + '\nexport { node15 };\n')
+            caller = root / 'caller.js'
+            caller.write_text('import { node15 } from "./library";\n'
+                              'db.query(node15("constant"));\n')
+            for paths in ([caller, library], [library, caller]):
+                self.assertEqual(list(taint_js.scan_project_findings(paths)), [])
+
+    def test_source_free_proof_retains_every_source_form_and_imported_origin(self):
+        # These are actual source-to-sink flows, including sources reconstructed
+        # from destructured formal paths rather than a contiguous source token.
+        expressions = ('req.body.sql', 'request.query.sql', 'ctx.request.body.sql',
+                       'context.req.params.sql', 'params.id', 'context.params.id',
+                       'req.file', 'event.target.value', 'e.target.value',
+                       'location.search', 'window.location', 'document.cookie',
+                       'localStorage.getItem("q")', 'sessionStorage.getItem("q")',
+                       'new FormData(form)', 'new URLSearchParams(query)', 'params')
+        with tempfile.TemporaryDirectory(prefix='all-taint-origins-') as scratch:
+            root = Path(scratch)
+            provider, caller = root / 'provider.js', root / 'caller.js'
+            caller.write_text('import { read } from "./provider";\ndb.query(read());\n')
+            for expression in expressions:
+                provider.write_text(f'export function read() {{ return {expression}; }}\n')
+                for paths in ([provider, caller], [caller, provider]):
+                    with self.subTest(expression=expression, order=paths[0].name):
+                        found = list(taint_js.scan_project_findings(paths))
+                        self.assertEqual([(p.name, rule, line) for p, rule, line, _, _ in found],
+                                         [('caller.js', 'js.taint.sql', 2)])
+            for parameter in ('{ req: { query: { sql: value } } }',
+                              '{ context: { params: { id: value } } }'):
+                caller.write_text(f'export function handle({parameter}) {{ db.query(value); }}\n')
+                with self.subTest(parameter=parameter):
+                    found = list(taint_js.scan_file_findings(caller))
+                    self.assertEqual([(rule, line) for rule, line, _, _ in found], [('js.taint.sql', 1)])
 
     def test_exponential_factory_heap_is_explicitly_incomplete(self):
         artifacts = REPO_ROOT / 'test-suite/artifacts/js-heap-expansion'

@@ -25,6 +25,8 @@ Git-only source delivery; signed release assets and installed-tool upgrades are 
   Each component conservatively inherits the sequence's dependencies without
   borrowing another component's validation; request-object identity survives
   destructuring. This may overreport a clean sibling of a tainted component.
+  Iterating request headers, query/parameter collections or content creates
+  an untrusted element read, including scalar aliases and tuple components.
   Unsupported case, cast and optional patterns still fail closed.
 - Collection `append(contentsOf:)` labels no longer activate unrelated
   file-reading analysis. Real file reads and request inputs, including nested

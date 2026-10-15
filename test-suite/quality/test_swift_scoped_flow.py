@@ -89,6 +89,35 @@ class SwiftScopedFlowTests(unittest.TestCase):
             }
         ''', (3,))
 
+    def test_request_collection_iteration_is_an_untrusted_source(self):
+        for sequence in ('req.headers', 'req.query', 'req.parameters', 'req.params', 'req.content'):
+            with self.subTest(sequence=sequence):
+                self.check('''
+                    func handle(req: Request) {
+                        for (_, target) in %s {
+                            _ = req.redirect(to: target)
+                        }
+                    }
+                ''' % sequence, (3,), suffix=sequence.rsplit('.', 1)[-1])
+        self.check('''
+            func handle(req: Request) {
+                let headers = req.headers
+                for target in headers {
+                    _ = String(contentsOfFile: target)
+                }
+            }
+        ''', (4,), 'path', 'scalar-alias')
+
+    def test_request_iteration_where_validation_stays_binding_local(self):
+        self.check(f'''
+            func handle(req: Request) {{
+                for (other, target) in req.headers where {LOCAL} {{
+                    _ = req.redirect(to: target)
+                    _ = req.redirect(to: other)
+                }}
+            }}
+        ''', (4,))
+
     def test_tuple_loop_shadowing_does_not_leak(self):
         self.check('''
             func handle(req: Request) {

@@ -1289,6 +1289,11 @@ class SwiftEngine:
             raise ValueError('Unsupported Swift control flow or closure; analysis is incomplete')
         if kind == 'element':
             value = self.expression(tokens, state, reads)
+            # Reading an element of request data is itself an untrusted read,
+            # just like subscripting it. Retaining only the collection shape
+            # would let a destructured header/query value reach a sink clean.
+            if any(swift_has_shape(value, shape) for shape in {'request-collection', 'request-content'}):
+                value = join(value, self.source(tokens[0].start, 'request iteration'))
             # Components conservatively inherit every element dependency, but
             # never a collection/other component's validation. Request shapes
             # must survive so destructured request.query remains a source.

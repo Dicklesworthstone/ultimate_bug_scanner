@@ -572,6 +572,22 @@ def swift_request_source_tokens(tokens):
     budget = Budget()
     newlines = [t.start for t in tokens if t.kind == 'code' and t.value == '\n']
     for index, token in enumerate(significant):
+        if token.kind != 'code' or token.value not in native | {'Vision'}:
+            continue
+        previous = significant[index - 1].value if index else ''
+        following = significant[index + 1].value if index + 1 < len(significant) else ''
+        if token.value == 'Vision':
+            if previous == 'import' or following == '.' or (index >= 2 and
+                    significant[index - 2].value == 'canImport' and previous == '('):
+                continue
+            return True
+        if previous == '.' and (index < 2 or significant[index - 2].value != 'Vision'):
+            return True
+        if previous not in {':', '->', '.'} and following != '(':
+            # In particular, a closure/generic/capture binding with the same
+            # spelling is not the imported constructor.
+            return True
+    for index, token in enumerate(significant):
         if token.kind == 'code' and token.value in {'req', 'request'}:
             tail = significant[index + 1:index + 5]
             member = tuple(t.value for t in tail if t.value not in {'?', '!'})
@@ -1360,6 +1376,10 @@ class SwiftEngine:
                    for left, right in zip(self.parser.tokens, self.parser.tokens[1:])):
                 return False
             if '.' not in name and any(fn.name == leaf for fn in self.parser.functions.values()):
+                return False
+            if '.' not in name and function.owner:
+                # An inherited member may shadow the global primitive. Module
+                # qualification is required when that lookup is unresolved.
                 return False
             return True
 

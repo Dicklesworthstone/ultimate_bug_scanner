@@ -118,6 +118,9 @@ class SwiftScopedFlowTests(unittest.TestCase):
             'func VNGenerateImageFeaturePrintRequest() -> Request {}',
             'func f(VNGenerateImageFeaturePrintRequest: () -> Any) { consume(request) }',
             'class Child: Parent { func f() { let request = VNCoreMLRequest(); consume(self.request) } }',
+            'func f() { provider { VNCoreMLRequest in let request = VNCoreMLRequest(); consume(request) } }',
+            'func f() { provider { Vision in let request = Vision.VNCoreMLRequest(); consume(request) } }',
+            'func f<VNCoreMLRequest>() { let request = VNCoreMLRequest(); consume(request) }',
         )
         for tail in tails:
             with self.subTest(tail=tail):
@@ -160,6 +163,15 @@ class SwiftScopedFlowTests(unittest.TestCase):
                         _ = req.redirect(to: target)
                     }
                 ''' % declaration)
+        with self.assertRaisesRegex(ValueError, 'guard.*does not exit'):
+            self.check('''
+                class Handler: ExternalBase {
+                    func handle(req: Request) {
+                        guard allowed(req) else { exit(1) }
+                        _ = req.redirect(to: req.query["next"])
+                    }
+                }
+            ''')
 
     def test_tuple_loop_propagates_each_component_to_sinks(self):
         for policy, sink in (('path', 'String(contentsOfFile: target)'),

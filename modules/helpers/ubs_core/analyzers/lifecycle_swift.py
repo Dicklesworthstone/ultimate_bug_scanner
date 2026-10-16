@@ -209,10 +209,30 @@ class LifecycleParser(SwiftParser):
             first = part[0].value
             if statement.kind == 'unsupported' and first in {'defer', 'do'}:
                 opening = next((i for i, token in enumerate(part) if token.value == '{'), -1)
-                if opening < 0 or swift_close(part, opening) != len(part) - 1:
+                if opening < 0:
                     raise ValueError('Swift lifecycle catch or malformed cleanup scope; analysis is incomplete')
-                body = self.block(part[opening + 1:-1], owner, scope, depth=depth + 1)
-                statement = SwiftStatement(first, part[:opening], body)
+                finish = swift_close(part, opening)
+                body = self.block(part[opening + 1:finish], owner, scope, depth=depth + 1)
+                cursor, catches = finish + 1, []
+                while cursor < len(part):
+                    if part[cursor].value == '\n':
+                        cursor += 1
+                        continue
+                    if first != 'do' or part[cursor].value != 'catch':
+                        raise ValueError('Swift lifecycle malformed cleanup scope; analysis is incomplete')
+                    start = cursor + 1
+                    cursor = start
+                    while cursor < len(part) and part[cursor].value != '{':
+                        if part[cursor].value in {'(', '['}:
+                            cursor = swift_close(part, cursor)
+                        cursor += 1
+                    if cursor == len(part):
+                        raise ValueError('Swift lifecycle catch has no body; analysis is incomplete')
+                    finish = swift_close(part, cursor)
+                    catches.append(SwiftStatement('catch', part[start:cursor],
+                        self.block(part[cursor + 1:finish], owner, scope, depth=depth + 1)))
+                    cursor = finish + 1
+                statement = SwiftStatement(first, part[:opening], body, extra=tuple(catches))
             elif statement.kind == 'simple' and first in {'init', 'deinit'}:
                 opening = next((i for i, token in enumerate(part) if token.value == '{'), -1)
                 if opening >= 0:
@@ -543,7 +563,9 @@ class LifecycleEngine:
                     next_paths.append((state, names, (*deferred, (statement.body, dict(names))), ''))
                     continue
                 if kind in {'if', 'guard'}:
-                    self.release_calls(statement.tokens, state, names)
+                    exceptions = []
+                    self.release_calls(statement.tokens, state, names, exceptions)
+                    next_paths.extend((exceptional, dict(names), deferred, 'throw') for exceptional in exceptions)
                     arms = (statement.body, statement.alternate)
                     literal = swift_text(swift_ungroup(statement.tokens))
                     if literal in {'true', 'false'}:
@@ -557,10 +579,46 @@ class LifecycleEngine:
                     continue
                 if kind == 'do':
                     for child, outcome in self.block(statement.body, state, names, depth + 1):
-                        next_paths.append((child, dict(names), deferred, outcome))
+                        if outcome != 'throw':
+                            next_paths.append((child, dict(names), deferred, outcome))
+                            continue
+                        # Inner defers have already run. Matching is conservative:
+                        # a typed/filtered catch may or may not match, and only an
+                        # unconditional catch consumes the unmatched throw path.
+                        exhaustive = False
+                        for handler in statement.extra:
+                            pattern = swift_ungroup(handler.tokens)
+                            parts = swift_parts(pattern, {'where'})
+                            if len(parts) > 2:
+                                raise ValueError('Swift lifecycle catch pattern needs binding analysis; analysis is incomplete')
+                            head = tuple(parts[0])
+                            caught_names = dict(names)
+                            bound = ['error']
+                            for index, token in enumerate(head):
+                                if token.value in {'let', 'var'}:
+                                    if index + 1 == len(head) or not re.fullmatch(IDENT, head[index + 1].value):
+                                        raise ValueError('Swift lifecycle catch pattern needs binding analysis; analysis is incomplete')
+                                    bound.append(head[index + 1].value)
+                            for name in bound:
+                                caught_names[name] = ('catch', statement.tokens[0].start, name)
+                            caught = child.copy()
+                            if len(parts) == 2:
+                                exceptional_filters = []
+                                self.release_calls(parts[1], caught, caught_names, exceptional_filters)
+                                next_paths.extend((item, dict(names), deferred, 'throw') for item in exceptional_filters)
+                            for handled, exit_kind in self.block(handler.body, caught, caught_names, depth + 1):
+                                next_paths.append((handled, dict(names), deferred, exit_kind))
+                            exhaustive = len(parts) == 1 and (not head or (
+                                len(head) == 2 and head[0].value in {'let', 'var'} and re.fullmatch(IDENT, head[1].value)))
+                            if exhaustive:
+                                break
+                        if not exhaustive:
+                            next_paths.append((child, dict(names), deferred, 'throw'))
                     continue
                 if kind in {'while', 'for'}:
-                    self.release_calls(statement.tokens, state, names)
+                    exceptions = []
+                    self.release_calls(statement.tokens, state, names, exceptions)
+                    next_paths.extend((exceptional, dict(names), deferred, 'throw') for exceptional in exceptions)
                     always = kind == 'while' and swift_text(swift_ungroup(statement.tokens)) == 'true'
                     pending, visited = [state.copy()], set()
                     while pending:

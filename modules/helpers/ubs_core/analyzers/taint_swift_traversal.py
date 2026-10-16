@@ -273,7 +273,7 @@ class SwiftParser:
                     while following < len(tokens) and tokens[following].value == '\n':
                         following += 1
                     next_value = tokens[following].value if following < len(tokens) and tokens[following].kind == 'code' else ''
-                    if previous not in continuation and next_value not in {'.', '&&', '||', '??', '+', ','}:
+                    if previous not in continuation and next_value not in {'.', '&&', '||', '??', '+', ',', 'catch'}:
                         return cursor
             cursor += 1
         return cursor

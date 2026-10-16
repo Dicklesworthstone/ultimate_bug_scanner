@@ -655,6 +655,94 @@ class SwiftLifecycleBindings(LoggedCase):
     @staticmethod
     def cases():
         cases = (
+            ('catch_cleans_exception_but_not_success', '''
+                func start() {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                  do { try work() } catch { timer.invalidate() }
+                }
+            '''),
+            ('success_and_catch_both_clean', '''
+                func start() {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                  do { try work(); timer.invalidate() }
+                  catch { timer.invalidate() }
+                }
+            '''),
+            ('catch_cannot_clean_success_return', '''
+                func start() {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                  do { try work(); return } catch { timer.invalidate() }
+                }
+            '''),
+            ('do_defer_runs_before_catch', '''
+                func start() {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                  do { defer { timer.invalidate() }; try work() } catch { recover() }
+                }
+            '''),
+            ('outer_defer_covers_catch_rethrow', '''
+                func start() {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                  defer { timer.invalidate() }
+                  do { try work() } catch { throw error }
+                }
+            '''),
+            ('filtered_catch_keeps_unmatched_throw', '''
+                func start() {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                  do { try work(); timer.invalidate() }
+                  catch let error where shouldHandle(error) { timer.invalidate() }
+                }
+            '''),
+            ('typed_catch_then_fallback_cleans', '''
+                func start() {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                  do { try work(); timer.invalidate() }
+                  catch is NetworkError { timer.invalidate() }
+                  catch { timer.invalidate() }
+                }
+            '''),
+            ('catch_binding_shadows_outer_resource', '''
+                func start() {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                  do { try work(); timer.invalidate() } catch let timer { timer.invalidate() }
+                }
+            '''),
+            ('implicit_error_shadows_outer_resource', '''
+                func start() {
+                  let error = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                  do { try work(); error.invalidate() } catch { error.invalidate() }
+                }
+            '''),
+            ('catch_throw_reaches_outer_handler', '''
+                func start() {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                  do {
+                    do { try work(); timer.invalidate() } catch { throw error }
+                  } catch { timer.invalidate() }
+                }
+            '''),
+            ('catch_throw_does_not_reenter_sibling_handler', '''
+                func start() {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                  do { try work(); timer.invalidate() }
+                  catch is NetworkError { throw error }
+                  catch { timer.invalidate() }
+                }
+            '''),
+            ('throwing_condition_reaches_catch', '''
+                func start() {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                  do { if try check() { timer.invalidate() } else { timer.invalidate() } }
+                  catch { recover() }
+                }
+            '''),
+            ('optional_try_does_not_enter_catch', '''
+                func start() {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                  do { try? work(); timer.invalidate() } catch { recover() }
+                }
+            '''),
             ('direct_timer_control', '''
                 import Foundation
                 func start() {

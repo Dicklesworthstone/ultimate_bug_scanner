@@ -14,6 +14,26 @@ _No changes yet._
 
 ---
 
+## [v5.5.6] - 2026-10-15 [Tag]
+
+Git-only source delivery; signed release assets and installed-tool upgrades are separate.
+
+### Fixed
+
+- Swift lifecycle analysis follows `do`/`catch` exception paths, nested rethrows,
+  and scope-exit `defer` cleanup. Filtered and typed handlers retain unmatched
+  exceptions; catch bindings cannot discharge a same-named outer resource.
+  Throwing branch/loop conditions also retain their exceptional exits.
+- Request-flow and outbound-URL activation distinguish lexically bound native
+  Vision requests from incoming web requests. Unknown or shadowed bindings,
+  actual request members, upload filenames and unsupported captures remain
+  conservative; no source files, rules or severities are excluded.
+- Unshadowed process-exit primitives terminate Swift guard failure paths.
+  Argument effects are still analyzed, and user-defined replacements do not
+  acquire a false non-returning guarantee.
+
+---
+
 ## [v5.5.5] - 2026-10-15 [Tag]
 
 Git-only source delivery; signed release assets and installed-tool upgrades are separate.

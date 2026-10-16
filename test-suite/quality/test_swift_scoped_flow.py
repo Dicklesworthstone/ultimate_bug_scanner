@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 import sys
 import textwrap
+from types import SimpleNamespace
 import unittest
 import uuid
 
@@ -80,6 +81,22 @@ class SwiftScopedFlowTests(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertFalse(swift_request_source_tokens(swift_validated_tokens(source)))
                 self.check(source, suffix=str(index))
+                from ubs_core.swift_detectors.outbound_url import scan
+                target = self.artifacts / ('vision-outbound-' + str(index) + '.swift')
+                target.write_text(textwrap.dedent(source), encoding='utf-8')
+                self.assertEqual(list(scan(SimpleNamespace(project_dir=self.artifacts, files=[target]))), [])
+
+    def test_vision_import_does_not_exempt_actual_outbound_request(self):
+        from ubs_core.swift_detectors.outbound_url import scan
+        source = '''import Vision
+        func load(req: Request) {
+            let target = req.query["url"]
+            _ = Data(contentsOf: URL(string: target)!)
+        }
+        '''
+        target = self.artifacts / 'vision-real-outbound.swift'
+        target.write_text(source, encoding='utf-8')
+        self.assertTrue(list(scan(SimpleNamespace(project_dir=self.artifacts, files=[target]))))
 
     def test_native_request_negative_proof_keeps_unknown_shadowing_and_sources(self):
         prefix = 'import Vision\nlet request = VNGenerateImageFeaturePrintRequest()\n'
@@ -99,6 +116,8 @@ class SwiftScopedFlowTests(unittest.TestCase):
             r'func handle() { consume("\(request)") }',
             'struct VNGenerateImageFeaturePrintRequest {}',
             'func VNGenerateImageFeaturePrintRequest() -> Request {}',
+            'func f(VNGenerateImageFeaturePrintRequest: () -> Any) { consume(request) }',
+            'class Child: Parent { func f() { let request = VNCoreMLRequest(); consume(self.request) } }',
         )
         for tail in tails:
             with self.subTest(tail=tail):
@@ -106,6 +125,10 @@ class SwiftScopedFlowTests(unittest.TestCase):
         source = '''import Vision
         func first() { let request = VNCoreMLRequest(); consume(request) }
         func second() { consume(request) }
+        '''
+        self.assertTrue(swift_request_source_tokens(swift_validated_tokens(source)))
+        source = '''import Vision
+        class Detector { class func extract() { consume(request); let request = VNCoreMLRequest() } }
         '''
         self.assertTrue(swift_request_source_tokens(swift_validated_tokens(source)))
 

@@ -569,6 +569,8 @@ def swift_request_source_tokens(tokens):
            for a, b in zip(code, code[1:])):
         return True
     significant = tuple(t for t in tokens if t.kind != 'code' or t.value != '\n')
+    budget = Budget()
+    newlines = [t.start for t in tokens if t.kind == 'code' and t.value == '\n']
     for index, token in enumerate(significant):
         if token.kind == 'code' and token.value in {'req', 'request'}:
             tail = significant[index + 1:index + 5]
@@ -591,7 +593,8 @@ def swift_request_source_tokens(tokens):
     for index, token in enumerate(significant):
         if token.kind == 'code' and token.value == '{':
             ranges.append((index, swift_close(significant, index)))
-        if token.kind == 'code' and token.value in {'class', 'struct', 'actor', 'enum', 'extension'}:
+        if (token.kind == 'code' and token.value in {'class', 'struct', 'actor', 'enum', 'extension'}
+                and index + 1 < len(significant) and significant[index + 1].value != 'func'):
             opening = index + 1
             while opening < len(significant) and significant[opening].value != '{':
                 opening += 1
@@ -619,12 +622,14 @@ def swift_request_source_tokens(tokens):
             if len(pieces) != 2 or not pieces[0]:
                 continue
             name = pieces[0][-1]
+            if name.value in native | {'Vision'}:
+                return True
             if name.value not in {'req', 'request'}:
                 continue
             if not native_type(swift_parts(pieces[1], {'='})[0]) or body == len(significant):
                 return True
             declarations.add(name.start)
-            bindings.append((name.value, body, swift_close(significant, body)))
+            bindings.append((name.value, body, swift_close(significant, body), False))
 
     for index, token in enumerate(significant):
         if token.kind != 'code' or token.value not in {'let', 'var'} or index + 1 == len(significant):
@@ -643,8 +648,8 @@ def swift_request_source_tokens(tokens):
         if following[0].value == ':':
             ending = position
             while ending < len(significant) and significant[ending].value not in {'=', '{', '}', ';'}:
-                if ending > position and '\n' in ''.join(t.value for t in tokens
-                        if significant[ending - 1].end <= t.start < significant[ending].start):
+                if ending > position and bisect_right(newlines, significant[ending - 1].end - 1) < bisect_right(
+                        newlines, significant[ending].start - 1):
                     break
                 ending += 1
             known = native_type(significant[position:ending])
@@ -660,7 +665,7 @@ def swift_request_source_tokens(tokens):
         containing = [(a, b) for a, b in ranges if a < index < b]
         scope = max(containing, default=(-1, len(significant)))
         start = scope[0] if scope in type_ranges else index
-        bindings.append((name.value, start, scope[1]))
+        bindings.append((name.value, start, scope[1], scope in type_ranges))
         declarations.add(name.start)
 
     for index, token in enumerate(significant):
@@ -675,6 +680,7 @@ def swift_request_source_tokens(tokens):
             return True
         for opening, closing in ranges:
             if opening < index < closing:
+                budget.spend(closing - opening)
                 header = significant[opening + 1:index + 1]
                 after = significant[index + 1:closing]
                 if not any(t.value in {';', '{', '}', 'let', 'var', 'return'} for t in header):
@@ -683,7 +689,8 @@ def swift_request_source_tokens(tokens):
                         return True
         if following == ':' and previous in {'(', ','}:
             continue  # actual argument label, not a value
-        if not any(name == token.value and start <= index < end for name, start, end in bindings):
+        if not any(name == token.value and start <= index < end and (previous != '.' or field)
+                   for name, start, end, field in bindings):
             return True
     return False
 

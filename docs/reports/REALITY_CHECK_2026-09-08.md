@@ -1,4 +1,163 @@
-# Reality Check — updated 2026-10-06 (v5.4.23)
+# Reality Check — updated 2026-10-13 (v5.4.41)
+
+This update supersedes the October 6 (`v5.4.23`) and September 8 (`v5.4.9`) conclusions, both of which are retained intact below for historical comparison and provenance. Scanner code was audited on `main` across `758bbe0b` (`v5.4.40`) through `3329749b` (`v5.4.41`). No scanner implementation files were modified by this audit; all live CLI probe outputs were written to gitignored scratch directories under `test-suite/artifacts/`.
+
+---
+
+## Phase 1: Ground-Truth Audit & Executive Verdict (2026-10-13)
+
+Between the October 6 reality check (`40cc563`, `v5.4.23`) and today (`3329749b`, `v5.4.41`), **150 commits** landed on `main`. That sprint delivered genuine, high-leverage engineering:
+1. **Python 3.9 runtime compatibility restored (`e104a9de`, `35c8bf29` — closes `mj1j.1/.2`):** Unconditional `@dataclass(slots=True)` was removed across `modules/helpers/`, `test-suite/shareable/test_helper_python_floor.py` compiles and imports 363/362 helper files with zero failures, and `.github/workflows/helper-python-runtime.yml` gates Python 3.9, 3.10, and 3.14.
+2. **13th Language Module — PHP (`0ee79b8a`, `2313bf47` — advances `mj1j.31/.32`):** `modules/ubs-php.sh`, `modules/helpers/ubs_core/php_scan.py`, `php_frontend.py`, and `analyzers/taint_php.py` now provide a contract-v2 PHP scanner with 6 request-to-sink security rules (`php.security.sql-injection`, `command-injection`, `code-injection`, `file-inclusion`, `xss`, `untrusted-deserialization`) and 109 unit tests (`test_php_taint.py`).
+3. **Persistent Repository Scan Policy `.ubs.json` (`c396e525`, `2313bf47` — closes `mj1j.39/.40`):** Declarative `.ubs.json` discovery, `--config=FILE`, `--no-config`, `UBS_CONFIG_FILE`, `ubs --schema=config`, `ubs robot-docs config`, and cache/daemon invalidation on policy changes are live and verified by `test-suite/quality/test_scan_config.py`.
+4. **Multi-Format Single-Scan Export (`27f22229`):** `--also=FORMAT:FILE` renders additional report formats from a single scan pass without re-running language modules.
+5. **All 6 October 6 Diagnostic Probes Now Pass (`6/6`):** Re-running the exact six October 6 CLI probes through `./ubs --format=json` (`test-suite/artifacts/reality-probes-20261013/oct6-retest/oct6-probes-retest.json`) confirms that identity helpers named `safeRedirect` / `safe_url` / `safe_redirect` in Java, Ruby, Swift, and Elixir are now caught (`exit=1, critical=1`), and literal overwrites in Java (`target = "/fixed"`) and Ruby (`u = "https://example.com/health"` before `Net::HTTP.get`) now clear taint (`exit=0, critical=0`).
+6. **Substantial Scoped Dataflow & Lifecycle Upgrades Landed:**
+   - **SQL Provenance (`mj1j.21/.22`):** Java JDBC `Statement`/`PreparedStatement`/batch/Servlet (`taint_java_sql.py`), Ruby ActiveRecord (`taint_ruby_traversal.py`), C# Dapper (`taint_csharp_sql.py`), Elixir Ecto (`taint_elixir_traversal.py`), and Rust fixed-point SQL dataflow (`rust_detectors/sql_flow.py`).
+   - **Per-Binding Resource & Task Lifecycle (`mj1j.13/.14`, `mj1j.17/.18`, `mj1j.19/.20`):** Native Kotlin coroutines (`coroutines_kotlin.py`) and resource ownership (`lifecycle_kotlin.py`), Ruby binding/helper resource tracking (`lifecycle_ruby.py`), Swift object/exit-path obligations (`lifecycle_swift.py`), and Elixir `File`/`Port`/`Task` ownership (`elixir_scan.py`).
+
+### What Still Breaks or Falls Short of the Vision (New Ground-Truth Findings)
+
+However, executing **second-order live CLI probes** (`test-suite/artifacts/reality-probes-20261013/`) and auditing the orchestrator wiring exposed **seven critical reality gaps** that commit messages and unit tests obscure:
+
+1. **Ubiquitous Framework Boilerplate Causes `exit=2` (`status: partial`) in Swift and Elixir:**
+   - **Elixir (`taint_elixir_traversal.py:215` / `Parser`):** Any Elixir module containing `use MyAppWeb, :controller`, `use Phoenix.Controller`, `use Ecto.Schema`, or `use GenServer` alongside request/sink tokens raises `ElixirSyntaxError: Elixir use macro expansion at line 2; analysis is incomplete`, causing `ubs-elixir.sh` to abort with **`exit=2` (`status: partial`) on virtually 100% of real-world Phoenix controllers and Ecto schemas** (in addition to Known Issue #168 for `apply/2,3`, `Code.eval_*`, `spawn`, `Task.async`, `Enum.reduce`).
+   - **Swift (`taint_swift_traversal.py`):** Any Swift file using a trailing route-handler closure — such as Vapor's standard `app.get("go") { req -> Response in ... }` — raises `ValueError: Swift escaping/trailing closure needs capture analysis; analysis is incomplete`, causing `ubs-swift.sh` to abort with **`exit=2` (`status: partial`) on standard Vapor route files**.
+2. **Legacy `*_detectors/` Split-Brain (Ruby `redirect_to` + Outbound URL / Header Injection Across 6 Languages):**
+   - While `taint_ruby_traversal.py` and `taint_ruby_url.py` were migrated to the scoped Ruby taint engine, **Ruby Open Redirect (`redirect_to`) is still served by `modules/helpers/ubs_core/ruby_detectors/open_redirect.py` (`ruby.redirect.open`)** — the legacy file-global regex line-tracker! As a result, `url = params[:return_to]; url = "/dashboard"; redirect_to url` **still falsely fires `ruby.redirect.open` (`exit=1, critical=1`)**, and a fake `def safe_redirect(u); u; end` is still trusted by name (`SAFE_EXPR_RE`).
+   - The exact same legacy file-global regex line-tracker (`SAFE_EXPR_RE` name trust, no function scope reset, no literal-overwrite kill) remains active in `ruby_detectors/response_header_injection.py`, `java_detectors/ssrf_outbound_url.py`, `java_detectors/header_injection.py`, `swift_detectors/outbound_url.py`, `swift_detectors/header_injection.py`, `elixir_detectors/outbound_url.py`, `elixir_detectors/response_header_injection.py`, `csharp_detectors/outbound_url.py`, `csharp_detectors/header_injection.py`, `cpp_detectors/outbound_url.py`, and `cpp_detectors/header_injection.py`.
+3. **In-Function Java/Kotlin Path Containment False Positive (`taint_java_traversal.py:646-652, 856-861`):**
+   - When `Path target = base.resolve(req.getParameter("file")).normalize(); if (target.startsWith(base)) { Files.readString(target); }` is written inside a helper method that *returns* `Path`, `Engine.summary_effect()` checks `summary.returned` for `'contained-path'`, discharges the `path-construction` diagnostic recorded at `base.resolve(...)`, and reports `0` findings (`exit=0`).
+   - When the **exact same 3 lines are written inline inside a `void` servlet/controller handler**, `summary.returned` is empty, so `summary_effect()` fails to discharge the `path-construction` effect at `base.resolve(...)` and **falsely reports a critical `java.taint.path_traversal` (`exit=1, critical=1`)**.
+4. **Dormant / Discarded / Unwired Analyzers Across Orchestrators (`mj1j.15/.16`):**
+   - **Executed & Discarded:** In `modules/helpers/ubs_core/swift_scan.py:501-565`, `guards_swift` (`layer="guards"`) is executed on every Swift file, and then `_analyzer_category(rule)` returns `None` for `swift.guards.*`, silently throwing away 100% of its findings after paying the scan cost.
+   - **Registered & Never Called:** In `modules/helpers/ubs_core/rust_scan.py`, the registered `guards_rust` and `taint_rust` analyzers in `ubs_core.registry` are never invoked (`rust_scan.py` invokes `rust_detectors.redirect_flow` instead).
+   - **Default-Off Behind `--enable-new-analyzers`:** 11 registered analyzers (`narrowing_py`, `narrowing_cpp`, `guards_go`, `narrowing_go`, `guards_java`, `narrowing_ruby`, `regex_swift`, `guards_csharp`, `guards_elixir`, `narrowing_elixir`) remain gated behind `--enable-new-analyzers`, which no `modules/ubs-*.sh` script passes.
+   - **Kotlin vs Java Scanner Asymmetry:** `modules/helpers/ubs_core/kotlin_scan.py:254-334` hardcodes only 2 JVM taint analyzers (`taint_java_traversal`, `taint_java_redirect`) and 4 `java_detectors`, omitting `taint_java_sql`, `jwt_verification`, `tls_verification`, and `trust_manager`; conversely, `java_scan.py:390` sets `allowed_layers = {"java": {"taint"}, "kotlin": {"narrowing"}}`, skipping `coroutines_kotlin` and `lifecycle_kotlin` when `.kt` files are scanned through `ubs-java.sh`.
+5. **17x Self-Scan Latency Regression on Python (`15s` → `260s`):**
+   - Running `./ubs . --ci --fail-on-warning --format=json` (`test-suite/artifacts/reality-selfscan-20261013.json`) passes (`exit=0`, `0 critical, 0 warning, 7,765 info` across 409 files), **but wall-clock time regressed from ~16.5s on Oct 6 to ~261s (4m 21s)**: `js` 1s, `golang` 7s, `bash` **43s** (up from 16s), and `python` **260s** (up from 15s) across the 365 helper files in `modules/helpers/`. The interprocedural/cyclic/classmethod/module-summary expansions in `taint_py.py` seriously degraded whole-repo Python scan latency relative to the README's `< 5s` promise.
+6. **Coverage Matrix & Release Tag Drift (`detectors.yml`, `docs/coverage-matrix.md`, `v5.4.19` vs `v5.4.41`):**
+   - `detectors.yml` and `docs/coverage-matrix.md` (plus the embedded table in `README.md`) still claim **"Languages Supported: 10"** (omitting Bash, Kotlin, and PHP) and still mark SQL Injection (`○` Planned) for Go, Java, Ruby, C#, and Elixir, Path Traversal (`○`) for Rust, and Resource Lifecycle / Async (`○`) for Swift and Elixir, directly contradicting the README prose and implemented analyzers.
+   - Local and remote git tags stop at `v5.4.19` while `VERSION` is `5.4.41` (a 22-version tag gap), causing `scripts/check-version-tag-drift.sh` to skip (`tag v5.4.41 does not exist locally — skipping drift check (no-op)`).
+7. **Work-Graph (`.beads/issues.jsonl`) Drift:**
+   - Before this audit's reconciliation pass, 49 issues were `open` and 22 `in_progress` (out of 339 total), including fully delivered slices (`mj1j.1/.2` Python 3.9 runtime floor, `mj1j.39/.40` `.ubs.json` scan config) and partially delivered umbrellas (`mj1j.3/.4`, `mj1j.5/.6`, `mj1j.7/.8`, `mj1j.9/.10`, `mj1j.13/.14`, `mj1j.17/.18`, `mj1j.19/.20`, `mj1j.21/.22`, `mj1j.23/.24`, `mj1j.31/.32`) that had zero progress notes or child beads recording what landed vs what remains.
+
+---
+
+### Summary Verification Table (2026-10-13, `v5.4.41` / `3329749b`)
+
+| Check / Gate | Command | Result | Ground-Truth Interpretation |
+|---|---|---|---|
+| ShellCheck gate | `shellcheck ubs modules/ubs-*.sh scripts/*.sh` | **PASS (`exit=0`)** | Prescribed ShellCheck command now exits 0 cleanly on `main` (unlike Oct 6's 197 diagnostics) |
+| Checksum verification | `./scripts/verify_checksums.sh` | **PASS (`exit=0`)** | All 13 modules + `ubs-common.sh` + 365 helpers verified |
+| SHA256SUMS verification | `./scripts/verify_sha256sums.sh` | **PASS (`exit=0`)** | `ubs`, `install.sh`, `ubs-daemon` digests match |
+| Docs claim checker | `python3 scripts/check_docs_claims.py` | **PASS (13/13)** | 172 flags, 13 languages/modules, 365 helpers, `v5.4.41`; does not catch `detectors.yml` 10-language staleness |
+| Version/tag drift | `./scripts/check-version-tag-drift.sh` | **SKIPPED (`exit=0`)** | Latest tag is `v5.4.19` vs `VERSION=5.4.41` (22-version tag gap) |
+| Doctor check | `./ubs doctor --format=json` | **PASS (`exit=0`)** | `"status": "ok"`, all cached/local modules healthy |
+| Embedded `ubs_core` self-tests | `python3 -m unittest discover -s test-suite/quality -p 'test_ubs_core_selftests.py'` | **PASS (425/425 in 0.42s)** | 96 registered analyzers across 12 `ubs_core` languages pass embedded self-tests |
+| Python 3.9 floor suite | `python3 test-suite/shareable/test_helper_python_floor.py` | **PASS (28 tests in 58.0s)** | 363 compiled, 362 imported, 0 failures; zero unconditional `slots=True` in `modules/helpers/` |
+| Scan config suite | `python3 test-suite/quality/test_scan_config.py` | **PASS (14 tests)** | `.ubs.json`, `--config`, `--no-config`, precedence, and daemon invalidation verified |
+| PHP taint suite | `python3 test-suite/quality/test_php_taint.py` | **PASS (109 tests, 10 skipped in 0.31s)** | Native PHP request-to-sink taint analyzer verified |
+| CLI contract suite | `python3 test-suite/shareable/test_cli_contract.py` | **PASS** | Custom rules across all 13 modules (including PHP), `--also`, `--config`, exit codes `0/1/2/3` |
+| Oct 6 diagnostic probes (6 cases) | `./ubs --format=json` on 6 Oct 6 cases | **PASS (6/6)** | Fake `safeRedirect`/`safe_url` caught (`exit=1`); Java/Ruby literal overwrites clean (`exit=0`) |
+| Oct 13 second-order CLI probes (5 cases) | `modules/ubs-*.sh --format=json` | **0/5 clean** | Exposes inline Java `base.resolve` FP, Ruby `redirect_to` legacy detector FP, Swift Vapor closure `exit=2`, Elixir `use` macro `exit=2` |
+| Native project self-scan | `./ubs . --ci --fail-on-warning --format=json` | **PASS (`exit=0`, 261s)** | 409 files; `0 critical, 0 warning, 7,765 info`; Python module took **260s** (`bash` 43s, `go` 7s, `js` 1s) |
+
+---
+
+### Updated Vision Checklist (2026-10-13, `v5.4.41`)
+
+| # | Promised User Outcome | Oct 6 Status | Oct 13 Reality | Evidence & Remaining Bridge |
+|---|---|---|---|---|
+| 1 | One CLI scans polyglot repositories (13 languages) | WORKING (12 langs) | **WORKING (13 langs)** | Added `modules/ubs-php.sh` (`taint_php.py`); all 13 modules pass checksums and custom-rule CLI contract tests |
+| 2 | Python 3.9+ helper runtime floor | BROKEN (regression) | **WORKING** | Fixed in `e104a9de` + `35c8bf29`; verified by `test_helper_python_floor.py` (`mj1j.1/.2` complete) |
+| 3 | Persistent declarative repo config (`.ubs.json`) | NOT_STARTED | **WORKING** | Implemented in `c396e525` (`--config`, `--no-config`, `--schema=config`); verified by `test_scan_config.py` (`mj1j.39/.40` complete) |
+| 4 | Multi-format single-scan output (`--also=FMT:PATH`) | PARTIAL | **WORKING** | Implemented in `27f22229`; verified in `test_cli_contract.py` |
+| 5 | Prescribed ShellCheck gate (`shellcheck ubs modules/ubs-*.sh scripts/*.sh`) | FAIL (197 issues) | **WORKING locally** | Exits `0` with zero diagnostics (`task-57.log`); formal callback proof documentation in `mj1j.37/.38` |
+| 6 | Request-to-sink security dataflow (redirects, paths, SQL, SSRF, headers) | PARTIAL | **PARTIAL (materially stronger, key gaps remain)** | All 6 Oct 6 probes pass; JDBC/ActiveRecord/Dapper/Ecto/Rust/PHP SQL dataflow landed; **but** `ruby_detectors/open_redirect.py` and 6 languages' `outbound_url`/`header_injection` detectors still use legacy regex line-tracking, Java inline `base.resolve` FPs in `void` methods, and Swift/Elixir fail with `exit=2` on Vapor closures and Phoenix `use` macros |
+| 7 | Per-binding resource & async/task lifecycle correlation | PARTIAL | **WORKING in 9 langs / PARTIAL integration** | Ruby (`4df96b18`, `4c1cfb9f`), Kotlin (`6d0e9b53`, `8e30458b`), Swift (`57862b4e`), Elixir (`14601346`) landed; need `java_scan.py` / `kotlin_scan.py` parity and full CLI probe sign-off (`mj1j.13-.20`) |
+| 8 | Dormant AST/guard/narrowing analyzers active in ordinary CLI | PARTIAL | **PARTIAL (still gated)** | 11 analyzers remain gated behind `--enable-new-analyzers`; `guards_swift` runs and drops all findings (`swift_scan.py:501`); `guards_rust`/`taint_rust` are never called by `rust_scan.py` (`mj1j.15/.16`) |
+| 9 | Fast feedback (`< 1s` single file, `< 5s` typical scan, `< 100ms` daemon) | UNPROVEN | **REGRESSED on Python whole-repo scan** | Single-file scans remain `< 1.5s`, but `./ubs .` self-scan took **260s** in `ubs-python.sh` (up from 15s on Oct 6) and **43s** in `ubs-bash.sh` (`q150.6`, `q150.7`, `7qy7.4`) |
+| 10 | Generated docs & coverage matrix match reality | PARTIAL | **PARTIAL (stale `detectors.yml`)** | `check_docs_claims.py` passes 13/13, but `detectors.yml` & `docs/coverage-matrix.md` still list 10 languages and mark Go/Java/Ruby/C#/Elixir SQLi and Swift/Elixir lifecycle as `○` Planned (`jtst.1`, `mj1j.42`) |
+| 11 | Calibrated confidence & held-out FP corpus | UNPROVEN | **UNPROVEN** | `1b9j.7` (D7) and `mj1j.41` remain open |
+| 12 | PostgreSQL SQL & Terraform/HCL modules | NOT_STARTED | **NOT_STARTED** | Tracked under `mj1j.33-.36` |
+| 13 | Current git tags & signed release assets match `VERSION` | PARTIAL | **PARTIAL (22-version tag gap)** | `VERSION` is `5.4.41` while latest git tag is `v5.4.19` (`7vb8.5`, `s2k5.7`) |
+
+---
+
+### Answers to the Five Reality-Check Questions (2026-10-13)
+
+1. **What works?**
+   - All 13 language modules (`js`, `python`, `cpp`, `rust`, `golang`, `java`, `kotlin`, `ruby`, `swift`, `csharp`, `elixir`, `bash`, `php`), the contract-v2 dispatcher,checksum/SHA256SUMS verification, `.ubs.json` repository scan config, `--also` multi-report export, Python 3.9 compatibility, ShellCheck linting, 425 embedded `ubs_core` analyzer self-tests, and all 6 of the October 6 sanitizer/literal-kill probes work and pass live verification.
+2. **What doesn't meet the vision?**
+   - **(a)** Real-world Phoenix (`use MyAppWeb, :controller`) and Vapor (`app.get(...) { req in ... }`) files trigger fail-closed `exit=2` (`status: partial`) in `ubs-elixir.sh` and `ubs-swift.sh`.
+   - **(b)** Legacy `*_detectors/` (`ruby_detectors/open_redirect.py`, plus `outbound_url.py` / `header_injection.py` across Ruby, Java, Swift, Elixir, C#, C++) were bypassed when `taint_*` analyzers were upgraded, leaving file-global taint and `SAFE_EXPR_RE` name trust in production.
+   - **(c)** Inline Java/Kotlin `base.resolve(untrusted).normalize()` + `if (target.startsWith(base))` inside a `void` method falsely fires `java.taint.path_traversal`.
+   - **(d)** `swift_scan.py` executes `guards_swift` and discards all its findings; `kotlin_scan.py` omits `taint_java_sql`, `jwt_verification`, `tls_verification`, and `trust_manager`; 11 analyzers remain default-off behind `--enable-new-analyzers`.
+   - **(e)** Whole-project Python scan time on UBS itself regressed from 15s to 260s.
+   - **(f)** `detectors.yml` / `docs/coverage-matrix.md` still show 10 languages and stale `○` markers, and git tags lag `VERSION` by 22 patch releases (`v5.4.19` vs `v5.4.41`).
+3. **What's blocking completion?**
+   - Completing the last mile of each partially landed `mj1j` slice (migrating legacy `*_detectors/open_redirect.py`, `outbound_url.py`, and `header_injection.py` onto the scoped taint engines; modeling Elixir `use` headers and Swift route closures without `exit=2`; discharging in-function Java `path-construction` effects; wiring `swift_scan.py` and `kotlin_scan.py`; bounding `taint_py` whole-repo scan cost; and updating `detectors.yml` to 13 languages).
+4. **If we completed all open beads today, would we reach the vision?**
+   - **Almost, provided the open `mj1j.*` umbrellas are refined to explicitly name the five second-order CLI defects above and the Python 260s self-scan regression.** Without explicit child tasks/acceptance criteria for Elixir `use` macros, Swift route closures, `ruby_detectors/open_redirect.py`, inline Java `base.resolve`, and `taint_py` self-scan latency, agents could close the existing beads on synthetic unit tests while leaving real Phoenix, Vapor, Rails, and Servlet files broken or slow.
+5. **What's missing from the issue tracker?**
+   - Five concrete child tasks under `mj1j` (`mj1j.4.3` for inline Java `base.resolve` discharge in `void` methods, `mj1j.6.4` for migrating `ruby_detectors/open_redirect.py` and legacy `*_detectors/` onto scoped taint, `mj1j.8.1` for Swift Vapor route closures + `guards_swift` sink wiring, `mj1j.10.1` for Elixir `use` macro tolerance + Known Issue #168 callbacks, and `mj1j.14.1` for `kotlin_scan.py`/`java_scan.py` detector parity), plus a performance task under `q150` (`q150.8`) to bring `ubs-python.sh` self-scan latency back under 30s, and closing `mj1j.1/.2` and `mj1j.39/.40` on cited evidence.
+
+---
+
+### Updated 13-Language Module Rankings (2026-10-13, `v5.4.41`)
+
+| Quality Rank | Module | Sophistication Rank | Oct 6 → Oct 13 Movement & Why | Most Consequential Current Limitation |
+|---|---|---|---|---|
+| 1 | **Python** | 1 | **#1 → #1:** Added cyclic/class-qualified/bound-classmethod interprocedural dataflow and faster exception-state deltas (`462ddfa5`, `d72f13a4`, `6d381f9c`) | Whole-repo self-scan regressed from 15s to **260s** across 365 helper files; `narrowing_py` still default-off |
+| 2 | **JavaScript / TypeScript** | 2 | **#2 → #2:** Added CommonJS/ESM/method-receiver cross-file summaries (`dd858e9a`, `bc7ffdcf`), bounded per-domain heap (`13845cb9`), and code-only operator rules (`3329749b`) | Lexical taint frontend (not full TS typechecker); 19/37 built-in AST rules in default counted ledger |
+| 3 | **Rust** | 3 | **#4 → #3:** Added fixed-point interprocedural SQL dataflow (`f4d7f69e`), redirect dataflow, and slice/array constant-time compare (`14170b36`) | Registered `guards_rust` and `taint_rust` in `ubs_core.registry` are bypassed by `rust_scan.py` |
+| 4 | **Go** | 4 | **#3 → #4:** Remains rock-solid (7s self-scan, package-level taint + Go AST lifecycle) | `guards_go` and `narrowing_go` remain default-off behind `--enable-new-analyzers` |
+| 5 | **Java** | 5 | **#7 → #5:** Huge leap — receiver-proven redirect/path flow (`fbefb2d7`, `eb0d8a71`), JDBC `Statement`/`PreparedStatement`/batch/Servlet SQL provenance (`dd35f2d7`, `64bf2bd2`, `abdfb348`), TLS hostname verifier (`dad7876f`), trust-all `X509TrustManager` (`c79f7bc2`), Auth0 JWT `Algorithm.none()` (`59250e7a`) | Inline `base.resolve(untrusted).normalize()` inside a `void` method still fires `path-construction` FP; `ssrf_outbound_url.py` & `header_injection.py` still use legacy regex line-tracker |
+| 6 | **C#** | 6 | **#5 → #6:** Added Dapper SQL injection dataflow (`56e21910`), `Task.Result` receiver classification (`71803a69`), and SQL-inert mail parsing (`70f544a9`) | `guards_csharp` default-off; `csharp_detectors/outbound_url.py` & `header_injection.py` still legacy line-trackers |
+| 7 | **Ruby** | 7 | **#10 → #7:** Big jump — scoped taint for paths, SSRF URLs, `eval`, ActiveRecord SQL (`c8b9bce1`), mutable aliases (`d1cf8ea8`), rescue/ensure/retry (`13bec6a9`), and per-binding resource/helper ownership (`4df96b18`, `4c1cfb9f`) | `ruby_detectors/open_redirect.py` (`ruby.redirect.open`) and `response_header_injection.py` still use the old file-global regex line-tracker |
+| 8 | **C / C++** | 8 | **#6 → #8:** Added CGI `std::getenv`, `cpp-httplib` redirect, and binding/helper/guard path & redirect dataflow (`d3cc89c7`) | `cpp_detectors/outbound_url.py` & `header_injection.py` remain legacy line-trackers; `narrowing_cpp` default-off |
+| 9 | **PHP** *(New)* | 9 | **New (#9):** Bounded native PHP frontend (`taint_php.py`) with 6 critical request-flow families (PDO/mysqli SQLi, shell/proc_open/pcntl_exec, eval/include, XSS contexts, unserialize) and 109 unit tests | Focused on 6 request-security families; broader non-taint PHP correctness/lifecycle categories still minimal |
+| 10 | **Kotlin** | 10 | **#12 → #10:** Added native coroutine cancellation/blocking/Job ownership (`coroutines_kotlin.py`, `8e30458b`) and per-binding resource ownership (`lifecycle_kotlin.py`, `6d0e9b53`) | `kotlin_scan.py` does not wire `taint_java_sql`, `jwt_verification`, `tls_verification`, or `trust_manager`; `java_scan.py` skips `coroutines_kotlin` & `lifecycle_kotlin` |
+| 11 | **Bash** | 11 | **#8 → #11:** Added bounded ShellCheck batching (`c3458e53`) and clean self-scan | Self-scan on UBS took 43s (up from 16s); only 2 manifest fixtures |
+| 12 | **Swift** | 12 | **#9 → #12:** Added scoped request-sink flow (`65eeb694`) and per-binding resource/task lifecycle (`57862b4e`) | Rejects trailing/escaping closures (`app.get(...) { req in ... }`) with `exit=2` (`status: partial`); `swift_scan.py` runs `guards_swift` and drops all its findings |
+| 13 | **Elixir** | 13 | **#11 → #13:** Added scoped path/redirect/Ecto SQL flow (`65eeb694`, `8d0a04ae`), anonymous callback flow (`92f955f6`), and scoped `File`/`Port`/`Task` ownership (`14601346`) | Rejects `use MyAppWeb, :controller` / `use Ecto.Schema` with `ElixirSyntaxError` (`exit=2`, `status: partial`), plus Known Issue #168 (`apply`, `spawn`, `Task.async`, `Enum.reduce`) |
+
+---
+
+## Phase 2 & Phase 4: Updated Bridge Plan & Three Ambition Rounds (2026-10-13)
+
+### Phase 2 Bridge Plan — Prioritized Workstreams
+
+1. **Workstream 1 (P1 — Immediate Real-World Scan Completeness & Precision):**
+   - **1A (`mj1j.10.1` under `mj1j.9/.10`):** Make `taint_elixir_traversal.py` tolerate standard module-level `use ...`, `import ...`, `alias ...`, `require ...`, and module attributes (`@...`), and bound unmodeled callback HOFs (`spawn`, `Task.async`, `Enum.reduce` — Known Issue #168) conservatively instead of aborting every Phoenix/OTP file with `exit=2` (`status: partial`).
+   - **1B (`mj1j.8.1` under `mj1j.7/.8`):** Teach `taint_swift_traversal.py` / `taint_swift_redirect.py` to analyze route-handler trailing closures (e.g., Vapor `app.get(...) { req in ... }`) as request-entry scopes rather than raising `ValueError` (`exit=2`), and map `swift.guards.*` in `swift_scan.py:_analyzer_category` so `guards_swift` findings are not silently discarded.
+   - **1C (`mj1j.6.4` under `mj1j.5/.6`):** Migrate `ruby_detectors/open_redirect.py` (`ruby.redirect.open`) and `ruby_detectors/response_header_injection.py` onto the scoped Ruby taint engine in `taint_ruby_traversal.py` so literal overwrites (`url = "/dashboard"`) and fake `safe_redirect` helpers obey real bindings rather than `SAFE_EXPR_RE` name trust.
+   - **1D (`mj1j.4.3` under `mj1j.3/.4`):** In `taint_java_traversal.py`, discharge `path-construction` effects recorded at `base.resolve(rel)` when every downstream sink use within the same `void` function is dominated by a `target.startsWith(base)` containment guard (matching the existing `summary_effect` behavior for helper functions).
+2. **Workstream 2 (P1 — Analyzer Activation, Parity & Performance):**
+   - **2A (`mj1j.14.1` under `mj1j.13/.14` & `mj1j.21-.24`):** Wire `taint_java_sql`, `jwt_verification`, `tls_verification`, and `trust_manager` into `kotlin_scan.py` (with `.kt` support), and enable `coroutines_kotlin` + `lifecycle_kotlin` when `.kt` files are scanned via `java_scan.py`.
+   - **2B (`mj1j.15/.16`):** Qualify or explicitly disposition the 11 `--enable-new-analyzers` default-off analyzers and reconcile `rust_scan.py` vs registered `guards_rust`/`taint_rust`.
+   - **2C (`q150.8` under `q150`):** Profile and bound `taint_py` interprocedural/module-summary fixed-point iteration on multi-hundred-file Python trees so `./ubs .` self-scan drops from **260s** back under **30s** without losing recall on the Python taint test suites.
+3. **Workstream 3 (P1/P2 — Documentation Truth, Release Coherence & Remaining Ecosystem Expansion):**
+   - **3A (`jtst.1` / `mj1j.42`):** Update `detectors.yml` from 10 languages to all **13 languages** (adding `kotlin`, `bash`, `php`), update all newly implemented cells (`sql_injection` for Go, Java, Ruby, C#, Elixir, PHP; `path_traversal` for Rust; `resource_lifecycle` for Swift, Elixir, Kotlin), regenerate `docs/coverage-matrix.md` and `README.md`, and make `scripts/check_docs_claims.py` assert that `len(detectors.yml["languages"]) == 13`.
+   - **3B (`mj1j.21-.36`):** Complete the remaining SQL provenance slices (Spring `JdbcTemplate`/JPA, Kotlin SQL), explicit framework security checks (`mj1j.23/.24`), deadlines/cancellation (`mj1j.25/.26`), crypto/constant-time context (`mj1j.27/.28`), result observation (`mj1j.29/.30`), and the PostgreSQL SQL (`mj1j.33/.34`) and Terraform/HCL (`mj1j.35/.36`) modules.
+   - **3C (`7vb8.5`, `s2k5.7`):** Tag and cut a verified release (`v5.4.41`+) to close the 22-version tag gap (`v5.4.19` → `v5.4.41`) so `scripts/check-version-tag-drift.sh` runs for real instead of skipping.
+
+### Phase 4: Three Internal Ambition Rounds (Applied In-Place)
+
+- **Ambition Round 1 (Eliminate Silent Work Waste & Split-Brain Detectors):**
+  - *Critique:* We discovered that `swift_scan.py` runs `guards_swift` on every file and drops 100% of its findings because `_analyzer_category` returns `None`, and that `ruby_detectors/open_redirect.py` + 10 other `*_detectors/{outbound_url,header_injection}.py` files still run legacy file-global regex taint right next to the new scoped taint engines.
+  - *Upgrade:* Add an automated invariant test in `test_ubs_core.py` that verifies every analyzer executed by `<lang>_scan.py` maps its emitted `rule` prefix to a valid non-`None` category, and require migrating `open_redirect`, `outbound_url`, and `header_injection` onto each language's scoped taint frontend before closing `mj1j.4/.6/.8/.10/.12`.
+- **Ambition Round 2 (Real-World Framework Idiom Survival Gate):**
+  - *Critique:* Synthetic unit tests passed while real Phoenix (`use MyAppWeb, :controller`) and Vapor (`app.get("go") { req in ... }`) files failed with `exit=2` (`status: partial`). Fail-closed on genuinely unanalyzable code is only a virtue if idiomatic framework entrypoints are modeled!
+  - *Upgrade:* Require every language's taint probe (`mj1j.3/.5/.7/.9/.11/.31`) to include idiomatic framework boilerplate (Servlet/Spring controller, Rails `ApplicationController` with `redirect_to`, Vapor `app.get` trailing closure, Phoenix `use MyAppWeb, :controller` + `Ecto.Schema`, ASP.NET minimal API/controller, Laravel/Symfony controller) and assert `exit=0` (`status: ok`) on clean guarded handlers.
+- **Ambition Round 3 (Self-Scan Latency Budget & 13-Language Matrix Truth Gate):**
+  - *Critique:* `check_docs_claims.py` verified `docs/coverage-matrix.md` was in sync with `detectors.yml`, completely missing that `detectors.yml` itself still only listed 10 languages! Meanwhile, `taint_py` expanded its interprocedural analysis until `./ubs .` took 260s on Python.
+  - *Upgrade:* Teach `scripts/check_docs_claims.py` to enforce `set(detectors_languages) == set(ALL_LANGS)` (accounting for Java/Kotlin if intentionally separated or 13 columns) and track per-module self-scan wall-clock duration in `q150.8` with a hard regression ceiling.
+
+---
+
+# Historical Reality Check — updated 2026-10-06 (v5.4.23)
 
 This update supersedes the September conclusions below. The historical report is retained intact for comparison. Scanner code was inspected at `40cc563`; another agent's fixture/evidence commits advanced the checkout to `b9de7ef`, followed by audit and work-graph snapshots. The findings below describe that inspected scanner code. No scanner implementation was changed by this audit.
 

@@ -121,6 +121,9 @@ class SwiftScopedFlowTests(unittest.TestCase):
             'func f() { provider { VNCoreMLRequest in let request = VNCoreMLRequest(); consume(request) } }',
             'func f() { provider { Vision in let request = Vision.VNCoreMLRequest(); consume(request) } }',
             'func f<VNCoreMLRequest>() { let request = VNCoreMLRequest(); consume(request) }',
+            'func f() { if let request = VNCoreMLRequest() { consume(request) }; consume(request) }',
+            'func f() { let other = 1, request = unknown(); consume(request) }',
+            'class C { let other: Int, request: OtherType; func f() { consume(request) } }',
         )
         for tail in tails:
             with self.subTest(tail=tail):

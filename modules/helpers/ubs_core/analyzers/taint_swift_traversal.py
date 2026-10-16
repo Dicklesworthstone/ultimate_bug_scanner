@@ -606,6 +606,13 @@ def swift_request_source_tokens(tokens):
     if any(swift_source_tokens(part) for t in tokens for part in t.parts):
         return True
     ranges, type_ranges, bindings, declarations = [], [], [], set()
+    parents, stack = {}, []
+    for index, token in enumerate(significant):
+        parents[index] = stack[-1] if stack else ''
+        if token.kind == 'code' and token.value in {'(', '[', '{'}:
+            stack.append(token.value)
+        elif token.kind == 'code' and token.value in {')', ']', '}'}:
+            stack.pop()
     for index, token in enumerate(significant):
         if token.kind == 'code' and token.value == '{':
             ranges.append((index, swift_close(significant, index)))
@@ -660,6 +667,13 @@ def swift_request_source_tokens(tokens):
         if not following or following[0].value in {'{', ',', 'else'}:
             # Optional-binding shorthand resolves the existing binding below.
             continue
+        header = index - 1
+        while header >= 0 and significant[header].value not in {';', '{', '}'}:
+            if significant[header].value in {'if', 'while', 'guard', 'for'}:
+                # Conditional bindings have narrower visibility than the
+                # enclosing brace. Do not grant a function-wide native proof.
+                return True
+            header -= 1
         position = index + 3
         if following[0].value == ':':
             ending = position
@@ -689,6 +703,8 @@ def swift_request_source_tokens(tokens):
             continue
         previous = significant[index - 1].value if index else ''
         following = significant[index + 1].value if index + 1 < len(significant) else ''
+        if previous == ',' and following in {'=', ':'} and parents[index] != '(':
+            return True  # later binding in a declaration/capture list
         # A closure/iteration binding or an arbitrary object's property is not
         # the outer local/field with the same spelling.
         if following == 'in' or previous == 'for' or (previous == '.' and (
@@ -703,7 +719,7 @@ def swift_request_source_tokens(tokens):
                     if any(t.value == 'in' for t in after[:next((i for i, t in enumerate(after)
                             if t.value in {';', '{', '}'}), len(after))]):
                         return True
-        if following == ':' and previous in {'(', ','}:
+        if following == ':' and previous in {'(', ','} and parents[index] == '(':
             continue  # actual argument label, not a value
         if not any(name == token.value and start <= index < end and (previous != '.' or field)
                    for name, start, end, field in bindings):

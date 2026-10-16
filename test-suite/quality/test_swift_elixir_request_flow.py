@@ -515,6 +515,38 @@ for _case in CASES:
 @unittest.skipUnless(os.environ.get('UBS_SCOPED_REQUEST_E2E') == '1',
                      'set UBS_SCOPED_REQUEST_E2E=1 for actual CLI scans')
 class ScopedRequestPublicTests(LoggedCase):
+    def test_native_request_and_exit_recovery_through_json_and_sarif(self):
+        cases = (
+            Case('swift', 'path', 'vision_native_request', '''
+                #if canImport(Vision)
+                import Vision
+                func extract() {
+                    let request = VNGenerateImageFeaturePrintRequest()
+                    let work = { consume(request) }
+                    _ = Data(contentsOf: bundledURL)
+                }
+                #endif
+            ''', ()),
+            Case('swift', 'redirect', 'vision_real_web_request', '''
+                import Vision
+                func handle(req: Request) {
+                    _ = req.redirect(to: req.query["next"])
+                }
+            ''', (3,)),
+            Case('swift', 'redirect', 'process_exit_guard', f'''
+                func handle(req: Request) {{
+                    let target = req.query["next"]
+                    guard {SWIFT_LOCAL} else {{ exit(1) }}
+                    _ = req.redirect(to: target)
+                }}
+            ''', ()),
+        )
+        for case in cases:
+            for fmt in ('json', 'sarif'):
+                with self.subTest(case=case.name, format=fmt):
+                    result, payload, target = self.scan(case, fmt, ('--no-cache',))
+                    self.assert_result(case, fmt, result, payload, target)
+
     def scan(self, case, fmt, extra=(), attempt='scan'):
         directory, target = self.source_file(case)
         evidence = directory / (fmt + '-' + attempt)

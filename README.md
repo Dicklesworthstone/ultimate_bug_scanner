@@ -377,10 +377,10 @@ docker run --rm -v /:/host ghcr.io/dicklesworthstone/ubs-tools bash -c "cd /host
 ⚠️ Use the host-mount pattern only when you understand the write-access implications.
 
 > [!NOTE]
-> The current image ships `bash`, `curl`, `jq`, and `ripgrep` only. It has no
-> `python3`, `unzip`, or ast-grep, so inside the container the AST helpers and
-> JavaScript/TypeScript scans are unavailable (regex-only languages still scan).
-> Bead `ultimate_bug_scanner-s2k5.1` adds those runtime dependencies to the image.
+> The repository `Dockerfile` (`debian:trixie-slim`) installs `bash`, `curl`, `git`, `jq`,
+> `ripgrep`, `rsync`, `python3`, and `unzip`, and pre-provisions the digest-verified `ast-grep`
+> binary and language modules at build time for offline container scans. Verify any published
+> registry tag against the release digest before assuming parity with the checkout `Dockerfile`.
 
 ### Deployment & Security
 
@@ -2550,30 +2550,32 @@ coverage/
 ## 🧭 **Language Coverage Comparison**
 
 <!-- coverage:matrix -->
-| Detector Family | JS / TS | Python | Go | Rust | Java | C / C++ | Ruby | Swift | C# | Elixir |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Archive Extraction (Zip Slip) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Async & Concurrency Hazards | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ○ |
-| Command Injection | ○ | ✓ | ○ | ✓ | ✓ | ○ | ○ | ✓ | ○ | ○ |
-| Constant-Time Secret Comparison | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ |
-| Credentialed Wildcard CORS | ✓ | ✓ | ✓ | ✓ | ○ | — | ○ | ○ | ○ | ○ |
-| Deep Guard Correlation | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ |
-| Disabled TLS Verification | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ |
-| HTTP Response Header Injection | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Hardcoded Secrets & Default Fallbacks | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ✓ |
-| Insecure Cookie Flags | ✓ | ✓ | ✓ | ○ | ○ | — | ○ | ○ | ○ | ○ |
-| Insecure Security Randomness | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| JWT Verification Bypass | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ |
-| Open Redirect | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Path Traversal | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Resource Lifecycle & Cleanup | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ○ |
-| SQL Injection | ✓ | ✓ | ○ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ |
-| Server-Side Request Forgery (SSRF) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Taint & Dataflow Engine | ✓ | ✓ | ✓ | ○ | ○ | ○ | ✓ | ○ | ○ | ○ |
-| Type Narrowing & Safe Casting | ✓ | ○ | ○ | ✓ | ✓ | ○ | ○ | ✓ | ✓ | ○ |
-| Unsafe Deserialization | ○ | ✓ | ○ | ○ | ○ | ○ | ✓ | ○ | ○ | ○ |
+
+| Detector Family | JS / TS | Python | Go | Rust | Java | Kotlin | C / C++ | Ruby | Swift | C# | Elixir | Bash | PHP |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Archive Extraction (Zip Slip) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ○ |
+| Async & Concurrency Hazards | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ○ | ✓ | ○ | ○ | ○ |
+| Command Injection | ○ | ✓ | ○ | ✓ | ✓ | ✓ | ○ | ○ | ✓ | ○ | ✓ | ✓ | ✓ |
+| Constant-Time Secret Comparison | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ |
+| Credentialed Wildcard CORS | ✓ | ✓ | ✓ | ✓ | ○ | ○ | — | ○ | ○ | ○ | ○ | — | ○ |
+| Deep Guard Correlation | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | — | ○ |
+| Disabled TLS Verification | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ |
+| HTTP Response Header Injection | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | ○ |
+| Hardcoded Secrets & Default Fallbacks | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ✓ | ○ | ○ |
+| Insecure Cookie Flags | ✓ | ✓ | ✓ | ○ | ○ | ○ | — | ○ | ○ | ○ | ○ | — | ○ |
+| Insecure Security Randomness | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ○ |
+| JWT Verification Bypass | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | — | ○ |
+| Open Redirect | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | ○ |
+| Path Traversal | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ |
+| Resource Lifecycle & Cleanup | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ○ | ✓ | ○ | ○ | ○ |
+| SQL Injection | ✓ | ✓ | ○ | ✓ | ○ | ○ | ○ | ○ | ○ | ✓ | ✓ | — | ✓ |
+| Server-Side Request Forgery (SSRF) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ○ |
+| Taint & Dataflow Engine | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ |
+| Type Narrowing & Safe Casting | ✓ | ○ | ○ | ✓ | ✓ | ✓ | ○ | ○ | ✓ | ✓ | ○ | — | ○ |
+| Unsafe Deserialization | ○ | ✓ | ○ | ○ | ○ | ○ | ○ | ✓ | ○ | ○ | ○ | — | ✓ |
 
 *(Legend: **✓** Implemented with dual-sided regression test pairs; **○** Planned; **—** N/A. Full details in [`docs/coverage-matrix.md`](docs/coverage-matrix.md).)*
+
 <!-- /coverage:matrix -->
 
 ---

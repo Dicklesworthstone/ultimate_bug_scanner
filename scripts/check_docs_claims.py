@@ -404,11 +404,23 @@ def check_module_contract() -> None:
 
 
 def check_coverage_matrix() -> None:
-    """detectors.yml agrees with docs/coverage-matrix.md and README.md."""
+    """detectors.yml agrees with ALL_LANGS, docs/coverage-matrix.md, and README.md."""
     import subprocess
     gen = ROOT / "scripts" / "generate_coverage_matrix.py"
     proc = subprocess.run([sys.executable, str(gen), "--check"], capture_output=True, text=True)  # ubs:ignore
-    report("coverage-matrix", proc.returncode == 0, (proc.stderr or proc.stdout).strip() if proc.returncode != 0 else "detectors.yml, docs/coverage-matrix.md, and README in sync")
+    problems: list[str] = []
+    if proc.returncode != 0:
+        problems.append((proc.stderr or proc.stdout).strip())
+    ubs_text = (ROOT / "ubs").read_text(encoding="utf-8")
+    match = re.search(r"^ALL_LANGS=\(([^)]*)\)", ubs_text, re.M)
+    all_langs = set(match.group(1).split()) if match else set()
+    reg = json.loads((ROOT / "detectors.yml").read_text(encoding="utf-8"))
+    reg_langs = {entry["id"] for entry in reg.get("languages", [])}
+    if reg_langs != all_langs:
+        missing = sorted(all_langs - reg_langs)
+        extra = sorted(reg_langs - all_langs)
+        problems.append(f"detectors.yml languages mismatch ALL_LANGS (missing={missing}, extra={extra})")
+    report("coverage-matrix", not problems, "; ".join(problems) if problems else f"detectors.yml ({len(reg_langs)} languages), docs/coverage-matrix.md, and README in sync")
 
 
 def main() -> int:

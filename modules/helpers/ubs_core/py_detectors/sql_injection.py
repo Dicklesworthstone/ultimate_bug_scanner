@@ -504,6 +504,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         self.weak_sql_vars = set()
         self._sink_risks = {}
         self.remaining_steps = max_steps
+        self._pending_raise = None
 
     @property
     def issues(self):
@@ -549,9 +550,17 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 break
             self.step()
             self.restore_sql_state(state)
-            result = self.visit(node)
+            enclosing_raise = self._pending_raise
+            self._pending_raise = None
+            try:
+                result = self.visit(node)
+                implicit_raise = self._pending_raise
+            finally:
+                self._pending_raise = enclosing_raise
             if result is None:
                 result = {'normal': self.sql_state()}
+            if implicit_raise is not None:
+                result = self.merge_flows(result, {'raise': implicit_raise})
             flow = self.merge_flows(flow, result)
         return flow
 
@@ -580,6 +589,33 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
 
     visit_AsyncFunctionDef = visit_FunctionDef
 
+    def visit_Lambda(self, node):
+        # Defaults execute now; the deferred body has its own bindings and
+        # must not mutate the defining scope or raise into its try block.
+        self.visit(node.args)
+        outer, enclosing_raise = self.sql_state(), self._pending_raise
+        self.store_sql_risk(_all_parameters(node), None)
+        self._pending_raise = None
+        try:
+            self.visit(node.body)
+        finally:
+            self.restore_sql_state(outer)
+            self._pending_raise = enclosing_raise
+
+    def visit_ClassDef(self, node):
+        for expression in [*node.decorator_list, *node.bases]:
+            self.visit(expression)
+        for keyword in node.keywords:
+            self.visit(keyword.value)
+        outer = self.sql_state()
+        body = self.statements(node.body, outer)
+        self.restore_sql_state(outer)
+        # Class-local assignments do not rebind names in the defining scope.
+        # Class creation itself can fail through metaclass/decorator code.
+        if node.bases or node.keywords or node.decorator_list:
+            self.note_possible_raise()
+        return {kind: outer for kind in body}
+
     def sql_state(self):
         """Snapshot SQL-value facts without sharing mutable branch stores."""
         return self.unsafe_sql_vars.copy(), self.weak_sql_vars.copy()
@@ -591,6 +627,8 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         self.visit(node.test)
         incoming = self.sql_state()
         truth = self.literal_truth(node.test)
+        if truth is None:
+            self.note_possible_raise()
         flow = self.merge_flows(
             self.statements(node.body, incoming) if truth is not False else {},
             self.statements(node.orelse, incoming) if truth is not True else {},
@@ -605,6 +643,13 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         return bool(node.value) if isinstance(node, ast.Constant) else None
 
     def visit_For(self, node):
+        if isinstance(node, ast.For) and isinstance(node.iter, (ast.List, ast.Tuple)):
+            if not any(isinstance(value, ast.Starred) for value in node.iter.elts):
+                risks = []
+                for value in node.iter.elts:
+                    self.visit(value)
+                    risks.append(self.sql_risk(value))
+                return self.finite_loop(node, risks)
         self.visit(node.iter)
         return self.loop(node, self.sql_risk(node.iter))
 
@@ -612,6 +657,32 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
 
     def visit_While(self, node):
         return self.loop(node)
+
+    def finite_loop(self, node, risks):
+        """A literal list/tuple has exactly this many iteration values.
+
+        Evaluate every element before entering the loop. Do not invent a
+        second iteration for a singleton or execute an empty literal body.
+        Dynamic iterables continue to use the conservative fixed point.
+        """
+        incoming = current = self.sql_state()
+        escaped, breaks = {}, None
+        for risk in risks:
+            if current is None:
+                break
+            self.step()
+            self.restore_sql_state(current)
+            self.store_sql_risk(binding_target_names(node.target), risk)
+            body = self.statements(node.body, self.sql_state())
+            breaks = self.join_sql_states(breaks, body.get('break'))
+            escaped = self.merge_flows(escaped, {
+                kind: state for kind, state in body.items() if kind in {'return', 'raise'}
+            })
+            current = self.join_sql_states(body.get('normal'), body.get('continue'))
+        normal = {'normal': breaks} if breaks is not None else {}
+        flow = self.merge_flows(escaped, self.statements(node.orelse, current), normal)
+        self.restore_sql_state(flow.get('normal', incoming))
+        return flow
 
     def loop(self, node, iterable_risk=None):
         """Finite may-flow fixed point, including zero and later iterations.
@@ -632,6 +703,11 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             if while_loop:
                 self.visit(node.test)
                 truth = self.literal_truth(node.test)
+                if truth is None:
+                    self.note_possible_raise()
+            else:
+                # Iterator advancement can fail before the target is bound.
+                self.note_possible_raise()
             tested = self.sql_state()
             exhausted = tested if truth is not True else None
             if not while_loop:
@@ -667,6 +743,157 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         if node.cause is not None:
             self.visit(node.cause)
         return {'raise': self.sql_state()}
+
+    def note_possible_raise(self):
+        self._pending_raise = self.join_sql_states(self._pending_raise, self.sql_state())
+
+    def visit_Attribute(self, node):
+        self.generic_visit(node)
+        self.note_possible_raise()
+
+    visit_Subscript = visit_Attribute
+    visit_BinOp = visit_Attribute
+    visit_UnaryOp = visit_Attribute
+    visit_Compare = visit_Attribute
+    visit_Await = visit_Attribute
+
+    def visit_FormattedValue(self, node):
+        self.generic_visit(node)
+        # Formatting a literal without a format specification cannot invoke
+        # user code. Do not fabricate an exception path for f"{7}"; a dynamic
+        # value or format specification can fail before an assignment stores.
+        if not isinstance(node.value, ast.Constant) or node.format_spec is not None:
+            self.note_possible_raise()
+
+    def visit_BoolOp(self, node):
+        # Short-circuited operands cannot overwrite the bypass store.
+        bypass = None
+        for index, value in enumerate(node.values):
+            self.visit(value)
+            if index == len(node.values) - 1:
+                break
+            truth = self.literal_truth(value)
+            if truth is None:
+                self.note_possible_raise()
+            continuing = True if isinstance(node.op, ast.And) else False
+            if truth is not continuing:
+                bypass = self.join_sql_states(bypass, self.sql_state())
+            if truth is not None and truth is not continuing:
+                break
+        self.restore_sql_state(self.join_sql_states(bypass, self.sql_state()))
+
+    def visit_IfExp(self, node):
+        self.visit(node.test)
+        incoming, branches = self.sql_state(), []
+        truth = self.literal_truth(node.test)
+        if truth is None:
+            self.note_possible_raise()
+        for expression, selected in ((node.body, True), (node.orelse, False)):
+            if truth is not None and truth is not selected:
+                continue
+            self.restore_sql_state(incoming)
+            self.visit(expression)
+            branches.append(self.sql_state())
+        self.restore_sql_state(self.join_sql_states(*branches))
+
+    def visit_Assert(self, node):
+        optimized = self.sql_state()
+        self.visit(node.test)
+        incoming = self.sql_state()
+        truth = self.literal_truth(node.test)
+        if truth is not True:
+            if node.msg is not None:
+                self.visit(node.msg)
+            failed = {'raise': self.sql_state()}
+        else:
+            failed = {}
+        # -O removes the entire assert, including side effects in its test.
+        # Assertions therefore cannot establish an unconditional clean store
+        # or make a later security sink unconditionally unreachable.
+        normal = {'normal': self.join_sql_states(optimized, incoming if truth is not False else None)}
+        self.restore_sql_state(normal['normal'])
+        return self.merge_flows(normal, failed)
+
+    def visit_Try(self, node):
+        """Route failures to handlers; resume each pending exit after finally.
+
+        Exception types are not resolved: typed handlers may match, and an
+        uncaught path remains possible. A bare handler catches all failures.
+        Importantly, else receives only successful body exits, and handler
+        failures are not offered to sibling handlers of the same try.
+        """
+        incoming = self.sql_state()
+        body = self.statements(node.body, incoming)
+        normal = body.pop('normal', None)
+        raised = body.pop('raise', None)
+        flow = self.merge_flows(body, self.statements(node.orelse, normal))
+        catches_all = False
+        if raised is not None:
+            for handler in node.handlers:
+                self.restore_sql_state(raised)
+                if handler.type is not None:
+                    self.visit(handler.type)
+                if handler.name:
+                    self.store_sql_risk([handler.name], None)
+                handled = self.statements(handler.body, self.sql_state())
+                if handler.name:
+                    # Python clears the exception target on every exit.
+                    handled = {kind: (state[0] - {handler.name}, state[1] - {handler.name})
+                               for kind, state in handled.items()}
+                flow = self.merge_flows(flow, handled)
+                if handler.type is None:
+                    catches_all = True
+                    break
+            if not catches_all:
+                flow = self.merge_flows(flow, {'raise': raised})
+        # Failure while evaluating an except type must also run finally.
+        # Statement bodies have already returned their own exception stores.
+        if self._pending_raise is not None:
+            flow = self.merge_flows(flow, {'raise': self._pending_raise})
+            self._pending_raise = None
+        if node.finalbody:
+            finalized = {}
+            for exit_kind, state in flow.items():
+                final = self.statements(node.finalbody, state)
+                resumed = final.pop('normal', None)
+                if resumed is not None:
+                    finalized = self.merge_flows(finalized, {exit_kind: resumed})
+                # A finally return/raise/break/continue replaces that exit.
+                finalized = self.merge_flows(finalized, final)
+            flow = finalized
+        self.restore_sql_state(flow.get('normal', incoming))
+        return flow
+
+    def visit_TryStar(self, node):
+        # Several except* handlers can execute for one ExceptionGroup;
+        # treating them as alternatives would silently discard write effects.
+        raise RuntimeError('SQL except* flow is unsupported; analysis is incomplete')
+
+    def visit_With(self, node):
+        incoming = self.sql_state()
+        suppressed_setup = None
+        for index, item in enumerate(node.items):
+            before = self.sql_state()
+            self.visit(item.context_expr)
+            self.note_possible_raise()
+            if index:
+                # An already-entered outer manager can suppress failure
+                # while evaluating/entering a later manager.
+                suppressed_setup = self.join_sql_states(suppressed_setup, before, self.sql_state())
+            if item.optional_vars is not None:
+                self.store_sql_risk(binding_target_names(item.optional_vars), None)
+        flow = self.statements(node.body, self.sql_state())
+        normal = self.join_sql_states(flow.get('normal'), flow.get('raise'), suppressed_setup)
+        if normal is not None:
+            flow['normal'] = normal
+        # Unknown __exit__/__aexit__ can suppress exceptions, never returns,
+        # breaks or continues. It can also raise from any exiting path.
+        for state in flow.values():
+            self._pending_raise = self.join_sql_states(self._pending_raise, state)
+        self.restore_sql_state(flow.get('normal', incoming))
+        return flow
+
+    visit_AsyncWith = visit_With
 
     def is_guarded(self, node):
         """Whether a sanitizer validated this exact expression before the sink.
@@ -885,8 +1112,10 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 yield argument, False
 
     def visit_Call(self, node):
+        self.note_possible_raise()
         if has_ignore(self.lines, node.lineno):
             self.generic_visit(node)
+            self.note_possible_raise()
             return
         # The sink's own first line is what a guard has to precede (GH #133).
         # Using the sink line rather than the interpolated value's line keeps
@@ -898,6 +1127,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         finally:
             self.sink_lineno = previous_sink
         self.generic_visit(node)
+        self.note_possible_raise()
 
     def classify_sink(self, node):
         worst = None

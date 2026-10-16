@@ -41,7 +41,21 @@ RULES = (
 RULE_CRITICAL, RULE_WARNING = RULES[0][0], RULES[1][0]
 
 SQL_RE = re.compile(r'\b(?:select|insert|update|delete|with|merge|call|exec|create|drop|alter|truncate)\b', re.IGNORECASE)
-EXECUTE_METHODS = {'execute', 'executemany', 'executescript', 'raw', 'read_sql', 'read_sql_query', 'scalar', 'scalars'}
+EXECUTE_METHODS = {'execute', 'executemany', 'executescript', 'exec_driver_sql', 'raw', 'read_sql', 'read_sql_query', 'scalar', 'scalars'}
+# Bind the SQL slot, never params/parameters: bound values may themselves
+# contain SQL-looking text without becoming executable SQL. These are the
+# public Psycopg, SQLAlchemy, pandas and Django argument names. SQLite's
+# executescript SQL argument is positional-only.
+SQL_ARGUMENT_KEYWORDS = {
+    'execute': frozenset({'query', 'statement'}),
+    'executemany': frozenset({'query'}),
+    'exec_driver_sql': frozenset({'statement'}),
+    'raw': frozenset({'raw_query'}),
+    'read_sql': frozenset({'sql'}),
+    'read_sql_query': frozenset({'sql'}),
+    'scalar': frozenset({'statement'}),
+    'scalars': frozenset({'statement'}),
+}
 
 # GH #133: functions a project declares as SQL-identifier sanitizers.
 #
@@ -662,12 +676,45 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         name = call_name(node.func)
         short = name.rsplit('.', 1)[-1]
         if short in EXECUTE_METHODS:
-            return node.args[0] if node.args else None
+            if node.args:
+                return node.args[0]
+            keywords = SQL_ARGUMENT_KEYWORDS.get(short, frozenset())
+            for keyword in node.keywords:
+                if keyword.arg in keywords:
+                    return keyword.value
         if short == 'extra':
             for keyword in node.keywords:
                 if keyword.arg == 'where':
                     return keyword.value
         return None
+
+    def sql_arguments(self, node):
+        """Yield SQL expressions and whether they need a statement keyword.
+
+        Django extra(select, where, params, ...) accepts SQL fragments, not
+        complete statements. Its select dictionary keys are result aliases;
+        only the values are raw SQL. Do not inspect params/select_params.
+        """
+        if call_name(node.func).rsplit('.', 1)[-1] != 'extra':
+            argument = self.sql_argument(node)
+            if argument is not None:
+                yield argument, True
+            return
+        for index, name in enumerate(('select', 'where')):
+            argument = next((keyword.value for keyword in node.keywords
+                             if keyword.arg == name), None)
+            if argument is None and len(node.args) > index:
+                # An unknown *args expansion makes subsequent positions
+                # ambiguous. Explicit keywords above remain identifiable.
+                if not any(isinstance(arg, ast.Starred) for arg in node.args[:index + 1]):
+                    argument = node.args[index]
+            if argument is None:
+                continue
+            if name == 'select' and isinstance(argument, ast.Dict):
+                for value in argument.values:
+                    yield value, False
+            else:
+                yield argument, False
 
     def visit_Call(self, node):
         if has_ignore(self.lines, node.lineno):
@@ -685,22 +732,19 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         self.generic_visit(node)
 
     def classify_sink(self, node):
-        arg = self.sql_argument(node)
-        if arg is not None:
-            risk = self.sql_risk(arg)
+        worst = None
+        for argument, require_sql in self.sql_arguments(node):
+            risk = self.sql_risk(argument, require_sql=require_sql)
             if risk == 'critical':
-                self.issues.append((node.lineno, source_line(self.lines, node.lineno)))
-            elif risk == 'warning':
-                self.warn_issues.append((node.lineno, source_line(self.lines, node.lineno)))
-        elif call_name(node.func).rsplit('.', 1)[-1] == 'extra':
-            for keyword in node.keywords:
-                if keyword.arg == 'where' and self.contains_interpolation(keyword.value):
-                    risk = self.sql_risk(keyword.value, require_sql=False)
-                    if risk == 'critical':
-                        self.issues.append((node.lineno, source_line(self.lines, node.lineno)))
-                    elif risk == 'warning':
-                        self.warn_issues.append((node.lineno, source_line(self.lines, node.lineno)))
-                    break
+                worst = risk
+                break
+            if risk == 'warning':
+                worst = risk
+        # One diagnostic at the sink, even when several fragments are unsafe.
+        if worst == 'critical':
+            self.issues.append((node.lineno, source_line(self.lines, node.lineno)))
+        elif worst == 'warning':
+            self.warn_issues.append((node.lineno, source_line(self.lines, node.lineno)))
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple[str, Path, int, int, str]]:

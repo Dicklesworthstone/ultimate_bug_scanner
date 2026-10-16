@@ -490,7 +490,8 @@ def build_provenance(tree):
 
 
 class SQLInjectionAnalyzer(ast.NodeVisitor):
-    def __init__(self, text, lines, param_names, name_risk, sanitizers=frozenset(), guarded_tables=None):
+    def __init__(self, text, lines, param_names, name_risk, sanitizers=frozenset(), guarded_tables=None,
+                 *, max_steps=100_000):
         self.text = text
         self.lines = lines
         self.param_names = param_names
@@ -501,8 +502,61 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         self.sink_lineno = None
         self.unsafe_sql_vars = set()
         self.weak_sql_vars = set()
-        self.issues = []
-        self.warn_issues = []
+        self._sink_risks = {}
+        self.remaining_steps = max_steps
+
+    @property
+    def issues(self):
+        return [(line, code) for risk, line, code in self._sink_risks.values() if risk == 'critical']
+
+    @property
+    def warn_issues(self):
+        return [(line, code) for risk, line, code in self._sink_risks.values() if risk == 'warning']
+
+    def step(self):
+        self.remaining_steps -= 1
+        if self.remaining_steps < 0:
+            raise RuntimeError('SQL dataflow budget exceeded; analysis is incomplete')
+
+    @staticmethod
+    def join_sql_states(*states):
+        present = [state for state in states if state is not None]
+        if not present:
+            return None
+        unsafe = set().union(*(state[0] for state in present))
+        weak = set().union(*(state[1] for state in present)) - unsafe
+        return unsafe, weak
+
+    def merge_flows(self, *flows):
+        merged = {}
+        for flow in flows:
+            for exit_kind, state in flow.items():
+                merged[exit_kind] = self.join_sql_states(merged.get(exit_kind), state)
+        return merged
+
+    def statements(self, nodes, incoming):
+        """Propagate normal execution separately from abrupt control flow.
+
+        None is unreachable, not an empty clean store. Return/break/continue
+        cannot run the next statement or accidentally clear another path.
+        """
+        if incoming is None:
+            return {}
+        flow = {'normal': incoming}
+        for node in nodes:
+            state = flow.pop('normal', None)
+            if state is None:
+                break
+            self.step()
+            self.restore_sql_state(state)
+            result = self.visit(node)
+            if result is None:
+                result = {'normal': self.sql_state()}
+            flow = self.merge_flows(flow, result)
+        return flow
+
+    def visit_Module(self, node):
+        self.statements(node.body, self.sql_state())
 
     def visit_FunctionDef(self, node):
         # Defaults/decorators run in the defining scope; the body does not.
@@ -519,8 +573,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         self.weak_sql_vars.difference_update(parameters)
         self.func_stack.append(node)
         try:
-            for statement in node.body:
-                self.visit(statement)
+            self.statements(node.body, self.sql_state())
         finally:
             self.func_stack.pop()
             self.restore_sql_state(outer)
@@ -535,21 +588,85 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         self.unsafe_sql_vars, self.weak_sql_vars = (set(names) for names in state)
 
     def visit_If(self, node):
-        # A lexical visit of body followed by else is not execution order:
-        # neither arm may overwrite the other's incoming or outgoing facts.
-        # Join possible values, with critical dominating warning. This is a
-        # conservative join, not path-feasibility or exceptional-exit proof.
         self.visit(node.test)
         incoming = self.sql_state()
-        for statement in node.body:
-            self.visit(statement)
-        body = self.sql_state()
-        self.restore_sql_state(incoming)
-        for statement in node.orelse:
-            self.visit(statement)
-        self.unsafe_sql_vars.update(body[0])
-        self.weak_sql_vars.update(body[1])
-        self.weak_sql_vars.difference_update(self.unsafe_sql_vars)
+        truth = self.literal_truth(node.test)
+        flow = self.merge_flows(
+            self.statements(node.body, incoming) if truth is not False else {},
+            self.statements(node.orelse, incoming) if truth is not True else {},
+        )
+        self.restore_sql_state(flow.get('normal', incoming))
+        return flow
+
+    @staticmethod
+    def literal_truth(node):
+        # Never evaluate source code. Only actual constant AST values have
+        # known truth here; arbitrary conditions retain both possibilities.
+        return bool(node.value) if isinstance(node, ast.Constant) else None
+
+    def visit_For(self, node):
+        self.visit(node.iter)
+        return self.loop(node, self.sql_risk(node.iter))
+
+    visit_AsyncFor = visit_For
+
+    def visit_While(self, node):
+        return self.loop(node)
+
+    def loop(self, node, iterable_risk=None):
+        """Finite may-flow fixed point, including zero and later iterations.
+
+        The loop header grows monotonically in the existing SQL-value
+        lattice. Break exits bypass else; continue joins the back edge;
+        return and raise escape instead of executing following statements.
+        For iterables are evaluated once, before any target rebinding.
+        """
+        incoming = header = self.sql_state()
+        escaped = {}
+        breaks = None
+        while_loop = isinstance(node, ast.While)
+        while True:
+            self.step()
+            self.restore_sql_state(header)
+            truth = None
+            if while_loop:
+                self.visit(node.test)
+                truth = self.literal_truth(node.test)
+            tested = self.sql_state()
+            exhausted = tested if truth is not True else None
+            if not while_loop:
+                self.store_sql_risk(binding_target_names(node.target), iterable_risk)
+            body = self.statements(node.body, self.sql_state()) if truth is not False else {}
+            breaks = self.join_sql_states(breaks, body.get('break'))
+            escaped = self.merge_flows(escaped, {
+                kind: state for kind, state in body.items() if kind in {'return', 'raise'}
+            })
+            next_header = self.join_sql_states(incoming, body.get('normal'), body.get('continue'))
+            if next_header == header:
+                break
+            header = next_header
+        normal = {'normal': breaks} if breaks is not None else {}
+        flow = self.merge_flows(escaped, self.statements(node.orelse, exhausted), normal)
+        self.restore_sql_state(flow.get('normal', incoming))
+        return flow
+
+    def visit_Break(self, node):
+        return {'break': self.sql_state()}
+
+    def visit_Continue(self, node):
+        return {'continue': self.sql_state()}
+
+    def visit_Return(self, node):
+        if node.value is not None:
+            self.visit(node.value)
+        return {'return': self.sql_state()}
+
+    def visit_Raise(self, node):
+        if node.exc is not None:
+            self.visit(node.exc)
+        if node.cause is not None:
+            self.visit(node.cause)
+        return {'raise': self.sql_state()}
 
     def is_guarded(self, node):
         """Whether a sanitizer validated this exact expression before the sink.
@@ -677,7 +794,9 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         return names
 
     def mark_assignment(self, names, value):
-        risk = self.sql_risk(value)
+        self.store_sql_risk(names, self.sql_risk(value))
+
+    def store_sql_risk(self, names, risk):
         if risk == 'critical':
             for name in names:
                 self.unsafe_sql_vars.add(name)
@@ -692,15 +811,24 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 self.weak_sql_vars.discard(name)
 
     def visit_Assign(self, node):
+        self.visit(node.value)
         names = self.target_names(node.targets)
         if names:
             self.mark_assignment(names, node.value)
-        self.generic_visit(node)
+        for target in node.targets:
+            self.visit(target)
 
     def visit_AnnAssign(self, node):
+        if node.value is not None:
+            self.visit(node.value)
         if isinstance(node.target, ast.Name) and node.value is not None:
             self.mark_assignment([node.target.id], node.value)
-        self.generic_visit(node)
+        self.visit(node.target)
+        self.visit(node.annotation)
+
+    def visit_NamedExpr(self, node):
+        self.visit(node.value)
+        self.mark_assignment(binding_target_names(node.target), node.value)
 
     def visit_AugAssign(self, node):
         if isinstance(node.target, ast.Name):
@@ -780,11 +908,11 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 break
             if risk == 'warning':
                 worst = risk
-        # One diagnostic at the sink, even when several fragments are unsafe.
-        if worst == 'critical':
-            self.issues.append((node.lineno, source_line(self.lines, node.lineno)))
-        elif worst == 'warning':
-            self.warn_issues.append((node.lineno, source_line(self.lines, node.lineno)))
+        # Fixed-point visits must not multiply diagnostics. Retain the worst
+        # reachable severity for this exact AST call (not just its line).
+        previous = self._sink_risks.get(id(node))
+        if worst is not None and (previous is None or worst == 'critical'):
+            self._sink_risks[id(node)] = (worst, node.lineno, source_line(self.lines, node.lineno))
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple[str, Path, int, int, str]]:

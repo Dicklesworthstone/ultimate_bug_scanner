@@ -16,6 +16,7 @@ Artifacts are intentionally retained beneath test-suite/artifacts/.
 from __future__ import annotations
 
 import hashlib
+import ast
 import json
 import os
 from pathlib import Path
@@ -90,6 +91,32 @@ CASES = (
     ("closure-captures-query", 'def run(cursor, user):\n    query = f"SELECT {user}"\n    def nested():\n        cursor.execute(query)\n', ((CRITICAL, 4),)),
     ("async-scope-restores-outer-query", 'def run(cursor, user):\n    query = f"SELECT {user}"\n    async def unused():\n        query = "SELECT 1"\n    cursor.execute(query)\n', ((CRITICAL, 5),)),
     ("function-default-evaluated-in-outer-scope", 'def run(cursor, user):\n    query = f"SELECT {user}"\n    def nested(query=cursor.execute(query)):\n        return query\n', ((CRITICAL, 3),)),
+    ("for-zero-iterations", 'def run(cursor, user, rows):\n    query = f"SELECT {user}"\n    for row in rows:\n        query = "SELECT 1"\n    cursor.execute(query)\n', ((CRITICAL, 5),)),
+    ("while-zero-iterations", 'def run(cursor, user, flag):\n    query = f"SELECT {user}"\n    while flag:\n        query = "SELECT 1"\n    cursor.execute(query)\n', ((CRITICAL, 5),)),
+    ("loop-carried-query", 'def run(cursor, user, rows):\n    query = "SELECT 1"\n    for row in rows:\n        cursor.execute(query)\n        query = f"SELECT {user}"\n', ((CRITICAL, 4),)),
+    ("loop-carried-chain", 'def run(cursor, user, rows):\n    a = b = c = "SELECT 1"\n    for row in rows:\n        cursor.execute(a)\n        a = b\n        b = c\n        c = f"SELECT {user}"\n', ((CRITICAL, 4),)),
+    ("loop-clean-overwrite-before-sink", 'def run(cursor, user, rows):\n    query = f"SELECT {user}"\n    for row in rows:\n        query = "SELECT 1"\n        cursor.execute(query)\n', ()),
+    ("loop-break-bypasses-else", 'def run(cursor, user, rows):\n    query = f"SELECT {user}"\n    for row in rows:\n        break\n    else:\n        query = "SELECT 1"\n    cursor.execute(query)\n', ((CRITICAL, 7),)),
+    ("loop-else-cleans-normal-exit", 'def run(cursor, user, rows):\n    query = f"SELECT {user}"\n    for row in rows:\n        pass\n    else:\n        query = "SELECT 1"\n    cursor.execute(query)\n', ()),
+    ("continue-bypasses-cleanup", 'def run(cursor, user, rows):\n    query = "SELECT 1"\n    for row in rows:\n        query = f"SELECT {user}"\n        continue\n        query = "SELECT 1"\n    cursor.execute(query)\n', ((CRITICAL, 7),)),
+    ("break-makes-following-sink-unreachable", 'def run(cursor, user, rows):\n    for row in rows:\n        break\n        cursor.execute(f"SELECT {user}")\n', ()),
+    ("return-makes-following-sink-unreachable", 'def run(cursor, user):\n    return\n    cursor.execute(f"SELECT {user}")\n', ()),
+    ("branch-return-does-not-clean-survivor", 'def run(cursor, user, flag):\n    query = f"SELECT {user}"\n    if flag:\n        return\n        query = "SELECT 1"\n    cursor.execute(query)\n', ((CRITICAL, 6),)),
+    ("both-branches-return", 'def run(cursor, user, flag):\n    if flag:\n        return\n    else:\n        return\n    cursor.execute(f"SELECT {user}")\n', ()),
+    ("constant-false-while", 'def run(cursor, user):\n    while False:\n        cursor.execute(f"SELECT {user}")\n', ()),
+    ("constant-true-while-without-exit", 'def run(cursor, user):\n    while True:\n        pass\n    cursor.execute(f"SELECT {user}")\n', ()),
+    ("constant-true-loop-break", 'def run(cursor, user):\n    query = f"SELECT {user}"\n    while True:\n        break\n    cursor.execute(query)\n', ((CRITICAL, 5),)),
+    ("stable-loop-deduplicates-sink", 'def run(cursor, user, rows):\n    query = f"SELECT {user}"\n    for row in rows:\n        cursor.execute(query)\n', ((CRITICAL, 4),)),
+    ("loop-promotes-warning-once", 'def run(cursor, user, rows):\n    query = f"SELECT {UNKNOWN}"\n    for row in rows:\n        cursor.execute(query)\n        query = f"SELECT {user}"\n', ((CRITICAL, 4),)),
+    ("for-target-shadows-old-query", 'def run(cursor, user, rows):\n    query = f"SELECT {user}"\n    for query in ["SELECT 1"]:\n        cursor.execute(query)\n', ()),
+    ("for-iterable-captures-query-value", 'def run(cursor, user):\n    query = f"SELECT {user}"\n    for saved in [query]:\n        query = "SELECT 1"\n        cursor.execute(saved)\n', ((CRITICAL, 5),)),
+    ("nested-loop-break-does-not-break-outer", 'def run(cursor, user, rows):\n    query = "SELECT 1"\n    for row in rows:\n        while True:\n            break\n        query = f"SELECT {user}"\n    cursor.execute(query)\n', ((CRITICAL, 7),)),
+    ("async-for-carried-query", 'async def run(cursor, user, rows):\n    query = "SELECT 1"\n    async for row in rows:\n        cursor.execute(query)\n        query = f"SELECT {user}"\n', ((CRITICAL, 4),)),
+    ("assignment-rhs-observes-old-query", 'def run(cursor, user):\n    query = f"SELECT {user}"\n    query = cursor.execute(query)\n', ((CRITICAL, 3),)),
+    ("annotated-rhs-observes-old-query", 'def run(cursor, user):\n    query = f"SELECT {user}"\n    query: object = cursor.execute(query)\n', ((CRITICAL, 3),)),
+    ("named-expression-stores-query", 'def run(cursor, user):\n    if (query := f"SELECT {user}"):\n        cursor.execute(query)\n', ((CRITICAL, 3),)),
+    ("named-expression-kills-query", 'def run(cursor, user):\n    query = f"SELECT {user}"\n    if (query := "SELECT 1"):\n        cursor.execute(query)\n', ()),
+    ("loop-bound-values-stay-data", 'def run(cursor, user, rows):\n    query = "SELECT 1"\n    for row in rows:\n        cursor.execute("SELECT %s", (query,))\n        query = f"SELECT {user}"\n', ()),
 )
 
 
@@ -130,6 +157,14 @@ class SQLSinkArguments(unittest.TestCase):
                 for _, found_path, _, column, _ in findings:
                     self.assertEqual(found_path, path)
                     self.assertEqual(column, 1)
+
+    def test_fixed_point_budget_is_not_a_clean_result(self):
+        source = 'def run(cursor, user, rows):\n    for row in rows:\n        cursor.execute(f"SELECT {user}")\n'
+        tree = ast.parse(source)
+        params, risks = detector.build_provenance(tree)
+        analyzer = detector.SQLInjectionAnalyzer(source, source.splitlines(), params, risks, max_steps=1)
+        with self.assertRaisesRegex(RuntimeError, 'budget.*incomplete'):
+            analyzer.visit(tree)
 
 
 if __name__ == "__main__":

@@ -505,11 +505,51 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         self.warn_issues = []
 
     def visit_FunctionDef(self, node):
+        # Defaults/decorators run in the defining scope; the body does not.
+        # In particular, a default may execute the *outer* query even when
+        # the new function has a parameter with the same name.
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        self.visit(node.args)
+        if node.returns is not None:
+            self.visit(node.returns)
+        outer = self.sql_state()
+        parameters = _all_parameters(node)
+        self.unsafe_sql_vars.difference_update(parameters)
+        self.weak_sql_vars.difference_update(parameters)
         self.func_stack.append(node)
-        self.generic_visit(node)
-        self.func_stack.pop()
+        try:
+            for statement in node.body:
+                self.visit(statement)
+        finally:
+            self.func_stack.pop()
+            self.restore_sql_state(outer)
 
     visit_AsyncFunctionDef = visit_FunctionDef
+
+    def sql_state(self):
+        """Snapshot SQL-value facts without sharing mutable branch stores."""
+        return self.unsafe_sql_vars.copy(), self.weak_sql_vars.copy()
+
+    def restore_sql_state(self, state):
+        self.unsafe_sql_vars, self.weak_sql_vars = (set(names) for names in state)
+
+    def visit_If(self, node):
+        # A lexical visit of body followed by else is not execution order:
+        # neither arm may overwrite the other's incoming or outgoing facts.
+        # Join possible values, with critical dominating warning. This is a
+        # conservative join, not path-feasibility or exceptional-exit proof.
+        self.visit(node.test)
+        incoming = self.sql_state()
+        for statement in node.body:
+            self.visit(statement)
+        body = self.sql_state()
+        self.restore_sql_state(incoming)
+        for statement in node.orelse:
+            self.visit(statement)
+        self.unsafe_sql_vars.update(body[0])
+        self.weak_sql_vars.update(body[1])
+        self.weak_sql_vars.difference_update(self.unsafe_sql_vars)
 
     def is_guarded(self, node):
         """Whether a sanitizer validated this exact expression before the sink.

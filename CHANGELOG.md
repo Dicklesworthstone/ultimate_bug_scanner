@@ -14,6 +14,25 @@ _No changes yet._
 
 ---
 
+## [v5.5.7] - 2026-10-15 [Tag]
+
+Git-only source delivery; signed release assets and installed-tool upgrades are separate.
+
+### Fixed
+
+- JavaScript logical assignments (`||=`, `&&=`, `??=`) retain the path that
+  skips the right-hand side, so conditional cleanup cannot hide unsafe data.
+  Scalar and property assignments share that flow. Throwing right-hand sides
+  no longer erase the normal bypass; computed keys and receivers are evaluated
+  before the split, and returned object aliases remain intact. This bounded
+  analysis conservatively retains both paths rather than proving truthiness.
+- Paired direct-analysis and public JSON/SARIF controls cover conditional
+  cleanup, RHS sink effects, exception paths, receiver rebinding and aliases.
+  Other inherited expanded JavaScript heap failures remain tracked separately;
+  this repair is not a clean whole-suite qualification claim.
+
+---
+
 ## [v5.5.6] - 2026-10-15 [Tag]
 
 Git-only source delivery; signed release assets and installed-tool upgrades are separate.

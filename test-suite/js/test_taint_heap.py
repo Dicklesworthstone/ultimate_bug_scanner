@@ -314,6 +314,67 @@ class JavaScriptHeapTests(unittest.TestCase):
         self.check('let text = req.query.html; const o = {value: "hello"}; '
                    'o.value ||= (text = "clean"); res.send(text);', 'xss')
 
+    def test_logical_assignments_preserve_conditional_scalar_cleanup(self):
+        for operator in ('||=', '&&=', '??='):
+            for target in ('o.value', 'value'):
+                with self.subTest(operator=operator, target=target):
+                    self.check('let text = req.query.html; const o = {value: flag}; let value = flag; '
+                               f'{target} {operator} (text = "clean"); res.send(text);', 'xss')
+                    self.check('let text = "clean"; const o = {value: flag}; let value = flag; '
+                               f'{target} {operator} (text = req.query.html); res.send(text);', 'xss')
+                    self.check('let text = "clean"; const o = {value: flag}; let value = flag; '
+                               f'{target} {operator} (text = "also clean"); res.send(text);')
+
+    def test_logical_assignment_preserves_heap_cleanup_bypass(self):
+        for operator in ('||=', '&&=', '??='):
+            with self.subTest(operator=operator):
+                self.check('const payload = {html: req.query.html}; const o = {value: flag}; '
+                           f'o.value {operator} (payload.html = "clean"); res.send(payload.html);', 'xss')
+                self.check('const payload = {html: "clean"}; const o = {value: flag}; '
+                           f'o.value {operator} (payload.html = "also clean"); res.send(payload.html);')
+
+    def test_logical_assignment_throw_keeps_normal_bypass(self):
+        for operator in ('||=', '&&=', '??='):
+            with self.subTest(operator=operator):
+                self.check('function fail() { throw new Error(); } '
+                           'const o = {value: flag}; '
+                           f'o.value {operator} fail(); res.send(req.query.html);', 'xss')
+                self.check('function fail() { throw req.query.html; } '
+                           'const o = {value: flag}; '
+                           f'try {{ o.value {operator} fail(); }} catch (error) {{ res.send(error); }}', 'xss')
+
+    def test_logical_assignment_returns_original_object_identity(self):
+        for operator in ('||=', '&&=', '??='):
+            with self.subTest(operator=operator):
+                self.check('const original = {}; const o = {value: original}; '
+                           f'const selected = (o.value {operator} {{}}); '
+                           'selected.html = req.query.html; res.send(original.html);', 'xss')
+
+    def test_logical_assignment_evaluates_receiver_before_rhs(self):
+        for operator in ('||=', '&&=', '??='):
+            with self.subTest(operator=operator):
+                self.check('const before = {}; let receiver = before; '
+                           'function choose() { receiver = {}; return req.query.html; } '
+                           f'receiver.html {operator} choose(); res.send(before.html);', 'xss')
+
+    def test_logical_assignment_keeps_computed_key_effects_on_bypass(self):
+        for operator in ('||=', '&&=', '??='):
+            with self.subTest(operator=operator):
+                self.check('let text = "clean"; const o = {}; '
+                           f'o[(text = req.query.html)] {operator} "value"; res.send(text);', 'xss')
+                self.check('let text = req.query.html; const o = {}; '
+                           f'o[(text = "clean")] {operator} "value"; res.send(text);')
+
+    def test_logical_assignment_keeps_rhs_sink_effects(self):
+        for operator in ('||=', '&&=', '??='):
+            with self.subTest(operator=operator):
+                self.check('const o = {value: flag}; '
+                           f'o.value {operator} eval(req.query.code);', 'eval')
+
+    def test_ordinary_heap_assignment_still_cleans_unconditionally(self):
+        self.check('let text = req.query.html; const o = {}; '
+                   'o.value = (text = "clean"); res.send(text);')
+
     def test_template_reads_selected_field_not_the_entire_heap(self):
         self.check('const o = {safe: "hello", raw: req.query.html}; res.send(`${o.safe}`);')
         self.check('const o = {safe: "hello", raw: req.query.html}; res.send(`${o.raw}`);', 'xss')
@@ -371,6 +432,41 @@ class JavaScriptHeapTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get('UBS_HEAP_E2E') == '1', 'set UBS_HEAP_E2E=1 for the real scanner')
 class JavaScriptHeapIntegrationTests(unittest.TestCase):
+    def test_logical_assignment_bypass_json_and_sarif(self):
+        for unsafe in (False, True):
+            initial = 'req.query.html' if unsafe else '"clean"'
+            source = '\n'.join(
+                f'function handle{index}() {{\n'
+                f'  let text = {initial}; const box = {{value: flag}};\n'
+                f'  box.value {operator} (text = "clean");\n'
+                '  res.send(text);\n'
+                f'}} handle{index}();'
+                for index, operator in enumerate(('||=', '&&=', '??='))
+            )
+            for fmt in ('json', 'sarif'):
+                with self.subTest(unsafe=unsafe, format=fmt), tempfile.TemporaryDirectory(prefix='ubs-logical-e2e-') as tmp:
+                    path = Path(tmp) / 'app.ts'
+                    path.write_text(source + '\n', encoding='utf-8')
+                    command = [str(ROOT / 'ubs'), str(path), '--only=js', '--ci', f'--format={fmt}']
+                    result = subprocess.run(command, cwd=tmp, text=True, capture_output=True, timeout=120)
+                    self.assertIn(result.returncode, (0, 1), (result.stdout, result.stderr))
+                    try:
+                        report = json.loads(result.stdout)
+                    except json.JSONDecodeError as error:
+                        self.fail(f'Invalid {fmt}: {error}; command={command}; stdout={result.stdout}; stderr={result.stderr}')
+                    rules = {'javascript.taint.xss', 'js.taint.xss'}
+                    if fmt == 'json':
+                        self.assertEqual(report['status'], 'ok', report)
+                        self.assertEqual(report.get('failed_modules'), [], report)
+                        lines = [item['line'] for item in report['findings'] if item['rule_id'] in rules]
+                    else:
+                        self.assertEqual(report['version'], '2.1.0', report)
+                        lines = [item['locations'][0]['physicalLocation']['region']['startLine']
+                                 for run in report['runs'] for item in run.get('results', [])
+                                 if item['ruleId'] in rules]
+                    self.assertEqual(sorted(lines), [4, 9, 14] if unsafe else [], report)
+                    print('JS_LOGICAL_E2E_PASS', fmt, unsafe, sorted(lines), flush=True)
+
     def test_real_scanner_heap_flows(self):
         cases = [
             ('alias-xss', 'const o = {}; const a = o; a.html = req.query.html; res.send(o.html);', {'xss'}),
@@ -395,7 +491,10 @@ class JavaScriptHeapIntegrationTests(unittest.TestCase):
                 result = subprocess.run([str(ROOT / 'ubs'), str(path), '--only=js', '--ci', '--format=json'],
                                         cwd=tmp, text=True, capture_output=True, timeout=120)
                 self.assertIn(result.returncode, (0, 1), (result.stdout, result.stderr))
-                report = json.loads(result.stdout)
+                try:
+                    report = json.loads(result.stdout)
+                except json.JSONDecodeError as error:
+                    self.fail(f'Invalid scanner JSON: {error}; stdout={result.stdout}; stderr={result.stderr}')
                 self.assertEqual(report['status'], 'ok', report)
                 rules = set()
                 def collect(value):

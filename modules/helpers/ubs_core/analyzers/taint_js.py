@@ -1926,18 +1926,31 @@ class _Flow:
                     self.value(*computed, state)
             old = (self.property(receiver, key, state) if receiver is not None
                    else self.reference(target, state)) if assignment.group(1) != '=' else frozenset()
-            old = _materialize(old, state.heap, budget=self.engine.budget)
-            fact = self.value(rhs, end, state)
-            if assignment.group(1) != '=':
+            logical = assignment.group(1) in {'||=', '&&=', '??='}
+            if logical:
+                # The receiver and computed key are evaluated once, before
+                # the split. A RHS write, call or throw belongs only to the
+                # taken branch; the bypass store must remain reachable.
+                fact, evaluated = self.branch_value(rhs, end, state.copy())
+                if evaluated is None:
+                    return old
+            else:
+                old = _materialize(old, state.heap, budget=self.engine.budget)
+                evaluated = state
+                fact = self.value(rhs, end, evaluated)
+            if assignment.group(1) == '+=':
                 fact = _join(old, fact)
             if receiver is not None and _refs(receiver):
-                self.write_property(receiver, key, _step(fact, target), state)
+                self.write_property(receiver, key, _step(fact, target), evaluated)
             else:
-                self.assign(target, fact, state, start, self.callable(rhs, end, state))
+                self.assign(target, fact, evaluated, start, self.callable(rhs, end, evaluated))
             for location, expr_start, rule, label in self.engine.write_sinks:
                 if (rule == self.rule and start <= location < expr_start <= rhs
                         and not code[expr_start:rhs].strip()):
-                    self.effect(location, label, fact, state)
+                    self.effect(location, label, fact, evaluated)
+            if logical:
+                self.replace_state(state, _join_states(state, evaluated))
+                return _join(old, fact)
             return fact
         if access and access[2] == end:
             fact = self.read_access(access, state)
@@ -2187,6 +2200,9 @@ class _Flow:
             return state
         compound = re.match(r'([A-Za-z_$][\w$]*)\s*(\+=|\|\|=|&&=|\?\?=)\s*(.+)', raw, re.S)
         if compound:
+            if compound.group(2) in {'||=', '&&=', '??='}:
+                self.value(offset, end, state)
+                return state
             name = compound.group(1)
             old = _materialize(self.reference(name, state), state.heap, budget=self.engine.budget)
             fact = self.value(offset + compound.start(3), end, state)

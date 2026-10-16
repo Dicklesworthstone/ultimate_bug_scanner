@@ -16,7 +16,7 @@ import uuid
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'modules/helpers'))
 from ubs_core.analyzers.taint_swift_traversal import (
-    file_url_read_offsets, flow_findings, swift_source_tokens, swift_validated_tokens,
+    file_url_read_offsets, flow_findings, swift_source_tokens, swift_validated_tokens, swift_request_source_tokens,
 )
 from ubs_core.taint_flow import AnalysisLimit
 
@@ -57,6 +57,86 @@ class SwiftScopedFlowTests(unittest.TestCase):
                 return req.redirect(to: target)
             }
         ''', (3,))
+
+    def test_native_vision_requests_are_not_web_request_sources(self):
+        sources = ('''
+            import Vision
+            func extract() {
+                let request = VNGenerateImageFeaturePrintRequest()
+                Task { consume(request) }
+                _ = Data(contentsOf: bundledURL)
+            }
+        ''', '''
+            import Vision
+            final class Detector {
+                let request: VNCoreMLRequest?
+                init() { request = makeRequest() }
+                func extract() { Task { consume(request) } }
+            }
+            func prewarm(request: VNCoreMLRequest) { Task { consume(request) } }
+            func load() { _ = Data(contentsOf: bundledURL) }
+        ''')
+        for index, source in enumerate(sources):
+            with self.subTest(source=source):
+                self.assertFalse(swift_request_source_tokens(swift_validated_tokens(source)))
+                self.check(source, suffix=str(index))
+
+    def test_native_request_negative_proof_keeps_unknown_shadowing_and_sources(self):
+        prefix = 'import Vision\nlet request = VNGenerateImageFeaturePrintRequest()\n'
+        tails = (
+            'func handle(request: Request) { Task { consume(request) } }',
+            'func handle(request: OtherType) { Task { consume(request) } }',
+            'func handle() { let request = unknown(); Task { consume(request) } }',
+            'func handle() { let work = { request in consume(request) } }',
+            'func handle() { let work = { (request: OtherType) in consume(request) } }',
+            'func handle() { let work = { [request = unknown()] in consume(request) } }',
+            'func handle() { for (request, _) in unknown() { consume(request) } }',
+            'func handle() { for request in unknown() { consume(request) } }',
+            'func handle() { let (request, _) = unknown(); consume(request) }',
+            'func handle() { consume(request.query["next"]) }',
+            'func handle() { consume(other.request) }',
+            'func handle() { consume(upload.filename) }',
+            r'func handle() { consume("\(request)") }',
+            'struct VNGenerateImageFeaturePrintRequest {}',
+            'func VNGenerateImageFeaturePrintRequest() -> Request {}',
+        )
+        for tail in tails:
+            with self.subTest(tail=tail):
+                self.assertTrue(swift_request_source_tokens(swift_validated_tokens(prefix + tail)))
+        source = '''import Vision
+        func first() { let request = VNCoreMLRequest(); consume(request) }
+        func second() { consume(request) }
+        '''
+        self.assertTrue(swift_request_source_tokens(swift_validated_tokens(source)))
+
+    def test_process_exit_terminates_guard_and_keeps_argument_sinks(self):
+        for call in ('exit(1)', 'Darwin.exit(1)', 'Glibc.exit(1)', 'fatalError()', 'Swift.preconditionFailure()'):
+            with self.subTest(call=call):
+                self.check(f'''
+                    func handle(req: Request) {{
+                        let target = req.query["next"]
+                        guard {LOCAL} else {{ {call} }}
+                        _ = req.redirect(to: target)
+                    }}
+                ''')
+        self.check('''
+            func handle(req: Request) {
+                fatalError(String(contentsOfFile: req.query["file"]))
+                _ = String(contentsOfFile: req.query["unreachable"])
+            }
+        ''', (2,), 'path')
+
+    def test_shadowed_process_exit_cannot_prove_guard_termination(self):
+        for declaration in ('func exit(_ status: Int) {}', 'let exit = callback'):
+            with self.subTest(declaration=declaration), self.assertRaisesRegex(ValueError, 'guard.*does not exit'):
+                self.check('''
+                    %s
+                    func handle(req: Request) {
+                        let target = req.query["next"]
+                        guard allowed(target) else { exit(1) }
+                        _ = req.redirect(to: target)
+                    }
+                ''' % declaration)
 
     def test_tuple_loop_propagates_each_component_to_sinks(self):
         for policy, sink in (('path', 'String(contentsOfFile: target)'),

@@ -599,9 +599,12 @@ class LifecycleEngine:
                                     if index + 1 == len(head) or not re.fullmatch(IDENT, head[index + 1].value):
                                         raise ValueError('Swift lifecycle catch pattern needs binding analysis; analysis is incomplete')
                                     bound.append(head[index + 1].value)
-                            for name in bound:
-                                caught_names[name] = ('catch', statement.tokens[0].start, name)
                             caught = child.copy()
+                            for name in bound:
+                                key = ('catch', statement.tokens[0].start, name)
+                                caught_names[name] = key
+                                caught.values[key] = ()
+                                caught.constants.pop(key, None)
                             if len(parts) == 2:
                                 exceptional_filters = []
                                 self.release_calls(parts[1], caught, caught_names, exceptional_filters)

@@ -548,6 +548,146 @@ def swift_source_tokens(tokens):
     return False
 
 
+def swift_request_source_tokens(tokens):
+    """Keep unknown roots, but distinguish lexically bound Vision requests.
+
+    This is only a negative source proof, not a source/sink suppression. Every
+    req/request occurrence must resolve to a known native declaration in its
+    lexical scope. Unknown/shadowed declarations, capture bindings, upload
+    names and actual Request types keep the ordinary fail-closed analysis.
+    """
+    tokens = tuple(tokens)
+    if not swift_source_tokens(tokens):
+        return False
+    native = {'VNCoreMLRequest', 'VNGenerateImageFeaturePrintRequest', 'VNRecognizeTextRequest'}
+    code = tuple(t for t in tokens if t.kind == 'code' and t.value != '\n')
+    if not any(a.value == 'import' and b.value == 'Vision' for a, b in zip(code, code[1:])):
+        return True
+    # A locally declared framework type/function can return a web request.
+    if any(b.value in native | {'Vision'} and a.value in {
+            'class', 'struct', 'enum', 'actor', 'protocol', 'typealias', 'func', 'let', 'var', 'extension'}
+           for a, b in zip(code, code[1:])):
+        return True
+    significant = tuple(t for t in tokens if t.kind != 'code' or t.value != '\n')
+    for index, token in enumerate(significant):
+        if token.kind == 'code' and token.value in {'req', 'request'}:
+            tail = significant[index + 1:index + 5]
+            member = tuple(t.value for t in tail if t.value not in {'?', '!'})
+            if len(member) >= 2 and member[0] == '.' and member[1] in {
+                    'query', 'parameters', 'params', 'headers', 'content', 'url', 'uri'}:
+                return True
+        if token.kind == 'code' and token.value == 'for':
+            end = index + 1
+            while end < len(significant) and significant[end].value not in {'in', '{'}:
+                end += 1
+            if any(t.value in {'req', 'request'} for t in significant[index + 1:end]):
+                return True
+    if swift_source_tokens(t for t in significant if t.value not in {'req', 'request'}):
+        return True
+    # Interpolations and nested patterns need their own binding model.
+    if any(swift_source_tokens(part) for t in tokens for part in t.parts):
+        return True
+    ranges, type_ranges, bindings, declarations = [], [], [], set()
+    for index, token in enumerate(significant):
+        if token.kind == 'code' and token.value == '{':
+            ranges.append((index, swift_close(significant, index)))
+        if token.kind == 'code' and token.value in {'class', 'struct', 'actor', 'enum', 'extension'}:
+            opening = index + 1
+            while opening < len(significant) and significant[opening].value != '{':
+                opening += 1
+            if opening < len(significant):
+                type_ranges.append((opening, swift_close(significant, opening)))
+
+    def native_type(part):
+        return swift_text(part).rstrip('?!') in native | {'Vision.' + name for name in native}
+
+    # Parameters are bound only in their own body, never a sibling function.
+    for index, token in enumerate(significant):
+        if token.value not in {'func', 'init'} or token.kind != 'code':
+            continue
+        opening = index + 1
+        while opening < len(significant) and significant[opening].value not in {'(', '{'}:
+            opening += 1
+        if opening == len(significant) or significant[opening].value != '(':
+            continue
+        close = swift_close(significant, opening)
+        body = close + 1
+        while body < len(significant) and significant[body].value not in {'{', ';'}:
+            body += 1
+        for part in swift_parts(significant[opening + 1:close], {','}, generics=True):
+            pieces = swift_parts(part, {':'})
+            if len(pieces) != 2 or not pieces[0]:
+                continue
+            name = pieces[0][-1]
+            if name.value not in {'req', 'request'}:
+                continue
+            if not native_type(swift_parts(pieces[1], {'='})[0]) or body == len(significant):
+                return True
+            declarations.add(name.start)
+            bindings.append((name.value, body, swift_close(significant, body)))
+
+    for index, token in enumerate(significant):
+        if token.kind != 'code' or token.value not in {'let', 'var'} or index + 1 == len(significant):
+            continue
+        name = significant[index + 1]
+        if name.value == '(':
+            if swift_source_tokens(significant[index + 2:swift_close(significant, index + 1)]):
+                return True
+        if name.value not in {'req', 'request'}:
+            continue
+        following = significant[index + 2:index + 3]
+        if not following or following[0].value in {'{', ',', 'else'}:
+            # Optional-binding shorthand resolves the existing binding below.
+            continue
+        position = index + 3
+        if following[0].value == ':':
+            ending = position
+            while ending < len(significant) and significant[ending].value not in {'=', '{', '}', ';'}:
+                if ending > position and '\n' in ''.join(t.value for t in tokens
+                        if significant[ending - 1].end <= t.start < significant[ending].start):
+                    break
+                ending += 1
+            known = native_type(significant[position:ending])
+        elif following[0].value == '=':
+            ending = position
+            while ending < len(significant) and significant[ending].value not in {'(', '{', ';', '}'}:
+                ending += 1
+            known = ending < len(significant) and significant[ending].value == '(' and native_type(significant[position:ending])
+        else:
+            known = False
+        if not known:
+            return True
+        containing = [(a, b) for a, b in ranges if a < index < b]
+        scope = max(containing, default=(-1, len(significant)))
+        start = scope[0] if scope in type_ranges else index
+        bindings.append((name.value, start, scope[1]))
+        declarations.add(name.start)
+
+    for index, token in enumerate(significant):
+        if token.kind != 'code' or token.value not in {'req', 'request'} or token.start in declarations:
+            continue
+        previous = significant[index - 1].value if index else ''
+        following = significant[index + 1].value if index + 1 < len(significant) else ''
+        # A closure/iteration binding or an arbitrary object's property is not
+        # the outer local/field with the same spelling.
+        if following == 'in' or previous == 'for' or (previous == '.' and (
+                index < 2 or significant[index - 2].value != 'self')):
+            return True
+        for opening, closing in ranges:
+            if opening < index < closing:
+                header = significant[opening + 1:index + 1]
+                after = significant[index + 1:closing]
+                if not any(t.value in {';', '{', '}', 'let', 'var', 'return'} for t in header):
+                    if any(t.value == 'in' for t in after[:next((i for i, t in enumerate(after)
+                            if t.value in {';', '{', '}'}), len(after))]):
+                        return True
+        if following == ':' and previous in {'(', ','}:
+            continue  # actual argument label, not a value
+        if not any(name == token.value and start <= index < end for name, start, end in bindings):
+            return True
+    return False
+
+
 def swift_flow_obligation(tokens):
     """Conservative syntax witnesses for this frontend's source/sink policies.
 
@@ -1197,13 +1337,36 @@ class SwiftEngine:
                     local[part[1].value] = part[1].value + '@' + str(part[1].start)
             return local
 
-        def terminates(statements):
+        def process_exit(tokens, bindings):
+            tokens = swift_ungroup(tokens)
+            opening = next((i for i, token in enumerate(tokens) if token.value == '('), -1)
+            if opening < 0 or swift_close(tokens, opening) != len(tokens) - 1:
+                return False
+            name = swift_text(tokens[:opening])
+            if name not in {'exit', 'Darwin.exit', 'Glibc.exit', 'fatalError', 'Swift.fatalError',
+                            'preconditionFailure', 'Swift.preconditionFailure'}:
+                return False
+            root, leaf = name.split('.')[0], name.split('.')[-1]
+            if root in bindings or root in self.parser.types or root in self.local_globals:
+                return False
+            if any(left.value in {'let', 'var'} and right.value == root
+                   for left, right in zip(self.parser.tokens, self.parser.tokens[1:])):
+                return False
+            if '.' not in name and any(fn.name == leaf for fn in self.parser.functions.values()):
+                return False
+            return True
+
+        def terminates(statements, bindings):
+            local = dict(bindings)
             for statement in statements:
+                assignment = self.parser.assignment(statement.tokens) if statement.kind == 'simple' else None
+                if assignment and assignment[-1] and assignment[0]:
+                    local[assignment[0]] = assignment[0]
                 if statement.kind in {'return', 'throw', 'break', 'continue'}:
                     return True
-                if statement.kind == 'if' and terminates(statement.body) and terminates(statement.alternate):
+                if statement.kind == 'if' and terminates(statement.body, local) and terminates(statement.alternate, local):
                     return True
-                if statement.kind == 'simple' and re.match(r'(?:fatalError|preconditionFailure)\(', swift_text(statement.tokens)):
+                if statement.kind == 'simple' and process_exit(statement.tokens, local):
                     return True
             return False
 
@@ -1230,7 +1393,7 @@ class SwiftEngine:
                     no = block(statement.alternate, following, local, break_to, continue_to)
                     following = condition(tokens, yes, no, yes_scope, local)
                 elif kind == 'guard':
-                    if not terminates(statement.body):
+                    if not terminates(statement.body, before):
                         raise ValueError('Swift guard else does not exit its enclosing scope; analysis is incomplete')
                     failure = block(statement.body, following, before, break_to, continue_to)
                     following = condition(tokens, following, failure, local, before)
@@ -1265,6 +1428,10 @@ class SwiftEngine:
                     following = node('branch', targets=(target,))
                 elif kind in {'return', 'throw'}:
                     following = node(kind, tokens, local, (exit_node,) if kind == 'return' else ())
+                elif kind == 'simple' and process_exit(tokens, before):
+                    # Evaluate arguments (which may contain sinks), but a real
+                    # Never-returning primitive has no successor edge.
+                    following = node('eval', tokens, local, ())
                 else:
                     following = node(kind, tokens, local, (following,), reads=before)
             return following
@@ -1411,7 +1578,7 @@ def flow_findings(path, text, policy='path'):
     # With no selected request source, there is no source-to-sink obligation
     # for these two policies; unrelated Swift closure/actor syntax belongs to
     # its own analyzer rather than being misreported as a failed taint pass.
-    if not swift_source_tokens(tokens) or not swift_flow_obligation(tokens):
+    if not swift_request_source_tokens(tokens) or not swift_flow_obligation(tokens):
         return []
     parser = SwiftParser(text, tokens)
     engine = SwiftEngine(path, text, policy, parser)

@@ -9,7 +9,9 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from ubs_core.analyzers.taint_swift_traversal import file_url_read_offsets
+from ubs_core.analyzers.taint_swift_traversal import (
+    file_url_read_offsets, swift_request_source_tokens, swift_validated_tokens,
+)
 from ubs_core.swift_detectors._common import (
     SKIP_DIRS, has_ignore, logical_statement, rel, should_skip,
     source_line, strip_line_comments,
@@ -143,6 +145,8 @@ def scan(ctx):
             continue
         text = path.read_text(encoding='utf-8')
         if not (re.search(r'\b(?:req|request)\b', text) and sink_re.search(text)):
+            continue
+        if not swift_request_source_tokens(swift_validated_tokens(text)):
             continue
 
         lines = text.splitlines()

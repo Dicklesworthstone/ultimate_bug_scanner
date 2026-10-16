@@ -1325,7 +1325,10 @@ class SwiftLifecycleBindings(LoggedCase):
                     }, indent=2), encoding='utf-8')
                     context = (command, result.returncode, result.stdout, result.stderr)
                     self.assertEqual(result.returncode, 2, context)
-                    payload = json.loads(result.stdout)
+                    try:
+                        payload = json.loads(result.stdout)
+                    except json.JSONDecodeError as exc:
+                        self.fail(f'Invalid public report JSON: {exc}; {context!r}')
                     if fmt == 'json':
                         self.assertEqual(payload['status'], 'partial', context)
                         self.assertEqual(payload['module_error'], 'ANALYZER_ERROR', context)
@@ -1368,7 +1371,10 @@ class SwiftLifecycleBindings(LoggedCase):
                     }, indent=2), encoding='utf-8')
                     context = (command, result.returncode, result.stdout, result.stderr)
                     self.assertEqual(result.returncode, int(bool(public_expected)), context)
-                    payload = json.loads(result.stdout)
+                    try:
+                        payload = json.loads(result.stdout)
+                    except json.JSONDecodeError as exc:
+                        self.fail(f'Invalid public report JSON: {exc}; {context!r}')
                     if fmt == 'json':
                         self.assertEqual(payload['status'], 'ok', context)
                         self.assertEqual(payload['critical'], 0, context)

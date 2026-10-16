@@ -70,7 +70,9 @@ class SwiftScopedFlowTests(unittest.TestCase):
         ''', '''
             import Vision
             final class Detector {
+                #if canImport(Vision)
                 let request: VNCoreMLRequest?
+                #endif
                 init() { request = makeRequest() }
                 func extract() { Task { consume(request) } }
             }
@@ -122,6 +124,7 @@ class SwiftScopedFlowTests(unittest.TestCase):
             'func f() { provider { Vision in let request = Vision.VNCoreMLRequest(); consume(request) } }',
             'func f<VNCoreMLRequest>() { let request = VNCoreMLRequest(); consume(request) }',
             'func f() { if let request = VNCoreMLRequest() { consume(request) }; consume(request) }',
+            'func f() {\n#if canImport(Vision)\nif let request = VNCoreMLRequest() { consume(request) }\n#endif\nconsume(request) }',
             'func f() { let other = 1, request = unknown(); consume(request) }',
             'class C { let other: Int, request: OtherType; func f() { consume(request) } }',
         )

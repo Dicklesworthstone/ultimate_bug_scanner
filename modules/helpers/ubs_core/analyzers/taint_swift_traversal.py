@@ -669,7 +669,9 @@ def swift_request_source_tokens(tokens):
             continue
         header = index - 1
         while header >= 0 and significant[header].value not in {';', '{', '}'}:
-            if significant[header].value in {'if', 'while', 'guard', 'for'}:
+            if (significant[header].value in {'if', 'while', 'guard', 'for'}
+                    and not (significant[header].value == 'if' and header > 0
+                             and significant[header - 1].value == '#')):
                 # Conditional bindings have narrower visibility than the
                 # enclosing brace. Do not grant a function-wide native proof.
                 return True

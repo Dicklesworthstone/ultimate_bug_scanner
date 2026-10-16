@@ -310,6 +310,35 @@ class ExplainRuleTests(unittest.TestCase):
 
         self._run_with_logging(case_id, _test)
 
+    def test_registry_covers_all_13_languages_and_explains_new_modules(self) -> None:
+        case_id = "explain-13-language-registry"
+
+        def _test() -> None:
+            import re
+            from ubs_core.explain import explain_rule
+
+            ubs_text = (REPO_ROOT / "ubs").read_text(encoding="utf-8")
+            match = re.search(r"^ALL_LANGS=\(([^)]*)\)", ubs_text, re.M)
+            all_langs = set(match.group(1).split()) if match else set()
+            registry = json.loads((REPO_ROOT / "detectors.yml").read_text(encoding="utf-8"))
+            reg_langs = {entry["id"] for entry in registry.get("languages", [])}
+            self.assertEqual(reg_langs, all_langs)
+
+            for rule_id, expected_lang in (
+                ("kotlin.security.archive_extraction", "kotlin"),
+                ("bash.security.eval_variable", "bash"),
+                ("ex.security.sql-interpolation", "elixir"),
+            ):
+                rc, stdout, stderr = explain_rule(rule_id, repo_root=REPO_ROOT, output_format="json")
+                self.assertEqual(rc, 0, stderr)
+                doc = json.loads(stdout)
+                self.assertEqual(doc["rule_id"], rule_id)
+                self.assertEqual(doc["language"], expected_lang)
+                self.assertIsNotNone(doc["buggy_fixture"], rule_id)
+                self.assertIsNotNone(doc["clean_fixture"], rule_id)
+
+        self._run_with_logging(case_id, _test)
+
 
 if __name__ == "__main__":
     unittest.main()

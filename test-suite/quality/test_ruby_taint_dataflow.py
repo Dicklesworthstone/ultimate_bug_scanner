@@ -1988,5 +1988,109 @@ class RubyPublicTests(LoggedCase):
                                 for row in payload.get('failed_modules', [])), payload)
 
 
+class RubyOpenRedirectFlowTests(unittest.TestCase):
+    def _lines(self, code: str) -> tuple[int, ...]:
+        from ubs_core.ruby_detectors import open_redirect
+
+        source = textwrap.dedent(code).strip('\n') + '\n'
+        issues: list[tuple] = []
+        open_redirect.analyze(source.splitlines(), issues, 'controller.rb')
+        return tuple(line_no for _path, line_no, _col, _detail in issues)
+
+    def test_literal_overwrite_clears_redirect_taint(self) -> None:
+        self.assertEqual(
+            self._lines('''
+                class RedirectController
+                  def show
+                    target = params[:return_url]
+                    target = "/dashboard"
+                    redirect_to target
+                  end
+                end
+            '''),
+            (),
+        )
+
+    def test_safe_named_identity_helper_does_not_sanitize_redirect(self) -> None:
+        self.assertEqual(
+            self._lines('''
+                class RedirectController
+                  def safe_redirect_url(raw)
+                    raw
+                  end
+                  def show
+                    redirect_to safe_redirect_url(params[:return_url])
+                  end
+                end
+            '''),
+            (6,),
+        )
+
+    def test_shadowed_url_from_helper_does_not_sanitize_redirect(self) -> None:
+        self.assertEqual(
+            self._lines('''
+                class RedirectController
+                  def url_from(raw)
+                    raw
+                  end
+                  def show
+                    redirect_to url_from(params[:return_url])
+                  end
+                end
+            '''),
+            (6,),
+        )
+
+    def test_single_slash_guard_without_double_slash_rejection_remains_unsafe(self) -> None:
+        self.assertEqual(
+            self._lines('''
+                class RedirectController
+                  def show
+                    target = params[:return_url]
+                    return unless target.start_with?("/")
+                    redirect_to target
+                  end
+                end
+            '''),
+            (5,),
+        )
+
+    def test_local_path_and_allowlisted_host_helper_sanitizes_redirect(self) -> None:
+        self.assertEqual(
+            self._lines('''
+                class RedirectController
+                  ALLOWED_REDIRECT_HOSTS = %w[app.example.com accounts.example.com].freeze
+                  def safe_redirect_url(raw)
+                    return raw if raw.to_s.start_with?("/") && !raw.to_s.start_with?("//")
+                    uri = URI.parse(raw.to_s)
+                    unless uri.scheme == "https" && ALLOWED_REDIRECT_HOSTS.include?(uri.host)
+                      raise ArgumentError, "blocked redirect"
+                    end
+                    uri.to_s
+                  end
+                  def show
+                    redirect_to safe_redirect_url(params[:return_url])
+                  end
+                end
+            '''),
+            (),
+        )
+
+    def test_rails_url_from_and_allow_other_host_false_suppress_redirect(self) -> None:
+        self.assertEqual(
+            self._lines('''
+                class RedirectController
+                  def show
+                    target = url_from(params[:return_url]) || "/home"
+                    response.headers["Location"] = target
+                    redirect_to params[:next], allow_other_host: false
+                  end
+                end
+            '''),
+            (),
+        )
+
+
 if __name__ == '__main__':
     unittest.main()
+

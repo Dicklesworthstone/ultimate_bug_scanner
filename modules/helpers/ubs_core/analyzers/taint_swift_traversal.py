@@ -988,12 +988,115 @@ class SwiftEngine:
                 cursor = close + 1
                 continue
             if token.value == '{':
+                close = swift_close(tokens, cursor)
+                if self.trailing_route_closure(name, token, tokens[close], state, bindings):
+                    cursor = close + 1
+                    continue
                 raise ValueError('Swift escaping/trailing closure needs capture analysis; analysis is incomplete')
             # Preserve dependencies in selected casts, tuples and unfamiliar
             # operators, but do not preserve any validation across them.
             value = self.forget(join(value, self.expression(tokens[cursor + 1:], state, bindings, depth + 1)))
             break
         return value
+
+    def trailing_route_closure(self, name, token, close_token, state, bindings):
+        leaf = name.rsplit('.', 1)[-1]
+        if '.' not in name or leaf not in {'get', 'post', 'put', 'patch', 'delete', 'on', 'webSocket'}:
+            return False
+        closure_tokens = tuple(
+            item for item in self.parser.tokens
+            if token.end <= item.start and item.end <= close_token.start
+        )
+        in_index = None
+        probe = 0
+        while probe < len(closure_tokens):
+            tok = closure_tokens[probe]
+            if tok.kind == 'code':
+                if tok.value in {'(', '['}:
+                    probe = swift_close(closure_tokens, probe)
+                elif tok.value in {'{', ';'}:
+                    break
+                elif tok.value == 'in':
+                    in_index = probe
+                    break
+            probe += 1
+        if in_index is None:
+            return False
+        header = tuple(tok for tok in closure_tokens[:in_index] if tok.kind != 'code' or tok.value != '\n')
+        arrow_parts = swift_parts(header, {'->'})
+        if len(arrow_parts) > 2:
+            return False
+        return_type = swift_text(swift_ungroup(arrow_parts[1])) if len(arrow_parts) == 2 else ''
+        param_section = arrow_parts[0]
+        while param_section and param_section[-1].kind == 'code' and param_section[-1].value in {'async', 'throws', 'rethrows'}:
+            param_section = param_section[:-1]
+        param_section = swift_ungroup(param_section)
+        raw_params = [swift_ungroup(p) for p in swift_parts(param_section, {','}) if swift_ungroup(p)]
+        if not raw_params:
+            return False
+        parameters = []
+        for idx, raw_param in enumerate(raw_params):
+            colon_parts = swift_parts(raw_param, {':'})
+            if len(colon_parts) == 1:
+                if len(raw_param) != 1 or raw_param[0].kind != 'code' or not re.fullmatch(r'[A-Za-z_]\w*', raw_param[0].value):
+                    return False
+                param_name = raw_param[0].value
+                decl_type = 'Request' if idx == 0 else ''
+            elif len(colon_parts) == 2:
+                lhs_names = [t.value for t in colon_parts[0] if t.kind == 'code']
+                if len(lhs_names) != 1 or not re.fullmatch(r'[A-Za-z_]\w*', lhs_names[0]):
+                    return False
+                param_name = lhs_names[0]
+                decl_type = swift_text(swift_ungroup(colon_parts[1]))
+            else:
+                return False
+            parameters.append((param_name, '', decl_type, ()))
+        body_tokens = closure_tokens[in_index + 1:]
+        body = self.parser.block(body_tokens, self.function.owner, (*self.function.scope, self.function.key))
+        if len(body) == 1 and body[0].kind == 'simple' and not self.parser.assignment(body[0].tokens):
+            body = (replace(body[0], kind='return'),)
+
+        def identifiers(statements):
+            for statement in statements:
+                yield from (item.value for item in statement.tokens if item.kind == 'code')
+                yield from identifiers(statement.body)
+                yield from identifiers(statement.alternate)
+
+        def outer_writes(statements, local_names):
+            for statement in statements:
+                if statement.kind == 'simple':
+                    assign = self.parser.assignment(statement.tokens)
+                    if assign and assign[0]:
+                        if assign[4]:
+                            local_names = local_names | {assign[0]}
+                        elif assign[0] not in local_names and assign[0] in bindings:
+                            return True
+                if outer_writes(statement.body, set(local_names)) or outer_writes(statement.alternate, set(local_names)):
+                    return True
+            return False
+
+        param_names = {item[0] for item in parameters}
+        if outer_writes(body, set(param_names)):
+            return False
+        names = set(identifiers(body)) - param_names
+        for captured in names.intersection(bindings):
+            fact = state.get(bindings[captured], CLEAN)
+            if swift_tainted(fact) or swift_has_shape(fact, 'request'):
+                return False
+        closure_fn = self.parser.functions.get(token.start)
+        if closure_fn is None:
+            closure_fn = SwiftFunction(
+                token.start,
+                f'<closure@{token.start}>',
+                self.function.owner,
+                (*self.function.scope, self.function.key),
+                tuple(parameters),
+                body,
+                return_type=return_type,
+            )
+            self.parser.functions[token.start] = closure_fn
+        self.context(closure_fn, tuple(CLEAN for _ in parameters), entry=True)
+        return True
 
     def check(self, name, tag, state, bindings):
         binding = bindings.get(name, name)

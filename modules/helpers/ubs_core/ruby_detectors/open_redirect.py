@@ -142,50 +142,13 @@ def analyze(lines, issues, path_str):
     if not lines:
         return
     text = "\n".join(lines)
-    if not (re.search(r'\b(?:params|request|env|Rack::Request)\b', text) and SINK_RE.search(text)):
+    if not (re.search(r'\b(?:params|request|req|rack_request|env|cookies|Rack::Request)\b', text) and SINK_RE.search(text)):
         return
-    tainted = {}
-    seen = set()
-    for idx in range(1, len(lines) + 1):
-        if has_ignore(lines, idx):
-            continue
-        statement = logical_statement(lines, idx).strip()
-        if not statement:
-            continue
-        assign = ASSIGN_RE.match(statement)
-        if assign:
-            name = assign.group("lhs")
-            rhs = assign.group("rhs")
-            taint = taint_from_expr(rhs, tainted, name)
-            if taint:
-                tainted[name] = taint
-            elif name in tainted and is_safe_expr(rhs):
-                tainted.pop(name, None)
-        if not SINK_RE.search(statement):
-            continue
-        if is_safe_expr(statement):
-            continue
-        direct = has_source(statement)
-        refs = refs_in_expr(statement, tainted)
-        if not direct and not refs:
-            continue
-        if has_safe_context(lines, idx, refs):
-            continue
-        key = (path_str, idx)
-        if key in seen:
-            continue
-        seen.add(key)
-        if direct:
-            source = SOURCE_RE.search(statement)
-            path_desc = f"{(source.group(0) if source else 'request redirect target').strip()} -> redirect sink"
-        else:
-            ref = refs[0]
-            seq = list(tainted.get(ref, {}).get("path", [ref]))
-            if len(seq) >= PATH_LIMIT:
-                seq = seq[-(PATH_LIMIT - 1):]
-            seq.append("redirect sink")
-            path_desc = " -> ".join(seq)
-        issues.append((path_str, idx, 1, f"{source_line(lines, idx)}  [{path_desc}]"))
+    from ubs_core.analyzers.taint_ruby_traversal import REDIRECT_RULE, flow_findings_from_text
+
+    for rule, line_no, code, _extras in flow_findings_from_text(Path(path_str), text, "redirect"):
+        if rule == REDIRECT_RULE:
+            issues.append((path_str, line_no, 1, code))
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple]:

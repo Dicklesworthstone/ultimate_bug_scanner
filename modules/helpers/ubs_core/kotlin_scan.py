@@ -259,9 +259,15 @@ def scan_analyzers(files: Sequence[Path], sink, skip: set[int], project_dir: Pat
         trav_files = files
         if prefilter is not None and not prefilter.is_bypass:
             trav_files = prefilter.filter_files_for_analyzer("taint_java_traversal", files)
-        if trav_files:
-            ctx = RunContext(lang="java", files=list(trav_files))
-            for finding in run_traversal(ctx):
+        for path in trav_files:
+            try:
+                findings = list(run_traversal(RunContext(lang="java", files=[path])))
+            except (OSError, UnicodeError, ValueError, RecursionError) as exc:
+                if errors is None:
+                    raise
+                errors.append(f"{path}: taint_java_traversal: {exc}")
+                continue
+            for finding in findings:
                 sink.write(json.dumps({
                     "rule": "kotlin.taint.path_traversal",
                     "category_id": "kotlin.security",
@@ -277,9 +283,15 @@ def scan_analyzers(files: Sequence[Path], sink, skip: set[int], project_dir: Pat
         redir_files = files
         if prefilter is not None and not prefilter.is_bypass:
             redir_files = prefilter.filter_files_for_analyzer("taint_java_redirect", files)
-        if redir_files:
-            ctx = RunContext(lang="java", files=list(redir_files))
-            for finding in run_redirect(ctx):
+        for path in redir_files:
+            try:
+                findings = list(run_redirect(RunContext(lang="java", files=[path])))
+            except (OSError, UnicodeError, ValueError, RecursionError) as exc:
+                if errors is None:
+                    raise
+                errors.append(f"{path}: taint_java_redirect: {exc}")
+                continue
+            for finding in findings:
                 sink.write(json.dumps({
                     "rule": "kotlin.taint.open_redirect",
                     "category_id": "kotlin.security",
@@ -293,7 +305,8 @@ def scan_analyzers(files: Sequence[Path], sink, skip: set[int], project_dir: Pat
                 }, ensure_ascii=False) + "\n")
 
 
-def scan_detectors(files: Sequence[Path], sink, skip: set[int]) -> None:
+def scan_detectors(files: Sequence[Path], sink, skip: set[int],
+                   errors: list[str] | None = None) -> None:
     if 4 in skip:
         return
 
@@ -315,22 +328,30 @@ def scan_detectors(files: Sequence[Path], sink, skip: set[int]) -> None:
         find = getattr(module, "find", None)
         if not find:
             continue
-        for hit in find(files):
-            if len(hit) == 5:
-                _rid, path, line_no, col, detail = hit
-            else:
-                path, line_no, col, detail = hit
-            msg = f"{title} — {detail}" if detail else title
-            sink.write(json.dumps({
-                "rule": rule_id,
-                "category_id": "kotlin.security",
-                "path": str(path),
-                "line": int(line_no),
-                "col": int(col),
-                "severity": "critical",
-                "message": msg[:300],
-                "suppressed": False,
-            }, ensure_ascii=False) + "\n")
+        batches = ([path] for path in files) if getattr(module, "FILE_SCOPED", False) else (files,)
+        for batch in batches:
+            try:
+                for hit in find(batch):
+                    if len(hit) == 5:
+                        _rid, path, line_no, col, detail = hit
+                    else:
+                        path, line_no, col, detail = hit
+                    msg = f"{title} — {detail}" if detail else title
+                    sink.write(json.dumps({
+                        "rule": rule_id,
+                        "category_id": "kotlin.security",
+                        "path": str(path),
+                        "line": int(line_no),
+                        "col": int(col),
+                        "severity": "critical",
+                        "message": msg[:300],
+                        "suppressed": False,
+                    }, ensure_ascii=False) + "\n")
+            except Exception as exc:
+                if errors is None:
+                    raise
+                source = str(batch[0]) if len(batch) == 1 else "selected files"
+                errors.append(f"{source}: detector {module.__name__.rsplit('.', 1)[-1]}: {type(exc).__name__}: {exc}")
 
 
 def _render_text(args, files: Sequence[Path], counters: dict[str, int]) -> None:
@@ -489,7 +510,7 @@ def main(argv: list[str] | None = None) -> int:
         scan_patterns(_PATTERNS, files_to_scan, capturing_sink, skip, prefilter=prefilter_res)
         scan_analyzers(files_to_scan, capturing_sink, skip, project_dir=Path(args.project_dir) if args.project_dir else None,
                        prefilter=prefilter_res, errors=scan_errors)
-        scan_detectors(files_to_scan, capturing_sink, skip)
+        scan_detectors(files_to_scan, capturing_sink, skip, errors=scan_errors)
         if args.custom_rules:
             from ubs_core.external_tools import scan_custom_rules
             scan_custom_rules(args.custom_rules, files_to_scan, capturing_sink, "kotlin", scan_errors)

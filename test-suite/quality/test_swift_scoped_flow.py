@@ -824,6 +824,48 @@ class SwiftScopedFlowTests(unittest.TestCase):
         with self.assertRaises(AnalysisLimit):
             self.check(source)
 
+    def test_vapor_route_handler_trailing_closure_redirect_and_guard(self):
+        self.check('''
+            import Vapor
+            func routes(_ app: Application) throws {
+                app.get("go") { req -> Response in
+                    let to = req.query[String.self, at: "to"] ?? "/"
+                    return req.redirect(to: to)
+                }
+            }
+        ''', (5,))
+        self.check(f'''
+            import Vapor
+            func routes(_ app: Application) throws {{
+                app.get("go") {{ req -> Response in
+                    let target = req.query[String.self, at: "to"] ?? "/"
+                    guard {LOCAL} else {{ return req.redirect(to: "/") }}
+                    return req.redirect(to: target)
+                }}
+            }}
+        ''', (), suffix='_clean')
+
+    def test_vapor_route_handler_trailing_closure_path_traversal(self):
+        self.check('''
+            import Vapor
+            func routes(_ app: Application) throws {
+                app.get("read") { (req: Request) async throws -> String in
+                    try String(contentsOfFile: req.query["path"] ?? "")
+                }
+            }
+        ''', (4,), 'path')
+
+    def test_vapor_route_handler_trailing_closure_capturing_outer_taint_is_incomplete(self):
+        with self.assertRaisesRegex(ValueError, 'closure.*incomplete'):
+            self.check('''
+                func handle(outerReq: Request, app: Application) {
+                    let leaked = outerReq.query["next"] ?? "/"
+                    app.get("go") { req -> Response in
+                        return req.redirect(to: leaked)
+                    }
+                }
+            ''')
+
 
 if __name__ == '__main__':
     unittest.main()

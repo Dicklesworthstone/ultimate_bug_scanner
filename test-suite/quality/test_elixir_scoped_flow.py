@@ -369,6 +369,35 @@ CASES = (
             redirect(conn, external: URI.to_string(uri))
           end
         end''', (5,)),
+    Case('elixir', 'redirect', 'phoenix_web_controller_use_directive', '''
+        defmodule MyAppWeb.PageController do
+          use MyAppWeb, :controller
+          def go(conn, %{"to" => to}) do
+            redirect(conn, external: to)
+          end
+        end''', (4,)),
+    Case('elixir', 'redirect', 'phoenix_controller_use_guarded_clean', f'''
+        defmodule MyAppWeb.PageController do
+          use Phoenix.Controller, formats: [:html, :json]
+          def go(conn, %{{"to" => target}}) do
+            if {ELIXIR_LOCAL} do
+              redirect(conn, external: target)
+            else
+              redirect(conn, to: "/")
+            end
+          end
+        end''', ()),
+    Case('elixir', 'redirect', 'enum_reduce_and_then_pipeline_preserves_taint', '''
+        defmodule MyAppWeb.PageController do
+          use MyAppWeb, :controller
+          def go(conn, params) do
+            target =
+              [params["next"]]
+              |> Enum.reduce("/home", fn item, _acc -> item end)
+              |> then(fn url -> url end)
+            redirect(conn, external: target)
+          end
+        end''', (8,)),
 )
 
 

@@ -3685,6 +3685,17 @@ class PathPrefixOracle { public static void main(String[] args) {
   if (!target.startsWith(root)) { return; }
   Files.readString(target);
 } }''', domain='path_traversal')
+        self.check('''class C {
+  Path choose(Path root, String p) {
+    Path leaked=root.resolve(p); // unsafe
+    Path target=root.resolve(p).normalize();
+    if (!target.startsWith(root)) { throw new SecurityException(); }
+    return target;
+  }
+  void handler(Request request, Path root) {
+    Files.readString(choose(root, request.getParameter("file")));
+  }
+}''', domain='path_traversal')
 
     def test_rule_scoped_suppression_and_lexical_decoys(self):
         for lang in ('java', 'kotlin'):

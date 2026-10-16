@@ -652,7 +652,7 @@ class ElixirEngine:
                             short = Parser.name(option.args[0])
                     self.aliases[owner][short] = name
                 elif directive == 'use':
-                    if not self.register_sql_repository(expr, owner):
+                    if not (self.register_sql_repository(expr, owner) or self.register_framework_use(expr, owner)):
                         raise ElixirSyntaxError(f'Elixir use macro expansion at line {expr.token.line}; analysis is incomplete')
                 elif directive == 'import' and len(expr.args) >= 2:
                     imported = Parser.name(expr.args[1])
@@ -686,6 +686,40 @@ class ElixirEngine:
             return name[7:]
         first, *rest = name.split('.')
         return '.'.join((self.aliases.get(owner, {}).get(first, first), *rest))
+
+    KNOWN_USE_MODULES = frozenset({
+        'Phoenix.Controller', 'Phoenix.LiveView', 'Phoenix.LiveComponent',
+        'Phoenix.Component', 'Phoenix.Router', 'Phoenix.Channel',
+        'Phoenix.VerifiedRoutes', 'Phoenix.HTML', 'Phoenix.View',
+        'Plug.Router', 'Plug.Builder', 'Plug.ErrorHandler', 'Plug.Debugger', 'Plug.Test',
+        'Ecto.Schema', 'Ecto.Migration', 'Ecto.Type',
+        'GenServer', 'Supervisor', 'DynamicSupervisor', 'Application', 'Agent', 'Task',
+    })
+    PHOENIX_USE_ENTRYPOINTS = frozenset({
+        'controller', 'live_view', 'live_component', 'component',
+        'html', 'router', 'channel', 'view', 'verified_routes',
+    })
+
+    @staticmethod
+    def _static_use_options(options):
+        for item in options:
+            if item.kind == 'pair':
+                continue
+            if item.kind == 'list' and all(entry.kind == 'pair' for entry in item.args):
+                continue
+            return False
+        return True
+
+    def register_framework_use(self, expr, owner):
+        if len(expr.args) < 2:
+            return False
+        target = self.module_in_scope(Parser.name(expr.args[1]), owner)
+        if target in self.KNOWN_USE_MODULES:
+            return self._static_use_options(expr.args[2:])
+        if (len(expr.args) >= 3 and expr.args[2].kind == 'atom'
+                and expr.args[2].value in self.PHOENIX_USE_ENTRYPOINTS):
+            return self._static_use_options(expr.args[3:])
+        return False
 
     def register_sql_repository(self, expr, owner):
         if len(expr.args) < 2:
@@ -1451,6 +1485,23 @@ class ElixirEngine:
         return False
 
     def enumerate_callback(self, expr, name, args, state):
+        if name == 'reduce':
+            if len(args) != 3 or args[0].kind != 'list':
+                raise ElixirSyntaxError(f'Unknown Elixir Enum.{name} collection at line {expr.token.line}; analysis is incomplete')
+            collection, initial_acc, callback = args
+            if callback.kind != 'callback' or callback.identity not in self.closures:
+                raise ElixirSyntaxError(f'Unknown Elixir Enum.{name} callback at line {expr.token.line}; analysis is incomplete')
+            pending = [(state, initial_acc)]
+            for item in collection.items:
+                self.budget.spend()
+                following = []
+                for before, acc in pending:
+                    for after, next_acc in self.invoke_callback(expr, callback, (item, acc), before):
+                        following.append((after, next_acc))
+                if len(following) > 512:
+                    raise AnalysisLimit('Elixir enumeration state limit exceeded; analysis is incomplete')
+                pending = following
+            return self.outcomes(pending)
         if len(args) != 2 or args[0].kind != 'list':
             raise ElixirSyntaxError(f'Unknown Elixir Enum.{name} collection at line {expr.token.line}; analysis is incomplete')
         collection, callback = args
@@ -1510,8 +1561,14 @@ class ElixirEngine:
                 options.extend(value.items)
         keywords = {value.literal: value.items[0] for value in options}
         positional = tuple(value for value in args if value.kind != 'pair')
-        if canonical in {'Enum.each', 'Enum.map'} and module not in self.attributes:
+        if canonical in {'Enum.each', 'Enum.map', 'Enum.reduce'} and module not in self.attributes:
             return self.enumerate_callback(expr, name, args, state)
+        if canonical in {'then', 'Kernel.then', 'tap', 'Kernel.tap'} and (not qualified or module not in self.attributes):
+            if len(args) != 2 or args[1].kind != 'callback' or args[1].identity not in self.closures:
+                raise ElixirSyntaxError(f'Unknown Elixir {canonical} callback at line {expr.token.line}; analysis is incomplete')
+            if name == 'then':
+                return self.invoke_callback(expr, args[1], (args[0],), state)
+            return self.outcomes((after, args[0]) for after, _ in self.invoke_callback(expr, args[1], (args[0],), state))
         if canonical == 'Code.eval_string' and module not in self.attributes:
             return self.literal_eval(expr, args, state)
         # The selected Ecto declarations and calls have the same identity for

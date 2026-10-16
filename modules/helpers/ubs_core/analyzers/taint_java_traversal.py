@@ -643,13 +643,34 @@ class Engine:
             self.record(offset, value)
         return False
 
+    def _discharged_construction(self, summary, trace):
+        ctor_tags = frozenset(tag for tag in trace.tags if tag.startswith('ctor-site:'))
+        matches = [
+            item for item in summary.returned
+            if item.kind == trace.kind
+            and item.key == trace.key
+            and (
+                not (ctor_tags and (item_ctors := frozenset(tag for tag in item.tags if tag.startswith('ctor-site:'))))
+                or (ctor_tags <= item_ctors)
+            )
+        ]
+        if not matches or not all('contained-path' in item.tags for item in matches):
+            return False
+        if ctor_tags and not any(
+            ctor_tags <= frozenset(tag for tag in item.tags if tag.startswith('ctor-site:'))
+            for item in matches
+        ):
+            return False
+        return True
+
     def summary_effect(self, summary, fact):
         # Construction diagnostics are retained unless this selected helper
-        # proves containment for every return of the same symbolic value.
-        return frozenset(trace for trace in fact if not self.safe_sink_trace(trace)
-            and ('path-construction' not in trace.tags or not (
-            (matches := [item for item in summary.returned if item.kind == trace.kind and item.key == trace.key])
-            and all('contained-path' in item.tags for item in matches))))
+        # proves containment for every return of the same constructed Path value.
+        return frozenset(
+            trace for trace in fact
+            if not self.safe_sink_trace(trace)
+            and ('path-construction' not in trace.tags or not self._discharged_construction(summary, trace))
+        )
 
     def summary_return(self, fact, offset):
         return fact
@@ -858,6 +879,7 @@ class Engine:
                 else:
                     break
             if constructor is not None:
+                atom = retag(atom, add=frozenset({f'ctor-site:{constructor}'}))
                 self.record(constructor, retag(atom, add=frozenset({'path-construction'})))
             value = join(value, atom)
         if '+' in self.code[start:end]:
@@ -1225,11 +1247,29 @@ def _selftest_containment_guard_suppression() -> None:
         '  }\n'
         '}\n'
     )
+    mixed_code = (
+        'class Mixed {\n'
+        '  Path choose(Path root, String raw) {\n'
+        '    Path leaked = root.resolve(raw);\n'
+        '    Path safe = root.resolve(raw).normalize();\n'
+        '    if (!safe.startsWith(root)) { throw new SecurityException("bad"); }\n'
+        '    return safe;\n'
+        '  }\n'
+        '  void handler(Request request, Path root) {\n'
+        '    Files.readString(choose(root, request.getParameter("file")));\n'
+        '  }\n'
+        '}\n'
+    )
     with tempfile.TemporaryDirectory(prefix="ubs_core_taint_java_traversal_") as tmp:
         target = Path(tmp) / "A.java"
         target.write_text(code, encoding="utf-8")
         findings = list(run(RunContext(lang="java", files=[target])))
-    assert findings == [], findings
+        assert findings == [], findings
+
+        mixed_target = Path(tmp) / "Mixed.java"
+        mixed_target.write_text(mixed_code, encoding="utf-8")
+        mixed_findings = list(run(RunContext(lang="java", files=[mixed_target])))
+        assert [item["line"] for item in mixed_findings] == [3], mixed_findings
 
 
 SELF_TESTS: tuple[tuple[str, callable], ...] = (

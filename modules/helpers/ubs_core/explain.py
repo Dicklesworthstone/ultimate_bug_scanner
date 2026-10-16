@@ -114,13 +114,15 @@ LANG_NAMES: dict[str, str] = {
     "csharp": "C# / .NET",
     "cs": "C# / .NET",
     "elixir": "Elixir",
+    "bash": "Bash / Shell",
+    "sh": "Bash / Shell",
     "php": "PHP",
 }
 
 SRC_EXTS = {
     ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
     ".go", ".rs", ".java", ".kt", ".kts", ".cpp", ".cc", ".cxx",
-    ".c", ".h", ".hh", ".hpp", ".hxx", ".rb", ".swift", ".cs", ".ex", ".exs", ".php", ".phtml",
+    ".c", ".h", ".hh", ".hpp", ".hxx", ".rb", ".swift", ".cs", ".ex", ".exs", ".sh", ".bash", ".php", ".phtml",
 }
 
 IGNORE_FILE_NAMES = {
@@ -192,6 +194,8 @@ def _find_primary_source_file(target_path: Path, lang: str | None = None) -> Pat
                 return c
             if "java" in lang_lower and ext in (".java", ".kt"):
                 return c
+            if "kotlin" in lang_lower and ext in (".kt", ".kts"):
+                return c
             if "cpp" in lang_lower and ext in (".cpp", ".cc", ".cxx", ".c"):
                 return c
             if "ruby" in lang_lower and ext == ".rb":
@@ -201,6 +205,8 @@ def _find_primary_source_file(target_path: Path, lang: str | None = None) -> Pat
             if "cs" in lang_lower and ext == ".cs":
                 return c
             if "elixir" in lang_lower and ext in (".ex", ".exs"):
+                return c
+            if ("bash" in lang_lower or lang_lower == "sh") and ext in (".sh", ".bash"):
                 return c
             if lang_lower == "php" and ext in (".php", ".phtml"):
                 return c

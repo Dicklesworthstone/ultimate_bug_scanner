@@ -613,6 +613,40 @@ class KotlinNativeAnalyzerTests(LoggedKotlinCase):
     def test_coroutine_api_identity_context_and_ownership(self):
         self.check_cases(COROUTINE_CASES)
 
+    def test_java_kotlin_analyzer_parity_and_error_isolation(self):
+        from unittest import mock
+        from ubs_core import java_scan
+
+        case = BY_NAME["blocking_sleep_in_suspend"]
+        directory, source = self.fixture(case, "-parity")
+        java_sink = io.StringIO()
+        java_errors = []
+        java_scan.run_analyzers([source], java_sink, set(), java_errors)
+        java_records = [json.loads(line) for line in java_sink.getvalue().splitlines() if line]
+        self.assertEqual(java_errors, [])
+        self.assert_records(case, java_records)
+
+        from ubs_core.analyzers import taint_java_traversal
+
+        bad_file = directory / "BrokenTaint.kt"
+        bad_file.write_text("fun ok() = 1\n", encoding="utf-8")
+        kt_sink = io.StringIO()
+        kt_errors = []
+        original_run = taint_java_traversal.run
+
+        def flaky_run(ctx):
+            if any(Path(p) == bad_file for p in ctx.files):
+                raise ValueError("synthetic taint failure")
+            return original_run(ctx)
+
+        with mock.patch.object(taint_java_traversal, "run", side_effect=flaky_run):
+            kotlin_scan.scan_analyzers([bad_file, source], kt_sink, set(), errors=kt_errors)
+        kt_records = [json.loads(line) for line in kt_sink.getvalue().splitlines() if line]
+        self.assertEqual(len(kt_errors), 1)
+        self.assertIn("taint_java_traversal", kt_errors[0])
+        self.assertIn("BrokenTaint.kt", kt_errors[0])
+        self.assert_records(case, kt_records)
+
 
 @unittest.skipUnless(os.environ.get("UBS_KOTLIN_NATIVE_E2E") == "1", "set UBS_KOTLIN_NATIVE_E2E=1 for actual CLI scans")
 class KotlinNativeCliTests(LoggedKotlinCase):

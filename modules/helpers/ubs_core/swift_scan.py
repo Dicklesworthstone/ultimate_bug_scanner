@@ -502,8 +502,10 @@ def _analyzer_category(rule: str) -> int | None:
     """Registry analyzers ran inside their legacy categories."""
     if rule.startswith("swift.taint."):
         return 6
-    if rule.startswith("swift.narrowing."):
+    if rule.startswith("swift.narrowing.") or rule.startswith("swift.guards."):
         return 1
+    if rule.startswith("swift.regex."):
+        return 12
     if rule.startswith("swift.lifecycle."):
         return 16
     return None
@@ -513,18 +515,18 @@ def run_analyzers(ctx: ScanContext, sink, skip: set[int], enable_new: bool = Fal
                   prefilter: Any = None, errors: list[str] | None = None) -> None:
     """Run registered swift analyzers (taint, narrowing, lifecycle).
 
-    ``regex_swift`` (ReDoS deep analysis) has no legacy counter impact — the
-    legacy cat-12 checks were pure rg pipelines — so it stays off unless
-    ``enable_new`` is set, keeping v2 totals at legacy parity. Analyzer
-    record paths retain their complete source identity for cache association.
+    ``regex_swift`` (ReDoS deep analysis) and ``guards_swift`` have no legacy
+    counter impact — they stay off unless ``enable_new`` is set, keeping v2
+    totals at legacy parity. Analyzer record paths retain their complete
+    source identity for cache association.
     """
     from ubs_core import analyzers  # noqa: F401  (populate registry)
     from ubs_core.registry import RunContext, analyzers_for_lang
 
     for analyzer in analyzers_for_lang("swift"):
-        if analyzer.layer == "regex" and not enable_new:
+        if analyzer.layer in ("regex", "guards") and not enable_new:
             continue
-        category = {"taint": 6, "narrowing": 1, "lifecycle": 16}.get(analyzer.layer)
+        category = {"taint": 6, "narrowing": 1, "guards": 1, "regex": 12, "lifecycle": 16}.get(analyzer.layer)
         if category in skip:
             continue
         if analyzer.layer == "narrowing":

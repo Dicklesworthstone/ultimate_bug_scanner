@@ -46,10 +46,11 @@ SINK_RE = re.compile(
     r'|\b(?:send_file|serve_file|download_file|write_file_response)\s*\(?'
     r'|\brender\s+(?:file|template):',
 )
-PROOF_TAGS = frozenset({'url-host', 'url-scheme', 'contained-path'})
+PROOF_TAGS = frozenset({'url-host', 'url-scheme', 'contained-path', 'redirect-slash-prefix', 'redirect-not-double-slash', 'safe-redirect'})
 VALUE_TAGS = PROOF_TAGS | frozenset({'canonical-path', 'parsed-uri', 'basename-path', 'not-dot-name', 'exact-literal', 'sql-bound-value', 'sql-integer-value'})
 PATH_RULE = 'ruby.taint.path_traversal'
 URL_RULE = 'ruby.taint.outbound_url'
+REDIRECT_RULE = 'ruby.redirect.open'
 EVAL_RULE = 'ruby.security.eval-family'
 DISPATCH_RULE = 'ruby.security.dynamic-dispatch'
 COMMAND_RULE = 'ruby.security.backticks-interpolated'
@@ -1205,13 +1206,17 @@ class RubyEngine:
     def record(self, offset, value, operation=''):
         unsafe = frozenset(trace for trace in tainted(value)
                            if ('contained-path' not in trace.tags if self.policy == 'path'
-                               else not {'url-host', 'url-scheme'} <= trace.tags)
+                               else not ({'url-host', 'url-scheme'} <= trace.tags
+                                         or (self.policy == 'redirect'
+                                             and ({'redirect-slash-prefix', 'redirect-not-double-slash'} <= trace.tags
+                                                  or 'safe-redirect' in trace.tags))))
                            and not (self.policy == 'path' and 'basename-path' in trace.tags
                                     and ('not-dot-name' in trace.tags or operation == 'send_file'
                                          or re.fullmatch(r'(?:File|IO)\.(?:read|binread|write|binwrite|open|truncate)', operation))))
         if unsafe:
-            label = 'file sink' if self.policy == 'path' else 'outbound URL sink'
-            site = (PATH_RULE if self.policy == 'path' else URL_RULE, offset)
+            label = 'file sink' if self.policy == 'path' else 'redirect sink' if self.policy == 'redirect' else 'outbound URL sink'
+            rule = PATH_RULE if self.policy == 'path' else REDIRECT_RULE if self.policy == 'redirect' else URL_RULE
+            site = (rule, offset)
             self.effects[site] = join(self.effects.get(site, CLEAN), advance(unsafe, self.step(offset, 'sink', label)))
 
     def execution_sink(self, offset, value, rule, operation, state):
@@ -1448,7 +1453,30 @@ class RubyEngine:
                               'pathname' if has_shape(receiver, 'pathname') else 'string', token.start)
         positional = [argument for argument in arguments
                       if not any(trace.kind == 'keyword' for trace in argument)]
-        if self.policy == 'url':
+        if self.policy == 'redirect':
+            if name in {'url_from', 'self.url_from'} and positional:
+                return self.fresh(retag(positional[0], add=frozenset({'safe-redirect'})), 'string', token.start)
+            if name in {'redirect_to', 'redirect', 'self.redirect_to', 'self.redirect'}:
+                allow_other_host_false = any(
+                    any(trace.kind == 'keyword' and trace.key == ('allow_other_host',) for trace in argument)
+                    and any(trace.kind == 'constant' and trace.key == ('code', 'false') for trace in argument)
+                    and not tainted(argument)
+                    for argument in arguments
+                )
+                if not allow_other_host_false:
+                    if positional:
+                        self.record(token.start, positional[0], name)
+                    for argument in arguments:
+                        if any(trace.kind == 'keyword' and trace.key[0] in {'location', 'url'} for trace in argument):
+                            self.record(token.start, argument, name)
+            elif name in {'head', 'self.head'}:
+                for argument in arguments:
+                    if any(trace.kind == 'keyword' and trace.key == ('location',) for trace in argument):
+                        self.record(token.start, argument, name)
+            elif re.fullmatch(r'(?:response(?:\.headers)?|headers)\.(?:store|\[\]=|set_header|add_header)', name, re.IGNORECASE) and len(positional) >= 2:
+                if any(trace.kind == 'constant' and trace.key[0] == 'literal' and trace.key[1].lower() == 'location' for trace in positional[0]):
+                    self.record(token.start, positional[1], name)
+        elif self.policy == 'url':
             is_sink = (name in {'URI.open', 'OpenURI.open', 'open'}
                        or re.fullmatch(r'Net::HTTP\.(?:get|get_response|post|post_form|start|new)', name)
                        or re.fullmatch(r'(?:Faraday|HTTParty|RestClient|Excon|HTTP|Typhoeus|Curl)\.(?:get|post|put|patch|delete|head|request)', name)
@@ -1511,6 +1539,16 @@ class RubyEngine:
         literal = self.literal_value(tokens)
         if literal:
             return literal
+        if (len(tokens) >= 2 and tokens[0].kind == 'code'
+                and re.fullmatch(r'[a-z_]\w*[!?]?', tokens[0].value)
+                and tokens[0].value not in {'not', 'and', 'or', 'true', 'false', 'nil', 'self'}
+                and tokens[0].value not in state
+                and (tokens[1].kind != 'code'
+                     or (tokens[1].value == ':' and tokens[0].end < tokens[1].start)
+                     or tokens[1].value not in {'.', '&.', '[', '(', '::', ',', ')', ']', '}', '=>', ':', '||', 'or', '&&', 'and', '==', '!=', '=~', '!~', '<', '>', '<=', '>=', '+', '-', '*', '/', '..', '<<'})):
+            arguments = self.call_arguments(tokens[1:], state, depth + 1)
+            atom = self.call(tokens[0].value, CLEAN, arguments, tokens[0], state)
+            return frozenset(trace for trace in atom if trace.kind != 'keyword')
         shifted = split_tokens(tokens, {'<<'})
         if len(shifted) == 2:
             previous = self.expression(shifted[0], state, depth + 1)
@@ -1520,8 +1558,9 @@ class RubyEngine:
         for operators in ({'=>', ':'}, {'||', 'or'}, {'&&', 'and'}, {'==', '!=', '=~', '!~', '<', '>', '<=', '>='}, {'+', '-', '*', '/', '..'}):
             parts = split_tokens(tokens, operators)
             if len(parts) > 1:
+                preserved = frozenset({'sql-integer-value', 'safe-redirect'}) if '||' in operators else frozenset({'sql-integer-value'})
                 combined = retag(self.invalidate_sql_binding(join(*(self.expression(part, state, depth + 1) for part in parts))),
-                                 remove=VALUE_TAGS - frozenset({'sql-integer-value'}))
+                                 remove=VALUE_TAGS - preserved)
                 if '+' in operators and all(parts):
                     return self.fresh(retag(self.without_sql_api(combined),
                                             remove=frozenset({'sql-raw-fragment'})), 'string', tokens[0].start)
@@ -1636,30 +1675,43 @@ class RubyEngine:
                                if all_required else frozenset.intersection(*(proof.get(name, frozenset()) for proof in proofs)))
                         for name in names}
         text = token_text(tokens)
-        if self.policy == 'url':
+        if self.policy in {'url', 'redirect'}:
             equal = split_tokens(tokens, {'==' if truth else '!='})
             if len(equal) == 2:
                 for member, literal in (equal, equal[::-1]):
-                    match = re.fullmatch(r'([A-Za-z_]\w*)\.(scheme|host|hostname)', token_text(member))
+                    match = re.fullmatch(r'(?:(?:URI|Addressable::URI)\.parse\(([A-Za-z_]\w*)(?:\.to_s)?\)|([A-Za-z_]\w*))\.(scheme|host|hostname)', token_text(member))
                     values = self.literal(literal)
-                    if match and len(values) == 1:
+                    if match and len(values) == 1 and (not match.group(1) or self.policy == 'redirect'):
+                        target_name = match.group(1) or match.group(2)
+                        prop = match.group(3)
                         item = next(iter(values))
                         if item.kind == 'constant' and item.key[0] == 'literal':
-                            if match.group(2) == 'scheme' and item.key[1] in {'https', 'http'}:
-                                return {match.group(1): frozenset({'url-scheme'})}
-                            if match.group(2) != 'scheme' and re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?', item.key[1]):
-                                return {match.group(1): frozenset({'url-host'})}
+                            if prop == 'scheme' and item.key[1] in {'https', 'http'}:
+                                return {target_name: frozenset({'url-scheme'})}
+                            if prop != 'scheme' and re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?', item.key[1]):
+                                return {target_name: frozenset({'url-host'})}
             if truth:
-                member = re.search(r'\.include\?\(([A-Za-z_]\w*)\.(host|hostname|scheme)\)$', text)
-                if member:
+                member = re.search(r'\.include\?\((?:(?:URI|Addressable::URI)\.parse\(([A-Za-z_]\w*)(?:\.to_s)?\)|([A-Za-z_]\w*))\.(host|hostname|scheme)\)$', text)
+                if member and (not member.group(1) or self.policy == 'redirect'):
+                    target_name = member.group(1) or member.group(2)
+                    prop = member.group(3)
                     split = next((index for index in range(len(tokens) - 1) if tokens[index].value == '.' and tokens[index + 1].value == 'include?'), None)
                     if split is not None:
                         allowed = self.expression(tokens[:split], state)
                         constants = [trace.key[1] for trace in allowed if trace.kind == 'constant' and trace.key[0] == 'literal']
                         if has_shape(allowed, 'literal-list') and not tainted(allowed) and constants:
-                            valid = all(value in {'https', 'http'} for value in constants) if member.group(2) == 'scheme' else all(re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?', value) for value in constants)
+                            valid = all(value in {'https', 'http'} for value in constants) if prop == 'scheme' else all(re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?', value) for value in constants)
                             if valid:
-                                return {member.group(1): frozenset({'url-scheme' if member.group(2) == 'scheme' else 'url-host'})}
+                                return {target_name: frozenset({'url-scheme' if prop == 'scheme' else 'url-host'})}
+            if self.policy == 'redirect':
+                if truth:
+                    slash = re.fullmatch(r'([A-Za-z_]\w*)(?:\.to_s)?\.start_with\?\([\'\"]/[\'\"]\)', text)
+                    if slash:
+                        return {slash.group(1): frozenset({'redirect-slash-prefix'})}
+                else:
+                    double_slash = re.fullmatch(r'([A-Za-z_]\w*)(?:\.to_s)?\.start_with\?\([\'\"](?://|/\\)[\'\"]\)', text)
+                    if double_slash:
+                        return {double_slash.group(1): frozenset({'redirect-not-double-slash'})}
         elif truth:
             prefix = re.fullmatch(r'([A-Za-z_]\w*)\.start_with\?\(([A-Za-z_]\w*)\+(?:File::SEPARATOR|[\'\"]/[\'\"])\)', text)
             equality = re.fullmatch(r'([A-Za-z_]\w*)==([A-Za-z_]\w*)', text)
@@ -1834,7 +1886,7 @@ class RubyEngine:
                     first = tokens[0].value if tokens and tokens[0].kind == 'code' else ''
                     if first == 'return':
                         following = evaluate('simple', tokens[1:], (return_to,), exception_to)
-                    elif first in {'raise', 'fail', 'throw', 'abort', 'exit'}:
+                    elif first in {'raise', 'fail', 'throw', 'abort', 'exit', 'halt'}:
                         following = node('raise', tokens[1:], (exception_to,))
                     elif first in {'break', 'next'}:
                         target = break_to if first == 'break' else next_to
@@ -1876,6 +1928,8 @@ class RubyEngine:
                         raise ValueError('Request-derived Ruby instance/global state needs heap analysis; analysis is incomplete')
                     state[name] = advance(value, self.step(lhs[0].start, 'assign', name))
                 else:
+                    if self.policy == 'redirect' and re.fullmatch(r'(?:response(?:\.headers)?|headers)\[\'location\'\]', token_text(lhs), re.IGNORECASE):
+                        self.record(lhs[0].start, value, 'response[Location]')
                     name = lhs[0].value
                     self.mutate(state.get(name, CLEAN), value, state, name)
             offset -= len(lhs_group) + 1
@@ -1974,6 +2028,9 @@ class RubyEngine:
             for name, tags in self.proof(tokens, extra, state).items():
                 state[name] = join(*(retag(frozenset({trace}), add=tags)
                                     if (self.policy == 'url' and 'parsed-uri' in trace.tags
+                                        or self.policy == 'redirect' and (
+                                            'parsed-uri' in trace.tags
+                                            or tags <= frozenset({'url-host', 'url-scheme', 'redirect-slash-prefix', 'redirect-not-double-slash'}))
                                         or self.policy == 'path' and ('canonical-path' in trace.tags or tags == frozenset({'not-dot-name'})))
                                     else frozenset({trace}) for trace in state.get(name, CLEAN)))
             return state
@@ -2077,6 +2134,7 @@ class RubyEngine:
                 self.parameter_values = dict(enumerate(key[1]))
                 state = {'@reachable': constant('reachable'),
                          'params': shape('request-params', function.key), 'env': shape('environment', function.key),
+                         **({'cookies': shape('request-params', function.key)} if self.policy == 'redirect' else {}),
                          **{name: shape('request', function.key) for name in ('request', 'req', 'rack_request')}}
                 if function.owner in self.sql_models and (function.singleton or function.scope):
                     state['self'] = shape('active-record-model', function.owner)
@@ -2108,10 +2166,9 @@ class RubyEngine:
         return effects
 
 
-def flow_findings(path, policy):
-    text = path.read_text(encoding='utf-8')
+def flow_findings_from_text(path, text, policy):
     # Skip files with no request vocabulary before parsing unrelated Ruby DSLs.
-    if not re.search(r'\b(?:params|request|req|rack_request|env|Rack::Request|original_filename|filename)\b', text):
+    if not re.search(r'\b(?:params|request|req|rack_request|env|cookies|Rack::Request|original_filename|filename)\b', text):
         return
     engine = RubyEngine(path, text, policy)
     lines = text.splitlines()
@@ -2138,6 +2195,11 @@ def flow_findings(path, policy):
     failures = set().union(*engine.dispatch_failures.values())
     if failures:
         raise ValueError('; '.join(sorted(failures)))
+
+
+def flow_findings(path, policy):
+    text = path.read_text(encoding='utf-8')
+    yield from flow_findings_from_text(path, text, policy)
 
 
 def analyze(path, issues):

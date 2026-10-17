@@ -14,12 +14,20 @@ names of unknown origin (e.g. imported constants) surface as WARNING.
 Module-constant f-strings therefore stay silent (static tier).
 
 Same-file and previous-line `ubs:ignore` markers suppress a hit at the call.
+
+Statement templates, raw predicates and SELECT mapping values retain distinct
+facts through the existing bounded flow engine. Finite literal iterables keep
+their exact trip counts; finally transforms abrupt as well as normal exits.
+Exception matching and unknown callee/heap effects remain conservative. An
+exhausted budget or unsupported exception-group flow is not a clean result.
 """
 from __future__ import annotations
 
 import ast
 import os
 import re
+import tokenize
+from pathlib import Path
 from typing import Iterable, Sequence
 
 from ubs_core.io import python_source_segment
@@ -391,10 +399,19 @@ def all_static_strings(node):
 # parameters, or names bound to such values), 'unknown' = a plain name whose
 # origin is not visible in this file (e.g. an imported constant).
 RISK_ORDER = {'static': 0, 'unknown': 1, 'tainted': 2}
+SQL_RISK_ORDER = {None: 0, 'warning': 1, 'critical': 2}
+
+
+class SQLFlowLimit(RuntimeError):
+    """The bounded SQL pass could not establish a complete result."""
 
 
 def max_risk(a, b):
     return a if RISK_ORDER[a] >= RISK_ORDER[b] else b
+
+
+def join_sql_risks(*risks):
+    return max(risks, key=SQL_RISK_ORDER.__getitem__, default=None)
 
 
 def binding_target_names(target):
@@ -502,9 +519,40 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         self.sink_lineno = None
         self.unsafe_sql_vars = set()
         self.weak_sql_vars = set()
+        # Raw predicates need no statement keyword. Mapping values remain
+        # separate because Django quotes SELECT result-alias keys.
+        self.fragment_sql_vars = {}
+        self.select_sql_vars = {}
+        self.sql_template_vars = set()
+        self.value_risks = {}
         self._sink_risks = {}
         self.remaining_steps = max_steps
         self._pending_raise = None
+        # A loaded expression denotes its value *at evaluation time*. Later
+        # argument/walrus writes must not change a value already captured by
+        # a tuple, SQL call or bound format method. AST objects (not their
+        # recycled numeric ids) key these bounded per-analysis snapshots.
+        self._evaluated_values = {}
+
+    def visit(self, node):
+        if not isinstance(node, ast.expr):
+            return super().visit(node)
+        self.step()
+        # The same AST may run on another branch, loop iteration or finally
+        # exit. Recompute its snapshot instead of reusing a previous store.
+        self._evaluated_values.pop(node, None)
+        result = super().visit(node)
+        if node not in self._evaluated_values:
+            self._evaluated_values[node] = self.value_facts(node)
+        return result
+
+    @staticmethod
+    def join_value_facts(*facts):
+        return (join_sql_risks(*(fact[0] for fact in facts)),
+                join_sql_risks(*(fact[1] for fact in facts)),
+                join_sql_risks(*(fact[2] for fact in facts)),
+                any(fact[3] for fact in facts),
+                max((fact[4] for fact in facts), key=RISK_ORDER.__getitem__, default='unknown'))
 
     @property
     def issues(self):
@@ -517,7 +565,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
     def step(self):
         self.remaining_steps -= 1
         if self.remaining_steps < 0:
-            raise RuntimeError('SQL dataflow budget exceeded; analysis is incomplete')
+            raise SQLFlowLimit('SQL dataflow budget exceeded; analysis is incomplete')
 
     @staticmethod
     def join_sql_states(*states):
@@ -526,7 +574,17 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             return None
         unsafe = set().union(*(state[0] for state in present))
         weak = set().union(*(state[1] for state in present)) - unsafe
-        return unsafe, weak
+        fragments, selects = {}, {}
+        for state in present:
+            for merged, incoming in ((fragments, state[2]), (selects, state[3])):
+                for name, risk in incoming.items():
+                    merged[name] = join_sql_risks(merged.get(name), risk)
+        templates = set().union(*(state[4] for state in present))
+        values = {}
+        for name in set().union(*(state[5] for state in present)):
+            values[name] = max((state[5].get(name, 'unknown') for state in present),
+                               key=RISK_ORDER.__getitem__)
+        return unsafe, weak, fragments, selects, templates, values
 
     def merge_flows(self, *flows):
         merged = {}
@@ -580,6 +638,11 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         parameters = _all_parameters(node)
         self.unsafe_sql_vars.difference_update(parameters)
         self.weak_sql_vars.difference_update(parameters)
+        self.sql_template_vars.difference_update(parameters)
+        for parameter in parameters:
+            self.fragment_sql_vars.pop(parameter, None)
+            self.select_sql_vars.pop(parameter, None)
+            self.value_risks[parameter] = 'tainted'
         self.func_stack.append(node)
         try:
             self.statements(node.body, self.sql_state())
@@ -594,13 +657,15 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         # must not mutate the defining scope or raise into its try block.
         self.visit(node.args)
         outer, enclosing_raise = self.sql_state(), self._pending_raise
-        self.store_sql_risk(_all_parameters(node), None)
+        self.bind_value_facts(_all_parameters(node), (None, None, None, False, 'tainted'))
         self._pending_raise = None
         try:
             self.visit(node.body)
         finally:
             self.restore_sql_state(outer)
             self._pending_raise = enclosing_raise
+        # Creating a function does not return the value of its deferred body.
+        self._evaluated_values[node] = (None, None, None, False, 'unknown')
 
     def visit_ClassDef(self, node):
         for expression in [*node.decorator_list, *node.bases]:
@@ -618,10 +683,13 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
 
     def sql_state(self):
         """Snapshot SQL-value facts without sharing mutable branch stores."""
-        return self.unsafe_sql_vars.copy(), self.weak_sql_vars.copy()
+        return (self.unsafe_sql_vars.copy(), self.weak_sql_vars.copy(),
+                self.fragment_sql_vars.copy(), self.select_sql_vars.copy(),
+                self.sql_template_vars.copy(), self.value_risks.copy())
 
     def restore_sql_state(self, state):
-        self.unsafe_sql_vars, self.weak_sql_vars = (set(names) for names in state)
+        (self.unsafe_sql_vars, self.weak_sql_vars, self.fragment_sql_vars,
+         self.select_sql_vars, self.sql_template_vars, self.value_risks) = (part.copy() for part in state)
 
     def visit_If(self, node):
         self.visit(node.test)
@@ -645,20 +713,20 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
     def visit_For(self, node):
         if isinstance(node, ast.For) and isinstance(node.iter, (ast.List, ast.Tuple)):
             if not any(isinstance(value, ast.Starred) for value in node.iter.elts):
-                risks = []
+                items = []
                 for value in node.iter.elts:
                     self.visit(value)
-                    risks.append(self.sql_risk(value))
-                return self.finite_loop(node, risks)
+                    items.append(self.assignment_bindings(node.target, value))
+                return self.finite_loop(node, items)
         self.visit(node.iter)
-        return self.loop(node, self.sql_risk(node.iter))
+        return self.loop(node, self.value_facts(node.iter))
 
     visit_AsyncFor = visit_For
 
     def visit_While(self, node):
         return self.loop(node)
 
-    def finite_loop(self, node, risks):
+    def finite_loop(self, node, items):
         """A literal list/tuple has exactly this many iteration values.
 
         Evaluate every element before entering the loop. Do not invent a
@@ -667,12 +735,13 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         """
         incoming = current = self.sql_state()
         escaped, breaks = {}, None
-        for risk in risks:
+        for bindings in items:
             if current is None:
                 break
             self.step()
             self.restore_sql_state(current)
-            self.store_sql_risk(binding_target_names(node.target), risk)
+            for names, facts in bindings:
+                self.bind_value_facts(names, facts)
             body = self.statements(node.body, self.sql_state())
             breaks = self.join_sql_states(breaks, body.get('break'))
             escaped = self.merge_flows(escaped, {
@@ -684,7 +753,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         self.restore_sql_state(flow.get('normal', incoming))
         return flow
 
-    def loop(self, node, iterable_risk=None):
+    def loop(self, node, iterable_facts=None):
         """Finite may-flow fixed point, including zero and later iterations.
 
         The loop header grows monotonically in the existing SQL-value
@@ -711,7 +780,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             tested = self.sql_state()
             exhausted = tested if truth is not True else None
             if not while_loop:
-                self.store_sql_risk(binding_target_names(node.target), iterable_risk)
+                self.bind_value_facts(binding_target_names(node.target), iterable_facts)
             body = self.statements(node.body, self.sql_state()) if truth is not False else {}
             breaks = self.join_sql_states(breaks, body.get('break'))
             escaped = self.merge_flows(escaped, {
@@ -768,9 +837,11 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
     def visit_BoolOp(self, node):
         # Short-circuited operands cannot overwrite the bypass store.
         bypass = None
+        values = []
         for index, value in enumerate(node.values):
             self.visit(value)
             if index == len(node.values) - 1:
+                values.append(self.value_facts(value))
                 break
             truth = self.literal_truth(value)
             if truth is None:
@@ -778,13 +849,16 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             continuing = True if isinstance(node.op, ast.And) else False
             if truth is not continuing:
                 bypass = self.join_sql_states(bypass, self.sql_state())
+                values.append(self.value_facts(value))
             if truth is not None and truth is not continuing:
                 break
         self.restore_sql_state(self.join_sql_states(bypass, self.sql_state()))
+        self._evaluated_values[node] = self.join_value_facts(*values)
 
     def visit_IfExp(self, node):
         self.visit(node.test)
         incoming, branches = self.sql_state(), []
+        values = []
         truth = self.literal_truth(node.test)
         if truth is None:
             self.note_possible_raise()
@@ -794,7 +868,17 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             self.restore_sql_state(incoming)
             self.visit(expression)
             branches.append(self.sql_state())
+            values.append(self.value_facts(expression))
         self.restore_sql_state(self.join_sql_states(*branches))
+        self._evaluated_values[node] = self.join_value_facts(*values)
+
+    def visit_Dict(self, node):
+        # ast.iter_child_nodes lists all keys before all values. Python
+        # instead evaluates each key immediately before its associated value.
+        for key, value in zip(node.keys, node.values):
+            if key is not None:
+                self.visit(key)
+            self.visit(value)
 
     def visit_Assert(self, node):
         optimized = self.sql_state()
@@ -834,12 +918,14 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 if handler.type is not None:
                     self.visit(handler.type)
                 if handler.name:
-                    self.store_sql_risk([handler.name], None)
+                    self.bind_value_facts([handler.name], (None, None, None, False, 'tainted'))
                 handled = self.statements(handler.body, self.sql_state())
                 if handler.name:
                     # Python clears the exception target on every exit.
-                    handled = {kind: (state[0] - {handler.name}, state[1] - {handler.name})
-                               for kind, state in handled.items()}
+                    for kind, state in handled.items():
+                        self.restore_sql_state(state)
+                        self.bind_value_facts([handler.name], (None, None, None, False, 'unknown'))
+                        handled[kind] = self.sql_state()
                 flow = self.merge_flows(flow, handled)
                 if handler.type is None:
                     catches_all = True
@@ -867,7 +953,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
     def visit_TryStar(self, node):
         # Several except* handlers can execute for one ExceptionGroup;
         # treating them as alternatives would silently discard write effects.
-        raise RuntimeError('SQL except* flow is unsupported; analysis is incomplete')
+        raise SQLFlowLimit('SQL except* exception-group flow is unsupported; analysis is incomplete')
 
     def visit_With(self, node):
         incoming = self.sql_state()
@@ -881,7 +967,8 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 # while evaluating/entering a later manager.
                 suppressed_setup = self.join_sql_states(suppressed_setup, before, self.sql_state())
             if item.optional_vars is not None:
-                self.store_sql_risk(binding_target_names(item.optional_vars), None)
+                self.bind_value_facts(binding_target_names(item.optional_vars),
+                                      (None, None, None, False, 'tainted'))
         flow = self.statements(node.body, self.sql_state())
         normal = self.join_sql_states(flow.get('normal'), flow.get('raise'), suppressed_setup)
         if normal is not None:
@@ -894,6 +981,44 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         return flow
 
     visit_AsyncWith = visit_With
+
+    def visit_Match(self, node):
+        # Each arm has an independent incoming store. Without value/type
+        # resolution, refutable patterns may miss; only an unguarded
+        # capture/wildcard consumes all remaining subjects.
+        self.visit(node.subject)
+        incoming = self.sql_state()
+        subject_facts = self.value_facts(node.subject)
+        flow, exhaustive = {}, False
+        for case in node.cases:
+            self.step()
+            self.restore_sql_state(incoming)
+            names = [part.name for part in ast.walk(case.pattern)
+                     if getattr(part, 'name', None)]
+            names += [part.rest for part in ast.walk(case.pattern)
+                      if getattr(part, 'rest', None)]
+            self.bind_value_facts(names, subject_facts)
+            truth = None
+            if case.guard is not None:
+                self.visit(case.guard)
+                truth = self.literal_truth(case.guard)
+                if truth is None:
+                    self.note_possible_raise()
+            guarded = self.sql_state()
+            if truth is not False:
+                flow = self.merge_flows(flow, self.statements(case.body, guarded))
+            if isinstance(case.pattern, ast.MatchAs) and case.pattern.pattern is None:
+                if case.guard is None or truth is True:
+                    exhaustive = True
+                    break
+            # A failed guard may still have executed assignments that are
+            # visible to later alternatives and the unmatched successor.
+            if case.guard is not None and truth is not True:
+                incoming = self.join_sql_states(incoming, guarded)
+        if not exhaustive:
+            flow = self.merge_flows(flow, {'normal': incoming})
+        self.restore_sql_state(flow.get('normal', incoming))
+        return flow
 
     def is_guarded(self, node):
         """Whether a sanitizer validated this exact expression before the sink.
@@ -915,8 +1040,26 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         at = guarded.get(segment.strip())
         return at is not None and at < self.sink_lineno
 
+    def value_nodes(self, node):
+        """Traverse value contributors, excluding format_map lookup keys."""
+        yield node
+        if node in self._evaluated_values:
+            return
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and
+                node.func.attr == 'format_map'):
+            yield from self.value_nodes(node.func.value)
+            for argument in node.args:
+                values = argument.values if isinstance(argument, ast.Dict) else [argument]
+                for value in values:
+                    yield from self.value_nodes(value)
+            for keyword in node.keywords:
+                yield from self.value_nodes(keyword.value)
+        else:
+            for child in ast.iter_child_nodes(node):
+                yield from self.value_nodes(child)
+
     def names_in(self, node):
-        return {child.id for child in ast.walk(node) if isinstance(child, ast.Name)}
+        return {child.id for child in self.value_nodes(node) if isinstance(child, ast.Name)}
 
     def unsafe_names_in(self, node):
         return sorted(name for name in self.names_in(node) if name in self.unsafe_sql_vars)
@@ -927,6 +1070,8 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
     def classify_expr(self, node):
         # GH #94: provenance of one interpolated value. Names tainted by an
         # interpolated-SQL assignment count as tainted here too.
+        if node in self._evaluated_values:
+            return self._evaluated_values[node][4]
         if isinstance(node, ast.Constant):
             return 'static'
         if isinstance(node, ast.JoinedStr):
@@ -938,6 +1083,9 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
             return max_risk(self.classify_expr(node.left), self.classify_expr(node.right))
         if isinstance(node, ast.Name):
+            if node.id in self.value_risks:
+                risk = self.value_risks[node.id]
+                return 'unknown' if risk == 'tainted' and self.is_guarded(node) else risk
             if node.id in self.param_names or node.id in self.unsafe_sql_vars:
                 # GH #133: a validated identifier is still not provably
                 # static, so it drops one tier to Warning rather than
@@ -973,12 +1121,15 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             parts = [node.right]
         elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
             parts = [node.left, node.right]
-        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == 'format':
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in {'format', 'format_map'}:
             parts = list(node.args) + [kw.value for kw in node.keywords]
+            if node.func.attr == 'format_map':
+                parts = [value for part in parts
+                         for value in (part.values if isinstance(part, ast.Dict) else [part])]
             sql_node = node.func.value
         else:
             return None
-        if require_sql and not looks_like_sql(sql_node, self.text):
+        if require_sql and not self.has_sql_template(sql_node):
             return None
         risk = 'static'
         for part in parts:
@@ -992,24 +1143,86 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             return True
         if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Mod, ast.Add)) and not all_static_strings(node):
             return True
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == 'format':
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in {'format', 'format_map'}:
             return True
         return any(self.contains_interpolation(child) for child in ast.iter_child_nodes(node))
 
     def sql_risk(self, node, require_sql=True):
         # Worst severity over the expression: None (safe), 'warning', 'critical'.
         worst = None
-        if self.unsafe_names_in(node):
-            return 'critical'
-        if self.weak_names_in(node):
-            worst = 'warning'
-        for child in ast.walk(node):
-            severity = self.interpolated_sql_severity(child, require_sql=require_sql)
+        for child in self.value_nodes(node):
+            if child in self._evaluated_values:
+                severity = self._evaluated_values[child][0 if require_sql else 1]
+            elif isinstance(child, ast.Name):
+                if require_sql:
+                    severity = ('critical' if child.id in self.unsafe_sql_vars else
+                                'warning' if child.id in self.weak_sql_vars else None)
+                else:
+                    severity = self.fragment_sql_vars.get(child.id)
+            else:
+                severity = self.interpolated_sql_severity(child, require_sql=require_sql)
             if severity == 'critical':
                 return 'critical'
             if severity == 'warning':
-                worst = 'warning'
+                worst = join_sql_risks(worst, severity)
         return worst
+
+    def has_sql_template(self, node):
+        if node in self._evaluated_values:
+            return self._evaluated_values[node][3]
+        return (looks_like_sql(node, self.text) or any(
+            self._evaluated_values[child][3] if child in self._evaluated_values else
+            isinstance(child, ast.Name) and child.id in self.sql_template_vars
+            for child in self.value_nodes(node)))
+
+    def select_risk(self, node):
+        """Risk of raw SQL mapping values, retaining the distinction on aliases."""
+        if node in self._evaluated_values:
+            return self._evaluated_values[node][2]
+        if isinstance(node, ast.Name):
+            return self.select_sql_vars.get(node.id)
+        if isinstance(node, ast.Dict):
+            return join_sql_risks(*(
+                self.select_risk(value) if key is None else self.sql_risk(value, require_sql=False)
+                for key, value in zip(node.keys, node.values)
+            ))
+        if isinstance(node, ast.IfExp):
+            return join_sql_risks(self.select_risk(node.body), self.select_risk(node.orelse))
+        return self.sql_risk(node, require_sql=False)
+
+    def value_facts(self, value):
+        if value in self._evaluated_values:
+            return self._evaluated_values[value]
+        return (self.sql_risk(value), self.sql_risk(value, require_sql=False),
+                self.select_risk(value), self.has_sql_template(value), self.classify_expr(value))
+
+    def bind_value_facts(self, names, facts):
+        risk, fragment_risk, select_risk, template, provenance = facts
+        self.store_sql_risk(names, risk)
+        for name in names:
+            self.value_risks[name] = provenance
+            for store, value in ((self.fragment_sql_vars, fragment_risk),
+                                 (self.select_sql_vars, select_risk)):
+                if value is None:
+                    store.pop(name, None)
+                else:
+                    store[name] = value
+            if template:
+                self.sql_template_vars.add(name)
+            else:
+                self.sql_template_vars.discard(name)
+
+    def assignment_bindings(self, target, value):
+        # Capture every RHS value before binding any target. A swap is not
+        # two sequential assignments; matching tuple/list elements retain
+        # separate facts rather than tainting every target with their union.
+        if (isinstance(target, (ast.Tuple, ast.List)) and
+                isinstance(value, (ast.Tuple, ast.List)) and
+                len(target.elts) == len(value.elts) and
+                not any(isinstance(item, ast.Starred) for item in target.elts + value.elts)):
+            return [binding for left, right in zip(target.elts, value.elts)
+                    for binding in self.assignment_bindings(left, right)]
+        return [(binding_target_names(target), self.value_facts(value))]
 
     def target_names(self, targets):
         names = []
@@ -1021,7 +1234,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         return names
 
     def mark_assignment(self, names, value):
-        self.store_sql_risk(names, self.sql_risk(value))
+        self.bind_value_facts(names, self.value_facts(value))
 
     def store_sql_risk(self, names, risk):
         if risk == 'critical':
@@ -1039,11 +1252,12 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
 
     def visit_Assign(self, node):
         self.visit(node.value)
-        names = self.target_names(node.targets)
-        if names:
-            self.mark_assignment(names, node.value)
+        pending = [binding for target in node.targets
+                   for binding in self.assignment_bindings(target, node.value)]
         for target in node.targets:
             self.visit(target)
+        for names, facts in pending:
+            self.bind_value_facts(names, facts)
 
     def visit_AnnAssign(self, node):
         if node.value is not None:
@@ -1056,27 +1270,32 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
     def visit_NamedExpr(self, node):
         self.visit(node.value)
         self.mark_assignment(binding_target_names(node.target), node.value)
+        self._evaluated_values[node] = self.value_facts(node.value)
 
     def visit_AugAssign(self, node):
+        self.visit(node.target)
+        left = self.value_facts(node.target)
+        self.visit(node.value)
+        self.note_possible_raise()
         if isinstance(node.target, ast.Name):
-            risk = self.sql_risk(node.value)
-            if node.target.id in self.unsafe_sql_vars or risk == 'critical':
-                self.unsafe_sql_vars.add(node.target.id)
-                self.weak_sql_vars.discard(node.target.id)
-            elif node.target.id in self.weak_sql_vars or risk == 'warning':
-                self.weak_sql_vars.add(node.target.id)
-        self.generic_visit(node)
+            # += reads its left value before evaluating the RHS, unlike a
+            # fresh lookup of the same name after an RHS assignment expression.
+            self._evaluated_values[node.target] = left
+            value = ast.copy_location(ast.BinOp(left=node.target, op=node.op, right=node.value), node)
+            self.mark_assignment([node.target.id], value)
 
     def sql_argument(self, node):
         name = call_name(node.func)
         short = name.rsplit('.', 1)[-1]
         if short in EXECUTE_METHODS:
-            if node.args:
+            if node.args and not isinstance(node.args[0], ast.Starred):
                 return node.args[0]
             keywords = SQL_ARGUMENT_KEYWORDS.get(short, frozenset())
             for keyword in node.keywords:
                 if keyword.arg in keywords:
                     return keyword.value
+            if node.args:
+                return node.args[0]
         if short == 'extra':
             for keyword in node.keywords:
                 if keyword.arg == 'where':
@@ -1084,7 +1303,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         return None
 
     def sql_arguments(self, node):
-        """Yield SQL expressions and whether they need a statement keyword.
+        """Yield SQL expressions and their statement/fragment/mapping context.
 
         Django extra(select, where, params, ...) accepts SQL fragments, not
         complete statements. Its select dictionary keys are result aliases;
@@ -1093,7 +1312,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         if call_name(node.func).rsplit('.', 1)[-1] != 'extra':
             argument = self.sql_argument(node)
             if argument is not None:
-                yield argument, True
+                yield argument, 'statement'
             return
         for index, name in enumerate(('select', 'where')):
             argument = next((keyword.value for keyword in node.keywords
@@ -1105,34 +1324,36 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                     argument = node.args[index]
             if argument is None:
                 continue
-            if name == 'select' and isinstance(argument, ast.Dict):
-                for value in argument.values:
-                    yield value, False
-            else:
-                yield argument, False
+            yield argument, 'select' if name == 'select' else 'fragment'
 
     def visit_Call(self, node):
         self.note_possible_raise()
-        if has_ignore(self.lines, node.lineno):
-            self.generic_visit(node)
-            self.note_possible_raise()
-            return
         # The sink's own first line is what a guard has to precede (GH #133).
         # Using the sink line rather than the interpolated value's line keeps
         # a guard written inside the same multi-line call from counting.
+        is_sink = bool(list(self.sql_arguments(node)))
         previous_sink = self.sink_lineno
-        self.sink_lineno = node.lineno
+        if is_sink:
+            self.sink_lineno = node.lineno
         try:
-            self.classify_sink(node)
+            self.visit(node.func)
+            for argument in node.args:
+                self.visit(argument)
+            for keyword in node.keywords:
+                self.visit(keyword.value)
+            # All effects have now occurred, but each argument retains its
+            # own evaluation-time value. Suppress findings, never execution.
+            if is_sink and not has_ignore(self.lines, node.lineno):
+                self.classify_sink(node)
         finally:
             self.sink_lineno = previous_sink
-        self.generic_visit(node)
         self.note_possible_raise()
 
     def classify_sink(self, node):
         worst = None
-        for argument, require_sql in self.sql_arguments(node):
-            risk = self.sql_risk(argument, require_sql=require_sql)
+        for argument, context in self.sql_arguments(node):
+            risk = (self.select_risk(argument) if context == 'select' else
+                    self.sql_risk(argument, require_sql=context == 'statement'))
             if risk == 'critical':
                 worst = risk
                 break
@@ -1145,15 +1366,16 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             self._sink_risks[id(node)] = (worst, node.lineno, source_line(self.lines, node.lineno))
 
 
-def find(files: Sequence[Path]) -> Iterable[tuple[str, Path, int, int, str]]:
+def find(files: Sequence[Path], *, max_steps=100_000) -> Iterable[tuple[str, Path, int, int, str]]:
     for path in files:
         if path.suffix.lower() not in {'.py', '.pyi'}:
             continue
         try:
-            text = path.read_text(encoding='utf-8', errors='ignore')
+            with tokenize.open(path) as stream:
+                text = stream.read()
             tree = ast.parse(text, filename=str(path))
-        except Exception:
-            continue
+        except (OSError, UnicodeError, SyntaxError) as exc:
+            raise SQLFlowLimit(f'Cannot analyze Python SQL source {path}: {exc}; analysis is incomplete') from exc
         lines = text.splitlines()
         param_names, name_risk = build_provenance(tree)
         sanitizers = configured_sanitizers()
@@ -1164,6 +1386,7 @@ def find(files: Sequence[Path]) -> Iterable[tuple[str, Path, int, int, str]]:
             name_risk,
             sanitizers,
             build_guarded_expressions(tree, text, sanitizers),
+            max_steps=max_steps,
         )
         analyzer.visit(tree)
         for line_no, code in analyzer.issues:

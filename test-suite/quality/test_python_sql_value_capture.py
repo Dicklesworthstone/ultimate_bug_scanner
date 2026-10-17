@@ -64,6 +64,40 @@ CASES = (
 )
 
 
+CASES += (
+    ('comp-tainted-item', '    queries = [f"SELECT {item}" for item in [user]]\n    for query in queries:\n        cursor.execute(query)\n', ((CRITICAL, 4),)),
+    ('comp-static-shadow', '    queries = [f"SELECT {user}" for user in [1]]\n    for query in queries:\n        cursor.execute(query)\n', ()),
+    ('comp-static-projection', '    queries = ["SELECT 1" for item in [f"SELECT {user}"]]\n    for query in queries:\n        cursor.execute(query)\n', ()),
+    ('comp-empty-keeps-outer', '    query = f"SELECT {user}"\n    unused = [(query := "SELECT 1") for item in []]\n    cursor.execute(query)\n', ((CRITICAL, 4),)),
+    ('comp-nonempty-cleans-outer', '    query = f"SELECT {user}"\n    unused = [(query := "SELECT 1") for item in [1]]\n    cursor.execute(query)\n', ()),
+    ('comp-false-filter-keeps-outer', '    query = f"SELECT {user}"\n    unused = [(query := "SELECT 1") for item in [1] if False]\n    cursor.execute(query)\n', ((CRITICAL, 4),)),
+    ('comp-false-filter-does-not-taint', '    query = "SELECT 1"\n    unused = [(query := f"SELECT {user}") for item in [1] if False]\n    cursor.execute(query)\n', ()),
+    ('comp-empty-skips-sink', '    unused = [cursor.execute(f"SELECT {user}") for item in []]\n', ()),
+    ('comp-false-filter-skips-sink', '    unused = [cursor.execute(f"SELECT {user}") for item in [1] if False]\n', ()),
+    ('comp-one-trip-no-backedge', '    query = "SELECT 1"\n    unused = [(cursor.execute(query), (query := f"SELECT {user}")) for item in [1]]\n', ()),
+    ('comp-two-trips-real-backedge', '    query = "SELECT 1"\n    unused = [(cursor.execute(query), (query := f"SELECT {user}")) for item in [1, 2]]\n', ((CRITICAL, 3),)),
+    ('comp-unknown-iteration-keeps-outer', '    query = f"SELECT {user}"\n    unused = [(query := "SELECT 1") for item in rows]\n    cursor.execute(query)\n', ((CRITICAL, 4),)),
+    ('comp-unknown-iteration-backedge', '    query = "SELECT 1"\n    unused = [(cursor.execute(query), (query := f"SELECT {user}")) for item in rows]\n', ((CRITICAL, 3),)),
+    ('comp-target-does-not-leak', '    query = f"SELECT {user}"\n    unused = [query for query in ["SELECT 1"]]\n    cursor.execute(query)\n', ((CRITICAL, 4),)),
+    ('comp-target-does-not-taint-outer', '    query = "SELECT 1"\n    unused = [query for query in [f"SELECT {user}"]]\n    cursor.execute(query)\n', ()),
+    ('comp-filter-write-retained', '    query = "SELECT 1"\n    unused = [None for item in [1] if (query := f"SELECT {user}") if False]\n    cursor.execute(query)\n', ((CRITICAL, 4),)),
+    ('comp-filter-write-before-body', '    query = "SELECT 1"\n    unused = [cursor.execute(query) for item in [1] if (query := f"SELECT {user}")]\n', ((CRITICAL, 3),)),
+    ('comp-filter-clean-before-body', '    query = f"SELECT {user}"\n    unused = [cursor.execute(query) for item in [1] if (query := "SELECT 1")]\n', ()),
+    ('comp-dict-tainted-values', '    columns = {"flag": f"name = {item}" for item in [user]}\n    qs.extra(select=columns)\n', ((CRITICAL, 3),)),
+    ('comp-dict-keys-not-sql', '    columns = {f"SELECT {item}": "1" for item in [user]}\n    qs.extra(select=columns)\n', ()),
+    ('comp-set-tainted-values', '    clauses = {f"name = {item}" for item in [user]}\n    qs.extra(where=clauses)\n', ((CRITICAL, 3),)),
+    ('comp-set-empty-keeps-outer', '    query = f"SELECT {user}"\n    unused = {(query := "SELECT 1") for item in []}\n    cursor.execute(query)\n', ((CRITICAL, 4),)),
+    ('comp-nested-generators', '    queries = [f"SELECT {item}" for group in [[user]] for item in group]\n    for query in queries:\n        cursor.execute(query)\n', ((CRITICAL, 4),)),
+    ('comp-nested-static', '    queries = [f"SELECT {item}" for group in [[1]] for item in group]\n    for query in queries:\n        cursor.execute(query)\n', ()),
+    ('comp-nested-empty', '    unused = [cursor.execute(f"SELECT {user}") for group in [1] for item in []]\n', ()),
+    ('comp-empty-outer-skips-inner', '    unused = [cursor.execute(f"SELECT {user}") for group in [] for item in [1]]\n', ()),
+    ('comp-first-iterable-in-outer-scope', '    query = f"SELECT {user}"\n    unused = [cursor.execute(query) for query in [query]]\n', ((CRITICAL, 3),)),
+    ('comp-dict-key-before-value', '    query = f"SELECT {user}"\n    columns = {str((query := "SELECT 1")): query for item in [1]}\n    qs.extra(select=columns)\n', ()),
+    ('comp-exception-restores-local', '    query = f"SELECT {user}"\n    try:\n        unused = [work() for query in ["SELECT 1"]]\n    except Exception:\n        cursor.execute(query)\n', ((CRITICAL, 6),)),
+    ('comp-bound-values-remain-data', '    values = [f"SELECT {item}" for item in [user]]\n    cursor.execute("SELECT %s", values)\n', ()),
+)
+
+
 def program(body):
     return 'def run(cursor, qs, user, rows):\n' + body
 
@@ -138,10 +172,66 @@ class SQLValueCaptureTests(unittest.TestCase):
                 self.assertEqual(actual, rows)
                 self.inspect('sqlite-' + name, source, expected)
 
+    def test_real_sqlite_comprehensions(self):
+        unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
+        fixed = '"SELECT count(*) FROM users WHERE name = \'alice\'"'
+        witnesses = (
+            ('empty-list', f'    query = {unsafe}\n    [(query := {fixed}) for item in []]\n    return cursor.execute(query).fetchone()[0]\n', 2, ((CRITICAL, 4),)),
+            ('nonempty-list', f'    query = {unsafe}\n    [(query := {fixed}) for item in [1]]\n    return cursor.execute(query).fetchone()[0]\n', 1, ()),
+            ('false-filter', f'    query = {unsafe}\n    [(query := {fixed}) for item in [1] if False]\n    return cursor.execute(query).fetchone()[0]\n', 2, ((CRITICAL, 4),)),
+            ('filter-write', f'    query = {unsafe}\n    [1 for item in [1] if (query := {fixed}) and False]\n    return cursor.execute(query).fetchone()[0]\n', 1, ()),
+            ('local-target', f'    query = {unsafe}\n    [query for query in [{fixed}]]\n    return cursor.execute(query).fetchone()[0]\n', 2, ((CRITICAL, 4),)),
+            ('safe-projection', f'    queries = [{fixed} for item in [user]]\n    for query in queries:\n        return cursor.execute(query).fetchone()[0]\n', 1, ()),
+            ('tainted-projection', f'    queries = [{unsafe} for user in [user]]\n    for query in queries:\n        return cursor.execute(query).fetchone()[0]\n', 2, ((CRITICAL, 4),)),
+            ('one-trip', f'    query = {fixed}\n    values = [(cursor.execute(query).fetchone()[0], (query := {unsafe}))[0] for item in [1]]\n    return values[-1]\n', 1, ()),
+            ('two-trips', f'    query = {fixed}\n    values = [(cursor.execute(query).fetchone()[0], (query := {unsafe}))[0] for item in [1, 2]]\n    return values[-1]\n', 2, ((CRITICAL, 3),)),
+            ('empty-set', f'    query = {unsafe}\n    {{(query := {fixed}) for item in []}}\n    return cursor.execute(query).fetchone()[0]\n', 2, ((CRITICAL, 4),)),
+            ('dictionary-order', f'    query = {unsafe}\n    {{(query := {fixed}): query for item in [1]}}\n    return cursor.execute(query).fetchone()[0]\n', 1, ()),
+            ('nested-empty', f'    query = {unsafe}\n    [(query := {fixed}) for group in [1] for item in []]\n    return cursor.execute(query).fetchone()[0]\n', 2, ((CRITICAL, 4),)),
+        )
+        for name, body, rows, expected in witnesses:
+            with self.subTest(case=name):
+                source = program(body)
+                namespace = {'__builtins__': {}}
+                exec(compile(source, name, 'exec'), namespace)
+                connection = sqlite3.connect(':memory:')
+                try:
+                    cursor = connection.cursor()
+                    cursor.execute('CREATE TABLE users (name TEXT)')
+                    cursor.executemany('INSERT INTO users VALUES (?)', [('alice',), ('bob',)])
+                    actual = namespace['run'](cursor, None, "' OR 1=1 --", [])
+                finally:
+                    connection.close()
+                (self.artifacts / ('sqlite-comp-' + name + '-execution.json')).write_text(json.dumps({
+                    'sqlite_version': sqlite3.sqlite_version, 'expected_rows': rows,
+                    'actual_rows': actual, 'python': sys.version,
+                }, indent=2) + '\n', encoding='utf-8')
+                self.assertEqual(actual, rows)
+                self.inspect('sqlite-comp-' + name, source, expected)
+
+    def test_async_comprehension_flow(self):
+        cases = (
+            ('async-projection', '    queries = [f"SELECT {user}" async for item in rows]\n    for query in queries:\n        cursor.execute(query)\n', ((CRITICAL, 4),)),
+            ('async-static-projection', '    queries = ["SELECT 1" async for item in rows]\n    for query in queries:\n        cursor.execute(query)\n', ()),
+            ('async-zero-trip', '    query = f"SELECT {user}"\n    [(query := "SELECT 1") async for item in rows]\n    cursor.execute(query)\n', ((CRITICAL, 4),)),
+        )
+        for name, body, expected in cases:
+            with self.subTest(case=name):
+                self.inspect(name, 'async ' + program(body), expected)
+
+    def test_comprehension_budget_is_not_clean(self):
+        source = program('    queries = [f"SELECT {user}" for item in rows]\n    cursor.execute(queries[0])\n')
+        path = self.artifacts / 'comp-budget.py'
+        path.write_text(source, encoding='utf-8')
+        with self.assertRaisesRegex(detector.SQLFlowLimit, 'budget.*incomplete'):
+            list(detector.find([path], max_steps=2))
+
     @unittest.skipUnless((ROOT / 'ubs').is_file(), 'real CLI requires full checkout')
     def test_real_cli_capture(self):
         selected = {'predicate-alias', 'predicate-kill', 'early-keyword-taints',
-                    'early-keyword-cleans', 'tuple-capture', 'tuple-clean-capture'}
+                    'early-keyword-cleans', 'tuple-capture', 'tuple-clean-capture',
+                    'comp-tainted-item', 'comp-static-projection',
+                    'comp-empty-keeps-outer', 'comp-nonempty-cleans-outer'}
         for name, body, expected in CASES:
             if name not in selected:
                 continue

@@ -880,6 +880,129 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 self.visit(key)
             self.visit(value)
 
+    @staticmethod
+    def restore_local_facts(state, enclosing, names):
+        """Remove comprehension locals without undoing outer walrus writes."""
+        if state is None:
+            return None
+        restored = tuple(part.copy() for part in state)
+        for part, outer in zip(restored, enclosing):
+            if isinstance(part, set):
+                part.difference_update(names)
+                part.update(outer.intersection(names))
+            else:
+                for name in names:
+                    if name in outer:
+                        part[name] = outer[name]
+                    else:
+                        part.pop(name, None)
+        return restored
+
+    def visit_ListComp(self, node):
+        """Evaluate eager comprehensions in loop/filter order and local scope.
+
+        Literal lists/tuples have exact iteration counts. Dynamic iterables
+        reuse the finite SQL-state lattice, including zero-trip and backedge
+        paths. Only emitted expressions contribute result values; iterables,
+        filters and dictionary keys are not SELECT mapping values.
+        """
+        if len(node.generators) > 64:
+            raise SQLFlowLimit('SQL comprehension nesting exceeded; analysis is incomplete')
+        first = node.generators[0]
+        # Python evaluates just the outermost iterable in the enclosing scope.
+        self.visit(first.iter)
+        enclosing = self.sql_state()
+        enclosing_raise = self._pending_raise
+        self._pending_raise = None
+        local_names = {name for generator in node.generators
+                       for name in binding_target_names(generator.target)}
+        self.bind_value_facts(local_names, (None, None, None, False, 'unknown'))
+        produced = None
+
+        def emit():
+            nonlocal produced
+            if isinstance(node, ast.DictComp):
+                self.visit(node.key)
+                key = self.value_facts(node.key)
+                self.visit(node.value)
+                value = self.value_facts(node.value)
+                combined = self.join_value_facts(key, value)
+                facts = (combined[0], combined[1], value[1], combined[3], combined[4])
+                # Hashing a nonliteral key may raise during insertion.
+                if not isinstance(node.key, ast.Constant):
+                    self.note_possible_raise()
+            else:
+                self.visit(node.elt)
+                facts = self.value_facts(node.elt)
+                if isinstance(node, ast.SetComp) and not isinstance(node.elt, ast.Constant):
+                    self.note_possible_raise()
+            produced = facts if produced is None else self.join_value_facts(produced, facts)
+            return self.sql_state()
+
+        def filtered(index):
+            bypass = None
+            for condition in node.generators[index].ifs:
+                self.visit(condition)
+                truth = self.literal_truth(condition)
+                if truth is None:
+                    self.note_possible_raise()
+                if truth is not True:
+                    bypass = self.join_sql_states(bypass, self.sql_state())
+                if truth is False:
+                    return bypass
+            result = (level(index + 1, self.sql_state())
+                      if index + 1 < len(node.generators) else emit())
+            return self.join_sql_states(bypass, result)
+
+        def level(index, incoming):
+            self.step()
+            self.restore_sql_state(incoming)
+            generator = node.generators[index]
+            if index:
+                self.visit(generator.iter)
+            entered = self.sql_state()
+            iterable = generator.iter
+            if (not generator.is_async and isinstance(iterable, (ast.List, ast.Tuple))
+                    and not any(isinstance(item, ast.Starred) for item in iterable.elts)):
+                # Every iterable element was evaluated before entering its
+                # loop, not lazily after earlier body assignments.
+                items = [self.assignment_bindings(generator.target, item) for item in iterable.elts]
+                current = entered
+                for bindings in items:
+                    self.step()
+                    self.restore_sql_state(current)
+                    for names, facts in bindings:
+                        self.bind_value_facts(names, facts)
+                    current = filtered(index)
+                return current
+            facts = self.value_facts(iterable)
+            header = entered
+            while True:
+                self.step()
+                self.restore_sql_state(header)
+                self.note_possible_raise()
+                self.bind_value_facts(binding_target_names(generator.target), facts)
+                after = filtered(index)
+                updated = self.join_sql_states(entered, after)
+                if updated == header:
+                    return updated
+                header = updated
+
+        try:
+            result = level(0, self.sql_state())
+            self.restore_sql_state(result)
+            self._evaluated_values[node] = produced or (None, None, None, False, 'static')
+        finally:
+            # Iteration variables are local even on exceptional exits; Python
+            # assignment-expression targets outside them remain enclosing.
+            state = self.restore_local_facts(self.sql_state(), enclosing, local_names)
+            raised = self.restore_local_facts(self._pending_raise, enclosing, local_names)
+            self.restore_sql_state(state)
+            self._pending_raise = self.join_sql_states(enclosing_raise, raised)
+
+    visit_SetComp = visit_ListComp
+    visit_DictComp = visit_ListComp
+
     def visit_Assert(self, node):
         optimized = self.sql_state()
         self.visit(node.test)
@@ -1074,6 +1197,12 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             return self._evaluated_values[node][4]
         if isinstance(node, ast.Constant):
             return 'static'
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            # Load/Store context nodes are syntax, not unknown values. The
+            # contents of a literal collection determine its provenance and
+            # that of items projected by a nested comprehension clause.
+            return max((self.classify_expr(item) for item in node.elts),
+                       key=RISK_ORDER.__getitem__, default='static')
         if isinstance(node, ast.JoinedStr):
             risk = 'static'
             for part in node.values:

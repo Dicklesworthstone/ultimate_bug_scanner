@@ -54,6 +54,13 @@ SINK_JS = json.dumps({
 }) + "\n"
 
 
+def decode_report(test: unittest.TestCase, text: str, context: str = "scanner output") -> dict:
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        test.fail(f"{context} is not valid JSON: {exc}")
+
+
 class FindingsMergeTests(unittest.TestCase):
     def read_report(self, path: Path) -> dict:
         try:
@@ -259,7 +266,7 @@ class FindingsMergeTests(unittest.TestCase):
             proc = subprocess.run([sys.executable, "-c", code, str(HELPERS_DIR), str(root), str(combined)],
                                   capture_output=True, text=True, timeout=120, check=False)
             self.assertEqual(proc.returncode, 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
-            measured = json.loads(proc.stdout)
+            measured = decode_report(self, proc.stdout, "merger memory measurement")
             self.assertEqual(measured["count"], 120_000)
             self.assertLess(measured["rss"], 64 * 1024, measured)
             # JSON parsing is outside the measured merger process. Verify the
@@ -323,6 +330,62 @@ class FindingsMergeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="ubs-fm-") as tmp:
             with self.assertRaises(ValueError):
                 merge(Path(tmp), Path(tmp) / "missing.json")
+
+    def test_standalone_sarif_reads_all_concrete_records(self) -> None:
+        from ubs_core.cli import main
+
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="ubs-sarif-sink-", dir=artifacts) as tmp:
+            root = Path(tmp)
+            summary = root / "summary.json"
+            sink = root / "findings.ndjson"
+            summary.write_text(json.dumps({
+                "language": "python", "status": "partial", "exit_code": 2,
+                "findings": [{"rule": "py.sql", "count": 32, "samples": []}],
+            }), encoding="utf-8")
+            records = [{"rule": "py.sql", "path": "space dir/query.py", "line": n,
+                        "col": 3, "message": f"unsafe SQL at {n}", "severity": "critical"}
+                       for n in range(1, 33)]
+            sink.write_text("\n".join(json.dumps(rec) for rec in records) + "\n", encoding="utf-8")
+            output = io.StringIO()
+            with patch("sys.stdout", output):
+                status = main(["findings-sarif", "--combined", str(summary), "--findings", str(sink)])
+            self.assertEqual(status, 0)
+            run = decode_report(self, output.getvalue(), "standalone SARIF")["runs"][0]
+            self.assertEqual(run["tool"]["driver"]["name"], "ubs-python")
+            self.assertEqual(len(run["results"]), 32)
+            for expected, finding in zip(records, run["results"]):
+                self.assertEqual(finding["ruleId"], "py.sql")
+                self.assertEqual(finding["level"], "error")
+                self.assertEqual(finding["message"]["text"], expected["message"])
+                physical = finding["locations"][0]["physicalLocation"]
+                self.assertEqual(physical["artifactLocation"]["uri"], expected["path"])
+                self.assertEqual(physical["region"], {"startLine": expected["line"], "startColumn": 3})
+            self.assertFalse(run["invocations"][0]["executionSuccessful"])
+            self.assertEqual(run["invocations"][0]["exitCode"], 2)
+
+    def test_standalone_sarif_refuses_lost_or_corrupt_sink(self) -> None:
+        from ubs_core.cli import main
+
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="ubs-sarif-invalid-", dir=artifacts) as tmp:
+            root = Path(tmp)
+            summary = root / "summary.json"
+            summary.write_text('{"language":"python","findings":[]}', encoding="utf-8")
+            for name, contents in (("missing", None), ("truncated", '{"rule":'),
+                                   ("invalid-record", '{"rule":"py.sql"}\n')):
+                with self.subTest(case=name):
+                    sink = root / name
+                    if contents is not None:
+                        sink.write_text(contents, encoding="utf-8")
+                    output, error = io.StringIO(), io.StringIO()
+                    with patch("sys.stdout", output), patch("sys.stderr", error):
+                        status = main(["findings-sarif", "--combined", str(summary), "--findings", str(sink)])
+                    self.assertEqual(status, 2)
+                    self.assertEqual(output.getvalue(), "")
+                    self.assertIn("findings-sarif:", error.getvalue())
 
     def test_to_sarif_builds_valid_runs_and_results(self) -> None:
         doc = {
@@ -930,15 +993,15 @@ class FindingsMergeFailureIntegrationTests(unittest.TestCase):
 
             initial = scan(f"--save-baseline={baseline}")
             self.assertEqual(initial.returncode, 1, initial.stdout + initial.stderr)
-            known = json.loads(baseline.read_text(encoding="utf-8"))
+            known = decode_report(self, baseline.read_text(encoding="utf-8"), "saved baseline")
             self.assertTrue(any(f["rule_id"] == "bash.security.eval_variable" for f in known["findings"]), known)
             unchanged = scan("--format=json", f"--baseline={baseline}", "--new-only")
             self.assertEqual(unchanged.returncode, 0, unchanged.stdout + unchanged.stderr)
-            self.assertEqual(json.loads(unchanged.stdout)["findings"], [])
+            self.assertEqual(decode_report(self, unchanged.stdout)["findings"], [])
             (project / "new.sh").write_text('#!/bin/bash\neval "$other"\n', encoding="utf-8")
             changed = scan("--format=json", f"--baseline={baseline}", "--new-only")
             self.assertEqual(changed.returncode, 1, changed.stdout + changed.stderr)
-            findings = json.loads(changed.stdout)["findings"]
+            findings = decode_report(self, changed.stdout)["findings"]
             self.assertTrue(any(f["rule_id"] == "bash.security.eval_variable" for f in findings), findings)
             self.assertTrue(all(Path(f["file"]).name == "new.sh" for f in findings), findings)
         print(f"[findings-merge-text-baseline] PASS ({time.monotonic() - started:.2f}s)", flush=True)
@@ -965,12 +1028,12 @@ class FindingsMergeFailureIntegrationTests(unittest.TestCase):
 
             initial = scan(f"--save-baseline={baseline}")
             self.assertEqual(initial.returncode, 1, initial.stdout + initial.stderr)
-            findings = json.loads(baseline.read_text(encoding="utf-8"))["findings"]
+            findings = decode_report(self, baseline.read_text(encoding="utf-8"), "staged baseline")["findings"]
             self.assertTrue(findings)
             self.assertTrue(all(Path(f["file"]) == source for f in findings), findings)
             unchanged = scan("--format=json", f"--baseline={baseline}", "--new-only")
             self.assertEqual(unchanged.returncode, 0, unchanged.stdout + unchanged.stderr)
-            self.assertEqual(json.loads(unchanged.stdout)["findings"], [])
+            self.assertEqual(decode_report(self, unchanged.stdout)["findings"], [])
 
     def test_failed_ledger_cannot_pass_or_replace_a_baseline(self) -> None:
         stub_source = r'''#!/usr/bin/env bash
@@ -1021,7 +1084,7 @@ fi
 
             control = scan("json", valid=True)
             self.assertEqual(control.returncode, 0, control.stdout + control.stderr)
-            control_doc = json.loads(control.stdout)
+            control_doc = decode_report(self, control.stdout, "positive control")
             self.assertEqual(control_doc["status"], "ok")
             self.assertEqual(control_doc["findings"][0]["count"], 1)
             cases = [
@@ -1043,22 +1106,22 @@ fi
                     self.assertIn("FINDINGS_MERGE_ERROR", proc.stderr, detail)
                     self.assertEqual(baseline.read_bytes(), saved_bytes, detail)
                     if fmt == "json":
-                        doc = json.loads(proc.stdout)
+                        doc = decode_report(self, proc.stdout, detail)
                         self.assertEqual(doc["status"], "partial", detail)
                         self.assertEqual(doc["reason"], "findings-merge-failed", detail)
                         self.assertEqual(doc["exit_code"], 2, detail)
                         self.assertEqual(doc["failed_modules"][-1]["module_error"], "FINDINGS_MERGE_ERROR", detail)
                         self.assertEqual(doc["scanners"][0]["warning"], 1, detail)
                     elif fmt == "jsonl":
-                        rows = [json.loads(line) for line in proc.stdout.splitlines()]
+                        rows = [decode_report(self, line, detail) for line in proc.stdout.splitlines()]
                         self.assertTrue(any(row.get("status") == "partial" for row in rows), detail)
                     elif fmt == "sarif":
-                        doc = json.loads(proc.stdout)
+                        doc = decode_report(self, proc.stdout, detail)
                         invocation = doc["runs"][0]["invocations"][0]
                         self.assertFalse(invocation["executionSuccessful"], detail)
                         self.assertEqual(invocation["exitCode"], 2, detail)
                     print(f"[findings-merge-failure:{fmt}] PASS ({time.monotonic() - started:.2f}s)", flush=True)
-            self.assertEqual(json.loads(report.read_text(encoding="utf-8"))["status"], "partial")
+            self.assertEqual(decode_report(self, report.read_text(encoding="utf-8"), "saved partial report")["status"], "partial")
 
 
 if __name__ == "__main__":

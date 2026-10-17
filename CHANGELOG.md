@@ -14,6 +14,25 @@ _No changes yet._
 
 ---
 
+## [v5.5.8] - 2026-10-16 [Tag]
+
+Git-only source delivery; signed release assets and installed-tool upgrades are separate.
+
+### Fixed
+
+- Python descriptor analysis recognizes adjacent `ExitStack.callback(os.close, fd)`
+  registration inside branches and loops, and immediate ownership transfer to
+  a resolved `os.fdopen` context. Leaks still warn when registration is conditional,
+  the stack escapes, an intervening operation can raise, or `closefd` is false or
+  unknown. Calling `.close()` on an integer no longer hides a descriptor leak.
+  A builtin `open` context also owns the raw descriptor returned directly by
+  its inline `opener`, while shadowed or unresolved owners retain warnings.
+- Standalone Python SARIF retains every concrete finding's location and message
+  by reading the complete findings sink instead of the grouped summary. Missing
+  or corrupt evidence and failed SARIF conversion return an explicit error.
+
+---
+
 ## [v5.5.7] - 2026-10-15 [Tag]
 
 Git-only source delivery; signed release assets and installed-tool upgrades are separate.

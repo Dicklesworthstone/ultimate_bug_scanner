@@ -98,6 +98,36 @@ CASES += (
 )
 
 
+GENERATOR_CASES = (
+    ('gen-unused-keeps-outer', '    query = f"SELECT {user}"\n    pending = ((query := "SELECT 1") for item in [1])\n    cursor.execute(query)\n', ((CRITICAL, 4),)),
+    ('gen-unused-does-not-taint', '    query = "SELECT 1"\n    pending = ((query := f"SELECT {user}") for item in [1])\n    cursor.execute(query)\n', ()),
+    ('gen-unused-sink-does-not-execute', '    pending = (cursor.execute(f"SELECT {user}") for item in [1])\n', ()),
+    ('gen-first-iterable-is-eager', '    query = f"SELECT {user}"\n    pending = (None for item in [(query := "SELECT 1")])\n    cursor.execute(query)\n', ()),
+    ('gen-first-iterable-sink-is-eager', '    pending = (None for item in [cursor.execute(f"SELECT {user}")])\n', ((CRITICAL, 2),)),
+    ('gen-empty-never-runs-body', '    query = f"SELECT {user}"\n    pending = ((query := "SELECT 1") for item in [])\n    list(pending)\n    cursor.execute(query)\n', ((CRITICAL, 5),)),
+    ('gen-drain-cleans-outer', '    query = f"SELECT {user}"\n    pending = ((query := "SELECT 1") for item in [1])\n    list(pending)\n    cursor.execute(query)\n', ()),
+    ('gen-drain-taints-outer', '    query = "SELECT 1"\n    pending = ((query := f"SELECT {user}") for item in [1])\n    list(pending)\n    cursor.execute(query)\n', ((CRITICAL, 5),)),
+    ('gen-yield-sees-later-write', '    query = "SELECT 1"\n    pending = (query for item in [1])\n    query = f"SELECT {user}"\n    qs.extra(where=list(pending))\n', ((CRITICAL, 5),)),
+    ('gen-yield-sees-later-clean', '    query = f"SELECT {user}"\n    pending = (query for item in [1])\n    query = "SELECT 1"\n    qs.extra(where=list(pending))\n', ()),
+    ('gen-iterable-captures-earlier-value', '    query = f"SELECT {user}"\n    pending = (item for item in [query])\n    query = "SELECT 1"\n    qs.extra(where=list(pending))\n', ((CRITICAL, 5),)),
+    ('gen-iterable-captures-clean-value', '    query = "SELECT 1"\n    pending = (item for item in [query])\n    query = f"SELECT {user}"\n    qs.extra(where=list(pending))\n', ()),
+    ('gen-alias-shares-exhaustion', '    pending = (f"name = {item}" for item in [user])\n    alias = pending\n    first = list(alias)\n    qs.extra(where=list(pending))\n    qs.extra(where=first)\n', ((CRITICAL, 6),)),
+    ('gen-conditional-consumption', '    pending = (f"name = {item}" for item in [user])\n    if rows:\n        list(pending)\n    qs.extra(where=list(pending))\n', ((CRITICAL, 5),)),
+    ('gen-both-branches-exhaust', '    pending = (f"name = {item}" for item in [user])\n    if rows:\n        list(pending)\n    else:\n        tuple(pending)\n    qs.extra(where=list(pending))\n', ()),
+    ('gen-false-filter', '    query = f"SELECT {user}"\n    pending = ((query := "SELECT 1") for item in [1] if False)\n    tuple(pending)\n    cursor.execute(query)\n', ((CRITICAL, 5),)),
+    ('gen-filter-write-at-consumption', '    query = f"SELECT {user}"\n    pending = (None for item in [1] if (query := "SELECT 1"))\n    cursor.execute(query)\n    tuple(pending)\n    cursor.execute(query)\n', ((CRITICAL, 4),)),
+    ('gen-nested-iterable-is-lazy', '    query = f"SELECT {user}"\n    pending = (None for item in [1] for other in [(query := "SELECT 1")])\n    cursor.execute(query)\n    list(pending)\n    cursor.execute(query)\n', ((CRITICAL, 4),)),
+    ('gen-sink-at-consumption', '    query = "SELECT 1"\n    pending = (cursor.execute(query) for item in [1])\n    query = f"SELECT {user}"\n    list(pending)\n', ((CRITICAL, 3),)),
+    ('gen-static-shadowing', '    qs.extra(where=list(f"id = {user}" for user in [1]))\n', ()),
+    ('gen-safe-projection', '    qs.extra(where=list("id = 1" for item in [f"SELECT {user}"]))\n', ()),
+    ('gen-direct-extra-consumes', '    qs.extra(where=(f"name = {item}" for item in [user]))\n', ((CRITICAL, 2),)),
+    ('gen-iter-is-not-consumption', '    query = f"SELECT {user}"\n    pending = ((query := "SELECT 1") for item in [1])\n    alias = iter(pending)\n    cursor.execute(query)\n    list(alias)\n    cursor.execute(query)\n', ((CRITICAL, 5),)),
+    ('gen-close-does-not-run-body', '    query = f"SELECT {user}"\n    pending = ((query := "SELECT 1") for item in [1])\n    pending.close()\n    list(pending)\n    cursor.execute(query)\n', ((CRITICAL, 6),)),
+    ('gen-captured-argument-before-rebind', '    pending = (f"name = {item}" for item in [user])\n    alias = pending\n    qs.extra(where=alias, params=((pending := None),)[:0])\n', ((CRITICAL, 4),)),
+    ('gen-raise-during-drain-closes-it', '    query = f"SELECT {user}"\n    pending = (work() for item in [1])\n    try:\n        list(pending)\n    except Exception:\n        qs.extra(where=list(pending))\n    cursor.execute(query)\n', ((CRITICAL, 8),)),
+)
+
+
 def program(body):
     return 'def run(cursor, qs, user, rows):\n' + body
 
@@ -131,6 +161,73 @@ class SQLValueCaptureTests(unittest.TestCase):
         for name, body, expected in CASES:
             with self.subTest(case=name):
                 self.inspect(name, program(body), expected)
+
+    def test_lazy_generator_programs(self):
+        for name, body, expected in GENERATOR_CASES:
+            with self.subTest(case=name):
+                self.inspect(name, program(body), expected)
+
+    def test_deferred_validator_is_not_an_executed_guard(self):
+        sources = (
+            'def run(cursor, user):\n    pending = (validate_sql_identifier(user) for item in [1])\n    cursor.execute(f"SELECT {user}")\n',
+            'def check(user):\n    return (validate_sql_identifier(user) for item in [1])\ndef run(cursor, user):\n    check(user)\n    cursor.execute(f"SELECT {user}")\n',
+        )
+        for index, source in enumerate(sources):
+            with self.subTest(case=index):
+                path = self.artifacts / f'generator-validator-{index}.py'
+                path.write_text(source, encoding='utf-8')
+                with patch.dict(os.environ, {detector.SANITIZER_ENV: 'validate_sql_identifier'}):
+                    hits = list(detector.find([path]))
+                self.assertEqual([(rule, line) for rule, _, line, _, _ in hits],
+                                 [(CRITICAL, len(source.splitlines()))])
+
+    def test_generator_consumer_boundaries_are_explicit(self):
+        bodies = (
+            '    pending = (f"SELECT {item}" for item in [user])\n    consume(pending)\n',
+            '    pending = (f"SELECT {item}" for item in [user])\n    next(pending)\n',
+            '    pending = (f"SELECT {item}" for item in [user])\n    list = unknown\n    list(pending)\n',
+            '    pending = (f"SELECT {item}" for item in [user])\n    if rows:\n        pending = None\n    list(pending)\n',
+            '    pending = (f"SELECT {item}" for item in [user])\n    def nested():\n        list(pending)\n',
+        )
+        for index, body in enumerate(bodies):
+            with self.subTest(case=index):
+                path = self.artifacts / f'generator-boundary-{index}.py'
+                path.write_text(program(body), encoding='utf-8')
+                with self.assertRaisesRegex(detector.SQLFlowLimit, 'generator.*incomplete'):
+                    list(detector.find([path]))
+
+    def test_real_sqlite_lazy_generators(self):
+        unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
+        fixed = '"SELECT count(*) FROM users WHERE name = \'alice\'"'
+        witnesses = (
+            ('unused', f'    query = {unsafe}\n    pending = ((query := {fixed}) for item in [1])\n    return cursor.execute(query).fetchone()[0]\n', 2, ((CRITICAL, 4),)),
+            ('drained', f'    query = {unsafe}\n    pending = ((query := {fixed}) for item in [1])\n    list(pending)\n    return cursor.execute(query).fetchone()[0]\n', 1, ()),
+            ('late-taint', f'    query = {fixed}\n    pending = (query for item in [1])\n    query = {unsafe}\n    return cursor.execute(list(pending)[0]).fetchone()[0]\n', 2, ((CRITICAL, 5),)),
+            ('late-clean', f'    query = {unsafe}\n    pending = (query for item in [1])\n    query = {fixed}\n    return cursor.execute(list(pending)[0]).fetchone()[0]\n', 1, ()),
+            ('iterable-capture', f'    query = {unsafe}\n    pending = (item for item in [query])\n    query = {fixed}\n    return cursor.execute(list(pending)[0]).fetchone()[0]\n', 2, ((CRITICAL, 5),)),
+            ('alias-exhaustion', f'    query = {unsafe}\n    pending = ((query := {fixed}) for item in [1])\n    alias = pending\n    list(pending)\n    query = {unsafe}\n    tuple(alias)\n    return cursor.execute(query).fetchone()[0]\n', 2, ((CRITICAL, 8),)),
+            ('filtered', f'    query = {unsafe}\n    pending = ((query := {fixed}) for item in [1] if False)\n    list(pending)\n    return cursor.execute(query).fetchone()[0]\n', 2, ((CRITICAL, 5),)),
+            ('closed', f'    query = {unsafe}\n    pending = ((query := {fixed}) for item in [1])\n    pending.close()\n    list(pending)\n    return cursor.execute(query).fetchone()[0]\n', 2, ((CRITICAL, 6),)),
+        )
+        for name, body, rows, expected in witnesses:
+            with self.subTest(case=name):
+                source = program(body)
+                namespace = {}
+                exec(compile(source, '<test-authored-generator>', 'exec'), namespace)
+                connection = sqlite3.connect(':memory:')
+                try:
+                    connection.execute('CREATE TABLE users(name TEXT)')
+                    connection.executemany('INSERT INTO users VALUES (?)', [('alice',), ('bob',)])
+                    actual = namespace['run'](connection.cursor(), None, "' OR 1=1 --", [])
+                finally:
+                    connection.close()
+                (self.artifacts / f'sqlite-generator-{name}-execution.json').write_text(json.dumps({
+                    'case': name, 'expected_rows': rows, 'actual_rows': actual,
+                    'source_sha256': hashlib.sha256(source.encode()).hexdigest(),
+                    'python': sys.version, 'sqlite_version': sqlite3.sqlite_version,
+                }, indent=2) + '\n', encoding='utf-8')
+                self.assertEqual(actual, rows)
+                self.inspect('sqlite-generator-' + name, source, expected)
 
     def test_real_sqlite_values(self):
         class KeywordCursor:
@@ -231,8 +328,11 @@ class SQLValueCaptureTests(unittest.TestCase):
         selected = {'predicate-alias', 'predicate-kill', 'early-keyword-taints',
                     'early-keyword-cleans', 'tuple-capture', 'tuple-clean-capture',
                     'comp-tainted-item', 'comp-static-projection',
-                    'comp-empty-keeps-outer', 'comp-nonempty-cleans-outer'}
-        for name, body, expected in CASES:
+                    'comp-empty-keeps-outer', 'comp-nonempty-cleans-outer',
+                    'gen-unused-keeps-outer', 'gen-drain-cleans-outer',
+                    'gen-yield-sees-later-write', 'gen-yield-sees-later-clean',
+                    'gen-alias-shares-exhaustion'}
+        for name, body, expected in CASES + GENERATOR_CASES:
             if name not in selected:
                 continue
             for entry in ('ubs', 'modules/ubs-python.sh'):

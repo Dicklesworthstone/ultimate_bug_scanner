@@ -222,6 +222,10 @@ def _function_validates(func, sanitizers, summaries):
         node = pending.pop()
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
             continue
+        if isinstance(node, ast.GeneratorExp):
+            # Deferred validation does not establish a guard at creation.
+            pending.append(node.generators[0].iter)
+            continue
         if isinstance(node, ast.Call):
             direct = is_sanitizer_call(node, sanitizers)
             record = None
@@ -319,6 +323,9 @@ def guarded_expressions(func, text, sanitizers, summaries=None):
     while pending:
         node = pending.pop()
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            continue
+        if isinstance(node, ast.GeneratorExp):
+            pending.append(node.generators[0].iter)
             continue
         if isinstance(node, ast.Call):
             for key in call_validated_segments(node, text, sanitizers, summaries):
@@ -533,6 +540,14 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         # a tuple, SQL call or bound format method. AST objects (not their
         # recycled numeric ids) key these bounded per-analysis snapshots.
         self._evaluated_values = {}
+        # Generator objects carry identity, not their future yielded value.
+        # Aliases share the fresh/exhausted state, including across branches.
+        self.generator_bindings = {}
+        self.generator_phases = {}
+        self._generator_specs = {}
+        self._generator_running = set()
+        self._generator_scope = ()
+        self._builtin_bindings = {}
 
     def visit(self, node):
         if not isinstance(node, ast.expr):
@@ -552,7 +567,12 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 join_sql_risks(*(fact[1] for fact in facts)),
                 join_sql_risks(*(fact[2] for fact in facts)),
                 any(fact[3] for fact in facts),
-                max((fact[4] for fact in facts), key=RISK_ORDER.__getitem__, default='unknown'))
+                max((fact[4] for fact in facts), key=RISK_ORDER.__getitem__, default='unknown'),
+                frozenset().union(*(SQLInjectionAnalyzer.generator_refs(fact) for fact in facts)))
+
+    @staticmethod
+    def generator_refs(facts):
+        return facts[5] if len(facts) > 5 else frozenset()
 
     @property
     def issues(self):
@@ -584,7 +604,17 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         for name in set().union(*(state[5] for state in present)):
             values[name] = max((state[5].get(name, 'unknown') for state in present),
                                key=RISK_ORDER.__getitem__)
-        return unsafe, weak, fragments, selects, templates, values
+        generators = {}
+        for name in set().union(*(state[6] for state in present)):
+            # A non-generator alternative cannot be silently treated as the
+            # known generator from the other arm.
+            generators[name] = frozenset().union(*(
+                state[6].get(name, frozenset({None})) for state in present))
+        phases = {}
+        for state in present:
+            for identity, incoming in state[7].items():
+                phases[identity] = phases.get(identity, frozenset()) | incoming
+        return unsafe, weak, fragments, selects, templates, values, generators, phases
 
     def merge_flows(self, *flows):
         merged = {}
@@ -623,7 +653,36 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         return flow
 
     def visit_Module(self, node):
+        self._generator_scope = (node,)
         self.statements(node.body, self.sql_state())
+
+    def builtin_is_unshadowed(self, name):
+        """Resolve only an unshadowed builtin, never a look-alike callee.
+
+        A lexical binding anywhere in a function makes that name local even
+        before its assignment. Module/class bindings are conservatively
+        treated the same way; dynamic rebinding remains unsupported.
+        """
+        for scope in self._generator_scope:
+            if scope not in self._builtin_bindings:
+                names = set(_all_parameters(scope)) if hasattr(scope, 'args') else set()
+                pending = list(scope.body) if isinstance(scope.body, list) else [scope.body]
+                while pending:
+                    child = pending.pop()
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        names.add(child.name)
+                        continue
+                    if isinstance(child, ast.Lambda):
+                        continue
+                    if isinstance(child, ast.Name) and isinstance(child.ctx, (ast.Store, ast.Del)):
+                        names.add(child.id)
+                    if isinstance(child, (ast.Import, ast.ImportFrom)):
+                        names.update(alias.asname or alias.name.split('.')[0] for alias in child.names)
+                    pending.extend(ast.iter_child_nodes(child))
+                self._builtin_bindings[scope] = names
+            if name in self._builtin_bindings[scope] or '*' in self._builtin_bindings[scope]:
+                return False
+        return True
 
     def visit_FunctionDef(self, node):
         # Defaults/decorators run in the defining scope; the body does not.
@@ -642,12 +701,16 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         for parameter in parameters:
             self.fragment_sql_vars.pop(parameter, None)
             self.select_sql_vars.pop(parameter, None)
+            self.generator_bindings.pop(parameter, None)
             self.value_risks[parameter] = 'tainted'
         self.func_stack.append(node)
+        scope = self._generator_scope
+        self._generator_scope = (*scope, node)
         try:
             self.statements(node.body, self.sql_state())
         finally:
             self.func_stack.pop()
+            self._generator_scope = scope
             self.restore_sql_state(outer)
 
     visit_AsyncFunctionDef = visit_FunctionDef
@@ -659,9 +722,12 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         outer, enclosing_raise = self.sql_state(), self._pending_raise
         self.bind_value_facts(_all_parameters(node), (None, None, None, False, 'tainted'))
         self._pending_raise = None
+        scope = self._generator_scope
+        self._generator_scope = (*scope, node)
         try:
             self.visit(node.body)
         finally:
+            self._generator_scope = scope
             self.restore_sql_state(outer)
             self._pending_raise = enclosing_raise
         # Creating a function does not return the value of its deferred body.
@@ -673,7 +739,12 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         for keyword in node.keywords:
             self.visit(keyword.value)
         outer = self.sql_state()
-        body = self.statements(node.body, outer)
+        scope = self._generator_scope
+        self._generator_scope = (*scope, node)
+        try:
+            body = self.statements(node.body, outer)
+        finally:
+            self._generator_scope = scope
         self.restore_sql_state(outer)
         # Class-local assignments do not rebind names in the defining scope.
         # Class creation itself can fail through metaclass/decorator code.
@@ -685,11 +756,13 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         """Snapshot SQL-value facts without sharing mutable branch stores."""
         return (self.unsafe_sql_vars.copy(), self.weak_sql_vars.copy(),
                 self.fragment_sql_vars.copy(), self.select_sql_vars.copy(),
-                self.sql_template_vars.copy(), self.value_risks.copy())
+                self.sql_template_vars.copy(), self.value_risks.copy(),
+                self.generator_bindings.copy(), self.generator_phases.copy())
 
     def restore_sql_state(self, state):
         (self.unsafe_sql_vars, self.weak_sql_vars, self.fragment_sql_vars,
-         self.select_sql_vars, self.sql_template_vars, self.value_risks) = (part.copy() for part in state)
+         self.select_sql_vars, self.sql_template_vars, self.value_risks,
+         self.generator_bindings, self.generator_phases) = (part.copy() for part in state)
 
     def visit_If(self, node):
         self.visit(node.test)
@@ -719,6 +792,8 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                     items.append(self.assignment_bindings(node.target, value))
                 return self.finite_loop(node, items)
         self.visit(node.iter)
+        if self.generator_refs(self.value_facts(node.iter)):
+            raise SQLFlowLimit('SQL generator streaming consumption is unsupported; analysis is incomplete')
         return self.loop(node, self.value_facts(node.iter))
 
     visit_AsyncFor = visit_For
@@ -898,7 +973,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                         part.pop(name, None)
         return restored
 
-    def visit_ListComp(self, node):
+    def visit_ListComp(self, node, *, captured=None, consumer_can_raise=False):
         """Evaluate eager comprehensions in loop/filter order and local scope.
 
         Literal lists/tuples have exact iteration counts. Dynamic iterables
@@ -910,7 +985,12 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             raise SQLFlowLimit('SQL comprehension nesting exceeded; analysis is incomplete')
         first = node.generators[0]
         # Python evaluates just the outermost iterable in the enclosing scope.
-        self.visit(first.iter)
+        if captured is None:
+            self.visit(first.iter)
+        else:
+            # The outermost iterator was constructed at generator creation.
+            # Its expression and element captures must not be evaluated again.
+            self._evaluated_values.update(captured)
         enclosing = self.sql_state()
         enclosing_raise = self._pending_raise
         self._pending_raise = None
@@ -936,6 +1016,14 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 facts = self.value_facts(node.elt)
                 if isinstance(node, ast.SetComp) and not isinstance(node.elt, ast.Constant):
                     self.note_possible_raise()
+            if consumer_can_raise:
+                # A reducer/hash/comparison can fail after this yield while
+                # leaving the generator suspended, unlike a body exception
+                # which closes it. Preserve that prefix's outer SQL facts.
+                phase = self.generator_phases[node]
+                self.generator_phases[node] = frozenset({'partial'})
+                self.note_possible_raise()
+                self.generator_phases[node] = phase
             produced = facts if produced is None else self.join_value_facts(produced, facts)
             return self.sql_state()
 
@@ -962,6 +1050,8 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 self.visit(generator.iter)
             entered = self.sql_state()
             iterable = generator.iter
+            if self.generator_refs(self.value_facts(iterable)):
+                raise SQLFlowLimit('SQL nested generator iteration is unsupported; analysis is incomplete')
             if (not generator.is_async and isinstance(iterable, (ast.List, ast.Tuple))
                     and not any(isinstance(item, ast.Starred) for item in iterable.elts)):
                 # Every iterable element was evaluated before entering its
@@ -1002,6 +1092,179 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
 
     visit_SetComp = visit_ListComp
     visit_DictComp = visit_ListComp
+
+    def visit_GeneratorExp(self, node):
+        """Create a lazy object; only its leftmost iterable executes now."""
+        first = node.generators[0].iter
+        self.visit(first)
+        if not isinstance(first, (ast.List, ast.Tuple, ast.Set, ast.Dict)):
+            self.note_possible_raise()  # constructing the iterator can fail
+        if any(node in refs for refs in self.generator_bindings.values()):
+            # Allocation-site reuse must not resurrect an exhausted alias or
+            # replace a still-live object's captured iterator with a new one.
+            raise SQLFlowLimit('SQL overlapping generator allocations are unsupported; analysis is incomplete')
+        captured = {child: self._evaluated_values[child] for child in ast.walk(first)
+                    if child in self._evaluated_values}
+        asynchronous = any(generator.is_async for generator in node.generators) or any(
+            isinstance(child, ast.Await) for expression in
+            [node.elt, *(condition for generator in node.generators for condition in generator.ifs)]
+            for child in ast.walk(expression))
+        self._generator_specs[node] = (self._generator_scope, captured, asynchronous)
+        self.generator_phases[node] = frozenset({'fresh'})
+        self._evaluated_values[node] = (None, None, None, False, 'unknown', frozenset({node}))
+
+    def materialize_generators(self, references, *, consumer_can_raise=False):
+        """Fully consume selected same-scope generators using the eager engine.
+
+        Generator identity and completion are stateful, whereas projected
+        SQL values are ordinary captured facts. Do not run an exhausted
+        alias again or mistake a generator object's repr for its contents.
+        """
+        incoming = self.sql_state()
+        stores, values = [], []
+        for identity in references:
+            self.step()
+            if identity is None or identity not in self._generator_specs:
+                raise SQLFlowLimit('SQL mixed generator binding is unsupported; analysis is incomplete')
+            scope, captured, asynchronous = self._generator_specs[identity]
+            if scope != self._generator_scope:
+                raise SQLFlowLimit('SQL cross-scope generator consumption is unsupported; analysis is incomplete')
+            if asynchronous:
+                raise SQLFlowLimit('SQL asynchronous generator consumption is unsupported; analysis is incomplete')
+            if identity in self._generator_running:
+                raise SQLFlowLimit('SQL reentrant generator consumption is unsupported; analysis is incomplete')
+            phases = incoming[7].get(identity, frozenset())
+            if not phases:
+                raise SQLFlowLimit('SQL generator lifetime is unresolved; analysis is incomplete')
+            for phase in phases:
+                self.restore_sql_state(incoming)
+                self.generator_phases[identity] = frozenset({'done'})
+                if phase == 'done':
+                    values.append((None, None, None, False, 'static'))
+                elif phase == 'fresh':
+                    self._generator_running.add(identity)
+                    try:
+                        self.visit_ListComp(identity, captured=captured, consumer_can_raise=consumer_can_raise)
+                        value = self.value_facts(identity)
+                        if self.generator_refs(value):
+                            raise SQLFlowLimit('SQL generator-valued projection is unsupported; analysis is incomplete')
+                        values.append(value[:5])
+                    finally:
+                        self._generator_running.remove(identity)
+                        # The AST expression still denotes the generator;
+                        # its projected values belong to this consumption.
+                        self._evaluated_values[identity] = (
+                            None, None, None, False, 'unknown', frozenset({identity}))
+                else:
+                    raise SQLFlowLimit('SQL partial generator consumption is unsupported; analysis is incomplete')
+                stores.append(self.sql_state())
+        self.restore_sql_state(self.join_sql_states(*stores))
+        return self.join_value_facts(*values)
+
+    def generator_call(self, node):
+        """Handle identified full consumers and reject unknown lazy effects."""
+        arguments = [(argument, self.generator_refs(self.value_facts(argument))) for argument in node.args]
+        arguments += [(keyword.value, self.generator_refs(self.value_facts(keyword.value)))
+                      for keyword in node.keywords]
+        arguments = [(argument, refs) for argument, refs in arguments if refs]
+        receiver = (self.generator_refs(self.value_facts(node.func.value))
+                    if isinstance(node.func, ast.Attribute) else frozenset())
+        if not arguments and not receiver:
+            return False
+        if isinstance(node.func, ast.Name) and self.builtin_is_unshadowed(node.func.id):
+            name = node.func.id
+            if len(node.args) == 1 and not node.keywords and arguments:
+                refs = arguments[0][1]
+                if name in {'list', 'tuple', 'set', 'frozenset', 'sorted', 'min', 'max', 'sum'}:
+                    self._evaluated_values[node] = self.materialize_generators(
+                        refs, consumer_can_raise=name not in {'list', 'tuple'})
+                    return True
+                if name in {'any', 'all'} and all(
+                        identity is not None and not self.generator_has_writes_or_sinks(identity) for identity in refs):
+                    for identity in refs:
+                        self.generator_phases[identity] = frozenset({'partial'})
+                    self._evaluated_values[node] = (None, None, None, False, 'static')
+                    return True
+                if name == 'iter':
+                    self._evaluated_values[node] = (None, None, None, False, 'unknown', refs)
+                    return True
+                if name in {'str', 'repr', 'bool', 'id', 'type'}:
+                    # Object introspection does not iterate a generator.
+                    self._evaluated_values[node] = (None, None, None, False, 'static')
+                    return True
+        if receiver and not arguments and not node.args and not node.keywords:
+            if node.func.attr == '__iter__':
+                self._evaluated_values[node] = (None, None, None, False, 'unknown', receiver)
+                return True
+            if node.func.attr == 'close':
+                for identity in receiver:
+                    if identity is None or identity not in self._generator_specs:
+                        raise SQLFlowLimit('SQL generator close binding is unresolved; analysis is incomplete')
+                    self.generator_phases[identity] = frozenset({'done'})
+                self._evaluated_values[node] = (None, None, None, False, 'static')
+                return True
+        if (isinstance(node.func, ast.Attribute) and node.func.attr == 'join'
+                and isinstance(node.func.value, ast.Constant) and isinstance(node.func.value.value, str)
+                and len(node.args) == 1 and not node.keywords and arguments):
+            facts = self.materialize_generators(arguments[0][1])
+            separator = self.value_facts(node.func.value)
+            combined = self.join_value_facts(facts, separator)
+            risk = None if combined[4] == 'static' else 'critical' if combined[4] == 'tainted' else 'warning'
+            self._evaluated_values[node] = (
+                join_sql_risks(combined[0], risk if combined[3] else None),
+                join_sql_risks(combined[1], risk), join_sql_risks(combined[2], risk),
+                combined[3], combined[4])
+            return True
+        # These selected APIs consume their input iterables during this call.
+        # Their SQL argument was captured earlier; parameter data is not SQL.
+        short = call_name(node.func).rsplit('.', 1)[-1]
+        consumed = set()
+        if short == 'extra':
+            consumed.update(argument for argument, context in self.sql_arguments(node) if context == 'fragment')
+        elif short == 'executemany':
+            if len(node.args) > 1:
+                consumed.add(node.args[1])
+            consumed.update(keyword.value for keyword in node.keywords if keyword.arg == 'params_seq')
+        if not receiver and all(argument in consumed for argument, _ in arguments):
+            for argument, refs in arguments:
+                self._evaluated_values[argument] = self.materialize_generators(refs)
+            return True
+        references = receiver | frozenset().union(*(refs for _, refs in arguments))
+        if all(identity is not None and not self.generator_has_sql_effects(identity) for identity in references):
+            # An opaque consumer of a read-only, non-SQL generator cannot
+            # change a tracked SQL binding. Do not turn routine any()/sum()
+            # idioms into file-wide failures. Its cursor is now unknown:
+            # subsequent modeled consumption must refuse, not restart it.
+            for identity in references:
+                self.generator_phases[identity] = frozenset({'partial'})
+            self._evaluated_values[node] = (None, None, None, False, 'unknown')
+            return True
+        raise SQLFlowLimit('SQL unknown generator consumer is unsupported; analysis is incomplete')
+
+    def generator_has_sql_effects(self, identity):
+        """Conservative relevance test, not a substitute for execution."""
+        spec = self._generator_specs.get(identity)
+        if spec is None:
+            return True
+        _, captured, _ = spec
+        if any(any(facts[:3]) or self.generator_refs(facts) for facts in captured.values()):
+            return True
+        deferred = [identity.elt]
+        deferred.extend(condition for generator in identity.generators for condition in generator.ifs)
+        deferred.extend(generator.iter for generator in identity.generators[1:])
+        for expression in deferred:
+            if self.sql_risk(expression, require_sql=False):
+                return True
+        return self.generator_has_writes_or_sinks(identity)
+
+    @staticmethod
+    def generator_has_writes_or_sinks(identity):
+        deferred = [identity.elt]
+        deferred.extend(condition for generator in identity.generators for condition in generator.ifs)
+        deferred.extend(generator.iter for generator in identity.generators[1:])
+        return any(isinstance(child, ast.NamedExpr) or
+                   isinstance(child, ast.Call) and call_name(child.func).rsplit('.', 1)[-1] in EXECUTE_METHODS | {'extra'}
+                   for expression in deferred for child in ast.walk(expression))
 
     def visit_Assert(self, node):
         optimized = self.sql_state()
@@ -1323,12 +1586,18 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         if value in self._evaluated_values:
             return self._evaluated_values[value]
         return (self.sql_risk(value), self.sql_risk(value, require_sql=False),
-                self.select_risk(value), self.has_sql_template(value), self.classify_expr(value))
+                self.select_risk(value), self.has_sql_template(value), self.classify_expr(value),
+                self.generator_bindings.get(value.id, frozenset()) if isinstance(value, ast.Name) else frozenset())
 
     def bind_value_facts(self, names, facts):
-        risk, fragment_risk, select_risk, template, provenance = facts
+        risk, fragment_risk, select_risk, template, provenance = facts[:5]
         self.store_sql_risk(names, risk)
         for name in names:
+            references = self.generator_refs(facts)
+            if references:
+                self.generator_bindings[name] = references
+            else:
+                self.generator_bindings.pop(name, None)
             self.value_risks[name] = provenance
             for store, value in ((self.fragment_sql_vars, fragment_risk),
                                  (self.select_sql_vars, select_risk)):
@@ -1456,7 +1725,11 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             yield argument, 'select' if name == 'select' else 'fragment'
 
     def visit_Call(self, node):
-        self.note_possible_raise()
+        known_builtin = (isinstance(node.func, ast.Name) and self.builtin_is_unshadowed(node.func.id)
+                         and node.func.id in {'list', 'tuple', 'set', 'frozenset', 'sorted', 'min', 'max', 'sum',
+                                              'any', 'all', 'iter', 'str', 'repr', 'bool', 'id', 'type'})
+        if not known_builtin:
+            self.note_possible_raise()
         # The sink's own first line is what a guard has to precede (GH #133).
         # Using the sink line rather than the interpolated value's line keeps
         # a guard written inside the same multi-line call from counting.
@@ -1470,6 +1743,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 self.visit(argument)
             for keyword in node.keywords:
                 self.visit(keyword.value)
+            self.generator_call(node)
             # All effects have now occurred, but each argument retains its
             # own evaluation-time value. Suppress findings, never execution.
             if is_sink and not has_ignore(self.lines, node.lineno):

@@ -5,7 +5,7 @@ export function CleanHooks({ userId, theme, signal }) {
   const memoizedConfig = useMemo(() => ({ userId, theme }), [userId, theme]);
 
   useEffect(() => {
-    fetch(`/api/users/${userId}`, { signal });
+    fetch(`/api/users/${userId}`, { signal }).catch((error) => console.error(error));
   }, [userId, signal]);
 
   const handleClick = useCallback(() => {

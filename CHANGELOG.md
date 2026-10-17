@@ -17,6 +17,25 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ---
 
+## [v5.5.9] - 2026-10-17 [Tag]
+
+Git-only source delivery; signed release assets and installed-tool upgrades are separate.
+
+### Fixed
+
+- Installed runners resolve JSON/JSONL/SARIF conversion helpers from their
+  selected module directory, preserving findings when the executable and
+  modules live in separate directories. Failed SARIF conversion exits 2.
+- Clean React hook examples handle fetch rejections instead of dropping their
+  promises. Strict JSON/SARIF clean-directory controls and buggy positive controls
+  retain the dangling-promise warning and verify both formats.
+- Checksum pins connect the already-committed Python SQL value-capture changes:
+  evaluation-time argument snapshots, eager comprehension scope and writes, and
+  lazy generator aliases with shared exhaustion. This does not complete the
+  broader cross-language taint-engine work.
+
+---
+
 ## [v5.5.8] - 2026-10-16 [Tag]
 
 Git-only source delivery; signed release assets and installed-tool upgrades are separate.

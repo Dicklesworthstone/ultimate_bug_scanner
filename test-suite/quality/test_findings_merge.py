@@ -6,6 +6,8 @@ import json
 import hashlib
 import io
 import os
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -13,6 +15,7 @@ import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import unquote
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HELPERS_DIR = REPO_ROOT / "modules" / "helpers"
@@ -67,6 +70,127 @@ class FindingsMergeTests(unittest.TestCase):
             return json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
             self.fail(f"merged report is not valid JSON: {exc}")
+
+    def test_installed_layout_preserves_findings_across_formats(self) -> None:
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        root = Path(tempfile.mkdtemp(prefix="ubs-installed-findings-", dir=artifacts))
+        runner = root / "bin" / "ubs"
+        runner.parent.mkdir()
+        shutil.copy2(REPO_ROOT / "ubs", runner)
+        modules = root / "share" / "ubs" / "modules"
+        shutil.copytree(REPO_ROOT / "modules", modules,
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        self.assertFalse((runner.parent / "modules").exists())
+        project = root / "project"
+        project.mkdir()
+        buggy = project / "buggy.py"
+        clean = project / "clean.py"
+        buggy.write_text("def run(user):\n    return eval(user)\n", encoding="utf-8")
+        clean.write_text("value = 1\n", encoding="utf-8")
+        env = {key: value for key, value in os.environ.items() if not key.startswith("UBS_")}
+        env.update(UBS_NO_AUTO_UPDATE="1", UBS_KEEP_TEMP="1", NO_COLOR="1")
+        for variable in ("XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "XDG_CONFIG_HOME"):
+            env[variable] = str(root / variable.lower())
+        identities = {}
+        for source, fmt in ((buggy, "json"), (buggy, "jsonl"), (buggy, "sarif"),
+                            (clean, "json"), (clean, "sarif")):
+            with self.subTest(source=source.name, format=fmt):
+                proc = subprocess.run(
+                    ["bash", str(runner), "--ci", "--no-cache", "--fail-on-warning",
+                     "--only=python", "--format=" + fmt, "--module-dir=" + str(modules), str(source)],
+                    cwd=project, env=env, text=True, capture_output=True, timeout=120,
+                )
+                prefix = root / (source.stem + "-" + fmt)
+                prefix.with_suffix(".stdout").write_text(proc.stdout, encoding="utf-8")
+                prefix.with_suffix(".stderr").write_text(proc.stderr, encoding="utf-8")
+                self.assertEqual(proc.returncode, 1 if source == buggy else 0, proc.stderr)
+                if fmt == "jsonl":
+                    findings = [decode_report(self, row) for row in proc.stdout.splitlines()]
+                    findings = [row for row in findings if row.get("type") == "finding"]
+                elif fmt == "json":
+                    doc = decode_report(self, proc.stdout)
+                    self.assertEqual(doc["status"], "ok")
+                    self.assertEqual(doc["failed_modules"], [])
+                    if source == clean:
+                        self.assertEqual((doc["totals"]["critical"], doc["totals"]["warning"]), (0, 0))
+                        findings = doc.get("findings", [])
+                    else:
+                        findings = doc["findings"]
+                else:
+                    doc = decode_report(self, proc.stdout)
+                    self.assertEqual(doc["version"], "2.1.0")
+                    findings = []
+                    for run in doc["runs"]:
+                        for result in run.get("results", []):
+                            if result.get("level", "warning") not in {"error", "warning"}:
+                                continue
+                            physical = result["locations"][0]["physicalLocation"]
+                            findings.append({
+                                "rule_id": result["ruleId"],
+                                "file": unquote(physical["artifactLocation"]["uri"]),
+                                "line": physical["region"]["startLine"],
+                                "severity": {"error": "critical", "warning": "warning", "note": "info",
+                                             "none": "info"}[result["level"]],
+                            })
+                relevant = [finding for finding in findings if finding["severity"] in {"critical", "warning"}]
+                actual = {(finding["rule_id"], Path(finding["file"]).name,
+                           finding["line"], finding["severity"]) for finding in relevant}
+                if source == buggy:
+                    self.assertTrue(any(item[2:] == (2, "critical") for item in actual), actual)
+                    identities[fmt] = actual
+                else:
+                    self.assertEqual(actual, set())
+        self.assertEqual(identities["json"], identities["jsonl"])
+        self.assertEqual(identities["json"], identities["sarif"])
+
+        # Checkout resolution follows the real runner through a symlink and
+        # takes precedence over an empty installed cache. Exercise that path
+        # without --module-dir; a split-install-only fix regresses checkouts.
+        checkout = root / "checkout"
+        checkout.mkdir()
+        shutil.copy2(REPO_ROOT / "ubs", checkout / "ubs")
+        (checkout / "modules").symlink_to(modules, target_is_directory=True)
+        launcher = root / "launcher" / "ubs"
+        launcher.parent.mkdir()
+        launcher.symlink_to(checkout / "ubs")
+        proc = subprocess.run(
+            ["bash", str(launcher), "--ci", "--no-cache", "--fail-on-warning", "--only=python",
+             "--format=sarif", str(buggy)],
+            cwd=project, env=env, text=True, capture_output=True, timeout=120,
+        )
+        (root / "checkout-symlink.stdout").write_text(proc.stdout, encoding="utf-8")
+        (root / "checkout-symlink.stderr").write_text(proc.stderr, encoding="utf-8")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        doc = decode_report(self, proc.stdout)
+        self.assertTrue(any(result["level"] == "error"
+                            and result["locations"][0]["physicalLocation"]["region"]["startLine"] == 2
+                            for run in doc["runs"] for result in run.get("results", [])))
+
+        # Fail only the real converter subprocess, after the real scan and
+        # findings merge succeeded. A renderer failure must not mean runs:[].
+        python_shim = runner.parent / "python3"
+        python_shim.write_text(
+            '#!/usr/bin/env bash\n'
+            'if [[ "${1:-}" == -m && "${2:-}" == ubs_core && "${3:-}" == findings-sarif ]]; then\n'
+            '  printf "forced converter failure\\n" >&2; exit 42\n'
+            'fi\nexec ' + shlex.quote(sys.executable) + ' "$@"\n', encoding="utf-8",
+        )
+        python_shim.chmod(0o755)
+        fault_env = {**env, "PATH": str(runner.parent) + os.pathsep + os.environ.get("PATH", "")}
+        proc = subprocess.run(
+            ["bash", str(runner), "--ci", "--no-cache", "--fail-on-warning", "--only=python",
+             "--format=sarif", "--module-dir=" + str(modules), str(buggy)],
+            cwd=project, env=fault_env, text=True, capture_output=True, timeout=120,
+        )
+        (root / "converter-failure.stdout").write_text(proc.stdout, encoding="utf-8")
+        (root / "converter-failure.stderr").write_text(proc.stderr, encoding="utf-8")
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("forced converter failure", proc.stderr)
+        doc = decode_report(self, proc.stdout)
+        self.assertEqual(doc["version"], "2.1.0")
+        self.assertTrue(any(invocation.get("executionSuccessful") is False
+                            for run in doc["runs"] for invocation in run.get("invocations", [])))
 
     def test_repeated_findings_read_source_once_and_preserve_fingerprints(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ubs-fm-source-") as tmp:

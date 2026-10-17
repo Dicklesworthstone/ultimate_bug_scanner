@@ -125,12 +125,60 @@
       }
     },
     {
+      "id": "js-module-clean-json",
+      "description": "Clean JS fixtures remain warning-free in JSON, including handled hook fetch failures.",
+      "path": "test-suite/js/clean",
+      "language": "js",
+      "tags": ["js", "module", "clean", "clean-format-parity"],
+      "args": ["--only=js", "--format=json", "--fail-on-warning"],
+      "expect": {
+        "exit_code": 0,
+        "totals": {"critical": {"max": 0}, "warning": {"max": 0}}
+      }
+    },
+    {
+      "id": "js-module-clean-sarif",
+      "description": "Clean JS fixtures remain warning-free in SARIF without suppressing promise diagnostics.",
+      "path": "test-suite/js/clean",
+      "language": "js",
+      "tags": ["js", "module", "clean", "clean-format-parity"],
+      "args": ["--only=js", "--format=sarif", "--fail-on-warning"],
+      "expect": {
+        "exit_code": 0,
+        "totals": {"critical": {"max": 0}, "warning": {"max": 0}}
+      }
+    },
+    {
+      "id": "js-module-buggy-json",
+      "description": "JSON positive control retains real critical and warning diagnostics.",
+      "path": "test-suite/js/buggy",
+      "language": "js",
+      "tags": ["js", "module", "buggy", "clean-format-parity"],
+      "args": ["--only=js", "--format=json", "--fail-on-warning"],
+      "expect": {
+        "exit_code": 1,
+        "totals": {"critical": {"min": 1}, "warning": {"min": 1}}
+      }
+    },
+    {
+      "id": "js-module-buggy-sarif",
+      "description": "SARIF positive control retains real critical and warning diagnostics.",
+      "path": "test-suite/js/buggy",
+      "language": "js",
+      "tags": ["js", "module", "buggy", "clean-format-parity"],
+      "args": ["--only=js", "--format=sarif", "--fail-on-warning"],
+      "expect": {
+        "exit_code": 1,
+        "totals": {"critical": {"min": 1}, "warning": {"min": 1}}
+      }
+    },
+    {
       "id": "js-module-clean",
       "description": "module-specific clean fixture (should stay warning-free).",
       "path": "test-suite/js/clean",
       "language": "js",
       "tags": ["js", "module", "clean"],
-      "args": ["--only=js"],
+      "args": ["--only=js", "--fail-on-warning"],
       "expect": {
         "exit_code": "zero",
         "totals": {

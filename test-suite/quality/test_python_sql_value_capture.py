@@ -396,5 +396,357 @@ class SQLValueCaptureTests(unittest.TestCase):
                         self.assertEqual(sorted(actual), sorted(expected), folder)
 
 
+class SQLValidationFlow(unittest.TestCase):
+    """A configured validator must protect every path to this exact value.
+
+    Contract: validate_sql_identifier raises on invalid input; it does not
+    sanitize a different value, an unexecuted branch, or a later assignment.
+    The wrapper cases use that same contract, not another scanner as oracle.
+    """
+
+    VALIDATOR = 'validate_sql_identifier'
+    CASES = (
+        ('direct', 'validate_sql_identifier(column)\ncursor.execute(f"SELECT {column}")', WARNING),
+        ('same-line', 'validate_sql_identifier(column); cursor.execute(f"SELECT {column}")', WARNING),
+        ('conditional', 'if flag:\n    validate_sql_identifier(column)\ncursor.execute(f"SELECT {column}")', CRITICAL),
+        ('false-branch', 'if False:\n    validate_sql_identifier(column)\ncursor.execute(f"SELECT {column}")', CRITICAL),
+        ('both-arms', 'if flag:\n    validate_sql_identifier(column)\nelse:\n    validate_sql_identifier(column)\ncursor.execute(f"SELECT {column}")', WARNING),
+        ('early-return', 'if flag:\n    return\nvalidate_sql_identifier(column)\ncursor.execute(f"SELECT {column}")', WARNING),
+        ('wrong-value', 'validate_sql_identifier(other)\ncursor.execute(f"SELECT {column}")', CRITICAL),
+        ('after-sink', 'cursor.execute(f"SELECT {column}")\nvalidate_sql_identifier(column)', CRITICAL),
+        ('rebound', 'validate_sql_identifier(column)\ncolumn = other\ncursor.execute(f"SELECT {column}")', CRITICAL),
+        ('rebound-during-validation', 'validate_sql_identifier(column, (column := other))\ncursor.execute(f"SELECT {column}")', CRITICAL),
+        ('rebound-before-validation', 'validate_sql_identifier((column := other))\ncursor.execute(f"SELECT {column}")', CRITICAL),
+        ('attribute-mutated-during-validation', 'validate_sql_identifier(config.column, config.refresh())\ncursor.execute(f"SELECT {config.column}")', CRITICAL),
+        ('literal-overwrite', 'validate_sql_identifier(column)\ncolumn = "id"\ncursor.execute(f"SELECT {column}")', None),
+        ('attribute-replaced', 'validate_sql_identifier(config.column)\nconfig.column = other\ncursor.execute(f"SELECT {config.column}")', CRITICAL),
+        ('root-replaced', 'validate_sql_identifier(config.column)\nconfig = other\ncursor.execute(f"SELECT {config.column}")', CRITICAL),
+        ('attribute-alias-write', 'alias = config\nvalidate_sql_identifier(config.column)\nalias.column = other\ncursor.execute(f"SELECT {config.column}")', CRITICAL),
+        ('call-can-mutate', 'validate_sql_identifier(config.column)\nmutate(config)\ncursor.execute(f"SELECT {config.column}")', CRITICAL),
+        ('method-can-mutate', 'validate_sql_identifier(config.column)\nconfig.refresh()\ncursor.execute(f"SELECT {config.column}")', CRITICAL),
+        ('failed-validator-caught', 'try:\n    validate_sql_identifier(column)\nexcept ValueError:\n    pass\ncursor.execute(f"SELECT {column}")', CRITICAL),
+        ('failed-validator-exits', 'try:\n    validate_sql_identifier(column)\nexcept ValueError:\n    return\ncursor.execute(f"SELECT {column}")', WARNING),
+        ('finally-validates', 'try:\n    work()\nexcept ValueError:\n    pass\nfinally:\n    validate_sql_identifier(column)\ncursor.execute(f"SELECT {column}")', WARNING),
+        ('zero-trip', 'for item in []:\n    validate_sql_identifier(column)\ncursor.execute(f"SELECT {column}")', CRITICAL),
+        ('one-trip', 'for item in [1]:\n    validate_sql_identifier(column)\ncursor.execute(f"SELECT {column}")', WARNING),
+        ('unknown-trip', 'for item in rows:\n    validate_sql_identifier(column)\ncursor.execute(f"SELECT {column}")', CRITICAL),
+        ('captured-before-validation', 'query = f"SELECT {column}"\nvalidate_sql_identifier(column)\ncursor.execute(query)', CRITICAL),
+        ('captured-after-validation', 'validate_sql_identifier(column)\nquery = f"SELECT {column}"\ncolumn = other\ncursor.execute(query)', WARNING),
+        ('nested-body-not-executed', 'def unused():\n    validate_sql_identifier(column)\ncursor.execute(f"SELECT {column}")', CRITICAL),
+        ('comprehension-local-not-proof', 'unused = [validate_sql_identifier(column) for column in ["id"]]\ncursor.execute(f"SELECT {column}")', CRITICAL),
+        ('lazy-unused-validation', 'pending = (validate_sql_identifier(column) for item in [1])\ncursor.execute(f"SELECT {column}")', CRITICAL),
+        ('lazy-drained-validation', 'pending = (validate_sql_identifier(column) for item in [1])\nlist(pending)\ncursor.execute(f"SELECT {column}")', WARNING),
+        ('lazy-empty-validation', 'pending = (validate_sql_identifier(column) for item in [])\nlist(pending)\ncursor.execute(f"SELECT {column}")', CRITICAL),
+        ('lazy-caught-failure', 'pending = (validate_sql_identifier(column) for item in [1])\ntry:\n    list(pending)\nexcept ValueError:\n    pass\ncursor.execute(f"SELECT {column}")', CRITICAL),
+        ('lazy-unknown-count', 'pending = (validate_sql_identifier(column) for item in rows)\nlist(pending)\ncursor.execute(f"SELECT {column}")', CRITICAL),
+        ('lazy-conditional-drain', 'pending = (validate_sql_identifier(column) for item in [1])\nif flag:\n    list(pending)\ncursor.execute(f"SELECT {column}")', CRITICAL),
+        ('lazy-both-drains', 'pending = (validate_sql_identifier(column) for item in [1])\nif flag:\n    list(pending)\nelse:\n    tuple(pending)\ncursor.execute(f"SELECT {column}")', WARNING),
+        ('lazy-alias-not-revalidation', 'pending = (validate_sql_identifier(column) for item in [1])\nalias = pending\nlist(pending)\ncolumn = other\nlist(alias)\ncursor.execute(f"SELECT {column}")', CRITICAL),
+    )
+    WRAPPERS = (
+        ('straight', 'validate_sql_identifier(value)', WARNING),
+        ('conditional', 'if flag:\n    validate_sql_identifier(value)', CRITICAL),
+        ('both-arms', 'if flag:\n    validate_sql_identifier(value)\nelse:\n    validate_sql_identifier(value)', WARNING),
+        ('return-before', 'return\nvalidate_sql_identifier(value)', CRITICAL),
+        ('return-path', 'if flag:\n    return\nvalidate_sql_identifier(value)', CRITICAL),
+        ('raise-path', 'if flag:\n    raise ValueError()\nvalidate_sql_identifier(value)', WARNING),
+        ('rebound-parameter', 'value = "id"\nvalidate_sql_identifier(value)', CRITICAL),
+        ('caught-validation', 'try:\n    validate_sql_identifier(value)\nexcept ValueError:\n    pass', CRITICAL),
+        ('zero-trip', 'for item in []:\n    validate_sql_identifier(value)', CRITICAL),
+        ('finally', 'try:\n    work()\nfinally:\n    validate_sql_identifier(value)', WARNING),
+        ('lazy-unconsumed', 'return (validate_sql_identifier(value) for item in [1])', CRITICAL),
+        ('lazy-drained', 'pending = (validate_sql_identifier(value) for item in [1])\nlist(pending)', WARNING),
+        ('lazy-empty', 'pending = (validate_sql_identifier(value) for item in [])\nlist(pending)', CRITICAL),
+        ('lazy-caught', 'pending = (validate_sql_identifier(value) for item in [1])\ntry:\n    list(pending)\nexcept ValueError:\n    pass', CRITICAL),
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        artifacts = ROOT / 'test-suite/artifacts'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        cls.artifacts = Path(tempfile.mkdtemp(prefix='sql-validation-flow-', dir=artifacts))
+
+    @classmethod
+    def programs(cls):
+        import textwrap
+        for name, body, rule in cls.CASES:
+            source = ('def run(cursor, column, other, config, flag, rows):\n' +
+                      textwrap.indent(body, '    ') + '\n')
+            yield name, source, rule
+        for name, body, rule in cls.WRAPPERS:
+            source = ('def check(value, flag):\n' + textwrap.indent(body, '    ') + '\n' +
+                      'def run(cursor, column, flag):\n    check(column, flag)\n'
+                      '    cursor.execute(f"SELECT {column}")\n')
+            yield 'wrapper-' + name, source, rule
+
+    def test_validation_paths(self):
+        for name, source, expected_rule in self.programs():
+            with self.subTest(case=name):
+                path = self.artifacts / (name + '.py')
+                path.write_text(source, encoding='utf-8')
+                expected = [] if expected_rule is None else [(expected_rule, next(
+                    n for n, line in enumerate(source.splitlines(), 1) if 'cursor.execute(' in line))]
+                started = time.perf_counter()
+                with patch.dict(os.environ, {detector.SANITIZER_ENV: self.VALIDATOR}):
+                    findings = list(detector.find([path]))
+                actual = [(rule, line) for rule, _, line, _, _ in findings]
+                path.with_suffix('.json').write_text(json.dumps({
+                    'case': name, 'expected': expected, 'actual': actual,
+                    'source_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                    'detector_sha256': hashlib.sha256(Path(detector.__file__).read_bytes()).hexdigest(),
+                    'elapsed_seconds': time.perf_counter() - started, 'python': sys.version,
+                }, indent=2) + '\n', encoding='utf-8')
+                self.assertEqual(actual, expected, source)
+
+    def test_sqlite_validation_witnesses(self):
+        import textwrap
+        cases = (
+            ('skipped', 'if flag:\n    validate_sql_identifier(column)', False, "' OR 1=1 --", 2, CRITICAL),
+            ('caught', 'try:\n    validate_sql_identifier(column)\nexcept ValueError:\n    pass', False, "' OR 1=1 --", 2, CRITICAL),
+            ('reassigned', 'validate_sql_identifier(column)\ncolumn = other', False, 'alice', 2, CRITICAL),
+            ('successful', 'validate_sql_identifier(column)', False, 'alice', 1, WARNING),
+            ('both-paths', 'if flag:\n    validate_sql_identifier(column)\nelse:\n    validate_sql_identifier(column)', False, 'alice', 1, WARNING),
+            ('return-on-failure', 'try:\n    validate_sql_identifier(column)\nexcept ValueError:\n    return -1', False, "' OR 1=1 --", -1, WARNING),
+        )
+        def validate_sql_identifier(value):
+            if value not in {'alice', 'bob'}:
+                raise ValueError('identifier not allowed')
+        for name, body, flag, value, count, rule in cases:
+            with self.subTest(case=name):
+                source = ('def run(cursor, column, other, flag):\n' + textwrap.indent(body, '    ') +
+                          '\n    return cursor.execute(f"SELECT count(*) FROM users WHERE name = \'{column}\'").fetchone()[0]\n')
+                namespace = {'validate_sql_identifier': validate_sql_identifier, 'ValueError': ValueError}
+                exec(compile(source, name, 'exec'), namespace)
+                connection = sqlite3.connect(':memory:')
+                try:
+                    cursor = connection.cursor()
+                    cursor.execute('CREATE TABLE users (name TEXT)')
+                    cursor.executemany('INSERT INTO users VALUES (?)', [('alice',), ('bob',)])
+                    actual_count = namespace['run'](cursor, value, "' OR 1=1 --", flag)
+                finally:
+                    connection.close()
+                path = self.artifacts / ('sqlite-' + name + '.py')
+                path.write_text(source, encoding='utf-8')
+                with patch.dict(os.environ, {detector.SANITIZER_ENV: self.VALIDATOR}):
+                    findings = list(detector.find([path]))
+                (self.artifacts / ('sqlite-' + name + '.json')).write_text(json.dumps({
+                    'case': name, 'expected_rows': count, 'actual_rows': actual_count,
+                    'expected_rule': rule, 'actual_rules': [item[0] for item in findings],
+                    'sqlite_version': sqlite3.sqlite_version, 'python': sys.version,
+                }, indent=2) + '\n', encoding='utf-8')
+                self.assertEqual(actual_count, count)
+                self.assertEqual([item[0] for item in findings], [rule])
+
+
+class SQLValidationBindings(unittest.TestCase):
+    """Trusted spelling must resolve to the configured callable, not a suffix."""
+
+    CASES = (
+        ('import-module', 'import psycopg.sql\ndef run(cursor, value):\n    cursor.execute(f"SELECT {psycopg.sql.Identifier(value)}")\n', 'psycopg.sql.Identifier', None),
+        ('import-submodule', 'from psycopg import sql\ndef run(cursor, value):\n    cursor.execute(f"SELECT {sql.Identifier(value)}")\n', 'psycopg.sql.Identifier', None),
+        ('import-alias', 'import psycopg.sql as query_sql\ndef run(cursor, value):\n    cursor.execute(f"SELECT {query_sql.Identifier(value)}")\n', 'psycopg.sql.Identifier', None),
+        ('import-function-alias', 'from psycopg.sql import Identifier as quoted\ndef run(cursor, value):\n    cursor.execute(f"SELECT {quoted(value)}")\n', 'psycopg.sql.Identifier', None),
+        ('module-binding-alias', 'from psycopg import sql\nquery_sql = sql\ndef run(cursor, value):\n    cursor.execute(f"SELECT {query_sql.Identifier(value)}")\n', 'psycopg.sql.Identifier', None),
+        ('callable-binding-alias', 'from psycopg import sql\nquoted = sql.Identifier\ndef run(cursor, value):\n    cursor.execute(f"SELECT {quoted(value)}")\n', 'psycopg.sql.Identifier', None),
+        ('alias-module-escape', 'from psycopg import sql\nother = sql\nconfigure(other)\ndef run(cursor, value):\n    cursor.execute(f"SELECT {sql.Identifier(value)}")\n', 'psycopg.sql.Identifier', CRITICAL),
+        ('annotation-exec', 'from psycopg import sql\ndef change(value: exec(code)):\n    pass\ndef run(cursor, value):\n    cursor.execute(f"SELECT {sql.Identifier(value)}")\n', 'psycopg.sql.Identifier', CRITICAL),
+        ('unrelated-import', 'from evil import sql\ndef run(cursor, value):\n    cursor.execute(f"SELECT {sql.Identifier(value)}")\n', 'psycopg.sql.Identifier', CRITICAL),
+        ('unrelated-receiver', 'def run(cursor, value, arbitrary):\n    cursor.execute(f"SELECT {arbitrary.Identifier(value)}")\n', 'psycopg.sql.Identifier', CRITICAL),
+        ('bare-parameter', 'def run(cursor, value, Identifier):\n    cursor.execute(f"SELECT {Identifier(value)}")\n', 'psycopg.sql.Identifier', CRITICAL),
+        ('module-shadow', 'from psycopg import sql\ndef run(cursor, value, sql):\n    cursor.execute(f"SELECT {sql.Identifier(value)}")\n', 'psycopg.sql.Identifier', CRITICAL),
+        ('alias-shadow', 'from psycopg.sql import Identifier as quoted\ndef run(cursor, value, quoted):\n    cursor.execute(f"SELECT {quoted(value)}")\n', 'psycopg.sql.Identifier', CRITICAL),
+        ('alias-reassigned', 'from psycopg.sql import Identifier as quoted\ndef run(cursor, value, replacement):\n    quoted = replacement\n    cursor.execute(f"SELECT {quoted(value)}")\n', 'psycopg.sql.Identifier', CRITICAL),
+        ('module-reassigned', 'from psycopg import sql\nsql = replacement\ndef run(cursor, value):\n    cursor.execute(f"SELECT {sql.Identifier(value)}")\n', 'psycopg.sql.Identifier', CRITICAL),
+        ('member-replaced', 'from psycopg import sql\nsql.Identifier = replacement\ndef run(cursor, value):\n    cursor.execute(f"SELECT {sql.Identifier(value)}")\n', 'psycopg.sql.Identifier', CRITICAL),
+        ('module-escaped', 'from psycopg import sql\nconfigure(sql)\ndef run(cursor, value):\n    cursor.execute(f"SELECT {sql.Identifier(value)}")\n', 'psycopg.sql.Identifier', CRITICAL),
+        ('relative-import-not-absolute', 'from .psycopg import sql\ndef run(cursor, value):\n    cursor.execute(f"SELECT {sql.Identifier(value)}")\n', 'psycopg.sql.Identifier', CRITICAL),
+        ('bare-contract', 'def run(cursor, value):\n    cursor.execute(f"SELECT {quote_ident(value)}")\n', 'quote_ident', None),
+        ('bare-contract-shadowed', 'def run(cursor, value, quote_ident):\n    cursor.execute(f"SELECT {quote_ident(value)}")\n', 'quote_ident', CRITICAL),
+        ('bare-contract-unrelated-method', 'def run(cursor, value, arbitrary):\n    cursor.execute(f"SELECT {arbitrary.quote_ident(value)}")\n', 'quote_ident', CRITICAL),
+        ('namespace-exec', 'from psycopg import sql\nexec(setup)\ndef run(cursor, value):\n    cursor.execute(f"SELECT {sql.Identifier(value)}")\n', 'psycopg.sql.Identifier', CRITICAL),
+        ('global-rebinding', 'from psycopg import sql\ndef replace():\n    global sql\n    sql = replacement\ndef run(cursor, value):\n    replace()\n    cursor.execute(f"SELECT {sql.Identifier(value)}")\n', 'psycopg.sql.Identifier', CRITICAL),
+        ('comp-shadow', 'from psycopg import sql\ndef run(cursor, value, replacements):\n    queries = [f"SELECT {sql.Identifier(value)}" for sql in replacements]\n    for query in queries:\n        cursor.execute(query)\n', 'psycopg.sql.Identifier', CRITICAL),
+        ('comp-import-retained-outside', 'from psycopg import sql\ndef run(cursor, value, replacements):\n    ignored = [sql for sql in replacements]\n    cursor.execute(f"SELECT {sql.Identifier(value)}")\n', 'psycopg.sql.Identifier', None),
+        ('helper-parameter-shadow', 'def check(value):\n    validate_sql_identifier(value)\ndef run(cursor, value, check):\n    check(value)\n    cursor.execute(f"SELECT {value}")\n', 'validate_sql_identifier', CRITICAL),
+        ('helper-rebound', 'def check(value):\n    validate_sql_identifier(value)\ndef run(cursor, value, replacement):\n    check = replacement\n    check(value)\n    cursor.execute(f"SELECT {value}")\n', 'validate_sql_identifier', CRITICAL),
+        ('helper-foreign-receiver', 'def check(value):\n    validate_sql_identifier(value)\ndef run(cursor, value, arbitrary):\n    arbitrary.check(value)\n    cursor.execute(f"SELECT {value}")\n', 'validate_sql_identifier', CRITICAL),
+        ('helper-decorated', '@replace_helper\ndef check(value):\n    validate_sql_identifier(value)\ndef run(cursor, value):\n    check(value)\n    cursor.execute(f"SELECT {value}")\n', 'validate_sql_identifier', CRITICAL),
+        ('helper-async-not-awaited', 'async def check(value):\n    validate_sql_identifier(value)\ndef run(cursor, value):\n    check(value)\n    cursor.execute(f"SELECT {value}")\n', 'validate_sql_identifier', CRITICAL),
+        ('helper-generator-not-consumed', 'def check(value):\n    validate_sql_identifier(value)\n    yield value\ndef run(cursor, value):\n    check(value)\n    cursor.execute(f"SELECT {value}")\n', 'validate_sql_identifier', CRITICAL),
+        ('helper-classmethod', 'class Writer:\n    @classmethod\n    def check(cls, value):\n        validate_sql_identifier(value)\n    @classmethod\n    def run(cls, cursor, value):\n        cls.check(value)\n        cursor.execute(f"SELECT {value}")\n', 'validate_sql_identifier', WARNING),
+        ('helper-staticmethod', 'class Writer:\n    @staticmethod\n    def check(value):\n        validate_sql_identifier(value)\ndef run(cursor, value):\n    Writer.check(value)\n    cursor.execute(f"SELECT {value}")\n', 'validate_sql_identifier', WARNING),
+        ('helper-unbound-method', 'class Writer:\n    def check(self, value):\n        validate_sql_identifier(value)\ndef run(cursor, value, instance):\n    Writer.check(instance, value)\n    cursor.execute(f"SELECT {value}")\n', 'validate_sql_identifier', WARNING),
+        ('helper-instance-method', 'class Writer:\n    def check(self, value):\n        validate_sql_identifier(value)\n    def run(self, cursor, value):\n        self.check(value)\n        cursor.execute(f"SELECT {value}")\n', 'validate_sql_identifier', WARNING),
+        ('helper-same-name-distinct-owner', 'class Good:\n    @staticmethod\n    def check(value):\n        validate_sql_identifier(value)\nclass Bad:\n    @staticmethod\n    def check(value):\n        return value\ndef run(cursor, value):\n    Good.check(value)\n    cursor.execute(f"SELECT {value}")\n', 'validate_sql_identifier', WARNING),
+        ('helper-foreign-same-name', 'class Good:\n    @staticmethod\n    def check(value):\n        validate_sql_identifier(value)\nclass Bad:\n    @staticmethod\n    def check(value):\n        return value\ndef run(cursor, value):\n    Bad.check(value)\n    cursor.execute(f"SELECT {value}")\n', 'validate_sql_identifier', CRITICAL),
+        ('helper-lambda-shadow', 'def check(value):\n    validate_sql_identifier(value)\ndef run(cursor, value):\n    check = lambda item: item\n    check(value)\n    cursor.execute(f"SELECT {value}")\n', 'validate_sql_identifier', CRITICAL),
+        ('helper-binding-alias', 'def check(value):\n    validate_sql_identifier(value)\nverify = check\ndef run(cursor, value):\n    verify(value)\n    cursor.execute(f"SELECT {value}")\n', 'validate_sql_identifier', WARNING),
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        artifacts = ROOT / 'test-suite/artifacts'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        cls.artifacts = Path(tempfile.mkdtemp(prefix='sql-validation-bindings-', dir=artifacts))
+
+    def test_binding_verified_validation(self):
+        for name, source, configuration, rule in self.CASES:
+            with self.subTest(case=name):
+                path = self.artifacts / (name + '.py')
+                path.write_text(source, encoding='utf-8')
+                expected = [] if rule is None else [(rule, next(
+                    n for n, line in enumerate(source.splitlines(), 1) if 'cursor.execute(' in line))]
+                with patch.dict(os.environ, {detector.SANITIZER_ENV: configuration}):
+                    actual = [(r, line) for r, _, line, _, _ in detector.find([path])]
+                path.with_suffix('.json').write_text(json.dumps({
+                    'case': name, 'configuration': configuration, 'expected': expected, 'actual': actual,
+                    'source_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                    'detector_sha256': hashlib.sha256(Path(detector.__file__).read_bytes()).hexdigest(),
+                    'python': sys.version,
+                }, indent=2) + '\n', encoding='utf-8')
+                self.assertEqual(actual, expected, source)
+
+    def test_sqlite_callable_identity(self):
+        suffix = '    return cursor.execute(f"SELECT count(*) FROM users WHERE name = \'{value}\'").fetchone()[0]\n'
+        header = 'def run(cursor, value, arbitrary):\n'
+        cases = (
+            ('foreign-Identifier', header + '    value = arbitrary.Identifier(value)\n' + suffix,
+             'psycopg.sql.Identifier', "' OR 1=1 --", 2, CRITICAL),
+            ('shadowed-quote', header + '    quote_ident = arbitrary.Identifier\n    value = quote_ident(value)\n' + suffix,
+             'quote_ident', "' OR 1=1 --", 2, CRITICAL),
+            ('wrong-helper-receiver', 'def check(value):\n    validate_sql_identifier(value)\n' +
+             header + '    arbitrary.check(value)\n' + suffix,
+             'validate_sql_identifier', "' OR 1=1 --", 2, CRITICAL),
+            ('decorator-replacement', 'def replacement(function):\n    return lambda value: value\n' +
+             '@replacement\ndef check(value):\n    validate_sql_identifier(value)\n' +
+             header + '    check(value)\n' + suffix, 'validate_sql_identifier', "' OR 1=1 --", 2, CRITICAL),
+            ('coroutine-not-executed', 'async def check(value):\n    validate_sql_identifier(value)\n' +
+             header + '    pending = check(value)\n    pending.close()\n' + suffix,
+             'validate_sql_identifier', "' OR 1=1 --", 2, CRITICAL),
+            ('generator-not-executed', 'def check(value):\n    validate_sql_identifier(value)\n    yield value\n' +
+             header + '    pending = check(value)\n    pending.close()\n' + suffix,
+             'validate_sql_identifier', "' OR 1=1 --", 2, CRITICAL),
+            ('real-static-helper', 'class Writer:\n    @staticmethod\n    def check(value):\n        validate_sql_identifier(value)\n' +
+             header + '    Writer.check(value)\n' + suffix, 'validate_sql_identifier', 'alice', 1, WARNING),
+        )
+        class Arbitrary:
+            def Identifier(self, value):
+                return value
+
+            def check(self, value):
+                return value
+
+        def validate_sql_identifier(value):
+            if value not in {'alice', 'bob'}:
+                raise ValueError('identifier not allowed')
+
+        for name, source, configuration, value, count, rule in cases:
+            with self.subTest(case=name):
+                namespace = {'validate_sql_identifier': validate_sql_identifier}
+                exec(compile(source, name, 'exec'), namespace)
+                connection = sqlite3.connect(':memory:')
+                try:
+                    cursor = connection.cursor()
+                    cursor.execute('CREATE TABLE users (name TEXT)')
+                    cursor.executemany('INSERT INTO users VALUES (?)', [('alice',), ('bob',)])
+                    actual_count = namespace['run'](cursor, value, Arbitrary())
+                finally:
+                    connection.close()
+                path = self.artifacts / ('sqlite-' + name + '.py')
+                path.write_text(source, encoding='utf-8')
+                with patch.dict(os.environ, {detector.SANITIZER_ENV: configuration}):
+                    actual = [(r, n) for r, _, n, _, _ in detector.find([path])]
+                expected = [(rule, next(n for n, line in enumerate(source.splitlines(), 1)
+                                        if 'cursor.execute(' in line))]
+                path.with_suffix('.json').write_text(json.dumps({
+                    'case': name, 'configuration': configuration, 'expected_rows': count,
+                    'actual_rows': actual_count, 'expected_findings': expected, 'actual_findings': actual,
+                    'sqlite_version': sqlite3.sqlite_version, 'python': sys.version,
+                }, indent=2) + '\n', encoding='utf-8')
+                self.assertEqual(actual_count, count)
+                self.assertEqual(actual, expected)
+
+    @unittest.skipUnless((ROOT / 'ubs').is_file() and (ROOT / 'modules/ubs-python.sh').is_file(),
+                         'real CLI requires a full checkout')
+    def test_real_cli_validation_contract(self):
+        selected = [(name, source, SQLValidationFlow.VALIDATOR, rule)
+                    for name, source, rule in SQLValidationFlow.programs()
+                    if name in {'conditional', 'failed-validator-caught', 'direct', 'literal-overwrite'}]
+        selected += [case for case in self.CASES if case[0] in {'import-function-alias', 'unrelated-receiver'}]
+        for name, source, configuration, rule in selected:
+            expected = [] if rule is None else [(rule, next(n for n, line in enumerate(source.splitlines(), 1)
+                                                          if 'cursor.execute(' in line))]
+            for entry in ('modules/ubs-python.sh', 'ubs'):
+                for fmt in ('json', 'sarif'):
+                    with self.subTest(case=name, entry=entry, format=fmt):
+                        folder = self.artifacts / (name + '-' + entry.replace('/', '-') + '-' + fmt)
+                        folder.mkdir()
+                        path = folder / 'case.py'
+                        path.write_text(source, encoding='utf-8')
+                        for directory in ('home', 'cache', 'tmp'):
+                            (folder / directory).mkdir()
+                        env = {key: value for key, value in os.environ.items() if not key.startswith('UBS_')}
+                        env.update(HOME=str(folder / 'home'), XDG_CACHE_HOME=str(folder / 'cache'),
+                                   TMPDIR=str(folder / 'tmp'), UBS_KEEP_TEMP='1', UBS_NO_AUTO_UPDATE='1',
+                                   PYTHONDONTWRITEBYTECODE='1', NO_COLOR='1', ENABLE_UV_TOOLS='0',
+                                   UBS_PY_SQL_SANITIZERS=configuration)
+                        skip = ','.join(str(n) for n in range(1, 24) if n != 7)
+                        command = ['bash', str(ROOT / entry), '--ci', '--no-color', '--fail-on-warning',
+                                   '--format=' + fmt, '--skip=' + skip]
+                        command += ['--only=python'] if entry == 'ubs' else ['--no-uv']
+                        command.append(str(path))
+                        started = time.perf_counter()
+                        try:
+                            result = subprocess.run(command, cwd=folder, env=env, capture_output=True,
+                                                    text=True, timeout=120, check=False)
+                        except subprocess.TimeoutExpired as exc:
+                            for stream in ('stdout', 'stderr'):
+                                content = getattr(exc, stream) or b''
+                                if isinstance(content, str):
+                                    content = content.encode('utf-8')
+                                (folder / (stream + '.log')).write_bytes(content)
+                            self.fail(f'CLI timeout: {command}; evidence: {folder}')
+                        (folder / 'stdout.log').write_text(result.stdout, encoding='utf-8')
+                        (folder / 'stderr.log').write_text(result.stderr, encoding='utf-8')
+                        (folder / 'run.json').write_text(json.dumps({
+                            'command': command, 'exit': result.returncode, 'configuration': configuration,
+                            'source_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                            'detector_sha256': hashlib.sha256(Path(detector.__file__).read_bytes()).hexdigest(),
+                            'entry_sha256': hashlib.sha256((ROOT / entry).read_bytes()).hexdigest(),
+                            'elapsed_seconds': time.perf_counter() - started,
+                        }, indent=2) + '\n', encoding='utf-8')
+                        self.assertEqual(result.returncode, 1 if rule else 0, result.stderr)
+                        try:
+                            doc = json.loads(result.stdout)
+                        except ValueError as exc:
+                            self.fail(f'Malformed CLI output: {exc}; evidence: {folder}')
+                        actual = []
+                        if fmt == 'json':
+                            scans = doc['scanners'] if entry == 'ubs' else [doc]
+                            self.assertEqual(len(scans), 1)
+                            scan = scans[0]
+                            self.assertEqual((scan['status'], scan['files']), ('ok', 1))
+                            for severity in ('critical', 'warning', 'info'):
+                                self.assertEqual(scan[severity], sum(f['count'] for f in scan['findings']
+                                                                    if f['severity'] == severity))
+                            for finding in scan['findings']:
+                                found_rule = finding.get('rule_id', finding.get('rule'))
+                                if found_rule in {CRITICAL, WARNING}:
+                                    self.assertEqual(finding['count'], len(finding['samples']))
+                                    for sample in finding['samples']:
+                                        self.assertEqual(Path(sample['file']).name, path.name)
+                                        actual.append((found_rule, sample['line']))
+                        else:
+                            self.assertEqual(doc['version'], '2.1.0')
+                            for run in doc['runs']:
+                                for finding in run.get('results', []):
+                                    if finding['ruleId'] in {CRITICAL, WARNING}:
+                                        place = finding['locations'][0]['physicalLocation']
+                                        self.assertEqual(Path(unquote(place['artifactLocation']['uri'])).name, path.name)
+                                        self.assertEqual(place['region']['startColumn'], 1)
+                                        actual.append((finding['ruleId'], place['region']['startLine']))
+                        self.assertEqual(sorted(actual), sorted(expected), folder)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

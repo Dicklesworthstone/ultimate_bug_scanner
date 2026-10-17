@@ -20,6 +20,9 @@ facts through the existing bounded flow engine. Finite literal iterables keep
 their exact trip counts; finally transforms abrupt as well as normal exits.
 Exception matching and unknown callee/heap effects remain conservative. An
 exhausted budget or unsupported exception-group flow is not a clean result.
+Configured validator contracts are trusted only at binding-resolved calls and
+successful execution points. Their proofs are intersected at joins, revoked on
+replacement or possible attribute mutation, and scoped to the evaluated value.
 """
 from __future__ import annotations
 
@@ -86,29 +89,260 @@ def dotted_suffixes(name):
     return {'.'.join(parts[index:]) for index in range(len(parts))}
 
 
+def configured_sanitizer_targets(environ=None):
+    """Exact project-declared targets, before building the spelling index."""
+    raw = (environ if environ is not None else os.environ).get(SANITIZER_ENV, '')
+    return frozenset(item.strip() for item in raw.split(',') if item.strip())
+
+
 def configured_sanitizers(environ=None):
     """Sanitizer names from the environment, expanded to their suffixes.
 
     A project writing `psycopg.sql.Identifier` means the same function that
     the code calls as `sql.Identifier(...)` after `from psycopg import sql`,
-    so the configured name is stored with its suffixes and a call matches when
-    any of its own suffixes is in the set.
+    so the spelling index includes suffixes. A suffix alone never authorizes
+    a call: SanitizerBindings also verifies its canonical target and scope.
     """
-    raw = (environ if environ is not None else os.environ).get(SANITIZER_ENV, '')
     names = set()
-    for item in raw.split(','):
-        item = item.strip()
-        if item:
-            names.update(dotted_suffixes(item))
+    for item in configured_sanitizer_targets(environ):
+        names.update(dotted_suffixes(item))
     return frozenset(names)
 
 
-def is_sanitizer_call(node, sanitizers):
+def is_sanitizer_call(node, sanitizers, bindings=None):
     """Whether `node` is a call to one of the configured sanitizers."""
     if not sanitizers or not isinstance(node, ast.Call):
         return False
-    name = call_name(node.func)
-    return bool(name) and bool(dotted_suffixes(name) & sanitizers)
+    if bindings is not None:
+        return bindings.is_sanitizer(node)
+    # Missing scope information is not permission to trust a name match.
+    return False
+
+
+class SanitizerBindings:
+    """Resolve selected stable imports and same-file helper definitions.
+
+    Parameters, reassigned names, unknown receivers, decorators, namespace
+    escapes and member writes cannot inherit a trusted leaf spelling. This
+    intentionally does not infer arbitrary dynamic dispatch or monkeypatches.
+    """
+
+    def __init__(self, tree, targets, budget):
+        self.targets = targets
+        self.budget = budget
+        self.scope_of = {}
+        self.owner_scopes = {}
+        self.member_writes = set()
+        self.indirect_rebindings = set()
+        self.calls = []
+        self.escaped_imports = set()
+        self.dynamic_namespace = False
+        self._walk(tree, self._scope(tree, None))
+        for call in self.calls:
+            if isinstance(call.func, ast.Name) and call.func.id in {'exec', 'eval', 'globals', 'locals'}:
+                self.dynamic_namespace = True
+            for argument in [*call.args, *(kw.value for kw in call.keywords)]:
+                resolved = self.resolve(argument)
+                if resolved and resolved[0] == 'import':
+                    self.escaped_imports.add(resolved[1])
+
+    def _scope(self, node, parent):
+        scope = {'node': node, 'parent': parent, 'names': {}}
+        self.owner_scopes[node] = scope
+        return scope
+
+    @staticmethod
+    def _bind(scope, name, value):
+        scope['names'].setdefault(name, []).append(value)
+
+    def _walk(self, node, scope):
+        self.budget[0] -= 1
+        if self.budget[0] < 0:
+            raise SQLFlowLimit('SQL binding budget exceeded; analysis is incomplete')
+        self.scope_of[node] = scope
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            if not isinstance(node, ast.Lambda):
+                self._bind(scope, node.name, ('function', node, False))
+                for expression in [*node.decorator_list, *([node.returns] if node.returns else [])]:
+                    self._walk(expression, scope)
+            for expression in [*node.args.defaults, *(v for v in node.args.kw_defaults if v is not None)]:
+                self._walk(expression, scope)
+            arguments = [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]
+            arguments += [arg for arg in (node.args.vararg, node.args.kwarg) if arg is not None]
+            for argument in arguments:
+                if argument.annotation is not None:
+                    self._walk(argument.annotation, scope)
+            inner = self._scope(node, scope)
+            for parameter in getattr(node, 'type_params', []):
+                self._bind(inner, parameter.name, None)
+            positional = _positional_parameters(node)
+            decorators = [call_name(d) for d in getattr(node, 'decorator_list', [])]
+            for name in _all_parameters(node):
+                receiver = None
+                if (isinstance(scope['node'], ast.ClassDef) and positional and name == positional[0]
+                        and decorators in ([], ['classmethod'])):
+                    receiver = ('receiver', scope['node'], not decorators)
+                self._bind(inner, name, receiver)
+            for statement in ([node.body] if isinstance(node, ast.Lambda) else node.body):
+                self._walk(statement, inner)
+            return
+        if isinstance(node, ast.ClassDef):
+            self._bind(scope, node.name, ('class', node, False))
+            for expression in [*node.decorator_list, *node.bases, *(kw.value for kw in node.keywords)]:
+                self._walk(expression, scope)
+            inner = self._scope(node, scope)
+            for parameter in getattr(node, 'type_params', []):
+                self._bind(inner, parameter.name, None)
+            for statement in node.body:
+                self._walk(statement, inner)
+            return
+        if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+            self._walk(node.generators[0].iter, scope)
+            inner = self._scope(node, scope)
+            for index, generator in enumerate(node.generators):
+                self._walk(generator.target, inner)
+                if index:
+                    self._walk(generator.iter, inner)
+                for condition in generator.ifs:
+                    self._walk(condition, inner)
+            for expression in ([node.key, node.value] if isinstance(node, ast.DictComp) else [node.elt]):
+                self._walk(expression, inner)
+            return
+        if isinstance(node, (ast.Global, ast.Nonlocal)):
+            self.indirect_rebindings.update(node.names)
+        if isinstance(node, (ast.Assign, ast.AnnAssign)) and isinstance(node.value, (ast.Name, ast.Attribute)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            self._walk(node.value, scope)
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    self.scope_of[target] = scope
+                    self._bind(scope, target.id, ('alias', node.value))
+                else:
+                    self._walk(target, scope)
+            if isinstance(node, ast.AnnAssign):
+                self._walk(node.annotation, scope)
+            return
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            self._bind(scope, node.id, None)
+        if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            self.member_writes.add(node.attr)
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if alias.name == '*':
+                    self.dynamic_namespace = True
+                    continue
+                name = alias.asname or alias.name.split('.')[0]
+                canonical = alias.name if alias.asname else alias.name.split('.')[0]
+                if isinstance(node, ast.ImportFrom):
+                    canonical = '.'.join(part for part in (node.module, alias.name) if part)
+                    if node.level:
+                        canonical = '.' * node.level + canonical
+                self._bind(scope, name, ('import', canonical))
+        if isinstance(node, ast.ExceptHandler) and node.name:
+            self._bind(scope, node.name, None)
+        if type(node).__name__ in {'MatchAs', 'MatchStar'} and node.name:
+            self._bind(scope, node.name, None)
+        if isinstance(node, ast.Call):
+            self.calls.append(node)
+        if isinstance(node, ast.NamedExpr):
+            target_scope = scope
+            while isinstance(target_scope['node'], (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                target_scope = target_scope['parent']
+            self._walk(node.target, target_scope)
+            self._walk(node.value, scope)
+            return
+        for child in ast.iter_child_nodes(node):
+            self._walk(child, scope)
+
+    def lookup(self, name, scope, seen=None):
+        if name in self.indirect_rebindings:
+            return None
+        while scope:
+            candidates = scope['names'].get(name)
+            if candidates is not None:
+                value = candidates[0] if len(candidates) == 1 else None
+                if value and value[0] == 'alias':
+                    return self.resolve(value[1], seen)
+                return value
+            child = scope['node']
+            scope = scope['parent']
+            if not isinstance(child, ast.ClassDef):
+                while scope and isinstance(scope['node'], ast.ClassDef):
+                    scope = scope['parent']
+        return ('unbound', name)
+
+    def resolve(self, node, seen=None):
+        self.budget[0] -= 1
+        if self.budget[0] < 0:
+            raise SQLFlowLimit('SQL binding resolution budget exceeded; analysis is incomplete')
+        seen = set() if seen is None else seen
+        if node in seen:
+            return None
+        seen.add(node)
+        if isinstance(node, ast.Name):
+            return self.lookup(node.id, self.scope_of.get(node), seen)
+        if not isinstance(node, ast.Attribute) or node.attr in self.member_writes:
+            return None
+        parent = self.resolve(node.value, seen)
+        if not parent:
+            return None
+        if parent[0] == 'import':
+            return ('import', parent[1] + '.' + node.attr)
+        if parent[0] in {'class', 'receiver'}:
+            owner = parent[1]
+            if owner.decorator_list or owner.bases or owner.keywords:
+                return None
+            candidates = self.owner_scopes[owner]['names'].get(node.attr, [])
+            value = candidates[0] if len(candidates) == 1 else None
+            if value and value[0] == 'function':
+                method = value[1]
+                decorators = [call_name(d) for d in method.decorator_list]
+                if decorators not in ([], ['classmethod'], ['staticmethod']):
+                    return None
+                for decorator in method.decorator_list:
+                    if self.resolve(decorator) != ('unbound', call_name(decorator)):
+                        return None
+                bound = decorators == ['classmethod'] or (not decorators and parent[0] == 'receiver' and parent[2])
+                return ('function', method, bound)
+        return None
+
+    def eager_function(self, function):
+        if isinstance(function, ast.AsyncFunctionDef):
+            return False
+        return not any(isinstance(node, (ast.Yield, ast.YieldFrom)) and
+                       self.scope_of[node]['node'] is function for node in ast.walk(function))
+
+    def is_sanitizer(self, node):
+        if self.dynamic_namespace:
+            return False
+        resolved = self.resolve(node.func)
+        if not resolved:
+            return False
+        if resolved[0] == 'import':
+            canonical = resolved[1]
+            if any(canonical == root or canonical.startswith(root + '.') for root in self.escaped_imports):
+                return False
+            if canonical in self.targets:
+                return True
+        if resolved[0] == 'function':
+            if not self.eager_function(resolved[1]) or resolved[1].decorator_list:
+                return False
+        # A bare project-declared helper is a deliberate contract, not an
+        # authorization for every unrelated object's same-named method.
+        return (isinstance(node.func, ast.Name) and node.func.id in self.targets
+                and resolved[0] in {'unbound', 'import', 'function'})
+
+    def summary(self, node, summaries):
+        if self.dynamic_namespace:
+            return None
+        resolved = self.resolve(node.func)
+        if not resolved or resolved[0] != 'function' or not self.eager_function(resolved[1]):
+            return None
+        function = resolved[1]
+        if function.decorator_list and not isinstance(node.func, ast.Attribute):
+            return None
+        record = summaries.get(function)
+        return dict(record, bound_receiver=resolved[2]) if record else None
 
 
 def rooted_attribute(node):
@@ -148,12 +382,12 @@ def _bind_call_arguments(node, record):
     """Map parameter name -> caller-side argument expression for one call.
 
     `cls._validate(config, col)` binds `config`/`col` to the *second* and
-    third parameters of a method whose first is `cls`, so the implicit
-    receiver is dropped when the call goes through an attribute. `*args`
-    stops positional binding: past it nothing can be matched to a name.
+    third parameters of a class method. Drop only a receiver proved bound
+    by the resolver: Class.instance_method(obj, value) is an unbound call.
+    `*args` stops positional binding: past it nothing can be matched to a name.
     """
     positional = list(record['positional'])
-    if positional and positional[0] in ('self', 'cls') and isinstance(node.func, ast.Attribute):
+    if positional and record.get('bound_receiver', False):
         positional = positional[1:]
     bound = {}
     for index, argument in enumerate(node.args):
@@ -167,7 +401,7 @@ def _bind_call_arguments(node, record):
     return bound
 
 
-def call_validated_segments(node, text, sanitizers, summaries):
+def call_validated_segments(node, text, sanitizers, summaries, stable_arguments=None, bindings=None):
     """Source segments this call validates, direct or through a wrapper.
 
     A direct sanitizer call validates its own arguments. A call to a function
@@ -179,9 +413,11 @@ def call_validated_segments(node, text, sanitizers, summaries):
     `config.some_other_column` stays tainted (GH #133).
     """
     segments = []
-    if is_sanitizer_call(node, sanitizers):
+    if is_sanitizer_call(node, sanitizers, bindings):
         for argument in list(node.args) + [keyword.value for keyword in node.keywords]:
-            segment = python_source_segment(text, argument)
+            if stable_arguments is not None and argument not in stable_arguments:
+                continue
+            segment = validation_key(argument)
             if segment:
                 segments.append(segment.strip())
         return segments
@@ -189,7 +425,7 @@ def call_validated_segments(node, text, sanitizers, summaries):
     name = call_name(node.func)
     if not name:
         return segments
-    record = summaries.get(name.split('.')[-1])
+    record = bindings.summary(node, summaries) if bindings is not None else summaries.get(name)
     if not record:
         return segments
     bound = _bind_call_arguments(node, record)
@@ -197,7 +433,9 @@ def call_validated_segments(node, text, sanitizers, summaries):
         argument = bound.get(parameter)
         if argument is None:
             continue
-        segment = python_source_segment(text, argument)
+        if stable_arguments is not None and argument not in stable_arguments:
+            continue
+        segment = validation_key(argument)
         if not segment:
             continue
         segment = segment.strip()
@@ -206,71 +444,89 @@ def call_validated_segments(node, text, sanitizers, summaries):
     return segments
 
 
-def _function_validates(func, sanitizers, summaries):
-    """Which of `func`'s own parameters reach a sanitizer, and as what.
+def validation_key(node):
+    """Only stable name/attribute paths can denote a checked binding.
 
-    `{'config': {'pg_table', 'pg_schema'}, 'writeback_column': {''}}`. The
-    empty suffix means the parameter itself was validated. Nested functions
-    are skipped for the same reason `guarded_expressions` skips them.
+    Repeated calls and subscripts can produce different objects. Source-text
+    equality is not evidence that their results are the same checked value.
+    """
+    rooted = rooted_attribute(node)
+    if rooted is None:
+        return None
+    return '.'.join(part for part in rooted if part)
+
+
+def _function_validates(func, text, sanitizers, summaries, budget, bindings):
+    """Must-validation on every successful helper exit, using the real engine.
+
+    Throwing paths need not validate; caught failures and early returns do.
+    A rebinding of a formal parameter never certifies the caller's argument.
+    Unresolved aliases are intentionally not exported as validation proof.
     """
     parameters = _all_parameters(func)
-    validates = {}
     if not parameters:
-        return validates
+        return {}
+    rebound = set()
     pending = list(func.body)
     while pending:
         node = pending.pop()
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            rebound.add(getattr(node, 'name', ''))
             continue
-        if isinstance(node, ast.GeneratorExp):
-            # Deferred validation does not establish a guard at creation.
-            pending.append(node.generators[0].iter)
-            continue
-        if isinstance(node, ast.Call):
-            direct = is_sanitizer_call(node, sanitizers)
-            record = None
-            if not direct:
-                name = call_name(node.func)
-                record = summaries.get(name.split('.')[-1]) if name else None
-            if direct:
-                arguments = list(node.args) + [keyword.value for keyword in node.keywords]
-                pairs = [(argument, '') for argument in arguments]
-            elif record:
-                bound = _bind_call_arguments(node, record)
-                pairs = [
-                    (bound[parameter], suffix)
-                    for parameter, suffixes in record['validates'].items()
-                    if parameter in bound
-                    for suffix in suffixes
-                ]
-            else:
-                pairs = []
-            for argument, suffix in pairs:
-                rooted = rooted_attribute(argument)
-                if rooted is None or rooted[0] not in parameters:
-                    continue
-                root, own_suffix = rooted
-                combined = '.'.join(part for part in (own_suffix, suffix) if part)
-                validates.setdefault(root, set()).add(combined)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            rebound.add(node.id)
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            rebound.update(alias.asname or alias.name.split('.')[0] for alias in node.names)
+        if isinstance(node, ast.ExceptHandler) and node.name:
+            rebound.add(node.name)
         pending.extend(ast.iter_child_nodes(node))
+
+    analyzer = SQLInjectionAnalyzer(text, text.splitlines(), parameters, {}, sanitizers,
+                                    summaries, budget=budget, bindings=bindings)
+    analyzer.func_stack.append(func)
+    scope = bindings.owner_scopes[func]
+    scopes = []
+    while scope is not None:
+        scopes.append(scope['node'])
+        scope = scope['parent']
+    analyzer._generator_scope = tuple(reversed(scopes))
+    analyzer.value_risks.update({name: 'tainted' for name in parameters})
+    flow = analyzer.statements(func.body, analyzer.sql_state())
+    successful = [state for kind, state in flow.items() if kind in {'normal', 'return'}]
+    if not successful:
+        return {}
+    proven = set.intersection(*(state[8] for state in successful))
+    validates = {}
+    for key in proven:
+        root, _, suffix = key.partition('.')
+        if root in parameters and root not in rebound:
+            validates.setdefault(root, set()).add(suffix)
     return validates
 
 
-def build_sanitizer_summaries(tree, sanitizers, rounds=4):
-    """Per-function-name summaries of which parameters reach a sanitizer.
+def build_sanitizer_summaries(tree, sanitizers, rounds=4, *, text=None, budget=None, bindings=None):
+    """Per-definition summaries of parameters validated on successful exits.
 
     Recomputed a bounded number of times so a wrapper that calls a wrapper is
     reached (`_validate_all` -> `_validate_one` -> `validate_sql_identifier`)
     without letting a recursive definition iterate forever.
 
-    Two functions in one module may share a name. Rather than guess which one
-    a call meant, the name is dropped unless both take the same positional
-    parameters, and then only what BOTH validate is kept — a summary must
-    never claim a guard that one of the candidates does not perform.
+    The binding resolver chooses a concrete definition and its receiver.
+    Unrelated objects and lexical shadows cannot borrow another definition's
+    proof. Unawaited coroutine and unconsumed generator bodies prove nothing.
     """
     summaries = {}
     if not sanitizers:
         return summaries
+    if text is None:
+        text = ast.unparse(tree)
+        tree = ast.parse(text)
+    if budget is None:
+        budget = [100_000]
+    if bindings is None:
+        targets = {name for name in sanitizers if not any(
+            other.endswith('.' + name) for other in sanitizers)}
+        bindings = SanitizerBindings(tree, targets, budget)
     functions = [
         node for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -280,74 +536,17 @@ def build_sanitizer_summaries(tree, sanitizers, rounds=4):
 
     for _ in range(rounds):
         current = {}
-        dropped = set()
         for func in functions:
-            validates = _function_validates(func, sanitizers, summaries)
+            if not bindings.eager_function(func):
+                continue
+            validates = _function_validates(func, text, sanitizers, summaries, budget, bindings)
             record = {'positional': _positional_parameters(func), 'validates': validates}
-            existing = current.get(func.name)
-            if existing is None:
-                if func.name not in dropped:
-                    current[func.name] = record
-                continue
-            if existing['positional'] != record['positional']:
-                current.pop(func.name, None)
-                dropped.add(func.name)
-                continue
-            merged = {}
-            for parameter, suffixes in existing['validates'].items():
-                shared = suffixes & record['validates'].get(parameter, set())
-                if shared:
-                    merged[parameter] = shared
-            existing['validates'] = merged
-        current = {name: record for name, record in current.items() if record['validates']}
+            if validates:
+                current[func] = record
         if current == summaries:
             break
         summaries = current
     return summaries
-
-
-def guarded_expressions(func, text, sanitizers, summaries=None):
-    """Source text of every expression a sanitizer validates in `func`.
-
-    Maps the expression's source segment to the earliest line that validates
-    it, so a sink can require the guard to come first. Nested functions are
-    not descended into: a guard that runs in a closure does not dominate a
-    sink in the enclosing body, and the conservative reading is the one that
-    downgrades less.
-    """
-    guarded = {}
-    if not sanitizers:
-        return guarded
-    summaries = summaries or {}
-    pending = list(func.body)
-    while pending:
-        node = pending.pop()
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
-            continue
-        if isinstance(node, ast.GeneratorExp):
-            pending.append(node.generators[0].iter)
-            continue
-        if isinstance(node, ast.Call):
-            for key in call_validated_segments(node, text, sanitizers, summaries):
-                line = node.lineno
-                if key not in guarded or line < guarded[key]:
-                    guarded[key] = line
-        pending.extend(ast.iter_child_nodes(node))
-    return guarded
-
-
-def build_guarded_expressions(tree, text, sanitizers):
-    """Per-function guarded-expression tables, keyed by function node id."""
-    tables = {}
-    if not sanitizers:
-        return tables
-    summaries = build_sanitizer_summaries(tree, sanitizers)
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            guarded = guarded_expressions(node, text, sanitizers, summaries)
-            if guarded:
-                tables[id(node)] = guarded
-    return tables
 
 
 def call_name(node):
@@ -514,14 +713,21 @@ def build_provenance(tree):
 
 
 class SQLInjectionAnalyzer(ast.NodeVisitor):
-    def __init__(self, text, lines, param_names, name_risk, sanitizers=frozenset(), guarded_tables=None,
-                 *, max_steps=100_000):
+    def __init__(self, text, lines, param_names, name_risk, sanitizers=frozenset(), sanitizer_summaries=None,
+                 *, max_steps=100_000, budget=None, bindings=None):
         self.text = text
         self.lines = lines
         self.param_names = param_names
         self.name_risk = name_risk
         self.sanitizers = sanitizers
-        self.guarded_tables = guarded_tables or {}
+        self.sanitizer_summaries = sanitizer_summaries or {}
+        self.bindings = bindings
+        self.validated = set()
+        # Evaluation-local epochs are not part of the flow lattice. They
+        # prevent later argument effects from blessing an earlier argument's
+        # now-rebound source expression; no unbounded loop state is added.
+        self._binding_epochs = {}
+        self._attribute_epoch = 0
         self.func_stack = []
         self.sink_lineno = None
         self.unsafe_sql_vars = set()
@@ -534,6 +740,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         self.value_risks = {}
         self._sink_risks = {}
         self.remaining_steps = max_steps
+        self._budget = [max_steps] if budget is None else budget
         self._pending_raise = None
         # A loaded expression denotes its value *at evaluation time*. Later
         # argument/walrus writes must not change a value already captured by
@@ -583,7 +790,8 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         return [(line, code) for risk, line, code in self._sink_risks.values() if risk == 'warning']
 
     def step(self):
-        self.remaining_steps -= 1
+        self._budget[0] -= 1
+        self.remaining_steps = self._budget[0]
         if self.remaining_steps < 0:
             raise SQLFlowLimit('SQL dataflow budget exceeded; analysis is incomplete')
 
@@ -614,7 +822,10 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         for state in present:
             for identity, incoming in state[7].items():
                 phases[identity] = phases.get(identity, frozenset()) | incoming
-        return unsafe, weak, fragments, selects, templates, values, generators, phases
+        # SQL risk is may-flow; validation is must-flow. One bypass or failed
+        # validator is enough to revoke a proof at the joined program point.
+        validated = set.intersection(*(state[8] for state in present))
+        return unsafe, weak, fragments, selects, templates, values, generators, phases, validated
 
     def merge_flows(self, *flows):
         merged = {}
@@ -694,6 +905,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         if node.returns is not None:
             self.visit(node.returns)
         outer = self.sql_state()
+        self.validated.clear()
         parameters = _all_parameters(node)
         self.unsafe_sql_vars.difference_update(parameters)
         self.weak_sql_vars.difference_update(parameters)
@@ -720,6 +932,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         # must not mutate the defining scope or raise into its try block.
         self.visit(node.args)
         outer, enclosing_raise = self.sql_state(), self._pending_raise
+        self.validated.clear()
         self.bind_value_facts(_all_parameters(node), (None, None, None, False, 'tainted'))
         self._pending_raise = None
         scope = self._generator_scope
@@ -757,12 +970,12 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         return (self.unsafe_sql_vars.copy(), self.weak_sql_vars.copy(),
                 self.fragment_sql_vars.copy(), self.select_sql_vars.copy(),
                 self.sql_template_vars.copy(), self.value_risks.copy(),
-                self.generator_bindings.copy(), self.generator_phases.copy())
+                self.generator_bindings.copy(), self.generator_phases.copy(), self.validated.copy())
 
     def restore_sql_state(self, state):
         (self.unsafe_sql_vars, self.weak_sql_vars, self.fragment_sql_vars,
          self.select_sql_vars, self.sql_template_vars, self.value_risks,
-         self.generator_bindings, self.generator_phases) = (part.copy() for part in state)
+         self.generator_bindings, self.generator_phases, self.validated) = (part.copy() for part in state)
 
     def visit_If(self, node):
         self.visit(node.test)
@@ -893,6 +1106,10 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
 
     def visit_Attribute(self, node):
         self.generic_visit(node)
+        if isinstance(getattr(node, 'ctx', None), (ast.Store, ast.Del)):
+            # Without heap alias proof, a write through any alias can replace
+            # a checked property. Never retain a stale attribute validation.
+            self.invalidate_attribute_validations()
         self.note_possible_raise()
 
     visit_Subscript = visit_Attribute
@@ -961,8 +1178,11 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         if state is None:
             return None
         restored = tuple(part.copy() for part in state)
-        for part, outer in zip(restored, enclosing):
-            if isinstance(part, set):
+        for index, (part, outer) in enumerate(zip(restored, enclosing)):
+            if index == 8:
+                part.difference_update(key for key in tuple(part) if key.split('.')[0] in names)
+                part.update(key for key in outer if key.split('.')[0] in names)
+            elif isinstance(part, set):
                 part.difference_update(names)
                 part.update(outer.intersection(names))
             else:
@@ -1407,24 +1627,24 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         return flow
 
     def is_guarded(self, node):
-        """Whether a sanitizer validated this exact expression before the sink.
+        """The exact binding was checked on every path to this evaluation."""
+        return bool(self.sanitizers) and validation_key(node) in self.validated
 
-        The comparison is on source text inside one function body, which is
-        what the accepted pattern actually writes: the same
-        `config.pg_table` is handed to the validator and then interpolated.
-        A sink outside any function, an expression with no recoverable source
-        segment, or a guard on a later line all answer no (GH #133).
-        """
-        if not self.sanitizers or not self.func_stack or self.sink_lineno is None:
-            return False
-        guarded = self.guarded_tables.get(id(self.func_stack[-1]))
-        if not guarded:
-            return False
-        segment = python_source_segment(self.text, node)
-        if not segment:
-            return False
-        at = guarded.get(segment.strip())
-        return at is not None and at < self.sink_lineno
+    def invalidate_attribute_validations(self):
+        self.validated = {key for key in self.validated if '.' not in key}
+        self._attribute_epoch += 1
+
+    def invalidate_validation(self, names):
+        roots = set(names)
+        for name in roots:
+            self._binding_epochs[name] = self._binding_epochs.get(name, 0) + 1
+        self.validated = {key for key in self.validated if key.split('.')[0] not in roots}
+
+    def validation_epoch(self, node):
+        key = validation_key(node)
+        if key is None:
+            return None
+        return (self._binding_epochs.get(key.split('.')[0], 0), self._attribute_epoch)
 
     def value_nodes(self, node):
         """Traverse value contributors, excluding format_map lookup keys."""
@@ -1490,7 +1710,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             # A value produced BY a sanitizer is safe by that function's own
             # contract — `quote_ident(x)` returns a quoted identifier — so it
             # is static rather than merely downgraded (GH #133).
-            if is_sanitizer_call(node, self.sanitizers):
+            if is_sanitizer_call(node, self.sanitizers, self.bindings):
                 return 'static'
             return 'unknown' if self.is_guarded(node) else 'tainted'
         risk = None
@@ -1590,6 +1810,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 self.generator_bindings.get(value.id, frozenset()) if isinstance(value, ast.Name) else frozenset())
 
     def bind_value_facts(self, names, facts):
+        self.invalidate_validation(names)
         risk, fragment_risk, select_risk, template, provenance = facts[:5]
         self.store_sql_risk(names, risk)
         for name in names:
@@ -1670,6 +1891,11 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         self.mark_assignment(binding_target_names(node.target), node.value)
         self._evaluated_values[node] = self.value_facts(node.value)
 
+    def visit_Delete(self, node):
+        for target in node.targets:
+            self.visit(target)
+            self.bind_value_facts(binding_target_names(target), (None, None, None, False, 'unknown'))
+
     def visit_AugAssign(self, node):
         self.visit(node.target)
         left = self.value_facts(node.target)
@@ -1737,12 +1963,15 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         previous_sink = self.sink_lineno
         if is_sink:
             self.sink_lineno = node.lineno
+        argument_epochs = {}
         try:
             self.visit(node.func)
             for argument in node.args:
                 self.visit(argument)
+                argument_epochs[argument] = self.validation_epoch(argument)
             for keyword in node.keywords:
                 self.visit(keyword.value)
+                argument_epochs[keyword.value] = self.validation_epoch(keyword.value)
             self.generator_call(node)
             # All effects have now occurred, but each argument retains its
             # own evaluation-time value. Suppress findings, never execution.
@@ -1750,7 +1979,15 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 self.classify_sink(node)
         finally:
             self.sink_lineno = previous_sink
+        stable = {argument for argument, epoch in argument_epochs.items()
+                  if epoch is not None and epoch == self.validation_epoch(argument)}
+        if not is_sanitizer_call(node, self.sanitizers, self.bindings):
+            self.invalidate_attribute_validations()
         self.note_possible_raise()
+        # Only successful completion establishes a proof. The pending error
+        # store above must remain unvalidated when a handler catches failure.
+        self.validated.update(call_validated_segments(
+            node, self.text, self.sanitizers, self.sanitizer_summaries, stable, self.bindings))
 
     def classify_sink(self, node):
         worst = None
@@ -1782,14 +2019,19 @@ def find(files: Sequence[Path], *, max_steps=100_000) -> Iterable[tuple[str, Pat
         lines = text.splitlines()
         param_names, name_risk = build_provenance(tree)
         sanitizers = configured_sanitizers()
+        budget = [max_steps]
+        bindings = SanitizerBindings(tree, configured_sanitizer_targets(), budget) if sanitizers else None
+        summaries = build_sanitizer_summaries(tree, sanitizers, text=text, budget=budget, bindings=bindings)
         analyzer = SQLInjectionAnalyzer(
             text,
             lines,
             param_names,
             name_risk,
             sanitizers,
-            build_guarded_expressions(tree, text, sanitizers),
+            summaries,
             max_steps=max_steps,
+            budget=budget,
+            bindings=bindings,
         )
         analyzer.visit(tree)
         for line_no, code in analyzer.issues:

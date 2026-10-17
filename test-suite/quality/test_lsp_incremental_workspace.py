@@ -144,6 +144,30 @@ class ReuseTests(Fixture):
             self.assertEqual(second.copied_bytes, 5)
         self.assertTrue(old_root.exists())
 
+    def test_same_stamp_disk_edit_refreshes_from_current_bytes(self):
+        original_stamp = lsp.file_stamp
+        with patch.object(lsp, 'file_stamp', lambda info: original_stamp(info)[:4] + (0, 0)):
+            with self.workspace() as first:
+                old_root = first.root
+            before = lsp.file_stamp(self.support.stat())
+            self.support.write_text('DENY!')
+            self.assertEqual(lsp.file_stamp(self.support.stat()), before)
+            with self.workspace() as second:
+                self.assertTrue(second.reused)
+                self.assertEqual(second.root, old_root)
+                self.assertEqual((second.root / 'support.dat').read_text(), 'DENY!')
+                self.assertEqual(second.copied_bytes, 5)
+
+    def test_same_stamp_disk_edit_during_analysis_is_refused(self):
+        original_stamp = lsp.file_stamp
+        with patch.object(lsp, 'file_stamp', lambda info: original_stamp(info)[:4] + (0, 0)):
+            with self.assertRaisesRegex(lsp.ProtocolError, 'Workspace context'):
+                with self.workspace() as workspace:
+                    before = lsp.file_stamp(self.support.stat())
+                    self.support.write_text('DENY!')
+                    self.assertEqual(lsp.file_stamp(self.support.stat()), before)
+                    workspace.verify()
+
     def test_added_removed_and_new_buffer_membership_rebuild_context(self):
         with self.workspace() as first:
             old_root = first.root
@@ -191,6 +215,22 @@ class ReuseTests(Fixture):
             self.assertFalse(second.reused)
             self.assertEqual((second.root / 'a.py').read_text(), 'replacement')
         self.assertEqual(self.source.read_bytes(), original)
+
+    def test_private_tampering_is_rejected_when_file_timestamps_collide(self):
+        # Deterministic metadata-resolution control for the real rapid-write
+        # collision observed on ZFS. Bytes and inode operations remain real.
+        original_stamp = lsp.file_stamp
+        with patch.object(lsp, 'file_stamp', lambda info: original_stamp(info)[:4] + (0, 0)):
+            with self.workspace() as first:
+                old_root = first.root
+            target = old_root / 'support.dat'
+            before = lsp.file_stamp(target.stat())
+            target.write_text('DENY!')
+            self.assertEqual(lsp.file_stamp(target.stat()), before)
+            with self.workspace() as second:
+                self.assertFalse(second.reused)
+                self.assertEqual((second.root / 'support.dat').read_text(), 'allow')
+            self.assertFalse(old_root.exists())
 
     def test_hardlinked_private_input_is_not_accepted(self):
         with self.workspace() as first:

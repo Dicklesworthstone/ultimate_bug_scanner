@@ -850,3 +850,12 @@ class SizeGuardExcludeTest(unittest.TestCase):
         self.assertLess(self.measure("ignored"), unfiltered - 4)
         # An unrelated exclude must not remove the big file.
         self.assertGreaterEqual(self.measure("/nested/**"), unfiltered - 1)
+
+    def test_sparse_file_counts_readable_bytes_in_every_size_path(self) -> None:
+        sparse = self.root / "sparse.py"
+        with sparse.open("wb") as stream:
+            stream.truncate(9 * 1024 * 1024)
+        self.assertGreaterEqual(self.measure(""), 14)
+        self.assertGreaterEqual(self.measure("ignored"), 9)
+        self.assertGreaterEqual(self.measure("/ignored/**"), 9)
+        self.assertGreaterEqual(self.measure("sparse.py"), 5)

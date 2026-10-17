@@ -72,6 +72,24 @@ class ThresholdTests(unittest.TestCase):
 
 
 class MatchTests(unittest.TestCase):
+    def test_case_insensitive_flag_preserves_other_regex_flags(self) -> None:
+        p = _pat(regex=re.compile(r"^debugger", re.MULTILINE), case_insensitive=True)
+        self.assertEqual(list(iter_matches(p, "safe();\nDEBUGGER;\nDeBuGgEr;\n")),
+                         [(2, "DEBUGGER;"), (3, "DeBuGgEr;")])
+
+    def test_default_matching_remains_case_sensitive(self) -> None:
+        self.assertEqual(list(iter_matches(_pat(), "DEBUGGER;\ndebugger;\n")),
+                         [(2, "debugger;")])
+
+    def test_sensitive_log_rule_matches_identifier_case_and_honors_ignore(self) -> None:
+        p = next(p for p in load_patterns() if p.rule_id == "js.debug.sensitive-log")
+        text = ("console.log(process.env.ACCRETIVE_GOOGLE_CLIENT_SECRET);\n"
+                "console.dir(accessToken);\n"
+                "console.log(PASSWORD);\n"
+                "console.log(status);\n"
+                "console.log(TOKEN); // ubs:ignore - intentional negative test\n")
+        self.assertEqual([line for line, _ in iter_matches(p, text)], [1, 2, 3])
+
     def test_marker_lines_excluded(self) -> None:
         p = _pat()
         text = "debugger;\ndebugger;  # ubs:ignore\n"
@@ -91,6 +109,32 @@ class MatchTests(unittest.TestCase):
 
 
 class ScanTests(unittest.TestCase):
+    def test_case_insensitive_code_only_candidate_is_not_discarded(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ubs-jsv2-") as tmp:
+            src = Path(tmp) / "s.js"
+            src.write_text('DEBUGGER;\n"DEBUGGER";\n// DEBUGGER\n', encoding="utf-8")
+            sink = io.StringIO()
+            counts = scan_patterns([_pat(case_insensitive=True, code_only=True)], [src], sink, skip=set())
+            self.assertEqual(counts, {"critical": 1, "warning": 0, "info": 0})
+            self.assertEqual([json.loads(line)["line"] for line in sink.getvalue().splitlines()], [1])
+
+    def test_sensitive_log_prefilter_preserves_uppercase_findings(self) -> None:
+        from ubs_core.prefilter import build_prefilter_index, run_prefilter
+
+        with tempfile.TemporaryDirectory(prefix="ubs-jsv2-") as tmp:
+            src = Path(tmp) / "s.js"
+            src.write_text("console.log(process.env.CLIENT_SECRET);\nconsole.log(status);\n", encoding="utf-8")
+            patterns = [p for p in load_patterns() if p.rule_id == "js.debug.sensitive-log"]
+            index = build_prefilter_index(patterns=patterns, lang="javascript")
+            with mock.patch.dict(os.environ, {"UBS_NO_PREFILTER": "0"}):
+                prefilter = run_prefilter([src], index, project_dir=Path(tmp))
+            self.assertFalse(prefilter.is_bypass)
+            filtered, unfiltered = io.StringIO(), io.StringIO()
+            expected = {"critical": 1, "warning": 0, "info": 0}
+            self.assertEqual(scan_patterns(patterns, [src], filtered, skip=set(), prefilter=prefilter), expected)
+            self.assertEqual(scan_patterns(patterns, [src], unfiltered, skip=set()), expected)
+            self.assertEqual(filtered.getvalue(), unfiltered.getvalue())
+
     def test_counters_and_sink_records(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ubs-jsv2-") as tmp:
             src = Path(tmp) / "s.js"
@@ -241,13 +285,18 @@ class TextReportMemoryTests(unittest.TestCase):
                 script.write_text(module[begin:end] + '\nrun_v2_legacy_parity_bridges "$@"\n')
                 text_out = artifacts / "report.txt"
                 text_out.write_text("")
+                json_out = artifacts / "report.json"
+                json_out.write_text(json.dumps({
+                    "language": "js", "files": 1, "critical": 0, "warning": 0, "info": 0,
+                    "status": "partial", "module_error": "ANALYZER_ERROR", "findings": [],
+                }))
                 peak = artifacts / "peak-rss-kib.txt"
-                env = dict(os.environ, UBS_SKIP_TYPE_NARROWING="1")
+                env = dict(os.environ, UBS_SKIP_TYPE_NARROWING="1", PYTHONPATH=str(HELPERS_DIR))
                 # Exercise the production bridge independently of the scanner:
                 # it must retain findings and the scanner's incomplete exit.
                 result = subprocess.run(
                     [gnu_time(), "-f", "%M", "-o", str(peak),
-                     "bash", str(script), str(sink), str(files), "2", str(text_out)],
+                     "bash", str(script), str(sink), str(files), "2", str(text_out), str(json_out)],
                     cwd=root, env=env, capture_output=True, text=True, timeout=60,
                 )
                 (artifacts / "stdout.log").write_text(result.stdout)
@@ -261,6 +310,11 @@ class TextReportMemoryTests(unittest.TestCase):
                 self.assertNotIn("DEBUGGING & PRODUCTION CODE", report)
                 self.assertNotIn("TYPESCRIPT STRICTNESS", report)
                 self.assertIn("NODE.JS I/O & MODULES", report)
+                summary = json.loads(json_out.read_text())
+                self.assertEqual(summary["status"], "partial")
+                self.assertEqual(summary["module_error"], "ANALYZER_ERROR")
+                self.assertEqual((summary["critical"], summary["warning"], summary["info"]), (399970, 30, 0))
+                self.assertEqual(len(summary["findings"]), 400000)
                 rss_kib = int(peak.read_text().splitlines()[-1])
                 self.assertLess(rss_kib, 64 * 1024,
                                 f"bridge peaked at {rss_kib / 1024:.1f} MiB")
@@ -395,6 +449,102 @@ class JsonReportMemoryTests(unittest.TestCase):
             self.assertLess(rss_kib, 64 * 1024,
                             f"JSON renderer peaked at {rss_kib / 1024:.1f} MiB")
         return rss_kib
+
+
+@unittest.skipUnless(shutil.which("ast-grep") and shutil.which("node"),
+                     "real ast-grep and Node required")
+class NarrowingReportIntegrationTests(unittest.TestCase):
+    """Late narrowing findings must survive every public report renderer."""
+
+    def test_bridge_preserves_partial_status_and_rejects_invalid_metadata(self):
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="js-final-summary-", dir=artifacts) as tmp:
+            root = Path(tmp)
+            module = (REPO_ROOT / "modules/ubs-js.sh").read_text()
+            begin = module.index("run_v2_legacy_parity_bridges(){")
+            end = module.index("\n}\n", begin) + 2
+            script = root / "bridge.sh"
+            script.write_text(module[begin:end] + '\nrun_v2_legacy_parity_bridges "$@"\n')
+            records = [{"rule": "js.debug.debugger", "severity": "critical", "category_id": "js.debug"},
+                       {"rule": "js.typescript.type-narrowing", "severity": "warning", "category_id": "js.typescript"}]
+            sink = root / "findings.ndjson"
+            sink.write_text("".join(json.dumps(record) + "\n" for record in records))
+            files = root / "files.0"
+            files.write_bytes(b"source.ts\0")
+            report = root / "summary.json"
+            metadata = {"language": "js", "files": 1, "critical": 0, "warning": 0, "info": 0,
+                        "status": "partial", "module_error": "ANALYZER_ERROR", "message": "scan interrupted",
+                        "findings": [], "extras": {"profile": {"cache_hits": 0}}}
+            env = {**os.environ, "UBS_SKIP_TYPE_NARROWING": "1", "PYTHONPATH": str(HELPERS_DIR)}
+            for value in (metadata, None):
+                with self.subTest(valid_metadata=isinstance(value, dict)):
+                    report.write_text(json.dumps(value))
+                    result = subprocess.run(["bash", str(script), str(sink), str(files), "2", "", str(report)],
+                                            cwd=root, env=env, capture_output=True, text=True, timeout=30)
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    if value is None:
+                        self.assertIn("cannot finalize report", result.stderr)
+                    else:
+                        doc = json.loads(report.read_text())
+                        self.assertEqual(doc["findings"], records)
+                        self.assertEqual((doc["critical"], doc["warning"], doc["info"]), (1, 1, 0))
+                        for key in ("language", "files", "status", "module_error", "message", "extras"):
+                            self.assertEqual(doc[key], metadata[key])
+
+    def test_final_findings_and_counts_agree_across_report_formats(self):
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="js-narrowing-reports-", dir=artifacts) as tmp:
+            root = Path(tmp)
+            project = root / "project"
+            project.mkdir()
+            (project / "sample.ts").write_text(
+                'function render(value: string | null) {\n'
+                '  if (!value) { console.log("missing"); }\n'
+                '  console.log(value.length);\n}\n')
+            env = {**os.environ, "UBS_NO_AUTO_UPDATE": "1", "UBS_NO_CACHE": "1",
+                   "UBS_SKIP_TYPE_NARROWING": "0"}
+            rule = "js.typescript.type-narrowing"
+            for meta in (False, True):
+                for fmt in (("json", "sarif", "text") if not meta else ("json", "jsonl", "sarif")):
+                    with self.subTest(meta=meta, format=fmt):
+                        command = REPO_ROOT / ("ubs" if meta else "modules/ubs-js.sh")
+                        sidecar = root / f"{meta}-{fmt}.ndjson"
+                        args = [str(command), f"--format={fmt}", "--no-color", "--fail-on-warning"]
+                        args += ["--only=js"] if meta else [f"--report-json={sidecar}"]
+                        result = subprocess.run([*args, str(project)], cwd=root, env=env,
+                                                capture_output=True, text=True, timeout=60)
+                        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                        if fmt == "json":
+                            doc = json.loads(result.stdout)
+                            records = doc["findings"]
+                            totals = doc["totals"] if meta else doc
+                            self.assertIn(rule, {r.get("rule", r.get("rule_id")) for r in records})
+                            for severity in ("critical", "warning", "info"):
+                                self.assertEqual(totals[severity], sum(r["severity"] == severity for r in records))
+                            if meta:
+                                self.assertEqual(doc["scanners"][0]["warning"], totals["warning"])
+                        elif fmt == "jsonl":
+                            rows = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+                            records = [r for r in rows if r["type"] == "finding"]
+                            totals = next(r for r in rows if r["type"] == "totals")
+                            self.assertIn(rule, {r.get("rule", r.get("rule_id")) for r in records})
+                            for severity in ("critical", "warning", "info"):
+                                self.assertEqual(totals[severity], sum(r["severity"] == severity for r in records))
+                        elif fmt == "sarif":
+                            doc = json.loads(result.stdout)
+                            records = [r for run in doc["runs"] for r in run["results"]]
+                            narrowing = [r for r in records if r["ruleId"] == rule]
+                            self.assertTrue(narrowing, result.stdout)
+                            self.assertTrue(all(r["level"] == "warning" for r in narrowing))
+                        else:
+                            records = [json.loads(line) for line in sidecar.read_text().splitlines()]
+                            self.assertIn(rule, {r["rule"] for r in records})
+                            for severity, label in (("critical", "Critical issues"), ("warning", "Warning issues"), ("info", "Info items")):
+                                counts = re.findall(rf"{label}: (\d+)", result.stdout)
+                                self.assertTrue(counts, result.stdout)
+                                self.assertEqual(int(counts[-1]), sum(r["severity"] == severity for r in records))
 
 
 class ExemplarPatternsTests(unittest.TestCase):

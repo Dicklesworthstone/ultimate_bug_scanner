@@ -2081,6 +2081,11 @@ class _Flow:
                     if not normal and not deferred:
                         raise _NoNormalCompletion
                 else:
+                    # A scalar summary can be consumed inside a heap context.
+                    # Revisit that context if the summary changes later, not
+                    # just the independently analyzed lexical caller.
+                    if self.engine.current_task is not None:
+                        self.engine.dependents[(callee, self.rule)].add(self.engine.current_task)
                     returned, effects, writes, normal, thrown, throw_writes = self.engine.summaries.get(
                         (callee, self.rule), (frozenset(), {}, {}, False, None, {}))
                     call_fact = self.substitute(returned, callee, bound, incoming)
@@ -2509,6 +2514,7 @@ class _Flow:
 class _Engine:
     def __init__(self, text, code, graph=None, modules=()):
         self.graph = graph
+        self.source_free = False
         self.module_roots = {}
         self.default_targets = {}
         self.commonjs_targets = {}
@@ -2575,6 +2581,16 @@ class _Engine:
         else:
             self.root, self.functions = _function_scopes(text, code)
             self.scopes = [self.root, *self.functions]
+        # Every concrete origin comes from a source pattern, bare route
+        # params, or a destructured framework parameter. Check the entire
+        # selected component, including source-only dependencies. Parameters
+        # and captures alone cannot manufacture a concrete source origin.
+        # Keep text matches conservative (even inert strings may retain work).
+        self.source_free = (not any(pattern.search(text) for pattern, _ in SOURCE_PATTERNS)
+                            and re.search(r'\bparams\b', code, re.IGNORECASE) is None
+                            and not any(scope.parameter_sources for scope in self.functions))
+        if self.source_free:
+            return
         self.summaries, self.final_states = {}, {}
         self.dependents = defaultdict(set)
         self.heap_calls = {}
@@ -2820,9 +2836,13 @@ class _Engine:
             self.pending.append(task)
 
     def heap_required(self, callee, bound, state):
-        return (callee in self.heap_scopes or isinstance(self.current_task, _HeapCall)
+        # Scalar helpers use substitutable summaries even when their caller
+        # allocates objects. Only objects the callee receives or captures need
+        # a separate heap context; unrelated caller cells cannot affect it.
+        return (callee in self.heap_scopes
                 or any(_refs(fact) for fact in bound.values())
-                or any(_refs(fact) for fact in state.cells.values()))
+                or any(_refs(fact) for key, fact in state.cells.items()
+                       if key in self.capture_keys[callee]))
 
     def heap_input(self, callee, bound, incoming, recursive):
         state = _State(budget=self.budget)
@@ -3283,6 +3303,8 @@ class _Engine:
         return found
 
     def findings(self):
+        if self.source_free:
+            return
         found, failures = {}, []
         active_rules = {rule for rule, _label in self.call_sinks.values()}
         active_rules.update(rule for _location, _expr_start, rule, _label in self.write_sinks)

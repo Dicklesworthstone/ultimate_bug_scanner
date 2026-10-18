@@ -5,8 +5,8 @@ Verbatim port of run_hardcoded_secret_checks (modules/ubs-elixir.sh
 with literal values (>= 8 chars, not low-value placeholders), plus
 System.get_env literal fallbacks whose env name looks secret-keyed. Test
 trees (a /test/ path segment, *_test.exs, config/test.exs) are skipped like
-the heredoc's should_skip. Same-file and previous-line `ubs:ignore` markers
-suppress a hit.
+the heredoc's should_skip. Lexical statement-owned `ubs:ignore` markers
+suppress only matching rules.
 """
 from __future__ import annotations
 
@@ -14,10 +14,10 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.suppression import SourceSuppressions
 from ubs_core.elixir_detectors._common import (
     EXTS,
     elixir_files,
-    has_ignore,
     read_lines,
     source_line,
 )
@@ -124,10 +124,9 @@ def scan_file_findings(path: Path) -> Iterable[tuple[int, int, str]]:
     text = "\n".join(lines)
     if not (SECRET_KEY_RE.search(text) or 'System.get_env' in text):
         return
+    suppressions = SourceSuppressions('elixir').index(path, text)
     seen: set[tuple[int, str]] = set()
     for idx, _ in enumerate(lines, start=1):
-        if has_ignore(lines, idx):
-            continue
         statement = strip_line_comment(lines[idx - 1]).strip()
         for regex in (ASSIGNMENT_SECRET_RE, MODULE_ATTR_SECRET_RE, CONFIG_SECRET_RE):
             for match in regex.finditer(statement):
@@ -140,7 +139,8 @@ def scan_file_findings(path: Path) -> Iterable[tuple[int, int, str]]:
                 if (idx, key) in seen:
                     continue
                 seen.add((idx, key))
-                yield idx, 1, f"{source_line(lines, idx)}  [hardcoded {key}]"
+                if not suppressions.is_suppressed(idx, RULE_ID):
+                    yield idx, 1, f"{source_line(lines, idx)}  [hardcoded {key}]"
         for match in ENV_FALLBACK_RE.finditer(statement):
             env_name = match.group('env')
             value = match.group('value')
@@ -149,7 +149,8 @@ def scan_file_findings(path: Path) -> Iterable[tuple[int, int, str]]:
             if (idx, env_name) in seen:
                 continue
             seen.add((idx, env_name))
-            yield idx, 1, f"{source_line(lines, idx)}  [literal fallback for {env_name}]"
+            if not suppressions.is_suppressed(idx, RULE_ID):
+                yield idx, 1, f"{source_line(lines, idx)}  [literal fallback for {env_name}]"
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple]:

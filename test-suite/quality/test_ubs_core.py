@@ -5692,5 +5692,268 @@ fun generate(): String {
                     self.assertEqual(actual, expected, context)
 
 
+class SwiftCppSuppressionTests(unittest.TestCase):
+    """Real legacy producers must retain facts before suppressing owned diagnostics."""
+
+    SECURITY_CASES = (
+        ("swift_detectors.header_injection", "swift", "swift.taint.header-injection", 2, 4, [4],
+         'func displayName(req: Request, response: inout Response) {\n'
+         '    let name = req.query["displayName"] ?? "guest"\n    _ = 0\n'
+         '    response.headers["X-Display-Name"] = name\n}\n',
+         'func displayName(req: Request, response: inout Response) {\n'
+         '    let name = safeHeaderValue(req.query["displayName"] ?? "guest")\n    _ = 0\n'
+         '    response.headers["X-Display-Name"] = name\n}\n',
+         "swift/header_injection_clean/HeadersSafe.swift"),
+        ("swift_detectors.outbound_url", "swift", "swift.taint.outbound-url", 2, 4, [4],
+         'func fetchQueryURL(req: Request) {\n'
+         '    let target = req.query["url"] ?? "https://example.com"\n    _ = 0\n'
+         '    URLSession.shared.dataTask(with: URL(string: target)!).resume()\n}\n',
+         'func fetchQueryURL(req: Request) throws {\n'
+         '    let target = try safeOutboundURL(req.query["url"] ?? "https://api.example.com")\n'
+         '    _ = 0\n    URLSession.shared.dataTask(with: target).resume()\n}\n',
+         "swift/ssrf_clean/RequestURLsSafe.swift"),
+        ("swift_detectors.archive_extraction", "swift", "swift.security.archive-extraction", 2, 4, [4],
+         'func archiveTarget(entry: ArchiveEntry, destination: URL) -> URL {\n'
+         '    let name = entry.path\n    _ = 0\n'
+         '    return destination.appendingPathComponent(name)\n}\n',
+         'func archiveTarget(entry: ArchiveEntry, destination: URL) throws -> URL {\n'
+         '    let name = entry.path\n    _ = 0\n'
+         '    return try safeArchiveURL(destination: destination, entryPath: name)\n}\n',
+         "swift/archive_extraction_clean/ZipSlipSafe.swift"),
+        ("swift_detectors.security_randomness", "swift", "swift.crypto.weak-randomness", 2, 4, [2, 4],
+         'func issueApiKey() -> String {\n    var rng = SystemRandomNumberGenerator()\n'
+         '    _ = 0\n' + r'    return "ak_\(rng.next())"' + '\n}\n',
+         'import Security\nfunc sessionToken() -> [UInt8] {\n'
+         '    var bytes = [UInt8](repeating: 0, count: 32)\n'
+         '    let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)\n'
+         '    guard status == errSecSuccess else { return [] }\n    return bytes\n}\n',
+         "swift/security_randomness_clean/Tokens.swift"),
+        ("analyzers.taint_swift_traversal", "swift", "swift.taint.request_path_traversal", 2, 4, [4],
+         'func readDownload(req: Request) throws -> String {\n'
+         '    let path = req.query["file"] ?? "index.html"\n    _ = 0\n'
+         '    return try String(contentsOfFile: path)\n}\n',
+         'func readDownload(req: Request) throws -> String {\n'
+         '    let requested = req.query["file"] ?? "index.html"\n'
+         '    let path = URL(fileURLWithPath: requested).lastPathComponent\n'
+         '    return try String(contentsOfFile: path)\n}\n',
+         "swift/path_traversal_clean/RequestPathsSafe.swift"),
+        ("analyzers.taint_swift_redirect", "swift", "swift.taint.request_open_redirect", 2, 4, [4],
+         'func queryRedirect(req: Request) -> Response {\n'
+         '    let target = req.query["returnUrl"] ?? "/"\n    _ = 0\n'
+         '    return req.redirect(to: target)\n}\n',
+         'func localOnly(req: Request) throws -> Response {\n'
+         '    let target = req.query["returnUrl"] ?? "/"\n'
+         '    guard let url = URL(string: target), let host = url.host, allowedHosts.contains(host) else {\n'
+         '        throw Abort(.badRequest)\n    }\n    return req.redirect(to: target)\n}\n',
+         "swift/open_redirect_clean/RedirectsSafe.swift"),
+        ("cpp_detectors.header_injection", "cpp", "cpp.detector.header-injection", 2, 4, [4],
+         'void display_name(const Request& req, Response& response) {\n'
+         '    auto name = req.get_param_value("display_name");\n    (void)0;\n'
+         '    response.set_header("X-Display-Name", name);\n}\n',
+         'void display_name(const Request& req, Response& response) {\n'
+         '    auto name = safe_header_value(req.get_param_value("display_name"));\n    (void)0;\n'
+         '    response.set_header("X-Display-Name", name);\n}\n',
+         "cpp/security/header_injection_clean.cpp"),
+        ("cpp_detectors.outbound_url", "cpp", "cpp.detector.outbound-url", 2, 5, [5],
+         'void fetch_from_query(CURL* curl) {\n    const char* raw = getenv("QUERY_STRING");\n'
+         '    std::string target = raw ? raw : "https://example.com";\n    (void)0;\n'
+         '    curl_easy_setopt(curl, CURLOPT_URL, target.c_str());\n}\n',
+         'void fetch_from_query(CURL* curl) {\n'
+         '    const std::string target = safe_outbound_url(getenv("QUERY_STRING"));\n    (void)0;\n'
+         '    curl_easy_setopt(curl, CURLOPT_URL, target);\n}\n',
+         "cpp/security/ssrf_clean.cpp"),
+        ("cpp_detectors.archive_entry", "cpp", "cpp.detector.archive-entry", 2, 4, [4],
+         'void archive_target(archive_entry* entry, const fs::path& destination) {\n'
+         '    const char* name = archive_entry_pathname(entry);\n    (void)0;\n'
+         '    auto target = destination / name;\n}\n',
+         'void archive_target(archive_entry* entry, const fs::path& destination) {\n'
+         '    const char* name = archive_entry_pathname(entry);\n    (void)0;\n'
+         '    auto target = safe_archive_path(destination, name);\n}\n',
+         "cpp/archive_extraction_clean/zip_slip_safe.cpp"),
+        ("cpp_detectors.weak_random", "cpp", "cpp.detector.weak-random", 3, 5, [3, 5],
+         '#include <random>\nunsigned sessionToken() {\n    std::mt19937 rng(1);\n'
+         '    (void)0;\n    return rng();\n}\n',
+         'extern "C" int RAND_bytes(unsigned char* buf, int num);\n'
+         'void sessionToken(unsigned char* bytes) {\n'
+         '    if (RAND_bytes(bytes, 32) != 1) throw 1;\n}\n',
+         "cpp/security_randomness_clean/tokens.cpp"),
+        ("analyzers.taint_cpp_traversal", "cpp", "cpp.taint.path_traversal", 2, 4, [4],
+         'void read_download(const Request& req) {\n'
+         '    std::string path = req.getParam("file");\n    (void)0;\n'
+         '    std::ifstream input(path);\n}\n',
+         'void read_download(const Request& req) {\n'
+         '    std::string path = sanitize_filename(req.getParam("file"));\n    (void)0;\n'
+         '    std::ifstream input(path);\n}\n',
+         "cpp/security/path_traversal_clean.cpp"),
+        ("analyzers.taint_cpp_redirect", "cpp", "cpp.taint.open_redirect", 2, 4, [4],
+         'void query_redirect(const Request& req, Response& res) {\n'
+         '    std::string url = req.getParam("next");\n    (void)0;\n    res.redirect(url);\n}\n',
+         'void query_redirect(const Request& req, Response& res) {\n'
+         '    std::string url = validate_redirect_target(req.getParam("next"));\n'
+         '    (void)0;\n    res.redirect(url);\n}\n',
+         "cpp/security/open_redirect_clean.cpp"),
+    )
+    # main's C++/Swift flow engines (d3cc89c7, 65eeb694, 48725603) give an
+    # unbound helper name or an undeclared allowlist no trust, so these inline
+    # programs still reach the sink there (expected sink lines below). The
+    # shipped clean fixtures (original-safe) carry the safe side for them.
+    UNBOUND_SAFE = {
+        "analyzers.taint_swift_redirect": [6],
+        "analyzers.taint_cpp_traversal": [4],
+        "analyzers.taint_cpp_redirect": [4],
+    }
+    DERIVED_CASES = (
+        ("swift_patterns.errors_security", "_process_residual", "swift.security.process-other", "Case.swift", 3,
+         'import Foundation\nfunc runFixedTool() throws {\n    let process = Process()\n'
+         '    process.executableURL = URL(fileURLWithPath: "/usr/bin/stat")\n'
+         '    process.arguments = ["--version"]\n    try process.run()\n}\n',
+         'import Foundation\nfunc runShellTool() throws {\n    let process = Process()\n'
+         '    process.executableURL = URL(fileURLWithPath: "/bin/sh")\n'
+         '    process.arguments = ["-c", "ls"]\n    try process.run()\n}\n', 0),
+        ("swift_patterns.threading_perf", "_filehandle_imbalance", "swift.files.filehandle", "Case.swift", 3,
+         'import Foundation\nfunc readFile() throws {\n'
+         '    let handle = try FileHandle(forReadingFrom: URL(fileURLWithPath: "/tmp/data"))\n'
+         '    _ = 0\n}\n',
+         'import Foundation\nfunc readFile() throws {\n'
+         '    let handle = try FileHandle(forReadingFrom: URL(fileURLWithPath: "/tmp/data"))\n'
+         '    _ = 0\n    try handle.close()\n}\n', 5),
+        ("swift_patterns.threading_perf", "_main_actor_presence", "swift.threading.main-actor", "Case.swift", 1,
+         'import SwiftUI\nfinal class ViewModel {}\n',
+         'import SwiftUI\n@MainActor final class ViewModel {}\n', 2),
+        ("swift_patterns.misc_cats", "_packaging", "swift.packaging.branch-pins", "Package.swift", 3,
+         'import PackageDescription\nlet dependencies: [Package.Dependency] = [\n'
+         '    .package(url: "https://example.com/pkg.git", .branch("main"))\n]\n'
+         'let package = Package(name: "Demo", dependencies: dependencies)\n',
+         'import PackageDescription\nlet dependencies: [Package.Dependency] = [\n'
+         '    .package(url: "https://example.com/pkg.git", .exact("1.2.3"))\n]\n'
+         'let package = Package(name: "Demo", dependencies: dependencies)\n', 0),
+        ("swift_patterns.misc_cats", "_packaging", "swift.packaging.unsafe-flags", "Package.swift", 2,
+         'import PackageDescription\nlet flags: [SwiftSetting] = [.unsafeFlags(["-Ounchecked"])]\n'
+         'let package = Package(name: "Demo", targets: [.target(name: "Demo", swiftSettings: flags)])\n',
+         'import PackageDescription\nlet flags: [SwiftSetting] = [.define("FEATURE")]\n'
+         'let package = Package(name: "Demo", targets: [.target(name: "Demo", swiftSettings: flags)])\n', 0),
+    )
+
+    def setUp(self):
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        self.scratch = tempfile.TemporaryDirectory(prefix="swift-cpp-suppression-", dir=artifacts)
+        self.addCleanup(self.scratch.cleanup)
+        self.root = Path(self.scratch.name)
+
+    @staticmethod
+    def marked(text, line, mode, rule, lang="swift"):
+        lines = text.splitlines()
+        marker = ('; _ = "ubs:ignore"' if lang == "swift" else ' (void)"ubs:ignore";') if mode == "quoted" else (
+            " // ubs:ignore" if mode == "bare" else
+            f" // ubs:ignore[{'unrelated.rule' if mode == 'wrong' else rule}]")
+        lines[line - 1] += marker
+        return "\n".join(lines) + "\n"
+
+    def invoke(self, module_name, lang, filename, text, label, function=None):
+        from ubs_core.registry import RunContext
+        from ubs_core.swift_scan import ScanContext
+        from ubs_core.suppression import SourceSuppressions
+
+        directory = self.root / label
+        directory.mkdir()
+        path = directory / filename
+        path.write_text(text, encoding="utf-8")
+        module = importlib.import_module("ubs_core." + module_name)
+        stdout, stderr = io.StringIO(), io.StringIO()
+        started = time.monotonic()
+        try:
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                if function is not None:
+                    records = list(getattr(module, function)(ScanContext(files=[path], project_dir=directory)))
+                elif module_name.startswith("swift_detectors."):
+                    records = list(module.scan(ScanContext(files=[path], project_dir=directory)))
+                elif module_name.startswith("cpp_detectors."):
+                    records = [{"rule": module.RULE_ID, "path": str(source), "line": line,
+                                "col": col, "detail": detail, "severity": module.SEVERITY}
+                               for source, line, col, detail in module.find([path])]
+                else:
+                    records = list(module.run(RunContext(lang=lang, files=[path])))
+        finally:
+            (directory / "stdout.log").write_text(stdout.getvalue(), encoding="utf-8")
+            (directory / "stderr.log").write_text(stderr.getvalue(), encoding="utf-8")
+        policy = SourceSuppressions(lang)
+        policy.index(path, text)
+        final = policy.filter(records)
+        (directory / "findings.json").write_text(json.dumps(
+            {"raw": records, "final": final}, indent=2, default=str), encoding="utf-8")
+        (directory / "identity.json").write_text(json.dumps({
+            "case": self.id() + ":" + label, "module": module_name, "function": function,
+            "source_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "producer_sha256": hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest(),
+            "seconds": time.monotonic() - started,
+        }, indent=2), encoding="utf-8")
+        return path, records, final
+
+    def test_security_markers_preserve_exact_rules_and_source_facts(self):
+        checked = 0
+        for module, lang, rule, source_line, sink_line, baseline, positive, safe, original_safe in self.SECURITY_CASES:
+            safe_variant = (("unbound-helper", safe, self.UNBOUND_SAFE[module]) if module in self.UNBOUND_SAFE
+                            else ("safe", safe, []))
+            variants = [("unmarked", positive, baseline), safe_variant,
+                        ("original-safe", (REPO_ROOT / "test-suite" / original_safe).read_text(encoding="utf-8"), [])]
+            for site, line in (("source", source_line), ("sink", sink_line)):
+                for mode in ("bare", "exact", "wrong", "quoted"):
+                    expected = [hit for hit in baseline if hit != line] if mode in ("bare", "exact") else baseline
+                    variants.append((site + "-" + mode, self.marked(positive, line, mode, rule, lang), expected))
+            for mode, text, expected in variants:
+                label = module.replace(".", "-") + "-" + mode
+                with self.subTest(producer=module, variant=mode):
+                    path, records, final = self.invoke(module, lang, "Case." + ("swift" if lang == "swift" else "cpp"),
+                                                       text, label)
+                    expected_rows = [(rule, line, 1, "critical") for line in expected]
+                    actual = lambda rows: [(row["rule"], row["line"], row.get("count", 1), row["severity"]) for row in rows]
+                    self.assertEqual(actual(records), expected_rows, records)
+                    self.assertEqual(actual(final), expected_rows, final)
+                    self.assertTrue(all(Path(row["path"]) == path.resolve() for row in records), records)
+                checked += 1
+        self.assertEqual(checked, 132)
+
+    def test_swift_derived_preserves_safe_facts_and_exact_contributions(self):
+        checked = 0
+        for module, function, rule, filename, line, positive, safe, fact_line in self.DERIVED_CASES:
+            baseline = [(3, 1)] if function == "_process_residual" else [(0, 1)]
+            variants = [("unmarked", positive, baseline), ("safe", safe, [])]
+            for mode in ("bare", "exact", "wrong", "quoted"):
+                # An absence aggregate is not owned by the UI import; real
+                # MainActor evidence remains a fact under every marker.
+                expected = [] if mode in ("bare", "exact") and function != "_main_actor_presence" else baseline
+                variants.append(("sink-" + mode, self.marked(positive, line, mode, rule), expected))
+                if fact_line:
+                    variants.append(("fact-" + mode, self.marked(safe, fact_line, mode, rule), []))
+            for mode, text, expected in variants:
+                label = rule.replace(".", "-") + "-" + mode
+                with self.subTest(rule=rule, variant=mode):
+                    _path, records, final = self.invoke(module, "swift", filename, text, label, function)
+                    expected_rows = [(rule, site, count) for site, count in expected]
+                    actual = lambda rows: [(row["rule"], row["line"], row["count"]) for row in rows]
+                    self.assertEqual(actual(records), expected_rows, records)
+                    self.assertEqual(actual(final), expected_rows, final)
+                checked += 1
+        self.assertEqual(checked, 38)
+
+    def test_original_taint_controls_are_unchanged(self):
+        checked = 0
+        for name in ("taint_swift_traversal", "taint_swift_redirect", "taint_cpp_traversal", "taint_cpp_redirect"):
+            module = importlib.import_module("ubs_core.analyzers." + name)
+            for label, original in module.SELF_TESTS:
+                with self.subTest(analyzer=name, control=label):
+                    stdout, stderr = io.StringIO(), io.StringIO()
+                    try:
+                        with redirect_stdout(stdout), redirect_stderr(stderr):
+                            original()
+                    finally:
+                        (self.root / (name + "-" + label + ".stdout.log")).write_text(stdout.getvalue(), encoding="utf-8")
+                        (self.root / (name + "-" + label + ".stderr.log")).write_text(stderr.getvalue(), encoding="utf-8")
+                checked += 1
+        # main's rewritten engines embed 19 controls (SwiftPine's base had 15).
+        self.assertEqual(checked, 19)
+
+
 if __name__ == "__main__":
     unittest.main()

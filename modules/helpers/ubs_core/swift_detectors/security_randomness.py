@@ -9,7 +9,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from ubs_core.swift_detectors._common import MARKER, rel, should_skip
+from ubs_core.swift_detectors._common import rel, should_skip
+from ubs_core.suppression import SourceSuppressions
 
 RULE_ID = "swift.crypto.weak-randomness"
 CATEGORY = 7
@@ -183,15 +184,6 @@ def logical_statement(lines: list[str], line_no: int) -> str:
     return statement
 
 
-def has_ignore(lines: list[str], line_no: int) -> bool:
-    idx = line_no - 1
-    return (
-        0 <= idx < len(lines) and MARKER in lines[idx]
-    ) or (
-        0 <= idx - 1 < len(lines) and MARKER in lines[idx - 1]
-    )
-
-
 def current_function_context(lines: list[str], line_no: int) -> str:
     start = max(0, line_no - 25)
     for raw in reversed(lines[start:line_no]):
@@ -246,6 +238,7 @@ def collect_findings(ctx):
     root = ctx.project_dir.resolve()
     base = root if root.is_dir() else root.parent
     findings = []
+    suppressions = SourceSuppressions("swift")
     for candidate in ctx.files:
         path = Path(candidate).resolve()
         if path.suffix != '.swift':
@@ -258,12 +251,11 @@ def collect_findings(ctx):
             continue
         if not (UNSAFE_RANDOM_RE.search(text) or PREDICTABLE_SOURCE_RE.search(text)):
             continue
+        suppressions.index(path, text)
         lines = text.splitlines()
         insecure_rng_vars = set()
         seen = set()
         for line_no in range(1, len(lines) + 1):
-            if has_ignore(lines, line_no):
-                continue
             statement = logical_statement(lines, line_no)
             updates_rng_vars(statement, insecure_rng_vars)
             function_context = current_function_context(lines, line_no)
@@ -272,6 +264,8 @@ def collect_findings(ctx):
                 continue
             source = unsafe_source(statement, insecure_rng_vars, sensitive)
             if not source:
+                continue
+            if suppressions.is_suppressed(path, line_no, RULE_ID):
                 continue
             key = (rel(path, base), line_no)
             if key in seen:

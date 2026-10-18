@@ -2432,5 +2432,138 @@ class StatementBoundaryTests(unittest.TestCase):
         self.assertTrue(build_index(code, lang="go").is_suppressed(1, "go.rule"))
 
 
+class RubyElixirSecuritySuppressionTests(unittest.TestCase):
+    CASES = (
+        ('ruby', 'archive_extraction', 'ruby.archive-extraction.path', 4, 6, [6],
+         'def unpack(archive_path, destination)\n'
+         '  Zip::File.open(archive_path) do |zip|\n'
+         '    zip.each do |entry|\n'
+         '      name = entry.name\n\n'
+         '      target = File.join(destination, name)\n'
+         '    end\n  end\nend\n'),
+        ('ruby', 'security_randomness', 'ruby.security.non-crypto-random', 2, 4, [4],
+         'def sample\n  rng = Random.new(7)\n\n  otp = rng.rand(1_000_000)\nend\n'),
+        ('ruby', 'open_redirect', 'ruby.redirect.open', 2, 4, [4],
+         'def query_redirect\n  target = params[:return_url]\n\n  redirect_to target\nend\n'),
+        ('ruby', 'response_header_injection', 'ruby.header-injection.response', 2, 4, [4],
+         'def display_name\n  name = params[:display_name]\n\n'
+         '  response.headers["X-Display-Name"] = name\nend\n'),
+        ('elixir', 'archive_extraction', 'ex.archive-extraction.path', 5, 7, [4, 7, 8],
+         'defmodule ArchiveProbe do\n'
+         '  def unpack(archive_path, destination) do\n'
+         '    {:ok, files} = :zip.extract(String.to_charlist(archive_path), [:memory])\n'
+         '    Enum.each(files, fn {name, contents} ->\n'
+         '      entry_name = name\n\n'
+         '      target = Path.join(destination, entry_name)\n'
+         '      File.write!(target, contents)\n'
+         '    end)\n  end\nend\n'),
+        ('elixir', 'security_randomness', 'ex.randomness.security-token', None, 3, [3],
+         'defmodule TokenProbe do\n  def session_secret do\n'
+         '    secret = Integer.to_string(:rand.uniform(1_000_000_000))\n'
+         '    secret\n  end\nend\n'),
+        ('elixir', 'hardcoded_secrets', 'ex.secrets.hardcoded', None, 2, [2],
+         'defmodule SecretProbe do\n  @api_key "sk_live_1234567890abcdef"\n'
+         '  def key, do: @api_key\nend\n'),
+        ('elixir', 'outbound_url', 'ex.ssrf.outbound-url', 3, 5, [5],
+         'defmodule FetchProbe do\n  def fetch_req(conn) do\n'
+         '    target = conn.params["url"]\n\n    Req.get!(target)\n  end\nend\n'),
+        ('elixir', 'response_header_injection', 'ex.header-injection.response', 3, 5, [5],
+         'defmodule HeaderProbe do\n  def display_name(conn) do\n'
+         '    name = conn.params["display_name"]\n\n'
+         '    Plug.Conn.put_resp_header(conn, "x-display-name", name)\n  end\nend\n'),
+    )
+    FIXTURES = {
+        ('ruby', 'archive_extraction'): (
+            'archive_extraction_buggy/zip_slip.rb', 'archive_extraction_clean/zip_slip_safe.rb',
+            [9, 19, 28, 37, 46]),
+        ('ruby', 'security_randomness'): (
+            'security_randomness_buggy/tokens.rb', 'security_randomness_clean/tokens.rb',
+            [3, 8, 13, 18, 23]),
+        ('ruby', 'open_redirect'): (
+            'open_redirect_buggy/redirects.rb', 'open_redirect_clean/redirects.rb',
+            [6, 11, 16, 21, 26, 31]),
+        ('ruby', 'response_header_injection'): (
+            'header_injection_buggy/headers.rb', 'header_injection_clean/headers.rb',
+            [6, 11, 16, 21, 26, 32]),
+        ('elixir', 'archive_extraction'): (
+            'buggy/archive_extraction.ex', 'clean/archive_extraction.ex',
+            [3, 7, 13, 14, 15, 22, 23, 24]),
+        ('elixir', 'security_randomness'): (
+            'buggy/security_randomness.ex', 'clean/security_randomness.ex', [3, 11, 16, 21, 25]),
+        ('elixir', 'hardcoded_secrets'): (
+            'buggy/hardcoded_secrets.ex', 'clean/hardcoded_secrets.ex', [2, 6, 8, 16, 17, 23, 24]),
+        ('elixir', 'outbound_url'): (
+            'buggy/ssrf.ex', 'clean/ssrf.ex', [4, 9, 16, 22, 27, 32]),
+        ('elixir', 'response_header_injection'): (
+            'buggy/header_injection.ex', 'clean/header_injection.ex', [8, 16, 26, 31, 36, 41, 46]),
+    }
+
+    def setUp(self):
+        artifacts = REPO_ROOT / 'test-suite' / 'artifacts'
+        artifacts.mkdir(exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(prefix='ruby-elixir-security-ownership-', dir=artifacts)
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def check_source(self, language, name, rule, label, text, expected):
+        case = language + '-' + name + '-' + label
+        print(f'[{case}] RUN', flush=True)
+        suffix = '.rb' if language == 'ruby' else '.ex'
+        source = self.root / (case + suffix)
+        source.write_text(text, encoding='utf-8')
+        detector = importlib.import_module(f'ubs_core.{language}_detectors.{name}')
+        self.assertEqual(detector.RULE_ID, rule)
+        records = list(detector.find([source]))
+        (self.root / (case + '.json')).write_text(json.dumps(records, indent=2, default=str))
+        self.assertEqual([int(record[1]) for record in records], expected,
+                         {'source': text, 'rule': rule, 'records': records})
+        print(f'[{case}] PASS', flush=True)
+
+    def test_all_receivers_keep_unrelated_scopes_quoted_markers_and_source_facts(self):
+        for language, name, rule, origin, sink, sites, positive in self.CASES:
+            variants = ['unmarked', 'sink-ordinary', 'sink-quoted', 'sink-wrong',
+                        'sink-owned', 'sink-bare', 'safe']
+            if origin is not None:
+                variants.extend(('source-ordinary', 'source-quoted', 'source-wrong', 'source-owned'))
+            for variant in variants:
+                with self.subTest(language=language, detector=name, variant=variant):
+                    expected = sites
+                    if variant == 'safe':
+                        clean = self.FIXTURES[(language, name)][1]
+                        text = (REPO_ROOT / 'test-suite' / language / clean).read_text()
+                        expected = []
+                    else:
+                        lines = positive.splitlines()
+                        target = (origin if variant.startswith('source-') else sink) - 1
+                        if variant.endswith(('ordinary', 'quoted')):
+                            note = 'marker_note' if language == 'ruby' else '_marker_note'
+                            value = 'ubs:ignore' if variant.endswith('quoted') else 'ordinary note'
+                            lines[target] += f'; {note} = "{value}"'
+                        elif variant.endswith('wrong'):
+                            lines[target] += ' # ubs:ignore[unrelated.rule]'
+                        elif variant.endswith('owned'):
+                            lines[target] += f' # ubs:ignore[{rule}]'
+                        elif variant.endswith('bare'):
+                            lines[target] += ' # ubs:ignore'
+                        if variant in ('sink-owned', 'sink-bare'):
+                            expected = []
+                        if variant == 'source-owned' and rule == 'ex.archive-extraction.path':
+                            # All three original sites belong to this Enum.each call.
+                            expected = []
+                        text = '\n'.join(lines) + '\n'
+                    self.check_source(language, name, rule, variant, text, expected)
+
+    def test_original_positive_and_safe_fixture_sites_remain_exact(self):
+        for language, name, rule, _origin, _sink, _sites, _positive in self.CASES:
+            buggy, clean, sites = self.FIXTURES[(language, name)]
+            detector = importlib.import_module(f'ubs_core.{language}_detectors.{name}')
+            self.assertEqual(detector.RULE_ID, rule)
+            for label, relative, expected in (('buggy', buggy, sites), ('clean', clean, [])):
+                with self.subTest(language=language, detector=name, fixture=label):
+                    source = REPO_ROOT / 'test-suite' / language / relative
+                    records = list(detector.find([source]))
+                    self.assertEqual([int(record[1]) for record in records], expected, records)
+
+
 if __name__ == "__main__":
     unittest.main()

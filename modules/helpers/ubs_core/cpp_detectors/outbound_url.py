@@ -10,6 +10,8 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.suppression import SourceSuppressions
+
 RULE_ID = "cpp.detector.outbound-url"
 CATEGORY = 7
 TITLE = "Request-derived URL reaches outbound HTTP client"
@@ -102,15 +104,6 @@ def strip_line_comments(line: str) -> str:
     return ''.join(out)
 
 
-def has_ignore(lines, line_no):
-    idx = line_no - 1
-    return (
-        0 <= idx < len(lines) and 'ubs:ignore' in lines[idx]
-    ) or (
-        0 <= idx - 1 < len(lines) and 'ubs:ignore' in lines[idx - 1]
-    )
-
-
 def logical_statement(lines, line_no):
     idx = line_no - 1
     statement = strip_line_comments(lines[idx])
@@ -182,14 +175,14 @@ def analyze(path: Path, cwd: Path) -> list[tuple[str, int, str]]:
         return []
     if not (SOURCE_RE.search(text) and SINK_RE.search(text)):
         return []
+    suppressions = SourceSuppressions("cpp")
+    suppressions.index(path, text)
     lines = text.splitlines()
     tainted = {}
     rel = str(path.resolve())
     seen = set()
     issues = []
     for idx, _ in enumerate(lines, start=1):
-        if has_ignore(lines, idx):
-            continue
         statement = logical_statement(lines, idx).strip()
         if not statement:
             continue
@@ -215,6 +208,8 @@ def analyze(path: Path, cwd: Path) -> list[tuple[str, int, str]]:
         if not direct and not refs:
             continue
         if has_allowlist_context(lines, idx, refs):
+            continue
+        if suppressions.is_suppressed(path, idx, RULE_ID):
             continue
         key = (rel, idx)
         if key in seen:

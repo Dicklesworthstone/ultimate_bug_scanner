@@ -5,7 +5,8 @@ Verbatim port of the ubs-csharp.sh ``run_request_outbound_url_checks`` heredoc
 host-check + reject context regexes, statement joiner, and PATH_LIMIT-bounded
 taint propagation (assignment kill on safe reassignment, TryGetValue out-param
 sources, url-ish LHS names). The NUL-filelist loader is replaced by iteration
-over ``files``; per-file match logic is unchanged.
+over ``files``. Source-owned directives filter exact-rule findings after
+request and alias facts have been collected.
 
 Legacy emission: critical "Request-derived URL reaches outbound HTTP client".
 """
@@ -15,8 +16,8 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.suppression import SourceSuppressions
 from ubs_core.csharp_detectors._common import (
-    has_ignore,
     logical_statement,
     relpath,
     source_line,
@@ -136,12 +137,12 @@ def analyze(path: Path, base_dir: Path, issues):
         return
     if not (re.search(r'\b(?:Request|HttpContext)\b', text) and SINK_RE.search(text)):
         return
+    suppression = SourceSuppressions('csharp').index(path, text)
     lines = text.splitlines()
     tainted = {}
     seen = set()
     for idx, _ in enumerate(lines, start=1):
-        if has_ignore(lines, idx):
-            continue
+        current_line = strip_line_comments(lines[idx - 1]).strip()
         statement = logical_statement(lines, idx).strip()
         if not statement:
             continue
@@ -160,7 +161,7 @@ def analyze(path: Path, base_dir: Path, issues):
                 tainted[name] = taint
             elif name in tainted and is_safe_expr(rhs):
                 tainted.pop(name, None)
-        if not SINK_RE.search(statement):
+        if not current_line or not SINK_RE.search(statement):
             continue
         if is_safe_expr(statement):
             continue
@@ -169,6 +170,8 @@ def analyze(path: Path, base_dir: Path, issues):
         if not direct and not refs:
             continue
         if has_allowlist_context(lines, idx, refs):
+            continue
+        if suppression.is_suppressed(idx, RULE_ID):
             continue
         key = (relpath(path, base_dir), idx)
         if key in seen:

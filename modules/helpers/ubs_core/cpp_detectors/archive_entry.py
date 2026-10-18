@@ -11,6 +11,8 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.suppression import SourceSuppressions
+
 RULE_ID = "cpp.detector.archive-entry"
 CATEGORY = 7
 TITLE = "Archive extraction path traversal risk"
@@ -108,15 +110,6 @@ def strip_line_comments(line: str) -> str:
         out.append(ch)
         i += 1
     return ''.join(out)
-
-
-def has_ignore(lines, line_no):
-    idx = line_no - 1
-    return (
-        0 <= idx < len(lines) and 'ubs:ignore' in lines[idx]
-    ) or (
-        0 <= idx - 1 < len(lines) and 'ubs:ignore' in lines[idx - 1]
-    )
 
 
 def logical_statement(lines, line_no):
@@ -221,6 +214,8 @@ def analyze(path: Path, cwd: Path) -> list[tuple[str, int, str]]:
         return []
     if not ARCHIVE_HINT_RE.search(text):
         return []
+    suppressions = SourceSuppressions("cpp")
+    suppressions.index(path, text)
     lines = text.splitlines()
     entry_aliases = collect_entry_aliases(lines)
     path_aliases = collect_path_aliases(lines, entry_aliases)
@@ -228,8 +223,6 @@ def analyze(path: Path, cwd: Path) -> list[tuple[str, int, str]]:
     seen = set()
     issues = []
     for idx, _ in enumerate(lines, start=1):
-        if has_ignore(lines, idx):
-            continue
         statement = logical_statement(lines, idx)
         unsafe_path_build = path_builds_from_entry(statement, entry_aliases)
         unsafe_path_sink = bool(SINK_RE.search(statement)) and references_path_alias(statement, path_aliases)
@@ -237,6 +230,8 @@ def analyze(path: Path, cwd: Path) -> list[tuple[str, int, str]]:
         if not (unsafe_path_build or unsafe_path_sink or unsafe_extract):
             continue
         if has_safe_context(statement, context_around(lines, idx)):
+            continue
+        if suppressions.is_suppressed(path, idx, RULE_ID):
             continue
         key = (rel, idx)
         if key in seen:

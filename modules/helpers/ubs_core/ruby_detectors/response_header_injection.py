@@ -6,8 +6,8 @@ cookies, request accessors, Rack env values), then flags NON-Location
 response-header writes whose value is request-derived. CR/LF stripping or
 checking helpers, encoded-filename helpers, header-safe escapes, and a
 CR/LF check followed by a reject (raise/head :bad_request/render status:)
-within 5 lines suppress the hit. Same-file and previous-line `ubs:ignore`
-markers suppress a hit.
+within 5 lines suppress the hit. Lexical statement-owned `ubs:ignore`
+markers suppress only matching rules.
 """
 from __future__ import annotations
 
@@ -15,9 +15,9 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.suppression import SourceSuppressions
 from ubs_core.ruby_detectors._common import (
     EXTS,
-    has_ignore,
     identifier_search_text,
     logical_statement,
     read_lines,
@@ -151,11 +151,10 @@ def analyze(lines, issues, path_str):
     text = "\n".join(lines)
     if not (re.search(r'\b(?:params|request|env|Rack::Request|cookies)\b', text) and SINK_RE.search(text)):
         return
+    suppressions = SourceSuppressions('ruby').index(path_str, text)
     tainted = {}
     seen = set()
     for idx in range(1, len(lines) + 1):
-        if has_ignore(lines, idx):
-            continue
         statement = logical_statement(lines, idx).strip()
         if not statement:
             continue
@@ -194,7 +193,8 @@ def analyze(lines, issues, path_str):
                 seq = seq[-(PATH_LIMIT - 1):]
             seq.append("response header")
             path_desc = " -> ".join(seq)
-        issues.append((path_str, idx, 1, f"{source_line(lines, idx)}  [{path_desc}]"))
+        if not suppressions.is_suppressed(idx, RULE_ID):
+            issues.append((path_str, idx, 1, f"{source_line(lines, idx)}  [{path_desc}]"))
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple]:

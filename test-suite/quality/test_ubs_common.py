@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LIB = REPO_ROOT / "modules" / "lib" / "ubs-common.sh"
@@ -24,8 +25,9 @@ def bash(script: str, *args: str, env: dict | None = None) -> subprocess.Complet
     full_env.pop("LC_ALL", None)
     if env:
         full_env.update(env)
+    # ubs:ignore[py.security.command-injection] Scripts are test-authored Bash literals; paths and test data are positional arguments.
     return subprocess.run(
-        ["bash", "-c", f'set -Eeuo pipefail; source "{LIB}"; {script}', "bash", *args],
+        ["bash", "-c", 'set -Eeuo pipefail; source "$1"; shift; ' + script, "bash", str(LIB), *args],
         capture_output=True, text=False, env=full_env, timeout=60, stdin=subprocess.DEVNULL,
     )
 
@@ -156,12 +158,21 @@ class ListFilesTests(unittest.TestCase):
 
 
 class LocaleTests(unittest.TestCase):
+    def test_source_path_is_literal_even_with_quotes_and_expansion_syntax(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            copied = Path(tmp) / 'library "$UNSET_LIBRARY_NAME".sh'
+            shutil.copyfile(LIB, copied)
+            with patch(__name__ + ".LIB", copied):
+                proc = bash('printf %s "$UBS_COMMON_VERSION"')
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout, b"1")
+
     def test_export_locale_reaches_children(self) -> None:
         proc = bash('ubs_export_locale; bash -c "printf %s \\"\\$LC_ALL:\\$PYTHONIOENCODING\\""')
         self.assertEqual(proc.stdout.decode(), "C:utf-8")
 
     def test_double_source_is_harmless(self) -> None:
-        proc = bash(f'source "{LIB}"; printf %s "$UBS_COMMON_VERSION"')
+        proc = bash('source "$1"; printf %s "$UBS_COMMON_VERSION"', str(LIB))
         self.assertEqual(proc.stdout.decode(), "1")
 
 

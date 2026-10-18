@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -79,6 +80,36 @@ class FormatContractTests(unittest.TestCase):
 
 
 class ListFilesTests(unittest.TestCase):
+    def test_literal_manifest_names_join_extensions_and_excludes_with_rg_and_find(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            names = ("go.mod", "go.sum", "go.work", "go.work.sum", "odd[1].mod",
+                     "literal*.mod", "!bang.mod", "back\\slash.mod", "line\nbreak.mod",
+                     "file{one}.mod", "#hash.mod", "question?.mod", "unclosed[.mod")
+            expected = [root / "main.go", *(root / name for name in names)]
+            for path in expected:
+                path.write_text("")
+            for name in ("README.txt", "odd1.mod", "literal-decoy.mod", "other.mod",
+                         "fileone.mod", "questionX.mod"):
+                (root / name).write_text("")
+            (root / "vendor").mkdir()
+            (root / "vendor" / "go.mod").write_text("")
+            tools = root / "tools"
+            tools.mkdir()
+            # cat owns the listing's destination (4add1640), so the find-only
+            # PATH still needs it.
+            for name in ("bash", "cat", "find"):
+                actual = shutil.which(name)
+                self.assertIsNotNone(actual)
+                (tools / name).symlink_to(actual)
+            for label, env in (("rg", None), ("find", {"PATH": str(tools)})):
+                with self.subTest(tool=label):
+                    proc = bash('ubs_list_files "$1" --ext go --names "$2" --exclude vendor',
+                                tmp, ",".join(names), env=env)
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertEqual(sorted(item for item in proc.stdout.split(b"\0") if item),
+                                     sorted(os.fsencode(path) for path in expected), proc.stderr)
+
     def test_nul_safe_listing_with_extensions_and_excludes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -377,7 +377,7 @@ declare -g -A UBS_COMMON_HELPER_CHECKSUMS=(
   ['helpers/ubs_core/go_patterns/json_fs.py']='e561c18ac8d49ca7d3a0644381b5624d3d0e5f975c43a3056e4ad177538a7b6b'
   ['helpers/ubs_core/go_patterns/misc.py']='d23874e0fd10bc3538fd0c9b4eae998dbcb3076dd66020a6c764c7bb297506bd'
   ['helpers/ubs_core/go_rules.py']='a11e1036d06d313c102fda792f9842af7af69ad6250ec9dcb0c21ceaddc00ce1'
-  ['helpers/ubs_core/go_scan.py']='b2b75743f3962cb7f6d745ca5606e1ff8588ccb7fe8c337b776e283c6cc58542'
+  ['helpers/ubs_core/go_scan.py']='90af774850844e6b9ac9d05475df40c22f809f820b7f1c341a41d3bd2361f63c'
   ['helpers/ubs_core/io.py']='f398594f6d9fa3f5042b7dd10d89cc6ee22cff1335ac6621a23ca1526ebf9149'
   ['helpers/ubs_core/java_ast.py']='50091504b3eed28240dea483b631b9bf47c45993ca1f2f9ff6daec6744eaecef'
   ['helpers/ubs_core/java_detectors/__init__.py']='ef52ffa7d353633e7bb1d1caa697c3b3bf83c6d7dc1ec111a3a4b71e2aa2d8f0'
@@ -765,9 +765,10 @@ ubs_validate_format(){
 }
 
 # ── File listing ────────────────────────────────────────────────────────────
-# ubs_list_files DIR [--ext CSV] [--exclude CSV] [--files-from FILE]
+# ubs_list_files DIR [--ext CSV] [--names CSV] [--exclude CSV] [--files-from FILE]
 # Prints NUL-separated paths (safe for names with spaces or newlines).
 #   --ext       comma-separated extensions without dots (js,ts); default: all
+#   --names     comma-separated literal basenames, included alongside extensions
 #   --exclude   comma-separated directory names or globs to skip
 #   --files-from  a file with one path per line (or NUL-separated): only those
 #                 that exist under DIR are listed (meta-runner file lists)
@@ -775,11 +776,13 @@ ubs_validate_format(){
 # the way the modules already do) and falls back to `find -print0`.
 ubs_list_files(){
   local dir="$1"; shift
-  local exts="" excludes="" files_from=""
+  local exts="" names="" excludes="" files_from=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --ext) exts="$2"; shift 2 ;;
       --ext=*) exts="${1#*=}"; shift ;;
+      --names) names="$2"; shift 2 ;;
+      --names=*) names="${1#*=}"; shift ;;
       --exclude) excludes="$2"; shift 2 ;;
       --exclude=*) excludes="${1#*=}"; shift ;;
       --files-from) files_from="$2"; shift 2 ;;
@@ -825,18 +828,40 @@ ubs_list_files(){
   fi
   local -a rg_args=(--files -0 --no-messages)
   local -a find_args=()
-  local item
+  local -a include_patterns=()
+  local item pattern
   if [[ -n "$exts" ]]; then
     local -a ext_list
     IFS=',' read -r -a ext_list <<<"$exts"
     for item in "${ext_list[@]}"; do
       item="${item#.}"
       [[ -z "$item" ]] && continue
-      rg_args+=(-g "*.${item}")
-      if [[ ${#find_args[@]} -eq 0 ]]; then find_args+=( '(' -name "*.${item}" ); else find_args+=( -o -name "*.${item}" ); fi
+      include_patterns+=("*.${item}")
     done
-    [[ ${#find_args[@]} -gt 0 ]] && find_args+=( ')' )
   fi
+  if [[ -n "$names" ]]; then
+    local -a name_list
+    IFS=',' read -r -d '' -a name_list < <(printf '%s\0' "$names")
+    for item in "${name_list[@]}"; do
+      [[ -z "$item" ]] && continue
+      # Both discovery backends accept globs; escape literal basename syntax.
+      pattern="${item//\\/\\\\}"
+      pattern="${pattern//\*/\\*}"
+      pattern="${pattern//\?/\\?}"
+      pattern="${pattern//\[/\\[}"
+      pattern="${pattern//\]/\\]}"
+      pattern="${pattern//\!/\\!}"
+      pattern="${pattern//#/\\#}"
+      pattern="${pattern//\{/\\{}"
+      pattern="${pattern//\}/\\\}}"
+      include_patterns+=("$pattern")
+    done
+  fi
+  for pattern in "${include_patterns[@]}"; do
+    rg_args+=(-g "$pattern")
+    if [[ ${#find_args[@]} -eq 0 ]]; then find_args+=( '(' -name "$pattern" ); else find_args+=( -o -name "$pattern" ); fi
+  done
+  [[ ${#find_args[@]} -gt 0 ]] && find_args+=( ')' )
   local -a prune_args=()
   if [[ -n "$excludes" ]]; then
     local -a ex_list

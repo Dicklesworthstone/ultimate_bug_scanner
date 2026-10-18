@@ -98,13 +98,8 @@ _RULE_CATEGORY = (
     ("go.ctcompare.", 9),
 )
 
-# Legacy index_project inventory (ubs-golang.sh 2829-2874).
+# Inventory records consume the selected source/manifest file list.
 _INVENTORY_NAMES = ("go.mod", "go.sum", "go.work", "go.work.sum")
-_INVENTORY_EXCLUDES = {
-    ".git", ".svn", ".hg", "vendor", "third_party", "Godeps", "node_modules",
-    ".cache", "build", "dist", "out", "tmp", ".idea", ".vscode", ".vs",
-    "go.work.d",
-}
 
 _GO_DIRECTIVE_RE = re.compile(r"^[ \t]*go[ \t]+([0-9]+\.[0-9]+)", re.MULTILINE)
 
@@ -929,15 +924,9 @@ def main(argv: list[str] | None = None) -> int:
     skip = _skip_set(args)
     single_file = bool(args.project_dir) and Path(args.project_dir).is_file()
 
-    # Legacy index_project scanned the whole project dir for the inventory
-    # names (go.mod/go.sum/go.work/go.work.sum) even though the rg pipelines
-    # include them via INCLUDE_NAMES — augment the ext-based file list so cat
-    # 12/19 and the "Files scanned" total match the legacy find.
-    if args.project_dir and Path(args.project_dir).is_dir():
-        listed = {str(p) for p in files}
-        for extra in _inventory_files(Path(args.project_dir)):
-            if str(extra) not in listed:
-                files.append(extra)
+    # The verified contract and the module FileSet already include manifests.
+    # Rewalking project_dir would resurrect ignored/unselected go.mod files,
+    # changing counts, cache entries and exit decisions outside this scan.
 
     patterns = load_patterns()
 
@@ -1128,32 +1117,6 @@ def main(argv: list[str] | None = None) -> int:
                                  "cache": cache.stats,
                                  "errors": scan_errors}) + "\n")
     return exit_code
-
-
-def _inventory_files(project_dir: Path) -> list[Path]:
-    """Legacy index_project inventory: find the INCLUDE_NAMES files anywhere
-    under project_dir, pruning EXCLUDE_DIRS (ubs-golang.sh 2821-2874)."""
-    found: list[Path] = []
-    if not project_dir.is_dir():
-        return found
-
-    def prune(directory: Path) -> bool:
-        return directory.name in _INVENTORY_EXCLUDES
-
-    stack = [project_dir]
-    while stack:
-        current = stack.pop()
-        try:
-            entries = sorted(current.iterdir(), key=lambda p: p.name)
-        except OSError:
-            continue
-        for entry in entries:
-            if entry.is_dir():
-                if not prune(entry):
-                    stack.append(entry)
-            elif entry.name in _INVENTORY_NAMES:
-                found.append(entry)
-    return found
 
 
 # AST consumption table (ubs_core.go_ast): rule id -> [(category, severity,

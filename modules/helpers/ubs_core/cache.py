@@ -619,7 +619,6 @@ class ScanCache:
                 recs = [
                     r for r in recs
                     if r.get("rule") not in (
-                        "py.functions.missing-returns",
                         "rust.code-quality.tech-debt",
                         "rust.async.spawn-handle-heuristic",
                         "rust.tests.test-todo",

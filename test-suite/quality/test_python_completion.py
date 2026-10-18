@@ -781,5 +781,196 @@ class PythonCompletionTests(unittest.TestCase):
                         self.assertEqual(bool(entries), not failure)
 
 
+class PythonMissingReturnSelectionTests(unittest.TestCase):
+    """A project-wide deficit must never become a reusable source fact."""
+
+    RULE = "py.functions.missing-returns"
+    TITLE = "Some functions may lack return statements"
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="python-return-selection-",
+                                         dir=REPO_ROOT / "test-suite/artifacts"))
+        self.sources = self.root / "sources"
+        self.sources.mkdir()
+        self.a, self.b, self.c = (self.sources / name for name in ("a.py", "b.py", "c.py"))
+        self.a.write_text("def alpha():\n    pass\n")
+        self.b.write_text("def complete():\n    return 1\n")
+        self.c.write_text("def charlie():\n    pass\n")
+        self.cache = self.root / "cache"
+        self.env = {key: value for key, value in os.environ.items()
+                    if not key.startswith(("UBS_", "XDG_"))}
+        self.env.update(PYTHONDONTWRITEBYTECODE="1", PYTHONPATH=str(HELPERS),
+                        UBS_NO_AUTO_UPDATE="1", ENABLE_UV_TOOLS="0",
+                        UBS_CACHE_DIR=str(self.cache), UBS_NO_PREFILTER="1",
+                        UBS_PROFILE="1")
+        self.watched = [HELPERS / "ubs_core/py_scan.py", HELPERS / "ubs_core/cache.py",
+                        HELPERS / "ubs_core/py_detectors/missing_returns.py", Path(__file__)]
+        import hashlib
+        self.hashes = {str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+                       for path in self.watched}
+        (self.root / "producer-hashes.json").write_text(json.dumps(self.hashes, indent=2) + "\n")
+
+    def tearDown(self):
+        import hashlib
+        self.assertEqual({str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+                          for path in self.watched}, self.hashes)
+
+    def run(self, result=None):
+        print(f"[{self.id()}] RUN", flush=True)
+        started = time.monotonic()
+        result = super().run(result)
+        failed = any(test is self or getattr(test, "test_case", None) is self
+                     for test, _ in result.failures + result.errors)
+        print(f"[{self.id()}] {'FAIL' if failed else 'PASS'} "
+              f"({time.monotonic() - started:.3f}s)", flush=True)
+        return result
+
+    def invoke(self, label, files, *, disabled=False, skip=""):
+        import hashlib
+        output = self.root / label
+        output.mkdir()
+        selected = output / "files.nul"
+        selected.write_bytes(b"".join(os.fsencode(path) + b"\0" for path in files))
+        sink, report, text = (output / name for name in ("findings.jsonl", "report.json", "report.txt"))
+        command = [sys.executable, "-m", "ubs_core.py_scan", "--files-from", str(selected),
+                   "--sink", str(sink), "--json-out", str(report), "--text-out", str(text),
+                   "--project-dir", str(self.sources), "--skip", skip]
+        proc = subprocess.run(command, cwd=self.sources,
+                              env={**self.env, "UBS_NO_CACHE": str(int(disabled))},
+                              capture_output=True, text=True, timeout=120)
+        (output / "stdout.log").write_text(proc.stdout)
+        (output / "stderr.log").write_text(proc.stderr)
+        receipt = {"command": command, "exit": proc.returncode,
+                   "disabled_cache": disabled,
+                   "inputs": {str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+                              for path in files}}
+        (output / "execution.json").write_text(json.dumps(receipt, indent=2) + "\n")
+        context = f"{label}: exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+        self.assertTrue(report.is_file(), context)
+        self.assertTrue(sink.is_file(), context)
+        doc = json.loads(report.read_text())
+        rows = [json.loads(line) for line in sink.read_text().splitlines()]
+        telemetry = json.loads(proc.stderr.splitlines()[-1])
+        self.assertEqual(telemetry["errors"], [], context)
+        self.assertEqual(proc.returncode, 0, context)
+        self.assertEqual(doc["status"], "ok", context)
+        self.assertNotIn("module_error", doc, context)
+        return doc, rows, context
+
+    def check_selection(self, label, files, sites, hits, *, skip=""):
+        started = time.monotonic()
+        print(f"[{self.id()}:{label}] RUN", flush=True)
+        actual = self.invoke(label, files, skip=skip)
+        fresh = self.invoke(label + "-disabled", files, disabled=True, skip=skip)
+        expected = [{"rule": self.RULE, "category_id": "python.functions",
+                     "path": str(path), "line": line, "col": 1, "severity": "info",
+                     "message": f"{self.TITLE} — {code}", "suppressed": False}
+                    for path, line, code in sites]
+        (self.root / label / "expected.json").write_text(json.dumps({
+            "records": expected, "critical": 0, "warning": 0, "info": len(expected),
+            "cache_hits": hits, "cache_misses": len(files) - hits,
+        }, indent=2) + "\n")
+        # Discovery order is not source identity. Compare every record field
+        # and retain duplicates while permitting the selected files to reorder.
+        def canonical(rows):
+            return sorted(rows, key=lambda row: (row["path"], row["line"], row["col"],
+                                                row["rule"], json.dumps(row, sort_keys=True)))
+
+        for result, expected_hits in ((actual, hits), (fresh, 0)):
+            doc, rows, context = result
+            self.assertEqual(canonical(rows), canonical(expected), context)
+            self.assertEqual((doc["critical"], doc["warning"], doc["info"]),
+                             (0, 0, len(expected)), context)
+            self.assertEqual(doc["files"], len(files), context)
+            for profile in (doc["profile"], doc["extras"]["profile"]):
+                self.assertEqual(profile["cache_hits"], expected_hits, context)
+                self.assertEqual(profile["cache_misses"], len(files) - expected_hits, context)
+        self.assertEqual(canonical(actual[1]), canonical(fresh[1]), label)
+        for key in ("critical", "warning", "info", "findings", "report"):
+            self.assertEqual(actual[0][key], fresh[0][key], label)
+        for entry in self.cache.glob("*/*/**/*.json"):
+            doc = json.loads(entry.read_text())
+            findings = doc.get("findings", [])
+            groups = findings.values() if isinstance(findings, dict) else (findings,)
+            self.assertFalse(any(row.get("rule") == self.RULE
+                                 for group in groups for row in group), str(entry))
+        print(f"[{self.id()}:{label}] PASS ({time.monotonic() - started:.3f}s)", flush=True)
+
+    def test_multi_to_singleton_reorder_and_subsets_recompute_the_deficit(self):
+        alpha = (self.a, 1, "def alpha():")
+        charlie = (self.c, 1, "def charlie():")
+        cases = [
+            ("multi-cold", [self.a, self.b], [alpha], 0),
+            ("singleton-warm", [self.a], [alpha], 1),
+            ("reorder-warm", [self.b, self.a], [alpha], 2),
+            ("other-singleton-cold", [self.c], [charlie], 0),
+            ("three-reordered-warm", [self.c, self.b, self.a],
+             [alpha, (self.b, 1, "def complete():")], 3),
+            ("safe-subset-warm", [self.b], [], 1),
+            ("positive-subset-warm", [self.c, self.a], [alpha, charlie], 2),
+        ]
+        for label, files, sites, hits in cases:
+            with self.subTest(selection=label):
+                self.check_selection(label, files, sites, hits)
+
+    def test_singleton_primes_and_sibling_edits_change_project_counts(self):
+        alpha = (self.a, 1, "def alpha():")
+        charlie = (self.c, 1, "def charlie():")
+        for label, files, sites in (("prime-alpha", [self.a], [alpha]),
+                                   ("prime-complete", [self.b], []),
+                                   ("prime-charlie", [self.c], [charlie])):
+            with self.subTest(selection=label):
+                self.check_selection(label, files, sites, 0)
+        self.b.write_text("def complete(value):\n    if value:\n        return 1\n    return 2\n")
+        for label, files, sites, hits in (
+            ("edited-safe-twin", [self.a, self.b], [], 1),
+            ("edited-safe-warm", [self.b, self.a], [], 2),
+            ("edited-three", [self.c, self.b, self.a], [alpha], 3),
+            ("edited-subset", [self.c, self.a], [alpha, charlie], 2),
+        ):
+            with self.subTest(selection=label):
+                self.check_selection(label, files, sites, hits)
+        self.b.write_text("def complete():\n    pass\n")
+        complete = (self.b, 1, "def complete():")
+        for label, files, sites, hits in (
+            ("edited-positive-twin", [self.a, self.b], [alpha, complete], 1),
+            ("edited-positive-warm", [self.b, self.a], [alpha, complete], 2),
+        ):
+            with self.subTest(selection=label):
+                self.check_selection(label, files, sites, hits)
+
+    def test_source_owned_counts_and_category_skip_survive_cache_selection(self):
+        alpha = (self.a, 1, "def alpha():  # ubs:ignore[unrelated.rule]")
+        self.a.write_text("def alpha():  # ubs:ignore[unrelated.rule]\n    pass\n")
+        self.b.write_text('def complete():\n    note = "ubs:ignore"\n    return 1\n')
+        for label, files, sites, hits in (
+            ("wrong-and-quoted-cold", [self.a, self.b], [alpha], 0),
+            ("wrong-and-quoted-warm", [self.b, self.a], [alpha], 2),
+        ):
+            with self.subTest(selection=label):
+                self.check_selection(label, files, sites, hits)
+        self.a.write_text(f"def alpha():  # ubs:ignore[{self.RULE}]\n    pass\n")
+        for label, files, sites, hits in (
+            ("owned-def-cold", [self.a, self.b], [], 1),
+            ("owned-def-warm", [self.b, self.a], [], 2),
+            ("owned-def-subset", [self.a], [], 1),
+        ):
+            with self.subTest(selection=label):
+                self.check_selection(label, files, sites, hits)
+        self.a.write_text("def alpha():\n    pass\n")
+        self.b.write_text(f"def complete():\n    return 1  # ubs:ignore[{self.RULE}]\n")
+        sites = [(self.a, 1, "def alpha():"), (self.b, 1, "def complete():")]
+        for label, files, expected, hits in (
+            ("owned-return-cold", [self.a, self.b], sites, 0),
+            ("owned-return-warm", [self.b, self.a], sites, 2),
+        ):
+            with self.subTest(selection=label):
+                self.check_selection(label, files, expected, hits)
+        with self.subTest(selection="category-skip"):
+            self.check_selection("category-skip", [self.a, self.b], [], 0, skip="8")
+        with self.subTest(selection="category-skip-warm"):
+            self.check_selection("category-skip-warm", [self.b, self.a], [], 2, skip="8")
+
+
 if __name__ == "__main__":
     unittest.main()

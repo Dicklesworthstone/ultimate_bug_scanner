@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -551,16 +552,17 @@ class PrefilterAdmissionTests(unittest.TestCase):
             ))
         self.index.finalize()
 
-    def fake_rg(self, output: str, status: int = 0) -> dict[str, str]:
+    def fake_rg(self, output: str | bytes, status: int = 0) -> dict[str, str]:
         executable = self.root / "rg"
+        data = output.encode("utf-8") if isinstance(output, str) else output
         executable.write_text(
-            f"#!{sys.executable}\nimport sys\nsys.stdout.write({output!r})\n"
+            f"#!{sys.executable}\nimport sys\nsys.stdout.buffer.write({data!r})\n"
             f"sys.exit({status})\n", encoding="utf-8",
         )
         executable.chmod(0o755)
         return {"PATH": str(self.root) + os.pathsep + os.environ.get("PATH", "")}
 
-    def assert_bypassed(self, output: str, status: int = 0) -> None:
+    def assert_bypassed(self, output: str | bytes, status: int = 0) -> None:
         stderr = io.StringIO()
         with patch.dict(os.environ, self.fake_rg(output, status)), patch("sys.stderr", stderr):
             result = run_prefilter([self.target], self.index)
@@ -614,15 +616,45 @@ class PrefilterAdmissionTests(unittest.TestCase):
                 result = run_prefilter([self.target], self.index)
                 self.assertEqual(result.candidate_rules_for(self.target), {"danger", "safe"})
 
+    def test_large_real_rg_stream_keeps_prefilter_and_final_literal(self) -> None:
+        # Every long source line matches, so rg's JSON exceeds the previous
+        # 16 MiB document cap before it reaches the final, different literal.
+        with self.target.open("w", encoding="utf-8") as source:
+            for _ in range(18000):
+                source.write("danger(); // " + "x" * 1024 + "\n")
+            source.write("safe();\n")
+        self.assertGreater(self.target.stat().st_size, 16 * 1024 * 1024)
+        with patch("sys.stderr", io.StringIO()) as stderr:
+            result = run_prefilter([self.target], self.index)
+        self.assertFalse(result.is_bypass, stderr.getvalue())
+        self.assertEqual(result.candidate_rules_for(self.target), {"danger", "safe"})
+        self.assertEqual(result.ast_files, [self.target])
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_unicode_line_separators_do_not_split_rg_json_records(self) -> None:
+        self.target.write_text("danger(); // one\u2028two\u0085three\u2029four\n", encoding="utf-8")
+        result = run_prefilter([self.target], self.index)
+        self.assertFalse(result.is_bypass)
+        self.assertEqual(result.candidate_rules_for(self.target), {"danger", "safe"})
+
+    def test_unreadable_record_cannot_hide_behind_a_valid_empty_summary(self) -> None:
+        from ubs_core import external_tools
+        summary = b'{"type":"summary","data":{"stats":{"matches":0}}}\n'
+        with patch.object(external_tools, "OUTPUT_RECORD_LIMIT", 128):
+            for bad in (b"\xff\n", b"x" * 1024 + b"\n"):
+                for output in (bad + summary, summary + bad):
+                    with self.subTest(output=output[:60]):
+                        self.assert_bypassed(output, status=1)
+
     def test_bounded_executor_failure_admits_every_check(self) -> None:
-        from ubs_core.external_tools import ToolOutput
+        from ubs_core.external_tools import ToolStreamOutput
 
         for message in ("timed out", "output exceeds limit", "could not launch"):
             def failed(*args, **kwargs):
                 args[4].append(message)
-                return ToolOutput(0, "", "")
+                return nullcontext(ToolStreamOutput(0, io.BytesIO(), ""))
             with self.subTest(message=message), patch(
-                "ubs_core.external_tools.run_command", side_effect=failed,
+                "ubs_core.external_tools.run_command_stream", side_effect=failed,
             ), patch("sys.stderr", io.StringIO()):
                 result = run_prefilter([self.target], self.index)
             self.assertTrue(result.is_bypass)
@@ -632,7 +664,7 @@ class PrefilterAdmissionTests(unittest.TestCase):
     def test_special_file_never_launches_rg(self) -> None:
         target = self.root / "named-pipe.js"
         os.mkfifo(target)
-        with patch("ubs_core.external_tools.run_command") as execute, patch("sys.stderr", io.StringIO()):
+        with patch("ubs_core.external_tools.run_command_stream") as execute, patch("sys.stderr", io.StringIO()):
             result = run_prefilter([target], self.index)
         execute.assert_not_called()
         self.assertTrue(result.is_bypass)

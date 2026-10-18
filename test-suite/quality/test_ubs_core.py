@@ -2094,14 +2094,113 @@ class AstIngestionTests(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertTrue(any("timed out" in e for e in errors))
 
-    def test_capture_limit_keeps_complete_records_and_reports_truncation(self) -> None:
+    def test_record_limit_keeps_later_records_and_reports_oversized_row(self) -> None:
         valid = self.payload(self.diagnostic())
-        self.executable(valid + b"x" * 2048)
+        self.executable(valid + b"x" * 2048 + b"\n" + self.payload(self.diagnostic(ruleId="later")))
         errors = []
-        with patch.object(self.tools, "OUTPUT_LIMIT", len(valid) + 8):
+        with patch.object(self.tools, "OUTPUT_RECORD_LIMIT", len(valid) + 8):
             records = list(self.tools.scan_ast_config(self.config, [self.source], errors))
-        self.assertEqual(len(records), 1)
+        self.assertEqual([record["ruleId"] for record in records], ["custom.critical", "later"])
         self.assertTrue(any("output exceeds" in e for e in errors))
+
+    def test_large_diagnostic_stream_retains_every_location_with_bounded_memory(self) -> None:
+        import tracemalloc
+        row = self.diagnostic(text="x" * 1024)
+        count = 20000
+        self.assertGreater(len(self.payload(row)) * count, 16 * 1024 * 1024)
+        self.executable(b"", suffix=(
+            f"import json\nrow = {row!r}\n"
+            f"for line in range({count}):\n"
+            "    row['range']['start']['line'] = line\n"
+            "    sys.stdout.write(json.dumps(row) + '\\n')\n"
+        ))
+        errors = []
+        tracemalloc.start()
+        try:
+            actual = 0
+            for diagnostic in self.tools.scan_ast_config(self.config, [self.source], errors):
+                self.assertEqual(diagnostic["range"]["start"]["line"], actual)
+                actual += 1
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(actual, count, errors)
+        self.assertFalse(errors)
+        # A higher total cap or a whole-file read would retain tens of MiB.
+        # This budget measures ingestion, excluding caller-retained findings.
+        self.assertLess(peak, 4 * 1024 * 1024, f"stream ingestion peaked at {peak} bytes")
+
+    def test_whole_document_capture_retains_its_output_and_stderr_bounds(self) -> None:
+        self.executable(b"x" * 2048, suffix="sys.stderr.write('e' * 8192)\n")
+        errors = []
+        with patch.object(self.tools, "OUTPUT_LIMIT", 512):
+            output = self.tools.run_command("document tool", [str(self.binary)], self.root, 5, errors)
+        self.assertIsNotNone(output)
+        self.assertEqual(output.stdout, "x" * 512)
+        self.assertEqual(output.stderr, "e" * 4096)
+        self.assertEqual(output.returncode, 0)
+        self.assertEqual(errors, ["document tool: output exceeds 512 bytes"])
+
+    def test_corrupt_stream_records_have_bounded_error_detail(self) -> None:
+        valid = self.payload(self.diagnostic())
+        errors = []
+        with patch.object(self.tools, "OUTPUT_RECORD_LIMIT", len(valid) + 8):
+            records = list(self.tools.parse_ast_diagnostics(
+                io.BytesIO((b"x" * 2048 + b"\n\xff\n") * 1000 + valid), errors,
+            ))
+        self.assertEqual(len(records), 1)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("2000 unreadable output record(s)", errors[0])
+        self.assertLess(len(errors[0]), 1000)
+
+    def test_stream_capture_read_failure_keeps_evidence_and_fails_closed(self) -> None:
+        class BrokenStream(io.BytesIO):
+            def readline(self, size=-1):
+                if self.tell() == len(self.getvalue()):
+                    raise OSError("capture device failed")
+                return super().readline(size)
+
+        for accumulate in (True, False):
+            records, errors = [], []
+            with self.subTest(accumulate=accumulate):
+                try:
+                    for record in self.tools.parse_ast_diagnostics(
+                        BrokenStream(self.payload(self.diagnostic())), errors if accumulate else None,
+                    ):
+                        records.append(record)
+                except RuntimeError as exc:
+                    self.assertFalse(accumulate)
+                    self.assertIn("capture device failed", str(exc))
+                else:
+                    self.assertTrue(accumulate)
+                    self.assertIn("capture device failed", errors[0])
+                self.assertEqual(len(records), 1)
+
+    def test_capture_handles_close_when_the_consumer_raises(self) -> None:
+        self.executable(self.payload(self.diagnostic()))
+        errors = []
+        with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+            with patch.object(self.tools.tempfile, "TemporaryFile", side_effect=[stdout, stderr]):
+                with self.assertRaisesRegex(OSError, "consumer failed"):
+                    with self.tools.run_command_stream("test analyzer", [str(self.binary)], self.root, 5, errors) as output:
+                        self.assertIsNotNone(output)
+                        self.assertFalse(output.stdout.closed)
+                        raise OSError("consumer failed")
+            self.assertTrue(stdout.closed)
+            self.assertTrue(stderr.closed)
+        self.assertFalse(errors)
+
+    def test_second_capture_open_failure_closes_first_handle_without_launching(self) -> None:
+        with tempfile.TemporaryFile() as first:
+            errors = []
+            with patch.object(self.tools.tempfile, "TemporaryFile", side_effect=[first, OSError("capture full")]), \
+                    patch.object(self.tools.subprocess, "Popen") as launch:
+                with self.tools.run_command_stream("test analyzer", [str(self.binary)], self.root, 5, errors) as output:
+                    self.assertIsNone(output)
+            launch.assert_not_called()
+            self.assertTrue(first.closed)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("could not launch or capture output: capture full", errors[0])
 
     def test_invalid_utf8_is_incomplete_but_valid_rows_remain(self) -> None:
         self.executable(self.payload(self.diagnostic()) + b"\xff\n")
@@ -2111,18 +2210,24 @@ class AstIngestionTests(unittest.TestCase):
         self.assertTrue(any("UTF-8" in e for e in errors))
 
     def test_later_batches_run_after_an_earlier_failure(self) -> None:
-        outputs = [self.tools.ToolOutput(2, "null\n", "failed first batch"),
-                   self.tools.ToolOutput(1, self.payload(self.diagnostic()).decode(), "")]
+        invocations = self.root / "invocations.jsonl"
+        self.executable(b"", suffix=(
+            "import json\nfrom pathlib import Path\n"
+            f"log = Path({str(invocations)!r})\nfirst = not log.exists()\n"
+            "with log.open('a') as sink:\n    sink.write(json.dumps(sys.argv) + '\\n')\n"
+            "if first:\n    sys.stdout.write('null\\n'); sys.exit(2)\n"
+            f"sys.stdout.buffer.write({self.payload(self.diagnostic())!r})\nsys.exit(1)\n"
+        ))
         errors = []
-        with patch.object(self.tools, "run_command", side_effect=outputs) as run:
-            records = list(self.tools.scan_ast_config(
-                self.config, [self.source, self.source], errors, batch_size=1,
-            ))
-        self.assertEqual(run.call_count, 2)
+        records = list(self.tools.scan_ast_config(
+            self.config, [self.source, self.source], errors, batch_size=1,
+        ))
+        commands = [json.loads(line) for line in invocations.read_text().splitlines()]
+        self.assertEqual(len(commands), 2)
         self.assertEqual(len(records), 1)
-        self.assertTrue(errors)
-        self.assertIn("--", run.call_args.args[1])
-        self.assertTrue(run.call_args.kwargs["strict_utf8"])
+        self.assertTrue(any("exited 2" in error for error in errors))
+        self.assertTrue(any("malformed AST" in error for error in errors))
+        self.assertTrue(all("--" in command for command in commands))
 
     def test_python_adapter_preserves_valid_finding_and_marks_corruption(self) -> None:
         from ubs_core import py_ast
@@ -2260,6 +2365,27 @@ class AstIngestionTests(unittest.TestCase):
         self.assertEqual(records[0]["path"], "source:with\nnewline.rs")
         self.assertEqual(records[0]["col"], 3)
         self.assertTrue(errors)
+
+    def test_rust_nested_pattern_stream_has_no_total_output_cap(self) -> None:
+        from ubs_core import rust_ast, rust_rules
+        row = self.diagnostic(text="value." + "x" * 1024 + ".unwrap()")
+        row.pop("ruleId")
+        row.pop("severity")
+        count = 18000
+        self.assertGreater(len(self.payload(row)) * count, 16 * 1024 * 1024)
+        self.executable(b"", suffix=(
+            f"import json\nrow = {row!r}\n"
+            f"for line in range({count}):\n"
+            "    row['range']['start']['line'] = line\n"
+            "    sys.stdout.write(json.dumps(row) + '\\n')\n"
+        ))
+        errors = []
+        with patch.object(rust_rules, "RUN_MODE_RULES", {"unwrap": "$A.unwrap()"}):
+            counts, matches = rust_ast._run_spawn_patterns([str(self.source)], str(self.binary), 400, errors)
+        self.assertFalse(errors)
+        self.assertEqual(counts, {"rust.ast.unwrap": count})
+        self.assertEqual([match["line"] for match in matches["rust.ast.unwrap"]], list(range(1, count + 1)))
+        self.assertTrue(all(match["text"] == row["text"] for match in matches["rust.ast.unwrap"]))
 
     @unittest.skipUnless(shutil.which("ast-grep"), "real ast-grep is required")
     def test_real_rust_nested_patterns_run_without_optional_manifest(self) -> None:

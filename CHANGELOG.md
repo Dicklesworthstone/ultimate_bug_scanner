@@ -12,6 +12,7 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Fixed
 
+- AST diagnostics and the ripgrep prefilter consume complete newline-delimited output with bounded record memory. Large Rust, JavaScript, TypeScript and TSX scans no longer stop at the former 16 MiB total-output ceiling; malformed records, tool failures and timeouts still mark analysis incomplete and retain valid diagnostics. Temporary output handles close on capture and consumer failures.
 - JavaScript taint analysis preserves captured object identities in nested helpers, so writes and array mutations through unassigned object parameters reach their callers. Field-specific reads and definite cleanup remain precise, with separate clean and tainted caller controls.
 - JavaScript taint analysis reuses scalar helper summaries inside allocating callers without copying unrelated heap state. Heap callers are revisited when those summaries change; captured objects and object arguments retain their contextual analysis.
 - Components proven to contain no modeled taint source avoid unnecessary heap expansion. The proof checks every selected module using the analyzer's source patterns and parsed parameter origins; source-bearing components retain the same analysis and work limits.

@@ -20,13 +20,12 @@ count exceeds its removeEventListener count.
 from __future__ import annotations
 
 import json
-import io
 import os
 from pathlib import Path
 from typing import Sequence
 
 from ubs_core.js_scan import MARKER
-from ubs_core.external_tools import run_command
+from ubs_core.external_tools import iter_output_lines, run_command_stream
 
 _ASTGREP_BIN = "ast-grep"
 
@@ -128,77 +127,77 @@ def scan_config(
     cache: dict[Path, list[str]] = {}
     for start in range(0, len(path_list), _BATCH):
         batch = [str(p) for p in path_list[start : start + _BATCH]]
-        proc = run_command(
+        with run_command_stream(
             f"ast-grep ({config.name})",
             [os.environ.get("UBS_AST_GREP_BIN") or ast_grep_bin,
-             "scan", "-c", str(config), "--json=stream", *batch],
-            Path.cwd(), _TIMEOUT, problems, strict_utf8=True,
-        )
-        if proc is None:
-            continue
-        # ast-grep exits 0 with no error-level diagnostics and 1 when it found
-        # some; anything else is a failed invocation, which used to degrade to
-        # zero AST findings.
-        if proc.returncode not in (0, 1):
-            detail = (proc.stderr or "").strip().splitlines()
-            problems.append(
-                f"ast-grep exited {proc.returncode} on {config.name}"
-                + (f": {detail[0][:160]}" if detail else "")
-            )
-        invalid = valid = 0
-        first_problem = ""
-        for record_no, line in enumerate(io.StringIO(proc.stdout), 1):
-            line = line.strip()
-            if not line:
+             "scan", "-c", str(config), "--json=stream", "--", *batch],
+            Path.cwd(), _TIMEOUT, problems,
+        ) as proc:
+            if proc is None:
                 continue
-            try:
-                match = _validated_match(line)
-            except (ValueError, UnicodeError, RecursionError) as exc:
-                invalid += 1
-                if not first_problem:
-                    first_problem = f"record {record_no}: {str(exc)[:160]}"
-                continue
-            valid += 1
-            rule_id = str(match.get("ruleId", "") or match.get("rule_id", ""))
-            file_str = str(match.get("file", "") or match.get("path", ""))
-            if not rule_id or not file_str:
-                continue
-            if count_only is not None and rule_id not in count_only:
-                continue  # informational dump in legacy — not counted
-            if skip_categories:
-                family = rule_id.rsplit(".", 1)[0]
-                category = _FAMILY_CATEGORY.get(family)
-                if category is not None and category in skip_categories:
-                    continue  # --skip: the category is disabled
-            rng = match.get("range", {}).get("start", {})
-            path = Path(file_str)
-            line_no = int(rng.get("line", 0)) + 1  # ast-grep rows are 0-based
-            severity = (severity_overrides or {}).get(rule_id) or str(match.get("severity", "warning"))
-            severity = {"error": "critical", "hint": "info"}.get(severity, severity)
-            if severity == "off":
-                continue
-            if severity not in counters:
-                severity = "warning"
-            if lang != "custom" and rule_id == "js.resource.listener-no-remove" and not _listener_imbalance(path, cache):
-                continue  # legacy rg-delta: adds <= removes means balanced
-            if _has_marker(path, line_no, cache):
-                continue  # legacy line + previous-line marker check
-            counters[severity] = counters.get(severity, 0) + 1
-            message = str(match.get("message", "")).strip() or str(match.get("text", ""))[:240]
-            sink.write(json.dumps({
-                "rule": rule_id,
-                "category_id": rule_id.rsplit(".", 1)[0] if "." in rule_id else rule_id,
-                "path": file_str,
-                "line": line_no,
-                "col": int(rng.get("column", 0)) + 1,
-                "severity": severity,
-                "message": message[:240],
-                "suppressed": False,
-            }, ensure_ascii=False) + "\n")
-        if invalid:
-            problems.append(f"ast-grep ({config.name}): {invalid} malformed diagnostic(s); {first_problem}")
-        if proc.returncode == 1 and not valid:
-            problems.append(f"ast-grep ({config.name}): findings exit without valid diagnostics")
+            # ast-grep exits 0 with no error-level diagnostics and 1 when it found
+            # some; anything else is a failed invocation, which used to degrade to
+            # zero AST findings.
+            if proc.returncode not in (0, 1):
+                detail = (proc.stderr or "").strip().splitlines()
+                problems.append(
+                    f"ast-grep exited {proc.returncode} on {config.name}"
+                    + (f": {detail[0][:160]}" if detail else "")
+                )
+            invalid = valid = 0
+            first_problem = ""
+            for record_no, line in iter_output_lines(proc.stdout, problems, context=f"ast-grep ({config.name})"):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    match = _validated_match(line)
+                except (ValueError, UnicodeError, RecursionError) as exc:
+                    invalid += 1
+                    if not first_problem:
+                        first_problem = f"record {record_no}: {str(exc)[:160]}"
+                    continue
+                valid += 1
+                rule_id = str(match.get("ruleId", "") or match.get("rule_id", ""))
+                file_str = str(match.get("file", "") or match.get("path", ""))
+                if not rule_id or not file_str:
+                    continue
+                if count_only is not None and rule_id not in count_only:
+                    continue  # informational dump in legacy — not counted
+                if skip_categories:
+                    family = rule_id.rsplit(".", 1)[0]
+                    category = _FAMILY_CATEGORY.get(family)
+                    if category is not None and category in skip_categories:
+                        continue  # --skip: the category is disabled
+                rng = match.get("range", {}).get("start", {})
+                path = Path(file_str)
+                line_no = int(rng.get("line", 0)) + 1  # ast-grep rows are 0-based
+                severity = (severity_overrides or {}).get(rule_id) or str(match.get("severity", "warning"))
+                severity = {"error": "critical", "hint": "info"}.get(severity, severity)
+                if severity == "off":
+                    continue
+                if severity not in counters:
+                    severity = "warning"
+                if lang != "custom" and rule_id == "js.resource.listener-no-remove" and not _listener_imbalance(path, cache):
+                    continue  # legacy rg-delta: adds <= removes means balanced
+                if _has_marker(path, line_no, cache):
+                    continue  # legacy line + previous-line marker check
+                counters[severity] = counters.get(severity, 0) + 1
+                message = str(match.get("message", "")).strip() or str(match.get("text", ""))[:240]
+                sink.write(json.dumps({
+                    "rule": rule_id,
+                    "category_id": rule_id.rsplit(".", 1)[0] if "." in rule_id else rule_id,
+                    "path": file_str,
+                    "line": line_no,
+                    "col": int(rng.get("column", 0)) + 1,
+                    "severity": severity,
+                    "message": message[:240],
+                    "suppressed": False,
+                }, ensure_ascii=False) + "\n")
+            if invalid:
+                problems.append(f"ast-grep ({config.name}): {invalid} malformed diagnostic(s); {first_problem}")
+            if proc.returncode == 1 and not valid:
+                problems.append(f"ast-grep ({config.name}): findings exit without valid diagnostics")
     return counters
 
 

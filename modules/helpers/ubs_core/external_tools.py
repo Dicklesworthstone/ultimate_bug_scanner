@@ -24,14 +24,18 @@ import signal
 import subprocess
 import tempfile
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
-from typing import Iterator, Sequence, TextIO
+from typing import BinaryIO, Iterator, Sequence, TextIO
 
 from ubs_core.suppression import SourceSuppressions
 
 OUTPUT_LIMIT = 16 * 1024 * 1024
+# Streaming tools have no total-output ceiling. Bound a single encoded record
+# so corrupt or runaway output cannot turn readline() into an unbounded slurp.
+OUTPUT_RECORD_LIMIT = 16 * 1024 * 1024
 RUBY_TOOLS = {
     "rubocop": "rubocop", "brakeman": "brakeman",
     "bundler-audit": "bundle-audit", "reek": "reek", "fasterer": "fasterer",
@@ -47,15 +51,34 @@ class ToolOutput:
     stderr: str
 
 
-def run_command(tool: str, argv: Sequence[str], root: Path, timeout: float,
-                errors: list[str], *, env: dict[str, str] | None = None,
-                merge_stderr: bool = False, strict_utf8: bool = False) -> ToolOutput | None:
-    """Bound execution, reap timed-out process groups, and bound captured memory."""
+@dataclass(frozen=True)
+class ToolStreamOutput:
+    returncode: int
+    stdout: BinaryIO
+    stderr: str
+
+
+@contextmanager
+def run_command_stream(tool: str, argv: Sequence[str], root: Path, timeout: float,
+                       errors: list[str], *, env: dict[str, str] | None = None,
+                       merge_stderr: bool = False) -> Iterator[ToolStreamOutput | None]:
+    """Spool complete output to disk with bounded execution and memory.
+
+    The stream is valid only inside the context. Consumers must read it in
+    bounded records or chunks. Timeouts and cancellation retain the same
+    process-group cleanup as whole-document capture; completed output remains
+    readable after an analyzer fails or times out. Only stderr's first 4 KiB
+    enters memory. Spooling also avoids pipe deadlocks on noisy analyzers.
+    """
     if not math.isfinite(timeout) or timeout <= 0:
         errors.append(f"{tool}: timeout must be a positive finite number")
-        return None
+        yield None
+        return
+    stdout = stderr = None
     try:
-        with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        try:
+            stdout = tempfile.TemporaryFile()
+            stderr = tempfile.TemporaryFile()
             # The only tainted argv reaching here is the operator's
             # UBS_AST_GREP_BIN override (scan_ast_config); argv is a list, no shell.
             proc = subprocess.Popen(  # ubs:ignore[python.taint.command] - executable comes from operator configuration, not request input.
@@ -101,21 +124,82 @@ def run_command(tool: str, argv: Sequence[str], root: Path, timeout: float,
                 for signum, previous in previous_handlers.items():
                     signal.signal(signum, previous)
             stdout.seek(0)
-            raw = stdout.read(OUTPUT_LIMIT + 1)
-            if len(raw) > OUTPUT_LIMIT:
-                errors.append(f"{tool}: output exceeds {OUTPUT_LIMIT} bytes")
-            data = raw[:OUTPUT_LIMIT]
-            if strict_utf8:
-                try:
-                    data.decode("utf-8")
-                except UnicodeDecodeError:
-                    errors.append(f"{tool}: output is not valid UTF-8")
             stderr.seek(0)
-            return ToolOutput(proc.returncode, data.decode("utf-8", "replace"),
-                              stderr.read(4096).decode("utf-8", "replace"))
+            output = ToolStreamOutput(proc.returncode, stdout, stderr.read(4096).decode("utf-8", "replace"))
+        except OSError as exc:
+            errors.append(f"{tool}: could not launch or capture output: {exc}")
+            output = None
+        # Keep caller exceptions outside the capture handler: an OSError in a
+        # consumer must never make this context manager attempt a second yield.
+        yield output
+    finally:
+        try:
+            if stderr is not None:
+                stderr.close()
+        finally:
+            if stdout is not None:
+                stdout.close()
+
+
+def run_command(tool: str, argv: Sequence[str], root: Path, timeout: float,
+                errors: list[str], *, env: dict[str, str] | None = None,
+                merge_stderr: bool = False, strict_utf8: bool = False) -> ToolOutput | None:
+    """Capture a bounded whole document for analyzers without a record stream."""
+    with run_command_stream(tool, argv, root, timeout, errors,
+                            env=env, merge_stderr=merge_stderr) as output:
+        if output is None:
+            return None
+        try:
+            raw = output.stdout.read(OUTPUT_LIMIT + 1)
+        except OSError as exc:
+            errors.append(f"{tool}: could not capture output: {exc}")
+            return None
+        if len(raw) > OUTPUT_LIMIT:
+            errors.append(f"{tool}: output exceeds {OUTPUT_LIMIT} bytes")
+        data = raw[:OUTPUT_LIMIT]
+        if strict_utf8:
+            try:
+                data.decode("utf-8")
+            except UnicodeDecodeError:
+                errors.append(f"{tool}: output is not valid UTF-8")
+        return ToolOutput(output.returncode, data.decode("utf-8", "replace"), output.stderr)
+
+
+def iter_output_lines(stream: BinaryIO, errors: list[str], *, context: str) -> Iterator[tuple[int, str]]:
+    """Read every LF-delimited record, bounding memory and error detail.
+
+    Oversized or non-UTF-8 rows are rejected as incomplete evidence, then the
+    next record is still read. An arbitrarily long malformed row is drained in
+    fixed chunks without accumulating it or discarding later diagnostics.
+    """
+    failures = 0
+    details: list[str] = []
+    number = 0
+    try:
+        while True:
+            raw = stream.readline(OUTPUT_RECORD_LIMIT + 1)
+            if not raw:
+                break
+            number += 1
+            if len(raw) > OUTPUT_RECORD_LIMIT:
+                while raw and not raw.endswith(b"\n"):
+                    raw = stream.readline(64 * 1024)
+                problem = f"record output exceeds {OUTPUT_RECORD_LIMIT} bytes"
+            else:
+                try:
+                    line = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    problem = "output is not valid UTF-8"
+                else:
+                    yield number, line
+                    continue
+            failures += 1
+            if len(details) < 4:
+                details.append(f"row {number}: {problem}")
     except OSError as exc:
-        errors.append(f"{tool}: could not launch or capture output: {exc}")
-        return None
+        errors.append(f"{context}: could not read captured output: {exc}")
+    if failures:
+        errors.append(f"{context}: {failures} unreadable output record(s) ({'; '.join(details)})")
 
 
 def _text(value: object) -> str:
@@ -158,7 +242,7 @@ def ast_rule_configs(rule_dir: Path, paths: Sequence[Path],
     return []
 
 
-def parse_ast_diagnostics(text: str, errors: list[str] | None = None,
+def parse_ast_diagnostics(text: str | BinaryIO, errors: list[str] | None = None,
                           *, context: str = "ast-grep",
                           run_rule_id: str | None = None) -> Iterator[dict]:
     """Yield validated NDJSON evidence; report corruption instead of skipping it.
@@ -171,11 +255,14 @@ def parse_ast_diagnostics(text: str, errors: list[str] | None = None,
     ``run --pattern`` has no diagnostic rule/severity fields: only that mode
     supplies ``run_rule_id`` from the caller's known pattern definition.
     """
+    problems = errors if errors is not None else []
     failures = 0
     details: list[str] = []
     # NDJSON is delimited by LF, not by Unicode line separators that may
     # legitimately occur inside a JSON string (including a source filename).
-    for number, line in enumerate(StringIO(text), 1):
+    lines = (enumerate(StringIO(text), 1) if isinstance(text, str)
+             else iter_output_lines(text, problems, context=context))
+    for number, line in lines:
         if not line.strip():
             continue
         try:
@@ -234,9 +321,9 @@ def parse_ast_diagnostics(text: str, errors: list[str] | None = None,
         yield match
     if failures:
         message = f"{context}: {failures} malformed AST diagnostic(s) ({'; '.join(details)})"
-        if errors is None:
-            raise RuntimeError(message)
-        errors.append(message)
+        problems.append(message)
+    if errors is None and problems:
+        raise RuntimeError("; ".join(problems))
 
 
 def scan_ast_config(config: Path, paths: Sequence[Path],
@@ -260,20 +347,20 @@ def scan_ast_config(config: Path, paths: Sequence[Path],
         executable = os.environ.get("UBS_AST_GREP_BIN") or ast_grep_bin
         for start in range(0, len(paths), batch_size):
             batch = [str(p) for p in paths[start:start + batch_size]]
-            output = run_command(
+            with run_command_stream(
                 "ast-grep", [executable, "scan", "-c", str(config.resolve()),
                              "--json=stream", "--", *batch],
-                Path.cwd(), timeout, failures, strict_utf8=True,
-            )
-            if output is None:
-                continue
-            if output.returncode not in (0, 1):
-                detail = output.stderr.strip().splitlines()
-                failures.append(
-                    f"ast-grep exited {output.returncode} on {config.name}"
-                    + (f": {detail[0][:160]}" if detail else "")
-                )
-            yield from parse_ast_diagnostics(output.stdout, failures, context=f"ast-grep ({config.name})")
+                Path.cwd(), timeout, failures,
+            ) as output:
+                if output is None:
+                    continue
+                if output.returncode not in (0, 1):
+                    detail = output.stderr.strip().splitlines()
+                    failures.append(
+                        f"ast-grep exited {output.returncode} on {config.name}"
+                        + (f": {detail[0][:160]}" if detail else "")
+                    )
+                yield from parse_ast_diagnostics(output.stdout, failures, context=f"ast-grep ({config.name})")
     if errors is None and failures:
         raise RuntimeError("; ".join(failures))
 

@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import nullcontext
 from unittest import mock
 from pathlib import Path
 
@@ -790,9 +791,10 @@ class AstCompletenessTests(unittest.TestCase):
         }
 
     def invoke(self, stdout, returncode=0, **kwargs):
-        from ubs_core.external_tools import ToolOutput
+        from ubs_core.external_tools import ToolStreamOutput
         sink, errors = io.StringIO(), []
-        with mock.patch.object(self.ast, "run_command", return_value=ToolOutput(returncode, stdout, "")):
+        output = ToolStreamOutput(returncode, io.BytesIO(stdout.encode("utf-8")), "")
+        with mock.patch.object(self.ast, "run_command_stream", return_value=nullcontext(output)):
             counts = self.ast.scan_config(
                 self.config, [self.source], sink, "custom", errors=errors, **kwargs,
             )
@@ -867,8 +869,9 @@ class AstCompletenessTests(unittest.TestCase):
 
     def test_missing_grammar_is_partial_even_with_other_configs_present(self):
         errors = []
-        from ubs_core.external_tools import ToolOutput
-        with mock.patch.object(self.ast, "run_command", return_value=ToolOutput(0, "", "")):
+        from ubs_core.external_tools import ToolStreamOutput
+        output = ToolStreamOutput(0, io.BytesIO(), "")
+        with mock.patch.object(self.ast, "run_command_stream", return_value=nullcontext(output)):
             self.ast.scan_all(self.root, [self.source], io.StringIO(), errors=errors)
         self.assertEqual(len(errors), 3)
         self.assertTrue(any("typescript" in error for error in errors))
@@ -881,16 +884,16 @@ class AstCompletenessTests(unittest.TestCase):
     def test_partial_output_sets_summary_exit_and_refuses_cache(self):
         from ubs_core import js_scan
         from ubs_core.cache import ScanCache
-        from ubs_core.external_tools import ToolOutput
+        from ubs_core.external_tools import ToolStreamOutput
         selected = self.root / "files.list"
         selected.write_bytes(os.fsencode(self.source) + b"\0")
         report = self.root / "report.json"
-        result = ToolOutput(0, json.dumps(self.match) + "\ninvalid-json\n", "")
         for grammar in ("javascript", "typescript", "tsx"):
             (self.root / f"sgconfig-{grammar}.yml").write_text("ruleDirs: []\n")
         def analyzer(tool, *args, **kwargs):
-            return result if "custom" in tool else ToolOutput(0, "", "")
-        with mock.patch.object(self.ast, "run_command", side_effect=analyzer), \
+            payload = (json.dumps(self.match) + "\ninvalid-json\n").encode() if "custom" in tool else b""
+            return nullcontext(ToolStreamOutput(0, io.BytesIO(payload), ""))
+        with mock.patch.object(self.ast, "run_command_stream", side_effect=analyzer), \
                 mock.patch.object(ScanCache, "store_scanned_files") as store, \
                 mock.patch.dict(os.environ, {"UBS_CACHE_DIR": str(self.root / "cache"), "UBS_NO_CACHE": "0"}):
             code = js_scan.main([
@@ -922,16 +925,78 @@ class AstCompletenessTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertTrue(any("UTF-8" in error for error in errors), errors)
 
-    def test_output_limit_is_partial_and_preserves_complete_prefix(self):
+    def test_record_limit_is_partial_and_preserves_later_diagnostics(self):
         from ubs_core import external_tools
         prefix = json.dumps(self.match) + "\n"
-        with mock.patch.object(external_tools, "OUTPUT_LIMIT", len(prefix.encode()) + 10):
+        later = json.dumps({**self.match, "ruleId": "org.later-policy"}) + "\n"
+        with mock.patch.object(external_tools, "OUTPUT_RECORD_LIMIT", len(prefix.encode()) + 10):
             counts, rows, errors = self.real_analyzer(
-                f"import sys\nsys.stdout.write({prefix!r} + 'x' * 10000)\n"
+                f"import sys\nsys.stdout.write({prefix!r} + 'x' * 10000 + '\\n' + {later!r})\n"
             )
-        self.assertEqual(counts["critical"], 1)
-        self.assertEqual(len(rows), 1)
+        self.assertEqual(counts["critical"], 2)
+        self.assertEqual([row["rule"] for row in rows], ["org.critical-policy", "org.later-policy"])
         self.assertTrue(any("output exceeds" in error for error in errors), errors)
+
+    def test_large_stream_preserves_every_finding_with_bounded_memory(self):
+        import tracemalloc
+        row = {**self.match, "text": "x" * 1024}
+        count = 20000
+        self.source.write_text("policyProbe();\n" * count)
+        self.assertGreater(len((json.dumps(row) + "\n").encode()) * count, 16 * 1024 * 1024)
+        binary = self.root / "ast-grep"
+        binary.write_text(
+            f"#!{sys.executable}\nimport json, sys\nrow = {row!r}\n"
+            f"for line in range({count}):\n"
+            "    row['range']['start']['line'] = line\n"
+            "    sys.stdout.write(json.dumps(row) + '\\n')\n"
+            "sys.exit(1)\n"
+        )
+        binary.chmod(0o755)
+        output = self.root / "large-findings.jsonl"
+        errors = []
+        with output.open("w", encoding="utf-8") as sink, \
+                mock.patch.dict(os.environ, {"UBS_AST_GREP_BIN": str(binary)}):
+            tracemalloc.start()
+            try:
+                counts = self.ast.scan_config(self.config, [self.source], sink, "custom", errors=errors)
+                _current, peak = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+        self.assertEqual(counts, {"critical": count, "warning": 0, "info": 0}, errors)
+        self.assertFalse(errors)
+        # Includes the source-line cache, but a whole analyzer-output buffer
+        # or a larger total cap would exceed this budget by many MiB.
+        self.assertLess(peak, 4 * 1024 * 1024, f"AST ingestion peaked at {peak} bytes")
+        actual = 0
+        with output.open(encoding="utf-8") as sink:
+            for actual, line in enumerate(sink, 1):
+                finding = json.loads(line)
+                self.assertEqual((finding["rule"], finding["path"], finding["line"], finding["col"],
+                                  finding["severity"]),
+                                 (self.match["ruleId"], str(self.source), actual, 1, "critical"))
+        self.assertEqual(actual, count)
+
+    def test_failed_stream_does_not_prevent_later_batches(self):
+        invocations = self.root / "commands.jsonl"
+        binary = self.root / "ast-grep"
+        binary.write_text(
+            f"#!{sys.executable}\nimport json, sys\nfrom pathlib import Path\n"
+            f"log = Path({str(invocations)!r})\nfirst = not log.exists()\n"
+            "with log.open('a') as sink:\n    sink.write(json.dumps(sys.argv) + '\\n')\n"
+            f"row = {self.match!r}\nrow['range']['start']['line'] = 0 if first else 1\n"
+            "print(json.dumps(row))\nsys.exit(2 if first else 1)\n"
+        )
+        binary.chmod(0o755)
+        sink, errors = io.StringIO(), []
+        with mock.patch.object(self.ast, "_BATCH", 1), \
+                mock.patch.dict(os.environ, {"UBS_AST_GREP_BIN": str(binary)}):
+            counts = self.ast.scan_config(self.config, [self.source, self.source], sink, "custom", errors=errors)
+        self.assertEqual(counts, {"critical": 2, "warning": 0, "info": 0})
+        self.assertTrue(any("exited 2" in error for error in errors), errors)
+        self.assertEqual([json.loads(line)["line"] for line in sink.getvalue().splitlines()], [1, 2])
+        commands = [json.loads(line) for line in invocations.read_text().splitlines()]
+        self.assertEqual(len(commands), 2)
+        self.assertTrue(all("--" in command for command in commands))
 
     def test_timeout_preserves_flushed_findings(self):
         with mock.patch.object(self.ast, "_TIMEOUT", 1.0):

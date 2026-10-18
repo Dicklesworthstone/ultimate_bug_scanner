@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import json
 import hashlib
+import re
 import shutil
 import subprocess
 import sys
@@ -21,7 +22,8 @@ ASYNC_HELPER = REPO_ROOT / "modules" / "helpers" / "async_task_handles_csharp.py
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(REPO_ROOT / "modules" / "helpers"))
 
-from ubs_core.analyzers.narrowing_csharp import scan_text  # noqa: E402
+from ubs_core.analyzers.narrowing_csharp import NarrowingLimit, scan_text  # noqa: E402
+from ubs_core.taint_flow import AnalysisLimit  # noqa: E402
 
 
 GUARD_REPRO = '''using System;
@@ -177,6 +179,362 @@ def run_helper(helper: Path, sources: dict[str, str]) -> list[str]:
 
 
 class CSharpHelperTests(unittest.TestCase):
+    def assert_negative_markers(self, source):
+        expected = []
+        for marker in re.finditer(r"/\*warn:([\w.]+)\*/", source):
+            prefix = source[:marker.end()]
+            expected.append(("negative_guard", prefix.count("\n") + 1,
+                             marker.end() - prefix.rfind("\n"),
+                             f"{marker.group(1)} may be null at this dereference after a null/empty guard"))
+        self.assertEqual(scan_text(source), expected, source)
+
+    def test_known_calls_invalidate_only_the_mutable_caller_bindings(self):
+        cases = (
+            ('void Clear(){p=null;}', 'Clear(); Use(/*warn:p*/p.Length);'),
+            ('void Clear(){this.p=null;}', 'this.Clear(); Use(/*warn:p*/p.Length);'),
+            ('void Clear(){p=null;} void Wrap(){Clear();}', 'Wrap(); Use(/*warn:p*/p.Length);'),
+            ('void Clear(bool stop){if(stop)p=null;else Clear(true);}', 'Clear(false); Use(/*warn:p*/p.Length);'),
+            ('void Clear(int ignored=0){p=null;}', 'Clear(); Use(/*warn:p*/p.Length);'),
+            ('void Clear(params int[] ignored){p=null;}', 'Clear(); Use(/*warn:p*/p.Length);'),
+            ('void Clear(){p=null;} void Clear(int ignored){}', 'Clear(1); Use(p.Length);'),
+            ('void Clear(){p="safe";}', 'Clear(); Use(p.Length);'),
+            ('void Clear(){string p=null;}', 'Clear(); Use(p.Length);'),
+            ('void Clear(string p){p=null;}', 'Clear(p); Use(p.Length);'),
+            ('string q;void Clear(){p=q;}', 'Clear(); Use(/*warn:p*/p.Length);'),
+            ('void Clear(string replacement){p=replacement;}', 'Clear(null); Use(/*warn:p*/p.Length);'),
+            ('void Clear(){string replacement=null;p=replacement;}', 'Clear(); Use(/*warn:p*/p.Length);'),
+            ('void Clear(){p=null;}', 'Use(p.Length);'),
+            ('void Clear(){p=null;}', 'Clear(); p="safe"; Use(p.Length);'),
+            ('void Clear(){p=null;}', 'Clear(); if(p==null)return; Use(p.Length);'),
+            ('int Clear(){p=null;return 0;}', 'Use(p.Length, Clear()); Use(/*warn:p*/p.Length);'),
+            ('int Clear(){p=null;return 0;}', 'Use(Clear(), /*warn:p*/p.Length);'),
+            ('void Clear(){p=null;}', 'try{Clear();p="safe";}finally{Use(/*warn:p*/p.Length);}'),
+        )
+        for declaration, body in cases:
+            source = f'class C {{ string p; {declaration} void Run() {{ if(p==null)return; {body} }} }}'
+            with self.subTest(source=source):
+                self.assert_negative_markers(source)
+
+    def test_call_write_summaries_preserve_capture_scope_and_delegate_aliases(self):
+        # C# local functions and anonymous functions share captured variable
+        # instances; declaring a callable does not execute its body.
+        bodies = (
+            'void Clear(){p=null;} Clear(); Use(/*warn:p*/p.Length);',
+            'void Clear(){p=null;} void Wrap(){Clear();} Wrap(); Use(/*warn:p*/p.Length);',
+            'void Clear(){p=null;} Use(p.Length);',
+            'void Clear(string p){p=null;} Clear(p); Use(p.Length);',
+            'System.Action clear=()=>{p=null;}; clear(); Use(/*warn:p*/p.Length);',
+            'System.Action clear=delegate{p=null;}; clear(); Use(/*warn:p*/p.Length);',
+            'System.Action clear=()=>{p=null;}; var alias=clear; alias(); Use(/*warn:p*/p.Length);',
+            'System.Action clear=()=>{p=null;}; clear.Invoke(); Use(/*warn:p*/p.Length);',
+            'System.Action clear=()=>{p=null;}; clear?.Invoke(); Use(/*warn:p*/p.Length);',
+            'System.Action<bool> clear=ignored=>{p=null;}; void Good(bool ignored){} '
+            'clear((clear=Good)==null); Use(/*warn:p*/p.Length);',
+            'System.Action<bool> clear=ignored=>{p=null;}; void Good(bool ignored){} '
+            'clear.Invoke((clear=Good)==null); Use(/*warn:p*/p.Length);',
+            'System.Action<bool> clear=ignored=>{p=null;}; void Good(bool ignored){} '
+            'clear?.Invoke((clear=Good)==null); Use(/*warn:p*/p.Length);',
+            'void Clear(){p=null;} System.Action clear=Clear; clear(); Use(/*warn:p*/p.Length);',
+            'System.Action clear=()=>{p=null;}; clear=()=>{}; clear(); Use(p.Length);',
+            'System.Action clear=()=>{p=null;}; clear=null; clear?.Invoke(); Use(p.Length);',
+            'System.Action clear=()=>{p=null;}; Use(p.Length);',
+        )
+        for body in bodies:
+            source = f'class C {{ void Run(string p) {{ if(p==null)return; {body} }} }}'
+            with self.subTest(source=source):
+                self.assert_negative_markers(source)
+        self.assert_negative_markers('class C {string p;System.Action clear;void Run(){'
+                                     'if(p==null)return;this.clear=()=>{p=null;};this.clear();Use(/*warn:p*/p.Length);}}')
+
+    def test_call_write_identity_respects_owners_and_fresh_construction(self):
+        cases = (
+            'namespace A {class C {static string p;static void Clear(){p=null;}'
+            'void Run(){if(p==null)return;A.C.Clear();Use(/*warn:p*/p.Length);}}}',
+            'namespace A {class C {string p;void Clear(){p=null;}'
+            'void Run(A.C receiver){if(p==null)return;receiver.Clear();Use(/*warn:p*/p.Length);}}}',
+            'namespace A {class C {string p;void Clear(){p=null;}}}'
+            'namespace B {class C {string p;void Clear(){}void Run(){if(p==null)return;Clear();Use(p.Length);}}}',
+            'class Other {string p;public void Clear(){p=null;}}'
+            'class C {string p;void Run(Other other){if(p==null)return;other.Clear();Use(p.Length);}}',
+            'class C {string p;void Clear(){p=null;}void Run(string p){if(p==null)return;Clear();Use(p.Length);}}',
+            'class C {string p;void Clear(){}void Run(){if(p==null)return;'
+            '{void Clear(){p=null;}}Clear();Use(p.Length);}}',
+            'class C {static string p;C(int ignored=0){p=null;}'
+            'void Run(){if(p==null)return;var other=new C();Use(/*warn:p*/p.Length);}}',
+            'class C {string p;C(int ignored=0){p=null;}'
+            'void Run(){if(p==null)return;var other=new C();Use(p.Length);}}',
+            'class Other {public Other(){C.p=null;}} class C {public static string p;'
+            'void Run(){if(p==null)return;var other=new Other();Use(/*warn:p*/p.Length);}}',
+        )
+        for source in cases:
+            with self.subTest(source=source):
+                self.assert_negative_markers(source)
+
+    def test_constructors_preserve_global_identity_and_borrowed_member_writes(self):
+        for creation in ('new C()', 'new global::C()', 'new global::C{}'):
+            source = ('class C{static string p;C(){p=null;}void Run(){if(p==null)return;'
+                      'var other=' + creation + ';Use(/*warn:p*/p.Length);}}')
+            with self.subTest(creation=creation):
+                self.assert_negative_markers(source)
+        for write in ('null', '"safe"'):
+            marker = '/*warn:p*/' if write == 'null' else ''
+            for invocation in ('new C(this);', 'Build(this);'):
+                source = ('class D{public string p;void Build(D d){new C(d);}void F(){'
+                          'if(p==null)return;' + invocation + 'Use(' + marker + 'p.Length);}}'
+                          'class C{public C(D d){d.p=' + write + ';}}')
+                with self.subTest(source=source):
+                    self.assert_negative_markers(source)
+        for call, marker in (('d.Clear()', '/*warn:p*/'), ('Clear()', ''), ('this.Clear()', '')):
+            for invocation in ('new D(this);', 'Build(this);'):
+                source = ('class D{string p;public D(D d){' + call + ';}void Clear(){p=null;}'
+                          'void Build(D d){new D(d);}void F(){if(p==null)return;' + invocation
+                          + 'Use(' + marker + 'p.Length);}}')
+                with self.subTest(source=source):
+                    self.assert_negative_markers(source)
+        for creation in ('new D()', 'new global::D()', 'new D{p=null}'):
+            self.assert_negative_markers('class D{public string p;public D(){p=null;}void F(){'
+                                         'if(p==null)return;var other=' + creation + ';Use(p.Length);}}')
+
+    def test_unresolved_called_closure_preserves_independent_findings(self):
+        bodies = (
+            'System.Action clear=()=>p=null;clear();',
+            'System.Action clear=()=>{p=null;};void Wrap(){clear();}Wrap();',
+            'void Invoke(System.Action callback){callback();}Invoke(()=>{p=null;});',
+            'void Invoke(System.Action callback){callback.Invoke();}Invoke(()=>{p=null;});',
+            'System.Action clear=()=>{};Replace(ref clear);clear();',
+        )
+        for body in bodies:
+            source = ('class C {\nvoid First(string p){if(p==null)Log();Use(p.Length);' + body + '}\n'
+                      'void Later(string p){if(p==null)Log();Use(p.Length);}\n}')
+            with self.subTest(source=source), self.assertRaisesRegex(NarrowingLimit, 'callable effects') as raised:
+                scan_text(source)
+            self.assertEqual(raised.exception.findings,
+                             tuple(('negative_guard', line, source.splitlines()[line - 1].index('p.Length') + 1,
+                                    'p may be null at this dereference after a null/empty guard') for line in (2, 3)))
+        self.assert_negative_markers('class C {void Run(string p){if(p==null)return;'
+                                     'System.Action clear=()=>p=null;Use(p.Length);}}')
+
+    def test_try_get_value_success_preserves_selected_output_nullability(self):
+        # Dictionary.TryGetValue returns the stored TValue. Reference type
+        # annotations cannot prevent null values; true establishes key presence.
+        cases = (
+            ('Dictionary<string,string?>', '', 'Use(/*try:p*/p.Length);'),
+            ('IDictionary<string,string?>', '', 'Use(/*try:p*/p.Length);'),
+            ('IReadOnlyDictionary<string,string?>', '', 'Use(/*try:p*/p.Length);'),
+            ('System.Collections.Generic.Dictionary<string,string?>', '', 'Use(/*try:p*/p.Length);'),
+            ('System.Collections.Concurrent.ConcurrentDictionary<string,string?>', '', 'Use(/*try:p*/p.Length);'),
+            ('Dictionary<string,string>', '', 'Use(/*try:p*/p.Length);'),
+            ('Dictionary<string,string>', 'map["key"]=null;', 'Use(/*try:p*/p.Length);'),
+            ('Dictionary<string,string>', '', 'if(p==null)return;Use(p.Length);'),
+            ('Dictionary<string,decimal>', '', 'Use(p.ToString());'),
+            ('Dictionary<string,decimal?>', '', 'Use(/*try:p*/p.Value);'),
+            ('Dictionary<string,decimal?>', '', 'Use(p.HasValue?p.Value:0);'),
+            ('Dictionary<string,System.Nullable<decimal>>', '', 'Use(p.HasValue?p.Value:0);'),
+            ('Dictionary<string,string?>', '', 'if(p==null)return;Use(p.Length);'),
+            ('Dictionary<string,T>', '', 'Use(/*try:p*/p.ToString());'),
+            ('UnknownMap', '', 'Use(/*try:p*/p.Length);'),
+            ('', 'var map=new Dictionary<string,string?>();', 'Use(/*try:p*/p.Length);'),
+            ('Dictionary<string,string?> original', 'var map=original;', 'Use(/*try:p*/p.Length);'),
+        )
+        for spelling, setup, body in cases:
+            parameters = spelling if spelling.endswith(' original') else spelling + ' map' if spelling else ''
+            source = (f'class C<T> {{void Run({parameters}){{{setup}'
+                      f'if(!map.TryGetValue("key",out var p))return;{body}' + '}}')
+            expected = []
+            for marker in re.finditer(r'/\*try:p\*/', source):
+                expected.append(('try_get_value', 1, marker.end() + 1,
+                                 'p may be null after TryGetValue; check the value as well as lookup success'))
+            with self.subTest(source=source):
+                self.assertEqual(scan_text(source), expected, source)
+        self.assertEqual(scan_text('struct Cell {public string Name;} class C {'
+                                   'void Run(Dictionary<string,Cell> map){if(!map.TryGetValue("key",out var p))return;'
+                                   'Use(p.ToString());}}'), [])
+        self.assertEqual(scan_text('class C {void Run(Dictionary<string,int> map){'
+                                   'if(!map.TryGetValue("key",out var p))Log();Use(p.ToString());}}'), [])
+
+    def test_conditional_access_preserves_skipped_and_reached_argument_paths(self):
+        cases = (
+            'if(p==null)Log(); receiver?.Use(p="safe"); Use(/*warn:p*/p.Length);',
+            'if(p==null)Log(); receiver=null; receiver?.Use(p.Length);',
+            'if(p==null)Log(); receiver=new C(); receiver?.Use(p="safe"); Use(p.Length);',
+            'if(p==null)Log(); receiver=new C(); receiver?.Use(/*warn:p*/p.Length);',
+            'if(p==null)return; receiver?.Use(p=null); Use(/*warn:p*/p.Length);',
+            'if(p==null)return; receiver=null; receiver?.Use(p=null); Use(p.Length);',
+            'if(p==null)Log(); receiver?.Next?.Use(p="safe"); Use(/*warn:p*/p.Length);',
+            'if(p==null)Log(); receiver=new C(); receiver?.Next?.Use(p="safe"); Use(/*warn:p*/p.Length);',
+            'if(p==null)Log(); receiver=null; var q=receiver?[p.Length];',
+            'if(p==null)Log(); receiver=new C(); var q=receiver?[/*warn:p*/p.Length];',
+            'if(p==null)Log(); receiver=null; var q=receiver?.Count + /*warn:p*/p.Length;',
+            'if(p==null)Log(); GetReceiver(p="safe")?.Use(p.Length);',
+            'if(p==null)Log(); receiver?.Use(p="safe", p.Length); Use(/*warn:p*/p.Length);',
+            'if(p==null)Log(); receiver?.Use(/*warn:p*/p.Length, p="safe");',
+        )
+        for body in cases:
+            source = f'class C {{ void Run(string p,C receiver) {{ {body} }} }}'
+            with self.subTest(source=source):
+                self.assert_negative_markers(source)
+
+    def test_shared_type_declarators_and_header_scopes_preserve_outer_bindings(self):
+        bodies = (
+            'if(p==null)Log(); { string first="safe",p="safe"; Use(p.Length); } Use(/*warn:p*/p.Length);',
+            'if(p==null)Log(); { string first,p; p="safe"; Use(p.Length); } Use(/*warn:p*/p.Length);',
+            'if(p==null)Log(); using(var p=new Resource()){Use(p.Name);} Use(/*warn:p*/p.Length);',
+            'if(p==null)Log(); using(Resource first=new Resource(),p=new Resource()){Use(p.Name);} Use(/*warn:p*/p.Length);',
+            'if(p==null)Log(); for(string first="safe",p="safe";false;){Use(p.Length);} Use(/*warn:p*/p.Length);',
+            'if(p==null)return; for(int i=0,j=0;i<1;i++,j++){p=null;} Use(/*warn:p*/p.Length);',
+        )
+        for body in bodies:
+            source = f'class C {{ string p; void Run() {{ {body} }} }}'
+            with self.subTest(source=source):
+                self.assert_negative_markers(source)
+
+    def test_nullable_identity_survives_field_local_and_var_copy_declarations(self):
+        cases = (
+            ('decimal? first,p;', 'if(p==null)Log(); Use(p.HasValue ? p.Value : 0);'),
+            ('decimal? first=0,p;', 'if(p==null)Log(); Use(p.HasValue ? p.Value : 0);'),
+            ('System.Nullable<decimal> first=0,p;', 'if(p==null)Log(); Use(p.HasValue ? p.Value : 0);'),
+            ('', 'decimal? first,p; p=null; if(p==null)Log(); Use(p.HasValue ? p.Value : 0);'),
+            ('', 'decimal? first=0,p=null; if(p==null)Log(); Use(p.HasValue ? p.Value : 0);'),
+            ('decimal? p;', 'if(p==null)Log(); var copy=p; Use(copy.HasValue ? copy.Value : 0);'),
+            ('decimal? p;', 'if(p==null)Log(); var copy=(p!); Use(copy.HasValue ? copy.Value : 0);'),
+            ('decimal? p;', 'if(p==null)Log(); var copy=p; copy=42; Use(copy.Value); Use(/*warn:p*/p.Value);'),
+            ('decimal? p;', 'if(p==null)return; var copy=p; p=null; Use(copy.Value);'),
+            ('Cell first,p;', 'if(p==null)Log(); Use(/*warn:p*/p.HasValue ? /*warn:p*/p.Value : 0);'),
+            ('Cell first=null,p;', 'if(p==null)Log(); var copy=p; Use(/*warn:copy*/copy.HasValue ? /*warn:copy*/copy.Value : 0);'),
+        )
+        for fields, body in cases:
+            source = f'class C {{ {fields} void Run() {{ {body} }} }}'
+            with self.subTest(source=source):
+                self.assert_negative_markers(source)
+
+    def test_static_qualified_field_aliases_respect_local_type_name_shadowing(self):
+        cases = (
+            ('string', '', 'if(p==null)return; C.p=null; Use(/*warn:p*/p.Length);'),
+            ('string', '', 'if(C.p==null)Log(); Use(/*warn:C.p*/C.p.Length);'),
+            ('string', '', 'if(C.p==null)return; p=null; Use(/*warn:C.p*/C.p.Length);'),
+            ('string', 'Cell C', 'if(p==null)return; C.p=null; Use(p.Length);'),
+            ('string', 'Cell C', 'if(C==null)Log(); Use(/*warn:C*/C.p);'),
+            ('decimal?', '', 'if(p==null)Log(); Use(C.p.HasValue ? C.p.Value : 0);'),
+            ('decimal?', '', 'if(C.p==null)Log(); Use(p.HasValue ? p.Value : 0);'),
+            ('decimal?', '', 'if(p==null)Log(); Use(/*warn:C.p*/C.p.Value);'),
+        )
+        for spelling, parameters, body in cases:
+            source = f'class C {{ static {spelling} first,p; void Run({parameters}) {{ {body} }} }}'
+            with self.subTest(source=source):
+                self.assert_negative_markers(source)
+
+    def test_framework_nullable_and_catch_identity_respects_enclosing_namespaces(self):
+        declaration = ('namespace Mine.System { class Nullable<T> {public bool HasValue;public decimal Value;} '
+                       'class Exception : global::System.Exception {} }')
+        for namespace, spelling, unsafe in (('Mine', 'System.Nullable<decimal>', True),
+                                            ('Elsewhere', 'System.Nullable<decimal>', False),
+                                            ('Mine', 'global::System.Nullable<decimal>', False)):
+            marker = '/*warn:p*/' if unsafe else ''
+            source = (declaration + f'namespace {namespace} {{ class C {{ void Run({spelling} p) {{'
+                      f'if(p==null)Log();Use({marker}p.HasValue ? {marker}p.Value : 0);' + '} } }')
+            with self.subTest(source=source):
+                self.assert_negative_markers(source)
+        for namespace, spelling, unsafe in (('Mine', 'System.Exception', True),
+                                            ('Elsewhere', 'System.Exception', False),
+                                            ('Mine', 'global::System.Exception', False)):
+            marker = '/*warn:p*/' if unsafe else ''
+            source = (declaration + f'namespace {namespace} {{ class C {{ void Run(string p) {{'
+                      'if(p==null)return;try{p=null;Other();p="safe";}'
+                      f'catch({spelling} e){{p="safe";}}finally{{Use({marker}p.Length);}}' + '} } }')
+            with self.subTest(source=source):
+                self.assert_negative_markers(source)
+
+    def test_switch_null_arms_refine_only_the_selected_binding(self):
+        bodies = (
+            'if(p==null)Log(); switch(p){case null:return;default:Use(p.Length);break;}',
+            'if(p==null)Log(); switch(p){case null:return;} Use(p.Length);',
+            'if(p==null)Log(); switch(p){case null:case "":return;default:Use(p.Length);break;}',
+            'if(p==null)Log(); switch(p){case not null:Use(p.Length);break;default:return;}',
+            'if(p==null)Log(); switch(p){case null:Use(/*warn:p*/p.Length);break;default:return;}',
+            'if(p==null)Log(); switch(p){case null:break;default:return;} Use(/*warn:p*/p.Length);',
+            'if(p==null)Log(); switch(q){case null:return;default:Use(/*warn:p*/p.Length);break;}',
+            'if(p==null)Log(); switch(p){case null:return;default:switch(n){case 1:break;default:break;}Use(p.Length);break;}',
+            'const string Missing=null; if(p==null)Log(); switch(p){case Missing:Use(/*warn:p*/p.Length);break;default:return;}',
+        )
+        for body in bodies:
+            source = f'class C {{ void Run(string p,string q,int n) {{ {body} }} }}'
+            with self.subTest(source=source):
+                self.assert_negative_markers(source)
+        for label in ('case string text:', 'case null when flag:', 'case { Length: 1 }:'):
+            source = f'class C {{ void Run(string p,bool flag) {{ if(p==null)Log(); switch(p){{{label} break;}} }} }}'
+            with self.subTest(source=source), self.assertRaisesRegex(AnalysisLimit, 'pattern flow'):
+                scan_text(source)
+
+    def test_throw_expressions_stop_only_the_throwing_path_and_operand_tail(self):
+        bodies = (
+            'if(p==null)Log(); p ??= "safe"; Use(p.Length);',
+            'if(p==null)Log(); p ??= null; Use(/*warn:p*/p.Length);',
+            'if(p==null)return; p ??= (p=null); Use(p.Length);',
+            'if(p==null)Log(); var q=p ?? throw new System.ArgumentException(); Use(p.Length);',
+            'if(p==null)Log(); var q=p==null ? throw new System.ArgumentException() : p; Use(p.Length);',
+            'if(p==null)Log(); var q=p!=null ? p : throw new System.ArgumentException(); Use(p.Length);',
+            'if(p==null)Log(); Use(p ?? throw new System.ArgumentException(), p.Length);',
+            'if(p==null)Log(); Use(/*warn:p*/p.Length, p ?? throw new System.ArgumentException());',
+            'if(p==null)Log(); Use(p ?? throw new System.ArgumentException(), p=null, /*warn:p*/p.Length);',
+            'if(p==null)Log(); var q=true ? throw new System.ArgumentException() : p; Use(p.Length);',
+        )
+        for body in bodies:
+            source = f'class C {{ void Run(string p) {{ {body} }} }}'
+            with self.subTest(source=source):
+                self.assert_negative_markers(source)
+
+    def test_implicit_exceptions_reach_finally_without_inventing_assignment_exceptions(self):
+        bodies = (
+            'if(p==null)return; try{p=null;Other();p="safe";}finally{Use(/*warn:p*/p.Length);}',
+            'if(p==null)return; try{p=null;p="safe";}finally{Use(p.Length);}',
+            'if(p==null)return; try{p=null;Other();p="safe";}catch{p="safe";}finally{Use(p.Length);}',
+            'if(p==null)return; try{p=null;Other();p="safe";}catch(System.Exception e){p="safe";}finally{Use(p.Length);}',
+            'if(p==null)return; try{p=null;throw new System.Exception();}catch{p="safe";}finally{Use(p.Length);}',
+            'if(p==null)return; try{Other();}catch{p=null;Other();p="safe";}finally{Use(/*warn:p*/p.Length);}',
+            'if(p==null)return; try{try{p=null;Other();p="safe";}finally{Other();}}finally{Use(/*warn:p*/p.Length);}',
+            'if(p==null)return; try{p=null;await task;p="safe";}finally{Use(/*warn:p*/p.Length);}',
+            'if(p==null)return; try{Action later=()=>{p=null;Other();};}finally{Use(p.Length);}',
+            'if(p==null)return; try{Action later=delegate{p=null;Other();};}finally{Use(p.Length);}',
+            'if(p==null)return; try{Action later=()=>{Other();};p=null;Other();}finally{Use(/*warn:p*/p.Length);}',
+            'if(p==null)Log(); try{Use(p ?? throw new System.Exception());}finally{Use(/*warn:p*/p.Length);}',
+            'if(p==null)return; try{p=null;Other();p="safe";}catch(SpecificException e){p="safe";}finally{Use(/*warn:p*/p.Length);}',
+        )
+        for body in bodies:
+            source = f'class C {{ async Task Run(string p,Task task) {{ {body} }} }}'
+            with self.subTest(source=source):
+                self.assert_negative_markers(source)
+
+    def test_incomplete_scope_retains_established_findings_and_independent_later_scopes(self):
+        source = '''class C {
+void First(string p) { if(p==null)Log(); Use(p.Length); try{Work();}catch(Exception e)when(flag){} }
+void Later(string p) { if(p==null)Log(); Use(p.Length); }
+}'''
+        with self.assertRaises(NarrowingLimit) as raised:
+            scan_text(source)
+        self.assertIsInstance(raised.exception, AnalysisLimit)
+        self.assertEqual(raised.exception.findings,
+                         tuple(("negative_guard", line, source.splitlines()[line - 1].index("p.Length") + 1,
+                                "p may be null at this dereference after a null/empty guard") for line in (2, 3)))
+        for malformed in ('class C { void Run(string p){if(p==null){Log();',
+                          'class C { void Run(string p){if(p==null)Log(); var q="unterminated; } }'):
+            with self.subTest(source=malformed), self.assertRaises(AnalysisLimit):
+                scan_text(malformed)
+
+    def test_exception_snapshots_follow_receiver_arguments_and_property_getters(self):
+        cases = (
+            'try{p=null;receiver.Call(p="safe");}finally{Use(p.Length);}',
+            'if(receiver==null)return; try{p=null;receiver?.Call(p="safe");}finally{Use(p.Length);}',
+            'try{p=null;var x=items[(p="safe").Length];}finally{Use(p.Length);}',
+            'try{p=null;receiver.Parent.Call(p="safe");}finally{Use(/*warn:p*/p.Length);}',
+            'try{p=null;receiver.Handler(p="safe");}finally{Use(/*warn:p*/p.Length);}',
+        )
+        for body in cases:
+            source = ('class C { C Parent {get;} System.Func<string,int> Handler {get;} '
+                      'void Call(string value) {} void Run(string p,C receiver,int[] items) {'
+                      'if(p==null)return;' + body + '} }')
+            with self.subTest(source=source):
+                self.assert_negative_markers(source)
+
     def test_reviewed_expression_effects_and_runtime_dereferences(self) -> None:
         cases = (
             ('string p', 'if(p==null)return; string q=null; var x=q??(p=null); Use(p.Length);', 'p.Length'),
@@ -201,7 +559,7 @@ class CSharpHelperTests(unittest.TestCase):
             source = f'class C {{ void Run({parameters}) {{ {body} }} }}'
             with self.subTest(source=source):
                 expected = [("negative_guard", 1, source.index(target) + 1,
-                             "p dereferenced after non-exiting null/empty guard")] if target else []
+                             "p may be null at this dereference after a null/empty guard")] if target else []
                 self.assertEqual(scan_text(source), expected)
 
     def test_explicit_this_field_identity_and_local_shadowing(self) -> None:
@@ -216,7 +574,7 @@ class CSharpHelperTests(unittest.TestCase):
             source = f'class C {{ string p; void Run({parameters}) {{ {body} }} }}'
             with self.subTest(source=source):
                 expected = [("negative_guard", 1, source.index(target) + 1,
-                             f"{name} dereferenced after non-exiting null/empty guard")] if target else []
+                             f"{name} may be null at this dereference after a null/empty guard")] if target else []
                 self.assertEqual(scan_text(source), expected)
 
     def test_constructor_accessor_callback_and_captured_type_scopes(self) -> None:
@@ -225,7 +583,7 @@ class CSharpHelperTests(unittest.TestCase):
             name = "value" if "expect-value" in line else "p" if "expect-negative" in line else None
             if name:
                 expected.append(("negative_guard", number, line.index(name + ".Length") + 1,
-                                 f"{name} dereferenced after non-exiting null/empty guard"))
+                                 f"{name} may be null at this dereference after a null/empty guard"))
         self.assertEqual(scan_text(GUARD_SCOPE_REPRO), expected)
         safe = GUARD_SCOPE_REPRO.replace('if (p == null) Log();', 'if (p == null) throw new Exception();')
         safe = safe.replace('if (value == null) Log();', 'if (value == null) throw new Exception();')
@@ -288,7 +646,7 @@ class CSharpHelperTests(unittest.TestCase):
                     prefix = source[:position]
                     expected = [("negative_guard", prefix.count("\n") + 1,
                                  position - prefix.rfind("\n"),
-                                 "p dereferenced after non-exiting null/empty guard")]
+                                 "p may be null at this dereference after a null/empty guard")]
                 else:
                     expected = []
                 self.assertEqual(observed, expected, source)
@@ -323,7 +681,7 @@ class CSharpHelperTests(unittest.TestCase):
         findings = scan_text(source)
         line = source.splitlines()[5]
         self.assertEqual(findings, [("negative_guard", 6, line.index(expression) + 1,
-                                     "p dereferenced after non-exiting null/empty guard")
+                                     "p may be null at this dereference after a null/empty guard")
                                     for expression in ("p.HasValue", "p.Value")])
 
     def test_has_value_proof_requires_nullable_value_type_identity(self) -> None:
@@ -343,7 +701,7 @@ class CSharpHelperTests(unittest.TestCase):
                 source = declaration + '\nclass C { decimal Read(' + spelling + ' p) { if (p == null) Log(); return p.HasValue ? p.Value : 0; } }'
                 line = source.splitlines()[1]
                 expected = [("negative_guard", 2, line.index(expression) + 1,
-                             "p dereferenced after non-exiting null/empty guard")
+                             "p may be null at this dereference after a null/empty guard")
                             for expression in ("p.HasValue", "p.Value")] if unsafe else []
                 self.assertEqual(scan_text(source), expected)
 
@@ -359,7 +717,7 @@ class CSharpHelperTests(unittest.TestCase):
             }
         }'''
         self.assertEqual(scan_text(source), [("negative_guard", 8, 21,
-                                             "p dereferenced after non-exiting null/empty guard")])
+                                             "p may be null at this dereference after a null/empty guard")])
 
     def test_positive_guard_alternate_exit_and_fallthrough(self) -> None:
         for alternate, expected in (("else return 0;", []), ("", ["positive_guard"])):
@@ -396,7 +754,7 @@ class CSharpHelperTests(unittest.TestCase):
 
     def test_reported_negative_guards_have_one_unsafe_use(self) -> None:
         expected = [("negative_guard", number, line.index("p.Value") + 1,
-                     "p dereferenced after non-exiting null/empty guard")
+                     "p may be null at this dereference after a null/empty guard")
                     for number, line in enumerate(GUARD_REPRO.splitlines(), 1)
                     if "// expect-negative" in line]
         self.assertEqual(scan_text(GUARD_REPRO), expected)
@@ -455,8 +813,8 @@ class CSharpHelperTests(unittest.TestCase):
                 """,
             },
         )
-        self.assertTrue(any("rawInput dereferenced after non-exiting null/empty guard" in line for line in lines))
-        self.assertTrue(any("token used after non-exiting TryGetValue guard" in line for line in lines))
+        self.assertTrue(any("rawInput may be null at this dereference after a null/empty guard" in line for line in lines))
+        self.assertTrue(any("token may be null after TryGetValue; check the value as well as lookup success" in line for line in lines))
 
     def test_type_narrowing_helper_stays_quiet_for_clean_guards(self) -> None:
         lines = run_helper(
@@ -470,7 +828,7 @@ class CSharpHelperTests(unittest.TestCase):
                         if (string.IsNullOrWhiteSpace(rawInput)) {
                             return null;
                         }
-                        if (!cache.TryGetValue("token", out var token)) {
+                        if (!cache.TryGetValue("token", out var token) || token == null) {
                             return null;
                         }
                         return rawInput.Trim().Length + token.Length;
@@ -586,6 +944,246 @@ class CSharpHelperTests(unittest.TestCase):
         )
         self.assertTrue(any("\tunobserved_task_handle\t" in line for line in lines))
 
+    def test_ref_out_writes_take_effect_after_the_argument_list(self):
+        for mode in ('ref', 'out'):
+            for declared in (False, True):
+                declaration = f'static void Clear({mode} string value,object ignored){{value=null;}}' if declared else ''
+                bodies = (
+                    f'Clear({mode} p,p="safe");Use(/*warn:p*/p.Length);',
+                    f'Clear({mode} p,p.Length);Use(/*warn:p*/p.Length);',
+                    f'Clear({mode} p,0);if(p==null)return;Use(p.Length);',
+                    f'Clear({mode} p,true?throw new System.Exception():0);Use(p.Length);',
+                )
+                for body in bodies:
+                    source = f'class C {{{declaration}void Run(string p){{if(p==null)return;{body}}}}}'
+                    with self.subTest(source=source):
+                        self.assert_negative_markers(source)
+
+    def test_known_getter_setter_and_dispose_writes_reach_caller_proofs(self):
+        properties = (
+            ('string P{get{p=null;return "safe";}}', 'var value=P;Use(/*warn:p*/p.Length);'),
+            ('string P{get{p=null;return "safe";}}', 'if(P==null)Log();Use(/*warn:p*/p.Length);'),
+            ('string P{get{p=null;return "safe";}}void Read(){var value=P;}', 'Read();Use(/*warn:p*/p.Length);'),
+            ('string P{set{p=null;}}', 'P="safe";Use(/*warn:p*/p.Length);'),
+            ('string P{get{return "safe";}}', 'if(P==null)return;Use(P.Length);Use(p.Length);'),
+            ('string P{get;set;}', 'if(P==null)return;Use(P.Length);Use(p.Length);'),
+            ('string P{get{string get(){p=null;return null;}return "safe";}}', 'var value=P;Use(p.Length);'),
+        )
+        for declaration, body in properties:
+            source = f'class C {{string p;{declaration}void Run(){{if(p==null)return;{body}}}}}'
+            with self.subTest(source=source):
+                self.assert_negative_markers(source)
+        for write, marker in (('null', '/*warn:p*/'), ('"safe"', '')):
+            for body in ('using(resource){}', '{using var copy=resource;}', 'WithLease(resource);'):
+                source = ('using System;class Lease:IDisposable{public void Dispose(){C.p=' + write + ';}}'
+                          'class C{public static string p="safe";void WithLease(Lease resource){using(resource){}}'
+                          'void Run(Lease resource){if(p==null)return;' + body + 'Use(' + marker + 'p.Length);}}')
+                with self.subTest(source=source):
+                    self.assert_negative_markers(source)
+
+    def test_unstable_property_guards_are_incomplete_and_keep_other_findings(self):
+        properties = (
+            'string P{get{return Tick()?null:"safe";}}',
+            'string P{get{var value=p;p=null;return value;}}',
+            'string P=>Tick()?null:"safe";',
+        )
+        for declaration in properties:
+            source = ('class C {string p;' + declaration + '\n'
+                      'void First(){if(p==null)Log();Use(p.Length);if(P==null)return;Use(P.Length);}\n'
+                      'void Later(string p){if(p==null)Log();Use(p.Length);}\n}')
+            with self.subTest(source=source), self.assertRaises(NarrowingLimit) as raised:
+                scan_text(source)
+            self.assertRegex(str(raised.exception), 'property guard|accessor effects')
+            self.assertEqual(raised.exception.findings,
+                             tuple(('negative_guard', line, source.splitlines()[line - 1].index('p.Length') + 1,
+                                    'p may be null at this dereference after a null/empty guard') for line in (2, 3)))
+
+    def test_global_qualified_call_and_field_types_keep_their_namespace_anchor(self):
+        for qualifier, marker in (('global::A.R', '/*warn:p*/'), ('A.R', '')):
+            source = ('namespace A{class R{public static void Clear(){B.C.p=null;}}}'
+                      'namespace B{namespace A{class R{public static void Clear(){}}}'
+                      'class C{public static string p="safe";void Run(){if(p==null)return;'
+                      + qualifier + '.Clear();Use(' + marker + 'p.Length);}}}')
+            with self.subTest(source=source):
+                self.assert_negative_markers(source)
+            source = ('using System;namespace A{class R{public Func<string,int> Call{get{throw new Exception();}}}}'
+                      'namespace B{namespace A{class R{public void Call(string value){}}}'
+                      'class C{' + qualifier + ' receiver;void Run(string p){if(p==null)return;'
+                      'try{p=null;receiver.Call(p="safe");}finally{Use(' + marker + 'p.Length);}}}}')
+            with self.subTest(source=source):
+                self.assert_negative_markers(source)
+
+    def test_called_helpers_keep_fresh_initializer_fields_separate(self):
+        for initializer, marker in (
+            ('new C{p=null}', ''), ('new C{p="safe"}', ''), ('new {p=null}', ''),
+            ('new C{p=(p=null)}', '/*warn:p*/'), ('new string[]{p=null}', '/*warn:p*/'),
+        ):
+            source = ('class C{string p;void Build(){var other=' + initializer + ';}'
+                      'void Run(){if(p==null)return;Build();Use(' + marker + 'p.Length);}}')
+            with self.subTest(source=source):
+                self.assert_negative_markers(source)
+        self.assert_negative_markers('class Other{public Other(){C.p=null;}}class C{public static string p;'
+                                     'void Run(){if(p==null)return;var value=new Other{};Use(/*warn:p*/p.Length);}}')
+
+    def test_target_typed_constructor_effects_are_explicitly_incomplete(self):
+        for construction in ('C other=new();', 'Build();'):
+            source = ('class C {static string p;C(){p=null;}void Build(){C other=new();}\n'
+                      'void First(){if(p==null)Log();Use(p.Length);' + construction + '}\n'
+                      'void Later(string p){if(p==null)Log();Use(p.Length);}\n}')
+            with self.subTest(source=source), self.assertRaisesRegex(NarrowingLimit, 'target-typed constructor') as raised:
+                scan_text(source)
+            self.assertEqual(raised.exception.findings,
+                             tuple(('negative_guard', line, source.splitlines()[line - 1].index('p.Length') + 1,
+                                    'p may be null at this dereference after a null/empty guard') for line in (2, 3)))
+
+    def assert_exception_body(self, body, expected):
+        if expected:
+            self.assertEqual(body.count("p.Length"), expected, body)
+            body = body.replace("p.Length", "/*warn:p*/p.Length")
+        source = '''using System;
+using System.Collections.Generic;
+class Throws { public Throws() { throw new Exception(); } }
+class C {
+    string Field;
+    string Property { get { throw new Exception(); } }
+    void Log() { }
+    void Run(string p, object value, int? nullable, object receiver,
+             IEnumerable<int> items, IDisposable resource, int[] array,
+             long number, string text, decimal decimalNumber, double doubleNumber) {
+        if (p == null) return;
+        BODY
+    }
+    void Use(object value) { }
+}'''.replace("BODY", body)
+        self.assert_negative_markers(source)
+
+    def test_exception_sites_reach_finally_before_later_repair(self):
+        for expression in (
+            "new Throws {}", "new Throws()", "(string)value", "(int)value",
+            "(int)nullable", "(int)decimalNumber", "(decimal)doubleNumber", "Property",
+        ):
+            with self.subTest(expression=expression):
+                self.assert_exception_body(
+                    'try { p=null; var result=EXPR; p="safe"; } '
+                    'finally { Use(p.Length); }'.replace("EXPR", expression), 1)
+        for statement in (
+            'lock(receiver) { p="safe"; }',
+            'foreach(var item in items) { p="safe"; } p="safe";',
+        ):
+            with self.subTest(statement=statement):
+                self.assert_exception_body('try { p=null; BODY } finally { Use(p.Length); }'
+                                           .replace("BODY", statement), 1)
+
+    def test_nonthrowing_reads_and_casts_do_not_invent_exception_paths(self):
+        for expression in (
+            "value as string", "(int)number", "(string)text", "Field", "(string)null",
+            "(decimal)number", "(double)decimalNumber",
+        ):
+            with self.subTest(expression=expression):
+                self.assert_exception_body(
+                    'try { p=null; var result=EXPR; p="safe"; } '
+                    'finally { Use(p.Length); }'.replace("EXPR", expression), 0)
+        self.assert_exception_body('try { p=null; var result=(object)(p="safe"); } '
+                                   'finally { Use(p.Length); }', 0)
+        self.assert_exception_body('if(nullable==null)return; '
+                                   'try { p=null; var result=(int)nullable; p="safe"; } '
+                                   'finally { Use(p.Length); }', 0)
+        self.assert_exception_body('if(array==null)return; try { p=null; '
+                                   'foreach(var item in array) { p="safe"; } p="safe"; } '
+                                   'finally { Use(p.Length); }', 0)
+        self.assert_exception_body('if(text==null)return; try { p=null; '
+                                   'foreach(var item in text) { p="safe"; } p="safe"; } '
+                                   'finally { Use(p.Length); }', 0)
+
+    def test_disposal_runs_at_the_end_of_the_resource_scope(self):
+        for block in (
+            'using(resource) { p=null; }',
+            'using(resource) { p=null; resource=null; }',
+            '{ using var copy=resource; p=null; }',
+            '{ using IDisposable first=null, second=resource; p=null; }',
+            'using(IDisposable first=null, second=resource) { p=null; }',
+        ):
+            with self.subTest(block=block):
+                self.assert_exception_body('try { BODY p="safe"; } finally { Use(p.Length); }'
+                                           .replace("BODY", block), 1)
+        for block in (
+            'using((IDisposable)null) { p=null; }',
+            'using(IDisposable first=null, second=null) { p=null; }',
+            '{ using IDisposable copy=null; p=null; }',
+            '{ using IDisposable first=null, second=null; p=null; }',
+        ):
+            with self.subTest(block=block):
+                self.assert_exception_body('try { BODY p="safe"; } finally { Use(p.Length); }'
+                                           .replace("BODY", block), 0)
+        self.assert_exception_body('try { using var copy=resource; p=null; p="safe"; } '
+                                   'finally { Use(p.Length); }', 0)
+
+    def test_exception_paths_join_catches_and_finally_in_order(self):
+        self.assert_exception_body('try { p=null; var result=new Throws {}; p="safe"; } '
+                                   'catch { } Use(p.Length);', 1)
+        self.assert_exception_body('try { p=null; var result=new Throws {}; p="safe"; } '
+                                   'catch { p="safe"; } Use(p.Length);', 0)
+        self.assert_exception_body('try { p=null; var result=new Throws {}; } '
+                                   'finally { p="safe"; } Use(p.Length);', 0)
+        self.assert_exception_body('try { p=null; var result=(string)value; return; } '
+                                   'finally { Use(p.Length); }', 1)
+
+    def test_initializer_members_do_not_rebind_caller_names(self):
+        head = '''using System;
+class C {
+    string p;
+    C nested;
+    int Count;
+    C() { nested=new C(true); }
+    C(bool child) { }
+    void Log() { }
+    void Use(object value) { }
+    void Run(int number) { if(p==null) Log();
+'''
+        for expression, expected in (
+            ('new C { p="safe" }', 1),
+            ('new C { nested={p="safe"} }', 1),
+            ('new C { p=(p="safe") }', 0),
+            ('new C { Count=number<2 ? 1:2, p=(p="safe") }', 0),
+            ('new { p="safe" }', 1),
+            ('new { Other=(p="safe") }', 0),
+            ('new string[] { p="safe" }', 0),
+        ):
+            with self.subTest(expression=expression):
+                marker = '/*warn:p*/' if expected else ''
+                source = head + 'var other=' + expression + '; Use(' + marker + 'p.Length); } }'
+                self.assert_negative_markers(source)
+        self.assert_exception_body('try { p=null; var other=new C { Field=(p="safe") }; } '
+                                   'finally { Use(p.Length); }', 1)
+        self.assert_exception_body('try { p=null; var other=new { Field=(p="safe") }; } '
+                                   'finally { Use(p.Length); }', 0)
+
+    def test_method_identity_is_qualified_and_lexical(self):
+        source = '''using System;
+namespace A { class Receiver { public void Call(string value) { } } }
+namespace B {
+    class Receiver {
+        public Func<string,int> Call { get { throw new Exception(); } }
+    }
+}
+class C {
+    void Run(string p, B.Receiver receiver) {
+        if(p==null)return;
+        try { p=null; receiver.Call(p="safe"); }
+        finally { Use(/*warn:p*/p.Length); }
+    }
+    void Use(object value) { }
+}'''
+        self.assert_negative_markers(source)
+        without_collision = source.replace(
+            'namespace A { class Receiver { public void Call(string value) { } } }', '')
+        self.assert_negative_markers(without_collision)
+        actual_method = source.replace('B.Receiver receiver', 'A.Receiver receiver').replace('/*warn:p*/', '')
+        self.assert_negative_markers(actual_method)
+        lexical = source.replace('class C {', 'namespace B { class C {').replace(
+            'B.Receiver receiver', 'Receiver receiver') + '}'
+        self.assert_negative_markers(lexical)
+
 
 @unittest.skipUnless(os.environ.get("UBS_CSHARP_SEMANTICS_PUBLIC") == "1",
                      "set UBS_CSHARP_SEMANTICS_PUBLIC=1 after verified module/helper pins")
@@ -627,15 +1225,17 @@ class CSharpSemanticPublicTests(unittest.TestCase):
         details = f"{command!r}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         self.assertEqual(result.returncode, 2 if partial else int(bool(expected)), details)
         if partial:
-            self.assertIn("incomplete", result.stderr, details)
+            self.assertIn("incomplete" if mode.startswith("module-") else "Partial run",
+                          result.stderr, details)
         try:
             report = json.loads(result.stdout)
         except ValueError as exc:
             self.fail(f"invalid {format_}: {exc}\n{details}")
         actual = []
         if format_ == "sarif":
-            successful = []
+            successful, invocations = [], []
             for run in report["runs"]:
+                invocations.extend(run.get("invocations", []))
                 successful.extend(invocation["executionSuccessful"] for invocation in run.get("invocations", []))
                 for finding in run.get("results", []):
                     location = finding["locations"][0]["physicalLocation"]
@@ -644,8 +1244,26 @@ class CSharpSemanticPublicTests(unittest.TestCase):
                     actual.append((finding["ruleId"], location["region"]["startLine"],
                                    location["region"]["startColumn"]))
             self.assertTrue(any(not value for value in successful) if partial else all(successful), details)
+            if partial:
+                self.assertTrue(all(invocation["exitCode"] == 2 for invocation in invocations), details)
+                if not mode.startswith("module-"):
+                    notifications = [item for invocation in invocations
+                                     for item in invocation.get("toolExecutionNotifications", [])]
+                    self.assertTrue(any("incomplete" in item.get("message", {}).get("text", "")
+                                        for item in notifications), details)
         else:
             self.assertEqual(report["status"], "partial" if partial else "ok", details)
+            if partial:
+                failure = report if mode.startswith("module-") else report["scanners"][0]
+                self.assertEqual((failure["error"], failure["reason"], failure["module_error"]),
+                                 ("analysis", "analysis-incomplete", "ANALYSIS_INCOMPLETE"), details)
+                if not mode.startswith("module-"):
+                    self.assertEqual((report["error"], report["reason"]),
+                                     ("analysis", "analysis-incomplete"), details)
+                    failed = report["failed_modules"][0]
+                    self.assertEqual((failed["language"], failed["status"], failed["module_error"]),
+                                     ("csharp", "partial", "ANALYSIS_INCOMPLETE"), details)
+                    self.assertIn("incomplete", failed["message"], details)
             counts = report if mode.startswith("module-") else report["totals"]
             self.assertEqual((counts["critical"], counts["warning"], counts["info"], counts["files"]),
                              (0, len(expected), 0, 1), details)

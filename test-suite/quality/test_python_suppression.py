@@ -451,5 +451,92 @@ class PythonDetectorMarkerOwnershipTests(unittest.TestCase):
                         self.assertEqual(sites, expected, hits)
 
 
+# index_arithmetic is left out on purpose: its tier markers (a warning-tier
+# marker hiding the info tier, 3bac98f5) are an open owner decision, and main
+# keeps its own marker handling for that detector until then.
+class PythonLegacyMarkerOwnershipTests(unittest.TestCase):
+    CASES = (
+        ("division", "py.numeric.division", "value = numerator / denominator\n", 1),
+        ("io_open_checks", "py.io.open-missing-with", "handle = open('config')\n", 1),
+        ("is_literal", "py.comparison.is-literal", "if value is 1000:\n    pass\n", 1),
+        ("missing_returns", "py.functions.missing-returns", "def work():\n    pass\n", 1),
+        ("mutation_during_iteration", "py.collections.mutation-during-iteration",
+         "for value in items:\n    items.remove(value)\n", 1),
+    )
+
+    @staticmethod
+    def sites(detector, source, rule):
+        return [hit[2] if len(hit) == 5 else hit[1] for hit in detector.find([source])
+                if (hit[0] if len(hit) == 5 else detector.RULE_ID) == rule]
+
+    def test_legacy_detectors_use_exact_comment_ownership(self):
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="python-legacy-markers-", dir=artifacts) as tmp:
+            source = Path(tmp) / "case.py"
+            for name, rule, text, line in self.CASES:
+                detector = importlib.import_module(f"ubs_core.py_detectors.{name}")
+                for variant, expected in (("unmarked", [line]), ("unrelated", [line]),
+                                          ("quoted", [line + 1]), ("owned", []), ("previous", [])):
+                    with self.subTest(detector=name, variant=variant):
+                        lines = text.splitlines()
+                        if variant == "unrelated":
+                            lines[line - 1] += "  # ubs:ignore[unrelated.rule]"
+                        elif variant == "owned":
+                            lines[line - 1] += f"  # ubs:ignore[{rule}]"
+                        elif variant == "quoted":
+                            lines.insert(line - 1, 'marker_note = "ubs:ignore"')
+                        elif variant == "previous":
+                            lines.insert(line - 1, f"# ubs:ignore[{rule}]")
+                        source.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                        self.assertEqual(self.sites(detector, source, rule), expected)
+
+    def test_multiline_legacy_statements_own_their_comments(self):
+        cases = (
+            ("division", "py.numeric.division", "value = (numerator /\n    denominator  # {marker}\n)\n", 1),
+            ("io_open_checks", "py.io.open-missing-with", "handle = open(\n    'config'  # {marker}\n)\n", 1),
+            ("is_literal", "py.comparison.is-literal", "if (  # {marker}\n    value is\n    1000\n):\n    pass\n", 3),
+            ("missing_returns", "py.functions.missing-returns", "def work(\n    value  # {marker}\n):\n    pass\n", 1),
+            ("mutation_during_iteration", "py.collections.mutation-during-iteration",
+             "for value in (\n    items  # {marker}\n):\n    items.remove(value)\n", 1),
+        )
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="python-legacy-multiline-", dir=artifacts) as tmp:
+            source = Path(tmp) / "case.py"
+            for name, rule, text, line in cases:
+                detector = importlib.import_module(f"ubs_core.py_detectors.{name}")
+                for marker, expected in ((f"ubs:ignore[{rule}]", []),
+                                         ("ubs:ignore[unrelated.rule]", [line])):
+                    with self.subTest(detector=name, marker=marker):
+                        source.write_text(text.replace("{marker}", marker), encoding="utf-8")
+                        self.assertEqual(self.sites(detector, source, rule), expected)
+
+    def test_ladders_apply_scope_before_selecting_each_eligible_tier(self):
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="python-legacy-ladders-", dir=artifacts) as tmp:
+            source = Path(tmp) / "case.py"
+            for name, high, low, statement in (
+                ("division", "py.numeric.division-heavy", "py.numeric.division", "value = numerator / denominator"),
+            ):
+                detector = importlib.import_module(f"ubs_core.py_detectors.{name}")
+                count = detector.WARNING_ABOVE + 1
+                for marker, marked, expected_rule, expected_count in (
+                    ("", 0, high, count),
+                    (f"ubs:ignore[{low}]", count, high, count),
+                    (f"ubs:ignore[{high}]", 1, low, count),
+                    (f"ubs:ignore[{high}]", count, low, count),
+                    ("ubs:ignore", 1, low, count - 1),
+                ):
+                    with self.subTest(detector=name, marker=marker, marked=marked):
+                        lines = [statement + (f"  # {marker}" if index < marked else "")
+                                 for index in range(count)]
+                        source.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                        hits = list(detector.find([source]))
+                        self.assertEqual(len(hits), expected_count, hits)
+                        self.assertEqual({hit[0] for hit in hits}, {expected_rule}, hits)
+
+
 if __name__ == "__main__":
     unittest.main()

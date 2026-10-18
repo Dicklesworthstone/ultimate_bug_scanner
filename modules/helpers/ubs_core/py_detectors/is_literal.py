@@ -16,7 +16,7 @@ writes `value is True or value == 1` is deliberately separating the two;
 rewriting it to `==` would be the bug. (The self-scan reported 22 of these,
 every one of them a tri-state check.)
 
-Same-file and previous-line `ubs:ignore` markers suppress a hit (9102-9108).
+Comment directives use shared statement ownership and exact rule scopes.
 """
 from __future__ import annotations
 
@@ -24,6 +24,8 @@ import ast
 import warnings
 from pathlib import Path
 from typing import Iterable, Sequence
+
+from ubs_core.suppression import SourceSuppressions
 
 RULE_ID = "py.comparison.is-literal"
 CATEGORY = 4
@@ -54,6 +56,7 @@ def _is_literal_operand(node: ast.AST) -> bool:
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
+    suppressions = SourceSuppressions("python")
     for path in files:
         if path.suffix.lower() not in {'.py', '.pyi'}:
             continue
@@ -66,6 +69,7 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
         except Exception:
             continue
         lines = text.splitlines()
+        suppression_index = suppressions.index(path, text)
         seen: set[int] = set()
         stack = [tree]
         while stack:
@@ -89,10 +93,7 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
                 if line_no in seen or line_no <= 0:
                     continue
                 idx = line_no - 1
-                if any(
-                    0 <= i < len(lines) and 'ubs:ignore' in lines[i]
-                    for i in (idx, idx - 1)
-                ):
+                if suppression_index.is_suppressed(line_no, RULE_ID):
                     continue
                 seen.add(line_no)
                 code = lines[idx].strip() if 0 <= idx < len(lines) else ''

@@ -12,6 +12,7 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Fixed
 
+- JavaScript destructuring retains null, undefined and noniterable entry failures before defaults or function bodies can hide unsafe data. Default and bypass exceptions retain their separate stores; parenthesized templates remain strings, and parameter initializers resolve shadowed `undefined` in their actual scope. Unary `void` preserves operand effects while supplying a clean undefined value.
 - External analyzer completion now accounts for inherited child processes, ignored child-exit signals, and native AST errors on stderr, including errors beyond the preview. Corrupt stream records remain recorded if consumption stops early; incomplete AST output cannot become a clean result through missing error collectors, inconsistent exit codes, or a prefilter failure.
 - JavaScript calls capture spread elements before later argument effects, evaluate spread expressions once, and keep updates that later parameter defaults make to earlier bindings. Destructuring assignments also retain receivers returned by calls, including their computed-key effects, exceptions and DOM sink writes.
 - JavaScript taint analysis preserves field identity through object and array destructuring in declarations, assignments and function parameters. Rest bindings are fresh shallow copies, defaults retain their ordered effects and exceptions, and member targets retain borrowed aliases and direct sink checks. Separate callers and clean sibling fields remain distinct.

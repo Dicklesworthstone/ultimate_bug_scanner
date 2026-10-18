@@ -683,6 +683,7 @@ class _State(dict):
         self.budget = budget if budget is not None else getattr(values, 'budget', None)
         if self.budget is not None:
             self.budget.spend(1 + len(values) + len(getattr(values, 'cells', {}))
+                              + len(getattr(values, 'binding_kinds', {}))
                               + _heap_work(getattr(values, 'heap', {})))
         super().__init__(values)
         self.bindings = dict(bindings if bindings is not None else getattr(values, 'bindings', {}))
@@ -694,6 +695,7 @@ class _State(dict):
         self.weak_refs = set(getattr(values, 'weak_refs', ()))
         self.array_lengths = dict(getattr(values, 'array_lengths', {}))
         self.written_cells = set(getattr(values, 'written_cells', ()))
+        self.binding_kinds = dict(getattr(values, 'binding_kinds', {}))
 
     def copy(self):
         return _State(self)
@@ -703,7 +705,8 @@ class _State(dict):
                 and self.bindings == other.bindings and self.owners == other.owners
                 and self.cells == other.cells and self.heap == other.heap
                 and self.weak_refs == other.weak_refs and self.array_lengths == other.array_lengths
-                and self.written_cells == other.written_cells)
+                and self.written_cells == other.written_cells
+                and self.binding_kinds == other.binding_kinds)
 
     def __ne__(self, other):
         return not self == other
@@ -725,7 +728,7 @@ def _join_states(*states):
         return None
     budget = states[0].budget
     if budget is not None:
-        budget.spend(sum(1 + len(state) + len(state.cells) + _heap_work(state.heap)
+        budget.spend(sum(1 + len(state) + len(state.cells) + len(state.binding_kinds) + _heap_work(state.heap)
                          for state in states))
     names = set().union(*(state.keys() for state in states))
     bindings = {}
@@ -751,6 +754,9 @@ def _join_states(*states):
         result.heap[ref] = {key: _join(*(slots.get(key, frozenset()) for slots in objects)) for key in keys}
     result.weak_refs = set().union(*(state.weak_refs for state in states))
     result.written_cells = set().union(*(state.written_cells for state in states))
+    for key in set().union(*(state.binding_kinds.keys() for state in states)):
+        kinds = [state.binding_kinds.get(key) for state in states]
+        result.binding_kinds[key] = kinds[0] if all(kind == kinds[0] for kind in kinds) else None
     for ref in set().union(*(state.array_lengths.keys() for state in states)):
         lengths = [state.array_lengths[ref] for state in states if ref in state.array_lengths]
         result.array_lengths[ref] = lengths[0] if all(length == lengths[0] for length in lengths) else None
@@ -846,6 +852,14 @@ class _NoNormalCompletion(Exception):
     """
 
 
+class _BoundValues(dict):
+    """Actual binding kinds travel to an existing bounded call context."""
+
+    def __init__(self):
+        super().__init__()
+        self.kinds = {}
+
+
 @dataclass(eq=False)
 class _HeapCall:
     """A reusable transfer summary for one abstract heap input, not an inline AST.
@@ -873,6 +887,7 @@ class _HeapOutput:
     heap: dict
     weak_refs: set
     array_lengths: dict
+    binding_kinds: dict = field(default_factory=dict)
 
 
 def _pairs(code, start=0, end=None):
@@ -1361,6 +1376,7 @@ class _Flow:
         state.weak_refs = incoming.weak_refs
         state.array_lengths = incoming.array_lengths
         state.written_cells = incoming.written_cells
+        state.binding_kinds = dict(incoming.binding_kinds)
 
     def effect(self, start, label, fact, state=None):
         if state is not None:
@@ -1385,7 +1401,9 @@ class _Flow:
             return _cell_value(self.engine.binding(scope, name, position), state)
         return frozenset()
 
-    def assign(self, name, fact, state, position, binding=None):
+    def assign(self, name, fact, state, position, binding=None, input_kind=None):
+        if input_kind == 'undefined':
+            fact = frozenset()
         state[name] = _step(fact, name)
         state.bindings[name] = binding
         if re.fullmatch(r'[A-Za-z_$][\w$]*', name):
@@ -1393,6 +1411,8 @@ class _Flow:
             state.owners[name] = key
             state.cells[key] = state[name]
             state.written_cells.add(key)
+            state.binding_kinds[key] = (input_kind or
+                ('present' if isinstance(binding, _Scope) or (_refs(fact) and not frozenset(fact)) else None))
 
     @staticmethod
     def property_key(raw):
@@ -1513,6 +1533,7 @@ class _Flow:
                     exported = self.engine.export_key(module, name)
                     if exported is not None:
                         state.cells[exported] = self.property(_Fact(refs=(ref,)), name, state)
+                        state.binding_kinds[exported] = None
                         state.written_cells.add(exported)
                         state.bindings[exported[2]] = None
             if ref in state.array_lengths:
@@ -1526,6 +1547,7 @@ class _Flow:
         """Evaluate an assignment target before reading its selected value."""
         text, code = self.engine.text, self.scope.code
         _, end = next(_chunks(code, start, end, '='))
+        _, end = next(_chunks(code, start, end, ':'))
         while start < end and text[start].isspace():
             start += 1
         while end > start and text[end - 1].isspace():
@@ -1537,6 +1559,8 @@ class _Flow:
             while end > start and text[end - 1].isspace():
                 end -= 1
         target = self.access(start, end)
+        if target is not None and target[2] == end and not target[1]:
+            return None
         if target is not None and target[2] == end and target[1]:
             receiver = self.read_access((target[0], target[1][:-1], target[2]), state)
             key, computed = target[1][-1]
@@ -1545,8 +1569,9 @@ class _Flow:
             # Retain its evaluated identity before a computed key/default can
             # mutate or rebind it; GetValue of the selected source follows.
             member = re.search(r'\.\s*([A-Za-z_$][\w$]*)\s*$', code[start:end])
-            opening = next((left for left, right in self.pairs.items()
-                            if start < left and right == end - 1 and code[left] == '['), None)
+            opening = self.pairs.get(end - 1) if code[end - 1:end] == ']' else None
+            if opening is not None and opening <= start:
+                opening = None
             if member is not None:
                 receiver = self.value(start, start + member.start(), state)
                 key, computed = member.group(1), None
@@ -1561,7 +1586,103 @@ class _Flow:
             self.value(*computed, state)
         return start, end, receiver, key
 
-    def bind_pattern(self, start, end, fact, state, position, missing=False, binding=None, reference=None):
+    def binding_input(self, start, end, state):
+        """Recognize definite entry values without guessing scalar types.
+
+        `void` consumes one unary expression. A following binary/comma
+        operator belongs to a larger value and must not activate a default.
+        """
+        code = self.engine.code
+
+        def skip(position):
+            while position < end and code[position].isspace():
+                position += 1
+            return position
+
+        start = skip(start)
+        while end > start and code[end - 1].isspace():
+            end -= 1
+        while code[start:start + 1] == '(' and self.pairs.get(start) == end - 1:
+            if self.engine.text[start:start + 1] == '`':
+                # Template delimiters also become parentheses in the lexical
+                # code view. Keep their string identity after outer parens;
+                # their interpolation's null/void value is not the input.
+                return 'present'
+            start, end = skip(start + 1), end - 1
+            while end > start and code[end - 1].isspace():
+                end -= 1
+        raw = code[start:end]
+        if raw == 'null':
+            return 'null'
+        if re.fullmatch(r'[A-Za-z_$][\w$]*', raw) and raw not in {'true', 'false', 'null'}:
+            scope, position = self.scope, start
+            if self.parameter_context:
+                # The parameter environment includes all formals, but body
+                # var/let/function declarations cannot shadow an initializer.
+                formal = any(raw in names for names, _, _, _ in scope.params)
+                if formal:
+                    position = scope.body_start
+                elif scope.parent is not None:
+                    position, scope = scope.start, scope.parent
+            lexical = self.engine.lexical_binding(scope, raw, position)
+            shadowed = (raw in state or any(name == raw and left == lexical[1]
+                        for left, _right, name in self.engine.binding_regions[lexical[0]]))
+            if raw == 'undefined' and not shadowed:
+                return 'undefined'
+            return state.binding_kinds.get(self.engine.binding(scope, raw, position))
+        if re.fullmatch(r'(?:true|false|(?:0[xX][\da-fA-F]+|0[bB][01]+|0[oO][0-7]+'
+                        r'|[0-9][\d_]*(?:\.[\d_]*)?(?:[eE][+-]?[\d_]+)?)n?)', raw):
+            return 'present' if self.engine.text[start:start + 1] in {'"', "'"} else 'noniterable'
+        head = re.match(r'void\b', raw)
+        if head is None:
+            return None
+        cursor = skip(start + head.end())
+        while cursor < end:
+            self.engine.budget.spend()
+            prefix = re.match(r'(?:void|typeof|delete|await|new)\b|\+\+|--|[!~+-]', code[cursor:end])
+            if prefix is None:
+                break
+            cursor = skip(cursor + prefix.end())
+        function = next((child for child in self.scope.children if child.start == cursor and child.end <= end), None)
+        if function is not None:
+            cursor = function.end
+        elif code[cursor:cursor + 1] in {'(', '[', '{'} and cursor in self.pairs:
+            cursor = self.pairs[cursor] + 1
+        else:
+            primary = re.match(r'[A-Za-z_$][\w$]*|(?:0[xX][\da-fA-F]+|0[bB][01]+|0[oO][0-7]+'
+                               r'|[0-9][\d_]*(?:\.[\d_]*)?(?:[eE][+-]?[\d_]+)?)n?', code[cursor:end])
+            if primary is None:
+                return None
+            cursor += primary.end()
+        while (cursor := skip(cursor)) < end:
+            self.engine.budget.spend()
+            member = re.match(r'(?:\?\.)?\.\s*[A-Za-z_$][\w$]*|\?\.\s*[A-Za-z_$][\w$]*', code[cursor:end])
+            if member:
+                cursor += member.end()
+            elif code[cursor:cursor + 2] == '?.' and code[skip(cursor + 2):skip(cursor + 2) + 1] in {'(', '['}:
+                opening = skip(cursor + 2)
+                cursor = self.pairs.get(opening, end) + 1
+            elif code[cursor:cursor + 1] in {'(', '['} and cursor in self.pairs:
+                cursor = self.pairs[cursor] + 1
+            elif code[cursor:cursor + 2] in {'++', '--'}:
+                cursor += 2
+            else:
+                break
+        return 'undefined' if skip(cursor) == end else None
+
+    def binding_entry_failure(self, fact, state, array, missing=False, input_kind=None):
+        """Snapshot possible pattern-entry failures before binding effects."""
+        unusable = (missing or input_kind in {'null', 'undefined'}
+                    or (array and input_kind == 'noniterable'))
+        unknown_scalar = (input_kind not in {'present', 'noniterable'}
+                          and (not _refs(fact) or frozenset(fact)))
+        unknown_iterator = array and any(ref not in state.array_lengths for ref in _refs(fact))
+        if unusable or unknown_scalar or unknown_iterator:
+            self.throws.append((frozenset(), state.copy()))
+        return unusable
+
+    def bind_pattern(self, start, end, fact, state, position, missing=False, binding=None,
+                     reference=None, input_kind=None, entry_checked=False):
         """Bind a pattern, preserving field identity and initializer order.
 
         Scalar facts do not distinguish undefined from another clean scalar,
@@ -1583,10 +1704,29 @@ class _Flow:
         if equals < end:
             if missing:
                 fact = self.value(equals + 1, end, state)
-            elif not _refs(fact) or frozenset(fact):
+                input_kind = self.binding_input(equals + 1, end, state)
+                missing = input_kind == 'undefined'
+                if missing:
+                    fact = frozenset()
+            elif input_kind is None and (not _refs(fact) or frozenset(fact)):
+                # The bypass can be null, while the default has its own
+                # result and effects. Check each entry store before joining:
+                # the null branch never executes the default initializer.
+                nested = code[start:start + 1] in {'{', '['}
+                if nested:
+                    self.binding_entry_failure(fact, state, code[start] == '[')
                 fallback, branch = self.branch_value(equals + 1, end, state.copy())
+                fallback_kind = (self.binding_input(equals + 1, end, branch)
+                                 if branch is not None else None)
+                if fallback_kind == 'undefined':
+                    fallback = frozenset()
+                if nested and branch is not None:
+                    self.binding_entry_failure(fallback, branch, code[start] == '[',
+                                               input_kind=fallback_kind)
+                entry_checked |= nested
                 self.replace_state(state, _join_states(state, branch))
                 fact = _join(fact, fallback)
+                input_kind = None
             end = equals
             while end > start and text[end - 1].isspace():
                 end -= 1
@@ -1599,7 +1739,13 @@ class _Flow:
             while end > start and text[end - 1].isspace():
                 end -= 1
         if code[start:start + 1] in {'{', '['} and self.pairs.get(start) == end - 1:
+            # RequireObjectCoercible/GetIterator happens before any selected
+            # property's target, default or body. Unknown scalar facts retain
+            # that exceptional path; a proven nullish input cannot continue.
             array, excluded = code[start] == '[', set()
+            if (not entry_checked and
+                    self.binding_entry_failure(fact, state, array, missing, input_kind)):
+                raise _NoNormalCompletion
             for index, (left, right) in enumerate(_chunks(code, start + 1, end - 1)):
                 while left < right and text[left].isspace():
                     left += 1
@@ -1676,7 +1822,8 @@ class _Flow:
             return
         for name in _binding_names(text[start:end]):
             state.owners[name] = self.engine.binding(self.scope, name, position)
-            self.assign(name, fact, state, position, binding)
+            self.assign(name, fact, state, position, binding,
+                        'undefined' if missing else input_kind)
 
     def allocate(self, start, end, state):
         text, code = self.engine.text, self.scope.code
@@ -1834,6 +1981,7 @@ class _Flow:
         for key, fact in writes.items():
             value = self.substitute(fact, callee, bound, incoming)
             state.cells[key] = value
+            state.binding_kinds[key] = None
             state.written_cells.add(key)
             name = key[2]
             if name not in state or state.owners.get(name) == key:
@@ -1870,12 +2018,13 @@ class _Flow:
         """
         actual, uncertain = [], None
         maybe_missing = set()
+        input_kinds = {}
 
         def expand(left, right):
             nonlocal uncertain
-            while left < right and self.scope.code[left].isspace():
+            while left < right and self.engine.text[left].isspace():
                 left += 1
-            while right > left and self.scope.code[right - 1].isspace():
+            while right > left and self.engine.text[right - 1].isspace():
                 right -= 1
             raw = self.scope.code[left:right].strip()
             if raw.startswith('...'):
@@ -1921,7 +2070,17 @@ class _Flow:
                     fact = self.property(fact, None, state)
             else:
                 fact = self.value(left, right, state)
-            actual.append((fact, raw in {'undefined', 'void 0'}))
+            kind = self.binding_input(left, right, state)
+            if kind is None and _refs(fact) and not frozenset(fact):
+                kind = 'present'
+            if kind is not None:
+                input_kinds[len(actual)] = kind
+            if kind == 'undefined':
+                fact = frozenset()  # operand effects ran; the void value is clean
+            unknown_undefined = kind is None and raw.strip('() \t\r\n') == 'undefined'
+            if unknown_undefined:
+                maybe_missing.add(len(actual))
+            actual.append((fact, kind == 'undefined' or unknown_undefined))
             return fact
 
         try:
@@ -1930,11 +2089,11 @@ class _Flow:
             # Recursive closures otherwise retain the completed flow and its
             # incoming heap until cyclic GC, including when expansion throws.
             expand = None
-        return facts, (actual, uncertain, maybe_missing)
+        return facts, (actual, uncertain, maybe_missing, input_kinds)
 
     def bind(self, callee, prepared, state, call_location):
-        actual, uncertain, maybe_missing = prepared
-        bound = {}
+        actual, uncertain, maybe_missing, input_kinds = prepared
+        bound = _BoundValues()
         default_flow = None
         default_state = None
 
@@ -1949,7 +2108,7 @@ class _Flow:
                 writes = {key: self.substitute(value, callee, bound, incoming)
                           for key, value in store.cells.items()
                           if key[0] is not callee and key in store.written_cells}
-                output = _HeapOutput(store.heap, store.weak_refs, store.array_lengths)
+                output = _HeapOutput(store.heap, store.weak_refs, store.array_lengths, store.binding_kinds)
                 thrown = self.engine.apply_heap_output(
                     incoming, exceptional, output, writes,
                     self.substitute(fact, callee, bound, incoming), call_location)
@@ -1958,7 +2117,8 @@ class _Flow:
                 writes = {key: self.substitute(value, callee, bound, incoming)
                           for key, value in default_state.cells.items()
                           if key[0] is not callee and key in default_state.written_cells}
-                output = _HeapOutput(default_state.heap, default_state.weak_refs, default_state.array_lengths)
+                output = _HeapOutput(default_state.heap, default_state.weak_refs, default_state.array_lengths,
+                                     default_state.binding_kinds)
                 # Initializers and rest bindings execute before the callee's
                 # summary. Give their fresh objects this invocation's history
                 # too, while borrowed aliases keep their incoming identities.
@@ -1971,9 +2131,14 @@ class _Flow:
         for index, (names, rest, default, pattern) in enumerate(callee.params):
             incoming = _join(*(fact for fact, _ in actual[index:])) if rest else (actual[index][0] if index < len(actual) else frozenset())
             missing = index >= len(actual) or actual[index][1]
+            input_kind = input_kinds.get(index)
+            if missing and index not in maybe_missing:
+                input_kind = 'undefined'
+            entry_checked = False
             if uncertain is not None and index >= uncertain:
                 incoming = _join(incoming, *(fact for fact, _ in actual[uncertain:]))
                 missing = True
+                input_kind = None
             destructured = self.engine.text[slice(*pattern)].lstrip().startswith(('{', '['))
             if rest or destructured or (default is not None and missing):
                 if default_flow is None:
@@ -1989,9 +2154,11 @@ class _Flow:
                     default_state.heap = {ref: dict(slots) for ref, slots in state.heap.items()}
                     default_state.weak_refs = set(state.weak_refs)
                     default_state.array_lengths = dict(state.array_lengths)
+                    default_state.binding_kinds = dict(state.binding_kinds)
                 default_state.update(bound)
                 for name in bound:
                     default_state.owners[name] = self.engine.binding(callee, name)
+                    default_state.binding_kinds[default_state.owners[name]] = bound.kinds.get(name)
             if rest:
                 # A rest formal receives a fresh array, including when its
                 # binding is itself an array/object pattern. Joining actuals
@@ -2012,31 +2179,54 @@ class _Flow:
                 default_state.array_lengths[ref] = (max(0, len(actual) - index)
                     if uncertain is None and previous is None else None)
                 incoming = _Fact(refs=(ref,))
+                missing, input_kind = False, 'present'
             if default is not None and missing and not rest:
                 default_flow.pairs.update(_pairs(callee.code, *default))
                 bypass = (default_state.copy() if index in maybe_missing or
                           (uncertain is not None and index >= uncertain) else None)
+                if bypass is not None and destructured:
+                    default_flow.binding_entry_failure(
+                        incoming, bypass, self.engine.text[slice(*pattern)].lstrip().startswith('['),
+                        input_kind=input_kind)
+                    entry_checked = True
                 default_fact, evaluated = default_flow.branch_value(*default, default_state)
                 if evaluated is None and bypass is None:
                     complete_defaults(normal=False)
                     raise _NoNormalCompletion
+                default_kind = (default_flow.binding_input(*default, evaluated)
+                                if evaluated is not None else None)
+                if default_kind == 'undefined':
+                    default_fact = frozenset()
+                if entry_checked and evaluated is not None:
+                    default_flow.binding_entry_failure(
+                        default_fact, evaluated, self.engine.text[slice(*pattern)].lstrip().startswith('['),
+                        input_kind=default_kind)
                 if bypass is not None:
                     # An unknown spread or scalar slot may supply this formal.
                     # Its default cannot prove that cleanup occurred.
                     default_state = _join_states(bypass, evaluated)
+                    input_kind = None
+                else:
+                    input_kind = default_kind
+                missing = input_kind == 'undefined'
                 incoming = _join(incoming, default_fact)
             if destructured:
                 default_flow.pairs.update(_pairs(callee.code, *pattern))
                 try:
-                    default_flow.bind_pattern(*pattern, incoming, default_state, callee.body_start)
+                    default_flow.bind_pattern(*pattern, incoming, default_state, callee.body_start,
+                                              missing and index not in maybe_missing and uncertain is None,
+                                              input_kind=input_kind, entry_checked=entry_checked)
                 except _NoNormalCompletion:
                     complete_defaults(normal=False)
                     raise
                 for name in names:
                     bound[name] = default_state.get(name, frozenset())
+                    bound.kinds[name] = default_state.binding_kinds.get(self.engine.binding(callee, name))
             else:
                 for name in names:
                     bound[name] = incoming
+                    bound.kinds[name] = (input_kind or
+                        ('present' if _refs(incoming) and not frozenset(incoming) else None))
             if default_state is not None:
                 # A later initializer can assign an earlier formal. Keep the
                 # updated parameter environment for both subsequent defaults
@@ -2044,6 +2234,7 @@ class _Flow:
                 for name in bound:
                     if name in default_state:
                         bound[name] = default_state[name]
+                        bound.kinds[name] = default_state.binding_kinds.get(self.engine.binding(callee, name))
         complete_defaults()
         return bound
 
@@ -2085,8 +2276,10 @@ class _Flow:
             closing = self.pairs[start]
             assignment = re.match(r'\s*=(?!=|>)\s*', code[closing + 1:end])
             if assignment is not None:
-                fact = self.value(closing + 1 + assignment.end(), end, state)
-                self.bind_pattern(start, closing + 1, fact, state, start)
+                rhs = closing + 1 + assignment.end()
+                fact = self.value(rhs, end, state)
+                self.bind_pattern(start, closing + 1, fact, state, start,
+                                  input_kind=self.binding_input(rhs, end, state))
                 return fact
             if closing == end - 1:
                 return self.allocate(start, end, state)
@@ -2121,7 +2314,8 @@ class _Flow:
             if receiver is not None and _refs(receiver):
                 self.write_property(receiver, key, _step(fact, target), evaluated)
             else:
-                self.assign(target, fact, evaluated, start, self.callable(rhs, end, evaluated))
+                self.assign(target, fact, evaluated, start, self.callable(rhs, end, evaluated),
+                            self.binding_input(rhs, end, evaluated) if assignment.group(1) == '=' else None)
             for location, expr_start, rule, label in self.engine.write_sinks:
                 if (rule == self.rule and start <= location < expr_start <= rhs
                         and not code[expr_start:rhs].strip()):
@@ -2223,6 +2417,15 @@ class _Flow:
                 callee = None
             if isinstance(callee, _Scope):
                 self.engine.import_captures(callee, state, self.rule)
+                if (callee in self.engine.input_kind_scopes and self.scope.parent is not None
+                        and self.scope not in self.engine.input_kind_scopes):
+                    # Namespace imports and runtime aliases can resolve only
+                    # after module/call summaries are available. Propagate
+                    # this finite requirement to their scalar wrappers too.
+                    self.engine.input_kind_scopes.add(self.scope)
+                    self.engine.heap_scopes.add(self.scope)
+                    for caller in self.engine.dependents[(self.scope, self.rule)]:
+                        self.engine.enqueue(caller)
                 deferred = callee.asynchronous and not re.search(r'\bawait\s*$', code[start:match_start])
                 sole_local_call = (code[start:match_start].strip() in {'', 'await'} and closing + 1 == end)
                 self.engine.dependents[(callee, self.rule)].add(self.scope)
@@ -2374,7 +2577,7 @@ class _Flow:
         offset = start + len(text[start:end]) - len(text[start:end].lstrip())
         entries = _declaration_entries(text, self.scope.code, start, end)
         if entries:
-            for _, names, left, rhs, finish in entries:
+            for kind, names, left, rhs, finish in entries:
                 fact = self.value(rhs, finish, state) if rhs is not None else frozenset()
                 binding = self.callable(rhs, finish, state) if rhs is not None else None
                 if rhs is not None and binding is None:
@@ -2383,10 +2586,18 @@ class _Flow:
                         binding = 'imported'
                 pattern_end = rhs - 1 if rhs is not None else finish
                 if text[left:pattern_end].lstrip().startswith(('{', '[')):
-                    self.bind_pattern(left, pattern_end, fact, state, start, binding=binding)
+                    self.bind_pattern(left, pattern_end, fact, state, start, binding=binding,
+                                      input_kind=self.binding_input(rhs, finish, state) if rhs is not None else 'undefined')
                 else:
                     for name in names:
-                        self.assign(name, fact, state, start, binding)
+                        if (kind == 'var' and rhs is None and
+                                self.engine.binding(self.scope, name, start) in state.binding_kinds):
+                            # Hoisting already initialized this cell. A later
+                            # bare var declaration does not replace a formal
+                            # or an earlier assignment with undefined.
+                            continue
+                        self.assign(name, fact, state, start, binding,
+                                    self.binding_input(rhs, finish, state) if rhs is not None else 'undefined')
             return state
         compound = re.match(r'([A-Za-z_$][\w$]*)\s*(\+=|\|\|=|&&=|\?\?=)\s*(.+)', raw, re.S)
         if compound:
@@ -2415,7 +2626,7 @@ class _Flow:
                 if required and not required.group(1).startswith(('./', '../', '/')):
                     binding = 'imported'
             for name in parse_targets(target):
-                self.assign(name, fact, state, start, binding)
+                self.assign(name, fact, state, start, binding, self.binding_input(rhs, end, state))
         else:
             self.value(start, end, state)
         return state
@@ -2509,6 +2720,7 @@ class _Flow:
             for name in local:
                 state[name], state.bindings[name] = frozenset(), None
                 state.owners[name] = self.engine.binding(self.scope, name, node.start + 1)
+                state.binding_kinds[state.owners[name]] = 'undefined'
             result = self.block(node.body, state)
             for exit_state in (*self.breaks[break_count:], *self.continues[continue_count:]):
                 self.restore(exit_state, outer, local)
@@ -2875,6 +3087,18 @@ class _Engine:
                                          if default is not None),
                                        *(pattern for _, _, _, pattern in scope.params)])
         }
+        # Shadowing identifies a lexical cell; it does not prove that the
+        # cell contains a defined value. These functions need the same finite
+        # caller contexts used for borrowed objects so a missing actual and a
+        # clean string actual do not share one default-initializer decision.
+        self.input_kind_scopes = {
+            scope for scope in self.functions
+            if any(name == 'undefined' for _left, _right, name in self.binding_regions[scope])
+            or any(key[2] == 'undefined' and any(left == key[1] and name == key[2]
+                   for left, _right, name in self.binding_regions[key[0]])
+                   for key in self.capture_keys[scope])
+        }
+        self.heap_scopes.update(self.input_kind_scopes)
         # Factories hidden behind ordinary local wrappers still need an object
         # result, including allocations/throws in parameter initializers. The
         # capture graph already includes those calls and named arrow helpers.
@@ -2882,9 +3106,12 @@ class _Engine:
         while True:
             added = {scope for scope in self.functions if scope not in self.heap_scopes
                      and self.local_targets[scope] & self.heap_scopes}
-            if not added:
+            kind_added = {scope for scope in self.functions if scope not in self.input_kind_scopes
+                          and self.local_targets[scope] & self.input_kind_scopes}
+            if not added and not kind_added:
                 break
             self.heap_scopes.update(added)
+            self.input_kind_scopes.update(kind_added)
 
     def selected_import(self, scope, name):
         key = self.lexical_binding(scope, name)
@@ -2957,6 +3184,7 @@ class _Engine:
             return frozenset()
         fact = source.cells.get(key, source.get(key[2], frozenset()))
         state.cells[key] = fact
+        state.binding_kinds[key] = source.binding_kinds.get(key)
         pending = list(_refs(fact))
         while pending:
             ref = pending.pop()
@@ -2972,6 +3200,7 @@ class _Engine:
                         state.written_cells.add(exported)
                         if exported in source.cells:
                             state.cells[exported] = source.cells[exported]
+                            state.binding_kinds[exported] = source.binding_kinds.get(exported)
             for value in state.heap[ref].values():
                 pending.extend(_refs(value) - state.heap.keys())
             if ref in source.array_lengths:
@@ -3060,6 +3289,9 @@ class _Engine:
         available = incoming.cells.keys() | incoming.owners.values()
         state.cells = {key: _cell_value(key, incoming) for key in available
                        if key[0] in ancestors and key in self.capture_keys[callee]}
+        state.binding_kinds = {key: incoming.binding_kinds.get(key) for key in state.cells}
+        state.binding_kinds.update({self.binding(callee, name): kind
+                                    for name, kind in getattr(bound, 'kinds', {}).items()})
         for name, key in incoming.owners.items():
             if key in state.cells and self.binding(callee, name) == key:
                 state[name], state.owners[name] = state.cells[key], key
@@ -3118,6 +3350,7 @@ class _Engine:
         else:
             signature = (callee, rule, location, frozenset(bound.items()),
                          frozenset(incoming.cells.items()), frozenset(incoming.bindings.items()),
+                         frozenset(incoming.binding_kinds.items()),
                          frozenset((ref, frozenset(slots.items())) for ref, slots in incoming.heap.items()),
                          frozenset(incoming.weak_refs), frozenset(incoming.array_lengths.items()))
             context = self.heap_calls.get(signature)
@@ -3236,6 +3469,7 @@ class _Engine:
         for key, fact in writes.items():
             value = translate(fact)
             state.cells[key] = value
+            state.binding_kinds[key] = output.binding_kinds.get(key)
             state.written_cells.add(key)
             name = key[2]
             if name not in state or state.owners.get(name) == key:
@@ -3252,14 +3486,17 @@ class _Engine:
         for name in self.declarations(statements):
             state[name], state.bindings[name] = frozenset(), None
             state.owners[name] = self.binding(scope, name)
+            state.binding_kinds[state.owners[name]] = 'undefined'
         for names, _, _, _ in scope.params:
             for name in names:
                 state[name] = context.bound.get(name, frozenset())
                 state.bindings[name], state.owners[name] = None, self.binding(scope, name)
+                state.binding_kinds[state.owners[name]] = context.incoming.binding_kinds.get(state.owners[name])
         for child in scope.children:
             if child.name and child.declaration:
                 state.bindings[child.name] = child
                 state.owners[child.name] = self.binding(scope, child.name, child.start)
+                state.binding_kinds[state.owners[child.name]] = 'present'
         flow = _Flow(self, scope, rule)
         if scope.concise:
             value, final = flow.branch_value(scope.body_start, scope.body_end, state)
@@ -3297,7 +3534,8 @@ class _Engine:
                 for fact in slots.values():
                     pending.extend(_refs(fact) - heap.keys())
             return _HeapOutput(heap, store.weak_refs & heap.keys(),
-                               {ref: length for ref, length in store.array_lengths.items() if ref in heap})
+                               {ref: length for ref, length in store.array_lengths.items() if ref in heap},
+                               {key: store.binding_kinds.get(key) for key in changes})
 
         return (returned, flow.effects, normal_writes, escaped_heap(output, returned, normal_writes),
                 thrown, throw_writes, escaped_heap(exceptional, thrown, throw_writes))
@@ -3410,15 +3648,18 @@ class _Engine:
         for name in self.declarations(statements):
             state[name], state.bindings[name] = frozenset(), None
             state.owners[name] = self.binding(scope, name)
+            state.binding_kinds[state.owners[name]] = 'undefined'
         for names, _, _, _ in scope.params:
             for name in names:
                 state[name] = frozenset({_Trace(('parameter', scope, name), (name,))})
                 state.bindings[name] = None
                 state.owners[name] = self.binding(scope, name)
+                state.binding_kinds[state.owners[name]] = None
         for child in scope.children:
             if child.name and child.declaration:
                 state.bindings[child.name] = child
                 state.owners[child.name] = self.binding(scope, child.name, child.start)
+                state.binding_kinds[state.owners[child.name]] = 'present'
         flow = _Flow(self, scope, rule)
         if scope.concise:
             value, final = flow.branch_value(scope.body_start, scope.body_end, state)
@@ -3496,7 +3737,33 @@ class _Engine:
                 for caller in self.dependents[(scope, rule)]:
                     self.enqueue(caller)
         self.current_task = None
+        callers, callees = defaultdict(set), defaultdict(set)
+        for (callee, domain), readers in self.dependents.items():
+            if domain != rule:
+                continue
+            for reader in readers:
+                caller = reader.scope if isinstance(reader, _HeapCall) else reader
+                callers[callee].add(caller)
+                callees[caller].add(callee)
+        # Follow concrete entry summaries, retaining independent summaries
+        # for uncalled functions and isolated recursive components. A cycle
+        # with no outside entry must not lose its direct source evidence.
+        pending = [scope for scope in self.scopes if scope.parent is None or not callers[scope]]
+        seen, invoked = set(), set()
+        while pending:
+            caller = pending.pop()
+            if caller in seen:
+                continue
+            seen.add(caller)
+            self.budget.spend(1 + len(callees[caller]))
+            invoked.update(callees[caller])
+            pending.extend(callees[caller] - seen)
         for scope in self.scopes:
+            if scope in self.input_kind_scopes and scope in invoked:
+                # These defaults depend on actual definedness, which a
+                # symbolic parameter trace cannot express. Concrete callers
+                # already publish the effects of their separate contexts.
+                continue
             for (location, label), fact in self.summaries[(scope, rule)][1].items():
                 if self.dependents[(scope, rule)]:
                     # Known call sites already instantiated captures at

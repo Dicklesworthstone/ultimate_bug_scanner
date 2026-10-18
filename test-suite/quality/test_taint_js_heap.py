@@ -42,15 +42,25 @@ class HeapTaintTests(unittest.TestCase):
             self.assertIn(' -> ', finding['message'])
         return findings
 
-    def assert_runtime_sends(self, source, expected):
+    def assert_runtime_sends(self, source, expected, *, module=False):
         """Use fixed harmless markers to check the independent JS behavior."""
         node = shutil.which('node')
         if node is None:
             return  # The scanner assertions still run without this optional oracle.
-        fixture = ('const req = {query: {html: "review-input"}}; '
-                   'const observed = []; const res = {send(value) { observed.push(value); }};\n')
-        result = subprocess.run([node, '-e', fixture + source
-                                 + '\nprocess.stdout.write(JSON.stringify(observed));'],
+        if module:
+            fixture = ('const req = {query: {html: "review-input"}}; '
+                       'const observed = []; const res = {send(value) { observed.push(value); }};\n')
+            command = [node, '--input-type=module', '-e', fixture + source
+                       + '\nprocess.stdout.write(JSON.stringify(observed));']
+        else:
+            # Fixture declarations before source would disable a root directive
+            # prologue. Execute the authored script verbatim with injected data.
+            fixture = ('const vm = require("node:vm"); const observed = []; '
+                       'const context = {req: {query: {html: "review-input"}}, '
+                       'res: {send(value) { observed.push(value); }}}; ')
+            command = [node, '-e', fixture + 'vm.runInNewContext(' + json.dumps(source)
+                       + ', context, {timeout: 5000}); process.stdout.write(JSON.stringify(observed));']
+        result = subprocess.run(command,
                                 text=True, capture_output=True, timeout=15, check=False)
         self.assertEqual(result.returncode, 0, (source, result.stdout, result.stderr))
         self.assertEqual(json.loads(result.stdout), expected, source)
@@ -816,6 +826,164 @@ class HeapTaintTests(unittest.TestCase):
             self.assertEqual([(path.name, rule, line) for path, rule, line, _, _ in findings],
                              [('app.mjs', 'js.taint.xss', 2)], findings)
 
+    def test_global_undefined_writes_cannot_suppress_parameter_defaults(self):
+        reader = 'function read(value = req.query.html) { return value; } '
+        for assignment in ('undefined = "safe";', 'undefined = req.query.html;',
+                           '({x: undefined} = {x: "safe"});', '[undefined] = ["safe"];',
+                           'undefined ||= "safe";', 'undefined ??= "safe";'):
+            for nested in (False, True):
+                with self.subTest(assignment=assignment, nested=nested):
+                    source = reader + ('function outer() { ' + assignment
+                              + ' return read(undefined); } res.send(outer());' if nested
+                              else assignment + ' res.send(read(undefined));')
+                    self.assert_runtime_sends(source, ['review-input'])
+                    self.scan(source, 'xss')
+        for declaration in ('let undefined;', 'var undefined;', 'let undefined = "old";'):
+            source = (reader + 'function outer() { ' + declaration
+                      + ' undefined = "safe"; return read(undefined); } res.send(outer());')
+            self.assert_runtime_sends(source, ['safe'])
+            self.scan(source)
+
+    def test_global_undefined_assignment_retains_rhs_value_and_effects_once(self):
+        source = ('const box = {html: "safe"}; const calls = []; '
+                  'function value() { calls.push("once"); box.html = req.query.html; return box.html; } '
+                  'const result = (undefined = value()); '
+                  'res.send(result); res.send(box.html); res.send(undefined); res.send(calls.length);')
+        self.assert_runtime_sends(source, ['review-input', 'review-input', None, 1])
+        self.scan(source, 'xss', 'xss')
+        source = ('function read(value = req.query.html) { return value; } '
+                  'function outer(value = (undefined = "safe"), result = read(undefined)) { '
+                  'let undefined = "body"; return result; } res.send(outer());')
+        self.assert_runtime_sends(source, ['review-input'])
+        self.scan(source, 'xss')
+
+    def test_strict_global_undefined_write_keeps_post_rhs_exception_store(self):
+        for initial, rhs, following, expected in (
+            ('req.query.html', '"safe"', 'box.html = "safe";', ['review-input']),
+            ('"safe"', '(box.html = req.query.html)', 'box.html = "safe";', ['review-input']),
+            ('req.query.html', '(box.html = "safe")', 'box.html = req.query.html;', ['safe']),
+        ):
+            for strict in (False, True):
+                with self.subTest(initial=initial, rhs=rhs, strict=strict):
+                    source = ('const box = {html: ' + initial + '}; function set() { '
+                              + ('"use strict";' if strict else '') + 'undefined = ' + rhs + '; '
+                              + following + ' } try { set(); } catch (error) {} res.send(box.html);')
+                    actual = expected if strict else ['review-input' if 'req.query.html' in following else 'safe']
+                    self.assert_runtime_sends(source, actual)
+                    self.scan(source, *(('xss',) if 'review-input' in actual else ()))
+        for target in ('({x: undefined} = {x: "safe"})', '[undefined] = ["safe"]'):
+            source = ('"use strict"; const box = {html: req.query.html}; try { ' + target
+                      + '; box.html = "safe"; } catch (error) {} res.send(box.html);')
+            self.assert_runtime_sends(source, ['review-input'])
+            self.scan(source, 'xss')
+        source = ('const box = {html: req.query.html}; function outer() { "use strict"; '
+                  'function set(value = (undefined = (box.html = "safe"))) { box.html = req.query.html; } '
+                  'try { set(); } catch (error) {} } outer(); res.send(box.html);')
+        self.assert_runtime_sends(source, ['safe'])
+        self.scan(source)
+
+    def test_strict_global_undefined_catch_finally_and_inheritance(self):
+        for handler, expected in (('catch (error) {}', ['review-input']),
+                                  ('catch (error) { box.html = "safe"; }', ['safe'])):
+            source = ('const box = {html: req.query.html}; function outer() { "use strict"; '
+                      'function set() { undefined = "safe"; box.html = "safe"; } '
+                      'try { set(); } ' + handler + ' } outer(); res.send(box.html);')
+            self.assert_runtime_sends(source, expected)
+            self.scan(source, *(('xss',) if 'review-input' in expected else ()))
+        source = ('const box = {html: req.query.html}; function set() { "use strict"; '
+                  'try { undefined = "safe"; box.html = "safe"; } finally { res.send(box.html); } } '
+                  'try { set(); } catch (error) {}')
+        self.assert_runtime_sends(source, ['review-input'])
+        self.scan(source, 'xss')
+        source = ('"use strict"; const box = {html: req.query.html}; function set() { '
+                  'let undefined; undefined = "safe"; box.html = "safe"; } set(); res.send(box.html);')
+        self.assert_runtime_sends(source, ['safe'])
+        self.scan(source)
+
+    def test_builtin_undefined_logical_writes_preserve_exact_bypass(self):
+        for strict in (False, True):
+            prefix = '"use strict";' if strict else ''
+            source = (prefix + 'const box = {html: req.query.html}; '
+                      'undefined &&= (box.html = "safe"); res.send(box.html);')
+            self.assert_runtime_sends(source, ['review-input'])
+            self.scan(source, 'xss')
+            source = (prefix + 'const box = {html: req.query.html}; try { '
+                      'undefined &&= (box.html = "ignored"); box.html = "safe"; '
+                      '} catch (error) {} res.send(box.html);')
+            self.assert_runtime_sends(source, ['safe'])
+            self.scan(source)
+            for operator in ('||=', '??='):
+                source = (prefix + 'const box = {html: "safe"}; try { undefined ' + operator
+                          + ' (box.html = req.query.html); box.html = "safe"; '
+                          '} catch (error) {} res.send(box.html);')
+                expected = ['review-input' if strict else 'safe']
+                self.assert_runtime_sends(source, expected)
+                self.scan(source, *(('xss',) if strict else ()))
+
+    def test_global_undefined_strictness_requires_a_real_directive(self):
+        body = ('const box = {html: req.query.html}; try { undefined = "safe"; '
+                'box.html = "safe"; } catch (error) {} res.send(box.html);')
+        for prefix in ('"use strict";', '\ufeff"use strict";',
+                       '/* before */ "other directive"; "use strict";', '"use strict"\n',
+                       '#!/usr/bin/env node\n"use strict";'):
+            with self.subTest(prefix=prefix):
+                self.assert_runtime_sends(prefix + body, ['review-input'])
+                self.scan(prefix + body, 'xss')
+        for prefix in ('; "use strict";', '"use strict" + "suffix";',
+                       '"use\\x20strict";', 'const ignored = "use strict";',
+                       'function before() {} "use strict";', '#!/usr/bin/export\n'):
+            with self.subTest(prefix=prefix):
+                self.assert_runtime_sends(prefix + body, ['safe'])
+                self.scan(prefix + body)
+
+    def test_global_undefined_module_strictness_excludes_property_names(self):
+        reader = 'function read(value = req.query.html) { return value; } '
+        for expression in ('obj.export', 'obj?.export', 'obj.export()', 'obj.import.meta',
+                           'obj.\ufeffexport'):
+            source = ('const obj = {export: function() {}, import: {meta: "safe"}}; '
+                      + expression + '; ' + reader + 'undefined = "safe"; res.send(read(undefined));')
+            self.assert_runtime_sends(source, ['review-input'])
+            self.scan(source, 'xss')
+        body = ('const box = {html: req.query.html}; try { undefined = "safe"; '
+                'box.html = "safe"; } catch (error) {} res.send(box.html);')
+        for suffix, prefix in (('mjs', ''), ('js', 'export {}; ')):
+            source = prefix + body
+            self.assert_runtime_sends(source, ['review-input'], module=True)
+            with tempfile.TemporaryDirectory(prefix='ubs-undefined-esm-') as scratch:
+                path = Path(scratch) / ('handler.' + suffix)
+                path.write_text(source, encoding='utf-8')
+                findings = list(taint.run(RunContext(lang='javascript', files=[path])))
+            self.assertEqual([item['rule'] for item in findings], ['javascript.taint.xss'])
+
+    def test_global_var_undefined_requires_known_declaration_environment(self):
+        source = ('function read(value = req.query.html) { return value; } '
+                  'var undefined = "safe"; res.send(read(undefined));')
+        self.assert_runtime_sends(source, ['review-input'])
+        with self.assertRaisesRegex(taint.AnalysisLimit, 'top-level var undefined'):
+            self.scan(source)
+        script_commonjs_names = ('var undefined = "safe"; const module = {exports: {}}; '
+                                'module.exports.x = 1; function read(value = req.query.html) { return value; } '
+                                'res.send(read(undefined));')
+        self.assert_runtime_sends(script_commonjs_names, ['review-input'])
+        with self.assertRaisesRegex(taint.AnalysisLimit, 'top-level var undefined'):
+            self.scan(script_commonjs_names)
+        unreachable = ('function read(x=req.query.html){return x} '
+                       'function outer(){undefined="safe";return read(undefined)} '
+                       'try{res.send(outer());throw 0;var undefined;}catch(error){}')
+        self.assert_runtime_sends(unreachable, ['review-input'])
+        with self.assertRaisesRegex(taint.AnalysisLimit, 'top-level var undefined'):
+            self.scan(unreachable)
+        self.assert_runtime_sends(source, ['safe'], module=True)
+        for suffix in ('mjs', 'cjs'):
+            with tempfile.TemporaryDirectory(prefix='ubs-undefined-var-') as scratch:
+                path = Path(scratch) / ('handler.' + suffix)
+                path.write_text(source, encoding='utf-8')
+                self.assertEqual(list(taint.run(RunContext(lang='javascript', files=[path]))), [])
+        for declaration in ('class Handler { set() {', 'const handler = { set() {'):
+            source = (declaration + 'undefined = "safe"; res.send(req.query.html); }};')
+            with self.assertRaisesRegex(taint.AnalysisLimit, 'unsupported strictness context'):
+                self.scan(source)
+
     def test_void_arguments_apply_defaults_after_operand_effects(self):
         for argument in ('void 1', 'void (1 + 2)', 'void +1', 'void 1e2', 'void 1n',
                          'void ({value: "safe"})', 'void Math.abs(-1)', 'void function() {}'):
@@ -1473,6 +1641,14 @@ class HeapTaintTests(unittest.TestCase):
             ('uninitialized-undefined-local-uses-default', 'function read(value=req.query.html){return value;} function outer(){var undefined;return read(undefined);} res.send(outer());', {'xss'}),
             ('void-undefined-local-uses-default', 'function read(value=req.query.html){return value;} function outer(){const undefined=void 0;return read(undefined);} res.send(outer());', {'xss'}),
             ('clean-undefined-formal-bypasses-default', 'function read(value=req.query.html){return value;} function outer(undefined){return read(undefined);} res.send(outer("safe"));', set()),
+            ('global-undefined-write-keeps-default', 'function read(value=req.query.html){return value;} undefined="safe"; res.send(read(undefined));', {'xss'}),
+            ('nested-global-undefined-write-keeps-default', 'function read(value=req.query.html){return value;} function outer(){undefined="safe";return read(undefined);} res.send(outer());', {'xss'}),
+            ('local-undefined-write-bypasses-default', 'function read(value=req.query.html){return value;} function outer(){let undefined;undefined="safe";return read(undefined);} res.send(outer());', set()),
+            ('strict-undefined-write-skips-cleanup', '"use strict";const box={html:req.query.html};try{undefined="safe";box.html="safe";}catch(error){}res.send(box.html);', {'xss'}),
+            ('strict-undefined-write-keeps-rhs-cleanup', '"use strict";const box={html:req.query.html};try{undefined=(box.html="safe");box.html=req.query.html;}catch(error){}res.send(box.html);', set()),
+            ('strict-undefined-and-bypasses-write', '"use strict";const box={html:req.query.html};undefined&&=(box.html="safe");res.send(box.html);', {'xss'}),
+            ('strict-undefined-or-keeps-rhs-source', '"use strict";const box={html:"safe"};try{undefined||=(box.html=req.query.html);box.html="safe";}catch(error){}res.send(box.html);', {'xss'}),
+            ('strict-undefined-catch-repairs-store', '"use strict";const box={html:req.query.html};try{undefined="safe";}catch(error){box.html="safe";}res.send(box.html);', set()),
             ('void-expression-uses-default', 'function read(x=req.query.html){return x;} res.send(read(void (1+2)));', {'xss'}),
         ]
         for name, source, expected in cases:

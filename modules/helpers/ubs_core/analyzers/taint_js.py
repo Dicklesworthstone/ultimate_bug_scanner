@@ -828,6 +828,7 @@ class _Scope:
     parameter_sources: dict = field(default_factory=dict)
     asynchronous: bool = False
     generator: bool = False
+    method: bool = False
 
 
 # Slots reduce the retained statement graph on runtimes whose dataclasses
@@ -1120,7 +1121,7 @@ def _function_scopes(text, code):
                 type_ranges.append((closing + 1, arrow))
                 arrow_parameters[arrow] = (opening, closing)
 
-    def add(start, parameter_span, body, name='', declaration=False, concise=False):
+    def add(start, parameter_span, body, name='', declaration=False, concise=False, method=False):
         params_start, params_end = parameter_span
         if body in body_starts:
             return
@@ -1145,6 +1146,7 @@ def _function_scopes(text, code):
         scope.parameter_sources = _parameter_sources(text, code, params_start, params_end)
         scope.asynchronous = async_prefix is not None
         scope.generator = generator
+        scope.method = method
         scopes.append(scope)
 
     for match in re.finditer(r'\bfunction\s*\*?\s*([A-Za-z_$][\w$]*)?', code):
@@ -1219,7 +1221,7 @@ def _function_scopes(text, code):
             continue
         body = _signature_body(code, pairs, closing)
         if body is not None and body not in body_starts:
-            add(match.start(), (match.end(), closing), body)
+            add(match.start(), (match.end(), closing), body, method=True)
 
     root = _Scope(0, len(text), 0, len(text), '<module>')
     for scope in sorted(scopes, key=lambda item: (item.start, -item.end)):
@@ -1401,7 +1403,35 @@ class _Flow:
             return _cell_value(self.engine.binding(scope, name, position), state)
         return frozenset()
 
+    def binding_context(self, name, position):
+        scope = self.scope
+        if self.parameter_context:
+            # All formals exist in the parameter environment; body declarations
+            # do not. A default's assignment follows the same lookup as a read.
+            if any(name in names for names, _, _, _ in scope.params):
+                position = scope.body_start
+            elif scope.parent is not None:
+                position, scope = scope.start, scope.parent
+        return scope, position
+
+    def global_undefined(self, position):
+        scope, position = self.binding_context('undefined', position)
+        owner, begin, _ = self.engine.lexical_binding(scope, 'undefined', position)
+        return not any(name == 'undefined' and left == begin
+                       for left, _right, name in self.engine.binding_regions[owner])
+
     def assign(self, name, fact, state, position, binding=None, input_kind=None):
+        if name == 'undefined' and self.global_undefined(position):
+            # The global property is nonwritable. The caller already evaluated
+            # the RHS, including its writes and its assignment-expression value.
+            # Strict PutValue throws with precisely that post-RHS store.
+            strict = self.engine.strict_mode(self.scope)
+            if strict is None:
+                raise AnalysisLimit('global undefined assignment has unsupported strictness context')
+            if strict:
+                self.throws.append((frozenset(), state.copy()))
+                raise _NoNormalCompletion
+            return
         if input_kind == 'undefined':
             fact = frozenset()
         state[name] = _step(fact, name)
@@ -1615,18 +1645,10 @@ class _Flow:
         if raw == 'null':
             return 'null'
         if re.fullmatch(r'[A-Za-z_$][\w$]*', raw) and raw not in {'true', 'false', 'null'}:
-            scope, position = self.scope, start
-            if self.parameter_context:
-                # The parameter environment includes all formals, but body
-                # var/let/function declarations cannot shadow an initializer.
-                formal = any(raw in names for names, _, _, _ in scope.params)
-                if formal:
-                    position = scope.body_start
-                elif scope.parent is not None:
-                    position, scope = scope.start, scope.parent
+            scope, position = self.binding_context(raw, start)
             lexical = self.engine.lexical_binding(scope, raw, position)
-            shadowed = (raw in state or any(name == raw and left == lexical[1]
-                        for left, _right, name in self.engine.binding_regions[lexical[0]]))
+            shadowed = any(name == raw and left == lexical[1]
+                           for left, _right, name in self.engine.binding_regions[lexical[0]])
             if raw == 'undefined' and not shadowed:
                 return 'undefined'
             return state.binding_kinds.get(self.engine.binding(scope, raw, position))
@@ -2298,6 +2320,13 @@ class _Flow:
             old = (self.property(receiver, key, state) if receiver is not None
                    else self.reference(target, state)) if assignment.group(1) != '=' else frozenset()
             logical = assignment.group(1) in {'||=', '&&=', '??='}
+            if logical and target == 'undefined' and self.global_undefined(start):
+                # This one builtin has a known falsy/nullish value. &&= never
+                # reaches its RHS or PutValue; ||= and ??= always reach both.
+                # Do not merge a fictitious bypass after a strict write throws.
+                if assignment.group(1) == '&&=':
+                    return frozenset()
+                logical = False
             if logical:
                 # The receiver and computed key are evaluated once, before
                 # the split. A RHS write, call or throw belongs only to the
@@ -2913,6 +2942,8 @@ class _Engine:
         self.graph = graph
         self.source_free = False
         self.module_roots = {}
+        self.module_kinds, self.strict_modes = {}, {}
+        self.global_undefined_vars = set()
         self.default_targets = {}
         self.commonjs_targets = {}
         self.commonjs_namespace_refs = {}
@@ -3112,6 +3143,110 @@ class _Engine:
                 break
             self.heap_scopes.update(added)
             self.input_kind_scopes.update(kind_added)
+
+    def module_kind(self, root):
+        if root in self.module_kinds:
+            return self.module_kinds[root]
+        module = self.module_roots.get(root)
+        kind = ('module' if module is not None and module.path.suffix in {'.mjs', '.mts'}
+                else 'commonjs' if module is not None and module.path.suffix in {'.cjs', '.cts'}
+                else 'script')
+        # The module graph masks static import/export syntax for flow parsing.
+        # Inspect its original lexical view once, skipping nested expressions
+        # and bodies, to recognize ESM strictness even in a selected .js file.
+        source = self.text[root.body_start:root.body_end]
+        self.budget.spend(len(source))
+        code = lexical_views(source)[1]
+        pairs, cursor = _pairs(code), 0
+        if source.startswith('#!'):
+            while cursor < len(code) and source[cursor] not in '\n\r\u2028\u2029':
+                self.budget.spend()
+                cursor += 1
+        identifier = re.compile(r'[A-Za-z_$][\w$]*')
+        while cursor < len(code) and kind != 'module':
+            self.budget.spend()
+            if code[cursor] in '([{' and cursor in pairs:
+                cursor = pairs[cursor] + 1
+                continue
+            word = identifier.match(code, cursor)
+            if word is not None:
+                after = word.end()
+                if word.group() in {'import', 'export'}:
+                    before = cursor - 1
+                    while before >= 0 and (code[before].isspace() or code[before] == '\ufeff'):
+                        before -= 1
+                    lookahead = after
+                    while lookahead < len(code) and (code[lookahead].isspace() or code[lookahead] == '\ufeff'):
+                        lookahead += 1
+                    if (before < 0 or code[before] != '.') and (word.group() == 'export'
+                            or code[lookahead:lookahead + 1] != '('):
+                        kind = 'module'
+                cursor = after
+            else:
+                cursor += 1
+        self.module_kinds[root] = kind
+        return kind
+
+    def strict_directive(self, scope):
+        if scope.concise:
+            return False
+        source, cursor, end = self.text, scope.body_start, scope.body_end
+        if scope.parent is None and source[cursor:cursor + 2] == '#!':
+            # A legal root hashbang is a comment before the directive prologue.
+            while cursor < end and source[cursor] not in '\n\r\u2028\u2029':
+                self.budget.spend()
+                cursor += 1
+        while cursor < end:
+            while cursor < end and (source[cursor].isspace() or source[cursor] == '\ufeff'):
+                cursor += 1
+            if source[cursor:cursor + 1] not in {'"', "'"}:
+                return False
+            start, quote = cursor, source[cursor]
+            cursor += 1
+            while cursor < end and source[cursor] != quote:
+                self.budget.spend()
+                cursor += 2 if source[cursor] == '\\' else 1
+            if cursor >= end:
+                return None
+            cursor += 1
+            literal_end = cursor
+            while cursor < end and (source[cursor].isspace() or source[cursor] == '\ufeff'):
+                cursor += 1
+            if cursor < end and source[cursor] != ';':
+                gap = source[literal_end:cursor]
+                if not any(char in gap for char in '\n\r\u2028\u2029'):
+                    return False  # The string is part of a larger expression.
+                word = re.match(r'[A-Za-z_$][\w$]*', source[cursor:end])
+                if word is None or word.group() in {'in', 'instanceof'}:
+                    # Restricted-line-terminator and continuation forms require
+                    # more grammar than this bounded directive recognizer.
+                    return None
+            if source[start:literal_end] in {'"use strict"', "'use strict'"}:
+                return True
+            if source[cursor:cursor + 1] == ';':
+                cursor += 1
+        return False
+
+    def strict_mode(self, scope):
+        original, pending, result = scope, [], False
+        while scope is not None:
+            if scope in self.strict_modes:
+                result = self.strict_modes[scope]
+                break
+            self.budget.spend()
+            directive = self.strict_directive(scope)
+            if directive is True or (scope.parent is None and self.module_kind(scope) == 'module'):
+                self.strict_modes[scope] = result = True
+                break
+            # The selected method recognizer includes both intrinsically strict
+            # class methods and possibly sloppy object methods. Do not guess.
+            pending.append((scope, directive is None or scope.method))
+            scope = scope.parent
+        for scope, uncertain in reversed(pending):
+            if uncertain and result is not True:
+                result = None
+            self.strict_modes[scope] = result
+        return self.strict_modes[original]
 
     def selected_import(self, scope, name):
         key = self.lexical_binding(scope, name)
@@ -3551,6 +3686,8 @@ class _Engine:
             for node in statements:
                 if node.kind == 'expression':
                     for kind, names, _, _, _ in _declaration_entries(self.text, scope.code, node.start, node.end):
+                        if kind == 'var' and 'undefined' in names and scope.parent is None:
+                            self.global_undefined_vars.add(scope)
                         begin, finish = (scope.body_start, scope.body_end) if kind == 'var' else (left, right)
                         regions.extend((begin, finish, name) for name in names)
                 if node.kind == 'block':
@@ -3561,12 +3698,17 @@ class _Engine:
                         finish = max((child.end for child in node.body), default=node.end)
                         header = next(_chunks(scope.code, node.start, node.end, ';'))
                         for kind, names, _, _, _ in _declaration_entries(self.text, scope.code, *header):
+                            if kind == 'var' and 'undefined' in names and scope.parent is None:
+                                self.global_undefined_vars.add(scope)
                             begin, stop = (scope.body_start, scope.body_end) if kind == 'var' else (node.start, finish)
                             regions.extend((begin, stop, name) for name in names)
                         iterator = re.match(r'\s*(let|const|var)\s+(.+?)\s+(?:of|in)\b', self.text[node.start:node.end])
                         if iterator:
+                            names = _binding_names(iterator.group(2))
+                            if iterator.group(1) == 'var' and 'undefined' in names and scope.parent is None:
+                                self.global_undefined_vars.add(scope)
                             begin, stop = (scope.body_start, scope.body_end) if iterator.group(1) == 'var' else (node.start, finish)
-                            regions.extend((begin, stop, name) for name in _binding_names(iterator.group(2)))
+                            regions.extend((begin, stop, name) for name in names)
                     pending.append((node.body, left, right))
                 pending.append((node.alternate, left, right))
                 if node.kind == 'try':
@@ -3643,6 +3785,11 @@ class _Engine:
         return [] if scope.concise else _Parser(scope).sequence(scope.body_start, scope.body_end)
 
     def analyze(self, scope, rule):
+        if scope in self.global_undefined_vars and self.module_kind(scope) == 'script':
+            # Global var declarations are instantiated even in unreachable code.
+            # A script reuses the nonwritable builtin, while CommonJS/ESM create
+            # a local cell. Plain .js cannot prove that declaration environment.
+            raise AnalysisLimit('top-level var undefined requires a known module declaration environment')
         statements = self.scope_statements(scope)
         state = _State(budget=self.budget)
         for name in self.declarations(statements):

@@ -2019,6 +2019,31 @@ class AstIngestionTests(unittest.TestCase):
         self.assertIn("5000 malformed", errors[0])
         self.assertLess(len(errors[0]), 1000)
 
+    def test_observed_corruption_survives_early_consumer_exit(self) -> None:
+        valid = self.payload(self.diagnostic())
+        for corrupt, detail in ((b"\xff\n", "UTF-8"), (b"null\n", "malformed AST"),
+                                (b"x" * 4096 + b"\n", "output exceeds")):
+            with self.subTest(detail=detail), patch.object(self.tools, "OUTPUT_RECORD_LIMIT", len(valid) + 8):
+                errors = []
+                records = self.tools.parse_ast_diagnostics(io.BytesIO(corrupt * 1000 + valid), errors)
+                self.assertEqual(next(records)["ruleId"], "custom.critical")
+                # Inspect before close: already-observed corruption cannot be
+                # deferred until a caller happens to exhaust the iterator.
+                self.assertEqual(len(errors), 1)
+                self.assertIn("1000", errors[0])
+                self.assertIn(detail, errors[0])
+                records.close()
+                self.assertEqual(len(errors), 1)
+                self.assertLess(len(errors[0]), 1000)
+
+    def test_stream_consumer_exception_is_not_a_capture_read_error(self) -> None:
+        errors = []
+        rows = self.tools.iter_output_lines(io.BytesIO(b"valid\n"), errors, context="test")
+        self.assertEqual(next(rows), (1, "valid\n"))
+        with self.assertRaisesRegex(OSError, "consumer failed"):
+            rows.throw(OSError("consumer failed"))
+        self.assertFalse(errors)
+
     def test_unicode_separators_inside_json_strings_are_not_record_boundaries(self) -> None:
         row = self.diagnostic(file="source\u2028name.py", message="one\u0085two\u2029three")
         errors = []
@@ -2065,6 +2090,14 @@ class AstIngestionTests(unittest.TestCase):
                 result = list(self.tools.scan_ast_config(self.config, [self.source], errors))
                 self.assertEqual(len(result), len(rows))
                 self.assertFalse(errors)
+
+    def test_finding_exit_without_diagnostics_is_incomplete(self) -> None:
+        self.executable(b" \n", 1)
+        errors = []
+        self.assertEqual(list(self.tools.scan_ast_config(self.config, [self.source], errors)), [])
+        self.assertTrue(any("findings exit without valid diagnostics" in error for error in errors))
+        with self.assertRaisesRegex(RuntimeError, "findings exit without valid diagnostics"):
+            list(self.tools.scan_ast_config(self.config, [self.source]))
 
     def test_failed_invocation_keeps_diagnostics(self) -> None:
         for code in (2, 3, 124, 127):
@@ -2141,6 +2174,143 @@ class AstIngestionTests(unittest.TestCase):
         self.assertEqual(output.returncode, 0)
         self.assertEqual(errors, ["document tool: output exceeds 512 bytes"])
 
+    def test_whole_document_capture_preserves_strict_utf8_and_merged_stderr(self) -> None:
+        self.executable(b"prefix\xff\n", suffix="sys.stderr.buffer.write(b'warning\\n')\nsys.stderr.flush()\n")
+        for strict in (False, True):
+            with self.subTest(strict=strict):
+                errors = []
+                output = self.tools.run_command("document tool", [str(self.binary)], self.root, 5, errors,
+                                                merge_stderr=True, strict_utf8=strict)
+                self.assertEqual(output.stdout, "prefix\ufffd\nwarning\n")
+                self.assertEqual(output.stderr, "")
+                self.assertEqual(bool(errors), strict)
+                if strict:
+                    self.assertIn("not valid UTF-8", errors[0])
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process groups")
+    def test_exited_leader_with_live_child_is_partial_and_child_stops(self) -> None:
+        import signal
+        import time
+        # The child writes its procfs identity: a sandbox may expose an outer
+        # procfs while Popen/kill use namespace-local PIDs.
+        child_state = self.root / "child-state.json"
+        child_code = (
+            "import json, os, time\nfrom pathlib import Path\n"
+            "stat = Path('/proc/self/stat')\n"
+            f"Path({str(child_state)!r}).write_text(json.dumps([os.getpid(), "
+            "stat.read_text().partition(' ')[0] if stat.exists() else None]))\n"
+            "time.sleep(30)\n"
+        )
+        local_pid_file = self.root / "child.pid"
+        self.executable(self.payload(self.diagnostic()), suffix=(
+            "import subprocess\nfrom pathlib import Path\n"
+            f"child = subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+            f"Path({str(local_pid_file)!r}).write_text(str(child.pid))\n"
+            f"while not Path({str(child_state)!r}).exists():\n    time.sleep(0.01)\n"
+        ))
+        errors = []
+        started = time.monotonic()
+        try:
+            records = list(self.tools.scan_ast_config(self.config, [self.source], errors, timeout=3))
+            self.assertEqual(len(records), 1, errors)
+            self.assertTrue(any("exited before its process group completed" in error for error in errors))
+            self.assertLess(time.monotonic() - started, 2)
+            local_pid, proc_pid = json.loads(child_state.read_text())
+            if Path("/proc").exists():
+                state_file = Path(f"/proc/{proc_pid}/stat")
+                try:
+                    state = state_file.read_text().rpartition(")")[2].split()[0]
+                except FileNotFoundError:
+                    state = "gone"
+                self.assertIn(state, ("Z", "X", "gone"))
+        finally:
+            if local_pid_file.exists():
+                try:
+                    os.kill(int(local_pid_file.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def test_completed_child_does_not_make_capture_partial(self) -> None:
+        self.executable(self.payload(self.diagnostic()), suffix=(
+            "import subprocess\n"
+            "subprocess.run([sys.executable, '-c', 'pass'], check=True)\n"
+        ))
+        errors = []
+        records = list(self.tools.scan_ast_config(self.config, [self.source], errors))
+        self.assertEqual(len(records), 1)
+        self.assertFalse(errors)
+
+    @unittest.skipUnless(os.name == "posix" and Path("/proc").exists(), "Linux parent cancellation")
+    def test_parent_cancellation_stops_isolated_analyzer(self) -> None:
+        import signal
+        import time
+        pid_file = self.root / "analyzer-identity.json"
+        self.executable(self.payload(self.diagnostic()), suffix=(
+            "import json, os\nfrom pathlib import Path\n"
+            f"Path({str(pid_file)!r}).write_text(json.dumps([os.getpid(), "
+            "Path('/proc/self/stat').read_text().partition(' ')[0]]))\n"
+            "time.sleep(30)\n"
+        ))
+        driver_code = (
+            "from pathlib import Path\nfrom ubs_core.external_tools import run_command_stream\n"
+            f"with run_command_stream('fixture', [{str(self.binary)!r}], Path({str(self.root)!r}), 30, []):\n"
+            "    pass\n"
+        )
+        driver = subprocess.Popen(
+            [sys.executable, "-c", driver_code], cwd=self.root, stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE, env={**os.environ, "PYTHONPATH": str(HELPERS_DIR),
+                                         "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        local_pid = None
+        try:
+            deadline = time.monotonic() + 5
+            while True:
+                try:
+                    local_pid, proc_pid = json.loads(pid_file.read_text())
+                    break
+                except (FileNotFoundError, ValueError):
+                    self.assertIsNone(driver.poll(), "driver exited before launching analyzer")
+                    self.assertLess(time.monotonic(), deadline, "analyzer did not start")
+                    time.sleep(0.01)
+            driver.send_signal(signal.SIGTERM)
+            _stdout, stderr = driver.communicate(timeout=5)
+            self.assertEqual(driver.returncode, 128 + signal.SIGTERM, stderr.decode("utf-8", "replace"))
+            state_file = Path(f"/proc/{proc_pid}/stat")
+            try:
+                state = state_file.read_text().rpartition(")")[2].split()[0]
+            except FileNotFoundError:
+                state = "gone"
+            self.assertIn(state, ("Z", "X", "gone"))
+        finally:
+            if driver.poll() is None:
+                driver.terminate()
+                try:
+                    driver.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    driver.kill()
+                    driver.wait(timeout=5)
+            if driver.stderr is not None:
+                driver.stderr.close()
+            if local_pid is not None:
+                try:
+                    os.kill(local_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    @unittest.skipUnless(os.name == "posix", "POSIX child-exit policy")
+    def test_ignored_sigchld_cannot_turn_failed_tool_into_complete_scan(self) -> None:
+        import signal
+        self.executable(self.payload(self.diagnostic()), code=2)
+        previous = signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+        try:
+            errors = []
+            records = list(self.tools.scan_ast_config(self.config, [self.source], errors))
+            self.assertEqual(len(records), 1)
+            self.assertTrue(any("cannot verify analyzer exit status" in error for error in errors))
+            self.assertEqual(signal.getsignal(signal.SIGCHLD), signal.SIG_IGN)
+        finally:
+            signal.signal(signal.SIGCHLD, previous)
+
     def test_corrupt_stream_records_have_bounded_error_detail(self) -> None:
         valid = self.payload(self.diagnostic())
         errors = []
@@ -2190,6 +2360,46 @@ class AstIngestionTests(unittest.TestCase):
             self.assertTrue(stderr.closed)
         self.assertFalse(errors)
 
+    def test_capture_close_failure_keeps_consumer_error_and_closes_both_handles(self) -> None:
+        self.executable(self.payload(self.diagnostic()))
+        errors = []
+        with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+            class BrokenClose:
+                def __getattr__(self, name):
+                    return getattr(stderr, name)
+
+                def close(self):
+                    stderr.close()
+                    raise OSError("capture close failed")
+
+            with patch.object(self.tools.tempfile, "TemporaryFile", side_effect=[stdout, BrokenClose()]):
+                with self.assertRaisesRegex(OSError, "consumer failed"):
+                    with self.tools.run_command_stream("test analyzer", [str(self.binary)], self.root, 5, errors):
+                        raise OSError("consumer failed")
+            self.assertTrue(stdout.closed)
+            self.assertTrue(stderr.closed)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("could not close captured output: capture close failed", errors[0])
+
+    def test_capture_seek_failure_closes_both_handles(self) -> None:
+        self.executable(self.payload(self.diagnostic()))
+        errors = []
+        with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+            class BrokenSeek:
+                def __getattr__(self, name):
+                    return getattr(stdout, name)
+
+                def seek(self, *args):
+                    raise OSError("capture seek failed")
+
+            with patch.object(self.tools.tempfile, "TemporaryFile", side_effect=[BrokenSeek(), stderr]):
+                with self.tools.run_command_stream("test analyzer", [str(self.binary)], self.root, 5, errors) as output:
+                    self.assertIsNone(output)
+            self.assertTrue(stdout.closed)
+            self.assertTrue(stderr.closed)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("capture seek failed", errors[0])
+
     def test_second_capture_open_failure_closes_first_handle_without_launching(self) -> None:
         with tempfile.TemporaryFile() as first:
             errors = []
@@ -2208,6 +2418,62 @@ class AstIngestionTests(unittest.TestCase):
         records = list(self.tools.scan_ast_config(self.config, [self.source], errors))
         self.assertEqual(len(records), 1)
         self.assertTrue(any("UTF-8" in e for e in errors))
+
+    def test_stderr_errors_beyond_preview_are_partial_with_bounded_detail(self) -> None:
+        self.executable(self.payload(self.diagnostic()), suffix=(
+            "sys.stderr.write('Warning: analyzer note\\n' * 300)\n"
+            "sys.stderr.write('ERROR: source could not be read\\n' * 2000)\n"
+        ))
+        errors = []
+        records = list(self.tools.scan_ast_config(self.config, [self.source], errors))
+        self.assertEqual(len(records), 1)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("2000 analyzer error(s) on stderr", errors[0])
+        self.assertLess(len(errors[0]), 1000)
+
+    def test_ordinary_stderr_warning_is_not_an_incomplete_scan(self) -> None:
+        self.executable(self.payload(self.diagnostic()), suffix="sys.stderr.write('Warning: analyzer note\\n')\n")
+        errors = []
+        self.assertEqual(len(list(self.tools.scan_ast_config(self.config, [self.source], errors))), 1)
+        self.assertFalse(errors)
+
+    def test_native_finding_summary_requires_matching_exit_and_valid_stdout(self) -> None:
+        for code, valid in ((1, True), (1, False), (0, True)):
+            with self.subTest(code=code, valid=valid):
+                self.executable(self.payload(self.diagnostic()) if valid else b"", code=code,
+                                suffix="sys.stderr.write('Error: 1 error(s) found in code.\\n')\n")
+                errors = []
+                records = list(self.tools.scan_ast_config(self.config, [self.source], errors))
+                self.assertEqual(len(records), int(valid))
+                self.assertEqual(bool(errors), not (code == 1 and valid))
+
+    def test_unreadable_stderr_records_preserve_stdout_findings(self) -> None:
+        valid = self.payload(self.diagnostic())
+        for bad in (b"\xff\n", b"x" * 2048 + b"\n"):
+            with self.subTest(bad=bad[:20]), patch.object(self.tools, "OUTPUT_RECORD_LIMIT", len(valid) + 8):
+                self.executable(valid, suffix=f"sys.stderr.buffer.write({bad!r})\n")
+                errors = []
+                records = list(self.tools.scan_ast_config(self.config, [self.source], errors))
+                self.assertEqual(len(records), 1)
+                self.assertTrue(any("stderr" in error and "unreadable output" in error for error in errors))
+
+    def test_stderr_capture_failure_does_not_erase_stdout_findings(self) -> None:
+        self.executable(self.payload(self.diagnostic()))
+        errors = []
+        with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+            class BrokenRead:
+                def __getattr__(self, name):
+                    return getattr(stderr, name)
+
+                def read(self, *args):
+                    raise OSError("stderr capture failed")
+
+            with patch.object(self.tools.tempfile, "TemporaryFile", side_effect=[stdout, BrokenRead()]):
+                records = list(self.tools.scan_ast_config(self.config, [self.source], errors))
+            self.assertTrue(stdout.closed)
+            self.assertTrue(stderr.closed)
+        self.assertEqual(len(records), 1)
+        self.assertTrue(any("could not read captured stderr" in error for error in errors))
 
     def test_later_batches_run_after_an_earlier_failure(self) -> None:
         invocations = self.root / "invocations.jsonl"
@@ -2261,6 +2527,18 @@ class AstIngestionTests(unittest.TestCase):
         self.assertEqual(counts["critical"], 1)
         self.assertFalse(errors)
         self.assertEqual(json.loads(sink.getvalue())["rule"], "policy-print")
+
+    @unittest.skipUnless(shutil.which("ast-grep"), "real ast-grep is required")
+    def test_real_ast_grep_missing_source_is_partial_and_keeps_readable_sibling(self) -> None:
+        rule = self.root / "policy.yaml"
+        rule.write_text("id: policy-print\nlanguage: python\nseverity: warning\nrule:\n  pattern: print($$$)\n")
+        self.config.write_text("ruleDirs: " + json.dumps([str(rule)]) + "\n")
+        self.source.write_text("print(42)\n")
+        errors = []
+        with patch.dict(os.environ, {"UBS_AST_GREP_BIN": shutil.which("ast-grep")}):
+            records = list(self.tools.scan_ast_config(self.config, [self.root / "missing.py", self.source], errors))
+        self.assertEqual([row["ruleId"] for row in records], ["policy-print"])
+        self.assertTrue(any("analyzer error(s) on stderr" in error for error in errors), errors)
 
     def test_python_complete_scan_and_partial_scan_are_not_cache_equivalent(self) -> None:
         from ubs_core.py_rules import generate
@@ -2347,6 +2625,28 @@ class AstIngestionTests(unittest.TestCase):
                 self.assertEqual(self.adapter(name, errors), [])
                 self.assertTrue(errors)
 
+    def test_every_adapter_and_custom_policy_reject_empty_findings_exit(self) -> None:
+        self.executable(b"", 1)
+        for name in self.ADAPTERS:
+            with self.subTest(adapter=name):
+                errors = []
+                self.assertEqual(self.adapter(name, errors), [])
+                self.assertTrue(any("without valid diagnostics" in error for error in errors))
+        policy = self.root / "policy.yaml"
+        policy.write_text("id: policy\nlanguage: python\nrule:\n  pattern: print($$$)\n")
+        sink, errors = io.StringIO(), []
+        self.assertEqual(self.tools.scan_custom_rules(self.root, [self.source], sink, "python", errors), 0)
+        self.assertFalse(sink.getvalue())
+        self.assertTrue(any("without valid diagnostics" in error for error in errors))
+
+    def test_every_adapter_preserves_stdout_when_stderr_reports_input_failure(self) -> None:
+        self.executable(self.payload(self.diagnostic()), suffix="sys.stderr.write('ERROR: missing selected source\\n')\n")
+        for name in self.ADAPTERS:
+            with self.subTest(adapter=name):
+                errors = []
+                self.assertEqual(len(self.adapter(name, errors)), 1)
+                self.assertTrue(any("analyzer error(s) on stderr" in error for error in errors))
+
     def test_config_discovery_preserves_java_base_pack_and_yaml_extension(self) -> None:
         (self.root / "sgbase-java.yaml").write_text("ruleDirs: []\n")
         errors = []
@@ -2365,6 +2665,36 @@ class AstIngestionTests(unittest.TestCase):
         self.assertEqual(records[0]["path"], "source:with\nnewline.rs")
         self.assertEqual(records[0]["col"], 3)
         self.assertTrue(errors)
+
+    def test_rust_run_mode_requires_consistent_match_exit(self) -> None:
+        from ubs_core import rust_ast, rust_rules
+        for code, has_record in ((0, False), (1, True), (0, True), (1, False)):
+            with self.subTest(code=code, has_record=has_record):
+                self.executable(self.payload(self.diagnostic()) if has_record else b"", code)
+                errors = []
+                with patch.object(rust_rules, "RUN_MODE_RULES", {"unwrap": "$A.unwrap()"}):
+                    counts, matches = rust_ast._run_spawn_patterns([str(self.source)], str(self.binary), 400, errors)
+                self.assertEqual(counts.get("rust.ast.unwrap", 0), int(has_record))
+                self.assertEqual(bool(matches), has_record)
+                self.assertEqual(bool(errors), has_record != (code == 0))
+
+    def test_rust_run_mode_valid_duplicates_still_establish_match_exit(self) -> None:
+        from ubs_core import rust_ast, rust_rules
+        self.executable(self.payload(self.diagnostic()))
+        errors = []
+        with patch.object(rust_rules, "RUN_MODE_RULES", {"unwrap": "$A.unwrap()"}):
+            counts, _ = rust_ast._run_spawn_patterns([str(self.source)] * 2, str(self.binary), 1, errors)
+        self.assertEqual(counts["rust.ast.unwrap"], 1)
+        self.assertFalse(errors)
+
+    def test_rust_run_mode_stderr_failure_preserves_matches(self) -> None:
+        from ubs_core import rust_ast, rust_rules
+        self.executable(self.payload(self.diagnostic()), suffix="sys.stderr.write('ERROR: missing selected source\\n')\n")
+        errors = []
+        with patch.object(rust_rules, "RUN_MODE_RULES", {"unwrap": "$A.unwrap()"}):
+            counts, _ = rust_ast._run_spawn_patterns([str(self.source)], str(self.binary), 400, errors)
+        self.assertEqual(counts["rust.ast.unwrap"], 1)
+        self.assertTrue(any("analyzer error(s) on stderr" in error for error in errors))
 
     def test_rust_nested_pattern_stream_has_no_total_output_cap(self) -> None:
         from ubs_core import rust_ast, rust_rules

@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Sequence
 
 from ubs_core.js_scan import MARKER
-from ubs_core.external_tools import iter_output_lines, run_command_stream
+from ubs_core.external_tools import iter_output_lines, report_ast_stderr, run_command_stream
 
 _ASTGREP_BIN = "ast-grep"
 
@@ -63,6 +63,15 @@ def _validated_match(line: str) -> dict:
         value = start.get(field)
         if type(value) is not int or value < 0:
             raise ValueError(f"invalid location {field}")
+    if "end" in location:
+        end = location["end"]
+        if not isinstance(end, dict) or any(
+            type(end.get(field)) is not int or end[field] < 0
+            for field in ("line", "column")
+        ):
+            raise ValueError("invalid end location")
+        if (end["line"], end["column"]) < (start["line"], start["column"]):
+            raise ValueError("reversed diagnostic range")
     severity = match.get("severity")
     if severity not in ("critical", "error", "warning", "info", "hint", "off"):
         raise ValueError("invalid diagnostic severity")
@@ -123,6 +132,8 @@ def scan_config(
         return counters
     if not config.is_file():
         problems.append(f"ast-grep: missing or nonregular config {config}")
+        if errors is None:
+            raise RuntimeError("; ".join(problems))
         return counters
     cache: dict[Path, list[str]] = {}
     for start in range(0, len(path_list), _BATCH):
@@ -135,6 +146,7 @@ def scan_config(
         ) as proc:
             if proc is None:
                 continue
+            report_ast_stderr(proc, problems, context=f"ast-grep ({config.name})")
             # ast-grep exits 0 with no error-level diagnostics and 1 when it found
             # some; anything else is a failed invocation, which used to degrade to
             # zero AST findings.
@@ -146,6 +158,7 @@ def scan_config(
                 )
             invalid = valid = 0
             first_problem = ""
+            failure_index = None
             for record_no, line in iter_output_lines(proc.stdout, problems, context=f"ast-grep ({config.name})"):
                 line = line.strip()
                 if not line:
@@ -156,6 +169,10 @@ def scan_config(
                     invalid += 1
                     if not first_problem:
                         first_problem = f"record {record_no}: {str(exc)[:160]}"
+                    if failure_index is None:
+                        failure_index = len(problems)
+                        problems.append("")
+                    problems[failure_index] = f"ast-grep ({config.name}): {invalid} malformed diagnostic(s); {first_problem}"
                     continue
                 valid += 1
                 rule_id = str(match.get("ruleId", "") or match.get("rule_id", ""))
@@ -194,10 +211,10 @@ def scan_config(
                     "message": message[:240],
                     "suppressed": False,
                 }, ensure_ascii=False) + "\n")
-            if invalid:
-                problems.append(f"ast-grep ({config.name}): {invalid} malformed diagnostic(s); {first_problem}")
             if proc.returncode == 1 and not valid:
                 problems.append(f"ast-grep ({config.name}): findings exit without valid diagnostics")
+    if errors is None and problems:
+        raise RuntimeError("; ".join(problems))
     return counters
 
 
@@ -220,18 +237,21 @@ def scan_all(
     ``errors`` collects any scan that could not complete, so the caller can
     report a partial run rather than a clean one (#111)."""
     total = {"critical": 0, "warning": 0, "info": 0}
+    problems = errors if errors is not None else []
     configs = sorted(rule_dir.glob("sgconfig-*.yml"))
-    if paths and errors is not None:
+    if paths:
         for grammar in ("javascript", "typescript", "tsx"):
             expected = rule_dir / f"sgconfig-{grammar}.yml"
             if not expected.is_file():
-                errors.append(f"ast-grep: missing or nonregular config {expected}")
+                problems.append(f"ast-grep: missing or nonregular config {expected}")
     for config in configs:
         lang = config.stem.removeprefix("sgconfig-")
         custom = lang == "custom"
         counters = scan_config(config, paths, sink, lang,
                                None if custom else severity_overrides, ast_grep_bin,
-                               None if custom else count_only, skip_categories, errors)
+                               None if custom else count_only, skip_categories, problems)
         for key, value in counters.items():
             total[key] = total.get(key, 0) + value
+    if errors is None and problems:
+        raise RuntimeError("; ".join(problems))
     return total

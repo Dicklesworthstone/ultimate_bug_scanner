@@ -22,8 +22,10 @@ import shlex
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from io import StringIO
@@ -36,6 +38,7 @@ OUTPUT_LIMIT = 16 * 1024 * 1024
 # Streaming tools have no total-output ceiling. Bound a single encoded record
 # so corrupt or runaway output cannot turn readline() into an unbounded slurp.
 OUTPUT_RECORD_LIMIT = 16 * 1024 * 1024
+_PROCESS_CLEANUP_GRACE = 1.0
 RUBY_TOOLS = {
     "rubocop": "rubocop", "brakeman": "brakeman",
     "bundler-audit": "bundle-audit", "reek": "reek", "fasterer": "fasterer",
@@ -56,6 +59,47 @@ class ToolStreamOutput:
     returncode: int
     stdout: BinaryIO
     stderr: str
+    stderr_stream: BinaryIO | None = None
+
+
+def _process_group_running(pgid: int) -> bool:
+    """Check for unfinished group members, excluding Linux zombies.
+
+    Reaping the command itself does not close descriptors inherited by its
+    children. A zombie, however, has already closed all its descriptors and
+    cannot contribute more output. Inspect /proc only for groups that survive
+    their leader; normal invocations need just the inexpensive killpg probe.
+    Without reliable process state, conservatively treat the group as live.
+    """
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    if sys.platform != "linux":
+        return True
+    try:
+        with open("/proc/self/stat", "rb") as stat:
+            if stat.read(4096).partition(b" ")[0] != str(os.getpid()).encode("ascii"):
+                # A host-mounted procfs can expose different PID numbers from
+                # killpg(). Never inspect an unrelated group's state there.
+                return True
+        with os.scandir("/proc") as entries:
+            for entry in entries:
+                if not entry.name.isdecimal():
+                    continue
+                try:
+                    with open(f"/proc/{entry.name}/stat", "rb") as stat:
+                        # The command name may contain spaces and parentheses.
+                        fields = stat.read(4096).rpartition(b")")[2].split()
+                except FileNotFoundError:
+                    continue  # the process finished while being inspected
+                if len(fields) < 3:
+                    return True
+                if fields[2] == str(pgid).encode("ascii") and fields[0] not in (b"Z", b"X"):
+                    return True
+    except OSError:
+        return True
+    return False
 
 
 @contextmanager
@@ -67,13 +111,20 @@ def run_command_stream(tool: str, argv: Sequence[str], root: Path, timeout: floa
     The stream is valid only inside the context. Consumers must read it in
     bounded records or chunks. Timeouts and cancellation retain the same
     process-group cleanup as whole-document capture; completed output remains
-    readable after an analyzer fails or times out. Only stderr's first 4 KiB
-    enters memory. Spooling also avoids pipe deadlocks on noisy analyzers.
+    readable after an analyzer fails or times out. The eager stderr preview
+    is limited to 4 KiB; its full stream uses the same bounded readers as
+    stdout. Spooling also avoids pipe deadlocks on noisy analyzers.
     """
     if not math.isfinite(timeout) or timeout <= 0:
         errors.append(f"{tool}: timeout must be a positive finite number")
         yield None
         return
+    if os.name == "posix" and signal.getsignal(signal.SIGCHLD) == signal.SIG_IGN:
+        # POSIX auto-reaps children under SIG_IGN. Popen then substitutes exit
+        # 0 when waitpid cannot obtain the actual status, even if the tool
+        # failed. Keep the caller's signal policy and any output, but never
+        # treat that unverifiable status as complete analysis.
+        errors.append(f"{tool}: cannot verify analyzer exit status while SIGCHLD is ignored")
     stdout = stderr = None
     try:
         try:
@@ -87,7 +138,7 @@ def run_command_stream(tool: str, argv: Sequence[str], root: Path, timeout: floa
                 start_new_session=os.name == "posix",
             )
 
-            def stop() -> None:
+            def stop() -> bool:
                 try:
                     if os.name == "posix":
                         os.killpg(proc.pid, signal.SIGKILL)
@@ -95,7 +146,23 @@ def run_command_stream(tool: str, argv: Sequence[str], root: Path, timeout: floa
                         proc.kill()
                 except ProcessLookupError:
                     pass
-                proc.wait()
+                # Killing the group is asynchronous. Do not read through a
+                # live writer's shared file offset or wait indefinitely for an
+                # uninterruptible process. Cleanup has its own small grace,
+                # never another full analyzer timeout.
+                deadline = time.monotonic() + _PROCESS_CLEANUP_GRACE
+                try:
+                    proc.wait(timeout=max(0, deadline - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    errors.append(f"{tool}: could not stop analyzer during cleanup")
+                    return False
+                while os.name == "posix" and _process_group_running(proc.pid):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        errors.append(f"{tool}: could not confirm process group stopped during cleanup")
+                        return False
+                    time.sleep(min(0.01, remaining))
+                return True
 
             def cancel(signum, _frame) -> None:
                 # GNU timeout signals the module group, but the analyzer is
@@ -103,6 +170,7 @@ def run_command_stream(tool: str, argv: Sequence[str], root: Path, timeout: floa
                 raise SystemExit(128 + signum)
 
             previous_handlers = {}
+            capture_ready = True
             try:
                 if os.name == "posix" and threading.current_thread() is threading.main_thread():
                     for signum in (signal.SIGTERM, signal.SIGHUP):
@@ -114,7 +182,11 @@ def run_command_stream(tool: str, argv: Sequence[str], root: Path, timeout: floa
                     proc.wait(timeout=timeout)
                 except subprocess.TimeoutExpired:
                     errors.append(f"{tool}: timed out after {timeout:g}s")
-                    stop()
+                    capture_ready = stop()
+                else:
+                    if os.name == "posix" and _process_group_running(proc.pid):
+                        errors.append(f"{tool}: analyzer exited before its process group completed")
+                        capture_ready = stop()
             except BaseException:
                 # KeyboardInterrupt, parent deadlines and caller cancellation
                 # must not leave the isolated analyzer (or its children) alive.
@@ -123,9 +195,23 @@ def run_command_stream(tool: str, argv: Sequence[str], root: Path, timeout: floa
             finally:
                 for signum, previous in previous_handlers.items():
                     signal.signal(signum, previous)
-            stdout.seek(0)
-            stderr.seek(0)
-            output = ToolStreamOutput(proc.returncode, stdout, stderr.read(4096).decode("utf-8", "replace"))
+            if capture_ready:
+                stdout.seek(0)
+                stderr_preview = ""
+                stderr_stream = stderr
+                try:
+                    stderr.seek(0)
+                    stderr_preview = stderr.read(4096).decode("utf-8", "replace")
+                    stderr.seek(0)
+                except OSError as exc:
+                    # Losing stderr does not erase independently captured
+                    # stdout findings. The missing evidence still fails the
+                    # completeness gate, and both handles remain owned here.
+                    errors.append(f"{tool}: could not read captured stderr: {exc}")
+                    stderr_stream = None
+                output = ToolStreamOutput(proc.returncode, stdout, stderr_preview, stderr_stream)
+            else:
+                output = None  # output cannot be frozen while writers survive
         except OSError as exc:
             errors.append(f"{tool}: could not launch or capture output: {exc}")
             output = None
@@ -133,12 +219,14 @@ def run_command_stream(tool: str, argv: Sequence[str], root: Path, timeout: floa
         # consumer must never make this context manager attempt a second yield.
         yield output
     finally:
-        try:
-            if stderr is not None:
-                stderr.close()
-        finally:
-            if stdout is not None:
-                stdout.close()
+        for stream in (stderr, stdout):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError as exc:
+                    # Preserve a consumer exception and still close the other
+                    # handle. Cleanup failures must reach the coverage gate.
+                    errors.append(f"{tool}: could not close captured output: {exc}")
 
 
 def run_command(tool: str, argv: Sequence[str], root: Path, timeout: float,
@@ -174,32 +262,69 @@ def iter_output_lines(stream: BinaryIO, errors: list[str], *, context: str) -> I
     """
     failures = 0
     details: list[str] = []
+    failure_index = None
     number = 0
-    try:
-        while True:
+    while True:
+        try:
             raw = stream.readline(OUTPUT_RECORD_LIMIT + 1)
             if not raw:
                 break
             number += 1
-            if len(raw) > OUTPUT_RECORD_LIMIT:
+            oversized = len(raw) > OUTPUT_RECORD_LIMIT
+            if oversized:
                 while raw and not raw.endswith(b"\n"):
                     raw = stream.readline(64 * 1024)
-                problem = f"record output exceeds {OUTPUT_RECORD_LIMIT} bytes"
+        except OSError as exc:
+            errors.append(f"{context}: could not read captured output: {exc}")
+            break
+        if oversized:
+            problem = f"record output exceeds {OUTPUT_RECORD_LIMIT} bytes"
+        else:
+            try:
+                line = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                problem = "output is not valid UTF-8"
             else:
-                try:
-                    line = raw.decode("utf-8")
-                except UnicodeDecodeError:
-                    problem = "output is not valid UTF-8"
-                else:
-                    yield number, line
-                    continue
-            failures += 1
-            if len(details) < 4:
-                details.append(f"row {number}: {problem}")
-    except OSError as exc:
-        errors.append(f"{context}: could not read captured output: {exc}")
+                yield number, line
+                continue
+        failures += 1
+        if len(details) < 4:
+            details.append(f"row {number}: {problem}")
+        if failure_index is None:
+            failure_index = len(errors)
+            errors.append("")
+        # Update one bounded entry immediately: an early consumer exit must
+        # not erase corruption that has already been observed.
+        errors[failure_index] = f"{context}: {failures} unreadable output record(s) ({'; '.join(details)})"
+
+
+def report_ast_stderr(output: ToolStreamOutput, errors: list[str], *, context: str) -> None:
+    """Retain native ast-grep input errors even when its exit status is zero.
+
+    ast-grep prints unreadable/missing-source errors as ``ERROR: ...`` on
+    stderr but can still exit zero and emit findings from readable siblings.
+    Check the full captured stream, not only the diagnostic preview. Ordinary
+    warnings are not an input failure; Ruby/Go tools retain their own exit and
+    report contracts instead of using this ast-grep-specific boundary.
+    """
+    lines = (iter_output_lines(output.stderr_stream, errors, context=f"{context} stderr")
+             if output.stderr_stream is not None else enumerate(StringIO(output.stderr), 1))
+    failures = 0
+    details: list[str] = []
+    for _number, line in lines:
+        line = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
+        if output.returncode == 1 and re.fullmatch(r"Error: [1-9][0-9]* error\(s\) found in code\.", line):
+            # The native scan CLI prints this summary for ordinary error-level
+            # findings. The adapter separately requires valid stdout evidence
+            # for exit 1; an empty/truncated report still fails that gate.
+            continue
+        if not re.match(r"(?:error|fatal):", line, re.IGNORECASE):
+            continue
+        failures += 1
+        if len(details) < 4:
+            details.append(line[:160])
     if failures:
-        errors.append(f"{context}: {failures} unreadable output record(s) ({'; '.join(details)})")
+        errors.append(f"{context}: {failures} analyzer error(s) on stderr ({'; '.join(details)})")
 
 
 def _text(value: object) -> str:
@@ -258,6 +383,7 @@ def parse_ast_diagnostics(text: str | BinaryIO, errors: list[str] | None = None,
     problems = errors if errors is not None else []
     failures = 0
     details: list[str] = []
+    failure_index = None
     # NDJSON is delimited by LF, not by Unicode line separators that may
     # legitimately occur inside a JSON string (including a source filename).
     lines = (enumerate(StringIO(text), 1) if isinstance(text, str)
@@ -317,11 +443,12 @@ def parse_ast_diagnostics(text: str | BinaryIO, errors: list[str] | None = None,
             failures += 1
             if len(details) < 4:
                 details.append(f"row {number}: {str(exc)[:160]}")
+            if failure_index is None:
+                failure_index = len(problems)
+                problems.append("")
+            problems[failure_index] = f"{context}: {failures} malformed AST diagnostic(s) ({'; '.join(details)})"
             continue
         yield match
-    if failures:
-        message = f"{context}: {failures} malformed AST diagnostic(s) ({'; '.join(details)})"
-        problems.append(message)
     if errors is None and problems:
         raise RuntimeError("; ".join(problems))
 
@@ -354,13 +481,19 @@ def scan_ast_config(config: Path, paths: Sequence[Path],
             ) as output:
                 if output is None:
                     continue
+                report_ast_stderr(output, failures, context=f"ast-grep ({config.name})")
                 if output.returncode not in (0, 1):
                     detail = output.stderr.strip().splitlines()
                     failures.append(
                         f"ast-grep exited {output.returncode} on {config.name}"
                         + (f": {detail[0][:160]}" if detail else "")
                     )
-                yield from parse_ast_diagnostics(output.stdout, failures, context=f"ast-grep ({config.name})")
+                valid = False
+                for diagnostic in parse_ast_diagnostics(output.stdout, failures, context=f"ast-grep ({config.name})"):
+                    valid = True
+                    yield diagnostic
+                if output.returncode == 1 and not valid:
+                    failures.append(f"ast-grep ({config.name}): findings exit without valid diagnostics")
     if errors is None and failures:
         raise RuntimeError("; ".join(failures))
 

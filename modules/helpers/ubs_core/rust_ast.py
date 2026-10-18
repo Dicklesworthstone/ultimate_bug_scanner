@@ -12,7 +12,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Sequence
 
-from ubs_core.external_tools import parse_ast_diagnostics, run_command_stream, scan_ast_config
+from ubs_core.external_tools import parse_ast_diagnostics, report_ast_stderr, run_command_stream, scan_ast_config
 
 _ASTGREP_BIN = "ast-grep"
 _BATCH = 400
@@ -60,6 +60,7 @@ def _run_spawn_patterns(path_list: list[str], ast_grep_bin: str, batch: int,
             ) as output:
                 if output is None:
                     continue
+                report_ast_stderr(output, failures, context=f"ast-grep ({rule_id})")
                 # run: 0 = matches, 1 = no matches; scan has different severity
                 # semantics, but both reject exit statuses outside this pair.
                 if output.returncode not in (0, 1):
@@ -68,9 +69,11 @@ def _run_spawn_patterns(path_list: list[str], ast_grep_bin: str, batch: int,
                         f"ast-grep exited {output.returncode} on pattern {rule_id}"
                         + (f": {detail[0][:160]}" if detail else "")
                     )
+                valid = False
                 for diagnostic in parse_ast_diagnostics(
                     output.stdout, failures, context=f"ast-grep ({rule_id})", run_rule_id=rule_id,
                 ):
+                    valid = True
                     match = _normalize_match(diagnostic)
                     # Nested expressions may start at the very same column.
                     # Their different matched spans are independent evidence.
@@ -80,6 +83,8 @@ def _run_spawn_patterns(path_list: list[str], ast_grep_bin: str, batch: int,
                     seen.add(key)
                     counts[rule_id] += 1
                     matches.setdefault(rule_id, []).append(match)
+                if output.returncode in (0, 1) and valid != (output.returncode == 0):
+                    failures.append(f"ast-grep ({rule_id}): exit {output.returncode} is inconsistent with match output")
     if errors is None and failures:
         raise RuntimeError("; ".join(failures))
     return counts, matches

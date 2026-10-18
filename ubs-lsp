@@ -1056,7 +1056,9 @@ def scan_buffers(scanner, root, documents, root_id, timeout, cancel, policy=(), 
 
 class Server:
     def __init__(self, root, scanner, send, *, jobs=2, timeout=120, policy=(), buffer_mode=False,
-                 incremental_workspace=False, output_available=None):
+                 incremental_workspace=False, output_available=None, scan_scope='document'):
+        if scan_scope not in ('document', 'open-documents'):
+            raise ProtocolError('Unknown saved-source scan scope')
         self.root, self.scanner, self.send = root, scanner, send
         self.output_available = output_available or (lambda: 2 * MAX_MESSAGE)
         info = root.stat()
@@ -1064,6 +1066,7 @@ class Server:
         self.jobs, self.timeout = jobs, timeout
         self.policy = policy
         self.buffer_mode = buffer_mode
+        self.scan_scope = scan_scope
         if incremental_workspace and not buffer_mode:
             raise ProtocolError('Incremental workspaces require buffer mode')
         self.workspace_cache = BufferWorkspaceCache() if incremental_workspace else None
@@ -1258,7 +1261,12 @@ class Server:
             self.documents[uri]['generation'] = self.generation
 
     def queue(self, uri, *, invalidate=True):
-        if self.buffer_mode:
+        # The selected open files are the context available to cross-file
+        # analyzers. Grouped saved mode uses the same context as buffer mode
+        # once there are peers; separate per-file scans can miss a source in a
+        # helper and leave an unchanged caller's diagnostics stale on save.
+        # Keep the immediate single-document path for the common solo case.
+        if self.buffer_mode or self.scan_scope == 'open-documents' and len(self.documents) > 1:
             self.queue_documents(invalidate=invalidate)
             return
         if invalidate:
@@ -1425,6 +1433,7 @@ class Server:
                                                                'workspaceDiagnostics': False}} if self.pull_mode else {}),
                                      'experimental': {'ubs': {
                                          'sourceMode': 'buffer' if self.buffer_mode else 'saved',
+                                         'scanScope': 'open-documents' if self.buffer_mode else self.scan_scope,
                                          'workspaceStrategy': 'incremental' if self.workspace_cache is not None else
                                                               'snapshot' if self.buffer_mode else 'original'}},
                                      'executeCommandProvider': {'commands': ['ubs.scanOpenDocuments']}, 'textDocumentSync': {
@@ -1505,7 +1514,10 @@ class Server:
                 self.invalidate(uri)
                 self.documents.pop(uri, None)
                 self.publish(uri, [])
-                if self.buffer_mode:
+                # Closing a peer changes the selected analysis context just
+                # as opening it does. Recheck the survivors in saved mode too;
+                # never leave the previous group's findings (or clean result).
+                if self.documents and (self.buffer_mode or self.scan_scope == 'open-documents'):
                     self.queue_documents()
                 self.refresh_diagnostics()
                 return
@@ -1593,6 +1605,8 @@ def main(argv=None):
     parser.add_argument('--scan-timeout', type=float, default=120)
     parser.add_argument('--profile', choices=('strict', 'loose'))
     parser.add_argument('--fail-on-warning', action='store_true')
+    parser.add_argument('--scan-scope', choices=('document', 'open-documents'), default='document',
+                        help='saved scans: individual documents (default) or all open documents as one context')
     parser.add_argument('--buffer-mode', choices=('saved', 'snapshot', 'incremental'), default='saved',
                         help='saved (default), one-shot snapshot, or reusable incremental private buffer workspace')
     args = parser.parse_args(argv)
@@ -1614,7 +1628,7 @@ def main(argv=None):
     policy = (('--profile=' + args.profile,) if args.profile else ()) + (('--fail-on-warning',) if args.fail_on_warning else ())
     server = Server(root, scanner, send, jobs=args.jobs, timeout=args.scan_timeout, policy=policy,
                     buffer_mode=args.buffer_mode != 'saved', incremental_workspace=args.buffer_mode == 'incremental',
-                    output_available=lambda: 2 * MAX_MESSAGE - output_bytes)
+                    output_available=lambda: 2 * MAX_MESSAGE - output_bytes, scan_scope=args.scan_scope)
     framer = Framer()
     incoming, output = sys.stdin.fileno(), sys.stdout.fileno()
     old_in, old_out = os.get_blocking(incoming), os.get_blocking(output)

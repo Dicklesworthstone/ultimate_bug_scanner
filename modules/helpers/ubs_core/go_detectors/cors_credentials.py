@@ -11,8 +11,8 @@ Legacy outcome:
 
     print_finding critical <count> "Credentialed wildcard/reflected CORS" ...
 
-Marker suppression is ported verbatim: `ubs:ignore` on the finding line
-or on the previous line suppresses it.
+Shared lexical statement ownership and exact rule scopes suppress annotated
+findings without treating quoted marker text as a directive.
 """
 from __future__ import annotations
 
@@ -20,12 +20,13 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.suppression import SourceSuppressions
+
 RULE_ID = "go.security.cors-credentials"
 CATEGORY = 9
 TITLE = "Credentialed wildcard/reflected CORS"
 SEVERITY = "critical"
 DESCRIPTION = "Echo origins only against an allow-list and never combine AllowCredentials with wildcard origins"
-MARKER = "ubs:ignore"
 
 ORIGIN_WILDCARD_RE = re.compile(
     r'\bAccess-Control-Allow-Origin\b["`]\s*,\s*["`]\*["`]'
@@ -85,15 +86,6 @@ def _strip_line_comments(line: str) -> str:
         out.append(ch)
         i += 1
     return ''.join(out)
-
-
-def _has_ignore(lines, line_no):
-    idx = line_no - 1
-    return (
-        0 <= idx < len(lines) and MARKER in lines[idx]
-    ) or (
-        0 <= idx - 1 < len(lines) and MARKER in lines[idx - 1]
-    )
 
 
 def _source_line(lines, line_no):
@@ -169,7 +161,7 @@ def _has_reflected_origin(context, refs):
     return False
 
 
-def _analyze_file(path, issues):
+def _analyze_file(path, issues, suppressions):
     try:
         text = path.read_text(encoding='utf-8', errors='ignore')
     except OSError:
@@ -177,11 +169,10 @@ def _analyze_file(path, issues):
     if not CANDIDATE_RE.search(text):
         return
     lines = text.splitlines()
+    suppression = suppressions.index(path, text)
     seen = set()
     last_issue = -100
     for idx, raw in enumerate(lines, start=1):
-        if _has_ignore(lines, idx):
-            continue
         stripped = _strip_line_comments(raw).strip()
         if not stripped or not CANDIDATE_RE.search(stripped):
             continue
@@ -193,7 +184,7 @@ def _analyze_file(path, issues):
             continue
         if idx - last_issue <= 3:
             continue
-        if idx in seen:
+        if idx in seen or suppression.is_suppressed(idx, RULE_ID):
             continue
         seen.add(idx)
         last_issue = idx
@@ -201,10 +192,11 @@ def _analyze_file(path, issues):
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
+    suppressions = SourceSuppressions("golang")
     for path in files:
         if path.suffix != ".go":
             continue
         issues = []
-        _analyze_file(path, issues)
+        _analyze_file(path, issues, suppressions)
         for line_no, detail in issues:
             yield (path, line_no, 1, detail)

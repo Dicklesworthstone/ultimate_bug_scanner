@@ -20,8 +20,9 @@ Legacy: ``print_finding critical $N "Security token generated with
 non-cryptographic randomness" "Use crypto/rand with rand.Read,
 io.ReadFull(rand.Reader, ...), or a helper backed by crypto/rand for
 tokens, sessions, CSRF nonces, OTPs, salts, API keys, and secrets"``.
-Same-file and previous-line ``ubs:ignore`` markers suppress a hit;
-dedupe is per (file, line, source). The rglob/SKIP_DIRS traversal is
+Shared lexical statement ownership and exact rule scopes suppress annotated
+findings while preserving RNG registrations; dedupe is per (file, line,
+source). The rglob/SKIP_DIRS traversal is
 replaced by the contract file list; the v2 record count equals the
 heredoc's __COUNT__.
 """
@@ -31,7 +32,7 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
-MARKER = "ubs:ignore"
+from ubs_core.suppression import SourceSuppressions
 
 RULE_ID = "go.security.insecure-random"
 CATEGORY = 9
@@ -204,16 +205,7 @@ def _starts_function(statement: str):
     return match.group('name') if match else None
 
 
-def _has_ignore(lines, line_no):
-    idx = line_no - 1
-    return (
-        0 <= idx < len(lines) and MARKER in lines[idx]
-    ) or (
-        0 <= idx - 1 < len(lines) and MARKER in lines[idx - 1]
-    )
-
-
-def _analyze(path: Path, issues: list) -> None:
+def _analyze(path: Path, issues: list, suppressions) -> None:
     try:
         text = path.read_text(encoding='utf-8', errors='ignore')
     except OSError:
@@ -221,6 +213,7 @@ def _analyze(path: Path, issues: list) -> None:
     if not ('math/rand' in text or any(token in text for token in PREDICTABLE_TOKENS)):
         return
     lines = text.splitlines()
+    suppression = suppressions.index(path, text)
     math_aliases = _find_math_rand_aliases(lines)
     has_predictable = any(token in text for token in PREDICTABLE_TOKENS)
     if not math_aliases and not has_predictable:
@@ -239,7 +232,7 @@ def _analyze(path: Path, issues: list) -> None:
         if func_name:
             func_stack.append((func_name, brace_depth + max(opens, 1)))
         current_func = func_stack[-1][0] if func_stack else ''
-        if _has_ignore(lines, idx) or not statement:
+        if not statement:
             brace_depth += opens - closes
             continue
         assign = ASSIGN_RE.match(statement)
@@ -258,16 +251,17 @@ def _analyze(path: Path, issues: list) -> None:
         source = _unsafe_source(statement, math_aliases, insecure_rng_vars, sensitive, line_sensitive)
         if source and sensitive:
             key = (path, idx, source)
-            if key not in seen:
+            if key not in seen and not suppression.is_suppressed(idx, RULE_ID):
                 seen.add(key)
                 issues.append((path, idx, 1, f"{_source_line(lines, idx)}  [{source} in security-sensitive generation context]"))
         brace_depth += opens - closes
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
+    suppressions = SourceSuppressions("golang")
     issues: list[tuple[Path, int, int, str]] = []
     for path in files:
         if path.suffix != ".go":
             continue
-        _analyze(path, issues)
+        _analyze(path, issues, suppressions)
     yield from issues

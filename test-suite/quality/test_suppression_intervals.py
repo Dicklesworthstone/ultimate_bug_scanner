@@ -1022,6 +1022,337 @@ class JavaScriptSecuritySuppressionTests(unittest.TestCase):
                     self.check_source(name, rule, 'multiline-' + marker.replace(':', '-'), program, expected)
 
 
+class GoPipelineSuppressionTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('jq') and shutil.which('rg') and shutil.which('ast-grep'),
+                         'native UBS dependencies required')
+    def test_native_pattern_counts_exits_and_cache_honor_only_the_owning_comment(self):
+        import time
+
+        artifacts = REPO_ROOT / 'test-suite' / 'artifacts'
+        artifacts.mkdir(exist_ok=True)
+        rule = 'go.logging.sensitive-data'
+        with tempfile.TemporaryDirectory(prefix='go-native-pattern-marker-', dir=artifacts) as tmp:
+            root = Path(tmp)
+            source = root / 'case.go'
+            selected = root / 'selected.nul'
+            selected.write_bytes(os.fsencode(source) + b'\0')
+            body = '    log.Printf("%s", token)'
+            for variant, statement, expected in (
+                ('unmarked', body, [4]),
+                ('quoted', body + '; _ = "ubs:ignore"', [4]),
+                ('wrong-scope', body + ' // ubs:ignore[unrelated.rule]', [4]),
+                ('owned', body + f' // ubs:ignore[{rule}]', []),
+                ('bare', body + ' // ubs:ignore', []),
+                ('previous', f'    // ubs:ignore[{rule}]\n' + body, []),
+            ):
+                source.write_text('package probe\nimport "log"\nfunc emit(token string) {\n'
+                                  + statement + '\n}\n', encoding='utf-8')
+                for fmt in ('json', 'sarif'):
+                    env = {key: value for key, value in os.environ.items() if not key.startswith('UBS_')}
+                    env.update(UBS_NO_AUTO_UPDATE='1', UBS_PROFILE='1', PYTHONDONTWRITEBYTECODE='1',
+                               UBS_CACHE_DIR=str(root / f'cache-{variant}-{fmt}'))
+                    for mode in ('cold', 'warm', 'disabled'):
+                        label = f'go-native-pattern-{variant}-{fmt}-{mode}'
+                        with self.subTest(case=label):
+                            print(f'[{label}] RUN', flush=True)
+                            started = time.monotonic()
+                            stats = root / (label + '.cache.json')
+                            run_env = dict(env, UBS_NO_CACHE='1' if mode == 'disabled' else '0',
+                                           UBS_CACHE_FILE=str(stats))
+                            command = [str(REPO_ROOT / 'modules/ubs-golang.sh'), '--ci', f'--format={fmt}',
+                                       '--files-from=' + str(selected), '--fail-on-warning',
+                                       '--skip=' + ','.join(str(cat) for cat in range(1, 23) if cat != 14),
+                                       str(root)]
+                            proc = subprocess.run(command, cwd=root, env=run_env, capture_output=True,
+                                                  text=True, timeout=120)
+                            (root / (label + '.stdout')).write_text(proc.stdout)
+                            (root / (label + '.stderr')).write_text(proc.stderr)
+                            self.assertEqual(proc.returncode, int(bool(expected)), proc.stdout + proc.stderr)
+                            report = json.loads(proc.stdout)
+                            if fmt == 'json':
+                                self.assertEqual(report['status'], 'ok', report)
+                                self.assertEqual(report['critical'], len(expected), report)
+                                self.assertEqual(report['warning'], 0, report)
+                                self.assertEqual(report['info'], 0, report)
+                                sites = [row['line'] for row in report['findings'] if row['rule'] == rule]
+                            else:
+                                results = [row for run in report['runs'] for row in run.get('results', [])]
+                                self.assertEqual(len(results), len(expected), report)
+                                self.assertTrue(all(row['level'] == 'error' for row in results), report)
+                                sites = [row['locations'][0]['physicalLocation']['region']['startLine']
+                                         for row in results if row['ruleId'] == rule]
+                            self.assertEqual(sites, expected, report)
+                            cache = json.loads(stats.read_text())
+                            self.assertEqual(cache['hits'], int(mode == 'warm'), cache)
+                            self.assertEqual(cache['misses'], int(mode != 'warm'), cache)
+                            print(f'[{label}] PASS ({time.monotonic() - started:.3f}s)', flush=True)
+
+    @unittest.skipUnless(shutil.which('ast-grep'), 'real ast-grep required')
+    def test_ast_counts_use_the_public_id_without_erasing_computed_facts(self):
+        from ubs_core import go_ast, go_rules, go_scan
+
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        ast_rule, computed_rule = 'go.tls-insecure-skip', 'go.crypto.insecureskipverify'
+        with tempfile.TemporaryDirectory(prefix='go-ast-marker-', dir=artifacts) as tmp:
+            root = Path(tmp)
+            source = root / 'case.go'
+            go_rules.generate(root / 'rules')
+            for marker, ast_count, computed_count in (
+                ('', 1, 1), (' // ubs:ignore[unrelated.rule]', 1, 1),
+                (f' // ubs:ignore[{ast_rule}]', 0, 1),
+                (f' // ubs:ignore[{computed_rule}]', 1, 0), (' // ubs:ignore', 0, 0),
+                ('; var marker_note = "ubs:ignore"', 1, 1),
+            ):
+                with self.subTest(marker=marker):
+                    source.write_text('package probe\nimport ("crypto/tls"; "net/http")\n'
+                                      'var config = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}'
+                                      + marker + '\n')
+                    sink, errors = StringIO(), []
+                    counts, matches = go_ast.scan_config(root / 'rules/sgconfig-go.yml', [source],
+                        {ast_rule: [(9, 'warning', 'TLS disabled')]}, sink, errors=errors)
+                    self.assertEqual(errors, [], errors)
+                    self.assertEqual(counts.get(ast_rule, 0), ast_count, matches)
+                    self.assertEqual(len(matches.get(ast_rule, [])), 1, matches)
+                    rows = [json.loads(line) for line in sink.getvalue().splitlines()]
+                    self.assertEqual(sum(row['rule'] == ast_rule for row in rows), ast_count * 2, rows)
+                    computed = go_scan.computed_checks([source], matches,
+                        {1, 2, 4, 5, 8, 12, 13, 19, 21, 22}, True)
+                    self.assertEqual(sum(row['rule'] == computed_rule for row in computed), computed_count, computed)
+
+    def test_patterns_count_only_the_owning_rule_before_thresholds(self):
+        from ubs_core import go_scan
+
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        rule = 'go.logging.sensitive-data'
+        pattern = next(item for item in go_scan.load_patterns() if item.rule_id == rule)
+        with tempfile.TemporaryDirectory(prefix="go-pattern-marker-", dir=artifacts) as tmp:
+            source = Path(tmp) / "case.go"
+            for marker, expected in (('', [1]), (' // ubs:ignore[unrelated.rule]', [1]),
+                                     ('; _ = "ubs:ignore"', [1]), (f' // ubs:ignore[{rule}]', [])):
+                with self.subTest(marker=marker):
+                    source.write_text('log.Printf("%s", token)' + marker + '\n', encoding='utf-8')
+                    sink = StringIO()
+                    counts = go_scan.scan_patterns([pattern], [source], sink, set())
+                    rows = [json.loads(line) for line in sink.getvalue().splitlines()]
+                    self.assertEqual([row['line'] for row in rows], expected)
+                    self.assertEqual(counts, {'critical': len(expected), 'warning': 0, 'info': 0})
+
+    def test_pipeline_and_real_cache_reapply_source_policy(self):
+        import contextlib
+        from ubs_core import go_scan
+
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        rule = 'go.logging.sensitive-data'
+        with tempfile.TemporaryDirectory(prefix="go-pipeline-marker-", dir=artifacts) as tmp:
+            root = Path(tmp)
+            source = root / 'case.go'
+            selected = root / 'files.txt'
+            selected.write_bytes(os.fsencode(source) + b'\0')
+            sink, summary = root / 'findings.ndjson', root / 'summary.json'
+            env = {key: value for key, value in os.environ.items() if not key.startswith('UBS_')}
+            env.update(UBS_NO_AUTO_UPDATE='1', UBS_CACHE_DIR=str(root / 'cache'))
+            args = ['--files-from', str(selected), '--sink', str(sink), '--json-out', str(summary),
+                    '--project-dir', str(root), '--fail-on-warning']
+            source.write_text('package probe\nimport "log"\nfunc emit(token string) {\n'
+                              f'    log.Printf("%s", token) // ubs:ignore[{rule}]\n}}\n', encoding='utf-8')
+            for mode in ('cold', 'warm', 'disabled'):
+                with self.subTest(cache=mode), patch.dict(os.environ, dict(env, UBS_NO_CACHE='1' if mode == 'disabled' else '0'), clear=True):
+                    with contextlib.redirect_stderr(StringIO()):
+                        code = go_scan.main(args)
+                    doc = json.loads(summary.read_text())
+                    self.assertEqual(code, 0, doc)
+                    self.assertEqual(doc['critical'], 0, doc)
+                    self.assertEqual(doc['status'], 'ok', doc)
+                    self.assertFalse(any(row['rule'] == rule for row in doc['findings']), doc)
+                    if mode != 'disabled':
+                        self.assertEqual(doc['extras']['profile']['cache_hits'], int(mode == 'warm'), doc)
+                        entries = list((root / 'cache').glob('*/files/**/*.json'))
+                        self.assertTrue(entries)
+                        rows = [row for entry in entries for row in json.loads(entry.read_text()).get('findings', [])]
+                        self.assertFalse(any(row['rule'] == rule for row in rows), rows)
+            # Inject a stale/old producer answer into the real warm cache; the
+            # output boundary must recheck source ownership before counting it.
+            for entry in (root / 'cache').glob('*/files/**/*.json'):
+                data = json.loads(entry.read_text())
+                data.setdefault('findings', []).append({'rule': rule, 'path': str(source), 'line': 4,
+                    'col': 1, 'severity': 'critical', 'message': 'old cached finding', 'category_id': 'golang.logging'})
+                entry.write_text(json.dumps(data), encoding='utf-8')
+            # Directory Merkle hits can bypass individual file entries.
+            for entry in (root / 'cache').glob('*/dirs/**/*.json'):
+                data = json.loads(entry.read_text())
+                for rows in data.get('findings', {}).values():
+                    rows.append({'rule': rule, 'path': str(source), 'line': 4, 'col': 1,
+                        'severity': 'critical', 'message': 'old directory finding', 'category_id': 'golang.logging'})
+                entry.write_text(json.dumps(data), encoding='utf-8')
+            with patch.dict(os.environ, env, clear=True), contextlib.redirect_stderr(StringIO()):
+                self.assertEqual(go_scan.main(args), 0)
+            doc = json.loads(summary.read_text())
+            self.assertEqual(doc['extras']['profile']['cache_hits'], 1, doc)
+            self.assertFalse(any(row['rule'] == rule for row in doc['findings']), doc)
+
+    def test_ratio_and_source_facts_do_not_disappear_for_unrelated_markers(self):
+        from ubs_core import go_scan
+
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        rule = 'go.filesystem.open-close-imbalance'
+        with tempfile.TemporaryDirectory(prefix="go-computed-marker-", dir=artifacts) as tmp:
+            source = Path(tmp) / 'case.go'
+            for marker, expected in (('', [1]), (' // ubs:ignore[unrelated.rule]', [1]),
+                                     ('; _ = "ubs:ignore"', [1]), (f' // ubs:ignore[{rule}]', [])):
+                with self.subTest(marker=marker):
+                    source.write_text('file, err := os.Open(path)' + marker + '\n', encoding='utf-8')
+                    self.assertEqual([row['line'] for row in go_scan.computed_checks([source], {}, {1, 2, 4, 5, 9, 12, 13, 19, 21, 22}, True)], expected)
+
+
+class GoDetectorSuppressionTests(unittest.TestCase):
+    CASES = (
+        ("cookie_security", "go.security.cookie-security", 6,
+         'package probes\n\nimport "net/http"\n\nfunc cookie(w http.ResponseWriter) {\n'
+         '\thttp.SetCookie(w, &http.Cookie{Name: "session", Value: "token"})\n}\n'),
+        ("cors_credentials", "go.security.cors-credentials", 6,
+         'package probes\n\nimport "net/http"\n\nfunc cors(w http.ResponseWriter) {\n'
+         '\tw.Header().Set("Access-Control-Allow-Origin", "*"); w.Header().Set("Access-Control-Allow-Credentials", "true")\n}\n'),
+        ("jwt_verification", "go.security.jwt-verification", 6,
+         'package probes\n\nimport jwt "github.com/golang-jwt/jwt/v5"\n\nfunc decode(raw string) {\n'
+         '\t_, _, _ = jwt.NewParser().ParseUnverified(raw, jwt.MapClaims{})\n}\n'),
+        ("request_regex", "go.security.request-regex", 9,
+         'package probes\n\nimport (\n\t"net/http"\n\t"regexp"\n)\n\n'
+         'func expression(r *http.Request) (*regexp.Regexp, error) {\n'
+         '\treturn regexp.Compile(r.URL.Query().Get("pattern"))\n}\n'),
+        ("security_randomness", "go.security.insecure-random", 6,
+         'package probes\n\nimport "math/rand"\n\nfunc token() int {\n\treturn rand.Int()\n}\n'),
+        ("hardcoded_secrets", "go.security.hardcoded-secrets", 4,
+         'package probes\n\nfunc value() string {\n\tsecret := "LivePassword123"\n\treturn secret\n}\n'),
+        ("archive_extraction", "go.security.archive-extraction", 10,
+         'package probes\n\nimport (\n\t"archive/tar"\n\t"os"\n\t"path/filepath"\n)\n\n'
+         'func extract(entry *tar.Header, root string) error {\n'
+         '\treturn os.WriteFile(filepath.Join(root, entry.Name), nil, 0600)\n}\n'),
+    )
+    FLOWS = (
+        ("header_injection", "go.security.header-injection", 7, '"net/http"',
+         'value := r.URL.Query().Get("name")', 'w.Header().Set("X-Result", value)'),
+        ("host_header", "go.security.host-header", 7, '"net/http"',
+         'value := r.Host', '_ = "https://" + value'),
+        ("outbound_url", "go.security.outbound-url", 7, '"net/http"',
+         'value := r.URL.Query().Get("url")', '_, _ = http.Get(value)'),
+        ("reverse_proxy_ssrf", "go.security.reverse-proxy-ssrf", 8,
+         '("net/http"; "net/http/httputil"; "net/url")',
+         'value := r.URL.Query().Get("upstream")\n    target, _ := url.Parse(value)',
+         '_ = httputil.NewSingleHostReverseProxy(target)'),
+        ("open_redirect", "go.security.open-redirect", 7, '"net/http"',
+         'value := r.URL.Query().Get("next")', 'http.Redirect(w, r, value, http.StatusFound)'),
+        ("request_body_limit", "go.filesystem.request-body-limit", 7, '("io"; "net/http")',
+         'body := r.Body', '_, _ = io.ReadAll(body)'),
+        ("path_traversal", "go.security.path-traversal", 7, '("net/http"; "os")',
+         'value := r.URL.Query().Get("path")', '_, _ = os.Open(value)'),
+        ("request_body_limit", "go.filesystem.request-body-limit", 7,
+         '("encoding/json"; "net/http")', 'body := r.Body',
+         'decoder := json.NewDecoder(body)\n    var value any\n    _ = 0\n    _ = decoder.Decode(&value)'),
+        ("request_regex", "go.security.request-regex", 11,
+         '("net/http"; "regexp")', 'pattern := r.URL.Query().Get("pattern")',
+         '_, _ = regexp.Compile(pattern)'),
+    )
+
+    def assert_sites(self, name, rule, source, expected):
+        detector = importlib.import_module(f"ubs_core.go_detectors.{name}")
+        self.assertEqual(detector.RULE_ID, rule)
+        self.assertEqual([hit[1] for hit in detector.find([source])], expected)
+
+    def test_security_randomness_requires_the_emitted_public_rule(self):
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        rule = "go.security.insecure-random"
+        positive = ('package suppression\n\nimport (\n\t"fmt"\n\tmathrand "math/rand"\n)\n\n'
+                    'func scopedRandomToken() string {\n'
+                    '\ttoken := fmt.Sprintf("%d", mathrand.Int63())')
+        safe = ('package suppression\n\nimport (\n\tcryptorand "crypto/rand"\n\t"encoding/hex"\n)\n\n'
+                'func scopedRandomToken() string {\n\tvar bytes [16]byte\n'
+                '\tif _, err := cryptorand.Read(bytes[:]); err != nil {\n\t\treturn ""\n\t}\n'
+                '\treturn hex.EncodeToString(bytes[:])\n}\n')
+        with tempfile.TemporaryDirectory(prefix="go-randomness-public-rule-", dir=artifacts) as tmp:
+            source = Path(tmp) / "case.go"
+            # A distinct scoped ID cannot own this heuristic diagnostic.
+            for marker, expected in (("", [9]), ("go.crypto.rand", [9]),
+                                     (rule, []), (f"go.crypto.rand,{rule}", [])):
+                with self.subTest(marker=marker):
+                    comment = f" // ubs:ignore[{marker}]" if marker else ""
+                    source.write_text(positive + comment + '\n\treturn token\n}\n', encoding="utf-8")
+                    self.assert_sites("security_randomness", rule, source, expected)
+            source.write_text(safe, encoding="utf-8")
+            self.assert_sites("security_randomness", rule, source, [])
+
+    def test_markers_require_real_comments_and_exact_rule_ownership(self):
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        cases = list(self.CASES)
+        for name, rule, line, imports, assignment, sink in self.FLOWS[:8]:
+            text = ('package probe\nimport ' + imports + '\n'
+                    'func handler(w http.ResponseWriter, r *http.Request) {\n    '
+                    + assignment + '\n    _ = 0\n    _ = 0\n    ' + sink + '\n}\n')
+            cases.append((name, rule, line, text))
+        with tempfile.TemporaryDirectory(prefix="go-marker-ownership-", dir=artifacts) as tmp:
+            source = Path(tmp) / "case.go"
+            for name, rule, line, text in cases:
+                for variant, expected in (("unmarked", [line]), ("wrong", [line]),
+                                          ("quoted", [line]), ("owned", []), ("bare", []),
+                                          ("previous", []), ("previous-wrong", [line + 1]),
+                                          ("previous-quoted", [line + 1])):
+                    with self.subTest(detector=name, sink=line, variant=variant):
+                        lines = text.splitlines()
+                        if variant in ("wrong", "owned", "bare"):
+                            marker = ("ubs:ignore[unrelated.rule]" if variant == "wrong" else
+                                      f"ubs:ignore[{rule}]" if variant == "owned" else "ubs:ignore")
+                            lines[line - 1] += " // " + marker
+                        elif variant == "quoted":
+                            if name == "hardcoded_secrets":
+                                # Keep the first-assignment anchor: the legacy
+                                # greedy detector also misses an ordinary prefix.
+                                lines[line - 1] += '; _ = "ubs:ignore"'
+                            else:
+                                lines[line - 1] = '_ = "ubs:ignore"; ' + lines[line - 1]
+                        elif variant.startswith("previous"):
+                            lines.insert(line - 1, '    _ = "ubs:ignore"' if variant == "previous-quoted" else
+                                         "    // ubs:ignore[unrelated.rule]" if variant == "previous-wrong" else
+                                         f"    // ubs:ignore[{rule}]")
+                        source.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                        self.assert_sites(name, rule, source, expected)
+
+    def test_marked_sources_preserve_later_unmarked_flow_findings(self):
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        cases = []
+        for name, rule, line, imports, assignment, sink in self.FLOWS:
+            if name == "request_regex":
+                text = ('package probes\n\nimport (\n    "net/http"\n    "regexp"\n)\n\n'
+                        'func expression(r *http.Request) {\n    ' + assignment + '\n\n    ' + sink + '\n}\n')
+                source_line = 9
+            else:
+                text = ('package probe\nimport ' + imports + '\n'
+                        'func handler(w http.ResponseWriter, r *http.Request) {\n    '
+                        + assignment + '\n    _ = 0\n    _ = 0\n    ' + sink + '\n}\n')
+                source_line = 4
+            cases.append((name, rule, line, source_line, text))
+        cases.append(("security_randomness", "go.security.insecure-random", 8, 6,
+                      'package probes\n\nimport "math/rand"\n\nfunc sample() int {\n'
+                      '\trng := rand.New(rand.NewSource(1))\n\n\ttoken := rng.Int(); return token\n}\n'))
+        with tempfile.TemporaryDirectory(prefix="go-marker-flow-", dir=artifacts) as tmp:
+            source = Path(tmp) / "flow.go"
+            for name, rule, line, source_line, text in cases:
+                for marker in ("", "ubs:ignore", f"ubs:ignore[{rule}]", 'quoted'):
+                    with self.subTest(detector=name, sink=line, marker=marker):
+                        lines = text.splitlines()
+                        if marker == 'quoted':
+                            lines[source_line - 1] += '; _ = "ubs:ignore"'
+                        elif marker:
+                            lines[source_line - 1] += ' // ' + marker
+                        source.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                        self.assert_sites(name, rule, source, [line])
+
+
 class RustDetectorSuppressionTests(unittest.TestCase):
     """Exercise real source parsing and taint flow at the existing anchors."""
 

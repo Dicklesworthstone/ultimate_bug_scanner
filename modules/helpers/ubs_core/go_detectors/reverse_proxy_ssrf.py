@@ -28,8 +28,8 @@ Legacy: ``print_finding critical $N "Request-derived reverse proxy
 target reaches httputil.ReverseProxy" "Validate reverse proxy targets
 with an HTTPS scheme and explicit host allow-list before
 NewSingleHostReverseProxy, ProxyRequest.SetURL, or Director URL
-mutation"``. Same-file and previous-line ``ubs:ignore`` markers suppress
-a hit; the legacy heredoc keeps no line dedupe here (preserved). The
+mutation"``. Comment directives use shared statement ownership and exact
+rule scopes; the legacy heredoc keeps no line dedupe here (preserved). The
 rglob/SKIP_DIRS traversal is replaced by the contract file list; the v2
 record count equals the heredoc's __COUNT__.
 """
@@ -39,7 +39,7 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
-MARKER = "ubs:ignore"
+from ubs_core.suppression import SourceSuppressions
 
 RULE_ID = "go.security.reverse-proxy-ssrf"
 CATEGORY = 9
@@ -123,15 +123,6 @@ def _strip_line_comments(line: str) -> str:
         out.append(ch)
         i += 1
     return ''.join(out)
-
-
-def _has_ignore(lines, line_no):
-    idx = line_no - 1
-    return (
-        0 <= idx < len(lines) and MARKER in lines[idx]
-    ) or (
-        0 <= idx - 1 < len(lines) and MARKER in lines[idx - 1]
-    )
 
 
 def _logical_statement(lines, line_no):
@@ -221,18 +212,17 @@ def _has_allowlist_context(lines, line_no, refs):
     return bool(ALLOWLIST_CONTEXT_RE.search(ref_context) and has_blocking_action)
 
 
-def _analyze(path: Path, issues: list) -> None:
+def _analyze(path: Path, issues: list, suppressions: SourceSuppressions) -> None:
     try:
         text = path.read_text(encoding='utf-8', errors='ignore')
     except OSError:
         return
     if not (SOURCE_RE.search(text) and REVERSE_PROXY_RE.search(text)):
         return
+    suppression_index = suppressions.index(path, text)
     lines = text.splitlines()
     tainted = {}
     for idx, _ in enumerate(lines, start=1):
-        if _has_ignore(lines, idx):
-            continue
         line = _logical_statement(lines, idx).strip()
         if not line:
             continue
@@ -263,6 +253,8 @@ def _analyze(path: Path, issues: list) -> None:
             continue
         if _has_allowlist_context(lines, idx, refs):
             continue
+        if suppression_index.is_suppressed(idx, RULE_ID):
+            continue
         if direct:
             path_desc = f"{direct.group(0).strip('(')} -> reverse proxy target"
         else:
@@ -277,8 +269,9 @@ def _analyze(path: Path, issues: list) -> None:
 
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
     issues: list[tuple[Path, int, int, str]] = []
+    suppressions = SourceSuppressions('golang')
     for path in files:
         if path.suffix != ".go":
             continue
-        _analyze(path, issues)
+        _analyze(path, issues, suppressions)
     yield from issues

@@ -126,6 +126,333 @@ class HeapTaintTests(unittest.TestCase):
                   'try { outer(clean, "safe"); } catch (error) { res.send(clean.html); }', 'xss')
         self.assertEqual(findings[0]['line'], 3)
 
+    def test_destructured_declarations_preserve_nested_aliases(self):
+        for declaration in (
+            'const {child: alias} = {child: box};',
+            'const [alias] = [box];',
+            'const {nested: [alias]} = {nested: [box]};',
+            'const {"child-key": alias} = {"child-key": box};',
+            'const {child: alias}: {child: object} = {child: box};',
+        ):
+            with self.subTest(declaration=declaration):
+                self.scan('const box = {html: "safe"}; ' + declaration
+                          + ' alias.html = req.query.html; res.send(box.html);', 'xss')
+
+    def test_destructured_bindings_keep_clean_fields_and_objects_separate(self):
+        self.scan('const {safe, dirty} = {safe: "hello", dirty: req.query.html}; '
+                  'res.send(safe); res.send(dirty);', 'xss')
+        self.scan('const a = {}; const b = {}; '
+                  'const {first, second} = {first: a, second: b}; '
+                  'first.html = req.query.html; res.send(second.html);')
+        self.scan('const [safe, dirty] = ["hello", req.query.html]; '
+                  'res.send(safe); res.send(dirty);', 'xss')
+
+    def test_destructured_scalars_are_snapshots_and_objects_are_aliases(self):
+        self.scan('const box = {html: "safe"}; const {html: snapshot} = box; '
+                  'box.html = req.query.html; res.send(snapshot);')
+        self.scan('const box = {html: req.query.html}; const {html: snapshot} = box; '
+                  'box.html = "safe"; res.send(snapshot);', 'xss')
+        self.scan('const box = {child: {html: "safe"}}; const {child: alias} = box; '
+                  'alias.html = req.query.html; res.send(box.child.html);', 'xss')
+
+    def test_destructuring_assignment_updates_existing_lexical_binding(self):
+        for assignment in ('({box: alias} = {box});', '[alias] = [box];'):
+            with self.subTest(assignment=assignment):
+                self.scan('const box = {}; let alias; ' + assignment
+                          + ' alias.html = req.query.html; res.send(box.html);', 'xss')
+        findings = self.scan('let result = {}; function assign() { '
+                  '({box: result} = {box: {html: req.query.html}}); }\n'
+                  '{ const result = {html: "safe"}; assign(); res.send(result.html); }\n'
+                  'res.send(result.html);', 'xss')
+        self.assertEqual(findings[0]['line'], 3)
+
+    def test_destructuring_assignment_writes_through_member_targets(self):
+        for assignment in ('({html: box.html} = {html: req.query.html});',
+                           '[box.html] = [req.query.html];',
+                           '({child: box["html"]} = {child: req.query.html});'):
+            with self.subTest(assignment=assignment):
+                self.scan('const box = {}; const alias = box; ' + assignment
+                          + ' res.send(alias.html);', 'xss')
+        self.scan('const box = {html: req.query.html}; '
+                  '({html: box.html} = {html: "safe"}); res.send(box.html);')
+
+    def test_destructuring_member_target_runs_before_source_read_and_default(self):
+        for initial, changed, rules in (('"safe"', 'req.query.html', ('xss',)),
+                                         ('req.query.html', '"safe"', ())):
+            with self.subTest(initial=initial, changed=changed):
+                self.scan('let value = ' + initial + '; const out = {}; '
+                          'function key() { value = ' + changed + '; return "html"; } '
+                          '({x: out[key()] = value} = {}); res.send(out.html);', *rules)
+                self.scan('const src = {x: ' + initial + '}; const out = {}; '
+                          'function key() { src.x = ' + changed + '; return "html"; } '
+                          '({x: out[key()]} = src); res.send(out.html);', *rules)
+                self.scan('const src = [' + initial + ']; const out = {}; '
+                          'function key() { src[0] = ' + changed + '; return "html"; } '
+                          '([out[key()]] = src); res.send(out.html);', *rules)
+
+    def test_destructuring_member_target_is_evaluated_once_and_keeps_receiver(self):
+        self.scan('let value = "safe"; let saved = req.query.html; const out = {}; '
+                  'function key() { const old = value; value = saved; saved = old; return "html"; } '
+                  '({x: out[key()] = value} = {}); res.send(out.html); res.send(value);', 'xss', 'xss')
+        self.scan('const first = {}; let out = first; '
+                  'function key() { out = {}; return "html"; } '
+                  '({x: out[key()]} = {x: req.query.html}); '
+                  'res.send(first.html); res.send(out.html);', 'xss')
+
+    def test_destructuring_member_target_throw_skips_default_and_assignment(self):
+        self.scan('const out = {}; const observed = {}; '
+                  'function key() { throw "stop"; } '
+                  'function fallback() { observed.html = req.query.html; return "safe"; } '
+                  'try { ({x: out[key()] = fallback()} = {}); } catch (error) {} '
+                  'res.send(observed.html); res.send(out.html);')
+
+    def test_destructuring_rest_target_runs_before_shallow_copy(self):
+        for initial, changed, rules in (('"safe"', 'req.query.html', ('xss',)),
+                                         ('req.query.html', '"safe"', ())):
+            with self.subTest(initial=initial, changed=changed):
+                self.scan('const src = {html: ' + initial + '}; const out = {}; '
+                          'function key() { src.html = ' + changed + '; return "copy"; } '
+                          '({...out[key()]} = src); res.send(out.copy.html);', *rules)
+
+    def test_destructuring_member_writes_reach_dom_sinks(self):
+        for assignment in (
+            '({html: element.innerHTML} = {html: req.query.html});',
+            '([element.innerHTML] = [req.query.html]);',
+            '({html: element["innerHTML"]} = {html: req.query.html});',
+            '({html: element.outerHTML} = {html: req.query.html});',
+            '({html: element.dangerouslySetInnerHTML} = {html: req.query.html});',
+            '({html: element.innerHTML = req.query.html} = {});',
+        ):
+            with self.subTest(assignment=assignment):
+                findings = self.scan(assignment, 'xss')
+                marker = '[' if 'element[' in assignment else '.'
+                self.assertEqual(findings[0]['col'], assignment.index(marker, assignment.index('element')) + 1)
+        self.scan('function render(value) { ({html: element.innerHTML} = value); } '
+                  'render({html: req.query.html});', 'xss')
+
+    def test_destructuring_dom_sinks_respect_fields_sanitizers_and_execution(self):
+        self.scan('({html: element.innerHTML} = {html: "safe", other: req.query.html});')
+        self.scan('const value = {html: DOMPurify.sanitize(req.query.html)}; '
+                  '({html: element.innerHTML} = value); eval(value.html);', 'eval')
+        self.scan('if (false) { ({html: element.innerHTML} = {html: req.query.html}); }')
+        self.scan('const text = "([element.innerHTML] = [req.query.html]);";')
+        self.scan('const value = {html: req.query.html}; '
+                  'const names = [element.innerHTML]; const {html} = value;')
+
+    def test_destructured_parameters_preserve_borrowed_objects_and_callers(self):
+        for pattern, dirty, clean in (
+            ('{child: box}', '{child: a}', '{child: b}'),
+            ('[box]', '[a]', '[b]'),
+            ('{nested: [box]}', '{nested: [a]}', '{nested: [b]}'),
+        ):
+            with self.subTest(pattern=pattern):
+                findings = self.scan('function put(' + pattern
+                    + ', value) { box.html = value; }\n'
+                    'const a = {}; const b = {};\n'
+                    'put(' + dirty + ', req.query.html); put(' + clean + ', "safe");\n'
+                    'res.send(a.html);\nres.send(b.html);', 'xss')
+                self.assertEqual(findings[0]['line'], 4)
+
+    def test_destructured_parameter_reads_keep_field_precision(self):
+        for declaration in (
+            'function read({html}) { return html; }',
+            'function read({html}: {html: string, other: string}) { return html; }',
+            'const read = ({html}) => html;',
+        ):
+            with self.subTest(declaration=declaration):
+                self.scan(declaration + ' res.send(read({html: "safe", other: req.query.html}));')
+                self.scan(declaration + ' res.send(read({html: req.query.html, other: "safe"}));', 'xss')
+
+    def test_destructured_defaults_observe_earlier_bindings(self):
+        self.scan('const {html, copy = html} = {html: req.query.html}; res.send(copy);', 'xss')
+        self.scan('function read({html, copy = html}) { return copy; } '
+                  'res.send(read({html: req.query.html}));', 'xss')
+        self.scan('function read(box, {child = box}) { return child; } '
+                  'const box = {}; const alias = read(box, {}); alias.html = req.query.html; '
+                  'res.send(box.html);', 'xss')
+
+    def test_ternary_destructured_defaults_do_not_become_property_aliases(self):
+        for fallback in ('flag ? req.query.html : "safe"', 'flag ? "safe" : req.query.html'):
+            with self.subTest(fallback=fallback):
+                self.scan('const {value = ' + fallback + '} = {}; res.send(value);', 'xss')
+                self.scan('function read({value = ' + fallback + '}) { return value; } '
+                          'res.send(read({}));', 'xss')
+                self.scan('try { throw {}; } catch ({value = ' + fallback
+                          + '}) { res.send(value); }', 'xss')
+
+    def test_destructured_defaults_use_captured_values_without_mixing_callers(self):
+        findings = self.scan('function factory(label) { function read({html = label}) { '
+                  'return {html}; } return read({}); }\n'
+                  'const a = factory(req.query.first); const b = factory(req.query.second); '
+                  'const clean = factory("safe");\n'
+                  'res.send(a.html);\nres.send(b.html);\nres.send(clean.html);', 'xss', 'xss')
+        self.assertEqual([finding['line'] for finding in findings], [3, 4])
+        for finding, source, other in zip(findings, ('first', 'second'), ('second', 'first')):
+            self.assertIn('req.query.' + source, finding['message'])
+            self.assertNotIn('req.query.' + other, finding['message'])
+
+    def test_missing_destructured_defaults_execute_and_known_objects_bypass(self):
+        self.scan('const {value = req.query.html} = {}; res.send(value);', 'xss')
+        self.scan('function read({value = req.query.html}) { return value; } res.send(read({}));', 'xss')
+        self.scan('const {value = {html: req.query.html}} = {value: {html: "safe"}}; '
+                  'res.send(value.html);')
+        self.scan('function read({value = {html: req.query.html}}) { return value; } '
+                  'res.send(read({value: {html: "safe"}}).html);')
+        self.scan('function read({html} = {html: req.query.html}) { return html; } '
+                  'res.send(read());', 'xss')
+
+    def test_destructured_defaults_keep_bypass_paths_for_unknown_fields(self):
+        prefix = ('const box = {html: req.query.html}; '
+                  'function clear() { box.html = "safe"; } ')
+        self.scan(prefix + 'const {unused = clear()} = unknown; res.send(box.html);', 'xss')
+        self.scan(prefix + 'function read({unused = clear()}) {} read(unknown); res.send(box.html);', 'xss')
+        self.scan('const {html = "safe"} = req.query; res.send(html);', 'xss')
+
+    def test_destructured_computed_keys_run_before_later_property_reads(self):
+        source = ('const box = {next: "safe"}; '
+                  'function change() { box.next = req.query.html; return "first"; } ')
+        self.scan(source + 'const {[change()]: first, next} = box; res.send(next);', 'xss')
+        self.scan(source + 'function read({[change()]: first, next}) { return next; } '
+                  'res.send(read(box));', 'xss')
+
+    def test_destructured_default_throws_keep_prior_writes_and_skip_body(self):
+        prefix = ('const box = {}; function reject() { '
+                  'box.html = req.query.html; throw {html: req.query.code}; }\n')
+        for declaration, invocation in (
+            ('', 'const {value = reject()} = {};'),
+            ('function read({value = reject()}) { box.html = "safe"; }\n', 'read({});'),
+        ):
+            with self.subTest(invocation=invocation):
+                self.scan(prefix + declaration + 'try { ' + invocation
+                          + ' } catch (error) { res.send(box.html); eval(error.html); }', 'xss', 'eval')
+
+    def test_object_rest_is_a_shallow_copy_with_excluded_fields(self):
+        self.scan('const box = {skip: req.query.html, child: {html: "safe"}}; '
+                  'const {skip, ...rest} = box; res.send(rest.skip); '
+                  'rest.child.html = req.query.code; eval(box.child.html);', 'eval')
+        self.scan('const box = {html: "safe"}; const {...rest} = box; '
+                  'rest.html = req.query.html; res.send(box.html);')
+        self.scan('const {skip, ...rest} = {skip: "safe", html: req.query.html}; '
+                  'res.send(rest.html);', 'xss')
+
+    def test_array_rest_reindexes_elements_and_preserves_nested_aliases(self):
+        self.scan('const box = {}; const [skip, ...tail] = [req.query.secret, box]; '
+                  'tail[0].html = req.query.html; res.send(box.html); '
+                  'res.send(tail.length); res.send(tail[1]);', 'xss')
+        self.scan('const [skip, ...tail] = [req.query.secret, "safe"]; res.send(tail[0]);')
+
+    def test_parameter_rest_copies_keep_separate_calls(self):
+        for pattern, dirty, clean, field in (
+            ('{skip, ...rest}', '{skip: "safe", html: req.query.html}',
+             '{skip: req.query.secret, html: "safe"}', '.html'),
+            ('[skip, ...rest]', '["safe", req.query.html]',
+             '[req.query.secret, "safe"]', '[0]'),
+        ):
+            with self.subTest(pattern=pattern):
+                findings = self.scan('function read(' + pattern + ') { return rest; }\n'
+                    'const dirty = read(' + dirty + '); const clean = read(' + clean + ');\n'
+                    'res.send(dirty' + field + ');\nres.send(clean' + field + ');', 'xss')
+                self.assertEqual(findings[0]['line'], 3)
+                self.assertNotIn('req.query.secret', findings[0]['message'])
+
+    def test_destructured_rest_formals_keep_positions_and_borrowed_objects(self):
+        for pattern in ('...[box, value]', '...{0: box, 1: value}',
+                        '...[box, value]: [object, string]'):
+            with self.subTest(pattern=pattern):
+                findings = self.scan('function put(skip, ' + pattern + ') { box.html = value; }\n'
+                    'const dirty = {}; const clean = {};\n'
+                    'put(req.query.secret, dirty, req.query.html); put(req.query.secret, clean, "safe");\n'
+                    'res.send(dirty.html);\nres.send(clean.html);', 'xss')
+                self.assertEqual(findings[0]['line'], 4)
+                self.assertNotIn('req.query.secret', findings[0]['message'])
+        self.scan('function put(...[[box], , value]) { box.html = value; } '
+                  'const box = {}; put([box], "skip", req.query.html); res.send(box.html);', 'xss')
+
+    def test_destructured_rest_formals_keep_clean_fields_and_defaults(self):
+        self.scan('function read(...[box]) { return box.html; } '
+                  'res.send(read({html: req.query.html}));', 'xss')
+        self.scan('function read(...[box]) { return box.html; } '
+                  'res.send(read({html: "safe", other: req.query.html}));')
+        self.scan('function read(...[box = {html: req.query.html}]) { return box; } '
+                  'res.send(read().html);', 'xss')
+        self.scan('function read(...[box = {html: req.query.html}]) { return box; } '
+                  'res.send(read({html: "safe"}).html);')
+
+    def test_rest_argument_arrays_are_fresh_shallow_copies(self):
+        self.scan('function collect(...items) { return items; } '
+                  'const first = collect("safe"); const second = collect("safe"); '
+                  'first[0] = req.query.html; res.send(first[0]); res.send(second[0]); '
+                  'res.send(first.length);', 'xss')
+        self.scan('function collect(...items) { return items; } '
+                  'const box = {}; const items = collect(box); '
+                  'items[0].html = req.query.html; res.send(box.html);', 'xss')
+        self.scan('function collect(...items) { items[0] = {html: req.query.html}; } '
+                  'const box = {html: "safe"}; collect(box); res.send(box.html);')
+        self.scan('function collect(...items) { return items; } '
+                  'const value = collect(DOMPurify.sanitize(req.query.html)); '
+                  'res.send(value[0]); eval(value[0]);', 'eval')
+
+    def test_rest_formals_preserve_known_and_uncertain_spread_elements(self):
+        prefix = 'function put(...[box, value]) { box.html = value; } const box = {}; '
+        self.scan(prefix + 'const args = [box, req.query.html]; '
+                  'put(...args); res.send(box.html);', 'xss')
+        self.scan(prefix + 'const args = [box]; if (flag) args.push({}); '
+                  'put(...args, req.query.html); res.send(box.html);', 'xss')
+        self.scan('function read(...[skip, ...tail]) { return tail; } '
+                  'const args = [req.query.secret, "safe"]; '
+                  'res.send(read(...args)[0]);')
+        self.scan('function put(...[box, value]) { box.html = value; } '
+                  'const box = {html: req.query.html}; const args = [box, "safe"]; '
+                  'put(...args); res.send(box.html);')
+
+    def test_known_array_spreads_keep_default_and_bypass_paths(self):
+        for literal in ('[undefined]', '[void 0]', '[,]'):
+            with self.subTest(literal=literal):
+                self.scan('function read(value = req.query.html) { return value; } '
+                          'const args = ' + literal + '; res.send(read(...args));', 'xss')
+        self.scan('const box = {html: req.query.html}; '
+                  'function clear() { box.html = "safe"; } '
+                  'function read(value = clear()) {} '
+                  'const args = ["safe"]; read(...args); res.send(box.html);', 'xss')
+        self.scan('function read(value = {html: req.query.html}) { return value; } '
+                  'const args = [{html: "safe"}]; res.send(read(...args).html);')
+
+    def test_default_parameter_allocations_keep_callsite_identity(self):
+        for initializer in ('{html: "safe"}', 'make()'):
+            with self.subTest(initializer=initializer):
+                source = ('function make() { return {html: "safe"}; } '
+                          'function read(value = ' + initializer + ') { return value; } '
+                          'const first = read(); const second = read(); '
+                          'first.html = req.query.html; ')
+                self.scan(source + 'res.send(second.html);')
+                self.scan(source + 'res.send(first.html);', 'xss')
+
+    def test_destructured_bindings_keep_sanitizer_domains(self):
+        self.scan('const {html} = {html: DOMPurify.sanitize(req.query.html)}; '
+                  'res.send(html); eval(html);', 'eval')
+        self.scan('function read({html}) { return html; } '
+                  'const value = read({html: DOMPurify.sanitize(req.query.html)}); '
+                  'res.send(value); eval(value);', 'eval')
+
+    def test_destructured_parameters_keep_selected_module_offsets_and_heap(self):
+        functions = ('function put({box}, value) { box.html = value; }\n'
+                     'function read({skip, ...rest}) { return rest; }\n')
+        for extension, exports, imports in (
+            ('js', 'export {put, read};', 'import {put, read} from "./z-lib.js";'),
+            ('cjs', 'module.exports = {put, read};', 'const {put, read} = require("./z-lib.cjs");'),
+        ):
+            with self.subTest(extension=extension), tempfile.TemporaryDirectory(prefix='ubs-pattern-modules-') as scratch:
+                library = Path(scratch) / ('z-lib.' + extension)
+                library.write_text(functions + exports + '\n', encoding='utf-8')
+                caller = Path(scratch) / ('app.' + extension)
+                caller.write_text(imports + '\nconst box = {};\n'
+                    'put({box}, req.query.html);\n'
+                    'const clean = read({skip: req.query.secret, html: "safe"});\n'
+                    'res.send(box.html);\nres.send(clean.html);\n', encoding='utf-8')
+                findings = list(taint.scan_project_findings([library, caller]))
+                self.assertEqual([(path.name, rule, line) for path, rule, line, _, _ in findings],
+                                 [(caller.name, 'js.taint.xss', 5)], findings)
+
     def test_mutual_recursion_preserves_borrowed_heap_mutations(self):
         source = ('function first(box, n) { if (n > 0) second(box, n - 1); '
                   'else box.html = box.input; } '
@@ -638,6 +965,13 @@ class HeapTaintTests(unittest.TestCase):
             ('helper-array', 'function add(a,x){a.push(x);} const a=[]; add(a,req.query.code); eval(a[0]);', {'eval'}),
             ('wrapper-allocation-isolation', 'function make(){return {};} function pair(){return {a:make(),b:make()};} const p=pair(); p.a.html=req.query.html; res.send(p.b.html);', set()),
             ('helper-sanitizer-domain', 'function clear(o,x){o.html=DOMPurify.sanitize(x);} const a={}; clear(a,req.query.html); res.send(a.html); eval(a.html);', {'eval'}),
+            ('destructured-alias', 'const box={}; const {box:alias}={box}; alias.html=req.query.html; res.send(box.html);', {'xss'}),
+            ('destructured-parameter', 'function put({box},x){box.html=x;} const box={}; put({box},req.query.html); res.send(box.html);', {'xss'}),
+            ('destructured-clean-field', 'function read({html}){return html;} res.send(read({html:"safe",other:req.query.html}));', set()),
+            ('destructured-rest-parameter', 'function put(...[box,value]){box.html=value;} const box={}; put(box,req.query.html); res.send(box.html);', {'xss'}),
+            ('destructured-target-order', 'const src={html:"safe"}; const out={}; function key(){src.html=req.query.html;return "html";} ({html:out[key()]}=src); res.send(out.html);', {'xss'}),
+            ('destructured-dom-write', '({html:element.innerHTML}={html:req.query.html});', {'xss'}),
+            ('destructured-dom-clean', '({html:element.innerHTML}={html:DOMPurify.sanitize(req.query.html)});', set()),
         ]
         for name, source, expected in cases:
             with self.subTest(name=name), tempfile.TemporaryDirectory(prefix='ubs-heap-meta-') as tmp:

@@ -2841,8 +2841,11 @@ class _Engine:
         # a separate heap context; unrelated caller cells cannot affect it.
         return (callee in self.heap_scopes
                 or any(_refs(fact) for fact in bound.values())
-                or any(_refs(fact) for key, fact in state.cells.items()
-                       if key in self.capture_keys[callee]))
+                # Unassigned formals live in the visible-name map. Use the
+                # same lexical lookup as heap_input so a nested setter or
+                # property reader cannot lose its captured object's identity
+                # by taking a scalar summary before the first assignment.
+                or any(_refs(_cell_value(key, state)) for key in self.capture_keys[callee]))
 
     def heap_input(self, callee, bound, incoming, recursive):
         state = _State(budget=self.budget)

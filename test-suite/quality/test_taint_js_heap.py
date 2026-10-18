@@ -65,6 +65,67 @@ class HeapTaintTests(unittest.TestCase):
                   'return get(3); } const a = simulate(req.query.label); '
                   'const b = simulate("safe"); res.send(a.note); res.send(b.note); res.send(a.kind);', 'xss')
 
+    def test_nested_setter_mutates_unassigned_object_parameter(self):
+        factory = ('function outer(box, value) { '
+                   'function set() { box.html = value; } set(); }\n')
+        calls = ('outer(dirty, req.query.html);', 'outer(clean, "safe");')
+        for order in (calls, calls[::-1]):
+            with self.subTest(order=order):
+                findings = self.scan(factory
+                    + 'const dirty = {}; const alias = dirty; const clean = {};\n'
+                    + '\n'.join(order) + '\n'
+                    + 'res.send(alias.html);\nres.send(clean.html);', 'xss')
+                self.assertEqual(findings[0]['line'], 5)
+                self.assertIn('req.query.html', findings[0]['message'])
+
+    def test_transitive_nested_setter_preserves_captured_heap(self):
+        self.scan('function outer(box, value) { function middle() { '
+                  'function set() { box.html = value; } set(); } middle(); } '
+                  'const result = {}; outer(result, req.query.html); res.send(result.html);', 'xss')
+
+    def test_nested_captured_property_read_keeps_field_precision(self):
+        factory = ('function outer(box) { function get() { return box.html; } '
+                   'return get(); } ')
+        self.scan(factory + 'res.send(outer({html: req.query.html, kind: "safe"}));', 'xss')
+        self.scan(factory + 'res.send(outer({html: "safe", kind: req.query.html}));')
+
+    def test_nested_captured_heap_cleanup_requires_definite_write(self):
+        for statement, rules in (('box.html = "safe";', ()),
+                                 ('if (flag) box.html = "safe";', ('xss',)),
+                                 ('return; box.html = "safe";', ('xss',))):
+            with self.subTest(statement=statement):
+                self.scan('function outer(box) { function clear() { ' + statement
+                          + ' } clear(); } const result = {html: req.query.html}; '
+                          'outer(result); res.send(result.html);', *rules)
+
+    def test_nested_captured_heap_respects_shadowing_rebinding_and_execution(self):
+        for helper, call in (
+            ('function set(box) { box.html = req.query.html; }', 'set({})'),
+            ('function set() { const box = {}; box.html = req.query.html; }', 'set()'),
+            ('function set() { box = {}; box.html = req.query.html; }', 'set()'),
+            ('function set() { box.html = req.query.html; }', ''),
+        ):
+            with self.subTest(helper=helper, call=call):
+                self.scan('function outer(box) { ' + helper + ' ' + call + '; } '
+                          'const result = {html: "safe"}; outer(result); res.send(result.html);')
+
+    def test_nested_array_mutator_keeps_captured_identity_and_sanitizer_domains(self):
+        findings = self.scan('function outer(items, value) { '
+                  'function append() { items.push(value); } append(); }\n'
+                  'const dirty = []; const clean = [];\n'
+                  'outer(dirty, req.query.html); outer(clean, DOMPurify.sanitize(req.query.html));\n'
+                  'res.send(dirty[0]);\nres.send(clean[0]);\neval(clean[0]);', 'xss', 'eval')
+        self.assertEqual([(finding['rule'], finding['line']) for finding in findings],
+                         [('javascript.taint.xss', 4), ('javascript.taint.eval', 6)])
+
+    def test_nested_captured_heap_mutation_survives_exception(self):
+        findings = self.scan('function outer(box, value) { function set() { '
+                  'box.html = value; throw "stop"; } set(); }\n'
+                  'const dirty = {}; const clean = {};\n'
+                  'try { outer(dirty, req.query.html); } catch (error) { res.send(dirty.html); }\n'
+                  'try { outer(clean, "safe"); } catch (error) { res.send(clean.html); }', 'xss')
+        self.assertEqual(findings[0]['line'], 3)
+
     def test_mutual_recursion_preserves_borrowed_heap_mutations(self):
         source = ('function first(box, n) { if (n > 0) second(box, n - 1); '
                   'else box.html = box.input; } '

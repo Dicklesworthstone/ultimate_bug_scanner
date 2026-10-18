@@ -306,7 +306,7 @@ def scan_detectors(files: Sequence[Path], sink, skip: set[int]) -> None:
         find = getattr(module, "find", None)
         if not find:
             continue
-        for hit in find(files):
+        for hit in find(files, language="kotlin", rule_id=rule_id):
             if len(hit) == 5:
                 _rid, path, line_no, col, detail = hit
             else:

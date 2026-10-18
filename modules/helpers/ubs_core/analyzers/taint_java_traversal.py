@@ -476,7 +476,9 @@ class Engine:
     path_constructors = True
 
     def __init__(self, path, text):
-        self.path, self.text = path, text
+        # FindingSink canonicalizes source locations; evidence and source keys
+        # must identify that same file when selection used a symlink alias.
+        self.path, self.text = path.resolve(), text
         self.parser = Parser(text, path.suffix.lower() in {'.kt', '.kts'}, self.source_re, self.sink_re)
         self.code = self.parser.code
         self.lines = [0, *(index + 1 for index, char in enumerate(text) if char == '\n')]

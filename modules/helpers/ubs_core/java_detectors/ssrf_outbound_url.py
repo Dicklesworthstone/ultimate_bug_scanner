@@ -4,8 +4,8 @@ Verbatim port of run_outbound_url_checks (modules/ubs-java.sh 1720-1993):
 request-derived values reaching outbound HTTP client sinks (HttpRequest
 builders, RestTemplate/WebClient/OkHttp calls, Jsoup/Unirest, openConnection)
 unless an allow-list context (safe/validate/allow helpers, URI host checks
-with a rejecting branch) guards them. Current+previous-line ubs:ignore
-suppresses.
+with a rejecting branch) guards them. Source-owned directives filter findings
+with the receiving language's actual public rule ID, preserving source facts.
 """
 from __future__ import annotations
 
@@ -13,9 +13,9 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.suppression import SourceSuppressions
 from ubs_core.java_detectors._common import (
     annotated_sources,
-    has_ignore,
     is_safe_expr,
     iter_java_files,
     logical_statement,
@@ -103,12 +103,13 @@ def has_allowlist_context(lines, line_no, refs, strip_line_comments):
     return bool(URL_PARSE_RE.search(context) and HOST_CHECK_RE.search(context) and REJECT_RE.search(context))
 
 
-def analyze(path: Path, issues):
+def analyze(path: Path, issues, *, suppressions: SourceSuppressions, rule_id: str):
     from ubs_core.java_detectors._common import strip_line_comments
 
     text = path.read_text(encoding='utf-8', errors='ignore')
     if not ((SOURCE_RE.search(text) or ANNOTATED_PARAM_RE.search(text)) and SINK_RE.search(text)):
         return
+    suppression = suppressions.index(path, text)
     lines = text.splitlines()
     non_http = frozenset()
     if path.suffix.lower() == ".java":
@@ -125,8 +126,6 @@ def analyze(path: Path, issues):
     tainted = annotated_sources(text, ANNOTATED_PARAM_RE)
     seen = set()
     for idx, _ in enumerate(lines, start=1):
-        if has_ignore(lines, idx):
-            continue
         statement = logical_statement(analysis_lines, idx).strip()
         if not statement:
             continue
@@ -164,6 +163,10 @@ def analyze(path: Path, issues):
             continue
         if has_allowlist_context(lines, idx, refs, strip_line_comments):
             continue
+        if not strip_line_comments(lines[idx - 1]).strip():
+            continue
+        if suppression.is_suppressed(idx, rule_id):
+            continue
         key = (str(path), idx)
         if key in seen:
             continue
@@ -172,11 +175,12 @@ def analyze(path: Path, issues):
         issues.append((path, idx, f"{source_line(lines, idx)}  [{path_desc}]"))
 
 
-def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
+def find(files: Sequence[Path], *, language: str = 'java', rule_id: str = RULE_ID) -> Iterable[tuple[Path, int, int, str]]:
+    suppressions = SourceSuppressions(language)
     issues: list[tuple[Path, int, str]] = []
     for path in iter_java_files(files):
         try:
-            analyze(path, issues)
+            analyze(path, issues, suppressions=suppressions, rule_id=rule_id)
         except OSError:
             continue
     for path, line_no, detail in issues:

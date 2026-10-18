@@ -15,6 +15,7 @@ import tempfile
 import textwrap
 import time
 import unittest
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -765,7 +766,7 @@ class PythonTaintDataflowTests(unittest.TestCase):
         self.assertEqual(payload['status'], 'ok', context)
         taint = [row for row in records if row['rule'].startswith('python.taint.')]
         self.assertEqual([(row['rule'], row['path'], row['line'], row['col']) for row in taint],
-                         [('python.taint.eval', str(source), 5, 5)], context)
+                         [('python.taint.eval', str(source.resolve()), 5, 5)], context)
         self.assertIn('request.args', taint[0]['message'], context)
         self.assertIn('evaluate()', taint[0]['message'], context)
 
@@ -3759,6 +3760,44 @@ class PathGuardOracle { public static void main(String[] args) throws Exception 
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(proc.stdout.strip(), 'string prefix admits sibling; chained transform escapes root')
 
+    def test_symlinked_sources_keep_canonical_taint_evidence_identity(self):
+        from ubs_core.analyzers import taint_java_redirect, taint_java_traversal
+        from ubs_core.registry import RunContext
+        physical = self.root / 'physical'
+        physical.mkdir()
+        alias = self.root / 'selected-alias'
+        alias.symlink_to(physical, target_is_directory=True)
+        for lang in ('java', 'kotlin'):
+            for label, code, domain, expected in self.cases(lang):
+                if label not in {'safeRedirect', 'misleading-path-helper'}:
+                    continue
+                analyzer = taint_java_redirect if domain == 'open_redirect' else taint_java_traversal
+                path = physical / (label + ('.java' if lang == 'java' else '.kt'))
+                path.write_text(code, encoding='utf-8')
+                canonical_extras = None
+                for selected in (path, alias / path.name):
+                    case = lang + '-' + label + '-' + selected.parent.name
+                    started = time.monotonic()
+                    print(f'[{case}] RUN', flush=True)
+                    with self.subTest(case=case):
+                        records = list(analyzer.run(RunContext(lang=lang, files=[selected])))
+                        self.assertEqual({row['line'] for row in records}, expected, records)
+                        self.assertEqual(len(records), len(expected), records)
+                        self.assertTrue(all(row['rule'] == 'java.taint.' + domain for row in records), records)
+                        extras = [row['extras'] for row in records]
+                        (self.root / (case + '.json')).write_text(json.dumps({
+                            'selected': str(selected), 'canonical': str(path.resolve()),
+                            'source_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                            'records': records,
+                        }, indent=2), encoding='utf-8')
+                        self.assertTrue(all(step['path'] == str(path.resolve())
+                                            for item in extras for step in item['taint_path']), records)
+                        if canonical_extras is None:
+                            canonical_extras = extras
+                        else:
+                            self.assertEqual(extras, canonical_extras, records)
+                        print(f'[{case}] PASS ({time.monotonic() - started:.3f}s)', flush=True)
+
     def test_basename_leaf_and_directory_semantics_with_real_java(self):
         if shutil.which('java') is None:
             self.skipTest('Java runtime unavailable for the independent basename API oracle')
@@ -4896,6 +4935,444 @@ console.log(JSON.stringify(origins));
                     self.assertEqual(actual, expected, context)
                     self.assertEqual(len(findings), len(expected), context)
                     print(f'[{label}] PASS ({time.monotonic() - started:.3f}s)', flush=True)
+
+
+class JavaDetectorSuppressionTests(unittest.TestCase):
+    """Real legacy receivers: suppress findings without deleting source facts."""
+
+    @classmethod
+    def setUpClass(cls):
+        # Keep artifacts with this test file even when a baseline harness
+        # selects a separate, immutable production checkout via REPO_ROOT.
+        artifacts = Path(__file__).resolve().parents[2] / 'test-suite/artifacts'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        cls.root = Path(tempfile.mkdtemp(prefix='a7-java-detectors-', dir=artifacts))
+        print(f'[JavaDetectorSuppressionTests] artifacts={cls.root}', flush=True)
+
+    @contextmanager
+    def case(self, label):
+        started = time.monotonic()
+        identity = self.id() + ':' + label
+        print(f'[{identity}] RUN', flush=True)
+        state = 'FAIL'
+        try:
+            yield
+            state = 'PASS'
+        finally:
+            elapsed = time.monotonic() - started
+            print(f'[{identity}] {state} ({elapsed:.3f}s)', flush=True)
+            with (self.root / 'cases.jsonl').open('a', encoding='utf-8') as output:
+                output.write(json.dumps({'case': identity, 'state': state, 'seconds': elapsed}) + '\n')
+
+    def programs(self):
+        # Explicit line tables are independent of the detector's own matches.
+        # Source lines are separated from sinks to expose lost alias state.
+        return (
+            ('archive_extraction', 'java.security.archive-extraction', 8, 5, '''import java.nio.file.Path;
+import java.util.zip.ZipEntry;
+class ArchiveProbe {
+    void extract(Path destination, ZipEntry entry) {
+        String value = entry.getName();
+        int padding = 0;
+        padding++;
+        destination.resolve(value);
+    }
+}
+''', (('destination.resolve(value)', 'destination.resolve("fixed")'),)),
+            ('header_injection', 'java.security.header-injection', 7, 4, '''import com.sun.net.httpserver.HttpExchange;
+class HeaderProbe {
+    void handle(HttpExchange request) {
+        String value = request.getRequestURI().getQuery();
+        int padding = 0;
+        padding++;
+        request.getResponseHeaders().add("X-Name", value);
+    }
+}
+''', (('add("X-Name", value)', 'add("X-Name", "fixed")'),)),
+            ('ssrf_outbound_url', 'java.security.ssrf-outbound-url', 9, 6, '''import com.sun.net.httpserver.HttpExchange;
+import java.net.URI;
+import java.net.http.HttpRequest;
+class SsrfProbe {
+    void handle(HttpExchange request) {
+        String value = request.getRequestURI().getQuery();
+        int padding = 0;
+        padding++;
+        HttpRequest.newBuilder(URI.create(value)).build();
+    }
+}
+''', (('URI.create(value)', 'URI.create("https://example.com")'),)),
+            ('security_randomness', 'java.security.insecure-randomness', 7, 4, '''import java.util.Random;
+class RandomProbe {
+    String generate() {
+        Random rng = new Random();
+        int padding = 0;
+        padding++;
+        int token = rng.nextInt();
+        return Integer.toString(token);
+    }
+}
+''', (('import java.util.Random;', 'import java.security.SecureRandom;'),
+      ('Random rng = new Random()', 'SecureRandom rng = new SecureRandom()'))),
+            ('collections_foreach', 'java.collections.foreach-remove', 6, 4, '''import java.util.List;
+class CollectionsProbe {
+    void mutate(List<String> items) {
+        for (String item : items) {
+            int padding = 0;
+            items.remove(item);
+        }
+    }
+}
+''', (('items.remove(item)', 'items.contains(item)'),)),
+            ('io_loops', 'java.io.readallbytes-loop', 7, 5, '''import java.nio.file.Files;
+import java.nio.file.Path;
+class IoProbe {
+    void read(Path path) throws java.io.IOException {
+        for (int i = 0; i < 2; i++) {
+            int padding = 0;
+            Files.readAllBytes(path);
+        }
+    }
+}
+''', (('Files.readAllBytes(path)', 'Files.exists(path)'),)),
+            ('streams_concat', 'java.streams-perf.string-plus-loop', 6, 4, '''class StreamsProbe {
+    String join(String[] items) {
+        String result = "";
+        for (String item : items) {
+            int padding = 0;
+            result += item;
+        }
+        return result;
+    }
+}
+''', (('String result = "";', 'StringBuilder result = new StringBuilder();'),
+      ('result += item;', 'result.append(item);'), ('return result;', 'return result.toString();'))),
+            ('optional_get', 'java.null-optional.optional-get', 4, None, '''import java.util.Optional;
+class OptionalProbe {
+    String read(Optional<String> value) {
+        return value.get();
+    }
+}
+''', (('value.get()', 'value.orElse("")'),)),
+            ('resource_leaks', 'java.resource.executor-leak', 4, None, '''import java.util.concurrent.Executors;
+class ExecutorProbe {
+    void launch() {
+        Executors.newSingleThreadExecutor();
+    }
+}
+''', (('Executors.newSingleThreadExecutor();', 'Executors.newSingleThreadExecutor().shutdown();'),)),
+            ('runtime_exec', 'java.security.runtime-exec', 3, None, '''class ExecProbe {
+    void run(String value) throws java.io.IOException {
+        Runtime.getRuntime().exec(value);
+    }
+}
+''', (('Runtime.getRuntime().exec(value);', 'System.out.println(value);'),)),
+            ('equals_hashcode', 'java.equality.equals-no-hashcode', 2, None, '''class EqualityProbe {
+    public boolean equals(Object other) {
+        return this == other;
+    }
+}
+''', (('class EqualityProbe {', 'class EqualityProbe {\n    public int hashCode() { return System.identityHashCode(this); }'),)),
+            ('sql_concat_fallback', 'java.sql.concat-fallback', 3, None, '''class SqlProbe {
+    String query(String value) {
+        return "SELECT id FROM users WHERE id = " + (value);
+    }
+}
+''', (('"SELECT id FROM users WHERE id = " + (value)', '"SELECT id FROM users WHERE id = 1"'),)),
+            ('control_flow', 'java.control-flow.switch-fallthrough', 4, None, '''class FallthroughProbe {
+    void run(int value) {
+        switch (value) {
+            case 1: System.out.println(value);
+            default: return;
+        }
+    }
+}
+''', (('case 1: System.out.println(value);', 'case 1: System.out.println(value); break;'),)),
+            ('control_flow', 'java.control-flow.switch-no-default', 3, None, '''class DefaultProbe {
+    void run(int value) {
+        switch (value) {
+            case 1: System.out.println(value); break;
+        }
+    }
+}
+''', (('case 1: System.out.println(value); break;', 'case 1: System.out.println(value); break;\n            default: break;'),)),
+            ('tech_debt', 'java.logging.tech-debt', 3, None, '''class DebtProbe {
+    void work() {
+        int item = 0; // TODO finish work
+    }
+}
+''', (('// TODO finish work', '// completed work'),)),
+            ('tech_debt', 'java.logging.tech-debt-significant', 3, None,
+             self.debt_program(22), (('TODO', 'completed'),)),
+        )
+
+    def debt_program(self, count):
+        return ('class SignificantDebtProbe {\n    void work() {\n' + ''.join(
+            f'        int item{index:02d} = 0; // TODO {index:02d}\n'
+            for index in range(1, count + 1)) + '    }\n}\n')
+
+    def variant(self, text, line, mode, rule, language='java'):
+        lines = text.splitlines()
+        index = line - 1
+        marker = 'ubs:ignore' if mode.endswith('bare') else f'ubs:ignore[{rule}]'
+        if mode.startswith('previous-'):
+            lines.insert(index, '        // ' + marker)
+        elif mode.endswith('quoted'):
+            raw = lines[index]
+            declaration = ('val marker = "ubs:ignore";' if language == 'kotlin'
+                           else 'String marker = "ubs:ignore";')
+            if mode.startswith('source-') or raw.rstrip().endswith('{'):
+                lines[index] += ' ' + declaration
+            elif raw.lstrip().startswith(('case ', 'default:')):
+                lines[index] = raw.replace(':', ': ' + declaration, 1)
+            else:
+                indent = raw[:len(raw) - len(raw.lstrip())]
+                lines[index] = indent + declaration + ' ' + raw.lstrip()
+        else:
+            lines[index] += ' // ' + marker
+        return '\n'.join(lines) + '\n'
+
+    def direct(self, module_name, text, label, expected):
+        module = importlib.import_module('ubs_core.java_detectors.' + module_name)
+        path = self.root / (label + '.java')
+        path.write_text(text, encoding='utf-8')
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            hits = list(module.find([path]))
+        (self.root / (label + '.direct.json')).write_text(json.dumps({
+            'source_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+            'expected': expected, 'hits': hits, 'stdout': stdout.getvalue(), 'stderr': stderr.getvalue(),
+        }, default=str, indent=2), encoding='utf-8')
+        actual = []
+        for hit in hits:
+            self.assertEqual(len(hit), 5 if hasattr(module, 'RULES') else 4, repr(hits))
+            if hasattr(module, 'RULES'):
+                rule, source, line, col, detail = hit
+            else:
+                source, line, col, detail = hit
+                rule = module.RULE_ID
+            self.assertEqual(Path(source), path)
+            self.assertTrue(detail)
+            actual.append((rule, line, col))
+        self.assertEqual(sorted(actual), sorted(expected), repr(hits))
+
+    def test_all_java_receivers_exact_sites_and_marker_ownership(self):
+        for number, (module, rule, line, _, text, replacements) in enumerate(self.programs()):
+            sites = list(range(3, 25)) if rule.endswith('tech-debt-significant') else [line]
+            for mode in ('unmarked', 'safe', 'bare', 'exact', 'unrelated', 'quoted',
+                         'previous-exact', 'previous-unrelated'):
+                label = f'java-{number:02d}-{module}-{mode}'
+                with self.subTest(case=label), self.case(label):
+                    code, expected_lines = text, sites
+                    if mode == 'safe':
+                        for old, new in replacements:
+                            self.assertIn(old, code)
+                            code = code.replace(old, new)
+                        expected_lines = []
+                    elif mode != 'unmarked':
+                        marker_rule = 'java.unrelated.rule' if 'unrelated' in mode else rule
+                        code = self.variant(text, line, mode, marker_rule)
+                        shift = int(mode.startswith('previous-'))
+                        expected_lines = [site + shift for site in sites
+                                          if mode not in ('bare', 'exact', 'previous-exact') or site != line]
+                    self.direct(module, code, label, [(rule, site, 1) for site in expected_lines])
+
+    def test_marked_sources_preserve_later_unmarked_sinks(self):
+        for module, rule, line, source_line, text, _ in self.programs():
+            if source_line is None:
+                continue
+            for mode in ('source-bare', 'source-exact', 'source-unrelated', 'source-quoted'):
+                label = module + '-' + mode
+                with self.subTest(case=label), self.case(label):
+                    marker_rule = 'java.unrelated.rule' if mode.endswith('unrelated') else rule
+                    code = self.variant(text, source_line, mode, marker_rule)
+                    self.direct(module, code, label, [(rule, line, 1)])
+
+    def test_public_rule_selection_preserves_counter_and_primary_facts(self):
+        fallthrough = 'java.control-flow.switch-fallthrough'
+        no_default = 'java.control-flow.switch-no-default'
+        two_rules = '''class TwoRulesProbe {
+    void run(int value) {
+        switch (value) {
+            case 1: System.out.println(value);
+        }
+    }
+}
+'''
+        for label, line, marker_rule, expected in (
+            ('switch-other-public', 3, fallthrough, [(fallthrough, 4, 1), (no_default, 3, 1)]),
+            ('case-other-public', 4, no_default, [(fallthrough, 4, 1), (no_default, 3, 1)]),
+            ('switch-owned', 3, no_default, [(fallthrough, 4, 1)]),
+            ('case-owned', 4, fallthrough, [(no_default, 3, 1)]),
+        ):
+            with self.subTest(case=label), self.case(label):
+                self.direct('control_flow', self.variant(two_rules, line, 'exact', marker_rule), label, expected)
+        safe_switch = '''class SafeSwitchProbe {
+    void run(int value) {
+        switch (value) {
+            case 1: System.out.println(value);
+                break;
+            default: return;
+        }
+    }
+}
+'''
+        for fact, line, rule in (('break', 5, fallthrough), ('default', 6, no_default)):
+            for mode in ('bare', 'exact', 'unrelated', 'quoted'):
+                label = 'switch-safe-fact-' + fact + '-' + mode
+                with self.subTest(case=label), self.case(label):
+                    marker_rule = 'java.unrelated.rule' if mode == 'unrelated' else rule
+                    self.direct('control_flow', self.variant(safe_switch, line, mode, marker_rule), label, [])
+        for count in (20, 21):
+            rule = 'java.logging.tech-debt' + ('-significant' if count > 20 else '')
+            for mode, marker_rule in (('unmarked', rule), ('exact', rule),
+                                      ('unrelated', 'java.unrelated.rule'),
+                                      ('other-public', 'java.logging.tech-debt' if count > 20
+                                       else 'java.logging.tech-debt-significant')):
+                label = f'debt-tier-{count}-{mode}'
+                with self.subTest(case=label), self.case(label):
+                    text = self.debt_program(count)
+                    if mode != 'unmarked':
+                        text = self.variant(text, 3, 'exact', marker_rule)
+                    first = 4 if mode == 'exact' else 3
+                    self.direct('tech_debt', text, label,
+                                [(rule, line, 1) for line in range(first, count + 3)])
+        primary = self.programs()[11][4].replace(' + (value)', ' + value')
+        for mode, marker_rule in (('unmarked', 'java.sql.concat'), ('bare', 'java.sql.concat'),
+                                  ('exact', 'java.sql.concat'), ('fallback-exact', 'java.sql.concat-fallback'),
+                                  ('unrelated', 'java.unrelated.rule'), ('quoted', 'java.sql.concat')):
+            label = 'sql-primary-facts-' + mode
+            with self.subTest(case=label), self.case(label):
+                text = primary if mode == 'unmarked' else self.variant(primary, 3, mode, marker_rule)
+                self.direct('sql_concat_fallback', text, label, [])
+
+    def test_kotlin_adapter_uses_actual_public_ids_and_keeps_source_state(self):
+        from ubs_core.kotlin_scan import scan_detectors
+        programs = (
+            ('archive-extraction', 7, 4, '''import java.nio.file.Path
+import java.util.zip.ZipEntry
+fun extract(destination: Path, entry: ZipEntry) {
+    val value = entry.getName();
+    val padding = 0;
+    println(padding);
+    destination.resolve(value);
+}
+''', ('destination.resolve(value)', 'destination.resolve("fixed")')),
+            ('header-injection', 6, 3, '''import com.sun.net.httpserver.HttpExchange
+fun handle(request: HttpExchange) {
+    val value = request.getRequestURI().getQuery();
+    val padding = 0;
+    println(padding);
+    request.getResponseHeaders().add("X-Name", value);
+}
+''', ('add("X-Name", value)', 'add("X-Name", "fixed")')),
+            ('ssrf-outbound-url', 8, 5, '''import com.sun.net.httpserver.HttpExchange
+import java.net.URI
+import java.net.http.HttpRequest
+fun handle(request: HttpExchange) {
+    val value = request.getRequestURI().getQuery();
+    val padding = 0;
+    println(padding);
+    HttpRequest.newBuilder(URI.create(value)).build();
+}
+''', ('URI.create(value)', 'URI.create("https://example.com")')),
+            ('insecure-randomness', 6, 3, '''import java.util.Random
+fun generate(): String {
+    val rng = Random();
+    val padding = 0;
+    println(padding);
+    val token = rng.nextInt();
+    return token.toString();
+}
+''', ('Random', 'java.security.SecureRandom')),
+        )
+        for slug, line, source_line, text, safe_change in programs:
+            rule = 'kotlin.security.' + slug
+            for mode in ('unmarked', 'safe', 'bare', 'exact', 'unrelated', 'quoted',
+                         'previous-exact', 'previous-unrelated', 'java-public',
+                         'source-bare', 'source-exact', 'source-unrelated', 'source-quoted'):
+                label = 'kotlin-' + slug + '-' + mode
+                with self.subTest(case=label), self.case(label):
+                    code = text
+                    if mode == 'safe':
+                        if slug == 'insecure-randomness':
+                            code = code.replace('import java.util.Random', 'import java.security.SecureRandom')
+                            code = code.replace('Random()', 'SecureRandom()')
+                        else:
+                            code = code.replace(*safe_change)
+                    elif mode != 'unmarked':
+                        marker_rule = ('java.security.' + slug if mode == 'java-public' else
+                                       'kotlin.unrelated.rule' if 'unrelated' in mode else rule)
+                        target = source_line if mode.startswith('source-') else line
+                        code = self.variant(text, target, mode, marker_rule, language='kotlin')
+                    path = self.root / (label + '.kt')
+                    path.write_text(code, encoding='utf-8')
+                    sink = io.StringIO()
+                    scan_detectors([path], sink, set())
+                    records = [json.loads(raw) for raw in sink.getvalue().splitlines()]
+                    (self.root / (label + '.ndjson')).write_text(sink.getvalue(), encoding='utf-8')
+                    expected = [] if mode in ('safe', 'bare', 'exact', 'previous-exact') else [
+                        (rule, line + int(mode.startswith('previous-')), 1, 'critical')]
+                    self.assertEqual([(row['rule'], row['line'], row['col'], row['severity'])
+                                      for row in records], expected, records)
+                    self.assertTrue(all(Path(row['path']) == path for row in records))
+
+    def test_native_sql_fallback_json_and_sarif_positive_safe_and_owned(self):
+        rule = 'java.sql.concat-fallback'
+        text = self.programs()[11][4]
+        for mode in ('unmarked', 'safe', 'unrelated', 'quoted', 'exact', 'previous-exact'):
+            code = text
+            if mode == 'safe':
+                code = code.replace('"SELECT id FROM users WHERE id = " + (value)',
+                                    '"SELECT id FROM users WHERE id = 1"')
+            elif mode != 'unmarked':
+                code = self.variant(text, 3, mode, 'java.unrelated.rule' if mode == 'unrelated' else rule)
+            path = self.root / ('native-sql-' + mode + '.java')
+            path.write_text(code, encoding='utf-8')
+            expected = [] if mode in ('safe', 'exact', 'previous-exact') else [(rule, 3, 1)]
+            for fmt in ('json', 'sarif'):
+                label = 'native-sql-' + mode + '-' + fmt
+                with self.subTest(case=label), self.case(label):
+                    directory = self.root / label
+                    directory.mkdir()
+                    command = [str(REPO_ROOT / 'modules/ubs-java.sh'), '--ci', '--no-color',
+                               '--only=13', '--fail-on-warning', '--format=' + fmt, str(path)]
+                    env = dict(os.environ, UBS_NO_CACHE='1', UBS_NO_AUTO_UPDATE='1',
+                               PYTHONDONTWRITEBYTECODE='1', ENABLE_UV_TOOLS='0')
+                    started = time.monotonic()
+                    proc = subprocess.run(command, cwd=directory, env=env, capture_output=True,
+                                          text=True, timeout=120)
+                    (directory / 'stdout.log').write_text(proc.stdout, encoding='utf-8')
+                    (directory / 'stderr.log').write_text(proc.stderr, encoding='utf-8')
+                    (directory / 'identity.json').write_text(json.dumps({
+                        'case': self.id() + ':' + label, 'command': command, 'cwd': str(directory),
+                        'source_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                        'exit': proc.returncode, 'seconds': time.monotonic() - started,
+                    }, indent=2), encoding='utf-8')
+                    context = f'{command!r}\nexit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}'
+                    self.assertNotIn('Traceback (most recent call last)', proc.stderr, context)
+                    self.assertEqual(proc.returncode, int(bool(expected)), context)
+                    summaries = [json.loads(raw) for raw in proc.stderr.splitlines()
+                                 if raw.startswith('{"counters":')]
+                    self.assertEqual(len(summaries), 1, context)
+                    self.assertEqual(summaries[0]['counters'],
+                                     {'critical': 0, 'warning': len(expected), 'info': 0}, context)
+                    self.assertEqual(summaries[0]['errors'], [], context)
+                    report = json.loads(proc.stdout)
+                    if fmt == 'json':
+                        self.assertEqual(report['status'], 'ok', context)
+                        self.assertEqual(report['files'], 1, context)
+                        self.assertEqual({key: report[key] for key in ('critical', 'warning', 'info')},
+                                         {'critical': 0, 'warning': len(expected), 'info': 0}, context)
+                        actual = [(row['rule'], row['line'], row['col']) for row in report['findings']]
+                        self.assertTrue(all(Path(row['path']) == path for row in report['findings']), context)
+                    else:
+                        results = [row for run in report['runs'] for row in run['results']]
+                        actual = [(row['ruleId'], row['locations'][0]['physicalLocation']['region']['startLine'],
+                                   row['locations'][0]['physicalLocation']['region']['startColumn']) for row in results]
+                        self.assertTrue(all(row['level'] == 'warning' for row in results), context)
+                        self.assertTrue(all(row['locations'][0]['physicalLocation']['artifactLocation']['uri']
+                                            == str(path) for row in results), context)
+                    self.assertEqual(actual, expected, context)
 
 
 if __name__ == "__main__":

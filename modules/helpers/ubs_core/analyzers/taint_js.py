@@ -1530,11 +1530,33 @@ class _Flow:
             start += 1
         while end > start and text[end - 1].isspace():
             end -= 1
+        while code[start:start + 1] == '(' and self.pairs.get(start) == end - 1:
+            start, end = start + 1, end - 1
+            while start < end and text[start].isspace():
+                start += 1
+            while end > start and text[end - 1].isspace():
+                end -= 1
         target = self.access(start, end)
-        if target is None or target[2] != end or not target[1]:
-            return None
-        receiver = self.read_access((target[0], target[1][:-1], target[2]), state)
-        key, computed = target[1][-1]
+        if target is not None and target[2] == end and target[1]:
+            receiver = self.read_access((target[0], target[1][:-1], target[2]), state)
+            key, computed = target[1][-1]
+        else:
+            # The receiver can itself be a call or a parenthesized expression.
+            # Retain its evaluated identity before a computed key/default can
+            # mutate or rebind it; GetValue of the selected source follows.
+            member = re.search(r'\.\s*([A-Za-z_$][\w$]*)\s*$', code[start:end])
+            opening = next((left for left, right in self.pairs.items()
+                            if start < left and right == end - 1 and code[left] == '['), None)
+            if member is not None:
+                receiver = self.value(start, start + member.start(), state)
+                key, computed = member.group(1), None
+            elif opening is not None:
+                receiver = self.value(start, opening, state)
+                raw = text[opening + 1:end - 1].strip()
+                key = self.property_key(raw) if raw.startswith(('"', "'")) or raw.isdecimal() else None
+                computed = (opening + 1, end - 1) if key is None else None
+            else:
+                return None
         if computed is not None:
             self.value(*computed, state)
         return start, end, receiver, key
@@ -1840,28 +1862,38 @@ class _Flow:
             return self.engine.call_target(self.scope, name, state, self.rule)
         return None
 
-    def bind(self, callee, arguments, ranges, state, call_location):
+    def evaluate_arguments(self, ranges, state):
+        """Evaluate and snapshot each spread before the following argument.
+
+        A later argument may mutate the iterable or replace one of its slots.
+        The already yielded values retain their own scalar/object identities.
+        """
         actual, uncertain = [], None
         maybe_missing = set()
 
-        def expand(fact, left, right):
+        def expand(left, right):
             nonlocal uncertain
+            while left < right and self.scope.code[left].isspace():
+                left += 1
+            while right > left and self.scope.code[right - 1].isspace():
+                right -= 1
             raw = self.scope.code[left:right].strip()
             if raw.startswith('...'):
                 opening = left + self.scope.code[left:right].index('...') + 3
                 while opening < right and self.scope.code[opening].isspace():
                     opening += 1
-                if self.scope.code[opening:opening + 1] == '[' and self.pairs.get(opening) is not None:
+                if self.scope.code[opening:opening + 1] == '[' and self.pairs.get(opening) == right - 1:
                     closing = self.pairs[opening]
+                    elements = []
                     if self.scope.code[opening + 1:closing].strip():
                         for begin, finish in _chunks(self.scope.code, opening + 1, closing):
                             if begin == finish == closing:
                                 continue  # a trailing comma creates no argument
                             if self.scope.code[begin:finish].strip():
-                                expand(self.value(begin, finish, state), begin, finish)
+                                elements.append(expand(begin, finish))
                             else:
                                 actual.append((frozenset(), True))  # an array hole is undefined
-                    return
+                    return _join(*elements)
                 fact = self.value(opening, right, state)
                 refs = _refs(fact)
                 lengths = [state.array_lengths.get(ref) for ref in refs]
@@ -1880,22 +1912,28 @@ class _Flow:
                             missing = True
                             maybe_missing.add(len(actual))
                         actual.append((value, missing))
-                    return
+                    return _join(*(value for value, _missing in actual[-lengths[0]:])) if lengths[0] else frozenset()
                 if uncertain is None:
                     uncertain = len(actual)
                 if refs and all(ref in state.array_lengths for ref in refs):
                     # An unknown-length spread supplies array elements, not
                     # the array object itself. Retain borrowed element refs.
                     fact = self.property(fact, None, state)
+            else:
+                fact = self.value(left, right, state)
             actual.append((fact, raw in {'undefined', 'void 0'}))
+            return fact
 
         try:
-            for fact, (left, right) in zip(arguments, ranges):
-                expand(fact, left, right)
+            facts = [expand(left, right) for left, right in ranges]
         finally:
             # Recursive closures otherwise retain the completed flow and its
             # incoming heap until cyclic GC, including when expansion throws.
             expand = None
+        return facts, (actual, uncertain, maybe_missing)
+
+    def bind(self, callee, prepared, state, call_location):
+        actual, uncertain, maybe_missing = prepared
         bound = {}
         default_flow = None
         default_state = None
@@ -1999,6 +2037,13 @@ class _Flow:
             else:
                 for name in names:
                     bound[name] = incoming
+            if default_state is not None:
+                # A later initializer can assign an earlier formal. Keep the
+                # updated parameter environment for both subsequent defaults
+                # and the callee body instead of restoring the old bound map.
+                for name in bound:
+                    if name in default_state:
+                        bound[name] = default_state[name]
         complete_defaults()
         return bound
 
@@ -2168,7 +2213,10 @@ class _Flow:
             sink_binding = state.bindings.get(callee_name, 'imported')
             if self.engine.relative_import(self.scope, receiver):
                 binding = None
-            argument_facts = [self.value(left, right, state) for left, right in arguments]
+            if isinstance(callee, _Scope) and not callee.generator:
+                argument_facts, prepared = self.evaluate_arguments(arguments, state)
+            else:
+                argument_facts = [self.value(left, right, state) for left, right in arguments]
             if isinstance(callee, _Scope) and callee.generator:
                 # A generator call creates an iterator; it does not execute
                 # the body. Iterator advancement is outside this call model.
@@ -2180,7 +2228,7 @@ class _Flow:
                 self.engine.dependents[(callee, self.rule)].add(self.scope)
                 throw_count = len(self.throws)
                 try:
-                    bound = self.bind(callee, argument_facts, arguments, state, match_start)
+                    bound = self.bind(callee, prepared, state, match_start)
                 except _NoNormalCompletion:
                     if not deferred:
                         raise

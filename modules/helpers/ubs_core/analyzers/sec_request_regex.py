@@ -2,12 +2,13 @@
 reaching the regex engine (bead A4-js security wave, bead 0xjg.4).
 
 Verbatim port of the legacy ubs-js.sh ``js_request_regex_matches`` function
-including its suppression helpers: same source/sink regexes, same 14-line
-statement window, same taint propagation (destructuring + assignments with
-escape-helper kill rules), same RegExp argument extraction, same ``ubs:ignore``
-placement rules (line above, same line, and anywhere inside the collected
-statement). The heredoc's os.walk over the project is replaced by iteration
-over ``RunContext.files``; per-file match logic is unchanged.
+with the same source/sink regexes, same 14-line statement window, same taint
+propagation (destructuring + assignments with
+escape-helper kill rules), same RegExp argument extraction. Suppression uses
+shared lexical statement ownership and exact rule scopes without erasing
+annotated source or validation facts. The heredoc's os.walk over the project
+is replaced by iteration over ``RunContext.files``; per-file match logic is
+unchanged.
 
 Legacy emission: print_finding "warning" / "Request-controlled regex pattern
 reaches regex engine". The legacy title rides in the message so the
@@ -21,6 +22,7 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.suppression import SourceSuppressions
 
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
 
@@ -210,14 +212,6 @@ def is_safe(expr: str) -> bool:
     return bool(safe_re.search(expr))
 
 
-def has_ignore(lines: list[str], index: int) -> bool:
-    return (
-        0 <= index < len(lines) and 'ubs:ignore' in lines[index]
-    ) or (
-        0 <= index - 1 < len(lines) and 'ubs:ignore' in lines[index - 1]
-    )
-
-
 def sink_arg(statement: str) -> str:
     match = sink_re.search(statement)
     if not match:
@@ -256,9 +250,11 @@ def source_line(lines: list[str], index: int) -> str:
 def scan_file_findings(path: Path) -> Iterator[tuple[int, str]]:
     """Yield (line_number, sample_text) per detection; heredoc-identical."""
     try:
-        lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
+        text = path.read_text(encoding='utf-8', errors='ignore')
     except OSError:
         return
+    lines = text.splitlines()
+    source_index = SourceSuppressions('javascript').index(path, text)
     text = '\n'.join(lines)
     if not (source_re.search(text) and sink_re.search(text)):
         return
@@ -266,10 +262,10 @@ def scan_file_findings(path: Path) -> Iterator[tuple[int, str]]:
     seen: set[tuple[str, int]] = set()
     for idx, raw in enumerate(lines):
         stripped = strip_line_comments(raw).strip()
-        if not stripped or has_ignore(lines, idx):
+        if not stripped:
             continue
         statement = statement_from(lines, idx)
-        if not statement or 'ubs:ignore' in statement:
+        if not statement:
             continue
         destruct = destructure_re.match(statement)
         if destruct:
@@ -294,7 +290,7 @@ def scan_file_findings(path: Path) -> Iterator[tuple[int, str]]:
         if not (source_re.search(arg) or refs(arg, tainted)):
             continue
         key = (str(path), idx + 1)
-        if key in seen:
+        if key in seen or source_index.is_suppressed(idx + 1, RULE):
             continue
         seen.add(key)
         yield idx + 1, source_line(lines, idx)

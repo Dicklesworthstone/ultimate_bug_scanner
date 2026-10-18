@@ -26,6 +26,7 @@ from pathlib import Path
 from os.path import commonpath
 from typing import Iterable
 
+from ubs_core.lexer import javascript_lexical_views as lexical_views
 from ubs_core.registry import Analyzer, RunContext, register
 from ubs_core.taint_flow import AnalysisLimit, Budget
 
@@ -137,126 +138,6 @@ def iter_js_files(root: Path):
             continue
         if path.suffix.lower() in EXTS:
             yield path
-
-
-def lexical_views(text: str) -> tuple[str, str]:
-    """Return comment-free source and executable code at original offsets.
-
-    Template text is inert, but ${expressions} (including nested templates)
-    are executable. Synthetic parentheses keep their boundaries balanced for
-    argument scanning. No source text is evaluated. Regex recognition is
-    intentionally lexical, not a claim to implement the JavaScript grammar.
-    """
-    source, code = list(text), list(text)
-    frames = [['code', 0]]
-
-    def mask(output, start, end):
-        for pos in range(start, end):
-            output[pos] = '\n' if text[pos] == '\n' else ' '
-
-    def regex_allowed(pos):
-        previous = pos - 1
-        while previous >= 0 and code[previous].isspace():
-            previous -= 1
-        if previous < 0 or code[previous] in '=(:,[!&|?;{}':
-            return True
-        if previous > 0 and text[previous - 1:previous + 1] == '=>':
-            return True
-        end = previous + 1
-        while previous >= 0 and (code[previous].isalnum() or code[previous] in '_$'):
-            previous -= 1
-        return ''.join(code[previous + 1:end]) in {'return', 'throw', 'yield', 'case', 'void', 'typeof', 'delete'}
-
-    i = 0
-    while i < len(text):
-        ch = text[i]
-        if frames[-1][0] == 'template':
-            code[i] = '\n' if ch == '\n' else ' '
-            if ch == '\\':
-                mask(code, i, min(i + 2, len(text)))
-                i += 2
-                continue
-            if ch == '`':
-                code[i] = ')'
-                frames.pop()
-            elif text.startswith('${', i):
-                code[i + 1] = '('
-                frames.append(['expression', 0])
-                i += 2
-                continue
-            i += 1
-            continue
-
-        if text.startswith('//', i):
-            end = text.find('\n', i + 2)
-            end = len(text) if end < 0 else end
-            mask(source, i, end)
-            mask(code, i, end)
-            i = end
-            continue
-        if text.startswith('/*', i):
-            end = text.find('*/', i + 2)
-            end = len(text) if end < 0 else end + 2
-            mask(source, i, end)
-            mask(code, i, end)
-            i = end
-            continue
-        if ch in ('"', "'"):
-            end = i + 1
-            while end < len(text):
-                if text[end] == '\\':
-                    end += 2
-                elif text[end] == ch:
-                    end += 1
-                    break
-                elif text[end] == '\n':
-                    break
-                else:
-                    end += 1
-            end = min(end, len(text))
-            mask(code, i, end)
-            code[i] = '0'  # an inert value, not missing syntax
-            i = end
-            continue
-        if ch == '`':
-            code[i] = '('
-            frames.append(['template', 0])
-            i += 1
-            continue
-        if ch == '/' and regex_allowed(i):
-            end, character_class = i + 1, False
-            while end < len(text) and text[end] != '\n':
-                if text[end] == '\\':
-                    end += 2
-                    continue
-                if text[end] == '[':
-                    character_class = True
-                elif text[end] == ']':
-                    character_class = False
-                elif text[end] == '/' and not character_class:
-                    end += 1
-                    while end < len(text) and text[end].isalpha():
-                        end += 1
-                    mask(code, i, end)
-                    code[i] = '0'
-                    i = end
-                    break
-                end += 1
-            else:
-                end = -1
-            if end >= 0:
-                continue
-        if frames[-1][0] == 'expression':
-            if ch == '{':
-                frames[-1][1] += 1
-            elif ch == '}':
-                if frames[-1][1] == 0:
-                    code[i] = ')'
-                    frames.pop()
-                else:
-                    frames[-1][1] -= 1
-        i += 1
-    return ''.join(source), ''.join(code)
 
 
 def strip_comments(text: str) -> str:

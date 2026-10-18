@@ -3,8 +3,8 @@
 Verbatim port of the legacy ubs-js.sh heredoc "CORS credentials with permissive
 origins" (``cors_credentials_report``): same candidate gate, same 18-line
 context window, same wildcard/reflected-origin + credentials-true conjunction,
-same 3-line coalescing rule, same ``ubs:ignore`` placement rules (trigger line,
-line above, or anywhere inside the collected context).
+same 3-line coalescing rule. Suppression uses the shared lexical statement
+policy and this analyzer's exact public rule.
 The heredoc's os.walk over the project is replaced by iteration over
 ``RunContext.files``; per-file match logic is unchanged.
 """
@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.suppression import SourceSuppressions
 
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
 
@@ -85,21 +86,25 @@ def context_from(lines, idx, max_lines=18):
 def scan_file_findings(path: Path) -> Iterator[int]:
     """Yield 1-based line numbers per detection; match logic identical to the heredoc."""
     try:
-        lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
+        source_text = path.read_text(encoding='utf-8', errors='ignore')
     except Exception:
         return
+    lines = source_text.splitlines()
+    suppressions = SourceSuppressions('javascript').index(path, source_text)
     seen_lines = set()
     last_issue_idx = -100
     for idx, line in enumerate(lines):
         stripped = code_line(line).strip()
-        if not stripped or 'ubs:ignore' in line or (idx > 0 and 'ubs:ignore' in lines[idx - 1]) or not candidate_re.search(stripped):
+        if not stripped or not candidate_re.search(stripped):
             continue
         context = context_from(lines, idx)
-        if not context or 'ubs:ignore' in context or not credentials_true_re.search(context):
+        if not context or not credentials_true_re.search(context):
             continue
         if not (origin_wildcard_re.search(context) or origin_reflection_re.search(context)):
             continue
         if idx in seen_lines or idx - last_issue_idx <= 3:
+            continue
+        if suppressions.is_suppressed(idx + 1, RULE):
             continue
         seen_lines.add(idx)
         last_issue_idx = idx
@@ -219,11 +224,11 @@ def _selftest_ignore_suppression(tmp_prefix: str = "ubs_core_sec_cors_ign_") -> 
             target.write_text(body, encoding="utf-8")
             findings = list(scan_file_findings(target))
             assert findings == [], (name, findings)
-        # heredoc semantics: a trailing comment on a LATER line does not suppress —
-        # code_line strips comments before the context ignore check runs.
+        # A real marker on a later physical line inside this same call owns
+        # the call's diagnostic, matching the shipped final suppression policy.
         later = Path(tmp) / "ctx.ts"
         later.write_text(in_context, encoding="utf-8")
-        assert list(scan_file_findings(later)) == [1], "context comment must not suppress"
+        assert list(scan_file_findings(later)) == [], "same-call multiline marker must suppress"
 
 
 def _selftest_coalescing_and_run_shape(tmp_prefix: str = "ubs_core_sec_cors_run_") -> None:

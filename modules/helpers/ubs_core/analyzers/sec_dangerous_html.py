@@ -3,8 +3,8 @@ sanitizer (bead A4-js security wave).
 
 Port of the legacy "dangerouslySetInnerHTML without sanitizer" heredoc from
 modules/ubs-js.sh: verbatim match semantics (raw-line detection, JSX tag
-window with brace balance, ubs:ignore / sanitizer suppression) with a
-run(ctx) adapter on top.
+window with brace balance and sanitizer guards), with shared lexical statement
+ownership and exact rule scopes for suppression and a run(ctx) adapter on top.
 """
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.suppression import SourceSuppressions
 
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
 
@@ -30,9 +31,11 @@ SAFE_RE = re.compile(
 def scan_file_findings(path: Path) -> Iterator[tuple[int, int]]:
     """Yield (line, col) per detection; match logic identical to the heredoc."""
     try:
-        lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
+        text = path.read_text(encoding='utf-8', errors='ignore')
     except Exception:
         return
+    lines = text.splitlines()
+    source_index = SourceSuppressions('javascript').index(path, text)
     for idx, line in enumerate(lines):
         stripped = line.strip()
         if not stripped or stripped.startswith(("//", "/*", "*")):
@@ -53,7 +56,9 @@ def scan_file_findings(path: Path) -> Iterator[tuple[int, int]]:
             if tag_idx >= idx and '>' in current and brace_balance <= 0:
                 break
         tag_text = ' '.join(tag_lines)
-        if 'ubs:ignore' in tag_text or SAFE_RE.search(tag_text):
+        if SAFE_RE.search(tag_text):
+            continue
+        if source_index.is_suppressed(idx + 1, RULE):
             continue
         yield idx + 1, DANGEROUS_RE.search(line).start() + 1
 

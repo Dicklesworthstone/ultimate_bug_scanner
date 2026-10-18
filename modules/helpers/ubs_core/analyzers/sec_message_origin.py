@@ -4,8 +4,8 @@ without an event.origin check (bead A4-js security wave).
 Port of the legacy "message event listener without origin check" heredoc
 from modules/ubs-js.sh: verbatim match semantics (window/globalThis listener
 start detection, paren+brace balanced 25-line window, message-arg/onmessage
-confirmation, ubs:ignore / origin-guard suppression) with a run(ctx) adapter
-on top.
+confirmation and origin guards), with shared lexical statement ownership and
+exact rule scopes for suppression and a run(ctx) adapter on top.
 """
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.suppression import SourceSuppressions
 
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
 
@@ -30,9 +31,11 @@ ORIGIN_RE = re.compile(r'\.origin\b|\borigin\s*(?:===?|!==?|in\b)|\btrustedOrigi
 def scan_file_findings(path: Path) -> Iterator[tuple[int, int]]:
     """Yield (line, col) per detection; match logic identical to the heredoc."""
     try:
-        lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
+        text = path.read_text(encoding='utf-8', errors='ignore')
     except Exception:
         return
+    lines = text.splitlines()
+    source_index = SourceSuppressions('javascript').index(path, text)
     for idx, line in enumerate(lines):
         stripped = line.strip()
         if not stripped or stripped.startswith(("//", "/*", "*")):
@@ -56,7 +59,9 @@ def scan_file_findings(path: Path) -> Iterator[tuple[int, int]]:
         listener_text = ' '.join(listener_lines)
         if not (ONMESSAGE_RE.search(listener_text) or MESSAGE_ARG_RE.search(listener_text)):
             continue
-        if 'ubs:ignore' in listener_text or ORIGIN_RE.search(listener_text):
+        if ORIGIN_RE.search(listener_text):
+            continue
+        if source_index.is_suppressed(idx + 1, RULE):
             continue
         yield idx + 1, LISTENER_START_RE.search(line).start() + 1
 

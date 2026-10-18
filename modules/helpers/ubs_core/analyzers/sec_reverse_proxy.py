@@ -7,6 +7,8 @@ createProxyServer/.web()/.ws(), NextResponse.rewrite) whose target comes from
 request data (query/headers/host) directly or via an unvalidated URL-ish local
 variable, unless a proxy-target validator (validateProxyTarget, allowedProxy*,
 ALLOWED_PROXY_* ...) guards the statement or surrounding function context.
+Suppression uses shared lexical statement ownership and exact rule scopes;
+annotated assignments still contribute their source and validation facts.
 """
 from __future__ import annotations
 
@@ -15,6 +17,7 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.suppression import SourceSuppressions
 
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
 
@@ -163,9 +166,11 @@ def tainted_ref(text, tainted_vars):
 def scan_file_findings(path: Path) -> Iterator[tuple[int, int, str]]:
     """Yield (line, col, source_line) per detection; logic identical to the heredoc."""
     try:
-        lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
+        text = path.read_text(encoding='utf-8', errors='ignore')
     except Exception:
         return
+    lines = text.splitlines()
+    source_index = SourceSuppressions('javascript').index(path, text)
     text = '\n'.join(lines)
     if not (source_re.search(text) and sink_re.search(text)):
         return
@@ -173,7 +178,7 @@ def scan_file_findings(path: Path) -> Iterator[tuple[int, int, str]]:
     seen_lines = set()
     for idx, line in enumerate(lines):
         stripped = code_line(line).strip()
-        if not stripped or 'ubs:ignore' in line or (idx > 0 and 'ubs:ignore' in lines[idx - 1]):
+        if not stripped:
             continue
         statement = statement_from(lines, idx)
         assignment = assignment_re.search(stripped)
@@ -187,7 +192,7 @@ def scan_file_findings(path: Path) -> Iterator[tuple[int, int, str]]:
                 tainted_vars[name] = idx
         if not sink_re.search(stripped):
             continue
-        if not statement or 'ubs:ignore' in statement or has_safe_validation(statement):
+        if not statement or has_safe_validation(statement):
             continue
         unsafe = bool(source_re.search(statement))
         if not unsafe:
@@ -197,7 +202,7 @@ def scan_file_findings(path: Path) -> Iterator[tuple[int, int, str]]:
                     if not has_safe_validation(context, name):
                         unsafe = True
                     break
-        if not unsafe or idx in seen_lines:
+        if not unsafe or idx in seen_lines or source_index.is_suppressed(idx + 1, RULE):
             continue
         seen_lines.add(idx)
         match = sink_re.search(line)

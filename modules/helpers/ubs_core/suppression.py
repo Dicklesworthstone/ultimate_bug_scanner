@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from heapq import heappop, heappush
 from pathlib import Path
 
-from ubs_core.lexer import strip_comments_and_strings
+from ubs_core.lexer import javascript_lexical_views, strip_comments_and_strings
 
 # An explicit empty scope is bare; a malformed scope must not backtrack to bare.
 MARKER_RE = re.compile(r"ubs:ignore(?:\[([A-Za-z0-9_.,\- ]*)\])?(?!\[)")
@@ -40,6 +40,7 @@ _QUALIFIED_MARKER_RE = re.compile(
 )
 
 _HASH_LANGS = frozenset({"python", "ruby", "elixir"})
+_JAVASCRIPT_LANGS = frozenset({"javascript", "js", "typescript", "ts", "jsx", "tsx", "mjs", "cjs", "mts", "cts"})
 _BLOCK_KEYWORDS = {"ruby": ("def ", "end"), "elixir": ("do", "end")}
 _C_CONTINUATION = ("\\", "(", "[", ",", "&&", "||", "=>", "=", "+", "-", "*", "/", "?", "|", "&", "<", ">", ".")
 _PY_CONTINUATION = ("\\", "(", "[", "{", ",", "&", "|", "+", ".", "->", "do", "then", "else")
@@ -230,12 +231,16 @@ def parse_markers(text: str, lang: str = "python") -> list[Marker]:
     stays active, so an apostrophe in a comment ("don't") cannot open a
     phantom string and hide later markers.
     """
-    masked = strip_comments_and_strings(
-        text, lang=lang, strip_strings=True, strip_comments=True, preserve_comments=True
-    )
-    code = strip_comments_and_strings(
-        text, lang=lang, strip_strings=False, strip_comments=True
-    )
+    if lang.lower().strip() in _JAVASCRIPT_LANGS:
+        code, _ = javascript_lexical_views(text)
+        masked = text
+    else:
+        masked = strip_comments_and_strings(
+            text, lang=lang, strip_strings=True, strip_comments=True, preserve_comments=True
+        )
+        code = strip_comments_and_strings(
+            text, lang=lang, strip_strings=False, strip_comments=True
+        )
     code_lines = code.splitlines()
     # Both views preserve offsets. Only comments survive the first mask while
     # disappearing in the second; ordinary code and preserved strings cannot
@@ -360,24 +365,29 @@ def _continues(code: str, paren_open: bool, lang: str) -> bool:
 
 def build_index(text: str, lang: str = "python") -> SuppressionIndex:
     """Build the suppression index for one file's text."""
-    masked = strip_comments_and_strings(
-        text,
-        lang=lang,
-        strip_strings=True,
-        strip_comments=True,
-    )
-    # Literals are opaque operands, not absent operands. Erasing a completed
-    # literal in value = request ?? "/" leaves a dangling ?? and wrongly
-    # joins the next statement to an inline suppression. A second lexical view
-    # distinguishes literal bytes from comments without exposing literal
-    # parentheses, braces, keywords, or comment-like text to the interval parser.
-    literal_view = strip_comments_and_strings(
-        text, lang=lang, strip_strings=False, strip_comments=True,
-    )
-    masked = "".join(
-        "x" if char == " " and literal_char not in " \t\r\n" else char
-        for char, literal_char in zip(masked, literal_view)
-    )
+    if lang.lower().strip() in _JAVASCRIPT_LANGS:
+        # The JavaScript lexer already leaves a completed literal as an opaque
+        # operand ("0"), so `value = request ?? "/"` keeps no dangling operator.
+        _, masked = javascript_lexical_views(text)
+    else:
+        masked = strip_comments_and_strings(
+            text,
+            lang=lang,
+            strip_strings=True,
+            strip_comments=True,
+        )
+        # Literals are opaque operands, not absent operands. Erasing a completed
+        # literal in value = request ?? "/" leaves a dangling ?? and wrongly
+        # joins the next statement to an inline suppression. A second lexical view
+        # distinguishes literal bytes from comments without exposing literal
+        # parentheses, braces, keywords, or comment-like text to the interval parser.
+        literal_view = strip_comments_and_strings(
+            text, lang=lang, strip_strings=False, strip_comments=True,
+        )
+        masked = "".join(
+            "x" if char == " " and literal_char not in " \t\r\n" else char
+            for char, literal_char in zip(masked, literal_view)
+        )
     lines = masked.splitlines()
     index = SuppressionIndex()
     index.markers = parse_markers(text, lang=lang)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import importlib
 import os
 import random
 import re
@@ -10,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from io import StringIO
 from pathlib import Path
@@ -23,7 +25,7 @@ if str(HELPERS_DIR) not in sys.path:
 
 from ubs_core.csharp_scan import render_text  # noqa: E402
 from ubs_core import cpp_scan, java_scan, rust_scan, swift_scan  # noqa: E402
-from ubs_core.lexer import strip_comments_and_strings  # noqa: E402
+from ubs_core.lexer import javascript_lexical_views, strip_comments_and_strings  # noqa: E402
 from ubs_core import rust_rules  # noqa: E402
 from ubs_core.analyzers import ctcompare_rust  # noqa: E402
 from ubs_core.rust_detectors import (  # noqa: E402
@@ -631,6 +633,393 @@ class MarkerScopePredicateTests(unittest.TestCase):
                 self.assertEqual(parse_markers("// " + marker, lang="c_like"), [])
                 for rule in (None, "rust.panic.assert-macros", "rust.security.request-url"):
                     self.assertFalse(has_suppression_marker(marker, rule))
+
+
+class JavaScriptAsyncSuppressionTests(unittest.TestCase):
+    CASES = (
+        ("async_map_ignored", "js.async.map-ignored", 'items.map(async (item) => { await work(item); });'),
+        ("async_timer", "js.async.timer", 'setTimeout(async () => { await work(); }, 1);'),
+        ("async_sort_comparator", "js.async.sort-comparator",
+         'items.sort(async (left, right) => (await score(left)) - (await score(right)));'),
+        ("async_map_awaited", "js.async.map-awaited", 'await items.map(async (item) => work(item));'),
+        ("async_reduce", "js.async.reduce", 'items.reduce(async (total, item) => total + (await load(item)), 0);'),
+        ("async_jsx_handler", "js.async.jsx-handler", 'const element = <button onClick={async () => { await work(); }}>Go</button>;'),
+        ("async_react_effect", "js.async.react-effect", 'useEffect(async () => { await work(); }, []);'),
+        ("async_promise_executor", "js.async.promise-executor", 'new Promise(async (resolve) => { resolve(await work()); });'),
+        ("async_foreach", "js.async.foreach", 'items.forEach(async (item) => { await work(item); });'),
+        ("async_promise_all_map", "js.async.promise-all-map", 'await Promise.all(items.map((item) => { work(item); }));'),
+        ("async_flatmap", "js.async.flatmap", 'items.flatMap(async (item) => [await work(item)]);'),
+        ("async_event_listener", "js.async.event-listener", "target.addEventListener('click', async () => { await work(); });"),
+        ("async_predicates", "js.async.predicate", 'items.filter(async (item) => await keep(item));'),
+        ("async_promise_all_foreach", "js.async.promise-all-foreach", 'Promise.all(items.forEach((item) => { work(item); }));'),
+        ("async_event_emitter", "js.async.event-emitter", 'bus.on("message", async (payload) => { await work(payload); });'),
+    )
+
+    def test_direct_analyzers_use_exact_real_comment_ownership(self):
+        from ubs_core.registry import RunContext
+
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="js-async-markers-", dir=artifacts) as tmp:
+            source = Path(tmp) / "case.tsx"
+            for name, rule, statement in self.CASES:
+                analyzer = importlib.import_module(f"ubs_core.analyzers.{name}")
+                for variant, expected in (("unmarked", [2]), ("wrong", [2]), ("quoted", [2]),
+                                          ("owned", []), ("bare", []), ("previous", []),
+                                          ("previous-wrong", [3]), ("previous-quoted", [3])):
+                    with self.subTest(analyzer=name, variant=variant):
+                        lines = ['async function probe(items, target, bus) {', '  ' + statement, '}']
+                        if variant in ("wrong", "owned", "bare"):
+                            marker = ("ubs:ignore[unrelated.rule]" if variant == "wrong" else
+                                      f"ubs:ignore[{rule}]" if variant == "owned" else "ubs:ignore")
+                            lines[1] += ' // ' + marker
+                        elif variant == "quoted":
+                            lines[1] = '  const marker_note = "ubs:ignore"; ' + statement
+                        elif variant.startswith("previous"):
+                            lines.insert(1, '  const marker_note = "ubs:ignore";' if variant == "previous-quoted" else
+                                         '  // ubs:ignore[unrelated.rule]' if variant == "previous-wrong" else
+                                         f'  // ubs:ignore[{rule}]')
+                        source.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                        records = list(analyzer.run(RunContext(lang="javascript", files=[source])))
+                        self.assertEqual([(record["rule"], record["line"]) for record in records],
+                                         [(rule, line) for line in expected], records)
+
+    def test_existing_analyzer_ownership_controls_remain_valid(self):
+        # The original embedded controls independently require deep markers
+        # inside six callback statements and the outer Promise.all marker.
+        for name, _rule, _statement in self.CASES:
+            analyzer = importlib.import_module(f"ubs_core.analyzers.{name}")
+            for label, check in analyzer.SELF_TESTS:
+                with self.subTest(analyzer=name, control=label):
+                    check()
+
+    def test_promise_all_owns_its_nested_diagnostic_without_hiding_the_next_call(self):
+        from ubs_core.registry import RunContext
+
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="js-promise-ownership-", dir=artifacts) as tmp:
+            source = Path(tmp) / "case.ts"
+            for name, rule, method in (
+                ("async_promise_all_map", "js.async.promise-all-map", "map"),
+                ("async_promise_all_foreach", "js.async.promise-all-foreach", "forEach"),
+            ):
+                analyzer = importlib.import_module(f"ubs_core.analyzers.{name}")
+                for owner, marker, first_visible in (
+                    (2, "", True), (2, "ubs:ignore[unrelated.rule]", True),
+                    (2, f"ubs:ignore[{rule}]", False), (4, f"ubs:ignore[{rule}]", False),
+                    (4, "ubs:ignore[unrelated.rule]", True),
+                ):
+                    with self.subTest(analyzer=name, owner=owner, marker=marker):
+                        lines = ['async function probe(items) {', '  await Promise.all(',
+                                 f'    items.{method}((item) => {{', '      work(item);',
+                                 '    })', '  );',
+                                 f'  await Promise.all(items.{method}((item) => {{ work(item); }}));', '}']
+                        if marker:
+                            lines[owner - 1] += ' // ' + marker
+                        source.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                        records = list(analyzer.run(RunContext(lang="javascript", files=[source])))
+                        self.assertEqual([(record["rule"], record["line"]) for record in records],
+                                         [(rule, line) for line in ([3, 7] if first_visible else [7])], records)
+
+    def test_callback_windows_do_not_own_a_later_statement_marker(self):
+        from ubs_core.registry import RunContext
+
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="js-async-next-marker-", dir=artifacts) as tmp:
+            source = Path(tmp) / "case.tsx"
+            for name, rule, statement in self.CASES:
+                with self.subTest(analyzer=name):
+                    analyzer = importlib.import_module(f"ubs_core.analyzers.{name}")
+                    source.write_text('async function probe(items, target, bus) {\n  ' + statement
+                                      + '\n  report("finished"); // ubs:ignore\n}\n', encoding="utf-8")
+                    records = list(analyzer.run(RunContext(lang="javascript", files=[source])))
+                    self.assertEqual([(record["rule"], record["line"]) for record in records], [(rule, 2)], records)
+
+
+class JavaScriptLexicalSuppressionTests(unittest.TestCase):
+    def test_jsx_self_closing_tags_preserve_comments_and_executable_delimiters(self):
+        prefixes = (
+            'const view = <Widget data={value} />;',
+            'const view = <Widget {...props} />;',
+            'const view = <Widget data={a > b ? a : b} />;',
+            'const view = <Widget child={<Inner data={value} />} />;',
+            'const view = <Widget><Inner data={value} /></Widget>;',
+            'const view = <Widget data={total / count} />;',
+            'const view = <Widget render={() => ({value})} />;',
+            'const view = (<Namespace.Widget data={value} />);',
+            'const view = <custom-widget data={value} />;',
+            'const view = <svg:path data={value} />;',
+        )
+        for prefix in prefixes:
+            source = prefix + ' // ubs:ignore[js.real]\n'
+            with self.subTest(source=source):
+                comment_free, executable = javascript_lexical_views(source)
+                self.assertEqual(comment_free.rstrip(), prefix)
+                self.assertEqual(executable.rstrip(), prefix)
+                self.assertEqual(len(comment_free), len(source))
+                self.assertEqual(len(executable), len(source))
+                self.assertEqual(parse_markers(source, lang='tsx'),
+                                 [Marker(1, frozenset({'js.real'}), False)])
+        source = ('const view = <Widget data={value /* ubs:ignore[js.inner] */} />; '
+                  '// ubs:ignore[js.real]\n')
+        self.assertEqual(parse_markers(source, lang='jsx'),
+                         [Marker(1, frozenset({'js.inner'}), False),
+                          Marker(1, frozenset({'js.real'}), False)])
+        source = 'const view = <Widget data={/>/.test(value)} />; // ubs:ignore[js.real]\n'
+        self.assertEqual(javascript_lexical_views(source)[1].rstrip(),
+                         'const view = <Widget data={0  .test(value)} />;')
+        self.assertEqual(parse_markers(source, lang='jsx'),
+                         [Marker(1, frozenset({'js.real'}), False)])
+
+    def test_jsx_slash_recognition_keeps_legal_regex_and_division(self):
+        for prefix in (
+            'const pattern = />ubs:ignore/;',
+            'const pattern = />.+ubs:ignore/;',
+            'const pattern = /[/>]ubs:ignore/;',
+            'if (ready) {} />ubs:ignore/.test(value);',
+            'if (a < b) {} />ubs:ignore/.test(value);',
+            'const quotient = ({}) / divisor;',
+            'const quotient = total / count;',
+        ):
+            source = prefix + ' // ubs:ignore[js.real]\n'
+            with self.subTest(source=source):
+                comment_free, executable = javascript_lexical_views(source)
+                self.assertEqual(comment_free.rstrip(), prefix)
+                self.assertEqual(len(executable), len(source))
+                self.assertEqual(parse_markers(source, lang='javascript'),
+                                 [Marker(1, frozenset({'js.real'}), False)])
+                if 'pattern' in prefix or prefix.startswith('if '):
+                    self.assertNotIn('ubs:ignore', executable)
+                else:
+                    self.assertIn(' / ', executable)
+
+    def test_template_and_regex_literals_cannot_create_comment_directives(self):
+        for source in (
+            'const resetUrl = `https://${req.headers.host}/reset`; const note = "ubs:ignore";\n',
+            'const text = `https://example.com/ubs:ignore`;\n',
+            'const text = `hello ${format(`https://${host}/ubs:ignore`)}`; const note = "ubs:ignore";\n',
+            'const text = `line1\nhttps://ubs:ignore\n${value}`; const note = "ubs:ignore";\n',
+            'const text = `escaped \\` https://ubs:ignore`; const note = "ubs:ignore";\n',
+            'const pattern = /[/*]ubs:ignore/; const note = "ubs:ignore";\n',
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(parse_markers(source, lang='javascript'), [])
+                self.assertFalse(build_index(source, lang='javascript').is_suppressed(1, 'js.security.host-header'))
+
+    def test_real_comments_inside_interpolation_and_after_literals_keep_exact_scopes(self):
+        for source in (
+            'const text = `https://ubs:ignore`; // ubs:ignore[js.real]\n',
+            'const text = `x${value /* ubs:ignore[js.real] */}`;\n',
+            'const text = `x${format(`https://${host}/ubs:ignore`) /* ubs:ignore[js.real] */}`;\n',
+            'const pattern = /[/*]ubs:ignore/; // ubs:ignore[js.real]\n',
+            'const ratio = total / count; // ubs:ignore[js.real]\n',
+        ):
+            for language in ('javascript', 'js', 'typescript', 'ts'):
+                with self.subTest(source=source, language=language):
+                    self.assertEqual(parse_markers(source, lang=language),
+                                     [Marker(line=1, rules=frozenset({'js.real'}), standalone=False)])
+                    index = build_index(source, lang=language)
+                    self.assertTrue(index.is_suppressed(1, 'js.real'))
+                    self.assertFalse(index.is_suppressed(1, 'unrelated.rule'))
+
+    def test_template_line_offsets_and_following_statement_ownership(self):
+        source = ('const text = `https://ubs:ignore\n${value /* ubs:ignore[js.real] */}`;\n'
+                  'work();\n// ubs:ignore[js.next]\nnext();\n')
+        for language in ('javascript', 'typescript'):
+            with self.subTest(language=language):
+                markers = parse_markers(source, lang=language)
+                self.assertEqual(markers, [Marker(2, frozenset({'js.real'}), False),
+                                           Marker(4, frozenset({'js.next'}), True)])
+                index = build_index(source, lang=language)
+                self.assertTrue(index.is_suppressed(1, 'js.real'))
+                self.assertFalse(index.is_suppressed(3, 'js.real'))
+                self.assertFalse(index.is_suppressed(3, 'js.next'))
+                self.assertTrue(index.is_suppressed(5, 'js.next'))
+
+
+class JavaScriptSecuritySuppressionTests(unittest.TestCase):
+    CASES = (
+        ('sec_fetch_abort', 'js.security.fetch-abort', [1], "fetch('/api/users');\n",
+         "fetch('/api/users', { signal: AbortSignal.timeout(5000) });\n"),
+        ('sec_ssrf_fetch', 'js.security.ssrf-fetch', [1],
+         'fetch(req.query.url, { signal: AbortSignal.timeout(5000) });\n',
+         "fetch('https://api.example.com/status', { signal: AbortSignal.timeout(5000) });\n"),
+        ('sec_tls', 'js.security.tls', [1], 'new https.Agent({ rejectUnauthorized: false });\n',
+         'new https.Agent({ rejectUnauthorized: true });\n'),
+        ('sec_jwt', 'js.security.jwt', [2], "import jwt from 'jsonwebtoken';\njwt.decode(token);\n",
+         "import jwt from 'jsonwebtoken';\njwt.verify(token, publicKey, { algorithms: ['RS256'], issuer: 'trusted', audience: 'app' });\n"),
+        ('sec_cors', 'js.security.cors', [1], "app.use(cors({ origin: '*', credentials: true }));\n",
+         "app.use(cors({ origin: 'https://trusted.example.com', credentials: true }));\n"),
+        ('sec_open_redirect', 'js.security.open-redirect', [1], 'router.push(searchParams.get("to"));\n',
+         'router.push("/dashboard");\n'),
+        ('sec_header_injection', 'js.security.header-injection', [1], "res.setHeader('X-Trace', req.query.name);\n",
+         "res.setHeader('X-Trace', encodeURIComponent(req.query.name));\n"),
+        ('sec_path_traversal', 'js.security.path-traversal', [1], 'res.download(path.join(ROOT, req.query.f));\n',
+         "res.download('/srv/static/report.pdf');\n"),
+        ('sec_host_header', 'js.security.host-header', [1], 'const resetUrl = `https://${req.headers.host}/reset`;\n',
+         "const resetUrl = process.env.PUBLIC_BASE_URL + '/reset';\n"),
+        ('sec_prototype_pollution', 'js.security.prototype-pollution', [1], 'const merged = Object.assign({}, req.body);\n',
+         "const merged = Object.assign({}, { label: 'safe' });\n"),
+        ('sec_hardcoded_secrets', 'js.security.hardcoded-secrets', [1],
+         "const jwtSecret = process.env.JWT_SECRET || 'live-jwt-signing-key-9f3a';\n",
+         'const jwtSecret = process.env.JWT_SECRET;\n'),
+        ('sec_weak_random', 'js.security.weak-random', [1], 'const resetCode = Math.random().toString(36).slice(2);\n',
+         'const resetCode = crypto.randomUUID();\n'),
+        ('sec_message_origin', 'js.security.message-origin', [1],
+         "window.addEventListener('message', (event) => { handle(event.data); });\n",
+         "window.addEventListener('message', (event) => { if (event.origin !== 'https://trusted.example.com') return; handle(event.data); });\n"),
+        ('sec_post_message', 'js.security.post-message', [1], "worker.postMessage(payload, '*');\n",
+         "worker.postMessage(payload, 'https://trusted.example.com');\n"),
+        ('ctcompare_js', 'javascript.ctcompare.unsafe_secret_compare', [1], 'const ok = authToken === expectedAuthToken;\n',
+         'const ok = crypto.timingSafeEqual(Buffer.from(authToken), Buffer.from(expectedAuthToken));\n'),
+        ('sec_cookies', 'js.security.cookies', [1], "res.cookie('session_id', sessionId);\n",
+         "res.cookie('session_id', sessionId, { httpOnly: true, secure: true, sameSite: 'strict' });\n"),
+        ('sec_request_regex', 'js.security.request-regex', [1], "new RegExp(req.query.get('q'));\n",
+         "new RegExp('^[a-z]+$');\n"),
+        ('sec_request_body', 'js.security.request-body', [2],
+         'async function POST(request) {\n  const payload = await request.json();\n}\n',
+         "async function POST(request) {\n  if (Number(request.headers.get('content-length')) > 1000000) throw new Error('large');\n  const payload = await request.json();\n}\n"),
+        ('sec_reverse_proxy', 'js.security.reverse-proxy', [1], 'createProxyMiddleware({ target: req.query.upstream });\n',
+         "createProxyMiddleware({ target: 'https://api.example.com' });\n"),
+        ('sec_archive_entry', 'js.security.archive-entry', [1], 'const outputPath = path.join(destination, entry.entryName);\n',
+         "const outputPath = path.join(destination, 'fixed-name.txt');\n"),
+        ('sec_sql_injection', 'js.security.sql-injection', [1], "db.query(`SELECT * FROM users WHERE id = '${req.query.id}'`);\n",
+         "db.query('SELECT * FROM users WHERE id = ?', [req.query.id]);\n"),
+        ('sec_jsx_target_blank', 'js.security.jsx-target-blank', [1], 'const link = <a href={href} target="_blank">link</a>;\n',
+         'const link = <a href={href} target="_blank" rel="noopener noreferrer">link</a>;\n'),
+        ('sec_dangerous_html', 'js.security.dangerous-html', [1], 'const view = <div dangerouslySetInnerHTML={{ __html: html }} />;\n',
+         'const view = <div dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(html) }} />;\n'),
+    )
+    FLOWS = (
+        ('sec_ssrf_fetch', 'js.security.ssrf-fetch', (1,), [3],
+         'const targetUrl = req.query.url;\ntouch();\nfetch(targetUrl, { signal: AbortSignal.timeout(5000) });\n'),
+        ('sec_open_redirect', 'js.security.open-redirect', (1,), [3],
+         'const target = searchParams.get("to");\ntouch();\nrouter.push(target);\n'),
+        ('sec_header_injection', 'js.security.header-injection', (1,), [3],
+         "const headerValue = req.query.name;\ntouch();\nres.setHeader('X-Trace', headerValue);\n"),
+        ('sec_path_traversal', 'js.security.path-traversal', (1,), [3],
+         'const requestedFile = req.query.f;\ntouch();\nres.download(path.join(ROOT, requestedFile));\n'),
+        ('sec_host_header', 'js.security.host-header', (1,), [3],
+         'const host = req.headers.host;\ntouch();\nconst resetUrl = `https://${host}/reset`;\n'),
+        ('sec_prototype_pollution', 'js.security.prototype-pollution', (1,), [3],
+         'const payload = req.body;\ntouch();\nconst merged = Object.assign({}, payload);\n'),
+        ('sec_reverse_proxy', 'js.security.reverse-proxy', (1,), [3],
+         'const target = req.query.upstream;\ntouch();\ncreateProxyMiddleware({ target });\n'),
+        ('sec_archive_entry', 'js.security.archive-entry', (1, 2), [4],
+         'const entry = new AdmZip(buffer).getEntries()[0];\nconst entryPath = entry.entryName;\ntouch();\n'
+         'const outputPath = path.join(destination, entryPath);\n'),
+        ('sec_request_regex', 'js.security.request-regex', (1,), [3],
+         "const pattern = req.query.get('q');\ntouch();\nnew RegExp(pattern);\n"),
+        ('sec_sql_injection', 'js.security.sql-injection', (1,), [3],
+         "const tenant = req.query.tenant;\ntouch();\ndb.query(`SELECT * FROM users WHERE tenant = '${tenant}'`);\n"),
+        ('sec_tls', 'js.security.tls', (1,), [3],
+         'const rejectUnauthorized = false;\ntouch();\nnew https.Agent({ rejectUnauthorized });\n'),
+        ('sec_fetch_abort', 'js.security.fetch-abort', (1,), [],
+         "const requestInit = { signal: AbortSignal.timeout(5000) };\ntouch();\nfetch('/api/users', requestInit);\n"),
+        ('ctcompare_js', 'javascript.ctcompare.unsafe_secret_compare', (1,), [3],
+         'const lhs = authToken;\ntouch();\nconst ok = lhs === expected;\n'),
+    )
+
+    def setUp(self):
+        artifacts = REPO_ROOT / 'test-suite' / 'artifacts'
+        artifacts.mkdir(exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(prefix='js-security-ownership-', dir=artifacts)
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def check_source(self, name, rule, label, text, expected):
+        import time
+        from ubs_core.registry import RunContext
+
+        case = name + '-' + label
+        started = time.monotonic()
+        print(f'[{case}] RUN', flush=True)
+        source = self.root / (case + '.tsx')
+        source.write_text(text, encoding='utf-8')
+        analyzer = importlib.import_module('ubs_core.analyzers.' + name)
+        raw = list(analyzer.run(RunContext(lang='javascript', files=[source])))
+        # Exercise the same final policy as the production suppress command;
+        # an early receiver must not erase facts this boundary cannot recover.
+        records = SourceSuppressions('javascript').filter(raw)
+        (self.root / (case + '.json')).write_text(json.dumps({'raw': raw, 'final': records}, indent=2))
+        actual = [(record['rule'], record['line']) for record in records]
+        try:
+            self.assertEqual(actual, [(rule, line) for line in expected], {'source': text, 'raw': raw, 'final': records})
+        except AssertionError:
+            print(f'[{case}] FAIL ({time.monotonic() - started:.3f}s) artifacts={self.root}', flush=True)
+            raise
+        print(f'[{case}] PASS ({time.monotonic() - started:.3f}s)', flush=True)
+
+    def test_all_security_receivers_keep_unrelated_scopes_and_quoted_markers(self):
+        for name, rule, sites, positive, negative in self.CASES:
+            for variant in ('unmarked', 'quoted', 'wrong', 'owned', 'bare', 'previous', 'previous-wrong', 'previous-quoted'):
+                with self.subTest(analyzer=name, variant=variant):
+                    lines = positive.splitlines()
+                    target = sites[0] - 1
+                    expected = sites if variant in ('unmarked', 'quoted', 'wrong') else []
+                    if variant == 'quoted':
+                        lines[target] += '; const marker_note = "ubs:ignore";'
+                    elif variant in ('wrong', 'owned', 'bare'):
+                        marker = ('ubs:ignore[unrelated.rule]' if variant == 'wrong' else
+                                  f'ubs:ignore[{rule}]' if variant == 'owned' else 'ubs:ignore')
+                        lines[target] += ' // ' + marker
+                    elif variant.startswith('previous'):
+                        lines.insert(target, 'const marker_note = "ubs:ignore";' if variant == 'previous-quoted' else
+                                     '// ubs:ignore[unrelated.rule]' if variant == 'previous-wrong' else
+                                     f'// ubs:ignore[{rule}]')
+                        expected = [line + 1 for line in sites] if variant != 'previous' else []
+                    self.check_source(name, rule, variant, '\n'.join(lines) + '\n', expected)
+            with self.subTest(analyzer=name, variant='safe'):
+                self.check_source(name, rule, 'safe', negative, [])
+
+    def test_source_annotations_preserve_later_sink_and_validation_facts(self):
+        for name, rule, origins, sites, program in self.FLOWS:
+            for origin in origins:
+                for variant in ('unmarked', 'bare', 'owned', 'wrong', 'quoted', 'previous'):
+                    with self.subTest(analyzer=name, origin=origin, variant=variant):
+                        lines = program.splitlines()
+                        expected = sites
+                        if variant == 'quoted':
+                            lines[origin - 1] += '; const marker_note = "ubs:ignore";'
+                        elif variant == 'previous':
+                            lines.insert(origin - 1, f'// ubs:ignore[{rule}]')
+                            expected = [line + 1 for line in sites]
+                        elif variant != 'unmarked':
+                            marker = ('ubs:ignore' if variant == 'bare' else
+                                      f'ubs:ignore[{rule}]' if variant == 'owned' else 'ubs:ignore[unrelated.rule]')
+                            lines[origin - 1] += ' // ' + marker
+                        self.check_source(name, rule, f'source-{origin}-{variant}', '\n'.join(lines) + '\n', expected)
+
+    def test_later_statement_marker_cannot_hide_an_earlier_message_handler(self):
+        name, rule, sites, positive, _negative = next(item for item in self.CASES if item[0] == 'sec_message_origin')
+        for marker in ('ubs:ignore', f'ubs:ignore[{rule}]', 'ubs:ignore[unrelated.rule]'):
+            with self.subTest(marker=marker):
+                self.check_source(name, rule, 'later-' + marker.replace(':', '-'),
+                                  positive + 'report("done"); // ' + marker + '\n', sites)
+
+    def test_original_security_controls_remain_explicit(self):
+        for name, _rule, _sites, _positive, _negative in self.CASES:
+            analyzer = importlib.import_module('ubs_core.analyzers.' + name)
+            for label, check in analyzer.SELF_TESTS:
+                with self.subTest(analyzer=name, control=label):
+                    check()
+
+    def test_multiline_call_comments_own_the_call_and_only_their_rule(self):
+        for name, rule, source, owner in (
+            ('sec_cors', 'js.security.cors',
+             "app.use(cors({\n  origin: '*',\n  credentials: true,\n}));\n", 3),
+            ('sec_cookies', 'js.security.cookies',
+             "res.cookie('auth_token', token, {\n  httpOnly: false,\n  secure: false,\n});\n", 2),
+        ):
+            for marker, expected in (('ubs:ignore', []), (f'ubs:ignore[{rule}]', []),
+                                     ('ubs:ignore[unrelated.rule]', [1])):
+                with self.subTest(analyzer=name, marker=marker):
+                    lines = source.splitlines()
+                    lines[owner - 1] += ' // ' + marker
+                    program = '\n'.join(lines) + '\n'
+                    self.check_source(name, rule, 'multiline-' + marker.replace(':', '-'), program, expected)
 
 
 class RustDetectorSuppressionTests(unittest.TestCase):

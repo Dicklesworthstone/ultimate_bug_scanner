@@ -2858,7 +2858,7 @@ class JavaKotlinDataflowTests(unittest.TestCase):
         except ValueError as exc:
             self.fail(f'invalid scanner JSON: {exc}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}')
 
-    def cli(self, path, lang, label, status=0):
+    def cli(self, path, lang, label, status=0, rule='path_traversal'):
         directory = self.root / label
         directory.mkdir()
         env = {key: value for key, value in os.environ.items()
@@ -2868,6 +2868,7 @@ class JavaKotlinDataflowTests(unittest.TestCase):
                    XDG_DATA_HOME=str(directory / 'data'), XDG_CACHE_HOME=str(directory / 'cache'))
         command = [str(REPO_ROOT / 'ubs'), '--ci', '--no-color', '--no-cache',
                    '--format=json', '--only=' + lang, '--', str(path)]
+        started = time.monotonic()
         try:
             proc = subprocess.run(command, cwd=directory, env=env,
                                   capture_output=True, text=True, timeout=180)
@@ -2875,6 +2876,11 @@ class JavaKotlinDataflowTests(unittest.TestCase):
             self.fail(f'{label} timed out\nstdout:\n{exc.stdout}\nstderr:\n{exc.stderr}')
         (directory / 'stdout.log').write_text(proc.stdout)
         (directory / 'stderr.log').write_text(proc.stderr)
+        (directory / 'command.json').write_text(json.dumps({
+            'case': self.id(), 'command': command, 'cwd': str(directory),
+            'seconds': time.monotonic() - started, 'exit': proc.returncode,
+            'source_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+        }, indent=2))
         context = f'{label}: exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}'
         self.assertEqual(proc.returncode, status, context)
         try:
@@ -2887,7 +2893,7 @@ class JavaKotlinDataflowTests(unittest.TestCase):
         self.assertEqual(len(report['scanners']), 1, context)
         self.assertEqual(report['scanners'][0]['status'], 'ok', context)
         findings = [finding for scanner in report['scanners'] for finding in scanner['findings']
-                    if finding['rule'] == lang + '.taint.path_traversal']
+                    if finding['rule'] == lang + '.taint.' + rule]
         return findings, context
 
     def test_shared_engine_branches_loops_local_summaries_and_evidence(self):
@@ -3402,6 +3408,294 @@ fun handler(request: jakarta.servlet.http.HttpServletRequest, again: Boolean) {
                 self.assertTrue(all(row['rule'] == lang + '.taint.path_traversal'
                                     and row['severity'] == 'critical' for row in findings), context)
                 self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), digest)
+
+    def test_redirects_use_selected_bindings_and_assignment_kills(self):
+        from ubs_core.analyzers.taint_java_redirect import run
+        from ubs_core.registry import RunContext
+        cases = (
+            ('safe-name-identity', '''class A {
+  String safeRedirect(String value) { return value; }
+  void run(Request request) {
+    String target = safeRedirect(request.getParameter("next"));
+    response.sendRedirect(target); // unsafe
+  }
+}'''),
+            ('literal-kill', '''class A {
+  void run(Request request) {
+    String target = request.getParameter("next");
+    target = "/fixed";
+    response.sendRedirect(target);
+  }
+}'''),
+            ('bound-clean-helper', '''class A {
+  String choose(String value) { return "/fixed"; }
+  void run(Request request) {
+    response.sendRedirect(choose(request.getParameter("next")));
+  }
+}'''),
+            ('branch-join', '''class A {
+  void run(Request request, boolean choice) {
+    String target = request.getParameter("next");
+    if (choice) { target = "/fixed"; }
+    response.sendRedirect(target); // unsafe
+  }
+}'''),
+            ('unrelated-scopes', '''class A {
+  void source(Request request) { String target = request.getParameter("next"); }
+  void sink() { String target = "/fixed"; response.sendRedirect(target); }
+}'''),
+            ('recursive-helper', '''class A {
+  String relay(String value, int count) {
+    if (count == 0) { return value; }
+    return relay(value, count - 1);
+  }
+  void run(Request request) {
+    response.sendRedirect(relay(request.getParameter("next"), 2)); // unsafe
+  }
+}'''),
+            ('unbound-validator', '''class A {
+  void run(Request request) {
+    String target = request.getParameter("next");
+    if (!isAllowedRedirect(target)) { throw new SecurityException("bad"); }
+    response.sendRedirect(target); // unsafe
+  }
+}'''),
+            ('different-sink-proof', '''class A {
+  void run(Request request) {
+    Path target = Paths.get(request.getParameter("next")).normalize();
+    if (!target.startsWith(base)) { throw new SecurityException("bad"); }
+    response.sendRedirect(target.toString()); // unsafe
+  }
+}'''),
+        )
+        for name, source in cases:
+            with self.subTest(case=name):
+                path = self.root / (name + '.java')
+                path.write_text(source, encoding='utf-8')
+                findings = list(run(RunContext(lang='java', files=[path])))
+                expected = self.lines(source)
+                self.assertEqual({f['line'] for f in findings}, expected, (source, findings))
+                self.assertEqual(len(findings), len(expected), findings)
+                self.assertTrue(all(f['rule'] == 'java.taint.open_redirect' and
+                                    f['severity'] == 'critical' for f in findings), findings)
+
+    def test_redirect_guards_validate_selected_values_and_keep_mutations(self):
+        from ubs_core.analyzers.taint_java_redirect import run
+        from ubs_core.registry import RunContext
+        cases = (
+            ('literal-guard', 'if (!"/home".equals(target)) { throw new SecurityException(); }', '', False),
+            ('selected-predicate', 'if (!allowed(target)) { throw new SecurityException(); }', '', False),
+            ('wrong-receiver', 'if (!other.allowed(target)) { throw new SecurityException(); }', '', True),
+            ('partial-guard', 'if (choice) { if (!allowed(target)) { throw new SecurityException(); } }', '', True),
+            ('later-mutation', 'if (!allowed(target)) { throw new SecurityException(); }', 'target = "//" + target;', True),
+            ('later-source', 'if (!allowed(target)) { throw new SecurityException(); }', 'target = request.getParameter("again");', True),
+            ('unknown-transform', 'if (!allowed(target)) { throw new SecurityException(); }', 'target = transform(target);', True),
+            ('boolean-precedence', 'if (!allowed(target) || choice) { throw new SecurityException(); }', '', False),
+        )
+        for name, guard, mutation, unsafe in cases:
+            with self.subTest(case=name):
+                source = ('class A {\n'
+                          ' boolean allowed(String value) { return "/home".equals(value); }\n'
+                          ' void run(Request request, boolean choice) {\n'
+                          ' String target = request.getParameter("next");\n'
+                          f' {guard}\n {mutation}\n'
+                          ' response.sendRedirect(target);\n }\n}\n')
+                path = self.root / (name + '.java')
+                path.write_text(source)
+                findings = list(run(RunContext(lang='java', files=[path])))
+                self.assertEqual([f['line'] for f in findings], [7] if unsafe else [], (source, findings))
+
+    def test_uri_redirect_validator_requires_authority_and_selected_allowlist(self):
+        from ubs_core.analyzers.taint_java_redirect import run
+        from ubs_core.registry import RunContext
+        cases = (
+            ('java', 'test-suite/java/security/OpenRedirectClean.java', {37, 41, 46, 51, 56},
+             'parsed.getRawAuthority() != null', 'false'),
+            ('kotlin', 'test-suite/kotlin/open_redirect_clean/OpenRedirectClean.kt', {29, 34},
+             'uri.rawAuthority == null', 'true'),
+        )
+        for lang, fixture, sink_lines, condition, missing in cases:
+            source = (REPO_ROOT / fixture).read_text()
+            suffix = '.java' if lang == 'java' else '.kt'
+            variants = (
+                ('complete', source, set()),
+                ('alpha-renamed', source.replace('safeRedirectTarget', 'chooseTarget'), set()),
+                ('network-path-bypass', source.replace(condition, missing), sink_lines),
+            )
+            if lang == 'kotlin':
+                escaped = source.replace('setOf("app.example.com")',
+                    'setOf("app.example.com", "accounts.example.com")').replace(
+                    'fun redirectQuery(call: ApplicationCall) {',
+                    'fun redirectQuery(call: ApplicationCall) { mutateHosts()')
+                prefix, closing = escaped.rsplit('\n}', 1)
+                escaped = prefix + ('\n    fun mutateHosts() {\n'
+                    '        val alias = allowedHosts as MutableSet<String>\n'
+                    '        alias.add("evil.example")\n    }\n}') + closing
+                variants += (
+                    ('escaped-allowlist', escaped, sink_lines),
+                    ('public-allowlist', source.replace('private val allowedHosts',
+                                                       'val allowedHosts'), sink_lines),
+                    ('typed-host-factory', source.replace('import java.net.URI',
+                        'import java.net.URI\nimport java.util.Set').replace(
+                        '    private val allowedHosts = setOf("app.example.com")',
+                        '    private val Set: HostFactory = HostFactory()\n'
+                        '    private val allowedHosts = Set.of("app.example.com")') +
+                        '\nclass HostFactory {\n'
+                        '    fun of(value: String): kotlin.collections.Set<String> {\n'
+                        '        return kotlin.collections.setOf("evil.example")\n    }\n}\n',
+                        {line + 2 for line in sink_lines}),
+                    ('typed-callable-set', source.replace(
+                        '    private val allowedHosts = setOf("app.example.com")',
+                        '    private val setOf: (String) -> Set<String> = '
+                        '{ kotlin.collections.setOf("evil.example") }\n'
+                        '    private val allowedHosts = setOf("app.example.com")'),
+                        {line + 1 for line in sink_lines}),
+                )
+            for label, text, expected in variants:
+                with self.subTest(language=lang, case=label):
+                    path = self.root / (lang + '-' + label + suffix)
+                    path.write_text(text)
+                    findings = list(run(RunContext(lang=lang, files=[path])))
+                    self.assertEqual({f['line'] for f in findings}, expected, (text, findings))
+                    self.assertEqual(len(findings), len(expected), findings)
+
+    def test_kotlin_uri_factory_shadow_cannot_validate_redirects(self):
+        from ubs_core.analyzers.taint_java_redirect import run
+        from ubs_core.registry import RunContext
+        source = '''import java.net.URI
+class Bogus(val raw: String) {
+  val isAbsolute = true
+  val scheme = "https"
+  val host = "app.example.com"
+  val path = "/home"
+  val rawAuthority: String? = null
+  override fun toString(): String = raw
+}
+class Factory {
+  fun create(value: String): Bogus = Bogus(value)
+}
+class Sample {
+  private val allowedHosts = setOf("app.example.com")
+  fun choose(raw: String, URI: Factory): String {
+    val uri = URI.create(raw)
+    if (uri.isAbsolute) {
+      require(uri.scheme == "https" && uri.host in allowedHosts) { "blocked" }
+      return uri.toString()
+    }
+    require(uri.rawAuthority == null) { "blocked" }
+    require(uri.path.startsWith("/") && !uri.path.startsWith("//")) { "blocked" }
+    return uri.toString()
+  }
+  fun run(call: ApplicationCall) {
+    call.respondRedirect(choose(call.request.queryParameters["next"] ?: "/", Factory()))
+  }
+}'''
+        path = self.root / 'ShadowedUri.kt'
+        path.write_text(source)
+        findings = list(run(RunContext(lang='kotlin', files=[path])))
+        self.assertEqual([(f['rule'], f['line']) for f in findings],
+                         [('java.taint.open_redirect', 26)], findings)
+        cli_findings, context = self.cli(path, 'kotlin', 'shadowed-uri', 1,
+                                         rule='open_redirect')
+        self.assertEqual([(f['rule'], f['line']) for f in cli_findings],
+                         [('kotlin.taint.open_redirect', 26)], context)
+
+        field_shadow = source.replace('  fun choose(raw: String, URI: Factory)',
+            '  private val URI: Factory = Factory()\n  fun choose(raw: String)').replace(
+            'choose(call.request.queryParameters["next"] ?: "/", Factory())',
+            'choose(call.request.queryParameters["next"] ?: "/")')
+        path = self.root / 'FieldShadowedUri.kt'
+        path.write_text(field_shadow)
+        findings = list(run(RunContext(lang='kotlin', files=[path])))
+        self.assertEqual([f['line'] for f in findings], [27], findings)
+        cli_findings, context = self.cli(path, 'kotlin', 'field-shadowed-uri', 1,
+                                         rule='open_redirect')
+        self.assertEqual([(f['rule'], f['line']) for f in cli_findings],
+                         [('kotlin.taint.open_redirect', 27)], context)
+
+        no_op = source.replace('URI: Factory', 'require: NoOp').replace(
+            'Factory()))', 'NoOp()))').replace('class Factory {',
+            'class NoOp { operator fun invoke(value: Boolean, message: () -> String) {} }\nclass Factory {')
+        path = self.root / 'ShadowedRequire.kt'
+        path.write_text(no_op)
+        findings = list(run(RunContext(lang='kotlin', files=[path])))
+        self.assertEqual([f['line'] for f in findings], [27], findings)
+
+        field_require = no_op.replace('  fun choose(raw: String, require: NoOp)',
+            '  private val require: NoOp = NoOp()\n  fun choose(raw: String)').replace(
+            'choose(call.request.queryParameters["next"] ?: "/", NoOp())',
+            'choose(call.request.queryParameters["next"] ?: "/")')
+        path = self.root / 'FieldShadowedRequire.kt'
+        path.write_text(field_require)
+        findings = list(run(RunContext(lang='kotlin', files=[path])))
+        self.assertEqual([f['line'] for f in findings], [28], findings)
+
+    def test_real_cli_redirect_binding_and_uri_controls(self):
+        cases = (
+            ('java', '.java', '''class Sample {
+  String safeRedirect(String value) { return value; }
+  void run(Request request) {
+    String target = safeRedirect(request.getParameter("next"));
+    response.sendRedirect(target);
+  }
+}''', 5),
+            ('kotlin', '.kt', '''fun safeRedirect(value: String): String { return value }
+fun run(call: ApplicationCall) {
+  var target = safeRedirect(call.request.queryParameters["next"] ?: "/")
+  call.respondRedirect(target)
+}''', 4),
+        )
+        for lang, suffix, source, sink_line in cases:
+            variants = (
+                ('misleading-helper', source, True),
+                ('alpha-renamed', source.replace('safeRedirect', 'relay'), True),
+                ('literal-overwrite', source.replace('    response.sendRedirect(target);',
+                  '    target = "/fixed"; response.sendRedirect(target);').replace('  call.respondRedirect(target)',
+                  '  target = "/fixed"; call.respondRedirect(target)'), False),
+            )
+            for label, text, unsafe in variants:
+                with self.subTest(language=lang, case=label):
+                    path = self.root / (lang + '-' + label + suffix)
+                    path.write_text(text)
+                    findings, context = self.cli(path, lang, lang + '-' + label,
+                                                 1 if unsafe else 0, rule='open_redirect')
+                    self.assertEqual([(f['rule'], f['line'], f['severity']) for f in findings],
+                                     [(lang + '.taint.open_redirect', sink_line, 'critical')] if unsafe else [], context)
+                    report = json.loads((self.root / (lang + '-' + label) / 'stdout.log').read_text())
+                    self.assertEqual(report['totals']['critical'], int(unsafe), context)
+                    self.assertEqual(report['totals']['warning'], 0, context)
+                    if unsafe:
+                        self.assertTrue(all(f['extras']['taint_path'] for f in findings), context)
+                    directory = self.root / (lang + '-' + label + '-sarif')
+                    directory.mkdir()
+                    env = os.environ.copy()
+                    env.update(PYTHONDONTWRITEBYTECODE='1', UBS_NO_AUTO_UPDATE='1',
+                               UBS_NO_CACHE='1', ENABLE_UV_TOOLS='0')
+                    for tool, arguments in (
+                        ('meta', [str(REPO_ROOT / 'ubs'), '--only=' + lang, '--format=sarif', '--ci', str(path)]),
+                        ('module', [str(REPO_ROOT / 'modules' / ('ubs-' + lang + '.sh')), '--format=sarif', '--ci', str(path)]),
+                    ):
+                        started = time.monotonic()
+                        proc = subprocess.run(arguments, cwd=directory, env=env,
+                                              capture_output=True, text=True, timeout=180)
+                        (directory / (tool + '.stdout.log')).write_text(proc.stdout)
+                        (directory / (tool + '.stderr.log')).write_text(proc.stderr)
+                        (directory / (tool + '.command.json')).write_text(json.dumps({
+                            'case': self.id(), 'command': arguments, 'cwd': str(directory),
+                            'seconds': time.monotonic() - started, 'exit': proc.returncode,
+                            'source_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                        }, indent=2))
+                        context = f'{arguments!r}: exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}'
+                        self.assertEqual(proc.returncode, int(unsafe), context)
+                        sarif = self.decode_report(proc)
+                        records = [record for run in sarif['runs'] for record in run.get('results', [])
+                                   if record['ruleId'] == lang + '.taint.open_redirect']
+                        self.assertEqual([record['locations'][0]['physicalLocation']['region']['startLine']
+                                          for record in records], [sink_line] if unsafe else [], context)
+                        if unsafe:
+                            self.assertEqual(records[0]['properties']['extras'], findings[0]['extras'], context)
+                            self.assertEqual(len(records[0]['codeFlows'][0]['threadFlows'][0]['locations']),
+                                             len(findings[0]['extras']['taint_path']), context)
 
 
 class JVMRedirectBindingTests(unittest.TestCase):
@@ -4036,6 +4330,29 @@ fun handler(request: Request, response: Response) {
             with self.subTest(imported=imported):
                 self.check('import ' + imported + '\n' + body, 'kotlin')
         self.check('import kotlin.require\n' + body.replace(' // unsafe', ''), 'kotlin')
+
+    def test_kotlin_check_with_a_constant_lazy_message_guards_like_require(self):
+        guard = r'target.startsWith("/") && !target.startsWith("//") && !target.contains("\\") && !target.contains("\r") && !target.contains("\n") && !target.contains("\t")'
+        body = ('fun handler(request: Request, response: Response) {\n'
+                '  val target=request.getParameter("next")\n'
+                '  check(' + guard + ') { "unsafe redirect target" }\n'
+                '  response.sendRedirect(target)\n}\n')
+        self.check(body, 'kotlin')
+        self.check('import kotlin.check\n' + body, 'kotlin')
+        unsafe = body.replace('  response.sendRedirect(target)\n', '  response.sendRedirect(target) // unsafe\n')
+        for imported in ('app.validation.check', 'app.validation.require as check', 'app.validation.*'):
+            with self.subTest(imported=imported):
+                self.check('import ' + imported + '\n' + unsafe, 'kotlin')
+        with self.subTest(case='local-check-function'):
+            self.check(unsafe + 'fun check(value: Boolean, message: () -> String) {}\n', 'kotlin')
+
+    def test_kotlin_interpolation_invalidates_the_selected_redirect_guard(self):
+        self.check(r'''fun handler(request: Request, response: Response) {
+  val target = request.getParameter("next")
+  if (!(target.startsWith("/") && !target.startsWith("//") && !target.contains("\\") && !target.contains("\r") && !target.contains("\n") && !target.contains("\t"))) { return }
+  response.sendRedirect(target)
+  response.sendRedirect("/$target") // unsafe
+}''', 'kotlin')
 
     def test_generic_and_array_parameters_do_not_inherit_argument_types(self):
         guard = r'target.startsWith("/") && !target.startsWith("//") && !target.contains("\\") && !target.contains("\r") && !target.contains("\n") && !target.contains("\t")'

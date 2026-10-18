@@ -89,6 +89,7 @@ class RedirectEngine(Engine):
             r'([A-Za-z_]\w*)\s*=\s*(?:Set\.of|setOf)\s*\(([^()]*)\)', text)
         for declaration in declarations:
             name, content = declaration.group(1, 2)
+            owner = tuple(owner for low, high, owner in self.parser.owners if low < declaration.start() < high)
             if self.code[declaration.start():declaration.start() + len('private')] != 'private':
                 continue
             if (' val ' not in ' ' + declaration.group() and not re.search(r'\bfinal\b', declaration.group())):
@@ -96,19 +97,23 @@ class RedirectEngine(Engine):
             if (not self.builtin_type('Set') or any(function.name == 'setOf' for function in self.parser.functions.values())
                     or re.search(r'\bimport\s+(?!kotlin\.collections\.setOf\b)[\w.]+\.setOf\b|\bimport\s+[\w.]+\s+as\s+setOf\b', self.code)):
                 continue
+            # A field named like the factory (Set or setOf) replaces it here.
+            factory = 'Set' if 'Set.of' in declaration.group() else 'setOf'
+            if any(field == factory and scope == owner[:len(scope)]
+                   for scope, field in self.shadowed_fields):
+                continue
             if not re.fullmatch(r'\s*"[A-Za-z0-9.-]+"(?:\s*,\s*"[A-Za-z0-9.-]+")*\s*', content):
                 continue
             uses = [m for m in re.finditer(r'\b' + re.escape(name) + r'\b', self.code)
                     if not declaration.start() <= m.start() < declaration.end()]
             if all(re.match(r'\s*\.contains\s*\(', self.code[m.end():]) or
                    re.search(r'\bin\s*$', self.code[max(0, m.start() - 8):m.start()]) for m in uses):
-                owner = tuple(owner for low, high, owner in self.parser.owners if low < declaration.start() < high)
                 self.host_sets.add((owner, name))
 
     def safe(self, trace):
         tags = trace.tags
         uri = any(tag.startswith('uri:') for tag in tags)
-        return (LOCAL_TAGS <= tags or (uri and 'uri-text' in tags and (
+        return ('literal-local' in tags or LOCAL_TAGS <= tags or (uri and 'uri-text' in tags and (
                 {'uri-https', 'uri-host'} <= tags or
                 {'uri-relative', 'uri-no-authority', 'uri-path-slash', 'uri-path-not-network', 'uri-text-not-network'} <= tags)))
 
@@ -168,7 +173,11 @@ class RedirectEngine(Engine):
         if prefix:
             start += prefix.end()
         value = super().expression(start, end, state, bindings, depth)
-        if '+' in self.code[start:end]:
+        # A Kotlin string template builds a new URL just like + does; only a
+        # bare "redirect:$target" keeps the checked value as the target.
+        interpolation = self.parser.kotlin and re.search(r'\$(?:[A-Za-z_]|\{)', self.text[start:end])
+        redirect_template = re.fullmatch(r'\s*"redirect:\$[A-Za-z_]\w*"\s*', self.text[start:end])
+        if '+' in self.code[start:end] or (interpolation and not redirect_template):
             value = self.without_proof(value)
         return value
 
@@ -216,6 +225,24 @@ class RedirectEngine(Engine):
             return [(not truth, guard) for truth, guard in self.guard_facts((start + 1, end))]
         raw = self.text[start:end].strip()
         checks = []
+        literal = self.literal_guard(raw)
+        if literal:
+            checks.append((True, (literal, 'literal-local', None, None)))
+        else:
+            # A one-parameter helper of the same owner whose whole body returns
+            # a fixed-local-URL equality on that parameter is the same proof.
+            selected = re.fullmatch(r'(?:this\.)?([A-Za-z_]\w*)\s*\(\s*([A-Za-z_]\w*)\s*\)', raw)
+            if selected:
+                functions = [function for function in self.parser.functions.values()
+                             if function.name == selected.group(1) and function.owner == self.function.owner
+                             and len(function.parameters) == 1]
+                if len(functions) == 1 and len(functions[0].body) == 1 and functions[0].body[0].kind == 'return':
+                    function = functions[0]
+                    statement = function.body[0]
+                    returned = re.sub(r'^return\s+', '', self.text[statement.start:statement.end].strip())
+                    if self.literal_guard(returned) == function.parameters[0]:
+                        checks.append((True, (selected.group(2), 'literal-local', None,
+                                              ('predicate', selected.group(1)))))
         check = re.fullmatch(r'([A-Za-z_]\w*)(\.(?:getPath\(\)|path|toString\(\)))?\.(startsWith|contains)\s*\(\s*("(?:[^"\\]|\\.)*")\s*\)', raw)
         if check:
             name, member, method, quoted = check.groups()
@@ -245,14 +272,40 @@ class RedirectEngine(Engine):
                 checks.append((True, (uri, 'uri-host', False, allowlist)))
         return checks
 
+    def literal_guard(self, expression):
+        """Name the variable an expression compares with a fixed local URL."""
+        quoted = r'("(?:[^"\\]|\\.)*")'
+        variable = r'([A-Za-z_]\w*)'
+        match = re.fullmatch(quoted + r'\.equals\s*\(\s*' + variable + r'\s*\)', expression)
+        if match:
+            value, name = match.groups()
+        elif self.parser.kotlin:
+            match = re.fullmatch(variable + r'\s*==\s*' + quoted, expression)
+            if not match:
+                return None
+            name, value = match.groups()
+        else:
+            return None
+        try:
+            url = json.loads(value)
+        except ValueError:
+            return None
+        return name if url.startswith('/') and not url.startswith('//') and not any(
+            char in url for char in '\\\r\n\t') else None
+
     def apply_guard(self, guard, state, bindings):
         name, tag, member, allowlist = guard
+        if isinstance(allowlist, tuple):
+            # A selected predicate proves nothing once its name is rebound.
+            if self.call_is_shadowed(allowlist[1], bindings):
+                return state
+            allowlist = None
         if allowlist in bindings:
             return state
         binding = bindings.get(name, name)
         original = state.get(binding, CLEAN)
         state[binding] = join(*(retag(frozenset({trace}), add=frozenset({tag}))
-                               if not member and (('jvm-string' in trace.tags if tag.startswith('url-') else 'uri-value' in trace.tags))
+                               if not member and (('jvm-string' in trace.tags if tag.startswith('url-') or tag == 'literal-local' else 'uri-value' in trace.tags))
                                else frozenset({trace}) for trace in original))
         for representation in ('path', 'text'):
             identities = {self.uri_identity(trace) for trace in original

@@ -7,7 +7,7 @@ and os execution sinks whose command or executable is a dynamic string
 (f-string / format / % / concatenation), a tainted name, a `sh -c` payload, or
 shell=True input. shlex.quote / pipes.quote sanitize a segment.
 
-Same-file and previous-line `ubs:ignore` markers suppress a hit; a per-file
+Statement-owned `ubs:ignore` comments suppress this rule's hits; a per-file
 `seen` line set dedupes repeats (legacy remember_issue).
 """
 from __future__ import annotations
@@ -17,6 +17,7 @@ import os
 import re
 from pathlib import Path
 from typing import Iterable, Sequence
+from ubs_core.suppression import SuppressionIndex, build_index, may_have_markers
 
 from ubs_core.io import python_source_segment
 
@@ -58,15 +59,6 @@ def source_line(lines, line_no):
     if 0 <= idx < len(lines):
         return lines[idx].strip()
     return ''
-
-
-def has_ignore(lines, line_no):
-    idx = line_no - 1
-    return (
-        0 <= idx < len(lines) and 'ubs:ignore' in lines[idx]
-    ) or (
-        0 <= idx - 1 < len(lines) and 'ubs:ignore' in lines[idx - 1]
-    )
 
 
 def keyword_value(call, name):
@@ -231,6 +223,7 @@ class CommandInjectionAnalyzer(ast.NodeVisitor):
     def __init__(self, text, lines, *, max_steps=100_000):
         self.text = text
         self.lines = lines
+        self.suppressions = build_index(text, "python") if may_have_markers(text) else SuppressionIndex()
         self.subprocess_modules = {'subprocess'}
         self.os_modules = {'os'}
         self.direct_calls = {}
@@ -591,7 +584,7 @@ class CommandInjectionAnalyzer(ast.NodeVisitor):
         return python_source_segment(self.text, node) or ''
 
     def remember_issue(self, line_no):
-        if has_ignore(self.lines, line_no) or line_no in self.seen_lines:
+        if self.suppressions.is_suppressed(line_no, RULE_ID) or line_no in self.seen_lines:
             return
         self.seen_lines.add(line_no)
         self.issues.append(line_no)

@@ -1,6 +1,6 @@
 """ubs_core.py_detectors.hardcoded_secrets — category 7 (bead 0xjg.5).
 
-Verbatim port of run_hardcoded_secrets_checks (modules/ubs-python.sh
+Port of run_hardcoded_secrets_checks (modules/ubs-python.sh
 11028-11323, "Hardcoded secrets" subheader of CATEGORY 7): an ast.NodeVisitor
 flagging secret-ish names assigned literal fallbacks. It catches sensitive
 targets (`password = "..."`, `self.api_key = "..."`, `CONF["token"] = ...`,
@@ -10,7 +10,7 @@ plausible credential: >=8 chars, alphanumeric, no whitespace, not a URL,
 not a placeholder/example string. Names denoting metadata about a secret
 (`token_uri`, `api_key_id`, `token_count`, …) are excluded (#64).
 
-Same-file AND previous-line `ubs:ignore` markers suppress a hit; per-file
+Comment directives use shared statement ownership and rule scopes; per-file
 line dedupe (legacy `issue_lines`) is preserved. Legacy traversal
 (SHOULD_SKIP dirs / rglob) is replaced by the contract file list; the
 legacy heredoc accepts .py/.pyi/.pyx. Detail is the source line
@@ -23,6 +23,8 @@ import re
 import warnings
 from pathlib import Path
 from typing import Iterable, Sequence
+
+from ubs_core.suppression import SourceSuppressions
 
 RULE_ID = "py.security.hardcoded-secrets"
 CATEGORY = 7
@@ -74,15 +76,6 @@ def source_line(lines, line_no):
     if 0 <= idx < len(lines):
         return lines[idx].strip().replace('\t', ' ')
     return ''
-
-
-def has_ignore(lines, line_no):
-    idx = line_no - 1
-    return (
-        0 <= idx < len(lines) and 'ubs:ignore' in lines[idx]
-    ) or (
-        0 <= idx - 1 < len(lines) and 'ubs:ignore' in lines[idx - 1]
-    )
 
 
 def normalize_name(name: str) -> str:
@@ -162,9 +155,10 @@ def target_names(node):
 
 
 class HardcodedSecretAnalyzer(ast.NodeVisitor):
-    def __init__(self, path, lines):
+    def __init__(self, path, lines, suppressions):
         self.path = path
         self.lines = lines
+        self.suppressions = suppressions
         self.os_aliases = {'os'}
         self.environ_aliases = {'environ'}
         self.getenv_aliases = set()
@@ -173,7 +167,7 @@ class HardcodedSecretAnalyzer(ast.NodeVisitor):
 
     def remember_issue(self, node):
         line_no = getattr(node, 'lineno', 0)
-        if line_no <= 0 or line_no in self.issue_lines or has_ignore(self.lines, line_no):
+        if line_no <= 0 or line_no in self.issue_lines or self.suppressions.is_suppressed(line_no, RULE_ID):
             return
         self.issue_lines.add(line_no)
         self.issues.append((self.path, line_no, source_line(self.lines, line_no)))
@@ -275,6 +269,7 @@ class HardcodedSecretAnalyzer(ast.NodeVisitor):
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
+    suppressions = SourceSuppressions('python')
     for path in files:
         if path.suffix.lower() not in EXTS:
             continue
@@ -287,7 +282,7 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
         except Exception:
             continue
         lines = text.splitlines()
-        analyzer = HardcodedSecretAnalyzer(path, lines)
+        analyzer = HardcodedSecretAnalyzer(path, lines, suppressions.index(path, text))
         analyzer.visit(tree)
         for _path, line_no, code in analyzer.issues:
             yield path, line_no, 1, code[:240]

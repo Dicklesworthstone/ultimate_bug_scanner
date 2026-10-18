@@ -7,9 +7,8 @@ Replaces the legacy module's ~350-400 process spawns with ONE python process:
 
 Layers, in order:
 1. Pattern layer — regex categories aggregated from ubs_core.js_patterns.*
-   (one Pattern per legacy rg pipeline; flat same-line ubs:ignore exclusion
-   preserves the legacy count_lines semantics; the A7 statement-interval
-   engine in the meta-runner postprocess adds the richer placements).
+   (one Pattern per legacy rg pipeline; shared lexical and statement-interval
+   suppression applies to the exact pattern rule before threshold counts).
 2. Analyzer layer — registered ubs_core analyzers for javascript
    (taint_js, guards_js, ctcompare_js, the 15 async detectors) via run(ctx).
 3. ast-grep layer — the consolidated rule packs (≤ 3 `scan -c` invocations)
@@ -33,6 +32,7 @@ from typing import Callable, Iterable, Sequence
 
 from ubs_core.registry import RunContext
 from ubs_core.io import iter_ndjson
+from ubs_core.suppression import SourceSuppressions, SuppressionIndex
 
 MARKER = "ubs:ignore"
 _PATTERN_CACHE_KIND = "_ubs_js_pattern"
@@ -165,17 +165,21 @@ def code_view(text: str) -> str:
 
 
 def iter_matches(
-    pattern: Pattern, text: str, raw_text: str | None = None
+    pattern: Pattern, text: str, raw_text: str | None = None,
+    *, source_index: SuppressionIndex | None = None,
 ) -> Iterable[tuple[int, str]]:
     """Yield (line_number, line_text) for matches, skipping excluded lines.
 
     ``text`` is the view the regex and the exclude_regex post-filter run
     against (the code view for code_only patterns, so `// prefer ===` cannot
     drop a real `==` on the same line); ``raw_text`` is the original source
-    used for the ubs:ignore check, which lives in comments, and for the
-    reported line. Both views and any mask_regex blanking share one
-    coordinate system."""
+    used for the shared source suppression index and the reported line. Both
+    views and any mask_regex blanking share one coordinate system. Callers
+    scanning a file across patterns reuse its source index.
+    """
     source = raw_text if raw_text is not None else text
+    if source_index is None:
+        source_index = SourceSuppressions("javascript").index("<inline>", source)
     haystack = text if pattern.mask_regex is None else _mask_spans(text, pattern.mask_regex)
     for match in pattern.regex.finditer(haystack):
         line_no = source.count("\n", 0, match.start()) + 1
@@ -184,8 +188,8 @@ def iter_matches(
         if line_end == -1:
             line_end = len(source)
         line_text = source[line_start:line_end]
-        if MARKER in line_text:
-            continue  # legacy count_lines drops marker lines from counts
+        if source_index.is_suppressed(line_no, pattern.rule_id):
+            continue
         if pattern.exclude_regex is not None and pattern.exclude_regex.search(text[line_start:line_end]):
             continue
         yield line_no, line_text.strip()[:240]
@@ -233,6 +237,8 @@ def scan_patterns(
         except OSError:
             continue
     code_views: dict[Path, str] = {}
+    suppressions = SourceSuppressions("javascript")
+    source_indexes = {path: suppressions.index(path, text) for path, text in texts.items()}
     for pattern in active:
         if defer_global_checks:
             if pattern.gate_regex is not None or pattern.suppress_when_regex is not None:
@@ -269,7 +275,9 @@ def scan_patterns(
                 if path not in code_views:
                     code_views[path] = code_view(text)
                 scan_text = code_views[path]
-            for line_no, line_text in iter_matches(pattern, scan_text, text):
+            for line_no, line_text in iter_matches(
+                pattern, scan_text, text, source_index=source_indexes[path],
+            ):
                 key = (path, line_no)
                 if key in seen:
                     continue

@@ -29,7 +29,7 @@ module SuppressionProbe
 
   # Arrangement 2b: rule-scoped trailing marker (ubs:ignore[rule]).
   def self.eval_rule_scoped(code)
-    eval(code) # ubs:ignore[rb.eval-exec] -- fixture: rule-scoped trailing marker
+    eval(code) # ubs:ignore[rb.eval-exec,ruby.security.eval-family] -- names both AST and pattern rules
     code
   end
 

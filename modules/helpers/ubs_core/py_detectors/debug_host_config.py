@@ -7,15 +7,17 @@ wildcard ALLOWED_HOSTS values ('*', '*.*', '*.host', '.domain') in plain,
 annnotated, `config.update()`/`config.from_mapping()`, and attribute
 assignments.
 
-Same-file and previous-line `ubs:ignore` markers suppress a hit; the
-heredoc keeps NO line dedupe here, so a line can carry several records —
-preserved verbatim.
+Shared lexical statement ownership and exact rule scopes suppress annotated
+hits; the heredoc keeps NO line dedupe here, so a line can carry several
+records — preserved verbatim.
 """
 from __future__ import annotations
 
 import ast
 from pathlib import Path
 from typing import Iterable, Sequence
+
+from ubs_core.suppression import SourceSuppressions
 
 RULE_ID = "py.security.debug-host-config"
 CATEGORY = 7
@@ -73,15 +75,6 @@ def _source_line(lines, line_no):
     return ''
 
 
-def _has_ignore(lines, line_no):
-    idx = line_no - 1
-    return (
-        0 <= idx < len(lines) and 'ubs:ignore' in lines[idx]
-    ) or (
-        0 <= idx - 1 < len(lines) and 'ubs:ignore' in lines[idx - 1]
-    )
-
-
 def _keyword_value(call, key):
     for keyword in call.keywords:
         if keyword.arg == key:
@@ -104,13 +97,14 @@ def _target_names(target):
 
 
 class _DebugHostAnalyzer(ast.NodeVisitor):
-    def __init__(self, path, lines):
+    def __init__(self, path, lines, suppression):
         self.path = path
         self.lines = lines
+        self.suppression = suppression
         self.issues = []
 
     def remember_issue(self, line_no):
-        if _has_ignore(self.lines, line_no):
+        if self.suppression.is_suppressed(line_no, RULE_ID):
             return
         self.issues.append(line_no)
 
@@ -163,6 +157,7 @@ class _DebugHostAnalyzer(ast.NodeVisitor):
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
+    suppressions = SourceSuppressions("python")
     for path in files:
         if path.suffix.lower() not in {'.py', '.pyi'}:
             continue
@@ -172,7 +167,7 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
         except Exception:
             continue
         lines = text.splitlines()
-        analyzer = _DebugHostAnalyzer(path, lines)
+        analyzer = _DebugHostAnalyzer(path, lines, suppressions.index(path, text))
         analyzer.visit(tree)
         for line_no in analyzer.issues:
             yield path, line_no, 1, _source_line(lines, line_no)[:240]

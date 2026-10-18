@@ -8,14 +8,16 @@ calls on variables bound to those clients, when no bounded ``timeout=``
 is in play (``timeout=None``/``False`` counts as unbounded). Variables
 bound to a constructor WITH a timeout mark client vars as safe.
 
-Same-file and previous-line ``ubs:ignore`` markers suppress a hit, and hits
-are line-deduped per file (legacy ``seen_lines``).
+Shared lexical statement ownership and exact rule scopes suppress annotated
+hits; hits are line-deduped per file (legacy ``seen_lines``).
 """
 from __future__ import annotations
 
 import ast
 from pathlib import Path
 from typing import Iterable, Sequence
+
+from ubs_core.suppression import SourceSuppressions
 
 RULE_ID = "py.security.http-timeout"
 CATEGORY = 7
@@ -43,15 +45,6 @@ def source_line(lines, line_no):
     if 0 <= idx < len(lines):
         return lines[idx].strip()
     return ''
-
-
-def has_ignore(lines, line_no):
-    idx = line_no - 1
-    return (
-        0 <= idx < len(lines) and 'ubs:ignore' in lines[idx]
-    ) or (
-        0 <= idx - 1 < len(lines) and 'ubs:ignore' in lines[idx - 1]
-    )
 
 
 def keyword_value(call, name):
@@ -85,8 +78,9 @@ def target_names(target):
 
 
 class HttpTimeoutAnalyzer(ast.NodeVisitor):
-    def __init__(self, lines):
+    def __init__(self, lines, suppression):
         self.lines = lines
+        self.suppression = suppression
         self.issues = []
         self.seen_lines = set()
         self.requests_modules = {'requests'}
@@ -98,7 +92,7 @@ class HttpTimeoutAnalyzer(ast.NodeVisitor):
         self.http_client_vars = {}
 
     def remember_issue(self, line_no):
-        if has_ignore(self.lines, line_no) or line_no in self.seen_lines:
+        if self.suppression.is_suppressed(line_no, RULE_ID) or line_no in self.seen_lines:
             return
         self.seen_lines.add(line_no)
         self.issues.append((line_no, source_line(self.lines, line_no)))
@@ -214,6 +208,7 @@ class HttpTimeoutAnalyzer(ast.NodeVisitor):
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
+    suppressions = SourceSuppressions("python")
     for path in files:
         if path.suffix.lower() not in {'.py', '.pyi'}:
             continue
@@ -222,7 +217,7 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
             tree = ast.parse(text, filename=str(path))
         except Exception:
             continue
-        analyzer = HttpTimeoutAnalyzer(text.splitlines())
+        analyzer = HttpTimeoutAnalyzer(text.splitlines(), suppressions.index(path, text))
         analyzer.visit(tree)
         for line_no, code in analyzer.issues:
             yield path, line_no, 1, code[:240]

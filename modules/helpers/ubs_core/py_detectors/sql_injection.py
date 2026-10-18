@@ -13,7 +13,7 @@ constant interpolants are as safe as a literal and produce no finding; plain
 names of unknown origin (e.g. imported constants) surface as WARNING.
 Module-constant f-strings therefore stay silent (static tier).
 
-Same-file and previous-line `ubs:ignore` markers suppress a hit at the call.
+Statement-owned `ubs:ignore` comments suppress the emitted SQL tier's rule ID.
 
 Statement templates, raw predicates and SELECT mapping values retain distinct
 facts through the existing bounded flow engine. Finite literal iterables keep
@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 from ubs_core.io import python_source_segment
+from ubs_core.suppression import SuppressionIndex, build_index, may_have_markers
 
 RULES = (
     ("py.security.sql-injection", 7,
@@ -563,15 +564,6 @@ def source_line(lines, line_no):
     if 0 <= idx < len(lines):
         return lines[idx].strip()
     return ''
-
-
-def has_ignore(lines, line_no):
-    idx = line_no - 1
-    return (
-        0 <= idx < len(lines) and 'ubs:ignore' in lines[idx]
-    ) or (
-        0 <= idx - 1 < len(lines) and 'ubs:ignore' in lines[idx - 1]
-    )
 
 
 def string_parts(node):
@@ -1974,8 +1966,9 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 argument_epochs[keyword.value] = self.validation_epoch(keyword.value)
             self.generator_call(node)
             # All effects have now occurred, but each argument retains its
-            # own evaluation-time value. Suppress findings, never execution.
-            if is_sink and not has_ignore(self.lines, node.lineno):
+            # own evaluation-time value. Markers suppress the emitted rule in
+            # find(), never execution.
+            if is_sink:
                 self.classify_sink(node)
         finally:
             self.sink_lineno = previous_sink
@@ -2034,7 +2027,10 @@ def find(files: Sequence[Path], *, max_steps=100_000) -> Iterable[tuple[str, Pat
             bindings=bindings,
         )
         analyzer.visit(tree)
+        suppressions = build_index(text, "python") if may_have_markers(text) else SuppressionIndex()
         for line_no, code in analyzer.issues:
-            yield RULE_CRITICAL, path, line_no, 1, code[:240]
+            if not suppressions.is_suppressed(line_no, RULE_CRITICAL):
+                yield RULE_CRITICAL, path, line_no, 1, code[:240]
         for line_no, code in analyzer.warn_issues:
-            yield RULE_WARNING, path, line_no, 1, code[:240]
+            if not suppressions.is_suppressed(line_no, RULE_WARNING):
+                yield RULE_WARNING, path, line_no, 1, code[:240]

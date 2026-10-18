@@ -33,8 +33,7 @@ from typing import Any, Iterable, Sequence
 
 from ubs_core.registry import RunContext
 from ubs_core.io import read_ndjson
-
-MARKER = "ubs:ignore"
+from ubs_core.suppression import SourceSuppressions
 
 _CATEGORY_SLUGS = {
     1: "syntax",
@@ -204,23 +203,6 @@ _NATIVE_CHECKS: list[NativeCheck] = [
 ]
 
 
-def _has_suppression(lines: list[str], lineno: int, rule_id: str) -> bool:
-    idx = lineno - 1
-    target_lines = []
-    if 0 <= idx < len(lines):
-        target_lines.append(lines[idx])
-    if idx > 0 and (idx - 1) < len(lines):
-        target_lines.append(lines[idx - 1])
-    for l in target_lines:
-        if MARKER in l:
-            m = re.search(r"ubs:ignore(?:\[([a-zA-Z0-9_.,-]+)\])?", l)
-            if m:
-                rules = m.group(1)
-                if not rules or rule_id in rules.split(","):
-                    return True
-    return False
-
-
 def scan_files_native(
     files: Sequence[Path],
     sink,
@@ -229,6 +211,7 @@ def scan_files_native(
     prefilter: Any = None,
 ) -> dict[str, int]:
     counters = {"critical": 0, "warning": 0, "info": 0}
+    suppressions = SourceSuppressions("bash")
 
     for path in files:
         active_checks = _NATIVE_CHECKS
@@ -245,6 +228,7 @@ def scan_files_native(
         except OSError:
             continue
         lines = content.splitlines()
+        suppression = suppressions.index(path, content)
         file_str = str(path)
 
         # Check POSIX sh shebang for bashisms
@@ -285,7 +269,7 @@ def scan_files_native(
                 # Check for bashisms in POSIX sh
                 if re.search(r"(?:^|[\s;&|])\[\[\s+", line) or re.search(r"^\s*function\s+[a-zA-Z_]", line):
                     rule_id = "bash.syntax.posix_bashism"
-                    if not _has_suppression(lines, lineno, rule_id):
+                    if not suppression.is_suppressed(lineno, rule_id):
                         key = (file_str, lineno, rule_id)
                         reported_locations.add(key)
                         counters["warning"] += 1
@@ -314,7 +298,7 @@ def scan_files_native(
                 ):
                     continue
                 if check.regex.search(line):
-                    if _has_suppression(lines, lineno, check.rule_id):
+                    if suppression.is_suppressed(lineno, check.rule_id):
                         continue
                     key = (file_str, lineno, check.rule_id)
                     reported_locations.add(key)
@@ -391,6 +375,7 @@ def scan_shellcheck(
     counters = {"critical": 0, "warning": 0, "info": 0}
     if 6 in skip or not shutil.which("shellcheck"):
         return counters
+    suppressions = SourceSuppressions("bash")
 
     # Sending many large scripts to one ShellCheck process can exhaust memory.
     # Bound their combined size; oversized individual files still run alone.
@@ -473,6 +458,8 @@ def scan_shellcheck(
                 sev = "info"
 
             rule_id = f"bash.shellcheck.SC{code}"
+            if suppressions.index(file_p).is_suppressed(lineno, rule_id):
+                continue
             counters[sev] += 1
             sink.write(json.dumps({
                 "rule": rule_id,
@@ -510,6 +497,7 @@ def scan_ast_rules(
     """
     counters = {"critical": 0, "warning": 0, "info": 0}
     config = rule_dir / "sgconfig-bash.yml"
+    suppressions = SourceSuppressions("bash")
     if not config.is_file():
         if errors is not None:
             errors.append(f"ast-grep configuration not found: {config}")
@@ -607,6 +595,8 @@ def scan_ast_rules(
 
             cat = 3 if "security" in rule_id else (2 if "variable" in rule_id else 1)
             if cat in skip:
+                continue
+            if suppressions.index(file_p).is_suppressed(lineno, rule_id):
                 continue
 
             counters[sev] += 1
@@ -752,6 +742,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         extra=f"no_shellcheck={args.no_shellcheck}",
     )
     cached_findings, files_to_scan = cache.partition_files(files)
+    suppressions = SourceSuppressions("bash")
 
     # Every analysis layer that could not complete appends here, so a scan that
     # did not finish is never reported as a finished one (#111).
@@ -776,7 +767,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         # run would hit the cache and report the findings this one could not
         # produce as a clean, finished scan (#111).
         if not scan_errors:
-            cache.store_scanned_files(files_to_scan, capturing_sink.by_file)
+            cache.store_scanned_files(files_to_scan, {
+                path: suppressions.filter(records)
+                for path, records in capturing_sink.by_file.items()
+            })
     else:
         from ubs_core.prefilter import PrefilterResult
         prefilter_res = PrefilterResult(
@@ -804,7 +798,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if recs is None and capturing_sink is not None:
                 recs = capturing_sink.get_for_file(f)
             if recs:
-                for r in recs:
+                for r in suppressions.filter(recs):
                     sink_file.write(json.dumps(r, ensure_ascii=False) + "\n")
                     reported_locations.add((r.get("path", ""), r.get("line", 1), r.get("rule", "")))
         if not args.no_shellcheck:

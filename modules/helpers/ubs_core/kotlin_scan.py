@@ -22,8 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 from ubs_core.io import read_ndjson
-
-MARKER = "ubs:ignore"
+from ubs_core.suppression import SourceSuppressions
 
 _CATEGORY_SLUGS = {
     1: "type-narrowing", 2: "equality", 3: "concurrency", 4: "security",
@@ -145,16 +144,6 @@ _PATTERNS: list[Pattern] = [
 ]
 
 
-def _has_suppression(line: str, rule_id: str) -> bool:
-    if MARKER in line:
-        m = re.search(r"ubs:ignore(?:\[([a-zA-Z0-9_.,-]+)\])?", line)
-        if m:
-            rules = m.group(1)
-            if not rules or rule_id in rules.split(","):
-                return True
-    return False
-
-
 def _record_category(rec: dict) -> int | None:
     rule = rec.get("rule", "")
     if rule.startswith("kotlin.narrowing."):
@@ -175,6 +164,7 @@ def _record_category(rec: dict) -> int | None:
 
 
 def scan_patterns(patterns: list[Pattern], files: Sequence[Path], sink, skip: set[int], prefilter: Any = None) -> None:
+    suppressions = SourceSuppressions("kotlin")
     for path in files:
         active_patterns = patterns
         if prefilter is not None and not prefilter.is_bypass:
@@ -188,12 +178,13 @@ def scan_patterns(patterns: list[Pattern], files: Sequence[Path], sink, skip: se
         except OSError:
             continue
         lines = content.splitlines()
+        suppression = suppressions.index(path, content)
         for pattern in active_patterns:
             if pattern.category in skip:
                 continue
             for lineno, line in enumerate(lines, 1):
                 if pattern.regex.search(line):
-                    if _has_suppression(line, pattern.rule_id):
+                    if suppression.is_suppressed(lineno, pattern.rule_id):
                         continue
                     detail = pattern.description
                     msg = f"{pattern.title} — {detail}" if detail else pattern.title
@@ -471,6 +462,7 @@ def main(argv: list[str] | None = None) -> int:
                f"custom_rules={hash_rules_dir(args.custom_rules) if args.custom_rules else ''}"),
     )
     cached_findings, files_to_scan = cache.partition_files(files)
+    suppressions = SourceSuppressions("kotlin")
 
     capturing_sink = None
     # A layer that could not complete makes the scan partial, never clean.
@@ -495,7 +487,10 @@ def main(argv: list[str] | None = None) -> int:
             scan_custom_rules(args.custom_rules, files_to_scan, capturing_sink, "kotlin", scan_errors)
         # An incomplete analysis must never become the cached answer.
         if not scan_errors:
-            cache.store_scanned_files(files_to_scan, capturing_sink.by_file)
+            cache.store_scanned_files(files_to_scan, {
+                path: suppressions.filter(records)
+                for path, records in capturing_sink.by_file.items()
+            })
     else:
         from ubs_core.prefilter import PrefilterResult
         prefilter_res = PrefilterResult(
@@ -518,7 +513,7 @@ def main(argv: list[str] | None = None) -> int:
             if recs is None and capturing_sink is not None:
                 recs = capturing_sink.get_for_file(f)
             if recs:
-                for r in recs:
+                for r in suppressions.filter(recs):
                     sink_file.write(json.dumps(r, ensure_ascii=False) + "\n")
 
     cache_file = os.environ.get("UBS_CACHE_FILE") or (os.path.splitext(args.sink)[0] + ".cache")

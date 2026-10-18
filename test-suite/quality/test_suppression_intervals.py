@@ -6,6 +6,7 @@ import json
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1493,6 +1494,147 @@ mod tests {
         # Token count exceeds _MAX_CFG_TOKENS (256)
         many_tokens = "all(test, " + ", ".join(f'feat_{i} = "v"' for i in range(150)) + ")"
         self.assertFalse(cfg_implies_test(many_tokens), "High token count cfg must fail closed")
+
+
+class ReceiverMarkerOwnershipTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("shellcheck"), "real ShellCheck required")
+    def test_shellcheck_uses_its_actual_rule_id_and_comment_ownership(self) -> None:
+        from ubs_core import bash_scan
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        rule = "bash.shellcheck.SC2086"
+        with tempfile.TemporaryDirectory(prefix="shellcheck-marker-", dir=artifacts) as temporary:
+            path = Path(temporary) / "case.sh"
+            for marker, expected in (("", [3]), ('; marker_note="ubs:ignore"', [3]),
+                                     (" # ubs:ignore[unrelated.rule]", [3]),
+                                     (f" # ubs:ignore[{rule}]", [])):
+                with self.subTest(marker=marker):
+                    path.write_text("#!/usr/bin/env bash\nvalue=$1\nprintf '%s\\n' $value" + marker + "\n")
+                    sink, errors = StringIO(), []
+                    counts = bash_scan.scan_shellcheck([path], sink, set(), set(), errors)
+                    self.assertEqual(errors, [])
+                    rows = [json.loads(line) for line in sink.getvalue().splitlines()]
+                    self.assertEqual([row["line"] for row in rows if row["rule"] == rule], expected)
+                    self.assertEqual(counts, {"critical": 0, "warning": 0, "info": len(expected)})
+
+    @unittest.skipUnless(shutil.which("jq") and shutil.which("rg") and shutil.which("ast-grep"),
+                         "native UBS dependencies required")
+    def test_native_bash_kotlin_cache_json_and_sarif_share_marker_policy(self) -> None:
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="native-receiver-marker-", dir=artifacts) as temporary:
+            root = Path(temporary)
+            for lang, suffix, body, rule, scopes, comment in (
+                ("bash", ".sh", 'eval "$command"', "bash.security.eval_variable",
+                 "bash.security.eval_variable,bash.security.eval-variable", "#"),
+                ("kotlin", ".kt", 'ProcessBuilder("sh", "-c", command)',
+                 "kotlin.security.processbuilder-shell", "kotlin.security.processbuilder-shell", "//"),
+            ):
+                path = root / ("case" + suffix)
+                for variant, source, expected in (
+                    ("unmarked", body + "\n", [1]),
+                    ("quoted", body + '; marker_note="ubs:ignore"\n', [1]),
+                    ("wrong-scope", body + f" {comment} ubs:ignore[unrelated.rule]\n", [1]),
+                    ("owned", body + f" {comment} ubs:ignore[{scopes}]\n", []),
+                    ("previous", f"{comment} ubs:ignore[{scopes}]\n" + body + "\n", []),
+                ):
+                    path.write_text(source, encoding="utf-8")
+                    for fmt in ("json", "sarif"):
+                        env = {key: value for key, value in os.environ.items() if not key.startswith("UBS_")}
+                        env.update(UBS_NO_AUTO_UPDATE="1", UBS_CACHE_DIR=str(root / f"cache-{lang}-{variant}-{fmt}"),
+                                   UBS_PROFILE="1", PYTHONDONTWRITEBYTECODE="1", ENABLE_UV_TOOLS="0")
+                        for mode in ("cold", "warm", "disabled"):
+                            with self.subTest(lang=lang, marker=variant, format=fmt, cache=mode):
+                                run_env = dict(env, UBS_NO_CACHE="1" if mode == "disabled" else "0")
+                                command = [str(REPO_ROOT / "modules" / f"ubs-{lang}.sh"),
+                                           "--ci", f"--format={fmt}", str(path)]
+                                if lang == "bash":
+                                    command.insert(1, "--skip=6")
+                                proc = subprocess.run(command, cwd=root, env=run_env, capture_output=True,
+                                                      text=True, timeout=120)
+                                self.assertEqual(proc.returncode, int(bool(expected)), proc.stdout + proc.stderr)
+                                report = json.loads(proc.stdout)
+                                if fmt == "json":
+                                    self.assertEqual(report["status"], "ok", report)
+                                    self.assertEqual(report["critical"], len(expected), report)
+                                    sites = [row["line"] for row in report["findings"] if row["rule"] == rule]
+                                    if mode != "disabled":
+                                        self.assertEqual(report["profile"]["cache_hits"], int(mode == "warm"), report)
+                                        self.assertEqual(report["profile"]["cache_misses"], int(mode == "cold"), report)
+                                else:
+                                    sites = [row["locations"][0]["physicalLocation"]["region"]["startLine"]
+                                             for run in report["runs"] for row in run.get("results", [])
+                                             if row["ruleId"] == rule]
+                                self.assertEqual(sites, expected, report)
+
+    def test_bash_and_kotlin_patterns_use_statement_owned_comments(self) -> None:
+        from ubs_core import bash_scan, kotlin_scan
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="receiver-marker-", dir=artifacts) as temporary:
+            for lang, suffix, body, rule, comment in (
+                ("bash", ".sh", 'eval "$command"', "bash.security.eval_variable", "#"),
+                ("kotlin", ".kt", 'ProcessBuilder("sh", "-c", command)', "kotlin.security.processbuilder-shell", "//"),
+            ):
+                path = Path(temporary) / ("case" + suffix)
+                for variant, source, expected in (
+                    ("unmarked", body + "\n", [1]),
+                    ("quoted", body + '; marker_note="ubs:ignore"\n', [1]),
+                    ("wrong-scope", body + f" {comment} ubs:ignore[unrelated.rule]\n", [1]),
+                    ("owned", body + f" {comment} ubs:ignore[{rule}]\n", []),
+                    ("previous", f"{comment} ubs:ignore[{rule}]\n" + body + "\n", []),
+                ):
+                    with self.subTest(lang=lang, variant=variant):
+                        path.write_text(source, encoding="utf-8")
+                        sink = StringIO()
+                        if lang == "bash":
+                            bash_scan.scan_files_native([path], sink, set(), set())
+                        else:
+                            kotlin_scan.scan_patterns(kotlin_scan._PATTERNS, [path], sink, set())
+                        records = [json.loads(line) for line in sink.getvalue().splitlines()]
+                        self.assertEqual([record["line"] for record in records if record["rule"] == rule], expected)
+
+    @unittest.skipUnless(shutil.which("ast-grep"), "real ast-grep required")
+    def test_real_ast_adapters_preserve_unrelated_rules_and_quoted_markers(self) -> None:
+        from ubs_core import js_ast, py_ast, ruby_ast, elixir_ast
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        rule = "ubs.a7.ast-ownership"
+        with tempfile.TemporaryDirectory(prefix="ast-marker-", dir=artifacts) as temporary:
+            root = Path(temporary)
+            rules = root / "rules"
+            rules.mkdir()
+            config = root / "sgconfig.yml"
+            config.write_text("ruleDirs:\n  - rules\n", encoding="utf-8")
+            for lang, suffix, body, pattern, comment, adapter in (
+                ("javascript", ".js", "eval(input)", "eval($X)", "//", js_ast),
+                ("python", ".py", "eval(input)", "eval($X)", "#", py_ast),
+                ("ruby", ".rb", "eval(input)", "eval($X)", "#", ruby_ast),
+                ("elixir", ".ex", "Code.eval_string(input)", "Code.eval_string($X)", "#", elixir_ast),
+            ):
+                (rules / "ownership.yml").write_text(
+                    f"id: {rule}\nlanguage: {lang}\nseverity: error\nmessage: owned marker oracle\n"
+                    f"rule:\n  pattern: {pattern}\n", encoding="utf-8")
+                path = root / ("case" + suffix)
+                for variant, source, expected in (
+                    ("unmarked", body + "\n", [1]),
+                    ("quoted", body + '; marker_note="ubs:ignore"\n', [1]),
+                    ("wrong-scope", body + f" {comment} ubs:ignore[unrelated.rule]\n", [1]),
+                    ("owned", body + f" {comment} ubs:ignore[{rule}]\n", []),
+                    ("previous", f"{comment} ubs:ignore[{rule}]\n" + body + "\n", []),
+                ):
+                    with self.subTest(lang=lang, variant=variant):
+                        path.write_text(source, encoding="utf-8")
+                        sink, errors = StringIO(), []
+                        extra = {"lang": lang} if adapter is js_ast else {}
+                        if adapter is ruby_ast:
+                            extra["counted_rules"] = {rule}
+                        counts = adapter.scan_config(config, [path], sink, errors=errors, **extra)
+                        self.assertEqual(errors, [])
+                        records = [json.loads(line) for line in sink.getvalue().splitlines()]
+                        self.assertEqual([(row["rule"], row["line"]) for row in records],
+                                         [(rule, line) for line in expected])
+                        self.assertEqual(counts, {"critical": len(expected), "warning": 0, "info": 0})
 
 
 class StatementBoundaryTests(unittest.TestCase):

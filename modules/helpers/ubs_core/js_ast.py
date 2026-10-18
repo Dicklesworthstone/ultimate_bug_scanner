@@ -5,9 +5,8 @@ Runs the grammar and custom-policy sgconfigs produced by `ubs_core.js_rules.gene
 parses the stream once, and appends normalized records to the same NDJSON
 findings sink the pattern layer uses.
 
-Suppression: flat same-line + previous-line `ubs:ignore` checks (the legacy
-emit_ast_rule_group semantics, ubs-js.sh 572-577); the A7 statement-interval
-engine in the meta-runner postprocess layers the richer placements on top.
+Suppression: invocation-local source indexes apply the shared lexical and
+statement-interval policy to the exact diagnostic rule before counting.
 
 Counting: when `count_only` is provided, only those rule ids are counted and
 emitted — legacy counts just the mapped emit_ast_rule_group ids and dumps
@@ -24,8 +23,8 @@ import os
 from pathlib import Path
 from typing import Sequence
 
-from ubs_core.js_scan import MARKER
 from ubs_core.external_tools import iter_output_lines, report_ast_stderr, run_command_stream
+from ubs_core.suppression import SourceSuppressions
 
 _ASTGREP_BIN = "ast-grep"
 
@@ -84,25 +83,23 @@ def _validated_match(line: str) -> dict:
     return match
 
 
-def _file_lines(path: Path, cache: dict[Path, list[str]]) -> list[str]:
+def _file_lines(path: Path, cache: dict[Path, list[str]],
+                suppressions: SourceSuppressions) -> list[str]:
     if path not in cache:
         try:
-            cache[path] = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
-            cache[path] = []
+            text = ""
+        cache[path] = text.splitlines()
+        suppressions.index(path, text)
     return cache[path]
 
 
-def _has_marker(path: Path, line_no: int, cache: dict[Path, list[str]]) -> bool:
-    lines = _file_lines(path, cache)
-    idx = line_no - 1
-    return any(0 <= i < len(lines) and MARKER in lines[i].lower() for i in (idx, idx - 1))
-
-
-def _listener_imbalance(path: Path, cache: dict[Path, list[str]]) -> bool:
+def _listener_imbalance(path: Path, cache: dict[Path, list[str]],
+                        suppressions: SourceSuppressions) -> bool:
     """Legacy rg-delta (ubs-js.sh 670-710): addEventListener count must exceed
     removeEventListener count in the same file for the finding to fire."""
-    lines = _file_lines(path, cache)
+    lines = _file_lines(path, cache, suppressions)
     adds = sum(line.count("addEventListener") for line in lines)
     removes = sum(line.count("removeEventListener") for line in lines)
     return adds > removes
@@ -136,6 +133,7 @@ def scan_config(
             raise RuntimeError("; ".join(problems))
         return counters
     cache: dict[Path, list[str]] = {}
+    suppressions = SourceSuppressions("javascript")
     for start in range(0, len(path_list), _BATCH):
         batch = [str(p) for p in path_list[start : start + _BATCH]]
         with run_command_stream(
@@ -195,10 +193,10 @@ def scan_config(
                     continue
                 if severity not in counters:
                     severity = "warning"
-                if lang != "custom" and rule_id == "js.resource.listener-no-remove" and not _listener_imbalance(path, cache):
+                if lang != "custom" and rule_id == "js.resource.listener-no-remove" and not _listener_imbalance(path, cache, suppressions):
                     continue  # legacy rg-delta: adds <= removes means balanced
-                if _has_marker(path, line_no, cache):
-                    continue  # legacy line + previous-line marker check
+                if suppressions.is_suppressed(path, line_no, rule_id):
+                    continue
                 counters[severity] = counters.get(severity, 0) + 1
                 message = str(match.get("message", "")).strip() or str(match.get("text", ""))[:240]
                 sink.write(json.dumps({

@@ -10,7 +10,7 @@ a tar ``extractall`` carries ``filter='data'`` / ``tarfile.data_filter``, or
 when ``extract`` / ``members=`` calls have a validation marker (safe_extract,
 resolve, normpath, a '..' literal, ...) within the preceding 16 lines.
 
-Same-file and previous-line ``ubs:ignore`` markers suppress a hit.
+Comment directives use shared statement ownership and rule scopes.
 """
 from __future__ import annotations
 
@@ -18,6 +18,8 @@ import ast
 import re
 from pathlib import Path
 from typing import Iterable, Sequence
+
+from ubs_core.suppression import SourceSuppressions
 
 RULE_ID = "py.security.archive-extraction"
 CATEGORY = 7
@@ -131,16 +133,8 @@ def _has_safe_archive_context(kind, call, lines):
     return False
 
 
-def _has_ignore(lines, line_no):
-    idx = line_no - 1
-    return (
-        0 <= idx < len(lines) and 'ubs:ignore' in lines[idx]
-    ) or (
-        0 <= idx - 1 < len(lines) and 'ubs:ignore' in lines[idx - 1]
-    )
-
-
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
+    suppressions = SourceSuppressions('python')
     for path in files:
         if path.suffix.lower() not in {'.py', '.pyi'}:
             continue
@@ -150,6 +144,7 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
         except Exception:
             continue
         lines = text.splitlines()
+        suppression_index = suppressions.index(path, text)
         tar_modules = {'tarfile'}
         zip_modules = {'zipfile'}
         tar_open_names = set()
@@ -186,7 +181,7 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call) or not hasattr(node, 'lineno'):
                 continue
-            if _has_ignore(lines, node.lineno):
+            if suppression_index.is_suppressed(node.lineno, RULE_ID):
                 continue
             kind = _extraction_kind(node, archive_vars, archive_contexts,
                                     tar_modules, zip_modules, tar_open_names,

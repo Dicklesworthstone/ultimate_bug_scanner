@@ -93,10 +93,34 @@ class MatchTests(unittest.TestCase):
 
     def test_marker_lines_excluded(self) -> None:
         p = _pat()
-        text = "debugger;\ndebugger;  # ubs:ignore\n"
+        text = "debugger;\ndebugger;  // ubs:ignore\n"
         hits = list(iter_matches(p, text))
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0][0], 1)
+
+    def test_hash_text_is_not_a_javascript_comment_marker(self) -> None:
+        hits = list(iter_matches(_pat(), "debugger;  # ubs:ignore\n"))
+        self.assertEqual([hit[0] for hit in hits], [1])
+
+    def test_body_markers_do_not_suppress_unrelated_function_headers(self) -> None:
+        pattern = _pat(rule_id="js.function-scope.callback-density", regex=re.compile(r"function"))
+        for body in (
+            "  const outputPath = getPath(); // ubs:ignore\n  write(outputPath);\n",
+            "  if (token !== expected) {\n    // ubs:ignore\n    return false;\n  }\n",
+        ):
+            with self.subTest(body=body):
+                source = "export function check(): boolean {\n" + body + "}\n"
+                self.assertEqual([hit[0] for hit in iter_matches(pattern, source)], [1])
+
+    def test_comment_markers_own_preceding_and_formatter_header_positions(self) -> None:
+        pattern = _pat(rule_id="js.function-scope.callback-density", regex=re.compile(r"function"))
+        for source in (
+            '// A quoted "ubs:ignore" in a comment is still a directive.\n'
+            "export function check() {\n  work();\n}\n",
+            "export function check() {\n  // ubs:ignore\n  work();\n}\n",
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(list(iter_matches(pattern, source)), [])
 
     def test_exclude_regex_drops_lines(self) -> None:
         p = _pat(

@@ -21,6 +21,8 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.suppression import SourceSuppressions
+
 RULE_ID = "py.security.security-assert"
 CATEGORY = 7
 TITLE = "Security-sensitive assert stripped by -O"
@@ -73,15 +75,6 @@ def source_line(lines, line_no):
     return ''
 
 
-def has_ignore(lines, line_no):
-    idx = line_no - 1
-    return (
-        0 <= idx < len(lines) and 'ubs:ignore' in lines[idx]
-    ) or (
-        0 <= idx - 1 < len(lines) and 'ubs:ignore' in lines[idx - 1]
-    )
-
-
 def name_is_security_sensitive(name):
     return bool(name and SECURITY_RE.search(name))
 
@@ -114,8 +107,9 @@ def expr_is_security_sensitive(node):
 
 
 class SecurityAssertAnalyzer(ast.NodeVisitor):
-    def __init__(self, lines):
+    def __init__(self, lines, suppression):
         self.lines = lines
+        self.suppression = suppression
         self.context_names = []
         self.issues = []
 
@@ -123,7 +117,7 @@ class SecurityAssertAnalyzer(ast.NodeVisitor):
         return any(name_is_security_sensitive(name) for name in self.context_names)
 
     def remember_issue(self, line_no):
-        if has_ignore(self.lines, line_no):
+        if self.suppression.is_suppressed(line_no, RULE_ID):
             return
         self.issues.append((line_no, source_line(self.lines, line_no)))
 
@@ -149,6 +143,7 @@ class SecurityAssertAnalyzer(ast.NodeVisitor):
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
+    suppressions = SourceSuppressions("python")
     for path in files:
         if path.suffix.lower() not in {'.py', '.pyi'}:
             continue
@@ -162,7 +157,7 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
             tree = ast.parse(text, filename=str(path))
         except Exception:
             continue
-        analyzer = SecurityAssertAnalyzer(text.splitlines())
+        analyzer = SecurityAssertAnalyzer(text.splitlines(), suppressions.index(path, text))
         analyzer.visit(tree)
         for line_no, code in analyzer.issues:
             yield path, line_no, 1, code[:240]

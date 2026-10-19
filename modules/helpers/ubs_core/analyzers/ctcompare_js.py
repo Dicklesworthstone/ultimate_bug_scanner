@@ -275,8 +275,74 @@ def open_jsx_tag(prefix):
     return match.group()
 
 
-def collect_sensitive_vars(lines, code_lines):
-    sensitive_vars = set()
+call_head_re = re.compile(
+    r'\s*(?:await\s+)?(?:new\s+)?[A-Za-z_$][\w$]*(?:\s*(?:\?\.|!?\.)\s*[A-Za-z_$][\w$]*)*'
+    r'\s*(?:<[^<>()]*>\s*)?(?:\?\.\s*)?\('
+)
+chained_call_re = re.compile(r'\s*(?:\?\.|!?\.)\s*[A-Za-z_$][\w$]*\s*(?:<[^<>()]*>\s*)?(?:\?\.\s*)?\(')
+call_tail_re = re.compile(r'\s*!?\s*(?:(?:as|satisfies)\s+[\w$.<>\[\]|&, ]+)?')
+# An equality's left operand runs back to the statement start, so it can carry
+# `return`, `yield` or assignment heads (`const ok = result.type`).
+member_read_re = re.compile(
+    r'(?:(?:return|yield)\s+|(?:(?:const|let|var)\s+)?[A-Za-z_$][\w$]*\s*=\s*)*'
+    r'\(*\s*(?P<root>[A-Za-z_$][\w$]*)(?P<chain>(?:\s*(?:\?\.|!?\.)\s*[A-Za-z_$][\w$]*)+)\s*\)*'
+)
+
+
+def is_call_result(expr):
+    """Whether an assignment's value is exactly the return value of a call.
+
+    `await api.open(x)`, `new Client(x)`, `make(x).build()` and TypeScript
+    `... as T` qualify; member reads of a result (`login(x).accessToken`),
+    operators and anything else after the call do not.
+    """
+    match = call_head_re.match(expr)
+    if not match:
+        return False
+    position = match.end() - 1
+    while True:
+        depth, close = 0, -1
+        for index in range(position, len(expr)):
+            if expr[index] == '(':
+                depth += 1
+            elif expr[index] == ')':
+                depth -= 1
+                if depth == 0:
+                    close = index
+                    break
+        if close < 0:
+            return False
+        chained = chained_call_re.match(expr, close + 1)
+        if not chained:
+            return call_tail_re.fullmatch(expr, close + 1) is not None
+        position = chained.end() - 1
+
+
+def call_result_metadata_read(operand, call_results):
+    """`result.type` where `result` only ever holds a call's return value (GH #181, #185).
+
+    The call's arguments or callee name may name a secret
+    (`openAuthSessionAsync(authorization.authorize_url)`), which is why the
+    result is tracked at all, but a METADATA member of the returned object is
+    its public discriminant, not that secret. Aliases of a secret
+    (`result = authorization`) never qualify. A member whose own name carries
+    secret vocabulary (`result.authTokenId`) is still reported by name.
+    """
+    read = member_read_re.fullmatch(operand)
+    if not read or read.group('root') not in call_results:
+        return False
+    terms = identifier_terms(identifier_re.findall(read.group('chain'))[-1])
+    return bool(terms) and terms[-1] in METADATA_TERMS
+
+
+def collect_sensitive_bindings(lines, code_lines):
+    """Locals assigned secret material, and those that only hold call results.
+
+    Returns (sensitive_vars, call_results). A name lands in call_results when
+    every assignment that made it sensitive was exactly a call expression and
+    the name itself carries no secret vocabulary.
+    """
+    sensitive_vars, call_vars, alias_vars = set(), set(), set()
     # Carry unfinished tags over physical lines. Attribute names are DOM
     # properties, not assignments to JavaScript locals. Keep assignments inside
     # their {...} expressions eligible, including nested assignment expressions.
@@ -301,9 +367,14 @@ def collect_sensitive_vars(lines, code_lines):
             expr = statement[match.end():].split(';', 1)[0]
             # String contents and JSX attribute names cannot taint locals;
             # real assignment expressions still propagate secret material.
-            if sensitive_families(name) or sensitive_families(expr):
+            named = bool(sensitive_families(name))
+            if named or sensitive_families(expr):
                 sensitive_vars.add(name)
-    return sensitive_vars
+                if not named and is_call_result(expr):
+                    call_vars.add(name)
+                else:
+                    alias_vars.add(name)
+    return sensitive_vars, frozenset(call_vars - alias_vars)
 
 
 def clean_operand_text(operand):
@@ -376,7 +447,8 @@ def comparison_operands(statement: str) -> Iterable[tuple[int, str, str]]:
             yield comparison.start(), left, right
 
 
-def unsafe_secret_compare(statement, sensitive_vars, *, comparison_start=0, comparison_limit=None):
+def unsafe_secret_compare(statement, sensitive_vars, *, call_results=frozenset(),
+                          comparison_start=0, comparison_limit=None):
     if safe_compare_re.search(statement):
         return False
     # Match within each term, never across &&/||. An exempt comparison only
@@ -386,12 +458,17 @@ def unsafe_secret_compare(statement, sensitive_vars, *, comparison_start=0, comp
             continue
         if comparison_limit is not None and offset >= comparison_limit:
             continue
-        if unsafe_secret_operands(left, right, sensitive_vars):
+        if unsafe_secret_operands(left, right, sensitive_vars, call_results):
             return True
     return False
 
 
-def unsafe_secret_operands(left, right, sensitive_vars):
+def operand_tainted(operand, sensitive_vars, call_results=frozenset()):
+    return (bool(operand_identifiers(operand) & sensitive_vars)
+            and not call_result_metadata_read(operand, call_results))
+
+
+def unsafe_secret_operands(left, right, sensitive_vars, call_results=frozenset()):
     left = clean_operand_text(left)
     right = clean_operand_text(right)
     if operand_is_nullish_or_shape_check(left) or operand_is_nullish_or_shape_check(right):
@@ -399,8 +476,8 @@ def unsafe_secret_operands(left, right, sensitive_vars):
 
     left_fams = sensitive_families(left)
     right_fams = sensitive_families(right)
-    left_taint = bool(operand_identifiers(left) & sensitive_vars)
-    right_taint = bool(operand_identifiers(right) & sensitive_vars)
+    left_taint = operand_tainted(left, sensitive_vars, call_results)
+    right_taint = operand_tainted(right, sensitive_vars, call_results)
     left_sensitive = bool(left_fams) or left_taint
     right_sensitive = bool(right_fams) or right_taint
 
@@ -437,7 +514,7 @@ def scan_file(path: Path, sample_root: Path) -> list[tuple[str, int, str]]:
     # Statement lookahead revisits each physical line. Keep its exact lexical
     # view only for this file; the shared index owns suppression separately.
     code_lines = [code_line(raw) for raw in lines]
-    sensitive_vars = collect_sensitive_vars(lines, code_lines)
+    sensitive_vars, call_results = collect_sensitive_bindings(lines, code_lines)
     seen_lines = set()
     for idx, code in enumerate(code_lines):
         stripped = code.strip()
@@ -455,8 +532,8 @@ def scan_file(path: Path, sample_root: Path) -> list[tuple[str, int, str]]:
         # Lookahead completes a multiline operand, but a comparison on a later
         # physical line must be reported there, not on this line as well.
         if not statement or not unsafe_secret_compare(
-            statement, sensitive_vars, comparison_start=len(prefix),
-            comparison_limit=len(prefix) + len(stripped)
+            statement, sensitive_vars, call_results=call_results,
+            comparison_start=len(prefix), comparison_limit=len(prefix) + len(stripped)
         ):
             continue
         if idx in seen_lines or source_index.is_suppressed(idx + 1, _RULE):
@@ -532,10 +609,9 @@ export function doneTokenCheck(doneAuthToken: string, expectedAuthToken: string)
 
 
 def _selftest_positive() -> None:
-    statement = "return sessionNonce === expectedNonce;"
-    assert unsafe_secret_compare(statement, collect_sensitive_vars([statement], [code_line(statement)])), statement
-    statement = "if (doneAuthToken !== expectedAuthToken) {"
-    assert unsafe_secret_compare(statement, collect_sensitive_vars([statement], [code_line(statement)])), statement
+    for statement in ("return sessionNonce === expectedNonce;", "if (doneAuthToken !== expectedAuthToken) {"):
+        sensitive_vars, call_results = collect_sensitive_bindings([statement], [code_line(statement)])
+        assert unsafe_secret_compare(statement, sensitive_vars, call_results=call_results), statement
 
 
 def _selftest_suppression() -> None:

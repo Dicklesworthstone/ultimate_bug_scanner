@@ -5955,5 +5955,152 @@ class SwiftCppSuppressionTests(unittest.TestCase):
         self.assertEqual(checked, 19)
 
 
+class SwiftLexicalFrontendTests(unittest.TestCase):
+    """Selected Swift lexical contracts, not Foundation runtime proof."""
+
+    LEXICAL_CASES = (
+        ('plain', 'let target = req.query["returnUrl"] ?? "/"\n', True),
+        ('literal', 'let note = "req.query // ubs:ignore[swift.taint.request_open_redirect]"\n', False),
+        ('nested-comment', '/* outer /* inner */ req.query */\nlet fixed = 1\n', False),
+        ('triple', 'let note = """\nreq.query // ubs:ignore[swift.taint.request_open_redirect]\n"""\n', False),
+        ('raw-one', 'let note = #"quote " req.query // ubs:ignore[swift.taint.request_open_redirect]"#\n', False),
+        ('raw-two', 'let note = ##"short closer "# req.query \\#(req.query)"##\n', False),
+        ('raw-triple', 'let note = ##"""\nshort closer """# req.query\n"""##\n', False),
+        ('interpolation', 'let target = "prefix \\(req.query["returnUrl"] ?? "/")"\n', True),
+        ('triple-interpolation', 'let target = """\nprefix \\(req.query["returnUrl"] ?? "/")\n"""\n', True),
+        ('raw-interpolation', 'let target = #"prefix \\#(req.query["returnUrl"] ?? "/")"#\n', True),
+        ('wrong-raw-interpolation', 'let note = ##"\\(req.query) \\#(req.query)"##\n', False),
+        ('two-raw-interpolation', 'let target = ##"\\##(req.query["returnUrl"] ?? "/")"##\n', True),
+        ('nested-call', 'let target = "\\(String(describing: (req.query["returnUrl"] ?? "/")))"\n', True),
+        ('comment-in-interpolation', 'let target = "\\(/* outer /* inner */ tail */ req.query["returnUrl"] ?? "/")"\n', True),
+        ('escaped-interpolation', 'let note = "\\\\(req.query[\\"returnUrl\\"])"\n', False),
+        ('unicode', 'let café = "雪 🐦 req.query"\nlet fixed = 1\n', False),
+        ('division', 'let ratio = req.query.count / 2\n', True),
+    )
+
+    def test_swift_lexical_payloads_and_all_existing_view_modes(self):
+        for name, source, active in self.LEXICAL_CASES:
+            for strings, comments, preserve in ((True, True, False), (True, True, True),
+                                                (False, True, False), (False, False, False)):
+                with self.subTest(case=name, strings=strings, comments=comments, preserve=preserve):
+                    actual = strip_comments_and_strings(source, lang="swift", strip_strings=strings,
+                                                        strip_comments=comments, preserve_comments=preserve)
+                    self.assertEqual(len(actual), len(source))
+                    self.assertEqual([i for i, c in enumerate(actual) if c == '\n'],
+                                     [i for i, c in enumerate(source) if c == '\n'])
+                    if strings and not preserve:
+                        self.assertEqual('req.query' in actual, active, actual)
+                    if not strings and not comments:
+                        self.assertEqual(actual, source)
+
+    def test_swift_markers_in_literals_are_inert_and_interpolation_comments_are_real(self):
+        from ubs_core.suppression import parse_markers
+        rule = 'swift.taint.request_open_redirect'
+        for source in ('let note = "// ubs:ignore[' + rule + ']"\n',
+                       'let note = #"quote " // ubs:ignore[' + rule + ']"#\n',
+                       'let note = ##"""\n"""# // ubs:ignore[' + rule + ']\n"""##\n',
+                       'let pattern = #/ // ubs:ignore[' + rule + '] /#\n'):
+            with self.subTest(source=source):
+                self.assertEqual(parse_markers(source, 'swift'), [])
+        source = 'let target = "\\(/* ubs:ignore[' + rule + '] */ req.query["returnUrl"] ?? "/")"\n'
+        markers = parse_markers(source, 'swift')
+        self.assertEqual([(m.line, m.rules) for m in markers], [(1, frozenset({rule}))])
+
+    def test_swift_regex_literals_are_opaque_and_division_stays_code(self):
+        # The Swift taint lexer reads these as regex literals too; SwiftPine's
+        # lexer rejected them as unsupported (b2ca4d04).
+        for source in ('let pattern = /req.query/\n', 'let pattern = #/req.query//#\n',
+                       'if s.contains(/req.query/) {}\n', 'switch s { case /req.query/: break }\n',
+                       'let pattern = #/\n  req.query // x\n/#\n'):
+            with self.subTest(source=source):
+                actual = strip_comments_and_strings(source, lang='swift')
+                self.assertNotIn('req.query', actual)
+                self.assertEqual([i for i, c in enumerate(actual) if c == '\n'],
+                                 [i for i, c in enumerate(source) if c == '\n'])
+        # A quote inside a regex literal opens no string.
+        self.assertIn('req.query', strip_comments_and_strings(
+            'let pattern = /a"b/\nlet target = req.query\n', lang='swift'))
+        # Swift lexes these slashes as operators (SE-0354): after an operand,
+        # before a blank, and an operator reference with no closing slash.
+        for source in ('let n = req.query.count / 2\n', 'let r = (a) / b / req.query\n',
+                       'let r = a! / req.query.count\n', 'let r = 10 / req.query.count / 2\n',
+                       'x /= 2; let y = req.query\n', 'let r = xs.reduce(1, /)\nlet t = req.query\n'):
+            with self.subTest(source=source):
+                self.assertEqual(strip_comments_and_strings(source, lang='swift'), source)
+        with self.assertRaisesRegex(ValueError, 'Unterminated Swift regex.*incomplete'):
+            strip_comments_and_strings('let pattern = #/req.query\n', lang='swift')
+
+    def test_swift_real_core_cli_keeps_partial_evidence_and_never_caches_incomplete_analysis(self):
+        programs = (
+            ('capture', 'func incomplete(req: Request) { let path = req.query["path"] ?? ""; '
+             'func captured() -> String { return path }; _ = try String(contentsOfFile: captured()) }\n'),
+            # A marker whose comment structure cannot be lexed has no provable
+            # ownership: the file is excluded and the scan is partial.
+            ('unlexable', '// ubs:ignore[swift.taint.request_open_redirect]\n'
+             'func incomplete(req: Request) { _ = try String(contentsOfFile: req.query["path"] ?? "") }\n'
+             '/* unterminated\n'),
+            ('regex', 'func complete(req: Request) { let pattern = /req.query/; '
+             '_ = try String(contentsOfFile: req.query["path"] ?? "") }\n'),
+        )
+        with tempfile.TemporaryDirectory(prefix='ubs_swift_partial_', dir=REPO_ROOT / 'test-suite/artifacts') as temporary:
+            root = Path(temporary)
+            supported = root / 'Supported.swift'
+            supported.write_text('func route(req: Request) { _ = try String(contentsOfFile: req.query["path"] ?? "") }\n')
+            for name, program in programs:
+                folder = root / name
+                folder.mkdir()
+                other = folder / 'Other.swift'
+                other.write_text(program)
+                files = folder / 'files.nul'
+                files.write_bytes(os.fsencode(supported.resolve()) + b'\0' + os.fsencode(other.resolve()) + b'\0')
+                for stage, no_cache, skipped in (('cold', False, ''), ('repeat', False, ''),
+                                                 ('disabled', True, ''), ('excluded-taint', True, '6'),
+                                                 ('excluded-all', True, ','.join(str(category) for category in range(1, 24)))):
+                    destination = folder / stage
+                    destination.mkdir()
+                    sink, summary = destination / 'findings.ndjson', destination / 'summary.json'
+                    stats, text = destination / 'cache.json', destination / 'report.txt'
+                    command = [sys.executable, '-B', '-m', 'ubs_core.swift_scan', '--files-from', str(files),
+                               '--sink', str(sink), '--json-out', str(summary), '--text-out', str(text),
+                               '--project-dir', str(root), '--skip', skipped]
+                    environment = dict(os.environ, PYTHONDONTWRITEBYTECODE='1', UBS_PROFILE='1',
+                                       UBS_CACHE_DIR=str(folder / 'cache'), UBS_CACHE_FILE=str(stats),
+                                       UBS_NO_CACHE='1' if no_cache else '0')
+                    environment['PYTHONPATH'] = str(HELPERS_DIR) + os.pathsep + environment.get('PYTHONPATH', '')
+                    result = subprocess.run(command, cwd=root, env=environment, capture_output=True,
+                                            text=True, timeout=60)  # ubs:ignore[python.taint.command] - fixed real core CLI with local retained source programs
+                    (destination / 'stdout.log').write_text(result.stdout)
+                    (destination / 'stderr.log').write_text(result.stderr)
+                    (destination / 'invocation.json').write_text(json.dumps({'argv': command, 'cwd': str(root),
+                                                                            'status': result.returncode}, indent=2))
+                    with self.subTest(program=name, stage=stage):
+                        document = json.loads(summary.read_text())
+                        records = [json.loads(line) for line in sink.read_text().splitlines() if line]
+                        findings = sorted((record['rule'], record['path'], record['line']) for record in records
+                                          if record['rule'].startswith('swift.taint.'))
+                        expected = [] if skipped else sorted(
+                            ('swift.taint.request_path_traversal', str(path.resolve()), 1)
+                            for path in ((supported, other) if name == 'regex' else (supported,)))
+                        # Skipping taint does not disable the lexical gate: other
+                        # categories still need marker ownership. Skipping every
+                        # category selects no producer and has no such failure.
+                        incomplete = name != 'regex' and (not skipped or (name == 'unlexable' and skipped == '6'))
+                        self.assertEqual(findings, expected, records)
+                        self.assertEqual(result.returncode, 2 if incomplete else 1 if expected else 0, result.stderr)
+                        self.assertEqual(document['status'], 'partial' if incomplete else 'ok', document)
+                        self.assertEqual(document.get('module_error'), 'ANALYZER_ERROR' if incomplete else None)
+                        # Only a complete analysis enters the cache.
+                        self.assertEqual(json.loads(stats.read_text())['hits'],
+                                         2 if name == 'regex' and stage == 'repeat' else 0)
+                        counter_log = [json.loads(line) for line in result.stderr.splitlines() if line.startswith('{')][-1]
+                        self.assertEqual(bool(counter_log['errors']), bool(incomplete), counter_log)
+                        if name == 'unlexable' and incomplete:
+                            self.assertEqual(len(counter_log['errors']), 1, counter_log)
+                            self.assertIn('Swift lexical analysis', counter_log['errors'][0])
+                            self.assertIn('Unterminated Swift comment', counter_log['errors'][0])
+                        if incomplete:
+                            self.assertNotIn('✓ OK', text.read_text())
+
+
 if __name__ == "__main__":
     unittest.main()

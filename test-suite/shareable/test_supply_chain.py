@@ -678,6 +678,9 @@ def test_corrupted_ast_grep_zip_refused() -> None:
 
         cache_dir = p / "cache"
         cache_dir.mkdir()
+        # Install authentic metadata so this check reaches the archive gate
+        # without fetching an unrelated, mutable remote contract.
+        shutil.copy2(MODULES / "contract.json", cache_dir / "contract.json")
         (cache_dir / "helpers").mkdir()
         (cache_dir / "lib").mkdir()
         shutil.copy2(MODULES / "ubs-js.sh", cache_dir / "ubs-js.sh")

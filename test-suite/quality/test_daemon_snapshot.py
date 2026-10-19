@@ -36,7 +36,9 @@ class SnapshotTests(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory(prefix='ubs-snapshot-')
         self.addCleanup(tmp.cleanup)
-        self.work = Path(tmp.name)
+        # The service compares sources against the canonical repository root;
+        # TMPDIR may sit behind a symlink (macOS /var/folders).
+        self.work = Path(tmp.name).resolve()
         self.root = self.work / 'project'
         self.root.mkdir()
         self.home = self.work / 'home'

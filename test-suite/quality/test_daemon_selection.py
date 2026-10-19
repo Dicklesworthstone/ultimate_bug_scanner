@@ -58,7 +58,8 @@ class SelectionFixture:
     def setUp(self):
         tmp = tempfile.TemporaryDirectory(prefix='ubs-sel-')
         self.addCleanup(tmp.cleanup)
-        self.work = Path(tmp.name)
+        # The daemon keys its socket by the canonical --repo (TMPDIR may be a symlink).
+        self.work = Path(tmp.name).resolve()
         self.root = self.work / 'project'
         self.root.mkdir()
         self.runtime = self.work / 'run'
@@ -74,7 +75,12 @@ class SelectionFixture:
         self.env = {key: value for key, value in os.environ.items()
                     if not key.startswith(('UBS_', 'GIT_', 'XDG_', 'CLAUDE_', 'SCAN_'))
                     and key not in {'ENABLE_UV_TOOLS', 'UV_TOOLS'}}
-        self.env.update(HOME=str(self.home), XDG_RUNTIME_DIR=str(self.runtime),
+        # GH #166: keep Unix socket paths short under any TMPDIR; every peer
+        # runs in project/, so the private runtime is '../run'.
+        previous = os.getcwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, previous)
+        self.env.update(HOME=str(self.home), XDG_RUNTIME_DIR=os.path.join(os.pardir, 'run'),
                         XDG_CONFIG_HOME=str(self.home / '.config'), XDG_CACHE_HOME=str(self.work / 'cache'),
                         SCAN_COUNT=str(self.work / 'count'), PYTHONDONTWRITEBYTECODE='1', UBS_NO_AUTO_UPDATE='1')
         environment = patch.dict(os.environ, self.env, clear=True)

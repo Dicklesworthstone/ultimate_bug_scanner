@@ -5,7 +5,8 @@ Ported verbatim from the modules/ubs-js.sh heredoc "Promise.all over forEach res
 ``Promise.allSettled(...)`` fed by a ``forEach`` await nothing and rejections escape
 unhandled. The heredoc scans for a ``Promise.all(``/``Promise.allSettled(`` entry
 line, joins the paren-balanced expression window (35 lines), and flags a
-``.forEach(`` call inside that expression unless the window contains ``ubs:ignore``.
+``.forEach(`` call inside that expression. Shared comment ownership applies to
+the outer Promise.all statement and the nested diagnostic's exact public rule.
 
 run(ctx) iterates ctx.files instead of self-walking; match logic is identical.
 """
@@ -19,6 +20,7 @@ from typing import Iterable
 
 from ubs_core.io import source_line
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.suppression import build_index
 
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
 SKIP_DIRS = {'.git', 'node_modules', 'dist', 'build', 'coverage', '.next', '.cache', '.turbo'}
@@ -33,6 +35,7 @@ WINDOW = 35
 def scan_lines(lines: list[str]) -> list[tuple[int, int]]:
     """Return (line, col) findings for one file's lines; heredoc match logic."""
     issues = []
+    suppression_index = build_index('\n'.join(lines), lang='javascript')
     for idx, line in enumerate(lines):
         stripped = line.strip()
         if not stripped or stripped.startswith(("//", "/*", "*")):
@@ -48,12 +51,14 @@ def scan_lines(lines: list[str]) -> list[tuple[int, int]]:
             if expr_idx > idx and paren_balance <= 0:
                 break
         expression = '\n'.join(expression_lines)
-        if 'ubs:ignore' in expression:
+        if suppression_index.is_suppressed(idx + 1, RULE_ID):
             continue
         match = FOREACH_RE.search(expression)
         if not match:
             continue
         sample_line = idx + expression[:match.start()].count('\n') + 1
+        if suppression_index.is_suppressed(sample_line, RULE_ID):
+            continue
         col_match = FOREACH_RE.search(source_line(lines, sample_line))
         col = col_match.start() + 1 if col_match else 1
         issues.append((sample_line, col))

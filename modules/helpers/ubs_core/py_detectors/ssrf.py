@@ -12,7 +12,7 @@ A safe validator (is_safe_url, validate_outbound_url, allowlisted_*,
 ipaddress., .hostname/.netloc/.scheme, ...) in the expression or mentioning
 the tainted name within the preceding 12 lines suppresses the hit.
 
-Same-file and previous-line ``ubs:ignore`` markers suppress a hit.
+Comment directives use shared statement ownership and rule scopes.
 """
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 from ubs_core.io import python_source_segment
+from ubs_core.suppression import SourceSuppressions
 
 RULE_ID = "py.security.ssrf"
 CATEGORY = 7
@@ -67,20 +68,12 @@ def _source_line(lines, line_no):
     return ''
 
 
-def _has_ignore(lines, line_no):
-    idx = line_no - 1
-    return (
-        0 <= idx < len(lines) and 'ubs:ignore' in lines[idx]
-    ) or (
-        0 <= idx - 1 < len(lines) and 'ubs:ignore' in lines[idx - 1]
-    )
-
-
 class _SSRFAnalyzer(ast.NodeVisitor):
-    def __init__(self, path, text, lines):
+    def __init__(self, path, text, lines, suppressions):
         self.path = path
         self.text = text
         self.lines = lines
+        self.suppressions = suppressions
         self.tainted = {}
         self.http_clients = set()
         self.modules = {
@@ -245,7 +238,7 @@ class _SSRFAnalyzer(ast.NodeVisitor):
         return None
 
     def visit_Call(self, node):
-        if _has_ignore(self.lines, node.lineno):
+        if self.suppressions.is_suppressed(node.lineno, RULE_ID):
             self.generic_visit(node)
             return
         arg = self.url_argument(node)
@@ -258,6 +251,7 @@ class _SSRFAnalyzer(ast.NodeVisitor):
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
+    suppressions = SourceSuppressions('python')
     for path in files:
         if path.suffix.lower() not in {'.py', '.pyi'}:
             continue
@@ -267,7 +261,7 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
         except Exception:
             continue
         lines = text.splitlines()
-        analyzer = _SSRFAnalyzer(path, text, lines)
+        analyzer = _SSRFAnalyzer(path, text, lines, suppressions.index(path, text))
         analyzer.visit(tree)
         for _, line_no, code in analyzer.issues:
             yield path, line_no, 1, code.strip()[:240]

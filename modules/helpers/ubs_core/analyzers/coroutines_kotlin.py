@@ -6,13 +6,16 @@ take precedence over imports. Coroutine builders establish suspend contexts;
 ordinary nested functions and deferred lambdas do not inherit them. An explicit
 IO dispatcher is inherited by structured children, but not GlobalScope children.
 
-Only selected CancellationException handlers and known GlobalScope acquisitions
-carry obligations. Branches preserve separate rethrow/ownership outcomes, and
-aliases refer to lexical bindings rather than variable spellings. Passing or
-returning a job transfers its ownership beyond this local analysis. Arbitrary
-catch(Exception), custom blocking APIs, cross-file types and virtual calls are
-outside this family. Unsupported control flow inside a selected obligation,
-malformed source and exhausted budgets report incomplete analysis.
+Selected CancellationException handlers and broad handlers protecting a known
+delay/yield/awaitCancellation call or an explicit CancellationException throw
+carry cancellation obligations. The first
+matching catch owns the cancellation path; type tests on the original exception
+can prove a branch rethrows it. Branches preserve separate rethrow/ownership
+outcomes, and aliases refer to lexical bindings rather than variable spellings.
+Passing or returning a job transfers its ownership beyond this local analysis.
+Ordinary broad error handlers, custom blocking APIs, cross-file types and virtual
+calls are outside this family. Unsupported control flow inside a selected
+obligation, malformed source and exhausted budgets report incomplete analysis.
 
 API contracts: kotlinlang.org/docs/coroutines-basics.html and
 kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines/
@@ -40,6 +43,10 @@ CANCELLATION_TYPES = frozenset({
     COROUTINES + "CancellationException", "java.util.concurrent.CancellationException",
     "kotlin.coroutines.cancellation.CancellationException",
 })
+CANCELLATION_BASE_NAMES = frozenset({"Throwable", "Exception", "RuntimeException", "IllegalStateException"})
+CANCELLATION_BASE_TYPES = frozenset(package + name for package in ("kotlin.", "java.lang.")
+                                  for name in CANCELLATION_BASE_NAMES)
+CANCELLABLE_CALLS = frozenset({"delay", "yield", "awaitCancellation"})
 BUILDERS = frozenset({"launch", "async", "withContext", "coroutineScope", "supervisorScope", "runBlocking"})
 JOB_IDENTITY_CALLS = frozenset({"kotlin.checkNotNull", "kotlin.requireNotNull"})
 JOB_DISCARD_CALLS = frozenset({"kotlin.io.print", "kotlin.io.println"})
@@ -181,6 +188,7 @@ class KotlinCoroutines:
         self._collect_bindings()
         self.calls: list[Call] = []
         self.lambda_calls: dict[int, Call] = {}
+        self.cancellation_effect_limit = False
         for index, token in enumerate(self.tokens):
             if not self.identifier(index) or index in self.function_names:
                 continue
@@ -358,19 +366,26 @@ class KotlinCoroutines:
 
     def canonical(self, name: str, position: int) -> str:
         parts = name.split(".")
-        if not parts or self.binding(parts[0], position) is not None:
+        if not parts:
             return ""
+        binding = self.binding(parts[0], position)
+        if binding is not None and (binding.low >= 0 or parts[0] not in self.imports):
+            return ""
+        return self.imported_name(name)
+
+    def imported_name(self, name: str) -> str:
+        parts = name.split(".")
         if parts[0] in self.imports:
             return ".".join([self.imports[parts[0]], *parts[1:]])
         if parts[0] in {"java", "kotlin", "kotlinx"} and len(parts) > 1:
             return name
         known = {
-            "kotlinx.coroutines": BUILDERS | {"CoroutineScope", "CancellationException", "GlobalScope", "Dispatchers", "Job", "NonCancellable", "cancelAndJoin"},
-            "kotlin": {"checkNotNull", "requireNotNull"},
+            "kotlinx.coroutines": BUILDERS | CANCELLABLE_CALLS | {"CoroutineScope", "CancellationException", "GlobalScope", "Dispatchers", "Job", "NonCancellable", "cancelAndJoin"},
+            "kotlin": CANCELLATION_BASE_NAMES | {"checkNotNull", "requireNotNull"},
             "kotlin.io": {"print", "println"},
             "java.util.concurrent": {"CancellationException"},
             "kotlin.coroutines.cancellation": {"CancellationException"},
-            "java.lang": {"Thread"},
+            "java.lang": CANCELLATION_BASE_NAMES | {"Thread"},
         }
         matches = [package + "." + name for package in self.wildcards if parts[0] in known.get(package, ())]
         unknown_wildcards = self.wildcards - set(known)
@@ -380,9 +395,168 @@ class KotlinCoroutines:
             return "java.lang." + name
         defaults = {"print": "kotlin.io.print", "println": "kotlin.io.println",
                     "checkNotNull": "kotlin.checkNotNull", "requireNotNull": "kotlin.requireNotNull"}
+        defaults.update({name: "kotlin." + name for name in CANCELLATION_BASE_NAMES})
         if not matches and not unknown_wildcards and name in defaults:
             return defaults[name]
         return ""
+
+    def cancellation_type(self, name: str, position: int, depth: int = 0) -> str:
+        """Resolve exact exception identities, including local type aliases."""
+        if depth > 24:
+            raise AnalysisLimit("Kotlin cancellation type alias depth exceeded; analysis is incomplete")
+        root = name.split(".", 1)[0]
+        candidates = [binding for binding in self.bindings.get(root, ())
+                      if binding.low <= position < binding.high
+                      and self.value(binding.declaration - 1) in {"class", "interface", "object", "typealias"}]
+        binding = max(candidates, key=lambda item: (item.low, item.declaration), default=None)
+        if root in self.imports and (binding is None or binding.low < 0):
+            return self.imported_name(name)
+        if (binding is not None and self.value(binding.declaration - 1) == "typealias"
+                and name == root and self.value(binding.declaration + 1) == "="):
+            start = binding.declaration + 2
+            end = self.simple_end(start, binding.high)
+            return self.cancellation_type(self.path(start, end), binding.declaration, depth + 1)
+        # Kotlin has separate value and type namespaces. A local value or
+        # function named Exception does not change a catch type annotation.
+        return "" if binding is not None else self.imported_name(name)
+
+    def cancellation_effects(self, start: int, end: int, aliases: frozenset[int]) -> frozenset[int]:
+        """Do not keep an identity proof across an opaque captured write.
+
+        Passing an exception value cannot rebind a Kotlin local. A callback or
+        source-local helper can capture that local, however. This bounded pass
+        invalidates affected aliases without pretending to execute callbacks;
+        if those facts are needed to prove propagation, the handler is partial.
+        """
+        if not aliases:
+            return aliases
+
+        def direct_scope(position, beginning):
+            scope, parent = self.scope_at[position], self.scope_at[beginning]
+            while scope != parent and scope >= 0:
+                if scope in self.function_bodies or scope in self.classes or scope in self.lambda_calls:
+                    return False
+                preceding = self.value(scope - 1)
+                header = self.value(self.reverse.get(scope - 1, -2) - 1) if preceding == ")" else preceding
+                if header not in {"if", "else", "for", "while", "do", "try", "catch", "finally", "when", "synchronized"}:
+                    return False
+                scope = self.parents[scope]
+            return scope == parent
+
+        def callable_bodies(binding):
+            if binding is None:
+                return []
+            bodies = [(fn.start + (not fn.expression), fn.end) for fn in self.functions
+                      if fn.name == binding.declaration]
+            opening = binding.declaration + 2
+            if self.value(binding.declaration + 1) == "=" and self.value(opening) == "{":
+                bodies.append((opening + 1, self.pairs[opening]))
+            return bodies
+
+        pending, seen, writes = [(start, end, False)], set(), []
+        while pending:
+            low, high, inspect_writes = pending.pop()
+            if (low, high) in seen:
+                continue
+            seen.add((low, high))
+            for call in self.calls:
+                self.spend()
+                if not low <= call.start < high or not direct_scope(call.start, low):
+                    continue
+                if any(low <= fn.declaration and fn.start <= call.start < fn.end for fn in self.functions):
+                    continue
+                bodies = []
+                if call.block is not None:
+                    bodies.append((call.block + 1, self.pairs[call.block]))
+                if call.arguments is not None:
+                    for first, last in self.parts(call.arguments + 1, self.pairs[call.arguments]):
+                        if self.value(first + 1) == "=":
+                            first += 2
+                        if self.value(first) == "{" and self.pairs[first] == last - 1:
+                            bodies.append((first + 1, last - 1))
+                        else:
+                            if self.value(first) == "::":
+                                first += 1
+                            if last == first + 1:
+                                bodies.extend(callable_bodies(self.binding(self.value(first), first)))
+                if call.start == call.name:
+                    bodies.extend(callable_bodies(self.binding(self.value(call.name), call.start)))
+                pending.extend((first, last, True) for first, last in bodies if first < last)
+            if inspect_writes:
+                for index in range(low, high):
+                    self.spend()
+                    if (self.value(index + 1) != "=" or self.value(index - 1) in {".", "?.", "(", ","}
+                            or self.alias_key(index) not in aliases or not direct_scope(index, low)):
+                        continue
+                    finish = self.simple_end(index + 2, high)
+                    writes.append((self.alias_key(index), index + 2, finish))
+        # A callback may replace one alias and then copy it into another.
+        # Invalidate that dependency transitively; lexical source order alone
+        # does not establish an execution order across opaque helper calls.
+        remaining = aliases
+        while True:
+            previous = remaining
+            for key, low, high in writes:
+                self.spend()
+                if key in remaining and not self.plain_alias(low, high, remaining):
+                    remaining -= {key}
+            if previous == remaining:
+                break
+        if remaining != aliases:
+            self.cancellation_effect_limit = True
+        return remaining
+
+    def cancellation_condition(self, start: int, end: int, aliases: frozenset[int]) -> bool | None:
+        return self.cancellation_test(start, end, aliases)[0]
+
+    def cancellation_test(self, start: int, end: int, aliases: frozenset[int], depth: int = 0) -> tuple[bool | None, frozenset[int]]:
+        """Evaluate only facts true on the selected cancellation path.
+
+        An alias denotes the caught CancellationException, including in a
+        broad handler. Unknown flags remain unknown; a matching type test in
+        one conjunct cannot discharge an independent condition.
+        """
+        self.spend()
+        if depth > 64:
+            raise AnalysisLimit("Kotlin cancellation condition depth exceeded; analysis is incomplete")
+        while self.value(start) == "(" and self.pairs.get(start) == end - 1:
+            start, end = start + 1, end - 1
+        for operator in ("||", "&&"):
+            index = start
+            while index < end:
+                if index in self.pairs:
+                    index = self.pairs[index]
+                elif self.value(index) == operator:
+                    left, incoming = self.cancellation_test(start, index, aliases, depth + 1)
+                    if (operator == "||" and left is True) or (operator == "&&" and left is False):
+                        return left, incoming
+                    right, outgoing = self.cancellation_test(index + 1, end, incoming, depth + 1)
+                    aliases = incoming & outgoing if left is None else outgoing
+                    if operator == "&&":
+                        return (False if right is False else True if left is True and right is True else None), aliases
+                    return (True if right is True else False if left is False and right is False else None), aliases
+                index += 1
+        if self.value(start) == "!":
+            value, aliases = self.cancellation_test(start + 1, end, aliases, depth + 1)
+            return (None if value is None else not value), aliases
+        aliases = self.cancellation_effects(start, end, aliases)
+        if end == start + 1 and self.value(start) in {"true", "false"}:
+            return self.value(start) == "true", aliases
+        index = start
+        while index < end:
+            if index in self.pairs:
+                index = self.pairs[index]
+            elif self.value(index) == "is":
+                negative = self.value(index - 1) == "!"
+                receiver_end = index - 1 if negative else index
+                if not self.plain_alias(start, receiver_end, aliases):
+                    return None, aliases
+                actual = self.cancellation_type(self.path(index + 1, end), index + 1)
+                if actual in CANCELLATION_TYPES | CANCELLATION_BASE_TYPES:
+                    return not negative, aliases
+                return None, aliases
+            index += 1
+        return None, aliases
 
     def scope_receiver(self, name: str, position: int, implicit: bool) -> bool:
         if name == "this":
@@ -545,8 +719,13 @@ class KotlinCoroutines:
                 if status != "live":
                     updated.add((status, aliases))
                 elif statement.kind in {"if", "loop"}:
-                    branch = self.flow(statement.body, {("live", aliases)}, kind)
-                    other = self.flow(statement.otherwise, {("live", aliases)}, kind) if statement.otherwise else {("live", aliases)}
+                    opening = statement.start + 1
+                    if kind == "cancellation":
+                        truth, aliases = self.cancellation_test(opening + 1, self.pairs[opening], aliases)
+                    else:
+                        truth = None
+                    branch = self.flow(statement.body, {("live", aliases)}, kind) if truth is not False else set()
+                    other = (self.flow(statement.otherwise, {("live", aliases)}, kind) if statement.otherwise else {("live", aliases)}) if truth is not True or statement.kind == "loop" else set()
                     updated.update(branch | other)
                 elif statement.kind == "block":
                     updated.update(self.flow(statement.body, {("live", aliases)}, kind))
@@ -562,6 +741,8 @@ class KotlinCoroutines:
     def simple_flow(self, statement: Statement, aliases: frozenset[int], kind: str) -> tuple[str, frozenset[int]]:
         start, end = statement.start, statement.end
         leading = self.value(start)
+        if kind == "cancellation":
+            aliases = self.cancellation_effects(start, end, aliases)
         if kind == "job" and self.job_observed(start, end, aliases):
             return "done", aliases
         if leading in {"return", "throw", "break", "continue"}:
@@ -616,6 +797,163 @@ class KotlinCoroutines:
             index += 1
         return False
 
+    def catch_origin(self, index: int) -> tuple[int | None, tuple[int, ...]]:
+        """Find the protected try body and earlier handlers without name matching."""
+        previous, handlers = index - 1, []
+        while self.value(previous) == "}":
+            self.spend()
+            opening = self.reverse[previous]
+            if self.value(opening - 1) == "try":
+                return opening, tuple(reversed(handlers))
+            parameters = self.reverse.get(opening - 1)
+            if parameters is None or self.value(parameters - 1) != "catch":
+                break
+            handlers.append(parameters - 1)
+            previous = parameters - 2
+        return None, ()
+
+    def cancellable_call(self, call: Call) -> bool:
+        if call.arguments is None:
+            return False
+        name = self.canonical(self.path(call.start, call.name + 1), call.start)
+        if name in CANCELLATION_TYPES:
+            start, end = call.start, call.end
+            while self.value(start - 1) == "(" and self.pairs.get(start - 1) == end:
+                start, end = start - 1, end + 1
+            return self.value(start - 1) == "throw" and self.simple_end(start, len(self.tokens)) == end
+        if name not in {COROUTINES + member for member in CANCELLABLE_CALLS}:
+            return False
+        arguments = list(self.parts(call.arguments + 1, self.pairs[call.arguments]))
+        if name != COROUTINES + "delay":
+            return not arguments
+        if len(arguments) != 1:
+            return False
+        low, high = arguments[0]
+        if self.value(low) in {"timeMillis", "duration"} and self.value(low + 1) == "=":
+            low += 2
+        while self.value(low) == "(" and self.pairs.get(low) == high - 1:
+            low, high = low + 1, high - 1
+        literal = self.path(low, high).replace("_", "")
+        if re.fullmatch(r"[+\-]?(?:0[xX][0-9a-fA-F]+|0[bB][01]+|[0-9]+)[lL]?", literal):
+            number = literal.rstrip("lL")
+            base = 16 if "x" in number.lower() else 2 if "b" in number.lower() else 10
+            # delay returns before consulting cancellation for nonpositive
+            # durations. Unknown durations may be positive at runtime.
+            return int(number, base) > 0
+        return True
+
+    def cancellable_expression(self, start: int, end: int, sites: frozenset[int], depth: int = 0) -> bool:
+        """Select sources only in operands that Kotlin may evaluate.
+
+        Assignment values and argument lists have separate expression spans.
+        Within each span, || and && evaluate their right operand only when the
+        left operand permits it. Unknown conditions keep both possible paths.
+        """
+        self.spend()
+        if depth > 64:
+            raise AnalysisLimit("Kotlin cancellation source expression depth exceeded; analysis is incomplete")
+        while self.value(start) == "(" and self.pairs.get(start) == end - 1:
+            self.spend()
+            start, end = start + 1, end - 1
+        operators = {}
+        index = start
+        while index < end:
+            self.spend()
+            if index in self.pairs:
+                index = self.pairs[index]
+            elif self.value(index) in {",", ";", "=", "||", "&&"}:
+                operators.setdefault(self.value(index), index)
+            index += 1
+        for operator in (",", ";", "=", "||", "&&"):
+            if operator not in operators:
+                continue
+            index = operators[operator]
+            if self.cancellable_expression(start, index, sites, depth + 1):
+                return True
+            if operator in {"||", "&&"}:
+                truth = self.cancellation_condition(start, index, frozenset())
+                if (operator == "||" and truth is True) or (operator == "&&" and truth is False):
+                    return False
+            return self.cancellable_expression(index + 1, end, sites, depth + 1)
+        index = start
+        while index < end:
+            self.spend()
+            if index in sites:
+                return True
+            if index in self.pairs:
+                closing = self.pairs[index]
+                if self.cancellable_expression(index + 1, closing, sites, depth + 1):
+                    return True
+                index = closing
+            index += 1
+        return False
+
+    def cancellable_paths(self, statements: tuple[Statement, ...], sites: frozenset[int]) -> tuple[bool, set[str]]:
+        """Reachable direct calls, with loop exits kept separate from returns."""
+        found, outcomes = False, {"normal"}
+        for statement in statements:
+            self.spend()
+            if "normal" not in outcomes:
+                break
+            outcomes.remove("normal")
+            if statement.kind == "block":
+                nested, exits = self.cancellable_paths(statement.body, sites)
+            elif statement.kind == "declaration":
+                nested, exits = False, {"normal"}
+            elif statement.kind in {"if", "loop"}:
+                opening = statement.start + 1
+                closing = self.pairs[opening]
+                nested = self.cancellable_expression(opening + 1, closing, sites)
+                truth = self.cancellation_condition(opening + 1, closing, frozenset())
+                left, exits = self.cancellable_paths(statement.body, sites) if truth is not False else (False, set())
+                nested |= left
+                if statement.kind == "if":
+                    right, alternate = self.cancellable_paths(statement.otherwise, sites) if truth is not True else (False, set())
+                    nested, exits = nested or right, exits | alternate
+                else:
+                    normal = truth is not True or self.value(statement.start) == "for" or "break" in exits
+                    exits -= {"normal", "break", "continue"}
+                    if normal:
+                        exits.add("normal")
+            else:
+                leading = self.value(statement.start)
+                start = statement.start + (leading in {"return", "throw"})
+                nested = self.cancellable_expression(start, statement.end, sites)
+                if leading in {"return", "throw", "break", "continue"}:
+                    if self.value(statement.start + 1) == "@":
+                        raise ValueError("Kotlin cancellation source uses a labelled exit; analysis is incomplete")
+                    exits = {leading}
+                else:
+                    exits = {"normal"}
+            found, outcomes = found or nested, outcomes | exits
+        return found, outcomes
+
+    def protected_cancellation(self, opening: int) -> bool:
+        closing = self.pairs[opening]
+        sites = set()
+        for call in self.calls:
+            self.spend()
+            if not opening < call.start < closing or not self.cancellable_call(call):
+                continue
+            if not self.context(call.start).suspend:
+                continue
+            # A child launch and a stored callback do not execute their body
+            # as part of the surrounding try. Each child has its own handler
+            # analysis. Local suspend declarations are likewise not calls.
+            if any(opening < fn.declaration and fn.start <= call.start < fn.end for fn in self.functions):
+                continue
+            scope = self.scope_at[call.start]
+            while scope != opening and scope >= 0:
+                if scope in self.function_bodies or scope in self.classes or scope in self.lambda_calls:
+                    break
+                scope = self.parents[scope]
+            if scope == opening:
+                sites.add(call.start)
+        if not sites:
+            return False
+        found, _ = self.cancellable_paths(self.statements(opening + 1, closing), frozenset(sites))
+        return found
+
     def cancellation_findings(self):
         for index, token in enumerate(self.tokens):
             if token.value != "catch" or self.value(index + 1) != "(" or not self.context(index).suspend:
@@ -624,12 +962,21 @@ class KotlinCoroutines:
             closing = self.pairs[index + 1]
             if not self.identifier(index + 2) or self.value(index + 3) != ":" or self.value(closing + 1) != "{":
                 raise ValueError("Unsupported Kotlin catch parameter; analysis is incomplete")
-            type_name = self.path(index + 4, closing)
-            if self.canonical(type_name, index) not in CANCELLATION_TYPES:
+            type_name = self.cancellation_type(self.path(index + 4, closing), index)
+            if type_name not in CANCELLATION_TYPES | CANCELLATION_BASE_TYPES:
+                continue
+            protected, earlier = self.catch_origin(index)
+            if any(self.cancellation_type(self.path(handler + 4, self.pairs[handler + 1]), handler)
+                   in CANCELLATION_TYPES | CANCELLATION_BASE_TYPES for handler in earlier):
+                continue
+            if type_name in CANCELLATION_BASE_TYPES and (protected is None or not self.protected_cancellation(protected)):
                 continue
             opening = closing + 1
+            self.cancellation_effect_limit = False
             states = self.flow(self.statements(opening + 1, self.pairs[opening]), {("live", frozenset({index + 2}))}, "cancellation")
             if any(status != "done" for status, _ in states):
+                if self.cancellation_effect_limit:
+                    raise ValueError("Kotlin cancellation propagation depends on a captured alias write; analysis is incomplete")
                 yield "swallowed-cancellation", token.start
 
     def blocking_findings(self):

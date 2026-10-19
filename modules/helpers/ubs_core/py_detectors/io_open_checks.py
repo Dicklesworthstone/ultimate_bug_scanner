@@ -45,7 +45,7 @@ import ast
 from pathlib import Path
 from typing import Iterable, Sequence
 
-from ubs_core.py_scan import MARKER
+from ubs_core.suppression import SourceSuppressions
 
 RULE_ID = "py.io.open-missing-with"
 CATEGORY = 16
@@ -310,6 +310,7 @@ def _managed(node: ast.Call, parents: dict[ast.AST, ast.AST],
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
+    suppressions = SourceSuppressions("python")
     candidates: list[tuple[Path, int, int, str]] = []
     for path in files:
         if path.suffix.lower() not in {'.py', '.pyi'}:
@@ -320,6 +321,7 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
         except Exception:
             continue
         lines = text.splitlines()
+        index = suppressions.index(path, text)
         parents: dict[ast.AST, ast.AST] = {}
         for parent in ast.walk(tree):
             for child in ast.iter_child_nodes(parent):
@@ -342,8 +344,8 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
             line_no = node.lineno
             if line_no in seen:
                 continue
-            if 0 <= line_no - 1 < len(lines) and MARKER in lines[line_no - 1]:
-                continue  # count_lines drops marker lines from both counts
+            if index.is_suppressed(line_no, RULE_ID):
+                continue
             seen.add(line_no)
             code = lines[line_no - 1].strip()[:240] if 0 <= line_no - 1 < len(lines) else ''
             candidates.append((path, line_no, node.col_offset + 1, code))

@@ -4,9 +4,8 @@ Verbatim port of the legacy ubs-js.sh heredoc "Security token generated with
 Math.random" (``random_security_report``): same Math.random candidate gate,
 same 10-line statement window, same ±context collection (6 lines back / 4
 forward, blank-gap > 2 and function-boundary stops), same sensitivity +
-token-shape conjunction, same ``ubs:ignore`` placement rules (trigger line,
-line above, or anywhere inside the collected statement — the heredoc does not
-honor ubs:ignore inside the surrounding context).
+token-shape conjunction. Suppression uses the shared lexical statement policy
+and this analyzer's exact public rule.
 The heredoc's os.walk over the project is replaced by iteration over
 ``RunContext.files``; per-file match logic is unchanged.
 """
@@ -17,6 +16,7 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.suppression import SourceSuppressions
 
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
 
@@ -116,21 +116,25 @@ def context_from(lines, idx):
 def scan_file_findings(path: Path) -> Iterator[int]:
     """Yield 1-based line numbers per detection; match logic identical to the heredoc."""
     try:
-        lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
+        source_text = path.read_text(encoding='utf-8', errors='ignore')
     except Exception:
         return
+    lines = source_text.splitlines()
+    suppressions = SourceSuppressions('javascript').index(path, source_text)
     seen_lines = set()
     for idx, line in enumerate(lines):
         stripped = code_line(line).strip()
-        if not stripped or 'ubs:ignore' in line or (idx > 0 and 'ubs:ignore' in lines[idx - 1]) or not math_random_re.search(stripped):
+        if not stripped or not math_random_re.search(stripped):
             continue
         statement = statement_from(lines, idx)
-        if not statement or 'ubs:ignore' in statement:
+        if not statement:
             continue
         context = context_from(lines, idx)
         if not (sensitive_re.search(identifier_terms(context)) or token_shape_re.search(statement)):
             continue
         if idx in seen_lines:
+            continue
+        if suppressions.is_suppressed(idx + 1, RULE):
             continue
         seen_lines.add(idx)
         yield idx + 1

@@ -3,8 +3,8 @@
 Port of the foreach-mutation window pipeline (modules/ubs-java.sh
 3689-3691): legacy piped `rg 'for\\s*\\([^)]+:[^)]+\\)\\s*\\{'` through
 `grep -A3 -F '.remove('` and re-filtered for .remove( lines — i.e. .remove(
-lines within 3 lines after an enhanced-for header. count_lines marker
-semantics apply.
+lines within 3 lines after an enhanced-for header. Source-owned directives
+filter findings after loop context is collected.
 """
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
-from ubs_core.java_scan import MARKER
+from ubs_core.suppression import SourceSuppressions
 from ubs_core.java_detectors._common import iter_java_files, read_lines
 
 RULE_ID = "java.collections.foreach-remove"
@@ -27,15 +27,16 @@ WINDOW = 3  # legacy grep -A3
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
+    suppressions = SourceSuppressions('java')
     for path in iter_java_files(files):
         lines = read_lines(path)
+        suppression = suppressions.index(path, '\n'.join(lines))
         foreach_line = None
         for idx, line in enumerate(lines, start=1):
             if FOREACH_RE.search(line):
                 foreach_line = idx
             if TARGET not in line:
                 continue
-            if MARKER in line:
-                continue
             if foreach_line is not None and idx - foreach_line <= WINDOW:
-                yield path, idx, 1, line.strip()[:240]
+                if not suppression.is_suppressed(idx, RULE_ID):
+                    yield path, idx, 1, line.strip()[:240]

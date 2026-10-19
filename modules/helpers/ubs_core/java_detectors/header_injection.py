@@ -4,8 +4,8 @@ Verbatim port of run_response_header_injection_checks (modules/ubs-java.sh
 1419-1718): request-derived values reaching header sinks (setHeader/addHeader/
 header/add/set/append with a literal header name, headers[...] =, headersOf)
 unless a safe encoder (URLEncoder, ContentDisposition, strip-CRLF, ...) or a
-CRLF-rejecting context guards them. Current+previous-line ubs:ignore
-suppresses.
+CRLF-rejecting context guards them. Source-owned directives filter findings
+with the receiving language's actual public rule ID, preserving source facts.
 """
 from __future__ import annotations
 
@@ -13,9 +13,9 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.suppression import SourceSuppressions
 from ubs_core.java_detectors._common import (
     annotated_sources,
-    has_ignore,
     is_safe_expr,
     iter_java_files,
     logical_statement,
@@ -126,19 +126,18 @@ def has_crlf_reject_context(lines, line_no, refs):
     return bool(CRLF_LITERAL_RE.search(context) and BLOCK_RE.search(context))
 
 
-def analyze(path: Path, issues):
+def analyze(path: Path, issues, *, suppressions: SourceSuppressions, rule_id: str):
     text = path.read_text(encoding='utf-8', errors='ignore')
     if not ((SOURCE_RE.search(text) or ANNOTATED_PARAM_RE.search(text)) and (
         HEADER_START_RE.search(text) or HEADER_CALL_RE.search(text) or HEADER_CONST_CALL_RE.search(text) or
         HEADER_INDEX_ASSIGN_RE.search(text) or HEADERS_OF_RE.search(text)
     )):
         return
+    suppression = suppressions.index(path, text)
     lines = text.splitlines()
     tainted = annotated_sources(text, ANNOTATED_PARAM_RE)
     seen = set()
     for idx, _ in enumerate(lines, start=1):
-        if has_ignore(lines, idx):
-            continue
         current_line = strip_line_comments(lines[idx - 1]).strip()
         statement = logical_statement(lines, idx).strip()
         if not statement:
@@ -164,6 +163,8 @@ def analyze(path: Path, issues):
             continue
         if has_crlf_reject_context(lines, idx, refs):
             continue
+        if suppression.is_suppressed(idx, rule_id):
+            continue
         key = (str(path), idx)
         if key in seen:
             continue
@@ -172,11 +173,12 @@ def analyze(path: Path, issues):
         issues.append((path, idx, f"{source_line(lines, idx)}  [{path_desc}]"))
 
 
-def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
+def find(files: Sequence[Path], *, language: str = 'java', rule_id: str = RULE_ID) -> Iterable[tuple[Path, int, int, str]]:
+    suppressions = SourceSuppressions(language)
     issues: list[tuple[Path, int, str]] = []
     for path in iter_java_files(files):
         try:
-            analyze(path, issues)
+            analyze(path, issues, suppressions=suppressions, rule_id=rule_id)
         except OSError:
             continue
     for path, line_no, detail in issues:

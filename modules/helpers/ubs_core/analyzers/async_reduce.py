@@ -4,9 +4,9 @@ accumulator (bead A4-js wave 1).
 Verbatim port of the legacy ubs-js.sh heredoc "async callbacks passed to
 reduce": same regexes (including the TS generic form ``reduce<T>(``), same
 18-line callback window with the saw-reduce paren-balance gate (paren counting
-only starts once the ``.reduce(``/``.reduceRight(`` opener has been seen), and
-same ``ubs:ignore`` placement rules (anywhere inside the collected callback
-text). The heredoc has no result-observation check — a const declaration or
+only starts once the ``.reduce(``/``.reduceRight(`` opener has been seen).
+Suppression uses shared lexical statement ownership and the exact rule ID.
+The heredoc has no result-observation check — a const declaration or
 Promise.all wrapper does not silence it. The heredoc's os.walk over the
 project is replaced by iteration over ``RunContext.files``; per-file match
 logic is unchanged.
@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.suppression import SourceSuppressions
 
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
 
@@ -37,9 +38,11 @@ ASYNC_REDUCE_RE = re.compile(
 def scan_file_findings(path: Path) -> Iterator[tuple[int, int, str]]:
     """Yield (line, col, method) per detection; match logic identical to the heredoc."""
     try:
-        lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
+        text = path.read_text(encoding='utf-8', errors='ignore')
     except Exception:
         return
+    lines = text.splitlines()
+    source_index = SourceSuppressions('javascript').index(path, text)
     for idx, line in enumerate(lines):
         stripped = line.strip()
         if not stripped or stripped.startswith(("//", "/*", "*")):
@@ -60,10 +63,10 @@ def scan_file_findings(path: Path) -> Iterator[tuple[int, int, str]]:
             if saw_reduce and callback_idx > idx and paren_balance <= 0:
                 break
         callback_text = ' '.join(callback_lines)
-        if 'ubs:ignore' in callback_text:
-            continue
         async_match = ASYNC_REDUCE_RE.search(callback_text)
         if not async_match:
+            continue
+        if source_index.is_suppressed(idx + 1, RULE):
             continue
         yield idx + 1, match.start() + 1, async_match.group(1)
 

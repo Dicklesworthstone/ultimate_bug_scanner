@@ -184,7 +184,7 @@ class SQLValueCaptureTests(unittest.TestCase):
     def test_generator_consumer_boundaries_are_explicit(self):
         bodies = (
             '    pending = (f"SELECT {item}" for item in [user])\n    consume(pending)\n',
-            '    pending = (f"SELECT {item}" for item in [user])\n    next(pending)\n',
+            '    pending = ((query := f"SELECT {item}") for item in [user])\n    next(pending)\n',
             '    pending = (f"SELECT {item}" for item in [user])\n    list = unknown\n    list(pending)\n',
             '    pending = (f"SELECT {item}" for item in [user])\n    if rows:\n        pending = None\n    list(pending)\n',
             '    pending = (f"SELECT {item}" for item in [user])\n    def nested():\n        list(pending)\n',
@@ -195,6 +195,82 @@ class SQLValueCaptureTests(unittest.TestCase):
                 path.write_text(program(body), encoding='utf-8')
                 with self.assertRaisesRegex(detector.SQLFlowLimit, 'generator.*incomplete'):
                     list(detector.find([path]))
+
+    def test_next_projection_preserves_sql_risk(self):
+        cases = (
+            ('unused-next', '    pending = (f"SELECT {item}" for item in [user])\n    next(pending)\n', ()),
+            ('unsafe-next', '    pending = (f"SELECT {item}" for item in [user])\n    cursor.execute(next(pending))\n', ((CRITICAL, 3),)),
+            ('safe-next', '    pending = ("SELECT 1" for item in rows)\n    cursor.execute(next(pending))\n', ()),
+            ('unsafe-default', '    pending = ("SELECT 1" for item in [])\n    cursor.execute(next(pending, f"SELECT {user}"))\n', ((CRITICAL, 3),)),
+            ('safe-default', '    pending = ("SELECT 1" for item in [])\n    cursor.execute(next(pending, "SELECT 2"))\n', ()),
+            ('late-value', '    query = "SELECT 1"\n    pending = (query for item in [1])\n    query = f"SELECT {user}"\n    cursor.execute(next(pending))\n', ((CRITICAL, 5),)),
+            ('captured-value', '    query = f"SELECT {user}"\n    pending = (item for item in [query])\n    query = "SELECT 1"\n    cursor.execute(next(pending))\n', ((CRITICAL, 5),)),
+            ('filtered-value', '    pending = (f"SELECT {user}" for item in [1] if False)\n    cursor.execute(next(pending, "SELECT 1"))\n', ()),
+            ('parser-index', '    index = next((i for i in range(len(rows)) if rows[i].value == "="), None)\n    return index\n', ()),
+        )
+        for name, body, expected in cases:
+            with self.subTest(case=name):
+                self.inspect('next-' + name, program(body), expected)
+
+    def test_next_projection_refuses_unmodeled_effects(self):
+        bodies = (
+            '    pending = ((query := f"SELECT {user}") for item in rows)\n    next(pending, None)\n',
+            '    pending = (cursor.execute(f"SELECT {user}") for item in rows)\n    next(pending, None)\n',
+            '    pending = (f"SELECT {user}" for item in rows)\n    next(pending)\n    list(pending)\n',
+            '    pending = (f"SELECT {user}" for item in rows)\n    next(pending)\n    next(pending)\n',
+            '    pending = (f"SELECT {user}" for item in rows)\n    next = unknown\n    next(pending)\n',
+            '    pending = (f"SELECT {user}" for item in rows)\n    alias = pending\n    next(pending)\n    tuple(alias)\n',
+            '    other = (f"SELECT {user}" for item in rows)\n    pending = (list(other) for item in [1])\n    next(pending)\n',
+        )
+        for index, body in enumerate(bodies):
+            with self.subTest(case=index):
+                path = self.artifacts / f'next-boundary-{index}.py'
+                path.write_text(program(body), encoding='utf-8')
+                with self.assertRaisesRegex(detector.SQLFlowLimit, 'generator|next projection'):
+                    list(detector.find([path]))
+
+    def test_real_sqlite_next_projection(self):
+        from contextlib import closing
+        unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
+        safe = '"SELECT count(*) FROM users WHERE name = \'alice\'"'
+        witnesses = (
+            ('selected-unsafe', f'next((query for query in [{unsafe}]), {safe})', 2, ((CRITICAL, 2),)),
+            ('selected-safe', f'next((query for query in [{safe}]), {safe})', 1, ()),
+            ('empty-default-unsafe', f'next((query for query in []), {unsafe})', 2, ((CRITICAL, 2),)),
+            ('empty-default-safe', f'next((query for query in []), {safe})', 1, ()),
+        )
+        for name, expression, rows, expected in witnesses:
+            with self.subTest(case=name):
+                source = program(f'    return cursor.execute({expression}).fetchone()[0]\n')
+                namespace = {}
+                exec(compile(source, '<test-authored-next>', 'exec'), namespace)
+                with closing(sqlite3.connect(':memory:')) as connection:
+                    connection.execute('CREATE TABLE users(name TEXT)')
+                    connection.executemany('INSERT INTO users VALUES (?)', [('alice',), ('bob',)])
+                    actual = namespace['run'](connection.cursor(), None, "' OR 1=1 --", [])
+                self.assertEqual(actual, rows)
+                self.inspect('sqlite-next-' + name, source, expected)
+
+    def test_next_eager_default_and_validation_order(self):
+        cases = (
+            ('late-validator', 'pending = (validate_sql_identifier(user) if item else "id" for item in [0, 1])\nnext(pending)\ncursor.execute(f"SELECT {user}")', CRITICAL),
+            ('first-validator', 'pending = (validate_sql_identifier(user) for item in [1])\nnext(pending)\ncursor.execute(f"SELECT {user}")', CRITICAL),
+            ('eager-default-validates', 'pending = ("id" for item in [1])\nnext(pending, validate_sql_identifier(user))\ncursor.execute(f"SELECT {user}")', WARNING),
+            ('caught-default-validation', 'pending = ("id" for item in [1])\ntry:\n    next(pending, validate_sql_identifier(user))\nexcept ValueError:\n    pass\ncursor.execute(f"SELECT {user}")', CRITICAL),
+            ('default-rebind-before-consumption', 'query = "SELECT 1"\npending = (query for item in [1])\nchosen = next(pending, (query := f"SELECT {user}"))\ncursor.execute(chosen)', CRITICAL),
+            ('closed-default', 'pending = ("SELECT 1" for item in [1])\npending.close()\ncursor.execute(next(pending, f"SELECT {user}"))', CRITICAL),
+            ('exhausted-default', 'pending = ("SELECT 1" for item in [])\nlist(pending)\ncursor.execute(next(pending, f"SELECT {user}"))', CRITICAL),
+        )
+        import textwrap
+        for name, body, rule in cases:
+            with self.subTest(case=name):
+                source = program(textwrap.indent(body, '    ') + '\n')
+                path = self.artifacts / ('next-order-' + name + '.py')
+                path.write_text(source, encoding='utf-8')
+                with patch.dict(os.environ, {detector.SANITIZER_ENV: 'validate_sql_identifier'}):
+                    findings = list(detector.find([path]))
+                self.assertEqual([(hit[0], hit[2]) for hit in findings],
+                                 [(rule, len(source.splitlines()))], source)
 
     def test_real_sqlite_lazy_generators(self):
         unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
@@ -331,8 +407,15 @@ class SQLValueCaptureTests(unittest.TestCase):
                     'comp-empty-keeps-outer', 'comp-nonempty-cleans-outer',
                     'gen-unused-keeps-outer', 'gen-drain-cleans-outer',
                     'gen-yield-sees-later-write', 'gen-yield-sees-later-clean',
-                    'gen-alias-shares-exhaustion'}
-        for name, body, expected in CASES + GENERATOR_CASES:
+                    'gen-alias-shares-exhaustion', 'next-projection-critical',
+                    'next-default-critical', 'next-default-static', 'next-late-validation'}
+        next_controls = (
+            ('next-projection-critical', '    pending = (f"SELECT {user}" for item in [1])\n    cursor.execute(next(pending))\n', ((CRITICAL, 3),)),
+            ('next-default-critical', '    pending = ("SELECT 1" for item in [])\n    cursor.execute(next(pending, f"SELECT {user}"))\n', ((CRITICAL, 3),)),
+            ('next-default-static', '    pending = ("SELECT 1" for item in [])\n    cursor.execute(next(pending, "SELECT 2"))\n', ()),
+            ('next-late-validation', '    pending = (validate_sql_identifier(user) if item else "id" for item in [0, 1])\n    next(pending)\n    cursor.execute(f"SELECT {user}")\n', ((CRITICAL, 4),)),
+        )
+        for name, body, expected in CASES + GENERATOR_CASES + next_controls:
             if name not in selected:
                 continue
             for entry in ('ubs', 'modules/ubs-python.sh'):

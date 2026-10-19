@@ -6,7 +6,7 @@ FastAPI ``CORSMiddleware`` (direct or via ``add_middleware``), and Django
 ``CORS_*`` settings where credentials are allowed together with a wildcard
 origin (or with no origin configured at all).
 
-Same-file and previous-line ``ubs:ignore`` markers suppress a hit (6710-6716).
+Shared lexical statement ownership and exact rule scopes suppress annotated hits.
 Django settings are paired per-file: a wildcard-origin setting only fires when
 a credentials setting also exists (finalize, 6874-6876).
 """
@@ -16,6 +16,8 @@ import ast
 import warnings
 from pathlib import Path
 from typing import Iterable, Sequence
+
+from ubs_core.suppression import SourceSuppressions
 
 RULE_ID = "py.security.cors-misconfig"
 CATEGORY = 7
@@ -56,15 +58,6 @@ def _source_line(lines: list[str], line_no: int) -> str:
     if 0 <= idx < len(lines):
         return lines[idx].strip()
     return ''
-
-
-def _has_ignore(lines: list[str], line_no: int) -> bool:
-    idx = line_no - 1
-    return (
-        0 <= idx < len(lines) and 'ubs:ignore' in lines[idx]
-    ) or (
-        0 <= idx - 1 < len(lines) and 'ubs:ignore' in lines[idx - 1]
-    )
 
 
 def _contains_wildcard_origin(node: ast.AST) -> bool:
@@ -158,8 +151,9 @@ def _target_names(target):
 
 
 class _CORSAnalyzer(ast.NodeVisitor):
-    def __init__(self, lines):
+    def __init__(self, lines, suppression):
         self.lines = lines
+        self.suppression = suppression
         self.cors_calls = {'CORS', 'cross_origin', 'flask_cors.CORS', 'flask_cors.cross_origin'}
         self.middleware_calls = {'CORSMiddleware', 'starlette.middleware.cors.CORSMiddleware', 'fastapi.middleware.cors.CORSMiddleware'}
         self.django_wildcard_origin_lines = []
@@ -167,7 +161,7 @@ class _CORSAnalyzer(ast.NodeVisitor):
         self.issues = []
 
     def remember_issue(self, line_no):
-        if _has_ignore(self.lines, line_no):
+        if self.suppression.is_suppressed(line_no, RULE_ID):
             return
         self.issues.append((line_no, _source_line(self.lines, line_no)))
 
@@ -234,6 +228,7 @@ class _CORSAnalyzer(ast.NodeVisitor):
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
+    suppressions = SourceSuppressions("python")
     for path in files:
         if path.suffix.lower() not in {'.py', '.pyi'}:
             continue
@@ -244,7 +239,7 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
         except Exception:
             continue
         lines = text.splitlines()
-        analyzer = _CORSAnalyzer(lines)
+        analyzer = _CORSAnalyzer(lines, suppressions.index(path, text))
         analyzer.visit(tree)
         analyzer.finalize()
         for line_no, code in analyzer.issues:

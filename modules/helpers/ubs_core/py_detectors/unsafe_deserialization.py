@@ -27,14 +27,16 @@ A call with no Loader at all (stream argument only) stays with
 ``py.yaml-unsafe`` (ast-grep pack) and ``py.security.yaml-load`` (category-7
 regex).
 
-Same-file and previous-line `ubs:ignore` markers suppress a hit; hits dedupe
-per (rule, line) within a file (legacy `seen_lines`).
+Comment directives use shared statement ownership and rule scopes; hits
+dedupe per (rule, line) within a file (legacy `seen_lines`).
 """
 from __future__ import annotations
 
 import ast
 from pathlib import Path
 from typing import Iterable, Sequence
+
+from ubs_core.suppression import SuppressionIndex, build_index, may_have_markers
 
 RULE_ID = "py.security.unsafe-deserialization"
 CATEGORY = 7
@@ -143,15 +145,6 @@ def _source_line(lines, line_no):
     return ''
 
 
-def _has_ignore(lines, line_no):
-    idx = line_no - 1
-    return (
-        0 <= idx < len(lines) and 'ubs:ignore' in lines[idx]
-    ) or (
-        0 <= idx - 1 < len(lines) and 'ubs:ignore' in lines[idx - 1]
-    )
-
-
 def _is_true(node):
     return isinstance(node, ast.Constant) and node.value is True
 
@@ -181,8 +174,9 @@ def _body_reaches_dangerous_call(nodes) -> bool:
 
 
 class _UnsafeDeserializerAnalyzer(ast.NodeVisitor):
-    def __init__(self, lines):
+    def __init__(self, lines, suppressions):
         self.lines = lines
+        self.suppressions = suppressions
         self.modules = {key: set(value) for key, value in MODULE_ALIASES.items()}
         self.direct_calls = {}
         self.issues: list[tuple[str, int, str]] = []
@@ -195,7 +189,7 @@ class _UnsafeDeserializerAnalyzer(ast.NodeVisitor):
         self.registrations: dict[str, list[ast.Call]] = {}  # class name -> add_*constructor calls
 
     def remember_issue(self, rule_id, line_no, detail=''):
-        if _has_ignore(self.lines, line_no) or (rule_id, line_no) in self.seen:
+        if self.suppressions.is_suppressed(line_no, rule_id) or (rule_id, line_no) in self.seen:
             return
         self.seen.add((rule_id, line_no))
         self.issues.append((rule_id, line_no, detail))
@@ -443,7 +437,8 @@ def analyze_source(text: str) -> list[tuple[str, int, str]]:
         tree = ast.parse(text)
     except Exception:
         return []
-    analyzer = _UnsafeDeserializerAnalyzer(text.splitlines())
+    suppressions = build_index(text, lang='python') if may_have_markers(text) else SuppressionIndex()
+    analyzer = _UnsafeDeserializerAnalyzer(text.splitlines(), suppressions)
     analyzer.collect(tree)
     analyzer.visit(tree)
     return analyzer.issues

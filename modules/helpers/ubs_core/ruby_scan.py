@@ -42,6 +42,7 @@ from typing import Iterable, Sequence
 
 from ubs_core.registry import RunContext
 from ubs_core.io import read_ndjson
+from ubs_core.suppression import SourceSuppressions
 
 MARKER = "ubs:ignore"
 
@@ -194,9 +195,9 @@ def line_text_of(text: str, pos: int) -> str:
 def iter_matches(regex: re.Pattern[str], text: str, exclude_regex: re.Pattern[str] | None = None) -> Iterable[tuple[int, str]]:
     """Yield (line_number, line_text) for distinct matching lines.
 
-    Legacy parity: rg prints each matching line once (deduped here per line),
-    and count_lines drops any line carrying a `ubs:ignore` marker before the
-    awk count; exclude_regex re-applies the legacy `grep -v` post-filters.
+    rg prints each matching line once (deduped here per line); exclude_regex
+    re-applies the legacy post-filters. The caller applies source suppression
+    with the owning pattern's exact rule before resolving threshold counts.
     """
     seen: set[int] = set()
     for match in regex.finditer(text):
@@ -205,8 +206,6 @@ def iter_matches(regex: re.Pattern[str], text: str, exclude_regex: re.Pattern[st
             continue
         seen.add(line_no)
         line_text = line_text_of(text, match.start())
-        if MARKER in line_text:
-            continue
         if exclude_regex is not None and exclude_regex.search(line_text):
             continue
         yield line_no, line_text.strip()[:240]
@@ -246,6 +245,8 @@ def scan_patterns(
             texts[path] = path.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
+    suppressions = SourceSuppressions("ruby")
+    source_indexes = {path: suppressions.index(path, text) for path, text in texts.items()}
     for pattern in active:
         if pattern.gate_regex is not None and not any(
             pattern.gate_regex.search(text) for text in texts.values()
@@ -264,12 +265,16 @@ def scan_patterns(
                     if prefilter is not None and pattern.rule_id not in prefilter.candidate_rules_for(path):
                         continue
                     for line_no, line_text in iter_matches(component, text, pattern.exclude_regex):
+                        if source_indexes[path].is_suppressed(line_no, pattern.rule_id):
+                            continue
                         hits.append((path, line_no, line_text))
         else:
             for path, text in texts.items():
                 if prefilter is not None and pattern.rule_id not in prefilter.candidate_rules_for(path):
                     continue
                 for line_no, line_text in iter_matches(pattern.regex, text, pattern.exclude_regex):
+                    if source_indexes[path].is_suppressed(line_no, pattern.rule_id):
+                        continue
                     hits.append((path, line_no, line_text))
         if not hits:
             continue

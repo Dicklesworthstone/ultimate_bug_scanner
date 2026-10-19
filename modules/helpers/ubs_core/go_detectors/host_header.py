@@ -21,8 +21,8 @@ func signature line that is itself a direct hit still reports).
 Legacy: ``print_finding critical $N "Request Host header used to build
 absolute URL" "Use a configured canonical origin or validate Host/
 X-Forwarded-Host against an explicit allow-list before generating
-links"``. Same-file and previous-line ``ubs:ignore`` markers suppress a
-hit; per-(file, line) dedupe is preserved. The legacy rglob/SKIP_DIRS
+links"``. Comment directives use shared statement ownership and exact
+rule scopes; per-(file, line) dedupe is preserved. The legacy rglob/SKIP_DIRS
 traversal is replaced by the contract file list; the v2 record count
 equals the heredoc's __COUNT__.
 """
@@ -32,7 +32,7 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
-MARKER = "ubs:ignore"
+from ubs_core.suppression import SourceSuppressions
 
 RULE_ID = "go.security.host-header"
 CATEGORY = 9
@@ -93,15 +93,6 @@ def _strip_line_comments(line: str) -> str:
         out.append(ch)
         i += 1
     return ''.join(out)
-
-
-def _has_ignore(lines, line_no):
-    idx = line_no - 1
-    return (
-        0 <= idx < len(lines) and MARKER in lines[idx]
-    ) or (
-        0 <= idx - 1 < len(lines) and MARKER in lines[idx - 1]
-    )
 
 
 def _logical_statement(lines, line_no):
@@ -197,19 +188,18 @@ def _has_allowlist_context(lines, line_no, refs):
     )
 
 
-def _analyze(path: Path, issues: list) -> None:
+def _analyze(path: Path, issues: list, suppressions: SourceSuppressions) -> None:
     try:
         text = path.read_text(encoding='utf-8', errors='ignore')
     except OSError:
         return
     if not HOST_SOURCE_RE.search(text):
         return
+    suppression_index = suppressions.index(path, text)
     lines = text.splitlines()
     tainted = {}
     seen = set()
     for idx, _ in enumerate(lines, start=1):
-        if _has_ignore(lines, idx):
-            continue
         raw_line = _strip_line_comments(lines[idx - 1]).strip()
         if FUNC_RE.search(raw_line):
             tainted = {}
@@ -239,6 +229,8 @@ def _analyze(path: Path, issues: list) -> None:
             continue
         if _is_safe_expr(line) or _has_allowlist_context(lines, idx, refs):
             continue
+        if suppression_index.is_suppressed(idx, RULE_ID):
+            continue
         key = (path, idx)
         if key in seen:
             continue
@@ -257,8 +249,9 @@ def _analyze(path: Path, issues: list) -> None:
 
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
     issues: list[tuple[Path, int, int, str]] = []
+    suppressions = SourceSuppressions('golang')
     for path in files:
         if path.suffix != ".go":
             continue
-        _analyze(path, issues)
+        _analyze(path, issues, suppressions)
     yield from issues

@@ -34,9 +34,8 @@ division line first, then emits records for exactly one tier — never both.
 Legacy counted one hit per ast-grep match (nested `a / b / c` scored twice);
 v2 counts DISTINCT lines, so one line yields at most one record.
 
-`ubs:ignore` on the hit line or the line immediately before suppresses a
-record (and its ladder count), mirroring the marker semantics of the other
-detector ports (the legacy ast-grep path predated the marker).
+Comment directives use shared statement ownership and exact rule scopes.
+Each ladder tier counts only sites eligible for that tier's public rule ID.
 """
 from __future__ import annotations
 
@@ -45,7 +44,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 from ubs_core.py_detectors._pathlike import PathHints
-from ubs_core.py_scan import MARKER
+from ubs_core.suppression import SourceSuppressions
 
 RULES = (
     ("py.numeric.division", 2,
@@ -75,6 +74,7 @@ def _is_variable_divisor(node: ast.AST) -> bool:
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple[str, Path, int, int, str]]:
+    suppressions = SourceSuppressions("python")
     hits: list[tuple[Path, int, str]] = []
     for path in files:
         if path.suffix.lower() not in {'.py', '.pyi'}:
@@ -85,6 +85,7 @@ def find(files: Sequence[Path]) -> Iterable[tuple[str, Path, int, int, str]]:
         except Exception:
             continue
         lines = text.splitlines()
+        suppressions.index(path, text)
         hints = PathHints(tree)
         seen: set[int] = set()  # DISTINCT division lines per file
         for node in ast.walk(tree):
@@ -98,13 +99,13 @@ def find(files: Sequence[Path]) -> Iterable[tuple[str, Path, int, int, str]]:
             if line_no in seen:
                 continue
             idx = line_no - 1
-            if any(0 <= i < len(lines) and MARKER in lines[i] for i in (idx, idx - 1)):
-                continue  # ubs:ignore on the hit line or the line before
             seen.add(line_no)
             code = lines[idx].strip()[:240] if 0 <= idx < len(lines) else ''
             hits.append((path, line_no, code))
-    if not hits:
-        return
-    rule = "py.numeric.division-heavy" if len(hits) > WARNING_ABOVE else "py.numeric.division"
-    for path, line_no, code in hits:
+    rule = "py.numeric.division-heavy"
+    eligible = [hit for hit in hits if not suppressions.is_suppressed(hit[0], hit[1], rule)]
+    if len(eligible) <= WARNING_ABOVE:
+        rule = "py.numeric.division"
+        eligible = [hit for hit in hits if not suppressions.is_suppressed(hit[0], hit[1], rule)]
+    for path, line_no, code in eligible:
         yield rule, path, line_no, 1, code

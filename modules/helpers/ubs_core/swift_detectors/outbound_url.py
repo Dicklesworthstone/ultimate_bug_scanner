@@ -13,9 +13,10 @@ from ubs_core.analyzers.taint_swift_traversal import (
     file_url_read_offsets, swift_request_source_tokens, swift_validated_tokens,
 )
 from ubs_core.swift_detectors._common import (
-    SKIP_DIRS, has_ignore, logical_statement, rel, should_skip,
+    SKIP_DIRS, logical_statement, rel, should_skip,
     source_line, strip_line_comments,
 )
+from ubs_core.suppression import SourceSuppressions
 
 RULE_ID = "swift.taint.outbound-url"
 CATEGORY = 6
@@ -137,6 +138,7 @@ def scan(ctx):
     root = project.resolve()
     base = root if root.is_dir() else root.parent
     findings = []
+    suppressions = SourceSuppressions("swift")
     for candidate in ctx.files:
         path = Path(candidate).resolve()
         if path.suffix != '.swift':
@@ -149,13 +151,12 @@ def scan(ctx):
         if not swift_request_source_tokens(swift_validated_tokens(text)):
             continue
 
+        suppressions.index(path, text)
         lines = text.splitlines()
         sink_lines = outbound_sink_lines(path, text)
         tainted = {}
         seen = set()
         for line_no in range(1, len(lines) + 1):
-            if has_ignore(lines, line_no):
-                continue
             statement = logical_statement(lines, line_no).strip()
             if not statement:
                 continue
@@ -178,6 +179,8 @@ def scan(ctx):
             if not direct and not refs:
                 continue
             if has_allowlist_context(lines, line_no, refs):
+                continue
+            if suppressions.is_suppressed(path, line_no, RULE_ID):
                 continue
             key = (rel(path, base), line_no)
             if key in seen:

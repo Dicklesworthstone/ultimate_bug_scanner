@@ -15,6 +15,7 @@ import tempfile
 import textwrap
 import time
 import unittest
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -765,7 +766,7 @@ class PythonTaintDataflowTests(unittest.TestCase):
         self.assertEqual(payload['status'], 'ok', context)
         taint = [row for row in records if row['rule'].startswith('python.taint.')]
         self.assertEqual([(row['rule'], row['path'], row['line'], row['col']) for row in taint],
-                         [('python.taint.eval', str(source), 5, 5)], context)
+                         [('python.taint.eval', str(source.resolve()), 5, 5)], context)
         self.assertIn('request.args', taint[0]['message'], context)
         self.assertIn('evaluate()', taint[0]['message'], context)
 
@@ -2019,6 +2020,31 @@ class AstIngestionTests(unittest.TestCase):
         self.assertIn("5000 malformed", errors[0])
         self.assertLess(len(errors[0]), 1000)
 
+    def test_observed_corruption_survives_early_consumer_exit(self) -> None:
+        valid = self.payload(self.diagnostic())
+        for corrupt, detail in ((b"\xff\n", "UTF-8"), (b"null\n", "malformed AST"),
+                                (b"x" * 4096 + b"\n", "output exceeds")):
+            with self.subTest(detail=detail), patch.object(self.tools, "OUTPUT_RECORD_LIMIT", len(valid) + 8):
+                errors = []
+                records = self.tools.parse_ast_diagnostics(io.BytesIO(corrupt * 1000 + valid), errors)
+                self.assertEqual(next(records)["ruleId"], "custom.critical")
+                # Inspect before close: already-observed corruption cannot be
+                # deferred until a caller happens to exhaust the iterator.
+                self.assertEqual(len(errors), 1)
+                self.assertIn("1000", errors[0])
+                self.assertIn(detail, errors[0])
+                records.close()
+                self.assertEqual(len(errors), 1)
+                self.assertLess(len(errors[0]), 1000)
+
+    def test_stream_consumer_exception_is_not_a_capture_read_error(self) -> None:
+        errors = []
+        rows = self.tools.iter_output_lines(io.BytesIO(b"valid\n"), errors, context="test")
+        self.assertEqual(next(rows), (1, "valid\n"))
+        with self.assertRaisesRegex(OSError, "consumer failed"):
+            rows.throw(OSError("consumer failed"))
+        self.assertFalse(errors)
+
     def test_unicode_separators_inside_json_strings_are_not_record_boundaries(self) -> None:
         row = self.diagnostic(file="source\u2028name.py", message="one\u0085two\u2029three")
         errors = []
@@ -2065,6 +2091,14 @@ class AstIngestionTests(unittest.TestCase):
                 result = list(self.tools.scan_ast_config(self.config, [self.source], errors))
                 self.assertEqual(len(result), len(rows))
                 self.assertFalse(errors)
+
+    def test_finding_exit_without_diagnostics_is_incomplete(self) -> None:
+        self.executable(b" \n", 1)
+        errors = []
+        self.assertEqual(list(self.tools.scan_ast_config(self.config, [self.source], errors)), [])
+        self.assertTrue(any("findings exit without valid diagnostics" in error for error in errors))
+        with self.assertRaisesRegex(RuntimeError, "findings exit without valid diagnostics"):
+            list(self.tools.scan_ast_config(self.config, [self.source]))
 
     def test_failed_invocation_keeps_diagnostics(self) -> None:
         for code in (2, 3, 124, 127):
@@ -2141,6 +2175,143 @@ class AstIngestionTests(unittest.TestCase):
         self.assertEqual(output.returncode, 0)
         self.assertEqual(errors, ["document tool: output exceeds 512 bytes"])
 
+    def test_whole_document_capture_preserves_strict_utf8_and_merged_stderr(self) -> None:
+        self.executable(b"prefix\xff\n", suffix="sys.stderr.buffer.write(b'warning\\n')\nsys.stderr.flush()\n")
+        for strict in (False, True):
+            with self.subTest(strict=strict):
+                errors = []
+                output = self.tools.run_command("document tool", [str(self.binary)], self.root, 5, errors,
+                                                merge_stderr=True, strict_utf8=strict)
+                self.assertEqual(output.stdout, "prefix\ufffd\nwarning\n")
+                self.assertEqual(output.stderr, "")
+                self.assertEqual(bool(errors), strict)
+                if strict:
+                    self.assertIn("not valid UTF-8", errors[0])
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process groups")
+    def test_exited_leader_with_live_child_is_partial_and_child_stops(self) -> None:
+        import signal
+        import time
+        # The child writes its procfs identity: a sandbox may expose an outer
+        # procfs while Popen/kill use namespace-local PIDs.
+        child_state = self.root / "child-state.json"
+        child_code = (
+            "import json, os, time\nfrom pathlib import Path\n"
+            "stat = Path('/proc/self/stat')\n"
+            f"Path({str(child_state)!r}).write_text(json.dumps([os.getpid(), "
+            "stat.read_text().partition(' ')[0] if stat.exists() else None]))\n"
+            "time.sleep(30)\n"
+        )
+        local_pid_file = self.root / "child.pid"
+        self.executable(self.payload(self.diagnostic()), suffix=(
+            "import subprocess\nfrom pathlib import Path\n"
+            f"child = subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+            f"Path({str(local_pid_file)!r}).write_text(str(child.pid))\n"
+            f"while not Path({str(child_state)!r}).exists():\n    time.sleep(0.01)\n"
+        ))
+        errors = []
+        started = time.monotonic()
+        try:
+            records = list(self.tools.scan_ast_config(self.config, [self.source], errors, timeout=3))
+            self.assertEqual(len(records), 1, errors)
+            self.assertTrue(any("exited before its process group completed" in error for error in errors))
+            self.assertLess(time.monotonic() - started, 2)
+            local_pid, proc_pid = json.loads(child_state.read_text())
+            if Path("/proc").exists():
+                state_file = Path(f"/proc/{proc_pid}/stat")
+                try:
+                    state = state_file.read_text().rpartition(")")[2].split()[0]
+                except FileNotFoundError:
+                    state = "gone"
+                self.assertIn(state, ("Z", "X", "gone"))
+        finally:
+            if local_pid_file.exists():
+                try:
+                    os.kill(int(local_pid_file.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def test_completed_child_does_not_make_capture_partial(self) -> None:
+        self.executable(self.payload(self.diagnostic()), suffix=(
+            "import subprocess\n"
+            "subprocess.run([sys.executable, '-c', 'pass'], check=True)\n"
+        ))
+        errors = []
+        records = list(self.tools.scan_ast_config(self.config, [self.source], errors))
+        self.assertEqual(len(records), 1)
+        self.assertFalse(errors)
+
+    @unittest.skipUnless(os.name == "posix" and Path("/proc").exists(), "Linux parent cancellation")
+    def test_parent_cancellation_stops_isolated_analyzer(self) -> None:
+        import signal
+        import time
+        pid_file = self.root / "analyzer-identity.json"
+        self.executable(self.payload(self.diagnostic()), suffix=(
+            "import json, os\nfrom pathlib import Path\n"
+            f"Path({str(pid_file)!r}).write_text(json.dumps([os.getpid(), "
+            "Path('/proc/self/stat').read_text().partition(' ')[0]]))\n"
+            "time.sleep(30)\n"
+        ))
+        driver_code = (
+            "from pathlib import Path\nfrom ubs_core.external_tools import run_command_stream\n"
+            f"with run_command_stream('fixture', [{str(self.binary)!r}], Path({str(self.root)!r}), 30, []):\n"
+            "    pass\n"
+        )
+        driver = subprocess.Popen(
+            [sys.executable, "-c", driver_code], cwd=self.root, stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE, env={**os.environ, "PYTHONPATH": str(HELPERS_DIR),
+                                         "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        local_pid = None
+        try:
+            deadline = time.monotonic() + 5
+            while True:
+                try:
+                    local_pid, proc_pid = json.loads(pid_file.read_text())
+                    break
+                except (FileNotFoundError, ValueError):
+                    self.assertIsNone(driver.poll(), "driver exited before launching analyzer")
+                    self.assertLess(time.monotonic(), deadline, "analyzer did not start")
+                    time.sleep(0.01)
+            driver.send_signal(signal.SIGTERM)
+            _stdout, stderr = driver.communicate(timeout=5)
+            self.assertEqual(driver.returncode, 128 + signal.SIGTERM, stderr.decode("utf-8", "replace"))
+            state_file = Path(f"/proc/{proc_pid}/stat")
+            try:
+                state = state_file.read_text().rpartition(")")[2].split()[0]
+            except FileNotFoundError:
+                state = "gone"
+            self.assertIn(state, ("Z", "X", "gone"))
+        finally:
+            if driver.poll() is None:
+                driver.terminate()
+                try:
+                    driver.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    driver.kill()
+                    driver.wait(timeout=5)
+            if driver.stderr is not None:
+                driver.stderr.close()
+            if local_pid is not None:
+                try:
+                    os.kill(local_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    @unittest.skipUnless(os.name == "posix", "POSIX child-exit policy")
+    def test_ignored_sigchld_cannot_turn_failed_tool_into_complete_scan(self) -> None:
+        import signal
+        self.executable(self.payload(self.diagnostic()), code=2)
+        previous = signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+        try:
+            errors = []
+            records = list(self.tools.scan_ast_config(self.config, [self.source], errors))
+            self.assertEqual(len(records), 1)
+            self.assertTrue(any("cannot verify analyzer exit status" in error for error in errors))
+            self.assertEqual(signal.getsignal(signal.SIGCHLD), signal.SIG_IGN)
+        finally:
+            signal.signal(signal.SIGCHLD, previous)
+
     def test_corrupt_stream_records_have_bounded_error_detail(self) -> None:
         valid = self.payload(self.diagnostic())
         errors = []
@@ -2190,6 +2361,46 @@ class AstIngestionTests(unittest.TestCase):
             self.assertTrue(stderr.closed)
         self.assertFalse(errors)
 
+    def test_capture_close_failure_keeps_consumer_error_and_closes_both_handles(self) -> None:
+        self.executable(self.payload(self.diagnostic()))
+        errors = []
+        with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+            class BrokenClose:
+                def __getattr__(self, name):
+                    return getattr(stderr, name)
+
+                def close(self):
+                    stderr.close()
+                    raise OSError("capture close failed")
+
+            with patch.object(self.tools.tempfile, "TemporaryFile", side_effect=[stdout, BrokenClose()]):
+                with self.assertRaisesRegex(OSError, "consumer failed"):
+                    with self.tools.run_command_stream("test analyzer", [str(self.binary)], self.root, 5, errors):
+                        raise OSError("consumer failed")
+            self.assertTrue(stdout.closed)
+            self.assertTrue(stderr.closed)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("could not close captured output: capture close failed", errors[0])
+
+    def test_capture_seek_failure_closes_both_handles(self) -> None:
+        self.executable(self.payload(self.diagnostic()))
+        errors = []
+        with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+            class BrokenSeek:
+                def __getattr__(self, name):
+                    return getattr(stdout, name)
+
+                def seek(self, *args):
+                    raise OSError("capture seek failed")
+
+            with patch.object(self.tools.tempfile, "TemporaryFile", side_effect=[BrokenSeek(), stderr]):
+                with self.tools.run_command_stream("test analyzer", [str(self.binary)], self.root, 5, errors) as output:
+                    self.assertIsNone(output)
+            self.assertTrue(stdout.closed)
+            self.assertTrue(stderr.closed)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("capture seek failed", errors[0])
+
     def test_second_capture_open_failure_closes_first_handle_without_launching(self) -> None:
         with tempfile.TemporaryFile() as first:
             errors = []
@@ -2208,6 +2419,62 @@ class AstIngestionTests(unittest.TestCase):
         records = list(self.tools.scan_ast_config(self.config, [self.source], errors))
         self.assertEqual(len(records), 1)
         self.assertTrue(any("UTF-8" in e for e in errors))
+
+    def test_stderr_errors_beyond_preview_are_partial_with_bounded_detail(self) -> None:
+        self.executable(self.payload(self.diagnostic()), suffix=(
+            "sys.stderr.write('Warning: analyzer note\\n' * 300)\n"
+            "sys.stderr.write('ERROR: source could not be read\\n' * 2000)\n"
+        ))
+        errors = []
+        records = list(self.tools.scan_ast_config(self.config, [self.source], errors))
+        self.assertEqual(len(records), 1)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("2000 analyzer error(s) on stderr", errors[0])
+        self.assertLess(len(errors[0]), 1000)
+
+    def test_ordinary_stderr_warning_is_not_an_incomplete_scan(self) -> None:
+        self.executable(self.payload(self.diagnostic()), suffix="sys.stderr.write('Warning: analyzer note\\n')\n")
+        errors = []
+        self.assertEqual(len(list(self.tools.scan_ast_config(self.config, [self.source], errors))), 1)
+        self.assertFalse(errors)
+
+    def test_native_finding_summary_requires_matching_exit_and_valid_stdout(self) -> None:
+        for code, valid in ((1, True), (1, False), (0, True)):
+            with self.subTest(code=code, valid=valid):
+                self.executable(self.payload(self.diagnostic()) if valid else b"", code=code,
+                                suffix="sys.stderr.write('Error: 1 error(s) found in code.\\n')\n")
+                errors = []
+                records = list(self.tools.scan_ast_config(self.config, [self.source], errors))
+                self.assertEqual(len(records), int(valid))
+                self.assertEqual(bool(errors), not (code == 1 and valid))
+
+    def test_unreadable_stderr_records_preserve_stdout_findings(self) -> None:
+        valid = self.payload(self.diagnostic())
+        for bad in (b"\xff\n", b"x" * 2048 + b"\n"):
+            with self.subTest(bad=bad[:20]), patch.object(self.tools, "OUTPUT_RECORD_LIMIT", len(valid) + 8):
+                self.executable(valid, suffix=f"sys.stderr.buffer.write({bad!r})\n")
+                errors = []
+                records = list(self.tools.scan_ast_config(self.config, [self.source], errors))
+                self.assertEqual(len(records), 1)
+                self.assertTrue(any("stderr" in error and "unreadable output" in error for error in errors))
+
+    def test_stderr_capture_failure_does_not_erase_stdout_findings(self) -> None:
+        self.executable(self.payload(self.diagnostic()))
+        errors = []
+        with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+            class BrokenRead:
+                def __getattr__(self, name):
+                    return getattr(stderr, name)
+
+                def read(self, *args):
+                    raise OSError("stderr capture failed")
+
+            with patch.object(self.tools.tempfile, "TemporaryFile", side_effect=[stdout, BrokenRead()]):
+                records = list(self.tools.scan_ast_config(self.config, [self.source], errors))
+            self.assertTrue(stdout.closed)
+            self.assertTrue(stderr.closed)
+        self.assertEqual(len(records), 1)
+        self.assertTrue(any("could not read captured stderr" in error for error in errors))
 
     def test_later_batches_run_after_an_earlier_failure(self) -> None:
         invocations = self.root / "invocations.jsonl"
@@ -2261,6 +2528,18 @@ class AstIngestionTests(unittest.TestCase):
         self.assertEqual(counts["critical"], 1)
         self.assertFalse(errors)
         self.assertEqual(json.loads(sink.getvalue())["rule"], "policy-print")
+
+    @unittest.skipUnless(shutil.which("ast-grep"), "real ast-grep is required")
+    def test_real_ast_grep_missing_source_is_partial_and_keeps_readable_sibling(self) -> None:
+        rule = self.root / "policy.yaml"
+        rule.write_text("id: policy-print\nlanguage: python\nseverity: warning\nrule:\n  pattern: print($$$)\n")
+        self.config.write_text("ruleDirs: " + json.dumps([str(rule)]) + "\n")
+        self.source.write_text("print(42)\n")
+        errors = []
+        with patch.dict(os.environ, {"UBS_AST_GREP_BIN": shutil.which("ast-grep")}):
+            records = list(self.tools.scan_ast_config(self.config, [self.root / "missing.py", self.source], errors))
+        self.assertEqual([row["ruleId"] for row in records], ["policy-print"])
+        self.assertTrue(any("analyzer error(s) on stderr" in error for error in errors), errors)
 
     def test_python_complete_scan_and_partial_scan_are_not_cache_equivalent(self) -> None:
         from ubs_core.py_rules import generate
@@ -2347,6 +2626,28 @@ class AstIngestionTests(unittest.TestCase):
                 self.assertEqual(self.adapter(name, errors), [])
                 self.assertTrue(errors)
 
+    def test_every_adapter_and_custom_policy_reject_empty_findings_exit(self) -> None:
+        self.executable(b"", 1)
+        for name in self.ADAPTERS:
+            with self.subTest(adapter=name):
+                errors = []
+                self.assertEqual(self.adapter(name, errors), [])
+                self.assertTrue(any("without valid diagnostics" in error for error in errors))
+        policy = self.root / "policy.yaml"
+        policy.write_text("id: policy\nlanguage: python\nrule:\n  pattern: print($$$)\n")
+        sink, errors = io.StringIO(), []
+        self.assertEqual(self.tools.scan_custom_rules(self.root, [self.source], sink, "python", errors), 0)
+        self.assertFalse(sink.getvalue())
+        self.assertTrue(any("without valid diagnostics" in error for error in errors))
+
+    def test_every_adapter_preserves_stdout_when_stderr_reports_input_failure(self) -> None:
+        self.executable(self.payload(self.diagnostic()), suffix="sys.stderr.write('ERROR: missing selected source\\n')\n")
+        for name in self.ADAPTERS:
+            with self.subTest(adapter=name):
+                errors = []
+                self.assertEqual(len(self.adapter(name, errors)), 1)
+                self.assertTrue(any("analyzer error(s) on stderr" in error for error in errors))
+
     def test_config_discovery_preserves_java_base_pack_and_yaml_extension(self) -> None:
         (self.root / "sgbase-java.yaml").write_text("ruleDirs: []\n")
         errors = []
@@ -2365,6 +2666,36 @@ class AstIngestionTests(unittest.TestCase):
         self.assertEqual(records[0]["path"], "source:with\nnewline.rs")
         self.assertEqual(records[0]["col"], 3)
         self.assertTrue(errors)
+
+    def test_rust_run_mode_requires_consistent_match_exit(self) -> None:
+        from ubs_core import rust_ast, rust_rules
+        for code, has_record in ((0, False), (1, True), (0, True), (1, False)):
+            with self.subTest(code=code, has_record=has_record):
+                self.executable(self.payload(self.diagnostic()) if has_record else b"", code)
+                errors = []
+                with patch.object(rust_rules, "RUN_MODE_RULES", {"unwrap": "$A.unwrap()"}):
+                    counts, matches = rust_ast._run_spawn_patterns([str(self.source)], str(self.binary), 400, errors)
+                self.assertEqual(counts.get("rust.ast.unwrap", 0), int(has_record))
+                self.assertEqual(bool(matches), has_record)
+                self.assertEqual(bool(errors), has_record != (code == 0))
+
+    def test_rust_run_mode_valid_duplicates_still_establish_match_exit(self) -> None:
+        from ubs_core import rust_ast, rust_rules
+        self.executable(self.payload(self.diagnostic()))
+        errors = []
+        with patch.object(rust_rules, "RUN_MODE_RULES", {"unwrap": "$A.unwrap()"}):
+            counts, _ = rust_ast._run_spawn_patterns([str(self.source)] * 2, str(self.binary), 1, errors)
+        self.assertEqual(counts["rust.ast.unwrap"], 1)
+        self.assertFalse(errors)
+
+    def test_rust_run_mode_stderr_failure_preserves_matches(self) -> None:
+        from ubs_core import rust_ast, rust_rules
+        self.executable(self.payload(self.diagnostic()), suffix="sys.stderr.write('ERROR: missing selected source\\n')\n")
+        errors = []
+        with patch.object(rust_rules, "RUN_MODE_RULES", {"unwrap": "$A.unwrap()"}):
+            counts, _ = rust_ast._run_spawn_patterns([str(self.source)], str(self.binary), 400, errors)
+        self.assertEqual(counts["rust.ast.unwrap"], 1)
+        self.assertTrue(any("analyzer error(s) on stderr" in error for error in errors))
 
     def test_rust_nested_pattern_stream_has_no_total_output_cap(self) -> None:
         from ubs_core import rust_ast, rust_rules
@@ -2527,7 +2858,7 @@ class JavaKotlinDataflowTests(unittest.TestCase):
         except ValueError as exc:
             self.fail(f'invalid scanner JSON: {exc}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}')
 
-    def cli(self, path, lang, label, status=0):
+    def cli(self, path, lang, label, status=0, rule='path_traversal'):
         directory = self.root / label
         directory.mkdir()
         env = {key: value for key, value in os.environ.items()
@@ -2537,6 +2868,7 @@ class JavaKotlinDataflowTests(unittest.TestCase):
                    XDG_DATA_HOME=str(directory / 'data'), XDG_CACHE_HOME=str(directory / 'cache'))
         command = [str(REPO_ROOT / 'ubs'), '--ci', '--no-color', '--no-cache',
                    '--format=json', '--only=' + lang, '--', str(path)]
+        started = time.monotonic()
         try:
             proc = subprocess.run(command, cwd=directory, env=env,
                                   capture_output=True, text=True, timeout=180)
@@ -2544,6 +2876,11 @@ class JavaKotlinDataflowTests(unittest.TestCase):
             self.fail(f'{label} timed out\nstdout:\n{exc.stdout}\nstderr:\n{exc.stderr}')
         (directory / 'stdout.log').write_text(proc.stdout)
         (directory / 'stderr.log').write_text(proc.stderr)
+        (directory / 'command.json').write_text(json.dumps({
+            'case': self.id(), 'command': command, 'cwd': str(directory),
+            'seconds': time.monotonic() - started, 'exit': proc.returncode,
+            'source_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+        }, indent=2))
         context = f'{label}: exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}'
         self.assertEqual(proc.returncode, status, context)
         try:
@@ -2556,7 +2893,7 @@ class JavaKotlinDataflowTests(unittest.TestCase):
         self.assertEqual(len(report['scanners']), 1, context)
         self.assertEqual(report['scanners'][0]['status'], 'ok', context)
         findings = [finding for scanner in report['scanners'] for finding in scanner['findings']
-                    if finding['rule'] == lang + '.taint.path_traversal']
+                    if finding['rule'] == lang + '.taint.' + rule]
         return findings, context
 
     def test_shared_engine_branches_loops_local_summaries_and_evidence(self):
@@ -3072,6 +3409,294 @@ fun handler(request: jakarta.servlet.http.HttpServletRequest, again: Boolean) {
                                     and row['severity'] == 'critical' for row in findings), context)
                 self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), digest)
 
+    def test_redirects_use_selected_bindings_and_assignment_kills(self):
+        from ubs_core.analyzers.taint_java_redirect import run
+        from ubs_core.registry import RunContext
+        cases = (
+            ('safe-name-identity', '''class A {
+  String safeRedirect(String value) { return value; }
+  void run(Request request) {
+    String target = safeRedirect(request.getParameter("next"));
+    response.sendRedirect(target); // unsafe
+  }
+}'''),
+            ('literal-kill', '''class A {
+  void run(Request request) {
+    String target = request.getParameter("next");
+    target = "/fixed";
+    response.sendRedirect(target);
+  }
+}'''),
+            ('bound-clean-helper', '''class A {
+  String choose(String value) { return "/fixed"; }
+  void run(Request request) {
+    response.sendRedirect(choose(request.getParameter("next")));
+  }
+}'''),
+            ('branch-join', '''class A {
+  void run(Request request, boolean choice) {
+    String target = request.getParameter("next");
+    if (choice) { target = "/fixed"; }
+    response.sendRedirect(target); // unsafe
+  }
+}'''),
+            ('unrelated-scopes', '''class A {
+  void source(Request request) { String target = request.getParameter("next"); }
+  void sink() { String target = "/fixed"; response.sendRedirect(target); }
+}'''),
+            ('recursive-helper', '''class A {
+  String relay(String value, int count) {
+    if (count == 0) { return value; }
+    return relay(value, count - 1);
+  }
+  void run(Request request) {
+    response.sendRedirect(relay(request.getParameter("next"), 2)); // unsafe
+  }
+}'''),
+            ('unbound-validator', '''class A {
+  void run(Request request) {
+    String target = request.getParameter("next");
+    if (!isAllowedRedirect(target)) { throw new SecurityException("bad"); }
+    response.sendRedirect(target); // unsafe
+  }
+}'''),
+            ('different-sink-proof', '''class A {
+  void run(Request request) {
+    Path target = Paths.get(request.getParameter("next")).normalize();
+    if (!target.startsWith(base)) { throw new SecurityException("bad"); }
+    response.sendRedirect(target.toString()); // unsafe
+  }
+}'''),
+        )
+        for name, source in cases:
+            with self.subTest(case=name):
+                path = self.root / (name + '.java')
+                path.write_text(source, encoding='utf-8')
+                findings = list(run(RunContext(lang='java', files=[path])))
+                expected = self.lines(source)
+                self.assertEqual({f['line'] for f in findings}, expected, (source, findings))
+                self.assertEqual(len(findings), len(expected), findings)
+                self.assertTrue(all(f['rule'] == 'java.taint.open_redirect' and
+                                    f['severity'] == 'critical' for f in findings), findings)
+
+    def test_redirect_guards_validate_selected_values_and_keep_mutations(self):
+        from ubs_core.analyzers.taint_java_redirect import run
+        from ubs_core.registry import RunContext
+        cases = (
+            ('literal-guard', 'if (!"/home".equals(target)) { throw new SecurityException(); }', '', False),
+            ('selected-predicate', 'if (!allowed(target)) { throw new SecurityException(); }', '', False),
+            ('wrong-receiver', 'if (!other.allowed(target)) { throw new SecurityException(); }', '', True),
+            ('partial-guard', 'if (choice) { if (!allowed(target)) { throw new SecurityException(); } }', '', True),
+            ('later-mutation', 'if (!allowed(target)) { throw new SecurityException(); }', 'target = "//" + target;', True),
+            ('later-source', 'if (!allowed(target)) { throw new SecurityException(); }', 'target = request.getParameter("again");', True),
+            ('unknown-transform', 'if (!allowed(target)) { throw new SecurityException(); }', 'target = transform(target);', True),
+            ('boolean-precedence', 'if (!allowed(target) || choice) { throw new SecurityException(); }', '', False),
+        )
+        for name, guard, mutation, unsafe in cases:
+            with self.subTest(case=name):
+                source = ('class A {\n'
+                          ' boolean allowed(String value) { return "/home".equals(value); }\n'
+                          ' void run(Request request, boolean choice) {\n'
+                          ' String target = request.getParameter("next");\n'
+                          f' {guard}\n {mutation}\n'
+                          ' response.sendRedirect(target);\n }\n}\n')
+                path = self.root / (name + '.java')
+                path.write_text(source)
+                findings = list(run(RunContext(lang='java', files=[path])))
+                self.assertEqual([f['line'] for f in findings], [7] if unsafe else [], (source, findings))
+
+    def test_uri_redirect_validator_requires_authority_and_selected_allowlist(self):
+        from ubs_core.analyzers.taint_java_redirect import run
+        from ubs_core.registry import RunContext
+        cases = (
+            ('java', 'test-suite/java/security/OpenRedirectClean.java', {37, 41, 46, 51, 56},
+             'parsed.getRawAuthority() != null', 'false'),
+            ('kotlin', 'test-suite/kotlin/open_redirect_clean/OpenRedirectClean.kt', {29, 34},
+             'uri.rawAuthority == null', 'true'),
+        )
+        for lang, fixture, sink_lines, condition, missing in cases:
+            source = (REPO_ROOT / fixture).read_text()
+            suffix = '.java' if lang == 'java' else '.kt'
+            variants = (
+                ('complete', source, set()),
+                ('alpha-renamed', source.replace('safeRedirectTarget', 'chooseTarget'), set()),
+                ('network-path-bypass', source.replace(condition, missing), sink_lines),
+            )
+            if lang == 'kotlin':
+                escaped = source.replace('setOf("app.example.com")',
+                    'setOf("app.example.com", "accounts.example.com")').replace(
+                    'fun redirectQuery(call: ApplicationCall) {',
+                    'fun redirectQuery(call: ApplicationCall) { mutateHosts()')
+                prefix, closing = escaped.rsplit('\n}', 1)
+                escaped = prefix + ('\n    fun mutateHosts() {\n'
+                    '        val alias = allowedHosts as MutableSet<String>\n'
+                    '        alias.add("evil.example")\n    }\n}') + closing
+                variants += (
+                    ('escaped-allowlist', escaped, sink_lines),
+                    ('public-allowlist', source.replace('private val allowedHosts',
+                                                       'val allowedHosts'), sink_lines),
+                    ('typed-host-factory', source.replace('import java.net.URI',
+                        'import java.net.URI\nimport java.util.Set').replace(
+                        '    private val allowedHosts = setOf("app.example.com")',
+                        '    private val Set: HostFactory = HostFactory()\n'
+                        '    private val allowedHosts = Set.of("app.example.com")') +
+                        '\nclass HostFactory {\n'
+                        '    fun of(value: String): kotlin.collections.Set<String> {\n'
+                        '        return kotlin.collections.setOf("evil.example")\n    }\n}\n',
+                        {line + 2 for line in sink_lines}),
+                    ('typed-callable-set', source.replace(
+                        '    private val allowedHosts = setOf("app.example.com")',
+                        '    private val setOf: (String) -> Set<String> = '
+                        '{ kotlin.collections.setOf("evil.example") }\n'
+                        '    private val allowedHosts = setOf("app.example.com")'),
+                        {line + 1 for line in sink_lines}),
+                )
+            for label, text, expected in variants:
+                with self.subTest(language=lang, case=label):
+                    path = self.root / (lang + '-' + label + suffix)
+                    path.write_text(text)
+                    findings = list(run(RunContext(lang=lang, files=[path])))
+                    self.assertEqual({f['line'] for f in findings}, expected, (text, findings))
+                    self.assertEqual(len(findings), len(expected), findings)
+
+    def test_kotlin_uri_factory_shadow_cannot_validate_redirects(self):
+        from ubs_core.analyzers.taint_java_redirect import run
+        from ubs_core.registry import RunContext
+        source = '''import java.net.URI
+class Bogus(val raw: String) {
+  val isAbsolute = true
+  val scheme = "https"
+  val host = "app.example.com"
+  val path = "/home"
+  val rawAuthority: String? = null
+  override fun toString(): String = raw
+}
+class Factory {
+  fun create(value: String): Bogus = Bogus(value)
+}
+class Sample {
+  private val allowedHosts = setOf("app.example.com")
+  fun choose(raw: String, URI: Factory): String {
+    val uri = URI.create(raw)
+    if (uri.isAbsolute) {
+      require(uri.scheme == "https" && uri.host in allowedHosts) { "blocked" }
+      return uri.toString()
+    }
+    require(uri.rawAuthority == null) { "blocked" }
+    require(uri.path.startsWith("/") && !uri.path.startsWith("//")) { "blocked" }
+    return uri.toString()
+  }
+  fun run(call: ApplicationCall) {
+    call.respondRedirect(choose(call.request.queryParameters["next"] ?: "/", Factory()))
+  }
+}'''
+        path = self.root / 'ShadowedUri.kt'
+        path.write_text(source)
+        findings = list(run(RunContext(lang='kotlin', files=[path])))
+        self.assertEqual([(f['rule'], f['line']) for f in findings],
+                         [('java.taint.open_redirect', 26)], findings)
+        cli_findings, context = self.cli(path, 'kotlin', 'shadowed-uri', 1,
+                                         rule='open_redirect')
+        self.assertEqual([(f['rule'], f['line']) for f in cli_findings],
+                         [('kotlin.taint.open_redirect', 26)], context)
+
+        field_shadow = source.replace('  fun choose(raw: String, URI: Factory)',
+            '  private val URI: Factory = Factory()\n  fun choose(raw: String)').replace(
+            'choose(call.request.queryParameters["next"] ?: "/", Factory())',
+            'choose(call.request.queryParameters["next"] ?: "/")')
+        path = self.root / 'FieldShadowedUri.kt'
+        path.write_text(field_shadow)
+        findings = list(run(RunContext(lang='kotlin', files=[path])))
+        self.assertEqual([f['line'] for f in findings], [27], findings)
+        cli_findings, context = self.cli(path, 'kotlin', 'field-shadowed-uri', 1,
+                                         rule='open_redirect')
+        self.assertEqual([(f['rule'], f['line']) for f in cli_findings],
+                         [('kotlin.taint.open_redirect', 27)], context)
+
+        no_op = source.replace('URI: Factory', 'require: NoOp').replace(
+            'Factory()))', 'NoOp()))').replace('class Factory {',
+            'class NoOp { operator fun invoke(value: Boolean, message: () -> String) {} }\nclass Factory {')
+        path = self.root / 'ShadowedRequire.kt'
+        path.write_text(no_op)
+        findings = list(run(RunContext(lang='kotlin', files=[path])))
+        self.assertEqual([f['line'] for f in findings], [27], findings)
+
+        field_require = no_op.replace('  fun choose(raw: String, require: NoOp)',
+            '  private val require: NoOp = NoOp()\n  fun choose(raw: String)').replace(
+            'choose(call.request.queryParameters["next"] ?: "/", NoOp())',
+            'choose(call.request.queryParameters["next"] ?: "/")')
+        path = self.root / 'FieldShadowedRequire.kt'
+        path.write_text(field_require)
+        findings = list(run(RunContext(lang='kotlin', files=[path])))
+        self.assertEqual([f['line'] for f in findings], [28], findings)
+
+    def test_real_cli_redirect_binding_and_uri_controls(self):
+        cases = (
+            ('java', '.java', '''class Sample {
+  String safeRedirect(String value) { return value; }
+  void run(Request request) {
+    String target = safeRedirect(request.getParameter("next"));
+    response.sendRedirect(target);
+  }
+}''', 5),
+            ('kotlin', '.kt', '''fun safeRedirect(value: String): String { return value }
+fun run(call: ApplicationCall) {
+  var target = safeRedirect(call.request.queryParameters["next"] ?: "/")
+  call.respondRedirect(target)
+}''', 4),
+        )
+        for lang, suffix, source, sink_line in cases:
+            variants = (
+                ('misleading-helper', source, True),
+                ('alpha-renamed', source.replace('safeRedirect', 'relay'), True),
+                ('literal-overwrite', source.replace('    response.sendRedirect(target);',
+                  '    target = "/fixed"; response.sendRedirect(target);').replace('  call.respondRedirect(target)',
+                  '  target = "/fixed"; call.respondRedirect(target)'), False),
+            )
+            for label, text, unsafe in variants:
+                with self.subTest(language=lang, case=label):
+                    path = self.root / (lang + '-' + label + suffix)
+                    path.write_text(text)
+                    findings, context = self.cli(path, lang, lang + '-' + label,
+                                                 1 if unsafe else 0, rule='open_redirect')
+                    self.assertEqual([(f['rule'], f['line'], f['severity']) for f in findings],
+                                     [(lang + '.taint.open_redirect', sink_line, 'critical')] if unsafe else [], context)
+                    report = json.loads((self.root / (lang + '-' + label) / 'stdout.log').read_text())
+                    self.assertEqual(report['totals']['critical'], int(unsafe), context)
+                    self.assertEqual(report['totals']['warning'], 0, context)
+                    if unsafe:
+                        self.assertTrue(all(f['extras']['taint_path'] for f in findings), context)
+                    directory = self.root / (lang + '-' + label + '-sarif')
+                    directory.mkdir()
+                    env = os.environ.copy()
+                    env.update(PYTHONDONTWRITEBYTECODE='1', UBS_NO_AUTO_UPDATE='1',
+                               UBS_NO_CACHE='1', ENABLE_UV_TOOLS='0')
+                    for tool, arguments in (
+                        ('meta', [str(REPO_ROOT / 'ubs'), '--only=' + lang, '--format=sarif', '--ci', str(path)]),
+                        ('module', [str(REPO_ROOT / 'modules' / ('ubs-' + lang + '.sh')), '--format=sarif', '--ci', str(path)]),
+                    ):
+                        started = time.monotonic()
+                        proc = subprocess.run(arguments, cwd=directory, env=env,
+                                              capture_output=True, text=True, timeout=180)
+                        (directory / (tool + '.stdout.log')).write_text(proc.stdout)
+                        (directory / (tool + '.stderr.log')).write_text(proc.stderr)
+                        (directory / (tool + '.command.json')).write_text(json.dumps({
+                            'case': self.id(), 'command': arguments, 'cwd': str(directory),
+                            'seconds': time.monotonic() - started, 'exit': proc.returncode,
+                            'source_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                        }, indent=2))
+                        context = f'{arguments!r}: exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}'
+                        self.assertEqual(proc.returncode, int(unsafe), context)
+                        sarif = self.decode_report(proc)
+                        records = [record for run in sarif['runs'] for record in run.get('results', [])
+                                   if record['ruleId'] == lang + '.taint.open_redirect']
+                        self.assertEqual([record['locations'][0]['physicalLocation']['region']['startLine']
+                                          for record in records], [sink_line] if unsafe else [], context)
+                        if unsafe:
+                            self.assertEqual(records[0]['properties']['extras'], findings[0]['extras'], context)
+                            self.assertEqual(len(records[0]['codeFlows'][0]['threadFlows'][0]['locations']),
+                                             len(findings[0]['extras']['taint_path']), context)
+
 
 class JVMRedirectBindingTests(unittest.TestCase):
     """Binding-equivalent regressions specified before the JVM policy changes."""
@@ -3429,6 +4054,44 @@ class PathGuardOracle { public static void main(String[] args) throws Exception 
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(proc.stdout.strip(), 'string prefix admits sibling; chained transform escapes root')
 
+    def test_symlinked_sources_keep_canonical_taint_evidence_identity(self):
+        from ubs_core.analyzers import taint_java_redirect, taint_java_traversal
+        from ubs_core.registry import RunContext
+        physical = self.root / 'physical'
+        physical.mkdir()
+        alias = self.root / 'selected-alias'
+        alias.symlink_to(physical, target_is_directory=True)
+        for lang in ('java', 'kotlin'):
+            for label, code, domain, expected in self.cases(lang):
+                if label not in {'safeRedirect', 'misleading-path-helper'}:
+                    continue
+                analyzer = taint_java_redirect if domain == 'open_redirect' else taint_java_traversal
+                path = physical / (label + ('.java' if lang == 'java' else '.kt'))
+                path.write_text(code, encoding='utf-8')
+                canonical_extras = None
+                for selected in (path, alias / path.name):
+                    case = lang + '-' + label + '-' + selected.parent.name
+                    started = time.monotonic()
+                    print(f'[{case}] RUN', flush=True)
+                    with self.subTest(case=case):
+                        records = list(analyzer.run(RunContext(lang=lang, files=[selected])))
+                        self.assertEqual({row['line'] for row in records}, expected, records)
+                        self.assertEqual(len(records), len(expected), records)
+                        self.assertTrue(all(row['rule'] == 'java.taint.' + domain for row in records), records)
+                        extras = [row['extras'] for row in records]
+                        (self.root / (case + '.json')).write_text(json.dumps({
+                            'selected': str(selected), 'canonical': str(path.resolve()),
+                            'source_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                            'records': records,
+                        }, indent=2), encoding='utf-8')
+                        self.assertTrue(all(step['path'] == str(path.resolve())
+                                            for item in extras for step in item['taint_path']), records)
+                        if canonical_extras is None:
+                            canonical_extras = extras
+                        else:
+                            self.assertEqual(extras, canonical_extras, records)
+                        print(f'[{case}] PASS ({time.monotonic() - started:.3f}s)', flush=True)
+
     def test_basename_leaf_and_directory_semantics_with_real_java(self):
         if shutil.which('java') is None:
             self.skipTest('Java runtime unavailable for the independent basename API oracle')
@@ -3667,6 +4330,29 @@ fun handler(request: Request, response: Response) {
             with self.subTest(imported=imported):
                 self.check('import ' + imported + '\n' + body, 'kotlin')
         self.check('import kotlin.require\n' + body.replace(' // unsafe', ''), 'kotlin')
+
+    def test_kotlin_check_with_a_constant_lazy_message_guards_like_require(self):
+        guard = r'target.startsWith("/") && !target.startsWith("//") && !target.contains("\\") && !target.contains("\r") && !target.contains("\n") && !target.contains("\t")'
+        body = ('fun handler(request: Request, response: Response) {\n'
+                '  val target=request.getParameter("next")\n'
+                '  check(' + guard + ') { "unsafe redirect target" }\n'
+                '  response.sendRedirect(target)\n}\n')
+        self.check(body, 'kotlin')
+        self.check('import kotlin.check\n' + body, 'kotlin')
+        unsafe = body.replace('  response.sendRedirect(target)\n', '  response.sendRedirect(target) // unsafe\n')
+        for imported in ('app.validation.check', 'app.validation.require as check', 'app.validation.*'):
+            with self.subTest(imported=imported):
+                self.check('import ' + imported + '\n' + unsafe, 'kotlin')
+        with self.subTest(case='local-check-function'):
+            self.check(unsafe + 'fun check(value: Boolean, message: () -> String) {}\n', 'kotlin')
+
+    def test_kotlin_interpolation_invalidates_the_selected_redirect_guard(self):
+        self.check(r'''fun handler(request: Request, response: Response) {
+  val target = request.getParameter("next")
+  if (!(target.startsWith("/") && !target.startsWith("//") && !target.contains("\\") && !target.contains("\r") && !target.contains("\n") && !target.contains("\t"))) { return }
+  response.sendRedirect(target)
+  response.sendRedirect("/$target") // unsafe
+}''', 'kotlin')
 
     def test_generic_and_array_parameters_do_not_inherit_argument_types(self):
         guard = r'target.startsWith("/") && !target.startsWith("//") && !target.contains("\\") && !target.contains("\r") && !target.contains("\n") && !target.contains("\t")'
@@ -4566,6 +5252,896 @@ console.log(JSON.stringify(origins));
                     self.assertEqual(actual, expected, context)
                     self.assertEqual(len(findings), len(expected), context)
                     print(f'[{label}] PASS ({time.monotonic() - started:.3f}s)', flush=True)
+
+
+class JavaDetectorSuppressionTests(unittest.TestCase):
+    """Real legacy receivers: suppress findings without deleting source facts."""
+
+    @classmethod
+    def setUpClass(cls):
+        # Keep artifacts with this test file even when a baseline harness
+        # selects a separate, immutable production checkout via REPO_ROOT.
+        artifacts = Path(__file__).resolve().parents[2] / 'test-suite/artifacts'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        cls.root = Path(tempfile.mkdtemp(prefix='a7-java-detectors-', dir=artifacts))
+        print(f'[JavaDetectorSuppressionTests] artifacts={cls.root}', flush=True)
+
+    @contextmanager
+    def case(self, label):
+        started = time.monotonic()
+        identity = self.id() + ':' + label
+        print(f'[{identity}] RUN', flush=True)
+        state = 'FAIL'
+        try:
+            yield
+            state = 'PASS'
+        finally:
+            elapsed = time.monotonic() - started
+            print(f'[{identity}] {state} ({elapsed:.3f}s)', flush=True)
+            with (self.root / 'cases.jsonl').open('a', encoding='utf-8') as output:
+                output.write(json.dumps({'case': identity, 'state': state, 'seconds': elapsed}) + '\n')
+
+    def programs(self):
+        # Explicit line tables are independent of the detector's own matches.
+        # Source lines are separated from sinks to expose lost alias state.
+        return (
+            ('archive_extraction', 'java.security.archive-extraction', 8, 5, '''import java.nio.file.Path;
+import java.util.zip.ZipEntry;
+class ArchiveProbe {
+    void extract(Path destination, ZipEntry entry) {
+        String value = entry.getName();
+        int padding = 0;
+        padding++;
+        destination.resolve(value);
+    }
+}
+''', (('destination.resolve(value)', 'destination.resolve("fixed")'),)),
+            ('header_injection', 'java.security.header-injection', 7, 4, '''import com.sun.net.httpserver.HttpExchange;
+class HeaderProbe {
+    void handle(HttpExchange request) {
+        String value = request.getRequestURI().getQuery();
+        int padding = 0;
+        padding++;
+        request.getResponseHeaders().add("X-Name", value);
+    }
+}
+''', (('add("X-Name", value)', 'add("X-Name", "fixed")'),)),
+            ('ssrf_outbound_url', 'java.security.ssrf-outbound-url', 9, 6, '''import com.sun.net.httpserver.HttpExchange;
+import java.net.URI;
+import java.net.http.HttpRequest;
+class SsrfProbe {
+    void handle(HttpExchange request) {
+        String value = request.getRequestURI().getQuery();
+        int padding = 0;
+        padding++;
+        HttpRequest.newBuilder(URI.create(value)).build();
+    }
+}
+''', (('URI.create(value)', 'URI.create("https://example.com")'),)),
+            ('security_randomness', 'java.security.insecure-randomness', 7, 4, '''import java.util.Random;
+class RandomProbe {
+    String generate() {
+        Random rng = new Random();
+        int padding = 0;
+        padding++;
+        int token = rng.nextInt();
+        return Integer.toString(token);
+    }
+}
+''', (('import java.util.Random;', 'import java.security.SecureRandom;'),
+      ('Random rng = new Random()', 'SecureRandom rng = new SecureRandom()'))),
+            ('collections_foreach', 'java.collections.foreach-remove', 6, 4, '''import java.util.List;
+class CollectionsProbe {
+    void mutate(List<String> items) {
+        for (String item : items) {
+            int padding = 0;
+            items.remove(item);
+        }
+    }
+}
+''', (('items.remove(item)', 'items.contains(item)'),)),
+            ('io_loops', 'java.io.readallbytes-loop', 7, 5, '''import java.nio.file.Files;
+import java.nio.file.Path;
+class IoProbe {
+    void read(Path path) throws java.io.IOException {
+        for (int i = 0; i < 2; i++) {
+            int padding = 0;
+            Files.readAllBytes(path);
+        }
+    }
+}
+''', (('Files.readAllBytes(path)', 'Files.exists(path)'),)),
+            ('streams_concat', 'java.streams-perf.string-plus-loop', 6, 4, '''class StreamsProbe {
+    String join(String[] items) {
+        String result = "";
+        for (String item : items) {
+            int padding = 0;
+            result += item;
+        }
+        return result;
+    }
+}
+''', (('String result = "";', 'StringBuilder result = new StringBuilder();'),
+      ('result += item;', 'result.append(item);'), ('return result;', 'return result.toString();'))),
+            ('optional_get', 'java.null-optional.optional-get', 4, None, '''import java.util.Optional;
+class OptionalProbe {
+    String read(Optional<String> value) {
+        return value.get();
+    }
+}
+''', (('value.get()', 'value.orElse("")'),)),
+            ('resource_leaks', 'java.resource.executor-leak', 4, None, '''import java.util.concurrent.Executors;
+class ExecutorProbe {
+    void launch() {
+        Executors.newSingleThreadExecutor();
+    }
+}
+''', (('Executors.newSingleThreadExecutor();', 'Executors.newSingleThreadExecutor().shutdown();'),)),
+            ('runtime_exec', 'java.security.runtime-exec', 3, None, '''class ExecProbe {
+    void run(String value) throws java.io.IOException {
+        Runtime.getRuntime().exec(value);
+    }
+}
+''', (('Runtime.getRuntime().exec(value);', 'System.out.println(value);'),)),
+            ('equals_hashcode', 'java.equality.equals-no-hashcode', 2, None, '''class EqualityProbe {
+    public boolean equals(Object other) {
+        return this == other;
+    }
+}
+''', (('class EqualityProbe {', 'class EqualityProbe {\n    public int hashCode() { return System.identityHashCode(this); }'),)),
+            ('sql_concat_fallback', 'java.sql.concat-fallback', 3, None, '''class SqlProbe {
+    String query(String value) {
+        return "SELECT id FROM users WHERE id = " + (value);
+    }
+}
+''', (('"SELECT id FROM users WHERE id = " + (value)', '"SELECT id FROM users WHERE id = 1"'),)),
+            ('control_flow', 'java.control-flow.switch-fallthrough', 4, None, '''class FallthroughProbe {
+    void run(int value) {
+        switch (value) {
+            case 1: System.out.println(value);
+            default: return;
+        }
+    }
+}
+''', (('case 1: System.out.println(value);', 'case 1: System.out.println(value); break;'),)),
+            ('control_flow', 'java.control-flow.switch-no-default', 3, None, '''class DefaultProbe {
+    void run(int value) {
+        switch (value) {
+            case 1: System.out.println(value); break;
+        }
+    }
+}
+''', (('case 1: System.out.println(value); break;', 'case 1: System.out.println(value); break;\n            default: break;'),)),
+            ('tech_debt', 'java.logging.tech-debt', 3, None, '''class DebtProbe {
+    void work() {
+        int item = 0; // TODO finish work
+    }
+}
+''', (('// TODO finish work', '// completed work'),)),
+            ('tech_debt', 'java.logging.tech-debt-significant', 3, None,
+             self.debt_program(22), (('TODO', 'completed'),)),
+        )
+
+    def debt_program(self, count):
+        return ('class SignificantDebtProbe {\n    void work() {\n' + ''.join(
+            f'        int item{index:02d} = 0; // TODO {index:02d}\n'
+            for index in range(1, count + 1)) + '    }\n}\n')
+
+    def variant(self, text, line, mode, rule, language='java'):
+        lines = text.splitlines()
+        index = line - 1
+        marker = 'ubs:ignore' if mode.endswith('bare') else f'ubs:ignore[{rule}]'
+        if mode.startswith('previous-'):
+            lines.insert(index, '        // ' + marker)
+        elif mode.endswith('quoted'):
+            raw = lines[index]
+            declaration = ('val marker = "ubs:ignore";' if language == 'kotlin'
+                           else 'String marker = "ubs:ignore";')
+            if mode.startswith('source-') or raw.rstrip().endswith('{'):
+                lines[index] += ' ' + declaration
+            elif raw.lstrip().startswith(('case ', 'default:')):
+                lines[index] = raw.replace(':', ': ' + declaration, 1)
+            else:
+                indent = raw[:len(raw) - len(raw.lstrip())]
+                lines[index] = indent + declaration + ' ' + raw.lstrip()
+        else:
+            lines[index] += ' // ' + marker
+        return '\n'.join(lines) + '\n'
+
+    def direct(self, module_name, text, label, expected):
+        module = importlib.import_module('ubs_core.java_detectors.' + module_name)
+        path = self.root / (label + '.java')
+        path.write_text(text, encoding='utf-8')
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            hits = list(module.find([path]))
+        (self.root / (label + '.direct.json')).write_text(json.dumps({
+            'source_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+            'expected': expected, 'hits': hits, 'stdout': stdout.getvalue(), 'stderr': stderr.getvalue(),
+        }, default=str, indent=2), encoding='utf-8')
+        actual = []
+        for hit in hits:
+            self.assertEqual(len(hit), 5 if hasattr(module, 'RULES') else 4, repr(hits))
+            if hasattr(module, 'RULES'):
+                rule, source, line, col, detail = hit
+            else:
+                source, line, col, detail = hit
+                rule = module.RULE_ID
+            self.assertEqual(Path(source), path)
+            self.assertTrue(detail)
+            actual.append((rule, line, col))
+        self.assertEqual(sorted(actual), sorted(expected), repr(hits))
+
+    def test_all_java_receivers_exact_sites_and_marker_ownership(self):
+        for number, (module, rule, line, _, text, replacements) in enumerate(self.programs()):
+            sites = list(range(3, 25)) if rule.endswith('tech-debt-significant') else [line]
+            for mode in ('unmarked', 'safe', 'bare', 'exact', 'unrelated', 'quoted',
+                         'previous-exact', 'previous-unrelated'):
+                label = f'java-{number:02d}-{module}-{mode}'
+                with self.subTest(case=label), self.case(label):
+                    code, expected_lines = text, sites
+                    if mode == 'safe':
+                        for old, new in replacements:
+                            self.assertIn(old, code)
+                            code = code.replace(old, new)
+                        expected_lines = []
+                    elif mode != 'unmarked':
+                        marker_rule = 'java.unrelated.rule' if 'unrelated' in mode else rule
+                        code = self.variant(text, line, mode, marker_rule)
+                        shift = int(mode.startswith('previous-'))
+                        expected_lines = [site + shift for site in sites
+                                          if mode not in ('bare', 'exact', 'previous-exact') or site != line]
+                    self.direct(module, code, label, [(rule, site, 1) for site in expected_lines])
+
+    def test_marked_sources_preserve_later_unmarked_sinks(self):
+        for module, rule, line, source_line, text, _ in self.programs():
+            if source_line is None:
+                continue
+            for mode in ('source-bare', 'source-exact', 'source-unrelated', 'source-quoted'):
+                label = module + '-' + mode
+                with self.subTest(case=label), self.case(label):
+                    marker_rule = 'java.unrelated.rule' if mode.endswith('unrelated') else rule
+                    code = self.variant(text, source_line, mode, marker_rule)
+                    self.direct(module, code, label, [(rule, line, 1)])
+
+    def test_public_rule_selection_preserves_counter_and_primary_facts(self):
+        fallthrough = 'java.control-flow.switch-fallthrough'
+        no_default = 'java.control-flow.switch-no-default'
+        two_rules = '''class TwoRulesProbe {
+    void run(int value) {
+        switch (value) {
+            case 1: System.out.println(value);
+        }
+    }
+}
+'''
+        for label, line, marker_rule, expected in (
+            ('switch-other-public', 3, fallthrough, [(fallthrough, 4, 1), (no_default, 3, 1)]),
+            ('case-other-public', 4, no_default, [(fallthrough, 4, 1), (no_default, 3, 1)]),
+            ('switch-owned', 3, no_default, [(fallthrough, 4, 1)]),
+            ('case-owned', 4, fallthrough, [(no_default, 3, 1)]),
+        ):
+            with self.subTest(case=label), self.case(label):
+                self.direct('control_flow', self.variant(two_rules, line, 'exact', marker_rule), label, expected)
+        safe_switch = '''class SafeSwitchProbe {
+    void run(int value) {
+        switch (value) {
+            case 1: System.out.println(value);
+                break;
+            default: return;
+        }
+    }
+}
+'''
+        for fact, line, rule in (('break', 5, fallthrough), ('default', 6, no_default)):
+            for mode in ('bare', 'exact', 'unrelated', 'quoted'):
+                label = 'switch-safe-fact-' + fact + '-' + mode
+                with self.subTest(case=label), self.case(label):
+                    marker_rule = 'java.unrelated.rule' if mode == 'unrelated' else rule
+                    self.direct('control_flow', self.variant(safe_switch, line, mode, marker_rule), label, [])
+        for count in (20, 21):
+            rule = 'java.logging.tech-debt' + ('-significant' if count > 20 else '')
+            for mode, marker_rule in (('unmarked', rule), ('exact', rule),
+                                      ('unrelated', 'java.unrelated.rule'),
+                                      ('other-public', 'java.logging.tech-debt' if count > 20
+                                       else 'java.logging.tech-debt-significant')):
+                label = f'debt-tier-{count}-{mode}'
+                with self.subTest(case=label), self.case(label):
+                    text = self.debt_program(count)
+                    if mode != 'unmarked':
+                        text = self.variant(text, 3, 'exact', marker_rule)
+                    first = 4 if mode == 'exact' else 3
+                    self.direct('tech_debt', text, label,
+                                [(rule, line, 1) for line in range(first, count + 3)])
+        primary = self.programs()[11][4].replace(' + (value)', ' + value')
+        for mode, marker_rule in (('unmarked', 'java.sql.concat'), ('bare', 'java.sql.concat'),
+                                  ('exact', 'java.sql.concat'), ('fallback-exact', 'java.sql.concat-fallback'),
+                                  ('unrelated', 'java.unrelated.rule'), ('quoted', 'java.sql.concat')):
+            label = 'sql-primary-facts-' + mode
+            with self.subTest(case=label), self.case(label):
+                text = primary if mode == 'unmarked' else self.variant(primary, 3, mode, marker_rule)
+                self.direct('sql_concat_fallback', text, label, [])
+
+    def test_kotlin_adapter_uses_actual_public_ids_and_keeps_source_state(self):
+        from ubs_core.kotlin_scan import scan_detectors
+        programs = (
+            ('archive-extraction', 7, 4, '''import java.nio.file.Path
+import java.util.zip.ZipEntry
+fun extract(destination: Path, entry: ZipEntry) {
+    val value = entry.getName();
+    val padding = 0;
+    println(padding);
+    destination.resolve(value);
+}
+''', ('destination.resolve(value)', 'destination.resolve("fixed")')),
+            ('header-injection', 6, 3, '''import com.sun.net.httpserver.HttpExchange
+fun handle(request: HttpExchange) {
+    val value = request.getRequestURI().getQuery();
+    val padding = 0;
+    println(padding);
+    request.getResponseHeaders().add("X-Name", value);
+}
+''', ('add("X-Name", value)', 'add("X-Name", "fixed")')),
+            ('ssrf-outbound-url', 8, 5, '''import com.sun.net.httpserver.HttpExchange
+import java.net.URI
+import java.net.http.HttpRequest
+fun handle(request: HttpExchange) {
+    val value = request.getRequestURI().getQuery();
+    val padding = 0;
+    println(padding);
+    HttpRequest.newBuilder(URI.create(value)).build();
+}
+''', ('URI.create(value)', 'URI.create("https://example.com")')),
+            ('insecure-randomness', 6, 3, '''import java.util.Random
+fun generate(): String {
+    val rng = Random();
+    val padding = 0;
+    println(padding);
+    val token = rng.nextInt();
+    return token.toString();
+}
+''', ('Random', 'java.security.SecureRandom')),
+        )
+        for slug, line, source_line, text, safe_change in programs:
+            rule = 'kotlin.security.' + slug
+            for mode in ('unmarked', 'safe', 'bare', 'exact', 'unrelated', 'quoted',
+                         'previous-exact', 'previous-unrelated', 'java-public',
+                         'source-bare', 'source-exact', 'source-unrelated', 'source-quoted'):
+                label = 'kotlin-' + slug + '-' + mode
+                with self.subTest(case=label), self.case(label):
+                    code = text
+                    if mode == 'safe':
+                        if slug == 'insecure-randomness':
+                            code = code.replace('import java.util.Random', 'import java.security.SecureRandom')
+                            code = code.replace('Random()', 'SecureRandom()')
+                        else:
+                            code = code.replace(*safe_change)
+                    elif mode != 'unmarked':
+                        marker_rule = ('java.security.' + slug if mode == 'java-public' else
+                                       'kotlin.unrelated.rule' if 'unrelated' in mode else rule)
+                        target = source_line if mode.startswith('source-') else line
+                        code = self.variant(text, target, mode, marker_rule, language='kotlin')
+                    path = self.root / (label + '.kt')
+                    path.write_text(code, encoding='utf-8')
+                    sink = io.StringIO()
+                    scan_detectors([path], sink, set())
+                    records = [json.loads(raw) for raw in sink.getvalue().splitlines()]
+                    (self.root / (label + '.ndjson')).write_text(sink.getvalue(), encoding='utf-8')
+                    expected = [] if mode in ('safe', 'bare', 'exact', 'previous-exact') else [
+                        (rule, line + int(mode.startswith('previous-')), 1, 'critical')]
+                    self.assertEqual([(row['rule'], row['line'], row['col'], row['severity'])
+                                      for row in records], expected, records)
+                    self.assertTrue(all(Path(row['path']) == path for row in records))
+
+    def test_native_sql_fallback_json_and_sarif_positive_safe_and_owned(self):
+        rule = 'java.sql.concat-fallback'
+        text = self.programs()[11][4]
+        for mode in ('unmarked', 'safe', 'unrelated', 'quoted', 'exact', 'previous-exact'):
+            code = text
+            if mode == 'safe':
+                code = code.replace('"SELECT id FROM users WHERE id = " + (value)',
+                                    '"SELECT id FROM users WHERE id = 1"')
+            elif mode != 'unmarked':
+                code = self.variant(text, 3, mode, 'java.unrelated.rule' if mode == 'unrelated' else rule)
+            path = self.root / ('native-sql-' + mode + '.java')
+            path.write_text(code, encoding='utf-8')
+            expected = [] if mode in ('safe', 'exact', 'previous-exact') else [(rule, 3, 1)]
+            for fmt in ('json', 'sarif'):
+                label = 'native-sql-' + mode + '-' + fmt
+                with self.subTest(case=label), self.case(label):
+                    directory = self.root / label
+                    directory.mkdir()
+                    command = [str(REPO_ROOT / 'modules/ubs-java.sh'), '--ci', '--no-color',
+                               '--only=13', '--fail-on-warning', '--format=' + fmt, str(path)]
+                    env = dict(os.environ, UBS_NO_CACHE='1', UBS_NO_AUTO_UPDATE='1',
+                               PYTHONDONTWRITEBYTECODE='1', ENABLE_UV_TOOLS='0')
+                    started = time.monotonic()
+                    proc = subprocess.run(command, cwd=directory, env=env, capture_output=True,
+                                          text=True, timeout=120)
+                    (directory / 'stdout.log').write_text(proc.stdout, encoding='utf-8')
+                    (directory / 'stderr.log').write_text(proc.stderr, encoding='utf-8')
+                    (directory / 'identity.json').write_text(json.dumps({
+                        'case': self.id() + ':' + label, 'command': command, 'cwd': str(directory),
+                        'source_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                        'exit': proc.returncode, 'seconds': time.monotonic() - started,
+                    }, indent=2), encoding='utf-8')
+                    context = f'{command!r}\nexit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}'
+                    self.assertNotIn('Traceback (most recent call last)', proc.stderr, context)
+                    self.assertEqual(proc.returncode, int(bool(expected)), context)
+                    summaries = [json.loads(raw) for raw in proc.stderr.splitlines()
+                                 if raw.startswith('{"counters":')]
+                    self.assertEqual(len(summaries), 1, context)
+                    self.assertEqual(summaries[0]['counters'],
+                                     {'critical': 0, 'warning': len(expected), 'info': 0}, context)
+                    self.assertEqual(summaries[0]['errors'], [], context)
+                    report = json.loads(proc.stdout)
+                    if fmt == 'json':
+                        self.assertEqual(report['status'], 'ok', context)
+                        self.assertEqual(report['files'], 1, context)
+                        self.assertEqual({key: report[key] for key in ('critical', 'warning', 'info')},
+                                         {'critical': 0, 'warning': len(expected), 'info': 0}, context)
+                        actual = [(row['rule'], row['line'], row['col']) for row in report['findings']]
+                        self.assertTrue(all(Path(row['path']) == path for row in report['findings']), context)
+                    else:
+                        results = [row for run in report['runs'] for row in run['results']]
+                        actual = [(row['ruleId'], row['locations'][0]['physicalLocation']['region']['startLine'],
+                                   row['locations'][0]['physicalLocation']['region']['startColumn']) for row in results]
+                        self.assertTrue(all(row['level'] == 'warning' for row in results), context)
+                        self.assertTrue(all(row['locations'][0]['physicalLocation']['artifactLocation']['uri']
+                                            == str(path) for row in results), context)
+                    self.assertEqual(actual, expected, context)
+
+
+class SwiftCppSuppressionTests(unittest.TestCase):
+    """Real legacy producers must retain facts before suppressing owned diagnostics."""
+
+    SECURITY_CASES = (
+        ("swift_detectors.header_injection", "swift", "swift.taint.header-injection", 2, 4, [4],
+         'func displayName(req: Request, response: inout Response) {\n'
+         '    let name = req.query["displayName"] ?? "guest"\n    _ = 0\n'
+         '    response.headers["X-Display-Name"] = name\n}\n',
+         'func displayName(req: Request, response: inout Response) {\n'
+         '    let name = safeHeaderValue(req.query["displayName"] ?? "guest")\n    _ = 0\n'
+         '    response.headers["X-Display-Name"] = name\n}\n',
+         "swift/header_injection_clean/HeadersSafe.swift"),
+        ("swift_detectors.outbound_url", "swift", "swift.taint.outbound-url", 2, 4, [4],
+         'func fetchQueryURL(req: Request) {\n'
+         '    let target = req.query["url"] ?? "https://example.com"\n    _ = 0\n'
+         '    URLSession.shared.dataTask(with: URL(string: target)!).resume()\n}\n',
+         'func fetchQueryURL(req: Request) throws {\n'
+         '    let target = try safeOutboundURL(req.query["url"] ?? "https://api.example.com")\n'
+         '    _ = 0\n    URLSession.shared.dataTask(with: target).resume()\n}\n',
+         "swift/ssrf_clean/RequestURLsSafe.swift"),
+        ("swift_detectors.archive_extraction", "swift", "swift.security.archive-extraction", 2, 4, [4],
+         'func archiveTarget(entry: ArchiveEntry, destination: URL) -> URL {\n'
+         '    let name = entry.path\n    _ = 0\n'
+         '    return destination.appendingPathComponent(name)\n}\n',
+         'func archiveTarget(entry: ArchiveEntry, destination: URL) throws -> URL {\n'
+         '    let name = entry.path\n    _ = 0\n'
+         '    return try safeArchiveURL(destination: destination, entryPath: name)\n}\n',
+         "swift/archive_extraction_clean/ZipSlipSafe.swift"),
+        ("swift_detectors.security_randomness", "swift", "swift.crypto.weak-randomness", 2, 4, [2, 4],
+         'func issueApiKey() -> String {\n    var rng = SystemRandomNumberGenerator()\n'
+         '    _ = 0\n' + r'    return "ak_\(rng.next())"' + '\n}\n',
+         'import Security\nfunc sessionToken() -> [UInt8] {\n'
+         '    var bytes = [UInt8](repeating: 0, count: 32)\n'
+         '    let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)\n'
+         '    guard status == errSecSuccess else { return [] }\n    return bytes\n}\n',
+         "swift/security_randomness_clean/Tokens.swift"),
+        ("analyzers.taint_swift_traversal", "swift", "swift.taint.request_path_traversal", 2, 4, [4],
+         'func readDownload(req: Request) throws -> String {\n'
+         '    let path = req.query["file"] ?? "index.html"\n    _ = 0\n'
+         '    return try String(contentsOfFile: path)\n}\n',
+         'func readDownload(req: Request) throws -> String {\n'
+         '    let requested = req.query["file"] ?? "index.html"\n'
+         '    let path = URL(fileURLWithPath: requested).lastPathComponent\n'
+         '    return try String(contentsOfFile: path)\n}\n',
+         "swift/path_traversal_clean/RequestPathsSafe.swift"),
+        ("analyzers.taint_swift_redirect", "swift", "swift.taint.request_open_redirect", 2, 4, [4],
+         'func queryRedirect(req: Request) -> Response {\n'
+         '    let target = req.query["returnUrl"] ?? "/"\n    _ = 0\n'
+         '    return req.redirect(to: target)\n}\n',
+         'func localOnly(req: Request) throws -> Response {\n'
+         '    let target = req.query["returnUrl"] ?? "/"\n'
+         '    guard let url = URL(string: target), let host = url.host, allowedHosts.contains(host) else {\n'
+         '        throw Abort(.badRequest)\n    }\n    return req.redirect(to: target)\n}\n',
+         "swift/open_redirect_clean/RedirectsSafe.swift"),
+        ("cpp_detectors.header_injection", "cpp", "cpp.detector.header-injection", 2, 4, [4],
+         'void display_name(const Request& req, Response& response) {\n'
+         '    auto name = req.get_param_value("display_name");\n    (void)0;\n'
+         '    response.set_header("X-Display-Name", name);\n}\n',
+         'void display_name(const Request& req, Response& response) {\n'
+         '    auto name = safe_header_value(req.get_param_value("display_name"));\n    (void)0;\n'
+         '    response.set_header("X-Display-Name", name);\n}\n',
+         "cpp/security/header_injection_clean.cpp"),
+        ("cpp_detectors.outbound_url", "cpp", "cpp.detector.outbound-url", 2, 5, [5],
+         'void fetch_from_query(CURL* curl) {\n    const char* raw = getenv("QUERY_STRING");\n'
+         '    std::string target = raw ? raw : "https://example.com";\n    (void)0;\n'
+         '    curl_easy_setopt(curl, CURLOPT_URL, target.c_str());\n}\n',
+         'void fetch_from_query(CURL* curl) {\n'
+         '    const std::string target = safe_outbound_url(getenv("QUERY_STRING"));\n    (void)0;\n'
+         '    curl_easy_setopt(curl, CURLOPT_URL, target);\n}\n',
+         "cpp/security/ssrf_clean.cpp"),
+        ("cpp_detectors.archive_entry", "cpp", "cpp.detector.archive-entry", 2, 4, [4],
+         'void archive_target(archive_entry* entry, const fs::path& destination) {\n'
+         '    const char* name = archive_entry_pathname(entry);\n    (void)0;\n'
+         '    auto target = destination / name;\n}\n',
+         'void archive_target(archive_entry* entry, const fs::path& destination) {\n'
+         '    const char* name = archive_entry_pathname(entry);\n    (void)0;\n'
+         '    auto target = safe_archive_path(destination, name);\n}\n',
+         "cpp/archive_extraction_clean/zip_slip_safe.cpp"),
+        ("cpp_detectors.weak_random", "cpp", "cpp.detector.weak-random", 3, 5, [3, 5],
+         '#include <random>\nunsigned sessionToken() {\n    std::mt19937 rng(1);\n'
+         '    (void)0;\n    return rng();\n}\n',
+         'extern "C" int RAND_bytes(unsigned char* buf, int num);\n'
+         'void sessionToken(unsigned char* bytes) {\n'
+         '    if (RAND_bytes(bytes, 32) != 1) throw 1;\n}\n',
+         "cpp/security_randomness_clean/tokens.cpp"),
+        ("analyzers.taint_cpp_traversal", "cpp", "cpp.taint.path_traversal", 2, 4, [4],
+         'void read_download(const Request& req) {\n'
+         '    std::string path = req.getParam("file");\n    (void)0;\n'
+         '    std::ifstream input(path);\n}\n',
+         'void read_download(const Request& req) {\n'
+         '    std::string path = sanitize_filename(req.getParam("file"));\n    (void)0;\n'
+         '    std::ifstream input(path);\n}\n',
+         "cpp/security/path_traversal_clean.cpp"),
+        ("analyzers.taint_cpp_redirect", "cpp", "cpp.taint.open_redirect", 2, 4, [4],
+         'void query_redirect(const Request& req, Response& res) {\n'
+         '    std::string url = req.getParam("next");\n    (void)0;\n    res.redirect(url);\n}\n',
+         'void query_redirect(const Request& req, Response& res) {\n'
+         '    std::string url = validate_redirect_target(req.getParam("next"));\n'
+         '    (void)0;\n    res.redirect(url);\n}\n',
+         "cpp/security/open_redirect_clean.cpp"),
+    )
+    # main's C++/Swift flow engines (d3cc89c7, 65eeb694, 48725603) give an
+    # unbound helper name or an undeclared allowlist no trust, so these inline
+    # programs still reach the sink there (expected sink lines below). The
+    # shipped clean fixtures (original-safe) carry the safe side for them.
+    UNBOUND_SAFE = {
+        "analyzers.taint_swift_redirect": [6],
+        "analyzers.taint_cpp_traversal": [4],
+        "analyzers.taint_cpp_redirect": [4],
+    }
+    DERIVED_CASES = (
+        ("swift_patterns.errors_security", "_process_residual", "swift.security.process-other", "Case.swift", 3,
+         'import Foundation\nfunc runFixedTool() throws {\n    let process = Process()\n'
+         '    process.executableURL = URL(fileURLWithPath: "/usr/bin/stat")\n'
+         '    process.arguments = ["--version"]\n    try process.run()\n}\n',
+         'import Foundation\nfunc runShellTool() throws {\n    let process = Process()\n'
+         '    process.executableURL = URL(fileURLWithPath: "/bin/sh")\n'
+         '    process.arguments = ["-c", "ls"]\n    try process.run()\n}\n', 0),
+        ("swift_patterns.threading_perf", "_filehandle_imbalance", "swift.files.filehandle", "Case.swift", 3,
+         'import Foundation\nfunc readFile() throws {\n'
+         '    let handle = try FileHandle(forReadingFrom: URL(fileURLWithPath: "/tmp/data"))\n'
+         '    _ = 0\n}\n',
+         'import Foundation\nfunc readFile() throws {\n'
+         '    let handle = try FileHandle(forReadingFrom: URL(fileURLWithPath: "/tmp/data"))\n'
+         '    _ = 0\n    try handle.close()\n}\n', 5),
+        ("swift_patterns.threading_perf", "_main_actor_presence", "swift.threading.main-actor", "Case.swift", 1,
+         'import SwiftUI\nfinal class ViewModel {}\n',
+         'import SwiftUI\n@MainActor final class ViewModel {}\n', 2),
+        ("swift_patterns.misc_cats", "_packaging", "swift.packaging.branch-pins", "Package.swift", 3,
+         'import PackageDescription\nlet dependencies: [Package.Dependency] = [\n'
+         '    .package(url: "https://example.com/pkg.git", .branch("main"))\n]\n'
+         'let package = Package(name: "Demo", dependencies: dependencies)\n',
+         'import PackageDescription\nlet dependencies: [Package.Dependency] = [\n'
+         '    .package(url: "https://example.com/pkg.git", .exact("1.2.3"))\n]\n'
+         'let package = Package(name: "Demo", dependencies: dependencies)\n', 0),
+        ("swift_patterns.misc_cats", "_packaging", "swift.packaging.unsafe-flags", "Package.swift", 2,
+         'import PackageDescription\nlet flags: [SwiftSetting] = [.unsafeFlags(["-Ounchecked"])]\n'
+         'let package = Package(name: "Demo", targets: [.target(name: "Demo", swiftSettings: flags)])\n',
+         'import PackageDescription\nlet flags: [SwiftSetting] = [.define("FEATURE")]\n'
+         'let package = Package(name: "Demo", targets: [.target(name: "Demo", swiftSettings: flags)])\n', 0),
+    )
+
+    def setUp(self):
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        self.scratch = tempfile.TemporaryDirectory(prefix="swift-cpp-suppression-", dir=artifacts)
+        self.addCleanup(self.scratch.cleanup)
+        self.root = Path(self.scratch.name)
+
+    @staticmethod
+    def marked(text, line, mode, rule, lang="swift"):
+        lines = text.splitlines()
+        marker = ('; _ = "ubs:ignore"' if lang == "swift" else ' (void)"ubs:ignore";') if mode == "quoted" else (
+            " // ubs:ignore" if mode == "bare" else
+            f" // ubs:ignore[{'unrelated.rule' if mode == 'wrong' else rule}]")
+        lines[line - 1] += marker
+        return "\n".join(lines) + "\n"
+
+    def invoke(self, module_name, lang, filename, text, label, function=None):
+        from ubs_core.registry import RunContext
+        from ubs_core.swift_scan import ScanContext
+        from ubs_core.suppression import SourceSuppressions
+
+        directory = self.root / label
+        directory.mkdir()
+        path = directory / filename
+        path.write_text(text, encoding="utf-8")
+        module = importlib.import_module("ubs_core." + module_name)
+        stdout, stderr = io.StringIO(), io.StringIO()
+        started = time.monotonic()
+        try:
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                if function is not None:
+                    records = list(getattr(module, function)(ScanContext(files=[path], project_dir=directory)))
+                elif module_name.startswith("swift_detectors."):
+                    records = list(module.scan(ScanContext(files=[path], project_dir=directory)))
+                elif module_name.startswith("cpp_detectors."):
+                    records = [{"rule": module.RULE_ID, "path": str(source), "line": line,
+                                "col": col, "detail": detail, "severity": module.SEVERITY}
+                               for source, line, col, detail in module.find([path])]
+                else:
+                    records = list(module.run(RunContext(lang=lang, files=[path])))
+        finally:
+            (directory / "stdout.log").write_text(stdout.getvalue(), encoding="utf-8")
+            (directory / "stderr.log").write_text(stderr.getvalue(), encoding="utf-8")
+        policy = SourceSuppressions(lang)
+        policy.index(path, text)
+        final = policy.filter(records)
+        (directory / "findings.json").write_text(json.dumps(
+            {"raw": records, "final": final}, indent=2, default=str), encoding="utf-8")
+        (directory / "identity.json").write_text(json.dumps({
+            "case": self.id() + ":" + label, "module": module_name, "function": function,
+            "source_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "producer_sha256": hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest(),
+            "seconds": time.monotonic() - started,
+        }, indent=2), encoding="utf-8")
+        return path, records, final
+
+    def test_security_markers_preserve_exact_rules_and_source_facts(self):
+        checked = 0
+        for module, lang, rule, source_line, sink_line, baseline, positive, safe, original_safe in self.SECURITY_CASES:
+            safe_variant = (("unbound-helper", safe, self.UNBOUND_SAFE[module]) if module in self.UNBOUND_SAFE
+                            else ("safe", safe, []))
+            variants = [("unmarked", positive, baseline), safe_variant,
+                        ("original-safe", (REPO_ROOT / "test-suite" / original_safe).read_text(encoding="utf-8"), [])]
+            for site, line in (("source", source_line), ("sink", sink_line)):
+                for mode in ("bare", "exact", "wrong", "quoted"):
+                    expected = [hit for hit in baseline if hit != line] if mode in ("bare", "exact") else baseline
+                    variants.append((site + "-" + mode, self.marked(positive, line, mode, rule, lang), expected))
+            for mode, text, expected in variants:
+                label = module.replace(".", "-") + "-" + mode
+                with self.subTest(producer=module, variant=mode):
+                    path, records, final = self.invoke(module, lang, "Case." + ("swift" if lang == "swift" else "cpp"),
+                                                       text, label)
+                    expected_rows = [(rule, line, 1, "critical") for line in expected]
+                    actual = lambda rows: [(row["rule"], row["line"], row.get("count", 1), row["severity"]) for row in rows]
+                    self.assertEqual(actual(records), expected_rows, records)
+                    self.assertEqual(actual(final), expected_rows, final)
+                    self.assertTrue(all(Path(row["path"]) == path.resolve() for row in records), records)
+                checked += 1
+        self.assertEqual(checked, 132)
+
+    def test_swift_derived_preserves_safe_facts_and_exact_contributions(self):
+        checked = 0
+        for module, function, rule, filename, line, positive, safe, fact_line in self.DERIVED_CASES:
+            baseline = [(3, 1)] if function == "_process_residual" else [(0, 1)]
+            variants = [("unmarked", positive, baseline), ("safe", safe, [])]
+            for mode in ("bare", "exact", "wrong", "quoted"):
+                # An absence aggregate is not owned by the UI import; real
+                # MainActor evidence remains a fact under every marker.
+                expected = [] if mode in ("bare", "exact") and function != "_main_actor_presence" else baseline
+                variants.append(("sink-" + mode, self.marked(positive, line, mode, rule), expected))
+                if fact_line:
+                    variants.append(("fact-" + mode, self.marked(safe, fact_line, mode, rule), []))
+            for mode, text, expected in variants:
+                label = rule.replace(".", "-") + "-" + mode
+                with self.subTest(rule=rule, variant=mode):
+                    _path, records, final = self.invoke(module, "swift", filename, text, label, function)
+                    expected_rows = [(rule, site, count) for site, count in expected]
+                    actual = lambda rows: [(row["rule"], row["line"], row["count"]) for row in rows]
+                    self.assertEqual(actual(records), expected_rows, records)
+                    self.assertEqual(actual(final), expected_rows, final)
+                checked += 1
+        self.assertEqual(checked, 38)
+
+    def test_original_taint_controls_are_unchanged(self):
+        checked = 0
+        for name in ("taint_swift_traversal", "taint_swift_redirect", "taint_cpp_traversal", "taint_cpp_redirect"):
+            module = importlib.import_module("ubs_core.analyzers." + name)
+            for label, original in module.SELF_TESTS:
+                with self.subTest(analyzer=name, control=label):
+                    stdout, stderr = io.StringIO(), io.StringIO()
+                    try:
+                        with redirect_stdout(stdout), redirect_stderr(stderr):
+                            original()
+                    finally:
+                        (self.root / (name + "-" + label + ".stdout.log")).write_text(stdout.getvalue(), encoding="utf-8")
+                        (self.root / (name + "-" + label + ".stderr.log")).write_text(stderr.getvalue(), encoding="utf-8")
+                checked += 1
+        # main's rewritten engines embed 19 controls (SwiftPine's base had 15).
+        self.assertEqual(checked, 19)
+
+
+class SwiftLexicalFrontendTests(unittest.TestCase):
+    """Selected Swift lexical contracts, not Foundation runtime proof."""
+
+    LEXICAL_CASES = (
+        ('plain', 'let target = req.query["returnUrl"] ?? "/"\n', True),
+        ('literal', 'let note = "req.query // ubs:ignore[swift.taint.request_open_redirect]"\n', False),
+        ('nested-comment', '/* outer /* inner */ req.query */\nlet fixed = 1\n', False),
+        ('triple', 'let note = """\nreq.query // ubs:ignore[swift.taint.request_open_redirect]\n"""\n', False),
+        ('raw-one', 'let note = #"quote " req.query // ubs:ignore[swift.taint.request_open_redirect]"#\n', False),
+        ('raw-two', 'let note = ##"short closer "# req.query \\#(req.query)"##\n', False),
+        ('raw-triple', 'let note = ##"""\nshort closer """# req.query\n"""##\n', False),
+        ('interpolation', 'let target = "prefix \\(req.query["returnUrl"] ?? "/")"\n', True),
+        ('triple-interpolation', 'let target = """\nprefix \\(req.query["returnUrl"] ?? "/")\n"""\n', True),
+        ('raw-interpolation', 'let target = #"prefix \\#(req.query["returnUrl"] ?? "/")"#\n', True),
+        ('wrong-raw-interpolation', 'let note = ##"\\(req.query) \\#(req.query)"##\n', False),
+        ('two-raw-interpolation', 'let target = ##"\\##(req.query["returnUrl"] ?? "/")"##\n', True),
+        ('nested-call', 'let target = "\\(String(describing: (req.query["returnUrl"] ?? "/")))"\n', True),
+        ('comment-in-interpolation', 'let target = "\\(/* outer /* inner */ tail */ req.query["returnUrl"] ?? "/")"\n', True),
+        ('escaped-interpolation', 'let note = "\\\\(req.query[\\"returnUrl\\"])"\n', False),
+        ('unicode', 'let café = "雪 🐦 req.query"\nlet fixed = 1\n', False),
+        ('division', 'let ratio = req.query.count / 2\n', True),
+    )
+
+    def test_swift_lexical_payloads_and_all_existing_view_modes(self):
+        for name, source, active in self.LEXICAL_CASES:
+            for strings, comments, preserve in ((True, True, False), (True, True, True),
+                                                (False, True, False), (False, False, False)):
+                with self.subTest(case=name, strings=strings, comments=comments, preserve=preserve):
+                    actual = strip_comments_and_strings(source, lang="swift", strip_strings=strings,
+                                                        strip_comments=comments, preserve_comments=preserve)
+                    self.assertEqual(len(actual), len(source))
+                    self.assertEqual([i for i, c in enumerate(actual) if c == '\n'],
+                                     [i for i, c in enumerate(source) if c == '\n'])
+                    if strings and not preserve:
+                        self.assertEqual('req.query' in actual, active, actual)
+                    if not strings and not comments:
+                        self.assertEqual(actual, source)
+
+    def test_swift_markers_in_literals_are_inert_and_interpolation_comments_are_real(self):
+        from ubs_core.suppression import parse_markers
+        rule = 'swift.taint.request_open_redirect'
+        for source in ('let note = "// ubs:ignore[' + rule + ']"\n',
+                       'let note = #"quote " // ubs:ignore[' + rule + ']"#\n',
+                       'let note = ##"""\n"""# // ubs:ignore[' + rule + ']\n"""##\n',
+                       'let pattern = #/ // ubs:ignore[' + rule + '] /#\n'):
+            with self.subTest(source=source):
+                self.assertEqual(parse_markers(source, 'swift'), [])
+        source = 'let target = "\\(/* ubs:ignore[' + rule + '] */ req.query["returnUrl"] ?? "/")"\n'
+        markers = parse_markers(source, 'swift')
+        self.assertEqual([(m.line, m.rules) for m in markers], [(1, frozenset({rule}))])
+
+    def test_swift_regex_literals_are_opaque_and_division_stays_code(self):
+        # The Swift taint lexer reads these as regex literals too; SwiftPine's
+        # lexer rejected them as unsupported (b2ca4d04).
+        for source in ('let pattern = /req.query/\n', 'let pattern = #/req.query//#\n',
+                       'if s.contains(/req.query/) {}\n', 'switch s { case /req.query/: break }\n',
+                       'let pattern = #/\n  req.query // x\n/#\n'):
+            with self.subTest(source=source):
+                actual = strip_comments_and_strings(source, lang='swift')
+                self.assertNotIn('req.query', actual)
+                self.assertEqual([i for i, c in enumerate(actual) if c == '\n'],
+                                 [i for i, c in enumerate(source) if c == '\n'])
+        # A quote inside a regex literal opens no string.
+        self.assertIn('req.query', strip_comments_and_strings(
+            'let pattern = /a"b/\nlet target = req.query\n', lang='swift'))
+        # Swift lexes these slashes as operators (SE-0354): after an operand,
+        # before a blank, and an operator reference with no closing slash.
+        for source in ('let n = req.query.count / 2\n', 'let r = (a) / b / req.query\n',
+                       'let r = a! / req.query.count\n', 'let r = 10 / req.query.count / 2\n',
+                       'x /= 2; let y = req.query\n', 'let r = xs.reduce(1, /)\nlet t = req.query\n'):
+            with self.subTest(source=source):
+                self.assertEqual(strip_comments_and_strings(source, lang='swift'), source)
+        with self.assertRaisesRegex(ValueError, 'Unterminated Swift regex.*incomplete'):
+            strip_comments_and_strings('let pattern = #/req.query\n', lang='swift')
+
+    def test_swift_real_core_cli_keeps_partial_evidence_and_never_caches_incomplete_analysis(self):
+        programs = (
+            ('capture', 'func incomplete(req: Request) { let path = req.query["path"] ?? ""; '
+             'func captured() -> String { return path }; _ = try String(contentsOfFile: captured()) }\n'),
+            # A marker whose comment structure cannot be lexed has no provable
+            # ownership: the file is excluded and the scan is partial.
+            ('unlexable', '// ubs:ignore[swift.taint.request_open_redirect]\n'
+             'func incomplete(req: Request) { _ = try String(contentsOfFile: req.query["path"] ?? "") }\n'
+             '/* unterminated\n'),
+            ('regex', 'func complete(req: Request) { let pattern = /req.query/; '
+             '_ = try String(contentsOfFile: req.query["path"] ?? "") }\n'),
+        )
+        with tempfile.TemporaryDirectory(prefix='ubs_swift_partial_', dir=REPO_ROOT / 'test-suite/artifacts') as temporary:
+            root = Path(temporary)
+            supported = root / 'Supported.swift'
+            supported.write_text('func route(req: Request) { _ = try String(contentsOfFile: req.query["path"] ?? "") }\n')
+            for name, program in programs:
+                folder = root / name
+                folder.mkdir()
+                other = folder / 'Other.swift'
+                other.write_text(program)
+                files = folder / 'files.nul'
+                files.write_bytes(os.fsencode(supported.resolve()) + b'\0' + os.fsencode(other.resolve()) + b'\0')
+                for stage, no_cache, skipped in (('cold', False, ''), ('repeat', False, ''),
+                                                 ('disabled', True, ''), ('excluded-taint', True, '6'),
+                                                 ('excluded-all', True, ','.join(str(category) for category in range(1, 24)))):
+                    destination = folder / stage
+                    destination.mkdir()
+                    sink, summary = destination / 'findings.ndjson', destination / 'summary.json'
+                    stats, text = destination / 'cache.json', destination / 'report.txt'
+                    command = [sys.executable, '-B', '-m', 'ubs_core.swift_scan', '--files-from', str(files),
+                               '--sink', str(sink), '--json-out', str(summary), '--text-out', str(text),
+                               '--project-dir', str(root), '--skip', skipped]
+                    environment = dict(os.environ, PYTHONDONTWRITEBYTECODE='1', UBS_PROFILE='1',
+                                       UBS_CACHE_DIR=str(folder / 'cache'), UBS_CACHE_FILE=str(stats),
+                                       UBS_NO_CACHE='1' if no_cache else '0')
+                    environment['PYTHONPATH'] = str(HELPERS_DIR) + os.pathsep + environment.get('PYTHONPATH', '')
+                    result = subprocess.run(command, cwd=root, env=environment, capture_output=True,
+                                            text=True, timeout=60)  # ubs:ignore[python.taint.command] - fixed real core CLI with local retained source programs
+                    (destination / 'stdout.log').write_text(result.stdout)
+                    (destination / 'stderr.log').write_text(result.stderr)
+                    (destination / 'invocation.json').write_text(json.dumps({'argv': command, 'cwd': str(root),
+                                                                            'status': result.returncode}, indent=2))
+                    with self.subTest(program=name, stage=stage):
+                        document = json.loads(summary.read_text())
+                        records = [json.loads(line) for line in sink.read_text().splitlines() if line]
+                        findings = sorted((record['rule'], record['path'], record['line']) for record in records
+                                          if record['rule'].startswith('swift.taint.'))
+                        expected = [] if skipped else sorted(
+                            ('swift.taint.request_path_traversal', str(path.resolve()), 1)
+                            for path in ((supported, other) if name == 'regex' else (supported,)))
+                        # Skipping taint does not disable the lexical gate: other
+                        # categories still need marker ownership. Skipping every
+                        # category selects no producer and has no such failure.
+                        incomplete = name != 'regex' and (not skipped or (name == 'unlexable' and skipped == '6'))
+                        self.assertEqual(findings, expected, records)
+                        self.assertEqual(result.returncode, 2 if incomplete else 1 if expected else 0, result.stderr)
+                        self.assertEqual(document['status'], 'partial' if incomplete else 'ok', document)
+                        self.assertEqual(document.get('module_error'), 'ANALYZER_ERROR' if incomplete else None)
+                        # Only a complete analysis enters the cache.
+                        self.assertEqual(json.loads(stats.read_text())['hits'],
+                                         2 if name == 'regex' and stage == 'repeat' else 0)
+                        counter_log = [json.loads(line) for line in result.stderr.splitlines() if line.startswith('{')][-1]
+                        self.assertEqual(bool(counter_log['errors']), bool(incomplete), counter_log)
+                        if name == 'unlexable' and incomplete:
+                            self.assertEqual(len(counter_log['errors']), 1, counter_log)
+                            self.assertIn('Swift lexical analysis', counter_log['errors'][0])
+                            self.assertIn('Unterminated Swift comment', counter_log['errors'][0])
+                        if incomplete:
+                            self.assertNotIn('✓ OK', text.read_text())
+
+    def test_swift_write_sink_excludes_declared_value_type_receivers(self):
+        from ubs_core.analyzers import taint_swift_traversal as analyzer
+        # SwiftPine's API-identity cases (snapshot 0c5659cd) plus receivers of
+        # unknown type or class type, which may still be Foundation values.
+        # None marks main's incomplete analysis for a request-derived
+        # lookalike constructor ("needs field analysis").
+        cases = (
+            ('shadowed-String-api', 'struct String {}\n', '', '_ = String(contentsOfFile: path)', None, False),
+            ('shadowed-Data-api', 'struct Data {}\n', '', '_ = Data(contentsOf: path)', None, False),
+            ('unrelated-unknown-write-api', 'struct Recorder {}\n', ', recorder: Recorder', 'recorder.write(to: path)', [], False),
+            ('foundation-string-write', '', ', text: String', 'try text.write(to: path, atomically: true, encoding: .utf8)', [4], True),
+            ('foundation-data-write', '', ', data: Data', 'try data.write(to: path)', [4], True),
+            ('qualified-data-write', 'import Foundation\nstruct Data {}\n', ', data: Foundation.Data', 'try data.write(to: path)', [5], True),
+            ('qualified-foundation-string-write', 'import Foundation\nstruct String {}\n', ', text: Foundation.String', 'try text.write(to: path, atomically: true, encoding: .utf8)', [5], True),
+            ('qualified-swift-string-write', 'import Foundation\nstruct String {}\n', ', text: Swift.String', 'try text.write(to: path, atomically: true, encoding: .utf8)', [5], True),
+            ('annotated-data-write', '', '', 'let data: Data = Data(); try data.write(to: path)', [4], True),
+            ('literal-string-write', '', '', 'try "fixed".write(to: path, atomically: true, encoding: .utf8)', [4], True),
+            ('shadowed-data-write', 'struct Data {}\n', ', data: Data', 'data.write(to: path)', [], False),
+            ('qualified-string-read', 'import Foundation\nstruct String {}\n', '', '_ = try Swift.String(contentsOfFile: path)', [5], False),
+            ('valid-String-lookalike', 'struct String { init(contentsOfFile path: Swift.String) {} }\n', '',
+             '_ = String(contentsOfFile: path)', None, False),
+            ('valid-Data-lookalike', 'import Foundation\nstruct Data { init(contentsOf path: Foundation.URL) {} }\n', '',
+             '_ = Data(contentsOf: path)', None, True),
+            ('valid-write-lookalike', 'import Foundation\nstruct Recorder { func write(to path: Foundation.URL) {} }\n', ', recorder: Recorder',
+             'recorder.write(to: path)', [], True),
+            ('unknown-receiver-write', '', '', 'let data = loadPayload(); try data.write(to: path)', [4], True),
+            ('final-class-write', 'import Foundation\nfinal class Archive {}\n', ', archive: Archive', 'try archive.write(to: path)', [5], True),
+            ('open-class-write', 'import Foundation\nclass Archive {}\n', ', archive: Archive', 'try archive.write(to: path)', [5], True),
+            ('enum-write', 'import Foundation\nenum Channel { case primary }\n', ', channel: Channel', 'channel.write(to: path)', [], True),
+            ('constructed-struct-write', 'import Foundation\nstruct Recorder {}\n', '', 'let recorder = Recorder(); recorder.write(to: path)', [], True),
+        )
+        for name, declaration, parameters, sink, expected, destination_is_url in cases:
+            source = (declaration or 'import Foundation\n') + 'func sample(req: Request' + parameters + ') throws {\n'
+            path = 'URL(fileURLWithPath: req.query["path"] ?? "")' if destination_is_url else 'req.query["path"] ?? ""'
+            source += '  let path = ' + path + '\n  ' + sink + '\n}\n'
+            with self.subTest(case=name):
+                if expected is None:
+                    with self.assertRaisesRegex(ValueError, 'needs field analysis; analysis is incomplete'):
+                        analyzer.scan_text(Path('F.swift'), source, Path('.'))
+                else:
+                    self.assertEqual([r[1] for r in analyzer.scan_text(Path('F.swift'), source, Path('.'))], expected)
 
 
 if __name__ == "__main__":

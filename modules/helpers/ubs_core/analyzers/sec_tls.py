@@ -4,9 +4,9 @@ security wave, bead 0xjg.4).
 Verbatim port of the legacy ubs-js.sh heredoc "Disabled TLS certificate
 verification": same regexes, same 14-line statement window (paren/brace
 balance, no bracket tracking), same false-like-constant resolution
-(``const rejectUnauthorized = false`` / ``= "0"``), same ``ubs:ignore``
-placement rules (same line or the line immediately above, anywhere in the
-collected statement). The heredoc's os.walk over the project is replaced by
+(``const rejectUnauthorized = false`` / ``= "0"``). Suppression uses the
+shared lexical statement policy without discarding false-like alias facts.
+The heredoc's os.walk over the project is replaced by
 iteration over ``RunContext.files``; per-file match logic is unchanged.
 
 Legacy emission: print_finding "warning" / "TLS certificate verification
@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.suppression import SourceSuppressions
 
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
 
@@ -76,7 +77,7 @@ def collect_false_like_vars(lines: list[str]) -> set[str]:
     names = set()
     for raw in lines:
         line = code_line(raw)
-        if not line or 'ubs:ignore' in line:
+        if not line:
             continue
         match = false_like_assignment_re.search(line)
         if match:
@@ -101,17 +102,19 @@ def uses_false_like_tls_var(statement: str, false_like_vars: set[str]) -> bool:
 def scan_file_findings(path: Path) -> Iterator[tuple[int, str]]:
     """Yield (line_number, sample_text) per detection; heredoc-identical."""
     try:
-        lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
+        source_text = path.read_text(encoding='utf-8', errors='ignore')
     except Exception:
         return
+    lines = source_text.splitlines()
+    suppressions = SourceSuppressions('javascript').index(path, source_text)
     false_like_vars = collect_false_like_vars(lines)
     seen_lines = set()
     for idx, line in enumerate(lines):
         stripped = code_line(line).strip()
-        if not stripped or 'ubs:ignore' in line or (idx > 0 and 'ubs:ignore' in lines[idx - 1]) or not candidate_re.search(stripped):
+        if not stripped or not candidate_re.search(stripped):
             continue
         statement = statement_from(lines, idx)
-        if not statement or 'ubs:ignore' in statement:
+        if not statement:
             continue
         if not (
             reject_unauthorized_false_re.search(statement)
@@ -120,6 +123,8 @@ def scan_file_findings(path: Path) -> Iterator[tuple[int, str]]:
         ):
             continue
         if idx in seen_lines:
+            continue
+        if suppressions.is_suppressed(idx + 1, RULE):
             continue
         seen_lines.add(idx)
         yield idx + 1, stripped.replace('\t', ' ')

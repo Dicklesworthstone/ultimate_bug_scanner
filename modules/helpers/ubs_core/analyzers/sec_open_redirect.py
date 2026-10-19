@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.suppression import SourceSuppressions
 
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
 
@@ -115,22 +116,22 @@ def validation_code_line(source_line):
 def scan_file_findings(path: Path) -> Iterator[tuple[int, int]]:
     """Yield (line, col) per detection; per-file logic identical to the heredoc."""
     try:
-        lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
+        source_text = path.read_text(encoding='utf-8', errors='ignore')
     except Exception:
         return
+    lines = source_text.splitlines()
+    suppressions = SourceSuppressions('javascript').index(path, source_text)
     tainted_vars = {}
     for idx, line in enumerate(lines):
         stripped = line.strip()
         if not stripped or stripped.startswith(("//", "/*", "*")):
             continue
         assignment = assignment_re.search(line)
-        if assignment and 'ubs:ignore' not in line:
+        if assignment:
             tainted_vars[assignment.group(1)] = idx
         if not sink_re.search(line):
             continue
         statement = statement_from(lines, idx)
-        if 'ubs:ignore' in statement or (idx > 0 and 'ubs:ignore' in lines[idx - 1]):
-            continue
         context_start = max(0, idx - 8)
         context_lines = [
             code_line
@@ -148,6 +149,8 @@ def scan_file_findings(path: Path) -> Iterator[tuple[int, int]]:
                     tainted = True
                     break
         if not tainted:
+            continue
+        if suppressions.is_suppressed(idx + 1, RULE):
             continue
         yield idx + 1, sink_re.search(line).start() + 1
 
@@ -245,8 +248,8 @@ def _selftest_safe_validator_suppressed(tmp_prefix: str = "ubs_core_sec_open_red
 def _selftest_assignment_ignore_suppressed(tmp_prefix: str = "ubs_core_sec_open_redirect_ign_") -> None:
     import tempfile
 
-    # ubs:ignore on the assignment line keeps the var out of the taint map;
-    # ubs:ignore above the sink line suppresses directly. Both must stay clean.
+    # An assignment marker preserves taint needed at a later unannotated sink;
+    # a standalone marker above the sink suppresses that sink's diagnostic.
     tainted_free = "\n".join([
         "const target = searchParams.get(\"to\"); // ubs:ignore",
         "router.push(target);",
@@ -263,7 +266,7 @@ def _selftest_assignment_ignore_suppressed(tmp_prefix: str = "ubs_core_sec_open_
         first.write_text(tainted_free, encoding="utf-8")
         second = Path(tmp) / "b.ts"
         second.write_text(sink_ignore, encoding="utf-8")
-        assert list(scan_file_findings(first)) == []
+        assert [line for line, _col in scan_file_findings(first)] == [2]
         assert list(scan_file_findings(second)) == []
 
 

@@ -2,7 +2,8 @@
 
 Verbatim port of the ubs-csharp.sh ``run_archive_extraction_checks`` heredoc
 (1412-1577): same hint/entry-name/alias/path-build/safe-context regexes, same
-±10/+12 context window, same ubs:ignore placement (current + previous line).
+±10/+12 context window. Source-owned directives filter only emitted findings
+for this exact public rule; archive aliases remain available to later sinks.
 The NUL-filelist loader is replaced by iteration over ``files``; per-file
 match logic is unchanged.
 
@@ -14,9 +15,9 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.suppression import SourceSuppressions
 from ubs_core.csharp_detectors._common import (
     context_around,
-    has_ignore,
     logical_statement,
     relpath,
     source_line,
@@ -101,15 +102,18 @@ def analyze(path: Path, base_dir: Path, issues):
         return
     if not ARCHIVE_HINT_RE.search(text):
         return
+    suppression = SourceSuppressions('csharp').index(path, text)
     lines = text.splitlines()
     aliases = collect_aliases(lines)
     for idx, _ in enumerate(lines, start=1):
-        if has_ignore(lines, idx):
+        if not strip_line_comments(lines[idx - 1]).strip():
             continue
         statement = logical_statement(lines, idx)
         if not path_builds_from_entry(statement, aliases):
             continue
         if has_safe_context(context_around(lines, idx)):
+            continue
+        if suppression.is_suppressed(idx, RULE_ID):
             continue
         issues.append((relpath(path, base_dir), idx, source_line(lines, idx)))
 

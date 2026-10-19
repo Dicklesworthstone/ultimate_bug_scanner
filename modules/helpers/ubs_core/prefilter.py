@@ -475,8 +475,11 @@ def run_prefilter(
             ast_files=list(files), is_bypass=True, index=index,
         )
 
-    if any(not p.is_file() for p in files):
-        return bypass("selection contains a missing or nonregular file")
+    try:
+        if any(not p.is_file() for p in files):
+            return bypass("selection contains a missing or nonregular file")
+    except (OSError, RuntimeError) as exc:
+        return bypass(f"cannot inspect selected input ({exc})")
 
     if not index.expanded_rules:
         index.finalize()
@@ -499,7 +502,7 @@ def run_prefilter(
         try:
             fset = file_matched_rules.setdefault(str(p.resolve()), set(index.fallback_rules))
             file_matched_rules[str(p)] = fset
-        except OSError as exc:
+        except (OSError, RuntimeError) as exc:
             return bypass(f"cannot resolve selected input ({exc})")
 
     import tempfile
@@ -580,7 +583,9 @@ def run_prefilter(
                         return bypass("; ".join(errors))
                     if not summary_seen or bool(matches) != (proc.returncode == 0):
                         raise ValueError("missing or inconsistent rg completion summary")
-    except (OSError, ValueError, RecursionError) as exc:
+                if errors:
+                    return bypass("; ".join(errors))
+    except (OSError, ValueError, RuntimeError) as exc:
         return bypass(f"invalid or incomplete rg result ({exc})")
 
     t1 = time.perf_counter()

@@ -42,6 +42,29 @@ class HeapTaintTests(unittest.TestCase):
             self.assertIn(' -> ', finding['message'])
         return findings
 
+    def assert_runtime_sends(self, source, expected, *, module=False):
+        """Use fixed harmless markers to check the independent JS behavior."""
+        node = shutil.which('node')
+        if node is None:
+            return  # The scanner assertions still run without this optional oracle.
+        if module:
+            fixture = ('const req = {query: {html: "review-input"}}; '
+                       'const observed = []; const res = {send(value) { observed.push(value); }};\n')
+            command = [node, '--input-type=module', '-e', fixture + source
+                       + '\nprocess.stdout.write(JSON.stringify(observed));']
+        else:
+            # Fixture declarations before source would disable a root directive
+            # prologue. Execute the authored script verbatim with injected data.
+            fixture = ('const vm = require("node:vm"); const observed = []; '
+                       'const context = {req: {query: {html: "review-input"}}, '
+                       'res: {send(value) { observed.push(value); }}}; ')
+            command = [node, '-e', fixture + 'vm.runInNewContext(' + json.dumps(source)
+                       + ', context, {timeout: 5000}); process.stdout.write(JSON.stringify(observed));']
+        result = subprocess.run(command,
+                                text=True, capture_output=True, timeout=15, check=False)
+        self.assertEqual(result.returncode, 0, (source, result.stdout, result.stderr))
+        self.assertEqual(json.loads(result.stdout), expected, source)
+
     def test_write_through_alias_reaches_original(self):
         self.scan('const box = {}; const alias = box; alias.html = req.query.html; res.send(box.html);', 'xss')
 
@@ -416,6 +439,634 @@ class HeapTaintTests(unittest.TestCase):
                   'const args = ["safe"]; read(...args); res.send(box.html);', 'xss')
         self.scan('function read(value = {html: req.query.html}) { return value; } '
                   'const args = [{html: "safe"}]; res.send(read(...args).html);')
+
+    def test_spread_elements_are_snapshotted_before_later_arguments(self):
+        for initial, replacement, expected, rules in (
+            ('req.query.html', '"safe"', ['review-input'], ('xss',)),
+            ('"safe"', 'req.query.html', ['safe'], ()),
+        ):
+            for formal in ('value', '...[value]'):
+                with self.subTest(initial=initial, replacement=replacement, formal=formal):
+                    source = ('function read(' + formal + ') { return value; } '
+                              'const items = [' + initial + ']; '
+                              'function replace() { items[0] = ' + replacement + '; return 0; } '
+                              'res.send(read(...items, replace()));')
+                    self.assert_runtime_sends(source, expected)
+                    self.scan(source, *rules)
+
+    def test_spreads_preserve_yielded_object_identity_and_run_once(self):
+        cases = (
+            ('const box = {html: "safe"}; const items = [box]; '
+             'function replace() { items[0] = {html: req.query.html}; } '
+             'res.send(read(...items, replace()).html);', ['safe'], ()),
+            ('const box = {html: "safe"}; const items = [box]; '
+             'function change() { box.html = req.query.html; } '
+             'res.send(read(...items, change()).html);', ['review-input'], ('xss',)),
+            ('let first = req.query.html; let second = "safe"; '
+             'function values() { const old = first; first = second; second = old; return []; } '
+             'read(...values()); res.send(first);', ['safe'], ()),
+            ('const values = ["safe", req.query.html]; '
+             'res.send(read(...values.reverse()));', ['review-input'], ('xss',)),
+        )
+        for body, expected, rules in cases:
+            with self.subTest(body=body):
+                source = 'function read(...[value]) { return value; } ' + body
+                self.assert_runtime_sends(source, expected)
+                self.scan(source, *rules)
+
+    def test_later_parameter_defaults_update_earlier_bindings(self):
+        for initial, replacement, expected, rules in (
+            ('"safe"', 'req.query.html', ['review-input'], ('xss',)),
+            ('req.query.html', '"safe"', ['safe'], ()),
+        ):
+            for formal, arguments in (
+                ('{value}, ignored = (value = ' + replacement + ')', '{value: ' + initial + '}'),
+                ('value, {ignored = (value = ' + replacement + ')}', initial + ', {}'),
+                ('value, ignored = (value = ' + replacement + '), ...rest', initial),
+                ('{value}, ignored = (value = ' + replacement + '), copy = value', '{value: ' + initial + '}'),
+            ):
+                with self.subTest(formal=formal, arguments=arguments):
+                    result = 'copy' if 'copy = value' in formal else 'value'
+                    source = ('function read(' + formal + ') { return ' + result + '; } '
+                              'res.send(read(' + arguments + '));')
+                    self.assert_runtime_sends(source, expected)
+                    self.scan(source, *rules)
+        source = ('function read({value}, ignored = (value = {html: req.query.html})) { return value; } '
+                  'res.send(read({value: {html: "safe"}}).html);')
+        self.assert_runtime_sends(source, ['review-input'])
+        self.scan(source, 'xss')
+
+    def test_nullish_destructured_arguments_throw_before_cleanup(self):
+        for pattern, clean in (('{value}', '{}'), ('[value]', '[]')):
+            for argument in ('', 'null', 'undefined', 'void 1', 'void (1 + 2)', clean):
+                with self.subTest(pattern=pattern, argument=argument):
+                    source = ('const box = {html: req.query.html}; '
+                              'function clear(' + pattern + ') { box.html = "safe"; } '
+                              'try { clear(' + argument + '); } catch (error) {} res.send(box.html);')
+                    unsafe = argument != clean
+                    self.assert_runtime_sends(source, ['review-input' if unsafe else 'safe'])
+                    self.scan(source, *('xss',) if unsafe else ())
+        source = ('const box = {html: req.query.html}; function clear({value}) { box.html = "safe"; } '
+                  'clear("safe"); res.send(box.html);')
+        self.assert_runtime_sends(source, ['safe'])
+        self.scan(source)
+
+    def test_nested_missing_patterns_and_null_defaults_keep_exception_store(self):
+        for declaration, unsafe in (
+            ('const {child: {value}} = {};', True),
+            ('const [[value]] = [];', True),
+            ('const {value} = null;', True),
+            ('let value; ({value} = undefined);', True),
+            ('const {child: {value} = null} = {};', True),
+            ('const {child: {value} = {}} = {child: null};', True),
+            ('const [[value] = []] = [null];', True),
+            ('const {child: {value} = {}} = {};', False),
+            ('const [[value] = []] = [];', False),
+        ):
+            with self.subTest(declaration=declaration):
+                source = ('const box = {html: req.query.html}; try { ' + declaration
+                          + ' box.html = "safe"; } catch (error) {} res.send(box.html);')
+                self.assert_runtime_sends(source, ['review-input' if unsafe else 'safe'])
+                self.scan(source, *('xss',) if unsafe else ())
+        for initial, replacement, expected, rules in (
+            ('req.query.html', '"safe"', ['review-input'], ('xss',)),
+            ('"safe"', 'req.query.html', ['safe'], ()),
+        ):
+            with self.subTest(initial=initial, replacement=replacement):
+                source = ('const box = {html: ' + initial + '}; '
+                          'function fallback() { box.html = ' + replacement + '; return {}; } try { '
+                          'const {child: {value} = fallback()} = {child: null}; '
+                          'box.html = "safe"; } catch (error) {} res.send(box.html);')
+                self.assert_runtime_sends(source, expected)
+                self.scan(source, *rules)
+
+    def test_array_patterns_preserve_noniterable_failure_path(self):
+        for argument, unsafe in (('1', True), ('true', True), ('1n', True),
+                                 ('0x10', True), ('{}', True), ('[]', False),
+                                 ('"safe"', False), ('`safe`', False),
+                                 ('`${req.query.html}`', False)):
+            for pattern in ('[value]', '{value}'):
+                with self.subTest(argument=argument, pattern=pattern):
+                    source = ('const box = {html: req.query.html}; '
+                              'function clear(' + pattern + ') { box.html = "safe"; } '
+                              'try { clear(' + argument + '); } catch (error) {} res.send(box.html);')
+                    throws = unsafe and pattern == '[value]'
+                    self.assert_runtime_sends(source, ['review-input' if throws else 'safe'])
+                    self.scan(source, *('xss',) if throws else ())
+        source = ('const box = {html: req.query.html}; try { const [value] = 1; '
+                  'box.html = "safe"; } catch (error) {} res.send(box.html);')
+        self.assert_runtime_sends(source, ['review-input'])
+        self.scan(source, 'xss')
+        source = ('function render([value], input) { res.send(input); } '
+                  'try { render(1, req.query.html); } catch (error) {}')
+        self.assert_runtime_sends(source, [])
+        self.scan(source)
+
+    def test_parenthesized_templates_keep_string_shape_and_interpolation_effects(self):
+        for template, expected in (
+            ('`safe`', 'safe'), ('`${null}`', 'null'), ('`${undefined}`', 'undefined'),
+            ('`${void 0}`', 'undefined'), ('`${1}`', '1'), ('`${true}`', 'true'),
+        ):
+            for depth in (1, 2):
+                argument = '(' * depth + template + ')' * depth
+                for pattern in ('{value}', '[value]'):
+                    with self.subTest(argument=argument, pattern=pattern):
+                        source = ('function render(' + pattern + ', input) { res.send(input); } '
+                                  'render(' + argument + ', req.query.html);')
+                        self.assert_runtime_sends(source, ['review-input'])
+                        self.scan(source, 'xss')
+                        source = ('const box = {html: req.query.html}; '
+                                  'function clear(' + pattern + ') { box.html = "safe"; } '
+                                  'try { clear(' + argument + '); } catch (error) {} res.send(box.html);')
+                        self.assert_runtime_sends(source, ['safe'])
+                        self.scan(source)
+                source = ('function read(value = req.query.html) { return value; } '
+                          'res.send(read(' + argument + '));')
+                self.assert_runtime_sends(source, [expected])
+                self.scan(source)
+        source = ('let first = req.query.html; let second = "safe"; '
+                  'function change() { const old = first; first = second; second = old; return null; } '
+                  'function render([value], input) { res.send(input); } '
+                  'render((`${change()}`), first); res.send(second);')
+        self.assert_runtime_sends(source, ['safe', 'review-input'])
+        findings = self.scan(source, 'xss')
+        self.assertEqual(findings[0]['col'], source.index('res.send(second)') + 1)
+
+    def test_spread_parameter_defaults_keep_separate_entry_exception_stores(self):
+        for pattern, fallback in (('{value}', '{}'), ('[value]', '[]')):
+            for initial, replacement, argument, expected, rules in (
+                ('req.query.html', '"safe"', 'null', ['review-input'], ('xss',)),
+                ('"safe"', 'req.query.html', 'null', ['safe'], ()),
+                ('"safe"', 'req.query.html', 'req.query.html', ['safe'], ()),
+                ('req.query.html', '"safe"', ',', ['safe'], ()),
+                ('req.query.html', 'req.query.html', fallback, ['safe'], ()),
+            ):
+                with self.subTest(pattern=pattern, argument=argument, replacement=replacement):
+                    source = ('const box = {html: ' + initial + '}; '
+                              'function fallback() { box.html = ' + replacement + '; return ' + fallback + '; } '
+                              'function clear(' + pattern + ' = fallback()) { box.html = "safe"; } '
+                              'const args = [' + argument + ']; '
+                              'try { clear(...args); } catch (error) {} res.send(box.html);')
+                    self.assert_runtime_sends(source, expected)
+                    self.scan(source, *rules)
+            for result in ('null', 'undefined', 'void req.query.html'):
+                with self.subTest(pattern=pattern, default_result=result):
+                    source = ('const box = {html: "safe"}; '
+                              'function fallback() { box.html = req.query.html; return ' + result + '; } '
+                              'function clear(' + pattern + ' = fallback()) { box.html = "safe"; } '
+                              'const args = [undefined]; '
+                              'try { clear(...args); } catch (error) {} res.send(box.html);')
+                    self.assert_runtime_sends(source, ['review-input'])
+                    self.scan(source, 'xss')
+
+    def test_nested_defaults_do_not_put_initializer_effects_on_null_bypass(self):
+        for binding, argument in (
+            ('{child: {value} = fallback()}', '{child: req.query.html}'),
+            ('[[value] = fallback()]', '[req.query.html]'),
+            ('...[{value} = fallback()]', 'req.query.html'),
+        ):
+            with self.subTest(binding=binding):
+                fallback = '[]' if binding.startswith('[') else '{}'
+                source = ('const box = {html: "safe"}; '
+                          'function fallback() { box.html = req.query.html; return ' + fallback + '; } '
+                          'function clear(' + binding + ') { box.html = "safe"; } '
+                          'try { clear(' + argument + '); } catch (error) {} res.send(box.html);')
+                self.assert_runtime_sends(source, ['safe'])
+                self.scan(source)
+
+    def test_destructuring_exception_preserves_prior_default_effects(self):
+        for initial, prior, later, expected, rules in (
+            ('"safe"', 'req.query.html', '"safe"', ['review-input'], ('xss',)),
+            ('req.query.html', '"safe"', 'req.query.html', ['safe'], ()),
+        ):
+            with self.subTest(prior=prior):
+                source = ('const box = {html: ' + initial + '}; '
+                          'function read(first = (box.html = ' + prior + '), {value}) { '
+                          'box.html = ' + later + '; } '
+                          'try { read(); } catch (error) {} res.send(box.html);')
+                self.assert_runtime_sends(source, expected)
+                self.scan(source, *rules)
+        source = ('function render({value}, input) { res.send(input); } '
+                  'try { render(null, req.query.html); } catch (error) {}')
+        self.assert_runtime_sends(source, [])
+        self.scan(source)
+        source = ('function read({value} = {value: req.query.html}) { return value; } '
+                  'try { res.send(read(null)); } catch (error) {}')
+        self.assert_runtime_sends(source, [])
+        self.scan(source)
+
+    def test_uncertain_destructuring_cannot_prove_catch_path_cleanup(self):
+        for actual, expected, rules in (('null', ['review-input'], ('xss',)),
+                                         ('{}', ['safe'], ())):
+            with self.subTest(actual=actual):
+                source = ('const box = {html: req.query.html}; const input = ' + actual + '; '
+                          'function clear({value}) { box.html = "safe"; } '
+                          'try { clear(input); } catch (error) {} res.send(box.html);')
+                self.assert_runtime_sends(source, expected)
+                self.scan(source, *rules)
+
+    def test_shadowed_undefined_does_not_activate_parameter_defaults(self):
+        for value, formal, result in (
+            ('"safe"', 'value = req.query.html', 'value'),
+            ('{html: "safe"}', '{html} = {html: req.query.html}', 'html'),
+        ):
+            for declaration, call in (('const undefined = ' + value + ';', 'outer();'),
+                                      ('', 'outer(' + value + ');')):
+                with self.subTest(value=value, declaration=declaration):
+                    parameters = '' if declaration else 'undefined'
+                    source = ('function outer(' + parameters + ') { ' + declaration
+                              + ' function read(' + formal + ') { return ' + result + '; } '
+                              'res.send(read(undefined)); } ' + call)
+                    self.assert_runtime_sends(source, ['safe'])
+                    self.scan(source)
+
+    def test_body_undefined_declarations_do_not_shadow_parameter_initializers(self):
+        for declaration in ('var undefined = "body";', 'let undefined = "body";',
+                            'const undefined = "body";', 'function undefined() { return "body"; }'):
+            with self.subTest(declaration=declaration):
+                source = ('function read(value = req.query.html) { return value; } '
+                          'function outer(value = read(undefined)) { ' + declaration + ' return value; } '
+                          'res.send(outer());')
+                self.assert_runtime_sends(source, ['review-input'])
+                self.scan(source, 'xss')
+                for actual, expected, rules in (('"safe"', ['safe'], ()),
+                                                 ('req.query.html', ['review-input'], ('xss',))):
+                    source = ('function read(value = "safe") { return value; } '
+                              'function outer(undefined) { function inner(value = read(undefined)) { '
+                              + declaration + ' return value; } return inner(); } '
+                              'res.send(outer(' + actual + '));')
+                    self.assert_runtime_sends(source, expected)
+                    self.scan(source, *rules)
+        for actual, expected, rules in (('"safe"', ['safe'], ()),
+                                         ('req.query.html', ['review-input'], ('xss',))):
+            source = ('function read(value = "safe") { return value; } '
+                      'function outer(undefined, value = read(undefined)) { return value; } '
+                      'res.send(outer(' + actual + '));')
+            self.assert_runtime_sends(source, expected)
+            self.scan(source, *rules)
+
+    def test_shadowed_undefined_values_still_activate_defaults(self):
+        read = 'function read(value = req.query.html) { return value; } '
+        for body in (
+            'function outer(undefined) { return read(undefined); }',
+            'function outer(undefined, value = read(undefined)) { return value; }',
+            'function outer() { var undefined; return read(undefined); }',
+            'function outer() { const undefined = void 0; return read(undefined); }',
+            'function outer() { let undefined; return read(((undefined))); }',
+            'function outer() { const missing = void 0; const undefined = missing; return read(undefined); }',
+            'function outer() { const {undefined} = {}; return read(undefined); }',
+        ):
+            with self.subTest(body=body):
+                source = read + body + ' res.send(outer());'
+                self.assert_runtime_sends(source, ['review-input'])
+                self.scan(source, 'xss')
+
+    def test_shadowed_undefined_contexts_keep_clean_actuals_separate(self):
+        read = 'function read(value = req.query.html) { return value; } '
+        for body in (
+            'function outer(undefined) { return read(undefined); }',
+            'function outer(undefined) { var undefined; return read(undefined); }',
+            'function outer(undefined, value = read(undefined)) { return value; }',
+            'function outer(undefined) { function inner() { return read(undefined); } return inner(); }',
+        ):
+            for actual in ('"safe"', 'null', '0', 'false'):
+                with self.subTest(body=body, actual=actual):
+                    source = read + body + '\nres.send(outer());\nres.send(outer(' + actual + '));'
+                    self.assert_runtime_sends(source, ['review-input', json.loads(actual)])
+                    findings = self.scan(source, 'xss')
+                    self.assertEqual(findings[0]['line'], 2)
+        source = (read + 'function outer() { var undefined = "safe"; var undefined; '
+                  'return read(undefined); } res.send(outer());')
+        self.assert_runtime_sends(source, ['safe'])
+        self.scan(source)
+
+    def test_shadowed_undefined_tracks_capture_and_initializer_writes(self):
+        read = 'function read(value = req.query.html) { return value; } '
+        for value, expected, rules in (('void 0', ['review-input'], ('xss',)),
+                                       ('"safe"', ['safe'], ())):
+            for body in (
+                'function outer(undefined) { function set() { undefined = ' + value + '; } '
+                'set(); return read(undefined); }',
+                'function outer(undefined, unused = (undefined = ' + value + ')) { return read(undefined); }',
+                'function outer(undefined) { undefined = ' + value + '; return read(undefined); }',
+                'function outer(undefined) { function set() { undefined = ' + value + '; throw "stop"; } '
+                'try { set(); } catch (error) {} return read(undefined); }',
+            ):
+                with self.subTest(body=body):
+                    source = read + body + ' res.send(outer("initial"));'
+                    self.assert_runtime_sends(source, expected)
+                    self.scan(source, *rules)
+        source = (read + 'function outer() { let undefined = "safe"; '
+                  '{ let undefined; res.send(read(undefined)); }\nres.send(read(undefined)); } outer();')
+        self.assert_runtime_sends(source, ['review-input', 'safe'])
+        findings = self.scan(source, 'xss')
+        self.assertEqual(findings[0]['line'], 1)
+
+    def test_shadowed_undefined_default_effects_preserve_bypass_and_snapshot(self):
+        setup = ('const box = {html: req.query.html}; '
+                 'function clear() { box.html = "safe"; return "safe"; } '
+                 'function read(value = clear(), unused) {} ')
+        for argument, expected, rules in (('', ['safe'], ()), ('"safe"', ['review-input'], ('xss',))):
+            source = ('function outer(undefined) { ' + setup
+                      + 'read(undefined); res.send(box.html); } outer(' + argument + ');')
+            self.assert_runtime_sends(source, expected)
+            self.scan(source, *rules)
+        source = ('function outer(undefined) { ' + setup
+                  + 'if (req.query.flag) undefined = void 0; read(undefined); '
+                  'res.send(box.html); } outer("safe");')
+        self.assert_runtime_sends(source, ['review-input'])
+        self.scan(source, 'xss')
+        for initial, replacement, expected, rules in (
+            ('void 0', '"safe"', ['safe'], ()),
+            ('"safe"', 'void 0', ['review-input'], ('xss',)),
+        ):
+            source = ('function outer() { let undefined = ' + initial + '; ' + setup
+                      + 'read(undefined, (undefined = ' + replacement + ')); '
+                      'res.send(box.html); } outer();')
+            self.assert_runtime_sends(source, expected)
+            self.scan(source, *rules)
+
+    def test_shadowed_undefined_recursive_and_uncalled_sources_are_retained(self):
+        source = ('function read(value = req.query.html) { return value; } '
+                  'function outer(undefined, depth) { if (depth) return outer(undefined, depth - 1); '
+                  'return read(undefined); }\nres.send(outer(void 0, 2));\nres.send(outer("safe", 2));')
+        self.assert_runtime_sends(source, ['review-input', 'safe'])
+        findings = self.scan(source, 'xss')
+        self.assertEqual(findings[0]['line'], 2)
+        # Uncalled bodies are still analyzed as possible external entries.
+        # A self edge alone must not suppress their independent source sites.
+        self.scan('function outer(undefined) { res.send(req.query.html); outer(undefined); }', 'xss')
+
+    def test_shadowed_undefined_annotations_do_not_change_runtime_values(self):
+        for body in (
+            'function outer(undefined: string | undefined = void 0) { return read(undefined); }',
+            'function outer(undefined: string | undefined = void 0, value = read(undefined)) { return value; }',
+            'function outer() { const undefined: string | undefined = void 0; return read(undefined); }',
+        ):
+            source = ('function read(value = req.query.html) { return value; } ' + body
+                      + ' res.send(outer());')
+            self.assert_runtime_sends(source.replace(': string | undefined', ''), ['review-input'])
+            self.scan(source, 'xss')
+
+    def test_shadowed_undefined_namespace_wrappers_keep_actual_kinds(self):
+        helper = ('export function outer(undefined) { '
+                  'function read(value = req.query.html) { return value; } return read(undefined); }')
+        caller = ('import * as lib from "./helper.mjs"; '
+                  'function wrapper(value) { return lib.outer(value); }\n'
+                  'res.send(wrapper(void 0));\nres.send(wrapper("safe"));')
+        self.assert_runtime_sends(helper.removeprefix('export ') + caller.replace(
+            'import * as lib from "./helper.mjs";', '').replace('lib.outer', 'outer'),
+            ['review-input', 'safe'])
+        with tempfile.TemporaryDirectory(prefix='ubs-undefined-modules-') as scratch:
+            root = Path(scratch)
+            paths = [root / 'helper.mjs', root / 'app.mjs']
+            for path, source in zip(paths, (helper, caller)):
+                path.write_text(source, encoding='utf-8')
+            findings = list(taint.scan_project_findings(paths))
+            self.assertEqual([(path.name, rule, line) for path, rule, line, _, _ in findings],
+                             [('app.mjs', 'js.taint.xss', 2)], findings)
+
+    def test_global_undefined_writes_cannot_suppress_parameter_defaults(self):
+        reader = 'function read(value = req.query.html) { return value; } '
+        for assignment in ('undefined = "safe";', 'undefined = req.query.html;',
+                           '({x: undefined} = {x: "safe"});', '[undefined] = ["safe"];',
+                           'undefined ||= "safe";', 'undefined ??= "safe";'):
+            for nested in (False, True):
+                with self.subTest(assignment=assignment, nested=nested):
+                    source = reader + ('function outer() { ' + assignment
+                              + ' return read(undefined); } res.send(outer());' if nested
+                              else assignment + ' res.send(read(undefined));')
+                    self.assert_runtime_sends(source, ['review-input'])
+                    self.scan(source, 'xss')
+        for declaration in ('let undefined;', 'var undefined;', 'let undefined = "old";'):
+            source = (reader + 'function outer() { ' + declaration
+                      + ' undefined = "safe"; return read(undefined); } res.send(outer());')
+            self.assert_runtime_sends(source, ['safe'])
+            self.scan(source)
+
+    def test_global_undefined_assignment_retains_rhs_value_and_effects_once(self):
+        source = ('const box = {html: "safe"}; const calls = []; '
+                  'function value() { calls.push("once"); box.html = req.query.html; return box.html; } '
+                  'const result = (undefined = value()); '
+                  'res.send(result); res.send(box.html); res.send(undefined); res.send(calls.length);')
+        self.assert_runtime_sends(source, ['review-input', 'review-input', None, 1])
+        self.scan(source, 'xss', 'xss')
+        source = ('function read(value = req.query.html) { return value; } '
+                  'function outer(value = (undefined = "safe"), result = read(undefined)) { '
+                  'let undefined = "body"; return result; } res.send(outer());')
+        self.assert_runtime_sends(source, ['review-input'])
+        self.scan(source, 'xss')
+
+    def test_strict_global_undefined_write_keeps_post_rhs_exception_store(self):
+        for initial, rhs, following, expected in (
+            ('req.query.html', '"safe"', 'box.html = "safe";', ['review-input']),
+            ('"safe"', '(box.html = req.query.html)', 'box.html = "safe";', ['review-input']),
+            ('req.query.html', '(box.html = "safe")', 'box.html = req.query.html;', ['safe']),
+        ):
+            for strict in (False, True):
+                with self.subTest(initial=initial, rhs=rhs, strict=strict):
+                    source = ('const box = {html: ' + initial + '}; function set() { '
+                              + ('"use strict";' if strict else '') + 'undefined = ' + rhs + '; '
+                              + following + ' } try { set(); } catch (error) {} res.send(box.html);')
+                    actual = expected if strict else ['review-input' if 'req.query.html' in following else 'safe']
+                    self.assert_runtime_sends(source, actual)
+                    self.scan(source, *(('xss',) if 'review-input' in actual else ()))
+        for target in ('({x: undefined} = {x: "safe"})', '[undefined] = ["safe"]'):
+            source = ('"use strict"; const box = {html: req.query.html}; try { ' + target
+                      + '; box.html = "safe"; } catch (error) {} res.send(box.html);')
+            self.assert_runtime_sends(source, ['review-input'])
+            self.scan(source, 'xss')
+        source = ('const box = {html: req.query.html}; function outer() { "use strict"; '
+                  'function set(value = (undefined = (box.html = "safe"))) { box.html = req.query.html; } '
+                  'try { set(); } catch (error) {} } outer(); res.send(box.html);')
+        self.assert_runtime_sends(source, ['safe'])
+        self.scan(source)
+
+    def test_strict_global_undefined_catch_finally_and_inheritance(self):
+        for handler, expected in (('catch (error) {}', ['review-input']),
+                                  ('catch (error) { box.html = "safe"; }', ['safe'])):
+            source = ('const box = {html: req.query.html}; function outer() { "use strict"; '
+                      'function set() { undefined = "safe"; box.html = "safe"; } '
+                      'try { set(); } ' + handler + ' } outer(); res.send(box.html);')
+            self.assert_runtime_sends(source, expected)
+            self.scan(source, *(('xss',) if 'review-input' in expected else ()))
+        source = ('const box = {html: req.query.html}; function set() { "use strict"; '
+                  'try { undefined = "safe"; box.html = "safe"; } finally { res.send(box.html); } } '
+                  'try { set(); } catch (error) {}')
+        self.assert_runtime_sends(source, ['review-input'])
+        self.scan(source, 'xss')
+        source = ('"use strict"; const box = {html: req.query.html}; function set() { '
+                  'let undefined; undefined = "safe"; box.html = "safe"; } set(); res.send(box.html);')
+        self.assert_runtime_sends(source, ['safe'])
+        self.scan(source)
+
+    def test_builtin_undefined_logical_writes_preserve_exact_bypass(self):
+        for strict in (False, True):
+            prefix = '"use strict";' if strict else ''
+            source = (prefix + 'const box = {html: req.query.html}; '
+                      'undefined &&= (box.html = "safe"); res.send(box.html);')
+            self.assert_runtime_sends(source, ['review-input'])
+            self.scan(source, 'xss')
+            source = (prefix + 'const box = {html: req.query.html}; try { '
+                      'undefined &&= (box.html = "ignored"); box.html = "safe"; '
+                      '} catch (error) {} res.send(box.html);')
+            self.assert_runtime_sends(source, ['safe'])
+            self.scan(source)
+            for operator in ('||=', '??='):
+                source = (prefix + 'const box = {html: "safe"}; try { undefined ' + operator
+                          + ' (box.html = req.query.html); box.html = "safe"; '
+                          '} catch (error) {} res.send(box.html);')
+                expected = ['review-input' if strict else 'safe']
+                self.assert_runtime_sends(source, expected)
+                self.scan(source, *(('xss',) if strict else ()))
+
+    def test_global_undefined_strictness_requires_a_real_directive(self):
+        body = ('const box = {html: req.query.html}; try { undefined = "safe"; '
+                'box.html = "safe"; } catch (error) {} res.send(box.html);')
+        for prefix in ('"use strict";', '\ufeff"use strict";',
+                       '/* before */ "other directive"; "use strict";', '"use strict"\n',
+                       '#!/usr/bin/env node\n"use strict";'):
+            with self.subTest(prefix=prefix):
+                self.assert_runtime_sends(prefix + body, ['review-input'])
+                self.scan(prefix + body, 'xss')
+        for prefix in ('; "use strict";', '"use strict" + "suffix";',
+                       '"use\\x20strict";', 'const ignored = "use strict";',
+                       'function before() {} "use strict";', '#!/usr/bin/export\n'):
+            with self.subTest(prefix=prefix):
+                self.assert_runtime_sends(prefix + body, ['safe'])
+                self.scan(prefix + body)
+
+    def test_global_undefined_module_strictness_excludes_property_names(self):
+        reader = 'function read(value = req.query.html) { return value; } '
+        for expression in ('obj.export', 'obj?.export', 'obj.export()', 'obj.import.meta',
+                           'obj.\ufeffexport'):
+            source = ('const obj = {export: function() {}, import: {meta: "safe"}}; '
+                      + expression + '; ' + reader + 'undefined = "safe"; res.send(read(undefined));')
+            self.assert_runtime_sends(source, ['review-input'])
+            self.scan(source, 'xss')
+        body = ('const box = {html: req.query.html}; try { undefined = "safe"; '
+                'box.html = "safe"; } catch (error) {} res.send(box.html);')
+        for suffix, prefix in (('mjs', ''), ('js', 'export {}; ')):
+            source = prefix + body
+            self.assert_runtime_sends(source, ['review-input'], module=True)
+            with tempfile.TemporaryDirectory(prefix='ubs-undefined-esm-') as scratch:
+                path = Path(scratch) / ('handler.' + suffix)
+                path.write_text(source, encoding='utf-8')
+                findings = list(taint.run(RunContext(lang='javascript', files=[path])))
+            self.assertEqual([item['rule'] for item in findings], ['javascript.taint.xss'])
+
+    def test_global_var_undefined_requires_known_declaration_environment(self):
+        source = ('function read(value = req.query.html) { return value; } '
+                  'var undefined = "safe"; res.send(read(undefined));')
+        self.assert_runtime_sends(source, ['review-input'])
+        with self.assertRaisesRegex(taint.AnalysisLimit, 'top-level var undefined'):
+            self.scan(source)
+        script_commonjs_names = ('var undefined = "safe"; const module = {exports: {}}; '
+                                'module.exports.x = 1; function read(value = req.query.html) { return value; } '
+                                'res.send(read(undefined));')
+        self.assert_runtime_sends(script_commonjs_names, ['review-input'])
+        with self.assertRaisesRegex(taint.AnalysisLimit, 'top-level var undefined'):
+            self.scan(script_commonjs_names)
+        unreachable = ('function read(x=req.query.html){return x} '
+                       'function outer(){undefined="safe";return read(undefined)} '
+                       'try{res.send(outer());throw 0;var undefined;}catch(error){}')
+        self.assert_runtime_sends(unreachable, ['review-input'])
+        with self.assertRaisesRegex(taint.AnalysisLimit, 'top-level var undefined'):
+            self.scan(unreachable)
+        self.assert_runtime_sends(source, ['safe'], module=True)
+        for suffix in ('mjs', 'cjs'):
+            with tempfile.TemporaryDirectory(prefix='ubs-undefined-var-') as scratch:
+                path = Path(scratch) / ('handler.' + suffix)
+                path.write_text(source, encoding='utf-8')
+                self.assertEqual(list(taint.run(RunContext(lang='javascript', files=[path]))), [])
+        for declaration in ('class Handler { set() {', 'const handler = { set() {'):
+            source = (declaration + 'undefined = "safe"; res.send(req.query.html); }};')
+            with self.assertRaisesRegex(taint.AnalysisLimit, 'unsupported strictness context'):
+                self.scan(source)
+
+    def test_void_arguments_apply_defaults_after_operand_effects(self):
+        for argument in ('void 1', 'void (1 + 2)', 'void +1', 'void 1e2', 'void 1n',
+                         'void ({value: "safe"})', 'void Math.abs(-1)', 'void function() {}'):
+            with self.subTest(argument=argument):
+                source = ('function read(value = req.query.html) { return value; } '
+                          'res.send(read(' + argument + '));')
+                self.assert_runtime_sends(source, ['review-input'])
+                self.scan(source, 'xss')
+        source = ('const box = {html: "safe"}; function change() { box.html = req.query.html; return "safe"; } '
+                  'function read(value = "safe") { return value; } '
+                  'res.send(read(void change())); res.send(box.html);')
+        self.assert_runtime_sends(source, ['safe', 'review-input'])
+        self.scan(source, 'xss')
+        source = ('const box = {html: req.query.html}; function clear() { box.html = "safe"; return req.query.html; } '
+                  'function read(value = "safe") { return value; } '
+                  'res.send(read(void clear())); res.send(box.html);')
+        self.assert_runtime_sends(source, ['safe', 'safe'])
+        self.scan(source)
+        for expression in ('void 1 + 2', '(void 1, 2)'):
+            source = ('function read(value = req.query.html) { return value; } '
+                      'res.send(String(read(' + expression + ')));')
+            self.assert_runtime_sends(source, ['NaN' if '+' in expression else '2'])
+            self.scan(source)
+        source = ('function read(value = "safe") { return value; } '
+                  'res.send(read(void function() {} + req.query.html));')
+        self.assert_runtime_sends(source, ['undefinedreview-input'])
+        self.scan(source, 'xss')
+
+    def test_void_defaults_discard_values_but_preserve_operand_effects(self):
+        for source in (
+            'function read(value = void req.query.html) { return value; } res.send(read());',
+            'function read({value = void req.query.html}) { return value; } res.send(read({}));',
+            'const {value = void req.query.html} = {}; res.send(value);',
+            'const {value = void req.query.html} = {value: "safe"}; res.send(value);',
+        ):
+            with self.subTest(source=source):
+                self.assert_runtime_sends(source, ['safe'] if 'value: "safe"' in source else [None])
+                self.scan(source)
+        source = ('const box = {html: "safe"}; '
+                  'function change() { box.html = req.query.html; return req.query.html; } '
+                  'function read(value = void change()) { return value; } '
+                  'res.send(read()); res.send(box.html);')
+        self.assert_runtime_sends(source, [None, 'review-input'])
+        findings = self.scan(source, 'xss')
+        self.assertEqual(findings[0]['col'], source.index('res.send(box.html)') + 1)
+        source = 'const {value = void res.send(req.query.html)} = {}; res.send(value);'
+        self.assert_runtime_sends(source, ['review-input', None])
+        findings = self.scan(source, 'xss')
+        self.assertEqual(findings[0]['col'], source.index('res.send(req.query.html)') + 1)
+
+    def test_destructuring_targets_keep_function_returned_receivers(self):
+        for target in ('target().html', '(target()).html', 'target()["html"]'):
+            for initial, expected, rules in (('req.query.html', ['review-input'], ('xss',)),
+                                             ('"safe"', ['safe'], ())):
+                with self.subTest(target=target, initial=initial):
+                    source = ('const box = {}; function target() { return box; } '
+                              '({value: ' + target + '} = {value: ' + initial + '}); res.send(box.html);')
+                    self.assert_runtime_sends(source, expected)
+                    self.scan(source, *rules)
+        source = ('const first = {}; let box = first; function target() { return box; } '
+                  'function key() { box = {}; return "html"; } '
+                  '([target()[key()]] = [req.query.html]); res.send(first.html); res.send(box.html);')
+        self.assert_runtime_sends(source, ['review-input', None])
+        self.scan(source, 'xss')
+        source = ('const box = {html: req.query.html}; function target() { throw "stop"; } '
+                  'try { ({value: target().html = (box.html = "safe")} = {}); } catch (error) {} '
+                  'res.send(box.html);')
+        self.assert_runtime_sends(source, ['review-input'])
+        self.scan(source, 'xss')
+        self.scan('function target() { return element; } '
+                  '({value: target().innerHTML} = {value: req.query.html});', 'xss')
+
+    def test_qualified_type_annotations_do_not_execute_binding_defaults_twice(self):
+        prefix = ('let first = req.query.html; let second = "safe"; '
+                  'function change() { const old = first; first = second; second = old; return "safe"; } ')
+        for body in (
+            'const {value = change()}: Box.Shape = {}; res.send(first);',
+            'function read({value = change()}: Box.Shape) { return value; } read({}); res.send(first);',
+        ):
+            with self.subTest(body=body):
+                source = prefix + body
+                self.assert_runtime_sends(source.replace(': Box.Shape', ''), ['safe'])
+                self.scan(source)
 
     def test_default_parameter_allocations_keep_callsite_identity(self):
         for initializer in ('{html: "safe"}', 'make()'):
@@ -972,6 +1623,33 @@ class HeapTaintTests(unittest.TestCase):
             ('destructured-target-order', 'const src={html:"safe"}; const out={}; function key(){src.html=req.query.html;return "html";} ({html:out[key()]}=src); res.send(out.html);', {'xss'}),
             ('destructured-dom-write', '({html:element.innerHTML}={html:req.query.html});', {'xss'}),
             ('destructured-dom-clean', '({html:element.innerHTML}={html:DOMPurify.sanitize(req.query.html)});', set()),
+            ('spread-before-later-clear', 'function read(...[x]){return x;} const a=[req.query.html]; function clear(){a[0]="safe";} res.send(read(...a,clear()));', {'xss'}),
+            ('spread-before-later-taint', 'function read(...[x]){return x;} const a=["safe"]; function change(){a[0]=req.query.html;} res.send(read(...a,change()));', set()),
+            ('later-default-updates-earlier', 'function read({x},ignored=(x=req.query.html)){return x;} res.send(read({x:"safe"}));', {'xss'}),
+            ('later-default-repairs-earlier', 'function read({x},ignored=(x="safe")){return x;} res.send(read({x:req.query.html}));', set()),
+            ('call-returned-destructuring-target', 'const box={}; function get(){return box;} ({x:get().html}={x:req.query.html}); res.send(box.html);', {'xss'}),
+            ('null-destructuring-skips-cleanup', 'const box={html:req.query.html}; function clear({x}){box.html="safe";} try{clear(null);}catch(error){} res.send(box.html);', {'xss'}),
+            ('template-null-remains-a-string', 'function render({x},input){res.send(input);} render((`${null}`),req.query.html);', {'xss'}),
+            ('template-string-allows-cleanup', 'const box={html:req.query.html}; function clear([x]){box.html="safe";} try{clear((`safe`));}catch(error){} res.send(box.html);', set()),
+            ('spread-null-default-keeps-catch-store', 'const box={html:req.query.html}; function fallback(){box.html="safe";return {};} function clear({x}=fallback()){box.html="safe";} const args=[null]; try{clear(...args);}catch(error){} res.send(box.html);', {'xss'}),
+            ('spread-default-effects-skip-null-bypass', 'const box={html:"safe"}; function fallback(){box.html=req.query.html;return {};} function clear({x}=fallback()){box.html="safe";} const args=[req.query.html]; try{clear(...args);}catch(error){} res.send(box.html);', set()),
+            ('noniterable-destructuring-skips-cleanup', 'const box={html:req.query.html}; function clear([x]){box.html="safe";} try{clear(1);}catch(error){} res.send(box.html);', {'xss'}),
+            ('shadowed-undefined-bypasses-default', 'function outer(){const undefined="safe"; function read(x=req.query.html){return x;} res.send(read(undefined));} outer();', set()),
+            ('body-undefined-does-not-shadow-default', 'function read(value=req.query.html){return value;} function outer(value=read(undefined)){var undefined="body";return value;} res.send(outer());', {'xss'}),
+            ('missing-undefined-formal-uses-default', 'function read(value=req.query.html){return value;} function outer(undefined){return read(undefined);} res.send(outer());', {'xss'}),
+            ('missing-prior-undefined-formal-uses-default', 'function read(value=req.query.html){return value;} function outer(undefined,value=read(undefined)){return value;} res.send(outer());', {'xss'}),
+            ('uninitialized-undefined-local-uses-default', 'function read(value=req.query.html){return value;} function outer(){var undefined;return read(undefined);} res.send(outer());', {'xss'}),
+            ('void-undefined-local-uses-default', 'function read(value=req.query.html){return value;} function outer(){const undefined=void 0;return read(undefined);} res.send(outer());', {'xss'}),
+            ('clean-undefined-formal-bypasses-default', 'function read(value=req.query.html){return value;} function outer(undefined){return read(undefined);} res.send(outer("safe"));', set()),
+            ('global-undefined-write-keeps-default', 'function read(value=req.query.html){return value;} undefined="safe"; res.send(read(undefined));', {'xss'}),
+            ('nested-global-undefined-write-keeps-default', 'function read(value=req.query.html){return value;} function outer(){undefined="safe";return read(undefined);} res.send(outer());', {'xss'}),
+            ('local-undefined-write-bypasses-default', 'function read(value=req.query.html){return value;} function outer(){let undefined;undefined="safe";return read(undefined);} res.send(outer());', set()),
+            ('strict-undefined-write-skips-cleanup', '"use strict";const box={html:req.query.html};try{undefined="safe";box.html="safe";}catch(error){}res.send(box.html);', {'xss'}),
+            ('strict-undefined-write-keeps-rhs-cleanup', '"use strict";const box={html:req.query.html};try{undefined=(box.html="safe");box.html=req.query.html;}catch(error){}res.send(box.html);', set()),
+            ('strict-undefined-and-bypasses-write', '"use strict";const box={html:req.query.html};undefined&&=(box.html="safe");res.send(box.html);', {'xss'}),
+            ('strict-undefined-or-keeps-rhs-source', '"use strict";const box={html:"safe"};try{undefined||=(box.html=req.query.html);box.html="safe";}catch(error){}res.send(box.html);', {'xss'}),
+            ('strict-undefined-catch-repairs-store', '"use strict";const box={html:req.query.html};try{undefined="safe";}catch(error){box.html="safe";}res.send(box.html);', set()),
+            ('void-expression-uses-default', 'function read(x=req.query.html){return x;} res.send(read(void (1+2)));', {'xss'}),
         ]
         for name, source, expected in cases:
             with self.subTest(name=name), tempfile.TemporaryDirectory(prefix='ubs-heap-meta-') as tmp:

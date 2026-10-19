@@ -1063,6 +1063,56 @@ class SwiftScopedFlowTests(unittest.TestCase):
                         }
                     ''' % (sink, label), (2,), policy=policy, suffix=f'-{label}-{policy}')
 
+    def test_request_argument_labels_are_not_incoming_sources(self):
+        for label in ('req', 'request'):
+            for arguments in (f'{label}: draft', f'id: draftID, {label}\n/* label */ : draft'):
+                for policy in ('path', 'redirect'):
+                    with self.subTest(label=label, arguments=arguments, policy=policy):
+                        self.check('''
+                            struct Editor {
+                                var saved: Draft { Draft(%s) }
+                                var body: some View {
+                                    ForEach(files) { file in Text(file.name) }
+                                }
+                                func save() { Task { persist(Draft(%s)) } }
+                            }
+                        ''' % (arguments, arguments), policy=policy,
+                                   suffix=f'-{label}-{len(arguments)}-{policy}')
+
+    def test_request_label_exclusion_preserves_value_witnesses(self):
+        for name in ('req', 'request'):
+            for source in (f'output([{name}: value])', f'output(flag ? {name} : value)',
+                           f'output(request: {name})', f'output(request: upload.{name})',
+                           f'output(request: {name}?.query["next"])',
+                           'output(request: "copy-\\(' + name + '.query["name"])")',
+                           f'func handle({name}: Request) {{}}'):
+                with self.subTest(source=source):
+                    self.assertTrue(swift_source_tokens(swift_validated_tokens(source)))
+            for source in (f'output({name}: draft)', f'output(id: key, {name} /* label */\n: draft)',
+                           'print("\\(output(' + name + ': draft))")'):
+                with self.subTest(source=source):
+                    self.assertFalse(swift_source_tokens(iter(swift_validated_tokens(source))))
+
+    def test_request_labels_do_not_hide_real_captures_or_sinks(self):
+        for label in ('req', 'request'):
+            for policy, sink in (('path', 'String(contentsOfFile: target)'),
+                                 ('redirect', 'Response.redirect(to: target)')):
+                with self.subTest(label=label, policy=policy):
+                    self.check('''
+                        func forward(%s target: String) {
+                            %s
+                        }
+                        func handle(req: Request) {
+                            forward(%s: req.query["target"])
+                        }
+                    ''' % (label, sink, label), (2,), policy=policy, suffix=f'-{label}-{policy}')
+                    with self.assertRaisesRegex(ValueError, 'closure.*incomplete'):
+                        self.check('''
+                            func handle(req: Request) {
+                                Task { forward(%s: req.query["target"]) }
+                            }
+                        ''' % label, policy=policy, suffix=f'-capture-{label}-{policy}')
+
     def test_actual_filename_capture_remains_explicitly_incomplete(self):
         sources = (
             'Task { IntentFile(filename: upload.filename) }',

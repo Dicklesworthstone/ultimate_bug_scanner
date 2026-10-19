@@ -6,7 +6,7 @@ when cases exceed breaks the difference is reported as "may be missing
 break", when switches exceed defaults as "no default case". The reported
 count is a delta, so the record stream anchors one record per counted unit
 on the trailing case/switch lines (delta == that many unmatched lines).
-count_lines marker semantics apply to every count.
+Source-owned directives filter the selected findings after all counts are known.
 """
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
-from ubs_core.java_scan import MARKER
+from ubs_core.suppression import SourceSuppressions
 from ubs_core.java_detectors._common import iter_java_files, read_lines
 
 CATEGORY = 9
@@ -34,15 +34,15 @@ ARROW_RE = re.compile(r"->")
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple[str, Path, int, int, str]]:
+    suppressions = SourceSuppressions('java')
     switch_lines: list[tuple[Path, int, str]] = []
     case_lines: list[tuple[Path, int, str]] = []
     breaks = 0
     defaults = 0
     for path in iter_java_files(files):
         lines = read_lines(path)
+        suppressions.index(path, '\n'.join(lines))
         for idx, line in enumerate(lines, start=1):
-            if MARKER in line:
-                continue  # count_lines drops marker lines from counts
             if SWITCH_RE.search(line):
                 switch_lines.append((path, idx, line.strip()[:240]))
             if CASE_RE.search(line) and not ARROW_RE.search(line):
@@ -54,8 +54,12 @@ def find(files: Sequence[Path]) -> Iterable[tuple[str, Path, int, int, str]]:
     fallthrough = len(case_lines) - breaks
     if len(case_lines) > breaks and fallthrough > 0:
         for path, line_no, detail in case_lines[-fallthrough:]:
-            yield "java.control-flow.switch-fallthrough", path, line_no, 1, detail
+            rule_id = "java.control-flow.switch-fallthrough"
+            if not suppressions.index(path).is_suppressed(line_no, rule_id):
+                yield rule_id, path, line_no, 1, detail
     missing_default = len(switch_lines) - defaults
     if len(switch_lines) > defaults and missing_default > 0:
         for path, line_no, detail in switch_lines[-missing_default:]:
-            yield "java.control-flow.switch-no-default", path, line_no, 1, detail
+            rule_id = "java.control-flow.switch-no-default"
+            if not suppressions.index(path).is_suppressed(line_no, rule_id):
+                yield rule_id, path, line_no, 1, detail

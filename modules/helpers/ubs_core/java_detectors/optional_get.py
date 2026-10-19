@@ -2,8 +2,8 @@
 
 Port of the `java_pattern_scan optional_get` mode (modules/ubs-java.sh
 615-641): Optional.get() calls on declared Optional variables plus chained
-Optional.of(...)/ofNullable(...)/empty(...).get(). No marker check in legacy
-(the heredoc never inspected ubs:ignore).
+Optional.of(...)/ofNullable(...)/empty(...).get(). Source-owned directives
+filter findings after Optional declarations are collected.
 """
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.suppression import SourceSuppressions
 from ubs_core.java_detectors._common import iter_java_files, read_lines, strip_line_comments
 
 RULE_ID = "java.null-optional.optional-get"
@@ -25,10 +26,12 @@ CHAINED_PAT = re.compile(r"\b(?:java\.util\.)?Optional\s*\.\s*(?:of|ofNullable|e
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
+    suppressions = SourceSuppressions('java')
     for path in iter_java_files(files):
         lines = read_lines(path)
         if not lines:
             continue
+        suppression = suppressions.index(path, '\n'.join(lines))
         optionals = set()
         for line in lines:
             stripped = line.split("//", 1)[0]
@@ -42,5 +45,5 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
                     break
             if not matched and CHAINED_PAT.search(stripped):
                 matched = True
-            if matched:
+            if matched and not suppression.is_suppressed(idx, RULE_ID):
                 yield path, idx, 1, line.strip()[:240]

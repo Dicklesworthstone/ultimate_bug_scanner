@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Iterable
 
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.suppression import SourceSuppressions
 
 exts = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
 skip_dirs = {'.git', 'node_modules', 'dist', 'build', 'coverage', '.next', '.cache', '.turbo'}
@@ -240,9 +241,8 @@ CONTINUATION_HEAD = ('.', '?', ':', ')', ']', '&&', '||', '+', '===', '!==', '==
 
 def statement_start(code_lines, index):
     # Walk upward over physical lines that belong to the same statement as
-    # lines[index] (assignment/paren/operator continuations), so a suppression
-    # marker placed above a MULTI-LINE statement still attaches to a finding
-    # reported against one of its continuation lines. GH #91.
+    # lines[index] (assignment/paren/operator continuations) to recover the
+    # left operand of a comparison whose operator starts a continuation line.
     start = index
     for _ in range(8):
         if start <= 0:
@@ -256,34 +256,6 @@ def statement_start(code_lines, index):
             continue
         break
     return start
-
-
-def has_ignore(lines, code_lines, index):
-    # Suppression markers live in comments, so they must be checked against the
-    # RAW source line, never against comment-stripped text: code_line() removes
-    # '// ubs:ignore' before it could ever match.
-    # GH #84: a count-time miss here made suppressed findings still count in
-    # totals and the exit code even though the report line was elided.
-    # GH #91: honored placements are (a) trailing the flagged line, (b) any
-    # physical line of the enclosing multi-line statement, (c) the line
-    # immediately above the statement's FIRST line (not just above the flagged
-    # continuation line), and (d) a comment-only line directly inside a block
-    # opened by the flagged line — formatters commonly relocate a trailing
-    # marker off a block-opening `if (...) {` onto the next line, which used to
-    # silently detach the suppression.
-    if not (0 <= index < len(lines)):
-        return False
-    if 'ubs:ignore' in lines[index]:
-        return True
-    start = statement_start(code_lines, index)
-    for pos in range(max(0, start - 1), index):
-        if 'ubs:ignore' in lines[pos]:
-            return True
-    if code_lines[index].rstrip().endswith('{') and index + 1 < len(lines):
-        relocated = lines[index + 1].strip()
-        if relocated.startswith(('//', '/*', '*')) and 'ubs:ignore' in relocated:
-            return True
-    return False
 
 
 def open_jsx_tag(prefix):
@@ -308,7 +280,7 @@ def collect_sensitive_vars(lines, code_lines):
         tag = open_jsx_tag(tag + ' ' + strip_string_literals(code))
     for idx, code in enumerate(code_lines):
         stripped = code.strip()
-        if not stripped or has_ignore(lines, code_lines, idx) or '=>' in stripped:
+        if not stripped or '=>' in stripped:
             continue
         statement = statement_from(code_lines, idx, max_lines=5)
         if not statement or safe_compare_re.search(statement):
@@ -392,7 +364,7 @@ def comparison_operands(statement: str) -> Iterable[tuple[int, str, str]]:
 
 
 def unsafe_secret_compare(statement, sensitive_vars, *, comparison_start=0, comparison_limit=None):
-    if safe_compare_re.search(statement) or 'ubs:ignore' in statement:
+    if safe_compare_re.search(statement):
         return False
     # Match within each term, never across &&/||. An exempt comparison only
     # exempts that term; later terms may still compare actual secret values.
@@ -444,18 +416,19 @@ def scan_file(path: Path, sample_root: Path) -> list[tuple[str, int, str]]:
     if path.suffix.lower() not in exts:
         return issues
     try:
-        lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
+        text = path.read_text(encoding='utf-8', errors='ignore')
     except Exception:
         return issues
-    # Statement lookahead and ignore placement revisit each physical line.
-    # Keep its exact lexical view only for this file; raw comments remain
-    # available for suppressions, and no source survives into the next file.
+    lines = text.splitlines()
+    source_index = SourceSuppressions('javascript').index(path, text)
+    # Statement lookahead revisits each physical line. Keep its exact lexical
+    # view only for this file; the shared index owns suppression separately.
     code_lines = [code_line(raw) for raw in lines]
     sensitive_vars = collect_sensitive_vars(lines, code_lines)
     seen_lines = set()
     for idx, code in enumerate(code_lines):
         stripped = code.strip()
-        if not stripped or has_ignore(lines, code_lines, idx) or ('==' not in stripped and '!=' not in stripped):
+        if not stripped or ('==' not in stripped and '!=' not in stripped):
             continue
         prefix = ''
         if compare_re.match(stripped):
@@ -473,7 +446,7 @@ def scan_file(path: Path, sample_root: Path) -> list[tuple[str, int, str]]:
             comparison_limit=len(prefix) + len(stripped)
         ):
             continue
-        if idx in seen_lines:
+        if idx in seen_lines or source_index.is_suppressed(idx + 1, _RULE):
             continue
         seen_lines.add(idx)
         try:
@@ -512,6 +485,7 @@ def main() -> int:
 
 
 _KIND = "unsafe_secret_compare"
+_RULE = f"javascript.ctcompare.{_KIND}"
 _MESSAGE = "Secret, signature, or token compared with ==/!= without timing-safe equality"
 
 
@@ -520,7 +494,7 @@ def run(ctx: RunContext) -> Iterable[dict]:
     for path in ctx.files:
         for rel, line, _sample in scan_file(path, cwd):
             yield {
-                "rule": f"javascript.ctcompare.{_KIND}",
+                "rule": _RULE,
                 "path": rel,
                 "line": line,
                 "col": 1,

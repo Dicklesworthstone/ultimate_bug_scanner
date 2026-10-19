@@ -254,6 +254,7 @@ class SwiftParser:
     def __init__(self, text, tokens=None):
         self.tokens = swift_validated_tokens(text) if tokens is None else tokens
         self.functions, self.types, self.extensions, self.final_types = {}, set(), set(), set()
+        self.value_types = set()
         body = self.block(self.tokens, (), (), declarations=True)
         self.functions[-1] = SwiftFunction(-1, '<script>', (), (), (), body)
 
@@ -374,6 +375,8 @@ class SwiftParser:
                 (self.extensions if kind == 'extension' else self.types).add(name)
                 if kind in {'struct', 'enum'} or any(token.value == 'final' for token in tokens[start:head]):
                     self.final_types.add(name)
+                if kind in {'struct', 'enum'}:
+                    self.value_types.add(name)
                 self.block(tokens[position + 1:finish], (*owner, name), scope, declarations=True, depth=depth + 1)
                 statements.append(SwiftStatement('definition', tuple(tokens[start:finish + 1])))
                 cursor = finish + 1
@@ -518,18 +521,18 @@ def swift_has_shape(fact, name):
 
 
 def swift_source_tokens(tokens):
-    # A filename *value/member* may be incoming upload data; the argument label
-    # in IntentFile(filename: name) is not a value at all. Only exclude a proven
-    # parenthesized label position, retaining dictionary keys, ternary values,
+    # A request/filename *value/member* may be incoming data; an argument label
+    # in Draft(request: draft) or IntentFile(filename: name) is not a value.
+    # Only exclude a proven parenthesized label position, retaining dictionary keys, ternary values,
     # member access and interpolation as conservative source witnesses.
     tokens = tuple(token for token in tokens if token.kind != 'code' or token.value != '\n')
     delimiters = []
     closing = {')': '(', ']': '[', '}': '{'}
     for index, token in enumerate(tokens):
         if token.kind == 'code':
-            if token.value in {'Request', 'req', 'request'}:
+            if token.value == 'Request':
                 return True
-            if token.value in {'filename', 'fileName', 'originalFilename', 'originalFileName'}:
+            if token.value in {'req', 'request', 'filename', 'fileName', 'originalFilename', 'originalFileName'}:
                 previous = tokens[index - 1] if index else None
                 following = tokens[index + 1] if index + 1 < len(tokens) else None
                 is_label = (
@@ -953,6 +956,13 @@ class SwiftEngine:
         native_file = (not candidates or name.startswith(('req.fileio.', 'request.fileio.')))
         if leaf in {'String', 'Data', 'FileHandle'}:
             native_file = native_file and self.builtin(name, state, bindings)
+        elif leaf == 'write' and receiver and all(
+                trace.kind == 'shape' and trace.key[0].startswith('instance:')
+                and trace.key[0][len('instance:'):] in self.parser.value_types for trace in receiver):
+            # A struct or enum declared here (including one shadowing Data)
+            # has no Foundation write(to:). A receiver of unknown type may
+            # still be String or Data, so it remains a file sink.
+            native_file = False
         if native_file and (leaf in {'String', 'Data', 'FileHandle', 'sendFile', 'streamFile', 'readFile', 'serveFile', 'writeFile', 'file', 'write'} or name.startswith('FileManager.default.')):
             selected, leaf_safe = [], False
             if leaf in {'String', 'Data'}:

@@ -10,10 +10,8 @@ other pack rule was a cat-18 --json-out/--sarif-out passthrough). Keep all
 AST records in the internal cache sink, marking report-only records so the
 caller can preserve SARIF evidence without changing the counted findings.
 
-Suppression: same-line + previous-line `ubs:ignore` checks (the legacy
-run_async_error_checks parser semantics, ubs-ruby.sh 3377-3391); the A7
-statement-interval engine in the meta-runner postprocess layers the richer
-placements on top.
+Suppression: invocation-local source indexes apply the shared lexical and
+statement-interval policy to the exact diagnostic rule before counting.
 """
 from __future__ import annotations
 
@@ -21,30 +19,11 @@ import json
 from pathlib import Path
 from typing import Sequence
 
-from ubs_core.ruby_scan import MARKER
 from ubs_core.external_tools import ast_rule_configs, scan_ast_config
+from ubs_core.suppression import SourceSuppressions
 
 _ASTGREP_BIN = "ast-grep"
 _BATCH = 400  # paths per scan invocation (argv length safety)
-
-
-def _file_lines(path: Path, cache: dict[Path, list[str]]) -> list[str]:
-    if path not in cache:
-        try:
-            cache[path] = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError:
-            cache[path] = []
-    return cache[path]
-
-
-def _has_marker(path: Path, line_no: int, cache: dict[Path, list[str]]) -> bool:
-    lines = _file_lines(path, cache)
-    idx = line_no - 1
-    return any(0 <= i < len(lines) and MARKER in lines[i].lower() for i in (idx, idx - 1))
-
-
-def _lines_for(path: Path, cache: dict[Path, list[str]]) -> list[str]:
-    return _file_lines(path, cache)
 
 
 def scan_config(
@@ -70,7 +49,7 @@ def scan_config(
     """
     counters = {"critical": 0, "warning": 0, "info": 0}
     path_list = [Path(p) for p in paths]
-    cache: dict[Path, list[str]] = {}
+    suppressions = SourceSuppressions("ruby")
     for match in scan_ast_config(config, path_list, errors,
                                  ast_grep_bin=ast_grep_bin, batch_size=_BATCH):
         rule_id, file_str = match["ruleId"], match["file"]
@@ -93,7 +72,7 @@ def scan_config(
         severity = (severity_overrides or {}).get(rule_id) or default_severity
         if severity not in counters:
             severity = "warning"
-        if _has_marker(path, line_no, cache):
+        if suppressions.is_suppressed(path, line_no, rule_id):
             continue
         if counted:
             counters[severity] = counters.get(severity, 0) + 1

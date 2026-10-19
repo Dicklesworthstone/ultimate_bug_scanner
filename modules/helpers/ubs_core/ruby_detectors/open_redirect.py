@@ -8,7 +8,7 @@ redirect sinks (redirect_to/redirect/head location/Location header writes)
 whose target is request-derived. Safe-redirect helpers, local-path
 start_with?('/'), url_from, allow_other_host: false, and URI.parse + host
 allow-list + reject contexts within the preceding 24 lines suppress the hit.
-Same-file and previous-line `ubs:ignore` markers suppress a hit.
+Lexical statement-owned `ubs:ignore` markers suppress only matching rules.
 """
 from __future__ import annotations
 
@@ -16,9 +16,9 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.suppression import SourceSuppressions
 from ubs_core.ruby_detectors._common import (
     EXTS,
-    has_ignore,
     logical_statement,
     read_lines,
     ruby_files,
@@ -144,11 +144,10 @@ def analyze(lines, issues, path_str):
     text = "\n".join(lines)
     if not (re.search(r'\b(?:params|request|env|Rack::Request)\b', text) and SINK_RE.search(text)):
         return
+    suppressions = SourceSuppressions('ruby').index(path_str, text)
     tainted = {}
     seen = set()
     for idx in range(1, len(lines) + 1):
-        if has_ignore(lines, idx):
-            continue
         statement = logical_statement(lines, idx).strip()
         if not statement:
             continue
@@ -185,7 +184,8 @@ def analyze(lines, issues, path_str):
                 seq = seq[-(PATH_LIMIT - 1):]
             seq.append("redirect sink")
             path_desc = " -> ".join(seq)
-        issues.append((path_str, idx, 1, f"{source_line(lines, idx)}  [{path_desc}]"))
+        if not suppressions.is_suppressed(idx, RULE_ID):
+            issues.append((path_str, idx, 1, f"{source_line(lines, idx)}  [{path_desc}]"))
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple]:

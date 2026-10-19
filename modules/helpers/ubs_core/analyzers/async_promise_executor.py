@@ -5,8 +5,8 @@ Ported verbatim from the modules/ubs-js.sh heredoc "async Promise executors":
 Promise the constructor discards, so ``throw`` inside it never rejects the outer
 promise (the error is lost). The heredoc scans for a ``new Promise(`` entry line
 (optional generic), joins the paren-balanced expression window (16 lines), and
-flags ``async``/``async function`` executors unless the window contains
-``ubs:ignore``.
+flags ``async``/``async function`` executors. Suppression uses shared lexical
+statement ownership and the exact rule ID.
 
 run(ctx) iterates ctx.files instead of self-walking; match logic is identical.
 """
@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Iterable
 
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.suppression import SourceSuppressions
 
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
 SKIP_DIRS = {'.git', 'node_modules', 'dist', 'build', 'coverage', '.next', '.cache', '.turbo'}
@@ -36,9 +37,11 @@ WINDOW = 16
 def scan_file(path: Path):
     """Return (line, col) findings for one file; heredoc match logic."""
     try:
-        lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
+        text = path.read_text(encoding='utf-8', errors='ignore')
     except Exception:
         return []
+    lines = text.splitlines()
+    source_index = SourceSuppressions('javascript').index(path, text)
     issues = []
     for idx, line in enumerate(lines):
         stripped = line.strip()
@@ -60,7 +63,9 @@ def scan_file(path: Path):
             if saw_promise and expr_idx > idx and paren_balance <= 0:
                 break
         expression_text = ' '.join(expression_lines)
-        if 'ubs:ignore' in expression_text or not ASYNC_EXECUTOR_RE.search(expression_text):
+        if not ASYNC_EXECUTOR_RE.search(expression_text):
+            continue
+        if source_index.is_suppressed(idx + 1, RULE_ID):
             continue
         issues.append((idx + 1, start_match.start() + 1))
     return issues

@@ -93,10 +93,34 @@ class MatchTests(unittest.TestCase):
 
     def test_marker_lines_excluded(self) -> None:
         p = _pat()
-        text = "debugger;\ndebugger;  # ubs:ignore\n"
+        text = "debugger;\ndebugger;  // ubs:ignore\n"
         hits = list(iter_matches(p, text))
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0][0], 1)
+
+    def test_hash_text_is_not_a_javascript_comment_marker(self) -> None:
+        hits = list(iter_matches(_pat(), "debugger;  # ubs:ignore\n"))
+        self.assertEqual([hit[0] for hit in hits], [1])
+
+    def test_body_markers_do_not_suppress_unrelated_function_headers(self) -> None:
+        pattern = _pat(rule_id="js.function-scope.callback-density", regex=re.compile(r"function"))
+        for body in (
+            "  const outputPath = getPath(); // ubs:ignore\n  write(outputPath);\n",
+            "  if (token !== expected) {\n    // ubs:ignore\n    return false;\n  }\n",
+        ):
+            with self.subTest(body=body):
+                source = "export function check(): boolean {\n" + body + "}\n"
+                self.assertEqual([hit[0] for hit in iter_matches(pattern, source)], [1])
+
+    def test_comment_markers_own_preceding_and_formatter_header_positions(self) -> None:
+        pattern = _pat(rule_id="js.function-scope.callback-density", regex=re.compile(r"function"))
+        for source in (
+            '// A quoted "ubs:ignore" in a comment is still a directive.\n'
+            "export function check() {\n  work();\n}\n",
+            "export function check() {\n  // ubs:ignore\n  work();\n}\n",
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(list(iter_matches(pattern, source)), [])
 
     def test_exclude_regex_drops_lines(self) -> None:
         p = _pat(
@@ -737,10 +761,11 @@ class CustomPolicyIntegrationTests(unittest.TestCase):
         pid_file = self.root / "analyzer.pid"
         binary.write_text(
             f"#!{sys.executable}\n"
-            "import os, sys, time\nfrom pathlib import Path\n"
+            "import json, os, sys, time\nfrom pathlib import Path\n"
             "if '--version' in sys.argv:\n    print('ast-grep 0.45.3'); sys.exit(0)\n"
             "if '-c' not in sys.argv:\n    sys.exit(0)\n"
-            f"Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
+            f"Path({str(pid_file)!r}).write_text(json.dumps([os.getpid(), "
+            "Path('/proc/self/stat').read_text().partition(' ')[0]]))\n"
             "time.sleep(30)\n"
         )
         binary.chmod(0o755)
@@ -752,11 +777,12 @@ class CustomPolicyIntegrationTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
             self.assertIn("MODULE_TIMEOUT", result.stdout + result.stderr)
             self.assertTrue(pid_file.is_file(), result.stdout + result.stderr)
-            state = Path(f"/proc/{int(pid_file.read_text())}/stat")
+            _local_pid, proc_pid = json.loads(pid_file.read_text())
+            state = Path(f"/proc/{proc_pid}/stat")
             deadline = time.monotonic() + 1.0
             while True:
                 try:
-                    child_state = state.read_text().split()[2]
+                    child_state = state.read_text().rpartition(")")[2].split()[0]
                 except FileNotFoundError:
                     break
                 if child_state == "Z":
@@ -766,7 +792,7 @@ class CustomPolicyIntegrationTests(unittest.TestCase):
         finally:
             if pid_file.is_file():
                 try:
-                    os.kill(int(pid_file.read_text()), signal.SIGKILL)
+                    os.kill(int(json.loads(pid_file.read_text())[0]), signal.SIGKILL)
                 except ProcessLookupError:
                     pass
 
@@ -790,10 +816,10 @@ class AstCompletenessTests(unittest.TestCase):
             "severity": "error", "message": "Policy violation",
         }
 
-    def invoke(self, stdout, returncode=0, **kwargs):
+    def invoke(self, stdout, returncode=0, stderr="", **kwargs):
         from ubs_core.external_tools import ToolStreamOutput
         sink, errors = io.StringIO(), []
-        output = ToolStreamOutput(returncode, io.BytesIO(stdout.encode("utf-8")), "")
+        output = ToolStreamOutput(returncode, io.BytesIO(stdout.encode("utf-8")), stderr)
         with mock.patch.object(self.ast, "run_command_stream", return_value=nullcontext(output)):
             counts = self.ast.scan_config(
                 self.config, [self.source], sink, "custom", errors=errors, **kwargs,
@@ -830,6 +856,16 @@ class AstCompletenessTests(unittest.TestCase):
                     self.assertFalse(rows)
                     self.assertTrue(errors)
 
+    def test_invalid_end_ranges_are_not_complete_evidence(self):
+        for end in (None, [], {}, {"line": True, "column": 0}, {"line": -1, "column": 0},
+                    {"line": 0, "column": 1}):
+            with self.subTest(end=end):
+                invalid = {**self.match, "range": {"start": {"line": 0, "column": 2}, "end": end}}
+                counts, rows, errors = self.invoke(json.dumps(invalid) + "\n" + json.dumps(self.match))
+                self.assertEqual(counts["critical"], 1)
+                self.assertEqual(len(rows), 1)
+                self.assertTrue(errors)
+
     def test_error_exit_without_evidence_is_partial(self):
         counts, rows, errors = self.invoke("", returncode=1)
         self.assertFalse(rows)
@@ -850,11 +886,55 @@ class AstCompletenessTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertIn("exited 2", errors[0])
 
+    def test_native_stderr_error_cannot_hide_behind_zero_exit(self):
+        counts, rows, errors = self.invoke(json.dumps(self.match), stderr="ERROR: missing selected source\n")
+        self.assertEqual(counts["critical"], 1)
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(any("analyzer error(s) on stderr" in error for error in errors))
+
+    def test_complete_stderr_stream_is_checked_beyond_preview(self):
+        counts, rows, errors = self.real_analyzer(
+            "import json, sys\n"
+            f"print(json.dumps({self.match!r}))\n"
+            "sys.stderr.write('Warning: analyzer note\\n' * 300)\n"
+            "sys.stderr.write('ERROR: missing selected source\\n')\n"
+        )
+        self.assertEqual(counts["critical"], 1)
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(any("analyzer error(s) on stderr" in error for error in errors))
+
     def test_many_malformed_records_have_bounded_diagnostics(self):
         _, _, errors = self.invoke("not-json\n" * 10000)
         self.assertEqual(len(errors), 1)
         self.assertIn("10000 malformed", errors[0])
         self.assertLess(len(errors[0]), 400)
+
+    def test_observed_corruption_survives_sink_failure(self):
+        from ubs_core.external_tools import ToolStreamOutput
+        errors = []
+        output = ToolStreamOutput(0, io.BytesIO(b"null\n" + json.dumps(self.match).encode() + b"\n"), "")
+        sink = mock.Mock()
+        sink.write.side_effect = OSError("consumer sink failed")
+        with mock.patch.object(self.ast, "run_command_stream", return_value=nullcontext(output)):
+            with self.assertRaisesRegex(OSError, "consumer sink failed"):
+                self.ast.scan_config(self.config, [self.source], sink, "custom", errors=errors)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("1 malformed diagnostic", errors[0])
+
+    def test_no_error_accumulator_still_rejects_incomplete_analysis(self):
+        from ubs_core.external_tools import ToolStreamOutput
+        for code, payload in ((1, b""), (2, b""), (0, b"null\n"), (0, b"\xff\n")):
+            with self.subTest(code=code, payload=payload):
+                valid = json.dumps(self.match).encode() + b"\n" if payload else b""
+                output = ToolStreamOutput(code, io.BytesIO(valid + payload), "")
+                sink = io.StringIO()
+                with mock.patch.object(self.ast, "run_command_stream", return_value=nullcontext(output)):
+                    with self.assertRaises(RuntimeError):
+                        self.ast.scan_config(self.config, [self.source], sink, "custom")
+                self.assertEqual(bool(sink.getvalue()), bool(valid))
+        with mock.patch.dict(os.environ, {"UBS_AST_GREP_BIN": str(self.root / "absent")}):
+            with self.assertRaisesRegex(RuntimeError, "could not launch"):
+                self.ast.scan_config(self.config, [self.source], io.StringIO(), "custom")
 
     def test_missing_config_is_not_a_clean_scan(self):
         sink, errors = io.StringIO(), []
@@ -866,6 +946,24 @@ class AstCompletenessTests(unittest.TestCase):
         errors = []
         self.ast.scan_all(self.root / "absent", [self.source], io.StringIO(), errors=errors)
         self.assertTrue(errors)
+
+    def test_missing_config_and_grammar_raise_without_error_accumulator(self):
+        with self.assertRaisesRegex(RuntimeError, "missing or nonregular config"):
+            self.ast.scan_config(self.root / "absent.yml", [self.source], io.StringIO(), "custom")
+        with self.assertRaisesRegex(RuntimeError, "missing or nonregular config"):
+            self.ast.scan_all(self.root / "absent", [self.source], io.StringIO())
+
+    def test_no_error_accumulator_keeps_custom_findings_before_missing_grammar_error(self):
+        from ubs_core.external_tools import ToolStreamOutput
+        output = ToolStreamOutput(1, io.BytesIO(json.dumps(self.match).encode() + b"\n"), "")
+        sink = io.StringIO()
+        with mock.patch.object(self.ast, "run_command_stream", return_value=nullcontext(output)):
+            with self.assertRaisesRegex(RuntimeError, "sgconfig-typescript.yml"):
+                self.ast.scan_all(self.root, [self.source], sink, count_only=set(),
+                                  severity_overrides={self.match["ruleId"]: "info"})
+        record = json.loads(sink.getvalue())
+        self.assertEqual(record["rule"], self.match["ruleId"])
+        self.assertEqual(record["severity"], "critical")
 
     def test_missing_grammar_is_partial_even_with_other_configs_present(self):
         errors = []
@@ -880,6 +978,10 @@ class AstCompletenessTests(unittest.TestCase):
         errors = []
         self.ast.scan_config(self.root / "absent.yml", [], io.StringIO(), "custom", errors=errors)
         self.assertFalse(errors)
+        self.assertEqual(self.ast.scan_config(self.root / "absent.yml", [], io.StringIO(), "custom"),
+                         {"critical": 0, "warning": 0, "info": 0})
+        self.assertEqual(self.ast.scan_all(self.root / "absent", [], io.StringIO()),
+                         {"critical": 0, "warning": 0, "info": 0})
 
     def test_partial_output_sets_summary_exit_and_refuses_cache(self):
         from ubs_core import js_scan
@@ -1012,25 +1114,31 @@ class AstCompletenessTests(unittest.TestCase):
         import signal
         import time
         pid_file = self.root / "child.pid"
+        state_file = self.root / "child-proc.pid"
+        child_code = (
+            "import time\nfrom pathlib import Path\n"
+            f"Path({str(state_file)!r}).write_text(Path('/proc/self/stat').read_text().partition(' ')[0])\n"
+            "time.sleep(30)\n"
+        )
         try:
             with mock.patch.object(self.ast, "_TIMEOUT", 1.0):
                 _, _, errors = self.real_analyzer(
                     "import subprocess, sys, time\nfrom pathlib import Path\n"
-                    "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+                    f"child = subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
                     f"Path({str(pid_file)!r}).write_text(str(child.pid))\n"
                     f"print({json.dumps(self.match)!r}, flush=True)\ntime.sleep(30)\n"
                 )
             self.assertTrue(any("timed out" in error for error in errors), errors)
             self.assertTrue(pid_file.is_file())
-            child_pid = int(pid_file.read_text())
-            state = Path(f"/proc/{child_pid}/stat")
+            self.assertTrue(state_file.is_file())
+            state = Path(f"/proc/{int(state_file.read_text())}/stat")
             # Waiting for the direct child does not wait for its descendants.
             # Give group SIGKILL delivery a bounded grace period, but fail if
             # the descendant remains alive (its own sleep lasts 30 seconds).
             deadline = time.monotonic() + 1.0
             while True:
                 try:
-                    child_state = state.read_text().split()[2]
+                    child_state = state.read_text().rpartition(")")[2].split()[0]
                 except FileNotFoundError:
                     break
                 if child_state == "Z":

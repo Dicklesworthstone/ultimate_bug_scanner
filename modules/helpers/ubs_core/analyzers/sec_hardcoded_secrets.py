@@ -4,8 +4,8 @@
 Verbatim port of the legacy ubs-js.sh heredoc "Hardcoded secrets/credentials":
 same literal/env-fallback/declaration/property/assignment regexes, same
 sensitive-name normalization and placeholder filtering, same 14-line statement
-window, same ``ubs:ignore`` placement rules (same line or the line immediately
-above, and anywhere inside the collected statement). The heredoc's os.walk over
+window. Suppression uses the shared lexical statement policy and exact public
+rule. The heredoc's os.walk over
 the project is replaced by iteration over ``RunContext.files``; per-file match
 logic is unchanged.
 
@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.suppression import SourceSuppressions
 
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
 
@@ -216,33 +217,31 @@ def assignment_literal(statement: str) -> str:
     return ""
 
 
-def has_ignore(lines: list[str], idx: int) -> bool:
-    if 'ubs:ignore' in lines[idx]:
-        return True
-    return idx > 0 and 'ubs:ignore' in lines[idx - 1]
-
-
 def scan_file_findings(path: Path) -> Iterator[tuple[int, str]]:
     """Yield (line_number, sample_text) per detection; heredoc-identical."""
     try:
-        lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
+        source_text = path.read_text(encoding='utf-8', errors='ignore')
     except Exception:
         return
+    lines = source_text.splitlines()
+    suppressions = SourceSuppressions('javascript').index(path, source_text)
     seen_lines = set()
     for idx, line in enumerate(lines):
         stripped = code_line(line).strip()
-        if not stripped or has_ignore(lines, idx):
+        if not stripped:
             continue
         if not is_sensitive_name(stripped):
             continue
         if re.match(r'(?:export\s+)?(?:async\s+)?function\b', stripped) and not env_fallback_literal(stripped):
             continue
         statement = statement_from(lines, idx)
-        if not statement or 'ubs:ignore' in statement:
+        if not statement:
             continue
         if not (env_fallback_literal(statement) or assignment_literal(statement)):
             continue
         if idx in seen_lines:
+            continue
+        if suppressions.is_suppressed(idx + 1, RULE):
             continue
         seen_lines.add(idx)
         yield idx + 1, stripped.replace('\t', ' ')

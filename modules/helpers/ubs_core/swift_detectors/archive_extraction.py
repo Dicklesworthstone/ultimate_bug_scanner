@@ -11,9 +11,10 @@ import re
 from pathlib import Path
 
 from ubs_core.swift_detectors._common import (
-    SKIP_DIRS, has_ignore, logical_statement, rel, should_skip,
+    SKIP_DIRS, logical_statement, rel, should_skip,
     source_line, strip_line_comments,
 )
+from ubs_core.suppression import SourceSuppressions
 
 RULE_ID = "swift.security.archive-extraction"
 CATEGORY = 6
@@ -90,6 +91,7 @@ def scan(ctx):
     root = project.resolve()
     base = root if root.is_dir() else root.parent
     findings = []
+    suppressions = SourceSuppressions("swift")
     for candidate in ctx.files:
         path = Path(candidate).resolve()
         if path.suffix != '.swift':
@@ -102,17 +104,18 @@ def scan(ctx):
             continue
         if not archive_hint.search(text):
             continue
+        suppressions.index(path, text)
         lines = text.splitlines()
         aliases = _collect_aliases(lines)
         for line_no in range(1, len(lines) + 1):
-            if has_ignore(lines, line_no):
-                continue
             statement = logical_statement(lines, line_no)
             if not path_build.search(statement):
                 continue
             if not _has_entry_name(statement, aliases):
                 continue
             if _has_safe_context(_context_around(lines, line_no)):
+                continue
+            if suppressions.is_suppressed(path, line_no, RULE_ID):
                 continue
             findings.append((rel(path, base), line_no, source_line(lines, line_no)))
 

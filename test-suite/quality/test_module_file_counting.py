@@ -21,6 +21,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODULES_WITH_COUNTER = ("modules/ubs-elixir.sh", "modules/ubs-ruby.sh")
+MODULE_CASES = (("elixir", ".ex"), ("ruby", ".rb"))
 
 
 def extract_safe_count_files(module_path: Path) -> str:
@@ -79,6 +80,88 @@ class SafeCountFilesTest(unittest.TestCase):
                     timeout=30,
                 )
                 self.assertEqual(result.stdout.decode("utf-8", "replace").strip(), "0")
+
+
+class ModuleFileCountTest(unittest.TestCase):
+    """The public module output counts the selected NUL-delimited paths once.
+
+    Includes the real BusyBox awk when installed, and paths with spaces and
+    newlines; the explicit file list is authoritative over the project root.
+    """
+
+    def _check_module_counts(self, *, empty: bool, busybox: bool = False) -> None:
+        artifacts = REPO_ROOT / "test-suite/artifacts/module-file-counting"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="case-", dir=artifacts) as tmp:
+            root = Path(tmp)
+            env = os.environ.copy()
+            env.update(NO_COLOR="1", UBS_NO_CACHE="1", UBS_ENABLE_AUTO_UPDATE="0")
+            if busybox:
+                tools = root / "tools"
+                tools.mkdir()
+                executable = shutil.which("busybox")
+                self.assertIsNotNone(executable)
+                (tools / "awk").symlink_to(executable)
+                env["PATH"] = str(tools) + os.pathsep + env.get("PATH", "")
+
+            for language, extension in MODULE_CASES:
+                with self.subTest(language=language, empty=empty, busybox=busybox):
+                    project = root / language
+                    project.mkdir()
+                    selected = []
+                    for name in ("one", "two spaces", "three\nlines"):
+                        path = project / (name + extension)
+                        path.write_text("# Intentionally empty source.\n", encoding="utf-8")
+                        selected.append(path)
+                    # The explicit NUL list is authoritative even when other
+                    # supported source files exist below the project root.
+                    (project / ("unselected" + extension)).write_text(
+                        'eval(ARGV[0])\n' if language == "ruby"
+                        else 'Code.eval_string(System.get_env("INPUT"))\n',
+                        encoding="utf-8",
+                    )
+                    file_list = root / (language + ".nul")
+                    file_list.write_bytes(
+                        b"" if empty else b"".join(os.fsencode(path) + b"\0" for path in selected)
+                    )
+                    command = [
+                        "bash", str(REPO_ROOT / f"modules/ubs-{language}.sh"),
+                        str(project), "--format=json", "--ci", "--fail-on-warning",
+                        "--files-from", str(file_list),
+                    ]
+                    started = time.monotonic()
+                    result = subprocess.run(
+                        command, cwd=root, capture_output=True, text=True, env=env,
+                        check=False, timeout=90,
+                    )
+                    (root / (language + "-stdout.log")).write_text(result.stdout, encoding="utf-8")
+                    (root / (language + "-stderr.log")).write_text(result.stderr, encoding="utf-8")
+                    context = (f"command={command!r}, empty={empty}, busybox={busybox}, "
+                               f"elapsed={time.monotonic() - started:.3f}s, exit={result.returncode}"
+                               f"\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}")
+                    self.assertEqual(result.returncode, 0, context)
+                    document = json.loads(result.stdout)
+                    self.assertEqual(document["language"], language, context)
+                    self.assertEqual(document["status"], "ok", context)
+                    self.assertEqual(document["files"], 0 if empty else 3, context)
+                    self.assertEqual(document["critical"], 0, context)
+                    self.assertEqual(document["warning"], 0, context)
+                    self.assertEqual(document["info"], 0, context)
+                    self.assertEqual(document["findings"], [], context)
+
+    def test_counts_selected_nul_delimited_paths(self) -> None:
+        self._check_module_counts(empty=False)
+
+    def test_counts_zero_for_empty_input(self) -> None:
+        self._check_module_counts(empty=True)
+
+    @unittest.skipUnless(shutil.which("busybox"), "real BusyBox awk is not installed")
+    def test_counts_selected_nul_delimited_paths_with_busybox_awk(self) -> None:
+        self._check_module_counts(empty=False, busybox=True)
+
+    @unittest.skipUnless(shutil.which("busybox"), "real BusyBox awk is not installed")
+    def test_counts_zero_for_empty_input_with_busybox_awk(self) -> None:
+        self._check_module_counts(empty=True, busybox=True)
 
 
 class ExtensionlessShellAdmissionTest(unittest.TestCase):

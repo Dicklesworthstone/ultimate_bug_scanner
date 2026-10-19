@@ -6,14 +6,16 @@ calls with a world-writable mode (``& 0o002``), ``os.open`` with a
 world-writable mode, and ``umask(0)``. Constant modes resolve through
 ``stat.S_I*`` bit names and simple tracked assignments (``mode = 0o777``).
 
-Same-file and previous-line ``ubs:ignore`` markers suppress a hit, and hits
-are line-deduped per file (legacy ``seen_lines``).
+Comment directives use shared statement ownership and rule scopes. Hits are
+line-deduped per file (legacy ``seen_lines``).
 """
 from __future__ import annotations
 
 import ast
 from pathlib import Path
 from typing import Iterable, Sequence
+
+from ubs_core.suppression import SourceSuppressions
 
 RULE_ID = "py.security.file-permissions"
 CATEGORY = 7
@@ -48,15 +50,6 @@ def source_line(lines, line_no):
     if 0 <= idx < len(lines):
         return lines[idx].strip()
     return ''
-
-
-def has_ignore(lines, line_no):
-    idx = line_no - 1
-    return (
-        0 <= idx < len(lines) and 'ubs:ignore' in lines[idx]
-    ) or (
-        0 <= idx - 1 < len(lines) and 'ubs:ignore' in lines[idx - 1]
-    )
 
 
 def target_names(target):
@@ -116,14 +109,15 @@ def has_insecure_mode_arg(node, mode_names, positional_index):
 
 
 class FilePermissionAnalyzer(ast.NodeVisitor):
-    def __init__(self, lines):
+    def __init__(self, lines, suppressions):
         self.lines = lines
+        self.suppressions = suppressions
         self.mode_names = {}
         self.issues = []
         self.seen_lines = set()
 
     def remember_issue(self, line_no):
-        if has_ignore(self.lines, line_no) or line_no in self.seen_lines:
+        if self.suppressions.is_suppressed(line_no, RULE_ID) or line_no in self.seen_lines:
             return
         self.seen_lines.add(line_no)
         self.issues.append((line_no, source_line(self.lines, line_no)))
@@ -171,6 +165,7 @@ class FilePermissionAnalyzer(ast.NodeVisitor):
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
+    suppressions = SourceSuppressions('python')
     for path in files:
         if path.suffix.lower() not in {'.py', '.pyi'}:
             continue
@@ -179,7 +174,7 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
             tree = ast.parse(text, filename=str(path))
         except Exception:
             continue
-        analyzer = FilePermissionAnalyzer(text.splitlines())
+        analyzer = FilePermissionAnalyzer(text.splitlines(), suppressions.index(path, text))
         analyzer.visit(tree)
         for line_no, code in analyzer.issues:
             yield path, line_no, 1, code[:240]

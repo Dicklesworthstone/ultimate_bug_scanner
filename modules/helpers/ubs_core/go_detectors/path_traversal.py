@@ -19,8 +19,8 @@ fs.ValidPath, comparison against ".."/"../").
 Legacy: ``print_finding critical $N "Request-derived path reaches file
 read/write/serve sink" "Validate paths with filepath.Rel/filepath.IsAbs
 containment checks or sanitize filenames before opening, serving, or
-saving files"``. Same-file and previous-line ``ubs:ignore`` markers
-suppress a hit; the v2 record count equals the heredoc's __COUNT__.
+saving files"``. Comment directives use shared statement ownership and
+exact rule scopes; the v2 record count equals the heredoc's __COUNT__.
 """
 from __future__ import annotations
 
@@ -28,12 +28,13 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.suppression import SourceSuppressions
+
 RULE_ID = "go.security.path-traversal"
 CATEGORY = 9
 TITLE = "Request-derived path reaches file read/write/serve sink"
 SEVERITY = "critical"
 DESCRIPTION = "Constrain request-derived paths with filepath.Rel containment or filepath.Base before filesystem sinks"
-MARKER = "ubs:ignore"
 
 SOURCE_RE = re.compile(
     r'\br\.URL\.Query\(\)\.Get\s*\('
@@ -102,15 +103,6 @@ def _strip_line_comments(line: str) -> str:
         out.append(ch)
         i += 1
     return ''.join(out)
-
-
-def _has_ignore(lines, line_no):
-    idx = line_no - 1
-    return (
-        0 <= idx < len(lines) and MARKER in lines[idx]
-    ) or (
-        0 <= idx - 1 < len(lines) and MARKER in lines[idx - 1]
-    )
 
 
 def _logical_statement(lines, line_no):
@@ -183,18 +175,17 @@ def _has_containment_context(lines, line_no, refs):
     return bool(REL_RE.search(context) and CONTAINMENT_GUARD_RE.search(context))
 
 
-def _analyze(path: Path, issues: list) -> None:
+def _analyze(path: Path, issues: list, suppressions: SourceSuppressions) -> None:
     try:
         text = path.read_text(encoding='utf-8', errors='ignore')
     except OSError:
         return
     if not (SOURCE_RE.search(text) and SINK_RE.search(text)):
         return
+    suppression_index = suppressions.index(path, text)
     lines = text.splitlines()
     tainted = {}
     for idx, raw in enumerate(lines, start=1):
-        if _has_ignore(lines, idx):
-            continue
         line = _logical_statement(lines, idx).strip()
         if not line:
             continue
@@ -220,6 +211,8 @@ def _analyze(path: Path, issues: list) -> None:
             continue
         if _has_containment_context(lines, idx, refs):
             continue
+        if suppression_index.is_suppressed(idx, RULE_ID):
+            continue
         if direct:
             path_desc = f"{direct.group(0).strip('(')} -> file sink"
         else:
@@ -234,8 +227,9 @@ def _analyze(path: Path, issues: list) -> None:
 
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
     issues: list[tuple[Path, int, int, str]] = []
+    suppressions = SourceSuppressions('golang')
     for path in files:
         if path.suffix != ".go":
             continue
-        _analyze(path, issues)
+        _analyze(path, issues, suppressions)
     yield from issues

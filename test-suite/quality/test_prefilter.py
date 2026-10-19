@@ -584,6 +584,32 @@ class PrefilterAdmissionTests(unittest.TestCase):
             "path": {"text": str(self.target)},
         }}) + "\n")
 
+    @unittest.skipUnless(hasattr(os, "symlink"), "requires symlinks")
+    def test_symlink_loop_in_rg_output_bypasses_on_supported_python_versions(self) -> None:
+        first, second = self.root / "first", self.root / "second"
+        first.symlink_to(second)
+        second.symlink_to(first)
+        # Path.resolve raised RuntimeError before Python 3.13; newer Python
+        # either raises OSError or leaves the unresolved path unselected.
+        output = json.dumps({"type": "begin", "data": {"path": {"text": str(first)}}}) + "\n"
+        self.assert_bypassed(output)
+
+    def test_source_inspection_failure_admits_every_check(self) -> None:
+        with patch.object(Path, "is_file", side_effect=PermissionError("cannot stat source")), \
+                patch("ubs_core.external_tools.run_command_stream") as execute, patch("sys.stderr", io.StringIO()):
+            result = run_prefilter([self.target], self.index)
+        execute.assert_not_called()
+        self.assertTrue(result.is_bypass)
+        self.assertEqual(result.candidate_rules_for(self.target), {"danger", "safe"})
+
+    def test_source_resolution_failure_admits_every_check(self) -> None:
+        with patch.object(Path, "resolve", side_effect=RuntimeError("symlink loop")), \
+                patch("ubs_core.external_tools.run_command_stream") as execute, patch("sys.stderr", io.StringIO()):
+            result = run_prefilter([self.target], self.index)
+        execute.assert_not_called()
+        self.assertTrue(result.is_bypass)
+        self.assertEqual(result.candidate_rules_for(self.target), {"danger", "safe"})
+
     @unittest.skipUnless(os.name == "posix", "requires byte-preserving POSIX filenames")
     def test_non_utf8_filename_retains_the_scannable_file(self) -> None:
         target = self.root / os.fsdecode(b"entry-\xff.js")
@@ -659,6 +685,26 @@ class PrefilterAdmissionTests(unittest.TestCase):
                 result = run_prefilter([self.target], self.index)
             self.assertTrue(result.is_bypass)
             self.assertEqual(result.candidate_rules_for(self.target), {"danger", "safe"})
+
+    def test_capture_cleanup_failure_admits_every_check(self) -> None:
+        from ubs_core import external_tools
+        with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+            class BrokenClose:
+                def __getattr__(self, name):
+                    return getattr(stderr, name)
+
+                def close(self):
+                    stderr.close()
+                    raise OSError("capture close failed")
+
+            with patch.object(external_tools.tempfile, "TemporaryFile", side_effect=[stdout, BrokenClose()]), \
+                    patch("sys.stderr", io.StringIO()) as log:
+                result = run_prefilter([self.target], self.index)
+            self.assertTrue(stdout.closed)
+            self.assertTrue(stderr.closed)
+        self.assertTrue(result.is_bypass)
+        self.assertEqual(result.candidate_rules_for(self.target), {"danger", "safe"})
+        self.assertIn("capture close failed", log.getvalue())
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "requires FIFOs")
     def test_special_file_never_launches_rg(self) -> None:

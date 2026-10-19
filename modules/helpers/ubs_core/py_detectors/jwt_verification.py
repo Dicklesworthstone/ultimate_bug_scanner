@@ -6,7 +6,7 @@ ast.NodeVisitor flagging jwt / jose.jwt decode calls that weaken verification â€
 verify_signature/verify_exp/verify_aud/verify_iss/verify_iat/verify_nbf, or an
 ``algorithms`` argument (or 3rd positional argument) containing ``"none"``.
 
-Same-file and previous-line ``ubs:ignore`` markers suppress a hit (6527-6533).
+Shared lexical statement ownership and exact rule scopes suppress annotated hits.
 Every unsafe call yields its own record (legacy counted without dedupe).
 """
 from __future__ import annotations
@@ -15,6 +15,8 @@ import ast
 import warnings
 from pathlib import Path
 from typing import Iterable, Sequence
+
+from ubs_core.suppression import SourceSuppressions
 
 RULE_ID = "py.security.jwt-verification"
 CATEGORY = 7
@@ -39,15 +41,6 @@ def _source_line(lines: list[str], line_no: int) -> str:
     if 0 <= idx < len(lines):
         return lines[idx].strip()
     return ''
-
-
-def _has_ignore(lines: list[str], line_no: int) -> bool:
-    idx = line_no - 1
-    return (
-        0 <= idx < len(lines) and 'ubs:ignore' in lines[idx]
-    ) or (
-        0 <= idx - 1 < len(lines) and 'ubs:ignore' in lines[idx - 1]
-    )
 
 
 def _const_value(node: ast.AST):
@@ -82,8 +75,9 @@ def _disables_verify_option(node: ast.AST) -> bool:
 
 
 class _JWTAnalyzer(ast.NodeVisitor):
-    def __init__(self, lines):
+    def __init__(self, lines, suppression):
         self.lines = lines
+        self.suppression = suppression
         self.jwt_modules = {'jwt'}
         self.decode_names: set[str] = set()
         self.issues = []
@@ -127,12 +121,13 @@ class _JWTAnalyzer(ast.NodeVisitor):
         return False
 
     def visit_Call(self, node):
-        if not _has_ignore(self.lines, node.lineno) and self.is_jwt_decode(node) and self.call_is_unsafe(node):
+        if not self.suppression.is_suppressed(node.lineno, RULE_ID) and self.is_jwt_decode(node) and self.call_is_unsafe(node):
             self.issues.append((node.lineno, _source_line(self.lines, node.lineno)))
         self.generic_visit(node)
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
+    suppressions = SourceSuppressions("python")
     for path in files:
         if path.suffix.lower() not in {'.py', '.pyi'}:
             continue
@@ -143,7 +138,7 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
         except Exception:
             continue
         lines = text.splitlines()
-        analyzer = _JWTAnalyzer(lines)
+        analyzer = _JWTAnalyzer(lines, suppressions.index(path, text))
         analyzer.visit(tree)
         for line_no, code in analyzer.issues:
             yield path, line_no, 1, code[:240]

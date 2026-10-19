@@ -9,8 +9,8 @@ Secure. Legacy outcome:
 
     print_finding warning <count> "Insecure auth/session cookie settings" ...
 
-Marker suppression is ported verbatim: `ubs:ignore` on the finding line,
-on the previous line, or anywhere in the joined statement suppresses it.
+Shared lexical statement ownership and exact rule scopes suppress annotated
+findings without treating quoted marker text as a directive.
 """
 from __future__ import annotations
 
@@ -18,12 +18,13 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.suppression import SourceSuppressions
+
 RULE_ID = "go.security.cookie-security"
 CATEGORY = 9
 TITLE = "Insecure auth/session cookie settings"
 SEVERITY = "warning"
 DESCRIPTION = "Set auth cookies with HttpOnly, Secure, and SameSite protections; SameSite=None must also use Secure"
-MARKER = "ubs:ignore"
 
 SENSITIVE_COOKIE_RE = re.compile(r'["`][^"`]*(?:session|sess|sid|auth|token|jwt|refresh|access|remember|login)[^"`]*["`]', re.IGNORECASE)
 COOKIE_CANDIDATE_RE = re.compile(r'\bhttp\.SetCookie\s*\(|\bhttp\.Cookie\s*\{|\bSet-Cookie\b|\.\s*SetCookie\s*\(', re.IGNORECASE)
@@ -77,15 +78,6 @@ def _source_line(lines, line_no):
     if 0 <= idx < len(lines):
         return lines[idx].strip().replace('\t', ' ')
     return ''
-
-
-def _has_ignore(lines, line_no):
-    idx = line_no - 1
-    return (
-        0 <= idx < len(lines) and MARKER in lines[idx]
-    ) or (
-        0 <= idx - 1 < len(lines) and MARKER in lines[idx - 1]
-    )
 
 
 def _statement_from(lines, line_no, max_lines=18):
@@ -217,7 +209,7 @@ def _insecure_cookie_statement(statement: str) -> bool:
     )
 
 
-def _analyze_file(path):
+def _analyze_file(path, suppressions):
     try:
         text = path.read_text(encoding='utf-8', errors='ignore')
     except OSError:
@@ -225,20 +217,19 @@ def _analyze_file(path):
     if not COOKIE_CANDIDATE_RE.search(text):
         return []
     lines = text.splitlines()
+    suppression = suppressions.index(path, text)
     issues = []
     seen = set()
     for idx, raw in enumerate(lines, start=1):
-        if _has_ignore(lines, idx):
-            continue
         stripped = _strip_line_comments(raw).strip()
         if not stripped or not COOKIE_CANDIDATE_RE.search(stripped):
             continue
         statement = _statement_from(lines, idx)
-        if not statement or MARKER in statement:
+        if not statement:
             continue
         if not _insecure_cookie_statement(statement):
             continue
-        if idx in seen:
+        if idx in seen or suppression.is_suppressed(idx, RULE_ID):
             continue
         seen.add(idx)
         issues.append((idx, _source_line(lines, idx)))
@@ -246,8 +237,9 @@ def _analyze_file(path):
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
+    suppressions = SourceSuppressions("golang")
     for path in files:
         if path.suffix != ".go":
             continue
-        for line_no, detail in _analyze_file(path):
+        for line_no, detail in _analyze_file(path, suppressions):
             yield (path, line_no, 1, detail)

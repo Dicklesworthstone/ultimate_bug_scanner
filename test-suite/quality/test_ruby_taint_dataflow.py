@@ -14,6 +14,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -1351,7 +1352,465 @@ SQL_BOUNDARIES = (
         query = Arel.sql('SELECT ?', application_value(params[:value]))
         ActiveRecord::Base.connection.select_all(query)''', (1,)),
 )
-CASES += EXECUTION_CASES + SQL_CASES
+CONSTANT_RECEIVER_CASES = (
+    Case('path_nested_file_identity_is_not_basename', PATH, '''
+        module App
+          module File
+            def self.basename(value)
+              value
+            end
+          end
+          def self.download
+            send_file(File.basename(params[:file]))
+          end
+        end''', (8,)),
+    Case('path_nested_file_visible_basename_body', PATH, '''
+        module App
+          module File
+            def self.basename(value)
+              ::File.basename(value)
+            end
+          end
+          def self.download
+            send_file(File.basename(params[:file]))
+          end
+        end''', ()),
+    Case('path_root_qualified_file_read', PATH, '::File.read(params[:file])', (1,)),
+    Case('path_root_qualified_file_basename', PATH, 'send_file(::File.basename(params[:file]))', ()),
+    Case('path_root_qualification_bypasses_nested_file', PATH, '''
+        module App
+          module File
+            def self.basename(value)
+              value
+            end
+          end
+          def self.download
+            send_file(::File.basename(params[:file]))
+          end
+        end''', ()),
+    Case('url_nested_constant_helper_returns_literal', URL, '''
+        module App
+          module Target
+            def self.url(value)
+              'https://api.example.com/health'
+            end
+          end
+          def self.fetch
+            Net::HTTP.get(URI.parse(Target.url(params[:url])))
+          end
+        end''', ()),
+    Case('url_nested_constant_helper_returns_input', URL, '''
+        module App
+          module Target
+            def self.url(value)
+              value
+            end
+          end
+          def self.fetch
+            Net::HTTP.get(URI.parse(Target.url(params[:url])))
+          end
+        end''', (8,)),
+    Case('url_nested_constant_helper_contains_sink', URL, '''
+        module App
+          module Client
+            def self.dispatch(value)
+              Net::HTTP.get(URI.parse(value))
+            end
+          end
+          def self.fetch
+            Client.dispatch(params[:url])
+          end
+        end''', (4,)),
+    Case('url_nested_constant_helper_sink_literal_control', URL, '''
+        module App
+          module Client
+            def self.dispatch(value)
+              Net::HTTP.get(URI.parse(value))
+            end
+          end
+          def self.fetch
+            Client.dispatch('https://api.example.com/health')
+          end
+        end
+        params''', ()),
+    Case('url_nested_lexical_module_selects_inner_helper', URL, '''
+        module Target
+          def self.url(value)
+            value
+          end
+        end
+        module App
+          module Target
+            def self.url(value)
+              'https://api.example.com/health'
+            end
+          end
+          module Worker
+            def self.fetch
+              Net::HTTP.get(URI.parse(Target.url(params[:url])))
+            end
+          end
+        end''', ()),
+    Case('url_compact_module_does_not_inherit_outer_lexical_scope', URL, '''
+        module Target
+          def self.url(value)
+            value
+          end
+        end
+        module App
+          module Target
+            def self.url(value)
+              'https://api.example.com/health'
+            end
+          end
+        end
+        module App::Worker
+          def self.fetch
+            Net::HTTP.get(URI.parse(Target.url(params[:url])))
+          end
+        end''', (15,)),
+    Case('url_root_helper_bypasses_nested_safe_namesake', URL, '''
+        module Target
+          def self.url(value)
+            value
+          end
+        end
+        module App
+          module Target
+            def self.url(value)
+              'https://api.example.com/health'
+            end
+          end
+          def self.fetch
+            Net::HTTP.get(URI.parse(::Target.url(params[:url])))
+          end
+        end''', (13,)),
+    Case('url_nested_helper_redefinition_keeps_unsafe_body', URL, '''
+        module App
+          module Target
+            def self.url(value)
+              'https://api.example.com/health'
+            end
+            def self.url(value)
+              value
+            end
+          end
+          def self.fetch
+            Net::HTTP.get(URI.parse(Target.url(params[:url])))
+          end
+        end''', (11,)),
+    Case('url_constant_alias_keeps_selected_literal_helper', URL, '''
+        module App
+          module Target
+            def self.url(value)
+              'https://api.example.com/health'
+            end
+          end
+          Selected = Target
+          def self.fetch
+            Net::HTTP.get(URI.parse(Selected.url(params[:url])))
+          end
+        end''', ()),
+    Case('url_constant_alias_keeps_selected_sink_helper', URL, '''
+        module App
+          module Client
+            def self.dispatch(value)
+              Net::HTTP.get(URI.parse(value))
+            end
+          end
+          Selected = Client
+          def self.fetch
+            Selected.dispatch(params[:url])
+          end
+        end''', (4,)),
+    Case('url_constant_alias_before_lexical_shadow', URL, '''
+        module Target
+          def self.url(value)
+            value
+          end
+        end
+        module Fixed
+          def self.url(value)
+            'https://api.example.com/health'
+          end
+        end
+        module App
+          Saved = Target
+          Target = ::Fixed
+          def self.fetch
+            Net::HTTP.get(URI.parse(Saved.url(params[:url])))
+          end
+        end''', (15,)),
+    Case('url_constant_alias_after_lexical_shadow', URL, '''
+        module Target
+          def self.url(value)
+            value
+          end
+        end
+        module Fixed
+          def self.url(value)
+            'https://api.example.com/health'
+          end
+        end
+        module App
+          Target = ::Fixed
+          Saved = Target
+          def self.fetch
+            Net::HTTP.get(URI.parse(Saved.url(params[:url])))
+          end
+        end''', ()),
+    Case('path_standard_file_constant_alias_read', PATH, '''
+        Paths = ::File
+        Paths.read(params[:file])''', (2,)),
+    Case('path_standard_file_constant_alias_basename', PATH, '''
+        Paths = ::File
+        send_file(Paths.basename(params[:file]))''', ()),
+    Case('path_method_definition_through_file_alias', PATH, '''
+        Paths = ::File
+        def Paths.basename(value)
+          value
+        end
+        send_file(::File.basename(params[:file]))''', (5,)),
+    Case('path_literal_method_definition_through_file_alias', PATH, '''
+        Paths = ::File
+        def Paths.basename(value)
+          'safe.txt'
+        end
+        send_file(::File.basename(params[:file]))''', ()),
+    Case('path_colon_method_definition_through_file_alias', PATH, '''
+        Paths = ::File
+        def Paths::basename(value)
+          value
+        end
+        send_file(Paths.basename(params[:file]))''', (5,)),
+    Case('path_literal_colon_definition_through_file_alias', PATH, '''
+        Paths = ::File
+        def Paths::basename(value)
+          'safe.txt'
+        end
+        send_file(Paths.basename(params[:file]))''', ()),
+    Case('url_standard_http_constant_alias', URL, '''
+        Client = ::Net::HTTP
+        Client.get(URI.parse(params[:url]))''', (2,)),
+    Case('path_nested_file_alias_does_not_borrow_builtin_proof', PATH, '''
+        module App
+          module Identity
+            def self.basename(value)
+              value
+            end
+          end
+          File = Identity
+          def self.download
+            send_file(File.basename(params[:file]))
+          end
+        end''', (9,)),
+    Case('path_shadowed_separator_is_not_containment', PATH, '''
+        module App
+          module File
+            SEPARATOR = ''
+          end
+          def self.download
+            base = ::File.expand_path('/srv/public')
+            target = ::File.expand_path(params[:file], base)
+            raise 'blocked' unless target.start_with?(base + File::SEPARATOR)
+            ::File.read(target)
+          end
+        end''', (9,)),
+    Case('path_root_separator_proves_containment', PATH, '''
+        module App
+          module File
+            SEPARATOR = ''
+          end
+          def self.download
+            base = ::File.expand_path('/srv/public')
+            target = ::File.expand_path(params[:file], base)
+            raise 'blocked' unless target.start_with?(base + ::File::SEPARATOR)
+            ::File.read(target)
+          end
+        end''', ()),
+    Case('path_rebound_separator_is_not_containment', PATH, '''
+        File::SEPARATOR = ''
+        base = File.expand_path('/srv/private')
+        target = File.expand_path(params[:file], base)
+        raise 'blocked' unless target.start_with?(base + File::SEPARATOR)
+        send_file(target)''', (5,)),
+    Case('path_ancestor_file_is_not_builtin_sanitizer', PATH, '''
+        class Base
+          module File
+            def self.basename(value)
+              value
+            end
+          end
+        end
+        class Child < Base
+          def self.download
+            send_file(File.basename(params[:file]))
+          end
+        end''', (10,)),
+    Case('path_root_file_bypasses_ancestor', PATH, '''
+        class Base
+          module File
+            def self.basename(value)
+              value
+            end
+          end
+        end
+        class Child < Base
+          def self.download
+            send_file(::File.basename(params[:file]))
+          end
+        end''', ()),
+    Case('path_lexical_file_precedes_safe_ancestor', PATH, '''
+        class Base
+          module File
+            def self.basename(value)
+              ::File.basename(value)
+            end
+          end
+        end
+        module App
+          module File
+            def self.basename(value)
+              value
+            end
+          end
+          class Child < Base
+            def self.download
+              send_file(File.basename(params[:file]))
+            end
+          end
+        end''', (16,)),
+    Case('path_safe_lexical_file_precedes_ancestor', PATH, '''
+        class Base
+          module File
+            def self.basename(value)
+              value
+            end
+          end
+        end
+        module App
+          module File
+            def self.basename(value)
+              ::File.basename(value)
+            end
+          end
+          class Child < Base
+            def self.download
+              send_file(File.basename(params[:file]))
+            end
+          end
+        end''', ()),
+)
+
+CONSTANT_RECEIVER_BOUNDARIES = (
+    Case('path_constant_alias_reassigned_to_unknown', PATH, '''
+        Paths = ::File
+        Paths = configured_paths
+        send_file(Paths.basename(params[:file]))''', (3,)),
+    Case('path_conditional_constant_alias', PATH, '''
+        if enabled
+          Paths = ::File
+        else
+          Paths = configured_paths
+        end
+        send_file(Paths.basename(params[:file]))''', (6,)),
+    Case('path_rebound_standard_file_receiver', PATH, '''
+        File = configured_paths
+        File.read(params[:file])''', ()),
+    Case('url_conditional_namespace_cannot_prove_safe_helper', URL, '''
+        module Target
+          def self.url(value)
+            value
+          end
+        end
+        module App
+          if false
+            module Target
+              def self.url(value)
+                'https://api.example.com/health'
+              end
+            end
+          end
+          def self.fetch
+            Net::HTTP.get(URI.parse(Target.url(params[:url])))
+          end
+        end''', (15,)),
+    Case('url_constant_alias_captures_before_rebinding', URL, '''
+        module Target
+          def self.url(value)
+            value
+          end
+        end
+        module Fixed
+          def self.url(value)
+            'https://api.example.com/health'
+          end
+        end
+        Saved = Target
+        Target = Fixed
+        Net::HTTP.get(URI.parse(Saved.url(params[:url])))''', (13,)),
+    Case('url_qualified_namespace_reopen_needs_owner_binding', URL, '''
+        module App
+          module Target
+            def self.url(value)
+              'https://api.example.com/health'
+            end
+          end
+        end
+        module Outer
+          module App::Target
+            def self.url(value)
+              value
+            end
+          end
+        end
+        Net::HTTP.get(URI.parse(App::Target.url(params[:url])))''', (15,)),
+    Case('url_conditional_method_alias_cannot_hide_inherited_body', URL, '''
+        class Parent
+          def self.url(value)
+            value
+          end
+        end
+        module App
+          class Target < Parent
+            class << self
+              def fixed(value)
+                'https://api.example.com/health'
+              end
+              if false
+                alias url fixed
+              end
+            end
+          end
+          def self.fetch
+            Net::HTTP.get(URI.parse(Target.url(params[:url])))
+          end
+        end''', (18,)),
+    Case('url_conditional_alias_chain_cannot_prove_helper', URL, '''
+        class Parent
+          def self.url(value)
+            value
+          end
+        end
+        module App
+          class Target < Parent
+            class << self
+              def fixed(value)
+                'https://api.example.com/health'
+              end
+              if false
+                alias url fixed
+              end
+              alias forward url
+            end
+          end
+          def self.fetch
+            Net::HTTP.get(URI.parse(Target.forward(params[:url])))
+          end
+        end''', (19,)),
+)
+
+CASES += EXECUTION_CASES + SQL_CASES + CONSTANT_RECEIVER_CASES
 BY_NAME = {case.name: case for case in CASES}
 UNRESOLVED_DISPATCH_CASES = (
     Case('dispatch_unknown', PATH, '''
@@ -1640,6 +2099,111 @@ class RubySemanticTests(LoggedCase):
                                      [(URL, line) for line in case.lines], findings)
 
 
+    def test_constant_receiver_rebinding_remains_explicitly_incomplete(self):
+        for case in CONSTANT_RECEIVER_BOUNDARIES:
+            with self.subTest(case=case.name):
+                directory = self.artifact / case.name
+                directory.mkdir()
+                target = directory / 'input.rb'
+                target.write_text(case.source)
+                findings = []
+                error = None
+                started = time.monotonic()
+                analyzer = taint_ruby_url if case.rule == URL else taint_ruby_traversal
+                try:
+                    for row in analyzer.run(RunContext(lang='ruby', files=[target])):
+                        findings.append(row)
+                except ValueError as exc:
+                    error = str(exc)
+                finally:
+                    (directory / 'result.json').write_text(json.dumps({
+                        'case': case.name, 'expected_rule': case.rule, 'expected_lines': case.lines,
+                        'source_sha256': hashlib.sha256(target.read_bytes()).hexdigest(),
+                        'elapsed': time.monotonic() - started, 'error': error, 'findings': findings,
+                    }, indent=2) + '\n')
+                self.assertIsNotNone(error, findings)
+                self.assertRegex(error, 'constant.*incomplete')
+                self.assertEqual([(row['rule'], row['line']) for row in findings],
+                                 [(case.rule, line) for line in case.lines], findings)
+
+    def test_constant_receiver_native_ruby_value_controls(self):
+        executable = os.environ.get('UBS_RUBY_BIN') or shutil.which('ruby')
+        if not executable:
+            self.skipTest('native Ruby is required for constant receiver value oracles')
+        # Ruby performs the binding and URI/File transformations. These two
+        # application boundary methods only retain their actual arguments;
+        # the oracle does not issue network requests or read arbitrary paths.
+        driver = '''require 'uri'
+$observed = []
+def params
+  {file: '../private.txt', url: 'https://untrusted.example/leaf'}
+end
+def send_file(value)
+  $observed << value.to_s
+end
+module Net
+  module HTTP
+    def self.get(value)
+      $observed << value.to_s
+    end
+  end
+end
+load ARGV[0]
+eval(ARGV[1], TOPLEVEL_BINDING)
+puts $observed
+'''
+        oracles = (
+            ('path_nested_file_identity_is_not_basename', 'App.download', '../private.txt'),
+            ('path_nested_file_visible_basename_body', 'App.download', 'private.txt'),
+            ('path_root_qualification_bypasses_nested_file', 'App.download', 'private.txt'),
+            ('url_nested_constant_helper_returns_literal', 'App.fetch', 'https://api.example.com/health'),
+            ('url_nested_constant_helper_returns_input', 'App.fetch', 'https://untrusted.example/leaf'),
+            ('url_nested_constant_helper_contains_sink', 'App.fetch', 'https://untrusted.example/leaf'),
+            ('url_nested_lexical_module_selects_inner_helper', 'App::Worker.fetch', 'https://api.example.com/health'),
+            ('url_compact_module_does_not_inherit_outer_lexical_scope', 'App::Worker.fetch', 'https://untrusted.example/leaf'),
+            ('url_root_helper_bypasses_nested_safe_namesake', 'App.fetch', 'https://untrusted.example/leaf'),
+            ('url_constant_alias_keeps_selected_literal_helper', 'App.fetch', 'https://api.example.com/health'),
+            ('url_constant_alias_keeps_selected_sink_helper', 'App.fetch', 'https://untrusted.example/leaf'),
+            ('path_nested_file_alias_does_not_borrow_builtin_proof', 'App.download', '../private.txt'),
+            ('path_method_definition_through_file_alias', '', '../private.txt'),
+            ('path_literal_method_definition_through_file_alias', '', 'safe.txt'),
+            ('path_rebound_separator_is_not_containment', '', '/srv/private.txt'),
+            ('url_conditional_namespace_cannot_prove_safe_helper', 'App.fetch', 'https://untrusted.example/leaf'),
+            ('url_constant_alias_captures_before_rebinding', '', 'https://untrusted.example/leaf'),
+            ('url_qualified_namespace_reopen_needs_owner_binding', '', 'https://untrusted.example/leaf'),
+            ('url_conditional_method_alias_cannot_hide_inherited_body', 'App.fetch', 'https://untrusted.example/leaf'),
+            ('url_conditional_alias_chain_cannot_prove_helper', 'App.fetch', 'https://untrusted.example/leaf'),
+            ('path_colon_method_definition_through_file_alias', '', '../private.txt'),
+            ('path_literal_colon_definition_through_file_alias', '', 'safe.txt'),
+            ('url_constant_alias_before_lexical_shadow', 'App.fetch', 'https://untrusted.example/leaf'),
+            ('url_constant_alias_after_lexical_shadow', 'App.fetch', 'https://api.example.com/health'),
+            ('path_ancestor_file_is_not_builtin_sanitizer', 'Child.download', '../private.txt'),
+            ('path_root_file_bypasses_ancestor', 'Child.download', 'private.txt'),
+            ('path_lexical_file_precedes_safe_ancestor', 'App::Child.download', '../private.txt'),
+            ('path_safe_lexical_file_precedes_ancestor', 'App::Child.download', 'private.txt'),
+        )
+        for name, invocation, expected in oracles:
+            with self.subTest(case=name):
+                case = next(case for case in (*CONSTANT_RECEIVER_CASES, *CONSTANT_RECEIVER_BOUNDARIES)
+                            if case.name == name)
+                directory = self.artifact / ('native-' + name)
+                directory.mkdir()
+                target = directory / 'input.rb'
+                target.write_text(case.source)
+                command = [executable, '-e', driver, str(target), invocation]
+                started = time.monotonic()
+                result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+                (directory / 'stdout.log').write_text(result.stdout)
+                (directory / 'stderr.log').write_text(result.stderr)
+                (directory / 'result.json').write_text(json.dumps({
+                    'command': command, 'source_sha256': hashlib.sha256(target.read_bytes()).hexdigest(),
+                    'elapsed': time.monotonic() - started, 'exit': result.returncode,
+                    'expected': expected,
+                }, indent=2) + '\n')
+                self.assertEqual(result.returncode, 0, (command, result.stdout, result.stderr))
+                self.assertEqual(result.stdout.splitlines(), [expected], (command, result.stdout, result.stderr))
+
+
 def semantic_test(case):
     def test(self):
         self.check_case(case)
@@ -1840,6 +2404,44 @@ class RubyPublicTests(LoggedCase):
                 with self.subTest(case=case.name, format=fmt):
                     result, payload = self.scan(directory / fmt, target, fmt)
                     self.assert_findings(result, payload, case, fmt, target)
+
+    def test_constant_receiver_identity_reaches_json_and_sarif(self):
+        for case in CONSTANT_RECEIVER_CASES:
+            directory = self.artifact / case.name
+            directory.mkdir()
+            selected = directory / 'input.rb'
+            selected.write_text(case.source)
+            for fmt in ('json', 'sarif'):
+                with self.subTest(case=case.name, format=fmt):
+                    result, payload = self.scan(directory / fmt, selected, fmt)
+                    self.assert_findings(result, payload, case, fmt, selected)
+
+    def test_constant_receiver_boundaries_retain_findings_and_partial_status(self):
+        for case in CONSTANT_RECEIVER_BOUNDARIES:
+            directory = self.artifact / case.name
+            directory.mkdir()
+            selected = directory / 'input.rb'
+            selected.write_text(case.source)
+            for fmt in ('json', 'sarif'):
+                with self.subTest(case=case.name, format=fmt):
+                    result, payload = self.scan(directory / fmt, selected, fmt)
+                    self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+                    if fmt == 'json':
+                        self.assertEqual(payload['status'], 'partial', payload)
+                        self.assertTrue(any(row.get('language') == 'ruby'
+                                            and row.get('module_error') == 'ANALYZER_ERROR'
+                                            for row in payload['failed_modules']), payload)
+                        actual = [(row['rule_id'], row['line']) for row in payload['findings']
+                                  if row['rule_id'] in TARGET_RULES]
+                    else:
+                        invocations = [item for run in payload['runs'] for item in run.get('invocations', [])]
+                        self.assertTrue(invocations, payload)
+                        self.assertTrue(all(not item['executionSuccessful'] and item['exitCode'] == 2
+                                            for item in invocations), payload)
+                        actual = [(row['ruleId'], row['locations'][0]['physicalLocation']['region']['startLine'])
+                                  for run in payload['runs'] for row in run.get('results', [])
+                                  if row['ruleId'] in TARGET_RULES]
+                    self.assertEqual(sorted(actual), [(case.rule, line) for line in case.lines], payload)
 
     def test_execution_and_static_dispatch_reach_json_and_sarif(self):
         names = ('execution_sinatra_eval', 'execution_instance_eval', 'execution_class_eval',

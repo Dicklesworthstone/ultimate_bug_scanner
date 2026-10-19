@@ -50,6 +50,7 @@ def scan_config(
     slug_for_rule: Callable[[str], str] | None = None,
     base_dir: Path | None = None,
     errors: list[str] | None = None,
+    qualify: Callable[[str, Path, dict], bool] | None = None,
 ) -> dict[str, int]:
     """Run one sgconfig over the path list; write sink records; return counters.
 
@@ -59,6 +60,9 @@ def scan_config(
     fixed for Python): this layer used to swallow launch failures, timeouts and
     non-zero exits, so a rule pack that never ran was indistinguishable from
     one that ran and found nothing.
+
+    ``qualify(rule_id, path, match)`` may reject a match that a syntactic
+    pattern cannot judge on its own (GH #169: receiver types for `.Result`).
     """
     counters = {"critical": 0, "warning": 0, "info": 0}
     path_list = [Path(p) for p in paths]
@@ -84,6 +88,8 @@ def scan_config(
         if suppressions.is_suppressed(path, line_no, rule_id):
             continue
         if match["severity"] == "off":
+            continue
+        if qualify is not None and not qualify(rule_id, path, match):
             continue
         severity = (severity_overrides or {}).get(rule_id) or _map_severity(match["severity"])
         if severity not in counters:
@@ -116,6 +122,7 @@ def scan_all(
     slug_for_rule: Callable[[str], str] | None = None,
     base_dir: Path | None = None,
     errors: list[str] | None = None,
+    qualify: Callable[[str, Path, dict], bool] | None = None,
 ) -> dict[str, int]:
     """Run every sgconfig-*.yml in rule_dir; aggregate counters.
 
@@ -126,7 +133,7 @@ def scan_all(
     for config in ast_rule_configs(rule_dir, paths, errors):
         counters = scan_config(
             config, paths, sink, severity_overrides, ast_grep_bin,
-            count_only, skip, rule_category, slug_for_rule, base_dir, errors,
+            count_only, skip, rule_category, slug_for_rule, base_dir, errors, qualify,
         )
         for key, value in counters.items():
             total[key] = total.get(key, 0) + value

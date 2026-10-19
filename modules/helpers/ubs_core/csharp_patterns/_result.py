@@ -8,6 +8,7 @@ The shared C# lexer preserves executable interpolation holes and source offsets.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 import re
 
 from ubs_core.analyzers.taint_csharp_request import masked_source
@@ -425,6 +426,36 @@ def result_lines(text: str) -> tuple[set[int], set[int]]:
     except (ValueError, RecursionError):
         return set(), {index for index, line in enumerate(text.splitlines(), 1)
                        if re.search(r"\.\s*Result\b", line)}
+
+
+def ast_result_qualifier(texts: dict):
+    """Receiver gate for the ast-grep pack's type-blind `$TASK.Result` rule (GH #169).
+
+    Keep a `cs-task-result-deadlock` match only when its `.Result` token (the
+    match's end) sits on a line this classifier reports as a Task/ValueTask or
+    unresolved receiver. Records, tuples and other proven non-task receivers
+    are dropped, exactly as for `cs.pattern.blocking-result`.
+    """
+    sources = {str(Path(path).resolve()): text for path, text in texts.items()}
+    lines: dict[str, set[int]] = {}
+
+    def qualify(rule_id: str, path: Path, match: dict) -> bool:
+        if rule_id != "cs-task-result-deadlock":
+            return True
+        key = str(Path(path).resolve())
+        if key not in lines:
+            text = sources.get(key)
+            if text is None:
+                try:
+                    text = Path(path).read_text(encoding="utf-8", errors="ignore")
+                except OSError:
+                    return True
+            critical, unknown = result_lines(text)
+            lines[key] = critical | unknown
+        location = match["range"].get("end") or match["range"]["start"]
+        return location["line"] + 1 in lines[key]
+
+    return qualify
 
 
 def task_result_lines(text: str) -> set[int]:

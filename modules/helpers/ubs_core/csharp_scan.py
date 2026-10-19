@@ -700,6 +700,7 @@ def main(argv: list | None = None) -> int:
                       prefilter=prefilter_res, errors=scan_errors, semantic_errors=semantic_errors)
         if args.ast_rule_dir:
             from ubs_core.csharp_ast import scan_all
+            from ubs_core.csharp_patterns._result import ast_result_qualifier
             from ubs_core.csharp_rules import CATEGORY_MAP, SEVERITY_MAP
 
             ast_files = prefilter_res.ast_files if not prefilter_res.is_bypass else files_to_scan
@@ -712,6 +713,7 @@ def main(argv: list | None = None) -> int:
                 slug_for_rule=slug_for_category,
                 base_dir=base_dir,
                 errors=scan_errors,
+                qualify=ast_result_qualifier(texts),
             )
             ast_ran = True
         scan_patterns(patterns, texts, capturing_sink, skip, phase=1, ast_ran=ast_ran, prefilter=prefilter_res)

@@ -1168,6 +1168,42 @@ class SwiftScopedFlowTests(unittest.TestCase):
                 }
             ''')
 
+    def test_api_write_without_destination_is_not_a_file_sink_obligation(self):
+        for index, call in enumerate((
+            'panel.write("/api/billing", body: request)',
+            'panel?.write("/api/billing", body: ["to": request])',
+            'panel.write(body: wrap(to: request))',
+            'panel.write("to", body: request)',
+            'panel.write(\n "/api/billing",\n body: request\n)',
+        )):
+            for policy in ('path', 'redirect'):
+                with self.subTest(call=call, policy=policy):
+                    self.check('func submit() { let request = UUID(); Task { %s } }' % call,
+                               policy=policy, suffix=str(index) + policy)
+
+    def test_api_write_keeps_real_nested_and_unknown_file_obligations(self):
+        for index, call in enumerate((
+            'body.write(to: request)',
+            'body.write(`to`: request)',
+            'panel.write("/api", body: body.write(to: request))',
+            'panel.write("/api", body: { body.write(to: request) })',
+            r'panel.write("/api", body: "value-\(body.write(to: request))")',
+            'let writer = body.write; writer(to: request)',
+            'panel.write("/api", body: request.query["path"])',
+            'panel.write("/api", body: request); readFile(path: request)',
+        )):
+            for policy in ('path', 'redirect'):
+                with self.subTest(call=call, policy=policy), self.assertRaisesRegex(ValueError, 'closure.*incomplete'):
+                    self.check('func submit() { let request = UUID(); Task { %s } }' % call,
+                               policy=policy, suffix=str(index) + policy)
+
+    def test_file_write_destination_still_reports_request_path(self):
+        self.check('''
+            func submit(req: Request) {
+                try body.write(to: URL(fileURLWithPath: req.query["path"] ?? ""))
+            }
+        ''', (2,), policy='path')
+
     def test_unrelated_unsupported_closure_with_a_sink_is_still_incomplete(self):
         with self.assertRaisesRegex(ValueError, 'closure.*incomplete'):
             self.check('''

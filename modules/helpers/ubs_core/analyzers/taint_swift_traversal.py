@@ -750,12 +750,30 @@ def swift_flow_obligation(tokens):
         'contentsOf', 'contentsOfFile', 'FileHandle', 'FileManager',
         'sendFile', 'streamFile', 'readFile', 'serveFile', 'writeFile', 'file', 'write',
     }
-    code = [token.value for token in tokens if token.kind == 'code' and token.value != '\n']
+    significant = tuple(token for token in tokens if token.kind != 'code' or token.value != '\n')
+    non_file_writes = set()
+    for index, token in enumerate(significant):
+        if (token.kind == 'code' and token.value == 'write' and index > 0
+                and significant[index - 1].value == '.' and index + 1 < len(significant)
+                and significant[index + 1].kind == 'code' and significant[index + 1].value == '('):
+            close = swift_close(significant, index + 1)
+            arguments = swift_parts(significant[index + 2:close], {','})
+            if not any(len(part) >= 2 and part[0].kind == 'code' and part[0].value == 'to'
+                       and part[1].kind == 'code' and part[1].value == ':' for part in arguments):
+                # The file policy models Foundation write(to:), not an API
+                # client's write(path, body:). Only this direct call is excluded:
+                # a bare method reference is unresolved, and nested arguments
+                # and interpolation still contribute their own obligations.
+                non_file_writes.add(token.start)
+    code_tokens = [token for token in tokens if token.kind == 'code' and token.value != '\n']
+    code = [token.value for token in code_tokens]
     request_members = {'query', 'parameters', 'params', 'headers', 'content', 'url', 'uri'}
     if any(code[index] in {'req', 'request'} and code[index + 1] == '.' and code[index + 2] in request_members
            for index in range(len(code) - 2)):
         return True
     for index, value in enumerate(code):
+        if value == 'write' and code_tokens[index].start in non_file_writes:
+            continue
         # A collection append's argument label is not Foundation's URL reader.
         # Actual reads elsewhere and request member/type witnesses still activate
         # analysis, including a read nested inside the appended expression.

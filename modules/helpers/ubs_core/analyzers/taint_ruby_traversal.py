@@ -827,16 +827,6 @@ class RubyEngine:
         self.dispatch_failures = {}
         self.pending_raises = CLEAN
         self.constants = {}
-        # Only unconditional, literal constant definitions can be an allowlist
-        # or trusted root. A second definition invalidates that static proof.
-        for function in self.parser.functions.values():
-            if not function.scope:
-                continue
-            for statement in function.body:
-                parts = split_tokens(statement.tokens, {'='})
-                if statement.kind == 'simple' and len(parts) == 2 and len(parts[0]) == 1 and re.fullmatch(r'[A-Z]\w*', parts[0][0].value):
-                    key = (function.owner, parts[0][0].value)
-                    self.constants[key] = CLEAN if key in self.constants else self.literal_value(parts[1], shared=True)
         self.constant_definitions = {function.owner for function in self.parser.functions.values()
                                      if function.scope and function.owner}
         self.constant_positions = {}
@@ -871,6 +861,14 @@ class RubyEngine:
                             self.constant_positions.get(definition, position), position)
                         direct = (unconditional and len(parts) == 2 and lhs == lhs_group
                                   and len(split_tokens(statement.tokens, {'='})) == 2)
+                        # Value proofs and namespace aliases use the same
+                        # definition inventory. A conditional write, namespace
+                        # collision or second assignment invalidates a literal
+                        # allowlist even when its first initializer was safe.
+                        key = (definition[:-1], definition[-1])
+                        fact = (self.literal_value(parts[-1], shared=True)
+                                if direct and definition not in declared_constants else CLEAN)
+                        self.constants[key] = CLEAN if key in self.constants else fact
                         target = token_text(parts[-1]) if direct else ''
                         alias = ((target, function.owner, function.lexical_owners, position)
                                  if direct and re.fullmatch(r'(?:::)?[A-Z]\w*(?:::[A-Z]\w*)*', target)
@@ -912,6 +910,9 @@ class RubyEngine:
             canonical = (*parent, owner[-1]) if parent is not None else owner
             if canonical != owner:
                 self.constant_aliases[canonical] = None if canonical in self.constant_aliases else alias
+                key = (canonical[:-1], canonical[-1])
+                self.constants[key] = (CLEAN if key in self.constants
+                                       else self.constants.get((owner[:-1], owner[-1]), CLEAN))
                 self.constant_definitions.add(canonical)
                 position = self.constant_positions[owner]
                 self.constant_positions[canonical] = min(
@@ -1068,6 +1069,19 @@ class RubyEngine:
                     if resolved is not None else None)
         return owner
 
+    def constant_value_owner(self, owner):
+        """Select a literal value without giving it class/module identity."""
+        if not owner:
+            return None
+        parent = self.constant_identity(owner[:-1])
+        if parent is None:
+            return None
+        selected = (*parent, owner[-1])
+        if any(selected[:length] in self.conditional_constants
+               for length in range(1, len(selected) + 1)):
+            return None
+        return selected if self.constants.get((selected[:-1], selected[-1])) else None
+
     def constant_call(self, name):
         """Canonicalize a syntactic constant receiver in its actual scope."""
         if '.' not in name:
@@ -1077,6 +1091,11 @@ class RubyEngine:
             return name
         owner = self.constant_owner(receiver, self.function.owner, self.function.lexical_owners)
         identity = self.constant_identity(owner)
+        if identity is None and self.constant_value_owner(owner) is not None:
+            # A constant may hold an array/string, including one named File.
+            # Keep ordinary value behavior while preventing its spelling from
+            # matching a builtin API or a selected namespace's singleton method.
+            return '<value>.' + method
         if identity is not None and any(identity[:length] in self.conditional_constants
                                         for length in range(1, len(identity) + 1)):
             return None
@@ -1503,7 +1522,7 @@ class RubyEngine:
             direct = bool(identities & aliases) or binding == name and not identities
             contained = bool(identities & object_ids(fact, members=True))
             if direct or contained:
-                if binding and binding[0].isupper() and tainted(changed):
+                if binding.removeprefix('::')[:1].isupper() and tainted(changed):
                     raise ValueError('Request-derived Ruby constant mutation needs shared-state analysis; analysis is incomplete')
                 if direct and (definite and aliases == identities or binding == name):
                     state[binding] = changed
@@ -1799,7 +1818,10 @@ class RubyEngine:
                                  else shape('unresolved-value', token.start))
                 if name not in state and re.fullmatch(r'(?:::)?[A-Z]\w*(?:::[A-Z]\w*)*', name):
                     owner = self.constant_owner(name, self.function.owner, self.function.lexical_owners)
-                    if owner in self.sql_models:
+                    selected = self.constant_value_owner(owner)
+                    if selected is not None:
+                        atom = state.get('::' + '::'.join(selected), CLEAN)
+                    elif owner in self.sql_models:
                         atom = shape('active-record-model', owner)
                 if cursor < len(tokens) and tokens[cursor].value == '(':
                     end = closing_token(tokens, cursor)
@@ -1882,7 +1904,7 @@ class RubyEngine:
                                 return {match.group(1): frozenset({'url-host'})}
             if truth:
                 member = re.search(r'\.include\?\(([A-Za-z_]\w*)\.(host|hostname|scheme)\)$', text)
-                if member:
+                if member and 'include?' not in self.unresolved_definition_methods:
                     split = next((index for index in range(len(tokens) - 1) if tokens[index].value == '.' and tokens[index + 1].value == 'include?'), None)
                     if split is not None:
                         allowed = self.expression(tokens[:split], state)
@@ -2317,7 +2339,13 @@ class RubyEngine:
                 if function.owner in self.sql_models and (function.singleton or function.scope):
                     state['self'] = shape('active-record-model', function.owner)
                 for (owner, name), fact in self.constants.items():
-                    if function.owner[:len(owner)] == owner:
+                    self.budget.spend()
+                    selected = self.constant_value_owner((*owner, name)) if fact else None
+                    if selected is None:
+                        continue
+                    state['::' + '::'.join(selected)] = fact
+                    visible = self.constant_owner(name, function.owner, function.lexical_owners)
+                    if self.constant_value_owner(visible) == selected:
                         state[name] = fact
                 for index, (name, fact) in enumerate(zip(function.parameters, key[1])):
                     if key[2] and not fact and index < len(function.defaults) and function.defaults[index]:

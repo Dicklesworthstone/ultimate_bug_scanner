@@ -222,7 +222,7 @@ class BufferScanTests(BufferFixture, unittest.TestCase):
         self.assertEqual(self.source.read_text(), 'clean\n')
 
     def test_invalid_report_fails_and_private_tree_is_cleaned(self):
-        self.scanner.write_text(SCANNER.replace("'status': 'ok'", "'status': 'partial'"))
+        self.scanner.write_text(SCANNER.replace("'status': 'ok'", "'status': 'invalid'"))
         self.open('BUG')
         self.drain()
         self.assertEqual(self.diagnostics()[-1]['diagnostics'][0]['code'], 'ubs.unverified')

@@ -1810,7 +1810,162 @@ CONSTANT_RECEIVER_BOUNDARIES = (
         end''', (19,)),
 )
 
-CASES += EXECUTION_CASES + SQL_CASES + CONSTANT_RECEIVER_CASES
+LITERAL_CONSTANT_CASES = (
+    Case('url_literal_constant_allowlist_is_complete', URL, '''
+        require 'uri'
+        class Client
+          ALLOWED = %w[api.example.com].freeze
+          def fetch
+            uri = URI.parse(params[:url])
+            raise 'blocked' unless uri.scheme == 'https' && ALLOWED.include?(uri.host)
+            Net::HTTP.get(uri)
+          end
+        end''', ()),
+    Case('url_nested_namespace_shadows_literal_allowlist', URL, '''
+        require 'uri'
+        module Outer
+          ALLOWED = %w[api.example.com].freeze
+          class Client
+            module ALLOWED
+              def self.include?(value)
+                true
+              end
+            end
+            def fetch
+              uri = URI.parse(params[:url])
+              raise 'blocked' unless uri.scheme == 'https' && ALLOWED.include?(uri.host)
+              Net::HTTP.get(uri)
+            end
+          end
+        end''', (13,)),
+    Case('url_compact_scope_does_not_inherit_literal_allowlist', URL, '''
+        require 'uri'
+        module Outer
+          ALLOWED = %w[api.example.com].freeze
+          class Client
+          end
+        end
+        module ALLOWED
+          def self.include?(value)
+            true
+          end
+        end
+        class Outer::Client
+          def fetch
+            uri = URI.parse(params[:url])
+            raise 'blocked' unless uri.scheme == 'https' && ALLOWED.include?(uri.host)
+            Net::HTTP.get(uri)
+          end
+        end''', (16,)),
+    Case('url_literal_allowlist_follows_nested_lexical_scope', URL, '''
+        module Outer
+          ALLOWED = %w[api.example.com].freeze
+          class Client
+            def fetch
+              uri = URI.parse(params[:url])
+              raise 'blocked' unless uri.scheme == 'https' && ALLOWED.include?(uri.host)
+              Net::HTTP.get(uri)
+            end
+          end
+        end''', ()),
+    Case('url_literal_allowlist_root_qualification', URL, '''
+        ALLOWED = %w[api.example.com].freeze
+        module App
+          module ALLOWED
+            def self.include?(value)
+              true
+            end
+          end
+          class Client
+            def fetch
+              uri = URI.parse(params[:url])
+              raise 'blocked' unless uri.scheme == 'https' && ::ALLOWED.include?(uri.host)
+              Net::HTTP.get(uri)
+            end
+          end
+        end''', ()),
+    Case('url_literal_allowlist_qualified_value', URL, '''
+        module Policy
+          ALLOWED = ['api.example.com', 'hooks.example.com'].freeze
+        end
+        class Client
+          def fetch
+            uri = URI.parse(params[:url])
+            raise 'blocked' unless uri.scheme == 'https' && Policy::ALLOWED.include?(uri.host)
+            Net::HTTP.get(uri)
+          end
+        end''', ()),
+)
+
+CONSTANT_RECEIVER_BOUNDARIES += (
+    Case('url_rebound_literal_allowlist_remains_incomplete', URL, '''
+        module Permissive
+          def self.include?(value)
+            true
+          end
+        end
+        ALLOWED = %w[api.example.com].freeze
+        ALLOWED = Permissive
+        Net::HTTP.get(params[:before])
+        uri = URI.parse(params[:url])
+        raise 'blocked' unless uri.scheme == 'https' && ALLOWED.include?(uri.host)
+        Net::HTTP.get(uri)''', (8, 11)),
+    Case('url_conditional_value_scope_cannot_prove_allowlist', URL, '''
+        module ALLOWED
+          def self.include?(value)
+            true
+          end
+        end
+        if flag
+          class Client
+            ALLOWED = %w[api.example.com].freeze
+          end
+        end
+        class Client
+          def fetch
+            Net::HTTP.get(params[:before])
+            uri = URI.parse(params[:url])
+            raise 'blocked' unless uri.scheme == 'https' && ALLOWED.include?(uri.host)
+            Net::HTTP.get(uri)
+          end
+        end''', (13, 16)),
+    Case('url_literal_allowlist_singleton_override_remains_incomplete', URL, '''
+        ALLOWED = %w[api.example.com]
+        def ALLOWED.include?(value)
+          true
+        end
+        Net::HTTP.get(params[:before])
+        uri = URI.parse(params[:url])
+        raise 'blocked' unless uri.scheme == 'https' && ALLOWED.include?(uri.host)
+        Net::HTTP.get(uri)''', (5, 8)),
+    Case('url_unknown_constant_value_remains_incomplete', URL, '''
+        ALLOWED = Object.new
+        def ALLOWED.include?(value)
+          true
+        end
+        Net::HTTP.get(params[:before])
+        uri = URI.parse(params[:url])
+        raise 'blocked' unless uri.scheme == 'https' && ALLOWED.include?(uri.host)
+        Net::HTTP.get(uri)''', (5, 8)),
+    Case('path_literal_file_receiver_cannot_borrow_basename', PATH, '''
+        File = %w[unused]
+        def File.basename(value)
+          value
+        end
+        send_file(params[:before])
+        send_file(File.basename(params[:file]))''', (5, 6)),
+    Case('url_qualified_constant_mutation_needs_shared_state', URL, '''
+        module Policy
+          ALLOWED = %w[api.example.com]
+        end
+        allowed = Policy::ALLOWED
+        allowed.push(URI.parse(params[:url]).host)
+        uri = URI.parse(params[:url])
+        raise 'blocked' unless uri.scheme == 'https' && Policy::ALLOWED.include?(uri.host)
+        Net::HTTP.get(uri)''', ()),
+)
+
+CASES += EXECUTION_CASES + SQL_CASES + CONSTANT_RECEIVER_CASES + LITERAL_CONSTANT_CASES
 BY_NAME = {case.name: case for case in CASES}
 UNRESOLVED_DISPATCH_CASES = (
     Case('dispatch_unknown', PATH, '''
@@ -2126,6 +2281,77 @@ class RubySemanticTests(LoggedCase):
                 self.assertEqual([(row['rule'], row['line']) for row in findings],
                                  [(case.rule, line) for line in case.lines], findings)
 
+    def test_existing_literal_allowlist_fixtures_are_complete(self):
+        for relative in ('ruby/open_redirect_clean/redirects.rb', 'ruby/ssrf_clean/request_urls.rb'):
+            with self.subTest(fixture=relative):
+                path = ROOT / 'test-suite' / relative
+                self.check_case(Case('existing-' + path.parent.name, URL, path.read_text(), ()))
+
+    def test_literal_constant_native_ruby_value_controls(self):
+        executable = os.environ.get('UBS_RUBY_BIN') or shutil.which('ruby')
+        if not executable:
+            self.skipTest('native Ruby is required for literal constant value oracles')
+        driver = '''require 'uri'
+$observed = []
+def params
+  {file: '../private.txt', url: 'https://untrusted.example/leaf', before: 'before-marker'}
+end
+def flag
+  false
+end
+def send_file(value)
+  $observed << value.to_s
+end
+module Net
+  module HTTP
+    def self.get(value)
+      $observed << value.to_s
+    end
+  end
+end
+begin
+  load ARGV[0]
+  eval(ARGV[1], TOPLEVEL_BINDING)
+rescue => error
+  raise unless error.message == 'blocked'
+  $observed << 'blocked'
+end
+puts $observed
+'''
+        untrusted = 'https://untrusted.example/leaf'
+        oracles = (
+            ('url_literal_constant_allowlist_is_complete', 'Client.new.fetch', ['blocked']),
+            ('url_nested_namespace_shadows_literal_allowlist', 'Outer::Client.new.fetch', [untrusted]),
+            ('url_compact_scope_does_not_inherit_literal_allowlist', 'Outer::Client.new.fetch', [untrusted]),
+            ('url_literal_allowlist_follows_nested_lexical_scope', 'Outer::Client.new.fetch', ['blocked']),
+            ('url_literal_allowlist_root_qualification', 'App::Client.new.fetch', ['blocked']),
+            ('url_literal_allowlist_qualified_value', 'Client.new.fetch', ['blocked']),
+            ('url_rebound_literal_allowlist_remains_incomplete', '', ['before-marker', untrusted]),
+            ('url_conditional_value_scope_cannot_prove_allowlist', 'Client.new.fetch', ['before-marker', untrusted]),
+            ('url_literal_allowlist_singleton_override_remains_incomplete', '', ['before-marker', untrusted]),
+            ('url_unknown_constant_value_remains_incomplete', '', ['before-marker', untrusted]),
+            ('path_literal_file_receiver_cannot_borrow_basename', '', ['before-marker', '../private.txt']),
+            ('url_qualified_constant_mutation_needs_shared_state', '', [untrusted]),
+        )
+        for name, invocation, expected in oracles:
+            with self.subTest(case=name):
+                case = next(case for case in (*LITERAL_CONSTANT_CASES, *CONSTANT_RECEIVER_BOUNDARIES)
+                            if case.name == name)
+                directory = self.artifact / ('native-' + name)
+                directory.mkdir()
+                target = directory / 'input.rb'
+                target.write_text(case.source)
+                command = [executable, '-e', driver, str(target), invocation]
+                result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+                (directory / 'stdout.log').write_text(result.stdout)
+                (directory / 'stderr.log').write_text(result.stderr)
+                (directory / 'result.json').write_text(json.dumps({
+                    'command': command, 'source_sha256': hashlib.sha256(target.read_bytes()).hexdigest(),
+                    'exit': result.returncode, 'expected': expected,
+                }, indent=2) + '\n')
+                self.assertEqual(result.returncode, 0, (command, result.stdout, result.stderr))
+                self.assertEqual(result.stdout.splitlines(), expected, (command, result.stdout, result.stderr))
+
     def test_constant_receiver_native_ruby_value_controls(self):
         executable = os.environ.get('UBS_RUBY_BIN') or shutil.which('ruby')
         if not executable:
@@ -2415,6 +2641,42 @@ class RubyPublicTests(LoggedCase):
                 with self.subTest(case=case.name, format=fmt):
                     result, payload = self.scan(directory / fmt, selected, fmt)
                     self.assert_findings(result, payload, case, fmt, selected)
+
+    def test_literal_constant_identity_reaches_json_and_sarif(self):
+        for case in LITERAL_CONSTANT_CASES:
+            directory = self.artifact / case.name
+            directory.mkdir()
+            selected = directory / 'input.rb'
+            selected.write_text(case.source)
+            for fmt in ('json', 'sarif'):
+                with self.subTest(case=case.name, format=fmt):
+                    result, payload = self.scan(directory / fmt, selected, fmt)
+                    self.assert_findings(result, payload, case, fmt, selected)
+
+    def test_existing_literal_allowlist_fixtures_are_complete_in_public_reports(self):
+        for relative in ('ruby/open_redirect_clean/redirects.rb', 'ruby/ssrf_clean/request_urls.rb'):
+            target = ROOT / 'test-suite' / relative
+            for module in (False, True):
+                for fmt in ('json', 'sarif'):
+                    with self.subTest(fixture=relative, module=module, format=fmt):
+                        directory = self.artifact / target.parent.name / ('module' if module else 'meta') / fmt
+                        result, payload = self.scan(directory, target, fmt, module=module)
+                        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+                        if fmt == 'json':
+                            self.assertEqual(payload['status'], 'ok', payload)
+                            counts = payload if module else payload['totals']
+                            self.assertEqual((counts['critical'], counts['warning']), (0, 0), payload)
+                            self.assertFalse([row for row in payload['findings']
+                                              if row.get('rule', row.get('rule_id')) in TARGET_RULES], payload)
+                            if not module:
+                                self.assertEqual(payload['failed_modules'], [], payload)
+                        else:
+                            self.assertFalse([row for run in payload['runs'] for row in run.get('results', [])
+                                              if row['ruleId'] in TARGET_RULES
+                                              or row.get('level', 'warning') in {'error', 'warning'}], payload)
+                            invocations = [item for run in payload['runs'] for item in run.get('invocations', [])]
+                            self.assertTrue(all(item['executionSuccessful'] and item.get('exitCode', 0) == 0
+                                                for item in invocations), payload)
 
     def test_constant_receiver_boundaries_retain_findings_and_partial_status(self):
         for case in CONSTANT_RECEIVER_BOUNDARIES:

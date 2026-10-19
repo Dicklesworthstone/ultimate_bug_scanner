@@ -28,7 +28,7 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from io import StringIO
+from io import BytesIO, StringIO
 from pathlib import Path
 from typing import BinaryIO, Iterator, Sequence, TextIO
 
@@ -797,29 +797,194 @@ def scan_ruby_tools(files: Sequence[Path], sink: TextIO, project_dir: str,
     return outcomes
 
 
-def _json_stream(output: str, tool: str, errors: list[str], *, vet: bool = False):
-    """Decode consecutive JSON values, keeping evidence before a broken tail.
+class _ReportErrors:
+    """Keep coverage failures visible without retaining every malformed row."""
+    def __init__(self, errors: list[str], tool: str):
+        self.errors, self.tool = errors, tool
+        self.count = 0
+        self.overflow: int | None = None
 
-    go vet's driver adds package headings around its JSON on stderr; these
-    headings (and dependency-download progress) are not analyzer diagnostics.
-    Do not fish arbitrary JSON out of an error message and call it success.
+    def append(self, message: str) -> None:
+        self.count += 1
+        if self.count <= 4:
+            self.errors.append(message[:400])
+            return
+        if self.overflow is None:
+            self.overflow = len(self.errors)
+            self.errors.append("")
+        self.errors[self.overflow] = f"{self.tool}: {self.count - 4} additional report error(s)"
+
+
+class _JSONReportReader:
+    """Read JSON containers incrementally, bounding each decoded value.
+
+    A vet package or diagnostic array may be arbitrarily large. Traverse
+    those containers without materializing them; only keys and individual
+    diagnostics (or govulncheck messages) use value(). Binary framing keeps
+    a corrupt UTF-8 tail from erasing valid values earlier in the same read.
     """
-    decoder = json.JSONDecoder()
-    offset = 0
-    while offset < len(output):
-        if output[offset].isspace():
-            offset += 1
-            continue
-        if vet and (output.startswith("# ", offset) or output.startswith("go: downloading ", offset)):
-            end = output.find("\n", offset)
-            offset = len(output) if end < 0 else end + 1
-            continue
-        try:
-            doc, offset = decoder.raw_decode(output, offset)
-        except ValueError:
-            errors.append(f"{tool}: invalid or truncated JSON report near {output[offset:offset+120]!r}")
-            break
-        yield doc
+    _CHUNK = 64 * 1024
+    _DEPTH = 128
+    _STRING_TOKEN = re.compile(rb'["\\]')
+    _CONTAINER_TOKEN = re.compile(rb'[{}\[\]"]')
+    _SCALAR_END = re.compile(rb'[\[\]{},:" \t\r\n]')
+    _NON_SPACE = re.compile(rb'[^ \t\r\n]')
+
+    def __init__(self, output: str | BinaryIO):
+        self.source = BytesIO(output.encode("utf-8")) if isinstance(output, str) else output
+        self.buffer = b""
+        self.position = 0
+        self.offset = 0
+        self.eof = False
+
+    def peek(self) -> bytes:
+        if self.position == len(self.buffer) and not self.eof:
+            self.offset += self.position
+            self.buffer = self.source.read(self._CHUNK)
+            self.position = 0
+            self.eof = not self.buffer
+        return self.buffer[self.position:self.position + 1]
+
+    def token(self) -> bytes:
+        while self.peek():
+            match = self._NON_SPACE.search(self.buffer, self.position)
+            self.position = match.start() if match else len(self.buffer)
+            if match:
+                return self.peek()
+        return b""
+
+    def error(self, message: str) -> ValueError:
+        return ValueError(f"{message} at byte {self.offset + self.position}")
+
+    def expect(self, token: bytes) -> None:
+        if self.token() != token:
+            raise self.error(f"expected {token.decode('ascii')!r}")
+        self.position += 1
+
+    @staticmethod
+    def invalid_constant(name: str):
+        raise ValueError(f"non-JSON numeric constant {name}")
+
+    def value(self):
+        first = self.token()
+        if not first or first in (b",", b":", b"}", b"]"):
+            raise self.error("expected JSON value")
+        raw = bytearray()
+
+        def take(end: int) -> None:
+            if len(raw) + end - self.position > OUTPUT_RECORD_LIMIT:
+                raise self.error(f"JSON value exceeds {OUTPUT_RECORD_LIMIT} bytes")
+            raw.extend(self.buffer[self.position:end])
+            self.position = end
+
+        stack = [b"}" if first == b"{" else b"]"] if first in (b"{", b"[") else []
+        quoted, escaped = first == b'"', False
+        if stack or quoted:
+            take(self.position + 1)
+            while True:
+                if not self.peek():
+                    raise self.error("unterminated JSON value")
+                if quoted:
+                    if escaped:
+                        take(self.position + 1)
+                        escaped = False
+                        continue
+                    match = self._STRING_TOKEN.search(self.buffer, self.position)
+                    take(match.end() if match else len(self.buffer))
+                    if match:
+                        if match.group() == b"\\":
+                            escaped = True
+                        else:
+                            quoted = False
+                            if not stack:
+                                break
+                else:
+                    match = self._CONTAINER_TOKEN.search(self.buffer, self.position)
+                    take(match.end() if match else len(self.buffer))
+                    if not match:
+                        continue
+                    token = match.group()
+                    if token == b'"':
+                        quoted = True
+                    elif token in (b"{", b"["):
+                        stack.append(b"}" if token == b"{" else b"]")
+                        if len(stack) > self._DEPTH:
+                            raise self.error(f"JSON value nesting exceeds {self._DEPTH}")
+                    else:
+                        if token != stack.pop():
+                            raise self.error("mismatched JSON delimiters")
+                        if not stack:
+                            break
+        else:
+            while self.peek():
+                match = self._SCALAR_END.search(self.buffer, self.position)
+                take(match.start() if match else len(self.buffer))
+                if match:
+                    break
+        # Decode only after framing: a later invalid byte never prevents
+        # earlier, independently complete diagnostics from being delivered.
+        return json.loads(raw.decode("utf-8"), parse_constant=self.invalid_constant)
+
+    def members(self) -> Iterator[str]:
+        self.expect(b"{")
+        if self.token() == b"}":
+            self.position += 1
+            return
+        while True:
+            if self.token() != b'"':
+                raise self.error("expected JSON object key")
+            name = self.value()
+            self.expect(b":")
+            yield name
+            if self.token() == b"}":
+                self.position += 1
+                return
+            self.expect(b",")
+
+    def elements(self) -> Iterator[None]:
+        self.expect(b"[")
+        if self.token() == b"]":
+            self.position += 1
+            return
+        while True:
+            yield None
+            if self.token() == b"]":
+                self.position += 1
+                return
+            self.expect(b",")
+
+    def documents(self, *, vet: bool = False) -> Iterator[None]:
+        while self.token():
+            if vet and self.peek() in (b"#", b"g"):
+                # These are the only non-JSON records emitted by Go's vet
+                # driver. Never search through arbitrary error text for JSON.
+                prefix = b"# " if self.peek() == b"#" else b"go: downloading "
+                for byte in prefix:
+                    if self.peek() != bytes((byte,)):
+                        raise self.error("unexpected text before JSON report")
+                    self.position += 1
+                size = len(prefix)
+                while self.peek():
+                    end = self.buffer.find(b"\n", self.position)
+                    limit = end + 1 if end >= 0 else len(self.buffer)
+                    size += limit - self.position
+                    if size > OUTPUT_RECORD_LIMIT:
+                        raise self.error(f"package heading exceeds {OUTPUT_RECORD_LIMIT} bytes")
+                    self.position = limit
+                    if end >= 0:
+                        break
+                continue
+            yield None
+
+
+def _json_stream(output: str | BinaryIO, tool: str, errors: _ReportErrors):
+    """Decode every bounded stream message and retain a valid prefix."""
+    try:
+        reader = _JSONReportReader(output)
+        for _ in reader.documents():
+            yield reader.value()
+    except (OSError, UnicodeError, ValueError, RecursionError) as exc:
+        errors.append(f"{tool}: invalid or truncated JSON report: {exc}")
 
 
 class GoFindings:
@@ -865,41 +1030,50 @@ class GoFindings:
             "suppressed": False, "extras": metadata,
         }, ensure_ascii=False) + "\n")
 
-    def vet(self, output: str, errors: list[str]) -> None:
+    def vet(self, output: str | BinaryIO, errors: list[str]) -> None:
         # In JSON mode even analysis errors may exit 0. Inspect both the
         # package/analyzer error objects and the actual diagnostic arrays.
         # See Go's analysis/unitchecker and analysis/internal/analysisflags.
         documents = 0
-        for doc in _json_stream(output, "go vet", errors, vet=True):
-            documents += 1
-            if not isinstance(doc, dict):
-                errors.append("go vet: expected package object")
-                continue
-            for package, analyzers in doc.items():
-                if not isinstance(analyzers, dict):
-                    errors.append(f"go vet: malformed package {package!r}")
+        problems = _ReportErrors(errors, "go vet")
+        try:
+            reader = _JSONReportReader(output)
+            for _ in reader.documents(vet=True):
+                documents += 1
+                if reader.token() != b"{":
+                    reader.value()
+                    problems.append("go vet: expected package object")
                     continue
-                for analyzer, rows in analyzers.items():
-                    if isinstance(rows, dict) and "error" in rows:
-                        errors.append(f"go vet ({analyzer}): {str(rows['error'])[:200]}")
+                for package in reader.members():
+                    if reader.token() != b"{":
+                        reader.value()
+                        problems.append(f"go vet: malformed package {package[:120]!r}")
                         continue
-                    if not isinstance(rows, list):
-                        errors.append(f"go vet ({analyzer}): expected diagnostic array")
-                        continue
-                    for row in rows:
-                        try:
-                            match = re.fullmatch(r"(.+):(\d+):(\d+)", _text(row["posn"]), re.S)
-                            if not match:
-                                raise ValueError("invalid source position")
-                            self.emit("vet", _text(analyzer), match[1], _positive(int(match[2])),
-                                      _positive(int(match[3])), "warning", _text(row["message"]),
-                                      extras={"package": package})
-                        except (KeyError, TypeError, ValueError, OSError):
-                            errors.append(f"go vet ({analyzer}): malformed diagnostic")
+                    for analyzer in reader.members():
+                        if reader.token() != b"[":
+                            rows = reader.value()
+                            if isinstance(rows, dict) and "error" in rows:
+                                problems.append(f"go vet ({analyzer[:120]}): {str(rows['error'])[:200]}")
+                            else:
+                                problems.append(f"go vet ({analyzer[:120]}): expected diagnostic array")
+                            continue
+                        for _ in reader.elements():
+                            row = reader.value()
+                            try:
+                                match = re.fullmatch(r"(.+):(\d+):(\d+)", _text(row["posn"]), re.S)
+                                if not match:
+                                    raise ValueError("invalid source position")
+                                self.emit("vet", _text(analyzer), match[1], _positive(int(match[2])),
+                                          _positive(int(match[3])), "warning", _text(row["message"]),
+                                          extras={"package": package})
+                            except (KeyError, TypeError, ValueError, OSError):
+                                problems.append(f"go vet ({analyzer[:120]}): malformed diagnostic")
+        except (OSError, UnicodeError, ValueError, RecursionError) as exc:
+            problems.append(f"go vet: invalid or truncated JSON report: {exc}")
         if not documents:
-            errors.append("go vet: no JSON analysis report")
+            problems.append("go vet: no JSON analysis report")
 
-    def govulncheck(self, output: str, errors: list[str]) -> None:
+    def govulncheck(self, output: str | BinaryIO, errors: list[str]) -> None:
         # JSON mode exits 0 even with vulnerabilities. OSV messages are NOT
         # findings: they include advisories not affecting the loaded version.
         # Lower-precision module/package messages precede symbol findings.
@@ -907,7 +1081,8 @@ class GoFindings:
         advisories: dict[str, dict] = {}
         groups: dict[tuple[str, str], list[tuple[int, dict]]] = {}
         config = False
-        for index, doc in enumerate(_json_stream(output, "govulncheck", errors)):
+        problems = _ReportErrors(errors, "govulncheck")
+        for index, doc in enumerate(_json_stream(output, "govulncheck", problems)):
             try:
                 if not isinstance(doc, dict) or len(doc) != 1:
                     raise ValueError("expected one message field")
@@ -915,7 +1090,7 @@ class GoFindings:
                 if not isinstance(value, dict):
                     raise ValueError(f"invalid {kind} message")
                 if index == 0 and kind != "config":
-                    errors.append("govulncheck: missing initial configuration")
+                    problems.append("govulncheck: missing initial configuration")
                 if kind == "config":
                     if config or value.get("protocol_version") != "v1.0.0":
                         raise ValueError("duplicate or unsupported protocol configuration")
@@ -939,9 +1114,9 @@ class GoFindings:
                 elif kind not in ("progress", "SBOM"):
                     raise ValueError(f"unknown message {kind!r}")
             except (ValueError, KeyError, TypeError):
-                errors.append("govulncheck: malformed or unsupported stream message")
+                problems.append("govulncheck: malformed or unsupported stream message")
         if not config:
-            errors.append("govulncheck: no valid configuration message")
+            problems.append("govulncheck: no valid configuration message")
         for (osv, module), rows in sorted(groups.items()):
             strongest = max(level for level, _ in rows)
             for level, row in rows:
@@ -968,7 +1143,7 @@ class GoFindings:
                             break
                     except (ValueError, KeyError, TypeError, OSError):
                         invalid = True
-                        errors.append("govulncheck: malformed source location")
+                        problems.append("govulncheck: malformed source location")
                 if invalid or (local_positions and project):
                     continue  # a trace into unselected source is not a selected-file finding
                 reachability = ("module", "package", "symbol")[level]
@@ -1028,19 +1203,29 @@ def scan_go_tools(files: Sequence[Path], sink: TextIO, project_dir: str,
                 ["vet", "-json", "--", *patterns] if tool == "go vet"
                 else ["-format=json", "-scan=symbol", *patterns]]
             for args in batches:
-                result = run_command(tool, [installed, *args], root, timeout, errors,
-                                     env=env, merge_stderr=tool == "go vet")
+                if tool != "gofmt":
+                    with run_command_stream(tool, [installed, *args], root, timeout, errors,
+                                            env=env, merge_stderr=tool == "go vet") as result:
+                        if result is None:
+                            continue
+                        # EOF establishes JSON framing, not native success.
+                        # Both tools can leave useful findings on a bad exit;
+                        # vet JSON analysis-error objects may even exit zero.
+                        if result.returncode != 0:
+                            errors.append(f"{tool}: exited {result.returncode}: {result.stderr.strip()[:160]}")
+                        if tool == "go vet":
+                            findings.vet(result.stdout, errors)
+                        else:
+                            findings.govulncheck(result.stdout, errors)
+                    continue
+                # A single filename cannot grow with the project's findings;
+                # keep gofmt's existing bounded, exact-name report contract.
+                result = run_command(tool, [installed, *args], root, timeout, errors, env=env)
                 if result is None:
                     continue
-                # All three commands use 0 for completed analysis in these
-                # formats. In particular, vet JSON errors can ALSO exit 0.
                 if result.returncode != 0:
                     errors.append(f"{tool}: exited {result.returncode}: {result.stderr.strip()[:160]}")
-                if tool == "go vet":
-                    findings.vet(result.stdout, errors)
-                elif tool == "govulncheck":
-                    findings.govulncheck(result.stdout, errors)
-                elif result.stdout == args[-1] + "\n":
+                if result.stdout == args[-1] + "\n":
                     findings.emit("gofmt", "format", args[-1], 1, 1, "info",
                                   "File differs from gofmt -s formatting")
                 elif result.stdout:

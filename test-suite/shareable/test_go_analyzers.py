@@ -2,6 +2,8 @@
 """Go optional tools must provide fresh findings and truthful coverage (#128)."""
 from __future__ import annotations
 
+from contextlib import contextmanager
+import hashlib
 import io
 import json
 import os
@@ -41,9 +43,22 @@ def finding(level: str = "symbol", source: str = "main.go") -> dict:
     return {"finding": {"osv": OSV, "fixed_version": "v1.2.3", "trace": trace}}
 
 
+class ChunkedReader:
+    """Expose short binary reads and reject a whole-report read."""
+    def __init__(self, source, chunk: int):
+        self.source, self.chunk = source, chunk
+
+    def read(self, size: int = -1):
+        if not 0 < size <= 64 * 1024:
+            raise AssertionError("native report reads must use bounded chunks")
+        return self.source.read(min(size, self.chunk))
+
+
 class Adapters(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory(prefix="ubs-go-adapter-")
+        artifacts = REPO / "test-suite/artifacts/go-analyzers"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        self.tmp = tempfile.TemporaryDirectory(prefix="ubs-go-adapter-", dir=artifacts)
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         (self.root / "go.mod").write_text(f"module {MODULE}\n\ngo 1.23\n")
@@ -82,6 +97,74 @@ class Adapters(unittest.TestCase):
         self.parser.vet(stream(doc) + '\n{"unfinished":', self.errors)
         self.assertEqual(len(self.rows()), 1)
         self.assertGreaterEqual(len(self.errors), 3)
+
+    def test_vet_stream_retains_prefix_inside_unfinished_package(self) -> None:
+        row = self.vet_doc()[MODULE]["printf"][0]
+        prefix = ('{"' + MODULE + '":{"printf":[' + json.dumps(row)).encode()
+        for tail in (b',{"posn":', b',]', b']', b']}} trailing failure',
+                     b',{"posn":"main.go:4:1","message":"\xff"}]}}',
+                     b',{"posn":"main.go:4:1","message":"bad","extra":NaN}]}}'):
+            with self.subTest(tail=tail):
+                sink, errors = io.StringIO(), []
+                tools.GoFindings([self.file], self.root, sink).vet(io.BytesIO(prefix + tail), errors)
+                self.assertEqual(len(sink.getvalue().splitlines()), 1)
+                self.assertTrue(errors)
+
+    def test_vet_stream_handles_fragmented_utf8_keys_strings_and_containers(self) -> None:
+        file = self.root / "source-µ-\u2028.go"
+        file.write_bytes(self.file.read_bytes())
+        message = 'Quotes " and \\ escapes, {brackets} [arrays], unicode µ and \n newlines'
+        doc = {MODULE: {"printf": [{"posn": f"{file}:3:2", "message": message,
+                                    "fixes": [{"edits": [1, True, None, {"text": "]}"}]}]}]}}
+        payload = ("# module\n# [module]\ngo: downloading example.invalid/dependency v1.0.0\n" +
+                   json.dumps(doc, ensure_ascii=False) + "\n{}\n").encode()
+        for chunk in (1, 2, 7, 64 * 1024):
+            with self.subTest(chunk=chunk):
+                sink, errors = io.StringIO(), []
+                tools.GoFindings([file], self.root, sink).vet(ChunkedReader(io.BytesIO(payload), chunk), errors)
+                self.assertEqual(errors, [])
+                rows = [json.loads(line) for line in io.StringIO(sink.getvalue())]
+                self.assertEqual([(row["path"], row["line"], row["col"], row["message"])
+                                  for row in rows], [(str(file), 3, 2, message)])
+
+    def test_vet_bounds_individual_values_and_depth_without_losing_prefix(self) -> None:
+        row = json.dumps(self.vet_doc()[MODULE]["printf"][0])
+        prefix = '{"' + MODULE + '":{"printf":[' + row + ','
+        for tail, limit, message in (
+            (json.dumps({"message": "x" * 300}), 256, "JSON value exceeds 256 bytes"),
+            ("[" * 130 + "0" + "]" * 130, 4096, "JSON value nesting exceeds 128"),
+        ):
+            with self.subTest(message=message), patch.object(tools, "OUTPUT_RECORD_LIMIT", limit):
+                sink, errors = io.StringIO(), []
+                tools.GoFindings([self.file], self.root, sink).vet(
+                    ChunkedReader(io.BytesIO((prefix + tail + ']}}').encode()), 7), errors)
+                self.assertEqual(len(sink.getvalue().splitlines()), 1)
+                self.assertIn(message, ";".join(errors))
+
+    def test_vet_bounds_error_detail_but_checks_every_row(self) -> None:
+        doc = self.vet_doc()
+        doc[MODULE]["printf"] += [None] * 2000
+        self.parser.vet(io.BytesIO(stream(doc).encode()), self.errors)
+        self.assertEqual(len(self.rows()), 1)
+        self.assertEqual(len(self.errors), 5)
+        self.assertIn("1996 additional report error(s)", self.errors[-1])
+
+    def test_vet_read_error_preserves_accepted_diagnostics(self) -> None:
+        prefix = ('{"' + MODULE + '":{"printf":[' +
+                  json.dumps(self.vet_doc()[MODULE]["printf"][0]) + ',').encode()
+        class BrokenReader:
+            def __init__(self):
+                self.started = False
+
+            def read(self, size):
+                if self.started:
+                    raise OSError("captured output read failed")
+                self.started = True
+                return prefix
+
+        self.parser.vet(BrokenReader(), self.errors)
+        self.assertEqual(len(self.rows()), 1)
+        self.assertIn("captured output read failed", ";".join(self.errors))
 
     def test_vet_deduplicates_test_variants_and_rejects_unselected(self) -> None:
         self.parser.vet(stream(self.vet_doc(), self.vet_doc(), self.vet_doc("excluded.go")), self.errors)
@@ -131,6 +214,37 @@ class Adapters(unittest.TestCase):
         self.assertTrue(self.errors)
         self.assertEqual(self.rows()[0]["severity"], "critical")
 
+    def test_vulnerability_stream_has_no_total_output_ceiling(self) -> None:
+        # Real protocol messages, generated on disk; progress does not become
+        # a finding or require retention until the final symbol evidence.
+        with tempfile.TemporaryFile(dir=self.root) as output:
+            output.write((stream(config()) + "\n").encode())
+            progress = (stream({"progress": {"message": "x" * 20_000}}) + "\n").encode()
+            for _ in range(900):
+                output.write(progress)
+            output.write((stream(finding("module"), finding(source="excluded.go"),
+                                 finding(), {"osv": {"id": OSV, "summary": "Late advisory"}}) + "\n").encode())
+            self.assertGreater(output.tell(), tools.OUTPUT_LIMIT)
+            output.seek(0)
+            self.parser.govulncheck(ChunkedReader(output, 1024), self.errors)
+        self.assertEqual(self.errors, [])
+        self.assertEqual(len(self.rows()), 1)
+        self.assertEqual(self.rows()[0]["extras"]["reachability"], "symbol")
+        self.assertIn("Late advisory", self.rows()[0]["message"])
+        self.assertEqual(self.rows()[0]["path"], str(self.file))
+
+    def test_vulnerability_stream_checks_invalid_utf8_size_depth_and_tail(self) -> None:
+        prefix = (stream(config(), finding()) + "\n").encode()
+        for tail, limit in ((b'{"progress":{"message":"\xff"}}', 4096),
+                            (b'{"progress":{"message":"' + b"x" * 5000 + b'"}}', 4096),
+                            (b'{"progress":' + b"[" * 130 + b"0" + b"]" * 130 + b"}", 4096)):
+            with self.subTest(tail=tail[:50]), patch.object(tools, "OUTPUT_RECORD_LIMIT", limit):
+                sink, errors = io.StringIO(), []
+                tools.GoFindings([self.file], self.root, sink).govulncheck(
+                    ChunkedReader(io.BytesIO(prefix + tail), 7), errors)
+                self.assertTrue(errors)
+                self.assertEqual(json.loads(sink.getvalue())["severity"], "critical")
+
     def test_unselected_callsite_is_not_readmitted(self) -> None:
         self.parser.govulncheck(stream(config(), finding(source="excluded.go")), self.errors)
         self.assertEqual(self.errors, [])
@@ -154,17 +268,19 @@ class Adapters(unittest.TestCase):
 
     def test_package_patterns_are_argv_not_shell_code(self) -> None:
         calls = []
+        @contextmanager
         def run(tool, argv, root, timeout, errors, **kwargs):
             calls.append(argv)
-            return tools.ToolOutput(0, "{}" if tool == "go vet" else stream(config()), "")
-        with patch.object(tools.shutil, "which", side_effect=lambda t: None if t == "gofmt" else t), patch.object(tools, "run_command", side_effect=run):
+            with io.BytesIO(("{}" if tool == "go vet" else stream(config())).encode()) as output:
+                yield tools.ToolStreamOutput(0, output, "")
+        with patch.object(tools.shutil, "which", side_effect=lambda t: None if t == "gofmt" else t), patch.object(tools, "run_command_stream", side_effect=run):
             tools.scan_go_tools([self.file], self.sink, str(self.root), './a "./space dir" "$(touch owned)"', 1, self.errors)
         self.assertEqual(self.errors, [])
         self.assertEqual(calls[0][-3:], ["./a", "./space dir", "$(touch owned)"])
         self.assertFalse((self.root / "owned").exists())
 
     def test_tool_options_cannot_be_smuggled_in_as_package_patterns(self) -> None:
-        with patch.object(tools, "run_command") as run:
+        with patch.object(tools, "run_command_stream") as run:
             tools.scan_go_tools([self.file], self.sink, str(self.root), "-fix ./...", 1, self.errors)
         self.assertTrue(self.errors)
         run.assert_not_called()
@@ -190,6 +306,19 @@ class Adapters(unittest.TestCase):
                           self.root, 0.05, self.errors, merge_stderr=True)
         self.assertIn("timed out", ";".join(self.errors))
 
+    def test_timeout_keeps_diagnostics_inside_unfinished_native_package(self) -> None:
+        prefix = '{"' + MODULE + '":{"printf":[' + json.dumps(self.vet_doc()[MODULE]["printf"][0]) + ','
+        code = "import sys,time;sys.stderr.write(" + repr(prefix) + ");sys.stderr.flush();time.sleep(30)"
+        with tools.run_command_stream("go vet", [sys.executable, "-c", code],
+                                      self.root, 2, self.errors, merge_stderr=True) as output:
+            self.assertIsNotNone(output)
+            self.assertNotEqual(output.returncode, 0)
+            self.parser.vet(output.stdout, self.errors)
+            self.assertEqual(len(self.rows()), 1)
+        self.assertTrue(output.stdout.closed)
+        self.assertIn("timed out", ";".join(self.errors))
+        self.assertIn("JSON", ";".join(self.errors))
+
 
 STUB = r'''#!PYTHON
 import json, os, sys, time
@@ -213,9 +342,12 @@ if mode == "malformed":
 if name == "gofmt":
     if mode == "finding": print(sys.argv[-1])
 elif name == "go":
-    rows = [{"posn":str(Path.cwd()/"main.go")+":3:2", "message":"stub vet finding"}] if mode in ("finding","error") else []
+    rows = [{"posn":str(Path.cwd()/"main.go")+":3:2", "message":"stub vet finding"}] if mode in ("finding","error","truncated") else []
     print("# sample\n# [sample]", file=sys.stderr)
-    print(json.dumps({"example.invalid/sample":{"printf":rows}}), file=sys.stderr)
+    if mode == "truncated":
+        print('{"example.invalid/sample":{"printf":[' + json.dumps(rows[0]) + ',', file=sys.stderr)
+    else:
+        print(json.dumps({"example.invalid/sample":{"printf":rows}}), file=sys.stderr)
 else:
     print(json.dumps({"config":{"protocol_version":"v1.0.0","scan_level":"symbol"}}))
     if mode in ("finding","error"):
@@ -229,7 +361,9 @@ raise SystemExit(1 if mode == "error" else 0)
 
 class Integration(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory(prefix="ubs-go-tools-")
+        artifacts = REPO / "test-suite/artifacts/go-analyzers"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        self.tmp = tempfile.TemporaryDirectory(prefix="ubs-go-tools-", dir=artifacts)
         self.addCleanup(self.tmp.cleanup)
         self.base = Path(self.tmp.name)
         self.root = self.base / "project with spaces"
@@ -278,6 +412,17 @@ class Integration(unittest.TestCase):
         self.assertEqual(doc["module_error"], "ANALYZER_ERROR")
         self.assertIn("go vet", doc["message"])
         self.assertTrue({"go.vet.printf", "go.govulncheck."+OSV} <= {f["rule"] for f in doc["findings"]})
+
+    def test_truncated_vet_package_keeps_findings_and_failed_coverage(self) -> None:
+        result = self.scan("--go-tools", "--format=json", vet="truncated")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        doc = json.loads(result.stdout)
+        self.assertEqual(doc["status"], "partial")
+        self.assertEqual(doc["module_error"], "ANALYZER_ERROR")
+        rows = [row for row in doc["findings"] if row["rule"] == "go.vet.printf"]
+        self.assertEqual([(row["path"], row["line"], row["col"]) for row in rows],
+                         [(str(self.file), 3, 2)])
+        self.assertIn("JSON", doc["message"])
 
     def test_warm_cache_retries_and_recovers_optional_tools(self) -> None:
         first = self.scan("--go-tools", "--format=json", vet="finding")
@@ -368,6 +513,47 @@ class RealGoTools(unittest.TestCase):
         self.assertEqual(self.file.read_bytes(), before)
         self.assertTrue({"go.vet.printf", "go.gofmt.format"} <= {f["rule"] for f in self.rows()})
         self.assertEqual(result[1]["status"], "ok")
+
+    def test_real_vet_keeps_every_diagnostic_beyond_sixteen_megabytes(self) -> None:
+        # A real offline vet run, with 13,000 distinct source sites in one
+        # package. Long but valid arguments grow the report past the former
+        # aggregate cap without storing a giant fixture in the repository.
+        files, expected = [], set()
+        for number in range(13):
+            path = self.root / f"part{number:02}.go"
+            body = '\tfmt.Printf("%d", "' + "x" * 1200 + '")\n'
+            path.write_text('package main\n\nimport "fmt"\n\n' +
+                            f"func Check{number}() {{\n" + body * 1000 + '}\n')
+            files.append(path)
+            expected.update((str(path), line, 2) for line in range(6, 1006))
+        hashes = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in files}
+        captured = {}
+        capture, which = tools.run_command_stream, shutil.which
+
+        @contextmanager
+        def observe(*args, **kwargs):
+            with capture(*args, **kwargs) as output:
+                if args[0] == "go vet" and output is not None:
+                    position = output.stdout.tell()
+                    captured["size"] = output.stdout.seek(0, io.SEEK_END)
+                    captured["exit"] = output.returncode
+                    output.stdout.seek(position)
+                yield output
+
+        with patch.object(tools.shutil, "which", side_effect=lambda t: None if t == "govulncheck" else which(t)), \
+             patch.object(tools, "run_command_stream", side_effect=observe), \
+             patch.dict(os.environ, {"GOTOOLCHAIN": "local", "GOPROXY": "off", "GOSUMDB": "off", "GOWORK": "off", "GOFLAGS": ""}):
+            outcomes = tools.scan_go_tools(files, self.sink, str(self.root), "./...", 120, self.errors)
+        self.assertEqual(captured["exit"], 0)
+        self.assertGreater(captured["size"], 16 * 1024 * 1024)
+        self.assertEqual(self.errors, [])
+        self.assertEqual(next(row["status"] for row in outcomes if row["tool"] == "go vet"), "ok")
+        rows = [row for row in self.rows() if row["rule"] == "go.vet.printf"]
+        self.assertEqual(len(rows), 13000)
+        self.assertEqual({(row["path"], row["line"], row["col"]) for row in rows}, expected)
+        self.assertTrue(all(row["severity"] == "warning" and "fmt.Printf format %d" in row["message"]
+                            for row in rows))
+        self.assertEqual({path: hashlib.sha256(path.read_bytes()).hexdigest() for path in files}, hashes)
 
 
 if __name__ == "__main__":

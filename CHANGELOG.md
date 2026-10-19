@@ -12,6 +12,7 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Fixed
 
+- Kotlin broad exception handlers now report swallowed cancellation when their protected code reaches a resolved `delay`, `yield`, `awaitCancellation`, or direct cancellation throw. Catch ordering, type tests, scoped aliases and reachable branches distinguish propagation from swallowing; ordinary synchronous handlers remain quiet. Captured writes cannot leave stale rethrow proofs, and explicit imports retain their actual Kotlin precedence. Direct Kotlin SARIF also records incomplete analysis as a failed invocation with its reason.
 - Ruby request-flow analysis now resolves constant receivers through lexical namespaces, explicit root qualification, stable aliases and visible superclass constants. Namespaced helper calls retain their source and sink flow, while custom or overridden `File` methods cannot borrow built-in path-sanitizer proofs. Alias assignment order and both singleton-definition spellings preserve the actual receiver; uncertain rebindings and conditional definitions retain findings and report incomplete analysis.
 
 - Native Go analyzer reports no longer stop at a 16 MiB aggregate output limit. `go vet` package and diagnostic arrays and `govulncheck` messages are read incrementally with bounded individual records. Valid diagnostics survive truncated, corrupt, oversized or failed output, and incomplete tool coverage remains explicit. A real 18.8 MB vet report now retains all 13,000 source diagnostics with exact locations.

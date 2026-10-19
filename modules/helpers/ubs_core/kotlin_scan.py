@@ -389,7 +389,8 @@ def _render_text(args, files: Sequence[Path], counters: dict[str, int]) -> None:
     Path(args.text_out).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _render_sarif(records: list[dict], counters: dict[str, int], project_path: str, files: Sequence[Path]) -> dict:
+def _render_sarif(records: list[dict], counters: dict[str, int], project_path: str, files: Sequence[Path],
+                  *, summary: dict | None = None) -> dict:
     from ubs_core.findings_merge import to_sarif
 
     rules_map: dict[str, dict] = {}
@@ -405,7 +406,13 @@ def _render_sarif(records: list[dict], counters: dict[str, int], project_path: s
             }
     # Use the same validated evidence conversion as the meta-runner and Java
     # module, retaining Kotlin's existing rule descriptions.
-    report = to_sarif({"version": "0.1.0", "language": "kotlin", "findings": records})
+    document = {**(summary or {}), "version": "0.1.0", "language": "kotlin", "findings": records}
+    if document.get("status", "ok") != "ok" and not document.get("failed_modules"):
+        document["failed_modules"] = [{
+            "language": "kotlin", "status": document["status"],
+            "message": document.get("message") or document.get("module_error") or "Kotlin analysis did not complete",
+        }]
+    report = to_sarif(document)
     report["runs"][0]["tool"]["driver"]["rules"] = list(rules_map.values())
     return report
 

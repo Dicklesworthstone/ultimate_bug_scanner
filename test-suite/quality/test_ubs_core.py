@@ -6101,6 +6101,48 @@ class SwiftLexicalFrontendTests(unittest.TestCase):
                         if incomplete:
                             self.assertNotIn('✓ OK', text.read_text())
 
+    def test_swift_write_sink_excludes_declared_value_type_receivers(self):
+        from ubs_core.analyzers import taint_swift_traversal as analyzer
+        # SwiftPine's API-identity cases (snapshot 0c5659cd) plus receivers of
+        # unknown type or class type, which may still be Foundation values.
+        # None marks main's incomplete analysis for a request-derived
+        # lookalike constructor ("needs field analysis").
+        cases = (
+            ('shadowed-String-api', 'struct String {}\n', '', '_ = String(contentsOfFile: path)', None, False),
+            ('shadowed-Data-api', 'struct Data {}\n', '', '_ = Data(contentsOf: path)', None, False),
+            ('unrelated-unknown-write-api', 'struct Recorder {}\n', ', recorder: Recorder', 'recorder.write(to: path)', [], False),
+            ('foundation-string-write', '', ', text: String', 'try text.write(to: path, atomically: true, encoding: .utf8)', [4], True),
+            ('foundation-data-write', '', ', data: Data', 'try data.write(to: path)', [4], True),
+            ('qualified-data-write', 'import Foundation\nstruct Data {}\n', ', data: Foundation.Data', 'try data.write(to: path)', [5], True),
+            ('qualified-foundation-string-write', 'import Foundation\nstruct String {}\n', ', text: Foundation.String', 'try text.write(to: path, atomically: true, encoding: .utf8)', [5], True),
+            ('qualified-swift-string-write', 'import Foundation\nstruct String {}\n', ', text: Swift.String', 'try text.write(to: path, atomically: true, encoding: .utf8)', [5], True),
+            ('annotated-data-write', '', '', 'let data: Data = Data(); try data.write(to: path)', [4], True),
+            ('literal-string-write', '', '', 'try "fixed".write(to: path, atomically: true, encoding: .utf8)', [4], True),
+            ('shadowed-data-write', 'struct Data {}\n', ', data: Data', 'data.write(to: path)', [], False),
+            ('qualified-string-read', 'import Foundation\nstruct String {}\n', '', '_ = try Swift.String(contentsOfFile: path)', [5], False),
+            ('valid-String-lookalike', 'struct String { init(contentsOfFile path: Swift.String) {} }\n', '',
+             '_ = String(contentsOfFile: path)', None, False),
+            ('valid-Data-lookalike', 'import Foundation\nstruct Data { init(contentsOf path: Foundation.URL) {} }\n', '',
+             '_ = Data(contentsOf: path)', None, True),
+            ('valid-write-lookalike', 'import Foundation\nstruct Recorder { func write(to path: Foundation.URL) {} }\n', ', recorder: Recorder',
+             'recorder.write(to: path)', [], True),
+            ('unknown-receiver-write', '', '', 'let data = loadPayload(); try data.write(to: path)', [4], True),
+            ('final-class-write', 'import Foundation\nfinal class Archive {}\n', ', archive: Archive', 'try archive.write(to: path)', [5], True),
+            ('open-class-write', 'import Foundation\nclass Archive {}\n', ', archive: Archive', 'try archive.write(to: path)', [5], True),
+            ('enum-write', 'import Foundation\nenum Channel { case primary }\n', ', channel: Channel', 'channel.write(to: path)', [], True),
+            ('constructed-struct-write', 'import Foundation\nstruct Recorder {}\n', '', 'let recorder = Recorder(); recorder.write(to: path)', [], True),
+        )
+        for name, declaration, parameters, sink, expected, destination_is_url in cases:
+            source = (declaration or 'import Foundation\n') + 'func sample(req: Request' + parameters + ') throws {\n'
+            path = 'URL(fileURLWithPath: req.query["path"] ?? "")' if destination_is_url else 'req.query["path"] ?? ""'
+            source += '  let path = ' + path + '\n  ' + sink + '\n}\n'
+            with self.subTest(case=name):
+                if expected is None:
+                    with self.assertRaisesRegex(ValueError, 'needs field analysis; analysis is incomplete'):
+                        analyzer.scan_text(Path('F.swift'), source, Path('.'))
+                else:
+                    self.assertEqual([r[1] for r in analyzer.scan_text(Path('F.swift'), source, Path('.'))], expected)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -10,6 +10,10 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+### Added
+
+- Kotlin category 13 now follows request data into JDBC SQL execution, including Java synthetic properties, source-local helper summaries, SQL captured by prepared statements and statement-owned batch queues. Static SQL with actual value binding stays clean. Named arguments, literal defaults and multiline expression bodies retain helper flow; unsupported receiver and default semantics report incomplete analysis. JSON and SARIF retain source-to-sink evidence, and the SQL work limit participates in cache invalidation.
+
 ### Fixed
 
 - Kotlin broad exception handlers now report swallowed cancellation when their protected code reaches a resolved `delay`, `yield`, `awaitCancellation`, or direct cancellation throw. Catch ordering, type tests, scoped aliases and reachable branches distinguish propagation from swallowing; ordinary synchronous handlers remain quiet. Captured writes cannot leave stale rethrow proofs, and explicit imports retain their actual Kotlin precedence. Direct Kotlin SARIF also records incomplete analysis as a failed invocation with its reason.

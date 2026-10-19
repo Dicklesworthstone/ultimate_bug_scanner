@@ -281,7 +281,7 @@ class Parser:
                 start, end = following + 1, self.pairs[following]
                 body = self.block(start, end)
             else:
-                start = following + 1
+                start = self.skip(following + 1, len(self.code))
                 end = self.end_statement(start, len(self.code))
                 body = (Statement(start, end, 'return'),)
             owner = tuple(name for low, high, name in owners if low < match.start() < high)

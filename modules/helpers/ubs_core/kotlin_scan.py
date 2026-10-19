@@ -146,6 +146,8 @@ _PATTERNS: list[Pattern] = [
 
 def _record_category(rec: dict) -> int | None:
     rule = rec.get("rule", "")
+    if rule == "kotlin.security.sql-injection":
+        return 13
     if rule.startswith("kotlin.narrowing."):
         return 1
     if rule.startswith("kotlin.coroutine."):
@@ -213,6 +215,7 @@ def scan_analyzers(files: Sequence[Path], sink, skip: set[int], project_dir: Pat
     for category, aname, category_id in (
         (1, "narrowing_kotlin", "kotlin.type-narrowing"),
         (3, "coroutines_kotlin", "kotlin.concurrency"),
+        (13, "taint_kotlin_sql", "kotlin.sql"),
         (19, "lifecycle_kotlin", "kotlin.resource-lifecycle"),
     ):
         if category in skip:
@@ -240,6 +243,7 @@ def scan_analyzers(files: Sequence[Path], sink, skip: set[int], project_dir: Pat
                     "severity": finding.get("severity", "warning"),
                     "message": finding.get("message", ""),
                     "suppressed": False,
+                    **({"extras": finding["extras"]} if finding.get("extras") else {}),
                 }, ensure_ascii=False) + "\n")
 
     # 2. Taint path traversal & redirect (category 4)
@@ -466,6 +470,7 @@ def main(argv: list[str] | None = None) -> int:
         extra=(f"new_analyzers={args.enable_new_analyzers};"
                f"kotlin_tokens={os.environ.get('UBS_KOTLIN_MAX_TOKENS', '')};"
                f"kotlin_nesting={os.environ.get('UBS_KOTLIN_MAX_NESTING', '')};"
+               f"kotlin_sql_steps={os.environ.get('UBS_KOTLIN_SQL_MAX_STEPS', '')};"
                f"custom_rules={hash_rules_dir(args.custom_rules) if args.custom_rules else ''}"),
     )
     cached_findings, files_to_scan = cache.partition_files(files)

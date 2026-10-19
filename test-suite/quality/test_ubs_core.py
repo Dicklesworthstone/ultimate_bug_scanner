@@ -3137,6 +3137,66 @@ class Second {
         with self.assertRaisesRegex(AnalysisLimit, 'incomplete'):
             engine.analyze()
 
+    def test_array_initializers_are_expressions_and_blocks_stay_incomplete(self):
+        # GH #184: `T[] x = {...};` and `new T[]{...}` are JLS 10.6 array
+        # initializers, not statement blocks; their elements carry data.
+        clean = '''class Flow {
+  void run(HttpServletRequest request) {
+    final boolean[] flag = {false};
+    boolean[] made = new boolean[] {true, false};
+    int[][] grid = {{1, 2}, {3}, new int[]{4}};
+    String[] fixed = {"a", "b"};
+    Files.readString(Path.of("/srv/" + fixed[0]));
+  }
+}'''
+        _, effects = self.helper(clean)
+        self.assertEqual(effects, {})
+        unsafe = '''class Flow {
+  void run(HttpServletRequest request) {
+    final boolean[] flag = {false};
+    String name = request.getParameter("name");
+    String[] names = {"fixed", name};
+    java.util.List[] lists = new java.util.List[] {null};
+    String[][] grid = {{"fixed"}, {name}};
+    String legacy[] = {name};
+    new File("/tmp/" + name); // unsafe
+    Files.readString(Path.of(names[1])); // unsafe
+    new File(grid[1][0]); // unsafe
+    new File(legacy[0]); // unsafe
+  }
+}'''
+        _, effects = self.helper(unsafe)
+        self.assertEqual(set(effects), self.lines(unsafe))
+        # Lambda and anonymous-class bodies contain statements, also when they
+        # sit inside an initializer; Kotlin `= {` is a lambda. Still incomplete.
+        for text, suffix in (
+            ('class F { void f(Request r) { Runnable x = () -> { new File(r.getParameter("a")); }; } }', '.java'),
+            ('class F { void f(Request r) { Runnable x = new Runnable() { public void run() {} }; } }', '.java'),
+            ('class F { void f(Request r) { Runnable[] x = { () -> { new File(r.getParameter("a")); } }; } }', '.java'),
+            ('class F { void f(Request r) { Object[] x = { new Object() { } }; new File(r.getParameter("a")); } }', '.java'),
+            ('fun f(r: Request) { val x = { File(r.getParameter("a")) }; x() }', '.kt'),
+        ):
+            with self.subTest(text=text), self.assertRaisesRegex(ValueError, 'expression block.*incomplete'):
+                self.helper(text, suffix)
+        # The reported file: a brace initializer next to a real traversal flow
+        # made the whole Java module exit 2; the flow is now reported.
+        path = self.root / 'Repro.java'
+        path.write_text(textwrap.dedent('''\
+            import java.io.File;
+            import javax.servlet.http.HttpServletRequest;
+
+            public class Repro {
+                void run(HttpServletRequest request) {
+                    final boolean[] flag = {false};
+                    String name = request.getParameter("name");
+                    File f = new File("/tmp/" + name);
+                    f.exists();
+                }
+            }
+        '''), encoding='utf-8')
+        findings, context = self.cli(path, 'java', 'gh184-array-initializer', status=1)
+        self.assertEqual([finding['line'] for finding in findings], [8], context)
+
     def test_unmodeled_writes_bind_symbolic_escapes_without_rejecting_clean_setters(self):
         safe = '''class Flow {
   void field(String value) { this.path = value; }

@@ -356,6 +356,40 @@ class Parser:
         if self.code[beginning:end].strip() or beginning != original:
             yield beginning, end
 
+    def array_initializer(self, opening):
+        """Whether the Java `{` at `opening` opens an array initializer (GH #184).
+
+        JLS 10.6 initializers follow `=` in a declaration (`T[] a = {...}`)
+        or the dimensions of an array creation (`new T[]{...}`); nested
+        initializers follow `{` or `,`. Their elements are expressions, so the
+        braces evaluate like parentheses. Lambda bodies and anonymous class
+        bodies (anywhere inside, too) contain statements and stay unsupported.
+        Kotlin has no brace initializer: `= {` there is a lambda.
+        """
+        if self.kotlin:
+            return False
+
+        def shape(position, nested):
+            previous = position - 1
+            while previous >= 0 and self.code[previous].isspace():
+                previous -= 1
+            if previous < 0:
+                return False
+            char = self.code[previous]
+            if nested and char in '{,':
+                return True
+            if char == '=':
+                return previous == 0 or self.code[previous - 1] not in '=!<>'
+            if char != ']':
+                return False
+            window = self.code[max(0, previous - 400):previous + 1]
+            return re.search(r'\bnew\s+[A-Za-z_$][\w$.]*(?:\s*<[^;{}()]*>)?(?:\s*\[\s*\])+$', window) is not None
+
+        if not shape(opening, False):
+            return False
+        close = self.pairs[opening]
+        return all(shape(index, True) for index in range(opening + 1, close) if self.code[index] == '{')
+
     def end_statement(self, start, end):
         while start < end:
             char = self.code[start]
@@ -364,7 +398,9 @@ class Parser:
             if char in '([':
                 start = self.pairs[start]
             elif char == '{':
-                raise ValueError('Unsupported Java/Kotlin expression block; analysis is incomplete')
+                if not self.array_initializer(start):
+                    raise ValueError('Unsupported Java/Kotlin expression block; analysis is incomplete')
+                start = self.pairs[start]
             start += 1
         return end
 
@@ -935,10 +971,12 @@ class Engine:
     def assignment(self, span):
         start, end = span
         text = self.code[start:end]
-        match = re.match(r'\s*(?:(?:final|val|var)\s+)?(?:[\w.]+(?:\s*<[^=;]+>)?(?:\[\])?\s+)?([A-Za-z_]\w*)\s*(?::\s*[\w.<>?]+\s*)?(\+?=)(?!=)', text)
+        # Java array declarators may repeat dimensions on the type
+        # (`String[][] m`) or put them after the name (`String m[]`).
+        match = re.match(r'\s*(?:(?:final|val|var)\s+)?(?:[\w.]+(?:\s*<[^=;]+>)?(?:\s*\[\s*\])*\s+)?([A-Za-z_]\w*)(?:\s*\[\s*\])*\s*(?::\s*[\w.<>?]+\s*)?(\+?=)(?!=)', text)
         if not match:
             return None
-        declaration = bool(re.match(r'\s*(?:final\s+)?(?:val|var|[\w.]+(?:\s*<[^=;]+>)?(?:\[\])?)\s+[A-Za-z_]\w*', text))
+        declaration = bool(re.match(r'\s*(?:final\s+)?(?:val|var|[\w.]+(?:\s*<[^=;]+>)?(?:\s*\[\s*\])*)\s+[A-Za-z_]\w*', text))
         return match.group(1), start + match.start(1), start + match.end(), end, match.group(2), declaration
 
     def unmodeled_write(self, span):

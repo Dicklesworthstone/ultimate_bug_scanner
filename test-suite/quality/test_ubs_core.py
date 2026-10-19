@@ -5762,6 +5762,45 @@ fun generate(): String {
                                             == str(path) for row in results), context)
                     self.assertEqual(actual, expected, context)
 
+    def test_literal_only_sql_concatenation_completes_the_java_module(self):
+        # GH #183: with no primary hit, the fallback branch yielded 3-tuples and
+        # java_scan's single-rule unpacking crashed the whole module (exit 2).
+        from ubs_core.java_detectors import sql_concat_fallback
+        from ubs_core.java_scan import run_detectors
+
+        path = self.root / 'Gh183Repro.java'
+        path.write_text('public class Repro {\n'
+                        '    void run(java.sql.Statement st) throws Exception {\n'
+                        '        st.execute("INSERT INTO t(a) " +\n'
+                        '                   "VALUES (1)");\n'
+                        '    }\n'
+                        '}\n', encoding='utf-8')
+        self.assertEqual([hit[1:3] for hit in sql_concat_fallback.find([path])], [(3, 1)])
+        sink, errors = io.StringIO(), []
+        run_detectors([path], sink, set(), errors=errors)
+        self.assertEqual(errors, [])
+        records = [json.loads(line) for line in sink.getvalue().splitlines()]
+        self.assertIn(('java.sql.concat-fallback', 3, 1),
+                      [(row['rule'], row['line'], row['col']) for row in records])
+        label = 'gh183-literal-sql'
+        with self.case(label):
+            directory = self.root / label
+            directory.mkdir()
+            command = [str(REPO_ROOT / 'modules/ubs-java.sh'), '--ci', '--no-color',
+                       '--format=json', str(path)]
+            env = dict(os.environ, UBS_NO_CACHE='1', UBS_NO_AUTO_UPDATE='1',
+                       PYTHONDONTWRITEBYTECODE='1', ENABLE_UV_TOOLS='0')
+            proc = subprocess.run(command, cwd=directory, env=env, capture_output=True,
+                                  text=True, timeout=120)
+            context = f'{command!r}\nexit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}'
+            self.assertNotIn('ValueError', proc.stderr, context)
+            self.assertEqual(proc.returncode, 0, context)
+            report = json.loads(proc.stdout)
+            self.assertEqual(report['status'], 'ok', context)
+            # Literal-plus-literal SQL is static: SQL qualification keeps it quiet.
+            self.assertEqual([row for row in report['findings'] if row['rule'].startswith('java.sql')],
+                             [], context)
+
 
 class SwiftCppSuppressionTests(unittest.TestCase):
     """Real legacy producers must retain facts before suppressing owned diagnostics."""

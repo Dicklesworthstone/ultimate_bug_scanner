@@ -1,0 +1,425 @@
+diff --git a/modules/helpers/ubs_core/analyzers/taint_js.py b/modules/helpers/ubs_core/analyzers/taint_js.py
+index a5adede485597d852fbbfa80103b367b060eea55..aa1b82776c5853ec5259e32226d9eb977c4df40d 100644
+--- a/modules/helpers/ubs_core/analyzers/taint_js.py
++++ b/modules/helpers/ubs_core/analyzers/taint_js.py
+@@ -78,9 +78,9 @@
+ CHILD_PROCESS_MODULE_RE = r"['\"](?:node:)?child_process['\"]"
+ 
+ SINKS = [
+-    (re.compile(r"\.innerHTML\s*=(?!=)"), 'js.taint.xss', 'innerHTML write', False),
+-    (re.compile(r"\.outerHTML\s*=(?!=)"), 'js.taint.xss', 'outerHTML write', False),
+-    (re.compile(r"\bdangerouslySetInnerHTML\s*=(?!=)"), 'js.taint.xss', 'dangerouslySetInnerHTML', False),
++    (re.compile(r"\.innerHTML\s*(?:=(?!=|>)|\+=|\|\|=|&&=|\?\?=)"), 'js.taint.xss', 'innerHTML write', False),
++    (re.compile(r"\.outerHTML\s*(?:=(?!=|>)|\+=|\|\|=|&&=|\?\?=)"), 'js.taint.xss', 'outerHTML write', False),
++    (re.compile(r"\bdangerouslySetInnerHTML\s*(?:=(?!=|>)|\+=|\|\|=|&&=|\?\?=)"), 'js.taint.xss', 'dangerouslySetInnerHTML', False),
+     (re.compile(r"\binsertAdjacentHTML\s*\("), 'js.taint.xss', 'insertAdjacentHTML', True),
+     (re.compile(r"\bdocument\.write\s*\("), 'js.taint.xss', 'document.write', True),
+     (re.compile(r"\bres(?:ponse)?\.send\s*\("), 'js.taint.xss', 'HTTP send', True),
+@@ -1492,6 +1492,34 @@
+                 break
+         return selectors, cursor
+ 
++    def logical_absent(self, receiver, key, state, rhs_start, end):
++        """Prove a missing ordinary field without assuming scalar truthiness.
++
++        Exclude inherited native members and any selected descriptor/prototype
++        operation. Unknown fields or external receivers never prove absence.
++        This needs no default-value or enumerable-property metadata.
++        """
++        refs = _refs(receiver)
++        inherited = {'constructor', '__proto__', 'toString', 'toLocaleString',
++                     'valueOf', 'hasOwnProperty', 'isPrototypeOf',
++                     'propertyIsEnumerable', '__defineGetter__', '__defineSetter__',
++                     '__lookupGetter__', '__lookupSetter__'}
++        if (not self.engine.logical_plain_data or not refs or frozenset(receiver)
++                or key is None or key in inherited):
++            return False
++        self.engine.budget.spend(1 + len(self.engine.logical_dynamic_calls))
++        if any(not rhs_start <= call < end for call in self.engine.logical_dynamic_calls):
++            return False
++        # A dynamic call located in this RHS has not run at the LHS read.
++        # Do not let an unexecuted eval invalidate the proof that skips it.
++        # Arrays and arguments also have inherited members. Positional holes
++        # may be proved absent, but their other properties need a richer model.
++        if any(ref in state.array_lengths or _ArgumentsObject in state.heap.get(ref, {})
++               for ref in refs) and self.array_index(key) is None:
++            return False
++        return all(ref in state.heap and key not in state.heap[ref]
++                   and None not in state.heap[ref] for ref in refs)
++
+     def property(self, fact, key, state):
+         # Unknown objects retain the original conservative parameter/source
+         # fact. Known allocations allow unrelated clean fields to stay clean.
+@@ -2420,6 +2448,7 @@
+         if assignment:
+             target = re.sub(r'\s+', '', text[start:access[2]])
+             rhs = access[2] + assignment.end()
++            operation = assignment.group(1)
+             receiver = None
+             if access[1]:
+                 receiver = self.read_access((access[0], access[1][:-1], access[2]), state)
+@@ -2427,19 +2456,57 @@
+                 if computed is not None:
+                     self.value(*computed, state)
+             old = (self.property(receiver, key, state) if receiver is not None
+-                   else self.reference(target, state)) if assignment.group(1) != '=' else frozenset()
+-            old = _materialize(old, state.heap, budget=self.engine.budget)
+-            fact = self.value(rhs, end, state)
+-            if assignment.group(1) != '=':
++                   else self.reference(target, state)) if operation != '=' else frozenset()
++            logical = operation in {'||=', '&&=', '??='}
++            bypass = state.copy() if logical else None
++            if logical and isinstance(self.callable(start, access[2], state),
++                                      (_Scope, _BoundTarget, _BoundChoices)):
++                # Unlike scalar bottom, an exact callable binding proves a
++                # truthy, non-nullish value. Do not invoke a skipped RHS or
++                # lose the existing function summary at an unnecessary join.
++                if operation != '&&=':
++                    return old
++                bypass = None
++            if logical and receiver is not None and self.logical_absent(receiver, key, state, rhs, end):
++                # A proven absent own-data field reads as undefined. Unlike
++                # scalar bottom, actual absence can select an operator path.
++                if operation == '&&=':
++                    return old
++                bypass = None
++            # GetValue precedes RHS effects. Concatenation snapshots reachable
++            # taint, whereas logical assignment returns the selected *value*,
++            # including object identity. It does not coerce that value.
++            if operation == '+=':
++                old = _materialize(old, state.heap, budget=self.engine.budget)
++            try:
++                fact = self.value(rhs, end, state)
++            except _NoNormalCompletion:
++                if bypass is None:
++                    raise
++                self.replace_state(state, bypass)
++                return old
++            if operation == '+=':
+                 fact = _join(old, fact)
+-            if receiver is not None and _refs(receiver):
+-                self.write_property(receiver, key, _step(fact, target), state)
+-            else:
+-                self.assign(target, fact, state, start, self.callable(rhs, end, state))
++            try:
++                if receiver is not None and _refs(receiver):
++                    self.write_property(receiver, key, _step(fact, target), state)
++                else:
++                    self.assign(target, fact, state, start, self.callable(rhs, end, state))
++            except _NoNormalCompletion:
++                if bypass is None:
++                    raise
++                self.replace_state(state, bypass)
++                return old
+             for location, expr_start, rule, label in self.engine.write_sinks:
+                 if (rule == self.rule and start <= location < expr_start <= rhs
+                         and not code[expr_start:rhs].strip()):
+                     self.effect(location, label, fact, state)
++            if bypass is not None:
++                # Scalar truthiness/nullishness is not represented by the
++                # taint lattice. Keep both paths rather than assuming the RHS
++                # executed and letting its cleanup hide a reachable defect.
++                self.replace_state(state, _join_states(bypass, state))
++                return _join(old, fact)
+             return fact
+         if access and access[2] == end:
+             fact = self.read_access(access, state)
+@@ -2680,10 +2747,9 @@
+             return state
+         compound = re.match(r'([A-Za-z_$][\w$]*)\s*(\+=|\|\|=|&&=|\?\?=)\s*(.+)', raw, re.S)
+         if compound:
+-            name = compound.group(1)
+-            old = _materialize(self.reference(name, state), state.heap, budget=self.engine.budget)
+-            fact = self.value(offset + compound.start(3), end, state)
+-            self.assign(name, _join(old, fact), state, start)
++            # Statement and expression positions must share conditional RHS
++            # evaluation, exception stores and reference capture.
++            self.value(offset, end, state)
+             return state
+         declaration = None
+         for pattern in (DESTRUCT_OBJECT, DESTRUCT_ARRAY, ASSIGN_DECL, ASSIGN_SIMPLE):
+@@ -3018,6 +3084,14 @@
+             r'\b(?:Object|Reflect)\s*\.\s*(?:defineProperty|defineProperties|setPrototypeOf))')
+         self.native_bind = not any(code[match.start()] == text[match.start()]
+                                    for match in bind_mutation.finditer(text))
++        logical_layout = re.compile(
++            r'\.\s*(?:definePropert(?:y|ies)|setPrototypeOf|freeze|seal|create)\b|'
++            r'\[\s*[\'\"](?:definePropert(?:y|ies)|setPrototypeOf|freeze|seal|create|prototype|__proto__)[\'\"]\s*\]|'
++            r'\b__proto__\b|\.\s*prototype\b|'
++            r'\b(?:get|set)\s+(?:[A-Za-z_$][\w$]*\s*\(|\[)')
++        self.logical_plain_data = not any(code[m.start()] == text[m.start()]
++                                         for m in logical_layout.finditer(text))
++        self.logical_dynamic_calls = tuple(m.start() for m in re.finditer(r'\b(?:Proxy|eval)\s*\(', code))
+         iterator_mutation = re.compile(r'\bSymbol\s*\.\s*iterator|\b__proto__\b|\.\s*prototype\b')
+         self.native_bound_iteration = not any(code[match.start()] == text[match.start()]
+                                              for match in iterator_mutation.finditer(text))
+diff --git a/test-suite/quality/test_taint_js_logical_assignments.py b/test-suite/quality/test_taint_js_logical_assignments.py
+new file mode 100644
+--- /dev/null
++++ b/test-suite/quality/test_taint_js_logical_assignments.py
+@@ -0,0 +1,265 @@
++"""Logical assignment may-flow: bypass, captured references and completions.
++
++The taint lattice does not refine scalar truthiness or nullishness. Unknown
++conditions retain both paths. These tests require reachable unsafe paths to
++survive, without pretending this is exact JavaScript value analysis.
++"""
++from __future__ import annotations
++
++from collections import Counter
++import importlib.util
++import json
++import os
++from pathlib import Path
++import shutil
++import subprocess
++import sys
++import tempfile
++import unittest
++
++ROOT = Path(__file__).resolve().parents[2]
++sys.path.insert(0, str(ROOT / 'modules/helpers'))
++from ubs_core.analyzers import taint_js
++from ubs_core.registry import RunContext
++
++
++class LogicalAssignmentTests(unittest.TestCase):
++    def scan(self, source, *expected):
++        sources = {'app.js': source} if isinstance(source, str) else source
++        with tempfile.TemporaryDirectory(prefix='ubs-logical-') as scratch:
++            files = []
++            for name, text in sources.items():
++                path = Path(scratch) / name
++                path.parent.mkdir(parents=True, exist_ok=True)
++                path.write_text(text + '\n', encoding='utf-8')
++                files.append(path)
++            findings = list(taint_js.run(RunContext(lang='javascript', files=files)))
++        self.assertEqual(Counter(f['rule'].removeprefix('javascript.taint.') for f in findings),
++                         Counter(expected), findings)
++        for finding in findings:
++            self.assertGreater(finding['line'], 0)
++            self.assertGreater(finding['col'], 0)
++            self.assertEqual(finding['severity'], 'critical')
++        return findings
++
++    def test_property_cleanup_preserves_bypass(self):
++        for op in ('||=', '&&=', '??='):
++            with self.subTest(op=op):
++                self.scan('let html=req.query.html;const box={gate:flag};'
++                          f'box.gate {op} (html="safe");res.send(html);', 'xss')
++
++    def test_variable_statement_cleanup_preserves_bypass(self):
++        for op in ('||=', '&&=', '??='):
++            with self.subTest(op=op):
++                self.scan('let html=req.query.html;let gate=flag;'
++                          f'gate {op} (html="safe");res.send(html);', 'xss')
++
++    def test_variable_expression_cleanup_preserves_bypass(self):
++        for op in ('||=', '&&=', '??='):
++            with self.subTest(op=op):
++                self.scan('let html=req.query.html;let gate=flag;'
++                          f'const value=(gate {op} (html="safe"));res.send(html);', 'xss')
++
++    def test_helper_cleanup_does_not_erase_skipped_path(self):
++        self.scan('let html=req.query.html;function clear(){html="safe";return "safe";}'
++                  'const box={gate:flag};box.gate ||= clear();res.send(html);', 'xss')
++
++    def test_imported_cleanup_preserves_shared_state(self):
++        self.scan({'lib.mjs':'export let html=req.query.html;export function clear(){html="safe";}',
++                   'app.mjs':'import {html,clear} from "./lib.mjs";const box={gate:flag};'
++                             'box.gate ??= clear();res.send(html);'}, 'xss')
++
++    def test_throwing_rhs_cannot_remove_bypass_continuation(self):
++        for op in ('||=', '&&=', '??='):
++            with self.subTest(op=op):
++                self.scan('function fail(){throw "stop";}const box={gate:flag};'
++                          f'box.gate {op} fail();res.send(req.query.html);', 'xss')
++
++    def test_throwing_variable_rhs_cannot_remove_bypass(self):
++        self.scan('function fail(){throw "stop";}let gate=flag;'
++                  'gate &&= fail();res.send(req.query.html);', 'xss')
++
++    def test_return_summary_retains_bypass(self):
++        self.scan('function fail(){throw "stop";}function read(){let gate=flag;'
++                  'gate ||= fail();return req.query.html;}res.send(read());', 'xss')
++
++    def test_exception_store_keeps_rhs_mutation(self):
++        self.scan('let html="safe";function fail(){html=req.query.html;throw "stop";}'
++                  'const box={gate:flag};try{box.gate ||= fail();}'
++                  'catch(error){res.send(html);}', 'xss')
++
++    def test_finalizer_cleans_taken_and_bypass_paths(self):
++        self.scan('let html=req.query.html;const box={gate:flag};'
++                  'try{box.gate ||= (html="safe");}finally{html="safe";}res.send(html);')
++
++    def test_object_result_preserves_bypass_alias(self):
++        self.scan('const original={html:"safe"};const box={value:original};'
++                  'const selected=(box.value ||= {});original.html=req.query.html;'
++                  'res.send(selected.html);', 'xss')
++
++    def test_variable_assignment_preserves_object_identity(self):
++        self.scan('const original={html:"safe"};let selected=original;'
++                  'selected ||= {};original.html=req.query.html;res.send(selected.html);', 'xss')
++
++    def test_object_result_preserves_taken_alias(self):
++        self.scan('const other={html:"safe"};const box={value:flag};'
++                  'const selected=(box.value &&= other);other.html=req.query.html;'
++                  'res.send(selected.html);', 'xss')
++
++    def test_returned_logical_result_keeps_identity(self):
++        self.scan('function choose(box,other){return box.value ??= other;}'
++                  'const old={html:"safe"};const box={value:old};'
++                  'const selected=choose(box,{});old.html=req.query.html;'
++                  'res.send(selected.html);', 'xss')
++
++    def test_rhs_rebinding_does_not_redirect_captured_receiver(self):
++        self.scan('const original={};let box=original;'
++                  'function change(){box={html:"safe"};return req.query.html;}'
++                  'box.html ||= change();res.send(box.html);res.send(original.html);', 'xss')
++
++    def test_computed_key_runs_before_rhs_once(self):
++        self.scan('let html=req.query.html;function key(){const old=html;html="safe";return old;}'
++                  'const box={};box[key()] ||= "safe";res.send(html);')
++
++    def test_computed_key_can_rebind_root_without_redirecting_write(self):
++        self.scan('const original={};let box=original;'
++                  'function key(){box={html:"safe"};return "html";}'
++                  'box[key()] ??= req.query.html;res.send(box.html);res.send(original.html);', 'xss')
++
++    def test_clean_objects_remain_clean(self):
++        self.scan('const box={value:{html:"safe"}};'
++                  'const selected=(box.value ||= {html:"safe"});res.send(selected.html);')
++
++    def test_sanitizer_domain_is_retained_on_rhs(self):
++        self.scan('const box={};box.html ||= DOMPurify.sanitize(req.query.html);'
++                  'res.send(box.html);eval(box.html);', 'eval')
++
++    def test_later_definite_overwrite_still_cleans(self):
++        self.scan('const box={gate:flag};box.gate ||= req.query.html;'
++                  'box.gate="safe";res.send(box.gate);')
++
++    def test_write_sink_is_reported_on_assignment_path(self):
++        findings = self.scan('const box={};\nbox.innerHTML ||= req.query.html;', 'xss')
++        self.assertEqual(findings[0]['line'], 2)
++
++    def test_nested_logical_assignment_retains_outer_bypass(self):
++        self.scan('let html=req.query.html;let a=flag;let b=flag;'
++                  'a ||= (b &&= (html="safe"));res.send(html);', 'xss')
++
++    def test_loop_converges_and_keeps_bypass(self):
++        self.scan('let html=req.query.html;const box={gate:flag};'
++                  'while(flag){box.gate ||= (html="safe");}res.send(html);', 'xss')
++
++    def test_add_assign_still_snapshots_old_scalar(self):
++        self.scan('const box={html:req.query.html};'
++                  'box.html += (box.html="safe");res.send(box.html);', 'xss')
++
++    def test_direct_assignment_does_not_gain_bypass(self):
++        self.scan('let html=req.query.html;const box={};'
++                  'box.gate = (html="safe");res.send(html);')
++
++    def test_absent_field_selects_undefined_operator_path(self):
++        self.scan('const box={};box.gate &&= eval(req.query.code);')
++        self.scan('const box={};box.gate ||= req.query.html;res.send(box.gate);', 'xss')
++        self.scan('const box={};box.gate ??= req.query.html;res.send(box.gate);', 'xss')
++
++    def test_absent_field_runs_cleanup_definitely(self):
++        self.scan('let html=req.query.html;const box={};'
++                  'box.gate ||= (html="safe");res.send(html);')
++
++    def test_known_callable_skips_replacement_and_preserves_target(self):
++        for op in ('||=', '??='):
++            with self.subTest(op=op):
++                self.scan('function read(){return req.query.html;}let callback=read;'
++                          f'callback {op} eval(req.query.code);res.send(callback());', 'xss')
++
++    def test_known_callable_and_assignment_replaces_target(self):
++        self.scan('function read(){return req.query.html;}function clean(){return "safe";}'
++                  'let callback=read;callback &&= clean;res.send(callback());')
++
++    def test_compound_html_sinks_count_only_executed_writes(self):
++        for property_name in ('innerHTML', 'outerHTML'):
++            for op in ('+=', '||=', '&&=', '??='):
++                with self.subTest(property=property_name, op=op):
++                    self.scan(f'const element={{}};element.{property_name} {op} req.query.html;',
++                              *([] if op == '&&=' else ['xss']))
++
++    def test_html_comparison_is_not_a_write(self):
++        self.scan('const element={};element.innerHTML === req.query.html;')
++
++    def test_namespace_write_rejection_does_not_remove_bypass(self):
++        self.scan({'lib.mjs':'export let html=req.query.html;',
++                   'app.mjs':'import * as api from "./lib.mjs";'
++                             'api.html ||= "safe";res.send(api.html);'}, 'xss')
++
++    def test_uncertain_prototype_layout_does_not_prove_absent(self):
++        self.scan('let html=req.query.html;const box={};'
++                  'Object.setPrototypeOf(box,external);box.gate ||= (html="safe");'
++                  'res.send(html);', 'xss')
++
++    @unittest.skipUnless(shutil.which('node'), 'Node.js is required for independent language controls')
++    def test_authored_programs_match_node_may_flow(self):
++        # Exact comparison is against the union of both authored branch values,
++        # not against an analyzer pretending to know an external flag's value.
++        cases = [
++            ('let html=req.query.html;const box={gate:flag};box.gate ||= (html="safe");res.send(html);', True),
++            ('let html=req.query.html;const box={gate:flag};box.gate &&= (html="safe");res.send(html);', True),
++            ('let html=req.query.html;const box={gate:flag?null:"yes"};box.gate ??= (html="safe");res.send(html);', True),
++            ('const old={html:"safe"};const box={value:old};const selected=(box.value ||= {});old.html=req.query.html;res.send(selected.html);', True),
++            ('function fail(){throw "stop";}const box={gate:flag};try{box.gate ||= fail();res.send(req.query.html);}catch(e){}', True),
++            ('let html=req.query.html;const box={gate:flag};try{box.gate ||= (html="safe");}finally{html="safe";}res.send(html);', False),
++            ('const box={gate:flag};box.gate ||= req.query.html;box.gate="safe";res.send(box.gate);', False),
++            ('const original={};let box=original;function change(){box={html:"safe"};return req.query.html;}box.html ||= change();res.send(box.html);res.send(original.html);', True),
++            ('const box={};box.value &&= res.send(req.query.html);', False),
++            ('function read(){return req.query.html;}let cb=read;cb ||= () => "safe";res.send(cb());', True),
++            ('function read(){return req.query.html;}function clean(){return "safe";}let cb=read;cb &&= clean;res.send(cb());', False),
++            ('let html="safe";function fail(){html=req.query.html;throw "stop";}const box={gate:flag};try{box.gate ||= fail();}catch(e){res.send(html);}', True),
++        ]
++        for code, unsafe in cases:
++            with self.subTest(code=code):
++                observations = []
++                for flag in (False, True):
++                    script = ('const flag=' + json.dumps(flag) + ';const req={query:{html:"unsafe-token"}};'
++                              'const seen=[];const res={send(value){seen.push(value);}};' + code +
++                              ';console.log(JSON.stringify(seen));')
++                    executed = subprocess.run(['node', '-e', script], capture_output=True, text=True, timeout=10)
++                    self.assertEqual(executed.returncode, 0, executed.stderr)
++                    observations += json.loads(executed.stdout)
++                self.assertEqual('unsafe-token' in observations, unsafe)
++                self.scan(code, *(['xss'] if unsafe else []))
++
++    @unittest.skipUnless(shutil.which('ast-grep'), 'ast-grep is required for actual scanner scenarios')
++    def test_actual_scanner_bypass_and_html_writes(self):
++        spec = importlib.util.spec_from_file_location(
++            'module_report_contract', ROOT / 'test-suite/quality/test_taint_js_modules.py')
++        reports = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(reports)
++        validator = reports.ModuleTaintTests()
++        cases = [
++            ('cleanup-bypass', 'let html=req.query.html;const box={gate:flag};box.gate ||= (html="safe");res.send(html);', 'xss'),
++            ('throw-bypass', 'function fail(){throw "stop";}const box={gate:flag};box.gate ||= fail();res.send(req.query.html);', 'xss'),
++            ('compound-html', 'const box={};box.innerHTML += req.query.html;', 'xss'),
++            ('absent-and', 'const box={};box.value &&= res.send(req.query.html);', None),
++            ('definite-clean', 'const box={gate:flag};box.gate ||= req.query.html;box.gate="safe";res.send(box.gate);', None),
++            ('direct-clean', 'let html=req.query.html;const box={};box.value=(html="safe");res.send(html);', None),
++        ]
++        for name, source, expected in cases:
++            with self.subTest(case=name), tempfile.TemporaryDirectory(prefix='ubs-logical-e2e-') as scratch:
++                root = Path(scratch).resolve()
++                target = root / 'app.js'
++                target.write_text(source + '\n', encoding='utf-8')
++                result = subprocess.run([str(ROOT / 'ubs'), str(target), '--only=js', '--format=json', '--ci'],
++                    cwd=root, capture_output=True, text=True, timeout=120,
++                    env={**os.environ, 'UBS_NO_AUTO_UPDATE': '1', 'UBS_NO_CACHE': '1'})
++                artifact = ROOT / 'test-suite/artifacts/javascript-logical-assignments' / name
++                artifact.mkdir(parents=True, exist_ok=True)
++                (artifact / 'stdout.log').write_text(result.stdout, encoding='utf-8')
++                (artifact / 'stderr.log').write_text(result.stderr, encoding='utf-8')
++                self.assertIn(result.returncode, (0, 1), (result.stdout, result.stderr))
++                report = json.loads(result.stdout)
++                self.assertEqual(report['totals']['files'], 1, report)
++                validator.assert_report_findings(report, root, ('app.js', expected) if expected else None)
++
++
++if __name__ == '__main__':
++    unittest.main(verbosity=2)

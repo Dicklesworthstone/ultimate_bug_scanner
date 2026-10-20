@@ -753,6 +753,137 @@ class OpenMissingWithTests(unittest.TestCase):
         '''})
         self.assertEqual(len(hits), 2, hits)
 
+    def test_exitstack_owns_the_exact_os_descriptor(self) -> None:
+        for imports, allocation, close, stack in (
+            ('import os, contextlib', 'os.open', 'os.close', 'contextlib.ExitStack'),
+            ('import os as posix\nimport contextlib as contexts',
+             'posix.open', 'posix.close', 'contexts.ExitStack'),
+            ('from os import open as allocate, close as release\nfrom contextlib import ExitStack as Stack',
+             'allocate', 'release', 'Stack'),
+        ):
+            source = (imports + '\ndef operation(path):\n'
+                      f'    with {stack}() as resources:\n'
+                      f'        descriptor = {allocation}(path, 0)\n'
+                      f'        resources.callback({close}, descriptor)\n'
+                      '        perform_operation(descriptor)\n')
+            with self.subTest(imports=imports):
+                self.assertEqual(run_detector(io_open_checks, {'owned.py': source}), [])
+                unowned = source.replace(f'        resources.callback({close}, descriptor)\n', '')
+                self.assertEqual(len(run_detector(io_open_checks, {'unowned.py': unowned})), 1)
+
+    def test_exitstack_descriptor_requires_real_unescaped_ownership(self) -> None:
+        original = ('import os, contextlib\ndef operation(path):\n'
+                    '    with contextlib.ExitStack() as resources:\n'
+                    '        descriptor = os.open(path, 0)\n'
+                    '        resources.callback(os.close, descriptor)\n')
+        for source in (
+            original.replace('contextlib.ExitStack()', 'unknown_stack()'),
+            original.replace('callback(os.close, descriptor)', 'callback(unknown_close, descriptor)'),
+            original.replace('callback(os.close, descriptor)', 'callback(os.close, other_descriptor)'),
+            original + '        resources.pop_all()\n',
+            original + '        escape(resources)\n',
+            original.replace('def operation(path):', 'def operation(path, contextlib):'),
+            original.replace('def operation(path):', 'contextlib = unknown\ndef operation(path):'),
+            original.replace('def operation(path):', 'os.close = unknown_close\ndef operation(path):'),
+            original.replace('def operation(path):', 'modify_module(os)\ndef operation(path):'),
+            original.replace('contextlib.ExitStack() as resources:',
+                             'contextlib.ExitStack() as resources, unknown_stack() as resources:'),
+            original.replace('        resources.callback', '        may_raise()\n        resources.callback'),
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(len(run_detector(io_open_checks, {'unsafe.py': source})), 1)
+
+    def test_exitstack_owns_adjacent_nested_allocations(self) -> None:
+        for body in (
+            'for path in paths:\n    descriptor = os.open(path, 0)\n'
+            '    resources.callback(os.close, descriptor)\n',
+            'if paths:\n    descriptor = os.open(paths[0], 0)\n'
+            '    resources.callback(os.close, descriptor)\n',
+            'try:\n    descriptor = os.open(paths[0], 0)\n'
+            '    resources.callback(os.close, descriptor)\nexcept OSError:\n    raise\n',
+        ):
+            source = ('import os, contextlib\ndef operation(paths):\n'
+                      '    with contextlib.ExitStack() as resources:\n'
+                      + textwrap.indent(body, '        '))
+            with self.subTest(body=body):
+                self.assertEqual(run_detector(io_open_checks, {'nested.py': source}), [])
+                leaked = source.replace('            resources.callback(os.close, descriptor)\n', '')
+                self.assertEqual(len(run_detector(io_open_checks, {'leaked.py': leaked})), 1)
+
+    def test_nested_registration_cannot_mask_a_conditional_or_escaped_owner(self) -> None:
+        for body in (
+            'descriptor = os.open(path, 0)\nif ready:\n    resources.callback(os.close, descriptor)\n',
+            'for path in paths:\n    descriptor = os.open(path, 0)\n'
+            '    may_raise()\n    resources.callback(os.close, descriptor)\n',
+            'for path in paths:\n    descriptor = os.open(path, 0)\n'
+            '    resources.callback(os.close, descriptor)\nresources.pop_all()\n',
+            'descriptor = os.open(path, 0)\ndef deferred():\n    resources.callback(os.close, descriptor)\n',
+            'descriptor = os.open(path, 0)\n'
+            'with contextlib.ExitStack() as resources:\n    resources.callback(os.close, descriptor)\n',
+        ):
+            source = ('import os, contextlib\ndef operation(paths, path, ready):\n'
+                      '    with contextlib.ExitStack() as resources:\n'
+                      + textwrap.indent(body, '        '))
+            with self.subTest(body=body):
+                self.assertEqual(len(run_detector(io_open_checks, {'unsafe.py': source})), 1)
+
+    def test_fdopen_context_takes_ownership_of_the_same_descriptor(self) -> None:
+        for imports, allocate, wrapper in (
+            ('import os', 'os.open', 'os.fdopen'),
+            ('import os as posix', 'posix.open', 'posix.fdopen'),
+            ('from os import open as allocate, fdopen as wrap', 'allocate', 'wrap'),
+        ):
+            for options in ('', ', "rb"', ', mode="rb"', ', "rb", closefd=True'):
+                source = (imports + '\ndef read(path):\n'
+                          f'    descriptor = {allocate}(path, 0)\n'
+                          f'    with {wrapper}(descriptor{options}) as handle:\n'
+                          '        return handle.read()\n')
+                with self.subTest(imports=imports, options=options):
+                    self.assertEqual(run_detector(io_open_checks, {'owned.py': source}), [])
+
+    def test_fdopen_requires_proven_immediate_ownership(self) -> None:
+        original = ('import os\ndef read(path):\n'
+                    '    descriptor = os.open(path, 0)\n'
+                    '    with os.fdopen(descriptor, "rb") as handle:\n'
+                    '        return handle.read()\n')
+        for source in (
+            original.replace('"rb")', '"rb", closefd=False)'),
+            original.replace('"rb")', '"rb", closefd=setting)'),
+            original.replace('"rb")', '"rb", **options)'),
+            original.replace('"rb")', 'get_mode())'),
+            original.replace('"rb")', '"invalid-mode")'),
+            original.replace('os.fdopen(descriptor', 'os.fdopen(other_descriptor'),
+            original.replace('os.fdopen(descriptor', 'unknown.fdopen(descriptor'),
+            original.replace('with os.fdopen', 'with may_raise(), os.fdopen'),
+            original.replace('    with os.fdopen', '    may_raise()\n    with os.fdopen'),
+            original.replace('def read(path):', 'def read(path, os):'),
+            original.replace('def read(path):', 'os.fdopen = unknown\ndef read(path):'),
+            # An integer has no .close() method and cannot be a context manager.
+            original.replace('    with os.fdopen(descriptor, "rb") as handle:\n'
+                             '        return handle.read()\n', '    descriptor.close()\n'),
+            original.replace('with os.fdopen(descriptor, "rb")', 'with descriptor'),
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(len(run_detector(io_open_checks, {'unsafe.py': source})), 1)
+
+    def test_builtin_open_context_owns_the_inline_opener_descriptor(self) -> None:
+        source = ('import os\ndef read(path):\n'
+                  '    with open(path, "rb", opener=lambda name, flags: os.open(name, flags)) as handle:\n'
+                  '        return handle.read()\n')
+        self.assertEqual(run_detector(io_open_checks, {'owned.py': source}), [])
+        for unsafe in (
+            source.replace('def read(path):', 'def read(path, open):'),
+            source.replace('def read(path):', 'from custom import open\ndef read(path):'),
+            source.replace('def read(path):', 'open = custom\ndef read(path):'),
+            source.replace('def read(path):', 'import builtins\nbuiltins.open = custom\ndef read(path):'),
+            source.replace('os.open(name, flags)', 'consume(os.open(name, flags))'),
+            source.replace('opener=lambda', 'closefd=False, opener=lambda'),
+            source.replace('opener=lambda', '**options, opener=lambda'),
+            'import os\nhandle = open(path, opener=lambda name, flags: os.open(name, flags))\n',
+        ):
+            with self.subTest(source=unsafe):
+                self.assertEqual(len(run_detector(io_open_checks, {'unsafe.py': unsafe})), 1)
+
 
 # ─────────────────────── json.loads without a handler ───────────────────────
 class OpenNoEncodingCalleeTests(unittest.TestCase):

@@ -22,6 +22,17 @@ function isPriceEqual(price1, price2) {
 // isPriceEqual(0.1 + 0.2, 0.3) === false
 // 0.1 + 0.2 === 0.30000000000000004
 
+// Executable precision mistakes, rather than comparisons in comments. Keep
+// four distinct comparisons so the shipped project-wide warning threshold
+// is exercised by actual operators. Every expression below evaluates false.
+function exactReceiptTotals() {
+  const subtotalMatches = 0.1 + 0.2 === 0.3;
+  const taxMatches = 0.1 * 0.2 === 0.02;
+  const changeMatches = 0.3 - 0.2 === 0.1;
+  const splitMatches = 0.3 / 3 === 0.1;
+  return subtotalMatches && taxMatches && changeMatches && splitMatches;
+}
+
 // BUG 4: Accumulating floating-point errors
 function calculateCartTotal(items) {
   let total = 0;

@@ -12,14 +12,16 @@ config), and host-sensitive sinks (send_mail, templates, jsonify, redirect,
 config, SAFE_HOST_FUNCS validators, and configured canonical names
 (SITE_URL, PUBLIC_BASE_URL, settings.*, os.environ[...], ...) count as safe.
 
-Line-deduped per file; same-file and previous-line ``ubs:ignore`` markers
-suppress a hit.
+Hits are line-deduped per file. Comment directives use shared statement
+ownership and rule scopes.
 """
 from __future__ import annotations
 
 import ast
 from pathlib import Path
 from typing import Iterable, Sequence
+
+from ubs_core.suppression import SourceSuppressions
 
 RULE_ID = "py.security.host-header-poisoning"
 CATEGORY = 7
@@ -92,15 +94,6 @@ def _source_line(lines, line_no):
     return ''
 
 
-def _has_ignore(lines, line_no):
-    idx = line_no - 1
-    return (
-        0 <= idx < len(lines) and 'ubs:ignore' in lines[idx]
-    ) or (
-        0 <= idx - 1 < len(lines) and 'ubs:ignore' in lines[idx - 1]
-    )
-
-
 def _target_names(target):
     if isinstance(target, ast.Name):
         return [target.id]
@@ -147,17 +140,18 @@ def _name_is_urlish(name):
 
 
 class _HostHeaderPoisoningAnalyzer(ast.NodeVisitor):
-    def __init__(self, path, text, lines):
+    def __init__(self, path, text, lines, suppressions):
         self.path = path
         self.text = text
         self.lines = lines
+        self.suppressions = suppressions
         self.host_tainted = set()
         self.safe_values = set()
         self.issues = []
         self.seen_lines = set()
 
     def remember_issue(self, line_no):
-        if _has_ignore(self.lines, line_no) or line_no in self.seen_lines:
+        if self.suppressions.is_suppressed(line_no, RULE_ID) or line_no in self.seen_lines:
             return
         self.seen_lines.add(line_no)
         self.issues.append((self.path, line_no, _source_line(self.lines, line_no)))
@@ -282,6 +276,7 @@ class _HostHeaderPoisoningAnalyzer(ast.NodeVisitor):
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
+    suppressions = SourceSuppressions('python')
     for path in files:
         if path.suffix.lower() not in {'.py', '.pyi'}:
             continue
@@ -291,7 +286,7 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
         except Exception:
             continue
         lines = text.splitlines()
-        analyzer = _HostHeaderPoisoningAnalyzer(path, text, lines)
+        analyzer = _HostHeaderPoisoningAnalyzer(path, text, lines, suppressions.index(path, text))
         analyzer.visit(tree)
         for _, line_no, code in analyzer.issues:
             yield path, line_no, 1, code.strip()[:240]

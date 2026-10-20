@@ -50,6 +50,13 @@ def rule(row):
     return row.get("rule", row.get("rule_id"))
 
 
+def parse_json_report(text):
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as error:
+        raise AssertionError(f'Malformed scanner report: {text!r}') from error
+
+
 class PatternIntegrationTests(unittest.TestCase):
     def scan(self, source):
         from ubs_core.csharp_scan import load_patterns, scan_patterns
@@ -58,7 +65,7 @@ class PatternIntegrationTests(unittest.TestCase):
             path.write_text(source, encoding="utf-8")
             sink = io.StringIO()
             scan_patterns(load_patterns(), {path: source}, sink, set(), phase=0)
-            return [json.loads(line) for line in sink.getvalue().splitlines()]
+            return [parse_json_report(line) for line in sink.getvalue().splitlines()]
 
     def test_reporter_rule_severity_and_location(self):
         rows = [row for row in self.scan(REPRO) if "blocking-result" in row["rule"]]
@@ -245,7 +252,7 @@ class ExecutionStatusTests(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 main(['--files-from', str(Path(directory) / 'missing'),
                       '--sink', str(Path(directory) / 'findings'), '--status-out', str(path)])
-            self.assertEqual(json.loads(path.read_text()), {})
+            self.assertEqual(parse_json_report(path.read_text()), {})
             self.assertEqual(read_execution_status(str(path), 2)['error'], 'environment')
 
     def test_orchestrator_retains_findings_and_records_per_file_coverage(self):
@@ -261,7 +268,7 @@ class ExecutionStatusTests(unittest.TestCase):
             sink, errors, semantic = io.StringIO(), [], []
             run_analyzers([source, neighbor], sink, set(), Path(directory),
                           prefilter=SqlOnly(), errors=errors, semantic_errors=semantic)
-            rows = [json.loads(line) for line in sink.getvalue().splitlines()]
+            rows = [parse_json_report(line) for line in sink.getvalue().splitlines()]
             self.assertEqual(len(rows), 2)
             self.assertTrue(all(rule(row) == 'cs.security.sql-injection' and row['severity'] == 'critical'
                                 for row in rows))
@@ -322,12 +329,14 @@ class ReportingBoundaryTests(unittest.TestCase):
             args = [str(sink), str(listing), str(exit_code), str(rendered) if text else '', '', '0', str(sidecar)]
             command = ('set -Eeuo pipefail\nubs_resolve_helpers_dir(){ return 1; }\n' + bridge +
                        '\nrun_v2_legacy_parity_bridges_csharp ' + shlex.join(args))
-            process = subprocess.run(['bash', '-c', command], env=env, cwd=directory,
+            script = root / 'bridge.sh'
+            script.write_text(command, encoding='utf-8')
+            process = subprocess.run(['bash', str(script)], env=env, cwd=directory,
                                      text=True, capture_output=True, timeout=20)
             self.assertTrue(summary.exists(), (process.returncode, process.stdout, process.stderr))
-            doc = json.loads(summary.read_text())
+            doc = parse_json_report(summary.read_text())
             if not text:
-                self.assertEqual(json.loads(process.stdout), doc)
+                self.assertEqual(parse_json_report(process.stdout), doc)
             return process, doc, rendered.read_text() if text else ''
 
     def test_bridge_keeps_findings_and_execution_exit_separate(self):
@@ -406,10 +415,12 @@ class ReportingBoundaryTests(unittest.TestCase):
                            'HAS_ENV_ERROR=1\nENV_ERROR_LANGS=(' + shlex.join(error_langs) + ')\n'
                            'langs=(' + shlex.join([doc['language'] for doc in docs]) + ')\n' +
                            qualify + '\n' + status + '\nqualify_combined_json\ncat "$COMBINED_JSON_FILE"\n')
-                proc = subprocess.run(['bash', '-c', command], env=env, text=True,
+                script = root / 'runner.sh'
+                script.write_text(command, encoding='utf-8')
+                proc = subprocess.run(['bash', str(script)], env=env, text=True,
                                       capture_output=True, timeout=20)
                 self.assertEqual(proc.returncode, 0, proc.stderr)
-                result = json.loads(proc.stdout)
+                result = parse_json_report(proc.stdout)
                 self.assertEqual((result['status'], result['exit_code'], result['error'], result['reason']),
                                  ('partial', 2, expected, reason))
                 self.assertEqual(result['findings'], findings)
@@ -427,7 +438,7 @@ class PublicContractTests(unittest.TestCase):
         self.project = self.directory / 'project'
         self.project.mkdir()
 
-    def execute(self, source, *, module=False, environment=None):
+    def execute(self, source, *, module=False, environment=None, extra=()):
         (self.project / 'Repro.cs').write_text(source, encoding='utf-8')
         env = dict(os.environ, UBS_NO_AUTO_UPDATE='1', UBS_ENABLE_AUTO_UPDATE='0',
                    ENABLE_UV_TOOLS='0', PYTHONDONTWRITEBYTECODE='1', NO_COLOR='1',
@@ -437,7 +448,7 @@ class PublicContractTests(unittest.TestCase):
             env.update(environment)
         command = ([str(ROOT / 'modules/ubs-csharp.sh'), '--ci', '--no-color', '--no-dotnet']
                    if module else [str(ROOT / 'ubs'), '--ci', '--no-config', '--no-dotnet', '--only=csharp'])
-        process = subprocess.run([*command, '--format=json', str(self.project)],
+        process = subprocess.run([*command, '--format=json', *extra, str(self.project)],
                                  cwd=self.project, env=env, text=True, capture_output=True, timeout=120)
         try:
             report = json.loads(process.stdout)
@@ -502,6 +513,52 @@ class PublicContractTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 2, (doc, proc.stderr))
         self.assertEqual((doc['status'], doc.get('error'), doc.get('reason')),
                          ('partial', 'analysis', 'analysis-incomplete'), doc)
+
+    def test_native_exports_preserve_coverage_identity_and_findings(self):
+        schema_result = subprocess.run([str(ROOT / 'ubs'), '--schema=json'],
+                                       capture_output=True, text=True, timeout=20)
+        self.assertEqual(schema_result.returncode, 0, schema_result.stderr)
+        schema = parse_json_report(schema_result.stdout)['$defs']
+        cases = (
+            (SQL_REPRO, {}, 0, 'ok', None),
+            (TAINTED.replace('MailAddress.TryCreate', 'Unknown.TryCreate'), {},
+             2, 'partial', 'analysis'),
+            (SQL_REPRO, {'UBS_CSHARP_SQL_MAX_TOKENS': 'invalid'},
+             2, 'partial', 'environment'),
+        )
+        for index, (source, environment, code, status, error) in enumerate(cases):
+            with self.subTest(error=error):
+                jsonl_path = self.directory / f'export-{index}.jsonl'
+                sarif_path = self.directory / f'export-{index}.sarif'
+                process, doc = self.execute(source, environment=environment, extra=(
+                    f'--also=jsonl:{jsonl_path}', f'--also=sarif:{sarif_path}'))
+                self.assertEqual(process.returncode, code, (doc, process.stderr))
+                self.assertEqual((doc['status'], doc.get('error')), (status, error), doc)
+                records = [parse_json_report(line) for line in jsonl_path.read_text().splitlines()]
+                totals = records[-1]
+                self.assertEqual((totals['type'], totals['status'], totals.get('error')),
+                                 ('totals', status, error), totals)
+                for field in ('reason', 'exit_code', 'message', 'failed_modules'):
+                    self.assertEqual(totals.get(field), doc.get(field), (field, totals, doc))
+                self.assertEqual(sorted(rule(row) for row in records if row['type'] == 'finding'),
+                                 sorted(rule(row) for row in doc['findings']))
+                self.assertIn(doc['scanners'][0]['status'],
+                              schema['scanner']['properties']['status']['enum'])
+                if error is not None:
+                    self.assertIn(error, schema['report']['properties']['error']['enum'])
+                sarif = parse_json_report(sarif_path.read_text())
+                invocations = [inv for run in sarif['runs'] for inv in run.get('invocations', [])]
+                if code == 2:
+                    self.assertTrue(invocations, sarif)
+                    self.assertTrue(all(inv['executionSuccessful'] is False
+                                        and inv['exitCode'] == 2 for inv in invocations), sarif)
+                else:
+                    self.assertFalse(any(inv['executionSuccessful'] is False
+                                         for inv in invocations), sarif)
+                if error == 'analysis':
+                    self.assertIn('cs.security.sql-injection', [rule(row) for row in doc['findings']])
+                    self.assertTrue(any(row.get('ruleId') == 'cs.security.sql-injection'
+                                        for run in sarif['runs'] for row in run['results']), sarif)
 
 
 if __name__ == '__main__':

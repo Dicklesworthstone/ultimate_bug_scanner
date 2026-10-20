@@ -25,8 +25,9 @@ drops the taint unconditionally.
 Legacy: ``print_finding critical $N "Request-controlled value reaches
 HTTP response header" "Reject or strip CR/LF, use mime.FormatMediaType
 for Content-Disposition, or route through a header-safe helper before
-Header().Set/Add"``. Same-file and previous-line ``ubs:ignore`` markers
-suppress a hit; the v2 record count equals the heredoc's __COUNT__.
+Header().Set/Add"``. Comment directives suppress findings through shared
+statement ownership and exact rule scopes; the v2 record count equals
+the heredoc's __COUNT__.
 """
 from __future__ import annotations
 
@@ -34,12 +35,13 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.suppression import SourceSuppressions
+
 RULE_ID = "go.security.header-injection"
 CATEGORY = 9
 TITLE = "Request-controlled value reaches HTTP response header"
 SEVERITY = "critical"
 DESCRIPTION = "Strip CR/LF or reject newline-bearing header values before w.Header().Set/Add"
-MARKER = "ubs:ignore"
 
 SOURCE_RE = re.compile(
     r'\br\.URL\.Query\(\)\.Get\s*\('
@@ -117,15 +119,6 @@ def _strip_line_comments(line: str) -> str:
     return ''.join(out)
 
 
-def _has_ignore(lines, line_no):
-    idx = line_no - 1
-    return (
-        0 <= idx < len(lines) and MARKER in lines[idx]
-    ) or (
-        0 <= idx - 1 < len(lines) and MARKER in lines[idx - 1]
-    )
-
-
 def _logical_statement(lines, line_no):
     idx = line_no - 1
     statement = _strip_line_comments(lines[idx])
@@ -201,18 +194,17 @@ def _has_header_validation_context(lines, line_no, refs):
     return bool(CRLF_CHECK_RE.search(context) and BLOCK_RE.search(context))
 
 
-def _analyze(path: Path, issues: list) -> None:
+def _analyze(path: Path, issues: list, suppressions: SourceSuppressions) -> None:
     try:
         text = path.read_text(encoding='utf-8', errors='ignore')
     except OSError:
         return
     if not (SOURCE_RE.search(text) and HEADER_SINK_RE.search(text)):
         return
+    suppression_index = suppressions.index(path, text)
     lines = text.splitlines()
     tainted = {}
     for idx, _ in enumerate(lines, start=1):
-        if _has_ignore(lines, idx):
-            continue
         line = _logical_statement(lines, idx).strip()
         if not line:
             continue
@@ -239,6 +231,8 @@ def _analyze(path: Path, issues: list) -> None:
             continue
         if _has_header_validation_context(lines, idx, refs):
             continue
+        if suppression_index.is_suppressed(idx, RULE_ID):
+            continue
         if direct:
             path_desc = f"{direct.group(0).strip('(')} -> response header"
         else:
@@ -253,8 +247,9 @@ def _analyze(path: Path, issues: list) -> None:
 
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
     issues: list[tuple[Path, int, int, str]] = []
+    suppressions = SourceSuppressions('golang')
     for path in files:
         if path.suffix != ".go":
             continue
-        _analyze(path, issues)
+        _analyze(path, issues, suppressions)
     yield from issues

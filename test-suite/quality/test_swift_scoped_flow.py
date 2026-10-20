@@ -10,12 +10,15 @@ import json
 from pathlib import Path
 import sys
 import textwrap
+from types import SimpleNamespace
 import unittest
 import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'modules/helpers'))
-from ubs_core.analyzers.taint_swift_traversal import file_url_read_offsets, flow_findings
+from ubs_core.analyzers.taint_swift_traversal import (
+    file_url_read_offsets, flow_findings, swift_source_tokens, swift_validated_tokens, swift_request_source_tokens,
+)
 from ubs_core.taint_flow import AnalysisLimit
 
 
@@ -48,6 +51,21 @@ class SwiftScopedFlowTests(unittest.TestCase):
             self.assertEqual(route[-1]['line'], finding['line'])
         return findings
 
+    def test_nested_comments_preserve_newlines_and_sink_locations(self):
+        comment = '/* outer\n /* inner */\n end */'
+        tokens = swift_validated_tokens(comment)
+        self.assertEqual([(token.value, token.start, token.end) for token in tokens],
+                         [('\n', 8, 9), ('\n', 21, 22)])
+        self.check('''
+            func handle(req: Request) {
+                /* outer comment
+                   nested /* inner
+                   comment */
+                */
+                _ = String(contentsOfFile: req.query["file"])
+            }
+        ''', (6,), 'path')
+
     def test_guard_optional_binding(self):
         self.check('''
             func handle(req: Request) -> Response {
@@ -55,6 +73,281 @@ class SwiftScopedFlowTests(unittest.TestCase):
                 return req.redirect(to: target)
             }
         ''', (3,))
+
+    def test_native_vision_requests_are_not_web_request_sources(self):
+        sources = ('''
+            import Vision
+            func extract() {
+                let request = VNGenerateImageFeaturePrintRequest()
+                Task { consume(request) }
+                _ = Data(contentsOf: bundledURL)
+            }
+        ''', '''
+            import Vision
+            final class Detector {
+                #if canImport(Vision)
+                let request: VNCoreMLRequest?
+                #endif
+                init() { request = makeRequest() }
+                func extract() { Task { consume(request) } }
+            }
+            func prewarm(request: VNCoreMLRequest) { Task { consume(request) } }
+            func load() { _ = Data(contentsOf: bundledURL) }
+        ''')
+        for index, source in enumerate(sources):
+            with self.subTest(source=source):
+                self.assertFalse(swift_request_source_tokens(swift_validated_tokens(source)))
+                self.check(source, suffix=str(index))
+                from ubs_core.swift_detectors.outbound_url import scan
+                target = self.artifacts / ('vision-outbound-' + str(index) + '.swift')
+                target.write_text(textwrap.dedent(source), encoding='utf-8')
+                self.assertEqual(list(scan(SimpleNamespace(project_dir=self.artifacts, files=[target]))), [])
+
+    def test_vision_import_does_not_exempt_actual_outbound_request(self):
+        from ubs_core.swift_detectors.outbound_url import scan
+        source = '''import Vision
+        func load(req: Request) {
+            let target = req.query["url"]
+            _ = Data(contentsOf: URL(string: target)!)
+        }
+        '''
+        target = self.artifacts / 'vision-real-outbound.swift'
+        target.write_text(source, encoding='utf-8')
+        self.assertTrue(list(scan(SimpleNamespace(project_dir=self.artifacts, files=[target]))))
+
+    def test_native_request_negative_proof_keeps_unknown_shadowing_and_sources(self):
+        prefix = 'import Vision\nlet request = VNGenerateImageFeaturePrintRequest()\n'
+        tails = (
+            'func handle(request: Request) { Task { consume(request) } }',
+            'func handle(request: OtherType) { Task { consume(request) } }',
+            'func handle() { let request = unknown(); Task { consume(request) } }',
+            'func handle() { let work = { request in consume(request) } }',
+            'func handle() { let work = { (request: OtherType) in consume(request) } }',
+            'func handle() { let work = { [request = unknown()] in consume(request) } }',
+            'func handle() { for (request, _) in unknown() { consume(request) } }',
+            'func handle() { for request in unknown() { consume(request) } }',
+            'func handle() { let (request, _) = unknown(); consume(request) }',
+            'func handle() { consume(request.query["next"]) }',
+            'func handle() { consume(other.request) }',
+            'func handle() { consume(upload.filename) }',
+            r'func handle() { consume("\(request)") }',
+            'struct VNGenerateImageFeaturePrintRequest {}',
+            'func VNGenerateImageFeaturePrintRequest() -> Request {}',
+            'func f(VNGenerateImageFeaturePrintRequest: () -> Any) { consume(request) }',
+            'class Child: Parent { func f() { let request = VNCoreMLRequest(); consume(self.request) } }',
+            'func f() { provider { VNCoreMLRequest in let request = VNCoreMLRequest(); consume(request) } }',
+            'func f() { provider { Vision in let request = Vision.VNCoreMLRequest(); consume(request) } }',
+            'func f<VNCoreMLRequest>() { let request = VNCoreMLRequest(); consume(request) }',
+            'func f() { if let request = VNCoreMLRequest() { consume(request) }; consume(request) }',
+            'func f() {\n#if canImport(Vision)\nif let request = VNCoreMLRequest() { consume(request) }\n#endif\nconsume(request) }',
+            'func f() { let other = 1, request = unknown(); consume(request) }',
+            'class C { let other: Int, request: OtherType; func f() { consume(request) } }',
+        )
+        for tail in tails:
+            with self.subTest(tail=tail):
+                self.assertTrue(swift_request_source_tokens(swift_validated_tokens(prefix + tail)))
+        source = '''import Vision
+        func first() { let request = VNCoreMLRequest(); consume(request) }
+        func second() { consume(request) }
+        '''
+        self.assertTrue(swift_request_source_tokens(swift_validated_tokens(source)))
+        source = '''import Vision
+        class Detector { class func extract() { consume(request); let request = VNCoreMLRequest() } }
+        '''
+        self.assertTrue(swift_request_source_tokens(swift_validated_tokens(source)))
+
+    def test_process_exit_terminates_guard_and_keeps_argument_sinks(self):
+        for call in ('exit(1)', 'Darwin.exit(1)', 'Glibc.exit(1)', 'fatalError()', 'Swift.preconditionFailure()'):
+            with self.subTest(call=call):
+                self.check(f'''
+                    func handle(req: Request) {{
+                        let target = req.query["next"]
+                        guard {LOCAL} else {{ {call} }}
+                        _ = req.redirect(to: target)
+                    }}
+                ''')
+        self.check('''
+            func handle(req: Request) {
+                fatalError(String(contentsOfFile: req.query["file"]))
+                _ = String(contentsOfFile: req.query["unreachable"])
+            }
+        ''', (2,), 'path')
+
+    def test_shadowed_process_exit_cannot_prove_guard_termination(self):
+        for declaration in ('func exit(_ status: Int) {}', 'let exit = callback'):
+            with self.subTest(declaration=declaration), self.assertRaisesRegex(ValueError, 'guard.*does not exit'):
+                self.check('''
+                    %s
+                    func handle(req: Request) {
+                        let target = req.query["next"]
+                        guard allowed(target) else { exit(1) }
+                        _ = req.redirect(to: target)
+                    }
+                ''' % declaration)
+        with self.assertRaisesRegex(ValueError, 'guard.*does not exit'):
+            self.check('''
+                class Handler: ExternalBase {
+                    func handle(req: Request) {
+                        guard allowed(req) else { exit(1) }
+                        _ = req.redirect(to: req.query["next"])
+                    }
+                }
+            ''')
+
+    def test_tuple_loop_propagates_each_component_to_sinks(self):
+        for policy, sink in (('path', 'String(contentsOfFile: target)'),
+                             ('redirect', 'req.redirect(to: target)')):
+            for value in ('(req.query["next"], "safe")', '("safe", req.query["next"])'):
+                with self.subTest(policy=policy, value=value):
+                    self.check('''
+                        func handle(req: Request) {
+                            for (target, other) in [%s] {
+                                _ = %s
+                            }
+                        }
+                    ''' % (value, sink), (3,), policy, str(len(value)))
+
+    def test_nested_tuple_loop_and_wildcards_preserve_sources(self):
+        self.check('''
+            func handle(req: Request) {
+                for (_, (target, _)) in [(0, (req.query["next"], 1))] {
+                    _ = req.redirect(to: target)
+                }
+            }
+        ''', (3,))
+
+    def test_tuple_loop_preserves_request_object_shape(self):
+        self.check('''
+            func handle(req: Request) {
+                for (input, _) in [(req, 0)] {
+                    _ = input.redirect(to: input.query["next"])
+                }
+            }
+        ''', (3,))
+
+    def test_request_collection_iteration_is_an_untrusted_source(self):
+        for sequence in ('req.headers', 'req.query', 'req.parameters', 'req.params', 'req.content'):
+            with self.subTest(sequence=sequence):
+                self.check('''
+                    func handle(req: Request) {
+                        for (_, target) in %s {
+                            _ = req.redirect(to: target)
+                        }
+                    }
+                ''' % sequence, (3,), suffix=sequence.rsplit('.', 1)[-1])
+        self.check('''
+            func handle(req: Request) {
+                let headers = req.headers
+                for target in headers {
+                    _ = String(contentsOfFile: target)
+                }
+            }
+        ''', (4,), 'path', 'scalar-alias')
+
+    def test_request_iteration_where_validation_stays_binding_local(self):
+        self.check(f'''
+            func handle(req: Request) {{
+                for (other, target) in req.headers where {LOCAL} {{
+                    _ = req.redirect(to: target)
+                    _ = req.redirect(to: other)
+                }}
+            }}
+        ''', (4,))
+
+    def test_tuple_loop_shadowing_does_not_leak(self):
+        self.check('''
+            func handle(req: Request) {
+                let target = req.query["next"]
+                for (target, _) in [("/fixed", 0)] {
+                    _ = req.redirect(to: target)
+                }
+                _ = req.redirect(to: target)
+            }
+        ''', (6,))
+
+    def test_tuple_loop_reads_sequence_before_binding_names(self):
+        self.check('''
+            func handle(req: Request) {
+                let target = [(req.query["next"], 0)]
+                for (target, _) in target {
+                    _ = req.redirect(to: target)
+                }
+            }
+        ''', (4,))
+
+    def test_tuple_loop_break_continue_and_outer_write(self):
+        self.check('''
+            func handle(req: Request) {
+                var output = "/fixed"
+                for (target, _) in [(req.query["next"], 0)] {
+                    if flag { continue }
+                    output = target
+                    break
+                    _ = req.redirect(to: target)
+                }
+                _ = req.redirect(to: output)
+            }
+        ''', (9,))
+
+    def test_tuple_loop_where_validation_is_binding_local(self):
+        self.check(f'''
+            func handle(req: Request) {{
+                for (target, other) in [(req.query["next"] ?? "/", "/fixed")] where {LOCAL} {{
+                    _ = req.redirect(to: target)
+                    _ = req.redirect(to: other)
+                }}
+            }}
+        ''', (4,))
+
+    def test_tuple_loop_all_discard_still_evaluates_sequence(self):
+        self.check('''
+            func handle(req: Request) {
+                for (_, _) in [(req.redirect(to: req.query["next"]), 0)] {}
+            }
+        ''', (2,))
+
+    def test_tuple_loop_clean_and_zero_iteration_path(self):
+        self.check('''
+            func handle(req: Request) {
+                var output = req.query["next"]
+                for (a, (b, _)) in [("/a", ("/b", 0))] {
+                    _ = req.redirect(to: a)
+                    _ = req.redirect(to: b)
+                    output = "/fixed"
+                }
+                _ = req.redirect(to: output)
+            }
+        ''', (8,))
+
+    def test_unsupported_loop_patterns_remain_incomplete(self):
+        for pattern in ('case let (a, b)', '(a, a)', '(a, b?)', '(a, b) as Pair'):
+            with self.subTest(pattern=pattern), self.assertRaisesRegex(ValueError, 'iteration binding.*incomplete'):
+                self.check('func handle(req: Request) { for %s in values { _ = req.redirect(to: req.query["next"]) } }' % pattern)
+
+    def test_append_contents_label_is_not_a_file_read_obligation(self):
+        for policy in ('path', 'redirect'):
+            self.check('''
+                func detect() {
+                    let values = requests.map { request in request.result }
+                    for (evidence, box) in values { record(evidence, box) }
+                    output.append(contentsOf: values)
+                }
+            ''', policy=policy, suffix=policy)
+
+    def test_append_does_not_hide_actual_request_or_file_read(self):
+        self.check('''
+            func handle(req: Request) {
+                output.append(contentsOf: ["fixed"])
+                _ = String(contentsOfFile: req.query["path"])
+            }
+        ''', (3,), 'path')
+        with self.assertRaisesRegex(ValueError, 'closure.*incomplete'):
+            self.check('''
+                func handle(req: Request) {
+                    let work = Task { consume(req.query["path"]) }
+                    output.append(contentsOf: ["fixed"])
+                }
+            ''')
 
     def test_if_optional_binding(self):
         self.check('''
@@ -756,6 +1049,113 @@ class SwiftScopedFlowTests(unittest.TestCase):
                 }
             ''')
 
+    def test_file_export_argument_labels_are_not_incoming_sources(self):
+        for label in ('filename', 'fileName', 'originalFilename', 'originalFileName'):
+            for arguments in (f'{label}: name, data: data', f'data: data, {label}\n/* label */ : name'):
+                for policy in ('path', 'redirect'):
+                    with self.subTest(label=label, arguments=arguments, policy=policy):
+                        self.check('''
+                            func export() async throws -> IntentFile {
+                                let snapshot = try await MainActor.run { try latestSnapshot() }
+                                let data = encode(snapshot)
+                                let name = exportName(snapshot)
+                                return IntentFile(%s)
+                            }
+                        ''' % arguments, policy=policy,
+                                   suffix=f'-{label}-{len(arguments)}-{policy}')
+
+    def test_filename_labels_do_not_hide_real_member_sources(self):
+        for label in ('filename', 'fileName', 'originalFilename', 'originalFileName'):
+            for policy, sink in (('path', 'String(contentsOfFile: target)'),
+                                 ('redirect', 'Response.redirect(to: target)')):
+                with self.subTest(label=label, policy=policy):
+                    self.check('''
+                        func forward(filename target: String) {
+                            %s
+                        }
+                        func handle(upload: Upload) {
+                            forward(filename: upload.%s)
+                        }
+                    ''' % (sink, label), (2,), policy=policy, suffix=f'-{label}-{policy}')
+
+    def test_request_argument_labels_are_not_incoming_sources(self):
+        for label in ('req', 'request'):
+            for arguments in (f'{label}: draft', f'id: draftID, {label}\n/* label */ : draft'):
+                for policy in ('path', 'redirect'):
+                    with self.subTest(label=label, arguments=arguments, policy=policy):
+                        self.check('''
+                            struct Editor {
+                                var saved: Draft { Draft(%s) }
+                                var body: some View {
+                                    ForEach(files) { file in Text(file.name) }
+                                }
+                                func save() { Task { persist(Draft(%s)) } }
+                            }
+                        ''' % (arguments, arguments), policy=policy,
+                                   suffix=f'-{label}-{len(arguments)}-{policy}')
+
+    def test_request_label_exclusion_preserves_value_witnesses(self):
+        for name in ('req', 'request'):
+            for source in (f'output([{name}: value])', f'output(flag ? {name} : value)',
+                           f'output(request: {name})', f'output(request: upload.{name})',
+                           f'output(request: {name}?.query["next"])',
+                           'output(request: "copy-\\(' + name + '.query["name"])")',
+                           f'func handle({name}: Request) {{}}'):
+                with self.subTest(source=source):
+                    self.assertTrue(swift_source_tokens(swift_validated_tokens(source)))
+            for source in (f'output({name}: draft)', f'output(id: key, {name} /* label */\n: draft)',
+                           'print("\\(output(' + name + ': draft))")'):
+                with self.subTest(source=source):
+                    self.assertFalse(swift_source_tokens(iter(swift_validated_tokens(source))))
+
+    def test_request_labels_do_not_hide_real_captures_or_sinks(self):
+        for label in ('req', 'request'):
+            for policy, sink in (('path', 'String(contentsOfFile: target)'),
+                                 ('redirect', 'Response.redirect(to: target)')):
+                with self.subTest(label=label, policy=policy):
+                    self.check('''
+                        func forward(%s target: String) {
+                            %s
+                        }
+                        func handle(req: Request) {
+                            forward(%s: req.query["target"])
+                        }
+                    ''' % (label, sink, label), (2,), policy=policy, suffix=f'-{label}-{policy}')
+                    with self.assertRaisesRegex(ValueError, 'closure.*incomplete'):
+                        self.check('''
+                            func handle(req: Request) {
+                                Task { forward(%s: req.query["target"]) }
+                            }
+                        ''' % label, policy=policy, suffix=f'-capture-{label}-{policy}')
+
+    def test_actual_filename_capture_remains_explicitly_incomplete(self):
+        sources = (
+            'Task { IntentFile(filename: upload.filename) }',
+            r'Task { IntentFile(filename: "copy-\(upload.fileName)") }',
+            'Task { IntentFile(filename: req.query["name"]) }',
+        )
+        for index, expression in enumerate(sources):
+            for policy in ('path', 'redirect'):
+                with self.subTest(expression=expression, policy=policy), self.assertRaisesRegex(ValueError, 'closure.*incomplete'):
+                    self.check('func handle(upload: Upload) { %s }' % expression,
+                               policy=policy, suffix=f'-{index}-{policy}')
+
+    def test_filename_source_witness_requires_proven_label_position(self):
+        # A colon alone is not evidence of an argument label: dictionary keys,
+        # ternary values and member values must stay conservative witnesses.
+        for source in ('output([filename: value])', 'output(flag ? filename : value)',
+                       'output(filename: upload.filename)', 'output(filename: upload?.filename)',
+                       r'output(filename: "copy-\(upload.filename)")',
+                       'output(filename: req.query["name"])'):
+            with self.subTest(source=source):
+                self.assertTrue(swift_source_tokens(swift_validated_tokens(source)))
+        for source in ('output(filename: "safe.csv")',
+                       'output(data: bytes, filename /* label */\n: "safe.csv")',
+                       r'print("\(output(filename: "safe.csv"))")'):
+            with self.subTest(source=source):
+                # The function also receives a generator when selecting bodies.
+                self.assertFalse(swift_source_tokens(iter(swift_validated_tokens(source))))
+
     def test_sink_hidden_in_interpolation_or_alias_is_not_filtered_out(self):
         sources = (r'''
             func handle(req: Request) -> String {
@@ -782,6 +1182,42 @@ class SwiftScopedFlowTests(unittest.TestCase):
                     return "outer \("inner \(Task { Response.redirect(to: req.query["next"] ?? "/") })")"
                 }
             ''')
+
+    def test_api_write_without_destination_is_not_a_file_sink_obligation(self):
+        for index, call in enumerate((
+            'panel.write("/api/billing", body: request)',
+            'panel?.write("/api/billing", body: ["to": request])',
+            'panel.write(body: wrap(to: request))',
+            'panel.write("to", body: request)',
+            'panel.write(\n "/api/billing",\n body: request\n)',
+        )):
+            for policy in ('path', 'redirect'):
+                with self.subTest(call=call, policy=policy):
+                    self.check('func submit() { let request = UUID(); Task { %s } }' % call,
+                               policy=policy, suffix=str(index) + policy)
+
+    def test_api_write_keeps_real_nested_and_unknown_file_obligations(self):
+        for index, call in enumerate((
+            'body.write(to: request)',
+            'body.write(`to`: request)',
+            'panel.write("/api", body: body.write(to: request))',
+            'panel.write("/api", body: { body.write(to: request) })',
+            r'panel.write("/api", body: "value-\(body.write(to: request))")',
+            'let writer = body.write; writer(to: request)',
+            'panel.write("/api", body: request.query["path"])',
+            'panel.write("/api", body: request); readFile(path: request)',
+        )):
+            for policy in ('path', 'redirect'):
+                with self.subTest(call=call, policy=policy), self.assertRaisesRegex(ValueError, 'closure.*incomplete'):
+                    self.check('func submit() { let request = UUID(); Task { %s } }' % call,
+                               policy=policy, suffix=str(index) + policy)
+
+    def test_file_write_destination_still_reports_request_path(self):
+        self.check('''
+            func submit(req: Request) {
+                try body.write(to: URL(fileURLWithPath: req.query["path"] ?? ""))
+            }
+        ''', (2,), policy='path')
 
     def test_unrelated_unsupported_closure_with_a_sink_is_still_incomplete(self):
         with self.assertRaisesRegex(ValueError, 'closure.*incomplete'):

@@ -58,6 +58,36 @@ and source races appear as explicit unverified diagnostics. The scanner's
 stderr never contaminates the LSP stream. Shutdown cancels request process
 groups, including helpers holding output pipes.
 
+### Automatic cross-file context for saved documents
+
+Use `--scan-scope=open-documents` when the open files should be analyzed together:
+
+```bash
+python3 -I /trusted/ultimate_bug_scanner/ubs-lsp \
+  --repo /absolute/project --scan-scope=open-documents
+```
+
+Open and save events then coalesce into one ordinary scanner invocation with
+all open documents as selected inputs. Saving a helper rechecks an unchanged
+caller, and closing a peer rechecks the remaining selection. A single open
+saved document retains the immediate individual-file path. The default
+`--scan-scope=document` keeps the original independent open/save behavior.
+
+In grouped saved mode every selected document must be synchronized and saved.
+An unsaved peer suspends verification of the group rather than letting another
+file appear clean from incomplete context. Scanner errors and missing coverage
+also leave the group explicitly unverified. Changes invalidate published peer
+results and outstanding pull requests. Concurrent pulls share the grouped scan;
+queued replies revalidate every selected source before delivery to a slow editor.
+Original documents are never written by this mode, and no snapshot is created.
+
+This is a launch-time selection policy, not a new detector or whole-workspace
+scan. Only open files become selected targets; detector-specific cross-file
+boundaries still apply. Global configuration and unobserved external changes
+are not certified. Initialization reports the effective scope in
+`experimental.ubs.scanScope`. Snapshot and incremental buffer modes always use
+`open-documents`, independently of the saved-mode selection setting.
+
 ## Opt in: unsaved-buffer snapshots
 
 To analyze edits before saving, explicitly launch snapshot mode:
@@ -186,10 +216,12 @@ notifications, routed back to the correct source document.
 In saved mode, all group members must be synchronized and saved. One unsaved
 or invalid member suspends the whole group. Changes or closes to any member
 cancel pending/running work and invalidate its published peers, including
-already-published clean results. Ordinary saved-mode open/save still supports
-individual-file scans; use the group command again to renew cross-file
-verification after saving all members. In snapshot mode, the command refreshes
-the current buffer group without requiring a save.
+already-published clean results. With `--scan-scope=document` (the default),
+ordinary saved-mode open/save uses individual-file scans; use the group command
+again to renew cross-file verification after saving all members. With
+`--scan-scope=open-documents`, open/save/close maintains the selected group
+automatically. In snapshot mode, the command refreshes the current buffer group
+without requiring a save.
 
 The adapter handles `workspace/didChangeWatchedFiles` events for files inside
 the configured repository. Creation, change and deletion notifications queue a
@@ -227,8 +259,9 @@ completion, navigation or automatic fixes.
 ## Bounds and validation
 
 The default concurrency is two scanners (`--jobs=1..4`); scans are bounded by
-`--scan-timeout` (default 120 seconds). Grouped buffer mode permits one snapshot
-scan at a time. The server retains at most 64 open documents, 2 MiB of UTF-8
+`--scan-timeout` (default 120 seconds). Grouped scans run one at a time,
+including automatic saved-document groups and grouped buffer snapshots.
+The server retains at most 64 open documents, 2 MiB of UTF-8
 text per source and 16 MiB of synchronized wire text, plus its normalized
 comparison representation. Scanner streams are bounded to 8 MiB each. LSP
 headers, message bodies and queued outbound bytes are also bounded.

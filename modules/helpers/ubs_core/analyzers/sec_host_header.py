@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.suppression import SourceSuppressions
 
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
 
@@ -156,17 +157,19 @@ def tainted_ref(text, tainted_vars):
 def scan_file_findings(path: Path) -> Iterator[tuple[int, int]]:
     """Yield (line, col) per detection; per-file logic identical to the heredoc."""
     try:
-        lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
+        source_text = path.read_text(encoding='utf-8', errors='ignore')
     except OSError:
         return
+    lines = source_text.splitlines()
     text = '\n'.join(lines)
     if not source_re.search(text):
         return
+    suppressions = SourceSuppressions('javascript').index(path, source_text)
     tainted_vars = {}
     seen_lines = set()
     for idx, line in enumerate(lines):
         stripped = code_line(line).strip()
-        if not stripped or 'ubs:ignore' in line or (idx > 0 and 'ubs:ignore' in lines[idx - 1]):
+        if not stripped:
             continue
         if function_boundary_re.search(stripped):
             tainted_vars = {}
@@ -190,6 +193,8 @@ def scan_file_findings(path: Path) -> Iterator[tuple[int, int]]:
         if has_safe_validation(statement) or has_safe_validation(context_from(lines, idx), ref):
             continue
         if idx in seen_lines:
+            continue
+        if suppressions.is_suppressed(idx + 1, RULE):
             continue
         seen_lines.add(idx)
         match = source_re.search(line) or absolute_url_re.search(line)

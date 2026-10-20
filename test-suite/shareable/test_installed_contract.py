@@ -20,6 +20,8 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 UBS_BIN = REPO_ROOT / "ubs"
+# modules/contract.json exactly as v5.4.17 shipped it (sha256 406ecd66...).
+OLDER_CONTRACT = Path(__file__).resolve().parent / "fixtures" / "contract-v5.4.17.json"
 
 FETCH_SHIM = r'''#!/usr/bin/env python3
 import os
@@ -113,11 +115,17 @@ class InstalledContract(unittest.TestCase):
             text=True, check=False, timeout=180,
         )
 
+    def parsed_report(self, result: subprocess.CompletedProcess[str]) -> dict:
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            self.fail(f'Invalid scanner JSON: {exc}\n{result.stdout}\n{result.stderr}')
+
     def scanned_rust(self, result: subprocess.CompletedProcess[str]) -> dict:
         output = result.stdout + result.stderr
         self.assertNotEqual(result.returncode, 3, output)
         self.assertNotIn("command not found", output)
-        payload = json.loads(result.stdout)
+        payload = self.parsed_report(result)
         self.assertNotEqual(payload.get("result"), "no-supported-languages", payload)
         self.assertIn("rust", {s.get("language") for s in payload.get("scanners", [])}, output)
         return payload
@@ -142,7 +150,7 @@ class InstalledContract(unittest.TestCase):
         result = self.run_ubs("doctor", *( ["--fix"] if fix else []), extra_env={
             "UBS_AST_GREP_BIN": str(ast), "TOON_TRU_BIN": str(toon),
         })
-        payload = json.loads(result.stdout)
+        payload = self.parsed_report(result)
         checks = {item["id"]: item for item in payload["checks"]}
         self.assertIn("helper:contract.json", checks, result.stdout + result.stderr)
         return result, checks["helper:contract.json"]
@@ -190,6 +198,32 @@ class InstalledContract(unittest.TestCase):
                 "UBS_REPO_RAW_BASE": base.as_uri(), "UBS_ALLOW_UNVERIFIED_HELPERS": "1",
             }))
             self.assertEqual((self.cache / "contract.json").read_bytes(), damaged)
+
+    def test_contract_left_by_an_earlier_release_is_refreshed(self) -> None:
+        # Issue #174: `ubs --update` from 5.4.x replaces the runner but leaves
+        # the cached contract of the old release; the first scan refreshes it.
+        older = OLDER_CONTRACT.read_bytes()
+        self.assertNotEqual(older, self.contract)
+        (self.cache / "contract.json").write_bytes(older)
+        result = self.run_ubs(str(self.target))
+        self.scanned_rust(result)
+        self.assertIn("is the v5.4.16 release's", result.stderr)
+        self.assertEqual((self.cache / "contract.json").read_bytes(), self.contract)
+        self.scanned_rust(self.run_ubs(str(self.target), extra_env={
+            "UBS_REPO_RAW_BASE": (self.root / "offline").as_uri(),
+        }))
+
+    def test_earlier_release_contract_fails_closed_when_it_cannot_be_refreshed(self) -> None:
+        older = OLDER_CONTRACT.read_bytes()
+        (self.cache / "contract.json").write_bytes(older)
+        self.rejected(self.run_ubs(str(self.target), extra_env={
+            "UBS_REPO_RAW_BASE": (self.root / "offline").as_uri(),
+        }))
+        self.assertEqual((self.cache / "contract.json").read_bytes(), older)
+        for source in self.contract_sources:
+            source.write_bytes(b'{"modules":{}}\n')
+        self.rejected(self.run_ubs(str(self.target)))
+        self.assertEqual((self.cache / "contract.json").read_bytes(), older)
 
     def test_corrupt_downloads_and_empty_payloads_fail_closed(self) -> None:
         for damaged in (b'{"modules":{}}\n', b''):

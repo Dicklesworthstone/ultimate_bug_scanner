@@ -3,8 +3,8 @@
 Verbatim port of the legacy ubs-js.sh heredoc "JWT decode/verify bypass risk"
 (``jwt_verification_report``): same import/require collection, same decode/verify
 candidate regexes, same 12-line statement window, same claim-binding rule
-(issuer AND audience must both be present), same ``ubs:ignore`` placement rules
-(trigger line, line above, or anywhere inside the collected statement).
+(issuer AND audience must both be present). Suppression uses the shared
+lexical statement policy and this analyzer's exact public rule.
 The heredoc's os.walk over the project is replaced by iteration over
 ``RunContext.files``; per-file match logic is unchanged.
 """
@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.suppression import SourceSuppressions
 
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
 
@@ -176,18 +177,20 @@ def verify_lacks_claim_binding(statement):
 def scan_file_findings(path: Path) -> Iterator[int]:
     """Yield 1-based line numbers per detection; match logic identical to the heredoc."""
     try:
-        lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
+        source_text = path.read_text(encoding='utf-8', errors='ignore')
     except Exception:
         return
+    lines = source_text.splitlines()
+    suppressions = SourceSuppressions('javascript').index(path, source_text)
     jwt_objects, decode_names, verify_names = collect_names(lines)
     for idx, line in enumerate(lines):
         stripped = code_line(line).strip()
-        if not stripped or 'ubs:ignore' in line or (idx > 0 and 'ubs:ignore' in lines[idx - 1]):
+        if not stripped:
             continue
         if not line_has_candidate_call(stripped, decode_names, verify_names):
             continue
         statement = statement_from(lines, idx)
-        if not statement or 'ubs:ignore' in statement:
+        if not statement:
             continue
         call_statement = mask_string_literals(statement)
         unsafe = False
@@ -215,6 +218,8 @@ def scan_file_findings(path: Path) -> Iterator[int]:
                     unsafe = True
                     break
         if not unsafe:
+            continue
+        if suppressions.is_suppressed(idx + 1, RULE):
             continue
         yield idx + 1
 

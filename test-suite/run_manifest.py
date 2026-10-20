@@ -194,7 +194,7 @@ def expect_schema_errors(expect: Any, label: str) -> List[str]:
             errors.extend(string_list_errors(expect[key], f"{label}.expect.{key}"))
 
     for key in ("allow_unparseable_output", "allow_zero_files", "findings_json_valid"):
-        if key in expect and type(expect[key]) is not bool:
+        if key in expect and not isinstance(expect[key], bool):
             errors.append(f"{label}.expect.{key} must be a boolean")
 
     if "sarif" in expect:
@@ -279,7 +279,7 @@ def manifest_schema_errors(manifest: Dict[str, Any]) -> List[str]:
         tags = case.get("tags")
         if tags is not None:
             errors.extend(string_list_errors(tags, f"{label}.tags"))
-        if "enabled" in case and type(case["enabled"]) is not bool:
+        if "enabled" in case and not isinstance(case["enabled"], bool):
             errors.append(f"{label}.enabled must be a boolean")
         if "ubs_bin" in case and not nonempty_string(case["ubs_bin"]):
             errors.append(f"{label}.ubs_bin must be a non-empty string")
@@ -583,10 +583,16 @@ def check_expectations(
             expected_code = int(need)
             if exit_code != expected_code:
                 errors.append(f"expected exit {expected_code} but got {exit_code}")
-        elif need == "zero" and derived_exit != 0:
-            errors.append(f"expected exit 0 but derived {derived_exit}")
-        elif need == "nonzero" and derived_exit == 0:
-            errors.append("expected non-zero exit but derived 0")
+        elif need == "zero":
+            if exit_code != 0:
+                errors.append(f"expected exit 0 but got {exit_code}")
+            if derived_exit != 0:
+                errors.append(f"expected exit 0 but derived {derived_exit}")
+        elif need == "nonzero":
+            if exit_code == 0:
+                errors.append("expected non-zero exit but got 0")
+            if derived_exit == 0:
+                errors.append("expected non-zero exit but derived 0")
     totals_expect = (expect or {}).get("totals", {})
     for severity, limits in totals_expect.items():
         observed = int(totals.get(severity, 0) or 0)

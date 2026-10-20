@@ -8,6 +8,7 @@ the Process residual derived check.
 from __future__ import annotations
 
 from ubs_core.swift_scan import Pattern
+from ubs_core.suppression import SourceSuppressions
 
 PATTERNS = [
     # 5. ERROR HANDLING
@@ -46,8 +47,10 @@ def _process_residual(ctx):
 
     shell_anchors = {(path, line) for path, line, _code, _reason in shell_execution.collect_findings(ctx)}
     regex = re.compile(r"Process\(|posix_spawn|system\(|popen\(")
+    suppressions = SourceSuppressions("swift")
     for path in ctx.files:
         text = ctx.text_of(path)
+        suppressions.index(path, text)
         seen = set()
         for match in regex.finditer(text):
             line_no = text.count("\n", 0, match.start()) + 1
@@ -59,10 +62,10 @@ def _process_residual(ctx):
             if line_end == -1:
                 line_end = len(text)
             line_text = text[line_start:line_end]
-            if "ubs:ignore" in line_text:
-                continue
             source = str(path.resolve())
             if (source, line_no) in shell_anchors:
+                continue
+            if suppressions.is_suppressed(path, line_no, "swift.security.process-other"):
                 continue
             yield {
                 "rule": "swift.security.process-other",

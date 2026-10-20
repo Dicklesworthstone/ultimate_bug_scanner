@@ -133,7 +133,7 @@ def generate(rule_dir: Path, user_rules_dir: Path | None = None) -> dict[str, di
                 break
         if rid:
             manifest[rid] = {
-                "file": str(rule_file),
+                "file": rule_file.relative_to(rule_dir).as_posix(),
                 "severity": SEVERITY_MAP.get(rid, "warning"),
                 "language": "bash",
             }
@@ -145,7 +145,7 @@ def generate(rule_dir: Path, user_rules_dir: Path | None = None) -> dict[str, di
             if line.startswith("id:"):
                 urid = line.split(":", 1)[1].strip()
                 manifest[urid] = {
-                    "file": str(dest),
+                    "file": dest.relative_to(rule_dir).as_posix(),
                     "severity": "warning",
                     "language": "bash",
                 }

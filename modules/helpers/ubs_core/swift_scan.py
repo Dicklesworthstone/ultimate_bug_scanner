@@ -428,6 +428,10 @@ def rel_for(path: Path, project_dir: Path) -> str:
 
 def run_derived(ctx: ScanContext, sink, skip: set[int], errors: list[str] | None = None) -> None:
     """Run the cross-count derived checks contributed by pattern modules."""
+    # Every derived record belongs to a category. With all of them skipped
+    # nothing can be reported, so the selection is not read or lexed here.
+    if all(category in skip for category in _CATEGORY_SLUGS):
+        return
     suppressions = SourceSuppressions("swift")
     for fn in load_derived(errors):
         try:
@@ -526,7 +530,8 @@ def run_analyzers(ctx: ScanContext, sink, skip: set[int], enable_new: bool = Fal
     for analyzer in analyzers_for_lang("swift"):
         if analyzer.layer in ("regex", "guards") and not enable_new:
             continue
-        category = {"taint": 6, "narrowing": 1, "guards": 1, "regex": 12, "lifecycle": 16}.get(analyzer.layer)
+        category = {"taint": 6, "narrowing": 1, "guards": 1,
+                    "lifecycle": 16, "regex": 12}.get(analyzer.layer)
         if category in skip:
             continue
         if analyzer.layer == "narrowing":
@@ -1040,6 +1045,20 @@ def main(argv: list[str] | None = None) -> int:
     # this invocation may publish a successful completion receipt.
     scan_errors: list[str] = []
     patterns = load_patterns(scan_errors)
+    # A file whose comment/literal structure cannot be lexed has no provable
+    # marker ownership. It is excluded and the scan is partial, while other
+    # selected files still contribute their findings.
+    suppressions = SourceSuppressions("swift")
+    if any(category not in skip for category in _CATEGORY_SLUGS):
+        eligible_files = []
+        for path in files:
+            try:
+                suppressions.index(path, ctx.text_of(path))
+            except ValueError as exc:
+                scan_errors.append(f"{path}: Swift lexical analysis: {type(exc).__name__}: {exc}")
+            else:
+                eligible_files.append(path)
+        ctx.files = eligible_files
 
     from ubs_core.cache import CapturingSink, ScanCache
 
@@ -1050,8 +1069,7 @@ def main(argv: list[str] | None = None) -> int:
         custom_rules=args.ast_rule_dir,
         extra=f"ast_available={args.ast_available};skip_narrowing={args.skip_type_narrowing};new_analyzers={args.enable_new_analyzers}",
     )
-    cached_findings, files_to_scan = cache.partition_files(files)
-    suppressions = SourceSuppressions("swift")
+    cached_findings, files_to_scan = cache.partition_files(ctx.files)
 
     capturing_sink = None
     if files_to_scan:

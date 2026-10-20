@@ -3,9 +3,9 @@
 
 Verbatim port of the legacy ubs-js.sh heredoc "fetch without AbortSignal
 cancellation": same regexes, same two-pass safe-variable collection, same
-14-line statement window with the fetch_start/new Request/'=' saw_open rule,
-same ubs:ignore placement rules (the marker must survive code_line() inside
-the collected call text — the heredoc tests the comment-stripped statement).
+14-line statement window with the fetch_start/new Request/'=' saw_open rule.
+Suppression uses the shared lexical statement policy and this analyzer's
+exact public rule; annotations do not remove safe-variable facts.
 The heredoc's os.walk over the project is replaced by iteration over
 RunContext.files; per-file match logic is unchanged.
 """
@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.suppression import SourceSuppressions
 
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
 
@@ -165,10 +166,11 @@ def leading_identifier(arg):
 def scan_file_findings(path: Path) -> Iterator[tuple[int, str]]:
     """Yield (line, sample_text) per detection; logic identical to the heredoc."""
     try:
-        lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
+        source_text = path.read_text(encoding='utf-8', errors='ignore')
     except Exception:
         return
-    lines = join_global_receivers(lines)
+    suppressions = SourceSuppressions('javascript').index(path, source_text)
+    lines = join_global_receivers(source_text.splitlines())
 
     safe_init_vars = set()
     safe_request_vars = set()
@@ -190,8 +192,6 @@ def scan_file_findings(path: Path) -> Iterator[tuple[int, str]]:
         if not stripped or definition_re.search(stripped) or not fetch_start_re.search(stripped):
             continue
         call_text = statement_from(lines, idx)
-        if 'ubs:ignore' in call_text:
-            continue
         args = split_top_level_args(extract_fetch_args(call_text))
         first_arg = args[0] if args else ""
         options_arg = args[1] if len(args) > 1 else ""
@@ -202,6 +202,8 @@ def scan_file_findings(path: Path) -> Iterator[tuple[int, str]]:
         if first_ident in safe_request_vars:
             continue
         if first_arg.startswith('new Request') and has_signal_option(first_arg):
+            continue
+        if suppressions.is_suppressed(idx + 1, RULE):
             continue
         yield idx + 1, stripped.replace('\t', ' ')
 

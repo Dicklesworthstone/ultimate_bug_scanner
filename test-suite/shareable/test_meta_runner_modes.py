@@ -78,6 +78,12 @@ def check_rust_cargo_phases(tmpdir: Path) -> None:
     sentinel.write_text(
         "#!/usr/bin/env bash\n"
         "printf 'cargo %s cwd=%s\\n' \"$*\" \"$PWD\" >> \"${SENTINEL_LOG:?}\"\n"
+        'if [[ -n "${SENTINEL_DIAGNOSTICS:-}" ]]; then\n'
+        '  case "$1" in\n'
+        '    clippy|check|test) printf "%s\\n" "$SENTINEL_DIAGNOSTICS" >&2;;\n'
+        '    *) exit 0;;\n'
+        '  esac\n'
+        'fi\n'
         "exit \"${SENTINEL_EXIT:-0}\"\n"
     )
     sentinel.chmod(0o755)
@@ -169,7 +175,54 @@ def check_rust_cargo_phases(tmpdir: Path) -> None:
     assert "exit 103" in out, out
     assert "cargo check could not run" in out, out
     assert "Partial: [CARGO_UNAVAILABLE]" in out, out
+    assert "Not evaluated: cargo check" in out, out
+    assert "Not evaluated: cargo checkcargo check" not in out, out
     assert "CRITICAL" not in out.split("cargo check could not run", 1)[1].split("\n", 3)[0], out
+
+    # An actual compiler diagnostic remains a finding with the same identity
+    # when Cargo/RCH colors its output; an unrecognized wrapper failure above
+    # still stays partial. The full CLI must agree across its report formats.
+    for diagnostics in (
+        'error[E0512]: cannot transmute between types of different sizes\n'
+        'error: could not compile sentinel_crate\nwarning: build failed',
+        '\x1b[1m\x1b[91merror[E0512]\x1b[0m\x1b[1m: cannot transmute between types of different sizes\x1b[0m\n'
+        '\x1b[1m\x1b[91merror\x1b[0m\x1b[1m: could not compile sentinel_crate\x1b[0m\n'
+        '\x1b[1m\x1b[33mwarning\x1b[0m\x1b[1m: build failed\x1b[0m',
+    ):
+        result, calls = scan(['--format=json', str(proj)], {
+            'SENTINEL_EXIT': '101', 'SENTINEL_DIAGNOSTICS': diagnostics,
+        })
+        assert result.returncode == 1, result.stdout + result.stderr
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise AssertionError(f'Rust compiler scan emitted invalid JSON: {exc}') from exc
+        assert payload['status'] == 'ok', payload
+        assert payload['failed_modules'] == [], payload
+        assert payload['totals']['critical'] >= 6, payload
+        assert payload['totals']['warning'] >= 3, payload
+        assert 'cargo clippy' in calls and 'cargo check' in calls and 'cargo test --no-run' in calls, calls
+        assert not any('could not run' in f.get('message', '') for f in payload['findings']), payload
+
+    # A real RCH failure summary may be followed by colored tracing frames.
+    # Preserve its useful cause without treating refused compilation as clean.
+    result, calls = scan(['--format=json', str(proj)], {
+        'SENTINEL_EXIT': '103',
+        'SENTINEL_DIAGNOSTICS':
+            '\x1b[31m[RCH] remote hz4 failed [RCH-E104] SSH command timed out (no local fallback)\x1b[0m\n'
+            '\x1b[2;3mat\x1b[0m rch/src/hook.rs:4623 \x1b[2;3mon\x1b[0m ThreadId(1)',
+    })
+    assert result.returncode == 2, result.stdout + result.stderr
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise AssertionError(f'RCH refusal scan emitted invalid JSON: {exc}') from exc
+    assert payload['status'] == 'partial', payload
+    failure = payload['failed_modules'][0]
+    assert failure['module_error'] == 'CARGO_UNAVAILABLE', failure
+    assert '[RCH-E104] SSH command timed out' in failure['message'], failure
+    assert 'hook.rs:4623' not in failure['message'] and '\x1b' not in failure['message'], failure
+    assert 'cargo clippy' in calls and 'cargo check' in calls and 'cargo test --no-run' in calls, calls
 
 
 def check_no_supported_languages(tmpdir: Path) -> None:
@@ -246,10 +299,8 @@ def check_detection_without_contract(tmpdir: Path) -> None:
     """An installed runner has no modules/contract.json and must still detect
     languages.
 
-    `modules/contract.json` carries the per-language extension lists, but it is
-    not a checksum-verified asset, so it is never downloaded or cached: only a
-    repo checkout has one next to the runner. The file listing used the
-    contract as its ONLY source of extensions, so with no contract nothing
+    `modules/contract.json` carries the per-language extension lists. The file
+    listing once used the contract as its ONLY source of extensions, so with no contract nothing
     matched any language, every per-language list came back empty, and
     detect_lang reads an empty list as "this language is absent". An installed
     ubs therefore answered `no-supported-languages` (exit 3) for every project
@@ -260,8 +311,10 @@ def check_detection_without_contract(tmpdir: Path) -> None:
 
     The installed layout is reproduced exactly: the runner sits in a directory
     with no `modules/` sibling, and its module directory holds every module and
-    helper but no contract.json. Symlinks keep it hermetic — no download, and
-    the content still matches the runner's checksum tables.
+    helper but no contract.json. Downloads now verify the contract, so an
+    empty local release tree exercises actual transport unavailability without
+    depending on a mutable remote branch. A fetched checksum mismatch must
+    still fail closed; it cannot stand in for a missing asset.
     """
     env = {"NO_COLOR": "1", "UBS_ENABLE_AUTO_UPDATE": "0", "UBS_NO_AUTO_UPDATE": "1"}
     root = tmpdir / "installed_layout"
@@ -269,13 +322,16 @@ def check_detection_without_contract(tmpdir: Path) -> None:
     mod_dir = root / "moddir"
     bin_dir.mkdir(parents=True)
     mod_dir.mkdir(parents=True)
+    unavailable = root / "unavailable-release"
+    unavailable.mkdir()
+    env["UBS_REPO_RAW_BASE"] = unavailable.as_uri()
 
     runner = bin_dir / "ubs"
     shutil.copy2(UBS_BIN, runner)
     runner.chmod(0o755)
     for entry in sorted((REPO_ROOT / "modules").iterdir()):
         if entry.name == "contract.json":
-            continue  # the whole point: an installed runner never has it
+            continue  # Exercise unavailable installed metadata.
         (mod_dir / entry.name).symlink_to(entry)
     assert not (mod_dir / "contract.json").exists(), "test setup leaked a contract"
 
@@ -307,6 +363,38 @@ def check_detection_without_contract(tmpdir: Path) -> None:
         f"expected python and rust scanners, got {languages}\n"
         f"stderr:\n{res.stderr}"
     )
+    assert res.returncode in (0, 1), res.stdout + res.stderr
+    assert payload["status"] == "ok" and payload["failed_modules"] == [], payload
+    assert payload["totals"]["files"] == 2, payload
+    assert "using built-in extension hints" in res.stderr, res.stderr
+
+    # The same real downloader must reject available but unauthenticated
+    # metadata, rather than silently taking the unavailable-asset fallback.
+    corrupt = unavailable / "main" / "modules" / "contract.json"
+    corrupt.parent.mkdir(parents=True)
+    corrupt.write_text("{}\n", encoding="utf-8")
+    rejected = subprocess.run(
+        [str(runner), str(target), f"--module-dir={mod_dir}", "--format=json"],
+        cwd=root, capture_output=True, text=True, env=merged, check=False, timeout=300,
+    )
+    assert rejected.returncode == 2, rejected.stdout + rejected.stderr
+    assert "contract.json failed verification" in rejected.stderr, rejected.stderr
+    assert "checksum mismatch" in rejected.stderr, rejected.stderr
+    assert "using built-in extension hints" not in rejected.stderr, rejected.stderr
+    assert not (mod_dir / "contract.json").exists(), "rejected asset was installed"
+
+    # Matching installed bytes restore the same complete two-language scan.
+    shutil.copy2(REPO_ROOT / "modules/contract.json", mod_dir / "contract.json")
+    restored = subprocess.run(
+        [str(runner), str(target), f"--module-dir={mod_dir}", "--format=json"],
+        cwd=root, capture_output=True, text=True, env=merged, check=False, timeout=300,
+    )
+    restored_doc = json.loads(restored.stdout)
+    assert restored.returncode in (0, 1), restored.stdout + restored.stderr
+    assert restored_doc["status"] == "ok" and restored_doc["failed_modules"] == [], restored_doc
+    assert restored_doc["totals"]["files"] == 2, restored_doc
+    assert {s["language"] for s in restored_doc["scanners"]} == {"python", "rust"}, restored_doc
+    assert "using built-in extension hints" not in restored.stderr, restored.stderr
 
 
 def check_version_identity(tmpdir: Path) -> None:
@@ -420,7 +508,10 @@ def check_staged_rsync_diagnostics(tmpdir: Path) -> None:
         assert result.returncode == 0, output
         assert "Failed to prepare shadow workspace" not in output, output
         assert "Scanning shadow workspace" in output, output
-        document = json.loads(result.stdout)
+        try:
+            document = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise AssertionError(f'Index scan emitted invalid JSON: {exc}\n{output}') from exc
         assert document["status"] == "ok", output
         assert document["totals"]["files"] == 1, output
 
@@ -754,7 +845,7 @@ def check_inline_suppression_alias_shell_guard(tmpdir: Path) -> None:
         # This makes a missing helper import or premature shell passthrough
         # fail the positive suppression controls rather than pass vacuously.
         result = subprocess.run(
-            ["bash", str(wrapper), str(REPO_ROOT / "modules"), str(source)],
+            ["bash", "--", str(wrapper), str(REPO_ROOT / "modules"), str(source)],
             input=module.stdout, cwd=root, env=env, capture_output=True, text=True,
             check=False, timeout=30,
         )

@@ -5,8 +5,8 @@ import json
 from pathlib import Path
 from typing import Callable, Sequence
 from ubs_core.external_tools import ast_rule_configs, scan_ast_config
+from ubs_core.suppression import SourceSuppressions
 
-MARKER = "ubs:ignore"
 _ASTGREP_BIN = "ast-grep"
 _BATCH = 400
 
@@ -18,23 +18,6 @@ def _map_severity(raw: str) -> str:
     if raw in ("info", "note", "hint"):
         return "info"
     return "warning"
-
-
-def _file_lines(path: Path, cache: dict[Path, list[str]]) -> list[str]:
-    if path not in cache:
-        try:
-            cache[path] = path.read_text(encoding="utf-8", errors="ignore").splitlines()
-        except OSError:
-            cache[path] = []
-    return cache[path]
-
-
-def _has_marker(path: Path, line_no: int, cache: dict[Path, list[str]]) -> bool:
-    lines = _file_lines(path, cache)
-    idx = line_no - 1
-    return (0 <= idx < len(lines) and MARKER in lines[idx]) or (
-        0 <= idx - 1 < len(lines) and MARKER in lines[idx - 1]
-    )
 
 
 def scan_config(
@@ -61,7 +44,7 @@ def scan_config(
     """
     counters = {"critical": 0, "warning": 0, "info": 0}
     path_list = [Path(p) for p in paths]
-    cache: dict[Path, list[str]] = {}
+    suppressions = SourceSuppressions("elixir")
     seen: set[tuple[str, str, int, int]] = set()
     for match in scan_ast_config(config, path_list, errors,
                                  ast_grep_bin=ast_grep_bin, batch_size=_BATCH):
@@ -79,7 +62,7 @@ def scan_config(
         category = rule_category.get(rule_id) if rule_category else None
         if skip and category is not None and category in skip:
             continue
-        if _has_marker(path, line_no, cache):
+        if suppressions.is_suppressed(path, line_no, rule_id):
             continue
         if match["severity"] == "off":
             continue

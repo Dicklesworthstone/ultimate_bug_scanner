@@ -55,6 +55,20 @@ CASES = (
     Case("direct_thread_join", "worker = Thread.new { work }\nworker.join", ()),
     Case("thread_value_observes_result", "worker = Thread.new { work }\nworker.value", ()),
     Case("unrelated_join_does_not_observe_anonymous_thread", "Thread.new { work }\nother.join", ((THREAD, 1),)),
+    # `::Thread` is the top-level core class; `Pool::Thread` is not.
+    Case("absolute_core_thread_leak", "::Thread.new { work }\nother.join", ((THREAD, 1),)),
+    Case("absolute_core_thread_join", "worker = ::Thread.new { work }\nworker.join", ()),
+    Case("namespaced_thread_lookalike_is_not_core", '''
+        module Pool
+          class Thread
+            def self.new
+              yield
+            end
+          end
+        end
+        Pool::Thread.new { work }
+        other.join
+    ''', ()),
     Case("uncalled_method_does_not_join_outer_thread", '''
         worker = Thread.new { work }
         def cleanup(worker)

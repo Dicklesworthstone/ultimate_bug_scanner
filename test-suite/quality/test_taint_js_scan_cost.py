@@ -579,6 +579,60 @@ class RuleStateTests(unittest.TestCase):
             self.assertEqual(list(taint_js.run(RunContext(lang="javascript", files=[paths[-1]]))), [])
 
 
+class ScalarHelperContextTests(unittest.TestCase):
+    def engine(self, root, source):
+        from ubs_core.js_modules import ModuleGraph
+        path = Path(root) / "handler.js"
+        path.write_text(source, encoding="utf-8")
+        graph = ModuleGraph([path])
+        return taint_js._Engine("", "", graph, next(iter(graph.components())))
+
+    def test_scalar_chain_keeps_all_sinks_with_bounded_work(self):
+        # A generic family of request handlers, with sixteen scalar calls
+        # inside an allocating helper. The previous dispatch spent 211,437
+        # units on 40 findings; scalar summaries need about 30,000. The bound
+        # measures actual charged work, not wall time or a changed engine cap.
+        source = "function keep(value) { return value; }\n"
+        source += "function build(value) { const spare={};\n"
+        source += "\n".join(f"const v{i}=keep({('value' if i == 0 else f'v{i-1}')});"
+                            for i in range(16))
+        source += "\nreturn v15; }\n"
+        source += "\n".join(
+            f"function handler{i}(req,res) {{ const local={{}}; res.send(build(req.query.value)); }}"
+            for i in range(40))
+        with tempfile.TemporaryDirectory(prefix="ubs-scalar-context-") as root:
+            engine = self.engine(root, source)
+            findings = list(engine.findings())
+        self.assertEqual(Counter(row[1] for row in findings), {"js.taint.xss": 40})
+        self.assertEqual(len({row[0] for row in findings}), 40)
+        self.assertLess(engine.work_limit - engine.budget.remaining, 100_000)
+
+    def test_scalar_capture_return_and_throw_preserve_tainted_and_clean_calls(self):
+        import itertools
+        families = (
+            ("function scalar(x) { return next(x); }", "function next(x) { return x; }",
+             "function make(x) { return {html:scalar(x)}; }"),
+            ("function scalar(x) { throw next(x); }", "function next(x) { return x; }",
+             "function make(x) { try { scalar(x); } catch (e) { return {html:e}; } }"),
+            ("function scalar(x) { return next(x); }", "function next(x) { return cap; }",
+             "function make(x) { cap=x; return {html:scalar(x)}; }"),
+            ("function scalar(x) { return x; }", "function next(x) { return scalar(x); }",
+             "function make(x) { return {html:next(x)}; }"),
+        )
+        with tempfile.TemporaryDirectory(prefix="ubs-scalar-order-") as root:
+            for family in families:
+                for order in itertools.permutations(family):
+                    for argument, expected in (("req.query.html", 1), ('"safe"', 0)):
+                        with self.subTest(order=order, argument=argument):
+                            source = 'let cap="safe";\n' + "\n".join(order)
+                            source += f"\nres.send(make({argument}).html);"
+                            engine = self.engine(root, source)
+                            self.assertTrue(engine.call_sinks)
+                            findings = list(engine.findings())
+                            self.assertEqual(Counter(row[1] for row in findings),
+                                             Counter({"js.taint.xss": expected}) if expected else Counter())
+
+
 class HeapExpansionCostTests(unittest.TestCase):
     """A small call graph must not expand an unchecked exponential heap."""
 
@@ -597,6 +651,46 @@ class HeapExpansionCostTests(unittest.TestCase):
             callee = 'leaf' if index == 0 else f'node{index - 1}'
             lines.append(f'function node{index}(x) {{ return {{left: {callee}(x), right: {callee}(x)}}; }}')
         return '\n'.join(lines)
+
+    def test_source_free_factory_component_does_not_expand_the_heap(self):
+        # Source-free is a proof over every selected module, not an assumption
+        # that test files, SQL adapters or constant-looking callees are safe.
+        with tempfile.TemporaryDirectory(prefix='source-free-factories-') as scratch:
+            root = Path(scratch)
+            library = root / 'library.js'
+            library.write_text(self.source(16) + '\nexport { node15 };\n')
+            caller = root / 'caller.js'
+            caller.write_text('import { node15 } from "./library";\n'
+                              'db.query(node15("constant"));\n')
+            for paths in ([caller, library], [library, caller]):
+                self.assertEqual(list(taint_js.scan_project_findings(paths)), [])
+
+    def test_source_free_proof_retains_every_source_form_and_imported_origin(self):
+        # These are actual source-to-sink flows, including sources reconstructed
+        # from destructured formal paths rather than a contiguous source token.
+        expressions = ('req.body.sql', 'request.query.sql', 'ctx.request.body.sql',
+                       'context.req.params.sql', 'params.id', 'context.params.id',
+                       'req.file', 'event.target.value', 'e.target.value',
+                       'location.search', 'window.location', 'document.cookie',
+                       'localStorage.getItem("q")', 'sessionStorage.getItem("q")',
+                       'new FormData(form)', 'new URLSearchParams(query)', 'params')
+        with tempfile.TemporaryDirectory(prefix='all-taint-origins-') as scratch:
+            root = Path(scratch)
+            provider, caller = root / 'provider.js', root / 'caller.js'
+            caller.write_text('import { read } from "./provider";\ndb.query(read());\n')
+            for expression in expressions:
+                provider.write_text(f'export function read() {{ return {expression}; }}\n')
+                for paths in ([provider, caller], [caller, provider]):
+                    with self.subTest(expression=expression, order=paths[0].name):
+                        found = list(taint_js.scan_project_findings(paths))
+                        self.assertEqual([(p.name, rule, line) for p, rule, line, _, _ in found],
+                                         [('caller.js', 'js.taint.sql', 2)])
+            for parameter in ('{ req: { query: { sql: value } } }',
+                              '{ context: { params: { id: value } } }'):
+                caller.write_text(f'export function handle({parameter}) {{ db.query(value); }}\n')
+                with self.subTest(parameter=parameter):
+                    found = list(taint_js.scan_file_findings(caller))
+                    self.assertEqual([(rule, line) for rule, line, _, _ in found], [('js.taint.sql', 1)])
 
     def test_exponential_factory_heap_is_explicitly_incomplete(self):
         artifacts = REPO_ROOT / 'test-suite/artifacts/js-heap-expansion'
@@ -771,6 +865,142 @@ class HeapExpansionCostTests(unittest.TestCase):
                          'real meta-runner integration requires ast-grep')
     def test_cli_budget_error_keeps_later_components_and_never_enters_cache(self):
         self._check_cli_budget_error(bad_first=True)
+
+
+class RecursiveInterpreterCostTests(unittest.TestCase):
+    """A recursive interpreter over shared closure state converges within the work limit.
+
+    Every log() object comes back named by a subset of the call sites it
+    passed, and the captured trace array collects them, so almost every
+    recursive run() call met a new input heap and the analysis stopped at the
+    work limit. A callee that calls itself now has one widened summary.
+    """
+
+    PROGRAM = """function simulate(prog, label) {
+  const st = { x: 0, dir: "N" };
+  const trace = [];
+  const log = (node, kind, extra) => trace.push(Object.assign({ node, kind, x: st.x, dir: st.dir }, extra));
+  function run(seq) {
+    for (const node of seq) {
+      if (node.c === "step") { st.x = st.x + 1; log(node, "step"); }
+      else if (node.c === "turn") { st.dir = st.dir === "N" ? "E" : "N"; log(node, "turn"); }
+      else if (node.c === "repeat") {
+        for (let r = 1; r <= node.n; r++) { log(node, "round", { r }); run(node.body); }
+      } else if (node.c === "if") { log(node, "test"); run(st.x > 2 ? node.then : node.else); }
+      else if (node.c === "while") {
+        for (;;) { const free = st.x < 9; log(node, "test", { free }); if (!free) break; run(node.body); }
+      }
+    }
+  }
+  log(prog, "start", { note: label });
+  run(prog);
+  return trace;
+}
+const trace = simulate(JSON.parse(req.query.prog), req.query.label);
+"""
+
+    def scan(self, sink):
+        with tempfile.TemporaryDirectory(prefix='ubs-interp-') as scratch:
+            path = Path(scratch) / 'interp.js'
+            path.write_text(self.PROGRAM + sink + '\n', encoding='utf-8')
+            return [(rule, line) for rule, line, _col, _trace in taint_js.scan_file_findings(path)]
+
+    def test_label_reaches_the_sink_through_the_trace(self):
+        self.assertEqual(self.scan('res.send(trace[0].note);'), [('js.taint.xss', 22)])
+
+    def test_constant_fields_of_the_trace_stay_clean(self):
+        self.assertEqual(self.scan('res.send(trace[0].kind);'), [])
+
+    def test_public_cli_completes_with_exact_xss_finding(self):
+        artifacts = REPO_ROOT / 'test-suite/artifacts/js-recursive-interpreter'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='cli-', dir=artifacts) as scratch:
+            root = Path(scratch)
+            source = root / 'interp.js'
+            source.write_text(self.PROGRAM + 'res.send(trace[0].note);\n', encoding='utf-8')
+            result = subprocess.run(
+                [str(REPO_ROOT / 'ubs'), str(source), '--ci', '--format=json', '--only=js'], cwd=root,
+                env={**os.environ, 'UBS_NO_AUTO_UPDATE': '1', 'UBS_NO_CACHE': '1'},
+                capture_output=True, text=True, timeout=30)
+            (artifacts / 'stdout.log').write_text(result.stdout)
+            (artifacts / 'stderr.log').write_text(result.stderr)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(report['status'], 'ok', report)
+            self.assertEqual([(item['rule_id'], item['line']) for item in report['findings']
+                              if item['rule_id'].startswith('javascript.taint.')],
+                             [('javascript.taint.xss', 22)], report)
+            self.assertEqual(report['totals']['critical'], 1, report)
+
+    def test_work_stays_within_the_existing_budget(self):
+        budgets = []
+        original = taint_js.Budget
+
+        def measure(limit):
+            budget = original(limit)
+            budgets.append(budget)
+            return budget
+
+        with patch.object(taint_js, 'Budget', side_effect=measure):
+            self.assertEqual(self.scan('res.send(trace[0].note);'), [('js.taint.xss', 22)])
+        self.assertTrue(budgets)
+        self.assertTrue(all(budget.remaining >= 0 for budget in budgets))
+
+
+class WidenedSummaryTests(unittest.TestCase):
+    def scan(self, source):
+        with tempfile.TemporaryDirectory(prefix='ubs-widened-') as scratch:
+            path = Path(scratch) / 'app.js'
+            path.write_text(source, encoding='utf-8')
+            return [(rule, line) for rule, line, _col, _trace in taint_js.scan_file_findings(path)]
+
+    def test_heap_only_change_reaches_a_recursive_summary(self):
+        # The third call differs from the first two only in box.html; `!=` on
+        # _State (dict.__ne__) would read the joined input as unchanged.
+        self.assertEqual(self.scan('function show(box, n) { if (n > 0) show(box, n - 1); res.send(box.html); }\n'
+                                   'const box = { html: "one" };\nshow(box, 2);\n'
+                                   'box.note = req.query.note;\nshow(box, 2);\n'
+                                   'box.html = req.query.html;\nshow(box, 2);\n'),
+                         [('js.taint.xss', 1)])
+
+    def test_outside_callers_of_a_recursive_function_stay_apart(self):
+        # Each entry into a recursion has its own widened summary and its own
+        # collapsed objects: a clean caller must not see a tainted caller's.
+        copy = 'function copy(o, d) { if (d > 0) return copy(o, d - 1); return { v: o.v }; }\n'
+        self.assertEqual(self.scan(copy + 'const a = copy({ v: req.query.x }, 2);\n'
+                                   'const b = copy({ v: "safe" }, 2);\nres.send(b.v);\n'), [])
+        self.assertEqual(self.scan(copy + 'const a = copy({ v: req.query.x }, 2);\n'
+                                   'const b = copy({ v: "safe" }, 2);\nres.send(a.v);\n'), [('js.taint.xss', 4)])
+        clone = ('function clone(o) {\n  if (Array.isArray(o)) return o.map(clone);\n'
+                 '  if (o && typeof o === "object") { const r = {}; for (const k of Object.keys(o)) r[k] = clone(o[k]); return r; }\n'
+                 '  return o;\n}\nconst a = clone({ html: req.query.html });\nconst b = clone({ html: "<b>ok</b>" });\n')
+        self.assertEqual(self.scan(clone + 'res.send(b.html);\n'), [])
+        self.assertEqual(self.scan(clone + 'res.send(a.html);\n'), [('js.taint.xss', 8)])
+
+    def test_a_tainted_first_entry_survives_a_clean_second_one(self):
+        # The joined input of a recursion holds the callee's own allocations;
+        # they are not the caller's borrowed objects on the way back.
+        flatten = ('function flatten(node, out) {\n  out.push({ name: node.name });\n'
+                   '  for (const child of node.children || []) flatten(child, out);\n  return out;\n}\n'
+                   'const unsafe = flatten({ name: req.query.name, children: [] }, []);\n'
+                   'const safe = flatten({ name: "root", children: [] }, []);\n')
+        self.assertEqual(self.scan(flatten + 'res.send(unsafe[0].name);\n'), [('js.taint.xss', 8)])
+        self.assertEqual(self.scan(flatten + 'res.send(safe[0].name);\n'), [])
+
+    def test_a_helper_called_inside_a_recursion_keeps_its_outside_callers_apart(self):
+        self.assertEqual(self.scan('function mk(o) { return { v: o.v }; }\n'
+                                   'function walk(n) { if (n && n.next) walk(n.next); return mk(n); }\n'
+                                   'walk({ v: "x", next: null });\nconst a = mk({ v: req.query.x });\n'
+                                   'const b = mk({ v: "safe" });\nres.send(b.v);\n'), [])
+
+    def test_callers_of_a_shared_inner_site_stay_apart_without_recursion(self):
+        self.assertEqual(self.scan('function mk(o) { return { v: o.v }; }\n'
+                                   'function wrap(o) { return mk(o); }\n'
+                                   'const a = wrap({ v: req.query.x });\n'
+                                   'const b = wrap({ v: "safe" });\nres.send(b.v);\n'), [])
+        self.assertEqual(self.scan('function mk(v) { return { v }; }\nconst out = [];\n'
+                                   'function add(o) { out.push(mk(o.v)); }\n'
+                                   'add({ v: "safe" });\nadd({ v: req.query.x });\nres.send(out[0].v);\n'), [])
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "GNU time reports peak RSS in KiB")

@@ -10,7 +10,7 @@ validator (url_has_allowed_host_and_scheme, is_safe_url, url_for, reverse,
 .netloc/.scheme, ...) clears the taint; a redirect argument or the preceding
 10 lines mentioning a validator suppresses the hit.
 
-Same-file and previous-line ``ubs:ignore`` markers suppress a hit.
+Comment directives use shared statement ownership and rule scopes.
 """
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 from ubs_core.io import python_source_segment
+from ubs_core.suppression import SourceSuppressions
 
 RULE_ID = "py.security.open-redirect"
 CATEGORY = 7
@@ -70,20 +71,12 @@ def _source_line(lines, line_no):
     return ''
 
 
-def _has_ignore(lines, line_no):
-    idx = line_no - 1
-    return (
-        0 <= idx < len(lines) and 'ubs:ignore' in lines[idx]
-    ) or (
-        0 <= idx - 1 < len(lines) and 'ubs:ignore' in lines[idx - 1]
-    )
-
-
 class _RedirectAnalyzer(ast.NodeVisitor):
-    def __init__(self, path, text, lines):
+    def __init__(self, path, text, lines, suppressions):
         self.path = path
         self.text = text
         self.lines = lines
+        self.suppressions = suppressions
         self.tainted = {}
         self.issues = []
 
@@ -162,7 +155,7 @@ class _RedirectAnalyzer(ast.NodeVisitor):
         short_name = name.rsplit('.', 1)[-1]
         if name in REDIRECT_SINKS or short_name in REDIRECT_SINKS:
             arg = self.redirect_argument(node)
-            if arg is not None and not _has_ignore(self.lines, node.lineno):
+            if arg is not None and not self.suppressions.is_suppressed(node.lineno, RULE_ID):
                 direct = self.is_request_source(arg)
                 refs = self.tainted_names_in(arg)
                 if (direct or refs) and not self.has_safe_expression(arg) and not self.safe_validation_context(refs, node.lineno):
@@ -171,6 +164,7 @@ class _RedirectAnalyzer(ast.NodeVisitor):
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
+    suppressions = SourceSuppressions('python')
     for path in files:
         if path.suffix.lower() not in {'.py', '.pyi'}:
             continue
@@ -180,7 +174,7 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
         except Exception:
             continue
         lines = text.splitlines()
-        analyzer = _RedirectAnalyzer(path, text, lines)
+        analyzer = _RedirectAnalyzer(path, text, lines, suppressions.index(path, text))
         analyzer.visit(tree)
         for _, line_no, code in analyzer.issues:
             yield path, line_no, 1, code.strip()[:240]

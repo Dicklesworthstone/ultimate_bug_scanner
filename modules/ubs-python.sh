@@ -18,7 +18,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="0636a77f4a482d4da306761f42ca20af5ca4d464d1e3cb0c86603a90e9c0057a"
+UBS_LIB_CHECKSUM="6b63a024bacfb102432db7fb95cd3742e5c9cc84880cdbf1c72418741e7422ca"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -773,7 +773,11 @@ PYUVSTATUS
 
   if [[ "$FORMAT" == "sarif" ]]; then
     if [[ -n "$v2_json_out" && -f "$v2_json_out" ]]; then
-      PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core findings-sarif --combined "$v2_json_out" 2>/dev/null || true
+      PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core findings-sarif \
+        --combined "$v2_json_out" --findings "$sink" || exit_code=2
+    else
+      echo "ERROR: cannot read the scan summary for SARIF; delivery is incomplete" >&2
+      exit_code=2
     fi
   fi
 

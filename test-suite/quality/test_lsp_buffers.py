@@ -222,10 +222,21 @@ class BufferScanTests(BufferFixture, unittest.TestCase):
         self.assertEqual(self.source.read_text(), 'clean\n')
 
     def test_invalid_report_fails_and_private_tree_is_cleaned(self):
-        self.scanner.write_text(SCANNER.replace("'status': 'ok'", "'status': 'partial'"))
+        self.scanner.write_text(SCANNER.replace("'status': 'ok'", "'status': 'invalid'"))
         self.open('BUG')
         self.drain()
         self.assertEqual(self.diagnostics()[-1]['diagnostics'][0]['code'], 'ubs.unverified')
+        self.assertFalse(Path(self.calls()[0]['cwd']).exists())
+
+    def test_partial_report_keeps_findings_and_private_tree_is_cleaned(self):
+        self.scanner.write_text(SCANNER.replace("'status': 'ok'", "'status': 'partial'"))
+        self.open('BUG')
+        self.drain()
+        diagnostics = self.diagnostics()[-1]['diagnostics']
+        self.assertEqual([item['code'] for item in diagnostics], ['ubs.incomplete-analysis', 'test.bug'])
+        self.assertEqual(diagnostics[1]['severity'], 1)
+        self.assertTrue(all(item['data']['ubsAnalysisStatus'] == 'partial' for item in diagnostics))
+        self.assertTrue(all(item['data']['ubsSourceMode'] == 'buffer' for item in diagnostics))
         self.assertFalse(Path(self.calls()[0]['cwd']).exists())
 
     def test_original_uri_and_full_utf16_line_survive_snapshot_routing(self):

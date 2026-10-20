@@ -3,8 +3,10 @@ one shard, sizes differ by at most one, and the split is stable across runs."""
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -14,8 +16,62 @@ import run_manifest  # noqa: E402
 
 
 class ShardTests(unittest.TestCase):
+    def test_symbolic_exit_requires_both_process_status_and_counts(self) -> None:
+        """A clean-looking partial run or an unsafe exit-0 must stay red."""
+        for expected, actual, critical, accepted in (
+            ("zero", 0, 0, True), ("zero", 2, 0, False),
+            ("zero", 0, 1, False), ("nonzero", 1, 1, True),
+            ("nonzero", 0, 1, False), ("nonzero", 1, 0, False),
+        ):
+            with self.subTest(expected=expected, actual=actual, critical=critical):
+                summary = {"totals": {"files": 1, "critical": critical, "warning": 0, "info": 0}}
+                errors = run_manifest.check_expectations(
+                    {"exit_code": expected}, actual, summary, "", "", False,
+                )
+                self.assertEqual(not errors, accepted, errors)
+
+    def test_native_cases_preserve_caller_remote_admission(self) -> None:
+        """Receiver control: manifest defaults must not force Cargo local.
+
+        This executes the real runner with a fixture receiver, not a compiler.
+        Actual native RCH compilation is qualified separately.
+        """
+        artifact_root = TEST_ROOT / "artifacts"
+        artifact_root.mkdir(exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix="manifest-remote-policy-", dir=artifact_root))
+        receiver = scratch / "receiver"
+        receiver.write_text(
+            f"#!{sys.executable}\n"
+            "import json, os, sys\n"
+            "required = os.environ.get('RCH_REQUIRE_REMOTE') == '1'\n"
+            "bypassed = os.environ.get('RCH_CARGO_WRAPPER_BYPASS') == '1'\n"
+            "message = 'caller-remote-policy-preserved' if required and not bypassed else 'caller-remote-policy-overridden'\n"
+            "print(json.dumps({'status': 'ok', 'message': message, 'totals': {'files': 1, 'critical': 0, 'warning': 0, 'info': 0}}))\n"
+            "sys.exit(0 if required and not bypassed else 73)\n"
+        )
+        receiver.chmod(0o700)
+        canonical = run_manifest.load_manifest(TEST_ROOT / "manifest.json")
+        defaults = dict(canonical["defaults"])
+        defaults["ubs_bin"] = str(receiver)
+        defaults["artifacts_dir"] = str(scratch / "reports")
+        manifest = scratch / "manifest.json"
+        manifest.write_text(json.dumps({"defaults": defaults, "cases": [{
+            "id": "remote-policy", "path": str(scratch), "language": "rust",
+            "description": "Native receiver preserves caller-required remote admission.",
+            "expect": {"exit_code": "zero", "require_substrings": ["caller-remote-policy-preserved"]},
+        }]}))
+        env = dict(os.environ)
+        env["RCH_REQUIRE_REMOTE"] = "1"
+        env.pop("RCH_CARGO_WRAPPER_BYPASS", None)
+        proc = subprocess.run(
+            [sys.executable, str(TEST_ROOT / "run_manifest.py"), "--manifest", str(manifest)],
+            capture_output=True, text=True, cwd=scratch, env=env, timeout=60,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("Completed 1 case(s) with 0 failure(s) and 0 skipped", proc.stdout)
+
     def test_partition_is_disjoint_complete_and_balanced(self) -> None:
-        manifest = json.loads((TEST_ROOT / "manifest.json").read_text())
+        manifest = run_manifest.load_manifest(TEST_ROOT / "manifest.json")
         ids = [c["id"] for c in manifest["cases"] if c.get("enabled", True)]
         total = 4
         shards = [run_manifest.shard_case_ids(ids, i, total) for i in range(1, total + 1)]

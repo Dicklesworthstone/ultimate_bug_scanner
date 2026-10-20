@@ -17,11 +17,9 @@ example_|sample_|dummy_ prefix), or against env-default fallbacks
 mustGetenvDefault with a risky literal, and os.Getenv("SECRET") paired
 with cmp.Or/Coalesce/Default and a risky fallback).
 
-Suppression is two-layered (both ported verbatim): a line is skipped
-when its own line or the previous line carries ``ubs:ignore``, and a
-candidate is dropped when the assembled multi-line statement contains
-``ubs:ignore`` (covers markers riding the opening line of a multi-line
-statement). A final pass dedupes per (file, line).
+Shared lexical statement ownership and exact rule scopes suppress annotated
+findings without treating quoted marker text as a directive. A final pass
+dedupes per (file, line).
 
 Legacy: ``print_finding critical $N "Possible hardcoded secrets" "Use
 secret managers or required environment variables; do not keep literal
@@ -35,7 +33,7 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
-MARKER = "ubs:ignore"
+from ubs_core.suppression import SourceSuppressions
 
 RULE_ID = "go.security.hardcoded-secrets"
 CATEGORY = 9
@@ -138,10 +136,6 @@ def _source_line(lines, line_no):
     return ''
 
 
-def _has_ignore(lines, idx):
-    return MARKER in lines[idx] or (idx > 0 and MARKER in lines[idx - 1])
-
-
 def _normalize_name(name: str) -> str:
     text = str(name or '').strip().strip('"`')
     text = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', text)
@@ -215,30 +209,34 @@ def _env_default_literal(statement: str) -> bool:
     return bool(('cmp.Or' in statement or 'Coalesce' in statement or 'Default' in statement) and _first_risky_literal(suffix))
 
 
-def _analyze(path: Path, issues: list) -> None:
+def _analyze(path: Path, issues: list, suppressions) -> None:
     try:
-        lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
+        text = path.read_text(encoding='utf-8', errors='ignore')
     except OSError:
         return
+    lines = text.splitlines()
+    suppression = suppressions.index(path, text)
     for idx, line in enumerate(lines):
         stripped = _strip_comments(line).strip()
-        if not stripped or _has_ignore(lines, idx):
+        if not stripped:
             continue
         if not (_is_sensitive_name(stripped) or OS_GETENV_RE.search(stripped)):
             continue
         statement = _statement_from(lines, idx)
-        if not statement or MARKER in statement:
+        if not statement:
             continue
-        if _assignment_literal(statement) or _env_default_literal(statement):
+        if ((_assignment_literal(statement) or _env_default_literal(statement))
+                and not suppression.is_suppressed(idx + 1, RULE_ID)):
             issues.append((path, idx + 1, 1, _source_line(lines, idx + 1)))
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
+    suppressions = SourceSuppressions("golang")
     issues: list[tuple[Path, int, int, str]] = []
     for path in files:
         if path.suffix != ".go":
             continue
-        _analyze(path, issues)
+        _analyze(path, issues, suppressions)
     deduped: list[tuple[Path, int, int, str]] = []
     seen = set()
     for item in issues:

@@ -515,6 +515,38 @@ for _case in CASES:
 @unittest.skipUnless(os.environ.get('UBS_SCOPED_REQUEST_E2E') == '1',
                      'set UBS_SCOPED_REQUEST_E2E=1 for actual CLI scans')
 class ScopedRequestPublicTests(LoggedCase):
+    def test_native_request_and_exit_recovery_through_json_and_sarif(self):
+        cases = (
+            Case('swift', 'path', 'vision_native_request', '''
+                #if canImport(Vision)
+                import Vision
+                func extract() {
+                    let request = VNGenerateImageFeaturePrintRequest()
+                    let work = { consume(request) }
+                    _ = Data(contentsOf: bundledURL)
+                }
+                #endif
+            ''', ()),
+            Case('swift', 'redirect', 'vision_real_web_request', '''
+                import Vision
+                func handle(req: Request) {
+                    _ = req.redirect(to: req.query["next"])
+                }
+            ''', (3,)),
+            Case('swift', 'redirect', 'process_exit_guard', f'''
+                func handle(req: Request) {{
+                    let target = req.query["next"]
+                    guard {SWIFT_LOCAL} else {{ exit(1) }}
+                    _ = req.redirect(to: target)
+                }}
+            ''', ()),
+        )
+        for case in cases:
+            for fmt in ('json', 'sarif'):
+                with self.subTest(case=case.name, format=fmt):
+                    result, payload, target = self.scan(case, fmt, ('--no-cache',))
+                    self.assert_result(case, fmt, result, payload, target)
+
     def scan(self, case, fmt, extra=(), attempt='scan'):
         directory, target = self.source_file(case)
         evidence = directory / (fmt + '-' + attempt)
@@ -655,6 +687,109 @@ class SwiftLifecycleBindings(LoggedCase):
     @staticmethod
     def cases():
         cases = (
+            ('selector_observer_with_unrelated_catch', '''
+                import Foundation
+                final class Listener: NSObject {
+                  override init() {
+                    super.init()
+                    NotificationCenter.default.addObserver(self, selector: #selector(refresh), name: nil, object: nil)
+                  }
+                  deinit { NotificationCenter.default.removeObserver(self) }
+                  @objc func refresh() {}
+                  func loadBalance() async {
+                    do { try await fetchBalance() } catch { refresh() }
+                  }
+                  func fetchBalance() async throws {}
+                }
+            '''),
+            ('catch_cleans_exception_but_not_success', '''
+                func start() {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                  do { try work() } catch { timer.invalidate() }
+                }
+            '''),
+            ('success_and_catch_both_clean', '''
+                func start() {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                  do { try work(); timer.invalidate() }
+                  catch { timer.invalidate() }
+                }
+            '''),
+            ('catch_cannot_clean_success_return', '''
+                func start() {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                  do { try work(); return } catch { timer.invalidate() }
+                }
+            '''),
+            ('do_defer_runs_before_catch', '''
+                func start() {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                  do { defer { timer.invalidate() }; try work() } catch { recover() }
+                }
+            '''),
+            ('outer_defer_covers_catch_rethrow', '''
+                func start() {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                  defer { timer.invalidate() }
+                  do { try work() } catch { throw error }
+                }
+            '''),
+            ('filtered_catch_keeps_unmatched_throw', '''
+                func start() {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                  do { try work(); timer.invalidate() }
+                  catch let error where shouldHandle(error) { timer.invalidate() }
+                }
+            '''),
+            ('typed_catch_then_fallback_cleans', '''
+                func start() {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                  do { try work(); timer.invalidate() }
+                  catch is NetworkError { timer.invalidate() }
+                  catch { timer.invalidate() }
+                }
+            '''),
+            ('catch_binding_shadows_outer_resource', '''
+                func start() {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                  do { try work(); timer.invalidate() } catch let timer { timer.invalidate() }
+                }
+            '''),
+            ('implicit_error_shadows_outer_resource', '''
+                func start() {
+                  let error = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                  do { try work(); error.invalidate() } catch { error.invalidate() }
+                }
+            '''),
+            ('catch_throw_reaches_outer_handler', '''
+                func start() {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                  do {
+                    do { try work(); timer.invalidate() } catch { throw error }
+                  } catch { timer.invalidate() }
+                }
+            '''),
+            ('catch_throw_does_not_reenter_sibling_handler', '''
+                func start() {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                  do { try work(); timer.invalidate() }
+                  catch is NetworkError { throw error }
+                  catch { timer.invalidate() }
+                }
+            '''),
+            ('throwing_condition_reaches_catch', '''
+                func start() {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                  do { if try check() { timer.invalidate() } else { timer.invalidate() } }
+                  catch { recover() }
+                }
+            '''),
+            ('optional_try_does_not_enter_catch', '''
+                func start() {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                  do { try? work(); timer.invalidate() } catch { recover() }
+                }
+            '''),
             ('direct_timer_control', '''
                 import Foundation
                 func start() {
@@ -1112,6 +1247,36 @@ class SwiftLifecycleBindings(LoggedCase):
     @staticmethod
     def incomplete_cases():
         return {
+            'resource_acquired_inside_catch_scope': '''
+                import Foundation
+                func start() {
+                    do {
+                        let timer: Timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                    } catch { }
+                }
+            ''',
+            'resource_acquired_inside_catch_arm': '''
+                import Foundation
+                func start() {
+                    do { try work() } catch {
+                        let timer: Timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                    }
+                }
+            ''',
+            'selected_resource_crosses_catch_scope': '''
+                import Foundation
+                func start() {
+                    let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                    do { try work(); timer.invalidate() } catch { }
+                }
+            ''',
+            'malformed_catch_scope': '''
+                import Foundation
+                func start() {
+                    NotificationCenter.default.addObserver(self, selector: #selector(refresh), name: nil, object: nil)
+                    do { try work() } catch
+                }
+            ''',
             'selected_callback_execution': '''
                 import Foundation
                 func start() {
@@ -1205,7 +1370,10 @@ class SwiftLifecycleBindings(LoggedCase):
                     }, indent=2), encoding='utf-8')
                     context = (command, result.returncode, result.stdout, result.stderr)
                     self.assertEqual(result.returncode, 2, context)
-                    payload = json.loads(result.stdout)
+                    try:
+                        payload = json.loads(result.stdout)
+                    except json.JSONDecodeError as exc:
+                        self.fail(f'Invalid public report JSON: {exc}; {context!r}')
                     if fmt == 'json':
                         self.assertEqual(payload['status'], 'partial', context)
                         self.assertEqual(payload['module_error'], 'ANALYZER_ERROR', context)
@@ -1248,7 +1416,10 @@ class SwiftLifecycleBindings(LoggedCase):
                     }, indent=2), encoding='utf-8')
                     context = (command, result.returncode, result.stdout, result.stderr)
                     self.assertEqual(result.returncode, int(bool(public_expected)), context)
-                    payload = json.loads(result.stdout)
+                    try:
+                        payload = json.loads(result.stdout)
+                    except json.JSONDecodeError as exc:
+                        self.fail(f'Invalid public report JSON: {exc}; {context!r}')
                     if fmt == 'json':
                         self.assertEqual(payload['status'], 'ok', context)
                         self.assertEqual(payload['critical'], 0, context)

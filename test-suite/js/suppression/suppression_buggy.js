@@ -16,7 +16,7 @@
 // critical finding for the heuristic pass and for ast-grep rule js.eval-call.
 // ---------------------------------------------------------------------------
 function runUserCode(userCode) {
-  eval(userCode); // ubs:ignore[js.eval-call] -- trailing marker arrangement
+  eval(userCode); // ubs:ignore[js.eval-call,js.security.eval] -- names both AST and pattern rules
 }
 
 // ---------------------------------------------------------------------------

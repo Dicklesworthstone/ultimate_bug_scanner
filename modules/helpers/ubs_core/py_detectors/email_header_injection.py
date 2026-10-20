@@ -11,14 +11,16 @@ input()/sys.stdin, or indexes sys.argv/os.environ, unless it passes through a
 SAFE_EMAIL_FUNCS sanitizer or a `.format()` over safe parts. Function scopes
 reset the taint/safe tracking, exactly like the legacy analyzer.
 
-Same-file and previous-line `ubs:ignore` markers suppress a hit; hits dedupe
-per line within a file (legacy `seen_lines`).
+Comment directives use shared statement ownership and rule scopes; hits
+dedupe per line within a file (legacy `seen_lines`).
 """
 from __future__ import annotations
 
 import ast
 from pathlib import Path
 from typing import Iterable, Sequence
+
+from ubs_core.suppression import SourceSuppressions
 
 RULE_ID = "py.security.email-header-injection"
 CATEGORY = 7
@@ -79,15 +81,6 @@ def _source_line(lines, line_no):
     return ''
 
 
-def _has_ignore(lines, line_no):
-    idx = line_no - 1
-    return (
-        0 <= idx < len(lines) and 'ubs:ignore' in lines[idx]
-    ) or (
-        0 <= idx - 1 < len(lines) and 'ubs:ignore' in lines[idx - 1]
-    )
-
-
 def _target_names(target):
     if isinstance(target, ast.Name):
         return [target.id]
@@ -137,15 +130,16 @@ def _dict_values(node):
 
 
 class _EmailHeaderInjectionAnalyzer(ast.NodeVisitor):
-    def __init__(self, lines):
+    def __init__(self, lines, suppressions):
         self.lines = lines
+        self.suppressions = suppressions
         self.tainted_values = set()
         self.safe_values = set()
         self.issue_lines = []
         self.seen_lines = set()
 
     def remember_issue(self, line_no):
-        if _has_ignore(self.lines, line_no) or line_no in self.seen_lines:
+        if self.suppressions.is_suppressed(line_no, RULE_ID) or line_no in self.seen_lines:
             return
         self.seen_lines.add(line_no)
         self.issue_lines.append(line_no)
@@ -307,6 +301,7 @@ class _EmailHeaderInjectionAnalyzer(ast.NodeVisitor):
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
+    suppressions = SourceSuppressions('python')
     for path in files:
         if path.suffix.lower() not in {'.py', '.pyi'}:
             continue
@@ -316,7 +311,7 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
         except Exception:
             continue
         lines = text.splitlines()
-        analyzer = _EmailHeaderInjectionAnalyzer(lines)
+        analyzer = _EmailHeaderInjectionAnalyzer(lines, suppressions.index(path, text))
         analyzer.visit(tree)
         for line_no in analyzer.issue_lines:
             yield path, line_no, 1, _source_line(lines, line_no)[:240]

@@ -429,10 +429,14 @@ sys.exit(0 if expected == actual and args[args.index('-P')+1] == 'fixture-key' e
 [[ "$PWD" == "$EXPECTED_CWD" ]] || exit 97
 exit 37
 ''')
-        self.env['EXPECTED_CWD'] = str(self.work)
+        self.env['EXPECTED_CWD'] = str(self.work.resolve())
         self.seal()
         output = self.work / 'installer.tar.gz'
         self.export(output)
+        self.env['EXPECTED_CWD'] = str(self.origin.resolve())
+        self.import_archive(output, expected=97, verify_only=False,
+                            extra=('--', '--label', 'space ; $literal'))
+        self.env['EXPECTED_CWD'] = str(self.work.resolve())
         self.import_archive(output, expected=37, verify_only=False,
                             extra=('--', '--label', 'space ; $literal'))
 

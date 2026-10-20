@@ -13,12 +13,12 @@ Output contract mirrors js_scan/py_scan: NDJSON findings sink, legacy text
 renderer, fd-3/`--json-out` summary object with module-level findings[].
 Contract-v2 orchestrator for modules/ubs-golang.sh (beads 0xjg.6 and 0xjg.18).
 
-Parity notes:
+Analysis notes:
 - Grep-pipeline counts are DISTINCT MATCHING LINES across the file list with
-  `ubs:ignore` lines dropped (legacy count_lines, ubs-golang.sh 365).
-- ast-grep records carry NO marker filtering and text severities come from
-  the per-callsite consumption table — the legacy ast_count walk had no
-  marker awareness and every print_finding hardcoded its severity.
+  shared statement ownership and exact rule scopes applied before thresholds.
+- ast-grep records and tallies use their exact public rule. Raw matches remain
+  available to computed checks with distinct IDs; cache and output boundaries
+  recheck source policy before emitting or counting findings.
 - go.tls-insecure-skip / go.exec-sh-c / go.time-after-in-loop /
   go.http-response-body-not-closed / go.sql.rows-not-closed keep their legacy
   "AST count, else regex fallback" semantics in computed_checks(); the
@@ -40,8 +40,7 @@ from typing import Any, Iterable, Sequence
 
 from ubs_core.registry import RunContext
 from ubs_core.io import read_ndjson
-
-MARKER = "ubs:ignore"
+from ubs_core.suppression import SourceSuppressions, build_index, may_have_markers
 
 _CATEGORY_SLUGS = {
     1: "concurrency", 2: "channels", 3: "context", 4: "http",
@@ -98,13 +97,8 @@ _RULE_CATEGORY = (
     ("go.ctcompare.", 9),
 )
 
-# Legacy index_project inventory (ubs-golang.sh 2829-2874).
+# Inventory records consume the selected source/manifest file list.
 _INVENTORY_NAMES = ("go.mod", "go.sum", "go.work", "go.work.sum")
-_INVENTORY_EXCLUDES = {
-    ".git", ".svn", ".hg", "vendor", "third_party", "Godeps", "node_modules",
-    ".cache", "build", "dist", "out", "tmp", ".idea", ".vscode", ".vs",
-    "go.work.d",
-}
 
 _GO_DIRECTIVE_RE = re.compile(r"^[ \t]*go[ \t]+([0-9]+\.[0-9]+)", re.MULTILINE)
 
@@ -120,8 +114,8 @@ class Pattern:
     thresholds is a descending list of (min_count_exclusive, severity); the
     first entry whose count > min_count wins. exclude_regex drops matching
     lines (legacy `grep -v` post-filters); require_regex keeps only matching
-    lines (legacy `grep -E` post-filters); marker lines are always dropped
-    (legacy count_lines).
+    lines (legacy `grep -E` post-filters). Comment ownership uses the exact
+    public rule before threshold selection.
     """
 
     category: int
@@ -136,6 +130,7 @@ class Pattern:
 
 def iter_matches(pattern: Pattern, text: str) -> Iterable[tuple[int, str]]:
     """Yield (line_number, line_text) for matches, skipping filtered lines."""
+    suppression = build_index(text, lang="golang") if may_have_markers(text) else None
     for match in pattern.regex.finditer(text):
         line_no = text.count("\n", 0, match.start()) + 1
         line_start = text.rfind("\n", 0, match.start()) + 1
@@ -143,8 +138,8 @@ def iter_matches(pattern: Pattern, text: str) -> Iterable[tuple[int, str]]:
         if line_end == -1:
             line_end = len(text)
         line_text = text[line_start:line_end]
-        if MARKER in line_text:
-            continue  # legacy count_lines drops marker lines from counts
+        if suppression is not None and suppression.is_suppressed(line_no, pattern.rule_id):
+            continue
         if pattern.exclude_regex is not None and pattern.exclude_regex.search(line_text):
             continue
         if pattern.require_regex is not None and not pattern.require_regex.search(line_text):
@@ -362,14 +357,15 @@ def _iter_file_lines(files: Sequence[Path], go_only: bool = True):
         yield path, lines
 
 
-def _match_lines(files: Sequence[Path], regex: re.Pattern[str], go_only: bool = True,
-                 drop_markers: bool = True) -> list[tuple[Path, int, str]]:
+def _match_lines(files: Sequence[Path], regex: re.Pattern[str], *, rule: str,
+                 suppressions: SourceSuppressions) -> list[tuple[Path, int, str]]:
     """Distinct matching lines across the file list (legacy grep_count_scoped)."""
     hits: list[tuple[Path, int, str]] = []
     seen: set[tuple[str, int]] = set()
-    for path, lines in _iter_file_lines(files, go_only=go_only):
+    for path, lines in _iter_file_lines(files):
+        index = suppressions.index(path, "\n".join(lines))
         for idx, line in enumerate(lines, 1):
-            if drop_markers and MARKER in line:
+            if index.is_suppressed(idx, rule):
                 continue
             if regex.search(line):
                 key = (str(path), idx)
@@ -380,9 +376,9 @@ def _match_lines(files: Sequence[Path], regex: re.Pattern[str], go_only: bool = 
     return hits
 
 
-def _count(files: Sequence[Path], regex: re.Pattern[str], go_only: bool = True,
-           drop_markers: bool = True) -> int:
-    return len(_match_lines(files, regex, go_only=go_only, drop_markers=drop_markers))
+def _count(files: Sequence[Path], regex: re.Pattern[str], *, rule: str,
+           suppressions: SourceSuppressions) -> int:
+    return len(_match_lines(files, regex, rule=rule, suppressions=suppressions))
 
 
 def _rec(rule_id: str, category: int, severity: str, path, line_no: int,
@@ -408,37 +404,39 @@ def _ratio_records(rule_id: str, category: int, severity: str, title: str,
     ]
 
 
-def _wg_balance(files: Sequence[Path]) -> list[dict]:
+def _wg_balance(files: Sequence[Path], suppressions: SourceSuppressions) -> list[dict]:
     # ubs-golang.sh 4969-4976
     add_re = re.compile(r"(wg|WaitGroup|waitGroup|waitgroup|group)\.Add\(")
     done_re = re.compile(r"(wg|WaitGroup|waitGroup|waitgroup|group)\.Done\(")
-    add = _count(files, add_re)
-    done = _count(files, done_re)
+    rule = "go.concurrency.waitgroup-imbalance"
+    add = _count(files, add_re, rule=rule, suppressions=suppressions)
+    done = _count(files, done_re, rule=rule, suppressions=suppressions)
     if add > done + 1:
         return _ratio_records(
             "go.concurrency.waitgroup-imbalance", 1, "warning",
             "WaitGroup Add exceeds Done (heuristic)",
-            _match_lines(files, add_re), add - done,
+            _match_lines(files, add_re, rule=rule, suppressions=suppressions), add - done,
         )
     return []
 
 
-def _mutex_pair(files: Sequence[Path]) -> list[dict]:
+def _mutex_pair(files: Sequence[Path], suppressions: SourceSuppressions) -> list[dict]:
     # ubs-golang.sh 4980-4989
     lock_re = re.compile(r"\.Lock\(")
     defer_unlock_re = re.compile(r"defer[ \t]+.*\.Unlock\(")
-    locks = _count(files, lock_re)
-    defer_unlock = _count(files, defer_unlock_re)
+    rule = "go.concurrency.mutex-manual-lock"
+    locks = _count(files, lock_re, rule=rule, suppressions=suppressions)
+    defer_unlock = _count(files, defer_unlock_re, rule=rule, suppressions=suppressions)
     if locks > 0 and defer_unlock * 2 < locks:
         return _ratio_records(
             "go.concurrency.mutex-manual-lock", 1, "warning",
             "Manual Lock without matching defer Unlock (heuristic)",
-            _match_lines(files, lock_re), locks,
+            _match_lines(files, lock_re, rule=rule, suppressions=suppressions), locks,
         )
     return []
 
 
-def _time_after(files: Sequence[Path], ast_matches: dict) -> list[dict]:
+def _time_after(files: Sequence[Path], ast_matches: dict, suppressions: SourceSuppressions) -> list[dict]:
     # ubs-golang.sh 5014-5027: AST count first, regex window fallback.
     title = "time.After allocations in loops - prefer reusable timer"
     hits = ast_matches.get("go.time-after-in-loop") or []
@@ -452,12 +450,13 @@ def _time_after(files: Sequence[Path], ast_matches: dict) -> list[dict]:
     after_re = re.compile(r"time\.After\(")
     records: list[dict] = []
     for path, lines in _iter_file_lines(files):
+        index = suppressions.index(path, "\n".join(lines))
         for idx, line in enumerate(lines):
-            if MARKER in line or not for_re.search(line):
+            if not for_re.search(line):
                 continue
             for probe in range(idx + 1, min(len(lines), idx + 9)):
                 probe_line = lines[probe]
-                if MARKER in probe_line:
+                if index.is_suppressed(probe + 1, "go.channels.time-after-in-loop"):
                     continue
                 if after_re.search(probe_line):
                     records.append(_rec(
@@ -467,7 +466,7 @@ def _time_after(files: Sequence[Path], ast_matches: dict) -> list[dict]:
     return records
 
 
-def _body_close(files: Sequence[Path], ast_matches: dict) -> list[dict]:
+def _body_close(files: Sequence[Path], ast_matches: dict, suppressions: SourceSuppressions) -> list[dict]:
     # ubs-golang.sh 5115-5131
     if ast_matches.get("go.http-response-body-not-closed"):
         return [
@@ -477,8 +476,9 @@ def _body_close(files: Sequence[Path], ast_matches: dict) -> list[dict]:
         ]
     http_re = re.compile(r"http\.(Get|Post|Head)\(|(client|Client|httpClient|c)\.Do\(")
     close_re = re.compile(r"\.Body\.Close\(")
-    http_calls = _match_lines(files, http_re)
-    body_close = _count(files, close_re)
+    rule = "go.http.body-close-regex-fallback"
+    http_calls = _match_lines(files, http_re, rule=rule, suppressions=suppressions)
+    body_close = _count(files, close_re, rule=rule, suppressions=suppressions)
     if http_calls and body_close < len(http_calls):
         return _ratio_records(
             "go.http.body-close-regex-fallback", 4, "warning",
@@ -488,7 +488,7 @@ def _body_close(files: Sequence[Path], ast_matches: dict) -> list[dict]:
     return []
 
 
-def _rows_not_closed(files: Sequence[Path], ast_matches: dict) -> list[dict]:
+def _rows_not_closed(files: Sequence[Path], ast_matches: dict, suppressions: SourceSuppressions) -> list[dict]:
     # ubs-golang.sh 5172-5184
     if ast_matches.get("go.sql.rows-not-closed"):
         return [
@@ -498,8 +498,9 @@ def _rows_not_closed(files: Sequence[Path], ast_matches: dict) -> list[dict]:
         ]
     query_re = re.compile(r"\.Query(Row|Context)?\(")
     close_re = re.compile(r"\.Close\(\)")
-    queries = _match_lines(files, query_re)
-    closes = _count(files, close_re)
+    rule = "go.sql.close-regex-fallback"
+    queries = _match_lines(files, query_re, rule=rule, suppressions=suppressions)
+    closes = _count(files, close_re, rule=rule, suppressions=suppressions)
     if queries and closes < len(queries):
         return _ratio_records(
             "go.sql.close-regex-fallback", 5, "info",
@@ -509,12 +510,13 @@ def _rows_not_closed(files: Sequence[Path], ast_matches: dict) -> list[dict]:
     return []
 
 
-def _tx_balance(files: Sequence[Path]) -> list[dict]:
+def _tx_balance(files: Sequence[Path], suppressions: SourceSuppressions) -> list[dict]:
     # ubs-golang.sh 5200-5206
     begin_re = re.compile(r"\b(Begin|BeginTx)\(")
     end_re = re.compile(r"\.(Commit|Rollback)\(")
-    begins = _match_lines(files, begin_re)
-    ends = _count(files, end_re)
+    rule = "go.sql.tx-balance"
+    begins = _match_lines(files, begin_re, rule=rule, suppressions=suppressions)
+    ends = _count(files, end_re, rule=rule, suppressions=suppressions)
     if begins and ends < len(begins):
         return _ratio_records(
             "go.sql.tx-balance", 5, "warning",
@@ -524,12 +526,13 @@ def _tx_balance(files: Sequence[Path]) -> list[dict]:
     return []
 
 
-def _open_close(files: Sequence[Path]) -> list[dict]:
+def _open_close(files: Sequence[Path], suppressions: SourceSuppressions) -> list[dict]:
     # ubs-golang.sh 5542-5548
     open_re = re.compile(r"os\.Open(File)?\(")
     close_re = re.compile(r"\.Close\(")
-    opens = _match_lines(files, open_re)
-    closes = _count(files, close_re)
+    rule = "go.filesystem.open-close-imbalance"
+    opens = _match_lines(files, open_re, rule=rule, suppressions=suppressions)
+    closes = _count(files, close_re, rule=rule, suppressions=suppressions)
     if opens and closes < len(opens):
         return _ratio_records(
             "go.filesystem.open-close-imbalance", 8, "warning",
@@ -539,12 +542,11 @@ def _open_close(files: Sequence[Path]) -> list[dict]:
     return []
 
 
-def _tls_skip(files: Sequence[Path], ast_matches: dict) -> list[dict]:
+def _tls_skip(files: Sequence[Path], ast_matches: dict, suppressions: SourceSuppressions) -> list[dict]:
     # ubs-golang.sh 7521-7533: AST literal count + rg literal fallback +
     # rg assignment count + the indirect python helper (7427-7489), all
-    # summed into ONE "InsecureSkipVerify enabled" finding. The legacy rg
-    # counts used wc_num (NO marker filtering); the indirect helper keeps
-    # its own marker checks.
+    # summed into ONE "InsecureSkipVerify enabled" finding. Its exact public
+    # rule filters candidates, while indirect source facts remain intact.
     rule = "go.crypto.insecureskipverify"
     title = "InsecureSkipVerify enabled"
     records: list[dict] = []
@@ -553,13 +555,13 @@ def _tls_skip(files: Sequence[Path], ast_matches: dict) -> list[dict]:
         records.append(_rec(rule, 9, "warning", m["path"], m["line"],
                             f"{title}: {m['text']}" if m["text"] else title))
     if not ast_hits:
-        # rg fallback for the literal — NOT marker filtered (wc_num parity).
+        # Preserve the AST-first fallback; use the computed public rule scope.
         for path, line_no, text in _match_lines(
-            files, re.compile(r"InsecureSkipVerify:[ \t]*true"), drop_markers=False
+            files, re.compile(r"InsecureSkipVerify:[ \t]*true"), rule=rule, suppressions=suppressions
         ):
             records.append(_rec(rule, 9, "warning", path, line_no, f"{title} — {text}"))
     for path, line_no, text in _match_lines(
-        files, re.compile(r"\.InsecureSkipVerify[ \t]*=[ \t]*true"), drop_markers=False
+        files, re.compile(r"\.InsecureSkipVerify[ \t]*=[ \t]*true"), rule=rule, suppressions=suppressions
     ):
         records.append(_rec(rule, 9, "warning", path, line_no, f"{title} — {text}"))
     records.extend(_tls_indirect(files, title, rule))
@@ -591,7 +593,7 @@ def _tls_indirect(files: Sequence[Path], title: str, rule: str) -> list[dict]:
         names: set[str] = set()
         for raw in lines:
             line = code_line(raw)
-            if not line or MARKER in line:
+            if not line:
                 continue
             for regex in (true_assignment_re, short_true_assignment_re):
                 match = regex.search(line)
@@ -601,7 +603,7 @@ def _tls_indirect(files: Sequence[Path], title: str, rule: str) -> list[dict]:
             continue
         for idx, raw in enumerate(lines, 1):
             line = code_line(raw)
-            if MARKER in line or "InsecureSkipVerify" not in line:
+            if "InsecureSkipVerify" not in line:
                 continue
             for match in insecure_field_re.finditer(line):
                 name = match.group("name") or match.group("assign")
@@ -611,7 +613,7 @@ def _tls_indirect(files: Sequence[Path], title: str, rule: str) -> list[dict]:
     return records
 
 
-def _exec_shell(files: Sequence[Path], ast_matches: dict) -> list[dict]:
+def _exec_shell(files: Sequence[Path], ast_matches: dict, suppressions: SourceSuppressions) -> list[dict]:
     # ubs-golang.sh 7535-7543: AST rule first, regex fallback through
     # count_lines (marker-filtered).
     title = "exec.Command shell interpreter detected"
@@ -629,15 +631,17 @@ def _exec_shell(files: Sequence[Path], ast_matches: dict) -> list[dict]:
         r'|exec\.Command(Context)?\(\s*"powershell"\s*,\s*"-Command"'
     )
     return _ratio_records(rule, 9, "critical", title,
-                          _match_lines(files, fallback_re), _count(files, fallback_re))
+                          _match_lines(files, fallback_re, rule=rule, suppressions=suppressions),
+                          _count(files, fallback_re, rule=rule, suppressions=suppressions))
 
 
-def _db_context(files: Sequence[Path]) -> list[dict]:
+def _db_context(files: Sequence[Path], suppressions: SourceSuppressions) -> list[dict]:
     # ubs-golang.sh 7904-7909
     noctx_re = re.compile(r"\.(Query|Exec|QueryRow)\(")
     ctx_re = re.compile(r"\.(QueryContext|ExecContext|QueryRowContext)\(")
-    noctx = _match_lines(files, noctx_re)
-    ctx = _count(files, ctx_re)
+    rule = "go.database.context-less-calls"
+    noctx = _match_lines(files, noctx_re, rule=rule, suppressions=suppressions)
+    ctx = _count(files, ctx_re, rule=rule, suppressions=suppressions)
     if noctx and ctx == 0:
         return _ratio_records(
             "go.database.context-less-calls", 21, "info",
@@ -647,12 +651,13 @@ def _db_context(files: Sequence[Path]) -> list[dict]:
     return []
 
 
-def _server_shutdown(files: Sequence[Path]) -> list[dict]:
+def _server_shutdown(files: Sequence[Path], suppressions: SourceSuppressions) -> list[dict]:
     # ubs-golang.sh 7924-7929
     srv_re = re.compile(r"http\.Server\{")
     sd_re = re.compile(r"\.Shutdown\(")
-    servers = _match_lines(files, srv_re)
-    shutdowns = _count(files, sd_re)
+    rule = "go.shutdown.server-no-shutdown"
+    servers = _match_lines(files, srv_re, rule=rule, suppressions=suppressions)
+    shutdowns = _count(files, sd_re, rule=rule, suppressions=suppressions)
     if servers and shutdowns == 0:
         return _ratio_records(
             "go.shutdown.server-no-shutdown", 22, "info",
@@ -662,12 +667,13 @@ def _server_shutdown(files: Sequence[Path]) -> list[dict]:
     return []
 
 
-def _t_parallel(files: Sequence[Path]) -> list[dict]:
+def _t_parallel(files: Sequence[Path], suppressions: SourceSuppressions) -> list[dict]:
     # ubs-golang.sh 7665-7668
     test_re = re.compile(r"^func[ \t]+Test[A-Za-z0-9_]*\(t[ \t]+\*testing\.T\)")
     par_re = re.compile(r"t\.Parallel\(\)")
-    tests = _match_lines(files, test_re)
-    par = _count(files, par_re)
+    rule = "go.testing.t-parallel"
+    tests = _match_lines(files, test_re, rule=rule, suppressions=suppressions)
+    par = _count(files, par_re, rule=rule, suppressions=suppressions)
     if tests and par == 0:
         return _ratio_records(
             "go.testing.t-parallel", 13, "info",
@@ -773,6 +779,7 @@ def computed_checks(files: Sequence[Path], ast_matches: dict, skip: set[int],
                     single_file: bool) -> list[dict]:
     """Every legacy bash/computed check, in category order."""
     records: list[dict] = []
+    suppressions = SourceSuppressions("golang")
     names: dict[str, list[Path]] = {name: [] for name in _INVENTORY_NAMES}
     go_files_count = 0
     for path in files:
@@ -785,29 +792,29 @@ def computed_checks(files: Sequence[Path], ast_matches: dict, skip: set[int],
         return category not in skip
 
     if active(1):
-        records.extend(_wg_balance(files))
-        records.extend(_mutex_pair(files))
+        records.extend(_wg_balance(files, suppressions))
+        records.extend(_mutex_pair(files, suppressions))
     if active(2):
-        records.extend(_time_after(files, ast_matches))
+        records.extend(_time_after(files, ast_matches, suppressions))
     if active(4):
-        records.extend(_body_close(files, ast_matches))
+        records.extend(_body_close(files, ast_matches, suppressions))
     if active(5):
-        records.extend(_rows_not_closed(files, ast_matches))
-        records.extend(_tx_balance(files))
+        records.extend(_rows_not_closed(files, ast_matches, suppressions))
+        records.extend(_tx_balance(files, suppressions))
     if active(8):
-        records.extend(_open_close(files))
+        records.extend(_open_close(files, suppressions))
     if active(9):
-        records.extend(_tls_skip(files, ast_matches))
-        records.extend(_exec_shell(files, ast_matches))
+        records.extend(_tls_skip(files, ast_matches, suppressions))
+        records.extend(_exec_shell(files, ast_matches, suppressions))
     if active(13):
-        records.extend(_t_parallel(files))
+        records.extend(_t_parallel(files, suppressions))
     if active(19) or active(12):
         records.extend(_inventory_records(files, names, go_files_count, single_file))
     if active(21):
-        records.extend(_db_context(files))
+        records.extend(_db_context(files, suppressions))
     if active(22):
-        records.extend(_server_shutdown(files))
-    return records
+        records.extend(_server_shutdown(files, suppressions))
+    return suppressions.filter(records)
 
 
 def _finding_title(rec: dict) -> str:
@@ -929,15 +936,9 @@ def main(argv: list[str] | None = None) -> int:
     skip = _skip_set(args)
     single_file = bool(args.project_dir) and Path(args.project_dir).is_file()
 
-    # Legacy index_project scanned the whole project dir for the inventory
-    # names (go.mod/go.sum/go.work/go.work.sum) even though the rg pipelines
-    # include them via INCLUDE_NAMES — augment the ext-based file list so cat
-    # 12/19 and the "Files scanned" total match the legacy find.
-    if args.project_dir and Path(args.project_dir).is_dir():
-        listed = {str(p) for p in files}
-        for extra in _inventory_files(Path(args.project_dir)):
-            if str(extra) not in listed:
-                files.append(extra)
+    # The verified contract and the module FileSet already include manifests.
+    # Rewalking project_dir would resurrect ignored/unselected go.mod files,
+    # changing counts, cache entries and exit decisions outside this scan.
 
     patterns = load_patterns()
 
@@ -955,6 +956,7 @@ def main(argv: list[str] | None = None) -> int:
     files_to_scan = _expand_package_misses(files, cached_findings, files_to_scan, cache)
 
     capturing_sink = None
+    suppressions = SourceSuppressions("golang")
     ast_tally: Counter = Counter()
     ast_matches: dict[str, list[dict]] = {}
     # Every analysis layer that could not complete appends here, so a scan that
@@ -1009,7 +1011,9 @@ def main(argv: list[str] | None = None) -> int:
         # run would hit the cache and report the findings this one could not
         # produce as a clean, finished scan (#111).
         if not scan_errors:
-            cache.store_scanned_files(files_to_scan, capturing_sink.by_file)
+            cache.store_scanned_files(files_to_scan, {
+                path: suppressions.filter(records) for path, records in capturing_sink.by_file.items()
+            })
     else:
         from ubs_core.prefilter import PrefilterResult
         prefilter_res = PrefilterResult(
@@ -1033,7 +1037,7 @@ def main(argv: list[str] | None = None) -> int:
             if recs is None and capturing_sink is not None:
                 recs = capturing_sink.get_for_file(f)
             if recs:
-                for cached_record in recs:
+                for cached_record in suppressions.filter(recs):
                     record = dict(cached_record)
                     is_ast = record.pop("_ast_pack", False)
                     report_only = record.pop("_report_only", False)
@@ -1048,9 +1052,13 @@ def main(argv: list[str] | None = None) -> int:
     external_tools = []
     if args.go_tools and 18 not in skip:
         from ubs_core.external_tools import scan_go_tools
+        tool_sink = CapturingSink()
+        external_tools = scan_go_tools(selected_files, tool_sink, args.project_dir,
+                                      args.test_pkgs, args.go_timeout, scan_errors)
         with open(args.sink, "a", encoding="utf-8") as sink_file:
-            external_tools = scan_go_tools(selected_files, sink_file, args.project_dir,
-                                          args.test_pkgs, args.go_timeout, scan_errors)
+            for records in tool_sink.by_file.values():
+                for record in suppressions.filter(records):
+                    sink_file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     # The sink is the single source of truth: recount severities from it so
     # every layer (patterns, detectors, analyzers, ast, computed) is
@@ -1128,32 +1136,6 @@ def main(argv: list[str] | None = None) -> int:
                                  "cache": cache.stats,
                                  "errors": scan_errors}) + "\n")
     return exit_code
-
-
-def _inventory_files(project_dir: Path) -> list[Path]:
-    """Legacy index_project inventory: find the INCLUDE_NAMES files anywhere
-    under project_dir, pruning EXCLUDE_DIRS (ubs-golang.sh 2821-2874)."""
-    found: list[Path] = []
-    if not project_dir.is_dir():
-        return found
-
-    def prune(directory: Path) -> bool:
-        return directory.name in _INVENTORY_EXCLUDES
-
-    stack = [project_dir]
-    while stack:
-        current = stack.pop()
-        try:
-            entries = sorted(current.iterdir(), key=lambda p: p.name)
-        except OSError:
-            continue
-        for entry in entries:
-            if entry.is_dir():
-                if not prune(entry):
-                    stack.append(entry)
-            elif entry.name in _INVENTORY_NAMES:
-                found.append(entry)
-    return found
 
 
 # AST consumption table (ubs_core.go_ast): rule id -> [(category, severity,

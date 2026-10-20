@@ -134,8 +134,9 @@ class SwiftLexer:
                 continue
             if text.startswith(('//', '/*'), cursor):
                 finish = self.comment(cursor, limit)
-                output.extend(SwiftToken('\n', position, position + 1)
-                              for position in range(cursor, finish) if text[position] == '\n')
+                for position in range(cursor, finish):
+                    if text[position] == '\n':
+                        output.append(SwiftToken('\n', position, position + 1))
                 cursor = finish
                 continue
             regex = char == '/' and (not output or output[-1].value in {'=', '(', ',', ':', 'return'})
@@ -254,6 +255,7 @@ class SwiftParser:
     def __init__(self, text, tokens=None):
         self.tokens = swift_validated_tokens(text) if tokens is None else tokens
         self.functions, self.types, self.extensions, self.final_types = {}, set(), set(), set()
+        self.value_types = set()
         body = self.block(self.tokens, (), (), declarations=True)
         self.functions[-1] = SwiftFunction(-1, '<script>', (), (), (), body)
 
@@ -273,7 +275,7 @@ class SwiftParser:
                     while following < len(tokens) and tokens[following].value == '\n':
                         following += 1
                     next_value = tokens[following].value if following < len(tokens) and tokens[following].kind == 'code' else ''
-                    if previous not in continuation and next_value not in {'.', '&&', '||', '??', '+', ','}:
+                    if previous not in continuation and next_value not in {'.', '&&', '||', '??', '+', ',', 'catch'}:
                         return cursor
             cursor += 1
         return cursor
@@ -374,6 +376,8 @@ class SwiftParser:
                 (self.extensions if kind == 'extension' else self.types).add(name)
                 if kind in {'struct', 'enum'} or any(token.value == 'final' for token in tokens[start:head]):
                     self.final_types.add(name)
+                if kind in {'struct', 'enum'}:
+                    self.value_types.add(name)
                 self.block(tokens[position + 1:finish], (*owner, name), scope, declarations=True, depth=depth + 1)
                 statements.append(SwiftStatement('definition', tuple(tokens[start:finish + 1])))
                 cursor = finish + 1
@@ -467,6 +471,24 @@ class SwiftParser:
         return binding[0].value, (binding[0],), parts[1], operator, declaration
 
     @staticmethod
+    def iteration_names(tokens, depth=0):
+        """Bind only identifier/wildcard tuple patterns, never case/cast patterns."""
+        if depth > 64:
+            raise AnalysisLimit('Swift iteration pattern nesting limit exceeded; analysis is incomplete')
+        tokens = tuple(token for token in tokens if token.kind != 'code' or token.value != '\n')
+        if (len(tokens) == 1 and tokens[0].kind == 'code'
+                and re.fullmatch(r'[A-Za-z_]\w*', tokens[0].value)
+                and tokens[0].value not in {'case', 'let', 'var', 'await', 'try', 'in', 'where',
+                                            'self', 'super', 'true', 'false', 'nil'}):
+            return () if tokens[0].value == '_' else tokens
+        if tokens and tokens[0].value == '(' and swift_close(tokens, 0) == len(tokens) - 1:
+            names = tuple(name for part in swift_parts(tokens[1:-1], {','})
+                          for name in SwiftParser.iteration_names(part, depth + 1))
+            if len({name.value for name in names}) == len(names):
+                return names
+        raise ValueError('Swift iteration binding needs pattern analysis; analysis is incomplete')
+
+    @staticmethod
     def uninitialized(tokens):
         tokens = swift_ungroup(tokens)
         if (len(tokens) >= 3 and tokens[0].value in {'let', 'var'}
@@ -500,10 +522,213 @@ def swift_has_shape(fact, name):
 
 
 def swift_source_tokens(tokens):
-    for token in tokens:
-        if token.kind == 'code' and token.value in {'Request', 'req', 'request', 'filename', 'fileName', 'originalFilename', 'originalFileName'}:
-            return True
+    # A request/filename *value/member* may be incoming data; an argument label
+    # in Draft(request: draft) or IntentFile(filename: name) is not a value.
+    # Only exclude a proven parenthesized label position, retaining dictionary keys, ternary values,
+    # member access and interpolation as conservative source witnesses.
+    tokens = tuple(token for token in tokens if token.kind != 'code' or token.value != '\n')
+    delimiters = []
+    closing = {')': '(', ']': '[', '}': '{'}
+    for index, token in enumerate(tokens):
+        if token.kind == 'code':
+            if token.value == 'Request':
+                return True
+            if token.value in {'req', 'request', 'filename', 'fileName', 'originalFilename', 'originalFileName'}:
+                previous = tokens[index - 1] if index else None
+                following = tokens[index + 1] if index + 1 < len(tokens) else None
+                is_label = (
+                    delimiters and delimiters[-1] == '('
+                    and previous is not None and previous.kind == 'code' and previous.value in {'(', ','}
+                    and following is not None and following.kind == 'code' and following.value == ':'
+                )
+                if not is_label:
+                    return True
+            if token.value in {'(', '[', '{'}:
+                delimiters.append(token.value)
+            elif token.value in closing and delimiters and delimiters[-1] == closing[token.value]:
+                delimiters.pop()
         if any(swift_source_tokens(part) for part in token.parts):
+            return True
+    return False
+
+
+def swift_request_source_tokens(tokens):
+    """Keep unknown roots, but distinguish lexically bound Vision requests.
+
+    This is only a negative source proof, not a source/sink suppression. Every
+    req/request occurrence must resolve to a known native declaration in its
+    lexical scope. Unknown/shadowed declarations, capture bindings, upload
+    names and actual Request types keep the ordinary fail-closed analysis.
+    """
+    tokens = tuple(tokens)
+    if not swift_source_tokens(tokens):
+        return False
+    native = {'VNCoreMLRequest', 'VNGenerateImageFeaturePrintRequest', 'VNRecognizeTextRequest'}
+    code = tuple(t for t in tokens if t.kind == 'code' and t.value != '\n')
+    if not any(a.value == 'import' and b.value == 'Vision' for a, b in zip(code, code[1:])):
+        return True
+    # A locally declared framework type/function can return a web request.
+    if any(b.value in native | {'Vision'} and a.value in {
+            'class', 'struct', 'enum', 'actor', 'protocol', 'typealias', 'func', 'let', 'var', 'extension'}
+           for a, b in zip(code, code[1:])):
+        return True
+    significant = tuple(t for t in tokens if t.kind != 'code' or t.value != '\n')
+    budget = Budget()
+    newlines = [t.start for t in tokens if t.kind == 'code' and t.value == '\n']
+    for index, token in enumerate(significant):
+        if token.kind != 'code' or token.value not in native | {'Vision'}:
+            continue
+        previous = significant[index - 1].value if index else ''
+        following = significant[index + 1].value if index + 1 < len(significant) else ''
+        if token.value == 'Vision':
+            if previous == 'import' or following == '.' or (index >= 2 and
+                    significant[index - 2].value == 'canImport' and previous == '('):
+                continue
+            return True
+        if previous == '.' and (index < 2 or significant[index - 2].value != 'Vision'):
+            return True
+        if previous not in {':', '->', '.'} and following != '(':
+            # In particular, a closure/generic/capture binding with the same
+            # spelling is not the imported constructor.
+            return True
+    for index, token in enumerate(significant):
+        if token.kind == 'code' and token.value in {'req', 'request'}:
+            tail = significant[index + 1:index + 5]
+            member = tuple(t.value for t in tail if t.value not in {'?', '!'})
+            if len(member) >= 2 and member[0] == '.' and member[1] in {
+                    'query', 'parameters', 'params', 'headers', 'content', 'url', 'uri'}:
+                return True
+        if token.kind == 'code' and token.value == 'for':
+            end = index + 1
+            while end < len(significant) and significant[end].value not in {'in', '{'}:
+                end += 1
+            if any(t.value in {'req', 'request'} for t in significant[index + 1:end]):
+                return True
+    if swift_source_tokens(t for t in significant if t.value not in {'req', 'request'}):
+        return True
+    # Interpolations and nested patterns need their own binding model.
+    if any(swift_source_tokens(part) for t in tokens for part in t.parts):
+        return True
+    ranges, type_ranges, bindings, declarations = [], [], [], set()
+    parents, stack = {}, []
+    for index, token in enumerate(significant):
+        parents[index] = stack[-1] if stack else ''
+        if token.kind == 'code' and token.value in {'(', '[', '{'}:
+            stack.append(token.value)
+        elif token.kind == 'code' and token.value in {')', ']', '}'}:
+            stack.pop()
+    for index, token in enumerate(significant):
+        if token.kind == 'code' and token.value == '{':
+            ranges.append((index, swift_close(significant, index)))
+        if (token.kind == 'code' and token.value in {'class', 'struct', 'actor', 'enum', 'extension'}
+                and index + 1 < len(significant) and significant[index + 1].value != 'func'):
+            opening = index + 1
+            while opening < len(significant) and significant[opening].value != '{':
+                opening += 1
+            if opening < len(significant):
+                type_ranges.append((opening, swift_close(significant, opening)))
+
+    def native_type(part):
+        return swift_text(part).rstrip('?!') in native | {'Vision.' + name for name in native}
+
+    # Parameters are bound only in their own body, never a sibling function.
+    for index, token in enumerate(significant):
+        if token.value not in {'func', 'init'} or token.kind != 'code':
+            continue
+        opening = index + 1
+        while opening < len(significant) and significant[opening].value not in {'(', '{'}:
+            opening += 1
+        if opening == len(significant) or significant[opening].value != '(':
+            continue
+        close = swift_close(significant, opening)
+        body = close + 1
+        while body < len(significant) and significant[body].value not in {'{', ';'}:
+            body += 1
+        for part in swift_parts(significant[opening + 1:close], {','}, generics=True):
+            pieces = swift_parts(part, {':'})
+            if len(pieces) != 2 or not pieces[0]:
+                continue
+            name = pieces[0][-1]
+            if name.value in native | {'Vision'}:
+                return True
+            if name.value not in {'req', 'request'}:
+                continue
+            if not native_type(swift_parts(pieces[1], {'='})[0]) or body == len(significant):
+                return True
+            declarations.add(name.start)
+            bindings.append((name.value, body, swift_close(significant, body), False))
+
+    for index, token in enumerate(significant):
+        if token.kind != 'code' or token.value not in {'let', 'var'} or index + 1 == len(significant):
+            continue
+        name = significant[index + 1]
+        if name.value == '(':
+            if swift_source_tokens(significant[index + 2:swift_close(significant, index + 1)]):
+                return True
+        if name.value not in {'req', 'request'}:
+            continue
+        following = significant[index + 2:index + 3]
+        if not following or following[0].value in {'{', ',', 'else'}:
+            # Optional-binding shorthand resolves the existing binding below.
+            continue
+        header = index - 1
+        while header >= 0 and significant[header].value not in {';', '{', '}'}:
+            if (significant[header].value in {'if', 'while', 'guard', 'for'}
+                    and not (significant[header].value == 'if' and header > 0
+                             and significant[header - 1].value == '#')):
+                # Conditional bindings have narrower visibility than the
+                # enclosing brace. Do not grant a function-wide native proof.
+                return True
+            header -= 1
+        position = index + 3
+        if following[0].value == ':':
+            ending = position
+            while ending < len(significant) and significant[ending].value not in {'=', '{', '}', ';'}:
+                if ending > position and bisect_right(newlines, significant[ending - 1].end - 1) < bisect_right(
+                        newlines, significant[ending].start - 1):
+                    break
+                ending += 1
+            known = native_type(significant[position:ending])
+        elif following[0].value == '=':
+            ending = position
+            while ending < len(significant) and significant[ending].value not in {'(', '{', ';', '}'}:
+                ending += 1
+            known = ending < len(significant) and significant[ending].value == '(' and native_type(significant[position:ending])
+        else:
+            known = False
+        if not known:
+            return True
+        containing = [(a, b) for a, b in ranges if a < index < b]
+        scope = max(containing, default=(-1, len(significant)))
+        start = scope[0] if scope in type_ranges else index
+        bindings.append((name.value, start, scope[1], scope in type_ranges))
+        declarations.add(name.start)
+
+    for index, token in enumerate(significant):
+        if token.kind != 'code' or token.value not in {'req', 'request'} or token.start in declarations:
+            continue
+        previous = significant[index - 1].value if index else ''
+        following = significant[index + 1].value if index + 1 < len(significant) else ''
+        if previous == ',' and following in {'=', ':'} and parents[index] != '(':
+            return True  # later binding in a declaration/capture list
+        # A closure/iteration binding or an arbitrary object's property is not
+        # the outer local/field with the same spelling.
+        if following == 'in' or previous == 'for' or (previous == '.' and (
+                index < 2 or significant[index - 2].value != 'self')):
+            return True
+        for opening, closing in ranges:
+            if opening < index < closing:
+                budget.spend(closing - opening)
+                header = significant[opening + 1:index + 1]
+                after = significant[index + 1:closing]
+                if not any(t.value in {';', '{', '}', 'let', 'var', 'return'} for t in header):
+                    if any(t.value == 'in' for t in after[:next((i for i, t in enumerate(after)
+                            if t.value in {';', '{', '}'}), len(after))]):
+                        return True
+        if following == ':' and previous in {'(', ','} and parents[index] == '(':
+            continue  # actual argument label, not a value
+        if not any(name == token.value and start <= index < end and (previous != '.' or field)
+                   for name, start, end, field in bindings):
             return True
     return False
 
@@ -526,14 +751,39 @@ def swift_flow_obligation(tokens):
         'contentsOf', 'contentsOfFile', 'FileHandle', 'FileManager',
         'sendFile', 'streamFile', 'readFile', 'serveFile', 'writeFile', 'file', 'write',
     }
-    code = [token.value for token in tokens if token.kind == 'code' and token.value != '\n']
+    significant = tuple(token for token in tokens if token.kind != 'code' or token.value != '\n')
+    non_file_writes = set()
+    for index, token in enumerate(significant):
+        if (token.kind == 'code' and token.value == 'write' and index > 0
+                and significant[index - 1].value == '.' and index + 1 < len(significant)
+                and significant[index + 1].kind == 'code' and significant[index + 1].value == '('):
+            close = swift_close(significant, index + 1)
+            arguments = swift_parts(significant[index + 2:close], {','})
+            if not any(len(part) >= 2 and part[0].kind == 'code' and part[0].value == 'to'
+                       and part[1].kind == 'code' and part[1].value == ':' for part in arguments):
+                # The file policy models Foundation write(to:), not an API
+                # client's write(path, body:). Only this direct call is excluded:
+                # a bare method reference is unresolved, and nested arguments
+                # and interpolation still contribute their own obligations.
+                non_file_writes.add(token.start)
+    code_tokens = [token for token in tokens if token.kind == 'code' and token.value != '\n']
+    code = [token.value for token in code_tokens]
     request_members = {'query', 'parameters', 'params', 'headers', 'content', 'url', 'uri'}
     if any(code[index] in {'req', 'request'} and code[index + 1] == '.' and code[index + 2] in request_members
            for index in range(len(code) - 2)):
         return True
-    for token in tokens:
-        if token.kind == 'code' and (token.value in witnesses or token.value.lower() == 'headers'):
+    for index, value in enumerate(code):
+        if value == 'write' and code_tokens[index].start in non_file_writes:
+            continue
+        # A collection append's argument label is not Foundation's URL reader.
+        # Actual reads elsewhere and request member/type witnesses still activate
+        # analysis, including a read nested inside the appended expression.
+        if (value == 'contentsOf' and index >= 3 and index + 1 < len(code)
+                and code[index - 3:index] == ['.', 'append', '('] and code[index + 1] == ':'):
+            continue
+        if value in witnesses or value.lower() == 'headers':
             return True
+    for token in tokens:
         if any(swift_flow_obligation(part) for part in token.parts):
             return True
     return False
@@ -725,6 +975,13 @@ class SwiftEngine:
         native_file = (not candidates or name.startswith(('req.fileio.', 'request.fileio.')))
         if leaf in {'String', 'Data', 'FileHandle'}:
             native_file = native_file and self.builtin(name, state, bindings)
+        elif leaf == 'write' and receiver and all(
+                trace.kind == 'shape' and trace.key[0].startswith('instance:')
+                and trace.key[0][len('instance:'):] in self.parser.value_types for trace in receiver):
+            # A struct or enum declared here (including one shadowing Data)
+            # has no Foundation write(to:). A receiver of unknown type may
+            # still be String or Data, so it remains a file sink.
+            native_file = False
         if native_file and (leaf in {'String', 'Data', 'FileHandle', 'sendFile', 'streamFile', 'readFile', 'serveFile', 'writeFile', 'file', 'write'} or name.startswith('FileManager.default.')):
             selected, leaf_safe = [], False
             if leaf in {'String', 'Data'}:
@@ -854,6 +1111,12 @@ class SwiftEngine:
             tokens = tokens[1:]
         if not tokens:
             return CLEAN
+        components = swift_parts(tokens, {','})
+        if len(components) > 1:
+            # Preserve all tuple dependencies, including request-object shapes.
+            # Iteration projection below deliberately drops validation facts;
+            # these joined components are not positional proof of a safe value.
+            return join(*(self.expression(part, state, bindings, depth + 1) for part in components))
         ternary = swift_parts(tokens, {'?'})
         if len(ternary) == 2:
             branches = swift_parts(ternary[1], {':'})
@@ -1247,13 +1510,40 @@ class SwiftEngine:
                     local[part[1].value] = part[1].value + '@' + str(part[1].start)
             return local
 
-        def terminates(statements):
+        def process_exit(tokens, bindings):
+            tokens = swift_ungroup(tokens)
+            opening = next((i for i, token in enumerate(tokens) if token.value == '('), -1)
+            if opening < 0 or swift_close(tokens, opening) != len(tokens) - 1:
+                return False
+            name = swift_text(tokens[:opening])
+            if name not in {'exit', 'Darwin.exit', 'Glibc.exit', 'fatalError', 'Swift.fatalError',
+                            'preconditionFailure', 'Swift.preconditionFailure'}:
+                return False
+            root, leaf = name.split('.')[0], name.split('.')[-1]
+            if root in bindings or root in self.parser.types or root in self.local_globals:
+                return False
+            if any(left.value in {'let', 'var'} and right.value == root
+                   for left, right in zip(self.parser.tokens, self.parser.tokens[1:])):
+                return False
+            if '.' not in name and any(fn.name == leaf for fn in self.parser.functions.values()):
+                return False
+            if '.' not in name and function.owner:
+                # An inherited member may shadow the global primitive. Module
+                # qualification is required when that lookup is unresolved.
+                return False
+            return True
+
+        def terminates(statements, bindings):
+            local = dict(bindings)
             for statement in statements:
+                assignment = self.parser.assignment(statement.tokens) if statement.kind == 'simple' else None
+                if assignment and assignment[-1] and assignment[0]:
+                    local[assignment[0]] = assignment[0]
                 if statement.kind in {'return', 'throw', 'break', 'continue'}:
                     return True
-                if statement.kind == 'if' and terminates(statement.body) and terminates(statement.alternate):
+                if statement.kind == 'if' and terminates(statement.body, local) and terminates(statement.alternate, local):
                     return True
-                if statement.kind == 'simple' and re.match(r'(?:fatalError|preconditionFailure)\(', swift_text(statement.tokens)):
+                if statement.kind == 'simple' and process_exit(statement.tokens, local):
                     return True
             return False
 
@@ -1280,7 +1570,7 @@ class SwiftEngine:
                     no = block(statement.alternate, following, local, break_to, continue_to)
                     following = condition(tokens, yes, no, yes_scope, local)
                 elif kind == 'guard':
-                    if not terminates(statement.body):
+                    if not terminates(statement.body, before):
                         raise ValueError('Swift guard else does not exit its enclosing scope; analysis is incomplete')
                     failure = block(statement.body, following, before, break_to, continue_to)
                     following = condition(tokens, following, failure, local, before)
@@ -1292,14 +1582,20 @@ class SwiftEngine:
                     following = loop
                 elif kind == 'for':
                     parts = swift_parts(tokens, {'in'})
-                    names = swift_ungroup(parts[0])
-                    if len(parts) != 2 or len(names) != 1 or names[0].kind != 'code':
+                    if len(parts) != 2:
                         raise ValueError('Swift iteration binding needs pattern analysis; analysis is incomplete')
+                    names = self.parser.iteration_names(parts[0])
+                    sequence = swift_parts(parts[1], {'where'})
+                    if len(sequence) > 2 or not all(swift_ungroup(part) for part in sequence):
+                        raise ValueError('Swift iteration filter needs condition analysis; analysis is incomplete')
                     inner = dict(local)
-                    inner[names[0].value] = names[0].value + '@' + str(names[0].start)
+                    for name in names:
+                        inner[name.value] = name.value + '@' + str(name.start)
                     loop = node('branch')
                     body = block(statement.body, loop, inner, following, loop)
-                    bound = node('element', parts[1], inner, (body,), names[0].value, reads=local)
+                    if len(sequence) == 2:
+                        body = condition(sequence[1], body, loop, inner)
+                    bound = node('element', sequence[0], inner, (body,), tuple(name.value for name in names), reads=local)
                     edges[loop] = (bound, following)
                     following = loop
                 elif kind in {'break', 'continue'}:
@@ -1309,6 +1605,10 @@ class SwiftEngine:
                     following = node('branch', targets=(target,))
                 elif kind in {'return', 'throw'}:
                     following = node(kind, tokens, local, (exit_node,) if kind == 'return' else ())
+                elif kind == 'simple' and process_exit(tokens, before):
+                    # Evaluate arguments (which may contain sinks), but a real
+                    # Never-returning primitive has no successor edge.
+                    following = node('eval', tokens, local, ())
                 else:
                     following = node(kind, tokens, local, (following,), reads=before)
             return following
@@ -1333,7 +1633,19 @@ class SwiftEngine:
             raise ValueError('Unsupported Swift control flow or closure; analysis is incomplete')
         if kind == 'element':
             value = self.expression(tokens, state, reads)
-            state[bindings[extra]] = advance(value, self.step(tokens[0].start, 'assign', extra))
+            # Reading an element of request data is itself an untrusted read,
+            # just like subscripting it. Retaining only the collection shape
+            # would let a destructured header/query value reach a sink clean.
+            if any(swift_has_shape(value, shape) for shape in {'request-collection', 'request-content'}):
+                value = join(value, self.source(tokens[0].start, 'request iteration'))
+            # Components conservatively inherit every element dependency, but
+            # never a collection/other component's validation. Request shapes
+            # must survive so destructured request.query remains a source.
+            requests = frozenset(trace for trace in value if trace.kind == 'shape'
+                and trace.key[0] in {'request', 'request-collection', 'request-content'})
+            value = join(self.forget(value), requests)
+            for name in extra:
+                state[bindings[name]] = advance(value, self.step(tokens[0].start, 'assign', name))
             return state
         if kind == 'optional-shorthand':
             name = tokens[1].value
@@ -1443,7 +1755,7 @@ def flow_findings(path, text, policy='path'):
     # With no selected request source, there is no source-to-sink obligation
     # for these two policies; unrelated Swift closure/actor syntax belongs to
     # its own analyzer rather than being misreported as a failed taint pass.
-    if not swift_source_tokens(tokens) or not swift_flow_obligation(tokens):
+    if not swift_request_source_tokens(tokens) or not swift_flow_obligation(tokens):
         return []
     parser = SwiftParser(text, tokens)
     engine = SwiftEngine(path, text, policy, parser)

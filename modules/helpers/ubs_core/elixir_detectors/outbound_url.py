@@ -5,8 +5,8 @@ Verbatim port of run_request_outbound_url_checks (modules/ubs-elixir.sh
 conn host/request_path) reaching outbound HTTP client sinks (Req, HTTPoison,
 HTTPotion, Finch, Tesla, :hackney, :httpc, Mint.HTTP.connect) without a
 safe-named helper or a URI.parse + scheme/host allow-list + reject context in
-the preceding 24 lines. Same-file and previous-line `ubs:ignore` markers
-suppress a hit.
+the preceding 24 lines. Lexical statement-owned `ubs:ignore` markers
+suppress only matching rules.
 """
 from __future__ import annotations
 
@@ -14,10 +14,10 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.suppression import SourceSuppressions
 from ubs_core.elixir_detectors._common import (
     EXTS,
     elixir_files,
-    has_ignore,
     read_lines,
     source_line,
     strip_line_comments,
@@ -153,11 +153,10 @@ def scan_file_findings(path: Path) -> Iterable[tuple[int, int, str]]:
     text = "\n".join(lines)
     if not (re.search(r'\b(?:conn|params|Plug\.Conn|query_params)\b', text) and SINK_RE.search(text)):
         return
+    suppressions = SourceSuppressions('elixir').index(path, text)
     tainted: dict[str, dict] = {}
     seen: set[int] = set()
     for idx, _ in enumerate(lines, start=1):
-        if has_ignore(lines, idx):
-            continue
         statement = logical_statement(lines, idx).strip()
         if not statement:
             continue
@@ -194,7 +193,8 @@ def scan_file_findings(path: Path) -> Iterable[tuple[int, int, str]]:
                 seq = seq[-(PATH_LIMIT - 1):]
             seq.append('outbound HTTP')
             path_desc = ' -> '.join(seq)
-        yield idx, 1, f"{source_line(lines, idx)}  [{path_desc}]"
+        if not suppressions.is_suppressed(idx, RULE_ID):
+            yield idx, 1, f"{source_line(lines, idx)}  [{path_desc}]"
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple]:

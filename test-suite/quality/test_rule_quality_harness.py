@@ -27,6 +27,11 @@ if str(HELPERS_DIR) not in sys.path:
 
 import rule_quality_harness
 
+SHAREABLE_DIR = REPO_ROOT / "test-suite" / "shareable"
+if str(SHAREABLE_DIR) not in sys.path:
+    sys.path.insert(0, str(SHAREABLE_DIR))
+import test_sarif_parity
+
 
 def load_artifact_result(artifact_dir: Path) -> Any:
     with (artifact_dir / "result.json").open(encoding="utf-8") as result_file:
@@ -36,6 +41,47 @@ def load_artifact_result(artifact_dir: Path) -> Any:
             raise AssertionError(
                 f"artifact result is not valid JSON: {artifact_dir / 'result.json'}"
             ) from exc
+
+
+class SarifCompletenessTest(unittest.TestCase):
+    """Hermetic report receivers; actual native SARIF scans run separately."""
+
+    def test_partial_or_failed_scans_cannot_pass_the_parity_gate(self) -> None:
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        root = Path(tempfile.mkdtemp(prefix="sarif-completeness-", dir=artifacts))
+        (root / "test-suite" / "python" / "buggy").mkdir(parents=True)
+        for json_exit, sarif_exit, status, failed, expected in (
+            (1, 1, "ok", [], 0),
+            (0, 0, "ok", [], 0),
+            (2, 1, "ok", [], 1),
+            (1, 2, "ok", [], 1),
+            (1, 1, "partial", [], 1),
+            (1, 1, "ok", [{"language": "python", "status": "partial"}], 1),
+        ):
+            with self.subTest(json_exit=json_exit, sarif_exit=sarif_exit, status=status, failed=failed):
+                doc = {"status": status, "failed_modules": failed, "scanners": [{
+                    "language": "python", "findings": [{"count": 1, "samples": [{}]}],
+                }]}
+                sarif = {"runs": [{"results": [{"ruleId": "python.control"}]}]}
+                replies = [subprocess.CompletedProcess([], json_exit, json.dumps(doc), ""),
+                           subprocess.CompletedProcess([], sarif_exit, json.dumps(sarif), "")]
+                with mock.patch.object(test_sarif_parity, "REPO_ROOT", root), \
+                     mock.patch.object(test_sarif_parity, "run", side_effect=replies), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(test_sarif_parity.main(["--assert=python", "python"]), expected)
+
+    def test_an_asserted_language_cannot_silently_skip_its_fixtures(self) -> None:
+        with mock.patch.object(test_sarif_parity, "audit", return_value={"lang": "rust", "skipped": "missing fixtures"}), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(test_sarif_parity.main(["--assert=rust", "rust"]), 1)
+            self.assertEqual(test_sarif_parity.main(["rust"]), 0)
+        complete = {"lang": "python", "json_occurrences": 1, "json_samples": 1,
+                    "sarif_results": 1, "json_titles": 1, "sarif_rules": 1}
+        with mock.patch.object(test_sarif_parity, "audit", return_value=complete) as audit, \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(test_sarif_parity.main(["--assert=rust", "python"]), 1)
+            audit.assert_not_called()
 
 
 class ProgressOutputTest(unittest.TestCase):
@@ -339,7 +385,10 @@ class SecurityPairCoverageTest(unittest.TestCase):
     def test_fixture_pin_does_not_replace_the_pair_case_for_its_file(self) -> None:
         # GH #147 pins re-scan a pair's buggy file for one rule's count. They
         # must not take the pair slot and drop its substring/severity checks.
-        manifest = json.loads((REPO_ROOT / "test-suite" / "manifest.json").read_text(encoding="utf-8"))
+        try:
+            manifest = json.loads((REPO_ROOT / "test-suite" / "manifest.json").read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise AssertionError(f"Canonical manifest is not valid JSON: {exc}") from exc
         by_id = {case["id"]: case for case in manifest["cases"]}
         pin = by_id["js-buggy-fixture-pin-fetch-abort"]
         self.assertEqual(pin["path"], by_id["js-typescript-fetch-cancellation-buggy"]["path"])

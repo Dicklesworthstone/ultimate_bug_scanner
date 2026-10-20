@@ -11,7 +11,7 @@ Layers, in order:
    preserves the legacy count_lines semantics; the A7 statement-interval
    engine in the meta-runner postprocess adds the richer placements).
 2. Analyzer layer — registered ubs_core analyzers: taint_java_traversal +
-   taint_java_redirect (category 4; verbatim heredoc ports) and
+   taint_java_redirect (category 4; bounded function-scoped dataflow) and
    narrowing_kotlin (category 1 Kotlin guard probe, run when .kt/.kts files
    are in scope). lifecycle_java does NOT run: with ast-grep available the
    legacy category-19 resource branch uses the ast rule group, and the

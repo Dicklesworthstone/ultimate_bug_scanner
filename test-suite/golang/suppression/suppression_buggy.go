@@ -48,6 +48,6 @@ func relocatedCookie(w http.ResponseWriter, r *http.Request) {
 
 // Placement 5 (rule-scoped): the marker names the single rule it suppresses.
 func scopedRandomToken() string {
-	token := fmt.Sprintf("%d", mathrand.Int63()) // ubs:ignore[go.crypto.rand] -- fixture: rule-scoped placement
+	token := fmt.Sprintf("%d", mathrand.Int63()) // ubs:ignore[go.crypto.rand,go.security.insecure-random] -- fixture: rule-scoped placement
 	return token
 }

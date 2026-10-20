@@ -15,7 +15,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="0636a77f4a482d4da306761f42ca20af5ca4d464d1e3cb0c86603a90e9c0057a"
+UBS_LIB_CHECKSUM="6b63a024bacfb102432db7fb95cd3742e5c9cc84880cdbf1c72418741e7422ca"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -232,7 +232,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 : "$VERBOSE" "$DETAIL_LIMIT" "$MAX_DETAILED" "$JOBS" "$DISABLE_PIPEFAIL_DURING_SCAN"
-: "$SARIF_RICH" "$INCLUDE_NAMES" "$RUN_GO_TOOLS" "$GOTEST_PKGS" "$ONLY_CHANGED" "$STRICT_MODE" "$BASELINE_FILE" "$NO_BANNER" "$ALLOW_NPX"
+: "$SARIF_RICH" "$RUN_GO_TOOLS" "$GOTEST_PKGS" "$ONLY_CHANGED" "$STRICT_MODE" "$BASELINE_FILE" "$NO_BANNER" "$ALLOW_NPX"
 
 # CI auto-detect + color override
 if [[ -n "${CI:-}" ]]; then CI_MODE=1; fi
@@ -477,7 +477,7 @@ run_contract_v2_go(){
   ubs_resolve_helpers_dir helpers_dir || helpers_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers"
   if [[ -f "$PROJECT_DIR" ]]; then
     printf '%s\0' "$PROJECT_DIR" >"$list_file" || { echo "ERROR: cannot write the scan file list; analysis is incomplete" >&2; return 2; }
-  elif ! ubs_list_files "$PROJECT_DIR" --ext "$INCLUDE_EXT" ${EXTRA_EXCLUDES:+--exclude "$EXTRA_EXCLUDES"} ${FILES_FROM:+--files-from "$FILES_FROM"} >"$list_file"; then
+  elif ! ubs_list_files "$PROJECT_DIR" --ext "$INCLUDE_EXT" --names "$INCLUDE_NAMES" ${EXTRA_EXCLUDES:+--exclude "$EXTRA_EXCLUDES"} ${FILES_FROM:+--files-from "$FILES_FROM"} >"$list_file"; then
     echo "ERROR: contract-v2 file list failed" >&2
     return 2
   fi

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import importlib
 import io
 import json
 import os
@@ -352,6 +353,189 @@ class PythonSourceSuppressionTests(unittest.TestCase):
                             self.assertRegex(proc.stdout, rf"Critical issues:\s+{expected}\b")
                             if not only_marked:
                                 self.assertIn("(1 found) — " + LIFECYCLE, proc.stdout)
+
+
+class PythonDetectorMarkerOwnershipTests(unittest.TestCase):
+    """Exercise the actual detector entry points, including distinct SQL/YAML IDs."""
+
+    CASES = (
+        ("json_loads", "py.parsing.json-loads-no-try", "import json\ndef handler(value):\n    return json.loads(value)\n", 3),
+        ("http_timeout", "py.security.http-timeout", "import requests\ndef handler():\n    return requests.get('https://example.test')\n", 3),
+        ("subprocess_timeout", "py.security.subprocess-timeout", "import subprocess\ndef handler():\n    return subprocess.run(['echo', 'ok'])\n", 3),
+        ("insecure_random", "py.security.insecure-random", "import random\ndef make_token():\n    return random.getrandbits(128)\n", 3),
+        ("cookie_security", "py.security.cookie-security", "SESSION_COOKIE_SECURE = False\n", 1),
+        ("jwt_verification", "py.security.jwt-verification", "import jwt\ndef handler(token):\n    return jwt.decode(token, options={'verify_signature': False})\n", 3),
+        ("template_autoescape", "py.security.template-autoescape", "import jinja2\nenv = jinja2.Environment(autoescape=False)\n", 2),
+        ("xml_parser_security", "py.security.xml-parser", "from lxml import etree\nparser = etree.XMLParser(resolve_entities=True)\n", 2),
+        ("debug_host_config", "py.security.debug-host-config", "DEBUG = True\n", 1),
+        ("cors_misconfig", "py.security.cors-misconfig", "from flask_cors import CORS\ndef configure(app):\n    return CORS(app, origins='*', supports_credentials=True)\n", 3),
+        ("csrf_disable", "py.security.csrf-disable", "WTF_CSRF_ENABLED = False\n", 1),
+        ("security_assert", "py.security.security-assert", "def authorize(user):\n    assert user.is_admin\n", 2),
+        ("password_hashing", "py.security.password-hashing", "from werkzeug.security import generate_password_hash\ndef hash_password(password):\n    return generate_password_hash(password, method='plain')\n", 3),
+        ("redos_regex", "py.security.redos-regex", "import re\ndef handler():\n    return re.compile(input())\n", 3),
+        ("template_injection", "py.security.template-injection", "from flask import render_template_string\ndef handler():\n    return render_template_string(input())\n", 3),
+        ("mass_assignment", "py.security.mass-assignment", "def handler(request, User):\n    return User(**request.get_json())\n", 2),
+        ("archive_extraction", "py.security.archive-extraction", "import tarfile\narchive = tarfile.open('bundle.tar')\narchive.extractall('out')\n", 3),
+        ("ssrf", "py.security.ssrf", "import requests\nrequests.get(request.args['url'])\n", 2),
+        ("host_header_poisoning", "py.security.host-header-poisoning", "reset_url = request.get_host()\n", 1),
+        ("ldap_injection", "py.security.ldap-injection", "conn.search('dc=example', request.args['filter'])\n", 1),
+        ("header_injection", "py.security.header-injection", "response.headers['X-Name'] = request.args['name']\n", 1),
+        ("crypto_misuse", "py.security.crypto-misuse", "DES.new(key)\n", 1),
+        ("nosql_injection", "py.security.nosql-injection", "collection.find(request.json)\n", 1),
+        ("hardcoded_secrets", "py.security.hardcoded-secrets", "password = 'LiveSecret123456'\n", 1),
+        ("file_permissions", "py.security.file-permissions", "import os\nos.chmod('f', 0o777)\n", 2),
+        ("tls_verification", "py.security.tls-verification", "import requests\nrequests.get('https://service.invalid', verify=False)\n", 2),
+        ("email_header_injection", "py.security.email-header-injection", "message['Subject'] = request.args['subject']\n", 1),
+        ("safe_html_xss", "py.security.safe-html-xss", "mark_safe(request.args['html'])\n", 1),
+        ("open_redirect", "py.security.open-redirect", "redirect(request.args['next'])\n", 1),
+        ("path_traversal", "py.security.path-traversal", "open(request.args['path'])\n", 1),
+        ("unsafe_deserialization", "py.security.unsafe-deserialization", "import marshal\nmarshal.loads(blob)\n", 2),
+        ("unsafe_deserialization", "py.security.yaml-unsafe-loader", "import yaml\nyaml.load(blob, Loader=yaml.FullLoader)\n", 2),
+        ("unsafe_deserialization", "py.security.yaml-loader-unresolved", "import yaml\nyaml.load(blob, Loader=runtime_loader)\n", 2),
+        ("command_injection", "py.security.command-injection", "import os\nos.system(input())\n", 2),
+        ("sql_injection", "py.security.sql-injection", "def handler(table):\n    cursor.execute(f'SELECT * FROM {table}')\n", 2),
+        ("sql_injection", "py.security.sql-injection-unproven", "from settings import table\ncursor.execute(f'SELECT * FROM {table}')\n", 2),
+    )
+
+    def test_markers_belong_to_the_emitted_rule_and_real_comments(self) -> None:
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="python-detector-markers-", dir=artifacts) as temporary:
+            source = Path(temporary) / "case.py"
+            for module_name, rule, text, line in self.CASES:
+                detector = importlib.import_module(f"ubs_core.py_detectors.{module_name}")
+                for label, suffix, expected in (
+                    ("unmarked", "", [line]),
+                    ("wrong-scope", "  # ubs:ignore[python.unrelated]", [line]),
+                    ("quoted", '; marker_note = "ubs:ignore"', [line]),
+                    ("owned", f"  # ubs:ignore[{rule}]", []),
+                ):
+                    with self.subTest(rule=rule, marker=label):
+                        lines = text.splitlines()
+                        lines[line - 1] += suffix
+                        source.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                        hits = list(detector.find([source]))
+                        sites = [hit[2] if len(hit) == 5 else hit[1] for hit in hits
+                                 if (hit[0] if len(hit) == 5 else detector.RULE_ID) == rule]
+                        self.assertEqual(sites, expected, hits)
+                with self.subTest(rule=rule, marker="previous-owned"):
+                    lines = text.splitlines()
+                    indent = re.match(r"\s*", lines[line - 1]).group()
+                    lines.insert(line - 1, indent + f"# ubs:ignore[{rule}]")
+                    source.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                    hits = list(detector.find([source]))
+                    sites = [hit[2] if len(hit) == 5 else hit[1] for hit in hits
+                             if (hit[0] if len(hit) == 5 else detector.RULE_ID) == rule]
+                    self.assertEqual(sites, [], hits)
+
+    def test_multiline_comments_use_the_classified_rule_without_erasing_taint(self) -> None:
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        cases = (
+            ("command_injection", "py.security.command-injection", "import os\nos.system(\n    input()  # {marker}\n)\n", 2),
+            ("sql_injection", "py.security.sql-injection", "def handler(table):\n    cursor.execute(\n        f'SELECT * FROM {table}'  # {marker}\n    )\n", 2),
+            ("sql_injection", "py.security.sql-injection-unproven", "from settings import table\ncursor.execute(\n    f'SELECT * FROM {table}'  # {marker}\n)\n", 2),
+            ("unsafe_deserialization", "py.security.yaml-unsafe-loader", "import yaml\nyaml.load(\n    blob, Loader=yaml.FullLoader  # {marker}\n)\n", 2),
+        )
+        with tempfile.TemporaryDirectory(prefix="python-multiline-markers-", dir=artifacts) as temporary:
+            source = Path(temporary) / "case.py"
+            for module_name, rule, text, line in cases:
+                detector = importlib.import_module(f"ubs_core.py_detectors.{module_name}")
+                for marker, expected in ((f"ubs:ignore[{rule}]", []),
+                                         ("ubs:ignore[unrelated.rule]", [line])):
+                    with self.subTest(rule=rule, marker=marker):
+                        source.write_text(text.replace("{marker}", marker), encoding="utf-8")
+                        hits = list(detector.find([source]))
+                        sites = [hit[2] if len(hit) == 5 else hit[1] for hit in hits
+                                 if (hit[0] if len(hit) == 5 else detector.RULE_ID) == rule]
+                        self.assertEqual(sites, expected, hits)
+
+
+# index_arithmetic is left out on purpose: its tier markers (a warning-tier
+# marker hiding the info tier, 3bac98f5) are an open owner decision, and main
+# keeps its own marker handling for that detector until then.
+class PythonLegacyMarkerOwnershipTests(unittest.TestCase):
+    CASES = (
+        ("division", "py.numeric.division", "value = numerator / denominator\n", 1),
+        ("io_open_checks", "py.io.open-missing-with", "handle = open('config')\n", 1),
+        ("is_literal", "py.comparison.is-literal", "if value is 1000:\n    pass\n", 1),
+        ("missing_returns", "py.functions.missing-returns", "def work():\n    pass\n", 1),
+        ("mutation_during_iteration", "py.collections.mutation-during-iteration",
+         "for value in items:\n    items.remove(value)\n", 1),
+    )
+
+    @staticmethod
+    def sites(detector, source, rule):
+        return [hit[2] if len(hit) == 5 else hit[1] for hit in detector.find([source])
+                if (hit[0] if len(hit) == 5 else detector.RULE_ID) == rule]
+
+    def test_legacy_detectors_use_exact_comment_ownership(self):
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="python-legacy-markers-", dir=artifacts) as tmp:
+            source = Path(tmp) / "case.py"
+            for name, rule, text, line in self.CASES:
+                detector = importlib.import_module(f"ubs_core.py_detectors.{name}")
+                for variant, expected in (("unmarked", [line]), ("unrelated", [line]),
+                                          ("quoted", [line + 1]), ("owned", []), ("previous", [])):
+                    with self.subTest(detector=name, variant=variant):
+                        lines = text.splitlines()
+                        if variant == "unrelated":
+                            lines[line - 1] += "  # ubs:ignore[unrelated.rule]"
+                        elif variant == "owned":
+                            lines[line - 1] += f"  # ubs:ignore[{rule}]"
+                        elif variant == "quoted":
+                            lines.insert(line - 1, 'marker_note = "ubs:ignore"')
+                        elif variant == "previous":
+                            lines.insert(line - 1, f"# ubs:ignore[{rule}]")
+                        source.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                        self.assertEqual(self.sites(detector, source, rule), expected)
+
+    def test_multiline_legacy_statements_own_their_comments(self):
+        cases = (
+            ("division", "py.numeric.division", "value = (numerator /\n    denominator  # {marker}\n)\n", 1),
+            ("io_open_checks", "py.io.open-missing-with", "handle = open(\n    'config'  # {marker}\n)\n", 1),
+            ("is_literal", "py.comparison.is-literal", "if (  # {marker}\n    value is\n    1000\n):\n    pass\n", 3),
+            ("missing_returns", "py.functions.missing-returns", "def work(\n    value  # {marker}\n):\n    pass\n", 1),
+            ("mutation_during_iteration", "py.collections.mutation-during-iteration",
+             "for value in (\n    items  # {marker}\n):\n    items.remove(value)\n", 1),
+        )
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="python-legacy-multiline-", dir=artifacts) as tmp:
+            source = Path(tmp) / "case.py"
+            for name, rule, text, line in cases:
+                detector = importlib.import_module(f"ubs_core.py_detectors.{name}")
+                for marker, expected in ((f"ubs:ignore[{rule}]", []),
+                                         ("ubs:ignore[unrelated.rule]", [line])):
+                    with self.subTest(detector=name, marker=marker):
+                        source.write_text(text.replace("{marker}", marker), encoding="utf-8")
+                        self.assertEqual(self.sites(detector, source, rule), expected)
+
+    def test_ladders_apply_scope_before_selecting_each_eligible_tier(self):
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="python-legacy-ladders-", dir=artifacts) as tmp:
+            source = Path(tmp) / "case.py"
+            for name, high, low, statement in (
+                ("division", "py.numeric.division-heavy", "py.numeric.division", "value = numerator / denominator"),
+            ):
+                detector = importlib.import_module(f"ubs_core.py_detectors.{name}")
+                count = detector.WARNING_ABOVE + 1
+                for marker, marked, expected_rule, expected_count in (
+                    ("", 0, high, count),
+                    (f"ubs:ignore[{low}]", count, high, count),
+                    (f"ubs:ignore[{high}]", 1, low, count),
+                    (f"ubs:ignore[{high}]", count, low, count),
+                    ("ubs:ignore", 1, low, count - 1),
+                ):
+                    with self.subTest(detector=name, marker=marker, marked=marked):
+                        lines = [statement + (f"  # {marker}" if index < marked else "")
+                                 for index in range(count)]
+                        source.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                        hits = list(detector.find([source]))
+                        self.assertEqual(len(hits), expected_count, hits)
+                        self.assertEqual({hit[0] for hit in hits}, {expected_rule}, hits)
 
 
 if __name__ == "__main__":

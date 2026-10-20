@@ -9,13 +9,15 @@ find_raw_batches/delete_one/delete_many/count_documents filters, update/replace/
 find_one_and_* first two args, aggregate/watch pipelines, and run.command —
 whose filter/query/pipeline/command/spec/where/update argument is unsafe.
 
-Same-file and previous-line `ubs:ignore` markers suppress a hit; a per-file
-`seen` line set dedupes repeats (legacy remember_issue).
+Comment directives use shared statement ownership and rule scopes. A
+per-file `seen` line set dedupes repeats (legacy remember_issue).
 """
 from __future__ import annotations
 
 import ast
 from typing import Iterable, Sequence
+
+from ubs_core.suppression import SourceSuppressions
 
 RULE_ID = "py.security.nosql-injection"
 CATEGORY = 7
@@ -61,15 +63,6 @@ def source_line(lines, line_no):
     return ''
 
 
-def has_ignore(lines, line_no):
-    idx = line_no - 1
-    return (
-        0 <= idx < len(lines) and 'ubs:ignore' in lines[idx]
-    ) or (
-        0 <= idx - 1 < len(lines) and 'ubs:ignore' in lines[idx - 1]
-    )
-
-
 def const_string(node):
     return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
 
@@ -98,9 +91,10 @@ def rooted_at_request(node):
 
 
 class NoSQLInjectionAnalyzer(ast.NodeVisitor):
-    def __init__(self, text, lines):
+    def __init__(self, text, lines, suppressions):
         self.text = text
         self.lines = lines
+        self.suppressions = suppressions
         self.untrusted_objects = set()
         self.unsafe_queries = set()
         self.request_values = set()
@@ -108,7 +102,7 @@ class NoSQLInjectionAnalyzer(ast.NodeVisitor):
         self.seen_lines = set()
 
     def remember_issue(self, line_no):
-        if has_ignore(self.lines, line_no) or line_no in self.seen_lines:
+        if self.suppressions.is_suppressed(line_no, RULE_ID) or line_no in self.seen_lines:
             return
         self.seen_lines.add(line_no)
         self.issues.append(line_no)
@@ -243,6 +237,7 @@ class NoSQLInjectionAnalyzer(ast.NodeVisitor):
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
+    suppressions = SourceSuppressions('python')
     for path in files:
         if path.suffix.lower() not in {'.py', '.pyi'}:
             continue
@@ -252,7 +247,7 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
         except Exception:
             continue
         lines = text.splitlines()
-        analyzer = NoSQLInjectionAnalyzer(text, lines)
+        analyzer = NoSQLInjectionAnalyzer(text, lines, suppressions.index(path, text))
         analyzer.visit(tree)
         for line_no in analyzer.issues:
             yield path, line_no, 1, source_line(lines, line_no)[:240]

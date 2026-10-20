@@ -5,7 +5,8 @@ Verbatim port of the ubs-csharp.sh ``run_security_randomness_checks`` heredoc
 tracking (safe reassignment kills), method-stack context, predictable-source
 gating on token material, brace-depth bookkeeping, and the /* */-aware comment
 stripper. The NUL-filelist loader is replaced by iteration over ``files``;
-per-file match logic is unchanged.
+source-owned directives filter exact-rule findings without erasing RNG or
+method-context facts needed by later statements.
 
 Legacy emission: critical "Security token generated with non-cryptographic
 randomness".
@@ -16,6 +17,7 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.suppression import SourceSuppressions
 from ubs_core.csharp_detectors._common import (
     logical_statement_randomness,
     relpath,
@@ -145,6 +147,7 @@ def analyze(path: Path, base_dir: Path, issues):
         'Stopwatch.GetTimestamp', 'GetHashCode', 'Process.GetCurrentProcess',
     )):
         return
+    suppression = SourceSuppressions('csharp').index(path, text)
     lines = text.splitlines()
     insecure_rng_vars = set()
     method_stack = []
@@ -170,12 +173,7 @@ def analyze(path: Path, base_dir: Path, issues):
             method_stack.append((pending_method, brace_depth + opens))
             pending_method = ''
         current_method = method_name or (method_stack[-1][0] if method_stack else '')
-        has_ignore = (
-            0 <= idx - 1 < len(lines) and 'ubs:ignore' in lines[idx - 1]
-        ) or (
-            0 <= idx - 2 < len(lines) and 'ubs:ignore' in lines[idx - 2]
-        )
-        if has_ignore or not raw_statement:
+        if not raw_statement:
             brace_depth += opens - closes
             continue
         statement = logical_statement_randomness(lines, idx)
@@ -183,7 +181,7 @@ def analyze(path: Path, base_dir: Path, issues):
         line_sensitive = has_security_context(statement, '')
         sensitive = line_sensitive or has_security_context('', current_method)
         source = unsafe_source(statement, insecure_rng_vars, sensitive, line_sensitive)
-        if source and sensitive:
+        if source and sensitive and not suppression.is_suppressed(idx, RULE_ID):
             key = (relpath(path, base_dir), idx, source)
             if key not in seen:
                 seen.add(key)

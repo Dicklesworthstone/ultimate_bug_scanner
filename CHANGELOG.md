@@ -10,11 +10,201 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+### Added
+
+- Kotlin category 13 now follows request data into JDBC SQL execution, including Java synthetic properties, source-local helper summaries, SQL captured by prepared statements and statement-owned batch queues. Static SQL with actual value binding stays clean. Named arguments, literal defaults and multiline expression bodies retain helper flow; unsupported receiver and default semantics report incomplete analysis. JSON and SARIF retain source-to-sink evidence, and the SQL work limit participates in cache invalidation.
+
+### Fixed
+
+- Kotlin broad exception handlers now report swallowed cancellation when their protected code reaches a resolved `delay`, `yield`, `awaitCancellation`, or direct cancellation throw. Catch ordering, type tests, scoped aliases and reachable branches distinguish propagation from swallowing; ordinary synchronous handlers remain quiet. Captured writes cannot leave stale rethrow proofs, and explicit imports retain their actual Kotlin precedence. Direct Kotlin SARIF also records incomplete analysis as a failed invocation with its reason.
+- Ruby request-flow analysis now resolves constant receivers through lexical namespaces, explicit root qualification, stable aliases and visible superclass constants. Namespaced helper calls retain their source and sink flow, while custom or overridden `File` methods cannot borrow built-in path-sanitizer proofs. Alias assignment order and both singleton-definition spellings preserve the actual receiver; uncertain rebindings and conditional definitions retain findings and report incomplete analysis.
+- Ruby literal allowlists use the constant selected by actual lexical lookup. Nested or compact namespace scopes cannot borrow an outer constant's safety proof, and ordinary literal-array calls no longer become incomplete namespace calls. Conditional definitions, reassignments, selected singleton overrides and request-derived shared mutations remain explicit analysis boundaries.
+
+- Native Go analyzer reports no longer stop at a 16 MiB aggregate output limit. `go vet` package and diagnostic arrays and `govulncheck` messages are read incrementally with bounded individual records. Valid diagnostics survive truncated, corrupt, oversized or failed output, and incomplete tool coverage remains explicit. A real 18.8 MB vet report now retains all 13,000 source diagnostics with exact locations.
+- JavaScript writes to the unshadowed global `undefined` no longer suppress parameter defaults or erase unsafe data. Right-hand-side effects and assignment results remain visible; strict-mode writes preserve their exceptional exits through catch and finally. Local shadows stay distinct, and ambiguous global declaration environments report incomplete analysis instead of a clean result.
+- C# null analysis no longer keeps stale guard proofs after captured helper writes, delegate calls, by-reference arguments or known accessor and disposal effects. Constructor writes to borrowed objects remain visible while fresh receiver fields stay separate. Nullable and reference-valued dictionary lookups require a value check; namespace-qualified bindings and exceptional exits keep their own state. Findings established before an unsupported scope survive in JSON and SARIF, including findings in later files, while the report explicitly marks incomplete analysis.
+- JavaScript destructuring retains null, undefined and noniterable entry failures before defaults or function bodies can hide unsafe data. Default and bypass exceptions retain their separate stores; parenthesized templates remain strings, and parameter initializers resolve shadowed `undefined` in their actual scope. Unary `void` preserves operand effects while supplying a clean undefined value.
+- External analyzer completion now accounts for inherited child processes, ignored child-exit signals, and native AST errors on stderr, including errors beyond the preview. Corrupt stream records remain recorded if consumption stops early; incomplete AST output cannot become a clean result through missing error collectors, inconsistent exit codes, or a prefilter failure.
+- JavaScript calls capture spread elements before later argument effects, evaluate spread expressions once, and keep updates that later parameter defaults make to earlier bindings. Destructuring assignments also retain receivers returned by calls, including their computed-key effects, exceptions and DOM sink writes.
+- JavaScript taint analysis preserves field identity through object and array destructuring in declarations, assignments and function parameters. Rest bindings are fresh shallow copies, defaults retain their ordered effects and exceptions, and member targets retain borrowed aliases and direct sink checks. Separate callers and clean sibling fields remain distinct.
+- C# null-guard analysis follows scoped branches, assignments and actual exit targets, including constructors, accessors and braced callbacks. Comments, unrelated bindings and nested conditional exits no longer create false proofs; uncertain selected control flow reports incomplete analysis. The exception rethrow rule matches the active catch binding and respects callable and finally boundaries, avoiding recommendations that would replace unrelated throws or produce invalid C#.
+- AST diagnostics and the ripgrep prefilter consume complete newline-delimited output with bounded record memory. Large Rust, JavaScript, TypeScript and TSX scans no longer stop at the former 16 MiB total-output ceiling; malformed records, tool failures and timeouts still mark analysis incomplete and retain valid diagnostics. Temporary output handles close on capture and consumer failures.
+- JavaScript taint analysis preserves captured object identities in nested helpers, so writes and array mutations through unassigned object parameters reach their callers. Field-specific reads and definite cleanup remain precise, with separate clean and tainted caller controls.
+- JavaScript taint analysis reuses scalar helper summaries inside allocating callers without copying unrelated heap state. Heap callers are revisited when those summaries change; captured objects and object arguments retain their contextual analysis.
+- Components proven to contain no modeled taint source avoid unnecessary heap expansion. The proof checks every selected module using the analyzer's source patterns and parsed parameter origins; source-bearing components retain the same analysis and work limits.
+
+---
+
+## [v5.5.9] - 2026-10-19 [Tag]
+
+Git-only source delivery; signed release assets and installed-tool upgrades are separate.
+
+### Fixed
+
+- Swift request-flow analysis no longer treats ordinary API `.write(...)` calls
+  without an outer `to:` argument as Foundation file writes. Real file destinations,
+  nested sinks, interpolation and request-derived values retain their checks.
+- Swift comment tokenization uses explicit ordered appends, preserving newline
+  offsets while allowing the Python SQL analyzer to complete its own source scan.
+
+---
+
+## [v5.5.8] - 2026-10-16 [Tag]
+
+Git-only source delivery; signed release assets and installed-tool upgrades are separate.
+
+### Fixed
+
+- Python descriptor analysis recognizes adjacent `ExitStack.callback(os.close, fd)`
+  registration inside branches and loops, and immediate ownership transfer to
+  a resolved `os.fdopen` context. Leaks still warn when registration is conditional,
+  the stack escapes, an intervening operation can raise, or `closefd` is false or
+  unknown. Calling `.close()` on an integer no longer hides a descriptor leak.
+  A builtin `open` context also owns the raw descriptor returned directly by
+  its inline `opener`, while shadowed or unresolved owners retain warnings.
+- Standalone Python SARIF retains every concrete finding's location and message
+  by reading the complete findings sink instead of the grouped summary. Missing
+  or corrupt evidence and failed SARIF conversion return an explicit error.
+
+---
+
+## [v5.5.7] - 2026-10-15 [Tag]
+
+Git-only source delivery; signed release assets and installed-tool upgrades are separate.
+
+### Fixed
+
+- JavaScript logical assignments (`||=`, `&&=`, `??=`) retain the path that
+  skips the right-hand side, so conditional cleanup cannot hide unsafe data.
+  Scalar and property assignments share that flow. Throwing right-hand sides
+  no longer erase the normal bypass; computed keys and receivers are evaluated
+  before the split, and returned object aliases remain intact. This bounded
+  analysis conservatively retains both paths rather than proving truthiness.
+- Paired direct-analysis and public JSON/SARIF controls cover conditional
+  cleanup, RHS sink effects, exception paths, receiver rebinding and aliases.
+  Other inherited expanded JavaScript heap failures remain tracked separately;
+  this repair is not a clean whole-suite qualification claim.
+
+---
+
+## [v5.5.6] - 2026-10-15 [Tag]
+
+Git-only source delivery; signed release assets and installed-tool upgrades are separate.
+
+### Fixed
+
+- Swift lifecycle analysis follows `do`/`catch` exception paths, nested rethrows,
+  and scope-exit `defer` cleanup. Filtered and typed handlers retain unmatched
+  exceptions; catch bindings cannot discharge a same-named outer resource.
+  Throwing branch/loop conditions also retain their exceptional exits.
+- Request-flow and outbound-URL activation distinguish lexically bound native
+  Vision requests from incoming web requests. Unknown or shadowed bindings,
+  actual request members, upload filenames and unsupported captures remain
+  conservative; no source files, rules or severities are excluded.
+- Unshadowed process-exit primitives terminate Swift guard failure paths.
+  Argument effects are still analyzed, and user-defined replacements do not
+  acquire a false non-returning guarantee.
+
+---
+
+## [v5.5.5] - 2026-10-15 [Tag]
+
+Git-only source delivery; signed release assets and installed-tool upgrades are separate.
+
+### Fixed
+
+- Swift request-flow analysis supports identifier and wildcard tuple bindings in
+  `for` loops, including nested tuples, lexical shadowing and `where` filters.
+  Each component conservatively inherits the sequence's dependencies without
+  borrowing another component's validation; request-object identity survives
+  destructuring. This may overreport a clean sibling of a tainted component.
+  Iterating request headers, query/parameter collections or content creates
+  an untrusted element read, including scalar aliases and tuple components.
+  Unsupported case, cast and optional patterns still fail closed.
+- Collection `append(contentsOf:)` labels no longer activate unrelated
+  file-reading analysis. Real file reads and request inputs, including nested
+  reads in the appended expression, retain their analysis obligations.
+- JavaScript nested default captures and heap completions retain their
+  dependencies through recursive function summaries.
+
+---
+
+## [v5.5.4] - 2026-10-15 [Tag]
+
+Git-only source delivery; signed release assets and installed-tool upgrades are separate.
+
+### Fixed
+
+- Swift request-flow analysis distinguishes filename argument labels, such as
+  `IntentFile(filename: name)`, from untrusted filename values. Clean App Intents
+  exports no longer activate unrelated unsupported closure analysis. Actual
+  upload members, request inputs, interpolations, dictionary keys and ternary
+  values retain their conservative source classification and fail-closed behavior.
+- Malformed internal exclusion-policy JSON fails with an explicit scanner-policy
+  diagnostic and retains its decoding cause; it is never replaced with an empty
+  policy. Valid project-anchored exclusions retain their original scope.
+- JavaScript taint summaries now widen recursive calls per recursion entry, so
+  recursive interpreters converge without mixing unrelated callers' heap
+  allocations. Adapted tryingET's proposed fix for #180, with regressions for
+  recursive copying, deep cloning, shared mutations and clean caller isolation.
+- Helper calls inside recursive summaries retain caller and call-site isolation.
+  Escaping catch-rest and CommonJS allocations preserve their tagged identities,
+  avoiding analyzer crashes and unrelated clean/tainted value mixing.
+- Nested heap-returning functions capture unassigned formal parameters, fixing
+  the related `get()` false negative. State inequality now includes heap and
+  captured-cell changes when scheduling dependent summaries.
+
+---
+
+## [v5.5.3] - 2026-10-14 [Release]
+
+### Fixed
+
+- Python URL guards reject host allow-lists rebound by pattern captures, class/function definitions, exception targets or wildcard imports. These bindings do not have ordinary assignment nodes and could previously hide an arbitrary outbound request after an apparently exact HTTPS/host check. Literal, unchanged allow-lists still pass; real JSON/SARIF scans preserve the unsafe request's SSRF finding and failure status.
+
+---
+
+## [v5.5.2] - 2026-10-14 [Tag]
+
+Included in the v5.5.3 release.
+
+### Fixed
+
+- Python SSRF taint analysis recognizes terminating local URL guards that resolve the stdlib parser and require HTTPS plus membership in a literal, non-escaping host allow-list. Unsafe alternate branches, mutable allow-lists, parser shadowing, reassigned destinations and unrelated sanitizer domains retain their findings.
+- Doctor repair tests package epoch-dated prebuilt ast-grep binaries with ZIP's minimum representable timestamp, preserving exact binary bytes and the original repair/checksum assertions. JavaScript precision fixtures now contain executable float comparisons instead of relying on comment text to meet the existing warning threshold.
+- Release-generation preparation closes descriptors when a directory cannot become a buffered stream, keeps descriptor ownership explicit and delimits download URL arguments. The file-ownership detector recognizes exact stdlib `ExitStack.callback(os.close, fd)` registration; unclosed descriptors, wrong closers, reassigned/shadowed APIs and escaped stacks still warn.
+- JSONL finding, scanner and totals records use one combined-scan timestamp, matching same-scan exports across second boundaries. Original module timestamps remain available as scanner_timestamp; legacy finding timestamps are retained separately. Summary-only scanner records preserve their coverage status.
+- Rust compiler diagnostics retain coded and ANSI-colored errors as findings. Unavailable Cargo/RCH phases remain partial, and their reports preserve the actionable transport/admission summary instead of a trailing colored tracing frame.
+- Preserve the published v5.5.1 protections against ast-grep launcher recursion and obsolete installed contracts alongside the newer scanner changes. Failure to create the launcher isolation path now refuses the scan before any module runs; the fallback diagnostic does not interpret launcher filenames as shell code.
+- Carry explicit incomplete semantic coverage through the shipped meta-runner as `analysis` / `analysis-incomplete`, retaining exit 2, partial status and supported findings. Tooling failures still take precedence. JSONL totals retain the same failure identity as JSON, and JSON/JSONL schemas accept partial scanner reports.
+- Python opaque import cycles preserve callback ownership instead of re-solving foreign functions against the cycle's globals. This prevents an unrelated cycle from overwriting a helper summary and hiding a later unsafe command flow. Immutable AST and lexical-scope walks are reused during preparation; selected files, import opacity, fixed-point rules and timeout limits are unchanged.
+- JavaScript operator checks use executable source, preserving real operations and template interpolations while excluding strings, comments and regular expressions. The strict corpus snapshot excludes six former bitwise findings on regex/string bytes; all other 1,009 records and generated rule coverage remain unchanged.
+
+---
+
+## [v5.5.1] - 2026-10-14 [Release]
+
+### Fixed
+
+- **Scans no longer spawn ast-grep without end when the installer placed ast-grep's `sg` launcher as `ast-grep`.** ast-grep's release archives contain the real `ast-grep` and `sg`, which recent ast-grep releases turned into a small deprecation launcher that runs `ast-grep` from `PATH`. When `ast-grep` was not installed, `install.sh` (v5.4.16 to v5.5.0) unpacked the 0.45.3 archive and installed whichever of the two `find` listed first as `~/.local/bin/ast-grep`. When that was the launcher, it ran itself recursively: a single-file Python scan timed out after 300 s with thousands of short-lived processes, and in a 4 GiB container the kernel killed ast-grep and everything after it. The installer now installs only the member named `ast-grep`, and treats a launcher already on `PATH` as missing, so re-running it repairs the install. The runner recognises the launcher from its bytes, without executing it, and for that run puts a verified ast-grep (another one on `PATH`, or its own tool cache) ahead of it on `PATH`, so no language module runs the launcher; it warns once per run and points at `install.sh` for the repair. Before, only JavaScript scans resolved a verified ast-grep, so every other module ran whatever `ast-grep` was first on `PATH`.
+- **`ubs --update` from v5.4.x no longer leaves every scan refusing** (#174). The updater replaces the runner and its daemon companion but not the cached `contract.json`, so the first scan after updating from v5.4.x failed closed with "contract.json failed verification (checksum mismatch …); refusing to scan" until `ubs doctor --fix`. A cached contract that is byte for byte one of the contracts earlier releases shipped (v5.4.0 through v5.4.19) is now refreshed from this release and verified against this runner's pin before the scan continues. Any other mismatch is still fatal and the cached file is kept for inspection (#129), as is a refresh that cannot be downloaded or does not verify. A contract in a checkout is never refreshed.
+
+### Known issues
+
+The known issues of v5.5.0 are unchanged: Elixir (#168) and C# (#171) scans can end partial where v5.4.17 exited 0, concurrent first scans can race on the ast-grep tool cache (#170), and `cs.pattern.blocking-result` reports any `.Result` (#169).
+
+---
+
+## [v5.5.0] - 2026-10-13 [Release]
+
 First published release since v5.4.17. It includes everything under the git-only tags v5.4.18 and v5.4.19 below, which never had release assets, and the work that moved `VERSION` from 5.4.20 to 5.4.40 on `main` without a tag. Installs that update through `ubs --update` or the installer go from v5.4.17 straight to this version.
 
 ### Known issues
 
 - **Elixir scans can end partial (exit 2) where v5.4.17 exited 0** (#168). A public function that calls `apply/2,3`, or a file that runs SQL (`Ecto.Adapters.SQL`, a `Repo` query) and also calls `Code.eval_*` or passes a callback to a function the engine does not model (`spawn`, `Task.async`, `Enum.reduce`, ...), makes the Elixir module report "analysis incomplete". Findings are still reported. `UBS_ALLOW_PARTIAL=1` returns the findings exit code (0 or 1) instead of 2. The engine treats such calls as unknown execution on purpose; #168 proposes treating calls that no request data reaches as opaque.
+- **C# scans can end partial (exit 2) where v5.4.17 exited 0** (#171). In a file that contains a SQL sink, a `ref`/`out` call the C# SQL engine cannot resolve (`MailAddress.TryCreate(raw, out _)`, a cross-file helper, Dapper dispatch) makes the C# module report "analysis incomplete", even when the SQL is parameterized and the call is unrelated. The run reports `error: environment`, but `ubs doctor` has nothing to fix. Findings are still reported; `UBS_ALLOW_PARTIAL=1` returns the findings exit code. Same mechanism as the Elixir case above.
+- **Concurrent scans can fail with "extracted ast-grep did not execute correctly"** (#170, also in v5.4.17). When `ast-grep` is not on `PATH`, every run re-extracts the cached ast-grep binary over itself, so a scan that starts while another is extracting can execute a half-written file and exit 2. Putting an `ast-grep` binary on `PATH` avoids the cache.
+- **C# `cs.pattern.blocking-result` reports any `.Result`** (#169, also in v5.4.17): a record or tuple member named `Result`, and comments, are reported as critical blocking calls, not only `Task.Result`.
 
 ### Changed
 

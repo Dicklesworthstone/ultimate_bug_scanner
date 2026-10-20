@@ -326,6 +326,8 @@ def run_analyzers(files: Sequence, sink, skip: set, base_dir: Path,
 
     skip_narrowing = os.environ.get("UBS_SKIP_TYPE_NARROWING", "0") == "1"
     for analyzer in analyzers_for_lang("csharp"):
+        if analyzer.name == "narrowing_csharp" and (skip_narrowing or 1 in skip):
+            continue
         if analyzer.name in {"taint_csharp_request", "taint_csharp_redirect", "taint_csharp_sql"} and 8 in skip:
             continue
         if prefilter is not None:
@@ -335,10 +337,10 @@ def run_analyzers(files: Sequence, sink, skip: set, base_dir: Path,
         if not target_files:
             continue
         def checked_findings():
-            # SQL analysis is bounded within each selected file. Stream known
-            # findings before recording incompleteness, then continue with the
-            # next file so an unsupported input cannot hide a neighbor's sink.
-            per_file = analyzer.name == "taint_csharp_sql"
+            # These analyses are bounded within each selected file. Stream
+            # known findings before recording incompleteness, then continue
+            # so an unsupported input cannot hide a neighbor's findings.
+            per_file = analyzer.name in {"taint_csharp_sql", "narrowing_csharp"}
             batches = ([path] for path in target_files) if per_file else (target_files,)
             for batch in batches:
                 ctx = RunContext(lang="csharp", files=batch)

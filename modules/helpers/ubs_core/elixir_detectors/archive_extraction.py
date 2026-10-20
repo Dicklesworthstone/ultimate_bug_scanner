@@ -5,8 +5,8 @@ Verbatim port of run_archive_extraction_checks (modules/ubs-elixir.sh
 Archive) are scanned for entry-name aliases feeding Path.join/expand/
 relative_to or File write sinks (or direct `cwd:`-option extracts) without a
 safe-named helper or a Path.expand/relative_to + starts_with?/reject
-containment context in the ±8/+10 window. Same-file and previous-line
-`ubs:ignore` markers suppress a hit.
+containment context in the ±8/+10 window. Lexical statement-owned
+`ubs:ignore` markers suppress only matching rules.
 """
 from __future__ import annotations
 
@@ -14,10 +14,10 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.suppression import SourceSuppressions
 from ubs_core.elixir_detectors._common import (
     EXTS,
     elixir_files,
-    has_ignore,
     read_lines,
     source_line,
     strip_line_comments,
@@ -149,12 +149,11 @@ def scan_file_findings(path: Path) -> Iterable[tuple[int, int, str]]:
     text = "\n".join(lines)
     if not ARCHIVE_HINT_RE.search(text):
         return
+    suppressions = SourceSuppressions('elixir').index(path, text)
     entry_aliases = collect_entry_aliases(lines)
     path_aliases = collect_path_aliases(lines, entry_aliases)
     seen: set[int] = set()
     for idx, _ in enumerate(lines, start=1):
-        if has_ignore(lines, idx):
-            continue
         statement = logical_statement(lines, idx)
         direct_cwd_extract = bool(DIRECT_CWD_EXTRACT_RE.search(statement))
         unsafe_path_build = bool(PATH_BUILD_RE.search(statement)) and references_any(statement, entry_aliases)
@@ -167,7 +166,8 @@ def scan_file_findings(path: Path) -> Iterable[tuple[int, int, str]]:
         if idx in seen:
             continue
         seen.add(idx)
-        yield idx, 1, source_line(lines, idx)
+        if not suppressions.is_suppressed(idx, RULE_ID):
+            yield idx, 1, source_line(lines, idx)
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple]:

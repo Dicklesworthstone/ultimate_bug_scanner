@@ -792,7 +792,9 @@ is an explicit incomplete-analysis error, never a truncated clean result.
         factory_parts = self.split(call_expression, {".", "&."})
         factory = ""
         if len(factory_parts) == 2 and factory_parts[1]:
-            receiver = self.lookup(self.text(factory_parts[0]), state)
+            # A leading `::` names the top-level constant, as expressions
+            # already read `::File.open`; `::Thread.new { }` is core Thread.
+            receiver = self.lookup(re.sub(r"^::\s*", "", self.text(factory_parts[0])), state)
             if receiver.kind == "constant":
                 factory = str(receiver.key) + "." + factory_parts[1][0].value
         if factory in {"Thread.new", "Thread.start", "Thread.fork"}:

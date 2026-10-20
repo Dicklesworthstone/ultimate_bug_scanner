@@ -17,7 +17,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="0636a77f4a482d4da306761f42ca20af5ca4d464d1e3cb0c86603a90e9c0057a"
+UBS_LIB_CHECKSUM="6b63a024bacfb102432db7fb95cd3742e5c9cc84880cdbf1c72418741e7422ca"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -546,8 +546,11 @@ cargo_phase_ec() {
 count_warnings_errors() {
   local file="$1"
   local w e
-  w=$(grep -E -c "^warning: |: warning:" "$file" 2>/dev/null || true)
-  e=$(grep -E -c "^error: |: error:" "$file" 2>/dev/null || true)
+  # Cargo/RCH may force terminal colors even with NO_COLOR set. Preserve the
+  # original log, but count the visible diagnostics rather than escape bytes.
+  # Coded rustc errors (error[E0512]) are compiler findings, not unavailable tools.
+  w=$(sed $'s/\033\\[[0-9;]*m//g' "$file" | grep -E -c "^warning(\[[^]]+\])?: |: warning:" || true)
+  e=$(sed $'s/\033\\[[0-9;]*m//g' "$file" | grep -E -c "^error(\[[^]]+\])?: |: error:" || true)
   echo "${w:-0} ${e:-0}"
 }
 
@@ -577,17 +580,24 @@ _v2_add_finding(){
 
 _v2_report_cargo_failure() {
   local severity="$1" logfile="$2" category="$3" title="$4"
-  local ec last
+  local ec last failure_phase
   ec="$(cargo_phase_ec "$logfile")"
-  last="$(grep -v '^[[:space:]]*$' "$logfile" 2>/dev/null | tail -n 1 | cut -c1-200)"
+  # RCH can append tracing frames after its actionable failure summary. Keep
+  # the actual admission/transport reason instead of reporting a source frame.
+  last="$(sed $'s/\033\\[[0-9;]*m//g' "$logfile" | grep -E '^\[RCH\] ' | tail -n 1 | cut -c1-200 || true)"
+  if [[ -z "$last" ]]; then
+    last="$(sed $'s/\033\\[[0-9;]*m//g' "$logfile" | grep -v '^[[:space:]]*$' | tail -n 1 | cut -c1-200 || true)"
+  fi
   if [[ "$severity" == "critical" || "$severity" == "warning" ]]; then
     severity="warning"
     if [[ "$CARGO_UNAVAILABLE" -eq 0 ]]; then
       CARGO_UNAVAILABLE=1
       CARGO_UNAVAILABLE_MSG="${title} (exit ${ec}): ${last:-no output captured}"
     fi
-    print_finding "info" 1 "Not evaluated: ${title%% could not run*}${title%% failed without diagnostics*}" "cargo returned exit $ec without diagnostics; the result is partial"
-    _v2_add_finding "info" 1 "Not evaluated: ${title%% could not run*}${title%% failed without diagnostics*}" "cargo returned exit $ec without diagnostics; the result is partial" "$category"
+    failure_phase="${title%% could not run*}"
+    failure_phase="${failure_phase%% failed without diagnostics*}"
+    print_finding "info" 1 "Not evaluated: $failure_phase" "cargo returned exit $ec without diagnostics; the result is partial"
+    _v2_add_finding "info" 1 "Not evaluated: $failure_phase" "cargo returned exit $ec without diagnostics; the result is partial" "$category"
   fi
   print_finding "$severity" 1 "$title (exit $ec)" "${last:-no output captured}"
   _v2_add_finding "$severity" 1 "$title (exit $ec)" "${last:-no output captured}" "$category"

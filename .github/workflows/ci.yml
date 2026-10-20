@@ -201,10 +201,13 @@ jobs:
           npm install -g @ast-grep/cli@0.45.3 >/dev/null
           "$(brew --prefix)/bin/bash" --version | head -n 1
 
-      - name: Stock /bin/bash 3.2 must fail with the documented message (exit 2)
+      - name: Stock /bin/bash 3.2 re-execs under Homebrew bash, else fails with the documented message (exit 2)
         run: |
+          # cron and launchd start `env bash` as /bin/bash 3.2; ubs must find the modern bash.
+          env -i HOME="$HOME" PATH=/usr/bin:/bin /bin/bash ./ubs --version | tee reexec.out
+          grep -q 'UBS Meta-Runner' reexec.out
           set +e
-          /bin/bash ./ubs --version > guard.out 2>&1
+          UBS_NO_BASH_REEXEC=1 /bin/bash ./ubs --version > guard.out 2>&1
           rc=$?
           set -e
           cat guard.out

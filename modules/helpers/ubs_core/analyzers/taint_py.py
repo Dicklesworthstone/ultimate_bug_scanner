@@ -67,7 +67,21 @@ SANITIZERS = {
     'shlex.quote': 'command',
 }
 
-KIND_BY_RULE = {f'py.taint.{kind}': kind for kind in ('xss', 'sql', 'command', 'eval')}
+KIND_BY_RULE = {f'py.taint.{kind}': kind for kind in ('xss', 'sql', 'command', 'eval', 'ssrf')}
+
+# These are resolved import identities, not method-name heuristics. A mapping
+# lookup or an unrelated object's get() must never acquire an HTTP contract.
+# request()/stream() take a method before their URL; convenience calls do not.
+# Bodies, query parameters, headers and authentication are not URL operands.
+_HTTP_URL_POSITIONS = {
+    **{f'{module}.{method}': 0
+       for module in ('requests', 'requests.api', 'httpx')
+       for method in ('get', 'post', 'put', 'patch', 'delete', 'head', 'options')},
+    'requests.request': 1,
+    'requests.api.request': 1,
+    'httpx.request': 1,
+    'httpx.stream': 1,
+}
 
 
 _PARAMETER_MARKERS = {
@@ -745,6 +759,10 @@ def _qualified(node: ast.AST, aliases: dict[str, object]) -> str:
                            'subprocess', 'os', 'asyncio', 'builtins', 'eval', 'exec', 'input', 'raw_input',
                            'render_template', 'render_template_string', 'HttpResponse', 'Response'}:
                 return ''
+        # HTTP names are not legacy implicit identities. Once a real import
+        # is absent or shadowed, spelling alone cannot restore a network API.
+        if node.id in {'requests', 'httpx'}:
+            return ''
         return node.id
     if isinstance(node, ast.Attribute):
         base = _qualified(node.value, aliases)
@@ -772,18 +790,20 @@ def _pattern_capture(node):
     return None
 
 
-def _local_names(scope, scope_nodes=None) -> set[str]:
+def _local_names(scope, nodes=None) -> set[str]:
+    if nodes is None:
+        nodes = tuple(_scope_nodes(scope))
     names = set()
     if scope_nodes is None:
         scope_nodes = list(_scope_nodes(scope))
     # Iteration targets belong to the comprehension, not its containing
     # function/module. Walrus targets still belong to the containing scope.
     comprehension_targets = {
-        child for node in scope_nodes
+        child for node in nodes
         if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp))
         for generator in node.generators for child in ast.walk(generator.target)
     }
-    for node in scope_nodes:
+    for node in nodes:
         if (isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del))
                 and node not in comprehension_targets):
             names.add(node.id)
@@ -797,7 +817,7 @@ def _local_names(scope, scope_nodes=None) -> set[str]:
         args = scope.args
         names.update(arg.arg for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs))
         names.update(arg.arg for arg in (args.vararg, args.kwarg) if arg is not None)
-        for node in scope_nodes:
+        for node in nodes:
             if isinstance(node, (ast.Global, ast.Nonlocal)):
                 names.difference_update(node.names)
     return names
@@ -980,6 +1000,83 @@ class _Flow:
         self.comprehension_budget = 64
         self.comprehension_environments = []
         self.context_globals = ()
+
+    def refine_url_guard(self, test, state, truth):
+        """Recognize an exact, terminating local URL allow-list predicate.
+
+        A helper's name is never a sanitizer. Its body must parse the tested
+        argument with the resolved stdlib urlparse and require both HTTPS and
+        membership in a literal host set that cannot be mutated or escape.
+        Only the successful branch receives the SSRF-specific fact.
+        """
+        if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+            return self.refine_url_guard(test.operand, state, not truth)
+        if not (truth and isinstance(test, ast.Call) and len(test.args) == 1
+                and not test.keywords and isinstance(test.args[0], ast.Name)):
+            return
+        choices = _binding_choices(self.expression_bindings.get(test.func))
+        if len(choices) != 1:
+            return
+        function = next(iter(choices))
+        if (not isinstance(function, ast.FunctionDef) or function.decorator_list
+                or function not in self.engine.functions):
+            return
+        args = function.args
+        parameters = [*args.posonlyargs, *args.args]
+        if (len(parameters) != 1 or args.vararg or args.kwarg or args.kwonlyargs
+                or args.defaults):
+            return
+        parameter = parameters[0].arg
+        body = list(function.body)
+        if body and isinstance(body[0], ast.If):
+            guard = body.pop(0)
+            if not (isinstance(guard.test, ast.UnaryOp) and isinstance(guard.test.op, ast.Not)
+                    and isinstance(guard.test.operand, ast.Name) and guard.test.operand.id == parameter
+                    and not guard.orelse and len(guard.body) == 1
+                    and isinstance(guard.body[0], ast.Return)
+                    and isinstance(guard.body[0].value, ast.Constant)
+                    and guard.body[0].value.value is False):
+                return
+        if not (len(body) == 2 and isinstance(body[0], ast.Assign)
+                and len(body[0].targets) == 1 and isinstance(body[0].targets[0], ast.Name)
+                and isinstance(body[1], ast.Return)):
+            return
+        parsed = body[0].targets[0].id
+        parser = body[0].value
+        if not (parsed != parameter and isinstance(parser, ast.Call)
+                and isinstance(parser.func, ast.Name) and parser.func.id not in {parsed, parameter}
+                and _qualified(parser.func, state.bindings) == 'urllib.parse.urlparse'
+                and _qualified(parser.func, self.engine.globals.bindings) == 'urllib.parse.urlparse'
+                and len(parser.args) == 1 and not parser.keywords
+                and isinstance(parser.args[0], ast.Name) and parser.args[0].id == parameter):
+            return
+        condition = body[1].value
+        if not (isinstance(condition, ast.BoolOp) and isinstance(condition.op, ast.And)
+                and len(condition.values) == 2):
+            return
+        checked = set()
+        for comparison in condition.values:
+            if not (isinstance(comparison, ast.Compare) and len(comparison.ops) == 1
+                    and isinstance(comparison.left, ast.Attribute)
+                    and isinstance(comparison.left.value, ast.Name)
+                    and comparison.left.value.id == parsed):
+                return
+            operand = comparison.comparators[0]
+            if (comparison.left.attr == 'scheme' and isinstance(comparison.ops[0], ast.Eq)
+                    and isinstance(operand, ast.Constant) and operand.value == 'https'):
+                checked.add('scheme')
+            elif (comparison.left.attr == 'hostname' and isinstance(comparison.ops[0], ast.In)
+                    and isinstance(operand, ast.Name) and operand.id in self.engine.url_allowlists
+                    and operand.id not in {parsed, parameter}):
+                checked.add('hostname')
+            else:
+                return
+        name = test.args[0].id
+        # Do not certify a mutable object's heap or unrelated aliases. A later
+        # assignment or heap mutation still introduces its unsanitized facts.
+        if checked == {'scheme', 'hostname'} and not any(
+                state.heap.get(ref, CLEAN) for ref in state.references.get(name, NO_REFERENCES)):
+            state[name] = _sanitize(state.value(name), 'ssrf')
 
     def possible_exception(self, state):
         if not (state.reachable and self.exception_states):
@@ -2100,6 +2197,24 @@ class _Flow:
         elif leaf in {'execute', 'executemany', 'text'} and name.split('.')[0] in {'cursor', 'session', 'conn', 'engine', 'db'}:
             query = source_argument('sql', 'query', 'statement', 'operation')
             self.effect('sql', node, 'SQL engine execute' if name.split('.')[0] in {'engine', 'db'} else 'SQL execute', query)
+        elif name in _HTTP_URL_POSITIONS:
+            position = _HTTP_URL_POSITIONS[name]
+            # The call view already expands literal *lists and *tuples. An
+            # opaque expansion before the URL can shift later arguments, so
+            # retain every possible URL rather than trusting the old offset.
+            # An expansion after an explicit URL cannot change that operand.
+            star = next((index for index, argument in enumerate(node.args)
+                         if index <= position and isinstance(argument, ast.Starred)), None)
+            if star is not None:
+                destination = join_facts(*arguments[star:], keywords.get('url', CLEAN),
+                                         keywords.get(None, CLEAN))
+            elif len(arguments) > position:
+                destination = arguments[position]
+            else:
+                destination = join_facts(keywords.get('url', CLEAN), keywords.get(None, CLEAN))
+            # Share the site key across callable alternatives: a joined
+            # requests.get/httpx.get target is one reachable network sink.
+            self.effect('ssrf', node, 'HTTP request URL', destination)
         elif name in {'subprocess.run', 'subprocess.Popen', 'subprocess.call', 'subprocess.check_output', 'subprocess.check_call'}:
             command_fact = source_argument('args')
             command_node = node.args[0] if node.args else keyword_nodes.get('args')
@@ -2776,7 +2891,10 @@ class _Flow:
             return None
         elif isinstance(node, ast.If):
             self.expr(node.test, state)
-            return _join_states(self.block(node.body, state.copy()), self.block(node.orelse, state.copy()))
+            yes, no = state.copy(), state.copy()
+            self.refine_url_guard(node.test, yes, True)
+            self.refine_url_guard(node.test, no, False)
+            return _join_states(self.block(node.body, yes), self.block(node.orelse, no))
         elif isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
             return self.loop(node, state)
         elif isinstance(node, ast.Break):
@@ -2932,6 +3050,7 @@ class _Analysis:
     def __init__(self, tree, project=None):
         self.tree = tree
         self.project = project
+        self.function_owners = {}
         self.globals = _State()
         self.summaries = {}
         self.defaults = {}
@@ -2946,19 +3065,58 @@ class _Analysis:
         self.default_bindings = {}
         self.class_members = {}
         self.class_callables = {}
-        self.parents = {}
-        self.call_sites = {}
+        # The syntax tree is immutable during analysis. Build its structural
+        # tables from one breadth-first walk; scope bodies likewise need only
+        # one walk for local names and generator classification. Rewalking all
+        # selected source here adds substantial setup cost before any flow is
+        # analyzed, without providing new information.
+        nodes = tuple(ast.walk(tree))
+        self.parents = {child: parent for parent in nodes for child in ast.iter_child_nodes(parent)}
+        # A literal allow-list is a proof only if every other use is exact
+        # membership testing. Rebinding, mutation, aliasing or passing the set
+        # to an opaque call invalidates it throughout this conservative model.
+        self.url_allowlists = set()
+        for statement in tree.body:
+            if not (isinstance(statement, ast.Assign) and len(statement.targets) == 1
+                    and isinstance(statement.targets[0], ast.Name)
+                    and isinstance(statement.value, (ast.Set, ast.Tuple, ast.List))
+                    and statement.value.elts and all(isinstance(item, ast.Constant)
+                        and isinstance(item.value, str) and item.value
+                        for item in statement.value.elts)):
+                continue
+            target = statement.targets[0]
+            uses = [node for node in nodes if isinstance(node, ast.Name) and node.id == target.id
+                    and node is not target]
+            rebound = any(
+                isinstance(node, ast.arg) and node.arg == target.id
+                or _pattern_capture(node) == target.id
+                or isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+                                     ast.ExceptHandler)) and node.name == target.id
+                or isinstance(node, (ast.Import, ast.ImportFrom)) and any(
+                    alias.name == '*' or (alias.asname or alias.name.split('.')[0]) == target.id
+                    for alias in node.names)
+                or isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id in {'exec', 'eval', 'globals', 'locals', 'vars'}
+                for node in nodes)
+            if not rebound and uses and all(isinstance(node.ctx, ast.Load)
+                    and isinstance(self.parents.get(node), ast.Compare)
+                    and len(self.parents[node].ops) == 1
+                    and isinstance(self.parents[node].ops[0], ast.In)
+                    and self.parents[node].comparators == [node] for node in uses):
+                self.url_allowlists.add(target.id)
+        self.call_sites = {node: _expanded_call(node) for node in nodes if isinstance(node, ast.Call)}
+        self.imports = tuple(node for node in nodes if isinstance(node, (ast.Import, ast.ImportFrom)))
         self.method_calls = {}
-        self.functions = []
+        self.functions = [node for node in nodes if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))]
+        self.generators = set()
         self.locals = {}
-        for node in ast.walk(tree):
-            for child in ast.iter_child_nodes(node):
-                self.parents[child] = node
-            if isinstance(node, ast.Call):
-                self.call_sites[node] = _expanded_call(node)
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
-                self.functions.append(node)
-            elif isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+        for scope in [tree, *self.functions]:
+            body = tuple(_scope_nodes(scope))
+            self.locals[scope] = _local_names(scope, body)
+            if scope is not tree and any(isinstance(node, (ast.Yield, ast.YieldFrom)) for node in body):
+                self.generators.add(scope)
+        for node in nodes:
+            if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
                 self.locals[node] = {child.id for generator in node.generators
                                      for child in ast.walk(generator.target)
                                      if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)}
@@ -3047,7 +3205,11 @@ class _Analysis:
         )
 
     def owner(self, function):
-        return self.project.owners.get(function, self) if self.project is not None else self
+        # An opaque import cycle disables the project resolver, not lexical
+        # ownership. Shared callback jobs must still use their defining
+        # module; otherwise every later cycle re-solves foreign functions
+        # against its own globals and overwrites their summaries.
+        return self.function_owners.get(function, self)
 
     @staticmethod
     def plain_class(node, state):
@@ -3437,6 +3599,8 @@ class _Project:
             self.namespaces.add(key)
             self.namespaces.update(parent for parent in key.parents if parent.is_relative_to(self.root))
         self.owners = {function: engine for _, _, engine, _ in self.sources for function in engine.functions}
+        for _, _, engine, _ in self.sources:
+            engine.function_owners = self.owners
         self.module_references = {'@module:' + str(key) for key in self.namespaces}
         self.module_ref_map = {key: frozenset({key}) for key in self.module_references}
         # AST-keyed metadata is safe to share. Module variable namespaces and
@@ -3474,9 +3638,7 @@ class _Project:
 
     def dependencies(self, engine):
         dependencies = set()
-        for node in ast.walk(engine.tree):
-            if not isinstance(node, (ast.Import, ast.ImportFrom)):
-                continue
+        for node in engine.imports:
             names = ([node.module or '', *('.'.join(filter(None, (node.module, alias.name)))
                       for alias in node.names if alias.name != '*')]
                      if isinstance(node, ast.ImportFrom) else [alias.name for alias in node.names])
@@ -3755,6 +3917,7 @@ _SEVERITY = {
     "sql": "critical",
     "command": "critical",
     "eval": "critical",
+    "ssrf": "critical",
 }
 
 _MESSAGE = {
@@ -3762,6 +3925,7 @@ _MESSAGE = {
     "sql": "User input flows into SQL execute() without parameters",
     "command": "User input reaches subprocess/os.system",
     "eval": "User input flows into eval/exec",
+    "ssrf": "User input controls an outbound HTTP request URL (possible SSRF)",
 }
 
 

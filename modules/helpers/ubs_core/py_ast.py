@@ -6,10 +6,9 @@ the stream once, and appends normalized records to the same NDJSON findings
 sink the pattern/detector layers use. Replaces the legacy 51-per-rule `scan
 -r` loops (text + sarif + summary histogram ≈ 156 spawns).
 
-Suppression: flat same-line + previous-line `ubs:ignore` checks (the legacy
-run_ast_rules parser semantics, ubs-python.sh 10085-10098); `py.assert-used`
-stays suppressed in test/conftest files (10111); the A7 statement-interval
-engine in the meta-runner postprocess layers the richer placements on top.
+Suppression: invocation-local source indexes apply the shared lexical and
+statement-interval policy to the exact diagnostic rule before counting.
+`py.assert-used` stays suppressed in test/conftest files.
 
 Counting: legacy counts EVERY rule bucket in totals (the pack ran outside the
 category loop, CURRENT_CATEGORY=0); only `py.async.task-no-await` is
@@ -22,26 +21,11 @@ import json
 from pathlib import Path
 from typing import Sequence
 
-from ubs_core.py_scan import MARKER
 from ubs_core.external_tools import ast_rule_configs, scan_ast_config
+from ubs_core.suppression import SourceSuppressions
 
 _ASTGREP_BIN = "ast-grep"
 _BATCH = 400  # paths per scan invocation (argv length safety)
-
-
-def _file_lines(path: Path, cache: dict[Path, list[str]]) -> list[str]:
-    if path not in cache:
-        try:
-            cache[path] = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError:
-            cache[path] = []
-    return cache[path]
-
-
-def _has_marker(path: Path, line_no: int, cache: dict[Path, list[str]]) -> bool:
-    lines = _file_lines(path, cache)
-    idx = line_no - 1
-    return any(0 <= i < len(lines) and MARKER in lines[i].lower() for i in (idx, idx - 1))
 
 
 def scan_config(
@@ -65,7 +49,7 @@ def scan_config(
     """
     counters = {"critical": 0, "warning": 0, "info": 0}
     path_list = [Path(p) for p in paths]
-    cache: dict[Path, list[str]] = {}
+    suppressions = SourceSuppressions("python")
     for match in scan_ast_config(config, path_list, errors, ast_grep_bin=ast_grep_bin,
                                  batch_size=_BATCH):
         rule_id, file_str = match["ruleId"], match["file"]
@@ -93,7 +77,7 @@ def scan_config(
             parts = [part.lower() for part in path.parts[:-1]]
             if name.startswith("test_") or name.endswith("_test.py") or name == "conftest.py" or any(part in {"tests", "test"} for part in parts):
                 continue
-        if _has_marker(path, line_no, cache):
+        if suppressions.is_suppressed(path, line_no, rule_id):
             continue
         counters[severity] += 1
         message = match.get("message", "").strip() or rule_id

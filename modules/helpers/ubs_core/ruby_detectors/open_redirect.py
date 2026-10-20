@@ -8,7 +8,7 @@ redirect sinks (redirect_to/redirect/head location/Location header writes)
 whose target is request-derived. Safe-redirect helpers, local-path
 start_with?('/'), url_from, allow_other_host: false, and URI.parse + host
 allow-list + reject contexts within the preceding 24 lines suppress the hit.
-Same-file and previous-line `ubs:ignore` markers suppress a hit.
+Lexical statement-owned `ubs:ignore` markers suppress only matching rules.
 """
 from __future__ import annotations
 
@@ -16,9 +16,9 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.suppression import SourceSuppressions
 from ubs_core.ruby_detectors._common import (
     EXTS,
-    has_ignore,
     logical_statement,
     read_lines,
     ruby_files,
@@ -146,7 +146,7 @@ def analyze(lines, issues, path_str):
         return
     from ubs_core.analyzers.taint_ruby_traversal import REDIRECT_RULE, flow_findings_from_text
 
-    for rule, line_no, code, _extras in flow_findings_from_text(Path(path_str), text, "redirect"):
+    for rule, line_no, code, _extras in flow_findings_from_text(Path(path_str), text, "redirect") or ():
         if rule == REDIRECT_RULE:
             issues.append((path_str, line_no, 1, code))
 

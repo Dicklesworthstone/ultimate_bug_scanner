@@ -10,6 +10,8 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.suppression import SourceSuppressions
+
 RULE_ID = "cpp.detector.weak-random"
 CATEGORY = 7
 TITLE = "Security token generated with non-cryptographic randomness"
@@ -119,15 +121,6 @@ def normalize_security_text(text: str) -> str:
     return text
 
 
-def has_ignore(lines, line_no):
-    idx = line_no - 1
-    return (
-        0 <= idx < len(lines) and 'ubs:ignore' in lines[idx]
-    ) or (
-        0 <= idx - 1 < len(lines) and 'ubs:ignore' in lines[idx - 1]
-    )
-
-
 def logical_statement(lines, line_no):
     idx = line_no - 1
     statement = code_without_comments_or_strings(lines[idx])
@@ -207,6 +200,8 @@ def analyze(path: Path, cwd: Path) -> list[tuple[str, int, str]]:
         or INSECURE_ENGINE_TYPE_RE.search(text)
     ):
         return []
+    suppressions = SourceSuppressions("cpp")
+    suppressions.index(path, text)
     raw_lines = text.splitlines()
     code_lines = strip_block_comments_preserve_lines(text).splitlines()
     while len(code_lines) < len(raw_lines):
@@ -216,13 +211,13 @@ def analyze(path: Path, cwd: Path) -> list[tuple[str, int, str]]:
     seen = set()
     issues = []
     for idx, _ in enumerate(code_lines, start=1):
-        if has_ignore(raw_lines, idx):
-            continue
         statement = logical_statement(code_lines, idx)
         context = context_around(code_lines, idx)
         if not has_security_context(statement, context):
             continue
         if not random_issue_reason(statement, rng_vars):
+            continue
+        if suppressions.is_suppressed(path, idx, RULE_ID):
             continue
         key = (rel, idx)
         if key in seen:

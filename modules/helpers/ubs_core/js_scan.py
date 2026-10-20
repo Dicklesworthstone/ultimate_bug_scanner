@@ -139,6 +139,12 @@ class Pattern:
     # it was before code_only; any other raw match brings the code view in.
     code_only: bool = False
 
+    def __post_init__(self) -> None:
+        if self.case_insensitive:
+            object.__setattr__(self, "regex", re.compile(
+                self.regex.pattern, self.regex.flags | re.IGNORECASE,
+            ))
+
 
 def _mask_spans(text: str, mask: re.Pattern[str]) -> str:
     """Blank every `mask` match with spaces of the same length, so offsets and
@@ -561,6 +567,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ast-rule-dir", default="", help="consolidated ast-grep rule dir (sgconfig-*.yml + manifest.json)")
     parser.add_argument("--text-out", default="", help="write the legacy-format text report here")
     parser.add_argument("--json-out", default="", help="write the UBS summary JSON document here")
+    parser.add_argument("--defer-findings", action="store_true",
+                        help="write JSON metadata only; the module finalizes findings after its bridges")
     parser.add_argument("--project", default="", help="project path recorded in the json summary")
     parser.add_argument("--version", default="", help="module version recorded in the json summary")
     parser.add_argument("--fail-on-warning", action="store_true")
@@ -769,7 +777,7 @@ def main(argv: list[str] | None = None) -> int:
         extras = doc.get("extras", {}) if isinstance(doc.get("extras"), dict) else {}
         extras["profile"] = profile_data
         doc["extras"] = extras
-        _write_summary(args.json_out, doc, iter_ndjson(args.sink))
+        _write_summary(args.json_out, doc, () if args.defer_findings else iter_ndjson(args.sink))
 
     if args.text_out:
         _render_text(args, files, counters, scan_errors)

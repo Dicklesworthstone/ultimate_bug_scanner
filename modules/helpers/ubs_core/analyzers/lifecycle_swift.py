@@ -24,6 +24,9 @@ from ubs_core.analyzers.taint_swift_traversal import (
 SKIP_DIRS = {".git", ".hg", ".svn", "build", "DerivedData", ".swiftpm", ".idea", "node_modules"}
 
 IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
+ACQUISITION_NAMES = {'scheduledTimer', 'publish', 'dataTask', 'uploadTask', 'downloadTask',
+                     'addObserver', 'sink', 'makeTimerSource', 'makeFileSystemObjectSource',
+                     'makeReadSource', 'makeWriteSource', 'CADisplayLink'}
 
 ASSIGNED_RULES: tuple[tuple[str, str, re.Pattern[str], tuple[re.Pattern[str], ...]], ...] = (
     (
@@ -209,8 +212,27 @@ class LifecycleParser(SwiftParser):
             first = part[0].value
             if statement.kind == 'unsupported' and first in {'defer', 'do'}:
                 opening = next((i for i, token in enumerate(part) if token.value == '{'), -1)
-                if opening < 0 or swift_close(part, opening) != len(part) - 1:
+                if opening < 0:
                     raise ValueError('Swift lifecycle catch or malformed cleanup scope; analysis is incomplete')
+                finish = swift_close(part, opening)
+                if first == 'do' and finish < len(part) - 1:
+                    # Preserve a well-formed catch as unsupported control flow.
+                    # The engine decides whether it can affect a selected resource;
+                    # unrelated error handling must not abort the entire file.
+                    cursor = finish + 1
+                    while cursor < len(part):
+                        if part[cursor].value != 'catch':
+                            raise ValueError('Swift lifecycle malformed catch scope; analysis is incomplete')
+                        opening = next((i for i in range(cursor + 1, len(part)) if part[i].value == '{'), -1)
+                        if opening < 0:
+                            raise ValueError('Swift lifecycle malformed catch scope; analysis is incomplete')
+                        cursor = swift_close(part, opening) + 1
+                        while cursor < len(part) and part[cursor].value == '\n':
+                            cursor += 1
+                    result.append(statement)
+                    continue
+                if finish != len(part) - 1:
+                    raise ValueError('Swift lifecycle malformed cleanup scope; analysis is incomplete')
                 body = self.block(part[opening + 1:-1], owner, scope, depth=depth + 1)
                 statement = SwiftStatement(first, part[:opening], body)
             elif statement.kind == 'simple' and first in {'init', 'deinit'}:
@@ -589,7 +611,9 @@ class LifecycleEngine:
                     next_paths.append((state, names, deferred, kind))
                     continue
                 if kind in {'unsupported', 'closure'}:
-                    if state.active or any(pattern.search(self.text) for _, _, pattern, _ in ASSIGNED_RULES):
+                    if (state.active or any(pattern.search(self.text) for _, _, pattern, _ in ASSIGNED_RULES)
+                            or any(token.kind == 'code' and token.value in ACQUISITION_NAMES
+                                   for token in statement.tokens)):
                         raise ValueError('Unsupported Swift lifecycle control flow; analysis is incomplete')
                 else:
                     exceptions = []
@@ -663,10 +687,7 @@ def scan_text(path: Path, text: str, base: Path) -> list[tuple[str, str, str, in
     # Owning FileHandle URL/path initializers close their descriptor in deinit.
     # A borrowed raw descriptor needs origin/ownership analysis, not a blanket
     # missing-explicit-close warning on the wrapper object.
-    acquisition_names = {'scheduledTimer', 'publish', 'dataTask', 'uploadTask', 'downloadTask',
-                         'addObserver', 'sink', 'makeTimerSource',
-                         'makeFileSystemObjectSource', 'makeReadSource', 'makeWriteSource', 'CADisplayLink'}
-    if any(token.kind == 'code' and token.value in acquisition_names for token in tokens):
+    if any(token.kind == 'code' and token.value in ACQUISITION_NAMES for token in tokens):
         for position, kind, message, name in LifecycleEngine(text).analyze():
             emit(position, kind, f"{message} ({name})")
 

@@ -90,6 +90,7 @@ comparison_token_re = re.compile(
     string_literal_re.pattern
     + rf'|(?P<compare>{compare_re.pattern})'
     + r'|(?P<boolean>&&|\|\|)'
+    + r'|(?P<conditional>(?<!\?)\?(?![.?])|:)'
     + r'|(?P<open>[\[(])|(?P<close>[\])])|(?P<separator>[;{}])'
 )
 keywords = {
@@ -223,9 +224,14 @@ def statement_from(code_lines, idx, max_lines=8):
 
 
 def operand_identifiers(operand):
+    # Ordinary quoted text cannot read a local variable. Preserve template
+    # literals conservatively: their ${...} expressions can read secrets.
+    code = string_literal_re.sub(
+        lambda match: match.group() if match.group(1) == '`' else '', operand
+    )
     return {
         token
-        for token in identifier_re.findall(operand)
+        for token in identifier_re.findall(code)
         if token not in keywords
     }
 
@@ -334,7 +340,9 @@ def clean_operand_text(operand):
     # Boolean boundaries are resolved before classifying a comparison (GH #135).
     # Truncating both operands at the first connective can replace the LEFT
     # operand with an unrelated earlier term, and also splits quoted text.
-    clean = re.split(r'\s*[;{]', clean, maxsplit=1)[0].strip()
+    boundary = next((match.start() for match in comparison_token_re.finditer(clean)
+                     if match.lastgroup == 'separator' and match.group() in ';{'), len(clean))
+    clean = clean[:boundary].strip()
     while clean and clean[-1] in ';{}){':
         clean = clean[:-1].strip()
     return clean
@@ -342,6 +350,11 @@ def clean_operand_text(operand):
 
 def operand_is_nullish_or_shape_check(operand):
     clean = clean_operand_text(operand)
+    # Only the complete unary identifier/member expression reveals a type.
+    # A compound expression such as typeof value + password still leaks a
+    # secret through equality and must keep the ordinary sensitivity checks.
+    if re.fullmatch(r'typeof\s+[A-Za-z_$][\w$]*(?:\s*(?:\?\.|\.)\s*[A-Za-z_$][\w$]*)*', clean):
+        return True
     if nullish_re.match(clean):
         return True
     if length_re.search(clean):
@@ -374,14 +387,14 @@ def comparison_operands(statement: str) -> Iterable[tuple[int, str, str]]:
         for previous, previous_level in reversed(tokens[:index]):
             kind = previous.lastgroup
             if (kind == 'separator'
-                    or (kind == 'boolean' and previous_level <= level)
+                    or (kind in {'boolean', 'conditional'} and previous_level <= level)
                     or (kind == 'open' and previous_level < level)):
                 start = previous.end()
                 break
         for following, following_level in tokens[index + 1:]:
             kind = following.lastgroup
             if (kind == 'separator'
-                    or (kind == 'boolean' and following_level <= level)
+                    or (kind in {'boolean', 'conditional'} and following_level <= level)
                     or (kind == 'close' and following_level <= level)):
                 end = following.start()
                 break
@@ -743,7 +756,37 @@ if (expectedSignature !== actualSignature &&
         assert [f["line"] for f in findings] == [2, 4, 7], (operator, findings)
 
 
+def _selftest_literal_and_conditional_operands() -> None:
+    # A quoted route segment does not read the unrelated secret-bearing local.
+    for quote in ('"', "'"):
+        statement = f'url.pathname === {quote}/api/org/link{quote}'
+        assert not unsafe_secret_compare(statement, {'org', 'link'}), statement
+    assert unsafe_secret_compare('alias === supplied', {'alias'})
+    assert unsafe_secret_compare('`${alias}` === supplied', {'alias'})
+    # Secret-bearing work in another conditional arm is not an operand.
+    for statement in (
+        'cookie !== null ? verifyToken(secret, cookie) : null',
+        'session.org === undefined ? publicValue : secret',
+        'typeof claims.nonce !== "string"',
+    ):
+        assert not unsafe_secret_compare(statement, {'session', 'claims'}), statement
+    # Neither conditional arm, nested expressions nor optional/nullish access
+    # may hide a real comparison. The original unsafe cases remain findings.
+    for statement in (
+        'ready ? expectedSignature === supplied : false',
+        'ready ? false : expectedSignature === supplied',
+        'expectedSignature === (ready ? actualSignature : backupSignature)',
+        '(expectedSignature ?? backupSignature) === supplied',
+        'ctx?.expectedSignature === supplied',
+        'typeof claims.nonce !== "string" || expectedSignature !== supplied',
+        'typeof value + password === supplied',
+        'typeof value + ":" + authToken === supplied',
+    ):
+        assert unsafe_secret_compare(statement, {'claims'}), statement
+
+
 SELF_TESTS: tuple[tuple[str, callable], ...] = (
+    ("literal_and_conditional_operands", _selftest_literal_and_conditional_operands),
     ("positive_detects_secret_compare", _selftest_positive),
     ("ubs_ignore_suppresses", _selftest_suppression),
     ("timing_safe_equal_negative", _selftest_safe_compare_negative),

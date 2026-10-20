@@ -474,6 +474,7 @@ class BufferWorkspace:
         self.root = None
         self.cache = cache
         self.content_hashes = {}
+        self.original_hashes = {}
         self.shadow_stamps = {}
         self.buffer_hashes = {}
         self.expected_paths = set()
@@ -515,8 +516,14 @@ class BufferWorkspace:
         for relative, expected in self.entries.items():
             fd = self.open_original(relative)
             try:
-                if file_stamp(os.fstat(fd)) != expected:
+                info = os.fstat(fd)
+                if file_stamp(info) != expected:
                     raise ProtocolError('Workspace context changed during buffer analysis: ' + str(relative))
+                if stat.S_ISREG(info.st_mode):
+                    if self.hash_original(fd, expected[3]) != self.original_hashes.get(relative):
+                        raise ProtocolError('Workspace context contents changed during buffer analysis: ' + str(relative))
+                    if file_stamp(os.fstat(fd)) != expected:
+                        raise ProtocolError('Workspace context changed while verifying contents: ' + str(relative))
             finally:
                 os.close(fd)
         for relative in self.missing:
@@ -529,6 +536,19 @@ class BufferWorkspace:
                 raise ProtocolError('A new buffer acquired disk contents during analysis: ' + str(relative))
         if self.shadow_stamps:
             self.verify_shadow()
+
+    def hash_original(self, fd, remaining):
+        """Bound source reads even when a same-size edit preserves its stamp."""
+        digest = hashlib.sha256()
+        while chunk := os.read(fd, min(65536, remaining + 1)):
+            self.check()
+            remaining -= len(chunk)
+            if remaining < 0:
+                raise ProtocolError('Workspace context grew during content verification')
+            digest.update(chunk)
+        if remaining:
+            raise ProtocolError('Workspace context shrank during content verification')
+        return digest.digest()
 
     def validate_configuration(self):
         self.check()
@@ -601,6 +621,7 @@ class BufferWorkspace:
                                 digest.update(chunk)
                                 self.copied_bytes += len(chunk)
                         target.chmod(0o700 if info.st_mode & 0o111 else 0o600)
+                        self.original_hashes[relative] = digest.digest()
                         if self.cache is not None:
                             self.content_hashes[relative] = digest.digest()
                     else:
@@ -674,8 +695,9 @@ class BufferWorkspace:
     def seal_shadow(self):
         """Prove the initial private tree contains exactly the copied input.
 
-        This one-time byte check prevents adopting a changed private file as
-        the baseline. Later leases check inode/ctime plus the full inventory.
+        This initial byte check prevents adopting a changed private file as
+        the baseline. Later leases also verify bytes: ctime can collide across
+        rapid writes even when the filesystem exposes nanosecond timestamps.
         No finding/result cache is involved.
         """
         info = self.root.lstat()
@@ -728,6 +750,19 @@ class BufferWorkspace:
                 info = os.fstat(fd)
                 if file_stamp(info) != expected or stat.S_ISREG(info.st_mode) and info.st_nlink != 1:
                     raise ProtocolError('Private buffer workspace changed: ' + str(relative))
+                if stat.S_ISREG(info.st_mode):
+                    digest = hashlib.sha256()
+                    remaining = info.st_size
+                    while chunk := os.read(fd, min(65536, remaining + 1)):
+                        self.check()
+                        remaining -= len(chunk)
+                        if remaining < 0:
+                            raise ProtocolError('Private buffer input grew during validation')
+                        digest.update(chunk)
+                    if remaining or digest.digest() != self.content_hashes.get(relative):
+                        raise ProtocolError('Private buffer workspace contents changed: ' + str(relative))
+                    if file_stamp(os.fstat(fd)) != expected:
+                        raise ProtocolError('Private buffer input changed during validation')
             finally:
                 os.close(fd)
 
@@ -760,12 +795,13 @@ class BufferWorkspace:
         """Refresh changed regular support files without recopying stable inputs.
 
         Enumerate the complete original graph before updating anything. A
-        structural change needs a fresh snapshot; metadata changes to existing
-        files (including atomic saves) can keep the private graph. Selected
+        structural change needs a fresh snapshot; content or metadata changes
+        to existing files (including atomic saves) keep the private graph. Selected
         buffer text always wins over newer saved bytes. All guards are local
         to this generation, and any mid-refresh race discards the whole lease.
         """
         current = {}
+        current_hashes = {}
         pending = [Path('.')]
         original_bytes = 0
         while pending:
@@ -791,6 +827,7 @@ class BufferWorkspace:
                     original_bytes += info.st_size
                     if original_bytes > MAX_WORKSPACE_BYTES:
                         raise ProtocolError('Buffer workspace byte limit exceeded')
+                    current_hashes[relative] = self.hash_original(fd, info.st_size)
                 else:
                     raise ProtocolError('Unsafe original workspace entry: ' + str(relative))
                 if file_stamp(os.fstat(fd)) != stamp:
@@ -805,12 +842,14 @@ class BufferWorkspace:
             raise ProtocolError('Buffer workspace entry limit exceeded')
         updates = [path for path, stamp in current.items()
                    if stat.S_ISREG(stamp[2]) and path not in self.buffer_hashes
-                   and stamp != self.entries[path]]
+                   and (stamp != self.entries[path]
+                        or current_hashes[path] != self.original_hashes.get(path))]
         total = sum(stamp[3] for stamp in self.shadow_stamps.values() if stat.S_ISREG(stamp[2]))
         total += sum(current[path][3] - self.shadow_stamps[path][3] for path in updates)
         if total > MAX_WORKSPACE_BYTES:
             raise ProtocolError('Buffer workspace byte limit exceeded')
         self.entries = current
+        self.original_hashes = current_hashes
         self.verify()
         for relative in updates:
             self.refresh_support_file(relative)
@@ -855,7 +894,8 @@ class BufferWorkspace:
                             raise ProtocolError('Incomplete private support write')
                         output = output[count:]
                         self.copied_bytes += count
-                if remaining or file_stamp(os.fstat(source)) != expected:
+                if (remaining or file_stamp(os.fstat(source)) != expected
+                        or digest.digest() != self.original_hashes.get(relative)):
                     raise ProtocolError('Workspace context changed during incremental copy')
                 os.fchmod(target, 0o700 if expected[2] & 0o111 else 0o600)
                 self.shadow_stamps[relative] = file_stamp(os.fstat(target))
@@ -903,6 +943,7 @@ class BufferWorkspaceCache:
                 workspace.missing = set(previous.missing)
                 workspace.expected_paths = set(previous.expected_paths)
                 workspace.content_hashes = dict(previous.content_hashes)
+                workspace.original_hashes = dict(previous.original_hashes)
                 workspace.buffer_hashes = dict(previous.buffer_hashes)
                 workspace.shadow_stamps = dict(previous.shadow_stamps)
                 workspace.shadow_id = previous.shadow_id
@@ -942,6 +983,7 @@ class BufferWorkspaceCache:
             workspace.missing.clear()
             workspace.shadow_stamps.clear()
             workspace.content_hashes.clear()
+            workspace.original_hashes.clear()
             workspace.buffer_hashes.clear()
             workspace.build()
             workspace.seal_shadow()

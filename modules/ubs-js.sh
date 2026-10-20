@@ -16,7 +16,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="bcd1fce741b5004ede5370223fc81b609c2aed015ff9ca229f3eb914c8e9a66d"
+UBS_LIB_CHECKSUM="2ac03fe8f28e76270b816098c33fdba9be6fc8ffffe2cccce20cb9acb64c9fab"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -302,7 +302,7 @@ fi
 
 # ── Legacy-parity bridges for the contract-v2 path ──────────────────────────
 run_v2_legacy_parity_bridges(){
-  local sink="$1" list_file="$2" js_exit="$3" text_out="${4:-}"
+  local sink="$1" list_file="$2" js_exit="$3" text_out="${4:-}" json_out="${5:-}"
   local run_tn=0 tn_status=0 tn_raw="" helper="" js_runner="" e
   local allow_ts=0
   if [[ "${UBS_SKIP_TYPE_NARROWING:-0}" -ne 1 ]]; then
@@ -349,13 +349,13 @@ run_v2_legacy_parity_bridges(){
   local files_n bridge_rc=0
   files_n="$(tr -dc '\0' <"$list_file" 2>/dev/null | wc -c)"
   python3 - "$sink" "$text_out" "$files_n" "${FAIL_ON_WARNING:-0}" "${SKIP_CATEGORIES:-}" \
-    "$run_tn" "$tn_status" "$tn_raw" "$js_exit" "${UBS_SKIP_TYPE_NARROWING:-0}" <<'PYV2BRIDGE' || bridge_rc=$?
+    "$run_tn" "$tn_status" "$tn_raw" "$js_exit" "${UBS_SKIP_TYPE_NARROWING:-0}" "$json_out" <<'PYV2BRIDGE' || bridge_rc=$?
 import json
 import os
 import sys
 
 (sink_path, text_out, files_raw, fow_raw, skip_csv, run_tn_raw, tn_status_raw,
- tn_raw_path, js_exit_raw, skip_tn_raw) = sys.argv[1:11]
+ tn_raw_path, js_exit_raw, skip_tn_raw, json_out) = sys.argv[1:12]
 files_n = int(files_raw or 0)
 fail_on_warning = fow_raw == "1"
 skip = {int(x) for x in skip_csv.split(",") if x.strip().isdigit()}
@@ -454,6 +454,22 @@ elif skip_tn and as_text:
     emit("Type narrowing validation")
     emit("  Type narrowing checks skipped")
     emit("    Set UBS_SKIP_TYPE_NARROWING=0 or remove --skip-type-narrowing to re-enable")
+
+if json_out:
+    # The scanner leaves only metadata here. Finalize from the complete sink
+    # after the bridge, preserving partial status and keeping findings streamed.
+    try:
+        from ubs_core.io import iter_ndjson
+        from ubs_core.js_scan import _write_summary
+        with open(json_out, encoding="utf-8") as fh:
+            summary = json.load(fh)
+        if not isinstance(summary, dict) or "findings" not in summary:
+            raise ValueError("missing scanner summary metadata")
+        summary.update(counts)
+        _write_summary(json_out, summary, iter_ndjson(sink_path))
+    except (OSError, ValueError, TypeError, ImportError) as exc:
+        print(f"ubs-js: cannot finalize report; analysis is incomplete: {exc}", file=sys.stderr)
+        sys.exit(2)
 
 if as_text:
     for num in sorted(SECTION):
@@ -559,7 +575,7 @@ PYRULES
   case "$FORMAT" in
     json|sarif)
       v2_json_out="$(mktemp 2>/dev/null || mktemp -t ubs-jsv2-json.XXXXXX)"
-      scan_args+=(--json-out "$v2_json_out" --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}")
+      scan_args+=(--json-out "$v2_json_out" --defer-findings --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}")
       ;;
     text)
       text_out="$(mktemp 2>/dev/null || mktemp -t ubs-jsv2-text.XXXXXX)"
@@ -571,7 +587,8 @@ PYRULES
   PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core.js_scan \
     "${scan_args[@]}" --version "4.7" || exit_code=$?
 
-  run_v2_legacy_parity_bridges "$sink" "$list_file" "$exit_code" "$text_out" || exit_code=$?
+  PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" \
+    run_v2_legacy_parity_bridges "$sink" "$list_file" "$exit_code" "$text_out" "$v2_json_out" || exit_code=$?
 
   if [[ "$FORMAT" == "sarif" ]]; then
     if [[ -n "$v2_json_out" && -f "$v2_json_out" ]]; then

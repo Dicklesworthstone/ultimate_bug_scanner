@@ -39,7 +39,17 @@ MERGE_SINK_RE = re.compile(
     r'\b(?:Object\.assign|(?:_|lodash)\.(?:merge|mergeWith|defaultsDeep|extend)|'
     r'deepmerge|merge|mergeWith|defaultsDeep|extend)\s*\('
 )
-DYNAMIC_WRITE_RE = re.compile(r'\[[^\]]+\]\s*=')
+# A computed property write has a receiver. Array binding/assignment patterns
+# such as `const [key, value] = request.body` do not write object properties.
+# Stop comments at their first closing delimiter. Trivia and repeated TS
+# non-null assertions do not change the computed property's receiver.
+COMPUTED_RECEIVER_TRIVIA = r'(?:\s|/\*(?:[^*]|\*(?!/))*\*/)*'
+DYNAMIC_WRITE_RE = re.compile(
+    r'(?:(?<![\w$])(?!(?:const|let|var|return|yield)\b)'
+    r'[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*|[)\]])'
+    + COMPUTED_RECEIVER_TRIVIA + r'(?:!' + COMPUTED_RECEIVER_TRIVIA + r')*'
+    r'\[[^\]]+\]' + COMPUTED_RECEIVER_TRIVIA + r'='
+)
 ASSIGN_RE = re.compile(
     r'^\s*(?:const|let|var)?\s*([A-Za-z_$][\w$]*)\s*(?::[^=;]+)?=\s*(.+)'
 )
@@ -323,7 +333,41 @@ def _selftest_run_record_shape(tmp_prefix: str = "ubs_core_sec_prototype_polluti
         assert "Request-derived object merge may allow prototype pollution" in rec["message"], rec
 
 
+def _selftest_destructuring_and_computed_receivers() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="ubs_core_prototype_receivers_") as tmp:
+        target = Path(tmp) / "receivers.ts"
+        for binding in ('const [key, value]', 'let [key, value]',
+                        'var [key, value]', '[key, value]',
+                        'const /* bindings */ [key, value]'):
+            target.write_text(f'{binding} = request.body;\n', encoding='utf-8')
+            assert list(scan_file_findings(target)) == [], binding
+        for receiver in ('target', 'object.target', 'object.const',
+                         'getTarget()', 'targets[0]', 'target!', 'target!!',
+                         'target /* mutable destination */ ',
+                         'target! /* mutable destination */ ',
+                         'target /* mutable destination */ !',
+                         'target /* receiver */ ! /* assertion */ '):
+            target.write_text(
+                'const key = req.query.field;\n'
+                f'{receiver}[key] = req.body;\n', encoding='utf-8'
+            )
+            assert list(scan_file_findings(target)) == [2], receiver
+        target.write_text(
+            'const key = req.query.field;\n'
+            'target[key] /* assigned value */ = req.body;\n', encoding='utf-8'
+        )
+        assert list(scan_file_findings(target)) == [2]
+        target.write_text(
+            'const [key, value] = request.body;\n'
+            'target[req.query.field] = value;\n', encoding='utf-8'
+        )
+        assert list(scan_file_findings(target)) == [2]
+
+
 SELF_TESTS: tuple[tuple[str, object], ...] = (
+    ("destructuring-and-computed-receivers", _selftest_destructuring_and_computed_receivers),
     ("merge-sink-flagged", _selftest_merge_sink_flagged),
     ("dynamic-write-flagged", _selftest_dynamic_write_flagged),
     ("safe-helpers-clean", _selftest_safe_helpers_clean),

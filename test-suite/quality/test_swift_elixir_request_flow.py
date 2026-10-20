@@ -655,6 +655,21 @@ class SwiftLifecycleBindings(LoggedCase):
     @staticmethod
     def cases():
         cases = (
+            ('selector_observer_with_unrelated_catch', '''
+                import Foundation
+                final class Listener: NSObject {
+                  override init() {
+                    super.init()
+                    NotificationCenter.default.addObserver(self, selector: #selector(refresh), name: nil, object: nil)
+                  }
+                  deinit { NotificationCenter.default.removeObserver(self) }
+                  @objc func refresh() {}
+                  func loadBalance() async {
+                    do { try await fetchBalance() } catch { refresh() }
+                  }
+                  func fetchBalance() async throws {}
+                }
+            '''),
             ('direct_timer_control', '''
                 import Foundation
                 func start() {
@@ -1112,6 +1127,36 @@ class SwiftLifecycleBindings(LoggedCase):
     @staticmethod
     def incomplete_cases():
         return {
+            'resource_acquired_inside_catch_scope': '''
+                import Foundation
+                func start() {
+                    do {
+                        let timer: Timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                    } catch { }
+                }
+            ''',
+            'resource_acquired_inside_catch_arm': '''
+                import Foundation
+                func start() {
+                    do { try work() } catch {
+                        let timer: Timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                    }
+                }
+            ''',
+            'selected_resource_crosses_catch_scope': '''
+                import Foundation
+                func start() {
+                    let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                    do { try work(); timer.invalidate() } catch { }
+                }
+            ''',
+            'malformed_catch_scope': '''
+                import Foundation
+                func start() {
+                    NotificationCenter.default.addObserver(self, selector: #selector(refresh), name: nil, object: nil)
+                    do { try work() } catch
+                }
+            ''',
             'selected_callback_execution': '''
                 import Foundation
                 func start() {

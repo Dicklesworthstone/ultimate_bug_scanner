@@ -51,12 +51,25 @@ CONTROLLERS = frozenset({"Microsoft.AspNetCore.Mvc.ControllerBase", "Microsoft.A
 MAPPER = "Dapper.SqlMapper"
 COMMAND = "Dapper.CommandDefinition"
 MAIL_ADDRESS = "System.Net.Mail.MailAddress"
-KNOWN_TYPES = CONNECTIONS | CONTROLLERS | frozenset({
+# BCL value types whose static two-argument TryParse(text, out T) writes only a
+# T and returns a Boolean (GH #171). None of them can hold a connection,
+# command or request, so the parse has no SQL effect.
+PARSE_TYPES = frozenset({
+    "System.Boolean", "System.Byte", "System.SByte", "System.Int16", "System.UInt16",
+    "System.Int32", "System.UInt32", "System.Int64", "System.UInt64", "System.Single",
+    "System.Double", "System.Decimal", "System.Char", "System.Guid", "System.DateTime",
+    "System.DateTimeOffset", "System.TimeSpan", "System.DateOnly", "System.TimeOnly",
+})
+KNOWN_TYPES = CONNECTIONS | CONTROLLERS | PARSE_TYPES | frozenset({
     REQUEST, CONTEXT, MAPPER, COMMAND, MAIL_ADDRESS, "System.Type", "System.String",
-    "System.Object", "System.Boolean", "System.Int32", "System.Int64", "System.Data.CommandType",
+    "System.Object", "System.Data.CommandType",
 })
 PRIMITIVES = {"string": "System.String", "object": "System.Object", "bool": "System.Boolean",
-              "int": "System.Int32", "long": "System.Int64", "dynamic": "dynamic"}
+              "byte": "System.Byte", "sbyte": "System.SByte", "short": "System.Int16",
+              "ushort": "System.UInt16", "int": "System.Int32", "uint": "System.UInt32",
+              "long": "System.Int64", "ulong": "System.UInt64", "float": "System.Single",
+              "double": "System.Double", "decimal": "System.Decimal", "char": "System.Char",
+              "dynamic": "dynamic"}
 REQUEST_MEMBERS = frozenset({"Query", "Form", "Headers", "Cookies", "RouteValues",
                              "Path", "PathBase", "QueryString"})
 STRING_METHODS = frozenset({"Execute", "ExecuteScalar", "Query", "QueryFirst", "QueryFirstOrDefault",
@@ -365,21 +378,8 @@ class DapperFlow(CSharpFlow):
             return False
         if self.types.resolve(qualifier, call.position) != MAIL_ADDRESS:
             return False
-        root = call.name.split(".")[0]
-        if not raw.startswith("global::"):
-            if root in call.bindings:
-                return False
-            # The CFG tracks local storage, not fields. A field named after
-            # an imported type/alias must not be mistaken for a static call.
-            without_imports = re.sub(
-                r"\b(?:global\s+)?using\s+(?:static\s+)?(?:@?\w+\s*=\s*)?[\w@.:]+\s*;",
-                "", self.code)
-            if re.search(r"(?:\b[\w@.<>:\[\]?]+\s+|,\s*)@?" + re.escape(root)
-                         + r"\s*(?:[=;,(){]|=>)", without_imports):
-                return False
-            if (any(item.static for item in self.types.visible_imports(call.position))
-                    or re.search(r"[<,]\s*@?" + re.escape(root) + r"\s*[,>]", self.code)):
-                return False
+        if not self.static_type_receiver(call, raw):
+            return False
         slots = {}
         for index, (keyword, low, high) in enumerate(call.args):
             slot = keyword if keyword is not None else ("address", "result")[index]
@@ -402,7 +402,40 @@ class DapperFlow(CSharpFlow):
         if any(scope.kind != "namespace" and scope.start < call.position < scope.end
                and ":" in scope.bases for scope in self.types.scopes):
             return False
-        index = slots["address"]
+        return self.proven_text_argument(call, slots["address"])
+
+    def static_type_receiver(self, call, raw):
+        """Whether the qualifier of `raw` names the resolved type, not storage.
+
+        The caller has already resolved the qualifier to a selected type. The
+        CFG tracks local storage, not fields: a local, a field, a static import
+        or a generic type parameter spelled like the qualifier's root would
+        make the call an instance call or a different method.
+        """
+        if raw.startswith("global::"):
+            return True
+        root = call.name.split(".")[0]
+        if root in call.bindings:
+            return False
+        # The CFG tracks local storage, not fields. A field named after
+        # an imported type/alias must not be mistaken for a static call.
+        without_imports = re.sub(
+            r"\b(?:global\s+)?using\s+(?:static\s+)?(?:@?\w+\s*=\s*)?[\w@.:]+\s*;",
+            "", self.code)
+        if re.search(r"(?:\b[\w@.<>:\[\]?]+\s+|,\s*)@?" + re.escape(root)
+                     + r"\s*(?:[=;,(){]|=>)", without_imports):
+            return False
+        if (any(item.static for item in self.types.visible_imports(call.position))
+                or re.search(r"[<,]\s*@?" + re.escape(root) + r"\s*[,>]", self.code)):
+            return False
+        return True
+
+    def proven_text_argument(self, call, index):
+        """A string literal, null, or a simple local/parameter declared string.
+
+        Anything else could reach the parameter through a user-defined implicit
+        conversion, which is code this file-local model has not analysed.
+        """
         _, low, high = call.args[index]
         code = self.code[low:high].strip()
         original = self.text[low:high].strip()
@@ -410,6 +443,58 @@ class DapperFlow(CSharpFlow):
         return (literal or code == "null"
                 or (bool(re.fullmatch(r"@?\w+", code))
                     and identities(call.values[index]) == {"System.String"}))
+
+    def request_text_argument(self, call, index):
+        """A direct ASP.NET request read such as `Request.Query["page"]`.
+
+        Its static type is a framework type (StringValues and friends) whose
+        conversion to string is framework code. The argument must be a plain
+        member/indexer chain, optionally ending in `.ToString()`, and every
+        trace of its value must be a request source read inside the argument
+        itself: provenance copied from another local (`dto.Page`) could carry a
+        user type with its own conversion and stays unproven.
+        """
+        _, low, high = call.args[index]
+        code = re.sub(r"\.\s*ToString\s*\(\s*\)\s*$", "", self.code[low:high].strip())
+        if not re.fullmatch(r"@?\w+(?:\s*\.\s*@?\w+|\s*\[[^\[\]();]*\])+", code):
+            return False
+        value = call.values[index]
+        return bool(value) and all(trace.kind == "source" and low <= trace.key[1] < high
+                                   for trace in value)
+
+    def sql_inert_value_parse(self, call):
+        """Prove a BCL value-type TryParse has no SQL effect (GH #171).
+
+        `int.TryParse(text, out var n)`, `Guid.TryParse(...)` and the other
+        PARSE_TYPES overloads with two positional arguments read a string and
+        write only a value of their own type, so the call cannot create,
+        replace or execute a connection or command; its Boolean result is not
+        request data. The output is not sanitized: the shared evaluator still
+        joins the input's provenance into the out storage. Other overloads
+        (format providers, styles, spans, generic forms), named arguments,
+        unproven inputs and shadowed receivers stay incomplete.
+        """
+        raw = self.raw_name(call.position, call.name)
+        qualifier, dot, method = raw.rpartition(".")
+        if not dot or method != "TryParse" or len(call.args) != 2:
+            return False
+        if self.code[call.name_end:call.opening].strip():
+            return False
+        if self.types.resolve(qualifier, call.position) not in PARSE_TYPES:
+            return False
+        # A C# keyword (`int`, `double`) always names its BCL type; `@int` is
+        # an ordinary identifier and needs the storage/shadowing proof.
+        keyword = qualifier in PRIMITIVES and self.code[call.position:call.position + 1] != "@"
+        if not keyword and not self.static_type_receiver(call, raw):
+            return False
+        (input_name, input_low, input_high), (output_name, output_low, output_high) = call.args
+        if input_name is not None or output_name is not None:
+            return False
+        if re.match(r"\s*(?:ref|out|in)\b", self.code[input_low:input_high]):
+            return False
+        if not re.match(r"\s*out\b", self.code[output_low:output_high]):
+            return False
+        return self.proven_text_argument(call, 0) or self.request_text_argument(call, 0)
 
     def selected_call(self, call):
         """Return the SQL slot only after resolving receiver, overload and mode."""
@@ -520,7 +605,7 @@ class DapperFlow(CSharpFlow):
         if raw in {"string.Format", "System.String.Format", "global::System.String.Format",
                    "string.Concat", "System.String.Concat", "global::System.String.Concat"}:
             return provenance(join(*values))
-        if self.sql_inert_mail_discard(call):
+        if self.sql_inert_mail_discard(call) or self.sql_inert_value_parse(call):
             return CLEAN
         if any(re.match(r"\s*(?:ref|out)\b", self.code[low:high]) for _, low, high in args):
             self.incomplete(position, "Unresolved ref/out call effects require cross-file analysis")

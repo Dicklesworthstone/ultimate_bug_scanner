@@ -134,8 +134,9 @@ class SwiftLexer:
                 continue
             if text.startswith(('//', '/*'), cursor):
                 finish = self.comment(cursor, limit)
-                output.extend(SwiftToken('\n', position, position + 1)
-                              for position in range(cursor, finish) if text[position] == '\n')
+                for position in range(cursor, finish):
+                    if text[position] == '\n':
+                        output.append(SwiftToken('\n', position, position + 1))
                 cursor = finish
                 continue
             regex = char == '/' and (not output or output[-1].value in {'=', '(', ',', ':', 'return'})

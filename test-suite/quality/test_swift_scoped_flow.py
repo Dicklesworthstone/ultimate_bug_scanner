@@ -51,6 +51,21 @@ class SwiftScopedFlowTests(unittest.TestCase):
             self.assertEqual(route[-1]['line'], finding['line'])
         return findings
 
+    def test_nested_comments_preserve_newlines_and_sink_locations(self):
+        comment = '/* outer\n /* inner */\n end */'
+        tokens = swift_validated_tokens(comment)
+        self.assertEqual([(token.value, token.start, token.end) for token in tokens],
+                         [('\n', 8, 9), ('\n', 21, 22)])
+        self.check('''
+            func handle(req: Request) {
+                /* outer comment
+                   nested /* inner
+                   comment */
+                */
+                _ = String(contentsOfFile: req.query["file"])
+            }
+        ''', (6,), 'path')
+
     def test_guard_optional_binding(self):
         self.check('''
             func handle(req: Request) -> Response {

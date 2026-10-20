@@ -35,6 +35,20 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ---
 
+## [v5.5.9] - 2026-10-19 [Tag]
+
+Git-only source delivery; signed release assets and installed-tool upgrades are separate.
+
+### Fixed
+
+- Swift request-flow analysis no longer treats ordinary API `.write(...)` calls
+  without an outer `to:` argument as Foundation file writes. Real file destinations,
+  nested sinks, interpolation and request-derived values retain their checks.
+- Swift comment tokenization uses explicit ordered appends, preserving newline
+  offsets while allowing the Python SQL analyzer to complete its own source scan.
+
+---
+
 ## [v5.5.8] - 2026-10-16 [Tag]
 
 Git-only source delivery; signed release assets and installed-tool upgrades are separate.

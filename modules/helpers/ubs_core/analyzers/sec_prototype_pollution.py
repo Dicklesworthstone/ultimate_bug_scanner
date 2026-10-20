@@ -3,12 +3,12 @@ prototype pollution (bead A4-js final wave).
 
 Verbatim port of the legacy ubs-js.sh heredoc "Request-derived object merge
 prototype pollution" (ubs-js.sh 5788-5995): same taint sources, same merge
-sinks, same logical-statement/context windows, same per-file taint tracking,
-same ``ubs:ignore`` placement rules (RAW line, line above, or anywhere inside
-the collected logical statement — markers live in comments, so the
-comment-stripped statement check is retained for fidelity), same safe-helper
+sinks, same logical-statement/context windows, same per-file taint tracking
+through annotated source assignments, same safe-helper
 suppressions (including the dynamic-write safe context requiring BOTH a
 prototype-key validator and ``Object.create(null)`` in the context window).
+Diagnostic suppression uses the shared lexical statement policy and exact
+public rule.
 The heredoc's os.walk over the project is replaced by iteration over
 ``RunContext.files``; per-file match logic is unchanged.
 """
@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.suppression import SourceSuppressions
 
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
 
@@ -156,27 +157,22 @@ def dynamic_write_has_safe_context(context: str) -> bool:
 def scan_file_findings(path: Path) -> Iterator[int]:
     """Yield 1-based line numbers per detection; match logic identical to the heredoc."""
     try:
-        lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
+        source_text = path.read_text(encoding='utf-8', errors='ignore')
     except OSError:
         return
+    lines = source_text.splitlines()
     if not any(token in '\n'.join(lines) for token in (
         'Object.assign', 'merge', 'defaultsDeep', 'extend', 'req.', 'request.', 'searchParams',
     )):
         return
+    suppressions = SourceSuppressions('javascript').index(path, source_text)
     tainted_vars = set()
     seen = set()
     for idx, raw in enumerate(lines):
         stripped = strip_line_comments(raw).strip()
         if not stripped or stripped.startswith(('*', 'import ', 'export type ', 'type ', 'interface ')):
             continue
-        # Suppression markers live in comments, so they must be tested on the
-        # RAW line (and the line above) -- logical_statement() is built from
-        # comment-stripped text and can never contain the marker (GH #84).
-        if 'ubs:ignore' in raw or (idx > 0 and 'ubs:ignore' in lines[idx - 1]):
-            continue
         statement = logical_statement(lines, idx)
-        if 'ubs:ignore' in statement:
-            continue
         update_taint(statement, tainted_vars)
         visible_statement = mask_strings(statement)
         context = context_window(lines, idx)
@@ -195,6 +191,8 @@ def scan_file_findings(path: Path) -> Iterator[int]:
             continue
         key = (str(path), idx + 1)
         if key in seen:
+            continue
+        if suppressions.is_suppressed(idx + 1, RULE):
             continue
         seen.add(key)
         yield idx + 1
@@ -292,11 +290,9 @@ def _selftest_safe_helpers_clean(tmp_prefix: str = "ubs_core_sec_prototype_pollu
 def _selftest_ignore_suppression(tmp_prefix: str = "ubs_core_sec_prototype_pollution_ign_") -> None:
     import tempfile
 
-    # ubs:ignore on the RAW line above and on the RAW line itself both
-    # suppress. The statement-window check is inert for comment markers
-    # (logical_statement() strips comments, GH #84), so a marker inside a
-    # spanning statement only suppresses its own line and the line below —
-    # the statement-start line still reports, exactly like the heredoc.
+    # Source annotations preserve taint at later unannotated sinks. An owned
+    # sink marker still suppresses its diagnostic; the existing spanning
+    # function-header diagnostic remains separate from the annotated source.
     above = "// ubs:ignore\nconst payload = req.body;\nconst out = Object.assign({}, payload);\n"
     same = "const merged = Object.assign({}, req.body); // ubs:ignore\n"
     in_stmt = "\n".join([
@@ -309,13 +305,13 @@ def _selftest_ignore_suppression(tmp_prefix: str = "ubs_core_sec_prototype_pollu
     with tempfile.TemporaryDirectory(prefix=tmp_prefix) as tmp:
         target = Path(tmp) / "above.ts"
         target.write_text(above, encoding="utf-8")
-        assert list(scan_file_findings(target)) == [], "above-line marker must suppress"
+        assert list(scan_file_findings(target)) == [3], "source marker must preserve the later sink"
         target = Path(tmp) / "same.ts"
         target.write_text(same, encoding="utf-8")
         assert list(scan_file_findings(target)) == [], "same-line marker must suppress"
         target = Path(tmp) / "stmt.ts"
         target.write_text(in_stmt, encoding="utf-8")
-        assert list(scan_file_findings(target)) == [1], "spanning statement still flags line 1"
+        assert list(scan_file_findings(target)) == [1, 3], "source marker preserves the spanning header and later sink"
 def _selftest_run_record_shape(tmp_prefix: str = "ubs_core_sec_prototype_pollution_run_") -> None:
     import tempfile
     src = "const payload = req.body;\nconst out = Object.assign({}, payload);\n"

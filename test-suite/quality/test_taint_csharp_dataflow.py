@@ -793,6 +793,108 @@ class RedirectDataflowTests(unittest.TestCase):
 
 
 class AnalysisBoundaryTests(unittest.TestCase):
+    def test_null_coverage_limits_preserve_findings_in_later_files(self):
+        import io
+        from ubs_core.csharp_scan import execution_status, run_analyzers
+        incomplete = '''class C {
+    void Unsupported(string p) {
+        if (p == null) return;
+        try { Work(); } catch (System.Exception e) when (Check(e)) {}
+        Use(p.Length);
+    }
+}
+'''
+        supported = '''class C {
+    int Unsafe(string p) {
+        if (p == null) Log();
+        return p.Length;
+    }
+}
+'''
+        with tempfile.TemporaryDirectory(prefix='ubs-csharp-null-boundary-') as tmp:
+            root = Path(tmp)
+            bad, good = root / 'a.cs', root / 'b.cs'
+            bad.write_text(incomplete, encoding='utf-8')
+            good.write_text(supported, encoding='utf-8')
+            for files in ([bad, good], [good, bad]):
+                with self.subTest(files=files):
+                    errors, semantic_errors, sink = [], [], io.StringIO()
+                    run_analyzers(files, sink, {8}, root, errors=errors,
+                                  semantic_errors=semantic_errors)
+                    findings = [json.loads(line) for line in sink.getvalue().splitlines()]
+                    self.assertEqual([(Path(f['path']).name, f['rule'], f['line'], f['col'])
+                                      for f in findings],
+                                     [('b.cs', 'csharp.narrowing.negative_guard', 4, 16)])
+                    self.assertEqual(len(errors), 1, errors)
+                    self.assertEqual(errors, semantic_errors)
+                    self.assertIn(str(bad), errors[0])
+                    status = execution_status(1, errors, semantic_errors)
+                    self.assertEqual((status['status'], status['exit_code'], status['error'],
+                                      status['reason'], status['module_error']),
+                                     ('partial', 2, 'analysis', 'analysis-incomplete',
+                                      'ANALYSIS_INCOMPLETE'))
+
+    def test_null_coverage_limits_keep_supported_scopes_and_prior_evidence(self):
+        import io
+        from ubs_core.csharp_scan import run_analyzers
+        source = '''class C {
+    int Before(string p) { if (p == null) Log(); return p.Length; }
+    void Incomplete(string p) {
+        if (p == null) Log();
+        Use(p.Length);
+        try { Work(); } catch (System.Exception e) when (Check(e)) {}
+    }
+    int After(string p) { if (p == null) Log(); return p.Length; }
+}
+'''
+        expected = [(number, line.index('p.Length') + 1)
+                    for number, line in enumerate(source.splitlines(), 1) if 'p.Length' in line]
+        with tempfile.TemporaryDirectory(prefix='ubs-csharp-null-scopes-') as tmp:
+            path = Path(tmp) / 'app.cs'
+            path.write_text(source, encoding='utf-8')
+            errors, semantic_errors, sink = [], [], io.StringIO()
+            run_analyzers([path], sink, {8}, path.parent, errors=errors,
+                          semantic_errors=semantic_errors)
+            findings = [json.loads(line) for line in sink.getvalue().splitlines()]
+            self.assertEqual([(f['line'], f['col']) for f in findings], expected)
+            self.assertTrue(errors)
+            self.assertEqual(errors, semantic_errors)
+
+    def test_disabled_null_analysis_does_not_create_partial_status(self):
+        import io
+        from unittest.mock import patch
+        from ubs_core.csharp_scan import run_analyzers
+        with tempfile.TemporaryDirectory(prefix='ubs-csharp-null-selection-') as tmp:
+            path = Path(tmp) / 'app.cs'
+            path.write_text('''class C {
+    void F(string p) {
+        if (p == null) return;
+        try { Work(); } catch (System.Exception e) when (Check(e)) {}
+    }
+}
+''', encoding='utf-8')
+            for skip, setting in (({1, 8}, '0'), ({8}, '1')):
+                with self.subTest(skip=skip, setting=setting), patch.dict(
+                        os.environ, {'UBS_SKIP_TYPE_NARROWING': setting}):
+                    errors, semantic_errors, sink = [], [], io.StringIO()
+                    run_analyzers([path], sink, skip, path.parent, errors=errors,
+                                  semantic_errors=semantic_errors)
+                    self.assertEqual(sink.getvalue(), '')
+                    self.assertEqual(errors, [])
+                    self.assertEqual(semantic_errors, [])
+
+    def test_null_source_syntax_is_a_coverage_limit(self):
+        import io
+        from ubs_core.csharp_scan import run_analyzers
+        with tempfile.TemporaryDirectory(prefix='ubs-csharp-null-syntax-') as tmp:
+            path = Path(tmp) / 'app.cs'
+            path.write_text('class C { void F(string p) { if (p == null) Log();', encoding='utf-8')
+            errors, semantic_errors = [], []
+            run_analyzers([path], io.StringIO(), {8}, path.parent, errors=errors,
+                          semantic_errors=semantic_errors)
+            self.assertEqual(len(errors), 1, errors)
+            self.assertEqual(errors, semantic_errors)
+
     def test_actual_helper_evidence_survives_combined_json_and_sarif(self):
         import io
         from ubs_core.csharp_scan import run_analyzers
@@ -882,6 +984,95 @@ class AnalysisBoundaryTests(unittest.TestCase):
             good.write_text('File.Delete("/fixed");')
             bad.write_text('File.Delete(Request.Query["p"]);')
             self.assertEqual(list(cs.run(RunContext(lang='csharp', files=[good]))), [])
+
+
+@unittest.skipUnless(os.environ.get('UBS_CSHARP_SEMANTICS_PUBLIC') == '1',
+                     'set UBS_CSHARP_SEMANTICS_PUBLIC=1 after verified module/helper pins')
+class NullCoveragePublicReportTests(unittest.TestCase):
+    def test_partial_reports_keep_prior_and_neighbor_evidence_then_recover(self):
+        artifacts = ROOT / 'test-suite/artifacts'
+        artifacts.mkdir(exist_ok=True)
+        root = Path(tempfile.mkdtemp(prefix='csharp-null-coverage-', dir=artifacts))
+        first, neighbor = root / 'a.cs', root / 'b.cs'
+        partial_source = '''class C {
+    void Unsafe(string p) {
+        if (p == null) Log();
+        Use(p.Length);
+        try { Work(); } catch (System.Exception e) when (Check(e)) {}
+    }
+}
+'''
+        first.write_text(partial_source, encoding='utf-8')
+        neighbor.write_text('''class D {
+    int Unsafe(string p) {
+        if (p == null) Log();
+        return p.Length;
+    }
+}
+''', encoding='utf-8')
+        env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1', UBS_NO_CACHE='0',
+                   UBS_CACHE_DIR=str(root / 'cache'), UBS_NO_AUTO_UPDATE='1',
+                   UBS_ENABLE_AUTO_UPDATE='0', ENABLE_UV_TOOLS='0', NO_COLOR='1')
+        skip = ','.join(str(number) for number in range(2, 25))
+        for phase in ('partial-cold', 'partial-repeat', 'complete'):
+            if phase == 'complete':
+                first.write_text(partial_source.replace(' when (Check(e))', ''), encoding='utf-8')
+            for mode in ('module-json', 'module-sarif', 'json', 'sarif'):
+                with self.subTest(phase=phase, mode=mode):
+                    format_ = mode.split('-')[-1]
+                    command = ([str(ROOT / 'modules/ubs-csharp.sh')] if mode.startswith('module-')
+                               else [str(ROOT / 'ubs'), '--no-config', '--only=csharp'])
+                    command += ['--ci', '--no-dotnet', '--fail-on-warning', '--skip=' + skip,
+                                '--format=' + format_, str(root)]
+                    result = subprocess.run(command, cwd=root, env=env, capture_output=True,
+                                            text=True, timeout=120, check=False)
+                    name = phase + '-' + mode
+                    (root / (name + '.stdout.json')).write_text(result.stdout, encoding='utf-8')
+                    (root / (name + '.stderr.log')).write_text(result.stderr, encoding='utf-8')
+                    details = f'{command!r}\nexit={result.returncode}\n{result.stdout}\n{result.stderr}'
+                    partial = phase != 'complete'
+                    self.assertEqual(result.returncode, 2 if partial else 1, details)
+                    report = json.loads(result.stdout)
+                    if format_ == 'sarif':
+                        invocations = [inv for run in report['runs'] for inv in run.get('invocations', [])]
+                        if partial:
+                            self.assertTrue(invocations, details)
+                            self.assertTrue(all(inv['exitCode'] == 2 for inv in invocations), details)
+                            if not mode.startswith('module-'):
+                                notifications = [item for inv in invocations
+                                                 for item in inv.get('toolExecutionNotifications', [])]
+                                self.assertTrue(any('incomplete' in item.get('message', {}).get('text', '')
+                                                    for item in notifications), details)
+                        # Successful SARIF may omit the optional invocations
+                        # array; a previous partial invocation must not survive.
+                        self.assertEqual(all(inv['executionSuccessful'] for inv in invocations),
+                                         not partial, details)
+                        findings = [finding for run in report['runs'] for finding in run.get('results', [])]
+                        locations = [(Path(f['locations'][0]['physicalLocation']['artifactLocation']['uri']).name,
+                                      f['ruleId'], f['locations'][0]['physicalLocation']['region']['startLine'],
+                                      f['locations'][0]['physicalLocation']['region']['startColumn']) for f in findings]
+                    else:
+                        self.assertEqual(report['status'], 'partial' if partial else 'ok', details)
+                        counts = report if mode.startswith('module-') else report['totals']
+                        self.assertEqual((counts['critical'], counts['warning'], counts['info'], counts['files']),
+                                         (0, 2, 0, 2), details)
+                        if partial:
+                            failure = report if mode.startswith('module-') else report['scanners'][0]
+                            self.assertEqual((failure['error'], failure['reason'], failure['module_error']),
+                                             ('analysis', 'analysis-incomplete', 'ANALYSIS_INCOMPLETE'), details)
+                            if not mode.startswith('module-'):
+                                self.assertEqual((report['error'], report['reason']),
+                                                 ('analysis', 'analysis-incomplete'), details)
+                                failed = report['failed_modules'][0]
+                                self.assertEqual((failed['language'], failed['status'], failed['module_error']),
+                                                 ('csharp', 'partial', 'ANALYSIS_INCOMPLETE'), details)
+                                self.assertIn('incomplete', failed['message'], details)
+                        findings = report['findings']
+                        locations = [(Path(f.get('path', f.get('file'))).name,
+                                      f.get('rule', f.get('rule_id')), f['line'], f['col']) for f in findings]
+                    self.assertEqual(sorted(locations),
+                                     [('a.cs', 'csharp.narrowing.negative_guard', 4, 13),
+                                      ('b.cs', 'csharp.narrowing.negative_guard', 4, 16)], details)
 
 
 class RedirectPublicReportTests(unittest.TestCase):

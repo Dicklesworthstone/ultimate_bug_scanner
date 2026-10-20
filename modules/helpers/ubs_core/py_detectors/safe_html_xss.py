@@ -8,14 +8,16 @@ tracked as "safe"; assignments from untrusted sources are tracked as
 "tainted", with per-function scoping. Import aliases for markupsafe, flask,
 jinja2, and django.utils.safestring/html extend the sink/sanitizer tables.
 
-Same-file and previous-line `ubs:ignore` markers suppress a hit, with
-per-file line dedupe, exactly like the heredoc.
+Comment directives use shared statement ownership and rule scopes, with
+per-file line dedupe preserved.
 """
 from __future__ import annotations
 
 import ast
 from pathlib import Path
 from typing import Iterable, Sequence
+
+from ubs_core.suppression import SourceSuppressions
 
 RULE_ID = "py.security.safe-html-xss"
 CATEGORY = 7
@@ -61,15 +63,6 @@ def _source_line(lines, line_no):
     return ''
 
 
-def _has_ignore(lines, line_no):
-    idx = line_no - 1
-    return (
-        0 <= idx < len(lines) and 'ubs:ignore' in lines[idx]
-    ) or (
-        0 <= idx - 1 < len(lines) and 'ubs:ignore' in lines[idx - 1]
-    )
-
-
 def _target_names(target):
     if isinstance(target, ast.Name):
         return [target.id]
@@ -105,10 +98,11 @@ def _direct_untrusted_source(node):
 
 
 class _SafeHtmlXssAnalyzer(ast.NodeVisitor):
-    def __init__(self, path, text, lines):
+    def __init__(self, path, text, lines, suppressions):
         self.path = path
         self.text = text
         self.lines = lines
+        self.suppressions = suppressions
         self.tainted_values = set()
         self.safe_values = set()
         self.safe_html_sinks = set(SAFE_HTML_SINKS)
@@ -117,7 +111,7 @@ class _SafeHtmlXssAnalyzer(ast.NodeVisitor):
         self.seen_lines = set()
 
     def remember_issue(self, line_no):
-        if _has_ignore(self.lines, line_no) or line_no in self.seen_lines:
+        if self.suppressions.is_suppressed(line_no, RULE_ID) or line_no in self.seen_lines:
             return
         self.seen_lines.add(line_no)
         self.issues.append(line_no)
@@ -235,6 +229,7 @@ class _SafeHtmlXssAnalyzer(ast.NodeVisitor):
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
+    suppressions = SourceSuppressions('python')
     for path in files:
         if path.suffix.lower() not in {'.py', '.pyi'}:
             continue
@@ -244,7 +239,7 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
         except Exception:
             continue
         lines = text.splitlines()
-        analyzer = _SafeHtmlXssAnalyzer(path, text, lines)
+        analyzer = _SafeHtmlXssAnalyzer(path, text, lines, suppressions.index(path, text))
         analyzer.visit(tree)
         for line_no in analyzer.issues:
             yield path, line_no, 1, _source_line(lines, line_no)[:240]

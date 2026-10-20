@@ -355,9 +355,13 @@ class SqlEngine(Engine):
             output.append(statement)
         return tuple(output)
 
-    def parameter_tags(self, declaration):
+    def parameter_type(self, declaration):
         match = re.fullmatch(r"\s*(?:final\s+)?([\w.$]+)\s+[A-Za-z_$][\w$]*\s*", declaration)
-        actual = self.jdbc.resolve_type(match.group(1), self.function.key) if match else None
+        return match.group(1) if match else None
+
+    def parameter_tags(self, declaration):
+        spelling = self.parameter_type(declaration)
+        actual = self.jdbc.resolve_type(spelling, self.function.key) if spelling else None
         return _type_tags(actual)
 
     def _receiver(self, name, offset, bindings, state):
@@ -431,19 +435,30 @@ class SqlEngine(Engine):
         selected = super().selected_calls(name, arguments, argument_names, offset, bindings)
         if len(selected) > 1:
             opening = self.code.find("(", offset)
-            actual_types = [self.jdbc.argument_type(low, high)
-                            for low, high in self.parser.parts(opening + 1, self.parser.pairs[opening])]
+            actual_types = []
+            for (low, high), keyword in zip(self.parser.parts(opening + 1, self.parser.pairs[opening]),
+                                            argument_names):
+                if keyword is not None:
+                    named = re.match(r"\s*[A-Za-z_]\w*\s*=(?!=)", self.code[low:high])
+                    low += named.end() if named else 0
+                actual_types.append(self.jdbc.argument_type(low, high))
             exact = []
             for function, actuals in selected:
                 formal_types = []
                 for declaration in function.parameter_declarations:
-                    match = re.fullmatch(r"\s*(?:final\s+)?([\w.$]+)\s+[A-Za-z_$][\w$]*\s*", declaration)
-                    formal_types.append(self.jdbc.nominal_type(match.group(1), function.key) if match else None)
+                    spelling = self.parameter_type(declaration)
+                    formal_types.append(self.jdbc.nominal_type(spelling, function.key) if spelling else None)
+                ordered_types = [formal_types[function.parameters.index(keyword)] if keyword is not None
+                                 else formal_types[index] for index, keyword in enumerate(argument_names)]
                 if (len(formal_types) == len(actual_types) and all(actual_types)
-                        and formal_types == actual_types):
+                        and ordered_types == actual_types):
                     exact.append((function, actuals))
             if exact:
                 selected = exact
+        return self._prepare_selected_calls(selected)
+
+    def _prepare_selected_calls(self, selected):
+        """Retain JDBC object identity and effects for selected helper calls."""
         for function, actuals in selected:
             if any(_types(value) & _BUILDERS for value in actuals.values()):
                 raise ValueError("SQL builder passed to a helper needs mutable object-effect summaries; analysis is incomplete")

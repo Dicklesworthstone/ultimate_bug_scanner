@@ -5,7 +5,8 @@ Verbatim port of run_security_randomness_checks (modules/ubs-java.sh
 UUID.randomUUID/predictable-time sources used in security-sensitive contexts
 (token, secret, otp, nonce, salt, ... identifiers or sensitive method names).
 Tracks insecure-RNG variables across assignments and the enclosing method
-name via a brace-depth stack. Current+previous-line ubs:ignore suppresses.
+name via a brace-depth stack. Source-owned directives filter findings with
+the receiving language's actual public rule ID, preserving RNG state.
 """
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.suppression import SourceSuppressions
 from ubs_core.registry import RunContext  # noqa: F401  (parity with analyzers)
 from ubs_core.java_detectors._common import iter_java_files, read_lines, strip_line_comments
 
@@ -156,7 +158,7 @@ def unsafe_source(statement: str, insecure_rng_vars, sensitive: bool, line_sensi
     return None
 
 
-def analyze(path: Path, issues):
+def analyze(path: Path, issues, *, suppressions: SourceSuppressions, rule_id: str):
     text = path.read_text(encoding='utf-8', errors='ignore')
     if not any(token in text for token in (
         'Random', 'ThreadLocalRandom', 'Math.random', 'currentTimeMillis', 'nanoTime',
@@ -164,6 +166,7 @@ def analyze(path: Path, issues):
         'randomUUID', 'Clock.System.now()',
     )):
         return
+    suppression = suppressions.index(path, text)
     lines = text.splitlines()
     insecure_rng_vars = set()
     method_stack = []
@@ -179,8 +182,7 @@ def analyze(path: Path, issues):
         if method_name:
             method_stack.append((method_name, brace_depth + max(opens, 1)))
         current_method = method_stack[-1][0] if method_stack else ''
-        from ubs_core.java_detectors._common import has_ignore
-        if has_ignore(lines, idx) or not raw_statement:
+        if not raw_statement:
             brace_depth += opens - closes
             continue
         pieces = []
@@ -196,7 +198,7 @@ def analyze(path: Path, issues):
         line_sensitive = has_security_context(statement, '')
         sensitive = line_sensitive or has_security_context('', current_method)
         source = unsafe_source(statement, insecure_rng_vars, sensitive, line_sensitive)
-        if source and sensitive:
+        if source and sensitive and not suppression.is_suppressed(idx, rule_id):
             key = (str(path), idx, source)
             if key not in seen:
                 seen.add(key)
@@ -211,11 +213,12 @@ def source_line(lines, line_no):
     return ''
 
 
-def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
+def find(files: Sequence[Path], *, language: str = 'java', rule_id: str = RULE_ID) -> Iterable[tuple[Path, int, int, str]]:
+    suppressions = SourceSuppressions(language)
     issues: list[tuple[Path, int, str]] = []
     for path in iter_java_files(files):
         try:
-            analyze(path, issues)
+            analyze(path, issues, suppressions=suppressions, rule_id=rule_id)
         except OSError:
             continue
     for path, line_no, detail in issues:

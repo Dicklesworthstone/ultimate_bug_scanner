@@ -4,9 +4,8 @@ Verbatim port of the legacy ubs-js.sh heredoc "Insecure auth/session cookie
 settings" (``cookie_security_report``): same cookie-call / Set-Cookie-header
 candidate regexes, same 18-line statement window, same explicit-insecure /
 SameSite-None-without-secure / missing-required-flags rules for cookie calls,
-same raw HttpOnly+Secure requirement for Set-Cookie headers, same ``ubs:ignore``
-placement rules (trigger line, line above, or anywhere inside the collected
-statement).
+same raw HttpOnly+Secure requirement for Set-Cookie headers. Suppression uses
+shared lexical statement ownership and exact rule scopes.
 The heredoc's os.walk over the project is replaced by iteration over
 ``RunContext.files``; per-file match logic is unchanged.
 """
@@ -17,6 +16,7 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.suppression import SourceSuppressions
 
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
 
@@ -106,22 +106,24 @@ def is_insecure_set_cookie_header(statement):
 def scan_file_findings(path: Path) -> Iterator[int]:
     """Yield 1-based line numbers per detection; match logic identical to the heredoc."""
     try:
-        lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
+        text = path.read_text(encoding='utf-8', errors='ignore')
     except Exception:
         return
+    lines = text.splitlines()
+    source_index = SourceSuppressions('javascript').index(path, text)
     seen_lines = set()
     for idx, line in enumerate(lines):
         stripped = code_line(line).strip()
-        if not stripped or 'ubs:ignore' in line or (idx > 0 and 'ubs:ignore' in lines[idx - 1]):
+        if not stripped:
             continue
         if not (cookie_call_re.search(stripped) or set_cookie_header_re.search(stripped)):
             continue
         statement = statement_from(lines, idx)
-        if not statement or 'ubs:ignore' in statement:
+        if not statement:
             continue
         if not (is_insecure_cookie_call(statement) or is_insecure_set_cookie_header(statement)):
             continue
-        if idx in seen_lines:
+        if idx in seen_lines or source_index.is_suppressed(idx + 1, RULE):
             continue
         seen_lines.add(idx)
         yield idx + 1
@@ -236,11 +238,11 @@ def _selftest_ignore_suppression(tmp_prefix: str = "ubs_core_sec_cookies_ign_") 
             target.write_text(body, encoding="utf-8")
             findings = list(scan_file_findings(target))
             assert findings == [], (name, findings)
-        # heredoc semantics: a trailing comment on a LATER statement line does not
-        # suppress — code_line strips comments before the statement ignore check.
+        # An actual comment on any physical line of this same multiline call
+        # owns the finding, matching the shared final suppression policy.
         later = Path(tmp) / "stmt.ts"
         later.write_text(in_stmt, encoding="utf-8")
-        assert list(scan_file_findings(later)) == [1], "statement comment must not suppress"
+        assert list(scan_file_findings(later)) == [], "same-call comment must suppress"
 
 
 def _selftest_run_record_shape(tmp_prefix: str = "ubs_core_sec_cookies_run_") -> None:

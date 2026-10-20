@@ -10,16 +10,153 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+### Added
+
+- Kotlin category 13 now follows request data into JDBC SQL execution, including Java synthetic properties, source-local helper summaries, SQL captured by prepared statements and statement-owned batch queues. Static SQL with actual value binding stays clean. Named arguments, literal defaults and multiline expression bodies retain helper flow; unsupported receiver and default semantics report incomplete analysis. JSON and SARIF retain source-to-sink evidence, and the SQL work limit participates in cache invalidation.
+
 ### Fixed
 
+- Kotlin broad exception handlers now report swallowed cancellation when their protected code reaches a resolved `delay`, `yield`, `awaitCancellation`, or direct cancellation throw. Catch ordering, type tests, scoped aliases and reachable branches distinguish propagation from swallowing; ordinary synchronous handlers remain quiet. Captured writes cannot leave stale rethrow proofs, and explicit imports retain their actual Kotlin precedence. Direct Kotlin SARIF also records incomplete analysis as a failed invocation with its reason.
+- Ruby request-flow analysis now resolves constant receivers through lexical namespaces, explicit root qualification, stable aliases and visible superclass constants. Namespaced helper calls retain their source and sink flow, while custom or overridden `File` methods cannot borrow built-in path-sanitizer proofs. Alias assignment order and both singleton-definition spellings preserve the actual receiver; uncertain rebindings and conditional definitions retain findings and report incomplete analysis.
+- Ruby literal allowlists use the constant selected by actual lexical lookup. Nested or compact namespace scopes cannot borrow an outer constant's safety proof, and ordinary literal-array calls no longer become incomplete namespace calls. Conditional definitions, reassignments, selected singleton overrides and request-derived shared mutations remain explicit analysis boundaries.
+
+- Native Go analyzer reports no longer stop at a 16 MiB aggregate output limit. `go vet` package and diagnostic arrays and `govulncheck` messages are read incrementally with bounded individual records. Valid diagnostics survive truncated, corrupt, oversized or failed output, and incomplete tool coverage remains explicit. A real 18.8 MB vet report now retains all 13,000 source diagnostics with exact locations.
+- JavaScript writes to the unshadowed global `undefined` no longer suppress parameter defaults or erase unsafe data. Right-hand-side effects and assignment results remain visible; strict-mode writes preserve their exceptional exits through catch and finally. Local shadows stay distinct, and ambiguous global declaration environments report incomplete analysis instead of a clean result.
+- C# null analysis no longer keeps stale guard proofs after captured helper writes, delegate calls, by-reference arguments or known accessor and disposal effects. Constructor writes to borrowed objects remain visible while fresh receiver fields stay separate. Nullable and reference-valued dictionary lookups require a value check; namespace-qualified bindings and exceptional exits keep their own state. Findings established before an unsupported scope survive in JSON and SARIF, including findings in later files, while the report explicitly marks incomplete analysis.
+- JavaScript destructuring retains null, undefined and noniterable entry failures before defaults or function bodies can hide unsafe data. Default and bypass exceptions retain their separate stores; parenthesized templates remain strings, and parameter initializers resolve shadowed `undefined` in their actual scope. Unary `void` preserves operand effects while supplying a clean undefined value.
+- External analyzer completion now accounts for inherited child processes, ignored child-exit signals, and native AST errors on stderr, including errors beyond the preview. Corrupt stream records remain recorded if consumption stops early; incomplete AST output cannot become a clean result through missing error collectors, inconsistent exit codes, or a prefilter failure.
+- JavaScript calls capture spread elements before later argument effects, evaluate spread expressions once, and keep updates that later parameter defaults make to earlier bindings. Destructuring assignments also retain receivers returned by calls, including their computed-key effects, exceptions and DOM sink writes.
+- JavaScript taint analysis preserves field identity through object and array destructuring in declarations, assignments and function parameters. Rest bindings are fresh shallow copies, defaults retain their ordered effects and exceptions, and member targets retain borrowed aliases and direct sink checks. Separate callers and clean sibling fields remain distinct.
+- C# null-guard analysis follows scoped branches, assignments and actual exit targets, including constructors, accessors and braced callbacks. Comments, unrelated bindings and nested conditional exits no longer create false proofs; uncertain selected control flow reports incomplete analysis. The exception rethrow rule matches the active catch binding and respects callable and finally boundaries, avoiding recommendations that would replace unrelated throws or produce invalid C#.
+- AST diagnostics and the ripgrep prefilter consume complete newline-delimited output with bounded record memory. Large Rust, JavaScript, TypeScript and TSX scans no longer stop at the former 16 MiB total-output ceiling; malformed records, tool failures and timeouts still mark analysis incomplete and retain valid diagnostics. Temporary output handles close on capture and consumer failures.
+- JavaScript taint analysis preserves captured object identities in nested helpers, so writes and array mutations through unassigned object parameters reach their callers. Field-specific reads and definite cleanup remain precise, with separate clean and tainted caller controls.
 - JavaScript taint analysis reuses scalar helper summaries inside allocating callers without copying unrelated heap state. Heap callers are revisited when those summaries change; captured objects and object arguments retain their contextual analysis.
 - Components proven to contain no modeled taint source avoid unnecessary heap expansion. The proof checks every selected module using the analyzer's source patterns and parsed parameter origins; source-bearing components retain the same analysis and work limits.
 
 ---
 
-## [v5.5.3] - 2026-10-14 [Tag]
+## [v5.5.9] - 2026-10-19 [Tag]
 
-Signed release assets and cloud mirror promotion await completion of native Cargo validation; the source tag is not a published binary release.
+Git-only source delivery; signed release assets and installed-tool upgrades are separate.
+
+### Fixed
+
+- Swift request-flow analysis no longer treats ordinary API `.write(...)` calls
+  without an outer `to:` argument as Foundation file writes. Real file destinations,
+  nested sinks, interpolation and request-derived values retain their checks.
+- Swift comment tokenization uses explicit ordered appends, preserving newline
+  offsets while allowing the Python SQL analyzer to complete its own source scan.
+
+---
+
+## [v5.5.8] - 2026-10-16 [Tag]
+
+Git-only source delivery; signed release assets and installed-tool upgrades are separate.
+
+### Fixed
+
+- Python descriptor analysis recognizes adjacent `ExitStack.callback(os.close, fd)`
+  registration inside branches and loops, and immediate ownership transfer to
+  a resolved `os.fdopen` context. Leaks still warn when registration is conditional,
+  the stack escapes, an intervening operation can raise, or `closefd` is false or
+  unknown. Calling `.close()` on an integer no longer hides a descriptor leak.
+  A builtin `open` context also owns the raw descriptor returned directly by
+  its inline `opener`, while shadowed or unresolved owners retain warnings.
+- Standalone Python SARIF retains every concrete finding's location and message
+  by reading the complete findings sink instead of the grouped summary. Missing
+  or corrupt evidence and failed SARIF conversion return an explicit error.
+
+---
+
+## [v5.5.7] - 2026-10-15 [Tag]
+
+Git-only source delivery; signed release assets and installed-tool upgrades are separate.
+
+### Fixed
+
+- JavaScript logical assignments (`||=`, `&&=`, `??=`) retain the path that
+  skips the right-hand side, so conditional cleanup cannot hide unsafe data.
+  Scalar and property assignments share that flow. Throwing right-hand sides
+  no longer erase the normal bypass; computed keys and receivers are evaluated
+  before the split, and returned object aliases remain intact. This bounded
+  analysis conservatively retains both paths rather than proving truthiness.
+- Paired direct-analysis and public JSON/SARIF controls cover conditional
+  cleanup, RHS sink effects, exception paths, receiver rebinding and aliases.
+  Other inherited expanded JavaScript heap failures remain tracked separately;
+  this repair is not a clean whole-suite qualification claim.
+
+---
+
+## [v5.5.6] - 2026-10-15 [Tag]
+
+Git-only source delivery; signed release assets and installed-tool upgrades are separate.
+
+### Fixed
+
+- Swift lifecycle analysis follows `do`/`catch` exception paths, nested rethrows,
+  and scope-exit `defer` cleanup. Filtered and typed handlers retain unmatched
+  exceptions; catch bindings cannot discharge a same-named outer resource.
+  Throwing branch/loop conditions also retain their exceptional exits.
+- Request-flow and outbound-URL activation distinguish lexically bound native
+  Vision requests from incoming web requests. Unknown or shadowed bindings,
+  actual request members, upload filenames and unsupported captures remain
+  conservative; no source files, rules or severities are excluded.
+- Unshadowed process-exit primitives terminate Swift guard failure paths.
+  Argument effects are still analyzed, and user-defined replacements do not
+  acquire a false non-returning guarantee.
+
+---
+
+## [v5.5.5] - 2026-10-15 [Tag]
+
+Git-only source delivery; signed release assets and installed-tool upgrades are separate.
+
+### Fixed
+
+- Swift request-flow analysis supports identifier and wildcard tuple bindings in
+  `for` loops, including nested tuples, lexical shadowing and `where` filters.
+  Each component conservatively inherits the sequence's dependencies without
+  borrowing another component's validation; request-object identity survives
+  destructuring. This may overreport a clean sibling of a tainted component.
+  Iterating request headers, query/parameter collections or content creates
+  an untrusted element read, including scalar aliases and tuple components.
+  Unsupported case, cast and optional patterns still fail closed.
+- Collection `append(contentsOf:)` labels no longer activate unrelated
+  file-reading analysis. Real file reads and request inputs, including nested
+  reads in the appended expression, retain their analysis obligations.
+- JavaScript nested default captures and heap completions retain their
+  dependencies through recursive function summaries.
+
+---
+
+## [v5.5.4] - 2026-10-15 [Tag]
+
+Git-only source delivery; signed release assets and installed-tool upgrades are separate.
+
+### Fixed
+
+- Swift request-flow analysis distinguishes filename argument labels, such as
+  `IntentFile(filename: name)`, from untrusted filename values. Clean App Intents
+  exports no longer activate unrelated unsupported closure analysis. Actual
+  upload members, request inputs, interpolations, dictionary keys and ternary
+  values retain their conservative source classification and fail-closed behavior.
+- Malformed internal exclusion-policy JSON fails with an explicit scanner-policy
+  diagnostic and retains its decoding cause; it is never replaced with an empty
+  policy. Valid project-anchored exclusions retain their original scope.
+- JavaScript taint summaries now widen recursive calls per recursion entry, so
+  recursive interpreters converge without mixing unrelated callers' heap
+  allocations. Adapted tryingET's proposed fix for #180, with regressions for
+  recursive copying, deep cloning, shared mutations and clean caller isolation.
+- Helper calls inside recursive summaries retain caller and call-site isolation.
+  Escaping catch-rest and CommonJS allocations preserve their tagged identities,
+  avoiding analyzer crashes and unrelated clean/tainted value mixing.
+- Nested heap-returning functions capture unassigned formal parameters, fixing
+  the related `get()` false negative. State inequality now includes heap and
+  captured-cell changes when scheduling dependent summaries.
+
+---
+
+## [v5.5.3] - 2026-10-14 [Release]
 
 ### Fixed
 
@@ -29,7 +166,7 @@ Signed release assets and cloud mirror promotion await completion of native Carg
 
 ## [v5.5.2] - 2026-10-14 [Tag]
 
-Signed release assets and cloud mirror promotion await completion of native Cargo validation; the source tag is not a published binary release.
+Included in the v5.5.3 release.
 
 ### Fixed
 

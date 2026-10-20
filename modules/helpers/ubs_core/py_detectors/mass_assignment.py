@@ -7,14 +7,16 @@ model_validate/setattr/populate_obj calls that spread request-derived data
 loop targets) via `**kwargs`, `data=`/`defaults=`/`values=`, or a first
 positional argument.
 
-Same-file and previous-line `ubs:ignore` markers suppress a hit, with
-per-file line dedupe, exactly like the heredoc.
+Shared lexical statement ownership and exact rule scopes suppress annotated
+hits, with per-file line dedupe.
 """
 from __future__ import annotations
 
 import ast
 from pathlib import Path
 from typing import Iterable, Sequence
+
+from ubs_core.suppression import SourceSuppressions
 
 RULE_ID = "py.security.mass-assignment"
 CATEGORY = 7
@@ -43,15 +45,6 @@ def _source_line(lines, line_no):
     if 0 <= idx < len(lines):
         return lines[idx].strip()
     return ''
-
-
-def _has_ignore(lines, line_no):
-    idx = line_no - 1
-    return (
-        0 <= idx < len(lines) and 'ubs:ignore' in lines[idx]
-    ) or (
-        0 <= idx - 1 < len(lines) and 'ubs:ignore' in lines[idx - 1]
-    )
 
 
 def _target_names(target):
@@ -112,16 +105,17 @@ def _owner_looks_modelish(owner):
 
 
 class _MassAssignmentAnalyzer(ast.NodeVisitor):
-    def __init__(self, path, lines):
+    def __init__(self, path, lines, suppression):
         self.path = path
         self.lines = lines
+        self.suppression = suppression
         self.tainted = set()
         self.loop_tainted = set()
         self.issues = []
         self.seen_lines = set()
 
     def remember_issue(self, line_no):
-        if _has_ignore(self.lines, line_no) or line_no in self.seen_lines:
+        if self.suppression.is_suppressed(line_no, RULE_ID) or line_no in self.seen_lines:
             return
         self.seen_lines.add(line_no)
         self.issues.append(line_no)
@@ -179,6 +173,7 @@ class _MassAssignmentAnalyzer(ast.NodeVisitor):
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
+    suppressions = SourceSuppressions("python")
     for path in files:
         if path.suffix.lower() not in {'.py', '.pyi'}:
             continue
@@ -188,7 +183,7 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
         except Exception:
             continue
         lines = text.splitlines()
-        analyzer = _MassAssignmentAnalyzer(path, lines)
+        analyzer = _MassAssignmentAnalyzer(path, lines, suppressions.index(path, text))
         analyzer.visit(tree)
         for line_no in analyzer.issues:
             yield path, line_no, 1, _source_line(lines, line_no)[:240]

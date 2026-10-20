@@ -475,8 +475,11 @@ def run_prefilter(
             ast_files=list(files), is_bypass=True, index=index,
         )
 
-    if any(not p.is_file() for p in files):
-        return bypass("selection contains a missing or nonregular file")
+    try:
+        if any(not p.is_file() for p in files):
+            return bypass("selection contains a missing or nonregular file")
+    except (OSError, RuntimeError) as exc:
+        return bypass(f"cannot inspect selected input ({exc})")
 
     if not index.expanded_rules:
         index.finalize()
@@ -499,11 +502,11 @@ def run_prefilter(
         try:
             fset = file_matched_rules.setdefault(str(p.resolve()), set(index.fallback_rules))
             file_matched_rules[str(p)] = fset
-        except OSError as exc:
+        except (OSError, RuntimeError) as exc:
             return bypass(f"cannot resolve selected input ({exc})")
 
     import tempfile
-    from ubs_core.external_tools import run_command
+    from ubs_core.external_tools import iter_output_lines, run_command_stream
 
     try:
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix="ubs_prefilter_lits_") as tf:
@@ -522,63 +525,67 @@ def run_prefilter(
                 batch = file_strs[start : start + _RG_BATCH]
                 cmd = ["rg", "--no-config", "--json", "--text", "-i", "-f", tf.name, "--", *batch]
                 errors: list[str] = []
-                proc = run_command("prefilter rg", cmd, Path.cwd(), 60, errors)
-                if proc is None or errors:
-                    return bypass("; ".join(errors) or "rg produced no result")
-                if proc.returncode not in (0, 1):
-                    return bypass(f"rg exited {proc.returncode}")
+                with run_command_stream("prefilter rg", cmd, Path.cwd(), 60, errors) as proc:
+                    if proc is None or errors:
+                        return bypass("; ".join(errors) or "rg produced no result")
+                    if proc.returncode not in (0, 1):
+                        return bypass(f"rg exited {proc.returncode}")
 
-                active: set[str] = set()
-                summary_seen = False
-                matches = 0
-                for line in proc.stdout.splitlines():
-                    if not line.strip():
-                        continue
-                    obj = json.loads(line)
-                    if not isinstance(obj, dict) or not isinstance(obj.get("data"), dict) or summary_seen:
-                        raise ValueError("invalid rg JSON event")
-                    kind, data = obj.get("type"), obj["data"]
-                    if kind == "summary":
-                        stats = data.get("stats")
-                        if (active or not isinstance(stats, dict)
-                                or type(stats.get("matches")) is not int
-                                or stats["matches"] != matches):
-                            raise ValueError("incomplete rg summary")
-                        summary_seen = True
-                        continue
-                    path_str = os.fsdecode(_rg_bytes(data.get("path")))
-                    resolved = str(Path(path_str).resolve())
-                    if not path_str or "\0" in path_str or resolved not in file_matched_rules:
-                        raise ValueError("rg returned an unselected path")
-                    file_set = file_matched_rules[resolved]
-                    if kind == "begin" and resolved not in active:
-                        active.add(resolved)
-                    elif kind == "end" and resolved in active:
-                        if data.get("binary_offset") is not None:
-                            raise ValueError("rg stopped early on binary content")
-                        active.remove(resolved)
-                    elif kind == "match" and resolved in active:
-                        source = _rg_bytes(data.get("lines"))
-                        submatches = data.get("submatches")
-                        if not isinstance(submatches, list) or not submatches:
-                            raise ValueError("missing rg submatches")
-                        for sub in submatches:
-                            if (not isinstance(sub, dict) or type(sub.get("start")) is not int
-                                    or type(sub.get("end")) is not int
-                                    or not 0 <= sub["start"] < sub["end"] <= len(source)
-                                    or _rg_bytes(sub.get("match")) != source[sub["start"]:sub["end"]]):
-                                raise ValueError("invalid rg submatch")
-                        matches += len(submatches)
-                        if not source.isascii():
-                            file_set.update(index.rules)
-                        elif index.literal_pattern is not None:
-                            for match in index.literal_pattern.finditer(source.decode("ascii")):
-                                file_set.update(index.expanded_rules[match.group(1).lower()])
-                    else:
-                        raise ValueError("unexpected rg event order or type")
-                if not summary_seen or bool(matches) != (proc.returncode == 0):
-                    raise ValueError("missing or inconsistent rg completion summary")
-    except (OSError, ValueError, RecursionError) as exc:
+                    active: set[str] = set()
+                    summary_seen = False
+                    matches = 0
+                    for _number, line in iter_output_lines(proc.stdout, errors, context="prefilter rg"):
+                        if not line.strip():
+                            continue
+                        obj = json.loads(line)
+                        if not isinstance(obj, dict) or not isinstance(obj.get("data"), dict) or summary_seen:
+                            raise ValueError("invalid rg JSON event")
+                        kind, data = obj.get("type"), obj["data"]
+                        if kind == "summary":
+                            stats = data.get("stats")
+                            if (active or not isinstance(stats, dict)
+                                    or type(stats.get("matches")) is not int
+                                    or stats["matches"] != matches):
+                                raise ValueError("incomplete rg summary")
+                            summary_seen = True
+                            continue
+                        path_str = os.fsdecode(_rg_bytes(data.get("path")))
+                        resolved = str(Path(path_str).resolve())
+                        if not path_str or "\0" in path_str or resolved not in file_matched_rules:
+                            raise ValueError("rg returned an unselected path")
+                        file_set = file_matched_rules[resolved]
+                        if kind == "begin" and resolved not in active:
+                            active.add(resolved)
+                        elif kind == "end" and resolved in active:
+                            if data.get("binary_offset") is not None:
+                                raise ValueError("rg stopped early on binary content")
+                            active.remove(resolved)
+                        elif kind == "match" and resolved in active:
+                            source = _rg_bytes(data.get("lines"))
+                            submatches = data.get("submatches")
+                            if not isinstance(submatches, list) or not submatches:
+                                raise ValueError("missing rg submatches")
+                            for sub in submatches:
+                                if (not isinstance(sub, dict) or type(sub.get("start")) is not int
+                                        or type(sub.get("end")) is not int
+                                        or not 0 <= sub["start"] < sub["end"] <= len(source)
+                                        or _rg_bytes(sub.get("match")) != source[sub["start"]:sub["end"]]):
+                                    raise ValueError("invalid rg submatch")
+                            matches += len(submatches)
+                            if not source.isascii():
+                                file_set.update(index.rules)
+                            elif index.literal_pattern is not None:
+                                for match in index.literal_pattern.finditer(source.decode("ascii")):
+                                    file_set.update(index.expanded_rules[match.group(1).lower()])
+                        else:
+                            raise ValueError("unexpected rg event order or type")
+                    if errors:
+                        return bypass("; ".join(errors))
+                    if not summary_seen or bool(matches) != (proc.returncode == 0):
+                        raise ValueError("missing or inconsistent rg completion summary")
+                if errors:
+                    return bypass("; ".join(errors))
+    except (OSError, ValueError, RuntimeError) as exc:
         return bypass(f"invalid or incomplete rg result ({exc})")
 
     t1 = time.perf_counter()

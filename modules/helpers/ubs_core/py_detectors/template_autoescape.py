@@ -9,8 +9,8 @@ ast.NodeVisitor flagging Jinja2 environments built with autoescape off —
 ``autoescape``-keyed assignments in a jinja-ish context (subscripts,
 attributes, plain ``autoescape = ...``).
 
-Same-file and previous-line ``ubs:ignore`` markers suppress a hit, and the
-per-file ``seen_lines`` set dedupes repeat reports on one line (7468-7476).
+Shared lexical statement ownership and exact rule scopes suppress annotated
+hits; the per-file ``seen_lines`` set dedupes repeat reports on one line.
 """
 from __future__ import annotations
 
@@ -18,6 +18,8 @@ import ast
 import warnings
 from pathlib import Path
 from typing import Iterable, Sequence
+
+from ubs_core.suppression import SourceSuppressions
 
 RULE_ID = "py.security.template-autoescape"
 CATEGORY = 7
@@ -68,15 +70,6 @@ def _source_line(lines: list[str], line_no: int) -> str:
     return ''
 
 
-def _has_ignore(lines: list[str], line_no: int) -> bool:
-    idx = line_no - 1
-    return (
-        0 <= idx < len(lines) and 'ubs:ignore' in lines[idx]
-    ) or (
-        0 <= idx - 1 < len(lines) and 'ubs:ignore' in lines[idx - 1]
-    )
-
-
 def _keyword_value(call, key):
     for keyword in call.keywords:
         if keyword.arg == key:
@@ -110,8 +103,9 @@ def _has_jinja_context(name: str) -> bool:
 
 
 class _TemplateAutoescapeAnalyzer(ast.NodeVisitor):
-    def __init__(self, lines):
+    def __init__(self, lines, suppression):
         self.lines = lines
+        self.suppression = suppression
         self.jinja_modules = {'jinja2'}
         self.env_factories = set(ENV_FACTORY_NAMES)
         self.select_autoescape_names = {'select_autoescape'}
@@ -119,7 +113,7 @@ class _TemplateAutoescapeAnalyzer(ast.NodeVisitor):
         self.seen_lines: set[int] = set()
 
     def remember_issue(self, line_no):
-        if _has_ignore(self.lines, line_no) or line_no in self.seen_lines:
+        if self.suppression.is_suppressed(line_no, RULE_ID) or line_no in self.seen_lines:
             return
         self.seen_lines.add(line_no)
         self.issues.append((line_no, _source_line(self.lines, line_no)))
@@ -211,6 +205,7 @@ class _TemplateAutoescapeAnalyzer(ast.NodeVisitor):
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
+    suppressions = SourceSuppressions("python")
     for path in files:
         if path.suffix.lower() not in {'.py', '.pyi'}:
             continue
@@ -221,7 +216,7 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
         except Exception:
             continue
         lines = text.splitlines()
-        analyzer = _TemplateAutoescapeAnalyzer(lines)
+        analyzer = _TemplateAutoescapeAnalyzer(lines, suppressions.index(path, text))
         analyzer.visit(tree)
         for line_no, code in analyzer.issues:
             yield path, line_no, 1, code[:240]

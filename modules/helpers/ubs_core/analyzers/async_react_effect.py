@@ -2,8 +2,8 @@
 useEffect (bead A4-js wave 1).
 
 Verbatim port of the legacy ubs-js.sh heredoc "async React effect callbacks":
-same regexes, same 12-line effect window, same paren-balance stop rule, same
-``ubs:ignore`` placement rules (anywhere inside the collected effect text).
+same regexes, same 12-line effect window, same paren-balance stop rule.
+Suppression uses shared lexical statement ownership and the exact rule ID.
 The heredoc's os.walk over the project is replaced by iteration over
 ``RunContext.files``; per-file match logic is unchanged.
 """
@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.suppression import SourceSuppressions
 
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
 
@@ -29,9 +30,11 @@ ASYNC_EFFECT_RE = re.compile(r'\b(?:React\.)?use(?:Layout|Insertion)?Effect\s*\(
 def scan_file_findings(path: Path) -> Iterator[tuple[int, int]]:
     """Yield (line, col) per detection; match logic identical to the heredoc."""
     try:
-        lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
+        text = path.read_text(encoding='utf-8', errors='ignore')
     except Exception:
         return
+    lines = text.splitlines()
+    source_index = SourceSuppressions('javascript').index(path, text)
     for idx, line in enumerate(lines):
         stripped = line.strip()
         if not stripped or stripped.startswith(("//", "/*", "*")):
@@ -51,7 +54,9 @@ def scan_file_findings(path: Path) -> Iterator[tuple[int, int]]:
             if saw_effect and effect_idx > idx and paren_balance <= 0:
                 break
         effect_text = ' '.join(effect_lines)
-        if 'ubs:ignore' in effect_text or not ASYNC_EFFECT_RE.search(effect_text):
+        if not ASYNC_EFFECT_RE.search(effect_text):
+            continue
+        if source_index.is_suppressed(idx + 1, RULE):
             continue
         yield idx + 1, START_RE.search(line).start() + 1
 

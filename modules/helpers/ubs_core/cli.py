@@ -88,6 +88,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="generate SARIF 2.1.0 document from combined summary findings (bead K2)",
     )
     fs.add_argument("--combined", required=True, help="combined summary JSON document")
+    fs.add_argument("--findings", default="", help="complete NDJSON findings sink for a standalone module")
     fs.add_argument("--blob", default="", help="git blob URL base for permalinks")
     fs.add_argument("--top", default="", help="git toplevel path")
     fs.add_argument("--repo", default="", help="git remote repository URI")
@@ -233,10 +234,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.layer == "findings-sarif":
-        from ubs_core.findings_merge import to_sarif
+        from ubs_core.findings_merge import load_sink, to_sarif
 
         try:
             doc = json.loads(Path(args.combined).read_text(encoding="utf-8"))
+            if args.findings:
+                # Module summaries group and cap samples. SARIF needs the
+                # complete concrete records, not one locationless group.
+                doc["findings"] = list(load_sink(Path(args.findings)))
             sarif = to_sarif(
                 doc,
                 git_blob_base=args.blob,

@@ -1,0 +1,161 @@
+diff --git a/modules/helpers/ubs_core/analyzers/taint_js.py b/modules/helpers/ubs_core/analyzers/taint_js.py
+index 3481a6dcb8b087b9d72825a7fcc71ec63c15a3a8..58899b60a638dedbf7a0893ada5595d5f8bb5102 100644
+--- a/modules/helpers/ubs_core/analyzers/taint_js.py
++++ b/modules/helpers/ubs_core/analyzers/taint_js.py
+@@ -2442,7 +2442,7 @@ class _Flow:
+                 value = _join(value, selected)
+         return value
+ 
+-    def optional_shape(self, start, end):
++    def optional_shape(self, start, end, *, require_optional=True):
+         """Parse a complete postfix chain before evaluating any of its parts.
+ 
+         Offsets refer to original executable code. One bypass skips every
+@@ -2491,7 +2491,26 @@ class _Flow:
+                 return None
+             steps.append(('.', cursor, cursor + member.end(), guarded, location))
+             cursor += member.end()
+-        return (primary_end, steps) if steps and optional and cursor == end else None
++        return (primary_end, steps) if steps and (optional or not require_optional) and cursor == end else None
++
++    def transformed_call_result(self, start, closing, end):
++        """Grouping cannot renew a sanitizer's guarantee after a transformation.
++
++        Inspect only the remaining expression. A sibling expression is not a
++        transformation of this result, and delimiters inside literals are inert.
++        No argument is evaluated here or replayed to recover discarded facts.
++        """
++        code = self.scope.code
++        cursor = closing + 1
++        while cursor < end:
++            if code[cursor].isspace():
++                cursor += 1
++            elif code[cursor] == ')' and self.pairs.get(cursor, start) < start:
++                cursor += 1
++            else:
++                break
++        return (code[cursor:cursor + 1] in {'.', '[', '('}
++                or code[cursor:cursor + 2] == '?.')
+ 
+     def optional_nullish(self, start, end, state, target=None):
+         """Prove syntax/binding facts, never guess from empty scalar taint.
+@@ -2570,7 +2589,7 @@ class _Flow:
+         self.throws.append((_materialize(_join(*facts), state.heap, budget=self.engine.budget), state.copy()))
+         return result
+ 
+-    def optional_paths(self, start, end, shape, state):
++    def optional_paths(self, start, end, shape, state, *, has_suffix=False):
+         primary_end, steps = shape
+         code, text = self.scope.code, self.engine.text
+         left, right = start, primary_end
+@@ -2580,9 +2599,12 @@ class _Flow:
+                 left += 1
+             while right > left and code[right - 1].isspace():
+                 right -= 1
+-        nested = self.optional_shape(left, right) if left != start and left < right else None
++        # The parent chain may be optional while its grouped prefix is ordinary.
++        # Retain that prefix's facts until all postfix transformations are known.
++        nested = (self.optional_shape(left, right, require_optional=False)
++                  if left != start and left < right else None)
+         if nested is not None:
+-            paths = self.optional_paths(left, right, nested, state)
++            paths = self.optional_paths(left, right, nested, state, has_suffix=True)
+         else:
+             value = self.value(start, primary_end, state)
+             name = re.sub(r'\s+', '', code[left:right])
+@@ -2621,7 +2643,8 @@ class _Flow:
+                         required_module = (path.name == 'require' and path.target is None and len(ranges) == 1
+                             and re.fullmatch(CHILD_PROCESS_MODULE_RE, text[ranges[0][0]:ranges[0][1]].strip()))
+                         path.value = self.optional_invoke(path.target, path.value, path.receiver, path.name,
+-                            path.location, ranges, state, has_suffix=index + 1 < len(steps), argument_start=left)
++                            path.location, ranges, state,
++                            has_suffix=has_suffix or index + 1 < len(steps), argument_start=left)
+                         path.target = self.engine.bound_target(path.value, state)
+                         path.name, path.receiver, path.nullish = ('child_process' if required_module else ''), frozenset(), None
+                         continue
+@@ -2940,8 +2963,8 @@ class _Flow:
+                     selected = argument_facts[:1] if self.rule == 'js.taint.sql' else argument_facts
+                     self.effect(match_start, sink[1], _join(*selected), state)
+                 regex = SANITIZERS_BY_RULE.get(self.rule)
+-                following = code[closing + 1:end].lstrip()
+-                if regex and regex.match(candidate) and not following.startswith(('.', '[')):
++                if (regex and regex.match(candidate)
++                        and not self.transformed_call_result(match_start, closing, end)):
+                     previous = code[:match_start].rstrip()
+                     if not previous.endswith('.') and binding == 'imported':
+                         call_fact = frozenset()
+diff --git a/test-suite/quality/test_taint_js_optional_chains.py b/test-suite/quality/test_taint_js_optional_chains.py
+index bf05a1bce1c9751ac7faf43081da68b06cd52ec7..ddc023f275cccb0ebe20ae155924a4f09c03915a 100644
+--- a/test-suite/quality/test_taint_js_optional_chains.py
++++ b/test-suite/quality/test_taint_js_optional_chains.py
+@@ -97,6 +97,70 @@ class OptionalChainTests(unittest.TestCase):
+         self.scan('function input(){DOMPurify=external;return req.query.html;}'
+                   'res.send(DOMPurify?.sanitize(input()));')
+ 
++    def test_grouped_optional_sanitizer_transformation_keeps_input(self):
++        for call in ('escapeHtml?.(req.query.html)', 'DOMPurify?.sanitize(req.query.html)',
++                     'DOMPurify.sanitize?.(req.query.html)'):
++            for depth in (1, 2, 5):
++                with self.subTest(call=call, depth=depth):
++                    self.scan('res.send(' + '(' * depth + call + ')' * depth +
++                              '.replace("&lt;", "<"));', 'xss')
++
++    def test_grouped_ordinary_sanitizer_transformation_keeps_input(self):
++        self.scan('res.send((escapeHtml(req.query.html)).replace("&lt;", "<"));', 'xss')
++        self.scan('res.send(((DOMPurify.sanitize(req.query.html))).unknown());', 'xss')
++
++    def test_grouped_sanitizer_optional_suffix_keeps_input(self):
++        self.scan('res.send(((escapeHtml?.(req.query.html)))?.replace("&lt;", "<"));', 'xss')
++        self.scan('res.send((escapeHtml(req.query.html))?.replace("&lt;", "<"));', 'xss')
++
++    def test_grouped_sql_escape_cannot_remove_its_quotes(self):
++        self.scan('db.query((mysql.escape?.(req.query.sql)).slice(1, -1));', 'sql')
++        self.scan('db.query((mysql.escape(req.query.sql)).slice(1, -1));', 'sql')
++
++    def test_grouped_shell_escape_cannot_remove_its_quotes(self):
++        self.scan('shell.exec((shellescape?.(req.query.command)).slice(1, -1));', 'command')
++        self.scan('shell.exec((shellescape(req.query.command)).slice(1, -1));', 'command')
++
++    def test_grouped_sanitizer_property_lookup_keeps_input(self):
++        self.scan('res.send((escapeHtml?.(req.query.html))[key]);', 'xss')
++        self.scan('res.send((escapeHtml(req.query.html))[key]);', 'xss')
++
++    def test_grouped_sanitizer_terminal_results_remain_clean(self):
++        for call in ('escapeHtml(req.query.html)', 'escapeHtml?.(req.query.html)',
++                     'DOMPurify?.sanitize(req.query.html)'):
++            with self.subTest(call=call):
++                self.scan('res.send((((' + call + '))));')
++                self.scan('res.send("prefix" + (((' + call + '))));')
++                self.scan('const clean=(((' + call + ')));res.send(clean);')
++
++    def test_grouped_sanitizer_does_not_hide_its_sink_arguments(self):
++        self.scan('res.send((DOMPurify?.sanitize(eval(req.query.code))).replace("x", "y"));', 'eval', 'xss')
++
++    def test_grouped_sanitizer_evaluates_argument_once(self):
++        self.scan('let value=req.query.html;function take(){const old=value;value="safe";return old;}'
++                  'res.send((escapeHtml?.(take())).replace("&lt;", "<"));', 'xss')
++
++    @unittest.skipUnless(shutil.which('node'), 'Node.js required for independent controls')
++    def test_grouped_sanitizer_programs_match_node(self):
++        # Only these authored programs are executed; scanner input is never run.
++        calls = ('escapeHtml(req.query.html)', 'escapeHtml?.(req.query.html)')
++        for call in calls:
++            for depth in (1, 3):
++                for transform in (False, True):
++                    grouped = '(' * depth + call + ')' * depth
++                    expression = grouped + ('.replace("&lt;", "<").replace("&gt;", ">")' if transform else '')
++                    source = 'res.send(' + expression + ');'
++                    bootstrap = ('const req={query:{html:"<unsafe-token>"}};'
++                                 'function escapeHtml(x){return x.replaceAll("<","&lt;").replaceAll(">","&gt;");}'
++                                 'const out=[];const res={send(x){out.push(x);}};')
++                    result = subprocess.run(['node', '-e', bootstrap + source +
++                                             'console.log(JSON.stringify(out));'],
++                                            text=True, capture_output=True, timeout=10)
++                    with self.subTest(call=call, depth=depth, transform=transform):
++                        self.assertEqual(result.returncode, 0, result.stderr)
++                        self.assertEqual(json.loads(result.stdout) == ['<unsafe-token>'], transform)
++                        self.scan(source, *(['xss'] if transform else []))
++
+     def test_known_local_optional_call_uses_return_summary(self):
+         self.scan('function id(x){return x;}res.send(id?.(req.query.html));', 'xss')
+         self.scan('function clean(x){return "safe";}res.send(clean?.(req.query.html));')

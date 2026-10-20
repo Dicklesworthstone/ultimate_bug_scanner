@@ -82,7 +82,7 @@ SUMMARY_MAP: dict[str, str] = {
     "cs-weak-random": "System.Random is predictable; use RandomNumberGenerator for security",
     "cs-xml-document": "XmlDocument is vulnerable to XML external entity (XXE) injection",
     "cs-empty-catch": "Empty catch block swallows exceptions silently",
-    "cs-rethrow-ex": "throw ex resets exception stack trace; use throw; instead",
+    "cs-rethrow-ex": "Throwing a catch variable can reset the caught exception's stack trace",
     "cs-gc-collect": "Manual GC.Collect() call degrades garbage collector efficiency",
     "cs-process-start": "Process.Start invocation requires strict argument validation",
     "cs-goto-statement": "goto statement harms code maintainability and control flow",
@@ -109,7 +109,7 @@ REMEDIATION_MAP: dict[str, str] = {
     "cs-weak-random": "Use System.Security.Cryptography.RandomNumberGenerator",
     "cs-xml-document": "Use XmlReaderSettings with DtdProcessing = DtdProcessing.Prohibit",
     "cs-empty-catch": "Log or properly handle caught exceptions",
-    "cs-rethrow-ex": "Use throw; to preserve stack trace",
+    "cs-rethrow-ex": "If the variable still refers to the currently handled exception, use throw; to preserve its stack trace",
     "cs-gc-collect": "Let the CLR manage memory collection automatically",
     "cs-process-start": "Use ProcessStartInfo with ArgumentList and validate inputs",
     "cs-goto-statement": "Refactor using structured loops and conditionals",
@@ -363,11 +363,32 @@ rule:
     (
         "cs-rethrow-ex",
         r'''id: cs-rethrow-ex
-message: "throw ex resets exception stack trace; use throw; instead."
+message: "If this variable still refers to the currently handled exception, use throw; to preserve its stack trace."
 severity: warning
 language: csharp
 rule:
-  pattern: throw $EX;
+  all:
+    - pattern: throw $EX;
+    - inside:
+        kind: catch_clause
+        has:
+          kind: catch_declaration
+          has:
+            field: name
+            pattern: $EX
+        # throw; refers to the active handler. Crossing another catch or a
+        # deferred callable would recommend rethrowing a different exception
+        # (or a throw; that is not legal in that callable).
+        stopBy:
+          any:
+            - kind: catch_clause
+            - kind: finally_clause
+            - kind: local_function_statement
+            - kind: lambda_expression
+            - kind: anonymous_method_expression
+constraints:
+  EX:
+    kind: identifier
 ''',
     ),
     (

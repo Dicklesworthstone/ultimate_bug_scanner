@@ -4,8 +4,8 @@ filesystem read/download/write sink (bead A4-js security wave).
 Verbatim port of the legacy ubs-js.sh heredoc "Request-derived filesystem
 paths": same regexes, quote-aware code_line(), same 16-line statement window,
 same taint fixpoint with upload provenance tracking, same containment-context
-suppression, same ubs:ignore placement rules (the marker on the finding line,
-on the line before it, or anywhere inside the collected statement text).
+suppression. Diagnostic annotations use the shared lexical statement policy
+and exact public rule without discarding annotated source facts.
 The heredoc's os.walk over the project is replaced by iteration over
 RunContext.files; per-file match logic is unchanged.
 """
@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.suppression import SourceSuppressions
 
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
 
@@ -260,7 +261,7 @@ def collect_tainted_vars(lines):
     upload_vars = set()
     for idx, line in enumerate(lines):
         stripped = code_line(line).strip()
-        if not stripped or 'ubs:ignore' in line or (idx > 0 and 'ubs:ignore' in lines[idx - 1]):
+        if not stripped:
             continue
         statement = statement_from(lines, idx)
         if not statement:
@@ -315,17 +316,19 @@ def sink_arg_text(statement):
 def scan_file_findings(path: Path) -> Iterator[tuple[int, str]]:
     """Yield (line, sample_text) per detection; logic identical to the heredoc."""
     try:
-        lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
+        source_text = path.read_text(encoding='utf-8', errors='ignore')
     except Exception:
         return
+    lines = source_text.splitlines()
+    suppressions = SourceSuppressions('javascript').index(path, source_text)
     tainted_vars = collect_tainted_vars(lines)
     seen_lines = set()
     for idx, line in enumerate(lines):
         stripped = code_line(line).strip()
-        if not stripped or 'ubs:ignore' in line or (idx > 0 and 'ubs:ignore' in lines[idx - 1]) or not candidate_re.search(stripped):
+        if not stripped or not candidate_re.search(stripped):
             continue
         statement = statement_from(lines, idx)
-        if not statement or 'ubs:ignore' in statement or not sink_re.search(statement):
+        if not statement or not sink_re.search(statement):
             continue
         args_text = sink_arg_text(statement)
         if not args_text:
@@ -337,6 +340,8 @@ def scan_file_findings(path: Path) -> Iterator[tuple[int, str]]:
         if has_safe_context(args_text, lines, idx, refs):
             continue
         if idx in seen_lines:
+            continue
+        if suppressions.is_suppressed(idx + 1, RULE):
             continue
         seen_lines.add(idx)
         yield idx + 1, stripped.replace('\t', ' ')

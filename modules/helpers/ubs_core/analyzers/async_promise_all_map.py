@@ -5,7 +5,8 @@ return": a ``.map(callback)`` whose block body never ``return``s produces an arr
 ``undefined`` values, so ``Promise.all`` resolves before any work finishes. The
 heredoc scans for a line containing ``Promise.all``, joins the paren-balanced
 expression window (35 lines), and flags every block-bodied non-async ``.map(``
-callback without a ``return`` in its body unless the window contains ``ubs:ignore``.
+callback without a ``return`` in its body. Shared comment ownership applies to
+the outer Promise.all statement and the nested diagnostic's exact public rule.
 
 run(ctx) iterates ctx.files instead of self-walking; match logic is identical.
 """
@@ -19,6 +20,7 @@ from typing import Iterable
 
 from ubs_core.io import source_line
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.suppression import build_index
 
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
 SKIP_DIRS = {'.git', 'node_modules', 'dist', 'build', 'coverage', '.next', '.cache', '.turbo'}
@@ -50,6 +52,7 @@ def matching_brace(text: str, open_index: int) -> int:
 def scan_lines(lines: list[str]) -> list[tuple[int, int]]:
     """Return (line, col) findings for one file's lines; heredoc match logic."""
     issues = []
+    suppression_index = build_index('\n'.join(lines), lang='javascript')
     for idx, line in enumerate(lines):
         stripped = line.strip()
         if 'Promise.all' not in line or not stripped or stripped.startswith(("//", "/*", "*")):
@@ -63,7 +66,7 @@ def scan_lines(lines: list[str]) -> list[tuple[int, int]]:
             if expr_idx > idx and paren_balance <= 0:
                 break
         expression = '\n'.join(expression_lines)
-        if 'ubs:ignore' in expression:
+        if suppression_index.is_suppressed(idx + 1, RULE_ID):
             continue
         for match in MAP_BLOCK_RE.finditer(expression):
             open_brace = match.end() - 1
@@ -74,6 +77,8 @@ def scan_lines(lines: list[str]) -> list[tuple[int, int]]:
             if RETURN_RE.search(callback_body):
                 continue
             sample_line = idx + expression[:match.start()].count('\n') + 1
+            if suppression_index.is_suppressed(sample_line, RULE_ID):
+                continue
             col_match = MAP_DOT_RE.search(source_line(lines, sample_line))
             col = col_match.start() + 1 if col_match else 1
             issues.append((sample_line, col))

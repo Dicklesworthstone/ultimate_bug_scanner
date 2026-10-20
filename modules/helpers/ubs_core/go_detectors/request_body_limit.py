@@ -9,8 +9,8 @@ request field. A read is suppressed when the surrounding context (up to
 value in http.MaxBytesReader or io.LimitReader. Alias and decoder maps
 reset at each ``func`` boundary.
 
-Unlike the sibling trackers, the ``ubs:ignore`` window here is three
-lines: the hit line plus the two lines above it (idx-2..idx). Legacy
+Comment directives use shared statement ownership and exact rule scopes
+at the reported line, without changing alias or decoder state. Legacy
 detail is the raw source line (strip, tabs→spaces) — not the
 comment-stripped statement — and dedupe is per (file, line) inside each
 file (legacy per-file ``seen`` set).
@@ -27,7 +27,7 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
-MARKER = "ubs:ignore"
+from ubs_core.suppression import SourceSuppressions, SuppressionIndex
 
 RULE_ID = "go.filesystem.request-body-limit"
 CATEGORY = 8
@@ -84,11 +84,6 @@ def _strip_line_comments(line: str) -> str:
     return ''.join(out)
 
 
-def _has_ignore(lines, idx):
-    start = max(0, idx - 2)
-    return any(MARKER in lines[pos] for pos in range(start, idx + 1))
-
-
 def _context_around(lines, idx):
     start = idx
     while start > 0 and idx - start < 35:
@@ -115,7 +110,9 @@ def _resolve_body(body_aliases, body: str) -> str | None:
     return body_aliases.get(body)
 
 
-def _add_issue(issues, seen, path: Path, idx: int, raw: str):
+def _add_issue(issues, seen, path: Path, idx: int, raw: str, suppression_index: SuppressionIndex):
+    if suppression_index.is_suppressed(idx + 1, RULE_ID):
+        return
     key = (path, idx + 1)
     if key in seen:
         return
@@ -123,17 +120,17 @@ def _add_issue(issues, seen, path: Path, idx: int, raw: str):
     issues.append((path, idx + 1, 1, raw.strip().replace('\t', ' ')))
 
 
-def _analyze(path: Path, issues: list) -> None:
+def _analyze(path: Path, issues: list, suppressions: SourceSuppressions) -> None:
     try:
-        lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
+        text = path.read_text(encoding='utf-8', errors='ignore')
     except OSError:
         return
+    suppression_index = suppressions.index(path, text)
+    lines = text.splitlines()
     seen = set()
     body_aliases = {}
     decoder_bodies = {}
     for idx, raw in enumerate(lines):
-        if _has_ignore(lines, idx):
-            continue
         stripped = _strip_line_comments(raw).strip()
         if not stripped:
             continue
@@ -164,7 +161,7 @@ def _analyze(path: Path, issues: list) -> None:
             context = _context_around(lines, idx)
             if _body_is_limited(context, body):
                 continue
-            _add_issue(issues, seen, path, idx, raw)
+            _add_issue(issues, seen, path, idx, raw, suppression_index)
 
         decode_call = JSON_DECODE_CALL_RE.search(stripped)
         if not decode_call:
@@ -176,13 +173,14 @@ def _analyze(path: Path, issues: list) -> None:
         context = _context_around(lines, idx)
         if _body_is_limited(context, body):
             continue
-        _add_issue(issues, seen, path, assignment_idx, assignment_raw)
+        _add_issue(issues, seen, path, assignment_idx, assignment_raw, suppression_index)
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
     issues: list[tuple[Path, int, int, str]] = []
+    suppressions = SourceSuppressions('golang')
     for path in files:
         if path.suffix != ".go":
             continue
-        _analyze(path, issues)
+        _analyze(path, issues, suppressions)
     yield from issues

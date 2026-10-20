@@ -5,8 +5,8 @@ that touch zip/tar/gem archive APIs are scanned for entry-name-derived path
 construction (entry .name/.full_name/.path aliases feeding File.join/expand_
 path/write/open, Pathname, FileUtils, #{}-interpolated separators) without a
 safe-destination helper or a start_with?/canonicalization containment check
-in the ±8/+10 line context. Same-file and previous-line `ubs:ignore`
-markers suppress a hit.
+in the ±8/+10 line context. Lexical statement-owned `ubs:ignore`
+markers suppress only matching rules.
 """
 from __future__ import annotations
 
@@ -14,10 +14,10 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.suppression import SourceSuppressions
 from ubs_core.ruby_detectors._common import (
     EXTS,
     context_around,
-    has_ignore,
     logical_statement,
     read_lines,
     ruby_files,
@@ -102,16 +102,16 @@ def analyze(lines, issues, path_str):
     text = "\n".join(lines)
     if not ARCHIVE_HINT_RE.search(text):
         return
+    suppressions = SourceSuppressions('ruby').index(path_str, text)
     aliases = collect_aliases(lines)
     for idx in range(1, len(lines) + 1):
-        if has_ignore(lines, idx):
-            continue
         statement = logical_statement(lines, idx)
         if not path_builds_from_entry(statement, aliases):
             continue
         if has_safe_context(context_around(lines, idx)):
             continue
-        issues.append((path_str, idx, 1, source_line(lines, idx)))
+        if not suppressions.is_suppressed(idx, RULE_ID):
+            issues.append((path_str, idx, 1, source_line(lines, idx)))
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple]:

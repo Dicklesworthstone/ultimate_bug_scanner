@@ -6,9 +6,8 @@ flagging every ``json.loads(...)`` call — Attribute ``loads`` on a Name
 one detection (the heredoc's count has no dedupe; its 3-example cap was
 display-only), reported at the call's own ``node.lineno``.
 
-The literal heredoc applied no ubs:ignore filtering; the contract-mandated
-suppression (marker on the hit line or the line immediately before) is added
-here so annotated call sites stay silent.
+The literal heredoc applied no ubs:ignore filtering; shared lexical
+statement ownership and exact rule scopes keep annotated call sites silent.
 
 This is the only rule for ``json.loads``. The ast-grep pack rule
 ``py.json.loads-no-try`` used to fire alongside it, so every unguarded call was
@@ -32,23 +31,13 @@ import ast
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.suppression import SourceSuppressions
+
 RULE_ID = "py.parsing.json-loads-no-try"
 CATEGORY = 9
 TITLE = "json.loads without error handling"
 SEVERITY = "warning"
 DESCRIPTION = "Wrap in try/except ValueError"
-
-MARKER = "ubs:ignore"
-
-
-def _suppressed(lines: list[str], line_no: int) -> bool:
-    """Same-line or previous-line ubs:ignore suppresses the hit."""
-    idx = line_no - 1
-    return (
-        0 <= idx < len(lines) and MARKER in lines[idx]
-    ) or (
-        0 <= idx - 1 < len(lines) and MARKER in lines[idx - 1]
-    )
 
 
 def _guarded(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
@@ -72,6 +61,7 @@ def _guarded(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
+    suppressions = SourceSuppressions("python")
     for path in files:
         # Legacy heredoc walked root.rglob("*.py") — .py only, not .pyi.
         if path.suffix.lower() != ".py":
@@ -82,6 +72,7 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
         except Exception:
             continue
         lines = text.splitlines()
+        suppression = suppressions.index(path, text)
         parents: dict[ast.AST, ast.AST] = {}
         for parent in ast.walk(tree):
             for child in ast.iter_child_nodes(parent):
@@ -97,7 +88,7 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
             if _guarded(node, parents):
                 continue
             line_no = node.lineno
-            if _suppressed(lines, line_no):
+            if suppression.is_suppressed(line_no, RULE_ID):
                 continue
             idx = line_no - 1
             detail = lines[idx].strip()[:240] if 0 <= idx < len(lines) else ""

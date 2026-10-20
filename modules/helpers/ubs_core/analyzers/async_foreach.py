@@ -3,9 +3,9 @@
 
 Verbatim port of the legacy ubs-js.sh heredoc "async callbacks passed to
 forEach": same regexes, same 14-line callback window, same paren-balance stop
-rule, same ``ubs:ignore`` placement rules (anywhere inside the collected
-callback text). The heredoc's os.walk over the project is replaced by
-iteration over ``RunContext.files``; per-file match logic is unchanged.
+rule. Suppression uses shared lexical statement ownership and the exact rule
+ID. The heredoc's os.walk over the project is replaced by iteration over
+``RunContext.files``; per-file detection logic is unchanged.
 """
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.suppression import SourceSuppressions
 
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
 
@@ -29,9 +30,11 @@ ASYNC_FOREACH_RE = re.compile(r'\.\s*forEach\s*\(\s*(?:async\b|async\s+function\
 def scan_file_findings(path: Path) -> Iterator[tuple[int, int]]:
     """Yield (line, col) per detection; match logic identical to the heredoc."""
     try:
-        lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
+        text = path.read_text(encoding='utf-8', errors='ignore')
     except Exception:
         return
+    lines = text.splitlines()
+    source_index = SourceSuppressions('javascript').index(path, text)
     for idx, line in enumerate(lines):
         stripped = line.strip()
         if not stripped or stripped.startswith(("//", "/*", "*")):
@@ -47,7 +50,9 @@ def scan_file_findings(path: Path) -> Iterator[tuple[int, int]]:
             if paren_balance <= 0:
                 break
         callback_text = ' '.join(callback_lines)
-        if 'ubs:ignore' in callback_text or not ASYNC_FOREACH_RE.search(callback_text):
+        if not ASYNC_FOREACH_RE.search(callback_text):
+            continue
+        if source_index.is_suppressed(idx + 1, RULE):
             continue
         yield idx + 1, START_RE.search(line).start() + 1
 

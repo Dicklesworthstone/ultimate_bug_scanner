@@ -4,8 +4,8 @@ Verbatim port of run_archive_extraction_checks (modules/ubs-java.sh
 672-870): archive entry names (getName/getPath/.name/.path and aliases
 assigned from them) flowing into path construction or Files.copy/move/write
 sinks, unless a safe-named helper or a containment+normalization context
-guards them. Requires an archive API hint in the file. Current+previous-line
-ubs:ignore suppresses.
+guards them. Requires an archive API hint in the file. Source-owned directives
+filter findings with the receiving language's actual public rule ID.
 """
 from __future__ import annotations
 
@@ -13,8 +13,8 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.suppression import SourceSuppressions
 from ubs_core.java_detectors._common import (
-    has_ignore,
     iter_java_files,
     logical_statement_balance,
     read_lines,
@@ -103,28 +103,30 @@ def path_builds_from_entry(statement, aliases):
     return has_entry_name(statement, aliases)
 
 
-def analyze(path: Path, issues):
+def analyze(path: Path, issues, *, suppressions: SourceSuppressions, rule_id: str):
     text = path.read_text(encoding='utf-8', errors='ignore')
     if not ARCHIVE_HINT_RE.search(text):
         return
+    suppression = suppressions.index(path, text)
     lines = text.splitlines()
     aliases = collect_aliases(lines)
     for idx, _ in enumerate(lines, start=1):
-        if has_ignore(lines, idx):
-            continue
         statement = logical_statement_balance(lines, idx)
         if not path_builds_from_entry(statement, aliases):
             continue
         if has_safe_context(context_around(lines, idx)):
             continue
+        if suppression.is_suppressed(idx, rule_id):
+            continue
         issues.append((path, idx, source_line(lines, idx)))
 
 
-def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
+def find(files: Sequence[Path], *, language: str = 'java', rule_id: str = RULE_ID) -> Iterable[tuple[Path, int, int, str]]:
+    suppressions = SourceSuppressions(language)
     issues: list[tuple[Path, int, str]] = []
     for path in iter_java_files(files):
         try:
-            analyze(path, issues)
+            analyze(path, issues, suppressions=suppressions, rule_id=rule_id)
         except OSError:
             continue
     for path, line_no, detail in issues:

@@ -9,8 +9,8 @@ and binds both issuer and audience. Legacy outcome:
 
     print_finding critical <count> "JWT parse/decode verification bypass risk" ...
 
-Marker suppression is ported verbatim: `ubs:ignore` on the finding line,
-on the previous line, or anywhere in the joined statement suppresses it.
+Shared lexical statement ownership and exact rule scopes suppress annotated
+findings without treating quoted marker text as a directive.
 """
 from __future__ import annotations
 
@@ -18,12 +18,13 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.suppression import SourceSuppressions
+
 RULE_ID = "go.security.jwt-verification"
 CATEGORY = 9
 TITLE = "JWT parse/decode verification bypass risk"
 SEVERITY = "critical"
 DESCRIPTION = "Validate signing methods against an allow-list and bind issuer/audience before trusting JWT claims"
-MARKER = "ubs:ignore"
 
 JWT_IMPORT_RE = re.compile(
     r'^\s*(?:(?P<alias>[A-Za-z_][A-Za-z0-9_]*)\s+|[._]\s+)?'
@@ -100,15 +101,6 @@ def _source_line(lines, line_no):
     return ''
 
 
-def _has_ignore(lines, line_no):
-    idx = line_no - 1
-    return (
-        0 <= idx < len(lines) and MARKER in lines[idx]
-    ) or (
-        0 <= idx - 1 < len(lines) and MARKER in lines[idx - 1]
-    )
-
-
 def _statement_from(lines, line_no, max_lines=12):
     idx = line_no - 1
     parts = []
@@ -183,7 +175,7 @@ def _prefixed_call_re(names, methods):
     return re.compile(rf'\b(?:{prefix})\.(?:{method})\s*\(')
 
 
-def _analyze_file(path):
+def _analyze_file(path, suppressions):
     try:
         text = path.read_text(encoding='utf-8', errors='ignore')
     except OSError:
@@ -191,6 +183,7 @@ def _analyze_file(path):
     if not QUICK_REJECT_RE.search(text):
         return []
     lines = text.splitlines()
+    suppression = suppressions.index(path, text)
     jwt_names = _collect_jwt_names(lines)
     parser_names = _collect_parser_names(lines, jwt_names)
     all_receivers = jwt_names | parser_names
@@ -199,15 +192,13 @@ def _analyze_file(path):
     issues = []
     seen = set()
     for line_no, raw in enumerate(lines, start=1):
-        if _has_ignore(lines, line_no):
-            continue
         stripped = _strip_line_comments(raw).strip()
         if not stripped:
             continue
         if not LINE_TRIGGER_RE.search(stripped):
             continue
         statement = _statement_from(lines, line_no)
-        if not statement or MARKER in statement:
+        if not statement:
             continue
         reason = ''
         if unverified_re.search(statement) or re.search(r'\bParseUnverified\s*\(', statement):
@@ -224,7 +215,7 @@ def _analyze_file(path):
                 reason = 'claims-unbound'
         if not reason:
             continue
-        if line_no in seen:
+        if line_no in seen or suppression.is_suppressed(line_no, RULE_ID):
             continue
         seen.add(line_no)
         issues.append((line_no, _source_line(lines, line_no)))
@@ -232,8 +223,9 @@ def _analyze_file(path):
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
+    suppressions = SourceSuppressions("golang")
     for path in files:
         if path.suffix != ".go":
             continue
-        for line_no, detail in _analyze_file(path):
+        for line_no, detail in _analyze_file(path, suppressions):
             yield (path, line_no, 1, detail)

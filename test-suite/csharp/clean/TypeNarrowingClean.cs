@@ -9,7 +9,7 @@ public static class TypeNarrowingClean
             return null;
         }
 
-        if (!cache.TryGetValue("token", out var token))
+        if (!cache.TryGetValue("token", out var token) || token == null)
         {
             return null;
         }

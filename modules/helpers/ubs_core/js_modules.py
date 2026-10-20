@@ -179,7 +179,7 @@ class Module:
                     self.exports[function.group(1)] = (None, function.group(1))
                 elif re.match(r'(const|let|var)\b', body):
                     end = expression_end(code, begin)
-                    for _kind, bound, _a, _b in _declaration_entries(self.text, code, begin, end):
+                    for _kind, bound, _pattern, _a, _b in _declaration_entries(self.text, code, begin, end):
                         for name in bound:
                             self.exports[name] = (None, name)
         self.parse_commonjs(code, ''.join(top), pairs, out)
@@ -208,9 +208,11 @@ class Module:
                 begin = match.start()
                 end = expression_end(code, begin)
                 entries = _declaration_entries(self.text, code, begin, end)
-                if len(entries) != 1 or entries[0][2] is None:
+                if len(entries) != 1:
                     continue
-                _, bound, rhs, _ = entries[0]
+                _, bound, _pattern, rhs, _ = entries[0]
+                if rhs is None:
+                    continue
                 required = re.fullmatch(r'\s*require\s*\(\s*' + _SPECIFIER +
                                         r'\s*\)\s*(?:\.\s*(' + _IDENTIFIER + r'))?\s*',
                                         self.text[rhs:end])

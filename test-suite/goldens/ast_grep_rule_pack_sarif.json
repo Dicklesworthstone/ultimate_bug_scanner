@@ -564,7 +564,7 @@
       "fixture": "test-suite/js",
       "label": "js-rule-pack",
       "module": "ubs-js.sh",
-      "result_count": 1012,
+      "result_count": 1010,
       "result_rule_ids": [
         "javascript.ctcompare.unsafe_secret_compare",
         "javascript.guards.deep_unguarded_chain",
@@ -802,7 +802,7 @@
       "fixture": "test-suite/csharp",
       "label": "csharp-rule-pack",
       "module": "ubs-csharp.sh",
-      "result_count": 50,
+      "result_count": 45,
       "result_rule_ids": [
         "cs-async-discarded-startnew",
         "cs-async-discarded-task-run",

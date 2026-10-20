@@ -56,6 +56,10 @@ from ubs_core.rust_detectors import (  # noqa: E402
 )
 from ubs_core import rust_rules  # noqa: E402
 from ubs_core.swift_detectors import security_randomness as swift_randomness  # noqa: E402
+from ubs_core.csharp_detectors import (  # noqa: E402
+    archive_extraction as cs_archive, header_injection as cs_header,
+    outbound_url as cs_outbound, security_randomness as cs_random,
+)
 
 JS_SECURITY = REPO_ROOT / "test-suite" / "js" / "security"
 PY_SECURITY = REPO_ROOT / "test-suite" / "python" / "security"
@@ -3146,6 +3150,66 @@ class RustTaintReferenceTests(unittest.TestCase):
         for detector, result in zip(self.DETECTORS, results):
             self.assertEqual(result, self.original_refs(detector, expression, tainted))
         self.assertLessEqual(len(calls), 4, f"regex compilations scaled with taint table: {len(calls)}")
+
+
+class CSharpSecuritySuppressionTests(unittest.TestCase):
+    CASES = (
+        (cs_archive, 'ZipArchive archive;\nvar target = Path.Combine(destination, entry.FullName);\n',
+         'ZipArchive archive;\nvar target = SafeArchivePath(destination, entry.FullName);\n'),
+        (cs_header, 'var name = Request.Query["name"];\nResponse.Headers.Append("X-Name", name);\n',
+         'var name = Request.Query["name"];\nResponse.Headers.Append("X-Name", Uri.EscapeDataString(name));\n'),
+        (cs_outbound, 'var url = Request.Query["url"];\nawait client.GetAsync(url);\n',
+         'var url = Request.Query["url"];\nawait client.GetAsync(SafeOutboundUrl(url));\n'),
+        (cs_random, 'var rng = new Random();\nvar authToken = rng.Next();\n',
+         'var authToken = RandomNumberGenerator.GetBytes(32);\n'),
+    )
+
+    def findings(self, detector, text):
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="ubs-csharp-ownership-", dir=artifacts) as tmp:
+            source = Path(tmp) / "Ownership.cs"
+            source.write_text(text, encoding="utf-8")
+            rows = list(detector.find([source], base_dir=source.parent))
+            self.assertTrue(all(row[0] == "Ownership.cs" and row[2] == 1 for row in rows), rows)
+            return rows
+
+    def test_exact_sink_scope_and_lexical_marker_ownership(self):
+        for detector, positive, safe in self.CASES:
+            rule = detector.RULE_ID
+            lines = positive.splitlines(keepends=True)
+            variants = (
+                ("unmarked", positive, [2]),
+                ("safe", safe, []),
+                ("owned", lines[0] + lines[1].rstrip() + f" // ubs:ignore[{rule}]\n", []),
+                ("bare", lines[0] + lines[1].rstrip() + " // ubs:ignore\n", []),
+                ("wrong", lines[0] + lines[1].rstrip() + " // ubs:ignore[csharp.other.rule]\n", [2]),
+                ("quoted", lines[0] + lines[1].rstrip() + f' var example = "ubs:ignore[{rule}]";\n', [2]),
+                ("preceding-owned", lines[0] + f"// ubs:ignore[{rule}]\n" + lines[1], []),
+                ("preceding-wrong", lines[0] + "// ubs:ignore[csharp.other.rule]\n" + lines[1], [3]),
+            )
+            for name, text, expected in variants:
+                with self.subTest(rule=rule, placement=name):
+                    self.assertEqual([row[1] for row in self.findings(detector, text)], expected)
+
+    def test_annotated_source_and_alias_facts_reach_later_sink(self):
+        for detector, positive, _ in self.CASES[1:]:
+            source, sink = positive.splitlines(keepends=True)
+            for marker in ("ubs:ignore", f"ubs:ignore[{detector.RULE_ID}]", "ubs:ignore[csharp.other.rule]"):
+                with self.subTest(rule=detector.RULE_ID, source_marker=marker):
+                    text = source.rstrip() + f" // {marker}\nConsole.WriteLine(0);\n" + sink
+                    self.assertEqual([row[1] for row in self.findings(detector, text)], [3])
+            with self.subTest(rule=detector.RULE_ID, source_marker="quoted"):
+                text = source.rstrip() + f' var example = "ubs:ignore[{detector.RULE_ID}]";\nConsole.WriteLine(0);\n' + sink
+                self.assertEqual([row[1] for row in self.findings(detector, text)], [3])
+        for detector, source, transfer, sink in (
+            (cs_header, 'var name = Request.Query["name"];\n', 'var alias = name;\n', 'Response.Headers.Append("X-Name", alias);\n'),
+            (cs_outbound, 'var url = Request.Query["url"];\n', 'var target = url;\n', 'await client.GetAsync(target);\n'),
+        ):
+            for marker in ("", f" // ubs:ignore[{detector.RULE_ID}]", " // ubs:ignore[csharp.other.rule]"):
+                with self.subTest(rule=detector.RULE_ID, alias_marker=marker):
+                    text = source + transfer.rstrip() + marker + "\nConsole.WriteLine(0);\n" + sink
+                    self.assertEqual([row[1] for row in self.findings(detector, text)], [4])
 
 
 if __name__ == "__main__":

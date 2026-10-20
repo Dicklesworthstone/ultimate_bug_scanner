@@ -2,11 +2,11 @@
 (bead A4-js security wave, bead 0xjg.4).
 
 Verbatim port of the legacy ubs-js.sh ``js_unbounded_request_body_matches``
-function including its suppression helpers: same body-consumer regex
+function: same body-consumer regex
 (json/text/arrayBuffer/formData/blob over req/request/nextRequest/event.request
 /ctx.request/context.request), same size-guard/allowlist suppressions resolved
-inside the ±(45/16)-line function context, same ``ubs:ignore`` placement rules
-(any of the three lines ending at the match line). The heredoc's os.walk over
+inside the ±(45/16)-line function context. Suppression uses shared lexical
+statement ownership and exact rule scopes. The heredoc's os.walk over
 the project is replaced by iteration over ``RunContext.files``; per-file match
 logic is unchanged.
 
@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.suppression import SourceSuppressions
 
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
 
@@ -67,11 +68,6 @@ def strip_line_comments(line: str) -> str:
     return line
 
 
-def has_ignore(lines: list[str], idx: int) -> bool:
-    start = max(0, idx - 2)
-    return any('ubs:ignore' in lines[pos] for pos in range(start, idx + 1))
-
-
 def source_line(lines: list[str], idx: int) -> str:
     return lines[idx].strip().replace('\t', ' ')
 
@@ -98,23 +94,21 @@ def guarded(context: str) -> bool:
 def scan_file_findings(path: Path) -> Iterator[tuple[int, str]]:
     """Yield (line_number, sample_text) per detection; heredoc-identical."""
     try:
-        lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
+        text = path.read_text(encoding='utf-8', errors='ignore')
     except OSError:
         return
+    lines = text.splitlines()
+    source_index = SourceSuppressions('javascript').index(path, text)
     seen: set[tuple[str, int]] = set()
     for idx, raw in enumerate(lines):
-        if has_ignore(lines, idx):
-            continue
         stripped = strip_line_comments(raw).strip()
         if not stripped or not body_call_re.search(stripped):
-            continue
-        if 'ubs:ignore' in stripped:
             continue
         context = function_context(lines, idx)
         if guarded(context):
             continue
         key = (str(path), idx + 1)
-        if key in seen:
+        if key in seen or source_index.is_suppressed(idx + 1, RULE):
             continue
         seen.add(key)
         yield idx + 1, source_line(lines, idx)

@@ -390,7 +390,7 @@ class GoInventorySelectionTest(unittest.TestCase):
         self.assertEqual(len(outdated), 1, context)
         self.assertEqual(outdated[0]["locations"][0]["physicalLocation"]["region"]["startLine"], 3, context)
         self.assertEqual(outdated[0]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
-                         str(selected.resolve()), context)
+                         selected.resolve().as_uri(), context)
 
     def test_directory_alias_keeps_inventory_exclusions_cache_and_source_findings(self):
         source = self.project / "main.go"

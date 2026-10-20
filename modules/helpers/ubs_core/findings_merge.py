@@ -23,6 +23,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import quote
 
 SCANNER_SUMMARY_KEYS = {"language", "project", "files", "critical", "warning", "info", "timestamp", "status", "version"}
 
@@ -779,6 +780,32 @@ def merge(
     return count
 
 
+def _uri_path(path: str) -> str:
+    """Percent-encode a native path for use as a URI path (RFC 3986).
+
+    Every byte outside the unreserved set and '/' is encoded with upper-case
+    hex (SARIF 2.1.0 section 3.10.1 normalisation), so a space, '#', '?' or
+    '%' in a file name stays part of the path instead of starting a fragment,
+    a query or an escape. Undecodable file-name bytes (surrogate escapes) are
+    encoded as the original bytes.
+    """
+    return quote(path, safe="/", errors="surrogateescape")
+
+
+def _artifact_uri(path: str) -> str:
+    """The SARIF artifactLocation.uri for a finding's path.
+
+    SARIF 2.1.0 section 3.10.1 requires every URI-valued property to be an
+    RFC 3986 string, and section 3.10.2 says a file URI should start with
+    file:///. An absolute path becomes a file URI and a relative path a
+    relative reference. A value that is already a file URI is kept.
+    """
+    if path.startswith("file://"):
+        return path
+    encoded = _uri_path(path)
+    return "file://" + encoded if path.startswith("/") else encoded
+
+
 def to_sarif(
     doc: dict,
     *,
@@ -880,7 +907,7 @@ def to_sarif(
                     col_no = 1
                 loc: dict = {
                     "physicalLocation": {
-                        "artifactLocation": {"uri": file_path},
+                        "artifactLocation": {"uri": _artifact_uri(file_path)},
                         "region": {
                             "startLine": line_no,
                             "startColumn": col_no,
@@ -888,13 +915,21 @@ def to_sarif(
                     }
                 }
                 if git_blob_base:
+                    # The permalink is a URL too: its path part is encoded
+                    # exactly once, whether the finding named a native path
+                    # or an already encoded file URI.
                     rel = file_path
-                    if rel.startswith("file://"):
+                    encoded = rel.startswith("file://")
+                    top = git_top
+                    if encoded:
                         rel = rel[7:]
-                    if git_top and rel.startswith(git_top + "/"):
-                        rel = rel[len(git_top) + 1:]
+                        top = _uri_path(git_top) if git_top else ""
+                    if top and rel.startswith(top + "/"):
+                        rel = rel[len(top) + 1:]
                     elif rel.startswith("./"):
                         rel = rel[2:]
+                    if not encoded:
+                        rel = _uri_path(rel)
                     loc["properties"] = {"permalink": f"{git_blob_base}/{rel}#L{line_no}"}
                 res["locations"] = [loc]
 
@@ -918,7 +953,7 @@ def to_sarif(
                                 or not isinstance(step.get("label"), str)):
                             raise ValueError("taint_path contains an invalid evidence step")
                         locations.append({"executionOrder": order, "kinds": [step["kind"]], "location": {
-                            "physicalLocation": {"artifactLocation": {"uri": step["path"]},
+                            "physicalLocation": {"artifactLocation": {"uri": _artifact_uri(step["path"])},
                                                  "region": {"startLine": step["line"], "startColumn": step["col"]}},
                             "message": {"text": step["kind"] + ": " + step["label"]}}})
                     if locations:

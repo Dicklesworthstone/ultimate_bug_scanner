@@ -166,6 +166,17 @@ class NewModuleScaffoldTest(unittest.TestCase):
         self.assertGreaterEqual(len(sarif["runs"][0]["results"]), 1)
         levels = {r["level"] for r in sarif["runs"][0]["results"]}
         self.assertEqual(levels, {"error", "note"}, "the eval hit renders as error, the TODO marker as note")
+        # SARIF 2.1.0 section 3.10: artifact locations are RFC 3986 URIs that
+        # name the scanned file (absolute paths as file:// URIs).
+        from urllib.parse import unquote, urlparse
+        uris = {location["physicalLocation"]["artifactLocation"]["uri"]
+                for result in sarif["runs"][0]["results"] for location in result["locations"]}
+        self.assertTrue(uris)
+        for uri in uris:
+            parsed = urlparse(uri)
+            self.assertEqual((parsed.query, parsed.fragment), ("", ""), uri)
+            named = Path(unquote(parsed.path))
+            self.assertTrue((named if parsed.scheme == "file" else Path.cwd() / named).is_file(), uri)
         proc = run([str(self.module), "--format=toon", str(buggy)])
         self.assertEqual(proc.returncode, 2, "toon must be refused by a module (meta-runner format)")
         proc = run([str(self.module), "--list-categories"])

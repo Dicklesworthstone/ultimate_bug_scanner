@@ -39,6 +39,18 @@ from ubs_core.lexer import (
 )
 
 
+def sarif_uri(path) -> str:
+    """The SARIF 2.1.0 section 3.10 artifact URI of a native path, computed independently.
+
+    An absolute path is a file URI (pathlib's own encoding); a relative path is
+    a percent-encoded relative reference.
+    """
+    from urllib.parse import quote
+
+    native = Path(path)
+    return native.as_uri() if native.is_absolute() else quote(str(path))
+
+
 class UbsCorePackageImportTests(unittest.TestCase):
     def _isolated_python(self, script: str, *arguments: str) -> dict:
         command = [sys.executable, "-I", "-S", "-B", "-c", script, *arguments]
@@ -1452,7 +1464,7 @@ class StructuredSourceIdentityTests(unittest.TestCase):
                             self.assertEqual(result["level"], "note" if rule == task_rule else "warning", result)
                             self.assertEqual(len(result["locations"]), 1, result)
                             location = result["locations"][0]["physicalLocation"]
-                            self.assertEqual(location["artifactLocation"]["uri"], str(source), result)
+                            self.assertEqual(location["artifactLocation"]["uri"], sarif_uri(source), result)
                             self.assertEqual(location["region"]["startLine"], line, result)
                             self.assertEqual(location["region"]["startColumn"], column, result)
                 return sorted(records, key=lambda record: json.dumps(record, sort_keys=True))
@@ -1561,7 +1573,7 @@ class StructuredSourceIdentityTests(unittest.TestCase):
                         self.assertEqual(result["level"], "note", result)
                         self.assertEqual(len(result["locations"]), 1, result)
                         location = result["locations"][0]["physicalLocation"]
-                        self.assertEqual(location["artifactLocation"]["uri"], str(balance), result)
+                        self.assertEqual(location["artifactLocation"]["uri"], sarif_uri(balance), result)
                         self.assertEqual((location["region"]["startLine"], location["region"]["startColumn"]),
                                          (task_line, 1), result)
                 return sorted(records, key=lambda record: json.dumps(record, sort_keys=True))
@@ -1714,7 +1726,7 @@ class RustSqlSourceTests(unittest.TestCase):
                         physical = result["locations"][0]["physicalLocation"]
                         actual.append((result["ruleId"], physical["artifactLocation"]["uri"],
                                        physical["region"]["startLine"], physical["region"]["startColumn"], result["level"]))
-                    self.assertCountEqual(actual, [(rule, path, line, col, "error")
+                    self.assertCountEqual(actual, [(rule, sarif_uri(path), line, col, "error")
                                                    for rule, path, line, col, _severity in wanted], context)
                 return sorted(records, key=lambda record: json.dumps(record, sort_keys=True))
 
@@ -1953,7 +1965,7 @@ fn probe_text_version(client: &Client, url: &str) {
                             physical = result["locations"][0]["physicalLocation"]
                             actual.append((result["ruleId"], physical["artifactLocation"]["uri"],
                                            physical["region"]["startLine"], physical["region"]["startColumn"], result["level"]))
-                        self.assertCountEqual(actual, [(rule, path, line, col, "error")
+                        self.assertCountEqual(actual, [(rule, sarif_uri(path), line, col, "error")
                                                        for rule, path, line, col, _severity in wanted], context)
                     return sorted(records, key=lambda record: json.dumps(record, sort_keys=True))
 
@@ -3029,7 +3041,7 @@ fun handler(request: Request) {
                 for location, step in zip(locations, steps):
                     physical = location['location']['physicalLocation']
                     self.assertEqual(location['kinds'], [step['kind']], context)
-                    self.assertEqual(physical['artifactLocation']['uri'], step['path'], context)
+                    self.assertEqual(physical['artifactLocation']['uri'], sarif_uri(step['path']), context)
                     self.assertEqual(physical['region'],
                                      {'startLine': step['line'], 'startColumn': step['col']}, context)
 
@@ -4663,7 +4675,7 @@ String inert="response.sendRedirect(request.getParameter(x))";
                                 for location, step in zip(locations, extras['taint_path']):
                                     physical = location['location']['physicalLocation']
                                     self.assertEqual(location['kinds'], [step['kind']], context)
-                                    self.assertEqual(physical['artifactLocation']['uri'], step['path'], context)
+                                    self.assertEqual(physical['artifactLocation']['uri'], sarif_uri(step['path']), context)
                                     self.assertEqual(physical['region'], {'startLine': step['line'], 'startColumn': step['col']}, context)
                         self.assertEqual(len(found), len(expected), context)
                         self.assertEqual(actual, expected, context)
@@ -5777,7 +5789,7 @@ fun generate(): String {
                                    row['locations'][0]['physicalLocation']['region']['startColumn']) for row in results]
                         self.assertTrue(all(row['level'] == 'warning' for row in results), context)
                         self.assertTrue(all(row['locations'][0]['physicalLocation']['artifactLocation']['uri']
-                                            == str(path) for row in results), context)
+                                            == sarif_uri(path) for row in results), context)
                     self.assertEqual(actual, expected, context)
 
     def test_literal_only_sql_concatenation_completes_the_java_module(self):

@@ -47,6 +47,21 @@ from ubs_core.py_detectors import unsafe_deserialization  # noqa: E402
 from ubs_core.py_patterns.security_rg import PATTERNS  # noqa: E402
 from ubs_core.py_rules import _RULES  # noqa: E402
 from ubs_core.py_scan import iter_matches  # noqa: E402
+
+
+def sarif_location_path(uri: str, base: Path | None = None) -> Path:
+    """The native path a SARIF artifactLocation.uri names (SARIF 2.1.0 section 3.10).
+
+    A file URI is decoded to its absolute path; a relative reference is decoded
+    and, when `base` is given, resolved against it.
+    """
+    from urllib.parse import unquote, urlparse
+
+    parsed = urlparse(uri)
+    if parsed.scheme == "file":
+        return Path(unquote(parsed.path))
+    relative = Path(unquote(uri))
+    return base / relative if base is not None else relative
 from ubs_core.rust_detectors import jwt_verification  # noqa: E402
 from ubs_core.rust_detectors import hardcoded_secrets as rust_hardcoded_secrets  # noqa: E402
 from ubs_core.rust_detectors import security_randomness  # noqa: E402
@@ -459,7 +474,7 @@ class Negative {
                         self.assertEqual(len(result["locations"]), 1, context)
                         location = result["locations"][0]["physicalLocation"]
                         region = location["region"]
-                        run_sites.append((result["ruleId"], str((self.root / location["artifactLocation"]["uri"]).resolve()),
+                        run_sites.append((result["ruleId"], str(sarif_location_path(location["artifactLocation"]["uri"], self.root).resolve()),
                                           region["startLine"], region["startColumn"], "warning"))
                     by_driver[driver] = sorted(run_sites)
                 # SARIF keeps the original AST evidence in a separate run,
@@ -546,7 +561,7 @@ class Negative {
                                 location = result["locations"][0]["physicalLocation"]
                                 region = location["region"]
                                 self.assertIn(result["level"], ("note", "warning"), context)
-                                sites.append((result["ruleId"], location["artifactLocation"]["uri"],
+                                sites.append((result["ruleId"], str(sarif_location_path(location["artifactLocation"]["uri"])),
                                               region["startLine"], region["startColumn"],
                                               "info" if result["level"] == "note" else "warning"))
                             by_driver[driver] = sorted(sites)
@@ -742,7 +757,7 @@ class PublicScopedSuppressionTests(unittest.TestCase):
                     for record in run.get("results", []):
                         self.assertEqual(len(record["locations"]), 1, context)
                         loc = record["locations"][0]["physicalLocation"]
-                        actual.append((record["ruleId"], str((root / loc["artifactLocation"]["uri"]).resolve()),
+                        actual.append((record["ruleId"], str(sarif_location_path(loc["artifactLocation"]["uri"], root).resolve()),
                                        loc["region"]["startLine"],
                                        "info" if record["level"] == "note" else record["level"],
                                        loc["region"]["startColumn"]))
@@ -2316,7 +2331,7 @@ fn reassignment(supplied: &str) {
                             self.assertEqual(record["level"], "error", context)
                             self.assertEqual(len(record["locations"]), 1, context)
                             location = record["locations"][0]["physicalLocation"]
-                            sarif.append((record["ruleId"], str((root / location["artifactLocation"]["uri"]).resolve()),
+                            sarif.append((record["ruleId"], str(sarif_location_path(location["artifactLocation"]["uri"], root).resolve()),
                                           location["region"]["startLine"], location["region"]["startColumn"], "critical"))
                         self.assertEqual(sorted(sarif), sorted(expected), context)
                     return sorted(records, key=lambda record: (record["path"], record["line"], record["col"]))
@@ -2495,7 +2510,7 @@ fn password_reset_token() {
                             self.assertEqual(record["level"], "error", context)
                             self.assertEqual(len(record["locations"]), 1, context)
                             loc = record["locations"][0]["physicalLocation"]
-                            sarif.append((record["ruleId"], str((root / loc["artifactLocation"]["uri"]).resolve()),
+                            sarif.append((record["ruleId"], str(sarif_location_path(loc["artifactLocation"]["uri"], root).resolve()),
                                           loc["region"]["startLine"], loc["region"]["startColumn"], "critical"))
                         self.assertEqual(sorted(sarif), sorted(expected), context)
                     return sorted(records, key=lambda record: (record["path"], record["line"], record["col"]))

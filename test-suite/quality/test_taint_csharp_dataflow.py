@@ -919,9 +919,13 @@ class AnalysisBoundaryTests(unittest.TestCase):
             locations = result['codeFlows'][0]['threadFlows'][0]['locations']
             self.assertEqual(len(locations), len(evidence))
             self.assertEqual(result['properties']['extras'], finding['extras'])
+            from urllib.parse import quote
             for original, location in zip(evidence, locations):
                 physical = location['location']['physicalLocation']
-                self.assertEqual(physical['artifactLocation']['uri'], original['path'])
+                # SARIF 2.1.0 section 3.10: absolute paths are file URIs.
+                native = Path(original['path'])
+                self.assertEqual(physical['artifactLocation']['uri'],
+                                 native.as_uri() if native.is_absolute() else quote(original['path']))
                 self.assertEqual(physical['region']['startLine'], original['line'])
                 self.assertEqual(physical['region']['startColumn'], original['col'])
 

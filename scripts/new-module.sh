@@ -93,7 +93,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="fe5d775fa779f80d0206a860d44513aa7a9ef070dd346f46310b06efa8a8df54"
+UBS_LIB_CHECKSUM="831ee4eeddddba31e08d62ae3b4818f6d2b2de1230d6f83459585235f3051e01"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -285,6 +285,24 @@ render_json(){
   done
   printf ']}\n'
 }
+# SARIF 2.1.0 section 3.10: artifactLocation.uri is an RFC 3986 string. An
+# absolute path becomes a file:// URI and a relative path a relative reference;
+# every byte outside the unreserved set and '/' is percent-encoded, so ' ', '#',
+# '?' or '%' in a file name stays part of the path.
+sarif_uri(){
+  local LC_ALL=C
+  local path="$1" out="" ch i
+  local -i byte
+  for ((i = 0; i < ${#path}; i++)); do
+    ch="${path:i:1}"
+    case "$ch" in
+      [A-Za-z0-9._~/-]) out+="$ch" ;;
+      *) printf -v byte '%d' "'$ch"; printf -v ch '%%%02X' "$((byte & 255))"; out+="$ch" ;;
+    esac
+  done
+  [[ "$path" == /* ]] && out="file://$out"
+  printf '%s' "$out"
+}
 render_sarif(){
   local i s file line code first=1 level
   printf '{"$schema":"https://json.schemastore.org/sarif-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"ubs-%s","version":"%s"}},"results":[' "$LANGUAGE" "$VERSION"
@@ -296,7 +314,7 @@ render_sarif(){
       [[ "$first" -eq 1 ]] || printf ','
       first=0
       printf '{"ruleId":"%s","level":"%s","message":{"text":"%s"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"%s"},"region":{"startLine":%s}}}]}' \
-        "${F_RULE[$i]}" "$level" "$(json_escape "${F_TITLE[$i]}")" "$(json_escape "$file")" "${line:-1}"
+        "${F_RULE[$i]}" "$level" "$(json_escape "${F_TITLE[$i]}")" "$(json_escape "$(sarif_uri "$file")")" "${line:-1}"
     done
   done
   printf ']}]}\n'

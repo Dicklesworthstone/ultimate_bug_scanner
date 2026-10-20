@@ -1432,7 +1432,10 @@ class SwiftLifecycleBindings(LoggedCase):
                                     if f.get('level') in {'error', 'warning'}]
                         actual = sorted((f['ruleId'], f['locations'][0]['physicalLocation']['region']['startLine'])
                                         for f in findings)
-                        self.assertTrue(all(Path(f['locations'][0]['physicalLocation']['artifactLocation']['uri']) == target
+                        from urllib.parse import unquote, urlparse
+                        # SARIF 2.1.0 section 3.10: an absolute path is a file URI.
+                        self.assertTrue(all(Path(unquote(urlparse(
+                            f['locations'][0]['physicalLocation']['artifactLocation']['uri']).path)) == target
                                             for f in findings), context)
                     self.assertEqual(actual, public_expected, context)
                     print(f'[swift-lifecycle-{label}] PASS ({time.monotonic() - started:.3f}s)', flush=True)

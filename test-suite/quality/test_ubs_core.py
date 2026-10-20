@@ -398,6 +398,24 @@ class PythonTaintDataflowTests(unittest.TestCase):
         print(f'[{case}] {status} ({time.monotonic() - start:.3f}s)', flush=True)
         return result
 
+    def test_local_names_of_a_function_scope(self):
+        # A merge left a second, never-bound `scope_nodes` default inside
+        # _local_names, so every function scope raised UnboundLocalError and
+        # every Python scan that reached taint analysis exited 2.
+        import ast
+        from ubs_core.analyzers import taint_py
+
+        function = ast.parse('def run(value, *rest, key=None):\n'
+                             '    total = value\n'
+                             '    for item in rest:\n'
+                             '        pass\n'
+                             '    return [x for x in rest]\n').body[0]
+        expected = {'value', 'rest', 'key', 'total', 'item'}
+        self.assertEqual(taint_py._local_names(function), expected)
+        self.assertEqual(taint_py._local_names(function, tuple(taint_py._scope_nodes(function))), expected)
+        _, records = self.findings('def run(value):\n    eval(value)\n')
+        self.assertEqual(records, [])
+
     def findings(self, source: str) -> tuple[str, list[dict]]:
         from ubs_core.analyzers import taint_py
         from ubs_core.registry import RunContext

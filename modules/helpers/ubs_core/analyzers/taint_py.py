@@ -794,8 +794,6 @@ def _local_names(scope, nodes=None) -> set[str]:
     if nodes is None:
         nodes = tuple(_scope_nodes(scope))
     names = set()
-    if scope_nodes is None:
-        scope_nodes = list(_scope_nodes(scope))
     # Iteration targets belong to the comprehension, not its containing
     # function/module. Walrus targets still belong to the containing scope.
     comprehension_targets = {

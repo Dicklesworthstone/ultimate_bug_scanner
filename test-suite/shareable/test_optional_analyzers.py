@@ -7,9 +7,11 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -331,6 +333,176 @@ cat "$TMPDIR_RUN/second.out"
                 doc = json.loads(proc.stdout)
                 self.assertEqual([s["language"] for s in doc["scanners"]], list(languages))
                 self.assertEqual(doc["totals"]["critical"], len(languages))
+
+
+@unittest.skipUnless(os.name == "posix", "Python module requires a POSIX shell")
+class PythonOptionalIntegration(unittest.TestCase):
+    """Real module and child processes; injected tools only exercise failures."""
+
+    def setUp(self):
+        artifacts = ROOT / "test-suite/artifacts"
+        artifacts.mkdir(exist_ok=True)
+        self.root = Path(tempfile.mkdtemp(prefix="python-optional-", dir=artifacts))
+        self.project = self.root / "project"
+        self.project.mkdir()
+        self.source = self.project / "sample.py"
+        self.source.write_text('import os\nhandle = open("data", encoding="utf-8")\n')
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        # Omit user tool directories so the direct route cannot accidentally
+        # provision an audit through an installed uv. Use the test interpreter.
+        (self.bin / "python3").symlink_to(sys.executable)
+        self.calls = self.root / "calls.jsonl"
+        self.pids = self.root / "pids.json"
+        self.env = {key: value for key, value in os.environ.items()
+                    if not key.startswith(("UBS_", "UV_", "XDG_"))}
+        self.env.update(PATH=f"{self.bin}:/usr/bin:/bin", NO_COLOR="1", CI="1",
+                        PYTHONDONTWRITEBYTECODE="1", ENABLE_UV_TOOLS="1",
+                        UBS_CACHE_DIR=str(self.root / "cache"), UBS_NO_AUTO_UPDATE="1",
+                        UBS_TEST_FORCE_NO_AST_GREP="1", UV_TIMEOUT="10",
+                        AUDIT_CALLS=str(self.calls), AUDIT_PIDS=str(self.pids))
+
+    def failure_tool(self, tool, *, uv=False):
+        # An executable with a recorded PID and real descendants verifies
+        # cancellation without pretending to provide successful audit results.
+        script = f"#!{sys.executable}\n" + r'''
+import json, os, signal, subprocess, sys, time
+from pathlib import Path
+with open(os.environ["AUDIT_CALLS"], "a") as stream:
+    stream.write(json.dumps(sys.argv[1:]) + "\n")
+mode = os.environ.get("AUDIT_MODE", "empty")
+if mode in ("output", "stall"):
+    print('[{"message":"audit evidence before failure"}]', flush=True)
+    print("audit stderr before failure", file=sys.stderr, flush=True)
+if mode == "stall":
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    Path(os.environ["AUDIT_PIDS"]).write_text(json.dumps([os.getpid(), child.pid]))
+    time.sleep(120)
+sys.exit(int(os.environ.get("AUDIT_EXIT", "2")))
+'''
+        target = self.bin / ("uvx" if uv else tool)
+        target.write_text(script)
+        target.chmod(0o755)
+        if uv:
+            # Only presence is queried. uvx is the actual attempted command.
+            (self.bin / "uv").symlink_to(target)
+
+    def command(self, tool):
+        return [str(ROOT / "modules/ubs-python.sh"), str(self.project),
+                "--format=text", f"--uv-tools={tool}",
+                f"--summary-json={self.root / 'summary.json'}"]
+
+    def scan(self, tool, **env):
+        proc = subprocess.run(self.command(tool), cwd=self.root,
+                              env={**self.env, **env}, capture_output=True,
+                              text=True, timeout=60, check=False)
+        (self.root / "stdout.txt").write_text(proc.stdout)
+        (self.root / "stderr.txt").write_text(proc.stderr)
+        return proc, json.loads((self.root / "summary.json").read_text())
+
+    def assert_partial(self, proc, summary, tool):
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertEqual(summary["status"], "partial", summary)
+        self.assertEqual(summary["module_error"], "ANALYZER_ERROR", summary)
+        self.assertIn(tool, summary["message"])
+        self.assertIn("analysis incomplete", proc.stderr)
+        self.assertNotIn("Ruff clean", proc.stdout)
+        # The external error must not replace independently observed findings.
+        self.assertIn("python.lifecycle.file_handle",
+                      {row["rule"] for row in summary["findings"]})
+        self.assertIn("sample.py", proc.stdout)
+        self.assertIn("coverage is incomplete", proc.stdout)
+
+    def test_empty_abnormal_output_is_partial_for_all_default_tools(self):
+        for tool in ("ruff", "bandit", "pip-audit"):
+            self.failure_tool(tool)
+            for code in ((0, 2) if tool == "ruff" else (1, 2)):
+                with self.subTest(tool=tool, code=code):
+                    proc, summary = self.scan(tool, AUDIT_EXIT=str(code))
+                    self.assert_partial(proc, summary, tool)
+        self.assertEqual(len(self.calls.read_text().splitlines()), 6)
+        self.assertGreater(summary["extras"]["profile"]["cache_hits"], 0)
+
+    def test_uvx_failure_preserves_both_output_streams_and_native_findings(self):
+        self.failure_tool("ruff", uv=True)
+        proc, summary = self.scan("ruff", AUDIT_MODE="output")
+        self.assert_partial(proc, summary, "ruff")
+        self.assertIn("audit evidence before failure", proc.stdout)
+        self.assertIn("audit stderr before failure", proc.stdout)
+        argv = json.loads(self.calls.read_text().splitlines()[0])
+        self.assertEqual(argv[:3], ["--quiet", "ruff", "check"])
+        self.assertIn("--no-fix", argv)
+
+    @staticmethod
+    def running(pid):
+        try:
+            state = Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()[0]
+        except (FileNotFoundError, ProcessLookupError):
+            return False
+        return state not in ("Z", "X")
+
+    @unittest.skipUnless(Path("/proc/self/stat").exists(), "Linux process cleanup evidence")
+    def test_tool_deadline_stops_descendants_and_keeps_earlier_evidence(self):
+        self.failure_tool("pip-audit", uv=True)
+        proc, summary = self.scan("pip-audit", AUDIT_MODE="stall", UV_TIMEOUT="1")
+        self.assert_partial(proc, summary, "pip-audit")
+        self.assertIn("timed out after 1s", proc.stdout)
+        self.assertIn("audit evidence before failure", proc.stdout)
+        self.assertIn("audit stderr before failure", proc.stdout)
+        for pid in json.loads(self.pids.read_text()):
+            self.assertFalse(self.running(pid), f"audit process {pid} survived its deadline")
+
+    @unittest.skipUnless(Path("/proc/self/stat").exists(), "Linux process cleanup evidence")
+    def test_module_cancellation_stops_isolated_audit_descendants(self):
+        self.failure_tool("pip-audit", uv=True)
+        with (self.root / "cancel.stdout").open("w") as out, \
+                (self.root / "cancel.stderr").open("w") as err:
+            proc = subprocess.Popen(self.command("pip-audit"), cwd=self.root,
+                                    env={**self.env, "AUDIT_MODE": "stall", "UV_TIMEOUT": "60"},
+                                    stdout=out, stderr=err, start_new_session=True)
+            pids = []
+            try:
+                deadline = time.monotonic() + 30
+                while not self.pids.exists() and proc.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(self.pids.exists(), "audit child never started")
+                pids = json.loads(self.pids.read_text())
+                self.assertTrue(all(self.running(pid) for pid in pids))
+                # The analyzer really is isolated from the module's group.
+                self.assertNotEqual(os.getpgid(pids[0]), proc.pid)
+                os.killpg(proc.pid, signal.SIGTERM)
+                self.assertNotEqual(proc.wait(timeout=5), 0)
+                deadline = time.monotonic() + 3
+                while any(self.running(pid) for pid in pids) and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertFalse(any(self.running(pid) for pid in pids), pids)
+            finally:
+                if proc.poll() is None:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                    proc.wait(timeout=5)
+                for pid in pids:
+                    if self.running(pid):
+                        os.kill(pid, signal.SIGKILL)
+
+    @unittest.skipUnless(shutil.which("ruff"), "requires an installed real Ruff")
+    def test_real_ruff_keeps_findings_and_recovers_after_failed_audit(self):
+        self.failure_tool("ruff", uv=True)
+        failed, summary = self.scan("ruff")
+        self.assert_partial(failed, summary, "ruff")
+        # Use a separate PATH without uv, so the next pass runs genuine Ruff.
+        direct = self.root / "direct"
+        direct.mkdir()
+        (direct / "python3").symlink_to(sys.executable)
+        (direct / "ruff").symlink_to(shutil.which("ruff"))
+        proc, summary = self.scan("ruff", PATH=f"{direct}:/usr/bin:/bin")
+        self.assertIn(proc.returncode, (0, 1), proc.stdout + proc.stderr)
+        self.assertEqual(summary["status"], "ok", summary)
+        self.assertNotIn("module_error", summary)
+        self.assertGreater(summary["extras"]["profile"]["cache_hits"], 0)
+        self.assertIn('"code": "F401"', proc.stdout)
+        self.assertIn("Ruff emitted findings", proc.stdout)
+        self.assertNotIn("analysis incomplete", proc.stderr)
 
 
 if __name__ == "__main__":

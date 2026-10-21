@@ -42,7 +42,7 @@ set -Eeuo pipefail
 shopt -s lastpipe || true
 trap '' SIGPIPE 2>/dev/null || true
 
-UBS_VERSION="5.5.11"
+UBS_VERSION="5.5.12"
 # The optional service is a release executable, not a command trusted via PATH.
 # scripts/update_checksums.py keeps this pin in sync with ubs-daemon.
 UBS_DAEMON_SHA256="617d8d283c2caac455991cff4ef67b7e36be9933e989130bdeae0e935b30e8a0"
@@ -129,7 +129,7 @@ declare -A MODULE_CHECKSUMS=(
   [js]='d8bd02fa715e09fc630c16956b750b538233fec9413b609f66511f164a1d1693'
   [kotlin]='aa02cd6ecf65148309ef9bf3373cddb60fa6c28a8ea77eda3c80e953f50920cf'
   [php]='bcc0822533c34e3c7f74478fcc49b5f0c4e1b5183a2595371020cddba2f4b6d8'
-  [python]='033802070a7f1c036dfcf8da6c51cd9e1440a867af71e1d8d48e8326307f2243'
+  [python]='86fa1e0436f9869ee45dbdbc938f58276442b8257fdc2598860d909b34ac48d6'
   [ruby]='34fd2ec7e3016b2dbe74c6f8441d6c7b311a8fc796816e5c6d678293d8d73a2a'
   [rust]='17dc1e5d82973004a94e01cc2a32ac450b2c2ed3c5c81a814a48ddafe0a59563'
   [swift]='9dc0625f7c9a4f4d66f883e6d453937db1ea9214ec6d6654ab87130fe7df30f3'

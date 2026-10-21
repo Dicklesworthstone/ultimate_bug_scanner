@@ -355,11 +355,6 @@ if [[ "$ENABLE_UV_TOOLS" -eq 1 ]] && command -v uv >/dev/null 2>&1; then
   UVX_CMD=(uvx --quiet)
 fi
 
-TIMEOUT_CMD=""
-if command -v timeout >/dev/null 2>&1; then TIMEOUT_CMD="timeout"
-elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT_CMD="gtimeout"
-fi
-
 # Optional-analyzer invocation status (issue #103). `|| true` used to discard
 # it entirely, so a Ruff that exited 2 without producing findings was reported
 # as "Ruff clean". UV_TOOL_STATUS is the process exit status; -1 means the tool
@@ -369,25 +364,47 @@ UV_TOOL_ERRORS=()
 
 run_uv_tool_text() {
   local tool="$1"; shift
-  local rc=0
+  local rc=0 helpers_dir=""
+  local -a command_args=()
   UV_TOOL_STATUS=0
   if [[ "$HAS_UV" -eq 1 ]]; then
-    if [[ -n "$TIMEOUT_CMD" ]]; then
-      ( set +o pipefail; "$TIMEOUT_CMD" "$UV_TIMEOUT" "${UVX_CMD[@]}" "$tool" "$@" ) || rc=$?
-    else
-      ( set +o pipefail; "${UVX_CMD[@]}" "$tool" "$@" ) || rc=$?
-    fi
+    command_args=("${UVX_CMD[@]}" "$tool" "$@")
+  elif command -v "$tool" >/dev/null 2>&1; then
+    command_args=("$tool" "$@")
   else
-    if command -v "$tool" >/dev/null 2>&1; then
-      if [[ -n "$TIMEOUT_CMD" ]]; then
-        ( set +o pipefail; "$TIMEOUT_CMD" "$UV_TIMEOUT" "$tool" "$@" ) || rc=$?
-      else
-        ( set +o pipefail; "$tool" "$@" ) || rc=$?
-      fi
-    else
-      rc=-1
-    fi
+    UV_TOOL_STATUS=-1
+    return 0
   fi
+  # A nested GNU timeout creates a group outside the meta-runner's cleanup.
+  # The shared launcher owns its isolated tool group and stops it on module
+  # cancellation too. Spool/copy all output, including evidence before failure.
+  ubs_resolve_helpers_dir helpers_dir || helpers_dir="$SCRIPT_DIR/helpers"
+  PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 - "$tool" "$UV_TIMEOUT" "${command_args[@]}" <<'PYUVTOOL' || rc=$?
+from pathlib import Path
+import shutil
+import sys
+from ubs_core.external_tools import run_command_stream
+
+tool, timeout_raw, *command = sys.argv[1:]
+try:
+    timeout = float(timeout_raw)
+except ValueError:
+    print(f"{tool}: timeout must be a positive finite number", file=sys.stderr)
+    sys.exit(2)
+errors = []
+status = 2
+with run_command_stream(tool, command, Path.cwd(), timeout, errors) as output:
+    if output is not None:
+        shutil.copyfileobj(output.stdout, sys.stdout.buffer, length=64 * 1024)
+        if output.stderr_stream is not None:
+            shutil.copyfileobj(output.stderr_stream, sys.stderr.buffer, length=64 * 1024)
+        status = output.returncode
+        if status < 0:
+            status = 128 - status
+for error in errors:
+    print(error, file=sys.stderr)
+sys.exit(2 if errors else status)
+PYUVTOOL
   UV_TOOL_STATUS="$rc"
   return 0
 }
@@ -449,18 +466,17 @@ PYRUFF
         if [[ "$ruff_rc" -eq -1 ]]; then
           say "  ${GRAY}${INFO} ruff not available; lint coverage not collected${RESET}"
         elif [[ -z "$ruff_trimmed" ]]; then
-          # No result document at all: the analyzer never got far enough to
-          # report anything (commonly a launcher that could not provision it
-          # offline). That is missing coverage, not a clean lint — but it is
-          # also not evidence that ruff itself failed, so it does not fail the
-          # scan the way a real analyzer error does.
-          say "  ${GRAY}${INFO} ruff produced no result document (exit $ruff_rc); lint coverage not collected${RESET}"
+          # An attempted invocation without its required result document has
+          # incomplete coverage, including provisioning failures and timeouts.
+          print_finding "warn" 1 "Ruff produced no result document (exit $ruff_rc)" "Lint coverage is incomplete for this scan"
           if [[ -s "$ruff_stderr" ]]; then
             say "  ${DIM}ruff stderr:${RESET}"
             cat "$ruff_stderr" 2>/dev/null || true
           fi
+          record_uv_tool_failure "ruff produced no result document (exit $ruff_rc)"
         elif [[ "$ruff_rc" -ne 0 && "$ruff_rc" -ne 1 ]]; then
           # A failed invocation is never "clean", whatever it printed.
+          cat "$ruff_stdout" 2>/dev/null || true
           print_finding "warn" 1 "Ruff did not complete (exit $ruff_rc)" "Lint coverage is incomplete for this scan"
           say "  ${DIM}ruff stderr:${RESET}"
           cat "$ruff_stderr" 2>/dev/null || true
@@ -515,7 +531,8 @@ PYRUFF
         if [[ "$UV_TOOL_STATUS" -eq -1 ]]; then
           say "  ${GRAY}${INFO} bandit not available; security coverage not collected${RESET}"
         elif [[ "$UV_TOOL_STATUS" -ne 0 && ! -s "$_tool_out" ]]; then
-          say "  ${GRAY}${INFO} bandit produced no output (exit $UV_TOOL_STATUS); security coverage not collected${RESET}"
+          print_finding "warn" 1 "Bandit produced no output (exit $UV_TOOL_STATUS)" "Security coverage is incomplete for this scan"
+          record_uv_tool_failure "bandit produced no output (exit $UV_TOOL_STATUS)"
         elif [[ "$UV_TOOL_STATUS" -eq 0 || "$UV_TOOL_STATUS" -eq 1 ]]; then
           print_finding "info" 0 "Bandit scan completed" "See output above"
         else
@@ -545,7 +562,8 @@ PYRUFF
         if [[ "$UV_TOOL_STATUS" -eq -1 ]]; then
           say "  ${GRAY}${INFO} pip-audit not available; dependency coverage not collected${RESET}"
         elif [[ "$UV_TOOL_STATUS" -ne 0 && ! -s "$_tool_out" ]]; then
-          say "  ${GRAY}${INFO} pip-audit produced no output (exit $UV_TOOL_STATUS); dependency coverage not collected${RESET}"
+          print_finding "warn" 1 "pip-audit produced no output (exit $UV_TOOL_STATUS)" "Dependency coverage is incomplete for this scan"
+          record_uv_tool_failure "pip-audit produced no output (exit $UV_TOOL_STATUS)"
         elif [[ "$UV_TOOL_STATUS" -eq 0 || "$UV_TOOL_STATUS" -eq 1 ]]; then
           print_finding "info" 0 "pip-audit ran against $_pa_input" "Review advisories above"
         else

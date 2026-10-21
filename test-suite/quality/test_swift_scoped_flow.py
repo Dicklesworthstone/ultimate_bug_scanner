@@ -1575,6 +1575,38 @@ class SwiftScopedFlowTests(unittest.TestCase):
                 }
             ''')
 
+    def test_collection_callback_throw_survives_a_discarded_helper_expression(self):
+        for method in ('forEach', 'map', 'compactMap', 'flatMap', 'filter', 'contains', 'first'):
+            with self.subTest(method=method):
+                self.check('''
+                    import Testing
+                    func fail(_ paths: [String]) throws {
+                        try paths.METHOD { path in throw SomeError(path: path) }
+                        print("completed")
+                    }
+                    func handle(req: Request) throws {
+                        let error = #expect(throws: SomeError.self) { try fail([req.query["path"]]) }
+                        _ = String(contentsOfFile: error?.path ?? "/safe")
+                    }
+                '''.replace('METHOD', method), (8,), 'path', suffix=method)
+
+    def test_collection_callback_error_caught_inside_helper_does_not_escape(self):
+        for assertion in ('expect', 'require'):
+            with self.subTest(assertion=assertion):
+                self.check('''
+                    import Testing
+                    func caught(_ paths: [String]) throws {
+                        let error = #ASSERTION(throws: SomeError.self) {
+                            try paths.forEach { path in throw SomeError(path: path) }
+                        }
+                        print("completed")
+                    }
+                    func handle(req: Request) throws {
+                        let error = #expect(throws: SomeError.self) { try caught([req.query["path"]]) }
+                        _ = String(contentsOfFile: error?.path ?? "/safe")
+                    }
+                '''.replace('ASSERTION', assertion), (), 'path', suffix=assertion)
+
     def test_route_callback_cannot_drop_future_captured_request_values(self):
         with self.assertRaisesRegex(ValueError, 'incomplete'):
             self.check('''

@@ -1126,7 +1126,7 @@ class SwiftEngine:
             return receiver
         return self.forget(receiver)
 
-    def inline_closure(self, tokens, argument, state, bindings, depth):
+    def inline_closure(self, tokens, argument, state, bindings, depth, *, catches_errors=False):
         """Evaluate a collection callback with lexical captures and a loop join.
 
         A method name does not establish nonescaping execution. Captures also
@@ -1169,7 +1169,7 @@ class SwiftEngine:
         initial['@reachable'] = swift_constant('true', 'code')
         entry, actions, edges = self.graph(function, scope)
         returned, mutations, context, thrown = self.returned, self.mutations, self.active_context, self.thrown
-        result = CLEAN
+        result, raised = CLEAN, CLEAN
         # Only parent bindings escape the callback. Its locals and @result
         # must not overwrite either a sibling closure or the enclosing return.
         captured = set(state) - {'@result', '@reachable'}
@@ -1193,6 +1193,7 @@ class SwiftEngine:
                 # Unknown collection implementations may also handle it, so
                 # retain dependencies from exceptional callback exits.
                 result = join(result, self.returned, self.thrown)
+                raised = join(raised, self.thrown)
                 updated = dict(initial)
                 for binding in captured:
                     updated[binding] = join(initial.get(binding, CLEAN), observed.get(binding, CLEAN))
@@ -1205,7 +1206,10 @@ class SwiftEngine:
             return result
         finally:
             self.function, self.returned, self.mutations, self.active_context = parent, returned, mutations, context
-            self.thrown = thrown
+            # Collection operations can rethrow even when their expression
+            # result is discarded by a multi-statement enclosing helper.
+            # Testing assertions catch that error into their own result.
+            self.thrown = thrown if catches_errors else join(thrown, raised)
 
     def callback(self, name, receiver, tokens, state, bindings, depth, member_call=False):
         if not self.callback_seen:
@@ -1227,7 +1231,8 @@ class SwiftEngine:
             argument = join(self.forget(argument), requests)
         else:
             raise ValueError('Swift escaping/trailing closure needs capture analysis; analysis is incomplete')
-        value = self.inline_closure(tokens, argument, state, bindings, depth + 1)
+        value = self.inline_closure(tokens, argument, state, bindings, depth + 1,
+                                    catches_errors=name in {'#expect', '#require'})
         # A method name also does not prove that its result is exactly the
         # callback return (an external map may ignore the callback). Retain
         # receiver dependencies rather than treating map as a sanitizer.

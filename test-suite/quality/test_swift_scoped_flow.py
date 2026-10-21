@@ -1250,6 +1250,279 @@ class SwiftScopedFlowTests(unittest.TestCase):
                 self.check('func work() { let request = UUID(); Task { %s } }' % call,
                            suffix=str(index))
 
+    def test_collection_closure_elements_reach_real_sink_sites(self):
+        for callback in ('map', 'compactMap', 'flatMap', 'filter', 'forEach', 'contains', 'first'):
+            with self.subTest(callback=callback):
+                self.check('''
+                    func handle(req: Request) {
+                        _ = req.query.%s { element in
+                            return String(contentsOfFile: element)
+                        }
+                    }
+                ''' % callback, (3,), 'path', callback)
+
+    def test_collection_closure_return_and_capture_flow(self):
+        self.check('''
+            func handle(req: Request) {
+                let targets = [req.query["path"]].map { $0 }
+                _ = String(contentsOfFile: targets.first)
+            }
+        ''', (3,), 'path')
+        self.check('''
+            func handle(req: Request) {
+                let destination = req.query["path"]
+                _ = [1].map { unused in
+                    String(contentsOfFile: destination)
+                }
+            }
+        ''', (4,), 'path', 'capture')
+
+    def test_collection_closure_bindings_shadow_and_do_not_leak(self):
+        self.check('''
+            func handle(req: Request) {
+                let target = req.query["path"]
+                _ = ["/fixed"].map { target in String(contentsOfFile: target) }
+                _ = String(contentsOfFile: target)
+            }
+        ''', (4,), 'path')
+        self.check('''
+            func handle(req: Request) {
+                let target = "/fixed"
+                _ = [req.query["path"]].map { target in String(contentsOfFile: target) }
+                _ = String(contentsOfFile: target)
+            }
+        ''', (3,), 'path', 'reverse')
+
+    def test_collection_closure_mutations_join_across_invocations(self):
+        self.check('''
+            func handle(req: Request) {
+                var target = "/fixed"
+                _ = [1, 2].map { item in
+                    _ = String(contentsOfFile: target)
+                    target = req.query["path"]
+                    return item
+                }
+                _ = String(contentsOfFile: target)
+            }
+        ''', (4, 8), 'path')
+        self.check('''
+            func handle(req: Request) {
+                var target = req.query["path"]
+                _ = [].map { item in target = "/fixed"; return item }
+                _ = String(contentsOfFile: target)
+            }
+        ''', (4,), 'path', 'empty')
+
+    def test_nested_collection_closures_keep_outer_capture_identity(self):
+        self.check('''
+            func handle(req: Request) {
+                _ = [req.query["path"]].map { outer in
+                    ["fixed"].map { _ in String(contentsOfFile: outer) }
+                }
+            }
+        ''', (3,), 'path')
+        self.check('''
+            func handle(req: Request) {
+                _ = [req.query["path"]].map { outer in
+                    ["fixed"].map { outer in String(contentsOfFile: outer) }
+                }
+            }
+        ''', (), 'path', 'shadow')
+
+    def test_collection_element_validation_does_not_validate_receiver(self):
+        self.check('''
+            func handle(req: Request) {
+                let targets = [req.query["next"]]
+                _ = targets.filter { target in
+                    guard %s else { return false }
+                    _ = req.redirect(to: target)
+                    return true
+                }
+                _ = req.redirect(to: targets.first)
+            }
+        ''' % LOCAL, (8,))
+
+    def test_testing_macros_analyze_real_arguments_and_awaited_body(self):
+        self.check('''
+            import Testing
+            func handle(req: Request) async throws {
+                #expect(String(contentsOfFile: req.query["path"]) == "")
+                let path = try #require(req.query["path"])
+                _ = String(contentsOfFile: path)
+                await #expect(throws: (any Error).self) {
+                    try await String(contentsOfFile: req.query["other"])
+                }
+            }
+        ''', (3, 5, 7), 'path')
+
+    def test_unresolved_collection_and_macro_dispatch_stays_incomplete(self):
+        for body in (
+            'let closure = { req.query["path"] }',
+            'Task { String(contentsOfFile: req.query["path"]) }',
+            'unknown { String(contentsOfFile: req.query["path"]) }',
+            'items.map { [path = req.query["path"]] in String(contentsOfFile: path) }',
+            'items.map { (left, right) in String(contentsOfFile: left) }',
+        ):
+            with self.subTest(body=body), self.assertRaisesRegex(ValueError, 'closure.*incomplete'):
+                self.check('func handle(req: Request) { %s }' % body, policy='path')
+        for prefix in ('', 'import Testing\nmacro expect() = externalMacro()'):
+            with self.subTest(prefix=prefix), self.assertRaisesRegex(ValueError, 'macro.*incomplete'):
+                self.check(prefix + '\nfunc handle(req: Request) { #expect(String(contentsOfFile: req.query["path"])) }', policy='path')
+        with self.assertRaisesRegex(ValueError, 'closure.*incomplete'):
+            self.check('''
+                struct Custom { func map(_ body: () -> String) {} }
+                func handle(req: Request) {
+                    Custom().map { String(contentsOfFile: req.query["path"]) }
+                }
+            ''', policy='path')
+
+    def test_closure_captures_do_not_hide_indirect_or_nested_sinks(self):
+        self.check('''
+            func read(_ path: String) { _ = String(contentsOfFile: path) }
+            func handle(req: Request) {
+                let path = req.query["path"]
+                _ = [1].map { _ in read(path) }
+            }
+        ''', (1,), 'path')
+        self.check('''
+            func handle(req: Request) {
+                let paths = [req.query["path"]].map { outer in
+                    [1].map { inner in outer }
+                }
+                _ = String(contentsOfFile: paths.first)
+            }
+        ''', (5,), 'path', 'nested-return')
+        self.check('''
+            func handle(req: Request) {
+                _ = [req].map { original in
+                    original.query.map { path in String(contentsOfFile: path) }
+                }
+            }
+        ''', (3,), 'path', 'request-shape')
+
+    def test_closure_throws_and_short_circuit_do_not_erase_captures(self):
+        self.check('''
+            func handle(req: Request) {
+                var path = "/fixed"
+                _ = [1].map { _ in
+                    path = req.query["path"]
+                    throw SomeError()
+                }
+                _ = String(contentsOfFile: path)
+            }
+        ''', (7,), 'path')
+        self.check('''
+            func handle(req: Request) {
+                var path = req.query["path"]
+                _ = condition && items.map { _ in path = "/fixed"; return true }
+                _ = String(contentsOfFile: path)
+            }
+        ''', (4,), 'path', 'short-circuit')
+
+    def test_collection_callable_field_does_not_claim_nonescaping_semantics(self):
+        with self.assertRaisesRegex(ValueError, 'closure.*incomplete'):
+            self.check('''
+                struct Custom { let map: (@escaping () -> String) -> Void }
+                func handle(req: Request) {
+                    let custom = Custom(map: storeForLater)
+                    var target = "/fixed"
+                    custom.map { String(contentsOfFile: target) }
+                    target = req.query["path"]
+                }
+            ''', policy='path')
+
+    def test_unknown_collection_callback_sees_later_capture_mutations(self):
+        self.check('''
+            func handle(req: Request) {
+                var path = "/fixed"
+                items.map { _ in String(contentsOfFile: path) }
+                path = req.query["path"]
+            }
+        ''', (3,), 'path')
+        self.check('''
+            func handle(req: Request) {
+                items.map { _ in
+                    var path = "/fixed"
+                    other.map { _ in String(contentsOfFile: path) }
+                    path = req.query["path"]
+                }
+            }
+        ''', (4,), 'path', 'nested')
+        self.check('''
+            func handle(req: Request) {
+                var path = "/fixed"
+                let pending = [1].lazy.map { _ in String(contentsOfFile: path) }
+                path = req.query["path"]
+                _ = Array(pending)
+            }
+        ''', (3,), 'path', 'lazy')
+
+    def test_unknown_map_return_is_not_a_sanitizer(self):
+        self.check('''
+            func handle(req: Request) {
+                let transformed = req.query.map { _ in "/fixed" }
+                _ = String(contentsOfFile: transformed)
+            }
+        ''', (3,), 'path')
+
+    def test_testing_throw_result_retains_exception_dependencies(self):
+        self.check('''
+            import Testing
+            func handle(req: Request) async throws {
+                let error = await #expect(throws: SomeError.self) {
+                    throw SomeError(path: req.query["path"])
+                }
+                _ = String(contentsOfFile: error.path)
+            }
+        ''', (6,), 'path')
+        self.check('''
+            import Testing
+            func fail(_ path: String) throws { throw SomeError(path: path) }
+            func forward(_ path: String) throws { try fail(path) }
+            func handle(req: Request) async throws {
+                let error = await #expect(throws: SomeError.self) {
+                    try forward(req.query["path"])
+                }
+                _ = String(contentsOfFile: error.path)
+            }
+        ''', (8,), 'path', 'helper')
+
+    def test_callback_object_alias_mutations_are_explicitly_incomplete(self):
+        for mutation in ('alias.path = req.query["path"]',
+                         'alias.setPath(req.query["path"])',
+                         'update(alias, req.query["path"])',
+                         'alias.append(req.query["path"])'):
+            for late in (False, True):
+                with self.subTest(mutation=mutation, late=late), self.assertRaisesRegex(ValueError, 'heap/capture.*incomplete'):
+                    self.check('''
+                        class Box {}
+                        func handle(req: Request) {
+                            let box = Box()
+                            let alias = box
+                            %s
+                            let pending = [1].lazy.map { _ in String(contentsOfFile: box.path) }
+                            %s
+                            _ = Array(pending)
+                        }
+                    ''' % ('' if late else mutation, mutation if late else ''), policy='path')
+
+    def test_callback_alias_request_objects_are_explicitly_incomplete(self):
+        for value, access in (('req', 'box.value.query["path"]'),
+                              ('req.query', 'box.value["path"]'),
+                              ('req.content', 'box.value.decode(String.self)')):
+            for mutation in (f'alias.value = {value}', f'alias.setValue({value})'):
+                with self.subTest(value=value, mutation=mutation), self.assertRaisesRegex(ValueError, 'heap/capture.*incomplete'):
+                    self.check('''
+                        class Box {}
+                        func handle(req: Request) {
+                            let box = Box()
+                            let alias = box
+                            let pending = [1].lazy.map { _ in String(contentsOfFile: %s) }
+                            %s
+                            _ = Array(pending)
+                        }
+                    ''' % (access, mutation), policy='path')
+
     def test_malformed_interpolation_is_not_a_source_free_clean_result(self):
         for source in (r'func title() { print("\(broken[)") }', r'let x = "\( { )"'):
             with self.subTest(source=source), self.assertRaisesRegex(ValueError, 'incomplete'):
@@ -1301,6 +1574,43 @@ class SwiftScopedFlowTests(unittest.TestCase):
                     }
                 }
             ''')
+
+    def test_route_callback_cannot_drop_future_captured_request_values(self):
+        with self.assertRaisesRegex(ValueError, 'incomplete'):
+            self.check('''
+                func handle(outerReq: Request, app: Application) {
+                    var target = "/safe"
+                    app.get("go") { req -> Response in
+                        return req.redirect(to: target)
+                    }
+                    target = outerReq.query["next"] ?? "/"
+                }
+            ''')
+
+    def test_route_callback_cannot_drop_request_collection_captures(self):
+        with self.assertRaisesRegex(ValueError, 'incomplete'):
+            self.check('''
+                func handle(outerReq: Request, app: Application) {
+                    let paths = outerReq.query
+                    app.get("read") { req -> String in
+                        return String(contentsOfFile: paths["file"])
+                    }
+                }
+            ''', policy='path')
+
+    def test_route_callback_cannot_drop_future_heap_alias_writes(self):
+        with self.assertRaisesRegex(ValueError, 'incomplete'):
+            self.check('''
+                class Box {}
+                func handle(outerReq: Request, app: Application) {
+                    let box = Box()
+                    let alias = box
+                    app.get("read") { req -> String in
+                        return String(contentsOfFile: box.value)
+                    }
+                    alias.value = outerReq.query["file"]
+                }
+            ''', policy='path')
 
 
 if __name__ == '__main__':

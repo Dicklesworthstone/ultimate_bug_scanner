@@ -8,6 +8,7 @@ NUL-safe file listing with a newline in a file name, and the exported locale.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shutil
 import subprocess
@@ -54,6 +55,64 @@ class JsonEscapeTests(unittest.TestCase):
         self.assertEqual(bash('printf "[%s]" "$(json_escape "")"').stdout, b"[]")
         self.assertEqual(bash('printf "[%s]" "$(json_escape </dev/null)"').stdout, b"[]")
         self.assertEqual(bash('printf "[%s]" "$(printf "x\\"y" | json_escape)"').stdout, b'[x\\"y]')
+
+
+class HelperIntegrityTests(unittest.TestCase):
+    """Real helper bytes must be checked before the directory is returned."""
+
+    assets = ("helpers/ubs_core/io.py", "helpers/ubs_core/kotlin_scan.py",
+              "helpers/ubs_core/java_scan.py")
+
+    def verify(self, directory: Path, digests: dict[str, str]) -> subprocess.CompletedProcess:
+        args = [str(directory)]
+        for name, digest in digests.items():
+            args.extend((name, digest))
+        return bash('''
+UBS_MODULE_LIB_DIR="$1"; shift
+UBS_VERIFIED_ASSET_DIR=""
+UBS_ALLOW_UNVERIFIED_HELPERS=0
+UBS_COMMON_HELPER_CHECKSUMS=()
+while (( $# )); do
+  UBS_COMMON_HELPER_CHECKSUMS["$1"]="$2"
+  shift 2
+done
+ubs_resolve_helpers_dir result
+printf '%s\\n' "$result"
+''', *args)
+
+    def case(self, suffix: str, tamper: str | None = None) -> None:
+        # Retain the control artifacts under the caller's private disk TMPDIR.
+        root = Path(tempfile.mkdtemp(prefix="ubs-helper-integrity-")) / suffix
+        digests = {}
+        for name in self.assets:
+            source = REPO_ROOT / "modules" / name
+            data = source.read_bytes()
+            digests[name] = hashlib.sha256(data).hexdigest()
+            target = root / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data + (b"\n# tampered integrity control\n" if name == tamper else b""))
+        proc = self.verify(root, digests)
+        if tamper:
+            self.assertEqual(proc.returncode, 2, proc.stderr)
+            self.assertIn(tamper.encode(), proc.stderr)
+            self.assertIn(b"failed checksum verification", proc.stderr)
+            self.assertEqual(proc.stdout, b"")
+        else:
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout, os.fsencode(str(root / "helpers")) + b"\n")
+
+    def test_all_intact_helpers_are_accepted(self) -> None:
+        self.case("modules")
+
+    def test_escaped_directory_names_keep_every_digest_bound_to_its_file(self) -> None:
+        for suffix in ("space directory", "back\\slash", "line\nbreak"):
+            with self.subTest(path=suffix):
+                self.case(suffix)
+
+    def test_each_tampered_helper_refuses_before_returning_the_directory(self) -> None:
+        for asset in self.assets:
+            with self.subTest(asset=asset):
+                self.case("modules", tamper=asset)
 
 
 class SeverityTests(unittest.TestCase):

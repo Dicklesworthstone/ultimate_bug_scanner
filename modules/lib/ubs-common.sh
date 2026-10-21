@@ -289,7 +289,7 @@ declare -g -A UBS_COMMON_HELPER_CHECKSUMS=(
   ['helpers/ubs_core/analyzers/taint_ruby_url.py']='c7e98db31c900d364f427aa65bc2ff3bb62a8a28f05b7dd78357b6f6a51a7a84'
   ['helpers/ubs_core/analyzers/taint_rust.py']='920988d1dd05014915d79e22127535735db0dee0ae25448f57cab89451fb4987'
   ['helpers/ubs_core/analyzers/taint_swift_redirect.py']='a0503c0be9ed06e4e68b9f4dc76748d6149bfcda12959a350c874a663ef23eda'
-  ['helpers/ubs_core/analyzers/taint_swift_traversal.py']='2cf47b7edc3ed4fab0e46af7ad45a1047ce19b80cd8b0fff5086c2be30273950'
+  ['helpers/ubs_core/analyzers/taint_swift_traversal.py']='a6d09e893569499b58cec126b6c0de0fc5fbe9ed6c70d6f5e09b2651d384329e'
   ['helpers/ubs_core/bash_rules.py']='21fb455e701160e12575b478819d8f52254bca2d672d6962992a93d8c186a20c'
   ['helpers/ubs_core/bash_scan.py']='8f03f31986f26ce6f728c7541edf52d79b01fcc0b459b1ae01a5e69c67fb9825'
   ['helpers/ubs_core/cache.py']='76acddcfa36b58482502358035ac2e55e231a70fbfcd7c5a0a3fb825404acac4'
@@ -686,16 +686,45 @@ ubs_resolve_helpers_dir(){
   if [[ "${UBS_ALLOW_UNVERIFIED_HELPERS:-0}" == "1" ]]; then
     printf 'warning: UBS_ALLOW_UNVERIFIED_HELPERS=1: using unverified helpers dir at %s\n' "$target" >&2
   elif [[ -d "${target}/ubs_core" ]]; then
-    local _core_rel _core_actual _core_expected
+    local _core_rel _core_actual _core_expected _core_batch="" _core_line _core_digest _core_i
+    local _core_batch_ok=0 _core_batch_valid=1
+    local -a _core_files=() _core_rels=() _core_digests=()
     for _core_rel in "${!UBS_COMMON_HELPER_CHECKSUMS[@]}"; do
       if [[ "$_core_rel" == helpers/ubs_core/* && -f "${base_dir}/${_core_rel}" ]]; then
-        _core_expected="${UBS_COMMON_HELPER_CHECKSUMS[$_core_rel]}"
+        _core_files+=("${base_dir}/${_core_rel}")
+        _core_rels+=("$_core_rel")
+      fi
+    done
+    # Hash every selected helper in one process. sha256sum escapes newlines
+    # and backslashes in names, so each output line still supplies one digest.
+    # A failed/unsupported batch falls back to the existing per-file verifier;
+    # no cache, partial result or missing digest can authorize helper loading.
+    if (( ${#_core_files[@]} > 0 )) && command -v sha256sum >/dev/null 2>&1; then
+      if _core_batch="$(sha256sum -- "${_core_files[@]}" 2>/dev/null)"; then
+        while IFS= read -r _core_line; do
+          _core_digest="${_core_line#\\}"
+          _core_digest="${_core_digest%%[[:space:]]*}"
+          if [[ ! "$_core_digest" =~ ^[0-9a-fA-F]{64}$ ]]; then
+            _core_batch_valid=0
+            break
+          fi
+          _core_digests+=("${_core_digest,,}")
+        done <<< "$_core_batch"
+        (( _core_batch_valid && ${#_core_digests[@]} == ${#_core_files[@]} )) && _core_batch_ok=1
+      fi
+    fi
+    for _core_i in "${!_core_files[@]}"; do
+      _core_rel="${_core_rels[$_core_i]}"
+      _core_expected="${UBS_COMMON_HELPER_CHECKSUMS[$_core_rel]}"
+      if (( _core_batch_ok )); then
+        _core_actual="${_core_digests[$_core_i]}"
+      else
         if ! ubs_sha256_into _core_actual "${base_dir}/${_core_rel}"; then
           ubs_die "helper file '$_core_rel': $UBS_SHA256_ERR; refusing to execute" 2
         fi
-        if [[ "$_core_actual" != "$_core_expected" ]]; then
-          ubs_die "helper file '$_core_rel' failed checksum verification (expected $_core_expected, got $_core_actual); refusing to execute (run 'ubs doctor --fix' or set UBS_ALLOW_UNVERIFIED_HELPERS=1 to override)" 2
-        fi
+      fi
+      if [[ "$_core_actual" != "$_core_expected" ]]; then
+        ubs_die "helper file '$_core_rel' failed checksum verification (expected $_core_expected, got $_core_actual); refusing to execute (run 'ubs doctor --fix' or set UBS_ALLOW_UNVERIFIED_HELPERS=1 to override)" 2
       fi
     done
   fi

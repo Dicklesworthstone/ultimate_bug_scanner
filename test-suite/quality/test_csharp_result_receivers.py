@@ -1,8 +1,12 @@
 """Issue #169: source-aware Task.Result findings and conservative fallback."""
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
+import subprocess
 import sys
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -177,6 +181,74 @@ var x = value.Result;'''
 
     def test_malformed_input_does_not_erase_findings(self):
         self.assertEqual((set(), {1}), result_lines('void Broken( { task.Result;'))
+
+
+UNRESOLVED = '''class C {
+    object A(dynamic value) => value.Result;
+    object B() => GetElsewhere()
+        .Result;
+}
+'''
+
+
+class AstPackResultTests(unittest.TestCase):
+    """The ast-grep pack's type-blind `$TASK.Result` rule follows the same receivers."""
+
+    def setUp(self):
+        artifacts = ROOT / 'test-suite' / 'artifacts'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        self.folder = Path(tempfile.mkdtemp(prefix='csharp-ast-result-', dir=artifacts))
+
+    def ast_lines(self, sources):
+        from ubs_core.cache import CapturingSink
+        from ubs_core.csharp_ast import scan_all
+        from ubs_core.csharp_patterns._result import ast_result_qualifier
+        from ubs_core.csharp_rules import generate
+
+        generate(self.folder / 'pack')
+        texts = {}
+        for name, source in sources.items():
+            path = self.folder / name
+            path.write_text(source, encoding='utf-8')
+            texts[path] = source
+        sink, errors = CapturingSink(), []
+        scan_all(self.folder / 'pack', list(texts), sink, errors=errors,
+                 qualify=ast_result_qualifier(texts))
+        self.assertEqual(errors, [])
+        return {Path(key).name: sorted(record['line'] for record in records
+                                       if record['rule'] == 'cs-task-result-deadlock')
+                for key, records in sink.by_file.items()}
+
+    def test_record_and_tuple_members_are_not_task_results(self):
+        lines = self.ast_lines({'Repro.cs': REPRO, 'Unresolved.cs': UNRESOLVED})
+        self.assertEqual(lines['Repro.cs'], [15])
+        # Unresolved receivers stay visible, including one whose `.Result`
+        # token is on a later line than the start of its receiver.
+        self.assertEqual(lines['Unresolved.cs'], [2, 3])
+
+    def test_public_scan_reports_only_the_task_result(self):
+        target = self.folder / 'Repro.cs'
+        target.write_text(REPRO, encoding='utf-8')
+        env = {key: value for key, value in os.environ.items()
+               if not key.startswith(('UBS_', 'XDG_'))}
+        env.update(UBS_NO_AUTO_UPDATE='1', UBS_NO_CACHE='1', PYTHONDONTWRITEBYTECODE='1',
+                   NO_COLOR='1', XDG_DATA_HOME=str(self.folder / 'data'),
+                   XDG_CACHE_HOME=str(self.folder / 'cache'))
+        command = [str(ROOT / 'ubs'), '--no-config', '--only=csharp', '--ci', '--no-cache',
+                   '--format=json', str(target)]
+        result = subprocess.run(command, cwd=self.folder, env=env, capture_output=True,
+                                text=True, timeout=180, check=False)
+        details = f'{command!r}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}'
+        self.assertEqual(result.returncode, 1, details)
+        report = json.loads(result.stdout)
+        self.assertEqual(report['status'], 'ok', details)
+        observed = sorted((finding['rule'], finding['line'])
+                          for scanner in report['scanners'] for finding in scanner['findings']
+                          if finding['rule'] in {'cs.pattern.blocking-result',
+                                                 'cs.pattern.possible-blocking-result',
+                                                 'cs-task-result-deadlock'})
+        self.assertEqual(observed, [('cs-task-result-deadlock', 15),
+                                    ('cs.pattern.blocking-result', 15)], details)
 
 
 if __name__ == '__main__':

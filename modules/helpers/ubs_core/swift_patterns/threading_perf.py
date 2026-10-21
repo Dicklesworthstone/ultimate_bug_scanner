@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 
 from ubs_core.swift_scan import Pattern
+from ubs_core.suppression import SourceSuppressions
 
 LOOP_REGEX = r"for\s+.+\s+in\s+.+\{"
 
@@ -39,21 +40,20 @@ PATTERNS = [
 ]
 
 
-def _distinct_line_count(ctx, regex: re.Pattern[str]) -> int:
+def _distinct_line_count(ctx, regex: re.Pattern[str], rule_id: str | None = None) -> int:
     total = 0
+    suppressions = SourceSuppressions("swift") if rule_id is not None else None
     for path in ctx.files:
         text = ctx.text_of(path)
+        if suppressions is not None:
+            suppressions.index(path, text)
         seen = set()
         for match in regex.finditer(text):
             line_no = text.count("\n", 0, match.start()) + 1
             if line_no in seen:
                 continue
             seen.add(line_no)
-            line_start = text.rfind("\n", 0, match.start()) + 1
-            line_end = text.find("\n", match.start())
-            if line_end == -1:
-                line_end = len(text)
-            if "ubs:ignore" in text[line_start:line_end]:
+            if suppressions is not None and suppressions.is_suppressed(path, line_no, rule_id):
                 continue
             total += 1
     return total
@@ -62,7 +62,9 @@ def _distinct_line_count(ctx, regex: re.Pattern[str]) -> int:
 def _filehandle_imbalance(ctx):
     """Legacy cat 8: FileHandle opens vs .close() calls, warning on the diff."""
     opens = _distinct_line_count(
-        ctx, re.compile(r"FileHandle\s*\(\s*for(Reading|Writing|Updating)(From|To|AtPath)\s*:"))
+        ctx, re.compile(r"FileHandle\s*\(\s*for(Reading|Writing|Updating)(From|To|AtPath)\s*:"),
+        "swift.files.filehandle")
+    # Closing a resource is a fact even when its statement is annotated.
     closes = _distinct_line_count(ctx, re.compile(r"\.close\s*\(\)"))
     if opens <= 0 or closes >= opens:
         return
@@ -85,6 +87,7 @@ def _main_actor_presence(ctx):
         text = ctx.text_of(path)
         if re.search(r"UIKit|AppKit|SwiftUI", text):
             ui_files.append(path)
+    # An annotation cannot make a real MainActor declaration disappear.
     mainactor = _distinct_line_count(ctx, re.compile(r"@MainActor"))
     if ui_files and mainactor == 0:
         yield {

@@ -326,6 +326,8 @@ def run_analyzers(files: Sequence, sink, skip: set, base_dir: Path,
 
     skip_narrowing = os.environ.get("UBS_SKIP_TYPE_NARROWING", "0") == "1"
     for analyzer in analyzers_for_lang("csharp"):
+        if analyzer.name == "narrowing_csharp" and (skip_narrowing or 1 in skip):
+            continue
         if analyzer.name in {"taint_csharp_request", "taint_csharp_redirect", "taint_csharp_sql"} and 8 in skip:
             continue
         if prefilter is not None:
@@ -335,10 +337,10 @@ def run_analyzers(files: Sequence, sink, skip: set, base_dir: Path,
         if not target_files:
             continue
         def checked_findings():
-            # SQL analysis is bounded within each selected file. Stream known
-            # findings before recording incompleteness, then continue with the
-            # next file so an unsupported input cannot hide a neighbor's sink.
-            per_file = analyzer.name == "taint_csharp_sql"
+            # These analyses are bounded within each selected file. Stream
+            # known findings before recording incompleteness, then continue
+            # so an unsupported input cannot hide a neighbor's findings.
+            per_file = analyzer.name in {"taint_csharp_sql", "narrowing_csharp"}
             batches = ([path] for path in target_files) if per_file else (target_files,)
             for batch in batches:
                 ctx = RunContext(lang="csharp", files=batch)
@@ -698,6 +700,7 @@ def main(argv: list | None = None) -> int:
                       prefilter=prefilter_res, errors=scan_errors, semantic_errors=semantic_errors)
         if args.ast_rule_dir:
             from ubs_core.csharp_ast import scan_all
+            from ubs_core.csharp_patterns._result import ast_result_qualifier
             from ubs_core.csharp_rules import CATEGORY_MAP, SEVERITY_MAP
 
             ast_files = prefilter_res.ast_files if not prefilter_res.is_bypass else files_to_scan
@@ -710,6 +713,7 @@ def main(argv: list | None = None) -> int:
                 slug_for_rule=slug_for_category,
                 base_dir=base_dir,
                 errors=scan_errors,
+                qualify=ast_result_qualifier(texts),
             )
             ast_ran = True
         scan_patterns(patterns, texts, capturing_sink, skip, phase=1, ast_ran=ast_ran, prefilter=prefilter_res)

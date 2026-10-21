@@ -89,7 +89,7 @@ The project provides a Nix flake with:
 - **`packages.default`** — installs `ubs` to `$out/bin/ubs`
 - **`devShells.default`** — `bashInteractive`, `shellcheck`, `git`, `cmake`, `python3`, `jq`, `ripgrep`, `uv`
 - **`nixosModules.ubs`** — NixOS module with `programs.ubs.enable`
-- **Docker** — `Dockerfile` based on `debian:bookworm-slim`
+- **Docker** — `Dockerfile` based on `debian:trixie-slim`
 
 ---
 
@@ -251,7 +251,7 @@ ultimate_bug_scanner/
 ├── VERSION                            # Semver version file
 ├── install.sh                         # Signed installer script
 ├── SHA256SUMS                         # Signed checksums for supply-chain integrity
-├── Dockerfile                         # OCI image (debian:bookworm-slim)
+├── Dockerfile                         # OCI image (debian:trixie-slim)
 ├── flake.nix                          # Nix flake: packaging, dev shell, NixOS module
 ├── pyproject.toml                     # Python helper tooling (uv-managed)
 ├── .ubsignore                         # Paths/globs skipped by ubs (like .gitignore)
@@ -383,7 +383,7 @@ Additional integrity controls:
 - **`--ci` mode** — stable UTC ISO-8601 timestamps for reproducible CI output
 - **Helper assets for deep analysis** — Python/Go/JS/C# helpers handle AST-level resource lifecycle and type narrowing checks that regex alone cannot express
 - **Nix flake for packaging** — reproducible builds, dev shell, NixOS module
-- **Docker image** — `debian:bookworm-slim` base for containerized CI use
+- **Docker image** — `debian:trixie-slim` base for containerized CI use
 - **Console output should be informative, detailed, stylish, and colorful**, fully leveraging appropriate libraries/escape sequences wherever possible
 
 ---

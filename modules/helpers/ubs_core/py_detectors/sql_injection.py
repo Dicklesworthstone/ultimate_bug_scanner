@@ -13,7 +13,7 @@ constant interpolants are as safe as a literal and produce no finding; plain
 names of unknown origin (e.g. imported constants) surface as WARNING.
 Module-constant f-strings therefore stay silent (static tier).
 
-Same-file and previous-line `ubs:ignore` markers suppress a hit at the call.
+Statement-owned `ubs:ignore` comments suppress the emitted SQL tier's rule ID.
 
 Statement templates, raw predicates and SELECT mapping values retain distinct
 facts through the existing bounded flow engine. Finite literal iterables keep
@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 from ubs_core.io import python_source_segment
+from ubs_core.suppression import SuppressionIndex, build_index, may_have_markers
 
 RULES = (
     ("py.security.sql-injection", 7,
@@ -563,15 +564,6 @@ def source_line(lines, line_no):
     if 0 <= idx < len(lines):
         return lines[idx].strip()
     return ''
-
-
-def has_ignore(lines, line_no):
-    idx = line_no - 1
-    return (
-        0 <= idx < len(lines) and 'ubs:ignore' in lines[idx]
-    ) or (
-        0 <= idx - 1 < len(lines) and 'ubs:ignore' in lines[idx - 1]
-    )
 
 
 def string_parts(node):
@@ -1393,6 +1385,35 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             return False
         if isinstance(node.func, ast.Name) and self.builtin_is_unshadowed(node.func.id):
             name = node.func.id
+            if name == 'next' and len(node.args) in {1, 2} and not node.keywords:
+                refs = self.generator_refs(self.value_facts(node.args[0]))
+                if (refs and len(arguments) == 1 and arguments[0][0] is node.args[0] and
+                        all(identity is not None and not self.generator_has_writes_or_sinks(identity)
+                            for identity in refs)):
+                    # Project a conservative union of possible yielded values,
+                    # not a claim that next() drains the iterator. Deferred
+                    # writes/sinks are excluded above, and other tracked state
+                    # must remain unchanged during the projection below.
+                    incoming = self.sql_state()
+                    facts = self.materialize_generators(refs)
+                    projected = self.sql_state()
+                    other_phases = {key: value for key, value in projected[7].items() if key not in refs}
+                    prior_other = {key: value for key, value in incoming[7].items() if key not in refs}
+                    if projected[:7] != incoming[:7] or other_phases != prior_other:
+                        raise SQLFlowLimit('SQL effectful next projection is unsupported; analysis is incomplete')
+                    self.restore_sql_state(incoming)
+                    # A validator in a later, unconsumed item must never grant
+                    # an outer proof. Invalidations are still retained.
+                    self.validated.intersection_update(projected[8])
+                    for identity in refs:
+                        if 'fresh' in incoming[7][identity]:
+                            self.generator_phases[identity] = frozenset({'partial'})
+                    if len(node.args) == 2:
+                        facts = self.join_value_facts(facts, self.value_facts(node.args[1]))
+                    else:
+                        self.note_possible_raise()  # StopIteration is possible.
+                    self._evaluated_values[node] = facts
+                    return True
             if len(node.args) == 1 and not node.keywords and arguments:
                 refs = arguments[0][1]
                 if name in {'list', 'tuple', 'set', 'frozenset', 'sorted', 'min', 'max', 'sum'}:
@@ -1974,8 +1995,9 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 argument_epochs[keyword.value] = self.validation_epoch(keyword.value)
             self.generator_call(node)
             # All effects have now occurred, but each argument retains its
-            # own evaluation-time value. Suppress findings, never execution.
-            if is_sink and not has_ignore(self.lines, node.lineno):
+            # own evaluation-time value. Markers suppress the emitted rule in
+            # find(), never execution.
+            if is_sink:
                 self.classify_sink(node)
         finally:
             self.sink_lineno = previous_sink
@@ -2034,7 +2056,10 @@ def find(files: Sequence[Path], *, max_steps=100_000) -> Iterable[tuple[str, Pat
             bindings=bindings,
         )
         analyzer.visit(tree)
+        suppressions = build_index(text, "python") if may_have_markers(text) else SuppressionIndex()
         for line_no, code in analyzer.issues:
-            yield RULE_CRITICAL, path, line_no, 1, code[:240]
+            if not suppressions.is_suppressed(line_no, RULE_CRITICAL):
+                yield RULE_CRITICAL, path, line_no, 1, code[:240]
         for line_no, code in analyzer.warn_issues:
-            yield RULE_WARNING, path, line_no, 1, code[:240]
+            if not suppressions.is_suppressed(line_no, RULE_WARNING):
+                yield RULE_WARNING, path, line_no, 1, code[:240]

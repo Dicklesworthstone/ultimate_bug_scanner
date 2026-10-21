@@ -9,6 +9,7 @@ storyboard count are filesystem-gated derived checks.
 from __future__ import annotations
 
 from ubs_core.swift_scan import Pattern
+from ubs_core.suppression import SourceSuppressions
 
 PATTERNS = [
     # 15. CODE QUALITY MARKERS — legacy TODO/FIXME/HACK/XXX RNI sum
@@ -80,25 +81,24 @@ def _packaging(ctx):
         return
     import re
 
-    def _count(regex: str) -> int:
+    text = ctx.text_of(manifest)
+    suppressions = SourceSuppressions("swift")
+    suppressions.index(manifest, text)
+
+    def _count(regex: str, rule_id: str) -> int:
         total = 0
-        text = ctx.text_of(manifest)
         seen = set()
         for match in re.compile(regex).finditer(text):
             line_no = text.count("\n", 0, match.start()) + 1
             if line_no in seen:
                 continue
             seen.add(line_no)
-            line_start = text.rfind("\n", 0, match.start()) + 1
-            line_end = text.find("\n", match.start())
-            if line_end == -1:
-                line_end = len(text)
-            if "ubs:ignore" in text[line_start:line_end]:
+            if suppressions.is_suppressed(manifest, line_no, rule_id):
                 continue
             total += 1
         return total
 
-    branch = _count(r"\.branch\(|\.revision\(")
+    branch = _count(r"\.branch\(|\.revision\(", "swift.packaging.branch-pins")
     if branch:
         yield {
             "rule": "swift.packaging.branch-pins",
@@ -109,7 +109,7 @@ def _packaging(ctx):
             "title": "Branch/revision-based SPM dependencies",
             "message": "Branch/revision-based SPM dependencies",
         }
-    unsafe = _count(r"\.unsafeFlags\(")
+    unsafe = _count(r"\.unsafeFlags\(", "swift.packaging.unsafe-flags")
     if unsafe:
         yield {
             "rule": "swift.packaging.unsafe-flags",

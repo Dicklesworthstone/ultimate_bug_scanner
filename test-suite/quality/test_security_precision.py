@@ -47,6 +47,21 @@ from ubs_core.py_detectors import unsafe_deserialization  # noqa: E402
 from ubs_core.py_patterns.security_rg import PATTERNS  # noqa: E402
 from ubs_core.py_rules import _RULES  # noqa: E402
 from ubs_core.py_scan import iter_matches  # noqa: E402
+
+
+def sarif_location_path(uri: str, base: Path | None = None) -> Path:
+    """The native path a SARIF artifactLocation.uri names (SARIF 2.1.0 section 3.10).
+
+    A file URI is decoded to its absolute path; a relative reference is decoded
+    and, when `base` is given, resolved against it.
+    """
+    from urllib.parse import unquote, urlparse
+
+    parsed = urlparse(uri)
+    if parsed.scheme == "file":
+        return Path(unquote(parsed.path))
+    relative = Path(unquote(uri))
+    return base / relative if base is not None else relative
 from ubs_core.rust_detectors import jwt_verification  # noqa: E402
 from ubs_core.rust_detectors import hardcoded_secrets as rust_hardcoded_secrets  # noqa: E402
 from ubs_core.rust_detectors import security_randomness  # noqa: E402
@@ -56,6 +71,10 @@ from ubs_core.rust_detectors import (  # noqa: E402
 )
 from ubs_core import rust_rules  # noqa: E402
 from ubs_core.swift_detectors import security_randomness as swift_randomness  # noqa: E402
+from ubs_core.csharp_detectors import (  # noqa: E402
+    archive_extraction as cs_archive, header_injection as cs_header,
+    outbound_url as cs_outbound, security_randomness as cs_random,
+)
 
 JS_SECURITY = REPO_ROOT / "test-suite" / "js" / "security"
 PY_SECURITY = REPO_ROOT / "test-suite" / "python" / "security"
@@ -455,7 +474,7 @@ class Negative {
                         self.assertEqual(len(result["locations"]), 1, context)
                         location = result["locations"][0]["physicalLocation"]
                         region = location["region"]
-                        run_sites.append((result["ruleId"], str((self.root / location["artifactLocation"]["uri"]).resolve()),
+                        run_sites.append((result["ruleId"], str(sarif_location_path(location["artifactLocation"]["uri"], self.root).resolve()),
                                           region["startLine"], region["startColumn"], "warning"))
                     by_driver[driver] = sorted(run_sites)
                 # SARIF keeps the original AST evidence in a separate run,
@@ -542,7 +561,7 @@ class Negative {
                                 location = result["locations"][0]["physicalLocation"]
                                 region = location["region"]
                                 self.assertIn(result["level"], ("note", "warning"), context)
-                                sites.append((result["ruleId"], location["artifactLocation"]["uri"],
+                                sites.append((result["ruleId"], str(sarif_location_path(location["artifactLocation"]["uri"])),
                                               region["startLine"], region["startColumn"],
                                               "info" if result["level"] == "note" else "warning"))
                             by_driver[driver] = sorted(sites)
@@ -738,7 +757,7 @@ class PublicScopedSuppressionTests(unittest.TestCase):
                     for record in run.get("results", []):
                         self.assertEqual(len(record["locations"]), 1, context)
                         loc = record["locations"][0]["physicalLocation"]
-                        actual.append((record["ruleId"], str((root / loc["artifactLocation"]["uri"]).resolve()),
+                        actual.append((record["ruleId"], str(sarif_location_path(loc["artifactLocation"]["uri"], root).resolve()),
                                        loc["region"]["startLine"],
                                        "info" if record["level"] == "note" else record["level"],
                                        loc["region"]["startColumn"]))
@@ -2312,7 +2331,7 @@ fn reassignment(supplied: &str) {
                             self.assertEqual(record["level"], "error", context)
                             self.assertEqual(len(record["locations"]), 1, context)
                             location = record["locations"][0]["physicalLocation"]
-                            sarif.append((record["ruleId"], str((root / location["artifactLocation"]["uri"]).resolve()),
+                            sarif.append((record["ruleId"], str(sarif_location_path(location["artifactLocation"]["uri"], root).resolve()),
                                           location["region"]["startLine"], location["region"]["startColumn"], "critical"))
                         self.assertEqual(sorted(sarif), sorted(expected), context)
                     return sorted(records, key=lambda record: (record["path"], record["line"], record["col"]))
@@ -2491,7 +2510,7 @@ fn password_reset_token() {
                             self.assertEqual(record["level"], "error", context)
                             self.assertEqual(len(record["locations"]), 1, context)
                             loc = record["locations"][0]["physicalLocation"]
-                            sarif.append((record["ruleId"], str((root / loc["artifactLocation"]["uri"]).resolve()),
+                            sarif.append((record["ruleId"], str(sarif_location_path(loc["artifactLocation"]["uri"], root).resolve()),
                                           loc["region"]["startLine"], loc["region"]["startColumn"], "critical"))
                         self.assertEqual(sorted(sarif), sorted(expected), context)
                     return sorted(records, key=lambda record: (record["path"], record["line"], record["col"]))
@@ -3146,6 +3165,66 @@ class RustTaintReferenceTests(unittest.TestCase):
         for detector, result in zip(self.DETECTORS, results):
             self.assertEqual(result, self.original_refs(detector, expression, tainted))
         self.assertLessEqual(len(calls), 4, f"regex compilations scaled with taint table: {len(calls)}")
+
+
+class CSharpSecuritySuppressionTests(unittest.TestCase):
+    CASES = (
+        (cs_archive, 'ZipArchive archive;\nvar target = Path.Combine(destination, entry.FullName);\n',
+         'ZipArchive archive;\nvar target = SafeArchivePath(destination, entry.FullName);\n'),
+        (cs_header, 'var name = Request.Query["name"];\nResponse.Headers.Append("X-Name", name);\n',
+         'var name = Request.Query["name"];\nResponse.Headers.Append("X-Name", Uri.EscapeDataString(name));\n'),
+        (cs_outbound, 'var url = Request.Query["url"];\nawait client.GetAsync(url);\n',
+         'var url = Request.Query["url"];\nawait client.GetAsync(SafeOutboundUrl(url));\n'),
+        (cs_random, 'var rng = new Random();\nvar authToken = rng.Next();\n',
+         'var authToken = RandomNumberGenerator.GetBytes(32);\n'),
+    )
+
+    def findings(self, detector, text):
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="ubs-csharp-ownership-", dir=artifacts) as tmp:
+            source = Path(tmp) / "Ownership.cs"
+            source.write_text(text, encoding="utf-8")
+            rows = list(detector.find([source], base_dir=source.parent))
+            self.assertTrue(all(row[0] == "Ownership.cs" and row[2] == 1 for row in rows), rows)
+            return rows
+
+    def test_exact_sink_scope_and_lexical_marker_ownership(self):
+        for detector, positive, safe in self.CASES:
+            rule = detector.RULE_ID
+            lines = positive.splitlines(keepends=True)
+            variants = (
+                ("unmarked", positive, [2]),
+                ("safe", safe, []),
+                ("owned", lines[0] + lines[1].rstrip() + f" // ubs:ignore[{rule}]\n", []),
+                ("bare", lines[0] + lines[1].rstrip() + " // ubs:ignore\n", []),
+                ("wrong", lines[0] + lines[1].rstrip() + " // ubs:ignore[csharp.other.rule]\n", [2]),
+                ("quoted", lines[0] + lines[1].rstrip() + f' var example = "ubs:ignore[{rule}]";\n', [2]),
+                ("preceding-owned", lines[0] + f"// ubs:ignore[{rule}]\n" + lines[1], []),
+                ("preceding-wrong", lines[0] + "// ubs:ignore[csharp.other.rule]\n" + lines[1], [3]),
+            )
+            for name, text, expected in variants:
+                with self.subTest(rule=rule, placement=name):
+                    self.assertEqual([row[1] for row in self.findings(detector, text)], expected)
+
+    def test_annotated_source_and_alias_facts_reach_later_sink(self):
+        for detector, positive, _ in self.CASES[1:]:
+            source, sink = positive.splitlines(keepends=True)
+            for marker in ("ubs:ignore", f"ubs:ignore[{detector.RULE_ID}]", "ubs:ignore[csharp.other.rule]"):
+                with self.subTest(rule=detector.RULE_ID, source_marker=marker):
+                    text = source.rstrip() + f" // {marker}\nConsole.WriteLine(0);\n" + sink
+                    self.assertEqual([row[1] for row in self.findings(detector, text)], [3])
+            with self.subTest(rule=detector.RULE_ID, source_marker="quoted"):
+                text = source.rstrip() + f' var example = "ubs:ignore[{detector.RULE_ID}]";\nConsole.WriteLine(0);\n' + sink
+                self.assertEqual([row[1] for row in self.findings(detector, text)], [3])
+        for detector, source, transfer, sink in (
+            (cs_header, 'var name = Request.Query["name"];\n', 'var alias = name;\n', 'Response.Headers.Append("X-Name", alias);\n'),
+            (cs_outbound, 'var url = Request.Query["url"];\n', 'var target = url;\n', 'await client.GetAsync(target);\n'),
+        ):
+            for marker in ("", f" // ubs:ignore[{detector.RULE_ID}]", " // ubs:ignore[csharp.other.rule]"):
+                with self.subTest(rule=detector.RULE_ID, alias_marker=marker):
+                    text = source + transfer.rstrip() + marker + "\nConsole.WriteLine(0);\n" + sink
+                    self.assertEqual([row[1] for row in self.findings(detector, text)], [4])
 
 
 if __name__ == "__main__":

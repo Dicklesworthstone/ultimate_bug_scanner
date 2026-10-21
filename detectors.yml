@@ -19,7 +19,11 @@
     },
     {
       "id": "java",
-      "display": "Java / Kotlin"
+      "display": "Java"
+    },
+    {
+      "id": "kotlin",
+      "display": "Kotlin"
     },
     {
       "id": "cpp",
@@ -40,6 +44,14 @@
     {
       "id": "elixir",
       "display": "Elixir"
+    },
+    {
+      "id": "bash",
+      "display": "Bash / Shell"
+    },
+    {
+      "id": "php",
+      "display": "PHP"
     }
   ],
   "families": {
@@ -102,16 +114,27 @@
         "java": {
           "status": "implemented",
           "rule_ids": [
-            "java.security.archive_extraction",
-            "kotlin.security.archive_extraction"
+            "java.security.archive_extraction"
           ],
           "fixture_pair_ids": [
-            "archive_extraction",
-            "kotlin_archive_extraction"
+            "archive_extraction"
           ],
           "manifest_cases": [
             "java-archive-extraction-buggy",
             "java-archive-extraction-clean"
+          ]
+        },
+        "kotlin": {
+          "status": "implemented",
+          "rule_ids": [
+            "kotlin.security.archive_extraction"
+          ],
+          "fixture_pair_ids": [
+            "kotlin_archive_extraction"
+          ],
+          "manifest_cases": [
+            "kotlin-archive-extraction-buggy",
+            "kotlin-archive-extraction-clean"
           ]
         },
         "cpp": {
@@ -178,6 +201,18 @@
             "elixir-archive-extraction-buggy",
             "elixir-archive-extraction-clean"
           ]
+        },
+        "bash": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "php": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
         }
       }
     },
@@ -240,16 +275,27 @@
         "java": {
           "status": "implemented",
           "rule_ids": [
-            "java.security.open_redirect",
-            "kotlin.security.open_redirect"
+            "java.security.open_redirect"
           ],
           "fixture_pair_ids": [
-            "open_redirect",
-            "kotlin_open_redirect"
+            "open_redirect"
           ],
           "manifest_cases": [
             "java-open-redirect-buggy",
             "java-open-redirect-clean"
+          ]
+        },
+        "kotlin": {
+          "status": "implemented",
+          "rule_ids": [
+            "kotlin.security.open_redirect"
+          ],
+          "fixture_pair_ids": [
+            "kotlin_open_redirect"
+          ],
+          "manifest_cases": [
+            "kotlin-open-redirect-buggy",
+            "kotlin-open-redirect-clean"
           ]
         },
         "cpp": {
@@ -316,6 +362,18 @@
             "elixir-open-redirect-buggy",
             "elixir-open-redirect-clean"
           ]
+        },
+        "bash": {
+          "status": "n-a",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "php": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
         }
       }
     },
@@ -378,16 +436,27 @@
         "java": {
           "status": "implemented",
           "rule_ids": [
-            "java.security.ssrf",
-            "kotlin.security.ssrf"
+            "java.security.ssrf"
           ],
           "fixture_pair_ids": [
-            "ssrf",
-            "kotlin_ssrf"
+            "ssrf"
           ],
           "manifest_cases": [
             "java-ssrf-buggy",
             "java-ssrf-clean"
+          ]
+        },
+        "kotlin": {
+          "status": "implemented",
+          "rule_ids": [
+            "kotlin.security.ssrf"
+          ],
+          "fixture_pair_ids": [
+            "kotlin_ssrf"
+          ],
+          "manifest_cases": [
+            "kotlin-ssrf-buggy",
+            "kotlin-ssrf-clean"
           ]
         },
         "cpp": {
@@ -454,6 +523,18 @@
             "elixir-ssrf-buggy",
             "elixir-ssrf-clean"
           ]
+        },
+        "bash": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "php": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
         }
       }
     },
@@ -516,16 +597,27 @@
         "java": {
           "status": "implemented",
           "rule_ids": [
-            "java.security.header_injection",
-            "kotlin.security.header_injection"
+            "java.security.header_injection"
           ],
           "fixture_pair_ids": [
-            "header_injection",
-            "kotlin_header_injection"
+            "header_injection"
           ],
           "manifest_cases": [
             "java-header-injection-buggy",
             "java-header-injection-clean"
+          ]
+        },
+        "kotlin": {
+          "status": "implemented",
+          "rule_ids": [
+            "kotlin.security.header_injection"
+          ],
+          "fixture_pair_ids": [
+            "kotlin_header_injection"
+          ],
+          "manifest_cases": [
+            "kotlin-header-injection-buggy",
+            "kotlin-header-injection-clean"
           ]
         },
         "cpp": {
@@ -592,6 +684,18 @@
             "elixir-header-injection-buggy",
             "elixir-header-injection-clean"
           ]
+        },
+        "bash": {
+          "status": "n-a",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "php": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
         }
       }
     },
@@ -647,16 +751,27 @@
         "java": {
           "status": "implemented",
           "rule_ids": [
-            "java.security.path_traversal",
-            "kotlin.security.path_traversal"
+            "java.security.path_traversal"
           ],
           "fixture_pair_ids": [
-            "request_path_traversal",
-            "kotlin_path_traversal"
+            "request_path_traversal"
           ],
           "manifest_cases": [
             "java-request-path-traversal-buggy",
             "java-request-path-traversal-clean"
+          ]
+        },
+        "kotlin": {
+          "status": "implemented",
+          "rule_ids": [
+            "kotlin.security.path_traversal"
+          ],
+          "fixture_pair_ids": [
+            "kotlin_path_traversal"
+          ],
+          "manifest_cases": [
+            "kotlin-request-path-traversal-buggy",
+            "kotlin-request-path-traversal-clean"
           ]
         },
         "cpp": {
@@ -723,6 +838,25 @@
             "elixir-request-path-traversal-buggy",
             "elixir-request-path-traversal-clean"
           ]
+        },
+        "bash": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "php": {
+          "status": "implemented",
+          "rule_ids": [
+            "php.security.dynamic-include"
+          ],
+          "fixture_pair_ids": [
+            "php"
+          ],
+          "manifest_cases": [
+            "php-buggy",
+            "php-clean"
+          ]
         }
       }
     },
@@ -785,16 +919,27 @@
         "java": {
           "status": "implemented",
           "rule_ids": [
-            "java.security.randomness",
-            "kotlin.security.randomness"
+            "java.security.randomness"
           ],
           "fixture_pair_ids": [
-            "random_security",
-            "kotlin_security_randomness"
+            "random_security"
           ],
           "manifest_cases": [
             "java-random-security-buggy",
             "java-random-security-clean"
+          ]
+        },
+        "kotlin": {
+          "status": "implemented",
+          "rule_ids": [
+            "kotlin.security.randomness"
+          ],
+          "fixture_pair_ids": [
+            "kotlin_security_randomness"
+          ],
+          "manifest_cases": [
+            "kotlin-random-security-buggy",
+            "kotlin-random-security-clean"
           ]
         },
         "cpp": {
@@ -861,6 +1006,18 @@
             "elixir-security-randomness-buggy",
             "elixir-security-randomness-clean"
           ]
+        },
+        "bash": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "php": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
         }
       }
     },
@@ -929,6 +1086,12 @@
           "fixture_pair_ids": [],
           "manifest_cases": []
         },
+        "kotlin": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
         "cpp": {
           "status": "planned",
           "rule_ids": [],
@@ -954,6 +1117,18 @@
           "manifest_cases": []
         },
         "elixir": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "bash": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "php": {
           "status": "planned",
           "rule_ids": [],
           "fixture_pair_ids": [],
@@ -1023,6 +1198,12 @@
           "fixture_pair_ids": [],
           "manifest_cases": []
         },
+        "kotlin": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
         "cpp": {
           "status": "planned",
           "rule_ids": [],
@@ -1048,6 +1229,18 @@
           "manifest_cases": []
         },
         "elixir": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "bash": {
+          "status": "n-a",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "php": {
           "status": "planned",
           "rule_ids": [],
           "fixture_pair_ids": [],
@@ -1117,6 +1310,12 @@
           "fixture_pair_ids": [],
           "manifest_cases": []
         },
+        "kotlin": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
         "cpp": {
           "status": "n-a",
           "rule_ids": [],
@@ -1142,6 +1341,18 @@
           "manifest_cases": []
         },
         "elixir": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "bash": {
+          "status": "n-a",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "php": {
           "status": "planned",
           "rule_ids": [],
           "fixture_pair_ids": [],
@@ -1204,6 +1415,12 @@
           "fixture_pair_ids": [],
           "manifest_cases": []
         },
+        "kotlin": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
         "cpp": {
           "status": "n-a",
           "rule_ids": [],
@@ -1229,6 +1446,18 @@
           "manifest_cases": []
         },
         "elixir": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "bash": {
+          "status": "n-a",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "php": {
           "status": "planned",
           "rule_ids": [],
           "fixture_pair_ids": [],
@@ -1301,6 +1530,12 @@
           "fixture_pair_ids": [],
           "manifest_cases": []
         },
+        "kotlin": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
         "cpp": {
           "status": "planned",
           "rule_ids": [],
@@ -1337,6 +1572,18 @@
             "elixir-hardcoded-secrets-buggy",
             "elixir-hardcoded-secrets-clean"
           ]
+        },
+        "bash": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "php": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
         }
       }
     },
@@ -1409,6 +1656,12 @@
             "java-async-errors-clean"
           ]
         },
+        "kotlin": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
         "cpp": {
           "status": "implemented",
           "rule_ids": [
@@ -1455,6 +1708,18 @@
           ]
         },
         "elixir": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "bash": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "php": {
           "status": "planned",
           "rule_ids": [],
           "fixture_pair_ids": [],
@@ -1517,6 +1782,12 @@
           "fixture_pair_ids": [],
           "manifest_cases": []
         },
+        "kotlin": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
         "cpp": {
           "status": "planned",
           "rule_ids": [],
@@ -1536,16 +1807,49 @@
           "manifest_cases": []
         },
         "csharp": {
-          "status": "planned",
+          "status": "implemented",
+          "rule_ids": [
+            "cs.security.sql-injection"
+          ],
+          "fixture_pair_ids": [
+            "dapper"
+          ],
+          "manifest_cases": [
+            "csharp-dapper-buggy",
+            "csharp-dapper-clean"
+          ]
+        },
+        "elixir": {
+          "status": "implemented",
+          "rule_ids": [
+            "ex.security.sql-interpolation"
+          ],
+          "fixture_pair_ids": [
+            "callback_sql"
+          ],
+          "manifest_cases": [
+            "elixir-callback-sql-buggy",
+            "elixir-callback-sql-clean"
+          ]
+        },
+        "bash": {
+          "status": "n-a",
           "rule_ids": [],
           "fixture_pair_ids": [],
           "manifest_cases": []
         },
-        "elixir": {
-          "status": "planned",
-          "rule_ids": [],
-          "fixture_pair_ids": [],
-          "manifest_cases": []
+        "php": {
+          "status": "implemented",
+          "rule_ids": [
+            "php.security.sql-injection"
+          ],
+          "fixture_pair_ids": [
+            "php"
+          ],
+          "manifest_cases": [
+            "php-buggy",
+            "php-clean"
+          ]
         }
       }
     },
@@ -1594,6 +1898,19 @@
         "java": {
           "status": "implemented",
           "rule_ids": [
+            "java.security.command"
+          ],
+          "fixture_pair_ids": [
+            "java"
+          ],
+          "manifest_cases": [
+            "java-buggy",
+            "java-clean"
+          ]
+        },
+        "kotlin": {
+          "status": "implemented",
+          "rule_ids": [
             "kotlin.security.command"
           ],
           "fixture_pair_ids": [
@@ -1636,10 +1953,45 @@
           "manifest_cases": []
         },
         "elixir": {
-          "status": "planned",
-          "rule_ids": [],
-          "fixture_pair_ids": [],
-          "manifest_cases": []
+          "status": "implemented",
+          "rule_ids": [
+            "elixir.security.command"
+          ],
+          "fixture_pair_ids": [
+            "command_execution"
+          ],
+          "manifest_cases": [
+            "elixir-security-command-buggy",
+            "elixir-security-command-clean"
+          ]
+        },
+        "bash": {
+          "status": "implemented",
+          "rule_ids": [
+            "bash.security.eval_variable",
+            "bash.security.curl_pipe_bash"
+          ],
+          "fixture_pair_ids": [
+            "bash"
+          ],
+          "manifest_cases": [
+            "bash-buggy",
+            "bash-clean"
+          ]
+        },
+        "php": {
+          "status": "implemented",
+          "rule_ids": [
+            "php.security.command-injection",
+            "php.security.dynamic-code"
+          ],
+          "fixture_pair_ids": [
+            "php"
+          ],
+          "manifest_cases": [
+            "php-buggy",
+            "php-clean"
+          ]
         }
       }
     },
@@ -1689,6 +2041,12 @@
           "fixture_pair_ids": [],
           "manifest_cases": []
         },
+        "kotlin": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
         "cpp": {
           "status": "planned",
           "rule_ids": [],
@@ -1725,6 +2083,25 @@
           "rule_ids": [],
           "fixture_pair_ids": [],
           "manifest_cases": []
+        },
+        "bash": {
+          "status": "n-a",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "php": {
+          "status": "implemented",
+          "rule_ids": [
+            "php.security.unsafe-deserialization"
+          ],
+          "fixture_pair_ids": [
+            "php"
+          ],
+          "manifest_cases": [
+            "php-buggy",
+            "php-clean"
+          ]
         }
       }
     },
@@ -1790,6 +2167,12 @@
           "fixture_pair_ids": [],
           "manifest_cases": []
         },
+        "kotlin": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
         "cpp": {
           "status": "planned",
           "rule_ids": [],
@@ -1815,6 +2198,18 @@
           "manifest_cases": []
         },
         "elixir": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "bash": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "php": {
           "status": "planned",
           "rule_ids": [],
           "fixture_pair_ids": [],
@@ -1865,6 +2260,19 @@
           ]
         },
         "java": {
+          "status": "implemented",
+          "rule_ids": [
+            "java.narrowing.negative_guard"
+          ],
+          "fixture_pair_ids": [
+            "java"
+          ],
+          "manifest_cases": [
+            "java-buggy",
+            "java-clean"
+          ]
+        },
+        "kotlin": {
           "status": "implemented",
           "rule_ids": [
             "kotlin.type_narrowing"
@@ -1920,6 +2328,18 @@
           "rule_ids": [],
           "fixture_pair_ids": [],
           "manifest_cases": []
+        },
+        "bash": {
+          "status": "n-a",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "php": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
         }
       }
     },
@@ -1964,6 +2384,12 @@
           "fixture_pair_ids": [],
           "manifest_cases": []
         },
+        "kotlin": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
         "cpp": {
           "status": "planned",
           "rule_ids": [],
@@ -1989,6 +2415,18 @@
           "manifest_cases": []
         },
         "elixir": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "bash": {
+          "status": "n-a",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "php": {
           "status": "planned",
           "rule_ids": [],
           "fixture_pair_ids": [],
@@ -2065,6 +2503,12 @@
             "java-clean"
           ]
         },
+        "kotlin": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
         "cpp": {
           "status": "implemented",
           "rule_ids": [
@@ -2111,6 +2555,18 @@
           ]
         },
         "elixir": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "bash": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "php": {
           "status": "planned",
           "rule_ids": [],
           "fixture_pair_ids": [],
@@ -2168,16 +2624,49 @@
           "manifest_cases": []
         },
         "java": {
-          "status": "planned",
-          "rule_ids": [],
-          "fixture_pair_ids": [],
-          "manifest_cases": []
+          "status": "implemented",
+          "rule_ids": [
+            "java.taint.open_redirect",
+            "java.taint.path_traversal"
+          ],
+          "fixture_pair_ids": [
+            "open_redirect",
+            "request_path_traversal"
+          ],
+          "manifest_cases": [
+            "java-open-redirect-buggy",
+            "java-open-redirect-clean"
+          ]
+        },
+        "kotlin": {
+          "status": "implemented",
+          "rule_ids": [
+            "kotlin.taint.open_redirect",
+            "kotlin.taint.path_traversal"
+          ],
+          "fixture_pair_ids": [
+            "kotlin_open_redirect",
+            "kotlin_path_traversal"
+          ],
+          "manifest_cases": [
+            "kotlin-open-redirect-buggy",
+            "kotlin-open-redirect-clean"
+          ]
         },
         "cpp": {
-          "status": "planned",
-          "rule_ids": [],
-          "fixture_pair_ids": [],
-          "manifest_cases": []
+          "status": "implemented",
+          "rule_ids": [
+            "cpp.taint.open_redirect",
+            "cpp.taint.path_traversal"
+          ],
+          "fixture_pair_ids": [
+            "open_redirect",
+            "request_path_traversal"
+          ],
+          "manifest_cases": [
+            "cpp-open-redirect-buggy",
+            "cpp-open-redirect-clean"
+          ]
         },
         "ruby": {
           "status": "implemented",
@@ -2193,22 +2682,68 @@
           ]
         },
         "swift": {
-          "status": "planned",
-          "rule_ids": [],
-          "fixture_pair_ids": [],
-          "manifest_cases": []
+          "status": "implemented",
+          "rule_ids": [
+            "swift.taint.open_redirect",
+            "swift.taint.path_traversal"
+          ],
+          "fixture_pair_ids": [
+            "open_redirect",
+            "path_traversal"
+          ],
+          "manifest_cases": [
+            "swift-open-redirect-buggy",
+            "swift-open-redirect-clean"
+          ]
         },
         "csharp": {
+          "status": "implemented",
+          "rule_ids": [
+            "csharp.taint.open_redirect",
+            "csharp.taint.path_traversal"
+          ],
+          "fixture_pair_ids": [
+            "open_redirect",
+            "request_path_traversal"
+          ],
+          "manifest_cases": [
+            "csharp-open-redirect-buggy",
+            "csharp-open-redirect-clean"
+          ]
+        },
+        "elixir": {
+          "status": "implemented",
+          "rule_ids": [
+            "elixir.taint.open_redirect",
+            "elixir.taint.request_path_traversal"
+          ],
+          "fixture_pair_ids": [
+            "open_redirect",
+            "request_path_traversal"
+          ],
+          "manifest_cases": [
+            "elixir-open-redirect-buggy",
+            "elixir-open-redirect-clean"
+          ]
+        },
+        "bash": {
           "status": "planned",
           "rule_ids": [],
           "fixture_pair_ids": [],
           "manifest_cases": []
         },
-        "elixir": {
-          "status": "planned",
-          "rule_ids": [],
-          "fixture_pair_ids": [],
-          "manifest_cases": []
+        "php": {
+          "status": "implemented",
+          "rule_ids": [
+            "php.security.xss"
+          ],
+          "fixture_pair_ids": [
+            "php"
+          ],
+          "manifest_cases": [
+            "php-buggy",
+            "php-clean"
+          ]
         }
       }
     }

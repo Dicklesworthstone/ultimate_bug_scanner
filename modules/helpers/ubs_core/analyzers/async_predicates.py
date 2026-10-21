@@ -5,8 +5,8 @@ predicates": ``filter``/``some``/``every``/``find``/``findIndex`` expect a
 synchronous boolean, but an ``async`` predicate returns a Promise, so every element
 coerces to truthy ("[object Promise]") and the check never filters. The heredoc
 scans for a predicate entry line, joins the paren-balanced callback window
-(14 lines), and flags ``async``/``async function`` predicates unless the window
-contains ``ubs:ignore``.
+(14 lines), and flags ``async``/``async function`` predicates. Suppression uses
+shared lexical statement ownership and the exact rule ID.
 
 run(ctx) iterates ctx.files instead of self-walking; match logic is identical.
 """
@@ -20,6 +20,7 @@ from typing import Iterable
 
 from ubs_core.io import source_line
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.suppression import SourceSuppressions
 
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
 SKIP_DIRS = {'.git', 'node_modules', 'dist', 'build', 'coverage', '.next', '.cache', '.turbo'}
@@ -34,8 +35,10 @@ RULE_ID = "js.async.predicate"
 WINDOW = 14
 
 
-def scan_lines(lines: list[str]) -> list[tuple[int, int, str]]:
+def scan_lines(lines: list[str], *, source_text: str | None = None) -> list[tuple[int, int, str]]:
     """Return (line, col, method) findings for one file's lines; heredoc match logic."""
+    text = '\n'.join(lines) if source_text is None else source_text
+    source_index = SourceSuppressions('javascript').index('<inline>', text)
     issues = []
     for idx, line in enumerate(lines):
         stripped = line.strip()
@@ -53,10 +56,10 @@ def scan_lines(lines: list[str]) -> list[tuple[int, int, str]]:
             if paren_balance <= 0:
                 break
         callback_text = ' '.join(callback_lines)
-        if 'ubs:ignore' in callback_text:
-            continue
         match = ASYNC_PREDICATE_RE.search(callback_text)
         if not match:
+            continue
+        if source_index.is_suppressed(idx + 1, RULE_ID):
             continue
         issues.append((idx + 1, start_match.start() + 1, match.group(1)))
     return issues
@@ -65,10 +68,10 @@ def scan_lines(lines: list[str]) -> list[tuple[int, int, str]]:
 def scan_file(path: Path) -> list[tuple[int, int, str]]:
     """Return (line, col, method) findings for one file; heredoc match logic."""
     try:
-        lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
+        text = path.read_text(encoding='utf-8', errors='ignore')
     except Exception:
         return []
-    return scan_lines(lines)
+    return scan_lines(text.splitlines(), source_text=text)
 
 
 def collect_issues(root: Path) -> list[tuple[str, int, str, str]]:
@@ -89,10 +92,11 @@ def collect_issues(root: Path) -> list[tuple[str, int, str, str]]:
         if path.suffix.lower() not in EXTS:
             continue
         try:
-            lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
+            text = path.read_text(encoding='utf-8', errors='ignore')
         except Exception:
             continue
-        for issue_line, _col, method in scan_lines(lines):
+        lines = text.splitlines()
+        for issue_line, _col, method in scan_lines(lines, source_text=text):
             try:
                 rel = path.relative_to(sample_root)
             except ValueError:

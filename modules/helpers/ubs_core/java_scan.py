@@ -11,7 +11,7 @@ Layers, in order:
    preserves the legacy count_lines semantics; the A7 statement-interval
    engine in the meta-runner postprocess adds the richer placements).
 2. Analyzer layer — registered ubs_core analyzers: taint_java_traversal +
-   taint_java_redirect (category 4; verbatim heredoc ports) and
+   taint_java_redirect (category 4; bounded function-scoped dataflow) and
    narrowing_kotlin (category 1 Kotlin guard probe, run when .kt/.kts files
    are in scope). lifecycle_java does NOT run: with ast-grep available the
    legacy category-19 resource branch uses the ast rule group, and the
@@ -268,6 +268,10 @@ def _record_category(finding: dict) -> int | None:
         return 1
     if rule.startswith("kotlin.narrowing."):
         return 1
+    if rule.startswith("kotlin.coroutine."):
+        return 3
+    if rule.startswith("kotlin.resource."):
+        return 19
     # category_id is authoritative for pattern/detector records.
     for num, slug in _CATEGORY_SLUGS.items():
         if category_id == f"java.{slug}":
@@ -284,15 +288,15 @@ def _record_category(finding: dict) -> int | None:
 def run_analyzers(files: Sequence[Path], sink, skip: set[int] | None = None,
                   project_dir: Path | None = None, enable_new: bool = False,
                   prefilter: Any = None, errors: list[str] | None = None) -> None:
-    """Run registered analyzers: java taint pair + kotlin narrowing.
+    """Run registered analyzers: java taint pair + kotlin narrowing/lifecycle.
 
-    narrowing_kotlin registers under lang="kotlin" while the module's file
-    list mixes .java/.kt/.kts, so both registries run over the same list —
-    each analyzer filters by suffix itself. Two calibration gates keep v2
-    totals at legacy parity:
-    - layer=="lifecycle" (lifecycle_java) is the legacy NO-ast-grep fallback
-    - for the cat-19 resource branch; with ast-grep at the gate the counted
-      ast rule group owns those findings.
+    narrowing_kotlin, coroutines_kotlin, and lifecycle_kotlin register under
+    lang="kotlin" while the module's file list mixes .java/.kt/.kts, so both
+    registries run over the same list — each analyzer filters by suffix itself.
+    Two calibration gates keep v2 totals at legacy parity:
+    - layer=="lifecycle" on lang=="java" (lifecycle_java) is the legacy NO-ast-grep
+      fallback for the cat-19 resource branch; with ast-grep at the gate the
+      counted ast rule group owns those findings.
     - layer=="guards" (guards_java, bead D3) has no legacy java counterpart —
       it stays off unless ``enable_new``.
     Structured analyzer paths retain their source identity independently of
@@ -301,7 +305,7 @@ def run_analyzers(files: Sequence[Path], sink, skip: set[int] | None = None,
     from ubs_core import analyzers  # noqa: F401  (populate registry)
     from ubs_core.registry import analyzers_for_lang
 
-    allowed_layers = {"java": {"taint"}, "kotlin": {"narrowing"}}
+    allowed_layers = {"java": {"taint"}, "kotlin": {"narrowing", "lifecycle"}}
 
     def _source_path(path: str) -> str:
         return str(Path(path).resolve()) if path else path
@@ -312,7 +316,9 @@ def run_analyzers(files: Sequence[Path], sink, skip: set[int] | None = None,
                 if not (enable_new and analyzer.layer == "guards" and lang == "java"):
                     continue
             if skip and ((analyzer.layer == "taint" and 4 in skip) or
-                         (analyzer.layer == "narrowing" and 1 in skip)):
+                         (analyzer.layer == "narrowing" and 1 in skip) or
+                         (analyzer.name == "coroutines_kotlin" and 3 in skip) or
+                         (analyzer.name == "lifecycle_kotlin" and 19 in skip)):
                 continue
             if prefilter is not None:
                 target_files = prefilter.filter_files_for_analyzer(analyzer.name, files)

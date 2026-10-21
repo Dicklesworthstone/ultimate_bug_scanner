@@ -50,6 +50,9 @@ _PATTERN_CACHE_KIND = "_ubs_python_pattern"
 # Files whose text is a Python token stream (so string blanking is valid).
 _PY_SUFFIXES = frozenset({".py", ".pyi"})
 _PY_CODE_SUFFIXES = _PY_SUFFIXES | frozenset({".pyx", ".pxd", ".pxi", ".ipynb"})
+# These detectors compare facts across the selected project. Their results
+# cannot be reused as findings for one unchanged source file.
+_PROJECT_DETECTORS = frozenset({"missing_returns"})
 
 _CATEGORY_SLUGS = {
     1: "none", 2: "numeric", 3: "collections", 4: "comparison",
@@ -754,19 +757,23 @@ def _detector_process(module_name: str, files: Sequence[Path], skip: set[int] | 
 
 
 def run_detectors(files: Sequence[Path], sink, skip: set[int] | None = None,
-                  errors: list[str] | None = None, jobs: int = 1) -> None:
+                  errors: list[str] | None = None, jobs: int = 1, *,
+                  project: bool | None = None) -> None:
     """Run detectors, retaining project-wide thresholds and module ordering.
 
     Processes parallelize independent detector modules, never file shards:
     every ``find(files)`` sees the full project. Small projects and direct
     APIs without an error collector keep streaming on the calling process.
+    ``project`` selects the project-wide or the source-local detectors;
+    direct calls without that selection keep the complete detector set.
     """
     import pkgutil
 
     from ubs_core import py_detectors
 
     names = [info.name for info in pkgutil.iter_modules(py_detectors.__path__)
-             if not info.name.startswith("_")]
+             if not info.name.startswith("_")
+             and (project is None or (info.name in _PROJECT_DETECTORS) == project)]
     if not names or jobs <= 1 or len(files) < 8 or errors is None:
         for name in names:
             _run_detector(name, files, sink, skip, errors)
@@ -1008,7 +1015,8 @@ def main(argv: list[str] | None = None) -> int:
                       prefilter=prefilter_res, jobs=args.jobs, defer_global_checks=True,
                       suppressions=suppressions, errors=scan_errors)
         _run_stage(scan_errors, "detector scan", run_detectors,
-                      files_to_scan, capturing_sink, skip, errors=scan_errors, jobs=args.jobs)
+                      files_to_scan, capturing_sink, skip, errors=scan_errors, jobs=args.jobs,
+                      project=False)
         _run_stage(scan_errors, "analyzer scan", run_analyzers,
                       files_to_scan, capturing_sink, skip, enable_new=args.enable_new_analyzers,
                       prefilter=prefilter_res, taint=False, errors=scan_errors, registered=registered)
@@ -1062,6 +1070,10 @@ def main(argv: list[str] | None = None) -> int:
     # this selected-project pass out of per-file caches and literal prefilters;
     # all other analyzer layers retain their existing incremental behavior.
     taint_sink = CapturingSink()
+    # Project detectors (missing returns) count across every selected file,
+    # so a warm or reordered selection must not reuse a subset's answer.
+    _run_stage(scan_errors, "project detector scan", run_detectors,
+                  files, taint_sink, skip, errors=scan_errors, jobs=args.jobs, project=True)
     _run_stage(scan_errors, "project analyzer scan", run_analyzers,
                   files, taint_sink, skip, taint=True,
                   project_dir=args.project_dir or args.project or ".",

@@ -6,7 +6,7 @@ random/shuffle, System.unique_integer, :erlang.unique_integer/monotonic_time/
 system_time/phash2) assigned to security-named variables or sunk into
 session/cookie/encoding calls, skipping continuation lines and requiring a
 security name in the variable, statement, or enclosing function context.
-Same-file and previous-line `ubs:ignore` markers suppress a hit.
+Lexical statement-owned `ubs:ignore` markers suppress only matching rules.
 """
 from __future__ import annotations
 
@@ -14,10 +14,10 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.suppression import SourceSuppressions
 from ubs_core.elixir_detectors._common import (
     EXTS,
     elixir_files,
-    has_ignore,
     read_lines,
     source_line,
     strip_line_comments,
@@ -124,10 +124,9 @@ def scan_file_findings(path: Path) -> Iterable[tuple[int, int, str]]:
     text = "\n".join(lines)
     if not UNSAFE_RANDOM_RE.search(text):
         return
+    suppressions = SourceSuppressions('elixir').index(path, text)
     seen: set[int] = set()
     for idx, _ in enumerate(lines, start=1):
-        if has_ignore(lines, idx):
-            continue
         if is_continuation_line(lines, idx):
             continue
         statement = logical_statement(lines, idx).strip()
@@ -145,7 +144,8 @@ def scan_file_findings(path: Path) -> Iterable[tuple[int, int, str]]:
         if idx in seen:
             continue
         seen.add(idx)
-        yield idx, 1, source_line(lines, idx)
+        if not suppressions.is_suppressed(idx, RULE_ID):
+            yield idx, 1, source_line(lines, idx)
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple]:

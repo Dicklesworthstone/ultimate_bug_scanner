@@ -3,8 +3,9 @@ target origin (bead A4-js security wave).
 
 Port of the legacy "postMessage wildcard target origin" heredoc from
 modules/ubs-js.sh: verbatim match semantics (per-line call detection,
-paren-balanced call window, wildcard-origin regex over the joined call text,
-ubs:ignore suppression) with a run(ctx) adapter on top.
+paren-balanced call window and wildcard-origin regex over the joined call
+text), with shared lexical statement ownership and exact rule scopes for
+suppression and a run(ctx) adapter on top.
 """
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.suppression import SourceSuppressions
 
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
 
@@ -27,9 +29,11 @@ WILDCARD_ORIGIN_RE = re.compile(r'\bpostMessage\s*\([\s\S]*?,\s*(?:"\*"|\'\*\'|`
 def scan_file_findings(path: Path) -> Iterator[tuple[int, int]]:
     """Yield (line, col) per detection; match logic identical to the heredoc."""
     try:
-        lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
+        text = path.read_text(encoding='utf-8', errors='ignore')
     except Exception:
         return
+    lines = text.splitlines()
+    source_index = SourceSuppressions('javascript').index(path, text)
     for idx, line in enumerate(lines):
         stripped = line.strip()
         if not stripped or stripped.startswith(("//", "/*", "*")):
@@ -49,7 +53,9 @@ def scan_file_findings(path: Path) -> Iterator[tuple[int, int]]:
             if saw_call and paren_balance <= 0:
                 break
         call_text = ' '.join(call_lines)
-        if 'ubs:ignore' in call_text or not WILDCARD_ORIGIN_RE.search(call_text):
+        if not WILDCARD_ORIGIN_RE.search(call_text):
+            continue
+        if source_index.is_suppressed(idx + 1, RULE):
             continue
         yield idx + 1, CALL_RE.search(line).start() + 1
 

@@ -8,11 +8,14 @@ NUL-safe file listing with a newline in a file name, and the exported locale.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LIB = REPO_ROOT / "modules" / "lib" / "ubs-common.sh"
@@ -23,8 +26,9 @@ def bash(script: str, *args: str, env: dict | None = None) -> subprocess.Complet
     full_env.pop("LC_ALL", None)
     if env:
         full_env.update(env)
+    # ubs:ignore[py.security.command-injection] Scripts are test-authored Bash literals; paths and test data are positional arguments.
     return subprocess.run(
-        ["bash", "-c", f'set -Eeuo pipefail; source "{LIB}"; {script}', "bash", *args],
+        ["bash", "-c", 'set -Eeuo pipefail; source "$1"; shift; ' + script, "bash", str(LIB), *args],
         capture_output=True, text=False, env=full_env, timeout=60, stdin=subprocess.DEVNULL,
     )
 
@@ -53,6 +57,64 @@ class JsonEscapeTests(unittest.TestCase):
         self.assertEqual(bash('printf "[%s]" "$(printf "x\\"y" | json_escape)"').stdout, b'[x\\"y]')
 
 
+class HelperIntegrityTests(unittest.TestCase):
+    """Real helper bytes must be checked before the directory is returned."""
+
+    assets = ("helpers/ubs_core/io.py", "helpers/ubs_core/kotlin_scan.py",
+              "helpers/ubs_core/java_scan.py")
+
+    def verify(self, directory: Path, digests: dict[str, str]) -> subprocess.CompletedProcess:
+        args = [str(directory)]
+        for name, digest in digests.items():
+            args.extend((name, digest))
+        return bash('''
+UBS_MODULE_LIB_DIR="$1"; shift
+UBS_VERIFIED_ASSET_DIR=""
+UBS_ALLOW_UNVERIFIED_HELPERS=0
+UBS_COMMON_HELPER_CHECKSUMS=()
+while (( $# )); do
+  UBS_COMMON_HELPER_CHECKSUMS["$1"]="$2"
+  shift 2
+done
+ubs_resolve_helpers_dir result
+printf '%s\\n' "$result"
+''', *args)
+
+    def case(self, suffix: str, tamper: str | None = None) -> None:
+        # Retain the control artifacts under the caller's private disk TMPDIR.
+        root = Path(tempfile.mkdtemp(prefix="ubs-helper-integrity-")) / suffix
+        digests = {}
+        for name in self.assets:
+            source = REPO_ROOT / "modules" / name
+            data = source.read_bytes()
+            digests[name] = hashlib.sha256(data).hexdigest()
+            target = root / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data + (b"\n# tampered integrity control\n" if name == tamper else b""))
+        proc = self.verify(root, digests)
+        if tamper:
+            self.assertEqual(proc.returncode, 2, proc.stderr)
+            self.assertIn(tamper.encode(), proc.stderr)
+            self.assertIn(b"failed checksum verification", proc.stderr)
+            self.assertEqual(proc.stdout, b"")
+        else:
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout, os.fsencode(str(root / "helpers")) + b"\n")
+
+    def test_all_intact_helpers_are_accepted(self) -> None:
+        self.case("modules")
+
+    def test_escaped_directory_names_keep_every_digest_bound_to_its_file(self) -> None:
+        for suffix in ("space directory", "back\\slash", "line\nbreak"):
+            with self.subTest(path=suffix):
+                self.case(suffix)
+
+    def test_each_tampered_helper_refuses_before_returning_the_directory(self) -> None:
+        for asset in self.assets:
+            with self.subTest(asset=asset):
+                self.case("modules", tamper=asset)
+
+
 class SeverityTests(unittest.TestCase):
     def test_table(self) -> None:
         for raw, expected in (("CRITICAL", "critical"), ("error", "critical"), ("high", "critical"),
@@ -79,6 +141,36 @@ class FormatContractTests(unittest.TestCase):
 
 
 class ListFilesTests(unittest.TestCase):
+    def test_literal_manifest_names_join_extensions_and_excludes_with_rg_and_find(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            names = ("go.mod", "go.sum", "go.work", "go.work.sum", "odd[1].mod",
+                     "literal*.mod", "!bang.mod", "back\\slash.mod", "line\nbreak.mod",
+                     "file{one}.mod", "#hash.mod", "question?.mod", "unclosed[.mod")
+            expected = [root / "main.go", *(root / name for name in names)]
+            for path in expected:
+                path.write_text("")
+            for name in ("README.txt", "odd1.mod", "literal-decoy.mod", "other.mod",
+                         "fileone.mod", "questionX.mod"):
+                (root / name).write_text("")
+            (root / "vendor").mkdir()
+            (root / "vendor" / "go.mod").write_text("")
+            tools = root / "tools"
+            tools.mkdir()
+            # cat owns the listing's destination (4add1640), so the find-only
+            # PATH still needs it.
+            for name in ("bash", "cat", "find"):
+                actual = shutil.which(name)
+                self.assertIsNotNone(actual)
+                (tools / name).symlink_to(actual)
+            for label, env in (("rg", None), ("find", {"PATH": str(tools)})):
+                with self.subTest(tool=label):
+                    proc = bash('ubs_list_files "$1" --ext go --names "$2" --exclude vendor',
+                                tmp, ",".join(names), env=env)
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertEqual(sorted(item for item in proc.stdout.split(b"\0") if item),
+                                     sorted(os.fsencode(path) for path in expected), proc.stderr)
+
     def test_nul_safe_listing_with_extensions_and_excludes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -125,12 +217,21 @@ class ListFilesTests(unittest.TestCase):
 
 
 class LocaleTests(unittest.TestCase):
+    def test_source_path_is_literal_even_with_quotes_and_expansion_syntax(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            copied = Path(tmp) / 'library "$UNSET_LIBRARY_NAME".sh'
+            shutil.copyfile(LIB, copied)
+            with patch(__name__ + ".LIB", copied):
+                proc = bash('printf %s "$UBS_COMMON_VERSION"')
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout, b"1")
+
     def test_export_locale_reaches_children(self) -> None:
         proc = bash('ubs_export_locale; bash -c "printf %s \\"\\$LC_ALL:\\$PYTHONIOENCODING\\""')
         self.assertEqual(proc.stdout.decode(), "C:utf-8")
 
     def test_double_source_is_harmless(self) -> None:
-        proc = bash(f'source "{LIB}"; printf %s "$UBS_COMMON_VERSION"')
+        proc = bash('source "$1"; printf %s "$UBS_COMMON_VERSION"', str(LIB))
         self.assertEqual(proc.stdout.decode(), "1")
 
 

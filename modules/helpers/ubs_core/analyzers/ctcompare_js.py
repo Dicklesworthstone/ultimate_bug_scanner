@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Iterable
 
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.suppression import SourceSuppressions
 
 exts = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
 skip_dirs = {'.git', 'node_modules', 'dist', 'build', 'coverage', '.next', '.cache', '.turbo'}
@@ -90,6 +91,7 @@ comparison_token_re = re.compile(
     string_literal_re.pattern
     + rf'|(?P<compare>{compare_re.pattern})'
     + r'|(?P<boolean>&&|\|\|)'
+    + r'|(?P<conditional>(?<!\?)\?(?![.?])|:)'
     + r'|(?P<open>[\[(])|(?P<close>[\])])|(?P<separator>[;{}])'
 )
 keywords = {
@@ -223,9 +225,14 @@ def statement_from(code_lines, idx, max_lines=8):
 
 
 def operand_identifiers(operand):
+    # Ordinary quoted text cannot read a local variable. Preserve template
+    # literals conservatively: their ${...} expressions can read secrets.
+    code = string_literal_re.sub(
+        lambda match: match.group() if match.group(1) == '`' else '', operand
+    )
     return {
         token
-        for token in identifier_re.findall(operand)
+        for token in identifier_re.findall(code)
         if token not in keywords
     }
 
@@ -240,9 +247,8 @@ CONTINUATION_HEAD = ('.', '?', ':', ')', ']', '&&', '||', '+', '===', '!==', '==
 
 def statement_start(code_lines, index):
     # Walk upward over physical lines that belong to the same statement as
-    # lines[index] (assignment/paren/operator continuations), so a suppression
-    # marker placed above a MULTI-LINE statement still attaches to a finding
-    # reported against one of its continuation lines. GH #91.
+    # lines[index] (assignment/paren/operator continuations) to recover the
+    # left operand of a comparison whose operator starts a continuation line.
     start = index
     for _ in range(8):
         if start <= 0:
@@ -258,34 +264,6 @@ def statement_start(code_lines, index):
     return start
 
 
-def has_ignore(lines, code_lines, index):
-    # Suppression markers live in comments, so they must be checked against the
-    # RAW source line, never against comment-stripped text: code_line() removes
-    # '// ubs:ignore' before it could ever match.
-    # GH #84: a count-time miss here made suppressed findings still count in
-    # totals and the exit code even though the report line was elided.
-    # GH #91: honored placements are (a) trailing the flagged line, (b) any
-    # physical line of the enclosing multi-line statement, (c) the line
-    # immediately above the statement's FIRST line (not just above the flagged
-    # continuation line), and (d) a comment-only line directly inside a block
-    # opened by the flagged line — formatters commonly relocate a trailing
-    # marker off a block-opening `if (...) {` onto the next line, which used to
-    # silently detach the suppression.
-    if not (0 <= index < len(lines)):
-        return False
-    if 'ubs:ignore' in lines[index]:
-        return True
-    start = statement_start(code_lines, index)
-    for pos in range(max(0, start - 1), index):
-        if 'ubs:ignore' in lines[pos]:
-            return True
-    if code_lines[index].rstrip().endswith('{') and index + 1 < len(lines):
-        relocated = lines[index + 1].strip()
-        if relocated.startswith(('//', '/*', '*')) and 'ubs:ignore' in relocated:
-            return True
-    return False
-
-
 def open_jsx_tag(prefix):
     """Recognize an unfinished JSX tag, excluding ordinary less-than operands."""
     match = open_jsx_tag_re.search(prefix)
@@ -297,8 +275,74 @@ def open_jsx_tag(prefix):
     return match.group()
 
 
-def collect_sensitive_vars(lines, code_lines):
-    sensitive_vars = set()
+call_head_re = re.compile(
+    r'\s*(?:await\s+)?(?:new\s+)?[A-Za-z_$][\w$]*(?:\s*(?:\?\.|!?\.)\s*[A-Za-z_$][\w$]*)*'
+    r'\s*(?:<[^<>()]*>\s*)?(?:\?\.\s*)?\('
+)
+chained_call_re = re.compile(r'\s*(?:\?\.|!?\.)\s*[A-Za-z_$][\w$]*\s*(?:<[^<>()]*>\s*)?(?:\?\.\s*)?\(')
+call_tail_re = re.compile(r'\s*!?\s*(?:(?:as|satisfies)\s+[\w$.<>\[\]|&, ]+)?')
+# An equality's left operand runs back to the statement start, so it can carry
+# `return`, `yield` or assignment heads (`const ok = result.type`).
+member_read_re = re.compile(
+    r'(?:(?:return|yield)\s+|(?:(?:const|let|var)\s+)?[A-Za-z_$][\w$]*\s*=\s*)*'
+    r'\(*\s*(?P<root>[A-Za-z_$][\w$]*)(?P<chain>(?:\s*(?:\?\.|!?\.)\s*[A-Za-z_$][\w$]*)+)\s*\)*'
+)
+
+
+def is_call_result(expr):
+    """Whether an assignment's value is exactly the return value of a call.
+
+    `await api.open(x)`, `new Client(x)`, `make(x).build()` and TypeScript
+    `... as T` qualify; member reads of a result (`login(x).accessToken`),
+    operators and anything else after the call do not.
+    """
+    match = call_head_re.match(expr)
+    if not match:
+        return False
+    position = match.end() - 1
+    while True:
+        depth, close = 0, -1
+        for index in range(position, len(expr)):
+            if expr[index] == '(':
+                depth += 1
+            elif expr[index] == ')':
+                depth -= 1
+                if depth == 0:
+                    close = index
+                    break
+        if close < 0:
+            return False
+        chained = chained_call_re.match(expr, close + 1)
+        if not chained:
+            return call_tail_re.fullmatch(expr, close + 1) is not None
+        position = chained.end() - 1
+
+
+def call_result_metadata_read(operand, call_results):
+    """`result.type` where `result` only ever holds a call's return value (GH #181, #185).
+
+    The call's arguments or callee name may name a secret
+    (`openAuthSessionAsync(authorization.authorize_url)`), which is why the
+    result is tracked at all, but a METADATA member of the returned object is
+    its public discriminant, not that secret. Aliases of a secret
+    (`result = authorization`) never qualify. A member whose own name carries
+    secret vocabulary (`result.authTokenId`) is still reported by name.
+    """
+    read = member_read_re.fullmatch(operand)
+    if not read or read.group('root') not in call_results:
+        return False
+    terms = identifier_terms(identifier_re.findall(read.group('chain'))[-1])
+    return bool(terms) and terms[-1] in METADATA_TERMS
+
+
+def collect_sensitive_bindings(lines, code_lines):
+    """Locals assigned secret material, and those that only hold call results.
+
+    Returns (sensitive_vars, call_results). A name lands in call_results when
+    every assignment that made it sensitive was exactly a call expression and
+    the name itself carries no secret vocabulary.
+    """
+    sensitive_vars, call_vars, alias_vars = set(), set(), set()
     # Carry unfinished tags over physical lines. Attribute names are DOM
     # properties, not assignments to JavaScript locals. Keep assignments inside
     # their {...} expressions eligible, including nested assignment expressions.
@@ -308,7 +352,7 @@ def collect_sensitive_vars(lines, code_lines):
         tag = open_jsx_tag(tag + ' ' + strip_string_literals(code))
     for idx, code in enumerate(code_lines):
         stripped = code.strip()
-        if not stripped or has_ignore(lines, code_lines, idx) or '=>' in stripped:
+        if not stripped or '=>' in stripped:
             continue
         statement = statement_from(code_lines, idx, max_lines=5)
         if not statement or safe_compare_re.search(statement):
@@ -323,9 +367,14 @@ def collect_sensitive_vars(lines, code_lines):
             expr = statement[match.end():].split(';', 1)[0]
             # String contents and JSX attribute names cannot taint locals;
             # real assignment expressions still propagate secret material.
-            if sensitive_families(name) or sensitive_families(expr):
+            named = bool(sensitive_families(name))
+            if named or sensitive_families(expr):
                 sensitive_vars.add(name)
-    return sensitive_vars
+                if not named and is_call_result(expr):
+                    call_vars.add(name)
+                else:
+                    alias_vars.add(name)
+    return sensitive_vars, frozenset(call_vars - alias_vars)
 
 
 def clean_operand_text(operand):
@@ -334,7 +383,9 @@ def clean_operand_text(operand):
     # Boolean boundaries are resolved before classifying a comparison (GH #135).
     # Truncating both operands at the first connective can replace the LEFT
     # operand with an unrelated earlier term, and also splits quoted text.
-    clean = re.split(r'\s*[;{]', clean, maxsplit=1)[0].strip()
+    boundary = next((match.start() for match in comparison_token_re.finditer(clean)
+                     if match.lastgroup == 'separator' and match.group() in ';{'), len(clean))
+    clean = clean[:boundary].strip()
     while clean and clean[-1] in ';{}){':
         clean = clean[:-1].strip()
     return clean
@@ -342,6 +393,11 @@ def clean_operand_text(operand):
 
 def operand_is_nullish_or_shape_check(operand):
     clean = clean_operand_text(operand)
+    # Only the complete unary identifier/member expression reveals a type.
+    # A compound expression such as typeof value + password still leaks a
+    # secret through equality and must keep the ordinary sensitivity checks.
+    if re.fullmatch(r'typeof\s+[A-Za-z_$][\w$]*(?:\s*(?:\?\.|\.)\s*[A-Za-z_$][\w$]*)*', clean):
+        return True
     if nullish_re.match(clean):
         return True
     if length_re.search(clean):
@@ -374,14 +430,14 @@ def comparison_operands(statement: str) -> Iterable[tuple[int, str, str]]:
         for previous, previous_level in reversed(tokens[:index]):
             kind = previous.lastgroup
             if (kind == 'separator'
-                    or (kind == 'boolean' and previous_level <= level)
+                    or (kind in {'boolean', 'conditional'} and previous_level <= level)
                     or (kind == 'open' and previous_level < level)):
                 start = previous.end()
                 break
         for following, following_level in tokens[index + 1:]:
             kind = following.lastgroup
             if (kind == 'separator'
-                    or (kind == 'boolean' and following_level <= level)
+                    or (kind in {'boolean', 'conditional'} and following_level <= level)
                     or (kind == 'close' and following_level <= level)):
                 end = following.start()
                 break
@@ -391,8 +447,9 @@ def comparison_operands(statement: str) -> Iterable[tuple[int, str, str]]:
             yield comparison.start(), left, right
 
 
-def unsafe_secret_compare(statement, sensitive_vars, *, comparison_start=0, comparison_limit=None):
-    if safe_compare_re.search(statement) or 'ubs:ignore' in statement:
+def unsafe_secret_compare(statement, sensitive_vars, *, call_results=frozenset(),
+                          comparison_start=0, comparison_limit=None):
+    if safe_compare_re.search(statement):
         return False
     # Match within each term, never across &&/||. An exempt comparison only
     # exempts that term; later terms may still compare actual secret values.
@@ -401,12 +458,17 @@ def unsafe_secret_compare(statement, sensitive_vars, *, comparison_start=0, comp
             continue
         if comparison_limit is not None and offset >= comparison_limit:
             continue
-        if unsafe_secret_operands(left, right, sensitive_vars):
+        if unsafe_secret_operands(left, right, sensitive_vars, call_results):
             return True
     return False
 
 
-def unsafe_secret_operands(left, right, sensitive_vars):
+def operand_tainted(operand, sensitive_vars, call_results=frozenset()):
+    return (bool(operand_identifiers(operand) & sensitive_vars)
+            and not call_result_metadata_read(operand, call_results))
+
+
+def unsafe_secret_operands(left, right, sensitive_vars, call_results=frozenset()):
     left = clean_operand_text(left)
     right = clean_operand_text(right)
     if operand_is_nullish_or_shape_check(left) or operand_is_nullish_or_shape_check(right):
@@ -414,8 +476,8 @@ def unsafe_secret_operands(left, right, sensitive_vars):
 
     left_fams = sensitive_families(left)
     right_fams = sensitive_families(right)
-    left_taint = bool(operand_identifiers(left) & sensitive_vars)
-    right_taint = bool(operand_identifiers(right) & sensitive_vars)
+    left_taint = operand_tainted(left, sensitive_vars, call_results)
+    right_taint = operand_tainted(right, sensitive_vars, call_results)
     left_sensitive = bool(left_fams) or left_taint
     right_sensitive = bool(right_fams) or right_taint
 
@@ -444,18 +506,19 @@ def scan_file(path: Path, sample_root: Path) -> list[tuple[str, int, str]]:
     if path.suffix.lower() not in exts:
         return issues
     try:
-        lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
+        text = path.read_text(encoding='utf-8', errors='ignore')
     except Exception:
         return issues
-    # Statement lookahead and ignore placement revisit each physical line.
-    # Keep its exact lexical view only for this file; raw comments remain
-    # available for suppressions, and no source survives into the next file.
+    lines = text.splitlines()
+    source_index = SourceSuppressions('javascript').index(path, text)
+    # Statement lookahead revisits each physical line. Keep its exact lexical
+    # view only for this file; the shared index owns suppression separately.
     code_lines = [code_line(raw) for raw in lines]
-    sensitive_vars = collect_sensitive_vars(lines, code_lines)
+    sensitive_vars, call_results = collect_sensitive_bindings(lines, code_lines)
     seen_lines = set()
     for idx, code in enumerate(code_lines):
         stripped = code.strip()
-        if not stripped or has_ignore(lines, code_lines, idx) or ('==' not in stripped and '!=' not in stripped):
+        if not stripped or ('==' not in stripped and '!=' not in stripped):
             continue
         prefix = ''
         if compare_re.match(stripped):
@@ -469,11 +532,11 @@ def scan_file(path: Path, sample_root: Path) -> list[tuple[str, int, str]]:
         # Lookahead completes a multiline operand, but a comparison on a later
         # physical line must be reported there, not on this line as well.
         if not statement or not unsafe_secret_compare(
-            statement, sensitive_vars, comparison_start=len(prefix),
-            comparison_limit=len(prefix) + len(stripped)
+            statement, sensitive_vars, call_results=call_results,
+            comparison_start=len(prefix), comparison_limit=len(prefix) + len(stripped)
         ):
             continue
-        if idx in seen_lines:
+        if idx in seen_lines or source_index.is_suppressed(idx + 1, _RULE):
             continue
         seen_lines.add(idx)
         try:
@@ -512,6 +575,7 @@ def main() -> int:
 
 
 _KIND = "unsafe_secret_compare"
+_RULE = f"javascript.ctcompare.{_KIND}"
 _MESSAGE = "Secret, signature, or token compared with ==/!= without timing-safe equality"
 
 
@@ -520,7 +584,7 @@ def run(ctx: RunContext) -> Iterable[dict]:
     for path in ctx.files:
         for rel, line, _sample in scan_file(path, cwd):
             yield {
-                "rule": f"javascript.ctcompare.{_KIND}",
+                "rule": _RULE,
                 "path": rel,
                 "line": line,
                 "col": 1,
@@ -545,10 +609,9 @@ export function doneTokenCheck(doneAuthToken: string, expectedAuthToken: string)
 
 
 def _selftest_positive() -> None:
-    statement = "return sessionNonce === expectedNonce;"
-    assert unsafe_secret_compare(statement, collect_sensitive_vars([statement], [code_line(statement)])), statement
-    statement = "if (doneAuthToken !== expectedAuthToken) {"
-    assert unsafe_secret_compare(statement, collect_sensitive_vars([statement], [code_line(statement)])), statement
+    for statement in ("return sessionNonce === expectedNonce;", "if (doneAuthToken !== expectedAuthToken) {"):
+        sensitive_vars, call_results = collect_sensitive_bindings([statement], [code_line(statement)])
+        assert unsafe_secret_compare(statement, sensitive_vars, call_results=call_results), statement
 
 
 def _selftest_suppression() -> None:
@@ -743,7 +806,37 @@ if (expectedSignature !== actualSignature &&
         assert [f["line"] for f in findings] == [2, 4, 7], (operator, findings)
 
 
+def _selftest_literal_and_conditional_operands() -> None:
+    # A quoted route segment does not read the unrelated secret-bearing local.
+    for quote in ('"', "'"):
+        statement = f'url.pathname === {quote}/api/org/link{quote}'
+        assert not unsafe_secret_compare(statement, {'org', 'link'}), statement
+    assert unsafe_secret_compare('alias === supplied', {'alias'})
+    assert unsafe_secret_compare('`${alias}` === supplied', {'alias'})
+    # Secret-bearing work in another conditional arm is not an operand.
+    for statement in (
+        'cookie !== null ? verifyToken(secret, cookie) : null',
+        'session.org === undefined ? publicValue : secret',
+        'typeof claims.nonce !== "string"',
+    ):
+        assert not unsafe_secret_compare(statement, {'session', 'claims'}), statement
+    # Neither conditional arm, nested expressions nor optional/nullish access
+    # may hide a real comparison. The original unsafe cases remain findings.
+    for statement in (
+        'ready ? expectedSignature === supplied : false',
+        'ready ? false : expectedSignature === supplied',
+        'expectedSignature === (ready ? actualSignature : backupSignature)',
+        '(expectedSignature ?? backupSignature) === supplied',
+        'ctx?.expectedSignature === supplied',
+        'typeof claims.nonce !== "string" || expectedSignature !== supplied',
+        'typeof value + password === supplied',
+        'typeof value + ":" + authToken === supplied',
+    ):
+        assert unsafe_secret_compare(statement, {'claims'}), statement
+
+
 SELF_TESTS: tuple[tuple[str, callable], ...] = (
+    ("literal_and_conditional_operands", _selftest_literal_and_conditional_operands),
     ("positive_detects_secret_compare", _selftest_positive),
     ("ubs_ignore_suppresses", _selftest_suppression),
     ("timing_safe_equal_negative", _selftest_safe_compare_negative),

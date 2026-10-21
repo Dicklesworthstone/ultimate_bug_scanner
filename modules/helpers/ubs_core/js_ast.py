@@ -5,9 +5,8 @@ Runs the grammar and custom-policy sgconfigs produced by `ubs_core.js_rules.gene
 parses the stream once, and appends normalized records to the same NDJSON
 findings sink the pattern layer uses.
 
-Suppression: flat same-line + previous-line `ubs:ignore` checks (the legacy
-emit_ast_rule_group semantics, ubs-js.sh 572-577); the A7 statement-interval
-engine in the meta-runner postprocess layers the richer placements on top.
+Suppression: invocation-local source indexes apply the shared lexical and
+statement-interval policy to the exact diagnostic rule before counting.
 
 Counting: when `count_only` is provided, only those rule ids are counted and
 emitted — legacy counts just the mapped emit_ast_rule_group ids and dumps
@@ -20,13 +19,12 @@ count exceeds its removeEventListener count.
 from __future__ import annotations
 
 import json
-import io
 import os
 from pathlib import Path
 from typing import Sequence
 
-from ubs_core.js_scan import MARKER
-from ubs_core.external_tools import run_command
+from ubs_core.external_tools import iter_output_lines, report_ast_stderr, run_command_stream
+from ubs_core.suppression import SourceSuppressions
 
 _ASTGREP_BIN = "ast-grep"
 
@@ -64,6 +62,15 @@ def _validated_match(line: str) -> dict:
         value = start.get(field)
         if type(value) is not int or value < 0:
             raise ValueError(f"invalid location {field}")
+    if "end" in location:
+        end = location["end"]
+        if not isinstance(end, dict) or any(
+            type(end.get(field)) is not int or end[field] < 0
+            for field in ("line", "column")
+        ):
+            raise ValueError("invalid end location")
+        if (end["line"], end["column"]) < (start["line"], start["column"]):
+            raise ValueError("reversed diagnostic range")
     severity = match.get("severity")
     if severity not in ("critical", "error", "warning", "info", "hint", "off"):
         raise ValueError("invalid diagnostic severity")
@@ -76,25 +83,23 @@ def _validated_match(line: str) -> dict:
     return match
 
 
-def _file_lines(path: Path, cache: dict[Path, list[str]]) -> list[str]:
+def _file_lines(path: Path, cache: dict[Path, list[str]],
+                suppressions: SourceSuppressions) -> list[str]:
     if path not in cache:
         try:
-            cache[path] = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
-            cache[path] = []
+            text = ""
+        cache[path] = text.splitlines()
+        suppressions.index(path, text)
     return cache[path]
 
 
-def _has_marker(path: Path, line_no: int, cache: dict[Path, list[str]]) -> bool:
-    lines = _file_lines(path, cache)
-    idx = line_no - 1
-    return any(0 <= i < len(lines) and MARKER in lines[i].lower() for i in (idx, idx - 1))
-
-
-def _listener_imbalance(path: Path, cache: dict[Path, list[str]]) -> bool:
+def _listener_imbalance(path: Path, cache: dict[Path, list[str]],
+                        suppressions: SourceSuppressions) -> bool:
     """Legacy rg-delta (ubs-js.sh 670-710): addEventListener count must exceed
     removeEventListener count in the same file for the finding to fire."""
-    lines = _file_lines(path, cache)
+    lines = _file_lines(path, cache, suppressions)
     adds = sum(line.count("addEventListener") for line in lines)
     removes = sum(line.count("removeEventListener") for line in lines)
     return adds > removes
@@ -124,81 +129,90 @@ def scan_config(
         return counters
     if not config.is_file():
         problems.append(f"ast-grep: missing or nonregular config {config}")
+        if errors is None:
+            raise RuntimeError("; ".join(problems))
         return counters
     cache: dict[Path, list[str]] = {}
+    suppressions = SourceSuppressions("javascript")
     for start in range(0, len(path_list), _BATCH):
         batch = [str(p) for p in path_list[start : start + _BATCH]]
-        proc = run_command(
+        with run_command_stream(
             f"ast-grep ({config.name})",
             [os.environ.get("UBS_AST_GREP_BIN") or ast_grep_bin,
-             "scan", "-c", str(config), "--json=stream", *batch],
-            Path.cwd(), _TIMEOUT, problems, strict_utf8=True,
-        )
-        if proc is None:
-            continue
-        # ast-grep exits 0 with no error-level diagnostics and 1 when it found
-        # some; anything else is a failed invocation, which used to degrade to
-        # zero AST findings.
-        if proc.returncode not in (0, 1):
-            detail = (proc.stderr or "").strip().splitlines()
-            problems.append(
-                f"ast-grep exited {proc.returncode} on {config.name}"
-                + (f": {detail[0][:160]}" if detail else "")
-            )
-        invalid = valid = 0
-        first_problem = ""
-        for record_no, line in enumerate(io.StringIO(proc.stdout), 1):
-            line = line.strip()
-            if not line:
+             "scan", "-c", str(config), "--json=stream", "--", *batch],
+            Path.cwd(), _TIMEOUT, problems,
+        ) as proc:
+            if proc is None:
                 continue
-            try:
-                match = _validated_match(line)
-            except (ValueError, UnicodeError, RecursionError) as exc:
-                invalid += 1
-                if not first_problem:
-                    first_problem = f"record {record_no}: {str(exc)[:160]}"
-                continue
-            valid += 1
-            rule_id = str(match.get("ruleId", "") or match.get("rule_id", ""))
-            file_str = str(match.get("file", "") or match.get("path", ""))
-            if not rule_id or not file_str:
-                continue
-            if count_only is not None and rule_id not in count_only:
-                continue  # informational dump in legacy — not counted
-            if skip_categories:
-                family = rule_id.rsplit(".", 1)[0]
-                category = _FAMILY_CATEGORY.get(family)
-                if category is not None and category in skip_categories:
-                    continue  # --skip: the category is disabled
-            rng = match.get("range", {}).get("start", {})
-            path = Path(file_str)
-            line_no = int(rng.get("line", 0)) + 1  # ast-grep rows are 0-based
-            severity = (severity_overrides or {}).get(rule_id) or str(match.get("severity", "warning"))
-            severity = {"error": "critical", "hint": "info"}.get(severity, severity)
-            if severity == "off":
-                continue
-            if severity not in counters:
-                severity = "warning"
-            if lang != "custom" and rule_id == "js.resource.listener-no-remove" and not _listener_imbalance(path, cache):
-                continue  # legacy rg-delta: adds <= removes means balanced
-            if _has_marker(path, line_no, cache):
-                continue  # legacy line + previous-line marker check
-            counters[severity] = counters.get(severity, 0) + 1
-            message = str(match.get("message", "")).strip() or str(match.get("text", ""))[:240]
-            sink.write(json.dumps({
-                "rule": rule_id,
-                "category_id": rule_id.rsplit(".", 1)[0] if "." in rule_id else rule_id,
-                "path": file_str,
-                "line": line_no,
-                "col": int(rng.get("column", 0)) + 1,
-                "severity": severity,
-                "message": message[:240],
-                "suppressed": False,
-            }, ensure_ascii=False) + "\n")
-        if invalid:
-            problems.append(f"ast-grep ({config.name}): {invalid} malformed diagnostic(s); {first_problem}")
-        if proc.returncode == 1 and not valid:
-            problems.append(f"ast-grep ({config.name}): findings exit without valid diagnostics")
+            report_ast_stderr(proc, problems, context=f"ast-grep ({config.name})")
+            # ast-grep exits 0 with no error-level diagnostics and 1 when it found
+            # some; anything else is a failed invocation, which used to degrade to
+            # zero AST findings.
+            if proc.returncode not in (0, 1):
+                detail = (proc.stderr or "").strip().splitlines()
+                problems.append(
+                    f"ast-grep exited {proc.returncode} on {config.name}"
+                    + (f": {detail[0][:160]}" if detail else "")
+                )
+            invalid = valid = 0
+            first_problem = ""
+            failure_index = None
+            for record_no, line in iter_output_lines(proc.stdout, problems, context=f"ast-grep ({config.name})"):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    match = _validated_match(line)
+                except (ValueError, UnicodeError, RecursionError) as exc:
+                    invalid += 1
+                    if not first_problem:
+                        first_problem = f"record {record_no}: {str(exc)[:160]}"
+                    if failure_index is None:
+                        failure_index = len(problems)
+                        problems.append("")
+                    problems[failure_index] = f"ast-grep ({config.name}): {invalid} malformed diagnostic(s); {first_problem}"
+                    continue
+                valid += 1
+                rule_id = str(match.get("ruleId", "") or match.get("rule_id", ""))
+                file_str = str(match.get("file", "") or match.get("path", ""))
+                if not rule_id or not file_str:
+                    continue
+                if count_only is not None and rule_id not in count_only:
+                    continue  # informational dump in legacy — not counted
+                if skip_categories:
+                    family = rule_id.rsplit(".", 1)[0]
+                    category = _FAMILY_CATEGORY.get(family)
+                    if category is not None and category in skip_categories:
+                        continue  # --skip: the category is disabled
+                rng = match.get("range", {}).get("start", {})
+                path = Path(file_str)
+                line_no = int(rng.get("line", 0)) + 1  # ast-grep rows are 0-based
+                severity = (severity_overrides or {}).get(rule_id) or str(match.get("severity", "warning"))
+                severity = {"error": "critical", "hint": "info"}.get(severity, severity)
+                if severity == "off":
+                    continue
+                if severity not in counters:
+                    severity = "warning"
+                if lang != "custom" and rule_id == "js.resource.listener-no-remove" and not _listener_imbalance(path, cache, suppressions):
+                    continue  # legacy rg-delta: adds <= removes means balanced
+                if suppressions.is_suppressed(path, line_no, rule_id):
+                    continue
+                counters[severity] = counters.get(severity, 0) + 1
+                message = str(match.get("message", "")).strip() or str(match.get("text", ""))[:240]
+                sink.write(json.dumps({
+                    "rule": rule_id,
+                    "category_id": rule_id.rsplit(".", 1)[0] if "." in rule_id else rule_id,
+                    "path": file_str,
+                    "line": line_no,
+                    "col": int(rng.get("column", 0)) + 1,
+                    "severity": severity,
+                    "message": message[:240],
+                    "suppressed": False,
+                }, ensure_ascii=False) + "\n")
+            if proc.returncode == 1 and not valid:
+                problems.append(f"ast-grep ({config.name}): findings exit without valid diagnostics")
+    if errors is None and problems:
+        raise RuntimeError("; ".join(problems))
     return counters
 
 
@@ -221,18 +235,21 @@ def scan_all(
     ``errors`` collects any scan that could not complete, so the caller can
     report a partial run rather than a clean one (#111)."""
     total = {"critical": 0, "warning": 0, "info": 0}
+    problems = errors if errors is not None else []
     configs = sorted(rule_dir.glob("sgconfig-*.yml"))
-    if paths and errors is not None:
+    if paths:
         for grammar in ("javascript", "typescript", "tsx"):
             expected = rule_dir / f"sgconfig-{grammar}.yml"
             if not expected.is_file():
-                errors.append(f"ast-grep: missing or nonregular config {expected}")
+                problems.append(f"ast-grep: missing or nonregular config {expected}")
     for config in configs:
         lang = config.stem.removeprefix("sgconfig-")
         custom = lang == "custom"
         counters = scan_config(config, paths, sink, lang,
                                None if custom else severity_overrides, ast_grep_bin,
-                               None if custom else count_only, skip_categories, errors)
+                               None if custom else count_only, skip_categories, problems)
         for key, value in counters.items():
             total[key] = total.get(key, 0) + value
+    if errors is None and problems:
+        raise RuntimeError("; ".join(problems))
     return total

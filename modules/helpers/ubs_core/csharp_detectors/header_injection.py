@@ -5,7 +5,8 @@ heredoc (2089-2372): same request-source / annotated-param / safe-helper /
 CRLF-block / header-sink regexes, bracket-balanced statement joiner, sink-start
 gate on the raw line plus sink-name match on the joined statement, and the
 18-line CR/LF reject context. The NUL-filelist loader is replaced by iteration
-over ``files``; per-file match logic is unchanged.
+over ``files``. Source-owned directives filter exact-rule findings after
+request and alias facts have been collected.
 
 Legacy emission: critical "Request-controlled value reaches HTTP response
 header".
@@ -16,8 +17,8 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.suppression import SourceSuppressions
 from ubs_core.csharp_detectors._common import (
-    has_ignore,
     logical_statement_brackets,
     relpath,
     source_line,
@@ -182,12 +183,11 @@ def analyze(path: Path, base_dir: Path, issues):
         return
     if not ((SOURCE_RE.search(text) or ANNOTATED_PARAM_RE.search(text)) and HEADER_START_RE.search(text)):
         return
+    suppression = SourceSuppressions('csharp').index(path, text)
     lines = text.splitlines()
     tainted = annotated_sources(text)
     seen = set()
     for idx, _ in enumerate(lines, start=1):
-        if has_ignore(lines, idx):
-            continue
         current_line = strip_line_comments(lines[idx - 1]).strip()
         statement = logical_statement_brackets(lines, idx).strip()
         if not statement:
@@ -218,6 +218,8 @@ def analyze(path: Path, base_dir: Path, issues):
         if not direct and not refs:
             continue
         if has_crlf_reject_context(lines, idx, refs):
+            continue
+        if suppression.is_suppressed(idx, RULE_ID):
             continue
         key = (relpath(path, base_dir), idx)
         if key in seen:

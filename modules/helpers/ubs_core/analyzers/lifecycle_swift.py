@@ -24,6 +24,9 @@ from ubs_core.analyzers.taint_swift_traversal import (
 SKIP_DIRS = {".git", ".hg", ".svn", "build", "DerivedData", ".swiftpm", ".idea", "node_modules"}
 
 IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
+ACQUISITION_NAMES = {'scheduledTimer', 'publish', 'dataTask', 'uploadTask', 'downloadTask',
+                     'addObserver', 'sink', 'makeTimerSource', 'makeFileSystemObjectSource',
+                     'makeReadSource', 'makeWriteSource', 'CADisplayLink'}
 
 ASSIGNED_RULES: tuple[tuple[str, str, re.Pattern[str], tuple[re.Pattern[str], ...]], ...] = (
     (
@@ -650,7 +653,9 @@ class LifecycleEngine:
                     next_paths.append((state, names, deferred, kind))
                     continue
                 if kind in {'unsupported', 'closure'}:
-                    if state.active or any(pattern.search(self.text) for _, _, pattern, _ in ASSIGNED_RULES):
+                    if (state.active or any(pattern.search(self.text) for _, _, pattern, _ in ASSIGNED_RULES)
+                            or any(token.kind == 'code' and token.value in ACQUISITION_NAMES
+                                   for token in statement.tokens)):
                         raise ValueError('Unsupported Swift lifecycle control flow; analysis is incomplete')
                 else:
                     exceptions = []
@@ -724,10 +729,7 @@ def scan_text(path: Path, text: str, base: Path) -> list[tuple[str, str, str, in
     # Owning FileHandle URL/path initializers close their descriptor in deinit.
     # A borrowed raw descriptor needs origin/ownership analysis, not a blanket
     # missing-explicit-close warning on the wrapper object.
-    acquisition_names = {'scheduledTimer', 'publish', 'dataTask', 'uploadTask', 'downloadTask',
-                         'addObserver', 'sink', 'makeTimerSource',
-                         'makeFileSystemObjectSource', 'makeReadSource', 'makeWriteSource', 'CADisplayLink'}
-    if any(token.kind == 'code' and token.value in acquisition_names for token in tokens):
+    if any(token.kind == 'code' and token.value in ACQUISITION_NAMES for token in tokens):
         for position, kind, message, name in LifecycleEngine(text).analyze():
             emit(position, kind, f"{message} ({name})")
 

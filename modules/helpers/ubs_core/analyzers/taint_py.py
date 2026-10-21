@@ -58,6 +58,7 @@ SOURCE_PATTERNS = [
     re.compile(r"event\['body'\]", re.IGNORECASE),
     re.compile(r"params\[[^\]]+\]", re.IGNORECASE),
 ]
+_SOURCE_FAST_RE = re.compile('|'.join(f'(?:{p.pattern})' for p in SOURCE_PATTERNS), re.IGNORECASE)
 
 SANITIZERS = {
     'html.escape': 'xss', 'django.utils.html.escape': 'xss',
@@ -102,6 +103,10 @@ _ROUTER_TYPES = {'fastapi.FastAPI', 'fastapi.APIRouter', 'fastapi.applications.F
 _ROUTE_METHODS = {'get', 'post', 'put', 'patch', 'delete', 'options', 'head', 'trace', 'api_route'}
 _REQUEST_MEMBERS = {'args', 'get_json', 'json', 'form', 'values', 'data', 'body', 'GET', 'POST',
                     'query_params', 'path_params', 'headers', 'cookies', 'COOKIES', 'META'}
+_ALL_FRAMEWORK_NAMES = frozenset(
+    _PARAMETER_MARKERS | _DEPENDENCY_MARKERS | _ROUTER_TYPES | _REQUEST_TYPES | _SERVICE_TYPES
+)
+_FASTAPI_ROUTE_DECORATORS = frozenset(f'@fastapi.router.{method}' for method in _ROUTE_METHODS)
 
 
 @dataclass(frozen=True)
@@ -193,6 +198,13 @@ class TaintTrace:
     # Evidence is not part of the lattice. Growing a recursive provenance
     # path cannot keep a semantically stable fixpoint running indefinitely.
     path: tuple[str, ...] = field(default=(), compare=False)
+    _hash: int = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, '_hash', hash((self.source, self.parameter, self.sanitizers)))
+
+    def __hash__(self) -> int:
+        return self._hash
 
 
 Fact = frozenset[TaintTrace]
@@ -300,15 +312,18 @@ _IMPLICIT_IDENTITIES = frozenset({
     'sys', 'request', 'cursor', 'session', 'conn', 'engine', 'db',
     'render_template', 'render_template_string', 'HttpResponse', 'Response',
 })
+_IMPLICIT_IDENTITY_MAP = {
+    **{
+        name: 'builtins.' + name
+        for name, value in vars(builtins).items()
+        if isinstance(value, type) and issubclass(value, BaseException)
+    },
+    **{name: name for name in _IMPLICIT_IDENTITIES},
+}
 
 
 def _implicit_identity(name):
-    if name in _IMPLICIT_IDENTITIES:
-        return name
-    value = getattr(builtins, name, None)
-    if isinstance(value, type) and issubclass(value, BaseException):
-        return 'builtins.' + name
-    return None
+    return _IMPLICIT_IDENTITY_MAP.get(name)
 
 
 def _binding_choices(binding):
@@ -316,11 +331,33 @@ def _binding_choices(binding):
 
 
 def _join_bindings(*bindings):
-    if bindings and all(binding is bindings[0] for binding in bindings):
+    n = len(bindings)
+    if n == 1:
         only = bindings[0]
-        if not isinstance(only, frozenset):
+        if type(only) is not frozenset:  # ubs:ignore[py.comparison.type-equality,py.type-equality]
             return only
         return next(iter(only)) if len(only) == 1 else only
+    if n == 2:
+        a, b = bindings
+        if a is b:
+            if type(a) is not frozenset:  # ubs:ignore[py.comparison.type-equality,py.type-equality]
+                return a
+            return next(iter(a)) if len(a) == 1 else a
+        ca = a if isinstance(a, frozenset) else frozenset({a})
+        cb = b if isinstance(b, frozenset) else frozenset({b})
+        choices = ca | cb
+        return next(iter(choices)) if len(choices) == 1 else choices
+    if bindings:
+        first = bindings[0]
+        same = True
+        for b in bindings[1:]:
+            if b is not first:
+                same = False
+                break
+        if same:
+            if type(first) is not frozenset:  # ubs:ignore[py.comparison.type-equality,py.type-equality]
+                return first
+            return next(iter(first)) if len(first) == 1 else first
     choices = frozenset().union(*(_binding_choices(binding) for binding in bindings))
     if len(choices) == 1:
         return next(iter(choices))
@@ -332,6 +369,9 @@ def _without_object_contract(binding):
                             for value in _binding_choices(binding)))
 
 
+_QUALIFIER_WIDTH = max(4, *(candidate.count('.') + 1 for candidate in SANITIZERS))
+
+
 def _extend_qualifier(base: str, attribute: str) -> str:
     """Keep name identities finite without dropping value or receiver facts.
 
@@ -340,10 +380,9 @@ def _extend_qualifier(base: str, attribute: str) -> str:
     prevents long unknown paths from acquiring an exact sanitizer identity.
     """
     name = f'{base}.{attribute}'
-    components = name.split('.')
-    width = max(4, *(candidate.count('.') + 1 for candidate in SANITIZERS))
-    if len(components) <= width:
+    if name.count('.') < _QUALIFIER_WIDTH:
         return name
+    components = name.split('.')
     return '.'.join((components[0], '<unknown>', *components[-3:]))
 
 
@@ -375,17 +414,45 @@ def _expanded_call(node):
 
 def join_facts(*facts: Fact) -> Fact:
     """Finite powerset join, retaining deterministic shortest evidence."""
-    present = [fact for fact in facts if fact]
-    if not present:
+    n = len(facts)
+    if n == 0:
         return CLEAN
-    head = present[0]
+    if n == 1:
+        only = facts[0]
+        if not only:
+            return CLEAN
+        if type(only) is frozenset:  # ubs:ignore[py.comparison.type-equality,py.type-equality]
+            return only
+    elif n == 2:
+        a, b = facts
+        if not a:
+            if not b:
+                return CLEAN
+            if type(b) is frozenset:  # ubs:ignore[py.comparison.type-equality,py.type-equality]
+                return b
+        elif (not b or a is b) and type(a) is frozenset:  # ubs:ignore[py.comparison.type-equality,py.type-equality]
+            return a
+    head = None
+    same = True
+    for fact in facts:
+        if not fact:
+            continue
+        if head is None:
+            head = fact
+        elif fact is not head:
+            same = False
+            break
+    if head is None:
+        return CLEAN
     # A lone fact, or one fact object joined with itself, is its own join:
     # its traces are already distinct. Returning it keeps object identity,
     # which lets repeated state joins take the identity fast path below.
-    if type(head) is frozenset and all(fact is head for fact in present):  # ubs:ignore[py.comparison.type-equality,py.type-equality] - exact type on purpose: only a plain frozenset is known immutable with stock hashing/equality.
+    if same and type(head) is frozenset:  # ubs:ignore[py.comparison.type-equality,py.type-equality] - exact type on purpose: only a plain frozenset is known immutable with stock hashing/equality.
         return head
     traces: dict[TaintTrace, TaintTrace] = {}
     for fact in facts:
+        if not fact:
+            continue
         for trace in fact:
             previous = traces.get(trace)
             if previous is None or (len(trace.path), trace.path) < (len(previous.path), previous.path):
@@ -394,6 +461,8 @@ def join_facts(*facts: Fact) -> Fact:
 
 
 def _advance(fact: Fact, *steps: str) -> Fact:
+    if not fact or not steps:
+        return fact
     traces = []
     for trace in fact:
         path = list(trace.path)
@@ -535,11 +604,28 @@ class _State(dict):
         self.reachable = getattr(values, 'reachable', True)
 
     def value(self, name):
-        return join_facts(self.get(name, CLEAN), *(self.heap.get(ref, CLEAN)
-                          for ref in self.references.get(name, NO_REFERENCES)))
+        base = self.get(name, CLEAN)
+        heap = self.heap
+        if not heap:
+            return base
+        refs = self.references.get(name)
+        if not refs:
+            return base
+        if len(refs) == 1:
+            (ref,) = refs
+            hfact = heap.get(ref)
+            return join_facts(base, hfact) if hfact else base
+        return join_facts(base, *(heap[ref] for ref in refs if ref in heap))
 
     def copy(self):
-        return _State(self)
+        clone = _State.__new__(_State)
+        dict.__init__(clone, self)
+        clone.bindings = self.bindings.copy()
+        clone.references = self.references.copy()
+        clone.heap = self.heap.copy()
+        clone.mutated = self.mutated.copy()
+        clone.reachable = self.reachable
+        return clone
 
     def replace(self, other):
         if other is None:
@@ -547,10 +633,10 @@ class _State(dict):
             return
         self.clear()
         self.update(other)
-        self.bindings = dict(other.bindings)
-        self.references = dict(other.references)
-        self.heap = dict(other.heap)
-        self.mutated = set(other.mutated)
+        self.bindings = other.bindings.copy()
+        self.references = other.references.copy()
+        self.heap = other.heap.copy()
+        self.mutated = other.mutated.copy()
         self.reachable = other.reachable
 
     def __eq__(self, other):
@@ -571,51 +657,73 @@ def _join_states(*states):
     # state; an entry that is the very same object on both sides (the common
     # case: most expressions change few names) is skipped without a join.
     first, others = reachable[0], reachable[1:]
-    values = dict(first)
-    heap = dict(first.heap)
-    references = {key: frozenset(refs) for key, refs in first.references.items()}
+    if not others:
+        clone = first.copy()
+        for name, binding in clone.bindings.items():
+            if type(binding) is frozenset and len(binding) == 1:  # ubs:ignore[py.comparison.type-equality,py.type-equality]
+                clone.bindings[name] = next(iter(binding))
+        return clone
+    values = first.copy()
+    heap = values.heap
+    references = values.references
     for other in others:
-        for target, source in ((values, other), (heap, other.heap)):
-            for key, fact in source.items():
-                previous = target.get(key, _MISSING)
+        for key, fact in other.items():
+            previous = values.get(key, _MISSING)
+            if previous is _MISSING:
+                values[key] = fact
+            elif previous is not fact:
+                values[key] = join_facts(previous, fact)
+        if other.heap:
+            for key, fact in other.heap.items():
+                previous = heap.get(key, _MISSING)
                 if previous is _MISSING:
-                    target[key] = fact
+                    heap[key] = fact
                 elif previous is not fact:
-                    target[key] = join_facts(previous, fact)
+                    heap[key] = join_facts(previous, fact)
         for key, refs in other.references.items():
             previous = references.get(key, _MISSING)
             if previous is _MISSING:
-                references[key] = frozenset(refs)
+                references[key] = frozenset(refs) if type(refs) is not frozenset else refs  # ubs:ignore[py.comparison.type-equality,py.type-equality]
             elif previous is not refs:
                 references[key] = previous | refs
+        if other.mutated:
+            values.mutated.update(other.mutated)
     # A missing binding is not neutral: it stands for the name's implicit
     # identity, so bindings are joined over the full key union as before.
-    bindings = {}
     if len(others) == 1:
+        bindings = values.bindings
+        first_len = len(bindings)
         second = others[0].bindings
-        for name, binding in first.bindings.items():
-            other = second.get(name, _MISSING)
-            if other is binding and not isinstance(binding, frozenset):
-                bindings[name] = binding
-            else:
-                bindings[name] = _join_bindings(
-                    binding, _implicit_identity(name) if other is _MISSING else other)
+        matched = 0
         for name, other in second.items():
-            if name not in bindings:
+            binding = bindings.get(name, _MISSING)
+            if binding is _MISSING:
                 bindings[name] = _join_bindings(_implicit_identity(name), other)
-    elif others:
+            elif binding is other:
+                matched += 1
+                if type(binding) is frozenset and len(binding) == 1:  # ubs:ignore[py.comparison.type-equality,py.type-equality]
+                    bindings[name] = next(iter(binding))
+            else:
+                matched += 1
+                bindings[name] = _join_bindings(binding, other)
+        if matched != first_len:
+            for name, binding in list(bindings.items()):
+                if name not in second:
+                    bindings[name] = _join_bindings(binding, _implicit_identity(name))
+    else:
+        bindings = {}
         for name in set(first.bindings).union(*(state.bindings for state in others)):
             bindings[name] = _join_bindings(*(
                 state.bindings[name] if name in state.bindings else _implicit_identity(name)
                 for state in reachable))
-    else:
-        for name, binding in first.bindings.items():
-            bindings[name] = _join_bindings(binding)
-    joined = _State(values, bindings)
-    joined.references = references
-    joined.heap = heap
-    joined.mutated = set(first.mutated).union(*(state.mutated for state in others))
-    return joined
+        values.bindings = bindings
+    return values
+
+
+def _same_dict_identity(prev_d, cur_d):
+    return (len(prev_d) == len(cur_d)
+            and all(map(operator.is_, prev_d.values(), cur_d.values()))
+            and all(map(operator.eq, prev_d, cur_d)))
 
 
 def _identity_snapshot(state):
@@ -710,6 +818,57 @@ def _local_names(scope, nodes=None) -> set[str]:
         for node in nodes:
             if isinstance(node, (ast.Global, ast.Nonlocal)):
                 names.difference_update(node.names)
+    return names
+
+
+def _used_names(scope, scope_nodes=None) -> set[str]:
+    names = set()
+    if scope_nodes is None:
+        scope_nodes = list(_scope_nodes(scope))
+    nodes = list(scope_nodes)
+    idx = 0
+    while idx < len(nodes):
+        node = nodes[idx]
+        idx += 1
+        if isinstance(node, ast.Name):
+            names.add(node.id)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            names.update(node.names)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            names.add(node.name)
+            for child in (*node.decorator_list, *node.args.defaults,
+                          *(d for d in node.args.kw_defaults if d is not None)):
+                nodes.extend(ast.walk(child))
+            for arg in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs,
+                        *(a for a in (node.args.vararg, node.args.kwarg) if a is not None)):
+                if arg.annotation is not None:
+                    nodes.extend(ast.walk(arg.annotation))
+            if node.returns is not None:
+                nodes.extend(ast.walk(node.returns))
+        elif isinstance(node, ast.Lambda):
+            for child in (*node.args.defaults, *(d for d in node.args.kw_defaults if d is not None)):
+                nodes.extend(ast.walk(child))
+        elif isinstance(node, ast.ClassDef):
+            names.add(node.name)
+            for child in ast.iter_child_nodes(node):
+                nodes.extend(ast.walk(child))
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            names.add(node.name)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            names.update(alias.asname or alias.name.split('.')[0] for alias in node.names)
+        elif (capture := _pattern_capture(node)) is not None:
+            names.add(capture)
+    if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        args = scope.args
+        for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs,
+                    *(a for a in (args.vararg, args.kwarg) if a is not None)):
+            names.add(arg.arg)
+            if arg.annotation is not None:
+                for sub in ast.walk(arg.annotation):
+                    if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                        names.update(re.findall(r'[A-Za-z_]\w*', sub.value))
+                    elif isinstance(sub, ast.Name):
+                        names.add(sub.id)
     return names
 
 
@@ -838,6 +997,7 @@ class _Flow:
         # element/effect; this is a precision budget, not a scan cutoff.
         self.comprehension_budget = 64
         self.comprehension_environments = []
+        self.context_globals = ()
 
     def refine_url_guard(self, test, state, truth):
         """Recognize an exact, terminating local URL allow-list predicate.
@@ -925,51 +1085,68 @@ class _Flow:
         # those objects, including their evidence, independently of mutation
         # of the live input state.
         accumulated = self.exception_states[-1]
-        snapshot = _identity_snapshot(state)
         previous = getattr(accumulated, 'last_joined', None)
-        if previous is not None and _same_snapshot(previous, snapshot):
-            return
         if previous is None:
             joined = _join_states(accumulated, state)
-        else:
-            # This collector is owned exclusively by its active capture; it
-            # is exposed as a completion only after being popped. Its state
-            # already includes every entry in the previous input, so unchanged
-            # entries add nothing. Merge the delta in place instead of copying
-            # and re-joining the complete namespace at every raising expression.
-            joined = accumulated
-            for target, source, index in ((joined, state, 0), (joined.heap, state.heap, 6)):
-                if (previous[index] == snapshot[index]
-                        # _identity_snapshot returns nine entries and index is 0 or 6 — ubs:ignore[py.collections.index-arithmetic]
-                        and all(map(operator.is_, previous[index + 1], snapshot[index + 1]))):
+            joined.last_joined = (
+                dict(state),
+                state.bindings.copy(),
+                state.references.copy(),
+                state.heap.copy(),
+                frozenset(state.mutated),
+            )
+            self.exception_states[-1] = joined
+            return
+        prev_vals, prev_bindings, prev_refs, prev_heap, prev_mutated = previous
+        same_vals = _same_dict_identity(prev_vals, state)
+        same_bindings = _same_dict_identity(prev_bindings, state.bindings)
+        same_refs = _same_dict_identity(prev_refs, state.references)
+        same_heap = _same_dict_identity(prev_heap, state.heap)
+        same_mutated = (len(prev_mutated) == len(state.mutated) and prev_mutated == state.mutated)
+        if same_vals and same_bindings and same_refs and same_heap and same_mutated:
+            return
+        # This collector is owned exclusively by its active capture; it
+        # is exposed as a completion only after being popped. Its state
+        # already includes every entry in the previous input, so unchanged
+        # entries add nothing. Merge the delta in place instead of copying
+        # and re-joining the complete namespace at every raising expression.
+        joined = accumulated
+        if not same_vals:
+            for name, fact in state.items():
+                if prev_vals.get(name, _MISSING) is fact:
                     continue
-                # same nine-entry snapshot, index is 0 or 6 — ubs:ignore[py.collections.index-arithmetic]
-                before = dict(zip(previous[index], previous[index + 1]))
-                for name, fact in source.items():
-                    if before.get(name, _MISSING) is fact:
-                        continue
-                    joined_fact = target.get(name, _MISSING)
-                    target[name] = fact if joined_fact is _MISSING else join_facts(joined_fact, fact)
-            if not (previous[4] == snapshot[4]
-                    and all(map(operator.is_, previous[5], snapshot[5]))):
-                before = dict(zip(previous[4], previous[5]))
-                for name, refs in state.references.items():
-                    if before.get(name, _MISSING) is not refs:
-                        joined.references[name] = joined.references.get(name, NO_REFERENCES) | refs
-            if not (previous[2] == snapshot[2]
-                    and all(map(operator.is_, previous[3], snapshot[3]))):
-                before = dict(zip(previous[2], previous[3]))
-                for name, binding in state.bindings.items():
-                    if before.get(name, _MISSING) is not binding:
-                        joined.bindings[name] = _join_bindings(
-                            joined.bindings.get(name, _implicit_identity(name)), binding)
-                # Unlike a missing fact/reference, a missing callable binding
-                # contributes the implicit builtin identity. Deletions must
-                # join it even though absent keys do not appear in the input.
-                for name in before.keys() - state.bindings.keys():
+                joined_fact = joined.get(name, _MISSING)
+                joined[name] = fact if joined_fact is _MISSING else join_facts(joined_fact, fact)
+            prev_vals = dict(state)
+        if not same_heap:
+            heap = joined.heap
+            for name, fact in state.heap.items():
+                if prev_heap.get(name, _MISSING) is fact:
+                    continue
+                joined_fact = heap.get(name, _MISSING)
+                heap[name] = fact if joined_fact is _MISSING else join_facts(joined_fact, fact)
+            prev_heap = state.heap.copy()
+        if not same_refs:
+            for name, refs in state.references.items():
+                if prev_refs.get(name, _MISSING) is not refs:
+                    joined.references[name] = joined.references.get(name, NO_REFERENCES) | refs
+            prev_refs = state.references.copy()
+        if not same_bindings:
+            for name, binding in state.bindings.items():
+                if prev_bindings.get(name, _MISSING) is not binding:
+                    joined.bindings[name] = _join_bindings(
+                        joined.bindings.get(name, _implicit_identity(name)), binding)
+            # Unlike a missing fact/reference, a missing callable binding
+            # contributes the implicit builtin identity. Deletions must
+            # join it even though absent keys do not appear in the input.
+            if len(prev_bindings) > len(state.bindings) or prev_bindings.keys() != state.bindings.keys():
+                for name in prev_bindings.keys() - state.bindings.keys():
                     joined.bindings[name] = _join_bindings(joined.bindings[name], _implicit_identity(name))
+            prev_bindings = state.bindings.copy()
+        if not same_mutated:
             joined.mutated.update(state.mutated)
-        joined.last_joined = snapshot
+            prev_mutated = frozenset(state.mutated)
+        joined.last_joined = (prev_vals, prev_bindings, prev_refs, prev_heap, prev_mutated)
         self.exception_states[-1] = joined
 
     @staticmethod
@@ -1263,21 +1440,31 @@ class _Flow:
         if candidate is not None:
             pass
         elif isinstance(node, ast.Call):
-            candidate = _qualified(node.func, state.bindings) + '('
+            func_q = _qualified(node.func, state.bindings)
+            if not func_q:
+                return CLEAN
+            candidate = func_q + '('
         elif isinstance(node, ast.Subscript):
-            candidate = _qualified(node, state.bindings)
             base = _qualified(node.value, state.bindings)
             if base == 'params':
                 candidate = 'params[...]'
             elif base == 'event' and isinstance(node.slice, ast.Constant) and node.slice.value == 'body':
                 candidate = "event['body']"
-        else:
+            else:
+                return CLEAN
+        elif isinstance(node, (ast.Name, ast.Attribute)):
             candidate = _qualified(node, state.bindings)
+        else:
+            return CLEAN
+        if not candidate or candidate == '(':
+            return CLEAN
         if candidate.startswith('@request:'):
             qualified = candidate.removeprefix('@request:').removesuffix('(')
             request_type, _, member = qualified.rpartition('.')
             if request_type in _REQUEST_TYPES and member in _REQUEST_MEMBERS:
                 return frozenset({TaintTrace(qualified, path=(qualified,))})
+            return CLEAN
+        if not _SOURCE_FAST_RE.search(candidate):
             return CLEAN
         for pattern in SOURCE_PATTERNS:
             match = pattern.search(candidate)
@@ -1324,30 +1511,61 @@ class _Flow:
     def global_arguments(self, function, state):
         """A helper reads its defining module, never a caller's same-name local."""
         owner = self.engine.owner(function)
+        if not owner.global_names:
+            return
         module_ref = (owner.project.module_reference(owner) if owner.project is not None else None)
+        same_engine = owner is self.engine
+        is_fn_scope = same_engine and not isinstance(self.scope, ast.Module)
+        comp_envs = self.comprehension_environments if same_engine else ()
+        shadowed_in_scope = (
+            (self.engine.locals.get(self.scope, set()) | self.engine.closures.get(self.scope, set()))
+            if is_fn_scope
+            else ()
+        )
+        caller_used = self.engine.used_names.get(self.scope) if is_fn_scope else None
+        state_heap = state.heap
+        state_mutated = state.mutated
+        state_bindings = state.bindings
+        owner_bindings = owner.globals.bindings
+        module_heap_fact = state_heap.get(module_ref, CLEAN) if module_ref is not None and state_heap else CLEAN
+        module_mutated = module_ref in state_mutated if module_ref is not None and state_mutated else False
+        default_namespace = state if same_engine else owner.globals
         for name in owner.global_names:
-            namespace = state if owner is self.engine else owner.globals
-            if owner is self.engine:
-                for comprehension, outer in self.comprehension_environments:
+            key = f'@global:{name}'
+            if shadowed_in_scope and name in shadowed_in_scope:
+                fact, refs, value = owner.global_symbols[name]
+                yield key, fact, refs, value
+                continue
+            if caller_used is not None and name not in caller_used and name not in state_bindings:
+                sym_fact, refs, _ = owner.global_symbols[name]
+                fact = join_facts(sym_fact, state_heap[key]) if (state_heap and key in state_heap) else sym_fact
+                if module_heap_fact:
+                    fact = join_facts(fact, module_heap_fact)
+                value = owner_bindings.get(name)
+                if value is not None and state_mutated and (module_mutated or key in state_mutated):
+                    value = _without_object_contract(value)
+                yield key, fact, refs, value
+                continue
+            namespace = default_namespace
+            if comp_envs:
+                for comprehension, outer in comp_envs:
                     if name in self.engine.locals[comprehension]:
                         namespace = outer
                         break
-            key = f'@global:{name}'
-            if (owner is self.engine and not isinstance(self.scope, ast.Module)
-                    and (name in self.engine.locals.get(self.scope, set())
-                         or name in self.engine.closures.get(self.scope, set()))):
-                fact, refs, value = owner.global_symbols[name]
-                yield key, fact, refs, value
+            refs = namespace.references.get(name, NO_REFERENCES)
+            base_fact = namespace.value(name)
+            if state_heap and (module_heap_fact or (refs and namespace is not state)):
+                fact = join_facts(base_fact, module_heap_fact, *(state_heap.get(ref, CLEAN) for ref in refs))
+            elif module_heap_fact:
+                fact = join_facts(base_fact, module_heap_fact)
             else:
-                refs = namespace.references.get(name, NO_REFERENCES)
-                fact = join_facts(namespace.value(name), state.heap.get(module_ref, CLEAN),
-                                  *(state.heap.get(ref, CLEAN) for ref in refs))
-                value = namespace.bindings.get(name)
-                if refs & state.mutated or module_ref in state.mutated:
-                    value = _without_object_contract(value)
-                yield key, fact, refs, value
+                fact = base_fact
+            value = namespace.bindings.get(name)
+            if state_mutated and (module_mutated or (refs and (refs & state_mutated))):
+                value = _without_object_contract(value)
+            yield key, fact, refs, value
 
-    def bind(self, function, node, arguments, keywords, state):
+    def bind(self, function, node, arguments, keywords, state, globals_snapshot=None):
         positional = [arg.arg for arg in (*function.args.posonlyargs, *function.args.args)]
         bound = {name: fact for name, fact in zip(positional, arguments)}
         for name, fact in keywords.items():
@@ -1377,11 +1595,12 @@ class _Flow:
         captured = self.closure_namespace(function, state)
         for name in self.engine.closures.get(function, ()):
             bound[f'@free:{name}'] = captured.value(name)
-        for key, fact, _refs, _value in self.global_arguments(function, state):
+        global_items = globals_snapshot if globals_snapshot is not None else self.global_arguments(function, state)
+        for key, fact, _refs, _value in global_items:
             bound[key] = fact
         return bound
 
-    def bind_references(self, function, node, keyword_nodes, state):
+    def bind_references(self, function, node, keyword_nodes, state, globals_snapshot=None):
         """Bind references from evaluated argument snapshots, never re-read names.
 
         Variadic packs are new Python containers, not aliases to their values.
@@ -1405,14 +1624,20 @@ class _Flow:
         captured = self.closure_namespace(function, state)
         for name in self.engine.closures.get(function, ()):
             bound[f'@free:{name}'] = captured.references.get(name, NO_REFERENCES)
-        for key, _fact, refs, _value in self.global_arguments(function, state):
+        global_items = globals_snapshot if globals_snapshot is not None else self.global_arguments(function, state)
+        for key, _fact, refs, _value in global_items:
             bound[key] = refs
-        if self.engine.project is not None:
-            for key in self.engine.project.module_references:
-                bound[key] = frozenset({key})
         return bound
 
-    def bind_values(self, function, node, keyword_nodes, state):
+    def _lookup_refs(self, references, key):
+        res = references.get(key)
+        if res is not None:
+            return res
+        if self.engine.project is not None:
+            return self.engine.project.module_ref_map.get(key, NO_REFERENCES)
+        return NO_REFERENCES
+
+    def bind_values(self, function, node, keyword_nodes, state, globals_snapshot=None):
         positional = [arg.arg for arg in (*function.args.posonlyargs, *function.args.args)]
         bound = {name: self.expression_bindings.get(arg) for name, arg in zip(positional, node.args)}
         if any(isinstance(arg, ast.Starred) for arg in node.args):
@@ -1425,12 +1650,13 @@ class _Flow:
         captured = self.closure_namespace(function, state)
         for name in self.engine.closures.get(function, ()):
             bound[f'@free:{name}'] = captured.bindings.get(name)
-        for key, _fact, _refs, value in self.global_arguments(function, state):
+        global_items = globals_snapshot if globals_snapshot is not None else self.global_arguments(function, state)
+        for key, _fact, _refs, value in global_items:
             bound[key] = value
         return bound
 
     @staticmethod
-    def bind_method_receivers(bound, references, values, state):
+    def bind_method_receivers(bound, references, values, state, candidate_keys=None):
         """Bind callback receivers separately from the callable object itself.
 
         A helper taking a bound method may mutate its class even though it
@@ -1438,7 +1664,12 @@ class _Flow:
         slots carry those effects through the ordinary summary substitution.
         Concrete heaps and evidence never become callable context keys.
         """
-        for name, binding in tuple(values.items()):
+        items = ((name, values.get(name)) for name in candidate_keys) if candidate_keys is not None else tuple(values.items())
+        for name, binding in items:
+            if not isinstance(binding, _BoundClassMethod) and not (
+                isinstance(binding, frozenset) and any(isinstance(v, _BoundClassMethod) for v in binding)
+            ):
+                continue
             choices = []
             receivers, refs = [], []
             for value in _binding_choices(binding):
@@ -1479,6 +1710,8 @@ class _Flow:
 
     @staticmethod
     def substitute(fact, bound, call_name):
+        if not fact:
+            return CLEAN
         result = CLEAN
         for trace in fact:
             if trace.parameter is None:
@@ -1493,6 +1726,8 @@ class _Flow:
         return result
 
     def substitute_binding(self, binding, bound, references, node, call_name, values):
+        if binding is None:
+            return None
         choices = []
         for target in _binding_choices(binding):
             if isinstance(target, _SymbolicValue):
@@ -1507,12 +1742,12 @@ class _Flow:
                     operands.append((operand, self.substitute(fact, bound, call_name)))
                 choices.append(_ArgumentVector(tuple(operands)))
             elif isinstance(target, _BoundCallable):
-                actual = frozenset().union(*(references.get(ref, NO_REFERENCES) if isinstance(ref, str)
+                actual = frozenset().union(*(self._lookup_refs(references, ref) if isinstance(ref, str)
                                              else frozenset({node}) for ref in target.references))
                 choices.append(_BoundCallable(target.name, actual, self.substitute(target.receiver, bound, call_name)))
             elif isinstance(target, _BoundClassMethod):
                 actual = frozenset().union(*(
-                    references.get(ref, NO_REFERENCES) if isinstance(ref, str)
+                    self._lookup_refs(references, ref) if isinstance(ref, str)
                     else frozenset({ref if isinstance(ref, ast.ClassDef) else node})
                     for ref in target.references))
                 choices.append(_BoundClassMethod(target.function, target.owner, actual,
@@ -1521,7 +1756,7 @@ class _Flow:
                 arguments = tuple((name, self.substitute(fact, bound, call_name))
                                   for name, fact in target.arguments)
                 actual = tuple((name, frozenset().union(*(
-                    references.get(ref, NO_REFERENCES) if isinstance(ref, str) else frozenset({node})
+                    self._lookup_refs(references, ref) if isinstance(ref, str) else frozenset({node})
                     for ref in refs))) for name, refs in target.references)
                 captured_values = tuple((name, self.substitute_binding(value, bound, references,
                                                                        node, call_name, values))
@@ -1738,24 +1973,94 @@ class _Flow:
         if isinstance(target, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
             function = target
             call_name = _call_name(function)
+            owner = self.engine.owner(function)
             if resumed is None:
-                bound = self.bind(function, node, arguments, keywords, state)
-                references = self.bind_references(function, node, keyword_nodes, state)
-                values = self.bind_values(function, node, keyword_nodes, state)
+                module_ref = owner.project.module_reference(owner) if owner.project is not None else None
+                if (owner is self.engine
+                        and not isinstance(self.scope, ast.Module)
+                        and not self.comprehension_environments
+                        and (module_ref is None or (module_ref not in state.heap and module_ref not in state.mutated))):
+                    local_bound = self.bind(function, node, arguments, keywords, state, ())
+                    local_refs = self.bind_references(function, node, keyword_nodes, state, ())
+                    local_values = self.bind_values(function, node, keyword_nodes, state, ())
+                    bound = owner.base_global_bound.copy()
+                    references = owner.base_global_refs.copy()
+                    values = owner.base_global_values.copy()
+                    shadowed_vals = owner.shadowed_global_values.get(self.scope)
+                    non_base_keys = list(local_values)
+                    if state.heap:
+                        for hkey, hfact in state.heap.items():
+                            if isinstance(hkey, str) and hkey in bound and (not shadowed_vals or hkey not in shadowed_vals):
+                                bound[hkey] = join_facts(bound[hkey], hfact)
+                    if state.mutated:
+                        for mkey in state.mutated:
+                            if isinstance(mkey, str) and mkey in values and (not shadowed_vals or mkey not in shadowed_vals):
+                                val = values[mkey]
+                                if val is not None:
+                                    values[mkey] = _without_object_contract(val)
+                                    non_base_keys.append(mkey)
+                    if shadowed_vals:
+                        values.update(shadowed_vals)
+                        non_base_keys.extend(shadowed_vals)
+                    for gname in owner.active_globals.get(self.scope, ()):
+                        gkey = f'@global:{gname}'
+                        bound[gkey] = state.value(gname)
+                        grefs = state.references.get(gname, NO_REFERENCES)
+                        references[gkey] = grefs
+                        val = state.bindings.get(gname)
+                        if val is not None and state.mutated and grefs and (grefs & state.mutated):
+                            val = _without_object_contract(val)
+                        values[gkey] = val
+                        non_base_keys.append(gkey)
+                    for gname in self.context_globals:
+                        if shadowed_vals and f'@global:{gname}' in shadowed_vals:
+                            continue
+                        gkey = f'@global:{gname}'
+                        bound[gkey] = state.value(gname)
+                        grefs = state.references.get(gname, NO_REFERENCES)
+                        references[gkey] = grefs
+                        val = state.bindings.get(gname)
+                        if val is not None and state.mutated and grefs and (grefs & state.mutated):
+                            val = _without_object_contract(val)
+                        values[gkey] = val
+                        non_base_keys.append(gkey)
+                    bound.update(local_bound)
+                    references.update(local_refs)
+                    values.update(local_values)
+                    if state.mutated:
+                        for name, refs in local_refs.items():
+                            if refs and (refs & state.mutated):
+                                values[name] = _without_object_contract(values.get(name))
+                    receiver_keys = None if owner.has_base_bound_methods else non_base_keys
+                    summary_keys = (
+                        (*non_base_keys, *(k for k in owner.class_globals if k not in non_base_keys))
+                        if owner.class_globals else non_base_keys
+                    )
+                else:
+                    globals_snapshot = tuple(self.global_arguments(function, state))
+                    bound = self.bind(function, node, arguments, keywords, state, globals_snapshot)
+                    references = self.bind_references(function, node, keyword_nodes, state, globals_snapshot)
+                    values = self.bind_values(function, node, keyword_nodes, state, globals_snapshot)
+                    if state.mutated:
+                        for name, refs in references.items():
+                            if refs and (refs & state.mutated):
+                                values[name] = _without_object_contract(values.get(name))
+                    receiver_keys = None
+                    summary_keys = None
             else:
                 references = dict(resumed.references)
                 values = dict(resumed.values)
                 bound = {name: join_facts(fact, *(state.heap.get(ref, CLEAN)
-                                              for ref in references.get(name, NO_REFERENCES)))
+                                              for ref in self._lookup_refs(references, name)))
                          for name, fact in resumed.arguments}
                 self.resume_environment(function, bound, references, values, state)
-            # A default or suspended coroutine keeps the object, not an
-            # immutable proof of that object's members/shape. Invalidation
-            # applies even to clean writes between creation and execution.
-            for name, refs in references.items():
-                if refs & state.mutated:
-                    values[name] = _without_object_contract(values.get(name))
-            self.bind_method_receivers(bound, references, values, state)
+                if state.mutated:
+                    for name, refs in references.items():
+                        if refs and (refs & state.mutated):
+                            values[name] = _without_object_contract(values.get(name))
+                receiver_keys = None
+                summary_keys = None
+            self.bind_method_receivers(bound, references, values, state, receiver_keys)
             if (isinstance(function, ast.AsyncFunctionDef)
                     and function not in self.engine.generators and resumed is None):
                 self.expression_bindings[node] = _DeferredCall(
@@ -1763,7 +2068,7 @@ class _Flow:
                     tuple(sorted(values.items())))
                 self.expression_references[node] = NO_REFERENCES
                 return CLEAN
-            summary = self.engine.call_summary(function, values)
+            summary = self.engine.call_summary(function, values, summary_keys)
             for kind, line, column, label, fact in summary.effects:
                 propagated = self.substitute(fact, bound, call_name)
                 propagated = frozenset(trace for trace in propagated if not _safe_for(trace, kind, label))
@@ -1773,7 +2078,7 @@ class _Flow:
             for exception in summary.exceptions:
                 exceptional = state.copy()
                 for parameter, written in exception.mutations:
-                    self.mutate(references.get(parameter, NO_REFERENCES),
+                    self.mutate(self._lookup_refs(references, parameter),
                                 self.substitute(written, bound, call_name), exceptional)
                 self.pending.append(_Completion(
                     'raise', exceptional, self.substitute(exception.value, bound, call_name),
@@ -1786,8 +2091,8 @@ class _Flow:
                 return CLEAN
             for parameter, written in summary.mutations:
                 fact = self.substitute(written, bound, call_name)
-                self.mutate(references.get(parameter, NO_REFERENCES), fact, state)
-            returned_refs = frozenset().union(*(references.get(parameter, NO_REFERENCES)
+                self.mutate(self._lookup_refs(references, parameter), fact, state)
+            returned_refs = frozenset().union(*(self._lookup_refs(references, parameter)
                                                for parameter in summary.returned_references))
             self.expression_references[node] = returned_refs or frozenset({node})
             self.expression_bindings[node] = self.substitute_binding(
@@ -1800,7 +2105,7 @@ class _Flow:
                 self.expression_bindings[node] = self.substitute_binding(
                     summary.yielded_binding, bound, references, node, call_name, values)
                 self.expression_references[node] = frozenset().union(*(
-                    references.get(parameter, NO_REFERENCES) for parameter in summary.yielded_references))
+                    self._lookup_refs(references, parameter) for parameter in summary.yielded_references))
                 return self.substitute(summary.yielded, bound, call_name)
             return returned
         deferred = [target for expression in [*node.args, *keyword_nodes.values()]
@@ -2020,119 +2325,195 @@ class _Flow:
         return fact
 
     def expr(self, node, state):
-        if not state.reachable:
+        if node is None or not state.reachable:
             return CLEAN
+        if isinstance(node, ast.Constant):
+            self.expression_references.pop(node, None)
+            self.expression_bindings[node] = _LiteralString(node.value) if isinstance(node.value, str) else None
+            self.expression_facts[node] = CLEAN
+            return CLEAN
+        if isinstance(node, ast.Name):
+            fact = state.value(node.id)
+            self.expression_facts[node] = fact
+            binding = state.bindings.get(node.id, _implicit_identity(node.id))
+            refs = state.references.get(node.id, NO_REFERENCES)
+            self.expression_references[node] = refs
+            if state.mutated and (refs & state.mutated):
+                binding = _without_object_contract(binding)
+            self.expression_bindings[node] = binding
+            return fact
         # Callable identity belongs to the point before its arguments execute:
         # Query(alias := other) still constructs the originally bound marker.
-        imported_call = _imported_name(node.func, state.bindings) if isinstance(node, ast.Call) else ''
-        exception_type = self.exception_type(node.func, state) if isinstance(node, ast.Call) else None
+        is_call = isinstance(node, ast.Call)
+        imported_call = _imported_name(node.func, state.bindings) if is_call else ''
+        exception_type = self.exception_type(node.func, state) if is_call else None
         may_raise = isinstance(node, (ast.Attribute, ast.Subscript,
                                       ast.BinOp, ast.Compare, ast.UnaryOp))
-        if may_raise:
+        if may_raise and self.exception_states:
             self.possible_exception(state)
         self.expression_references.pop(node, None)
         self.expression_bindings.pop(node, None)
         fact = self.expression(node, state)
         if not state.reachable:
             return CLEAN
-        if node is not None:
-            self.expression_facts[node] = fact
-            binding = self.expression_bindings.get(node)
-            if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                binding = _LiteralString(node.value)
-            elif isinstance(node, ast.Name):
-                binding = state.bindings.get(node.id, _implicit_identity(node.id))
-            elif isinstance(node, ast.Attribute):
-                candidates = []
-                receiver_refs = self.expression_references.get(node.value, NO_REFERENCES)
-                receiver_fact = self.expression_facts.get(node.value, CLEAN)
-                for base in _binding_choices(self.expression_bindings.get(node.value)):
-                    if isinstance(base, ast.ClassDef):
-                        members = self.engine.class_members.get(base, {})
-                        if self.engine.reads is not None:
-                            self.engine.reads[('class_members', base)] = members
-                        member = members.get(node.attr)
-                        if isinstance(member, _ClassMethodDescriptor):
-                            member = _BoundClassMethod(member.function, base, receiver_refs, receiver_fact)
-                        candidates.append(member)
-                        continue
-                    if isinstance(base, _ModuleBinding):
-                        incoming, member, refs = base.project.member(base.key, node.attr, state)
-                        fact = join_facts(fact, incoming)
-                        self.expression_references[node] = self.expression_references.get(node, NO_REFERENCES) | refs
-                        candidates.append(member)
-                        continue
-                    if isinstance(base, _ProcessInput) and node.attr == 'communicate':
-                        candidates.append(_BoundCallable('@stdin.' + base.kind, receiver_refs, receiver_fact))
-                        continue
-                    name = (_extend_qualifier(base, node.attr) if isinstance(base, str)
-                            else _extend_qualifier(base.name, node.attr) if isinstance(base, _BoundCallable)
-                            else _qualified(node, state.bindings))
-                    if not name and receiver_refs:
-                        # A returned object has identity even without a source
-                        # spelling (identity(box).append(...)). Keep the method
-                        # and receiver without inventing an import/sanitizer.
-                        name = _extend_qualifier('<object>', node.attr)
-                    framework = name.startswith('@fastapi.router.') or name in (
-                        _PARAMETER_MARKERS | _DEPENDENCY_MARKERS | _ROUTER_TYPES | _REQUEST_TYPES | _SERVICE_TYPES)
-                    candidates.append(_BoundCallable(name, receiver_refs, receiver_fact) if name and receiver_refs and not framework
-                                      else name or None)
-                binding = _join_bindings(*candidates)
-                # A joined module identity can still denote a real source
-                # (for example sys.argv), even when no single qualifier wins.
-                for candidate in candidates:
-                    name = candidate.name if isinstance(candidate, _BoundCallable) else candidate
-                    if isinstance(name, str):
-                        fact = join_facts(fact, self.source(node, state, name))
-            elif isinstance(node, ast.Lambda):
-                binding = node
-            elif isinstance(node, ast.NamedExpr):
-                binding = self.expression_bindings.get(node.value)
-            elif isinstance(node, ast.IfExp):
-                binding = _join_bindings(self.expression_bindings.get(node.body), self.expression_bindings.get(node.orelse))
-            elif isinstance(node, ast.BoolOp):
-                binding = _join_bindings(*(self.expression_bindings.get(value) for value in node.values))
-            elif (isinstance(node, ast.Subscript) and isinstance(node.value, (ast.Tuple, ast.List))
-                  and isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, int)
-                  and -len(node.value.elts) <= node.slice.value < len(node.value.elts)):
-                binding = self.expression_bindings.get(node.value.elts[node.slice.value])
-            if isinstance(node, ast.Call):
-                if exception_type:
-                    binding = '@exception:' + exception_type
-                if imported_call in _ROUTER_TYPES:
-                    binding = '@fastapi.router'
-                elif imported_call in _PARAMETER_MARKERS:
-                    binding = _FrameworkInput('source', imported_call)
-                elif imported_call in _DEPENDENCY_MARKERS:
-                    binding = _FrameworkInput('dependency', imported_call,
-                                              _dependency_target(node, state.bindings, self.expression_bindings))
-            if isinstance(node, ast.Subscript):
-                binding = _framework_input(node, state.bindings, evaluated=self.expression_bindings) or binding
-            if isinstance(node, (ast.Tuple, ast.List)):
-                markers = tuple(self.expression_bindings.get(item) for item in node.elts)
-                if any(isinstance(marker, _FrameworkInput) for marker in markers):
-                    binding = markers
-                else:
-                    binding = _ArgumentVector(tuple(self.command_operands(node)))
-            self.expression_bindings[node] = binding
-            if isinstance(node, ast.Name):
-                self.expression_references[node] = state.references.get(node.id, NO_REFERENCES)
-            elif isinstance(node, (ast.Attribute, ast.Subscript, ast.Starred)):
-                self.expression_references.setdefault(node, self.expression_references.get(node.value, NO_REFERENCES))
-            elif isinstance(node, ast.NamedExpr):
-                self.expression_references[node] = self.expression_references.get(node.value, NO_REFERENCES)
-            elif isinstance(node, (ast.List, ast.Tuple, ast.Dict, ast.Set, ast.Call)):
-                self.expression_references.setdefault(node, frozenset({node}))
-            if self.expression_references.get(node, NO_REFERENCES) & state.mutated:
-                self.expression_bindings[node] = _without_object_contract(binding)
-            self.expression_facts[node] = fact
-        if may_raise:
+        self.expression_facts[node] = fact
+        binding = self.expression_bindings.get(node)
+        if isinstance(node, ast.Attribute):
+            candidates = []
+            receiver_refs = self.expression_references.get(node.value, NO_REFERENCES)
+            receiver_fact = self.expression_facts.get(node.value, CLEAN)
+            for base in _binding_choices(self.expression_bindings.get(node.value)):
+                if isinstance(base, ast.ClassDef):
+                    members = self.engine.class_members.get(base, {})
+                    if self.engine.reads is not None:
+                        self.engine.reads[('class_members', base)] = members
+                    member = members.get(node.attr)
+                    if isinstance(member, _ClassMethodDescriptor):
+                        member = _BoundClassMethod(member.function, base, receiver_refs, receiver_fact)
+                    candidates.append(member)
+                    continue
+                if isinstance(base, _ModuleBinding):
+                    incoming, member, refs = base.project.member(base.key, node.attr, state)
+                    fact = join_facts(fact, incoming)
+                    self.expression_references[node] = self.expression_references.get(node, NO_REFERENCES) | refs
+                    candidates.append(member)
+                    continue
+                if isinstance(base, _ProcessInput) and node.attr == 'communicate':
+                    candidates.append(_BoundCallable('@stdin.' + base.kind, receiver_refs, receiver_fact))
+                    continue
+                name = (_extend_qualifier(base, node.attr) if isinstance(base, str)
+                        else _extend_qualifier(base.name, node.attr) if isinstance(base, _BoundCallable)
+                        else _qualified(node, state.bindings))
+                if not name and receiver_refs:
+                    # A returned object has identity even without a source
+                    # spelling (identity(box).append(...)). Keep the method
+                    # and receiver without inventing an import/sanitizer.
+                    name = _extend_qualifier('<object>', node.attr)
+                framework = name.startswith('@fastapi.router.') or name in _ALL_FRAMEWORK_NAMES
+                candidates.append(_BoundCallable(name, receiver_refs, receiver_fact) if name and receiver_refs and not framework
+                                  else name or None)
+            binding = _join_bindings(*candidates)
+            # A joined module identity can still denote a real source
+            # (for example sys.argv), even when no single qualifier wins.
+            for candidate in candidates:
+                name = candidate.name if isinstance(candidate, _BoundCallable) else candidate
+                if isinstance(name, str):
+                    fact = join_facts(fact, self.source(node, state, name))
+        elif isinstance(node, ast.Lambda):
+            binding = node
+        elif isinstance(node, ast.NamedExpr):
+            binding = self.expression_bindings.get(node.value)
+        elif isinstance(node, ast.IfExp):
+            binding = _join_bindings(self.expression_bindings.get(node.body), self.expression_bindings.get(node.orelse))
+        elif isinstance(node, ast.BoolOp):
+            binding = _join_bindings(*(self.expression_bindings.get(value) for value in node.values))
+        elif (isinstance(node, ast.Subscript) and isinstance(node.value, (ast.Tuple, ast.List))
+              and isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, int)
+              and -len(node.value.elts) <= node.slice.value < len(node.value.elts)):
+            binding = self.expression_bindings.get(node.value.elts[node.slice.value])
+        if is_call:
+            if exception_type:
+                binding = '@exception:' + exception_type
+            if imported_call in _ROUTER_TYPES:
+                binding = '@fastapi.router'
+            elif imported_call in _PARAMETER_MARKERS:
+                binding = _FrameworkInput('source', imported_call)
+            elif imported_call in _DEPENDENCY_MARKERS:
+                binding = _FrameworkInput('dependency', imported_call,
+                                          _dependency_target(node, state.bindings, self.expression_bindings))
+        if isinstance(node, ast.Subscript):
+            binding = _framework_input(node, state.bindings, evaluated=self.expression_bindings) or binding
+        if isinstance(node, (ast.Tuple, ast.List)):
+            markers = tuple(self.expression_bindings.get(item) for item in node.elts)
+            if any(isinstance(marker, _FrameworkInput) for marker in markers):
+                binding = markers
+            else:
+                binding = _ArgumentVector(tuple(self.command_operands(node)))
+        self.expression_bindings[node] = binding
+        if isinstance(node, (ast.Attribute, ast.Subscript, ast.Starred)):
+            self.expression_references.setdefault(node, self.expression_references.get(node.value, NO_REFERENCES))
+        elif isinstance(node, ast.NamedExpr):
+            self.expression_references[node] = self.expression_references.get(node.value, NO_REFERENCES)
+        elif isinstance(node, (ast.List, ast.Tuple, ast.Dict, ast.Set, ast.Call)):
+            self.expression_references.setdefault(node, frozenset({node}))
+        if state.mutated and (self.expression_references.get(node, NO_REFERENCES) & state.mutated):
+            self.expression_bindings[node] = _without_object_contract(binding)
+        self.expression_facts[node] = fact
+        if may_raise and self.exception_states:
             self.possible_exception(state)
         return fact
 
     def expression(self, node, state):
         if node is None or isinstance(node, ast.Constant):
             return CLEAN
+        if isinstance(node, ast.Call):
+            return self.call(node, state)
+        if isinstance(node, ast.Attribute):
+            return join_facts(self.source(node, state), self.expr(node.value, state))
+        if isinstance(node, ast.Subscript):
+            return join_facts(self.source(node, state), self.expr(node.value, state), self.expr(node.slice, state))
+        if isinstance(node, ast.BinOp):
+            return join_facts(self.expr(node.left, state), self.expr(node.right, state))
+        if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+            return join_facts(*(self.expr(child, state) for child in node.elts)) if node.elts else CLEAN
+        if isinstance(node, ast.JoinedStr):
+            return join_facts(*(self.expr(child, state) for child in node.values)) if node.values else CLEAN
+        if isinstance(node, ast.FormattedValue):
+            value_fact = self.expr(node.value, state)
+            if node.format_spec is not None:
+                return join_facts(value_fact, self.expr(node.format_spec, state))
+            return value_fact
+        if isinstance(node, ast.Dict):
+            return join_facts(
+                *(self.expr(k, state) for k in node.keys if k is not None),
+                *(self.expr(v, state) for v in node.values),
+            )
+        if isinstance(node, ast.Starred):
+            return self.expr(node.value, state)
+        if isinstance(node, ast.Slice):
+            return join_facts(
+                self.expr(node.lower, state) if node.lower is not None else CLEAN,
+                self.expr(node.upper, state) if node.upper is not None else CLEAN,
+                self.expr(node.step, state) if node.step is not None else CLEAN,
+            )
+        if isinstance(node, ast.Compare):
+            self.expr(node.left, state)
+            self.expr(node.comparators[0], state)
+            for comparator in node.comparators[1:]:
+                executed = state.copy()
+                self.expr(comparator, executed)
+                state.replace(_join_states(state, executed))
+            return CLEAN  # A comparison produces a bool, not executable text.
+        if isinstance(node, ast.UnaryOp):
+            operand = self.expr(node.operand, state)
+            return CLEAN if isinstance(node.op, ast.Not) else operand
+        if isinstance(node, ast.Name):
+            return state.value(node.id)
+        if isinstance(node, ast.NamedExpr):
+            fact = self.expr(node.value, state)
+            self.assign(node.target, fact, state, node.value)
+            return fact
+        if isinstance(node, ast.IfExp):
+            self.expr(node.test, state)
+            left, right = state.copy(), state.copy()
+            fact = join_facts(self.expr(node.body, left), self.expr(node.orelse, right))
+            self.expression_references[node] = (self.expression_references.get(node.body, NO_REFERENCES)
+                                                | self.expression_references.get(node.orelse, NO_REFERENCES))
+            state.replace(_join_states(left, right))
+            return fact
+        if isinstance(node, ast.BoolOp):
+            fact = CLEAN
+            exits = []
+            continuation = state.copy()
+            for value in node.values:
+                fact = join_facts(fact, self.expr(value, continuation))
+                exits.append(continuation.copy())
+            self.expression_references[node] = frozenset().union(*(self.expression_references.get(value, NO_REFERENCES)
+                                                                   for value in node.values))
+            state.replace(_join_states(*exits))
+            return fact
+        if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp)):
+            return self.comprehension(node, state)
         if isinstance(node, ast.Await):
             value = self.expr(node.value, state)
             if not state.reachable:
@@ -2193,46 +2574,6 @@ class _Flow:
                                    *zip(signature.kwonlyargs, signature.kw_defaults)) if value is not None
             })
             return CLEAN
-        if isinstance(node, ast.Compare):
-            self.expr(node.left, state)
-            self.expr(node.comparators[0], state)
-            for comparator in node.comparators[1:]:
-                executed = state.copy()
-                self.expr(comparator, executed)
-                state.replace(_join_states(state, executed))
-            return CLEAN  # A comparison produces a bool, not executable text.
-        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
-            self.expr(node.operand, state)
-            return CLEAN
-        if isinstance(node, ast.Name):
-            return state.value(node.id)
-        if isinstance(node, ast.Call):
-            return self.call(node, state)
-        if isinstance(node, ast.NamedExpr):
-            fact = self.expr(node.value, state)
-            self.assign(node.target, fact, state, node.value)
-            return fact
-        if isinstance(node, ast.IfExp):
-            self.expr(node.test, state)
-            left, right = state.copy(), state.copy()
-            fact = join_facts(self.expr(node.body, left), self.expr(node.orelse, right))
-            self.expression_references[node] = (self.expression_references.get(node.body, NO_REFERENCES)
-                                                | self.expression_references.get(node.orelse, NO_REFERENCES))
-            state.replace(_join_states(left, right))
-            return fact
-        if isinstance(node, ast.BoolOp):
-            fact = CLEAN
-            exits = []
-            continuation = state.copy()
-            for value in node.values:
-                fact = join_facts(fact, self.expr(value, continuation))
-                exits.append(continuation.copy())
-            self.expression_references[node] = frozenset().union(*(self.expression_references.get(value, NO_REFERENCES)
-                                                                   for value in node.values))
-            state.replace(_join_states(*exits))
-            return fact
-        if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp)):
-            return self.comprehension(node, state)
         if isinstance(node, ast.GeneratorExp):
             # The outer iterable executes in the enclosing scope, even when
             # constructing a lazy generator. Inner iterations may be skipped.
@@ -2400,12 +2741,14 @@ class _Flow:
         return result
 
     def block(self, statements, state):
+        track_last = isinstance(self.scope, ast.Module)
         for node in statements:
             if state is None or not state.reachable:
                 break
-            self.last_state = state.copy()
+            if track_last:
+                self.last_state = state.copy()
             state = self.statement(node, state)
-            if state is not None:
+            if track_last and state is not None:
                 self.last_state = state.copy()
         return state if state is not None and state.reachable else None
 
@@ -2773,8 +3116,17 @@ class _Analysis:
         for node in nodes:
             if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
                 self.locals[node] = {child.id for generator in node.generators
-                                    for child in ast.walk(generator.target)
-                                    if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)}
+                                     for child in ast.walk(generator.target)
+                                     if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)}
+        self.generators = set()
+        self.locals[tree] = _local_names(tree)
+        raw_used = {}
+        for function in self.functions:
+            fn_nodes = list(_scope_nodes(function))
+            if any(isinstance(node, (ast.Yield, ast.YieldFrom)) for node in fn_nodes):
+                self.generators.add(function)
+            self.locals[function] = _local_names(function, fn_nodes)
+            raw_used[function] = _used_names(function, fn_nodes)
         self.global_names = self.locals[tree]
         # Formal globals are lexical constants, not concrete heap facts.
         # Reusing their immutable traces preserves paths and lets state joins
@@ -2784,14 +3136,71 @@ class _Analysis:
                    frozenset({f'@global:{name}'}), _SymbolicValue(f'@global:{name}'))
             for name in self.global_names
         }
+        parent_captured = {}
+        for function in reversed(self.functions):
+            parent = self.enclosing(function)
+            while parent is not None and not isinstance(parent, ast.Module):
+                if parent in raw_used:
+                    raw_used[parent].update(raw_used[function])
+                parent_captured.setdefault(parent, set()).update(raw_used[function])
+                parent = self.enclosing(parent)
         self.closures = {}
         for function in self.functions:
             available = set()
             parent = self.enclosing(function)
             while parent is not None and not isinstance(parent, ast.Module):
-                available.update(self.locals.get(parent, set()))
+                available.update(self.locals.get(parent, set()) & parent_captured.get(parent, set()))
                 parent = self.enclosing(parent)
             self.closures[function] = available - self.locals[function]
+        all_closures = set().union(*self.closures.values()) if self.closures else set()
+        self.used_names = {
+            function: (raw_used[function] | self.locals[function] | all_closures)
+            for function in self.functions
+        }
+        self.shadowed_globals = {
+            function: (self.locals[function] | self.closures[function]) & self.global_names
+            for function in self.functions
+        }
+        self.shadowed_global_values = {
+            function: {f'@global:{name}': self.global_symbols[name][2] for name in shadowed}
+            for function, shadowed in self.shadowed_globals.items()
+        }
+        self.active_globals = {
+            function: tuple(
+                name for name in (self.used_names[function] & self.global_names)
+                if name not in self.shadowed_globals[function]
+            )
+            for function in self.functions
+        }
+        self.base_global_bound = {
+            f'@global:{name}': self.global_symbols[name][0]
+            for name in self.global_names
+        }
+        self.base_global_refs = {
+            f'@global:{name}': self.global_symbols[name][1]
+            for name in self.global_names
+        }
+        self.refresh_globals(self.globals)
+
+    def refresh_globals(self, globals_):
+        self.globals = globals_
+        bindings = globals_.bindings
+        self.base_global_values = {
+            f'@global:{name}': bindings.get(name)
+            for name in self.global_names
+        }
+        self.has_base_bound_methods = any(
+            isinstance(choice, _BoundClassMethod)
+            for val in self.base_global_values.values()
+            if val is not None
+            for choice in _binding_choices(val)
+        )
+        self.class_globals = tuple(
+            f'@global:{name}'
+            for name in self.global_names
+            if isinstance(bindings.get(name), (frozenset, ast.ClassDef, _BoundClassMethod))
+            and any(isinstance(v, (ast.ClassDef, _BoundClassMethod)) for v in _binding_choices(bindings.get(name)))
+        )
 
     def owner(self, function):
         # An opaque import cycle disables the project resolver, not lexical
@@ -2931,7 +3340,7 @@ class _Analysis:
             if not changed:
                 return bound
 
-    def call_summary(self, function, values):
+    def call_summary(self, function, values, candidate_keys=None):
         """Request a symbolic summary for known callback identities.
 
         Facts, heaps and evidence paths are NOT context keys. Only finite
@@ -2941,17 +3350,29 @@ class _Analysis:
         loop, never by recursively interpreting callees on the Python stack.
         """
         context = []
-        for name, binding in sorted(values.items()):
+        owner_fn = None
+        owner_bindings = None
+        items = ((name, values.get(name)) for name in candidate_keys) if candidate_keys is not None else values.items()
+        for name, binding in items:
             if name.startswith('@global:'):
                 # A class namespace is a mutable object. A caller may replace
                 # one of its methods after a helper's definition, so neither
                 # the helper's original nor the module's final class binding
                 # can certify this invocation. Include the finite class value
                 # (or its revoked/unknown alternative) in the summary context.
-                nominal = self.owner(function).globals.bindings.get(name[len('@global:'):])
+                if owner_fn is None:
+                    owner_fn = self.owner(function)
+                    owner_bindings = owner_fn.globals.bindings
+                gname = name[8:]
+                nominal = owner_bindings.get(gname)
+                if (not isinstance(binding, (frozenset, ast.ClassDef, _BoundClassMethod))
+                        and not isinstance(nominal, (frozenset, ast.ClassDef, _BoundClassMethod))):
+                    continue
                 if not any(isinstance(value, (ast.ClassDef, _BoundClassMethod))
                            for value in (*_binding_choices(binding), *_binding_choices(nominal))):
                     continue
+            elif binding is None or isinstance(binding, _SymbolicValue):
+                continue
             choices = []
             for value in _binding_choices(binding):
                 if isinstance(value, _BoundClassMethod):
@@ -2961,8 +3382,18 @@ class _Analysis:
                 elif not isinstance(value, (str, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
                     value = None
                 choices.append(value)
-            if name.startswith('@global:') or any(value is not None for value in choices):
+            if name.startswith('@global:'):
+                joined_choice = _join_bindings(*choices)
+                if (joined_choice is nominal
+                        and gname in owner_bindings
+                        and gname not in owner_fn.locals[function]
+                        and gname not in owner_fn.closures[function]):
+                    continue
+                context.append((name, joined_choice))
+            elif any(value is not None for value in choices):
                 context.append((name, _join_bindings(*choices)))
+        if len(context) > 1:
+            context.sort(key=lambda item: item[0])
         key = (function, tuple(context)) if context else function
         summary = self.summaries.setdefault(key, FunctionSummary())
         if self.reads is not None:
@@ -3014,7 +3445,7 @@ class _Analysis:
             changed = globals_ != self.globals
             if changed:
                 solved.clear()  # Every job of this module starts from the namespace.
-            self.globals = globals_
+            self.refresh_globals(globals_)
             flows = [module]
             jobs = [(function, (), function) for function in self.functions]
             jobs.extend((key[0], key[1], key) for key in list(self.summaries)
@@ -3035,12 +3466,14 @@ class _Analysis:
                 owner.reads, owner.writes = reads, writes
                 namespace = globals_ if owner is self else owner.globals
                 local = owner.locals[function]
+                used = owner.used_names[function]
                 flow = _Flow(owner, function)
                 state = _State({name: owner.global_symbols[name][0]
-                                for name in owner.global_names if name not in local},
-                               {name: target for name, target in namespace.bindings.items() if name not in local})
+                                for name in owner.global_names if name in used and name not in local},
+                               {name: target for name, target in namespace.bindings.items()
+                                if name in used and name not in local})
                 state.references.update({name: owner.global_symbols[name][1]
-                                         for name in owner.global_names if name not in local})
+                                         for name in owner.global_names if name in used and name not in local})
                 for name in local:
                     state.bindings[name] = None
                 arguments = function.args
@@ -3058,8 +3491,17 @@ class _Analysis:
                     state[name] = frozenset({TaintTrace(name, parameter=f'@free:{name}', path=(name,))})
                     state.bindings[name] = _SymbolicValue(f'@free:{name}')
                     state.references[name] = frozenset({f'@free:{name}'})
-                for name, binding in context:
-                    state.bindings[name.removeprefix('@free:').removeprefix('@global:')] = binding
+                if context:
+                    ctx_globals = []
+                    for name, binding in context:
+                        raw = name.removeprefix('@free:').removeprefix('@global:')
+                        if name.startswith('@global:') and raw in owner.global_symbols and raw not in local:
+                            state.setdefault(raw, owner.global_symbols[raw][0])
+                            state.references.setdefault(raw, owner.global_symbols[raw][1])
+                            ctx_globals.append(raw)
+                        state.bindings[raw] = binding
+                    if ctx_globals:
+                        flow.context_globals = tuple(ctx_globals)
                 if isinstance(function, ast.Lambda):
                     # Analyze lambda bodies once per fixed-point pass, not by
                     # recursively interpreting their call sites on our stack.
@@ -3072,7 +3514,7 @@ class _Analysis:
                     flow.returned_references.update(flow.expression_references.get(function.body, NO_REFERENCES))
                     flow.returned_bindings.append(flow.expression_bindings.get(function.body))
                 else:
-                    if function.name not in local and function.name not in state.bindings:
+                    if function.name in used and function.name not in local and function.name not in state.bindings:
                         state.bindings[function.name] = function
                     flow.normal_state, completed = flow.capture(function.body, state, exceptions=True)
                     flow.pending.extend(completed)
@@ -3087,7 +3529,7 @@ class _Analysis:
                 if not context:
                     flows.append(flow)
             if not changed and len(self.summaries) == previous_contexts:
-                self.globals = globals_
+                self.refresh_globals(globals_)
                 effects = {}
                 framework_bound = self.framework_bound(globals_)
                 self.framework_values = framework_bound
@@ -3158,9 +3600,11 @@ class _Project:
         for _, _, engine, _ in self.sources:
             engine.function_owners = self.owners
         self.module_references = {'@module:' + str(key) for key in self.namespaces}
+        self.module_ref_map = {key: frozenset({key}) for key in self.module_references}
         # AST-keyed metadata is safe to share. Module variable namespaces and
         # framework entrypoint bindings remain separate per defining module.
         for name in ('summaries', 'defaults', 'default_references', 'default_bindings', 'parents', 'locals', 'closures',
+                     'used_names', 'shadowed_globals', 'shadowed_global_values', 'active_globals',
                      'class_members', 'class_callables'):
             shared = {}
             for _, _, engine, _ in self.sources:
@@ -3334,7 +3778,7 @@ class _Project:
         # function body and cannot read a peer member under deferred_cycle's
         # initializer contract. Qualified lookups then see complete namespaces.
         for engine in component:
-            engine.globals = _Flow(engine, engine.tree).block(engine.tree.body, _State())
+            engine.refresh_globals(_Flow(engine, engine.tree).block(engine.tree.body, _State()) or _State())
         self.ready.update(component)
         self.solving = set(component)
         try:

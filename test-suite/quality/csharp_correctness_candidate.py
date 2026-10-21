@@ -200,6 +200,78 @@ class C { void M(IDbConnection db, HttpRequest http) { MailAddress.TryCreate(db,
         self.assertEqual([(rule(row), row['line'], row['severity']) for row in rows],
                          [('cs.security.sql-injection', 6, 'critical')])
 
+    PARSE_CALLS = {
+        'keyword_var': 'public static int P(string raw) => int.TryParse(raw, out var n) ? n : 0;',
+        'keyword_typed': 'public static int P(string raw) { int.TryParse(raw, out int n); return n; }',
+        'existing_local': 'public static int P(string raw) { int n = 0; int.TryParse(raw, out n); return n; }',
+        'discard': 'public static bool P(string raw) => long.TryParse(raw, out _);',
+        'imported_type': 'public static Guid P(string raw) => Guid.TryParse(raw, out var g) ? g : Guid.Empty;',
+        'qualified_type': 'public static bool P(string raw) => System.Int32.TryParse(raw, out var n);',
+        'global_type': 'public static bool P(string raw) => global::System.DateTime.TryParse(raw, out var d);',
+        'literal': 'public static bool P() => double.TryParse("1.5", out var d);',
+        'request_read': 'public static bool P(HttpRequest http) => int.TryParse(http.Query["page"], out var p);',
+        'request_to_string': 'public static bool P(HttpRequest http) => int.TryParse(http.Query["page"].ToString(), out var p);',
+    }
+
+    def parse_source(self, method):
+        head = SQL_REPRO.split('    // A BCL call')[0]
+        return ('using System;\nusing Microsoft.AspNetCore.Http;\n' + head.replace('using System.Net.Mail;\n', '')
+                + '    ' + method + '\n}\n')
+
+    def test_value_type_tryparse_is_sql_inert(self):
+        # GH #171: int.TryParse/Guid.TryParse/... write only their own value
+        # type, so they cannot affect a SQL sink and must not make the file
+        # partial.
+        for label, method in self.PARSE_CALLS.items():
+            with self.subTest(label=label):
+                self.assertEqual(self.scan(self.parse_source(method)), ([], None))
+
+    def test_unproven_parses_and_trygetvalue_stay_incomplete(self):
+        from ubs_core.taint_flow import AnalysisLimit
+        methods = (
+            # Other overloads, named arguments and generic forms are not modeled.
+            'public static bool P(string raw) => int.TryParse(raw, System.Globalization.NumberStyles.Any, null, out var n);',
+            'public static bool P(string raw) => int.TryParse(s: raw, result: out var n);',
+            'public static bool P(string raw) => int.TryParse<int>(raw, out var n);',
+            # Unknown receiver, shadowed receivers, an escaped keyword identifier.
+            'public static bool P(string raw) => Widget.TryParse(raw, out var w);',
+            'public static bool P(string raw, dynamic Guid) => Guid.TryParse(raw, out var g);',
+            'public static bool P(string raw, dynamic @int) => @int.TryParse(raw, out var g);',
+            # Inputs that could reach the parse through a user conversion.
+            'public static bool P(object raw) => int.TryParse(raw, out var n);',
+            'public static bool P(string raw) => int.TryParse(Helper(raw), out var n);',
+            'public static bool P(HttpRequest http) { var dto = Make(http.Query["x"]); return int.TryParse(dto.Page, out var n); }',
+            # The output type of TryGetValue is the dictionary's value type.
+            'public static string P(System.Collections.Generic.Dictionary<string, string> d, string k) => d.TryGetValue(k, out var v) ? v : "";',
+        )
+        for method in methods:
+            with self.subTest(method=method):
+                rows, error = self.scan(self.parse_source(method))
+                self.assertEqual(rows, [])
+                self.assertIsInstance(error, AnalysisLimit)
+
+    def test_parsed_request_value_keeps_its_provenance(self):
+        # The parse is SQL-inert, not a sanitizer: request data parsed into a
+        # local and concatenated into SQL is still reported, as is SQL next to
+        # the parse.
+        source = '''using System.Data;
+using Dapper;
+using Microsoft.AspNetCore.Http;
+class C {
+    static void Run(IDbConnection db, HttpRequest http, string raw) {
+        int.TryParse(http.Query["id"], out var n);
+        db.Execute("SELECT * FROM t WHERE id = " + n);
+        int.TryParse(raw, out var m);
+        db.Execute("SELECT * FROM t WHERE a = " + http.Query["a"]);
+    }
+}
+'''
+        rows, error = self.scan(source)
+        self.assertIsNone(error)
+        self.assertEqual([(rule(row), row['line'], row['severity']) for row in rows],
+                         [('cs.security.sql-injection', 7, 'critical'),
+                          ('cs.security.sql-injection', 9, 'critical')])
+
 
 class ExecutionStatusTests(unittest.TestCase):
     def test_complete_and_severity_failures_are_not_analysis_errors(self):

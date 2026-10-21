@@ -46,15 +46,22 @@ SINK_RE = re.compile(
     r'|\b(?:send_file|serve_file|download_file|write_file_response)\s*\(?'
     r'|\brender\s+(?:file|template):',
 )
-PROOF_TAGS = frozenset({'url-host', 'url-scheme', 'contained-path'})
+PROOF_TAGS = frozenset({'url-host', 'url-scheme', 'contained-path', 'redirect-slash-prefix', 'redirect-not-double-slash', 'safe-redirect'})
 VALUE_TAGS = PROOF_TAGS | frozenset({'canonical-path', 'parsed-uri', 'basename-path', 'not-dot-name', 'exact-literal', 'sql-bound-value', 'sql-integer-value'})
 PATH_RULE = 'ruby.taint.path_traversal'
 URL_RULE = 'ruby.taint.outbound_url'
+REDIRECT_RULE = 'ruby.redirect.open'
 EVAL_RULE = 'ruby.security.eval-family'
 DISPATCH_RULE = 'ruby.security.dynamic-dispatch'
 COMMAND_RULE = 'ruby.security.backticks-interpolated'
 SQL_RULE = 'ruby.security.sql-injection'
 EXECUTION_RULES = frozenset({EVAL_RULE, DISPATCH_RULE, COMMAND_RULE})
+API_CONSTANTS = frozenset(tuple(name.split('::')) for name in (
+    'File', 'IO', 'FileUtils', 'Dir', 'Pathname', 'URI', 'OpenURI',
+    'Net', 'Net::HTTP', 'Addressable', 'Addressable::URI', 'Rack', 'Rack::Request',
+    'Faraday', 'HTTParty', 'RestClient', 'Excon', 'HTTP', 'Typhoeus', 'Curl',
+    'ActiveRecord', 'ActiveRecord::Base', 'Arel',
+))
 # ActiveRecord::ConnectionAdapters::DatabaseStatements: query text is the
 # first positional operand, independently of log names and value bindings.
 SQL_CONNECTION_ARITIES = {
@@ -359,6 +366,10 @@ class RubyFunction:
     scope: bool = False
     defaults: tuple = ()
     parameter_kinds: tuple = ()
+    lexical_owners: tuple = ()
+    definition_receiver: str = ''
+    namespace_receiver: str = ''
+    conditional: bool = False
 
 
 class RubyParser:
@@ -366,8 +377,11 @@ class RubyParser:
         self.tokens = RubyLexer(text).scan()
         self.position, self.depth = 0, 0
         self.functions, self.aliases = {}, {}
+        self.conditional_aliases = set()
         self.class_bases = {}
         self.singleton_scope = False
+        self.lexical_owners = ()
+        self.conditional_depth = 0
         body = self.block((), ())
         self.functions[-1] = RubyFunction(-1, '<script>', (), (), body, scope=True)
         self.bind_numbered_parameters()
@@ -526,7 +540,9 @@ class RubyParser:
             self.position += 1
         return tuple(self.tokens[start:self.position])
 
-    def block(self, stops, owner):
+    def block(self, stops, owner, conditional=False):
+        previous_conditional = self.conditional_depth
+        self.conditional_depth += bool(conditional)
         self.depth += 1
         if self.depth > 64:
             raise AnalysisLimit('Ruby block nesting limit exceeded; analysis is incomplete')
@@ -541,6 +557,7 @@ class RubyParser:
                 raise ValueError('Unsupported Ruby block structure; analysis is incomplete')
             self.separators()
         self.depth -= 1
+        self.conditional_depth = previous_conditional
         return tuple(body)
 
     def end(self):
@@ -551,7 +568,7 @@ class RubyParser:
     def branch(self, kind, owner):
         condition = self.take()
         self.separators()
-        body = self.block({'else', 'elsif', 'end'}, owner)
+        body = self.block({'else', 'elsif', 'end'}, owner, conditional=True)
         alternate = ()
         if self.value() == 'elsif':
             self.position += 1
@@ -559,13 +576,13 @@ class RubyParser:
             return RubyStatement(kind, condition, body, alternate)
         if self.value() == 'else':
             self.position += 1
-            alternate = self.block({'end'}, owner)
+            alternate = self.block({'end'}, owner, conditional=True)
         self.end()
         return RubyStatement(kind, condition, body, alternate)
 
-    def exception_body(self, owner):
+    def exception_body(self, owner, conditional=False):
         """Parse explicit begin and Ruby's implicit method/block exception body."""
-        body = self.block({'rescue', 'else', 'ensure', 'end'}, owner)
+        body = self.block({'rescue', 'else', 'ensure', 'end'}, owner, conditional=conditional)
         handlers, alternate, finalizer = [], (), ()
         while self.value() == 'rescue':
             self.position += 1
@@ -579,16 +596,16 @@ class RubyParser:
                 names = (binding[1][0].value,)
             if binding[0] and not re.fullmatch(r'(?:::)?[A-Z]\w*(?:::[A-Z]\w*)*(?:,(?:::)?[A-Z]\w*(?:::[A-Z]\w*)*)*', token_text(binding[0])):
                 raise ValueError('Dynamic Ruby rescue classes need dispatch analysis; analysis is incomplete')
-            caught = self.block({'rescue', 'else', 'ensure', 'end'}, owner)
+            caught = self.block({'rescue', 'else', 'ensure', 'end'}, owner, conditional=True)
             handlers.append(RubyStatement('handler', header, caught, names=names))
         if self.value() == 'else':
             if not handlers:
                 raise ValueError('Ruby exception else needs a rescue clause; analysis is incomplete')
             self.position += 1
-            alternate = self.block({'ensure', 'end'}, owner)
+            alternate = self.block({'ensure', 'end'}, owner, conditional=True)
         if self.value() == 'ensure':
             self.position += 1
-            finalizer = self.block({'end'}, owner)
+            finalizer = self.block({'end'}, owner, conditional=conditional)
         self.end()
         if handlers or alternate or finalizer:
             return (RubyStatement('rescue', body=body, alternate=alternate,
@@ -604,9 +621,10 @@ class RubyParser:
                 raise ValueError('Unsupported Ruby definition; analysis is incomplete')
             if kind == 'def':
                 opening = next((i for i, token in enumerate(header) if token.value == '('), None)
-                name_end = opening if opening is not None else 1
-                if opening is None and len(header) > 2 and header[1].value in {'.', '::'}:
-                    name_end = 3
+                name_end = opening if opening is not None else 2 if header[0].value == '::' else 1
+                if opening is None:
+                    while name_end + 1 < len(header) and header[name_end].value in {'.', '::'}:
+                        name_end += 2
                 name = token_text(header[:name_end])
                 parameter_tokens = header[opening + 1:-1] if opening is not None else header[name_end:]
                 parameter_parts = tuple(part for part in split_tokens(parameter_tokens, {','}) if part)
@@ -622,21 +640,28 @@ class RubyParser:
                         pieces = split_tokens(part, {'='})
                         defaults.append(part[2:] if keyword else pieces[1] if len(pieces) == 2 else ())
                         kinds.append('keyword' if keyword else 'positional')
-                singleton = '.' in name or self.singleton_scope
-                function_owner, method = owner, name
-                if '.' in name:
-                    receiver, method = name.rsplit('.', 1)
+                singleton = '.' in name or '::' in name or self.singleton_scope
+                function_owner, method, definition_receiver = owner, name, ''
+                if '.' in name or '::' in name:
+                    receiver, method = name.rsplit('.' if '.' in name else '::', 1)
                     if receiver != 'self':
+                        definition_receiver = receiver
                         function_owner = (*owner, *receiver.split('::'))
+                conditional = bool(self.conditional_depth)
+                self.conditional_depth += 1
                 if self.value() == '=':
                     self.position += 1
                     body = (RubyStatement('simple', self.take()),)
                 else:
                     self.separators()
                     body = self.exception_body(function_owner)
+                self.conditional_depth -= 1
                 key = self.tokens[start].start
                 self.functions[key] = RubyFunction(key, method, function_owner, tuple(parameters), body, singleton,
-                                                   defaults=tuple(defaults), parameter_kinds=tuple(kinds))
+                                                   defaults=tuple(defaults), parameter_kinds=tuple(kinds),
+                                                   lexical_owners=self.lexical_owners,
+                                                   definition_receiver=definition_receiver,
+                                                   conditional=conditional)
             else:
                 if token_text(header) == '<<self':
                     previous = self.singleton_scope
@@ -651,12 +676,18 @@ class RubyParser:
                 if kind == 'class' and len(bases) == 2:
                     self.class_bases.setdefault(child_owner, set()).add((owner, token_text(bases[1])))
                 previous = self.singleton_scope
+                previous_owners = self.lexical_owners
                 self.singleton_scope = False
+                self.lexical_owners = (child_owner, *previous_owners)
                 self.separators()
                 body = self.exception_body(child_owner)
                 self.singleton_scope = previous
+                lexical_owners, self.lexical_owners = self.lexical_owners, previous_owners
                 key = self.tokens[start].start
-                self.functions[key] = RubyFunction(key, '<' + kind + '>', child_owner, (), body, scope=True)
+                self.functions[key] = RubyFunction(key, '<' + kind + '>', child_owner, (), body, scope=True,
+                                                   lexical_owners=lexical_owners,
+                                                   namespace_receiver=name if '::' in name else '',
+                                                   conditional=bool(self.conditional_depth))
             return None
         if kind in {'if', 'unless'}:
             self.position += 1
@@ -673,7 +704,7 @@ class RubyParser:
             if self.value() == 'do':
                 self.position += 1
             self.separators()
-            body = self.block({'end'}, owner)
+            body = self.block({'end'}, owner, conditional=True)
             self.end()
             return RubyStatement(kind, condition, body, names=names)
         if kind == 'begin':
@@ -689,6 +720,8 @@ class RubyParser:
                 raise ValueError('Dynamic Ruby method aliases need binding analysis; analysis is incomplete')
             key = owner, self.singleton_scope, names[0]
             self.aliases.setdefault(key, set()).add(names[1])
+            if self.conditional_depth:
+                self.conditional_aliases.add(key)
             return None
         for index, token in enumerate(tokens):
             if token.kind == 'code' and token.value in {'(', '['}:
@@ -710,7 +743,7 @@ class RubyParser:
                     inner = inner[closing + 1:]
                 saved_tokens, saved_position = self.tokens, self.position
                 self.tokens, self.position = list(inner), 0
-                body = self.block((), owner)
+                body = self.block((), owner, conditional=True)
                 self.tokens, self.position = saved_tokens, saved_position
                 return RubyStatement('iterate', tokens[:index], body, names=tuple(names), explicit_parameters=explicit)
         if self.value() == 'do':
@@ -729,7 +762,7 @@ class RubyParser:
                     raise ValueError('Unterminated Ruby block parameters; analysis is incomplete')
                 self.position += 1
             self.separators()
-            body = self.exception_body(owner)
+            body = self.exception_body(owner, conditional=True)
             return RubyStatement('iterate', tokens, body, names=tuple(names), explicit_parameters=explicit)
         if len(split_tokens(tokens, {'rescue'})) > 1:
             raise ValueError('Ruby modifier rescue needs expression binding analysis; analysis is incomplete')
@@ -795,35 +828,132 @@ class RubyEngine:
         self.dispatch_failures = {}
         self.pending_raises = CLEAN
         self.constants = {}
-        # Only unconditional, literal constant definitions can be an allowlist
-        # or trusted root. A second definition invalidates that static proof.
-        for function in self.parser.functions.values():
-            if not function.scope:
-                continue
-            for statement in function.body:
-                parts = split_tokens(statement.tokens, {'='})
-                if statement.kind == 'simple' and len(parts) == 2 and len(parts[0]) == 1 and re.fullmatch(r'[A-Z]\w*', parts[0][0].value):
-                    key = (function.owner, parts[0][0].value)
-                    self.constants[key] = CLEAN if key in self.constants else self.literal_value(parts[1], shared=True)
         self.constant_definitions = {function.owner for function in self.parser.functions.values()
                                      if function.scope and function.owner}
+        self.constant_positions = {}
+        self.class_contexts = {}
+        for function in self.parser.functions.values():
+            if function.scope and function.owner:
+                self.constant_positions[function.owner] = min(
+                    self.constant_positions.get(function.owner, function.key), function.key)
+                if function.name == '<class>' and (
+                        function.owner not in self.class_contexts
+                        or function.key < self.class_contexts[function.owner][1]):
+                    self.class_contexts[function.owner] = (function.lexical_owners[1:], function.key)
+        declared_constants = frozenset(self.constant_definitions)
+        self.conditional_constants = {function.owner for function in self.parser.functions.values()
+                                      if function.scope and function.conditional}
+        self.constant_aliases = {}
+        self.unresolved_definition_methods = set()
 
-        def constant_bindings(statements, owner):
+        def constant_bindings(statements, function, unconditional=False):
             for statement in statements:
                 self.budget.spend()
-                parts = split_tokens(statement.tokens, {'=', '||=', '&&='})
-                for lhs in parts[:-1]:
-                    name = token_text(lhs)
-                    if re.fullmatch(r'(?:::)?[A-Z]\w*(?:::[A-Z]\w*)*', name):
-                        definition = tuple(name[2:].split('::')) if name.startswith('::') else (*owner, *name.split('::'))
+                parts = split_tokens(statement.tokens, {'=', '||=', '&&=', '+=', '-='})
+                for lhs_group in parts[:-1]:
+                    for lhs in split_tokens(lhs_group, {','}):
+                        name = token_text(lhs)
+                        if not re.fullmatch(r'(?:::)?[A-Z]\w*(?:::[A-Z]\w*)*', name):
+                            continue
+                        definition = tuple(name[2:].split('::')) if name.startswith('::') else (*function.owner, *name.split('::'))
                         self.constant_definitions.add(definition)
-                constant_bindings(statement.body, owner)
-                constant_bindings(statement.alternate, owner)
+                        position = lhs[0].start
+                        self.constant_positions[definition] = min(
+                            self.constant_positions.get(definition, position), position)
+                        direct = (unconditional and len(parts) == 2 and lhs == lhs_group
+                                  and len(split_tokens(statement.tokens, {'='})) == 2)
+                        # Value proofs and namespace aliases use the same
+                        # definition inventory. A conditional write, namespace
+                        # collision or second assignment invalidates a literal
+                        # allowlist even when its first initializer was safe.
+                        key = (definition[:-1], definition[-1])
+                        fact = (self.literal_value(parts[-1], shared=True)
+                                if direct and definition not in declared_constants else CLEAN)
+                        self.constants[key] = CLEAN if key in self.constants else fact
+                        target = token_text(parts[-1]) if direct else ''
+                        alias = ((target, function.owner, function.lexical_owners, position)
+                                 if direct and re.fullmatch(r'(?:::)?[A-Z]\w*(?:::[A-Z]\w*)*', target)
+                                 else None)
+                        # An alias captures an object, not a live reference to
+                        # its constant slot. Rebinding an existing namespace
+                        # needs definition-order analysis before earlier aliases
+                        # can be associated with the replacement safely.
+                        if definition in declared_constants or definition in API_CONSTANTS:
+                            alias = None
+                        self.constant_aliases[definition] = None if definition in self.constant_aliases else alias
+                constant_bindings(statement.body, function)
+                constant_bindings(statement.alternate, function)
                 for handler in statement.handlers:
-                    constant_bindings(handler.body, owner)
-                constant_bindings(statement.finalizer, owner)
+                    constant_bindings(handler.body, function)
+                constant_bindings(statement.finalizer, function)
         for function in self.parser.functions.values():
-            constant_bindings(function.body, function.owner)
+            constant_bindings(function.body, function, function.scope and not function.conditional)
+        # A compact namespace opened inside another scope may resolve outside
+        # that scope. The parser's lexical owner is insufficient to associate
+        # those definitions with earlier bodies safely; keep their selected
+        # method identities explicitly unresolved instead of trusting a stale
+        # sanitizer body on the original namespace.
+        unresolved_scopes = set()
+        for function in self.parser.functions.values():
+            if function.scope and function.namespace_receiver:
+                owner = self.constant_owner(function.namespace_receiver, function.owner,
+                                            function.lexical_owners[1:], position=function.key)
+                if owner != function.owner:
+                    unresolved_scopes.add(function.owner)
+        for function in self.parser.functions.values():
+            if not function.scope and any(function.owner[:length] in unresolved_scopes
+                                          for length in range(1, len(function.owner) + 1)):
+                self.unresolved_definition_methods.add(function.name)
+        # A qualified assignment through an alias changes the same namespace.
+        # Keep its spelling for lookup and also invalidate the canonical slot.
+        for owner, alias in tuple(self.constant_aliases.items()):
+            parent = self.constant_identity(owner[:-1])
+            canonical = (*parent, owner[-1]) if parent is not None else owner
+            if canonical != owner:
+                self.constant_aliases[canonical] = None if canonical in self.constant_aliases else alias
+                key = (canonical[:-1], canonical[-1])
+                self.constants[key] = (CLEAN if key in self.constants
+                                       else self.constants.get((owner[:-1], owner[-1]), CLEAN))
+                self.constant_definitions.add(canonical)
+                position = self.constant_positions[owner]
+                self.constant_positions[canonical] = min(
+                    self.constant_positions.get(canonical, position), position)
+        for function in self.parser.functions.values():
+            owner = (self.constant_owner(function.definition_receiver, function.owner,
+                                         function.lexical_owners, position=function.key)
+                     if function.definition_receiver else function.owner)
+            canonical = self.constant_identity(owner)
+            if canonical is None:
+                if not function.scope:
+                    self.unresolved_definition_methods.add(function.name)
+                continue
+            function.owner = canonical
+            function.lexical_owners = tuple(self.constant_identity(owner) or owner
+                                            for owner in function.lexical_owners)
+            if function.scope:
+                self.constant_definitions.add(canonical)
+                self.constant_positions[canonical] = min(
+                    self.constant_positions.get(canonical, function.key), function.key)
+                if function.conditional:
+                    self.conditional_constants.add(canonical)
+        aliases, reverse_aliases = {}, {}
+        for (owner, singleton, name), targets in self.parser.aliases.items():
+            canonical = self.constant_identity(owner)
+            if canonical is None or (owner, singleton, name) in self.parser.conditional_aliases:
+                self.unresolved_definition_methods.add(name)
+            if canonical is not None:
+                aliases.setdefault((canonical, singleton, name), set()).update(targets)
+            for target in targets:
+                reverse_aliases.setdefault(target, set()).add(name)
+        self.parser.aliases = aliases
+        # An alias of an uncertain method must not restore a safe identity.
+        pending = list(self.unresolved_definition_methods)
+        while pending:
+            self.budget.spend()
+            for name in reverse_aliases.get(pending.pop(), ()):
+                if name not in self.unresolved_definition_methods:
+                    self.unresolved_definition_methods.add(name)
+                    pending.append(name)
         self.sql_models = {owner for owner in self.constant_definitions | {('ActiveRecord', 'Base')}
                            if self.active_record_model(owner)}
         self.repeated_sites = set()
@@ -863,16 +993,114 @@ class RubyEngine:
         line_index = bisect_right(self.lines, offset) - 1
         return Step(str(self.path), line_index + 1, offset - self.lines[line_index] + 1, kind, label[:160])
 
-    def constant_owner(self, name, lexical_owner):
+    def constant_owner(self, name, lexical_owner, lexical_owners=None, *, position=None, depth=0):
         """Resolve a selected class name before assigning framework identity."""
+        if depth > 64:
+            raise AnalysisLimit('Ruby constant lookup depth limit exceeded; analysis is incomplete')
         if name.startswith('::'):
             return tuple(name[2:].split('::'))
         parts = tuple(name.split('::'))
-        for count in range(len(lexical_owner), -1, -1):
-            prefix = lexical_owner[:count]
-            if (*prefix, parts[0]) in self.constant_definitions:
+        # `module A::B` nests only A::B; it does not add A to Module.nesting.
+        # Superclass metadata still uses the original enclosing-owner record.
+        owners = ((*lexical_owners, ()) if lexical_owners is not None
+                  else tuple(lexical_owner[:count] for count in range(len(lexical_owner), -1, -1)))
+        for prefix in owners:
+            if not prefix:
+                continue
+            candidate = (*prefix, parts[0])
+            if candidate in self.constant_definitions and (
+                    position is None or self.constant_positions.get(candidate, -1) < position):
                 return (*prefix, *parts)
+        # All lexical nesting precedes the innermost class's ancestors, and
+        # both precede Object's root constants. Resolve only a single visible
+        # superclass chain; a dynamic/rebound ancestor cannot prove File's
+        # sanitizer identity.
+        if lexical_owners:
+            owner = self.constant_identity(lexical_owners[0], depth=depth + 1)
+            seen = set()
+            if owner is None:
+                return None
+            while owner in self.parser.class_bases:
+                self.budget.spend()
+                if owner in seen or len(seen) >= 64:
+                    return None
+                seen.add(owner)
+                bases = self.parser.class_bases[owner]
+                if len(bases) != 1:
+                    return None
+                outer, base = next(iter(bases))
+                if not re.fullmatch(r'(?:::)?[A-Z]\w*(?:::[A-Z]\w*)*', base):
+                    return None
+                nesting, declaration = self.class_contexts.get(owner, (None, None))
+                owner = self.constant_identity(self.constant_owner(
+                    base, outer, nesting, position=declaration, depth=depth + 1), depth=depth + 1)
+                if owner is None or (owner not in self.constant_definitions and owner not in API_CONSTANTS):
+                    return None
+                candidate = (*owner, parts[0])
+                if candidate in self.constant_definitions and (
+                        position is None or self.constant_positions.get(candidate, -1) < position):
+                    return (*owner, *parts)
         return parts
+
+    def constant_identity(self, owner, seen=frozenset(), *, depth=0):
+        """Resolve only unchanged, unconditional constant-reference aliases.
+
+        Reassignment, conditional binding and value-producing initializers
+        cannot prove a class/module identity. Prefix aliases also apply to
+        qualified names such as Client::HTTP.
+        """
+        self.budget.spend()
+        if owner is None:
+            return None
+        if len(seen) > 64 or len(owner) > 64 or depth > 64:
+            raise AnalysisLimit('Ruby constant alias depth limit exceeded; analysis is incomplete')
+        for length in range(1, len(owner) + 1):
+            prefix = owner[:length]
+            if prefix not in self.constant_aliases:
+                continue
+            alias = self.constant_aliases[prefix]
+            if alias is None or prefix in seen:
+                return None
+            name, lexical_owner, lexical_owners, position = alias
+            # Constant aliases capture the receiver at this assignment. A
+            # later lexical shadow must not retroactively replace that object.
+            target = self.constant_owner(name, lexical_owner, lexical_owners, position=position, depth=depth + 1)
+            resolved = self.constant_identity(target, seen | {prefix}, depth=depth + 1)
+            return (self.constant_identity((*resolved, *owner[length:]), seen | {prefix}, depth=depth + 1)
+                    if resolved is not None else None)
+        return owner
+
+    def constant_value_owner(self, owner):
+        """Select a literal value without giving it class/module identity."""
+        if not owner:
+            return None
+        parent = self.constant_identity(owner[:-1])
+        if parent is None:
+            return None
+        selected = (*parent, owner[-1])
+        if any(selected[:length] in self.conditional_constants
+               for length in range(1, len(selected) + 1)):
+            return None
+        return selected if self.constants.get((selected[:-1], selected[-1])) else None
+
+    def constant_call(self, name):
+        """Canonicalize a syntactic constant receiver in its actual scope."""
+        if '.' not in name:
+            return name
+        receiver, method = name.rsplit('.', 1)
+        if not re.fullmatch(r'(?:::)?[A-Z]\w*(?:::[A-Z]\w*)*', receiver):
+            return name
+        owner = self.constant_owner(receiver, self.function.owner, self.function.lexical_owners)
+        identity = self.constant_identity(owner)
+        if identity is None and self.constant_value_owner(owner) is not None:
+            # A constant may hold an array/string, including one named File.
+            # Keep ordinary value behavior while preventing its spelling from
+            # matching a builtin API or a selected namespace's singleton method.
+            return '<value>.' + method
+        if identity is not None and any(identity[:length] in self.conditional_constants
+                                        for length in range(1, len(identity) + 1)):
+            return None
+        return '::'.join(identity) + '.' + method if identity is not None else None
 
     def active_record_model(self, owner, seen=frozenset()):
         self.budget.spend()
@@ -942,9 +1170,10 @@ class RubyEngine:
         if method == 'lease_connection' and has_shape(receiver, 'active-record-pool') and not arguments:
             return self.fresh(shape('active-record-connection', token.start),
                               'active-record-connection', token.start)
-        arel_sql = (name in {'Arel.sql', '::Arel.sql'}
-                    and self.constant_owner(name.rsplit('.', 1)[0], self.function.owner) == ('Arel',)
-                    and ('Arel',) not in self.constant_definitions)
+        # call() already resolved a constant receiver, including a leading
+        # root qualifier. Resolving its canonical name lexically again could
+        # substitute an unrelated nested Arel constant.
+        arel_sql = name == 'Arel.sql' and ('Arel',) not in self.constant_definitions
         if arel_sql and positional and has_shape(positional[0], 'arel-sql-literal'):
             # Arel.sql(SqlLiteral) returns the same object, including when
             # options were supplied. A new allocation would lose mutations.
@@ -1120,7 +1349,11 @@ class RubyEngine:
             receiver, method = name.rsplit('.', 1)
             if not re.fullmatch(r'(?:::)?[A-Z]\w*(?:::[A-Z]\w*)*', receiver):
                 return []
-            owner, singleton = tuple(receiver.removeprefix('::').split('::')), True
+            owner = self.constant_identity(self.constant_owner(receiver, self.function.owner,
+                                                               self.function.lexical_owners))
+            if owner is None:
+                return []
+            singleton = True
         names, pending = {method}, [method]
         while pending:
             for alias in self.parser.aliases.get((owner, singleton, pending.pop()), ()):
@@ -1205,13 +1438,17 @@ class RubyEngine:
     def record(self, offset, value, operation=''):
         unsafe = frozenset(trace for trace in tainted(value)
                            if ('contained-path' not in trace.tags if self.policy == 'path'
-                               else not {'url-host', 'url-scheme'} <= trace.tags)
+                               else not ({'url-host', 'url-scheme'} <= trace.tags
+                                         or (self.policy == 'redirect'
+                                             and ({'redirect-slash-prefix', 'redirect-not-double-slash'} <= trace.tags
+                                                  or 'safe-redirect' in trace.tags))))
                            and not (self.policy == 'path' and 'basename-path' in trace.tags
                                     and ('not-dot-name' in trace.tags or operation == 'send_file'
                                          or re.fullmatch(r'(?:File|IO)\.(?:read|binread|write|binwrite|open|truncate)', operation))))
         if unsafe:
-            label = 'file sink' if self.policy == 'path' else 'outbound URL sink'
-            site = (PATH_RULE if self.policy == 'path' else URL_RULE, offset)
+            label = 'file sink' if self.policy == 'path' else 'redirect sink' if self.policy == 'redirect' else 'outbound URL sink'
+            rule = PATH_RULE if self.policy == 'path' else REDIRECT_RULE if self.policy == 'redirect' else URL_RULE
+            site = (rule, offset)
             self.effects[site] = join(self.effects.get(site, CLEAN), advance(unsafe, self.step(offset, 'sink', label)))
 
     def execution_sink(self, offset, value, rule, operation, state):
@@ -1290,7 +1527,7 @@ class RubyEngine:
             direct = bool(identities & aliases) or binding == name and not identities
             contained = bool(identities & object_ids(fact, members=True))
             if direct or contained:
-                if binding and binding[0].isupper() and tainted(changed):
+                if binding.removeprefix('::')[:1].isupper() and tainted(changed):
                     raise ValueError('Request-derived Ruby constant mutation needs shared-state analysis; analysis is incomplete')
                 if direct and (definite and aliases == identities or binding == name):
                     state[binding] = changed
@@ -1305,7 +1542,20 @@ class RubyEngine:
 
     def call(self, name, receiver, arguments, token, state):
         self.budget.spend()
-        candidates = self.candidates(name, len(arguments))
+        original_name = name
+        name = self.constant_call(name)
+        unresolved_definition = original_name.rsplit('.', 1)[-1] in self.unresolved_definition_methods
+        if name is None or unresolved_definition:
+            value = join(receiver, *arguments)
+            if tainted(value) or unresolved_definition:
+                self.unresolved_calls.add(
+                    f'{self.path}:{self.step(token.start, "call", original_name).line}: '
+                    'Ruby constant receiver binding is unresolved; analysis is incomplete')
+            self.pending_raises = join(self.pending_raises, self.exception_value(value, '*'))
+            return self.fresh(retag(value, remove=VALUE_TAGS), 'unknown', token.start)
+        constant_receiver = ('.' in original_name and re.fullmatch(
+            r'(?:::)?[A-Z]\w*(?:::[A-Z]\w*)*', original_name.rsplit('.', 1)[0]))
+        candidates = self.candidates('::' + name if constant_receiver else name, len(arguments))
         models = {trace.key[1] for trace in receiver
                   if trace.kind == 'shape' and trace.key[0] == 'active-record-model'}
         framework_models = set()
@@ -1313,7 +1563,7 @@ class RubyEngine:
             candidates = []
             for owner in models:
                 for ancestor in self.model_ancestors(owner):
-                    choices = self.candidates('::'.join(ancestor) + '.' + name.rsplit('.', 1)[-1], len(arguments))
+                    choices = self.candidates('::' + '::'.join(ancestor) + '.' + name.rsplit('.', 1)[-1], len(arguments))
                     if choices:
                         candidates.extend(choices)
                         break
@@ -1333,6 +1583,11 @@ class RubyEngine:
                 if values is None:
                     continue
                 matched = True
+                if function.conditional:
+                    self.unresolved_calls.add(
+                        f'{self.path}:{self.step(token.start, "call", original_name).line}: '
+                        'Ruby constant/method definition is conditional; analysis is incomplete')
+                    returned = join(returned, retag(join(receiver, *arguments), remove=VALUE_TAGS))
                 call = self.step(token.start, 'call', name + '()')
                 bound = tuple(advance(value, call) for value in values)
                 summary = self.summaries[self.context(function, bound)]
@@ -1448,7 +1703,30 @@ class RubyEngine:
                               'pathname' if has_shape(receiver, 'pathname') else 'string', token.start)
         positional = [argument for argument in arguments
                       if not any(trace.kind == 'keyword' for trace in argument)]
-        if self.policy == 'url':
+        if self.policy == 'redirect':
+            if name in {'url_from', 'self.url_from'} and positional:
+                return self.fresh(retag(positional[0], add=frozenset({'safe-redirect'})), 'string', token.start)
+            if name in {'redirect_to', 'redirect', 'self.redirect_to', 'self.redirect'}:
+                allow_other_host_false = any(
+                    any(trace.kind == 'keyword' and trace.key == ('allow_other_host',) for trace in argument)
+                    and any(trace.kind == 'constant' and trace.key == ('code', 'false') for trace in argument)
+                    and not tainted(argument)
+                    for argument in arguments
+                )
+                if not allow_other_host_false:
+                    if positional:
+                        self.record(token.start, positional[0], name)
+                    for argument in arguments:
+                        if any(trace.kind == 'keyword' and trace.key[0] in {'location', 'url'} for trace in argument):
+                            self.record(token.start, argument, name)
+            elif name in {'head', 'self.head'}:
+                for argument in arguments:
+                    if any(trace.kind == 'keyword' and trace.key == ('location',) for trace in argument):
+                        self.record(token.start, argument, name)
+            elif re.fullmatch(r'(?:response(?:\.headers)?|headers)\.(?:store|\[\]=|set_header|add_header)', name, re.IGNORECASE) and len(positional) >= 2:
+                if any(trace.kind == 'constant' and trace.key[0] == 'literal' and trace.key[1].lower() == 'location' for trace in positional[0]):
+                    self.record(token.start, positional[1], name)
+        elif self.policy == 'url':
             is_sink = (name in {'URI.open', 'OpenURI.open', 'open'}
                        or re.fullmatch(r'Net::HTTP\.(?:get|get_response|post|post_form|start|new)', name)
                        or re.fullmatch(r'(?:Faraday|HTTParty|RestClient|Excon|HTTP|Typhoeus|Curl)\.(?:get|post|put|patch|delete|head|request)', name)
@@ -1511,6 +1789,16 @@ class RubyEngine:
         literal = self.literal_value(tokens)
         if literal:
             return literal
+        if (len(tokens) >= 2 and tokens[0].kind == 'code'
+                and re.fullmatch(r'[a-z_]\w*[!?]?', tokens[0].value)
+                and tokens[0].value not in {'not', 'and', 'or', 'true', 'false', 'nil', 'self'}
+                and tokens[0].value not in state
+                and (tokens[1].kind != 'code'
+                     or (tokens[1].value == ':' and tokens[0].end < tokens[1].start)
+                     or tokens[1].value not in {'.', '&.', '[', '(', '::', ',', ')', ']', '}', '=>', ':', '||', 'or', '&&', 'and', '==', '!=', '=~', '!~', '<', '>', '<=', '>=', '+', '-', '*', '/', '..', '<<'})):
+            arguments = self.call_arguments(tokens[1:], state, depth + 1)
+            atom = self.call(tokens[0].value, CLEAN, arguments, tokens[0], state)
+            return frozenset(trace for trace in atom if trace.kind != 'keyword')
         shifted = split_tokens(tokens, {'<<'})
         if len(shifted) == 2:
             previous = self.expression(shifted[0], state, depth + 1)
@@ -1520,8 +1808,9 @@ class RubyEngine:
         for operators in ({'=>', ':'}, {'||', 'or'}, {'&&', 'and'}, {'==', '!=', '=~', '!~', '<', '>', '<=', '>='}, {'+', '-', '*', '/', '..'}):
             parts = split_tokens(tokens, operators)
             if len(parts) > 1:
+                preserved = frozenset({'sql-integer-value', 'safe-redirect'}) if '||' in operators else frozenset({'sql-integer-value'})
                 combined = retag(self.invalidate_sql_binding(join(*(self.expression(part, state, depth + 1) for part in parts))),
-                                 remove=VALUE_TAGS - frozenset({'sql-integer-value'}))
+                                 remove=VALUE_TAGS - preserved)
                 if '+' in operators and all(parts):
                     return self.fresh(retag(self.without_sql_api(combined),
                                             remove=frozenset({'sql-raw-fragment'})), 'string', tokens[0].start)
@@ -1567,8 +1856,11 @@ class RubyEngine:
                 atom = state.get(name, CLEAN if constant_receiver
                                  else shape('unresolved-value', token.start))
                 if name not in state and re.fullmatch(r'(?:::)?[A-Z]\w*(?:::[A-Z]\w*)*', name):
-                    owner = self.constant_owner(name, self.function.owner)
-                    if owner in self.sql_models:
+                    owner = self.constant_owner(name, self.function.owner, self.function.lexical_owners)
+                    selected = self.constant_value_owner(owner)
+                    if selected is not None:
+                        atom = state.get('::' + '::'.join(selected), CLEAN)
+                    elif owner in self.sql_models:
                         atom = shape('active-record-model', owner)
                 if cursor < len(tokens) and tokens[cursor].value == '(':
                     end = closing_token(tokens, cursor)
@@ -1636,36 +1928,54 @@ class RubyEngine:
                                if all_required else frozenset.intersection(*(proof.get(name, frozenset()) for proof in proofs)))
                         for name in names}
         text = token_text(tokens)
-        if self.policy == 'url':
+        if self.policy in {'url', 'redirect'}:
             equal = split_tokens(tokens, {'==' if truth else '!='})
             if len(equal) == 2:
                 for member, literal in (equal, equal[::-1]):
-                    match = re.fullmatch(r'([A-Za-z_]\w*)\.(scheme|host|hostname)', token_text(member))
+                    match = re.fullmatch(r'(?:(?:URI|Addressable::URI)\.parse\(([A-Za-z_]\w*)(?:\.to_s)?\)|([A-Za-z_]\w*))\.(scheme|host|hostname)', token_text(member))
                     values = self.literal(literal)
-                    if match and len(values) == 1:
+                    if match and len(values) == 1 and (not match.group(1) or self.policy == 'redirect'):
+                        target_name = match.group(1) or match.group(2)
+                        prop = match.group(3)
                         item = next(iter(values))
                         if item.kind == 'constant' and item.key[0] == 'literal':
-                            if match.group(2) == 'scheme' and item.key[1] in {'https', 'http'}:
-                                return {match.group(1): frozenset({'url-scheme'})}
-                            if match.group(2) != 'scheme' and re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?', item.key[1]):
-                                return {match.group(1): frozenset({'url-host'})}
+                            if prop == 'scheme' and item.key[1] in {'https', 'http'}:
+                                return {target_name: frozenset({'url-scheme'})}
+                            if prop != 'scheme' and re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?', item.key[1]):
+                                return {target_name: frozenset({'url-host'})}
             if truth:
-                member = re.search(r'\.include\?\(([A-Za-z_]\w*)\.(host|hostname|scheme)\)$', text)
-                if member:
+                member = re.search(r'\.include\?\((?:(?:URI|Addressable::URI)\.parse\(([A-Za-z_]\w*)(?:\.to_s)?\)|([A-Za-z_]\w*))\.(host|hostname|scheme)\)$', text)
+                if member and (not member.group(1) or self.policy == 'redirect') and 'include?' not in self.unresolved_definition_methods:
+                    target_name = member.group(1) or member.group(2)
+                    prop = member.group(3)
                     split = next((index for index in range(len(tokens) - 1) if tokens[index].value == '.' and tokens[index + 1].value == 'include?'), None)
                     if split is not None:
                         allowed = self.expression(tokens[:split], state)
                         constants = [trace.key[1] for trace in allowed if trace.kind == 'constant' and trace.key[0] == 'literal']
                         if has_shape(allowed, 'literal-list') and not tainted(allowed) and constants:
-                            valid = all(value in {'https', 'http'} for value in constants) if member.group(2) == 'scheme' else all(re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?', value) for value in constants)
+                            valid = all(value in {'https', 'http'} for value in constants) if prop == 'scheme' else all(re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?', value) for value in constants)
                             if valid:
-                                return {member.group(1): frozenset({'url-scheme' if member.group(2) == 'scheme' else 'url-host'})}
+                                return {target_name: frozenset({'url-scheme' if prop == 'scheme' else 'url-host'})}
+            if self.policy == 'redirect':
+                if truth:
+                    slash = re.fullmatch(r'([A-Za-z_]\w*)(?:\.to_s)?\.start_with\?\([\'\"]/[\'\"]\)', text)
+                    if slash:
+                        return {slash.group(1): frozenset({'redirect-slash-prefix'})}
+                else:
+                    double_slash = re.fullmatch(r'([A-Za-z_]\w*)(?:\.to_s)?\.start_with\?\([\'\"](?://|/\\)[\'\"]\)', text)
+                    if double_slash:
+                        return {double_slash.group(1): frozenset({'redirect-not-double-slash'})}
         elif truth:
-            prefix = re.fullmatch(r'([A-Za-z_]\w*)\.start_with\?\(([A-Za-z_]\w*)\+(?:File::SEPARATOR|[\'\"]/[\'\"])\)', text)
+            prefix = re.fullmatch(r'([A-Za-z_]\w*)\.start_with\?\(([A-Za-z_]\w*)\+((?:::)?File::SEPARATOR|[\'\"]/[\'\"])\)', text)
             equality = re.fullmatch(r'([A-Za-z_]\w*)==([A-Za-z_]\w*)', text)
             match = prefix or equality
             if match:
-                name, base = match.groups()
+                name, base = match.group(1, 2)
+                if prefix and prefix.group(3).endswith('::SEPARATOR'):
+                    owner = self.constant_owner(prefix.group(3)[:-len('::SEPARATOR')],
+                                                self.function.owner, self.function.lexical_owners)
+                    if owner is None or self.constant_identity((*owner, 'SEPARATOR')) != ('File', 'SEPARATOR'):
+                        return {}
                 base_fact = state.get(base, CLEAN)
                 if has_shape(base_fact, 'canonical-path') and not tainted(base_fact) and any(trace.kind == 'constant' for trace in base_fact):
                     return {name: frozenset({'contained-path'})}
@@ -1834,7 +2144,7 @@ class RubyEngine:
                     first = tokens[0].value if tokens and tokens[0].kind == 'code' else ''
                     if first == 'return':
                         following = evaluate('simple', tokens[1:], (return_to,), exception_to)
-                    elif first in {'raise', 'fail', 'throw', 'abort', 'exit'}:
+                    elif first in {'raise', 'fail', 'throw', 'abort', 'exit', 'halt'}:
                         following = node('raise', tokens[1:], (exception_to,))
                     elif first in {'break', 'next'}:
                         target = break_to if first == 'break' else next_to
@@ -1876,6 +2186,8 @@ class RubyEngine:
                         raise ValueError('Request-derived Ruby instance/global state needs heap analysis; analysis is incomplete')
                     state[name] = advance(value, self.step(lhs[0].start, 'assign', name))
                 else:
+                    if self.policy == 'redirect' and re.fullmatch(r'(?:response(?:\.headers)?|headers)\[\'location\'\]', token_text(lhs), re.IGNORECASE):
+                        self.record(lhs[0].start, value, 'response[Location]')
                     name = lhs[0].value
                     self.mutate(state.get(name, CLEAN), value, state, name)
             offset -= len(lhs_group) + 1
@@ -1974,6 +2286,9 @@ class RubyEngine:
             for name, tags in self.proof(tokens, extra, state).items():
                 state[name] = join(*(retag(frozenset({trace}), add=tags)
                                     if (self.policy == 'url' and 'parsed-uri' in trace.tags
+                                        or self.policy == 'redirect' and (
+                                            'parsed-uri' in trace.tags
+                                            or tags <= frozenset({'url-host', 'url-scheme', 'redirect-slash-prefix', 'redirect-not-double-slash'}))
                                         or self.policy == 'path' and ('canonical-path' in trace.tags or tags == frozenset({'not-dot-name'})))
                                     else frozenset({trace}) for trace in state.get(name, CLEAN)))
             return state
@@ -2077,11 +2392,18 @@ class RubyEngine:
                 self.parameter_values = dict(enumerate(key[1]))
                 state = {'@reachable': constant('reachable'),
                          'params': shape('request-params', function.key), 'env': shape('environment', function.key),
+                         **({'cookies': shape('request-params', function.key)} if self.policy == 'redirect' else {}),
                          **{name: shape('request', function.key) for name in ('request', 'req', 'rack_request')}}
                 if function.owner in self.sql_models and (function.singleton or function.scope):
                     state['self'] = shape('active-record-model', function.owner)
                 for (owner, name), fact in self.constants.items():
-                    if function.owner[:len(owner)] == owner:
+                    self.budget.spend()
+                    selected = self.constant_value_owner((*owner, name)) if fact else None
+                    if selected is None:
+                        continue
+                    state['::' + '::'.join(selected)] = fact
+                    visible = self.constant_owner(name, function.owner, function.lexical_owners)
+                    if self.constant_value_owner(visible) == selected:
                         state[name] = fact
                 for index, (name, fact) in enumerate(zip(function.parameters, key[1])):
                     if key[2] and not fact and index < len(function.defaults) and function.defaults[index]:
@@ -2108,10 +2430,9 @@ class RubyEngine:
         return effects
 
 
-def flow_findings(path, policy):
-    text = path.read_text(encoding='utf-8')
+def flow_findings_from_text(path, text, policy):
     # Skip files with no request vocabulary before parsing unrelated Ruby DSLs.
-    if not re.search(r'\b(?:params|request|req|rack_request|env|Rack::Request|original_filename|filename)\b', text):
+    if not re.search(r'\b(?:params|request|req|rack_request|env|cookies|Rack::Request|original_filename|filename)\b', text):
         return
     engine = RubyEngine(path, text, policy)
     lines = text.splitlines()
@@ -2138,6 +2459,11 @@ def flow_findings(path, policy):
     failures = set().union(*engine.dispatch_failures.values())
     if failures:
         raise ValueError('; '.join(sorted(failures)))
+
+
+def flow_findings(path, policy):
+    text = path.read_text(encoding='utf-8')
+    yield from flow_findings_from_text(path, text, policy)
 
 
 def analyze(path, issues):

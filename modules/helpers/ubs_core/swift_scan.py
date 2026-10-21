@@ -428,6 +428,10 @@ def rel_for(path: Path, project_dir: Path) -> str:
 
 def run_derived(ctx: ScanContext, sink, skip: set[int], errors: list[str] | None = None) -> None:
     """Run the cross-count derived checks contributed by pattern modules."""
+    # Every derived record belongs to a category. With all of them skipped
+    # nothing can be reported, so the selection is not read or lexed here.
+    if all(category in skip for category in _CATEGORY_SLUGS):
+        return
     suppressions = SourceSuppressions("swift")
     for fn in load_derived(errors):
         try:
@@ -502,8 +506,10 @@ def _analyzer_category(rule: str) -> int | None:
     """Registry analyzers ran inside their legacy categories."""
     if rule.startswith("swift.taint."):
         return 6
-    if rule.startswith("swift.narrowing."):
+    if rule.startswith("swift.narrowing.") or rule.startswith("swift.guards."):
         return 1
+    if rule.startswith("swift.regex."):
+        return 12
     if rule.startswith("swift.lifecycle."):
         return 16
     return None
@@ -513,18 +519,19 @@ def run_analyzers(ctx: ScanContext, sink, skip: set[int], enable_new: bool = Fal
                   prefilter: Any = None, errors: list[str] | None = None) -> None:
     """Run registered swift analyzers (taint, narrowing, lifecycle).
 
-    ``regex_swift`` (ReDoS deep analysis) has no legacy counter impact — the
-    legacy cat-12 checks were pure rg pipelines — so it stays off unless
-    ``enable_new`` is set, keeping v2 totals at legacy parity. Analyzer
-    record paths retain their complete source identity for cache association.
+    ``regex_swift`` (ReDoS deep analysis) and ``guards_swift`` have no legacy
+    counter impact — they stay off unless ``enable_new`` is set, keeping v2
+    totals at legacy parity. Analyzer record paths retain their complete
+    source identity for cache association.
     """
     from ubs_core import analyzers  # noqa: F401  (populate registry)
     from ubs_core.registry import RunContext, analyzers_for_lang
 
     for analyzer in analyzers_for_lang("swift"):
-        if analyzer.layer == "regex" and not enable_new:
+        if analyzer.layer in ("regex", "guards") and not enable_new:
             continue
-        category = {"taint": 6, "narrowing": 1, "lifecycle": 16}.get(analyzer.layer)
+        category = {"taint": 6, "narrowing": 1, "guards": 1,
+                    "lifecycle": 16, "regex": 12}.get(analyzer.layer)
         if category in skip:
             continue
         if analyzer.layer == "narrowing":
@@ -1038,6 +1045,20 @@ def main(argv: list[str] | None = None) -> int:
     # this invocation may publish a successful completion receipt.
     scan_errors: list[str] = []
     patterns = load_patterns(scan_errors)
+    # A file whose comment/literal structure cannot be lexed has no provable
+    # marker ownership. It is excluded and the scan is partial, while other
+    # selected files still contribute their findings.
+    suppressions = SourceSuppressions("swift")
+    if any(category not in skip for category in _CATEGORY_SLUGS):
+        eligible_files = []
+        for path in files:
+            try:
+                suppressions.index(path, ctx.text_of(path))
+            except ValueError as exc:
+                scan_errors.append(f"{path}: Swift lexical analysis: {type(exc).__name__}: {exc}")
+            else:
+                eligible_files.append(path)
+        ctx.files = eligible_files
 
     from ubs_core.cache import CapturingSink, ScanCache
 
@@ -1048,8 +1069,7 @@ def main(argv: list[str] | None = None) -> int:
         custom_rules=args.ast_rule_dir,
         extra=f"ast_available={args.ast_available};skip_narrowing={args.skip_type_narrowing};new_analyzers={args.enable_new_analyzers}",
     )
-    cached_findings, files_to_scan = cache.partition_files(files)
-    suppressions = SourceSuppressions("swift")
+    cached_findings, files_to_scan = cache.partition_files(ctx.files)
 
     capturing_sink = None
     if files_to_scan:

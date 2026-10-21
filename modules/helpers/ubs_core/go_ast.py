@@ -8,11 +8,9 @@ layers use. Replaces the legacy single `ast-grep scan -c … --json` cache
 (`ensure_ast_scan_json`, ubs-golang.sh 2878-2907) whose per-rule counts were
 re-derived by the `ast_count` python walk (2910-2946).
 
-Suppression parity: the legacy `ast_count` walk has NO ubs:ignore awareness
-and neither does this layer — marker suppression for Go happens inside the
-python detectors and the rg `count_lines` filter, and the A7 statement-
-interval engine in the meta-runner postprocess strips annotated lines from
-the rendered text (documented legacy invariant, ubs-golang.sh 7538-7539).
+Shared statement ownership and exact public rule scopes filter emitted
+records and tallies. Raw matches remain available to computed checks: those
+checks have distinct public IDs and apply their own suppression policy.
 
 Counting parity: legacy text severities are hardcoded per callsite, so the
 consumption table below (rule id -> [(category, severity, title), …]) drives
@@ -35,6 +33,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Sequence
 from ubs_core.external_tools import ast_rule_configs, parse_ast_diagnostics, scan_ast_config
+from ubs_core.suppression import SourceSuppressions
 
 _ASTGREP_BIN = "ast-grep"
 _BATCH = 400  # paths per scan invocation (argv length safety)
@@ -78,13 +77,13 @@ def scan_config(
 
     Returns (rule-id match tally, rule-id -> match list). Records for rules
     in ``consumption`` are appended to the sink (one record per match per
-    consumption entry), unless the entry's category is in ``skip``. Tally and
-    matches cover every rule the config reports regardless of skip — they
-    feed the category-16 inventory tally and the computed checks, exactly as
-    the legacy AST_JSON cache did.
+    consumption entry), unless the entry's category is in ``skip``. Tallies
+    count unsuppressed diagnostics; raw matches include annotated candidates
+    so computed checks can apply their distinct public rule scopes.
     """
     counts: Counter = Counter()
     matches: dict[str, list[dict]] = {}
+    suppressions = SourceSuppressions("golang")
     path_list = [Path(p) for p in paths]
     slug = slug_for_category or (lambda category: f"cat{category}")
     for diagnostic in scan_ast_config(config, path_list, errors,
@@ -93,8 +92,10 @@ def scan_config(
             continue
         match = _normalize_match(diagnostic)
         rule_id = match["rule"]
-        counts[rule_id] += 1
         matches.setdefault(rule_id, []).append(match)
+        if suppressions.is_suppressed(match["path"], match["line"], rule_id):
+            continue
+        counts[rule_id] += 1
         report_category = 1 if config.name == "sgconfig-go-async.yml" else 16
         if not skip or report_category not in skip:
             severity = match["severity"]

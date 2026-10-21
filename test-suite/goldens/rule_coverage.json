@@ -1,10 +1,10 @@
 {
   "all_language_expectation_strength_scopes": {
     "all": {
-      "buggy_cases_with_required_substrings": 156,
-      "case_count": 312,
-      "clean_cases_with_forbidden_substrings": 156,
-      "strict_zero_clean_cases": 156,
+      "buggy_cases_with_required_substrings": 157,
+      "case_count": 314,
+      "clean_cases_with_forbidden_substrings": 157,
+      "strict_zero_clean_cases": 157,
       "weak_case_count": 0,
       "weak_cases": []
     },
@@ -27,9 +27,9 @@
   },
   "clean_fuzz_budget_scopes": {
     "all": {
-      "case_count": 188,
+      "case_count": 189,
       "default_iterations": 3,
-      "default_transformed_scan_count": 564
+      "default_transformed_scan_count": 567
     },
     "campaign": {
       "case_count": 99,
@@ -108,8 +108,8 @@
     "kotlin": {
       "buggy_cases_with_required_substrings": 7,
       "clean_cases_with_forbidden_substrings": 7,
-      "security_pairs": 7,
-      "strict_zero_clean_cases": 7
+      "security_pairs": 8,
+      "strict_zero_clean_cases": 8
     },
     "python": {
       "buggy_cases_with_required_substrings": 38,
@@ -308,6 +308,8 @@
           "kotlin-security-command-clean",
           "kotlin-random-security-buggy",
           "kotlin-random-security-clean",
+          "kotlin-jdbc-sql-buggy",
+          "kotlin-jdbc-sql-clean",
           "kotlin-ssrf-buggy",
           "kotlin-ssrf-clean",
           "python-archive-extraction-buggy",
@@ -716,8 +718,8 @@
           "rust-type-narrowing-clean"
         ]
       },
-      "case_count": 375,
-      "transformed_scan_count": 572
+      "case_count": 377,
+      "transformed_scan_count": 574
     },
     "campaign": {
       "by_transform": {
@@ -2368,6 +2370,20 @@
       "slug": "kotlin_security_randomness"
     },
     {
+      "buggy_case": "kotlin-jdbc-sql-buggy",
+      "buggy_min_critical": 2,
+      "buggy_min_warning": 0,
+      "buggy_path": "test-suite/kotlin/security/SqlRequestBuggy.kt",
+      "buggy_require_count": 0,
+      "clean_case": "kotlin-jdbc-sql-clean",
+      "clean_forbid_count": 0,
+      "clean_max_critical": 0,
+      "clean_max_warning": 0,
+      "clean_path": "test-suite/kotlin/security/SqlRequestClean.kt",
+      "language": "kotlin",
+      "slug": "kotlin_sql_request"
+    },
+    {
       "buggy_case": "kotlin-ssrf-buggy",
       "buggy_min_critical": 1,
       "buggy_min_warning": 0,
@@ -3463,6 +3479,7 @@
         "kotlin-request-path-traversal-clean",
         "kotlin-security-command-clean",
         "kotlin-random-security-clean",
+        "kotlin-jdbc-sql-clean",
         "kotlin-ssrf-clean",
         "python-archive-extraction-clean",
         "python-assert-security-clean",
@@ -3737,6 +3754,8 @@
         "kotlin-security-command-clean",
         "kotlin-random-security-buggy",
         "kotlin-random-security-clean",
+        "kotlin-jdbc-sql-buggy",
+        "kotlin-jdbc-sql-clean",
         "kotlin-ssrf-buggy",
         "kotlin-ssrf-clean",
         "python-archive-extraction-buggy",
@@ -4478,6 +4497,8 @@
       "kotlin-security-command-clean",
       "kotlin-random-security-buggy",
       "kotlin-random-security-clean",
+      "kotlin-jdbc-sql-buggy",
+      "kotlin-jdbc-sql-clean",
       "kotlin-ssrf-buggy",
       "kotlin-ssrf-clean",
       "python-archive-extraction-buggy",

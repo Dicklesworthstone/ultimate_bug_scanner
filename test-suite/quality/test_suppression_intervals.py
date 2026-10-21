@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import importlib
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from io import StringIO
 from pathlib import Path
@@ -22,7 +25,7 @@ if str(HELPERS_DIR) not in sys.path:
 
 from ubs_core.csharp_scan import render_text  # noqa: E402
 from ubs_core import cpp_scan, java_scan, rust_scan, swift_scan  # noqa: E402
-from ubs_core.lexer import strip_comments_and_strings  # noqa: E402
+from ubs_core.lexer import javascript_lexical_views, strip_comments_and_strings  # noqa: E402
 from ubs_core import rust_rules  # noqa: E402
 from ubs_core.analyzers import ctcompare_rust  # noqa: E402
 from ubs_core.rust_detectors import (  # noqa: E402
@@ -630,6 +633,724 @@ class MarkerScopePredicateTests(unittest.TestCase):
                 self.assertEqual(parse_markers("// " + marker, lang="c_like"), [])
                 for rule in (None, "rust.panic.assert-macros", "rust.security.request-url"):
                     self.assertFalse(has_suppression_marker(marker, rule))
+
+
+class JavaScriptAsyncSuppressionTests(unittest.TestCase):
+    CASES = (
+        ("async_map_ignored", "js.async.map-ignored", 'items.map(async (item) => { await work(item); });'),
+        ("async_timer", "js.async.timer", 'setTimeout(async () => { await work(); }, 1);'),
+        ("async_sort_comparator", "js.async.sort-comparator",
+         'items.sort(async (left, right) => (await score(left)) - (await score(right)));'),
+        ("async_map_awaited", "js.async.map-awaited", 'await items.map(async (item) => work(item));'),
+        ("async_reduce", "js.async.reduce", 'items.reduce(async (total, item) => total + (await load(item)), 0);'),
+        ("async_jsx_handler", "js.async.jsx-handler", 'const element = <button onClick={async () => { await work(); }}>Go</button>;'),
+        ("async_react_effect", "js.async.react-effect", 'useEffect(async () => { await work(); }, []);'),
+        ("async_promise_executor", "js.async.promise-executor", 'new Promise(async (resolve) => { resolve(await work()); });'),
+        ("async_foreach", "js.async.foreach", 'items.forEach(async (item) => { await work(item); });'),
+        ("async_promise_all_map", "js.async.promise-all-map", 'await Promise.all(items.map((item) => { work(item); }));'),
+        ("async_flatmap", "js.async.flatmap", 'items.flatMap(async (item) => [await work(item)]);'),
+        ("async_event_listener", "js.async.event-listener", "target.addEventListener('click', async () => { await work(); });"),
+        ("async_predicates", "js.async.predicate", 'items.filter(async (item) => await keep(item));'),
+        ("async_promise_all_foreach", "js.async.promise-all-foreach", 'Promise.all(items.forEach((item) => { work(item); }));'),
+        ("async_event_emitter", "js.async.event-emitter", 'bus.on("message", async (payload) => { await work(payload); });'),
+    )
+
+    def test_direct_analyzers_use_exact_real_comment_ownership(self):
+        from ubs_core.registry import RunContext
+
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="js-async-markers-", dir=artifacts) as tmp:
+            source = Path(tmp) / "case.tsx"
+            for name, rule, statement in self.CASES:
+                analyzer = importlib.import_module(f"ubs_core.analyzers.{name}")
+                for variant, expected in (("unmarked", [2]), ("wrong", [2]), ("quoted", [2]),
+                                          ("owned", []), ("bare", []), ("previous", []),
+                                          ("previous-wrong", [3]), ("previous-quoted", [3])):
+                    with self.subTest(analyzer=name, variant=variant):
+                        lines = ['async function probe(items, target, bus) {', '  ' + statement, '}']
+                        if variant in ("wrong", "owned", "bare"):
+                            marker = ("ubs:ignore[unrelated.rule]" if variant == "wrong" else
+                                      f"ubs:ignore[{rule}]" if variant == "owned" else "ubs:ignore")
+                            lines[1] += ' // ' + marker
+                        elif variant == "quoted":
+                            lines[1] = '  const marker_note = "ubs:ignore"; ' + statement
+                        elif variant.startswith("previous"):
+                            lines.insert(1, '  const marker_note = "ubs:ignore";' if variant == "previous-quoted" else
+                                         '  // ubs:ignore[unrelated.rule]' if variant == "previous-wrong" else
+                                         f'  // ubs:ignore[{rule}]')
+                        source.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                        records = list(analyzer.run(RunContext(lang="javascript", files=[source])))
+                        self.assertEqual([(record["rule"], record["line"]) for record in records],
+                                         [(rule, line) for line in expected], records)
+
+    def test_existing_analyzer_ownership_controls_remain_valid(self):
+        # The original embedded controls independently require deep markers
+        # inside six callback statements and the outer Promise.all marker.
+        for name, _rule, _statement in self.CASES:
+            analyzer = importlib.import_module(f"ubs_core.analyzers.{name}")
+            for label, check in analyzer.SELF_TESTS:
+                with self.subTest(analyzer=name, control=label):
+                    check()
+
+    def test_promise_all_owns_its_nested_diagnostic_without_hiding_the_next_call(self):
+        from ubs_core.registry import RunContext
+
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="js-promise-ownership-", dir=artifacts) as tmp:
+            source = Path(tmp) / "case.ts"
+            for name, rule, method in (
+                ("async_promise_all_map", "js.async.promise-all-map", "map"),
+                ("async_promise_all_foreach", "js.async.promise-all-foreach", "forEach"),
+            ):
+                analyzer = importlib.import_module(f"ubs_core.analyzers.{name}")
+                for owner, marker, first_visible in (
+                    (2, "", True), (2, "ubs:ignore[unrelated.rule]", True),
+                    (2, f"ubs:ignore[{rule}]", False), (4, f"ubs:ignore[{rule}]", False),
+                    (4, "ubs:ignore[unrelated.rule]", True),
+                ):
+                    with self.subTest(analyzer=name, owner=owner, marker=marker):
+                        lines = ['async function probe(items) {', '  await Promise.all(',
+                                 f'    items.{method}((item) => {{', '      work(item);',
+                                 '    })', '  );',
+                                 f'  await Promise.all(items.{method}((item) => {{ work(item); }}));', '}']
+                        if marker:
+                            lines[owner - 1] += ' // ' + marker
+                        source.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                        records = list(analyzer.run(RunContext(lang="javascript", files=[source])))
+                        self.assertEqual([(record["rule"], record["line"]) for record in records],
+                                         [(rule, line) for line in ([3, 7] if first_visible else [7])], records)
+
+    def test_callback_windows_do_not_own_a_later_statement_marker(self):
+        from ubs_core.registry import RunContext
+
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="js-async-next-marker-", dir=artifacts) as tmp:
+            source = Path(tmp) / "case.tsx"
+            for name, rule, statement in self.CASES:
+                with self.subTest(analyzer=name):
+                    analyzer = importlib.import_module(f"ubs_core.analyzers.{name}")
+                    source.write_text('async function probe(items, target, bus) {\n  ' + statement
+                                      + '\n  report("finished"); // ubs:ignore\n}\n', encoding="utf-8")
+                    records = list(analyzer.run(RunContext(lang="javascript", files=[source])))
+                    self.assertEqual([(record["rule"], record["line"]) for record in records], [(rule, 2)], records)
+
+
+class JavaScriptLexicalSuppressionTests(unittest.TestCase):
+    def test_jsx_self_closing_tags_preserve_comments_and_executable_delimiters(self):
+        prefixes = (
+            'const view = <Widget data={value} />;',
+            'const view = <Widget {...props} />;',
+            'const view = <Widget data={a > b ? a : b} />;',
+            'const view = <Widget child={<Inner data={value} />} />;',
+            'const view = <Widget><Inner data={value} /></Widget>;',
+            'const view = <Widget data={total / count} />;',
+            'const view = <Widget render={() => ({value})} />;',
+            'const view = (<Namespace.Widget data={value} />);',
+            'const view = <custom-widget data={value} />;',
+            'const view = <svg:path data={value} />;',
+        )
+        for prefix in prefixes:
+            source = prefix + ' // ubs:ignore[js.real]\n'
+            with self.subTest(source=source):
+                comment_free, executable = javascript_lexical_views(source)
+                self.assertEqual(comment_free.rstrip(), prefix)
+                self.assertEqual(executable.rstrip(), prefix)
+                self.assertEqual(len(comment_free), len(source))
+                self.assertEqual(len(executable), len(source))
+                self.assertEqual(parse_markers(source, lang='tsx'),
+                                 [Marker(1, frozenset({'js.real'}), False)])
+        source = ('const view = <Widget data={value /* ubs:ignore[js.inner] */} />; '
+                  '// ubs:ignore[js.real]\n')
+        self.assertEqual(parse_markers(source, lang='jsx'),
+                         [Marker(1, frozenset({'js.inner'}), False),
+                          Marker(1, frozenset({'js.real'}), False)])
+        source = 'const view = <Widget data={/>/.test(value)} />; // ubs:ignore[js.real]\n'
+        self.assertEqual(javascript_lexical_views(source)[1].rstrip(),
+                         'const view = <Widget data={0  .test(value)} />;')
+        self.assertEqual(parse_markers(source, lang='jsx'),
+                         [Marker(1, frozenset({'js.real'}), False)])
+
+    def test_jsx_slash_recognition_keeps_legal_regex_and_division(self):
+        for prefix in (
+            'const pattern = />ubs:ignore/;',
+            'const pattern = />.+ubs:ignore/;',
+            'const pattern = /[/>]ubs:ignore/;',
+            'if (ready) {} />ubs:ignore/.test(value);',
+            'if (a < b) {} />ubs:ignore/.test(value);',
+            'const quotient = ({}) / divisor;',
+            'const quotient = total / count;',
+        ):
+            source = prefix + ' // ubs:ignore[js.real]\n'
+            with self.subTest(source=source):
+                comment_free, executable = javascript_lexical_views(source)
+                self.assertEqual(comment_free.rstrip(), prefix)
+                self.assertEqual(len(executable), len(source))
+                self.assertEqual(parse_markers(source, lang='javascript'),
+                                 [Marker(1, frozenset({'js.real'}), False)])
+                if 'pattern' in prefix or prefix.startswith('if '):
+                    self.assertNotIn('ubs:ignore', executable)
+                else:
+                    self.assertIn(' / ', executable)
+
+    def test_template_and_regex_literals_cannot_create_comment_directives(self):
+        for source in (
+            'const resetUrl = `https://${req.headers.host}/reset`; const note = "ubs:ignore";\n',
+            'const text = `https://example.com/ubs:ignore`;\n',
+            'const text = `hello ${format(`https://${host}/ubs:ignore`)}`; const note = "ubs:ignore";\n',
+            'const text = `line1\nhttps://ubs:ignore\n${value}`; const note = "ubs:ignore";\n',
+            'const text = `escaped \\` https://ubs:ignore`; const note = "ubs:ignore";\n',
+            'const pattern = /[/*]ubs:ignore/; const note = "ubs:ignore";\n',
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(parse_markers(source, lang='javascript'), [])
+                self.assertFalse(build_index(source, lang='javascript').is_suppressed(1, 'js.security.host-header'))
+
+    def test_real_comments_inside_interpolation_and_after_literals_keep_exact_scopes(self):
+        for source in (
+            'const text = `https://ubs:ignore`; // ubs:ignore[js.real]\n',
+            'const text = `x${value /* ubs:ignore[js.real] */}`;\n',
+            'const text = `x${format(`https://${host}/ubs:ignore`) /* ubs:ignore[js.real] */}`;\n',
+            'const pattern = /[/*]ubs:ignore/; // ubs:ignore[js.real]\n',
+            'const ratio = total / count; // ubs:ignore[js.real]\n',
+        ):
+            for language in ('javascript', 'js', 'typescript', 'ts'):
+                with self.subTest(source=source, language=language):
+                    self.assertEqual(parse_markers(source, lang=language),
+                                     [Marker(line=1, rules=frozenset({'js.real'}), standalone=False)])
+                    index = build_index(source, lang=language)
+                    self.assertTrue(index.is_suppressed(1, 'js.real'))
+                    self.assertFalse(index.is_suppressed(1, 'unrelated.rule'))
+
+    def test_template_line_offsets_and_following_statement_ownership(self):
+        source = ('const text = `https://ubs:ignore\n${value /* ubs:ignore[js.real] */}`;\n'
+                  'work();\n// ubs:ignore[js.next]\nnext();\n')
+        for language in ('javascript', 'typescript'):
+            with self.subTest(language=language):
+                markers = parse_markers(source, lang=language)
+                self.assertEqual(markers, [Marker(2, frozenset({'js.real'}), False),
+                                           Marker(4, frozenset({'js.next'}), True)])
+                index = build_index(source, lang=language)
+                self.assertTrue(index.is_suppressed(1, 'js.real'))
+                self.assertFalse(index.is_suppressed(3, 'js.real'))
+                self.assertFalse(index.is_suppressed(3, 'js.next'))
+                self.assertTrue(index.is_suppressed(5, 'js.next'))
+
+
+class JavaScriptSecuritySuppressionTests(unittest.TestCase):
+    CASES = (
+        ('sec_fetch_abort', 'js.security.fetch-abort', [1], "fetch('/api/users');\n",
+         "fetch('/api/users', { signal: AbortSignal.timeout(5000) });\n"),
+        ('sec_ssrf_fetch', 'js.security.ssrf-fetch', [1],
+         'fetch(req.query.url, { signal: AbortSignal.timeout(5000) });\n',
+         "fetch('https://api.example.com/status', { signal: AbortSignal.timeout(5000) });\n"),
+        ('sec_tls', 'js.security.tls', [1], 'new https.Agent({ rejectUnauthorized: false });\n',
+         'new https.Agent({ rejectUnauthorized: true });\n'),
+        ('sec_jwt', 'js.security.jwt', [2], "import jwt from 'jsonwebtoken';\njwt.decode(token);\n",
+         "import jwt from 'jsonwebtoken';\njwt.verify(token, publicKey, { algorithms: ['RS256'], issuer: 'trusted', audience: 'app' });\n"),
+        ('sec_cors', 'js.security.cors', [1], "app.use(cors({ origin: '*', credentials: true }));\n",
+         "app.use(cors({ origin: 'https://trusted.example.com', credentials: true }));\n"),
+        ('sec_open_redirect', 'js.security.open-redirect', [1], 'router.push(searchParams.get("to"));\n',
+         'router.push("/dashboard");\n'),
+        ('sec_header_injection', 'js.security.header-injection', [1], "res.setHeader('X-Trace', req.query.name);\n",
+         "res.setHeader('X-Trace', encodeURIComponent(req.query.name));\n"),
+        ('sec_path_traversal', 'js.security.path-traversal', [1], 'res.download(path.join(ROOT, req.query.f));\n',
+         "res.download('/srv/static/report.pdf');\n"),
+        ('sec_host_header', 'js.security.host-header', [1], 'const resetUrl = `https://${req.headers.host}/reset`;\n',
+         "const resetUrl = process.env.PUBLIC_BASE_URL + '/reset';\n"),
+        ('sec_prototype_pollution', 'js.security.prototype-pollution', [1], 'const merged = Object.assign({}, req.body);\n',
+         "const merged = Object.assign({}, { label: 'safe' });\n"),
+        ('sec_hardcoded_secrets', 'js.security.hardcoded-secrets', [1],
+         "const jwtSecret = process.env.JWT_SECRET || 'live-jwt-signing-key-9f3a';\n",
+         'const jwtSecret = process.env.JWT_SECRET;\n'),
+        ('sec_weak_random', 'js.security.weak-random', [1], 'const resetCode = Math.random().toString(36).slice(2);\n',
+         'const resetCode = crypto.randomUUID();\n'),
+        ('sec_message_origin', 'js.security.message-origin', [1],
+         "window.addEventListener('message', (event) => { handle(event.data); });\n",
+         "window.addEventListener('message', (event) => { if (event.origin !== 'https://trusted.example.com') return; handle(event.data); });\n"),
+        ('sec_post_message', 'js.security.post-message', [1], "worker.postMessage(payload, '*');\n",
+         "worker.postMessage(payload, 'https://trusted.example.com');\n"),
+        ('ctcompare_js', 'javascript.ctcompare.unsafe_secret_compare', [1], 'const ok = authToken === expectedAuthToken;\n',
+         'const ok = crypto.timingSafeEqual(Buffer.from(authToken), Buffer.from(expectedAuthToken));\n'),
+        ('sec_cookies', 'js.security.cookies', [1], "res.cookie('session_id', sessionId);\n",
+         "res.cookie('session_id', sessionId, { httpOnly: true, secure: true, sameSite: 'strict' });\n"),
+        ('sec_request_regex', 'js.security.request-regex', [1], "new RegExp(req.query.get('q'));\n",
+         "new RegExp('^[a-z]+$');\n"),
+        ('sec_request_body', 'js.security.request-body', [2],
+         'async function POST(request) {\n  const payload = await request.json();\n}\n',
+         "async function POST(request) {\n  if (Number(request.headers.get('content-length')) > 1000000) throw new Error('large');\n  const payload = await request.json();\n}\n"),
+        ('sec_reverse_proxy', 'js.security.reverse-proxy', [1], 'createProxyMiddleware({ target: req.query.upstream });\n',
+         "createProxyMiddleware({ target: 'https://api.example.com' });\n"),
+        ('sec_archive_entry', 'js.security.archive-entry', [1], 'const outputPath = path.join(destination, entry.entryName);\n',
+         "const outputPath = path.join(destination, 'fixed-name.txt');\n"),
+        ('sec_sql_injection', 'js.security.sql-injection', [1], "db.query(`SELECT * FROM users WHERE id = '${req.query.id}'`);\n",
+         "db.query('SELECT * FROM users WHERE id = ?', [req.query.id]);\n"),
+        ('sec_jsx_target_blank', 'js.security.jsx-target-blank', [1], 'const link = <a href={href} target="_blank">link</a>;\n',
+         'const link = <a href={href} target="_blank" rel="noopener noreferrer">link</a>;\n'),
+        ('sec_dangerous_html', 'js.security.dangerous-html', [1], 'const view = <div dangerouslySetInnerHTML={{ __html: html }} />;\n',
+         'const view = <div dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(html) }} />;\n'),
+    )
+    FLOWS = (
+        ('sec_ssrf_fetch', 'js.security.ssrf-fetch', (1,), [3],
+         'const targetUrl = req.query.url;\ntouch();\nfetch(targetUrl, { signal: AbortSignal.timeout(5000) });\n'),
+        ('sec_open_redirect', 'js.security.open-redirect', (1,), [3],
+         'const target = searchParams.get("to");\ntouch();\nrouter.push(target);\n'),
+        ('sec_header_injection', 'js.security.header-injection', (1,), [3],
+         "const headerValue = req.query.name;\ntouch();\nres.setHeader('X-Trace', headerValue);\n"),
+        ('sec_path_traversal', 'js.security.path-traversal', (1,), [3],
+         'const requestedFile = req.query.f;\ntouch();\nres.download(path.join(ROOT, requestedFile));\n'),
+        ('sec_host_header', 'js.security.host-header', (1,), [3],
+         'const host = req.headers.host;\ntouch();\nconst resetUrl = `https://${host}/reset`;\n'),
+        ('sec_prototype_pollution', 'js.security.prototype-pollution', (1,), [3],
+         'const payload = req.body;\ntouch();\nconst merged = Object.assign({}, payload);\n'),
+        ('sec_reverse_proxy', 'js.security.reverse-proxy', (1,), [3],
+         'const target = req.query.upstream;\ntouch();\ncreateProxyMiddleware({ target });\n'),
+        ('sec_archive_entry', 'js.security.archive-entry', (1, 2), [4],
+         'const entry = new AdmZip(buffer).getEntries()[0];\nconst entryPath = entry.entryName;\ntouch();\n'
+         'const outputPath = path.join(destination, entryPath);\n'),
+        ('sec_request_regex', 'js.security.request-regex', (1,), [3],
+         "const pattern = req.query.get('q');\ntouch();\nnew RegExp(pattern);\n"),
+        ('sec_sql_injection', 'js.security.sql-injection', (1,), [3],
+         "const tenant = req.query.tenant;\ntouch();\ndb.query(`SELECT * FROM users WHERE tenant = '${tenant}'`);\n"),
+        ('sec_tls', 'js.security.tls', (1,), [3],
+         'const rejectUnauthorized = false;\ntouch();\nnew https.Agent({ rejectUnauthorized });\n'),
+        ('sec_fetch_abort', 'js.security.fetch-abort', (1,), [],
+         "const requestInit = { signal: AbortSignal.timeout(5000) };\ntouch();\nfetch('/api/users', requestInit);\n"),
+        ('ctcompare_js', 'javascript.ctcompare.unsafe_secret_compare', (1,), [3],
+         'const lhs = authToken;\ntouch();\nconst ok = lhs === expected;\n'),
+    )
+
+    def setUp(self):
+        artifacts = REPO_ROOT / 'test-suite' / 'artifacts'
+        artifacts.mkdir(exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(prefix='js-security-ownership-', dir=artifacts)
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def check_source(self, name, rule, label, text, expected):
+        import time
+        from ubs_core.registry import RunContext
+
+        case = name + '-' + label
+        started = time.monotonic()
+        print(f'[{case}] RUN', flush=True)
+        source = self.root / (case + '.tsx')
+        source.write_text(text, encoding='utf-8')
+        analyzer = importlib.import_module('ubs_core.analyzers.' + name)
+        raw = list(analyzer.run(RunContext(lang='javascript', files=[source])))
+        # Exercise the same final policy as the production suppress command;
+        # an early receiver must not erase facts this boundary cannot recover.
+        records = SourceSuppressions('javascript').filter(raw)
+        (self.root / (case + '.json')).write_text(json.dumps({'raw': raw, 'final': records}, indent=2))
+        actual = [(record['rule'], record['line']) for record in records]
+        try:
+            self.assertEqual(actual, [(rule, line) for line in expected], {'source': text, 'raw': raw, 'final': records})
+        except AssertionError:
+            print(f'[{case}] FAIL ({time.monotonic() - started:.3f}s) artifacts={self.root}', flush=True)
+            raise
+        print(f'[{case}] PASS ({time.monotonic() - started:.3f}s)', flush=True)
+
+    def test_all_security_receivers_keep_unrelated_scopes_and_quoted_markers(self):
+        for name, rule, sites, positive, negative in self.CASES:
+            for variant in ('unmarked', 'quoted', 'wrong', 'owned', 'bare', 'previous', 'previous-wrong', 'previous-quoted'):
+                with self.subTest(analyzer=name, variant=variant):
+                    lines = positive.splitlines()
+                    target = sites[0] - 1
+                    expected = sites if variant in ('unmarked', 'quoted', 'wrong') else []
+                    if variant == 'quoted':
+                        lines[target] += '; const marker_note = "ubs:ignore";'
+                    elif variant in ('wrong', 'owned', 'bare'):
+                        marker = ('ubs:ignore[unrelated.rule]' if variant == 'wrong' else
+                                  f'ubs:ignore[{rule}]' if variant == 'owned' else 'ubs:ignore')
+                        lines[target] += ' // ' + marker
+                    elif variant.startswith('previous'):
+                        lines.insert(target, 'const marker_note = "ubs:ignore";' if variant == 'previous-quoted' else
+                                     '// ubs:ignore[unrelated.rule]' if variant == 'previous-wrong' else
+                                     f'// ubs:ignore[{rule}]')
+                        expected = [line + 1 for line in sites] if variant != 'previous' else []
+                    self.check_source(name, rule, variant, '\n'.join(lines) + '\n', expected)
+            with self.subTest(analyzer=name, variant='safe'):
+                self.check_source(name, rule, 'safe', negative, [])
+
+    def test_source_annotations_preserve_later_sink_and_validation_facts(self):
+        for name, rule, origins, sites, program in self.FLOWS:
+            for origin in origins:
+                for variant in ('unmarked', 'bare', 'owned', 'wrong', 'quoted', 'previous'):
+                    with self.subTest(analyzer=name, origin=origin, variant=variant):
+                        lines = program.splitlines()
+                        expected = sites
+                        if variant == 'quoted':
+                            lines[origin - 1] += '; const marker_note = "ubs:ignore";'
+                        elif variant == 'previous':
+                            lines.insert(origin - 1, f'// ubs:ignore[{rule}]')
+                            expected = [line + 1 for line in sites]
+                        elif variant != 'unmarked':
+                            marker = ('ubs:ignore' if variant == 'bare' else
+                                      f'ubs:ignore[{rule}]' if variant == 'owned' else 'ubs:ignore[unrelated.rule]')
+                            lines[origin - 1] += ' // ' + marker
+                        self.check_source(name, rule, f'source-{origin}-{variant}', '\n'.join(lines) + '\n', expected)
+
+    def test_later_statement_marker_cannot_hide_an_earlier_message_handler(self):
+        name, rule, sites, positive, _negative = next(item for item in self.CASES if item[0] == 'sec_message_origin')
+        for marker in ('ubs:ignore', f'ubs:ignore[{rule}]', 'ubs:ignore[unrelated.rule]'):
+            with self.subTest(marker=marker):
+                self.check_source(name, rule, 'later-' + marker.replace(':', '-'),
+                                  positive + 'report("done"); // ' + marker + '\n', sites)
+
+    def test_original_security_controls_remain_explicit(self):
+        for name, _rule, _sites, _positive, _negative in self.CASES:
+            analyzer = importlib.import_module('ubs_core.analyzers.' + name)
+            for label, check in analyzer.SELF_TESTS:
+                with self.subTest(analyzer=name, control=label):
+                    check()
+
+    def test_multiline_call_comments_own_the_call_and_only_their_rule(self):
+        for name, rule, source, owner in (
+            ('sec_cors', 'js.security.cors',
+             "app.use(cors({\n  origin: '*',\n  credentials: true,\n}));\n", 3),
+            ('sec_cookies', 'js.security.cookies',
+             "res.cookie('auth_token', token, {\n  httpOnly: false,\n  secure: false,\n});\n", 2),
+        ):
+            for marker, expected in (('ubs:ignore', []), (f'ubs:ignore[{rule}]', []),
+                                     ('ubs:ignore[unrelated.rule]', [1])):
+                with self.subTest(analyzer=name, marker=marker):
+                    lines = source.splitlines()
+                    lines[owner - 1] += ' // ' + marker
+                    program = '\n'.join(lines) + '\n'
+                    self.check_source(name, rule, 'multiline-' + marker.replace(':', '-'), program, expected)
+
+
+class GoPipelineSuppressionTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('jq') and shutil.which('rg') and shutil.which('ast-grep'),
+                         'native UBS dependencies required')
+    def test_native_pattern_counts_exits_and_cache_honor_only_the_owning_comment(self):
+        import time
+
+        artifacts = REPO_ROOT / 'test-suite' / 'artifacts'
+        artifacts.mkdir(exist_ok=True)
+        rule = 'go.logging.sensitive-data'
+        with tempfile.TemporaryDirectory(prefix='go-native-pattern-marker-', dir=artifacts) as tmp:
+            root = Path(tmp)
+            source = root / 'case.go'
+            selected = root / 'selected.nul'
+            selected.write_bytes(os.fsencode(source) + b'\0')
+            body = '    log.Printf("%s", token)'
+            for variant, statement, expected in (
+                ('unmarked', body, [4]),
+                ('quoted', body + '; _ = "ubs:ignore"', [4]),
+                ('wrong-scope', body + ' // ubs:ignore[unrelated.rule]', [4]),
+                ('owned', body + f' // ubs:ignore[{rule}]', []),
+                ('bare', body + ' // ubs:ignore', []),
+                ('previous', f'    // ubs:ignore[{rule}]\n' + body, []),
+            ):
+                source.write_text('package probe\nimport "log"\nfunc emit(token string) {\n'
+                                  + statement + '\n}\n', encoding='utf-8')
+                for fmt in ('json', 'sarif'):
+                    env = {key: value for key, value in os.environ.items() if not key.startswith('UBS_')}
+                    env.update(UBS_NO_AUTO_UPDATE='1', UBS_PROFILE='1', PYTHONDONTWRITEBYTECODE='1',
+                               UBS_CACHE_DIR=str(root / f'cache-{variant}-{fmt}'))
+                    for mode in ('cold', 'warm', 'disabled'):
+                        label = f'go-native-pattern-{variant}-{fmt}-{mode}'
+                        with self.subTest(case=label):
+                            print(f'[{label}] RUN', flush=True)
+                            started = time.monotonic()
+                            stats = root / (label + '.cache.json')
+                            run_env = dict(env, UBS_NO_CACHE='1' if mode == 'disabled' else '0',
+                                           UBS_CACHE_FILE=str(stats))
+                            command = [str(REPO_ROOT / 'modules/ubs-golang.sh'), '--ci', f'--format={fmt}',
+                                       '--files-from=' + str(selected), '--fail-on-warning',
+                                       '--skip=' + ','.join(str(cat) for cat in range(1, 23) if cat != 14),
+                                       str(root)]
+                            proc = subprocess.run(command, cwd=root, env=run_env, capture_output=True,
+                                                  text=True, timeout=120)
+                            (root / (label + '.stdout')).write_text(proc.stdout)
+                            (root / (label + '.stderr')).write_text(proc.stderr)
+                            self.assertEqual(proc.returncode, int(bool(expected)), proc.stdout + proc.stderr)
+                            report = json.loads(proc.stdout)
+                            if fmt == 'json':
+                                self.assertEqual(report['status'], 'ok', report)
+                                self.assertEqual(report['critical'], len(expected), report)
+                                self.assertEqual(report['warning'], 0, report)
+                                self.assertEqual(report['info'], 0, report)
+                                sites = [row['line'] for row in report['findings'] if row['rule'] == rule]
+                            else:
+                                results = [row for run in report['runs'] for row in run.get('results', [])]
+                                self.assertEqual(len(results), len(expected), report)
+                                self.assertTrue(all(row['level'] == 'error' for row in results), report)
+                                sites = [row['locations'][0]['physicalLocation']['region']['startLine']
+                                         for row in results if row['ruleId'] == rule]
+                            self.assertEqual(sites, expected, report)
+                            cache = json.loads(stats.read_text())
+                            self.assertEqual(cache['hits'], int(mode == 'warm'), cache)
+                            self.assertEqual(cache['misses'], int(mode != 'warm'), cache)
+                            print(f'[{label}] PASS ({time.monotonic() - started:.3f}s)', flush=True)
+
+    @unittest.skipUnless(shutil.which('ast-grep'), 'real ast-grep required')
+    def test_ast_counts_use_the_public_id_without_erasing_computed_facts(self):
+        from ubs_core import go_ast, go_rules, go_scan
+
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        ast_rule, computed_rule = 'go.tls-insecure-skip', 'go.crypto.insecureskipverify'
+        with tempfile.TemporaryDirectory(prefix='go-ast-marker-', dir=artifacts) as tmp:
+            root = Path(tmp)
+            source = root / 'case.go'
+            go_rules.generate(root / 'rules')
+            for marker, ast_count, computed_count in (
+                ('', 1, 1), (' // ubs:ignore[unrelated.rule]', 1, 1),
+                (f' // ubs:ignore[{ast_rule}]', 0, 1),
+                (f' // ubs:ignore[{computed_rule}]', 1, 0), (' // ubs:ignore', 0, 0),
+                ('; var marker_note = "ubs:ignore"', 1, 1),
+            ):
+                with self.subTest(marker=marker):
+                    source.write_text('package probe\nimport ("crypto/tls"; "net/http")\n'
+                                      'var config = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}'
+                                      + marker + '\n')
+                    sink, errors = StringIO(), []
+                    counts, matches = go_ast.scan_config(root / 'rules/sgconfig-go.yml', [source],
+                        {ast_rule: [(9, 'warning', 'TLS disabled')]}, sink, errors=errors)
+                    self.assertEqual(errors, [], errors)
+                    self.assertEqual(counts.get(ast_rule, 0), ast_count, matches)
+                    self.assertEqual(len(matches.get(ast_rule, [])), 1, matches)
+                    rows = [json.loads(line) for line in sink.getvalue().splitlines()]
+                    self.assertEqual(sum(row['rule'] == ast_rule for row in rows), ast_count * 2, rows)
+                    computed = go_scan.computed_checks([source], matches,
+                        {1, 2, 4, 5, 8, 12, 13, 19, 21, 22}, True)
+                    self.assertEqual(sum(row['rule'] == computed_rule for row in computed), computed_count, computed)
+
+    def test_patterns_count_only_the_owning_rule_before_thresholds(self):
+        from ubs_core import go_scan
+
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        rule = 'go.logging.sensitive-data'
+        pattern = next(item for item in go_scan.load_patterns() if item.rule_id == rule)
+        with tempfile.TemporaryDirectory(prefix="go-pattern-marker-", dir=artifacts) as tmp:
+            source = Path(tmp) / "case.go"
+            for marker, expected in (('', [1]), (' // ubs:ignore[unrelated.rule]', [1]),
+                                     ('; _ = "ubs:ignore"', [1]), (f' // ubs:ignore[{rule}]', [])):
+                with self.subTest(marker=marker):
+                    source.write_text('log.Printf("%s", token)' + marker + '\n', encoding='utf-8')
+                    sink = StringIO()
+                    counts = go_scan.scan_patterns([pattern], [source], sink, set())
+                    rows = [json.loads(line) for line in sink.getvalue().splitlines()]
+                    self.assertEqual([row['line'] for row in rows], expected)
+                    self.assertEqual(counts, {'critical': len(expected), 'warning': 0, 'info': 0})
+
+    def test_pipeline_and_real_cache_reapply_source_policy(self):
+        import contextlib
+        from ubs_core import go_scan
+
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        rule = 'go.logging.sensitive-data'
+        with tempfile.TemporaryDirectory(prefix="go-pipeline-marker-", dir=artifacts) as tmp:
+            root = Path(tmp)
+            source = root / 'case.go'
+            selected = root / 'files.txt'
+            selected.write_bytes(os.fsencode(source) + b'\0')
+            sink, summary = root / 'findings.ndjson', root / 'summary.json'
+            env = {key: value for key, value in os.environ.items() if not key.startswith('UBS_')}
+            env.update(UBS_NO_AUTO_UPDATE='1', UBS_CACHE_DIR=str(root / 'cache'))
+            args = ['--files-from', str(selected), '--sink', str(sink), '--json-out', str(summary),
+                    '--project-dir', str(root), '--fail-on-warning']
+            source.write_text('package probe\nimport "log"\nfunc emit(token string) {\n'
+                              f'    log.Printf("%s", token) // ubs:ignore[{rule}]\n}}\n', encoding='utf-8')
+            for mode in ('cold', 'warm', 'disabled'):
+                with self.subTest(cache=mode), patch.dict(os.environ, dict(env, UBS_NO_CACHE='1' if mode == 'disabled' else '0'), clear=True):
+                    with contextlib.redirect_stderr(StringIO()):
+                        code = go_scan.main(args)
+                    doc = json.loads(summary.read_text())
+                    self.assertEqual(code, 0, doc)
+                    self.assertEqual(doc['critical'], 0, doc)
+                    self.assertEqual(doc['status'], 'ok', doc)
+                    self.assertFalse(any(row['rule'] == rule for row in doc['findings']), doc)
+                    if mode != 'disabled':
+                        self.assertEqual(doc['extras']['profile']['cache_hits'], int(mode == 'warm'), doc)
+                        entries = list((root / 'cache').glob('*/files/**/*.json'))
+                        self.assertTrue(entries)
+                        rows = [row for entry in entries for row in json.loads(entry.read_text()).get('findings', [])]
+                        self.assertFalse(any(row['rule'] == rule for row in rows), rows)
+            # Inject a stale/old producer answer into the real warm cache; the
+            # output boundary must recheck source ownership before counting it.
+            for entry in (root / 'cache').glob('*/files/**/*.json'):
+                data = json.loads(entry.read_text())
+                data.setdefault('findings', []).append({'rule': rule, 'path': str(source), 'line': 4,
+                    'col': 1, 'severity': 'critical', 'message': 'old cached finding', 'category_id': 'golang.logging'})
+                entry.write_text(json.dumps(data), encoding='utf-8')
+            # Directory Merkle hits can bypass individual file entries.
+            for entry in (root / 'cache').glob('*/dirs/**/*.json'):
+                data = json.loads(entry.read_text())
+                for rows in data.get('findings', {}).values():
+                    rows.append({'rule': rule, 'path': str(source), 'line': 4, 'col': 1,
+                        'severity': 'critical', 'message': 'old directory finding', 'category_id': 'golang.logging'})
+                entry.write_text(json.dumps(data), encoding='utf-8')
+            with patch.dict(os.environ, env, clear=True), contextlib.redirect_stderr(StringIO()):
+                self.assertEqual(go_scan.main(args), 0)
+            doc = json.loads(summary.read_text())
+            self.assertEqual(doc['extras']['profile']['cache_hits'], 1, doc)
+            self.assertFalse(any(row['rule'] == rule for row in doc['findings']), doc)
+
+    def test_ratio_and_source_facts_do_not_disappear_for_unrelated_markers(self):
+        from ubs_core import go_scan
+
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        rule = 'go.filesystem.open-close-imbalance'
+        with tempfile.TemporaryDirectory(prefix="go-computed-marker-", dir=artifacts) as tmp:
+            source = Path(tmp) / 'case.go'
+            for marker, expected in (('', [1]), (' // ubs:ignore[unrelated.rule]', [1]),
+                                     ('; _ = "ubs:ignore"', [1]), (f' // ubs:ignore[{rule}]', [])):
+                with self.subTest(marker=marker):
+                    source.write_text('file, err := os.Open(path)' + marker + '\n', encoding='utf-8')
+                    self.assertEqual([row['line'] for row in go_scan.computed_checks([source], {}, {1, 2, 4, 5, 9, 12, 13, 19, 21, 22}, True)], expected)
+
+
+class GoDetectorSuppressionTests(unittest.TestCase):
+    CASES = (
+        ("cookie_security", "go.security.cookie-security", 6,
+         'package probes\n\nimport "net/http"\n\nfunc cookie(w http.ResponseWriter) {\n'
+         '\thttp.SetCookie(w, &http.Cookie{Name: "session", Value: "token"})\n}\n'),
+        ("cors_credentials", "go.security.cors-credentials", 6,
+         'package probes\n\nimport "net/http"\n\nfunc cors(w http.ResponseWriter) {\n'
+         '\tw.Header().Set("Access-Control-Allow-Origin", "*"); w.Header().Set("Access-Control-Allow-Credentials", "true")\n}\n'),
+        ("jwt_verification", "go.security.jwt-verification", 6,
+         'package probes\n\nimport jwt "github.com/golang-jwt/jwt/v5"\n\nfunc decode(raw string) {\n'
+         '\t_, _, _ = jwt.NewParser().ParseUnverified(raw, jwt.MapClaims{})\n}\n'),
+        ("request_regex", "go.security.request-regex", 9,
+         'package probes\n\nimport (\n\t"net/http"\n\t"regexp"\n)\n\n'
+         'func expression(r *http.Request) (*regexp.Regexp, error) {\n'
+         '\treturn regexp.Compile(r.URL.Query().Get("pattern"))\n}\n'),
+        ("security_randomness", "go.security.insecure-random", 6,
+         'package probes\n\nimport "math/rand"\n\nfunc token() int {\n\treturn rand.Int()\n}\n'),
+        ("hardcoded_secrets", "go.security.hardcoded-secrets", 4,
+         'package probes\n\nfunc value() string {\n\tsecret := "LivePassword123"\n\treturn secret\n}\n'),
+        ("archive_extraction", "go.security.archive-extraction", 10,
+         'package probes\n\nimport (\n\t"archive/tar"\n\t"os"\n\t"path/filepath"\n)\n\n'
+         'func extract(entry *tar.Header, root string) error {\n'
+         '\treturn os.WriteFile(filepath.Join(root, entry.Name), nil, 0600)\n}\n'),
+    )
+    FLOWS = (
+        ("header_injection", "go.security.header-injection", 7, '"net/http"',
+         'value := r.URL.Query().Get("name")', 'w.Header().Set("X-Result", value)'),
+        ("host_header", "go.security.host-header", 7, '"net/http"',
+         'value := r.Host', '_ = "https://" + value'),
+        ("outbound_url", "go.security.outbound-url", 7, '"net/http"',
+         'value := r.URL.Query().Get("url")', '_, _ = http.Get(value)'),
+        ("reverse_proxy_ssrf", "go.security.reverse-proxy-ssrf", 8,
+         '("net/http"; "net/http/httputil"; "net/url")',
+         'value := r.URL.Query().Get("upstream")\n    target, _ := url.Parse(value)',
+         '_ = httputil.NewSingleHostReverseProxy(target)'),
+        ("open_redirect", "go.security.open-redirect", 7, '"net/http"',
+         'value := r.URL.Query().Get("next")', 'http.Redirect(w, r, value, http.StatusFound)'),
+        ("request_body_limit", "go.filesystem.request-body-limit", 7, '("io"; "net/http")',
+         'body := r.Body', '_, _ = io.ReadAll(body)'),
+        ("path_traversal", "go.security.path-traversal", 7, '("net/http"; "os")',
+         'value := r.URL.Query().Get("path")', '_, _ = os.Open(value)'),
+        ("request_body_limit", "go.filesystem.request-body-limit", 7,
+         '("encoding/json"; "net/http")', 'body := r.Body',
+         'decoder := json.NewDecoder(body)\n    var value any\n    _ = 0\n    _ = decoder.Decode(&value)'),
+        ("request_regex", "go.security.request-regex", 11,
+         '("net/http"; "regexp")', 'pattern := r.URL.Query().Get("pattern")',
+         '_, _ = regexp.Compile(pattern)'),
+    )
+
+    def assert_sites(self, name, rule, source, expected):
+        detector = importlib.import_module(f"ubs_core.go_detectors.{name}")
+        self.assertEqual(detector.RULE_ID, rule)
+        self.assertEqual([hit[1] for hit in detector.find([source])], expected)
+
+    def test_security_randomness_requires_the_emitted_public_rule(self):
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        rule = "go.security.insecure-random"
+        positive = ('package suppression\n\nimport (\n\t"fmt"\n\tmathrand "math/rand"\n)\n\n'
+                    'func scopedRandomToken() string {\n'
+                    '\ttoken := fmt.Sprintf("%d", mathrand.Int63())')
+        safe = ('package suppression\n\nimport (\n\tcryptorand "crypto/rand"\n\t"encoding/hex"\n)\n\n'
+                'func scopedRandomToken() string {\n\tvar bytes [16]byte\n'
+                '\tif _, err := cryptorand.Read(bytes[:]); err != nil {\n\t\treturn ""\n\t}\n'
+                '\treturn hex.EncodeToString(bytes[:])\n}\n')
+        with tempfile.TemporaryDirectory(prefix="go-randomness-public-rule-", dir=artifacts) as tmp:
+            source = Path(tmp) / "case.go"
+            # A distinct scoped ID cannot own this heuristic diagnostic.
+            for marker, expected in (("", [9]), ("go.crypto.rand", [9]),
+                                     (rule, []), (f"go.crypto.rand,{rule}", [])):
+                with self.subTest(marker=marker):
+                    comment = f" // ubs:ignore[{marker}]" if marker else ""
+                    source.write_text(positive + comment + '\n\treturn token\n}\n', encoding="utf-8")
+                    self.assert_sites("security_randomness", rule, source, expected)
+            source.write_text(safe, encoding="utf-8")
+            self.assert_sites("security_randomness", rule, source, [])
+
+    def test_markers_require_real_comments_and_exact_rule_ownership(self):
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        cases = list(self.CASES)
+        for name, rule, line, imports, assignment, sink in self.FLOWS[:8]:
+            text = ('package probe\nimport ' + imports + '\n'
+                    'func handler(w http.ResponseWriter, r *http.Request) {\n    '
+                    + assignment + '\n    _ = 0\n    _ = 0\n    ' + sink + '\n}\n')
+            cases.append((name, rule, line, text))
+        with tempfile.TemporaryDirectory(prefix="go-marker-ownership-", dir=artifacts) as tmp:
+            source = Path(tmp) / "case.go"
+            for name, rule, line, text in cases:
+                for variant, expected in (("unmarked", [line]), ("wrong", [line]),
+                                          ("quoted", [line]), ("owned", []), ("bare", []),
+                                          ("previous", []), ("previous-wrong", [line + 1]),
+                                          ("previous-quoted", [line + 1])):
+                    with self.subTest(detector=name, sink=line, variant=variant):
+                        lines = text.splitlines()
+                        if variant in ("wrong", "owned", "bare"):
+                            marker = ("ubs:ignore[unrelated.rule]" if variant == "wrong" else
+                                      f"ubs:ignore[{rule}]" if variant == "owned" else "ubs:ignore")
+                            lines[line - 1] += " // " + marker
+                        elif variant == "quoted":
+                            if name == "hardcoded_secrets":
+                                # Keep the first-assignment anchor: the legacy
+                                # greedy detector also misses an ordinary prefix.
+                                lines[line - 1] += '; _ = "ubs:ignore"'
+                            else:
+                                lines[line - 1] = '_ = "ubs:ignore"; ' + lines[line - 1]
+                        elif variant.startswith("previous"):
+                            lines.insert(line - 1, '    _ = "ubs:ignore"' if variant == "previous-quoted" else
+                                         "    // ubs:ignore[unrelated.rule]" if variant == "previous-wrong" else
+                                         f"    // ubs:ignore[{rule}]")
+                        source.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                        self.assert_sites(name, rule, source, expected)
+
+    def test_marked_sources_preserve_later_unmarked_flow_findings(self):
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        cases = []
+        for name, rule, line, imports, assignment, sink in self.FLOWS:
+            if name == "request_regex":
+                text = ('package probes\n\nimport (\n    "net/http"\n    "regexp"\n)\n\n'
+                        'func expression(r *http.Request) {\n    ' + assignment + '\n\n    ' + sink + '\n}\n')
+                source_line = 9
+            else:
+                text = ('package probe\nimport ' + imports + '\n'
+                        'func handler(w http.ResponseWriter, r *http.Request) {\n    '
+                        + assignment + '\n    _ = 0\n    _ = 0\n    ' + sink + '\n}\n')
+                source_line = 4
+            cases.append((name, rule, line, source_line, text))
+        cases.append(("security_randomness", "go.security.insecure-random", 8, 6,
+                      'package probes\n\nimport "math/rand"\n\nfunc sample() int {\n'
+                      '\trng := rand.New(rand.NewSource(1))\n\n\ttoken := rng.Int(); return token\n}\n'))
+        with tempfile.TemporaryDirectory(prefix="go-marker-flow-", dir=artifacts) as tmp:
+            source = Path(tmp) / "flow.go"
+            for name, rule, line, source_line, text in cases:
+                for marker in ("", "ubs:ignore", f"ubs:ignore[{rule}]", 'quoted'):
+                    with self.subTest(detector=name, sink=line, marker=marker):
+                        lines = text.splitlines()
+                        if marker == 'quoted':
+                            lines[source_line - 1] += '; _ = "ubs:ignore"'
+                        elif marker:
+                            lines[source_line - 1] += ' // ' + marker
+                        source.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                        self.assert_sites(name, rule, source, [line])
 
 
 class RustDetectorSuppressionTests(unittest.TestCase):
@@ -1495,6 +2216,147 @@ mod tests {
         self.assertFalse(cfg_implies_test(many_tokens), "High token count cfg must fail closed")
 
 
+class ReceiverMarkerOwnershipTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("shellcheck"), "real ShellCheck required")
+    def test_shellcheck_uses_its_actual_rule_id_and_comment_ownership(self) -> None:
+        from ubs_core import bash_scan
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        rule = "bash.shellcheck.SC2086"
+        with tempfile.TemporaryDirectory(prefix="shellcheck-marker-", dir=artifacts) as temporary:
+            path = Path(temporary) / "case.sh"
+            for marker, expected in (("", [3]), ('; marker_note="ubs:ignore"', [3]),
+                                     (" # ubs:ignore[unrelated.rule]", [3]),
+                                     (f" # ubs:ignore[{rule}]", [])):
+                with self.subTest(marker=marker):
+                    path.write_text("#!/usr/bin/env bash\nvalue=$1\nprintf '%s\\n' $value" + marker + "\n")
+                    sink, errors = StringIO(), []
+                    counts = bash_scan.scan_shellcheck([path], sink, set(), set(), errors)
+                    self.assertEqual(errors, [])
+                    rows = [json.loads(line) for line in sink.getvalue().splitlines()]
+                    self.assertEqual([row["line"] for row in rows if row["rule"] == rule], expected)
+                    self.assertEqual(counts, {"critical": 0, "warning": 0, "info": len(expected)})
+
+    @unittest.skipUnless(shutil.which("jq") and shutil.which("rg") and shutil.which("ast-grep"),
+                         "native UBS dependencies required")
+    def test_native_bash_kotlin_cache_json_and_sarif_share_marker_policy(self) -> None:
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="native-receiver-marker-", dir=artifacts) as temporary:
+            root = Path(temporary)
+            for lang, suffix, body, rule, scopes, comment in (
+                ("bash", ".sh", 'eval "$command"', "bash.security.eval_variable",
+                 "bash.security.eval_variable,bash.security.eval-variable", "#"),
+                ("kotlin", ".kt", 'ProcessBuilder("sh", "-c", command)',
+                 "kotlin.security.processbuilder-shell", "kotlin.security.processbuilder-shell", "//"),
+            ):
+                path = root / ("case" + suffix)
+                for variant, source, expected in (
+                    ("unmarked", body + "\n", [1]),
+                    ("quoted", body + '; marker_note="ubs:ignore"\n', [1]),
+                    ("wrong-scope", body + f" {comment} ubs:ignore[unrelated.rule]\n", [1]),
+                    ("owned", body + f" {comment} ubs:ignore[{scopes}]\n", []),
+                    ("previous", f"{comment} ubs:ignore[{scopes}]\n" + body + "\n", []),
+                ):
+                    path.write_text(source, encoding="utf-8")
+                    for fmt in ("json", "sarif"):
+                        env = {key: value for key, value in os.environ.items() if not key.startswith("UBS_")}
+                        env.update(UBS_NO_AUTO_UPDATE="1", UBS_CACHE_DIR=str(root / f"cache-{lang}-{variant}-{fmt}"),
+                                   UBS_PROFILE="1", PYTHONDONTWRITEBYTECODE="1", ENABLE_UV_TOOLS="0")
+                        for mode in ("cold", "warm", "disabled"):
+                            with self.subTest(lang=lang, marker=variant, format=fmt, cache=mode):
+                                run_env = dict(env, UBS_NO_CACHE="1" if mode == "disabled" else "0")
+                                command = [str(REPO_ROOT / "modules" / f"ubs-{lang}.sh"),
+                                           "--ci", f"--format={fmt}", str(path)]
+                                if lang == "bash":
+                                    command.insert(1, "--skip=6")
+                                proc = subprocess.run(command, cwd=root, env=run_env, capture_output=True,
+                                                      text=True, timeout=120)
+                                self.assertEqual(proc.returncode, int(bool(expected)), proc.stdout + proc.stderr)
+                                report = json.loads(proc.stdout)
+                                if fmt == "json":
+                                    self.assertEqual(report["status"], "ok", report)
+                                    self.assertEqual(report["critical"], len(expected), report)
+                                    sites = [row["line"] for row in report["findings"] if row["rule"] == rule]
+                                    if mode != "disabled":
+                                        self.assertEqual(report["profile"]["cache_hits"], int(mode == "warm"), report)
+                                        self.assertEqual(report["profile"]["cache_misses"], int(mode == "cold"), report)
+                                else:
+                                    sites = [row["locations"][0]["physicalLocation"]["region"]["startLine"]
+                                             for run in report["runs"] for row in run.get("results", [])
+                                             if row["ruleId"] == rule]
+                                self.assertEqual(sites, expected, report)
+
+    def test_bash_and_kotlin_patterns_use_statement_owned_comments(self) -> None:
+        from ubs_core import bash_scan, kotlin_scan
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="receiver-marker-", dir=artifacts) as temporary:
+            for lang, suffix, body, rule, comment in (
+                ("bash", ".sh", 'eval "$command"', "bash.security.eval_variable", "#"),
+                ("kotlin", ".kt", 'ProcessBuilder("sh", "-c", command)', "kotlin.security.processbuilder-shell", "//"),
+            ):
+                path = Path(temporary) / ("case" + suffix)
+                for variant, source, expected in (
+                    ("unmarked", body + "\n", [1]),
+                    ("quoted", body + '; marker_note="ubs:ignore"\n', [1]),
+                    ("wrong-scope", body + f" {comment} ubs:ignore[unrelated.rule]\n", [1]),
+                    ("owned", body + f" {comment} ubs:ignore[{rule}]\n", []),
+                    ("previous", f"{comment} ubs:ignore[{rule}]\n" + body + "\n", []),
+                ):
+                    with self.subTest(lang=lang, variant=variant):
+                        path.write_text(source, encoding="utf-8")
+                        sink = StringIO()
+                        if lang == "bash":
+                            bash_scan.scan_files_native([path], sink, set(), set())
+                        else:
+                            kotlin_scan.scan_patterns(kotlin_scan._PATTERNS, [path], sink, set())
+                        records = [json.loads(line) for line in sink.getvalue().splitlines()]
+                        self.assertEqual([record["line"] for record in records if record["rule"] == rule], expected)
+
+    @unittest.skipUnless(shutil.which("ast-grep"), "real ast-grep required")
+    def test_real_ast_adapters_preserve_unrelated_rules_and_quoted_markers(self) -> None:
+        from ubs_core import js_ast, py_ast, ruby_ast, elixir_ast
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        rule = "ubs.a7.ast-ownership"
+        with tempfile.TemporaryDirectory(prefix="ast-marker-", dir=artifacts) as temporary:
+            root = Path(temporary)
+            rules = root / "rules"
+            rules.mkdir()
+            config = root / "sgconfig.yml"
+            config.write_text("ruleDirs:\n  - rules\n", encoding="utf-8")
+            for lang, suffix, body, pattern, comment, adapter in (
+                ("javascript", ".js", "eval(input)", "eval($X)", "//", js_ast),
+                ("python", ".py", "eval(input)", "eval($X)", "#", py_ast),
+                ("ruby", ".rb", "eval(input)", "eval($X)", "#", ruby_ast),
+                ("elixir", ".ex", "Code.eval_string(input)", "Code.eval_string($X)", "#", elixir_ast),
+            ):
+                (rules / "ownership.yml").write_text(
+                    f"id: {rule}\nlanguage: {lang}\nseverity: error\nmessage: owned marker oracle\n"
+                    f"rule:\n  pattern: {pattern}\n", encoding="utf-8")
+                path = root / ("case" + suffix)
+                for variant, source, expected in (
+                    ("unmarked", body + "\n", [1]),
+                    ("quoted", body + '; marker_note="ubs:ignore"\n', [1]),
+                    ("wrong-scope", body + f" {comment} ubs:ignore[unrelated.rule]\n", [1]),
+                    ("owned", body + f" {comment} ubs:ignore[{rule}]\n", []),
+                    ("previous", f"{comment} ubs:ignore[{rule}]\n" + body + "\n", []),
+                ):
+                    with self.subTest(lang=lang, variant=variant):
+                        path.write_text(source, encoding="utf-8")
+                        sink, errors = StringIO(), []
+                        extra = {"lang": lang} if adapter is js_ast else {}
+                        if adapter is ruby_ast:
+                            extra["counted_rules"] = {rule}
+                        counts = adapter.scan_config(config, [path], sink, errors=errors, **extra)
+                        self.assertEqual(errors, [])
+                        records = [json.loads(line) for line in sink.getvalue().splitlines()]
+                        self.assertEqual([(row["rule"], row["line"]) for row in records],
+                                         [(rule, line) for line in expected])
+                        self.assertEqual(counts, {"critical": len(expected), "warning": 0, "info": 0})
+
+
 class StatementBoundaryTests(unittest.TestCase):
     """A marker on one statement never leaks onto the next one."""
 
@@ -1568,6 +2430,139 @@ class StatementBoundaryTests(unittest.TestCase):
         # A dangling binary operator still continues the statement.
         code = "total := a +\n    b // ubs:ignore[go.rule]\n"
         self.assertTrue(build_index(code, lang="go").is_suppressed(1, "go.rule"))
+
+
+class RubyElixirSecuritySuppressionTests(unittest.TestCase):
+    CASES = (
+        ('ruby', 'archive_extraction', 'ruby.archive-extraction.path', 4, 6, [6],
+         'def unpack(archive_path, destination)\n'
+         '  Zip::File.open(archive_path) do |zip|\n'
+         '    zip.each do |entry|\n'
+         '      name = entry.name\n\n'
+         '      target = File.join(destination, name)\n'
+         '    end\n  end\nend\n'),
+        ('ruby', 'security_randomness', 'ruby.security.non-crypto-random', 2, 4, [4],
+         'def sample\n  rng = Random.new(7)\n\n  otp = rng.rand(1_000_000)\nend\n'),
+        ('ruby', 'open_redirect', 'ruby.redirect.open', 2, 4, [4],
+         'def query_redirect\n  target = params[:return_url]\n\n  redirect_to target\nend\n'),
+        ('ruby', 'response_header_injection', 'ruby.header-injection.response', 2, 4, [4],
+         'def display_name\n  name = params[:display_name]\n\n'
+         '  response.headers["X-Display-Name"] = name\nend\n'),
+        ('elixir', 'archive_extraction', 'ex.archive-extraction.path', 5, 7, [4, 7, 8],
+         'defmodule ArchiveProbe do\n'
+         '  def unpack(archive_path, destination) do\n'
+         '    {:ok, files} = :zip.extract(String.to_charlist(archive_path), [:memory])\n'
+         '    Enum.each(files, fn {name, contents} ->\n'
+         '      entry_name = name\n\n'
+         '      target = Path.join(destination, entry_name)\n'
+         '      File.write!(target, contents)\n'
+         '    end)\n  end\nend\n'),
+        ('elixir', 'security_randomness', 'ex.randomness.security-token', None, 3, [3],
+         'defmodule TokenProbe do\n  def session_secret do\n'
+         '    secret = Integer.to_string(:rand.uniform(1_000_000_000))\n'
+         '    secret\n  end\nend\n'),
+        ('elixir', 'hardcoded_secrets', 'ex.secrets.hardcoded', None, 2, [2],
+         'defmodule SecretProbe do\n  @api_key "sk_live_1234567890abcdef"\n'
+         '  def key, do: @api_key\nend\n'),
+        ('elixir', 'outbound_url', 'ex.ssrf.outbound-url', 3, 5, [5],
+         'defmodule FetchProbe do\n  def fetch_req(conn) do\n'
+         '    target = conn.params["url"]\n\n    Req.get!(target)\n  end\nend\n'),
+        ('elixir', 'response_header_injection', 'ex.header-injection.response', 3, 5, [5],
+         'defmodule HeaderProbe do\n  def display_name(conn) do\n'
+         '    name = conn.params["display_name"]\n\n'
+         '    Plug.Conn.put_resp_header(conn, "x-display-name", name)\n  end\nend\n'),
+    )
+    FIXTURES = {
+        ('ruby', 'archive_extraction'): (
+            'archive_extraction_buggy/zip_slip.rb', 'archive_extraction_clean/zip_slip_safe.rb',
+            [9, 19, 28, 37, 46]),
+        ('ruby', 'security_randomness'): (
+            'security_randomness_buggy/tokens.rb', 'security_randomness_clean/tokens.rb',
+            [3, 8, 13, 18, 23]),
+        ('ruby', 'open_redirect'): (
+            'open_redirect_buggy/redirects.rb', 'open_redirect_clean/redirects.rb',
+            [6, 11, 16, 21, 26, 31]),
+        ('ruby', 'response_header_injection'): (
+            'header_injection_buggy/headers.rb', 'header_injection_clean/headers.rb',
+            [6, 11, 16, 21, 26, 32]),
+        ('elixir', 'archive_extraction'): (
+            'buggy/archive_extraction.ex', 'clean/archive_extraction.ex',
+            [3, 7, 13, 14, 15, 22, 23, 24]),
+        ('elixir', 'security_randomness'): (
+            'buggy/security_randomness.ex', 'clean/security_randomness.ex', [3, 11, 16, 21, 25]),
+        ('elixir', 'hardcoded_secrets'): (
+            'buggy/hardcoded_secrets.ex', 'clean/hardcoded_secrets.ex', [2, 6, 8, 16, 17, 23, 24]),
+        ('elixir', 'outbound_url'): (
+            'buggy/ssrf.ex', 'clean/ssrf.ex', [4, 9, 16, 22, 27, 32]),
+        ('elixir', 'response_header_injection'): (
+            'buggy/header_injection.ex', 'clean/header_injection.ex', [8, 16, 26, 31, 36, 41, 46]),
+    }
+
+    def setUp(self):
+        artifacts = REPO_ROOT / 'test-suite' / 'artifacts'
+        artifacts.mkdir(exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(prefix='ruby-elixir-security-ownership-', dir=artifacts)
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def check_source(self, language, name, rule, label, text, expected):
+        case = language + '-' + name + '-' + label
+        print(f'[{case}] RUN', flush=True)
+        suffix = '.rb' if language == 'ruby' else '.ex'
+        source = self.root / (case + suffix)
+        source.write_text(text, encoding='utf-8')
+        detector = importlib.import_module(f'ubs_core.{language}_detectors.{name}')
+        self.assertEqual(detector.RULE_ID, rule)
+        records = list(detector.find([source]))
+        (self.root / (case + '.json')).write_text(json.dumps(records, indent=2, default=str))
+        self.assertEqual([int(record[1]) for record in records], expected,
+                         {'source': text, 'rule': rule, 'records': records})
+        print(f'[{case}] PASS', flush=True)
+
+    def test_all_receivers_keep_unrelated_scopes_quoted_markers_and_source_facts(self):
+        for language, name, rule, origin, sink, sites, positive in self.CASES:
+            variants = ['unmarked', 'sink-ordinary', 'sink-quoted', 'sink-wrong',
+                        'sink-owned', 'sink-bare', 'safe']
+            if origin is not None:
+                variants.extend(('source-ordinary', 'source-quoted', 'source-wrong', 'source-owned'))
+            for variant in variants:
+                with self.subTest(language=language, detector=name, variant=variant):
+                    expected = sites
+                    if variant == 'safe':
+                        clean = self.FIXTURES[(language, name)][1]
+                        text = (REPO_ROOT / 'test-suite' / language / clean).read_text()
+                        expected = []
+                    else:
+                        lines = positive.splitlines()
+                        target = (origin if variant.startswith('source-') else sink) - 1
+                        if variant.endswith(('ordinary', 'quoted')):
+                            note = 'marker_note' if language == 'ruby' else '_marker_note'
+                            value = 'ubs:ignore' if variant.endswith('quoted') else 'ordinary note'
+                            lines[target] += f'; {note} = "{value}"'
+                        elif variant.endswith('wrong'):
+                            lines[target] += ' # ubs:ignore[unrelated.rule]'
+                        elif variant.endswith('owned'):
+                            lines[target] += f' # ubs:ignore[{rule}]'
+                        elif variant.endswith('bare'):
+                            lines[target] += ' # ubs:ignore'
+                        if variant in ('sink-owned', 'sink-bare'):
+                            expected = []
+                        if variant == 'source-owned' and rule == 'ex.archive-extraction.path':
+                            # All three original sites belong to this Enum.each call.
+                            expected = []
+                        text = '\n'.join(lines) + '\n'
+                    self.check_source(language, name, rule, variant, text, expected)
+
+    def test_original_positive_and_safe_fixture_sites_remain_exact(self):
+        for language, name, rule, _origin, _sink, _sites, _positive in self.CASES:
+            buggy, clean, sites = self.FIXTURES[(language, name)]
+            detector = importlib.import_module(f'ubs_core.{language}_detectors.{name}')
+            self.assertEqual(detector.RULE_ID, rule)
+            for label, relative, expected in (('buggy', buggy, sites), ('clean', clean, [])):
+                with self.subTest(language=language, detector=name, fixture=label):
+                    source = REPO_ROOT / 'test-suite' / language / relative
+                    records = list(detector.find([source]))
+                    self.assertEqual([int(record[1]) for record in records], expected, records)
 
 
 if __name__ == "__main__":

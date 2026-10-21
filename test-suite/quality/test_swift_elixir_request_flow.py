@@ -687,6 +687,21 @@ class SwiftLifecycleBindings(LoggedCase):
     @staticmethod
     def cases():
         cases = (
+            ('selector_observer_with_unrelated_catch', '''
+                import Foundation
+                final class Listener: NSObject {
+                  override init() {
+                    super.init()
+                    NotificationCenter.default.addObserver(self, selector: #selector(refresh), name: nil, object: nil)
+                  }
+                  deinit { NotificationCenter.default.removeObserver(self) }
+                  @objc func refresh() {}
+                  func loadBalance() async {
+                    do { try await fetchBalance() } catch { refresh() }
+                  }
+                  func fetchBalance() async throws {}
+                }
+            '''),
             ('catch_cleans_exception_but_not_success', '''
                 func start() {
                   let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
@@ -1232,6 +1247,36 @@ class SwiftLifecycleBindings(LoggedCase):
     @staticmethod
     def incomplete_cases():
         return {
+            'resource_acquired_inside_catch_scope': '''
+                import Foundation
+                func start() {
+                    do {
+                        let timer: Timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                    } catch { }
+                }
+            ''',
+            'resource_acquired_inside_catch_arm': '''
+                import Foundation
+                func start() {
+                    do { try work() } catch {
+                        let timer: Timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                    }
+                }
+            ''',
+            'selected_resource_crosses_catch_scope': '''
+                import Foundation
+                func start() {
+                    let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                    do { try work(); timer.invalidate() } catch { }
+                }
+            ''',
+            'malformed_catch_scope': '''
+                import Foundation
+                func start() {
+                    NotificationCenter.default.addObserver(self, selector: #selector(refresh), name: nil, object: nil)
+                    do { try work() } catch
+                }
+            ''',
             'selected_callback_execution': '''
                 import Foundation
                 func start() {
@@ -1387,7 +1432,10 @@ class SwiftLifecycleBindings(LoggedCase):
                                     if f.get('level') in {'error', 'warning'}]
                         actual = sorted((f['ruleId'], f['locations'][0]['physicalLocation']['region']['startLine'])
                                         for f in findings)
-                        self.assertTrue(all(Path(f['locations'][0]['physicalLocation']['artifactLocation']['uri']) == target
+                        from urllib.parse import unquote, urlparse
+                        # SARIF 2.1.0 section 3.10: an absolute path is a file URI.
+                        self.assertTrue(all(Path(unquote(urlparse(
+                            f['locations'][0]['physicalLocation']['artifactLocation']['uri']).path)) == target
                                             for f in findings), context)
                     self.assertEqual(actual, public_expected, context)
                     print(f'[swift-lifecycle-{label}] PASS ({time.monotonic() - started:.3f}s)', flush=True)

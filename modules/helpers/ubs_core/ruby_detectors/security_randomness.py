@@ -5,8 +5,8 @@ line tracker with a def/block stack that flags rand/Random/srand sources
 and predictable material (Time.now, Process.pid, object_id, #hash) used in
 security-sensitive contexts (token/session/csrf/... naming on the line or
 its enclosing def), tracking Random.new instances and clearing them on
-SecureRandom reassignment. Same-file and previous-line `ubs:ignore` markers
-suppress a hit.
+SecureRandom reassignment. Lexical statement-owned `ubs:ignore` markers
+suppress only matching rules.
 """
 from __future__ import annotations
 
@@ -14,9 +14,9 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.suppression import SourceSuppressions
 from ubs_core.ruby_detectors._common import (
     EXTS,
-    has_ignore,
     identifier_search_text,
     logical_statement,
     read_lines,
@@ -135,15 +135,13 @@ def analyze(lines, issues, path_str):
         return
     if not SECURITY_CONTEXT_RE.search(text):
         return
+    suppressions = SourceSuppressions('ruby').index(path_str, text)
     block_stack = []
     insecure_rng_vars = set()
     seen = set()
     for idx in range(1, len(lines) + 1):
         raw_statement = strip_line_comments(lines[idx - 1])
         push_blocks(raw_statement, block_stack)
-        if has_ignore(lines, idx):
-            pop_blocks(raw_statement, block_stack)
-            continue
         statement = logical_statement(lines, idx).strip()
         if not statement:
             pop_blocks(raw_statement, block_stack)
@@ -166,9 +164,10 @@ def analyze(lines, issues, path_str):
             pop_blocks(raw_statement, block_stack)
             continue
         seen.add(key)
-        issues.append(
-            (path_str, idx, 1, f"{source_line(lines, idx)}  [{source} in security-sensitive generation context]")
-        )
+        if not suppressions.is_suppressed(idx, RULE_ID):
+            issues.append(
+                (path_str, idx, 1, f"{source_line(lines, idx)}  [{source} in security-sensitive generation context]")
+            )
         pop_blocks(raw_statement, block_stack)
 
 

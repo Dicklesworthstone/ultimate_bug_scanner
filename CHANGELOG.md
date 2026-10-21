@@ -10,16 +10,9 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
-### Fixed
+### Added
 
-- JavaScript taint analysis reuses scalar helper summaries inside allocating callers without copying unrelated heap state. Heap callers are revisited when those summaries change; captured objects and object arguments retain their contextual analysis.
-- Components proven to contain no modeled taint source avoid unnecessary heap expansion. The proof checks every selected module using the analyzer's source patterns and parsed parameter origins; source-bearing components retain the same analysis and work limits.
-
----
-
-## [v5.5.9] - 2026-10-17 [Tag]
-
-Git-only source delivery; signed release assets and installed-tool upgrades are separate.
+- Kotlin category 13 now follows request data into JDBC SQL execution, including Java synthetic properties, source-local helper summaries, SQL captured by prepared statements and statement-owned batch queues. Static SQL with actual value binding stays clean. Named arguments, literal defaults and multiline expression bodies retain helper flow; unsupported receiver and default semantics report incomplete analysis. JSON and SARIF retain source-to-sink evidence, and the SQL work limit participates in cache invalidation.
 
 ### Fixed
 
@@ -33,6 +26,41 @@ Git-only source delivery; signed release assets and installed-tool upgrades are 
   evaluation-time argument snapshots, eager comprehension scope and writes, and
   lazy generator aliases with shared exhaustion. This does not complete the
   broader cross-language taint-engine work.
+- Kotlin broad exception handlers now report swallowed cancellation when their protected code reaches a resolved `delay`, `yield`, `awaitCancellation`, or direct cancellation throw. Catch ordering, type tests, scoped aliases and reachable branches distinguish propagation from swallowing; ordinary synchronous handlers remain quiet. Captured writes cannot leave stale rethrow proofs, and explicit imports retain their actual Kotlin precedence. Direct Kotlin SARIF also records incomplete analysis as a failed invocation with its reason.
+- Ruby request-flow analysis now resolves constant receivers through lexical namespaces, explicit root qualification, stable aliases and visible superclass constants. Namespaced helper calls retain their source and sink flow, while custom or overridden `File` methods cannot borrow built-in path-sanitizer proofs. Alias assignment order and both singleton-definition spellings preserve the actual receiver; uncertain rebindings and conditional definitions retain findings and report incomplete analysis.
+- Ruby literal allowlists use the constant selected by actual lexical lookup. Nested or compact namespace scopes cannot borrow an outer constant's safety proof, and ordinary literal-array calls no longer become incomplete namespace calls. Conditional definitions, reassignments, selected singleton overrides and request-derived shared mutations remain explicit analysis boundaries.
+- Java path-traversal analysis parses array initializers (`boolean[] flag = {false};`, `new String[] {a, b}`, nested initializers) as expressions whose elements carry data, so a file containing one no longer ends the Java module with exit 2 (#184). Multi-dimensional and C-style declarators (`String[][] m`, `String m[]`) now bind their variable instead of dropping the flow. Lambda and anonymous-class bodies, including those inside an initializer, still report incomplete analysis.
+- JavaScript/TypeScript constant-time comparison analysis no longer treats a metadata member of a call result as the secret that flowed into the call. `result.type !== "success"` after `await WebBrowser.openAuthSessionAsync(authorization.authorize_url, ...)` is quiet, because a secret-sounding callee name or argument does not make the returned object's discriminant secret (#181, #185). Aliases of a secret (`result = authorization`), names that are also assigned a secret elsewhere, value members (`result.value`, `exchanged.accessToken`) and members read off the call expression itself are still reported.
+- The C# ast-grep rule `cs-task-result-deadlock` now follows the same receiver classification as `cs.pattern.blocking-result`: a record's own `Result` property or a named tuple element is no longer reported as a blocking Task `.Result`, while Task/ValueTask and unresolved receivers (including a `.Result` on a later line than its receiver) still are (#169).
+- SARIF `artifactLocation.uri` values are now RFC 3986 URIs (SARIF 2.1.0 sections 3.10.1-3.10.2), in primary locations and taint code flows. Absolute paths are written as `file:///...` URIs and relative paths as percent-encoded relative references, so a space, `#`, `?` or `%` in a file name no longer reads as URI syntax. Existing `file://` values are kept, the `permalink` property encodes its path once, and the module scaffold's own SARIF output does the same. Consumers that treated `uri` as a native path must decode it.
+- C# SQL analysis models the BCL value-type `TryParse` family (`int.TryParse(text, out var n)`, and the same two-argument form on the other integral types, `bool`, `float`, `double`, `decimal`, `char`, `Guid`, `DateTime`, `DateTimeOffset`, `TimeSpan`, `DateOnly` and `TimeOnly`) as SQL-inert, so such a call in a SQL-bearing file no longer makes the C# module partial (#171). The input must be a string literal, `null`, a string-typed local or parameter, or a direct ASP.NET request read. Parsed request data keeps its provenance. Other overloads, named arguments, shadowed receivers and `Dictionary.TryGetValue` still report incomplete analysis.
+
+- Native Go analyzer reports no longer stop at a 16 MiB aggregate output limit. `go vet` package and diagnostic arrays and `govulncheck` messages are read incrementally with bounded individual records. Valid diagnostics survive truncated, corrupt, oversized or failed output, and incomplete tool coverage remains explicit. A real 18.8 MB vet report now retains all 13,000 source diagnostics with exact locations.
+- JavaScript writes to the unshadowed global `undefined` no longer suppress parameter defaults or erase unsafe data. Right-hand-side effects and assignment results remain visible; strict-mode writes preserve their exceptional exits through catch and finally. Local shadows stay distinct, and ambiguous global declaration environments report incomplete analysis instead of a clean result.
+- C# null analysis no longer keeps stale guard proofs after captured helper writes, delegate calls, by-reference arguments or known accessor and disposal effects. Constructor writes to borrowed objects remain visible while fresh receiver fields stay separate. Nullable and reference-valued dictionary lookups require a value check; namespace-qualified bindings and exceptional exits keep their own state. Findings established before an unsupported scope survive in JSON and SARIF, including findings in later files, while the report explicitly marks incomplete analysis.
+- JavaScript destructuring retains null, undefined and noniterable entry failures before defaults or function bodies can hide unsafe data. Default and bypass exceptions retain their separate stores; parenthesized templates remain strings, and parameter initializers resolve shadowed `undefined` in their actual scope. Unary `void` preserves operand effects while supplying a clean undefined value.
+- External analyzer completion now accounts for inherited child processes, ignored child-exit signals, and native AST errors on stderr, including errors beyond the preview. Corrupt stream records remain recorded if consumption stops early; incomplete AST output cannot become a clean result through missing error collectors, inconsistent exit codes, or a prefilter failure.
+- JavaScript calls capture spread elements before later argument effects, evaluate spread expressions once, and keep updates that later parameter defaults make to earlier bindings. Destructuring assignments also retain receivers returned by calls, including their computed-key effects, exceptions and DOM sink writes.
+- JavaScript taint analysis preserves field identity through object and array destructuring in declarations, assignments and function parameters. Rest bindings are fresh shallow copies, defaults retain their ordered effects and exceptions, and member targets retain borrowed aliases and direct sink checks. Separate callers and clean sibling fields remain distinct.
+- C# null-guard analysis follows scoped branches, assignments and actual exit targets, including constructors, accessors and braced callbacks. Comments, unrelated bindings and nested conditional exits no longer create false proofs; uncertain selected control flow reports incomplete analysis. The exception rethrow rule matches the active catch binding and respects callable and finally boundaries, avoiding recommendations that would replace unrelated throws or produce invalid C#.
+- AST diagnostics and the ripgrep prefilter consume complete newline-delimited output with bounded record memory. Large Rust, JavaScript, TypeScript and TSX scans no longer stop at the former 16 MiB total-output ceiling; malformed records, tool failures and timeouts still mark analysis incomplete and retain valid diagnostics. Temporary output handles close on capture and consumer failures.
+- JavaScript taint analysis preserves captured object identities in nested helpers, so writes and array mutations through unassigned object parameters reach their callers. Field-specific reads and definite cleanup remain precise, with separate clean and tainted caller controls.
+- JavaScript taint analysis reuses scalar helper summaries inside allocating callers without copying unrelated heap state. Heap callers are revisited when those summaries change; captured objects and object arguments retain their contextual analysis.
+- Components proven to contain no modeled taint source avoid unnecessary heap expansion. The proof checks every selected module using the analyzer's source patterns and parsed parameter origins; source-bearing components retain the same analysis and work limits.
+
+---
+
+## [v5.5.9] - 2026-10-19 [Tag]
+
+Git-only source delivery; signed release assets and installed-tool upgrades are separate.
+
+### Fixed
+
+- Swift request-flow analysis no longer treats ordinary API `.write(...)` calls
+  without an outer `to:` argument as Foundation file writes. Real file destinations,
+  nested sinks, interpolation and request-derived values retain their checks.
+- Swift comment tokenization uses explicit ordered appends, preserving newline
+  offsets while allowing the Python SQL analyzer to complete its own source scan.
 
 ---
 

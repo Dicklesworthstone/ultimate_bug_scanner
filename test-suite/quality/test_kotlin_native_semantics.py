@@ -532,7 +532,468 @@ COROUTINE_CASES = (
         /* suspend fun f() { catch (e: CancellationException) { println(e) } } */
         '''),
 )
-CASES = NULL_CASES + COROUTINE_CASES
+BROAD_CANCELLATION_CASES = (
+    Case("broad_exception_swallows_delay", '''
+        import kotlinx.coroutines.delay
+        suspend fun poll() {
+            try { delay(1) }
+            catch (problem: Exception) { println(problem.message) } // expect-finding
+        }''', CANCELLATION),
+    Case("broad_throwable_swallows_await_cancellation", '''
+        import kotlinx.coroutines.awaitCancellation
+        suspend fun poll() {
+            try { awaitCancellation() }
+            catch (problem: Throwable) { println(problem.message) } // expect-finding
+        }''', CANCELLATION),
+    Case("broad_runtime_exception_swallows_yield", '''
+        import kotlinx.coroutines.yield
+        suspend fun poll() {
+            try { yield() }
+            catch (problem: RuntimeException) { println(problem.message) } // expect-finding
+        }''', CANCELLATION),
+    Case("broad_illegal_state_swallows_delay", '''
+        import kotlinx.coroutines.delay
+        suspend fun poll() {
+            try { delay(1) }
+            catch (problem: IllegalStateException) { println(problem.message) } // expect-finding
+        }''', CANCELLATION),
+    Case("broad_imported_call_and_exception_aliases", '''
+        import kotlinx.coroutines.delay as pause
+        import java.lang.Exception as Failure
+        suspend fun poll() {
+            try { pause(1) }
+            catch (problem: Failure) { println(problem.message) } // expect-finding
+        }''', CANCELLATION),
+    Case("broad_qualified_call_and_exception", '''
+        suspend fun poll() {
+            try { kotlinx.coroutines.delay(1) }
+            catch (problem: kotlin.Throwable) { println(problem.message) } // expect-finding
+        }''', CANCELLATION),
+    Case("broad_rethrow_preserves_original", '''
+        import kotlinx.coroutines.delay
+        suspend fun poll() {
+            try { delay(1) }
+            catch (problem: Exception) { throw problem }
+        }'''),
+    Case("broad_cancellation_type_guard_rethrows", '''
+        import kotlinx.coroutines.*
+        suspend fun poll() {
+            try { delay(1) }
+            catch (problem: Exception) {
+                if (problem is CancellationException) throw problem
+                println(problem.message)
+            }
+        }'''),
+    Case("broad_negative_type_guard_else_rethrows", '''
+        import kotlinx.coroutines.*
+        suspend fun poll() {
+            try { delay(1) }
+            catch (problem: Throwable) {
+                if (problem !is CancellationException) println(problem.message)
+                else throw problem
+            }
+        }'''),
+    Case("broad_negative_type_guard_return_then_rethrow", '''
+        import kotlinx.coroutines.*
+        suspend fun poll() {
+            try { delay(1) }
+            catch (problem: Exception) {
+                if (problem !is CancellationException) return
+                throw problem
+            }
+        }'''),
+    Case("broad_negative_type_guard_swallows_cancellation", '''
+        import kotlinx.coroutines.*
+        suspend fun poll() {
+            try { delay(1) }
+            catch (problem: Exception) { // expect-finding
+                if (problem !is CancellationException) throw problem
+                println("continued")
+            }
+        }''', CANCELLATION),
+    Case("broad_alias_type_guard_rethrows", '''
+        import kotlinx.coroutines.*
+        suspend fun poll() {
+            try { delay(1) }
+            catch (problem: Exception) {
+                val original = problem
+                if (original is CancellationException) throw original
+                println(problem.message)
+            }
+        }'''),
+    Case("broad_replaced_alias_does_not_rethrow_original", '''
+        import kotlinx.coroutines.*
+        suspend fun poll() {
+            try { delay(1) }
+            catch (problem: Exception) { // expect-finding
+                var original: Exception = problem
+                original = IllegalArgumentException("replacement")
+                if (original is CancellationException) throw original
+            }
+        }''', CANCELLATION),
+    Case("broad_conditional_type_rethrow_has_loss_path", '''
+        import kotlinx.coroutines.*
+        suspend fun poll(stop: Boolean) {
+            try { delay(1) }
+            catch (problem: Exception) { // expect-finding
+                if (problem is CancellationException && stop) throw problem
+            }
+        }''', CANCELLATION),
+    Case("broad_negated_type_test_rethrows", '''
+        import kotlinx.coroutines.*
+        suspend fun poll() {
+            try { delay(1) }
+            catch (problem: Exception) {
+                if (!(problem !is CancellationException)) throw problem
+            }
+        }'''),
+    Case("broad_supertype_guard_rethrows", '''
+        import kotlinx.coroutines.delay
+        suspend fun poll() {
+            try { delay(1) }
+            catch (problem: Throwable) {
+                if (problem is RuntimeException) throw problem
+            }
+        }'''),
+    Case("broad_shadowed_cancellation_type_is_not_proof", '''
+        import kotlinx.coroutines.delay
+        class CancellationException : Exception()
+        suspend fun poll() {
+            try { delay(1) }
+            catch (problem: Exception) { // expect-finding
+                if (problem is CancellationException) throw problem
+            }
+        }''', CANCELLATION),
+    Case("broad_earlier_typed_handler_propagates", '''
+        import kotlinx.coroutines.*
+        suspend fun poll() {
+            try { delay(1) }
+            catch (problem: CancellationException) { throw problem }
+            catch (problem: Exception) { println(problem.message) }
+        }'''),
+    Case("broad_after_unrelated_handler_still_catches", '''
+        import kotlinx.coroutines.delay
+        import java.io.IOException
+        suspend fun poll() {
+            try { delay(1) }
+            catch (problem: IOException) { println(problem.message) }
+            catch (problem: Exception) { println(problem.message) } // expect-finding
+        }''', CANCELLATION),
+    Case("broad_first_handler_owns_one_cancellation_finding", '''
+        import kotlinx.coroutines.*
+        suspend fun poll() {
+            try { delay(1) }
+            catch (problem: Exception) { println(problem.message) } // expect-finding
+            catch (problem: CancellationException) { println(problem.message) }
+        }''', CANCELLATION),
+    Case("broad_sync_failure_inside_suspend_stays_clean", '''
+        suspend fun poll() {
+            try { Integer.parseInt("42") }
+            catch (problem: Exception) { println(problem.message) }
+        }'''),
+    Case("broad_shadowed_delay_stays_clean", '''
+        import kotlinx.coroutines.delay
+        suspend fun poll() {
+            suspend fun delay(milliseconds: Long) { println(milliseconds) }
+            try { delay(1) }
+            catch (problem: Exception) { println(problem.message) }
+        }'''),
+    Case("broad_parameter_named_delay_stays_clean", '''
+        suspend fun poll(delay: (Long) -> Unit) {
+            try { delay(1) }
+            catch (problem: Exception) { println(problem.message) }
+        }'''),
+    Case("broad_unrelated_receiver_delay_stays_clean", '''
+        class Worker { fun delay(milliseconds: Long) { println(milliseconds) } }
+        suspend fun poll(worker: Worker) {
+            try { worker.delay(1) }
+            catch (problem: Exception) { println(problem.message) }
+        }'''),
+    Case("broad_shadowed_exception_type_stays_clean", '''
+        import kotlinx.coroutines.delay
+        class Exception : RuntimeException()
+        suspend fun poll() {
+            try { delay(1) }
+            catch (problem: Exception) { println(problem.message) }
+        }'''),
+    Case("broad_deferred_lambda_is_not_protected_call", '''
+        import kotlinx.coroutines.delay
+        suspend fun poll() {
+            try { val later: suspend () -> Unit = { delay(1) }; println(later) }
+            catch (problem: Exception) { println(problem.message) }
+        }'''),
+    Case("broad_nested_function_is_not_protected_call", '''
+        import kotlinx.coroutines.delay
+        suspend fun poll() {
+            try { suspend fun later() { delay(1) }; println("registered") }
+            catch (problem: Exception) { println(problem.message) }
+        }'''),
+    Case("broad_child_launch_is_not_caller_suspension", '''
+        import kotlinx.coroutines.CoroutineScope
+        import kotlinx.coroutines.delay
+        import kotlinx.coroutines.launch
+        suspend fun poll(scope: CoroutineScope) {
+            try { scope.launch { delay(1) } }
+            catch (problem: Exception) { println(problem.message) }
+        }'''),
+    Case("broad_handler_in_structured_child", '''
+        import kotlinx.coroutines.*
+        suspend fun poll() = coroutineScope {
+            launch {
+                try { delay(1) }
+                catch (problem: Exception) { println(problem.message) } // expect-finding
+            }
+        }''', CANCELLATION),
+    Case("broad_zero_delay_does_not_check_cancellation", '''
+        import kotlinx.coroutines.delay
+        suspend fun poll() {
+            try { delay(0) }
+            catch (problem: Exception) { println(problem.message) }
+        }'''),
+    Case("broad_negative_delay_does_not_check_cancellation", '''
+        import kotlinx.coroutines.delay
+        suspend fun poll() {
+            try { delay(-1L) }
+            catch (problem: Exception) { println(problem.message) }
+        }'''),
+    Case("broad_unreachable_delay_after_return_stays_clean", '''
+        import kotlinx.coroutines.delay
+        suspend fun poll() {
+            try { return; delay(1) }
+            catch (problem: Exception) { println(problem.message) }
+        }'''),
+    Case("broad_unreachable_delay_in_false_branch_stays_clean", '''
+        import kotlinx.coroutines.delay
+        suspend fun poll() {
+            try { if (false) { delay(1) } }
+            catch (problem: Exception) { println(problem.message) }
+        }'''),
+    Case("broad_possible_delay_in_branch_can_be_cancelled", '''
+        import kotlinx.coroutines.delay
+        suspend fun poll(wait: Boolean) {
+            try { if (wait) delay(1) }
+            catch (problem: Exception) { println(problem.message) } // expect-finding
+        }''', CANCELLATION),
+    Case("broad_lexical_call_decoys_stay_clean", '''
+        import kotlinx.coroutines.delay
+        suspend fun poll() {
+            try {
+                val example = "delay(1); yield(); awaitCancellation()"
+                // delay(1)
+                /* kotlinx.coroutines.delay(1) */
+                println(example)
+            }
+            catch (problem: Exception) { println(problem.message) }
+        }'''),
+    Case("broad_type_aliases_preserve_handler_identity", '''
+        import kotlinx.coroutines.delay
+        typealias Failure = Exception
+        suspend fun poll() {
+            try { delay(1) }
+            catch (problem: Failure) { println(problem.message) } // expect-finding
+        }''', CANCELLATION),
+    Case("broad_type_alias_guard_preserves_cancellation", '''
+        import kotlinx.coroutines.delay
+        typealias Cancelled = kotlinx.coroutines.CancellationException
+        suspend fun poll() {
+            try { delay(1) }
+            catch (problem: Exception) {
+                if (problem is Cancelled) throw problem
+                println(problem.message)
+            }
+        }'''),
+    Case("broad_type_guard_disjunction_rethrows", '''
+        import kotlinx.coroutines.*
+        suspend fun poll(stop: Boolean) {
+            try { delay(1) }
+            catch (problem: Exception) {
+                if (problem is CancellationException || stop) throw problem
+            }
+        }'''),
+    Case("broad_earlier_typed_swallow_owns_the_finding", '''
+        import kotlinx.coroutines.*
+        suspend fun poll() {
+            try { delay(1) }
+            catch (problem: CancellationException) { println(problem.message) } // expect-finding
+            catch (problem: Exception) { println(problem.message) }
+        }''', CANCELLATION),
+    Case("broad_unknown_delay_duration_can_be_cancelled", '''
+        import kotlinx.coroutines.delay
+        suspend fun poll(milliseconds: Long) {
+            try { delay(timeMillis = milliseconds) }
+            catch (problem: Exception) { println(problem.message) } // expect-finding
+        }''', CANCELLATION),
+    Case("broad_named_zero_delay_does_not_check_cancellation", '''
+        import kotlinx.coroutines.delay
+        suspend fun poll() {
+            try { delay(timeMillis = (0L)) }
+            catch (problem: Exception) { println(problem.message) }
+        }'''),
+    Case("broad_unreachable_delay_in_false_loop_stays_clean", '''
+        import kotlinx.coroutines.delay
+        suspend fun poll() {
+            try { while (false) { delay(1) } }
+            catch (problem: Exception) { println(problem.message) }
+        }'''),
+    Case("broad_return_in_true_loop_prevents_later_delay", '''
+        import kotlinx.coroutines.delay
+        suspend fun poll() {
+            try { while (true) { return }; delay(1) }
+            catch (problem: Exception) { println(problem.message) }
+        }'''),
+    Case("broad_break_in_true_loop_reaches_later_delay", '''
+        import kotlinx.coroutines.delay
+        suspend fun poll() {
+            try { while (true) { break }; delay(1) }
+            catch (problem: Exception) { println(problem.message) } // expect-finding
+        }''', CANCELLATION),
+    Case("broad_return_branch_prevents_later_delay", '''
+        import kotlinx.coroutines.delay
+        suspend fun poll(stop: Boolean) {
+            try { if (stop) return else return; delay(1) }
+            catch (problem: Exception) { println(problem.message) }
+        }'''),
+    Case("broad_possible_loop_call_can_be_cancelled", '''
+        import kotlinx.coroutines.delay
+        suspend fun poll(values: List<Int>) {
+            try { for (value in values) { delay(value.toLong()) } }
+            catch (problem: Exception) { println(problem.message) } // expect-finding
+        }''', CANCELLATION),
+    Case("broad_unrelated_when_flow_stays_complete", '''
+        suspend fun poll(stop: Boolean) {
+            try { when (stop) { true -> println("yes"); false -> println("no") } }
+            catch (problem: Exception) { println(problem.message) }
+        }'''),
+    Case("broad_value_named_exception_does_not_shadow_type", '''
+        import kotlinx.coroutines.delay
+        val Exception = "ordinary value"
+        suspend fun poll() {
+            try { delay(1) }
+            catch (problem: Exception) { println(problem.message) } // expect-finding
+        }''', CANCELLATION),
+    Case("broad_value_named_cancellation_does_not_shadow_type", '''
+        import kotlinx.coroutines.*
+        val CancellationException = "ordinary value"
+        suspend fun poll() {
+            try { delay(1) }
+            catch (problem: CancellationException) { println(problem.message) } // expect-finding
+        }''', CANCELLATION),
+    Case("broad_explicit_cancellation_uses_first_handler", '''
+        import kotlinx.coroutines.CancellationException
+        suspend fun poll() {
+            try { throw CancellationException("cancelled") }
+            catch (problem: Exception) { println(problem.message) } // expect-finding
+            catch (problem: CancellationException) { println(problem.message) }
+        }''', CANCELLATION),
+    Case("broad_explicit_cancellation_type_guard_rethrows", '''
+        import kotlinx.coroutines.CancellationException
+        suspend fun poll() {
+            try { throw CancellationException("cancelled") }
+            catch (problem: Exception) {
+                if (problem is CancellationException) throw problem
+            }
+        }'''),
+    Case("broad_constructor_name_does_not_establish_cancellation", '''
+        import kotlinx.coroutines.CancellationException
+        suspend fun poll() {
+            fun CancellationException(message: String): Exception = IllegalArgumentException(message)
+            try { throw CancellationException("ordinary failure") }
+            catch (problem: Exception) { println(problem.message) }
+        }'''),
+    Case("broad_captured_write_does_not_change_caught_parameter", '''
+        import kotlinx.coroutines.*
+        suspend fun poll() {
+            try { delay(1) }
+            catch (problem: Exception) {
+                var original: Exception = problem
+                if (run { original = IllegalArgumentException("replacement"); false }
+                    || problem is CancellationException) throw problem
+            }
+        }'''),
+    Case("broad_short_circuit_does_not_execute_alias_write", '''
+        import kotlinx.coroutines.*
+        suspend fun poll() {
+            try { delay(1) }
+            catch (problem: Exception) {
+                var original: Exception = problem
+                if (problem is CancellationException
+                    || run { original = IllegalArgumentException("replacement"); false }) throw original
+            }
+        }'''),
+    Case("broad_captured_identity_assignment_preserves_alias", '''
+        import kotlinx.coroutines.*
+        suspend fun poll() {
+            try { delay(1) }
+            catch (problem: Exception) {
+                var original: Exception = problem
+                if (run { original = problem; false } || original is CancellationException) throw original
+            }
+        }'''),
+    Case("broad_deferred_alias_writer_is_not_an_invocation", '''
+        import kotlinx.coroutines.*
+        suspend fun poll() {
+            try { delay(1) }
+            catch (problem: Exception) {
+                var original: Exception = problem
+                val later = { original = IllegalArgumentException("replacement") }
+                if (original is CancellationException) throw original
+            }
+        }'''),
+    Case("broad_explicit_import_beats_same_package_exception", '''
+        import java.lang.Exception
+        import kotlinx.coroutines.delay
+        class Exception
+        suspend fun poll() {
+            try { delay(1) }
+            catch (problem: Exception) { println(problem.message) } // expect-finding
+        }''', CANCELLATION),
+    Case("broad_explicit_import_beats_same_package_delay", '''
+        import kotlinx.coroutines.delay
+        suspend fun delay(milliseconds: Long) { println(milliseconds) }
+        suspend fun poll() {
+            try { delay(1) }
+            catch (problem: Exception) { println(problem.message) } // expect-finding
+        }''', CANCELLATION),
+    Case("broad_local_exception_class_shadows_explicit_import", '''
+        import java.lang.Exception
+        import kotlinx.coroutines.delay
+        suspend fun poll() {
+            class Exception : RuntimeException()
+            try { delay(1) }
+            catch (problem: Exception) { println(problem.message) }
+        }'''),
+    Case("broad_member_exception_class_shadows_explicit_import", '''
+        import java.lang.Exception
+        import kotlinx.coroutines.delay
+        class Worker {
+            class Exception : RuntimeException()
+            suspend fun poll() {
+                try { delay(1) }
+                catch (problem: Exception) { println(problem.message) }
+            }
+        }'''),
+)
+SHORT_CIRCUIT_CANCELLATION_CASES = tuple(
+    Case(name, "import kotlinx.coroutines.delay\nsuspend fun poll() {\n"
+         "    try { " + body + " }\n"
+         "    catch (problem: Exception) { println(problem.message) }"
+         + (" // expect-finding" if unsafe else "") + "\n}",
+         CANCELLATION if unsafe else "")
+    for name, body, unsafe in (
+        ("broad_false_and_skips_condition_source", "if (false && (delay(1) == Unit)) {}", False),
+        ("broad_true_or_skips_condition_source", "if (true || (delay(1) == Unit)) {}", False),
+        ("broad_true_and_evaluates_condition_source", "if (true && (delay(1) == Unit)) {}", True),
+        ("broad_false_result_keeps_evaluated_left_source", "if ((delay(1) == Unit) && false) {}", True),
+        ("broad_grouped_short_circuit_skips_source", "if (((false && (delay(1) == Unit)) || true)) {}", False),
+        ("broad_false_and_skips_loop_condition_source", "while (false && (delay(1) == Unit)) {}", False),
+        ("broad_false_and_skips_initializer_source", "val checked: Boolean = false && (delay(1) == Unit)", False),
+        ("broad_true_and_evaluates_initializer_source", "val checked = true && (delay(1) == Unit)", True),
+        ("broad_true_or_skips_standalone_source", "(true || (delay(1) == Unit))", False),
+        ("broad_later_argument_source_is_evaluated", "println(listOf(false && (delay(1) == Unit), true && (delay(1) == Unit)))", True),
+    )
+)
+BROAD_CANCELLATION_CASES += SHORT_CIRCUIT_CANCELLATION_CASES
+CASES = NULL_CASES + COROUTINE_CASES + BROAD_CANCELLATION_CASES
 BY_NAME = {case.name: case for case in CASES}
 
 
@@ -613,6 +1074,80 @@ class KotlinNativeAnalyzerTests(LoggedKotlinCase):
     def test_coroutine_api_identity_context_and_ownership(self):
         self.check_cases(COROUTINE_CASES)
 
+    def test_java_kotlin_analyzer_parity_and_error_isolation(self):
+        from unittest import mock
+        from ubs_core import java_scan
+
+        case = BY_NAME["blocking_sleep_in_suspend"]
+        directory, source = self.fixture(case, "-parity")
+        java_sink = io.StringIO()
+        java_errors = []
+        java_scan.run_analyzers([source], java_sink, set(), java_errors)
+        java_records = [json.loads(line) for line in java_sink.getvalue().splitlines() if line]
+        self.assertEqual(java_errors, [])
+        self.assert_records(case, java_records)
+
+        from ubs_core.analyzers import taint_java_traversal
+
+        bad_file = directory / "BrokenTaint.kt"
+        bad_file.write_text("fun ok() = 1\n", encoding="utf-8")
+        kt_sink = io.StringIO()
+        kt_errors = []
+        original_run = taint_java_traversal.run
+
+        def flaky_run(ctx):
+            if any(Path(p) == bad_file for p in ctx.files):
+                raise ValueError("synthetic taint failure")
+            return original_run(ctx)
+
+        with mock.patch.object(taint_java_traversal, "run", side_effect=flaky_run):
+            kotlin_scan.scan_analyzers([bad_file, source], kt_sink, set(), errors=kt_errors)
+        kt_records = [json.loads(line) for line in kt_sink.getvalue().splitlines() if line]
+        self.assertEqual(len(kt_errors), 1)
+        self.assertIn("taint_java_traversal", kt_errors[0])
+        self.assertIn("BrokenTaint.kt", kt_errors[0])
+        self.assert_records(case, kt_records)
+    def test_broad_handlers_with_selected_cancellation_sources(self):
+        self.check_cases(BROAD_CANCELLATION_CASES)
+
+    def test_selected_broad_handler_flow_limits_are_explicit(self):
+        bodies = {
+            "selected_when": 'when (stop) { true -> delay(1); false -> println("no") }',
+            "selected_nested_try": 'try { delay(1) } finally { println("cleanup") }',
+        }
+        for name, body in bodies.items():
+            with self.subTest(case=name):
+                case = Case(name, "import kotlinx.coroutines.delay\n"
+                            "suspend fun poll(stop: Boolean) {\n"
+                            "    try { " + body + " }\n"
+                            "    catch (problem: Exception) { println(problem.message) }\n}")
+                directory, source = self.fixture(case)
+                sink = io.StringIO()
+                with self.assertRaisesRegex(ValueError, "unsupported (when|try) flow; analysis is incomplete"):
+                    kotlin_scan.scan_analyzers([source], sink, set())
+                (directory / "records.jsonl").write_text(sink.getvalue(), encoding="utf-8")
+
+    def test_captured_alias_writes_do_not_prove_cancellation_propagation(self):
+        handlers = {
+            "inline_condition": ('Exception', 'if (run { original = IllegalArgumentException("replacement"); false } || original is CancellationException) throw original'),
+            "typed_inline_condition": ('CancellationException', 'if (run { original = IllegalArgumentException("replacement"); false } || original is CancellationException) throw original'),
+            "changed_rethrow_operand": ('Exception', 'if (run { original = IllegalArgumentException("replacement"); false } || problem is CancellationException) throw original'),
+            "initializer_callback": ('Exception', 'val result = run { original = IllegalArgumentException("replacement"); false }; if (original is CancellationException) throw original'),
+            "local_helper_chain": ('Exception', 'fun replace() { original = IllegalArgumentException("replacement") }; fun apply() { replace() }; if (run { apply(); false } || original is CancellationException) throw original'),
+            "invoked_local_callback": ('Exception', 'val replace = { original = IllegalArgumentException("replacement") }; if (run { replace(); false } || original is CancellationException) throw original'),
+            "transitive_alias_write": ('Exception', 'var selected: Exception = problem; if (run { original = IllegalArgumentException("replacement"); selected = original; false } || selected is CancellationException) throw selected'),
+        }
+        for name, (type_name, body) in handlers.items():
+            with self.subTest(case=name):
+                case = Case(name, "import kotlinx.coroutines.*\nsuspend fun poll() {\n"
+                            "    try { delay(1) }\n    catch (problem: " + type_name + ") {\n"
+                            "        var original: Exception = problem\n        " + body + "\n    }\n}")
+                directory, source = self.fixture(case)
+                sink = io.StringIO()
+                with self.assertRaisesRegex(ValueError, "captured alias write; analysis is incomplete"):
+                    kotlin_scan.scan_analyzers([source], sink, set())
+                (directory / "records.jsonl").write_text(sink.getvalue(), encoding="utf-8")
+
 
 @unittest.skipUnless(os.environ.get("UBS_KOTLIN_NATIVE_E2E") == "1", "set UBS_KOTLIN_NATIVE_E2E=1 for actual CLI scans")
 class KotlinNativeCliTests(LoggedKotlinCase):
@@ -675,6 +1210,33 @@ class KotlinNativeCliTests(LoggedKotlinCase):
                                         if record["ruleId"].startswith(PREFIXES))
                         self.assertEqual(actual, case.expected, payload)
 
+    def test_broad_cancellation_handlers_through_public_formats(self):
+        names = ("broad_exception_swallows_delay", "broad_imported_call_and_exception_aliases",
+                 "broad_cancellation_type_guard_rethrows", "broad_earlier_typed_handler_propagates",
+                 "broad_sync_failure_inside_suspend_stays_clean",
+                 "broad_false_and_skips_condition_source", "broad_true_or_skips_condition_source",
+                 "broad_true_and_evaluates_condition_source")
+        for name in names:
+            case = BY_NAME[name]
+            for meta in (False, True):
+                for fmt in ("json", "sarif"):
+                    with self.subTest(case=name, meta=meta, format=fmt):
+                        result, payload = self.scan(case, fmt=fmt, meta=meta)
+                        self.assertEqual(result.returncode, 1 if case.expected else 0,
+                                         (result.stdout, result.stderr))
+                        if fmt == "json":
+                            self.assertEqual(payload["status"], "ok", payload)
+                            records = self.meta_records(payload) if meta else payload["findings"]
+                            self.assert_records(case, records)
+                            totals = payload["totals"] if meta else payload
+                            self.assertEqual(totals["critical"], 0, payload)
+                            self.assertEqual(totals["warning"], len(case.expected), payload)
+                        else:
+                            actual = sorted((record["ruleId"], record["locations"][0]["physicalLocation"]["region"]["startLine"])
+                                            for run in payload["runs"] for record in run["results"]
+                                            if record["ruleId"].startswith(PREFIXES))
+                            self.assertEqual(actual, case.expected, payload)
+
     def test_ordinary_meta_runner_counts_active_rules(self):
         for name in ("cancellation_explicit_swallowed", "blocking_sleep_in_suspend", "job_global_launch_discarded",
                      "null_guard_conditional_return", "elvis_literal_proves_nonnull"):
@@ -720,6 +1282,19 @@ class KotlinNativeCliTests(LoggedKotlinCase):
                 self.assertEqual(payload["status"], "partial", payload)
                 self.assertEqual(payload["module_error"], "ANALYZER_ERROR", payload)
                 self.assertIn("incomplete", result.stderr.lower(), result.stderr)
+
+    def test_incomplete_sarif_has_failed_invocation_and_reason(self):
+        malformed = Case("malformed's-block", "suspend fun poll() {\n    Thread.sleep(25)\n")
+        for case, env in ((malformed, {}),
+                          (BY_NAME["blocking_sleep_in_suspend"], {"UBS_KOTLIN_MAX_TOKENS": "5"})):
+            for meta in (False, True):
+                with self.subTest(case=case.name, meta=meta):
+                    result, payload = self.scan(case, fmt="sarif", meta=meta,
+                                                env_updates=env, suffix="-incomplete-sarif")
+                    self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+                    invocations = [inv for run in payload["runs"] for inv in run.get("invocations", [])]
+                    self.assertTrue(any(inv.get("executionSuccessful") is False for inv in invocations), payload)
+                    self.assertIn("incomplete", json.dumps(invocations).lower())
 
     def test_cache_replays_and_invalidates_changed_source_and_policy(self):
         unsafe = BY_NAME["blocking_sleep_in_suspend"]

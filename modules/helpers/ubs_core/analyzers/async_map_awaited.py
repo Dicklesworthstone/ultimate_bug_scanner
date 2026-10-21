@@ -4,9 +4,9 @@ await the mapped promises (bead A4-js wave 1).
 Verbatim port of the legacy ubs-js.sh heredoc "awaited async map callback
 results": same regexes (including the TS generic form ``map<T>(``), same
 16-line expression window, same paren-balance stop rule, same statement-prefix
-lookback (max 6 previous lines, reset on blank/comment), and same
-``ubs:ignore`` placement rules (anywhere inside the collected expression
-text). A match is reported only when the statement prefix contains ``await``
+lookback (max 6 previous lines, reset on blank/comment). Suppression uses shared
+lexical statement ownership and the exact rule ID. A match is reported only
+when the statement prefix contains ``await``
 but no ``Promise.all``/``Promise.allSettled`` call. The heredoc's os.walk over
 the project is replaced by iteration over ``RunContext.files``; per-file match
 logic is unchanged.
@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.suppression import SourceSuppressions
 
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
 
@@ -49,9 +50,11 @@ def statement_prefix(lines: list[str], idx: int, line_prefix: str) -> str:
 def scan_file_findings(path: Path) -> Iterator[tuple[int, int]]:
     """Yield (line, col) per detection; match logic identical to the heredoc."""
     try:
-        lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
+        text = path.read_text(encoding='utf-8', errors='ignore')
     except Exception:
         return
+    lines = text.splitlines()
+    source_index = SourceSuppressions('javascript').index(path, text)
     for idx, line in enumerate(lines):
         stripped = line.strip()
         if not stripped or stripped.startswith(("//", "/*", "*")):
@@ -68,10 +71,12 @@ def scan_file_findings(path: Path) -> Iterator[tuple[int, int]]:
             if expr_idx > idx and paren_balance <= 0:
                 break
         expression_text = ' '.join(expression_lines)
-        if 'ubs:ignore' in expression_text or not ASYNC_MAP_RE.search(expression_text):
+        if not ASYNC_MAP_RE.search(expression_text):
             continue
         prefix = statement_prefix(lines, idx, line[:match.start()])
         if not AWAIT_RE.search(prefix) or PROMISE_ALL_RE.search(prefix):
+            continue
+        if source_index.is_suppressed(idx + 1, RULE):
             continue
         yield idx + 1, match.start() + 1
 

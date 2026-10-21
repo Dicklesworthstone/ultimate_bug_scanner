@@ -2,12 +2,13 @@
 reaching execution sinks (bead A4-js security wave, bead 0xjg.4).
 
 Verbatim port of the legacy ubs-js.sh ``js_sql_injection_matches`` function
-including its suppression helpers: same source/sink/keyword/safe-template
-regexes, same 18-line statement window, same taint propagation (destructuring,
+with the same source/sink/keyword/safe-template regexes, same 18-line statement
+window, same taint propagation (destructuring,
 route-param signatures, assignment kill rules), same parameterized/Prisma
-tagged-template suppression, same ``ubs:ignore`` placement rules (line above,
-same line, and anywhere inside the collected statement). The heredoc's
-os.walk over the project is replaced by iteration over ``RunContext.files``;
+tagged-template suppression. Marker suppression uses shared lexical statement
+ownership and exact rule scopes without erasing annotated source or validation
+facts. The heredoc's os.walk over the project is replaced by iteration over
+``RunContext.files``;
 per-file match logic is unchanged.
 
 Legacy emission: print_finding "critical" / "Interpolated SQL reaches
@@ -22,6 +23,7 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.suppression import SourceSuppressions
 
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
 
@@ -119,14 +121,6 @@ def statement_from(lines: list[str], index: int, max_lines: int = 18) -> str:
         if ';' in current and paren <= 0 and brace <= 0 and bracket <= 0:
             break
     return ' '.join(parts)
-
-
-def has_ignore(lines: list[str], index: int) -> bool:
-    return (
-        0 <= index < len(lines) and 'ubs:ignore' in lines[index]
-    ) or (
-        0 <= index - 1 < len(lines) and 'ubs:ignore' in lines[index - 1]
-    )
 
 
 def split_destructure_parts(blob: str) -> list[str]:
@@ -273,9 +267,11 @@ def source_line(lines: list[str], index: int) -> str:
 def scan_file_findings(path: Path) -> Iterator[tuple[int, str, str]]:
     """Yield (line_number, sample_text, reason) per detection; heredoc-identical."""
     try:
-        lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
+        text = path.read_text(encoding='utf-8', errors='ignore')
     except OSError:
         return
+    lines = text.splitlines()
+    source_index = SourceSuppressions('javascript').index(path, text)
     text = '\n'.join(lines)
     if not (sql_sink_re.search(text) or sql_keyword_re.search(text)):
         return
@@ -284,10 +280,10 @@ def scan_file_findings(path: Path) -> Iterator[tuple[int, str, str]]:
     seen: set[tuple[str, int, str]] = set()
     for idx, raw in enumerate(lines):
         stripped = strip_line_comments(raw).strip()
-        if not stripped or has_ignore(lines, idx):
+        if not stripped:
             continue
         statement = statement_from(lines, idx)
-        if not statement or 'ubs:ignore' in statement:
+        if not statement:
             continue
         tainted.update(route_param_names_from_signature(statement))
 
@@ -312,7 +308,7 @@ def scan_file_findings(path: Path) -> Iterator[tuple[int, str, str]]:
         if not sql_sink_re.search(stripped):
             continue
         statement = statement_from(lines, idx)
-        if not statement or 'ubs:ignore' in statement:
+        if not statement:
             continue
         if not sql_sink_re.search(statement):
             continue
@@ -341,7 +337,7 @@ def scan_file_findings(path: Path) -> Iterator[tuple[int, str, str]]:
         elif sql_var_refs:
             reason = f"request-derived SQL variable {sql_var_refs[0]} reaches execution"
         key = (str(path), idx + 1, reason)
-        if key in seen:
+        if key in seen or source_index.is_suppressed(idx + 1, RULE):
             continue
         seen.add(key)
         yield idx + 1, f"{source_line(lines, idx)}  [{reason}]", reason

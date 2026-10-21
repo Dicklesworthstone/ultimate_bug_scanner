@@ -8,6 +8,7 @@ Every module exposes:
     DESCRIPTION  legacy remediation text (informational)
     find(files)  iterable of (path, line, col, detail) per detection
 
-Detection logic is ported verbatim from the heredocs (same SOURCE/SINK/
-sanitizer tables); the heredocs' own `ubs:ignore` checks are preserved.
+Detection logic retains the heredocs' SOURCE/SINK/sanitizer tables. Migrated
+detectors use the shared statement-owned, rule-scoped comment policy; remaining
+legacy marker checks are tracked by bead A7 rather than treated as equivalent.
 """

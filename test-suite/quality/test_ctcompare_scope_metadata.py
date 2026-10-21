@@ -307,5 +307,89 @@ class CredentialDetectionTests(unittest.TestCase):
         self.assertEqual(scan_lines('js', source), [9, 13], source)
 
 
+class CallResultMetadataTests(unittest.TestCase):
+    """GH #181, #185: a call result's public discriminant is not the secret.
+
+    `openAuthSessionAsync(authorization.authorize_url)` taints `result`
+    through its callee name and argument; `result.type` is the returned
+    status, while aliases and value members of a secret stay reported.
+    """
+
+    def test_reported_auth_session_discriminants_are_clean(self) -> None:
+        for source in (
+            # GH #181
+            'import * as WebBrowser from "expo-web-browser";\n\n'
+            'export async function connect(authorization: { authorize_url: string }) {\n'
+            '  const result = await WebBrowser.openAuthSessionAsync(authorization.authorize_url, "example:///callback");\n'
+            '  if (result.type !== "success") return "cancelled";\n'
+            '  return result.url;\n'
+            '}\n',
+            # GH #185
+            'import * as WebBrowser from "expo-web-browser";\n\n'
+            'export async function connect(authorizeUrl: string, redirectUri: string): Promise<string> {\n'
+            '  const result = await WebBrowser.openAuthSessionAsync(authorizeUrl, redirectUri);\n'
+            '  if (result.type !== "success") {\n'
+            '    throw new Error("auth cancelled");\n'
+            '  }\n'
+            '  return result.url;\n'
+            '}\n',
+            # Member chains, TypeScript assertions, parentheses and assignment heads.
+            'export async function f(authorizeUrl: string, creds: string) {\n'
+            '  const result = await WebBrowser.openAuthSessionAsync(authorizeUrl, "x") as AuthResult;\n'
+            '  const session = makeAuthClient(creds).connect();\n'
+            '  if ((result!.type) !== "success") return 1;\n'
+            '  if (result?.error.kind === "dismiss") return 2;\n'
+            '  const open = session.state === "open";\n'
+            '  return open;\n'
+            '}\n',
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(scan_lines('js', source), [], source)
+
+    def test_reported_positive_controls_stay_reported(self) -> None:
+        controls = (
+            # GH #181 controls: scalar, value member and metadata member of an alias.
+            'export function scalar(supplied: string, authorization: string) {\n'
+            '  const result = authorization;\n'
+            '  return result === supplied;\n'
+            '}\n',
+            'export function member(supplied: string, authorization: { value: string }) {\n'
+            '  const result = authorization;\n'
+            '  return result.value === supplied;\n'
+            '}\n',
+            'export function namedType(supplied: string, authorization: { type: string }) {\n'
+            '  const result = authorization;\n'
+            '  return result.type === supplied;\n'
+            '}\n',
+            # GH #185 control.
+            'export function check(authToken: string, storedAuthToken: string): boolean {\n'
+            '  return authToken === storedAuthToken;\n'
+            '}\n',
+        )
+        for source in controls:
+            with self.subTest(source=source):
+                self.assertEqual(len(scan_lines('js', source)), 1, source)
+
+    def test_call_results_keep_secret_values(self) -> None:
+        source = '\n'.join([
+            'export async function f(authorization: any, authorizeUrl: string, supplied: string) {',
+            '  const token = getAuthToken();',
+            '  const exchanged = await exchange(authorization);',
+            '  let mixed = await WebBrowser.openAuthSessionAsync(authorizeUrl, "x");',
+            '  mixed = authorization;',
+            '  const member = (await login(authorization)).authSession;',
+            '  if (token === supplied) return 1;',
+            '  if (exchanged.accessToken === supplied) return 2;',
+            '  if (exchanged.authTokenId === supplied) return 3;',
+            '  if (mixed.type === supplied) return 4;',
+            '  if (member.type === supplied) return 5;',
+            '  return 0;',
+            '}',
+        ]) + '\n'
+        # A scalar call result, a secret-named member, a name that was also
+        # assigned a secret alias, and a member read before assignment.
+        self.assertEqual(scan_lines('js', source), [7, 8, 9, 10, 11], source)
+
+
 if __name__ == "__main__":
     unittest.main()

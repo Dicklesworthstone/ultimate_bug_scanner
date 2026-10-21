@@ -20,6 +20,7 @@ their own parent, and findings report the path the user actually named.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -306,6 +307,162 @@ class SelectionPathParityTest(unittest.TestCase):
                                  f"walk path selected the wrong files for {pattern}")
                 self.assertEqual(scanned_count(with_rg), len(survivors))
                 self.assertEqual(scanned_count(without_rg), len(survivors))
+
+
+class GoInventorySelectionTest(unittest.TestCase):
+    """Go inventory must consume the same selected files as every other pass."""
+
+    def setUp(self) -> None:
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        self.scratch = tempfile.TemporaryDirectory(prefix="go-inventory-selection-", dir=artifacts)
+        self.root = Path(self.scratch.name)
+        self.project = self.root / "project with spaces"
+        self.project.mkdir()
+        (self.project / "main.go").write_text("package main\nfunc main() {}\n", encoding="utf-8")
+        for directory, version in ((self.project, "1.24"), (self.project / "ignored", "1.10")):
+            directory.mkdir(exist_ok=True)
+            (directory / "go.mod").write_text(f"module example.invalid/inventory\n\ngo {version}\n", encoding="utf-8")
+            (directory / "go.sum").write_text("", encoding="utf-8")
+            (directory / "go.work").write_text(f"go {version}\nuse .\n", encoding="utf-8")
+            (directory / "go.work.sum").write_text("", encoding="utf-8")
+        (self.project / ".ubsignore").write_text("/ignored/**\n", encoding="utf-8")
+        self.env = dict(os.environ, UBS_NO_AUTO_UPDATE="1", UBS_CACHE_DIR=str(self.root / "cache"))
+        self.env.pop("UBS_NO_CACHE", None)
+
+    def tearDown(self) -> None:
+        self.scratch.cleanup()
+
+    def scan(self, label, command, extra=None):
+        started = time.perf_counter()
+        print(f"[go-inventory:{label}] RUN {command!r}", flush=True)
+        result = run_helper(command, cwd=self.project, env={**self.env, **(extra or {})},
+                            text=True, check=False, timeout=180)
+        elapsed = time.perf_counter() - started
+        logs = self.root / label
+        logs.mkdir()
+        (logs / "stdout.log").write_text(result.stdout, encoding="utf-8")
+        (logs / "stderr.log").write_text(result.stderr, encoding="utf-8")
+        (logs / "command.json").write_text(json.dumps({
+            "command": [str(arg) for arg in command], "cwd": str(self.project),
+            "exit": result.returncode, "elapsed": elapsed, "python": sys.version,
+            "source_sha256": {str(path.relative_to(REPO_ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
+                              for path in (UBS, REPO_ROOT / "modules/helpers/ubs_core/go_scan.py")},
+        }, indent=2) + "\n", encoding="utf-8")
+        context = f"{command!r}\nexit={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        print(f"[go-inventory:{label}] END exit={result.returncode} ({elapsed:.3f}s); {logs}", flush=True)
+        return result, context
+
+    def meta_command(self, output="json", target=None):
+        return [str(UBS), "--ci", "--fail-on-warning", "--only=golang",
+                "--format=" + output, str(target or self.project)]
+
+    def test_meta_inventory_respects_ignore_with_cold_warm_and_walk_selection(self):
+        for label, extra in (("cold", {}), ("warm", {}), ("walk", {"UBS_TEST_NO_RG": "1"})):
+            with self.subTest(case=label):
+                result, context = self.scan(label, self.meta_command(), extra)
+                doc = summary(result)
+                self.assertEqual(result.returncode, 0, context)
+                self.assertEqual(doc["status"], "ok", context)
+                self.assertEqual(doc["totals"]["files"], 5, context)
+                self.assertEqual(doc["totals"]["critical"], 0, context)
+                self.assertEqual(doc["totals"]["warning"], 0, context)
+                self.assertFalse(any("/ignored/" in item["file"] for item in doc["findings"]), context)
+                present = [item for item in doc["findings"] if item["rule_id"] == "go.build.go-mod-present"]
+                self.assertEqual([Path(item["file"]) for item in present], [self.project.resolve() / "go.mod"], context)
+
+    def test_sarif_drops_ignored_manifest_hazards(self):
+        result, context = self.scan("sarif-ignored", self.meta_command("sarif"))
+        doc = summary(result)
+        self.assertEqual(result.returncode, 0, context)
+        self.assertFalse(any(item["ruleId"] == "go.build.go-mod-outdated"
+                             for run in doc["runs"] for item in run.get("results", [])), context)
+
+    def test_selected_manifest_still_reports_outdated_directive_in_sarif(self):
+        selected = self.root / "selected manifest" / "go.mod"
+        selected.parent.mkdir()
+        selected.write_bytes((self.project / "ignored" / "go.mod").read_bytes())
+        result, context = self.scan("sarif-selected", self.meta_command("sarif", selected))
+        doc = summary(result)
+        self.assertEqual(result.returncode, 1, context)
+        outdated = [item for run in doc["runs"] for item in run.get("results", [])
+                    if item["ruleId"] == "go.build.go-mod-outdated"]
+        self.assertEqual(len(outdated), 1, context)
+        self.assertEqual(outdated[0]["locations"][0]["physicalLocation"]["region"]["startLine"], 3, context)
+        self.assertEqual(outdated[0]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
+                         selected.resolve().as_uri(), context)
+
+    def test_directory_alias_keeps_inventory_exclusions_cache_and_source_findings(self):
+        source = self.project / "main.go"
+        source.write_text("package main\nimport mathrand \"math/rand\"\n"
+                          "func sessionToken() int64 {\n  return mathrand.Int63()\n}\n"
+                          "func main() {}\n", encoding="utf-8")
+        alias = self.root / "directory alias"
+        alias.symlink_to(self.project.resolve(), target_is_directory=True)
+        expected_files = {
+            "go.build.go-mod-present": self.project.resolve() / "go.mod",
+            "go.build.go-work": self.project.resolve() / "go.work",
+            "go.security.insecure-random": source.resolve(),
+        }
+        baseline = None
+        for label, target, extra in (("alias-cold", alias, {}), ("alias-warm", alias, {}),
+                                     ("alias-walk", alias, {"UBS_TEST_NO_RG": "1"}),
+                                     ("alias-physical", self.project.resolve(), {})):
+            with self.subTest(case=label):
+                result, context = self.scan(label, self.meta_command(target=target), extra)
+                doc = summary(result)
+                self.assertEqual(result.returncode, 1, context)
+                self.assertEqual(doc["status"], "ok", context)
+                self.assertEqual(doc["project"], str(self.project.resolve()), context)
+                self.assertEqual(doc["totals"]["files"], 5, context)
+                self.assertEqual(doc["totals"]["critical"], 1, context)
+                self.assertEqual(doc["totals"]["warning"], 0, context)
+                self.assertFalse(any("/ignored/" in item["file"] for item in doc["findings"]), context)
+                for rule, path in expected_files.items():
+                    findings = [item for item in doc["findings"] if item["rule_id"] == rule]
+                    self.assertEqual([Path(item["file"]) for item in findings], [path], context)
+                    if rule == "go.security.insecure-random":
+                        self.assertEqual(findings[0]["line"], 4, context)
+                findings = sorted(json.dumps(item, sort_keys=True) for item in doc["findings"])
+                if baseline is None:
+                    baseline = findings
+                else:
+                    self.assertEqual(findings, baseline, context)
+                profile = doc["scanners"][0]["extras"]["profile"]
+                self.assertEqual(profile["cache_hits"], 0 if label == "alias-cold" else 5, context)
+                self.assertEqual(profile["cache_misses"], 5 if label == "alias-cold" else 0, context)
+
+    def test_direct_module_directory_keeps_selected_manifests(self):
+        command = [str(REPO_ROOT / "modules/ubs-golang.sh"), "--ci", "--fail-on-warning",
+                   "--format=json", "--exclude=ignored", str(self.project)]
+        result, context = self.scan("module-directory", command)
+        doc = summary(result)
+        self.assertEqual(result.returncode, 0, context)
+        self.assertEqual(doc["files"], 5, context)
+        self.assertEqual(doc["critical"], 0, context)
+        self.assertEqual(doc["warning"], 0, context)
+        present = [item for item in doc["findings"] if item["rule"] == "go.build.go-mod-present"]
+        self.assertEqual([Path(item["path"]) for item in present], [self.project / "go.mod"], context)
+
+    def test_direct_module_nul_file_list_is_authoritative_for_inventory(self):
+        source = self.project / "main.go"
+        manifest = self.project / "ignored" / "go.mod"
+        for label, selected in (("files-source", [source]), ("files-manifest", [source, manifest])):
+            with self.subTest(case=label):
+                listing = self.root / (label + ".files")
+                listing.write_bytes(b"\0".join(os.fsencode(path) for path in selected) + b"\0")
+                command = [str(REPO_ROOT / "modules/ubs-golang.sh"), "--ci", "--fail-on-warning",
+                           "--format=json", "--files-from=" + str(listing), str(self.project)]
+                result, context = self.scan(label, command)
+                doc = summary(result)
+                self.assertEqual(result.returncode, 1 if manifest in selected else 0, context)
+                self.assertEqual(doc["status"], "ok", context)
+                self.assertEqual(doc["files"], len(selected), context)
+                self.assertEqual(doc["critical"], 0, context)
+                self.assertEqual(doc["warning"], 1 if manifest in selected else 0, context)
+                outdated = [item for item in doc["findings"] if item["rule"] == "go.build.go-mod-outdated"]
+                self.assertEqual([(Path(item["path"]), item["line"]) for item in outdated],
+                                 [(manifest, 3)] if manifest in selected else [], context)
 
 
 class GitShadowFilterTest(unittest.TestCase):

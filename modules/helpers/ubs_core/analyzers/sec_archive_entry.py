@@ -5,9 +5,9 @@ Verbatim port of the legacy ubs-js.sh heredoc "Archive/upload entry paths
 joined into destinations": same provenance fixpoint (GH #77 — archive sources
 must come from archive libraries/objects or typed entry bindings, never from
 variable-name substrings), same 12-line statement window returning both the
-comment-stripped statement and its raw source span, same ubs:ignore placement
-rules (the marker is tested against the RAW source line and the RAW statement
-span, because code_line() strips the comment that carries it).
+comment-stripped statement and its raw source span. Suppression uses shared
+lexical statement ownership and exact rule scopes; annotated assignments
+still contribute their archive provenance.
 The heredoc's os.walk over the project is replaced by iteration over
 RunContext.files; per-file match logic is unchanged.
 """
@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.suppression import SourceSuppressions
 
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
 
@@ -141,9 +142,11 @@ def has_archive_source(text, archive_receivers, archive_path_vars):
 def scan_file_findings(path: Path) -> Iterator[tuple[int, str]]:
     """Yield (line, sample_text) per detection; logic identical to the heredoc."""
     try:
-        lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
+        text = path.read_text(encoding='utf-8', errors='ignore')
     except Exception:
         return
+    lines = text.splitlines()
+    source_index = SourceSuppressions('javascript').index(path, text)
 
     # Pass 1 (GH #77): collect archive provenance. archive_receivers holds
     # bindings that ARE archive objects/entries (typed params, archive-library
@@ -172,7 +175,7 @@ def scan_file_findings(path: Path) -> Iterator[tuple[int, str]]:
     for _ in range(3):
         changed = False
         for idx, statement, raw_statement in statements:
-            if not statement or 'ubs:ignore' in raw_statement:
+            if not statement:
                 continue
             loop = for_of_re.search(statement)
             if loop:
@@ -208,20 +211,18 @@ def scan_file_findings(path: Path) -> Iterator[tuple[int, str]]:
     seen_lines = set()
     for idx, line in enumerate(lines):
         stripped = code_line(line).strip()
-        # GH #77: test the suppression marker against the raw source, since
-        # code_line() has already removed the comment that carries it.
-        if not stripped or 'ubs:ignore' in line:
+        if not stripped:
             continue
         if not path_join_re.search(stripped):
             continue
         statement, raw_statement = statement_from(lines, idx)
-        if not statement or 'ubs:ignore' in raw_statement:
+        if not statement:
             continue
         if not has_archive_source(statement, archive_receivers, archive_path_vars):
             continue
         if safe_re.search(context_from(lines, idx)):
             continue
-        if idx in seen_lines:
+        if idx in seen_lines or source_index.is_suppressed(idx + 1, RULE):
             continue
         seen_lines.add(idx)
         yield idx + 1, stripped.replace('\t', ' ')

@@ -13,8 +13,8 @@ Legacy outcome:
 
     print_finding warning <count> "Request-controlled regex pattern reaches regex engine" ...
 
-Marker suppression is ported verbatim: `ubs:ignore` on the finding line
-or on the previous line suppresses it.
+Shared lexical statement ownership and exact rule scopes suppress annotated
+findings. Marked assignments still propagate their request-derived state.
 """
 from __future__ import annotations
 
@@ -22,12 +22,13 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.suppression import SourceSuppressions
+
 RULE_ID = "go.security.request-regex"
 CATEGORY = 9
 TITLE = "Request-controlled regex pattern reaches regex engine"
 SEVERITY = "warning"
 DESCRIPTION = "Escape with regexp.QuoteMeta or match against an allow-list before compiling/matching request-derived patterns"
-MARKER = "ubs:ignore"
 
 SOURCE_RE = re.compile(
     r'\br\.URL\.Query\(\)\.Get\s*\('
@@ -95,15 +96,6 @@ def _logical_statement(lines, line_no):
         balance += next_line.count('(') - next_line.count(')')
         lookahead += 1
     return statement
-
-
-def _has_ignore(lines, line_no):
-    idx = line_no - 1
-    return (
-        0 <= idx < len(lines) and MARKER in lines[idx]
-    ) or (
-        0 <= idx - 1 < len(lines) and MARKER in lines[idx - 1]
-    )
 
 
 def _source_line(lines, line_no):
@@ -179,7 +171,7 @@ def _first_arg(statement):
     return ''
 
 
-def _analyze_file(path, issues):
+def _analyze_file(path, issues, suppressions):
     try:
         text = path.read_text(encoding='utf-8', errors='ignore')
     except OSError:
@@ -187,11 +179,10 @@ def _analyze_file(path, issues):
     if not (SOURCE_RE.search(text) and SINK_RE.search(text)):
         return
     lines = text.splitlines()
+    suppression = suppressions.index(path, text)
     tainted = {}
     seen = set()
     for idx, raw in enumerate(lines, start=1):
-        if _has_ignore(lines, idx):
-            continue
         line = _logical_statement(lines, idx).strip()
         if not line:
             continue
@@ -215,7 +206,7 @@ def _analyze_file(path, issues):
         refs = _refs_in_expr(arg, tainted)
         if not direct and not refs:
             continue
-        if idx in seen:
+        if idx in seen or suppression.is_suppressed(idx, RULE_ID):
             continue
         seen.add(idx)
         if direct:
@@ -231,10 +222,11 @@ def _analyze_file(path, issues):
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
+    suppressions = SourceSuppressions("golang")
     for path in files:
         if path.suffix != ".go":
             continue
         issues = []
-        _analyze_file(path, issues)
+        _analyze_file(path, issues, suppressions)
         for line_no, detail in issues:
             yield (path, line_no, 1, detail)

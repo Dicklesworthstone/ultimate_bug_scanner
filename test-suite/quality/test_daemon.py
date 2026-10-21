@@ -51,7 +51,9 @@ class ServiceTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='ubs-d-')
         self.addCleanup(self.tmp.cleanup)
-        self.work = Path(self.tmp.name)
+        # The daemon keys its socket by the canonical --repo; TMPDIR may sit
+        # behind a symlink (macOS /var/folders), so peers use canonical paths.
+        self.work = Path(self.tmp.name).resolve()
         self.root = self.work / 'project'
         self.root.mkdir()
         self.runtime = self.work / 'run'
@@ -67,7 +69,13 @@ class ServiceTests(unittest.TestCase):
         self.env = {key: value for key, value in os.environ.items()
                     if not key.startswith(('UBS_', 'GIT_', 'XDG_', 'CLAUDE_', 'SCAN_'))
                     and key not in {'ENABLE_UV_TOOLS', 'UV_TOOLS'}}
-        self.env.update(XDG_RUNTIME_DIR=str(self.runtime), HOME=str(self.home),
+        # GH #166: the daemon refuses Unix socket paths over 100 bytes, so an
+        # absolute runtime below a long TMPDIR failed before any behavior ran.
+        # Every peer here runs in project/, so the private runtime is '../run'.
+        previous = os.getcwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, previous)
+        self.env.update(XDG_RUNTIME_DIR=os.path.join(os.pardir, 'run'), HOME=str(self.home),
                         XDG_CONFIG_HOME=str(self.home / '.config'), XDG_CACHE_HOME=str(self.work / 'cache'),
                         SCAN_COUNT=str(self.work / 'count'), PYTHONDONTWRITEBYTECODE='1', UBS_NO_AUTO_UPDATE='1')
         self.environment = patch.dict(os.environ, self.env, clear=True)

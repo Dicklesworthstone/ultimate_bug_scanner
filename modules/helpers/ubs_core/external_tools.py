@@ -22,16 +22,23 @@ import shlex
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
-from io import StringIO
+from io import BytesIO, StringIO
 from pathlib import Path
-from typing import Iterator, Sequence, TextIO
+from typing import BinaryIO, Iterator, Sequence, TextIO
 
 from ubs_core.suppression import SourceSuppressions
 
 OUTPUT_LIMIT = 16 * 1024 * 1024
+# Streaming tools have no total-output ceiling. Bound a single encoded record
+# so corrupt or runaway output cannot turn readline() into an unbounded slurp.
+OUTPUT_RECORD_LIMIT = 16 * 1024 * 1024
+_PROCESS_CLEANUP_GRACE = 1.0
 RUBY_TOOLS = {
     "rubocop": "rubocop", "brakeman": "brakeman",
     "bundler-audit": "bundle-audit", "reek": "reek", "fasterer": "fasterer",
@@ -47,15 +54,82 @@ class ToolOutput:
     stderr: str
 
 
-def run_command(tool: str, argv: Sequence[str], root: Path, timeout: float,
-                errors: list[str], *, env: dict[str, str] | None = None,
-                merge_stderr: bool = False, strict_utf8: bool = False) -> ToolOutput | None:
-    """Bound execution, reap timed-out process groups, and bound captured memory."""
+@dataclass(frozen=True)
+class ToolStreamOutput:
+    returncode: int
+    stdout: BinaryIO
+    stderr: str
+    stderr_stream: BinaryIO | None = None
+
+
+def _process_group_running(pgid: int) -> bool:
+    """Check for unfinished group members, excluding Linux zombies.
+
+    Reaping the command itself does not close descriptors inherited by its
+    children. A zombie, however, has already closed all its descriptors and
+    cannot contribute more output. Inspect /proc only for groups that survive
+    their leader; normal invocations need just the inexpensive killpg probe.
+    Without reliable process state, conservatively treat the group as live.
+    """
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    if sys.platform != "linux":
+        return True
+    try:
+        with open("/proc/self/stat", "rb") as stat:
+            if stat.read(4096).partition(b" ")[0] != str(os.getpid()).encode("ascii"):
+                # A host-mounted procfs can expose different PID numbers from
+                # killpg(). Never inspect an unrelated group's state there.
+                return True
+        with os.scandir("/proc") as entries:
+            for entry in entries:
+                if not entry.name.isdecimal():
+                    continue
+                try:
+                    with open(f"/proc/{entry.name}/stat", "rb") as stat:
+                        # The command name may contain spaces and parentheses.
+                        fields = stat.read(4096).rpartition(b")")[2].split()
+                except FileNotFoundError:
+                    continue  # the process finished while being inspected
+                if len(fields) < 3:
+                    return True
+                if fields[2] == str(pgid).encode("ascii") and fields[0] not in (b"Z", b"X"):
+                    return True
+    except OSError:
+        return True
+    return False
+
+
+@contextmanager
+def run_command_stream(tool: str, argv: Sequence[str], root: Path, timeout: float,
+                       errors: list[str], *, env: dict[str, str] | None = None,
+                       merge_stderr: bool = False) -> Iterator[ToolStreamOutput | None]:
+    """Spool complete output to disk with bounded execution and memory.
+
+    The stream is valid only inside the context. Consumers must read it in
+    bounded records or chunks. Timeouts and cancellation retain the same
+    process-group cleanup as whole-document capture; completed output remains
+    readable after an analyzer fails or times out. The eager stderr preview
+    is limited to 4 KiB; its full stream uses the same bounded readers as
+    stdout. Spooling also avoids pipe deadlocks on noisy analyzers.
+    """
     if not math.isfinite(timeout) or timeout <= 0:
         errors.append(f"{tool}: timeout must be a positive finite number")
-        return None
+        yield None
+        return
+    if os.name == "posix" and signal.getsignal(signal.SIGCHLD) == signal.SIG_IGN:
+        # POSIX auto-reaps children under SIG_IGN. Popen then substitutes exit
+        # 0 when waitpid cannot obtain the actual status, even if the tool
+        # failed. Keep the caller's signal policy and any output, but never
+        # treat that unverifiable status as complete analysis.
+        errors.append(f"{tool}: cannot verify analyzer exit status while SIGCHLD is ignored")
+    stdout = stderr = None
     try:
-        with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        try:
+            stdout = tempfile.TemporaryFile()
+            stderr = tempfile.TemporaryFile()
             # The only tainted argv reaching here is the operator's
             # UBS_AST_GREP_BIN override (scan_ast_config); argv is a list, no shell.
             proc = subprocess.Popen(  # ubs:ignore[python.taint.command] - executable comes from operator configuration, not request input.
@@ -64,7 +138,7 @@ def run_command(tool: str, argv: Sequence[str], root: Path, timeout: float,
                 start_new_session=os.name == "posix",
             )
 
-            def stop() -> None:
+            def stop() -> bool:
                 try:
                     if os.name == "posix":
                         os.killpg(proc.pid, signal.SIGKILL)
@@ -72,7 +146,23 @@ def run_command(tool: str, argv: Sequence[str], root: Path, timeout: float,
                         proc.kill()
                 except ProcessLookupError:
                     pass
-                proc.wait()
+                # Killing the group is asynchronous. Do not read through a
+                # live writer's shared file offset or wait indefinitely for an
+                # uninterruptible process. Cleanup has its own small grace,
+                # never another full analyzer timeout.
+                deadline = time.monotonic() + _PROCESS_CLEANUP_GRACE
+                try:
+                    proc.wait(timeout=max(0, deadline - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    errors.append(f"{tool}: could not stop analyzer during cleanup")
+                    return False
+                while os.name == "posix" and _process_group_running(proc.pid):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        errors.append(f"{tool}: could not confirm process group stopped during cleanup")
+                        return False
+                    time.sleep(min(0.01, remaining))
+                return True
 
             def cancel(signum, _frame) -> None:
                 # GNU timeout signals the module group, but the analyzer is
@@ -80,6 +170,7 @@ def run_command(tool: str, argv: Sequence[str], root: Path, timeout: float,
                 raise SystemExit(128 + signum)
 
             previous_handlers = {}
+            capture_ready = True
             try:
                 if os.name == "posix" and threading.current_thread() is threading.main_thread():
                     for signum in (signal.SIGTERM, signal.SIGHUP):
@@ -91,7 +182,11 @@ def run_command(tool: str, argv: Sequence[str], root: Path, timeout: float,
                     proc.wait(timeout=timeout)
                 except subprocess.TimeoutExpired:
                     errors.append(f"{tool}: timed out after {timeout:g}s")
-                    stop()
+                    capture_ready = stop()
+                else:
+                    if os.name == "posix" and _process_group_running(proc.pid):
+                        errors.append(f"{tool}: analyzer exited before its process group completed")
+                        capture_ready = stop()
             except BaseException:
                 # KeyboardInterrupt, parent deadlines and caller cancellation
                 # must not leave the isolated analyzer (or its children) alive.
@@ -100,22 +195,136 @@ def run_command(tool: str, argv: Sequence[str], root: Path, timeout: float,
             finally:
                 for signum, previous in previous_handlers.items():
                     signal.signal(signum, previous)
-            stdout.seek(0)
-            raw = stdout.read(OUTPUT_LIMIT + 1)
-            if len(raw) > OUTPUT_LIMIT:
-                errors.append(f"{tool}: output exceeds {OUTPUT_LIMIT} bytes")
-            data = raw[:OUTPUT_LIMIT]
-            if strict_utf8:
+            if capture_ready:
+                stdout.seek(0)
+                stderr_preview = ""
+                stderr_stream = stderr
                 try:
-                    data.decode("utf-8")
-                except UnicodeDecodeError:
-                    errors.append(f"{tool}: output is not valid UTF-8")
-            stderr.seek(0)
-            return ToolOutput(proc.returncode, data.decode("utf-8", "replace"),
-                              stderr.read(4096).decode("utf-8", "replace"))
-    except OSError as exc:
-        errors.append(f"{tool}: could not launch or capture output: {exc}")
-        return None
+                    stderr.seek(0)
+                    stderr_preview = stderr.read(4096).decode("utf-8", "replace")
+                    stderr.seek(0)
+                except OSError as exc:
+                    # Losing stderr does not erase independently captured
+                    # stdout findings. The missing evidence still fails the
+                    # completeness gate, and both handles remain owned here.
+                    errors.append(f"{tool}: could not read captured stderr: {exc}")
+                    stderr_stream = None
+                output = ToolStreamOutput(proc.returncode, stdout, stderr_preview, stderr_stream)
+            else:
+                output = None  # output cannot be frozen while writers survive
+        except OSError as exc:
+            errors.append(f"{tool}: could not launch or capture output: {exc}")
+            output = None
+        # Keep caller exceptions outside the capture handler: an OSError in a
+        # consumer must never make this context manager attempt a second yield.
+        yield output
+    finally:
+        for stream in (stderr, stdout):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError as exc:
+                    # Preserve a consumer exception and still close the other
+                    # handle. Cleanup failures must reach the coverage gate.
+                    errors.append(f"{tool}: could not close captured output: {exc}")
+
+
+def run_command(tool: str, argv: Sequence[str], root: Path, timeout: float,
+                errors: list[str], *, env: dict[str, str] | None = None,
+                merge_stderr: bool = False, strict_utf8: bool = False) -> ToolOutput | None:
+    """Capture a bounded whole document for analyzers without a record stream."""
+    with run_command_stream(tool, argv, root, timeout, errors,
+                            env=env, merge_stderr=merge_stderr) as output:
+        if output is None:
+            return None
+        try:
+            raw = output.stdout.read(OUTPUT_LIMIT + 1)
+        except OSError as exc:
+            errors.append(f"{tool}: could not capture output: {exc}")
+            return None
+        if len(raw) > OUTPUT_LIMIT:
+            errors.append(f"{tool}: output exceeds {OUTPUT_LIMIT} bytes")
+        data = raw[:OUTPUT_LIMIT]
+        if strict_utf8:
+            try:
+                data.decode("utf-8")
+            except UnicodeDecodeError:
+                errors.append(f"{tool}: output is not valid UTF-8")
+        return ToolOutput(output.returncode, data.decode("utf-8", "replace"), output.stderr)
+
+
+def iter_output_lines(stream: BinaryIO, errors: list[str], *, context: str) -> Iterator[tuple[int, str]]:
+    """Read every LF-delimited record, bounding memory and error detail.
+
+    Oversized or non-UTF-8 rows are rejected as incomplete evidence, then the
+    next record is still read. An arbitrarily long malformed row is drained in
+    fixed chunks without accumulating it or discarding later diagnostics.
+    """
+    failures = 0
+    details: list[str] = []
+    failure_index = None
+    number = 0
+    while True:
+        try:
+            raw = stream.readline(OUTPUT_RECORD_LIMIT + 1)
+            if not raw:
+                break
+            number += 1
+            oversized = len(raw) > OUTPUT_RECORD_LIMIT
+            if oversized:
+                while raw and not raw.endswith(b"\n"):
+                    raw = stream.readline(64 * 1024)
+        except OSError as exc:
+            errors.append(f"{context}: could not read captured output: {exc}")
+            break
+        if oversized:
+            problem = f"record output exceeds {OUTPUT_RECORD_LIMIT} bytes"
+        else:
+            try:
+                line = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                problem = "output is not valid UTF-8"
+            else:
+                yield number, line
+                continue
+        failures += 1
+        if len(details) < 4:
+            details.append(f"row {number}: {problem}")
+        if failure_index is None:
+            failure_index = len(errors)
+            errors.append("")
+        # Update one bounded entry immediately: an early consumer exit must
+        # not erase corruption that has already been observed.
+        errors[failure_index] = f"{context}: {failures} unreadable output record(s) ({'; '.join(details)})"
+
+
+def report_ast_stderr(output: ToolStreamOutput, errors: list[str], *, context: str) -> None:
+    """Retain native ast-grep input errors even when its exit status is zero.
+
+    ast-grep prints unreadable/missing-source errors as ``ERROR: ...`` on
+    stderr but can still exit zero and emit findings from readable siblings.
+    Check the full captured stream, not only the diagnostic preview. Ordinary
+    warnings are not an input failure; Ruby/Go tools retain their own exit and
+    report contracts instead of using this ast-grep-specific boundary.
+    """
+    lines = (iter_output_lines(output.stderr_stream, errors, context=f"{context} stderr")
+             if output.stderr_stream is not None else enumerate(StringIO(output.stderr), 1))
+    failures = 0
+    details: list[str] = []
+    for _number, line in lines:
+        line = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
+        if output.returncode == 1 and re.fullmatch(r"Error: [1-9][0-9]* error\(s\) found in code\.", line):
+            # The native scan CLI prints this summary for ordinary error-level
+            # findings. The adapter separately requires valid stdout evidence
+            # for exit 1; an empty/truncated report still fails that gate.
+            continue
+        if not re.match(r"(?:error|fatal):", line, re.IGNORECASE):
+            continue
+        failures += 1
+        if len(details) < 4:
+            details.append(line[:160])
+    if failures:
+        errors.append(f"{context}: {failures} analyzer error(s) on stderr ({'; '.join(details)})")
 
 
 def _text(value: object) -> str:
@@ -158,7 +367,7 @@ def ast_rule_configs(rule_dir: Path, paths: Sequence[Path],
     return []
 
 
-def parse_ast_diagnostics(text: str, errors: list[str] | None = None,
+def parse_ast_diagnostics(text: str | BinaryIO, errors: list[str] | None = None,
                           *, context: str = "ast-grep",
                           run_rule_id: str | None = None) -> Iterator[dict]:
     """Yield validated NDJSON evidence; report corruption instead of skipping it.
@@ -171,11 +380,15 @@ def parse_ast_diagnostics(text: str, errors: list[str] | None = None,
     ``run --pattern`` has no diagnostic rule/severity fields: only that mode
     supplies ``run_rule_id`` from the caller's known pattern definition.
     """
+    problems = errors if errors is not None else []
     failures = 0
     details: list[str] = []
+    failure_index = None
     # NDJSON is delimited by LF, not by Unicode line separators that may
     # legitimately occur inside a JSON string (including a source filename).
-    for number, line in enumerate(StringIO(text), 1):
+    lines = (enumerate(StringIO(text), 1) if isinstance(text, str)
+             else iter_output_lines(text, problems, context=context))
+    for number, line in lines:
         if not line.strip():
             continue
         try:
@@ -230,13 +443,14 @@ def parse_ast_diagnostics(text: str, errors: list[str] | None = None,
             failures += 1
             if len(details) < 4:
                 details.append(f"row {number}: {str(exc)[:160]}")
+            if failure_index is None:
+                failure_index = len(problems)
+                problems.append("")
+            problems[failure_index] = f"{context}: {failures} malformed AST diagnostic(s) ({'; '.join(details)})"
             continue
         yield match
-    if failures:
-        message = f"{context}: {failures} malformed AST diagnostic(s) ({'; '.join(details)})"
-        if errors is None:
-            raise RuntimeError(message)
-        errors.append(message)
+    if errors is None and problems:
+        raise RuntimeError("; ".join(problems))
 
 
 def scan_ast_config(config: Path, paths: Sequence[Path],
@@ -260,20 +474,26 @@ def scan_ast_config(config: Path, paths: Sequence[Path],
         executable = os.environ.get("UBS_AST_GREP_BIN") or ast_grep_bin
         for start in range(0, len(paths), batch_size):
             batch = [str(p) for p in paths[start:start + batch_size]]
-            output = run_command(
+            with run_command_stream(
                 "ast-grep", [executable, "scan", "-c", str(config.resolve()),
                              "--json=stream", "--", *batch],
-                Path.cwd(), timeout, failures, strict_utf8=True,
-            )
-            if output is None:
-                continue
-            if output.returncode not in (0, 1):
-                detail = output.stderr.strip().splitlines()
-                failures.append(
-                    f"ast-grep exited {output.returncode} on {config.name}"
-                    + (f": {detail[0][:160]}" if detail else "")
-                )
-            yield from parse_ast_diagnostics(output.stdout, failures, context=f"ast-grep ({config.name})")
+                Path.cwd(), timeout, failures,
+            ) as output:
+                if output is None:
+                    continue
+                report_ast_stderr(output, failures, context=f"ast-grep ({config.name})")
+                if output.returncode not in (0, 1):
+                    detail = output.stderr.strip().splitlines()
+                    failures.append(
+                        f"ast-grep exited {output.returncode} on {config.name}"
+                        + (f": {detail[0][:160]}" if detail else "")
+                    )
+                valid = False
+                for diagnostic in parse_ast_diagnostics(output.stdout, failures, context=f"ast-grep ({config.name})"):
+                    valid = True
+                    yield diagnostic
+                if output.returncode == 1 and not valid:
+                    failures.append(f"ast-grep ({config.name}): findings exit without valid diagnostics")
     if errors is None and failures:
         raise RuntimeError("; ".join(failures))
 
@@ -577,29 +797,194 @@ def scan_ruby_tools(files: Sequence[Path], sink: TextIO, project_dir: str,
     return outcomes
 
 
-def _json_stream(output: str, tool: str, errors: list[str], *, vet: bool = False):
-    """Decode consecutive JSON values, keeping evidence before a broken tail.
+class _ReportErrors:
+    """Keep coverage failures visible without retaining every malformed row."""
+    def __init__(self, errors: list[str], tool: str):
+        self.errors, self.tool = errors, tool
+        self.count = 0
+        self.overflow: int | None = None
 
-    go vet's driver adds package headings around its JSON on stderr; these
-    headings (and dependency-download progress) are not analyzer diagnostics.
-    Do not fish arbitrary JSON out of an error message and call it success.
+    def append(self, message: str) -> None:
+        self.count += 1
+        if self.count <= 4:
+            self.errors.append(message[:400])
+            return
+        if self.overflow is None:
+            self.overflow = len(self.errors)
+            self.errors.append("")
+        self.errors[self.overflow] = f"{self.tool}: {self.count - 4} additional report error(s)"
+
+
+class _JSONReportReader:
+    """Read JSON containers incrementally, bounding each decoded value.
+
+    A vet package or diagnostic array may be arbitrarily large. Traverse
+    those containers without materializing them; only keys and individual
+    diagnostics (or govulncheck messages) use value(). Binary framing keeps
+    a corrupt UTF-8 tail from erasing valid values earlier in the same read.
     """
-    decoder = json.JSONDecoder()
-    offset = 0
-    while offset < len(output):
-        if output[offset].isspace():
-            offset += 1
-            continue
-        if vet and (output.startswith("# ", offset) or output.startswith("go: downloading ", offset)):
-            end = output.find("\n", offset)
-            offset = len(output) if end < 0 else end + 1
-            continue
-        try:
-            doc, offset = decoder.raw_decode(output, offset)
-        except ValueError:
-            errors.append(f"{tool}: invalid or truncated JSON report near {output[offset:offset+120]!r}")
-            break
-        yield doc
+    _CHUNK = 64 * 1024
+    _DEPTH = 128
+    _STRING_TOKEN = re.compile(rb'["\\]')
+    _CONTAINER_TOKEN = re.compile(rb'[{}\[\]"]')
+    _SCALAR_END = re.compile(rb'[\[\]{},:" \t\r\n]')
+    _NON_SPACE = re.compile(rb'[^ \t\r\n]')
+
+    def __init__(self, output: str | BinaryIO):
+        self.source = BytesIO(output.encode("utf-8")) if isinstance(output, str) else output
+        self.buffer = b""
+        self.position = 0
+        self.offset = 0
+        self.eof = False
+
+    def peek(self) -> bytes:
+        if self.position == len(self.buffer) and not self.eof:
+            self.offset += self.position
+            self.buffer = self.source.read(self._CHUNK)
+            self.position = 0
+            self.eof = not self.buffer
+        return self.buffer[self.position:self.position + 1]
+
+    def token(self) -> bytes:
+        while self.peek():
+            match = self._NON_SPACE.search(self.buffer, self.position)
+            self.position = match.start() if match else len(self.buffer)
+            if match:
+                return self.peek()
+        return b""
+
+    def error(self, message: str) -> ValueError:
+        return ValueError(f"{message} at byte {self.offset + self.position}")
+
+    def expect(self, token: bytes) -> None:
+        if self.token() != token:
+            raise self.error(f"expected {token.decode('ascii')!r}")
+        self.position += 1
+
+    @staticmethod
+    def invalid_constant(name: str):
+        raise ValueError(f"non-JSON numeric constant {name}")
+
+    def value(self):
+        first = self.token()
+        if not first or first in (b",", b":", b"}", b"]"):
+            raise self.error("expected JSON value")
+        raw = bytearray()
+
+        def take(end: int) -> None:
+            if len(raw) + end - self.position > OUTPUT_RECORD_LIMIT:
+                raise self.error(f"JSON value exceeds {OUTPUT_RECORD_LIMIT} bytes")
+            raw.extend(self.buffer[self.position:end])
+            self.position = end
+
+        stack = [b"}" if first == b"{" else b"]"] if first in (b"{", b"[") else []
+        quoted, escaped = first == b'"', False
+        if stack or quoted:
+            take(self.position + 1)
+            while True:
+                if not self.peek():
+                    raise self.error("unterminated JSON value")
+                if quoted:
+                    if escaped:
+                        take(self.position + 1)
+                        escaped = False
+                        continue
+                    match = self._STRING_TOKEN.search(self.buffer, self.position)
+                    take(match.end() if match else len(self.buffer))
+                    if match:
+                        if match.group() == b"\\":
+                            escaped = True
+                        else:
+                            quoted = False
+                            if not stack:
+                                break
+                else:
+                    match = self._CONTAINER_TOKEN.search(self.buffer, self.position)
+                    take(match.end() if match else len(self.buffer))
+                    if not match:
+                        continue
+                    token = match.group()
+                    if token == b'"':
+                        quoted = True
+                    elif token in (b"{", b"["):
+                        stack.append(b"}" if token == b"{" else b"]")
+                        if len(stack) > self._DEPTH:
+                            raise self.error(f"JSON value nesting exceeds {self._DEPTH}")
+                    else:
+                        if token != stack.pop():
+                            raise self.error("mismatched JSON delimiters")
+                        if not stack:
+                            break
+        else:
+            while self.peek():
+                match = self._SCALAR_END.search(self.buffer, self.position)
+                take(match.start() if match else len(self.buffer))
+                if match:
+                    break
+        # Decode only after framing: a later invalid byte never prevents
+        # earlier, independently complete diagnostics from being delivered.
+        return json.loads(raw.decode("utf-8"), parse_constant=self.invalid_constant)
+
+    def members(self) -> Iterator[str]:
+        self.expect(b"{")
+        if self.token() == b"}":
+            self.position += 1
+            return
+        while True:
+            if self.token() != b'"':
+                raise self.error("expected JSON object key")
+            name = self.value()
+            self.expect(b":")
+            yield name
+            if self.token() == b"}":
+                self.position += 1
+                return
+            self.expect(b",")
+
+    def elements(self) -> Iterator[None]:
+        self.expect(b"[")
+        if self.token() == b"]":
+            self.position += 1
+            return
+        while True:
+            yield None
+            if self.token() == b"]":
+                self.position += 1
+                return
+            self.expect(b",")
+
+    def documents(self, *, vet: bool = False) -> Iterator[None]:
+        while self.token():
+            if vet and self.peek() in (b"#", b"g"):
+                # These are the only non-JSON records emitted by Go's vet
+                # driver. Never search through arbitrary error text for JSON.
+                prefix = b"# " if self.peek() == b"#" else b"go: downloading "
+                for byte in prefix:
+                    if self.peek() != bytes((byte,)):
+                        raise self.error("unexpected text before JSON report")
+                    self.position += 1
+                size = len(prefix)
+                while self.peek():
+                    end = self.buffer.find(b"\n", self.position)
+                    limit = end + 1 if end >= 0 else len(self.buffer)
+                    size += limit - self.position
+                    if size > OUTPUT_RECORD_LIMIT:
+                        raise self.error(f"package heading exceeds {OUTPUT_RECORD_LIMIT} bytes")
+                    self.position = limit
+                    if end >= 0:
+                        break
+                continue
+            yield None
+
+
+def _json_stream(output: str | BinaryIO, tool: str, errors: _ReportErrors):
+    """Decode every bounded stream message and retain a valid prefix."""
+    try:
+        reader = _JSONReportReader(output)
+        for _ in reader.documents():
+            yield reader.value()
+    except (OSError, UnicodeError, ValueError, RecursionError) as exc:
+        errors.append(f"{tool}: invalid or truncated JSON report: {exc}")
 
 
 class GoFindings:
@@ -645,41 +1030,50 @@ class GoFindings:
             "suppressed": False, "extras": metadata,
         }, ensure_ascii=False) + "\n")
 
-    def vet(self, output: str, errors: list[str]) -> None:
+    def vet(self, output: str | BinaryIO, errors: list[str]) -> None:
         # In JSON mode even analysis errors may exit 0. Inspect both the
         # package/analyzer error objects and the actual diagnostic arrays.
         # See Go's analysis/unitchecker and analysis/internal/analysisflags.
         documents = 0
-        for doc in _json_stream(output, "go vet", errors, vet=True):
-            documents += 1
-            if not isinstance(doc, dict):
-                errors.append("go vet: expected package object")
-                continue
-            for package, analyzers in doc.items():
-                if not isinstance(analyzers, dict):
-                    errors.append(f"go vet: malformed package {package!r}")
+        problems = _ReportErrors(errors, "go vet")
+        try:
+            reader = _JSONReportReader(output)
+            for _ in reader.documents(vet=True):
+                documents += 1
+                if reader.token() != b"{":
+                    reader.value()
+                    problems.append("go vet: expected package object")
                     continue
-                for analyzer, rows in analyzers.items():
-                    if isinstance(rows, dict) and "error" in rows:
-                        errors.append(f"go vet ({analyzer}): {str(rows['error'])[:200]}")
+                for package in reader.members():
+                    if reader.token() != b"{":
+                        reader.value()
+                        problems.append(f"go vet: malformed package {package[:120]!r}")
                         continue
-                    if not isinstance(rows, list):
-                        errors.append(f"go vet ({analyzer}): expected diagnostic array")
-                        continue
-                    for row in rows:
-                        try:
-                            match = re.fullmatch(r"(.+):(\d+):(\d+)", _text(row["posn"]), re.S)
-                            if not match:
-                                raise ValueError("invalid source position")
-                            self.emit("vet", _text(analyzer), match[1], _positive(int(match[2])),
-                                      _positive(int(match[3])), "warning", _text(row["message"]),
-                                      extras={"package": package})
-                        except (KeyError, TypeError, ValueError, OSError):
-                            errors.append(f"go vet ({analyzer}): malformed diagnostic")
+                    for analyzer in reader.members():
+                        if reader.token() != b"[":
+                            rows = reader.value()
+                            if isinstance(rows, dict) and "error" in rows:
+                                problems.append(f"go vet ({analyzer[:120]}): {str(rows['error'])[:200]}")
+                            else:
+                                problems.append(f"go vet ({analyzer[:120]}): expected diagnostic array")
+                            continue
+                        for _ in reader.elements():
+                            row = reader.value()
+                            try:
+                                match = re.fullmatch(r"(.+):(\d+):(\d+)", _text(row["posn"]), re.S)
+                                if not match:
+                                    raise ValueError("invalid source position")
+                                self.emit("vet", _text(analyzer), match[1], _positive(int(match[2])),
+                                          _positive(int(match[3])), "warning", _text(row["message"]),
+                                          extras={"package": package})
+                            except (KeyError, TypeError, ValueError, OSError):
+                                problems.append(f"go vet ({analyzer[:120]}): malformed diagnostic")
+        except (OSError, UnicodeError, ValueError, RecursionError) as exc:
+            problems.append(f"go vet: invalid or truncated JSON report: {exc}")
         if not documents:
-            errors.append("go vet: no JSON analysis report")
+            problems.append("go vet: no JSON analysis report")
 
-    def govulncheck(self, output: str, errors: list[str]) -> None:
+    def govulncheck(self, output: str | BinaryIO, errors: list[str]) -> None:
         # JSON mode exits 0 even with vulnerabilities. OSV messages are NOT
         # findings: they include advisories not affecting the loaded version.
         # Lower-precision module/package messages precede symbol findings.
@@ -687,7 +1081,8 @@ class GoFindings:
         advisories: dict[str, dict] = {}
         groups: dict[tuple[str, str], list[tuple[int, dict]]] = {}
         config = False
-        for index, doc in enumerate(_json_stream(output, "govulncheck", errors)):
+        problems = _ReportErrors(errors, "govulncheck")
+        for index, doc in enumerate(_json_stream(output, "govulncheck", problems)):
             try:
                 if not isinstance(doc, dict) or len(doc) != 1:
                     raise ValueError("expected one message field")
@@ -695,7 +1090,7 @@ class GoFindings:
                 if not isinstance(value, dict):
                     raise ValueError(f"invalid {kind} message")
                 if index == 0 and kind != "config":
-                    errors.append("govulncheck: missing initial configuration")
+                    problems.append("govulncheck: missing initial configuration")
                 if kind == "config":
                     if config or value.get("protocol_version") != "v1.0.0":
                         raise ValueError("duplicate or unsupported protocol configuration")
@@ -719,9 +1114,9 @@ class GoFindings:
                 elif kind not in ("progress", "SBOM"):
                     raise ValueError(f"unknown message {kind!r}")
             except (ValueError, KeyError, TypeError):
-                errors.append("govulncheck: malformed or unsupported stream message")
+                problems.append("govulncheck: malformed or unsupported stream message")
         if not config:
-            errors.append("govulncheck: no valid configuration message")
+            problems.append("govulncheck: no valid configuration message")
         for (osv, module), rows in sorted(groups.items()):
             strongest = max(level for level, _ in rows)
             for level, row in rows:
@@ -748,7 +1143,7 @@ class GoFindings:
                             break
                     except (ValueError, KeyError, TypeError, OSError):
                         invalid = True
-                        errors.append("govulncheck: malformed source location")
+                        problems.append("govulncheck: malformed source location")
                 if invalid or (local_positions and project):
                     continue  # a trace into unselected source is not a selected-file finding
                 reachability = ("module", "package", "symbol")[level]
@@ -808,19 +1203,29 @@ def scan_go_tools(files: Sequence[Path], sink: TextIO, project_dir: str,
                 ["vet", "-json", "--", *patterns] if tool == "go vet"
                 else ["-format=json", "-scan=symbol", *patterns]]
             for args in batches:
-                result = run_command(tool, [installed, *args], root, timeout, errors,
-                                     env=env, merge_stderr=tool == "go vet")
+                if tool != "gofmt":
+                    with run_command_stream(tool, [installed, *args], root, timeout, errors,
+                                            env=env, merge_stderr=tool == "go vet") as result:
+                        if result is None:
+                            continue
+                        # EOF establishes JSON framing, not native success.
+                        # Both tools can leave useful findings on a bad exit;
+                        # vet JSON analysis-error objects may even exit zero.
+                        if result.returncode != 0:
+                            errors.append(f"{tool}: exited {result.returncode}: {result.stderr.strip()[:160]}")
+                        if tool == "go vet":
+                            findings.vet(result.stdout, errors)
+                        else:
+                            findings.govulncheck(result.stdout, errors)
+                    continue
+                # A single filename cannot grow with the project's findings;
+                # keep gofmt's existing bounded, exact-name report contract.
+                result = run_command(tool, [installed, *args], root, timeout, errors, env=env)
                 if result is None:
                     continue
-                # All three commands use 0 for completed analysis in these
-                # formats. In particular, vet JSON errors can ALSO exit 0.
                 if result.returncode != 0:
                     errors.append(f"{tool}: exited {result.returncode}: {result.stderr.strip()[:160]}")
-                if tool == "go vet":
-                    findings.vet(result.stdout, errors)
-                elif tool == "govulncheck":
-                    findings.govulncheck(result.stdout, errors)
-                elif result.stdout == args[-1] + "\n":
+                if result.stdout == args[-1] + "\n":
                     findings.emit("gofmt", "format", args[-1], 1, 1, "info",
                                   "File differs from gofmt -s formatting")
                 elif result.stdout:

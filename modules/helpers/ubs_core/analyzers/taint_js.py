@@ -26,6 +26,7 @@ from pathlib import Path
 from os.path import commonpath
 from typing import Iterable
 
+from ubs_core.lexer import javascript_lexical_views as lexical_views
 from ubs_core.registry import Analyzer, RunContext, register
 from ubs_core.taint_flow import AnalysisLimit, Budget
 
@@ -99,6 +100,16 @@ SINKS = [
     (re.compile(r"\b(?:db|pool|connection|client|knex|sequelize|prisma)\.(?:query|execute|raw)\s*\("), 'js.taint.sql', 'SQL execution', True),
 ]
 
+PROPERTY_WRITE_SINKS = {
+    'innerHTML': ('js.taint.xss', 'innerHTML write'),
+    'outerHTML': ('js.taint.xss', 'outerHTML write'),
+    'dangerouslySetInnerHTML': ('js.taint.xss', 'dangerouslySetInnerHTML'),
+}
+BINDING_WRITE_TARGET = re.compile(
+    r'\.\s*(?:innerHTML|outerHTML|dangerouslySetInnerHTML)\b'
+    r'|\[\s*([\'"])(?:innerHTML|outerHTML|dangerouslySetInnerHTML)\1\s*\]'
+)
+
 ASSIGN_DECL = re.compile(r"^(?:const|let|var)\s+(.+?)\s*=\s*(.+)")
 ASSIGN_SIMPLE = re.compile(r"^([A-Za-z_$][\w$]*)\s*=\s*(?![=])(.+)")
 DESTRUCT_OBJECT = re.compile(r"^(?:const|let|var)\s*\{([^}]*)\}\s*=\s*(.+)")
@@ -127,126 +138,6 @@ def iter_js_files(root: Path):
             continue
         if path.suffix.lower() in EXTS:
             yield path
-
-
-def lexical_views(text: str) -> tuple[str, str]:
-    """Return comment-free source and executable code at original offsets.
-
-    Template text is inert, but ${expressions} (including nested templates)
-    are executable. Synthetic parentheses keep their boundaries balanced for
-    argument scanning. No source text is evaluated. Regex recognition is
-    intentionally lexical, not a claim to implement the JavaScript grammar.
-    """
-    source, code = list(text), list(text)
-    frames = [['code', 0]]
-
-    def mask(output, start, end):
-        for pos in range(start, end):
-            output[pos] = '\n' if text[pos] == '\n' else ' '
-
-    def regex_allowed(pos):
-        previous = pos - 1
-        while previous >= 0 and code[previous].isspace():
-            previous -= 1
-        if previous < 0 or code[previous] in '=(:,[!&|?;{}':
-            return True
-        if previous > 0 and text[previous - 1:previous + 1] == '=>':
-            return True
-        end = previous + 1
-        while previous >= 0 and (code[previous].isalnum() or code[previous] in '_$'):
-            previous -= 1
-        return ''.join(code[previous + 1:end]) in {'return', 'throw', 'yield', 'case', 'void', 'typeof', 'delete'}
-
-    i = 0
-    while i < len(text):
-        ch = text[i]
-        if frames[-1][0] == 'template':
-            code[i] = '\n' if ch == '\n' else ' '
-            if ch == '\\':
-                mask(code, i, min(i + 2, len(text)))
-                i += 2
-                continue
-            if ch == '`':
-                code[i] = ')'
-                frames.pop()
-            elif text.startswith('${', i):
-                code[i + 1] = '('
-                frames.append(['expression', 0])
-                i += 2
-                continue
-            i += 1
-            continue
-
-        if text.startswith('//', i):
-            end = text.find('\n', i + 2)
-            end = len(text) if end < 0 else end
-            mask(source, i, end)
-            mask(code, i, end)
-            i = end
-            continue
-        if text.startswith('/*', i):
-            end = text.find('*/', i + 2)
-            end = len(text) if end < 0 else end + 2
-            mask(source, i, end)
-            mask(code, i, end)
-            i = end
-            continue
-        if ch in ('"', "'"):
-            end = i + 1
-            while end < len(text):
-                if text[end] == '\\':
-                    end += 2
-                elif text[end] == ch:
-                    end += 1
-                    break
-                elif text[end] == '\n':
-                    break
-                else:
-                    end += 1
-            end = min(end, len(text))
-            mask(code, i, end)
-            code[i] = '0'  # an inert value, not missing syntax
-            i = end
-            continue
-        if ch == '`':
-            code[i] = '('
-            frames.append(['template', 0])
-            i += 1
-            continue
-        if ch == '/' and regex_allowed(i):
-            end, character_class = i + 1, False
-            while end < len(text) and text[end] != '\n':
-                if text[end] == '\\':
-                    end += 2
-                    continue
-                if text[end] == '[':
-                    character_class = True
-                elif text[end] == ']':
-                    character_class = False
-                elif text[end] == '/' and not character_class:
-                    end += 1
-                    while end < len(text) and text[end].isalpha():
-                        end += 1
-                    mask(code, i, end)
-                    code[i] = '0'
-                    i = end
-                    break
-                end += 1
-            else:
-                end = -1
-            if end >= 0:
-                continue
-        if frames[-1][0] == 'expression':
-            if ch == '{':
-                frames[-1][1] += 1
-            elif ch == '}':
-                if frames[-1][1] == 0:
-                    code[i] = ')'
-                    frames.pop()
-                else:
-                    frames[-1][1] -= 1
-        i += 1
-    return ''.join(source), ''.join(code)
 
 
 def strip_comments(text: str) -> str:
@@ -673,6 +564,7 @@ class _State(dict):
         self.budget = budget if budget is not None else getattr(values, 'budget', None)
         if self.budget is not None:
             self.budget.spend(1 + len(values) + len(getattr(values, 'cells', {}))
+                              + len(getattr(values, 'binding_kinds', {}))
                               + _heap_work(getattr(values, 'heap', {})))
         super().__init__(values)
         self.bindings = dict(bindings if bindings is not None else getattr(values, 'bindings', {}))
@@ -684,6 +576,7 @@ class _State(dict):
         self.weak_refs = set(getattr(values, 'weak_refs', ()))
         self.array_lengths = dict(getattr(values, 'array_lengths', {}))
         self.written_cells = set(getattr(values, 'written_cells', ()))
+        self.binding_kinds = dict(getattr(values, 'binding_kinds', {}))
 
     def copy(self):
         return _State(self)
@@ -693,7 +586,8 @@ class _State(dict):
                 and self.bindings == other.bindings and self.owners == other.owners
                 and self.cells == other.cells and self.heap == other.heap
                 and self.weak_refs == other.weak_refs and self.array_lengths == other.array_lengths
-                and self.written_cells == other.written_cells)
+                and self.written_cells == other.written_cells
+                and self.binding_kinds == other.binding_kinds)
 
     def __ne__(self, other):
         return not self == other
@@ -715,7 +609,7 @@ def _join_states(*states):
         return None
     budget = states[0].budget
     if budget is not None:
-        budget.spend(sum(1 + len(state) + len(state.cells) + _heap_work(state.heap)
+        budget.spend(sum(1 + len(state) + len(state.cells) + len(state.binding_kinds) + _heap_work(state.heap)
                          for state in states))
     names = set().union(*(state.keys() for state in states))
     bindings = {}
@@ -741,6 +635,9 @@ def _join_states(*states):
         result.heap[ref] = {key: _join(*(slots.get(key, frozenset()) for slots in objects)) for key in keys}
     result.weak_refs = set().union(*(state.weak_refs for state in states))
     result.written_cells = set().union(*(state.written_cells for state in states))
+    for key in set().union(*(state.binding_kinds.keys() for state in states)):
+        kinds = [state.binding_kinds.get(key) for state in states]
+        result.binding_kinds[key] = kinds[0] if all(kind == kinds[0] for kind in kinds) else None
     for ref in set().union(*(state.array_lengths.keys() for state in states)):
         lengths = [state.array_lengths[ref] for state in states if ref in state.array_lengths]
         result.array_lengths[ref] = lengths[0] if all(length == lengths[0] for length in lengths) else None
@@ -812,6 +709,7 @@ class _Scope:
     parameter_sources: dict = field(default_factory=dict)
     asynchronous: bool = False
     generator: bool = False
+    method: bool = False
 
 
 # Slots reduce the retained statement graph on runtimes whose dataclasses
@@ -834,6 +732,14 @@ class _NoNormalCompletion(Exception):
     Exceptional facts are recorded separately by the flow. This is never an
     exception raised by executing the scanned program (which is not run).
     """
+
+
+class _BoundValues(dict):
+    """Actual binding kinds travel to an existing bounded call context."""
+
+    def __init__(self):
+        super().__init__()
+        self.kinds = {}
 
 
 @dataclass(eq=False)
@@ -863,6 +769,7 @@ class _HeapOutput:
     heap: dict
     weak_refs: set
     array_lengths: dict
+    binding_kinds: dict = field(default_factory=dict)
 
 
 def _pairs(code, start=0, end=None):
@@ -919,7 +826,10 @@ def _parameters(text, code, start, end):
         declaration = text[left:equals].strip().removeprefix('...')
         targets = _binding_names(declaration)
         default = (equals + 1, right) if equals < right else None
-        result.append((tuple(targets), rest, default))
+        pattern_start = left + len(text[left:equals]) - len(text[left:equals].lstrip())
+        if rest:
+            pattern_start += 3
+        result.append((tuple(targets), rest, default, (pattern_start, equals)))
     return tuple(result)
 
 
@@ -929,7 +839,9 @@ def _binding_paths(target, prefix=()):
     if target.startswith(('{', '[')):
         bindings = []
         code = lexical_views(target)[1]
-        end = target.rfind('}' if target[0] == '{' else ']')
+        end = _pairs(code).get(0)
+        if end is None:
+            return []
         for index, (left, right) in enumerate(_chunks(code, 1, end)):
             _, equals = next(_chunks(code, left, right, '='))
             component = str(index)
@@ -968,7 +880,7 @@ def _declaration_entries(text, code, start, end):
     entries = []
     for left, right in _chunks(code, start + head.end(), end):
         _, equals = next(_chunks(code, left, right, '='))
-        entries.append((head.group(1), _binding_names(text[left:equals]),
+        entries.append((head.group(1), _binding_names(text[left:equals]), left,
                         equals + 1 if equals < right else None, right))
     return entries
 
@@ -1090,7 +1002,7 @@ def _function_scopes(text, code):
                 type_ranges.append((closing + 1, arrow))
                 arrow_parameters[arrow] = (opening, closing)
 
-    def add(start, parameter_span, body, name='', declaration=False, concise=False):
+    def add(start, parameter_span, body, name='', declaration=False, concise=False, method=False):
         params_start, params_end = parameter_span
         if body in body_starts:
             return
@@ -1115,6 +1027,7 @@ def _function_scopes(text, code):
         scope.parameter_sources = _parameter_sources(text, code, params_start, params_end)
         scope.asynchronous = async_prefix is not None
         scope.generator = generator
+        scope.method = method
         scopes.append(scope)
 
     for match in re.finditer(r'\bfunction\s*\*?\s*([A-Za-z_$][\w$]*)?', code):
@@ -1189,7 +1102,7 @@ def _function_scopes(text, code):
             continue
         body = _signature_body(code, pairs, closing)
         if body is not None and body not in body_starts:
-            add(match.start(), (match.end(), closing), body)
+            add(match.start(), (match.end(), closing), body, method=True)
 
     root = _Scope(0, len(text), 0, len(text), '<module>')
     for scope in sorted(scopes, key=lambda item: (item.start, -item.end)):
@@ -1346,6 +1259,7 @@ class _Flow:
         state.weak_refs = incoming.weak_refs
         state.array_lengths = incoming.array_lengths
         state.written_cells = incoming.written_cells
+        state.binding_kinds = dict(incoming.binding_kinds)
 
     def effect(self, start, label, fact, state=None):
         if state is not None:
@@ -1370,7 +1284,37 @@ class _Flow:
             return _cell_value(self.engine.binding(scope, name, position), state)
         return frozenset()
 
-    def assign(self, name, fact, state, position, binding=None):
+    def binding_context(self, name, position):
+        scope = self.scope
+        if self.parameter_context:
+            # All formals exist in the parameter environment; body declarations
+            # do not. A default's assignment follows the same lookup as a read.
+            if any(name in names for names, _, _, _ in scope.params):
+                position = scope.body_start
+            elif scope.parent is not None:
+                position, scope = scope.start, scope.parent
+        return scope, position
+
+    def global_undefined(self, position):
+        scope, position = self.binding_context('undefined', position)
+        owner, begin, _ = self.engine.lexical_binding(scope, 'undefined', position)
+        return not any(name == 'undefined' and left == begin
+                       for left, _right, name in self.engine.binding_regions[owner])
+
+    def assign(self, name, fact, state, position, binding=None, input_kind=None):
+        if name == 'undefined' and self.global_undefined(position):
+            # The global property is nonwritable. The caller already evaluated
+            # the RHS, including its writes and its assignment-expression value.
+            # Strict PutValue throws with precisely that post-RHS store.
+            strict = self.engine.strict_mode(self.scope)
+            if strict is None:
+                raise AnalysisLimit('global undefined assignment has unsupported strictness context')
+            if strict:
+                self.throws.append((frozenset(), state.copy()))
+                raise _NoNormalCompletion
+            return
+        if input_kind == 'undefined':
+            fact = frozenset()
         state[name] = _step(fact, name)
         state.bindings[name] = binding
         if re.fullmatch(r'[A-Za-z_$][\w$]*', name):
@@ -1378,6 +1322,8 @@ class _Flow:
             state.owners[name] = key
             state.cells[key] = state[name]
             state.written_cells.add(key)
+            state.binding_kinds[key] = (input_kind or
+                ('present' if isinstance(binding, _Scope) or (_refs(fact) and not frozenset(fact)) else None))
 
     @staticmethod
     def property_key(raw):
@@ -1498,6 +1444,7 @@ class _Flow:
                     exported = self.engine.export_key(module, name)
                     if exported is not None:
                         state.cells[exported] = self.property(_Fact(refs=(ref,)), name, state)
+                        state.binding_kinds[exported] = None
                         state.written_cells.add(exported)
                         state.bindings[exported[2]] = None
             if ref in state.array_lengths:
@@ -1507,8 +1454,139 @@ class _Flow:
                 elif self.array_index(key) is not None and length is not None:
                     state.array_lengths[ref] = max(length, int(key) + 1)
 
-    def catch_pattern(self, start, end, fact, state, position, missing=False):
-        """Bind a thrown value, preserving field identity and initializer order.
+    def binding_reference(self, start, end, state):
+        """Evaluate an assignment target before reading its selected value."""
+        text, code = self.engine.text, self.scope.code
+        _, end = next(_chunks(code, start, end, '='))
+        _, end = next(_chunks(code, start, end, ':'))
+        while start < end and text[start].isspace():
+            start += 1
+        while end > start and text[end - 1].isspace():
+            end -= 1
+        while code[start:start + 1] == '(' and self.pairs.get(start) == end - 1:
+            start, end = start + 1, end - 1
+            while start < end and text[start].isspace():
+                start += 1
+            while end > start and text[end - 1].isspace():
+                end -= 1
+        target = self.access(start, end)
+        if target is not None and target[2] == end and not target[1]:
+            return None
+        if target is not None and target[2] == end and target[1]:
+            receiver = self.read_access((target[0], target[1][:-1], target[2]), state)
+            key, computed = target[1][-1]
+        else:
+            # The receiver can itself be a call or a parenthesized expression.
+            # Retain its evaluated identity before a computed key/default can
+            # mutate or rebind it; GetValue of the selected source follows.
+            member = re.search(r'\.\s*([A-Za-z_$][\w$]*)\s*$', code[start:end])
+            opening = self.pairs.get(end - 1) if code[end - 1:end] == ']' else None
+            if opening is not None and opening <= start:
+                opening = None
+            if member is not None:
+                receiver = self.value(start, start + member.start(), state)
+                key, computed = member.group(1), None
+            elif opening is not None:
+                receiver = self.value(start, opening, state)
+                raw = text[opening + 1:end - 1].strip()
+                key = self.property_key(raw) if raw.startswith(('"', "'")) or raw.isdecimal() else None
+                computed = (opening + 1, end - 1) if key is None else None
+            else:
+                return None
+        if computed is not None:
+            self.value(*computed, state)
+        return start, end, receiver, key
+
+    def binding_input(self, start, end, state):
+        """Recognize definite entry values without guessing scalar types.
+
+        `void` consumes one unary expression. A following binary/comma
+        operator belongs to a larger value and must not activate a default.
+        """
+        code = self.engine.code
+
+        def skip(position):
+            while position < end and code[position].isspace():
+                position += 1
+            return position
+
+        start = skip(start)
+        while end > start and code[end - 1].isspace():
+            end -= 1
+        while code[start:start + 1] == '(' and self.pairs.get(start) == end - 1:
+            if self.engine.text[start:start + 1] == '`':
+                # Template delimiters also become parentheses in the lexical
+                # code view. Keep their string identity after outer parens;
+                # their interpolation's null/void value is not the input.
+                return 'present'
+            start, end = skip(start + 1), end - 1
+            while end > start and code[end - 1].isspace():
+                end -= 1
+        raw = code[start:end]
+        if raw == 'null':
+            return 'null'
+        if re.fullmatch(r'[A-Za-z_$][\w$]*', raw) and raw not in {'true', 'false', 'null'}:
+            scope, position = self.binding_context(raw, start)
+            lexical = self.engine.lexical_binding(scope, raw, position)
+            shadowed = any(name == raw and left == lexical[1]
+                           for left, _right, name in self.engine.binding_regions[lexical[0]])
+            if raw == 'undefined' and not shadowed:
+                return 'undefined'
+            return state.binding_kinds.get(self.engine.binding(scope, raw, position))
+        if re.fullmatch(r'(?:true|false|(?:0[xX][\da-fA-F]+|0[bB][01]+|0[oO][0-7]+'
+                        r'|[0-9][\d_]*(?:\.[\d_]*)?(?:[eE][+-]?[\d_]+)?)n?)', raw):
+            return 'present' if self.engine.text[start:start + 1] in {'"', "'"} else 'noniterable'
+        head = re.match(r'void\b', raw)
+        if head is None:
+            return None
+        cursor = skip(start + head.end())
+        while cursor < end:
+            self.engine.budget.spend()
+            prefix = re.match(r'(?:void|typeof|delete|await|new)\b|\+\+|--|[!~+-]', code[cursor:end])
+            if prefix is None:
+                break
+            cursor = skip(cursor + prefix.end())
+        function = next((child for child in self.scope.children if child.start == cursor and child.end <= end), None)
+        if function is not None:
+            cursor = function.end
+        elif code[cursor:cursor + 1] in {'(', '[', '{'} and cursor in self.pairs:
+            cursor = self.pairs[cursor] + 1
+        else:
+            primary = re.match(r'[A-Za-z_$][\w$]*|(?:0[xX][\da-fA-F]+|0[bB][01]+|0[oO][0-7]+'
+                               r'|[0-9][\d_]*(?:\.[\d_]*)?(?:[eE][+-]?[\d_]+)?)n?', code[cursor:end])
+            if primary is None:
+                return None
+            cursor += primary.end()
+        while (cursor := skip(cursor)) < end:
+            self.engine.budget.spend()
+            member = re.match(r'(?:\?\.)?\.\s*[A-Za-z_$][\w$]*|\?\.\s*[A-Za-z_$][\w$]*', code[cursor:end])
+            if member:
+                cursor += member.end()
+            elif code[cursor:cursor + 2] == '?.' and code[skip(cursor + 2):skip(cursor + 2) + 1] in {'(', '['}:
+                opening = skip(cursor + 2)
+                cursor = self.pairs.get(opening, end) + 1
+            elif code[cursor:cursor + 1] in {'(', '['} and cursor in self.pairs:
+                cursor = self.pairs[cursor] + 1
+            elif code[cursor:cursor + 2] in {'++', '--'}:
+                cursor += 2
+            else:
+                break
+        return 'undefined' if skip(cursor) == end else None
+
+    def binding_entry_failure(self, fact, state, array, missing=False, input_kind=None):
+        """Snapshot possible pattern-entry failures before binding effects."""
+        unusable = (missing or input_kind in {'null', 'undefined'}
+                    or (array and input_kind == 'noniterable'))
+        unknown_scalar = (input_kind not in {'present', 'noniterable'}
+                          and (not _refs(fact) or frozenset(fact)))
+        unknown_iterator = array and any(ref not in state.array_lengths for ref in _refs(fact))
+        if unusable or unknown_scalar or unknown_iterator:
+            self.throws.append((frozenset(), state.copy()))
+        return unusable
+
+    def bind_pattern(self, start, end, fact, state, position, missing=False, binding=None,
+                     reference=None, input_kind=None, entry_checked=False):
+        """Bind a pattern, preserving field identity and initializer order.
 
         Scalar facts do not distinguish undefined from another clean scalar,
         so an uncertain default joins both stores; it cannot prove cleanup.
@@ -1523,26 +1601,62 @@ class _Flow:
             end -= 1
         if start == end:
             return
+        if reference is None:
+            reference = self.binding_reference(start, end, state)
         _, equals = next(_chunks(code, start, end, '='))
         if equals < end:
             if missing:
                 fact = self.value(equals + 1, end, state)
-            elif not _refs(fact) or frozenset(fact):
+                input_kind = self.binding_input(equals + 1, end, state)
+                missing = input_kind == 'undefined'
+                if missing:
+                    fact = frozenset()
+            elif input_kind is None and (not _refs(fact) or frozenset(fact)):
+                # The bypass can be null, while the default has its own
+                # result and effects. Check each entry store before joining:
+                # the null branch never executes the default initializer.
+                nested = code[start:start + 1] in {'{', '['}
+                if nested:
+                    self.binding_entry_failure(fact, state, code[start] == '[')
                 fallback, branch = self.branch_value(equals + 1, end, state.copy())
+                fallback_kind = (self.binding_input(equals + 1, end, branch)
+                                 if branch is not None else None)
+                if fallback_kind == 'undefined':
+                    fallback = frozenset()
+                if nested and branch is not None:
+                    self.binding_entry_failure(fallback, branch, code[start] == '[',
+                                               input_kind=fallback_kind)
+                entry_checked |= nested
                 self.replace_state(state, _join_states(state, branch))
                 fact = _join(fact, fallback)
+                input_kind = None
             end = equals
             while end > start and text[end - 1].isspace():
                 end -= 1
+        # A TypeScript annotation describes the value, not another pattern.
+        # Inspect only the binding, after separating its initializer; a
+        # ternary default's colon is part of its executable expression.
+        _, annotation = next(_chunks(code, start, end, ':'))
+        if annotation < end:
+            end = annotation
+            while end > start and text[end - 1].isspace():
+                end -= 1
         if code[start:start + 1] in {'{', '['} and self.pairs.get(start) == end - 1:
+            # RequireObjectCoercible/GetIterator happens before any selected
+            # property's target, default or body. Unknown scalar facts retain
+            # that exceptional path; a proven nullish input cannot continue.
             array, excluded = code[start] == '[', set()
+            if (not entry_checked and
+                    self.binding_entry_failure(fact, state, array, missing, input_kind)):
+                raise _NoNormalCompletion
             for index, (left, right) in enumerate(_chunks(code, start + 1, end - 1)):
                 while left < right and text[left].isspace():
                     left += 1
                 if left == right:
                     continue
                 if code[left:left + 3] == '...':
-                    ref, slots = (self.scope, left, 'catch-rest'), {}
+                    target_reference = self.binding_reference(left + 3, right, state)
+                    ref, slots = (self.scope, left, 'binding-rest'), {}
                     for parent in _refs(fact):
                         for key, value in state.heap.get(parent, {}).items():
                             if array:
@@ -1553,21 +1667,27 @@ class _Flow:
                             elif key in excluded:
                                 continue
                             slots[key] = _join(slots.get(key, frozenset()), value)
+                    if ref in state.heap:
+                        previous = state.heap[ref]
+                        slots = {key: _join(previous.get(key, frozenset()), slots.get(key, frozenset()))
+                                 for key in previous.keys() | slots.keys()}
+                        state.weak_refs.add(ref)
                     state.heap[ref] = slots
                     if array:
                         lengths = [state.array_lengths.get(parent) for parent in _refs(fact)]
                         state.array_lengths[ref] = (max(0, lengths[0] - index) if lengths and
                             lengths[0] is not None and all(length == lengths[0] for length in lengths) else None)
                     rest = _Fact(frozenset(fact), refs=(ref,))
-                    self.catch_pattern(left + 3, right, rest, state, position)
+                    self.bind_pattern(left + 3, right, rest, state, position,
+                                      binding=binding, reference=target_reference)
                     continue
                 selected = frozenset()
                 if array:
                     key, begin = str(index), left
                 else:
-                    _, colon = next(_chunks(code, left, right, ':'))
-                    _, default = next(_chunks(code, left, colon, '='))
-                    raw_key = text[left:default].strip()
+                    _, default = next(_chunks(code, left, right, '='))
+                    _, colon = next(_chunks(code, left, default, ':'))
+                    raw_key = text[left:colon].strip()
                     key = self.property_key(raw_key)
                     if code[left:left + 1] == '[' and left in self.pairs:
                         close = self.pairs[left]
@@ -1575,20 +1695,38 @@ class _Flow:
                         key = self.property_key(literal) if literal.startswith(('"', "'")) or literal.isdecimal() else None
                         if key is None:
                             selected = self.value(left + 1, close, state)
-                    begin = colon + 1 if colon < right else left
+                    begin = colon + 1 if colon < default else left
                     if key is not None:
                         excluded.add(key)
+                # Get the target reference before GetV/IteratorStep and its
+                # default. A computed target can mutate the source or throw;
+                # retain its receiver so later effects cannot rebind it.
+                target_reference = self.binding_reference(begin, right, state)
                 value = self.property(fact, key, state)
                 if not _refs(fact) or frozenset(fact):
                     value = _join(value, selected)
                 absent = (bool(_refs(fact)) and not frozenset(fact) and key is not None
                           and all(key not in state.heap.get(parent, {}) and None not in state.heap.get(parent, {})
                                   for parent in _refs(fact)))
-                self.catch_pattern(begin, right, value, state, position, absent)
+                self.bind_pattern(begin, right, value, state, position, absent, binding, target_reference)
+            return
+        if reference is not None:
+            start, end, receiver, key = reference
+            name = re.sub(r'\s+', '', text[start:end])
+            sink = PROPERTY_WRITE_SINKS.get(key)
+            if sink is not None and sink[0] == self.rule:
+                candidates = list(BINDING_WRITE_TARGET.finditer(text, start, end))
+                location = candidates[-1].start() if candidates else start
+                self.effect(location, sink[1], fact, state)
+            if _refs(receiver):
+                self.write_property(receiver, key, _step(fact, name), state)
+            else:
+                self.assign(name, fact, state, position)
             return
         for name in _binding_names(text[start:end]):
             state.owners[name] = self.engine.binding(self.scope, name, position)
-            self.assign(name, fact, state, position)
+            self.assign(name, fact, state, position, binding,
+                        'undefined' if missing else input_kind)
 
     def allocate(self, start, end, state):
         text, code = self.engine.text, self.scope.code
@@ -1746,6 +1884,7 @@ class _Flow:
         for key, fact in writes.items():
             value = self.substitute(fact, callee, bound, incoming)
             state.cells[key] = value
+            state.binding_kinds[key] = None
             state.written_cells.add(key)
             name = key[2]
             if name not in state or state.owners.get(name) == key:
@@ -1774,40 +1913,90 @@ class _Flow:
             return self.engine.call_target(self.scope, name, state, self.rule)
         return None
 
-    def bind(self, callee, arguments, ranges, state):
-        actual, uncertain = [], None
+    def evaluate_arguments(self, ranges, state):
+        """Evaluate and snapshot each spread before the following argument.
 
-        def expand(fact, left, right):
+        A later argument may mutate the iterable or replace one of its slots.
+        The already yielded values retain their own scalar/object identities.
+        """
+        actual, uncertain = [], None
+        maybe_missing = set()
+        input_kinds = {}
+
+        def expand(left, right):
             nonlocal uncertain
+            while left < right and self.engine.text[left].isspace():
+                left += 1
+            while right > left and self.engine.text[right - 1].isspace():
+                right -= 1
             raw = self.scope.code[left:right].strip()
             if raw.startswith('...'):
                 opening = left + self.scope.code[left:right].index('...') + 3
                 while opening < right and self.scope.code[opening].isspace():
                     opening += 1
-                if self.scope.code[opening:opening + 1] == '[' and self.pairs.get(opening) is not None:
+                if self.scope.code[opening:opening + 1] == '[' and self.pairs.get(opening) == right - 1:
                     closing = self.pairs[opening]
+                    elements = []
                     if self.scope.code[opening + 1:closing].strip():
                         for begin, finish in _chunks(self.scope.code, opening + 1, closing):
                             if begin == finish == closing:
                                 continue  # a trailing comma creates no argument
                             if self.scope.code[begin:finish].strip():
-                                expand(self.value(begin, finish, state), begin, finish)
+                                elements.append(expand(begin, finish))
                             else:
                                 actual.append((frozenset(), True))  # an array hole is undefined
-                    return
+                    return _join(*elements)
+                fact = self.value(opening, right, state)
+                refs = _refs(fact)
+                lengths = [state.array_lengths.get(ref) for ref in refs]
+                if (refs and not frozenset(fact) and lengths[0] is not None
+                        and all(length == lengths[0] for length in lengths)):
+                    self.engine.budget.spend(lengths[0])
+                    for position in range(lengths[0]):
+                        key = str(position)
+                        missing = all(key not in state.heap.get(ref, {})
+                                      and None not in state.heap.get(ref, {}) for ref in refs)
+                        value = self.property(fact, key, state)
+                        if not missing and (not _refs(value) or frozenset(value)):
+                            # Heap scalar facts do not distinguish undefined
+                            # from another clean scalar. A default can run,
+                            # but its writes are not a definite cleanup.
+                            missing = True
+                            maybe_missing.add(len(actual))
+                        actual.append((value, missing))
+                    return _join(*(value for value, _missing in actual[-lengths[0]:])) if lengths[0] else frozenset()
                 if uncertain is None:
                     uncertain = len(actual)
-                fact = self.value(opening, right, state)
-            actual.append((fact, raw in {'undefined', 'void 0'}))
+                if refs and all(ref in state.array_lengths for ref in refs):
+                    # An unknown-length spread supplies array elements, not
+                    # the array object itself. Retain borrowed element refs.
+                    fact = self.property(fact, None, state)
+            else:
+                fact = self.value(left, right, state)
+            kind = self.binding_input(left, right, state)
+            if kind is None and _refs(fact) and not frozenset(fact):
+                kind = 'present'
+            if kind is not None:
+                input_kinds[len(actual)] = kind
+            if kind == 'undefined':
+                fact = frozenset()  # operand effects ran; the void value is clean
+            unknown_undefined = kind is None and raw.strip('() \t\r\n') == 'undefined'
+            if unknown_undefined:
+                maybe_missing.add(len(actual))
+            actual.append((fact, kind == 'undefined' or unknown_undefined))
+            return fact
 
         try:
-            for fact, (left, right) in zip(arguments, ranges):
-                expand(fact, left, right)
+            facts = [expand(left, right) for left, right in ranges]
         finally:
             # Recursive closures otherwise retain the completed flow and its
             # incoming heap until cyclic GC, including when expansion throws.
             expand = None
-        bound = {}
+        return facts, (actual, uncertain, maybe_missing, input_kinds)
+
+    def bind(self, callee, prepared, state, call_location):
+        actual, uncertain, maybe_missing, input_kinds = prepared
+        bound = _BoundValues()
         default_flow = None
         default_state = None
 
@@ -1819,31 +2008,42 @@ class _Flow:
                 self.effect(location, label, self.substitute(fact, callee, bound, incoming), incoming)
             for fact, store in default_flow.throws:
                 exceptional = incoming.copy()
-                exceptional.heap = store.heap
-                exceptional.weak_refs = store.weak_refs
-                exceptional.array_lengths = store.array_lengths
-                writes = {key: value for key, value in store.cells.items()
+                writes = {key: self.substitute(value, callee, bound, incoming)
+                          for key, value in store.cells.items()
                           if key[0] is not callee and key in store.written_cells}
-                self.apply_writes(writes, callee, bound, exceptional, incoming)
-                self.throws.append((self.substitute(fact, callee, bound, incoming), exceptional))
+                output = _HeapOutput(store.heap, store.weak_refs, store.array_lengths, store.binding_kinds)
+                thrown = self.engine.apply_heap_output(
+                    incoming, exceptional, output, writes,
+                    self.substitute(fact, callee, bound, incoming), call_location)
+                self.throws.append((thrown, exceptional))
             if normal:
-                state.heap = default_state.heap
-                state.weak_refs = default_state.weak_refs
-                state.array_lengths = default_state.array_lengths
-                writes = {key: value for key, value in default_state.cells.items()
+                writes = {key: self.substitute(value, callee, bound, incoming)
+                          for key, value in default_state.cells.items()
                           if key[0] is not callee and key in default_state.written_cells}
-                self.apply_writes(writes, callee, bound, state, incoming)
+                output = _HeapOutput(default_state.heap, default_state.weak_refs, default_state.array_lengths,
+                                     default_state.binding_kinds)
+                # Initializers and rest bindings execute before the callee's
+                # summary. Give their fresh objects this invocation's history
+                # too, while borrowed aliases keep their incoming identities.
+                self.engine.apply_heap_output(incoming, state, output, writes,
+                                              frozenset(), call_location, bound=bound)
             for dependency, callers in self.engine.dependents.items():
                 if dependency[1] == self.rule and callee in callers:
                     callers.add(self.scope)
 
-        for index, (names, rest, default) in enumerate(callee.params):
+        for index, (names, rest, default, pattern) in enumerate(callee.params):
             incoming = _join(*(fact for fact, _ in actual[index:])) if rest else (actual[index][0] if index < len(actual) else frozenset())
             missing = index >= len(actual) or actual[index][1]
+            input_kind = input_kinds.get(index)
+            if missing and index not in maybe_missing:
+                input_kind = 'undefined'
+            entry_checked = False
             if uncertain is not None and index >= uncertain:
                 incoming = _join(incoming, *(fact for fact, _ in actual[uncertain:]))
                 missing = True
-            if default is not None and missing and not rest:
+                input_kind = None
+            destructured = self.engine.text[slice(*pattern)].lstrip().startswith(('{', '['))
+            if rest or destructured or (default is not None and missing):
                 if default_flow is None:
                     default_flow = _Flow(self.engine, callee, self.rule)
                     default_flow.parameter_context = True
@@ -1857,22 +2057,87 @@ class _Flow:
                     default_state.heap = {ref: dict(slots) for ref, slots in state.heap.items()}
                     default_state.weak_refs = set(state.weak_refs)
                     default_state.array_lengths = dict(state.array_lengths)
+                    default_state.binding_kinds = dict(state.binding_kinds)
                 default_state.update(bound)
                 for name in bound:
                     default_state.owners[name] = self.engine.binding(callee, name)
+                    default_state.binding_kinds[default_state.owners[name]] = bound.kinds.get(name)
+            if rest:
+                # A rest formal receives a fresh array, including when its
+                # binding is itself an array/object pattern. Joining actuals
+                # loses positional fields and mistakes element objects for
+                # this wrapper; writes must still reach borrowed elements.
+                ref = (callee, pattern[0], 'arguments-rest')
+                precise_end = len(actual) if uncertain is None else uncertain
+                slots = {str(position - index): actual[position][0]
+                         for position in range(index, precise_end)}
+                if uncertain is not None:
+                    slots[None] = _join(*(fact for fact, _ in actual[uncertain:]))
+                previous = default_state.heap.get(ref)
+                if previous is not None:
+                    slots = {key: _join(previous.get(key, frozenset()), slots.get(key, frozenset()))
+                             for key in previous.keys() | slots.keys()}
+                    default_state.weak_refs.add(ref)
+                default_state.heap[ref] = slots
+                default_state.array_lengths[ref] = (max(0, len(actual) - index)
+                    if uncertain is None and previous is None else None)
+                incoming = _Fact(refs=(ref,))
+                missing, input_kind = False, 'present'
+            if default is not None and missing and not rest:
                 default_flow.pairs.update(_pairs(callee.code, *default))
-                bypass = default_state.copy() if uncertain is not None and index >= uncertain else None
+                bypass = (default_state.copy() if index in maybe_missing or
+                          (uncertain is not None and index >= uncertain) else None)
+                if bypass is not None and destructured:
+                    default_flow.binding_entry_failure(
+                        incoming, bypass, self.engine.text[slice(*pattern)].lstrip().startswith('['),
+                        input_kind=input_kind)
+                    entry_checked = True
                 default_fact, evaluated = default_flow.branch_value(*default, default_state)
                 if evaluated is None and bypass is None:
                     complete_defaults(normal=False)
                     raise _NoNormalCompletion
+                default_kind = (default_flow.binding_input(*default, evaluated)
+                                if evaluated is not None else None)
+                if default_kind == 'undefined':
+                    default_fact = frozenset()
+                if entry_checked and evaluated is not None:
+                    default_flow.binding_entry_failure(
+                        default_fact, evaluated, self.engine.text[slice(*pattern)].lstrip().startswith('['),
+                        input_kind=default_kind)
                 if bypass is not None:
-                    # An unknown spread may supply this formal. The default's
-                    # effects are possible, not proof that cleanup occurred.
+                    # An unknown spread or scalar slot may supply this formal.
+                    # Its default cannot prove that cleanup occurred.
                     default_state = _join_states(bypass, evaluated)
+                    input_kind = None
+                else:
+                    input_kind = default_kind
+                missing = input_kind == 'undefined'
                 incoming = _join(incoming, default_fact)
-            for name in names:
-                bound[name] = incoming
+            if destructured:
+                default_flow.pairs.update(_pairs(callee.code, *pattern))
+                try:
+                    default_flow.bind_pattern(*pattern, incoming, default_state, callee.body_start,
+                                              missing and index not in maybe_missing and uncertain is None,
+                                              input_kind=input_kind, entry_checked=entry_checked)
+                except _NoNormalCompletion:
+                    complete_defaults(normal=False)
+                    raise
+                for name in names:
+                    bound[name] = default_state.get(name, frozenset())
+                    bound.kinds[name] = default_state.binding_kinds.get(self.engine.binding(callee, name))
+            else:
+                for name in names:
+                    bound[name] = incoming
+                    bound.kinds[name] = (input_kind or
+                        ('present' if _refs(incoming) and not frozenset(incoming) else None))
+            if default_state is not None:
+                # A later initializer can assign an earlier formal. Keep the
+                # updated parameter environment for both subsequent defaults
+                # and the callee body instead of restoring the old bound map.
+                for name in bound:
+                    if name in default_state:
+                        bound[name] = default_state[name]
+                        bound.kinds[name] = default_state.binding_kinds.get(self.engine.binding(callee, name))
         complete_defaults()
         return bound
 
@@ -1910,8 +2175,17 @@ class _Flow:
             return frozenset()
         if code[start] == '(' and self.pairs.get(start) == end - 1:
             return self.value(start + 1, end - 1, state)
-        if code[start] in '[{' and self.pairs.get(start) == end - 1:
-            return self.allocate(start, end, state)
+        if code[start] in '[{' and start in self.pairs:
+            closing = self.pairs[start]
+            assignment = re.match(r'\s*=(?!=|>)\s*', code[closing + 1:end])
+            if assignment is not None:
+                rhs = closing + 1 + assignment.end()
+                fact = self.value(rhs, end, state)
+                self.bind_pattern(start, closing + 1, fact, state, start,
+                                  input_kind=self.binding_input(rhs, end, state))
+                return fact
+            if closing == end - 1:
+                return self.allocate(start, end, state)
         access = self.access(start, end)
         assignment = (re.match(r'\s*(=(?!=|>)|\+=|\|\|=|&&=|\?\?=)\s*', code[access[2]:end])
                       if access else None)
@@ -1927,6 +2201,13 @@ class _Flow:
             old = (self.property(receiver, key, state) if receiver is not None
                    else self.reference(target, state)) if assignment.group(1) != '=' else frozenset()
             logical = assignment.group(1) in {'||=', '&&=', '??='}
+            if logical and target == 'undefined' and self.global_undefined(start):
+                # This one builtin has a known falsy/nullish value. &&= never
+                # reaches its RHS or PutValue; ||= and ??= always reach both.
+                # Do not merge a fictitious bypass after a strict write throws.
+                if assignment.group(1) == '&&=':
+                    return frozenset()
+                logical = False
             if logical:
                 # The receiver and computed key are evaluated once, before
                 # the split. A RHS write, call or throw belongs only to the
@@ -1943,7 +2224,8 @@ class _Flow:
             if receiver is not None and _refs(receiver):
                 self.write_property(receiver, key, _step(fact, target), evaluated)
             else:
-                self.assign(target, fact, evaluated, start, self.callable(rhs, end, evaluated))
+                self.assign(target, fact, evaluated, start, self.callable(rhs, end, evaluated),
+                            self.binding_input(rhs, end, evaluated) if assignment.group(1) == '=' else None)
             for location, expr_start, rule, label in self.engine.write_sinks:
                 if (rule == self.rule and start <= location < expr_start <= rhs
                         and not code[expr_start:rhs].strip()):
@@ -2035,19 +2317,31 @@ class _Flow:
             sink_binding = state.bindings.get(callee_name, 'imported')
             if self.engine.relative_import(self.scope, receiver):
                 binding = None
-            argument_facts = [self.value(left, right, state) for left, right in arguments]
+            if isinstance(callee, _Scope) and not callee.generator:
+                argument_facts, prepared = self.evaluate_arguments(arguments, state)
+            else:
+                argument_facts = [self.value(left, right, state) for left, right in arguments]
             if isinstance(callee, _Scope) and callee.generator:
                 # A generator call creates an iterator; it does not execute
                 # the body. Iterator advancement is outside this call model.
                 callee = None
             if isinstance(callee, _Scope):
                 self.engine.import_captures(callee, state, self.rule)
+                if (callee in self.engine.input_kind_scopes and self.scope.parent is not None
+                        and self.scope not in self.engine.input_kind_scopes):
+                    # Namespace imports and runtime aliases can resolve only
+                    # after module/call summaries are available. Propagate
+                    # this finite requirement to their scalar wrappers too.
+                    self.engine.input_kind_scopes.add(self.scope)
+                    self.engine.heap_scopes.add(self.scope)
+                    for caller in self.engine.dependents[(self.scope, self.rule)]:
+                        self.engine.enqueue(caller)
                 deferred = callee.asynchronous and not re.search(r'\bawait\s*$', code[start:match_start])
                 sole_local_call = (code[start:match_start].strip() in {'', 'await'} and closing + 1 == end)
                 self.engine.dependents[(callee, self.rule)].add(self.scope)
                 throw_count = len(self.throws)
                 try:
-                    bound = self.bind(callee, argument_facts, arguments, state)
+                    bound = self.bind(callee, prepared, state, match_start)
                 except _NoNormalCompletion:
                     if not deferred:
                         raise
@@ -2193,15 +2487,27 @@ class _Flow:
         offset = start + len(text[start:end]) - len(text[start:end].lstrip())
         entries = _declaration_entries(text, self.scope.code, start, end)
         if entries:
-            for _, names, rhs, finish in entries:
+            for kind, names, left, rhs, finish in entries:
                 fact = self.value(rhs, finish, state) if rhs is not None else frozenset()
                 binding = self.callable(rhs, finish, state) if rhs is not None else None
                 if rhs is not None and binding is None:
                     required = re.match(r"\s*require\s*\(\s*['\"]([^'\"]+)['\"]\s*\)", text[rhs:finish])
                     if required and not required.group(1).startswith(('./', '../', '/')):
                         binding = 'imported'
-                for name in names:
-                    self.assign(name, fact, state, start, binding)
+                pattern_end = rhs - 1 if rhs is not None else finish
+                if text[left:pattern_end].lstrip().startswith(('{', '[')):
+                    self.bind_pattern(left, pattern_end, fact, state, start, binding=binding,
+                                      input_kind=self.binding_input(rhs, finish, state) if rhs is not None else 'undefined')
+                else:
+                    for name in names:
+                        if (kind == 'var' and rhs is None and
+                                self.engine.binding(self.scope, name, start) in state.binding_kinds):
+                            # Hoisting already initialized this cell. A later
+                            # bare var declaration does not replace a formal
+                            # or an earlier assignment with undefined.
+                            continue
+                        self.assign(name, fact, state, start, binding,
+                                    self.binding_input(rhs, finish, state) if rhs is not None else 'undefined')
             return state
         compound = re.match(r'([A-Za-z_$][\w$]*)\s*(\+=|\|\|=|&&=|\?\?=)\s*(.+)', raw, re.S)
         if compound:
@@ -2230,7 +2536,7 @@ class _Flow:
                 if required and not required.group(1).startswith(('./', '../', '/')):
                     binding = 'imported'
             for name in parse_targets(target):
-                self.assign(name, fact, state, start, binding)
+                self.assign(name, fact, state, start, binding, self.binding_input(rhs, end, state))
         else:
             self.value(start, end, state)
         return state
@@ -2324,6 +2630,7 @@ class _Flow:
             for name in local:
                 state[name], state.bindings[name] = frozenset(), None
                 state.owners[name] = self.engine.binding(self.scope, name, node.start + 1)
+                state.binding_kinds[state.owners[name]] = 'undefined'
             result = self.block(node.body, state)
             for exit_state in (*self.breaks[break_count:], *self.continues[continue_count:]):
                 self.restore(exit_state, outer, local)
@@ -2351,7 +2658,7 @@ class _Flow:
                 handler_break, handler_continue = len(self.breaks), len(self.continues)
                 try:
                     if node.catch_range is not None:
-                        self.catch_pattern(*node.catch_range, value, caught, node.alternate[0].start + 1)
+                        self.bind_pattern(*node.catch_range, value, caught, node.alternate[0].start + 1)
                     handler = self.block(node.alternate, caught)
                 except _NoNormalCompletion:
                     # Binding initializers are part of handler completion;
@@ -2421,7 +2728,7 @@ class _Flow:
                     if iterator.group(1) in {'const', 'let'}:
                         loop_names.update(iteration[0])
             if node.kind == 'for' and len(header) == 3:
-                loop_names.update(name for kind, names, _, _ in _declaration_entries(
+                loop_names.update(name for kind, names, _, _, _ in _declaration_entries(
                     self.engine.text, self.scope.code, *header[0]) if kind != 'var' for name in names)
                 for name in loop_names:
                     state.owners[name] = self.engine.binding(self.scope, name, node.start)
@@ -2516,6 +2823,8 @@ class _Engine:
         self.graph = graph
         self.source_free = False
         self.module_roots = {}
+        self.module_kinds, self.strict_modes = {}, {}
+        self.global_undefined_vars = set()
         self.default_targets = {}
         self.commonjs_targets = {}
         self.commonjs_namespace_refs = {}
@@ -2546,7 +2855,19 @@ class _Engine:
             sinks.extend((match.start(), match.end(), rule, label, call) for match in regex.finditer(code))
         self.call_sinks = {start: (rule, label) for start, _, rule, label, call in sinks if call}
         self.write_sinks = [(start, expr_start, rule, label) for start, expr_start, rule, label, call in sinks if not call]
-        if not sinks:
+        targets = [match.start() for match in BINDING_WRITE_TARGET.finditer(text)
+                   if code[match.start()] == text[match.start()]]
+        self.binding_write_sinks = False
+        if targets:
+            assignment_after = re.compile(r'\s*=(?!=|>)')
+            for opening, closing in _pairs(code).items():
+                if code[opening] not in '[{' or not assignment_after.match(code, closing + 1):
+                    continue
+                candidate = bisect_right(targets, opening)
+                if candidate < len(targets) and targets[candidate] < closing:
+                    self.binding_write_sinks = True
+                    break
+        if not sinks and not self.binding_write_sinks:
             # No rule can emit a finding without one of these exact sinks.
             # Avoid parsing scopes and constructing their capture graph for
             # sink-free components; every selected module was still inspected.
@@ -2562,8 +2883,9 @@ class _Engine:
                     scope.body_start += module.start
                     scope.body_end += module.start
                     scope.params = tuple((names, rest, None if default is None else
-                                          (default[0] + module.start, default[1] + module.start))
-                                         for names, rest, default in scope.params)
+                                          (default[0] + module.start, default[1] + module.start),
+                                          (pattern[0] + module.start, pattern[1] + module.start))
+                                         for names, rest, default, pattern in scope.params)
                     scope.code = code if scope.code == module.code else _ComponentCode(
                         code, scope.code, module.start)
                 module.root = root
@@ -2641,7 +2963,9 @@ class _Engine:
         for scope in self.functions:
             keys, targets = set(), set()
             ranges = [(scope.body_start, scope.body_end)]
-            ranges.extend(default for _names, _rest, default in scope.params if default is not None)
+            ranges.extend(default for _names, _rest, default, _pattern in scope.params if default is not None)
+            ranges.extend(pattern for _names, _rest, _default, pattern in scope.params
+                          if text[slice(*pattern)].lstrip().startswith(('{', '[')))
             for left, right in ranges:
                 for match in re.finditer(r'(?<![\w$.])[A-Za-z_$][\w$]*', scope.code[left:right]):
                     start, end = left + match.start(), left + match.end()
@@ -2671,9 +2995,22 @@ class _Engine:
             scope for scope in self.functions
             if any(re.search(r'[\[{]', scope.code[left:right])
                    for left, right in [(scope.body_start, scope.body_end),
-                                       *(default for _, _, default in scope.params
-                                         if default is not None)])
+                                       *(default for _, _, default, _ in scope.params
+                                         if default is not None),
+                                       *(pattern for _, _, _, pattern in scope.params)])
         }
+        # Shadowing identifies a lexical cell; it does not prove that the
+        # cell contains a defined value. These functions need the same finite
+        # caller contexts used for borrowed objects so a missing actual and a
+        # clean string actual do not share one default-initializer decision.
+        self.input_kind_scopes = {
+            scope for scope in self.functions
+            if any(name == 'undefined' for _left, _right, name in self.binding_regions[scope])
+            or any(key[2] == 'undefined' and any(left == key[1] and name == key[2]
+                   for left, _right, name in self.binding_regions[key[0]])
+                   for key in self.capture_keys[scope])
+        }
+        self.heap_scopes.update(self.input_kind_scopes)
         # Factories hidden behind ordinary local wrappers still need an object
         # result, including allocations/throws in parameter initializers. The
         # capture graph already includes those calls and named arrow helpers.
@@ -2681,9 +3018,116 @@ class _Engine:
         while True:
             added = {scope for scope in self.functions if scope not in self.heap_scopes
                      and self.local_targets[scope] & self.heap_scopes}
-            if not added:
+            kind_added = {scope for scope in self.functions if scope not in self.input_kind_scopes
+                          and self.local_targets[scope] & self.input_kind_scopes}
+            if not added and not kind_added:
                 break
             self.heap_scopes.update(added)
+            self.input_kind_scopes.update(kind_added)
+
+    def module_kind(self, root):
+        if root in self.module_kinds:
+            return self.module_kinds[root]
+        module = self.module_roots.get(root)
+        kind = ('module' if module is not None and module.path.suffix in {'.mjs', '.mts'}
+                else 'commonjs' if module is not None and module.path.suffix in {'.cjs', '.cts'}
+                else 'script')
+        # The module graph masks static import/export syntax for flow parsing.
+        # Inspect its original lexical view once, skipping nested expressions
+        # and bodies, to recognize ESM strictness even in a selected .js file.
+        source = self.text[root.body_start:root.body_end]
+        self.budget.spend(len(source))
+        code = lexical_views(source)[1]
+        pairs, cursor = _pairs(code), 0
+        if source.startswith('#!'):
+            while cursor < len(code) and source[cursor] not in '\n\r\u2028\u2029':
+                self.budget.spend()
+                cursor += 1
+        identifier = re.compile(r'[A-Za-z_$][\w$]*')
+        while cursor < len(code) and kind != 'module':
+            self.budget.spend()
+            if code[cursor] in '([{' and cursor in pairs:
+                cursor = pairs[cursor] + 1
+                continue
+            word = identifier.match(code, cursor)
+            if word is not None:
+                after = word.end()
+                if word.group() in {'import', 'export'}:
+                    before = cursor - 1
+                    while before >= 0 and (code[before].isspace() or code[before] == '\ufeff'):
+                        before -= 1
+                    lookahead = after
+                    while lookahead < len(code) and (code[lookahead].isspace() or code[lookahead] == '\ufeff'):
+                        lookahead += 1
+                    if (before < 0 or code[before] != '.') and (word.group() == 'export'
+                            or code[lookahead:lookahead + 1] != '('):
+                        kind = 'module'
+                cursor = after
+            else:
+                cursor += 1
+        self.module_kinds[root] = kind
+        return kind
+
+    def strict_directive(self, scope):
+        if scope.concise:
+            return False
+        source, cursor, end = self.text, scope.body_start, scope.body_end
+        if scope.parent is None and source[cursor:cursor + 2] == '#!':
+            # A legal root hashbang is a comment before the directive prologue.
+            while cursor < end and source[cursor] not in '\n\r\u2028\u2029':
+                self.budget.spend()
+                cursor += 1
+        while cursor < end:
+            while cursor < end and (source[cursor].isspace() or source[cursor] == '\ufeff'):
+                cursor += 1
+            if source[cursor:cursor + 1] not in {'"', "'"}:
+                return False
+            start, quote = cursor, source[cursor]
+            cursor += 1
+            while cursor < end and source[cursor] != quote:
+                self.budget.spend()
+                cursor += 2 if source[cursor] == '\\' else 1
+            if cursor >= end:
+                return None
+            cursor += 1
+            literal_end = cursor
+            while cursor < end and (source[cursor].isspace() or source[cursor] == '\ufeff'):
+                cursor += 1
+            if cursor < end and source[cursor] != ';':
+                gap = source[literal_end:cursor]
+                if not any(char in gap for char in '\n\r\u2028\u2029'):
+                    return False  # The string is part of a larger expression.
+                word = re.match(r'[A-Za-z_$][\w$]*', source[cursor:end])
+                if word is None or word.group() in {'in', 'instanceof'}:
+                    # Restricted-line-terminator and continuation forms require
+                    # more grammar than this bounded directive recognizer.
+                    return None
+            if source[start:literal_end] in {'"use strict"', "'use strict'"}:
+                return True
+            if source[cursor:cursor + 1] == ';':
+                cursor += 1
+        return False
+
+    def strict_mode(self, scope):
+        original, pending, result = scope, [], False
+        while scope is not None:
+            if scope in self.strict_modes:
+                result = self.strict_modes[scope]
+                break
+            self.budget.spend()
+            directive = self.strict_directive(scope)
+            if directive is True or (scope.parent is None and self.module_kind(scope) == 'module'):
+                self.strict_modes[scope] = result = True
+                break
+            # The selected method recognizer includes both intrinsically strict
+            # class methods and possibly sloppy object methods. Do not guess.
+            pending.append((scope, directive is None or scope.method))
+            scope = scope.parent
+        for scope, uncertain in reversed(pending):
+            if uncertain and result is not True:
+                result = None
+            self.strict_modes[scope] = result
+        return self.strict_modes[original]
 
     def selected_import(self, scope, name):
         key = self.lexical_binding(scope, name)
@@ -2756,6 +3200,7 @@ class _Engine:
             return frozenset()
         fact = source.cells.get(key, source.get(key[2], frozenset()))
         state.cells[key] = fact
+        state.binding_kinds[key] = source.binding_kinds.get(key)
         pending = list(_refs(fact))
         while pending:
             ref = pending.pop()
@@ -2771,6 +3216,7 @@ class _Engine:
                         state.written_cells.add(exported)
                         if exported in source.cells:
                             state.cells[exported] = source.cells[exported]
+                            state.binding_kinds[exported] = source.binding_kinds.get(exported)
             for value in state.heap[ref].values():
                 pending.extend(_refs(value) - state.heap.keys())
             if ref in source.array_lengths:
@@ -2841,8 +3287,11 @@ class _Engine:
         # a separate heap context; unrelated caller cells cannot affect it.
         return (callee in self.heap_scopes
                 or any(_refs(fact) for fact in bound.values())
-                or any(_refs(fact) for key, fact in state.cells.items()
-                       if key in self.capture_keys[callee]))
+                # Unassigned formals live in the visible-name map. Use the
+                # same lexical lookup as heap_input so a nested setter or
+                # property reader cannot lose its captured object's identity
+                # by taking a scalar summary before the first assignment.
+                or any(_refs(_cell_value(key, state)) for key in self.capture_keys[callee]))
 
     def heap_input(self, callee, bound, incoming, recursive):
         state = _State(budget=self.budget)
@@ -2856,6 +3305,9 @@ class _Engine:
         available = incoming.cells.keys() | incoming.owners.values()
         state.cells = {key: _cell_value(key, incoming) for key in available
                        if key[0] in ancestors and key in self.capture_keys[callee]}
+        state.binding_kinds = {key: incoming.binding_kinds.get(key) for key in state.cells}
+        state.binding_kinds.update({self.binding(callee, name): kind
+                                    for name, kind in getattr(bound, 'kinds', {}).items()})
         for name, key in incoming.owners.items():
             if key in state.cells and self.binding(callee, name) == key:
                 state[name], state.owners[name] = state.cells[key], key
@@ -2914,6 +3366,7 @@ class _Engine:
         else:
             signature = (callee, rule, location, frozenset(bound.items()),
                          frozenset(incoming.cells.items()), frozenset(incoming.bindings.items()),
+                         frozenset(incoming.binding_kinds.items()),
                          frozenset((ref, frozenset(slots.items())) for ref, slots in incoming.heap.items()),
                          frozenset(incoming.weak_refs), frozenset(incoming.array_lengths.items()))
             context = self.heap_calls.get(signature)
@@ -2983,13 +3436,13 @@ class _Engine:
             self.enqueue(context)
         return context
 
-    def apply_heap_output(self, incoming, state, output, writes, returned, location, *, widened=None):
+    def apply_heap_output(self, incoming, state, output, writes, returned, location, *, widened=None, bound=None):
         self.budget.spend(1 + _heap_work(output.heap))
 
         def fresh(ref):
             if _collapsed(ref):
                 return ref
-            # Tagged sites (catch-rest and CommonJS namespaces) have a string
+            # Tagged sites (binding-rest and CommonJS namespaces) have a string
             # discriminator. Only a trailing frozenset is a call history; keep
             # the entire allocation site rather than dropping its discriminator.
             has_history = len(ref) > 2 and isinstance(ref[-1], frozenset)
@@ -3032,10 +3485,14 @@ class _Engine:
         for key, fact in writes.items():
             value = translate(fact)
             state.cells[key] = value
+            state.binding_kinds[key] = output.binding_kinds.get(key)
             state.written_cells.add(key)
             name = key[2]
             if name not in state or state.owners.get(name) == key:
                 state[name], state.owners[name], state.bindings[name] = value, key, None
+        if bound is not None:
+            for name, fact in bound.items():
+                bound[name] = translate(fact)
         return translate(returned)
 
     def analyze_heap(self, context):
@@ -3045,14 +3502,17 @@ class _Engine:
         for name in self.declarations(statements):
             state[name], state.bindings[name] = frozenset(), None
             state.owners[name] = self.binding(scope, name)
-        for names, _, _ in scope.params:
+            state.binding_kinds[state.owners[name]] = 'undefined'
+        for names, _, _, _ in scope.params:
             for name in names:
                 state[name] = context.bound.get(name, frozenset())
                 state.bindings[name], state.owners[name] = None, self.binding(scope, name)
+                state.binding_kinds[state.owners[name]] = context.incoming.binding_kinds.get(state.owners[name])
         for child in scope.children:
             if child.name and child.declaration:
                 state.bindings[child.name] = child
                 state.owners[child.name] = self.binding(scope, child.name, child.start)
+                state.binding_kinds[state.owners[child.name]] = 'present'
         flow = _Flow(self, scope, rule)
         if scope.concise:
             value, final = flow.branch_value(scope.body_start, scope.body_end, state)
@@ -3090,7 +3550,8 @@ class _Engine:
                 for fact in slots.values():
                     pending.extend(_refs(fact) - heap.keys())
             return _HeapOutput(heap, store.weak_refs & heap.keys(),
-                               {ref: length for ref, length in store.array_lengths.items() if ref in heap})
+                               {ref: length for ref, length in store.array_lengths.items() if ref in heap},
+                               {key: store.binding_kinds.get(key) for key in changes})
 
         return (returned, flow.effects, normal_writes, escaped_heap(output, returned, normal_writes),
                 thrown, throw_writes, escaped_heap(exceptional, thrown, throw_writes))
@@ -3098,14 +3559,16 @@ class _Engine:
     def regions(self, scope):
         """Static lexical identities; dataflow state still supplies values."""
         regions = [(scope.body_start, scope.body_end, name)
-                   for names, _, _ in scope.params for name in names]
+                   for names, _, _, _ in scope.params for name in names]
         blocks = [(scope.body_start, scope.body_end)]
         pending = [(scope.statements, scope.body_start, scope.body_end)]
         while pending:
             statements, left, right = pending.pop()
             for node in statements:
                 if node.kind == 'expression':
-                    for kind, names, _, _ in _declaration_entries(self.text, scope.code, node.start, node.end):
+                    for kind, names, _, _, _ in _declaration_entries(self.text, scope.code, node.start, node.end):
+                        if kind == 'var' and 'undefined' in names and scope.parent is None:
+                            self.global_undefined_vars.add(scope)
                         begin, finish = (scope.body_start, scope.body_end) if kind == 'var' else (left, right)
                         regions.extend((begin, finish, name) for name in names)
                 if node.kind == 'block':
@@ -3115,13 +3578,18 @@ class _Engine:
                     if node.kind == 'for':
                         finish = max((child.end for child in node.body), default=node.end)
                         header = next(_chunks(scope.code, node.start, node.end, ';'))
-                        for kind, names, _, _ in _declaration_entries(self.text, scope.code, *header):
+                        for kind, names, _, _, _ in _declaration_entries(self.text, scope.code, *header):
+                            if kind == 'var' and 'undefined' in names and scope.parent is None:
+                                self.global_undefined_vars.add(scope)
                             begin, stop = (scope.body_start, scope.body_end) if kind == 'var' else (node.start, finish)
                             regions.extend((begin, stop, name) for name in names)
                         iterator = re.match(r'\s*(let|const|var)\s+(.+?)\s+(?:of|in)\b', self.text[node.start:node.end])
                         if iterator:
+                            names = _binding_names(iterator.group(2))
+                            if iterator.group(1) == 'var' and 'undefined' in names and scope.parent is None:
+                                self.global_undefined_vars.add(scope)
                             begin, stop = (scope.body_start, scope.body_end) if iterator.group(1) == 'var' else (node.start, finish)
-                            regions.extend((begin, stop, name) for name in _binding_names(iterator.group(2)))
+                            regions.extend((begin, stop, name) for name in names)
                     pending.append((node.body, left, right))
                 pending.append((node.alternate, left, right))
                 if node.kind == 'try':
@@ -3184,7 +3652,7 @@ class _Engine:
         while pending:
             node, direct = pending.pop()
             if node.kind == 'expression':
-                for kind, targets, _, _ in _declaration_entries(self.text, self.code, node.start, node.end):
+                for kind, targets, _, _, _ in _declaration_entries(self.text, self.code, node.start, node.end):
                     if (direct and (not block or kind != 'var')) or (not block and kind == 'var'):
                         names.update(targets)
             if not block:
@@ -3198,20 +3666,28 @@ class _Engine:
         return [] if scope.concise else _Parser(scope).sequence(scope.body_start, scope.body_end)
 
     def analyze(self, scope, rule):
+        if scope in self.global_undefined_vars and self.module_kind(scope) == 'script':
+            # Global var declarations are instantiated even in unreachable code.
+            # A script reuses the nonwritable builtin, while CommonJS/ESM create
+            # a local cell. Plain .js cannot prove that declaration environment.
+            raise AnalysisLimit('top-level var undefined requires a known module declaration environment')
         statements = self.scope_statements(scope)
         state = _State(budget=self.budget)
         for name in self.declarations(statements):
             state[name], state.bindings[name] = frozenset(), None
             state.owners[name] = self.binding(scope, name)
-        for names, _, _ in scope.params:
+            state.binding_kinds[state.owners[name]] = 'undefined'
+        for names, _, _, _ in scope.params:
             for name in names:
                 state[name] = frozenset({_Trace(('parameter', scope, name), (name,))})
                 state.bindings[name] = None
                 state.owners[name] = self.binding(scope, name)
+                state.binding_kinds[state.owners[name]] = None
         for child in scope.children:
             if child.name and child.declaration:
                 state.bindings[child.name] = child
                 state.owners[child.name] = self.binding(scope, child.name, child.start)
+                state.binding_kinds[state.owners[child.name]] = 'present'
         flow = _Flow(self, scope, rule)
         if scope.concise:
             value, final = flow.branch_value(scope.body_start, scope.body_end, state)
@@ -3289,7 +3765,33 @@ class _Engine:
                 for caller in self.dependents[(scope, rule)]:
                     self.enqueue(caller)
         self.current_task = None
+        callers, callees = defaultdict(set), defaultdict(set)
+        for (callee, domain), readers in self.dependents.items():
+            if domain != rule:
+                continue
+            for reader in readers:
+                caller = reader.scope if isinstance(reader, _HeapCall) else reader
+                callers[callee].add(caller)
+                callees[caller].add(callee)
+        # Follow concrete entry summaries, retaining independent summaries
+        # for uncalled functions and isolated recursive components. A cycle
+        # with no outside entry must not lose its direct source evidence.
+        pending = [scope for scope in self.scopes if scope.parent is None or not callers[scope]]
+        seen, invoked = set(), set()
+        while pending:
+            caller = pending.pop()
+            if caller in seen:
+                continue
+            seen.add(caller)
+            self.budget.spend(1 + len(callees[caller]))
+            invoked.update(callees[caller])
+            pending.extend(callees[caller] - seen)
         for scope in self.scopes:
+            if scope in self.input_kind_scopes and scope in invoked:
+                # These defaults depend on actual definedness, which a
+                # symbolic parameter trace cannot express. Concrete callers
+                # already publish the effects of their separate contexts.
+                continue
             for (location, label), fact in self.summaries[(scope, rule)][1].items():
                 if self.dependents[(scope, rule)]:
                     # Known call sites already instantiated captures at
@@ -3308,6 +3810,8 @@ class _Engine:
         found, failures = {}, []
         active_rules = {rule for rule, _label in self.call_sinks.values()}
         active_rules.update(rule for _location, _expr_start, rule, _label in self.write_sinks)
+        if self.binding_write_sinks:
+            active_rules.add('js.taint.xss')
         for rule in KIND_BY_RULE:
             if rule not in active_rules:
                 continue

@@ -24,6 +24,18 @@ if str(HELPERS_DIR) not in sys.path:
 
 from ubs_core.findings_merge import load_sink, merge, to_sarif  # noqa: E402
 
+
+def sarif_uri(path) -> str:
+    """The SARIF 2.1.0 section 3.10 form of a native path, computed independently.
+
+    An absolute path is a file URI (pathlib's own encoding); a relative path is
+    a percent-encoded relative reference.
+    """
+    from urllib.parse import quote
+
+    native = Path(path)
+    return native.as_uri() if native.is_absolute() else quote(str(path))
+
 SUMMARY_DOC = {
     "scanners": [
         {"language": "python", "files": 1, "critical": 0, "warning": 0, "info": 0, "status": "ok"},
@@ -484,10 +496,84 @@ class FindingsMergeTests(unittest.TestCase):
                 self.assertEqual(finding["level"], "error")
                 self.assertEqual(finding["message"]["text"], expected["message"])
                 physical = finding["locations"][0]["physicalLocation"]
-                self.assertEqual(physical["artifactLocation"]["uri"], expected["path"])
+                # SARIF 2.1.0 section 3.10.1: the space is percent-encoded.
+                self.assertEqual(physical["artifactLocation"]["uri"], "space%20dir/query.py")
+                self.assertEqual(physical["artifactLocation"]["uri"], sarif_uri(expected["path"]))
                 self.assertEqual(physical["region"], {"startLine": expected["line"], "startColumn": 3})
             self.assertFalse(run["invocations"][0]["executionSuccessful"])
             self.assertEqual(run["invocations"][0]["exitCode"], 2)
+
+    def test_sarif_artifact_locations_are_rfc3986_uris(self) -> None:
+        # SARIF 2.1.0 section 3.10.1: every URI-valued property is an RFC 3986
+        # string, so ' ', '#', '?' and '%' in a file name must not read as URI
+        # syntax (a fragment, a query, an escape). Section 3.10.2: file URIs
+        # start with file:///. Primary locations and taint code flows agree.
+        from urllib.parse import unquote, urlparse
+
+        expected = {
+            "/src/source #100%.py": "file:///src/source%20%23100%25.py",
+            "/src/q?x=1.py": "file:///src/q%3Fx%3D1.py",
+            "/src/sör.py": "file:///src/s%C3%B6r.py",
+            "rel dir/a#b.py": "rel%20dir/a%23b.py",
+            "plain/ok.py": "plain/ok.py",
+            # An already encoded file URI is kept, not encoded again.
+            "file:///src/encoded%20name.py": "file:///src/encoded%20name.py",
+        }
+        findings = [{"rule": "py.sql", "path": name, "line": line, "col": 1, "severity": "critical",
+                     "message": "unsafe SQL",
+                     "extras": {"taint_path": [{"path": name, "line": line, "col": 1,
+                                                "kind": "source", "label": "request"}]}}
+                    for line, name in enumerate(expected, 1)]
+        sarif = to_sarif({"language": "python", "findings": findings},
+                         git_blob_base="https://example.test/o/r/blob/abc", git_top="/src")
+        results = sarif["runs"][0]["results"]
+        self.assertEqual(len(results), len(expected))
+        for (name, uri), result in zip(expected.items(), results):
+            with self.subTest(path=name):
+                location = result["locations"][0]
+                self.assertEqual(location["physicalLocation"]["artifactLocation"]["uri"], uri)
+                flow = result["codeFlows"][0]["threadFlows"][0]["locations"][0]["location"]
+                self.assertEqual(flow["physicalLocation"]["artifactLocation"]["uri"], uri)
+                parsed = urlparse(uri)
+                self.assertEqual((parsed.query, parsed.fragment), ("", ""))
+                if not name.startswith("file://"):
+                    self.assertEqual(unquote(parsed.path), name)
+                    self.assertEqual(uri, sarif_uri(name))
+        permalinks = [result["locations"][0]["properties"]["permalink"] for result in results]
+        # The permalink is a URL as well; its path is encoded exactly once.
+        self.assertEqual(permalinks[0], "https://example.test/o/r/blob/abc/source%20%23100%25.py#L1")
+        self.assertEqual(permalinks[3], "https://example.test/o/r/blob/abc/rel%20dir/a%23b.py#L4")
+        self.assertEqual(permalinks[5], "https://example.test/o/r/blob/abc/encoded%20name.py#L6")
+
+    def test_public_sarif_names_special_file_names_by_uri(self) -> None:
+        from urllib.parse import unquote, urlparse
+
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="ubs-sarif-uri-", dir=artifacts) as tmp:
+            root = Path(tmp).resolve()
+            project = root / "project"
+            source = project / "sub dir" / "source #100%.py"
+            source.parent.mkdir(parents=True)
+            source.write_text("def run(value):\n    eval(value)\n", encoding="utf-8")
+            env = {key: value for key, value in os.environ.items()
+                   if not key.startswith(("UBS_", "XDG_"))}
+            env.update(NO_COLOR="1", UBS_NO_AUTO_UPDATE="1", UBS_NO_CACHE="1",
+                       PYTHONDONTWRITEBYTECODE="1", XDG_DATA_HOME=str(root / "data"),
+                       XDG_CACHE_HOME=str(root / "cache"))
+            proc = subprocess.run([str(REPO_ROOT / "ubs"), "--ci", "--no-config", "--only=python",
+                                   "--format=sarif", str(project)], cwd=root, env=env,
+                                  capture_output=True, text=True, timeout=180, check=False)
+            detail = f"exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+            self.assertIn(proc.returncode, (0, 1), detail)
+            uris = {location["physicalLocation"]["artifactLocation"]["uri"]
+                    for run in decode_report(self, proc.stdout, detail)["runs"]
+                    for result in run["results"] for location in result.get("locations", [])}
+            self.assertIn(source.as_uri(), uris, detail)
+            for uri in uris:
+                parsed = urlparse(uri)
+                self.assertEqual((parsed.scheme, parsed.query, parsed.fragment), ("file", "", ""), uri)
+                self.assertTrue(Path(unquote(parsed.path)).is_file(), uri)
 
     def test_standalone_sarif_refuses_lost_or_corrupt_sink(self) -> None:
         from ubs_core.cli import main
@@ -651,7 +737,7 @@ class FindingsMergeTests(unittest.TestCase):
                                 self.assertEqual(result["level"], "note")
                                 self.assertNotIn("scope", result["properties"])
                                 physical = result["locations"][0]["physicalLocation"]
-                                self.assertEqual(physical["artifactLocation"]["uri"], str(source))
+                                self.assertEqual(physical["artifactLocation"]["uri"], sarif_uri(source))
                                 self.assertEqual(physical["region"],
                                                  {"startLine": 1, "startColumn": 1})
 
@@ -680,7 +766,7 @@ class FindingsMergeTests(unittest.TestCase):
             self.assertNotIn("kind", result)
             self.assertNotIn("scope", result["properties"])
             physical = result["locations"][0]["physicalLocation"]
-            self.assertEqual(physical["artifactLocation"]["uri"], str(source))
+            self.assertEqual(physical["artifactLocation"]["uri"], sarif_uri(source))
             self.assertEqual(physical["region"], {"startLine": 1, "startColumn": 1})
 
             # A retained source info occurrence still counts when a zero-count
@@ -774,7 +860,7 @@ class FindingsMergeTests(unittest.TestCase):
                         self.assertEqual(result["level"], "note")
                         self.assertNotIn("scope", result["properties"])
                         physical = result["locations"][0]["physicalLocation"]
-                        self.assertEqual(physical["artifactLocation"]["uri"], str(first))
+                        self.assertEqual(physical["artifactLocation"]["uri"], sarif_uri(first))
                         self.assertEqual(physical["region"], {"startLine": 6, "startColumn": 1})
 
             check_sarif({"language": "swift", "findings": records}, [record["rule"] for record in records])
@@ -977,7 +1063,7 @@ class FindingsMergeTests(unittest.TestCase):
             self.assertEqual(result["ruleId"], "rb.nil-eq.eq")
             self.assertEqual(result["level"], "warning")
             location = result["locations"][0]["physicalLocation"]
-            self.assertEqual(location["artifactLocation"]["uri"], str(source))
+            self.assertEqual(location["artifactLocation"]["uri"], sarif_uri(source))
             self.assertEqual(location["region"], {"startLine": 1, "startColumn": 1})
             self.assertEqual(runs["ubs-ruby-ast"]["versionControlProvenance"][0]["revisionId"], "revision")
 

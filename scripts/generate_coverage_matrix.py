@@ -25,11 +25,14 @@ LANG_SHORT_DISPLAYS = {
     "golang": "Go",
     "rust": "Rust",
     "java": "Java",
+    "kotlin": "Kotlin",
     "cpp": "C / C++",
     "ruby": "Ruby",
     "swift": "Swift",
     "csharp": "C#",
     "elixir": "Elixir",
+    "bash": "Bash",
+    "php": "PHP",
 }
 
 

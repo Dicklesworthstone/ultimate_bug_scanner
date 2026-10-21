@@ -265,23 +265,25 @@ class JavaScriptScopeTests(unittest.TestCase):
     def test_typed_parameter_does_not_gain_a_phantom_default(self):
         text = 'callback: () => string'
         params = taint_js._parameters(text, taint_js.lexical_views(text)[1], 0, len(text))
-        self.assertEqual(params, ((('callback',), False, None),))
+        self.assertEqual(params, ((('callback',), False, None, (0, len(text))),))
 
     def test_typed_parameter_preserves_its_real_default(self):
         text = 'callback: () => string = fallback'
         params = taint_js._parameters(text, taint_js.lexical_views(text)[1], 0, len(text))
-        names, rest, default = params[0]
+        names, rest, default, pattern = params[0]
         self.assertEqual(names, ('callback',))
         self.assertFalse(rest)
         self.assertEqual(text[slice(*default)].strip(), 'fallback')
+        self.assertEqual(text[slice(*pattern)].strip(), 'callback: () => string')
 
     def test_typed_declaration_preserves_its_real_initializer(self):
         text = 'const read: () => string = () => req.query.html'
         entries = taint_js._declaration_entries(text, taint_js.lexical_views(text)[1], 0, len(text))
         self.assertEqual(len(entries), 1)
-        _, names, begin, end = entries[0]
+        _, names, pattern, begin, end = entries[0]
         self.assertEqual(names, ['read'])
         self.assertEqual(text[begin:end].strip(), '() => req.query.html')
+        self.assertEqual(text[pattern:begin - 1].strip(), 'read: () => string')
 
     def test_type_arrows_do_not_create_phantom_scopes(self):
         text = 'const read: () => string = () => req.query.html;'

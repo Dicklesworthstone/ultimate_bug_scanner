@@ -15,9 +15,7 @@ v2 yields one record per mutating loop, reporting the loop line with its
 code sample as the detail. The heredoc walked rglob("*.py"), so .pyi files
 are not scanned here.
 
-`ubs:ignore` on the hit line or the line immediately before suppresses a
-record, mirroring the marker semantics of the other detector ports (the
-legacy heredoc predated the marker).
+Comment directives use shared statement ownership and exact rule scopes.
 """
 from __future__ import annotations
 
@@ -25,7 +23,7 @@ import ast
 from pathlib import Path
 from typing import Iterable, Sequence
 
-from ubs_core.py_scan import MARKER
+from ubs_core.suppression import SourceSuppressions
 
 RULE_ID = "py.collections.mutation-during-iteration"
 CATEGORY = 3
@@ -63,6 +61,7 @@ def _body_mutates(body, name):
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
+    suppressions = SourceSuppressions("python")
     for path in files:
         if path.suffix.lower() != '.py':
             continue
@@ -74,6 +73,7 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
         except Exception:
             continue
         lines = text.splitlines()
+        index = suppressions.index(path, text)
         for node in ast.walk(tree):
             if not isinstance(node, ast.For) or not isinstance(node.iter, ast.Name):
                 continue
@@ -81,7 +81,7 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
                 continue
             line_no = node.lineno
             idx = line_no - 1
-            if any(0 <= i < len(lines) and MARKER in lines[i] for i in (idx, idx - 1)):
+            if index.is_suppressed(line_no, RULE_ID):
                 continue
             code = lines[idx].strip()[:240] if 0 <= idx < len(lines) else ''
             yield path, line_no, 1, code

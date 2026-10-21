@@ -281,7 +281,7 @@ class Parser:
                 start, end = following + 1, self.pairs[following]
                 body = self.block(start, end)
             else:
-                start = following + 1
+                start = self.skip(following + 1, len(self.code))
                 end = self.end_statement(start, len(self.code))
                 body = (Statement(start, end, 'return'),)
             owner = tuple(name for low, high, name in owners if low < match.start() < high)
@@ -356,6 +356,40 @@ class Parser:
         if self.code[beginning:end].strip() or beginning != original:
             yield beginning, end
 
+    def array_initializer(self, opening):
+        """Whether the Java `{` at `opening` opens an array initializer (GH #184).
+
+        JLS 10.6 initializers follow `=` in a declaration (`T[] a = {...}`)
+        or the dimensions of an array creation (`new T[]{...}`); nested
+        initializers follow `{` or `,`. Their elements are expressions, so the
+        braces evaluate like parentheses. Lambda bodies and anonymous class
+        bodies (anywhere inside, too) contain statements and stay unsupported.
+        Kotlin has no brace initializer: `= {` there is a lambda.
+        """
+        if self.kotlin:
+            return False
+
+        def shape(position, nested):
+            previous = position - 1
+            while previous >= 0 and self.code[previous].isspace():
+                previous -= 1
+            if previous < 0:
+                return False
+            char = self.code[previous]
+            if nested and char in '{,':
+                return True
+            if char == '=':
+                return previous == 0 or self.code[previous - 1] not in '=!<>'
+            if char != ']':
+                return False
+            window = self.code[max(0, previous - 400):previous + 1]
+            return re.search(r'\bnew\s+[A-Za-z_$][\w$.]*(?:\s*<[^;{}()]*>)?(?:\s*\[\s*\])+$', window) is not None
+
+        if not shape(opening, False):
+            return False
+        close = self.pairs[opening]
+        return all(shape(index, True) for index in range(opening + 1, close) if self.code[index] == '{')
+
     def end_statement(self, start, end):
         while start < end:
             char = self.code[start]
@@ -364,7 +398,9 @@ class Parser:
             if char in '([':
                 start = self.pairs[start]
             elif char == '{':
-                raise ValueError('Unsupported Java/Kotlin expression block; analysis is incomplete')
+                if not self.array_initializer(start):
+                    raise ValueError('Unsupported Java/Kotlin expression block; analysis is incomplete')
+                start = self.pairs[start]
             start += 1
         return end
 
@@ -382,7 +418,8 @@ class Parser:
         if self.code[start] == '{':
             finish = self.pairs[start]
             return Statement(start, finish + 1, 'block', self.block(start + 1, finish)), finish + 1
-        requirement = re.match(r'require\s*\(', self.code[start:end]) if self.kotlin else None
+        # Kotlin check(...) throws on a false condition exactly like require.
+        requirement = re.match(r'(require|check)\s*\(', self.code[start:end]) if self.kotlin else None
         if requirement:
             opening = start + requirement.end() - 1
             close = self.pairs[opening]
@@ -390,7 +427,7 @@ class Parser:
             if self.code[following:following + 1] == '{':
                 finish = self.pairs[following]
                 if self.code[following + 1:finish].strip() not in {'', '0'}:
-                    raise ValueError('Executable Kotlin require message needs callback analysis; analysis is incomplete')
+                    raise ValueError(f'Executable Kotlin {requirement.group(1)} message needs callback analysis; analysis is incomplete')
                 following = finish + 1
             return Statement(start, following, 'require', header=(opening + 1, close)), following
         control = re.match(r'(if|while|for|synchronized)\s*\(', self.code[start:end])
@@ -476,13 +513,58 @@ class Engine:
     path_constructors = True
 
     def __init__(self, path, text):
-        self.path, self.text = path, text
+        # FindingSink canonicalizes source locations; evidence and source keys
+        # must identify that same file when selection used a symlink alias.
+        self.path, self.text = path.resolve(), text
         self.parser = Parser(text, path.suffix.lower() in {'.kt', '.kts'}, self.source_re, self.sink_re)
         self.code = self.parser.code
         self.lines = [0, *(index + 1 for index, char in enumerate(text) if char == '\n')]
         self.budget = Budget()
         self.summaries = {key: Summary() for key in self.parser.functions}
         self.graphs = {}
+        self.shadowed_fields = set()
+        for match in re.finditer(r'\b([A-Za-z_]\w*)\s*(?::[^=;\n]+)?=(?!=)', self.code):
+            if any(function.key != -1 and function.declaration <= match.start() < function.end
+                   for function in self.parser.functions.values()):
+                continue
+            owner = tuple(name for low, high, name in self.parser.owners if low < match.start() < high)
+            self.shadowed_fields.add((owner, match.group(1)))
+        # A field can be assigned by a constructor, another method or caller.
+        # Its declaration shadows a factory even without an initializer here.
+        if self.parser.kotlin:
+            declarations = re.finditer(r'\b(?:val|var)\s+([A-Za-z_]\w*)\s*:', self.code)
+        else:
+            declarations = re.finditer(
+                r'\b[\w$]+(?:\.[\w$]+)*(?:\s*<[^;{}()]+>)?'
+                r'(?:\s*\[\s*\])*\s+([A-Za-z_]\w*)(?:\s*\[\s*\])*\s*(?=[=,;])', self.code)
+        for declaration in declarations:
+            position = declaration.start(1)
+            if any(function.key != -1 and function.declaration <= position < function.end
+                   for function in self.parser.functions.values()):
+                continue
+            scopes = [(low, high, name) for low, high, name in self.parser.owners if low < position < high]
+            if not self.parser.kotlin:
+                if not scopes or position < self.code.find('{', scopes[-1][0], scopes[-1][1]):
+                    continue
+            owner = tuple(name for _, _, name in scopes)
+            self.shadowed_fields.add((owner, declaration.group(1)))
+            if self.parser.kotlin:
+                continue
+            end = declaration.end(1)
+            while end < len(self.code) and self.code[end] not in ';}':
+                if self.code[end] in '([{':
+                    end = self.parser.pairs[end]
+                end += 1
+            if self.code[end:end + 1] == ';':
+                for low, high in self.parser.parts(position, end):
+                    name = re.match(r'\s*([A-Za-z_]\w*)(?:\s*\[\s*\])*\s*(?:=|$)', self.code[low:high])
+                    if name:
+                        self.shadowed_fields.add((owner, name.group(1)))
+
+    def call_is_shadowed(self, name, bindings):
+        return name in bindings or any(
+            field == name and owner == self.function.owner[:len(owner)]
+            for owner, field in self.shadowed_fields)
 
     def step(self, offset, kind, label):
         line = bisect_right(self.lines, offset)
@@ -643,13 +725,34 @@ class Engine:
             self.record(offset, value)
         return False
 
+    def _discharged_construction(self, summary, trace):
+        ctor_tags = frozenset(tag for tag in trace.tags if tag.startswith('ctor-site:'))
+        matches = [
+            item for item in summary.returned
+            if item.kind == trace.kind
+            and item.key == trace.key
+            and (
+                not (ctor_tags and (item_ctors := frozenset(tag for tag in item.tags if tag.startswith('ctor-site:'))))
+                or (ctor_tags <= item_ctors)
+            )
+        ]
+        if not matches or not all('contained-path' in item.tags for item in matches):
+            return False
+        if ctor_tags and not any(
+            ctor_tags <= frozenset(tag for tag in item.tags if tag.startswith('ctor-site:'))
+            for item in matches
+        ):
+            return False
+        return True
+
     def summary_effect(self, summary, fact):
         # Construction diagnostics are retained unless this selected helper
-        # proves containment for every return of the same symbolic value.
-        return frozenset(trace for trace in fact if not self.safe_sink_trace(trace)
-            and ('path-construction' not in trace.tags or not (
-            (matches := [item for item in summary.returned if item.kind == trace.kind and item.key == trace.key])
-            and all('contained-path' in item.tags for item in matches))))
+        # proves containment for every return of the same constructed Path value.
+        return frozenset(
+            trace for trace in fact
+            if not self.safe_sink_trace(trace)
+            and ('path-construction' not in trace.tags or not self._discharged_construction(summary, trace))
+        )
 
     def summary_return(self, fact, offset):
         return fact
@@ -858,6 +961,7 @@ class Engine:
                 else:
                     break
             if constructor is not None:
+                atom = retag(atom, add=frozenset({f'ctor-site:{constructor}'}))
                 self.record(constructor, retag(atom, add=frozenset({'path-construction'})))
             value = join(value, atom)
         if '+' in self.code[start:end]:
@@ -867,10 +971,12 @@ class Engine:
     def assignment(self, span):
         start, end = span
         text = self.code[start:end]
-        match = re.match(r'\s*(?:(?:final|val|var)\s+)?(?:[\w.]+(?:\s*<[^=;]+>)?(?:\[\])?\s+)?([A-Za-z_]\w*)\s*(?::\s*[\w.<>?]+\s*)?(\+?=)(?!=)', text)
+        # Java array declarators may repeat dimensions on the type
+        # (`String[][] m`) or put them after the name (`String m[]`).
+        match = re.match(r'\s*(?:(?:final|val|var)\s+)?(?:[\w.]+(?:\s*<[^=;]+>)?(?:\s*\[\s*\])*\s+)?([A-Za-z_]\w*)(?:\s*\[\s*\])*\s*(?::\s*[\w.<>?]+\s*)?(\+?=)(?!=)', text)
         if not match:
             return None
-        declaration = bool(re.match(r'\s*(?:final\s+)?(?:val|var|[\w.]+(?:\s*<[^=;]+>)?(?:\[\])?)\s+[A-Za-z_]\w*', text))
+        declaration = bool(re.match(r'\s*(?:final\s+)?(?:val|var|[\w.]+(?:\s*<[^=;]+>)?(?:\s*\[\s*\])*)\s+[A-Za-z_]\w*', text))
         return match.group(1), start + match.start(1), start + match.end(), end, match.group(2), declaration
 
     def unmodeled_write(self, span):
@@ -925,8 +1031,9 @@ class Engine:
                 if kind == 'definition':
                     continue
                 if kind == 'require':
-                    imported = re.search(r'\bimport\s+(?!kotlin\.require\s*(?:;|\r?$))[^\r\n;]*(?:\.require\b|\bas\s+require\b|\.\*)', self.code, re.MULTILINE)
-                    if not imported and 'require' not in local and not any(item.name == 'require' for item in self.parser.functions.values()):
+                    name = re.match(r'\s*(require|check)\b', self.code[statement.start:statement.end]).group(1)
+                    imported = re.search(r'\bimport\s+(?!kotlin\.' + name + r'\s*(?:;|\r?$))[^\r\n;]*(?:\.' + name + r'\b|\bas\s+' + name + r'\b|\.\*)', self.code, re.MULTILINE)
+                    if not imported and name not in local and not any(item.name == name for item in self.parser.functions.values()):
                         for truth, guard in self.guard_facts(statement.header):
                             if truth:
                                 entry = node('guard', statement.header, local, () if entry is None else (entry,), guard)
@@ -1225,11 +1332,29 @@ def _selftest_containment_guard_suppression() -> None:
         '  }\n'
         '}\n'
     )
+    mixed_code = (
+        'class Mixed {\n'
+        '  Path choose(Path root, String raw) {\n'
+        '    Path leaked = root.resolve(raw);\n'
+        '    Path safe = root.resolve(raw).normalize();\n'
+        '    if (!safe.startsWith(root)) { throw new SecurityException("bad"); }\n'
+        '    return safe;\n'
+        '  }\n'
+        '  void handler(Request request, Path root) {\n'
+        '    Files.readString(choose(root, request.getParameter("file")));\n'
+        '  }\n'
+        '}\n'
+    )
     with tempfile.TemporaryDirectory(prefix="ubs_core_taint_java_traversal_") as tmp:
         target = Path(tmp) / "A.java"
         target.write_text(code, encoding="utf-8")
         findings = list(run(RunContext(lang="java", files=[target])))
-    assert findings == [], findings
+        assert findings == [], findings
+
+        mixed_target = Path(tmp) / "Mixed.java"
+        mixed_target.write_text(mixed_code, encoding="utf-8")
+        mixed_findings = list(run(RunContext(lang="java", files=[mixed_target])))
+        assert [item["line"] for item in mixed_findings] == [3], mixed_findings
 
 
 SELF_TESTS: tuple[tuple[str, callable], ...] = (

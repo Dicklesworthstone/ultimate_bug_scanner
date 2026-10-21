@@ -31,7 +31,8 @@ class ObservationFixture:
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='ubs-notify-')
         self.addCleanup(self.tmp.cleanup)
-        self.work = Path(self.tmp.name)
+        # The daemon keys its socket by the canonical --repo (TMPDIR may be a symlink).
+        self.work = Path(self.tmp.name).resolve()
         self.root = self.work / 'project'
         self.root.mkdir()
         self.source = self.root / 'a.py'
@@ -348,7 +349,12 @@ class NativeWatchTests(ObservationFixture, unittest.TestCase):
         self.home.mkdir()
         self.env = {key: value for key, value in os.environ.items()
                     if not key.startswith(('UBS_', 'GIT_', 'XDG_', 'CLAUDE_', 'SCAN_'))}
-        self.env.update(HOME=str(self.home), XDG_RUNTIME_DIR=str(self.runtime),
+        # GH #166: keep Unix socket paths short under any TMPDIR; every peer
+        # runs in project/, so the private runtime is '../run'.
+        previous = os.getcwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, previous)
+        self.env.update(HOME=str(self.home), XDG_RUNTIME_DIR=os.path.join(os.pardir, 'run'),
                         XDG_CACHE_HOME=str(self.work / 'cache'), SCAN_COUNT=str(self.work / 'scans'),
                         PYTHONDONTWRITEBYTECODE='1', UBS_NO_AUTO_UPDATE='1')
         env = patch.dict(os.environ, self.env, clear=True)

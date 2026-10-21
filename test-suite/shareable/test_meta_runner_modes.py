@@ -299,10 +299,8 @@ def check_detection_without_contract(tmpdir: Path) -> None:
     """An installed runner has no modules/contract.json and must still detect
     languages.
 
-    `modules/contract.json` carries the per-language extension lists, but it is
-    not a checksum-verified asset, so it is never downloaded or cached: only a
-    repo checkout has one next to the runner. The file listing used the
-    contract as its ONLY source of extensions, so with no contract nothing
+    `modules/contract.json` carries the per-language extension lists. The file
+    listing once used the contract as its ONLY source of extensions, so with no contract nothing
     matched any language, every per-language list came back empty, and
     detect_lang reads an empty list as "this language is absent". An installed
     ubs therefore answered `no-supported-languages` (exit 3) for every project
@@ -313,8 +311,10 @@ def check_detection_without_contract(tmpdir: Path) -> None:
 
     The installed layout is reproduced exactly: the runner sits in a directory
     with no `modules/` sibling, and its module directory holds every module and
-    helper but no contract.json. Symlinks keep it hermetic — no download, and
-    the content still matches the runner's checksum tables.
+    helper but no contract.json. Downloads now verify the contract, so an
+    empty local release tree exercises actual transport unavailability without
+    depending on a mutable remote branch. A fetched checksum mismatch must
+    still fail closed; it cannot stand in for a missing asset.
     """
     env = {"NO_COLOR": "1", "UBS_ENABLE_AUTO_UPDATE": "0", "UBS_NO_AUTO_UPDATE": "1"}
     root = tmpdir / "installed_layout"
@@ -322,13 +322,16 @@ def check_detection_without_contract(tmpdir: Path) -> None:
     mod_dir = root / "moddir"
     bin_dir.mkdir(parents=True)
     mod_dir.mkdir(parents=True)
+    unavailable = root / "unavailable-release"
+    unavailable.mkdir()
+    env["UBS_REPO_RAW_BASE"] = unavailable.as_uri()
 
     runner = bin_dir / "ubs"
     shutil.copy2(UBS_BIN, runner)
     runner.chmod(0o755)
     for entry in sorted((REPO_ROOT / "modules").iterdir()):
         if entry.name == "contract.json":
-            continue  # the whole point: an installed runner never has it
+            continue  # Exercise unavailable installed metadata.
         (mod_dir / entry.name).symlink_to(entry)
     assert not (mod_dir / "contract.json").exists(), "test setup leaked a contract"
 
@@ -360,6 +363,38 @@ def check_detection_without_contract(tmpdir: Path) -> None:
         f"expected python and rust scanners, got {languages}\n"
         f"stderr:\n{res.stderr}"
     )
+    assert res.returncode in (0, 1), res.stdout + res.stderr
+    assert payload["status"] == "ok" and payload["failed_modules"] == [], payload
+    assert payload["totals"]["files"] == 2, payload
+    assert "using built-in extension hints" in res.stderr, res.stderr
+
+    # The same real downloader must reject available but unauthenticated
+    # metadata, rather than silently taking the unavailable-asset fallback.
+    corrupt = unavailable / "main" / "modules" / "contract.json"
+    corrupt.parent.mkdir(parents=True)
+    corrupt.write_text("{}\n", encoding="utf-8")
+    rejected = subprocess.run(
+        [str(runner), str(target), f"--module-dir={mod_dir}", "--format=json"],
+        cwd=root, capture_output=True, text=True, env=merged, check=False, timeout=300,
+    )
+    assert rejected.returncode == 2, rejected.stdout + rejected.stderr
+    assert "contract.json failed verification" in rejected.stderr, rejected.stderr
+    assert "checksum mismatch" in rejected.stderr, rejected.stderr
+    assert "using built-in extension hints" not in rejected.stderr, rejected.stderr
+    assert not (mod_dir / "contract.json").exists(), "rejected asset was installed"
+
+    # Matching installed bytes restore the same complete two-language scan.
+    shutil.copy2(REPO_ROOT / "modules/contract.json", mod_dir / "contract.json")
+    restored = subprocess.run(
+        [str(runner), str(target), f"--module-dir={mod_dir}", "--format=json"],
+        cwd=root, capture_output=True, text=True, env=merged, check=False, timeout=300,
+    )
+    restored_doc = json.loads(restored.stdout)
+    assert restored.returncode in (0, 1), restored.stdout + restored.stderr
+    assert restored_doc["status"] == "ok" and restored_doc["failed_modules"] == [], restored_doc
+    assert restored_doc["totals"]["files"] == 2, restored_doc
+    assert {s["language"] for s in restored_doc["scanners"]} == {"python", "rust"}, restored_doc
+    assert "using built-in extension hints" not in restored.stderr, restored.stderr
 
 
 def check_version_identity(tmpdir: Path) -> None:

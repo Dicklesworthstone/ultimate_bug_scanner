@@ -56,6 +56,7 @@ from typing import Any, Iterable, Sequence
 
 from ubs_core.registry import RunContext
 from ubs_core.io import read_ndjson
+from ubs_core.suppression import SourceSuppressions
 
 MARKER = "ubs:ignore"
 
@@ -165,60 +166,65 @@ def output_line(path: Path, line_no: int, line_text: str) -> str:
 
 
 def distinct_lines(regex: re.Pattern[str], texts: dict[Path, str],
-                   pattern: Pattern, apply_output_filters: bool) -> list[tuple[Path, int, str]]:
+                   pattern: Pattern, apply_output_filters: bool,
+                   suppressions: SourceSuppressions) -> list[tuple[Path, int, str]]:
     """Distinct matching lines for one regex, rg/count_lines parity.
 
-    Line-scoped matching (rg never crosses newlines), `ubs:ignore` marker
-    lines dropped (legacy count_lines), legacy output-line filters applied
-    when requested.
+    Matching stays line-scoped, with legacy output-line filters when requested.
+    Shared source suppression uses the owning pattern's exact rule.
     """
     hits: list[tuple[Path, int, str]] = []
     for path, text in texts.items():
         if pattern.file_regex is not None and not pattern.file_regex.search(str(path)):
             continue
+        source_index = suppressions.index(path, text)
         for line_no, line_text in enumerate(text.splitlines(), start=1):
-            if MARKER in line_text:
-                continue
             if apply_output_filters:
                 out_line = output_line(path, line_no, line_text)
                 if pattern.output_filter_regex is not None and pattern.output_filter_regex.search(out_line):
                     continue
                 if pattern.output_keep_regex is not None and not pattern.output_keep_regex.search(out_line):
                     continue
-            if regex.search(line_text):
+            if regex.search(line_text) and not source_index.is_suppressed(line_no, pattern.rule_id):
                 hits.append((path, line_no, line_text.strip()[:240]))
     return hits
 
 
-def count_regex(regex: re.Pattern[str], texts: dict[Path, str], file_regex) -> int:
+def count_regex(regex: re.Pattern[str], texts: dict[Path, str], file_regex,
+                rule_id: str, suppressions: SourceSuppressions) -> int:
     """Project-wide distinct-line count for guard/diff regexes (no filters)."""
     total = 0
     for path, text in texts.items():
         if file_regex is not None and not file_regex.search(str(path)):
             continue
+        source_index = suppressions.index(path, text)
         seen: set[int] = set()
         for line_no, line_text in enumerate(text.splitlines(), start=1):
-            if MARKER in line_text or line_no in seen:
+            if line_no in seen:
                 continue
-            if regex.search(line_text):
+            if regex.search(line_text) and not source_index.is_suppressed(line_no, rule_id):
                 seen.add(line_no)
         total += len(seen)
     return total
 
 
-def pattern_hits(pattern: Pattern, texts: dict[Path, str]) -> list[tuple[Path, int, str]]:
+def pattern_hits(pattern: Pattern, texts: dict[Path, str],
+                 suppressions: SourceSuppressions) -> list[tuple[Path, int, str]]:
     """The main-pattern hit list: components sum, plain patterns dedupe."""
     if pattern.rule_id == "ex.security.sql-interpolation":
         # Raw Ecto SQL now uses native query-operand provenance, retaining this
         # public ID. Keep the separate legacy fragment check until its macro
         # semantics are modeled; it must not duplicate raw-query findings.
-        return distinct_lines(pattern.regex, texts, pattern, apply_output_filters=True)
+        return distinct_lines(pattern.regex, texts, pattern, apply_output_filters=True,
+                              suppressions=suppressions)
     hits: list[tuple[Path, int, str]] = []
     if pattern.components:
         for component in pattern.components:
-            hits.extend(distinct_lines(component, texts, pattern, apply_output_filters=True))
+            hits.extend(distinct_lines(component, texts, pattern, apply_output_filters=True,
+                                       suppressions=suppressions))
     else:
-        hits.extend(distinct_lines(pattern.regex, texts, pattern, apply_output_filters=True))
+        hits.extend(distinct_lines(pattern.regex, texts, pattern, apply_output_filters=True,
+                                   suppressions=suppressions))
     return hits
 
 
@@ -243,6 +249,9 @@ def scan_patterns(patterns: Sequence[Pattern], files: Sequence[Path], sink,
             texts[path] = path.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
+    suppressions = SourceSuppressions("elixir")
+    for path, text in texts.items():
+        suppressions.index(path, text)
     for pattern in active:
         if pattern.gate is not None:
             gate_path_re, gate_content_re = pattern.gate
@@ -253,7 +262,7 @@ def scan_patterns(patterns: Sequence[Pattern], files: Sequence[Path], sink,
                 continue
         if pattern.suppress_if is not None:
             guard_re, cap = pattern.suppress_if
-            if count_regex(guard_re, texts, pattern.file_regex) >= cap:
+            if count_regex(guard_re, texts, pattern.file_regex, pattern.rule_id, suppressions) >= cap:
                 continue
 
         target_texts = texts
@@ -262,7 +271,7 @@ def scan_patterns(patterns: Sequence[Pattern], files: Sequence[Path], sink,
             if not target_texts:
                 continue
 
-        hits = pattern_hits(pattern, target_texts)
+        hits = pattern_hits(pattern, target_texts, suppressions)
         if not hits:
             if pattern.zero_finding is not None:
                 severity, title = pattern.zero_finding
@@ -281,7 +290,7 @@ def scan_patterns(patterns: Sequence[Pattern], files: Sequence[Path], sink,
         count = len(hits)
         if pattern.diff_regexes:
             for diff_re in pattern.diff_regexes:
-                count -= count_regex(diff_re, texts, pattern.file_regex)
+                count -= count_regex(diff_re, texts, pattern.file_regex, pattern.rule_id, suppressions)
         severity = active_tier(pattern, count)
         if severity is None:
             continue

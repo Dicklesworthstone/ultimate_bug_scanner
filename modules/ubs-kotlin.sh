@@ -10,7 +10,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="d4cd5df00d2e139a2fdef67b4c7ed6e9eb6c4ccd7b840e90e0bc6c9debb037dc"
+UBS_LIB_CHECKSUM="dd9bde9588a731c9f18cb815558481e7a0e76496cbacaeb4d3d33f00496180d2"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -337,18 +337,18 @@ case "$FORMAT" in
     fi
     ;;
   sarif)
-    sarif_content=$(PYTHONPATH="${helpers_dir}${PYTHONPATH:+:${PYTHONPATH}}" python3 -c "
-import json
+    sarif_content=$(PYTHONPATH="${helpers_dir}${PYTHONPATH:+:${PYTHONPATH}}" python3 - "$JSON_TMP" "$LIST_FILE" "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}" <<'PY'
+import json, sys
+from pathlib import Path
 from ubs_core.kotlin_scan import _render_sarif
-records = [json.loads(line) for line in open('$SINK_FILE') if line.strip()]
-counters = {'critical': 0, 'warning': 0, 'info': 0}
-for r in records:
-    sev = r.get('severity', 'info')
-    counters[sev] = counters.get(sev, 0) + 1
-files = [line for line in open('$LIST_FILE').read().split('\0') if line.strip()]
-sarif = _render_sarif(records, counters, '${SOURCE_PROJECT_DIR:-$PROJECT_DIR}', files)
+summary = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
+records = summary['findings']
+counters = {severity: summary[severity] for severity in ('critical', 'warning', 'info')}
+files = [line for line in Path(sys.argv[2]).read_text().split('\0') if line.strip()]
+sarif = _render_sarif(records, counters, sys.argv[3], files, summary=summary)
 print(json.dumps(sarif, indent=2))
-")
+PY
+)
     if [[ -n "$SARIF_OUT" ]]; then
       echo "$sarif_content" > "$SARIF_OUT"
     fi

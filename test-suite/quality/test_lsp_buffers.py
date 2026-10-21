@@ -238,6 +238,7 @@ class BufferScanTests(BufferFixture, unittest.TestCase):
         self.assertTrue(all(item['data']['ubsAnalysisStatus'] == 'partial' for item in diagnostics))
         self.assertTrue(all(item['data']['ubsSourceMode'] == 'buffer' for item in diagnostics))
         self.assertFalse(Path(self.calls()[0]['cwd']).exists())
+        self.assertEqual(self.source.read_text(), 'clean\n')
 
     def test_original_uri_and_full_utf16_line_survive_snapshot_routing(self):
         source = self.root / 'line space😀.py'

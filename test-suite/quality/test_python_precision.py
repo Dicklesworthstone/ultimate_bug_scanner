@@ -46,7 +46,7 @@ if str(HELPERS_DIR) not in sys.path:
 
 from ubs_core.io import iter_ndjson_lines, parse_ndjson_lines, read_ndjson, source_line  # noqa: E402
 from ubs_core.py_detectors import division, index_arithmetic, io_open_checks, is_literal  # noqa: E402
-from ubs_core.py_detectors import json_loads  # noqa: E402
+from ubs_core.py_detectors import json_loads, ldap_injection  # noqa: E402
 from ubs_core.py_detectors import missing_returns  # noqa: E402
 from ubs_core.py_detectors import sql_injection  # noqa: E402
 from ubs_core.py_patterns.debug_typing import PATTERNS as DEBUG_PATTERNS  # noqa: E402
@@ -1788,6 +1788,41 @@ class SqlIdentifierSanitizerTests(unittest.TestCase):
             frozenset({"a", "b"}),
         )
         self.assertEqual(sql_injection.configured_sanitizers({}), frozenset())
+
+
+class LDAPReceiverIdentityTests(unittest.TestCase):
+    def test_builtin_sets_are_not_directory_connections(self):
+        cases = (
+            ('private-set', 'def run(request):\n    verified = set()\n    verified.add(request.args["dn"])\n', []),
+            ('literal-set', 'def run(request, set):\n    verified = {0}\n    verified.add(request.args["dn"])\n', []),
+            ('directory-connection', 'def run(request, conn):\n    conn.add(request.args["dn"])\n', [2]),
+            ('shadowed-factory', 'def run(request, set):\n    verified = set()\n    verified.add(request.args["dn"])\n', [3]),
+            ('rebound-receiver', 'def run(request, conn):\n    verified = set()\n    verified = conn\n    verified.add(request.args["dn"])\n', [4]),
+            ('conditional-rebinding', 'def run(request, conn):\n    verified = set()\n    if request.args:\n        verified = conn\n    verified.add(request.args["dn"])\n', [5]),
+            ('conditional-parameter', 'def run(request, verified):\n    if request.args:\n        verified = set()\n    verified.add(request.args["dn"])\n', [4]),
+            ('nonlocal-rebinding', 'def run(request, conn):\n    verified = set()\n    def replace():\n        nonlocal verified\n        verified = conn\n    replace()\n    verified.add(request.args["dn"])\n', [7]),
+            ('reflected-rebinding', 'def run(request, conn):\n    verified = set()\n    locals()["verified"] = conn\n    verified.add(request.args["dn"])\n', [4]),
+            ('pattern-shadowed-factory', 'def run(request, conn):\n    match conn:\n        case set:\n            verified = set()\n            verified.add(request.args["dn"])\n', [5]),
+            ('dunder-shadowed-factory', 'import builtins\ndef run(request, conn):\n    builtins.__setattr__("set", lambda: conn)\n    verified = set()\n    verified.add(request.args["dn"])\n', [5]),
+            ('function-globals-factory', 'def run(request, conn):\n    def helper(): pass\n    helper.__globals__["set"] = lambda: conn\n    verified = set()\n    verified.add(request.args["dn"])\n', [5]),
+            ('closure-cell-receiver', 'def run(request, conn):\n    verified = {0}\n    def capture(): return verified\n    capture.__closure__[0].cell_contents = conn\n    verified.add(request.args["dn"])\n', [5]),
+        )
+        artifacts = REPO_ROOT / 'test-suite/artifacts'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        work = Path(tempfile.mkdtemp(prefix='ldap-receiver-', dir=artifacts))
+        for name, source, expected in cases:
+            with self.subTest(case=name):
+                started = time.perf_counter()
+                print(f'[{name}] RUN')
+                path = work / f'{name}.py'
+                path.write_text(source, encoding='utf-8')
+                actual = [line for _, line, _, _ in ldap_injection.find([path])]
+                (work / f'{name}.json').write_text(json.dumps({
+                    'expected': expected, 'actual': actual,
+                    'elapsed_seconds': time.perf_counter() - started,
+                }, indent=2) + '\n', encoding='utf-8')
+                self.assertEqual(actual, expected)
+                print(f'[{name}] PASS ({time.perf_counter() - started:.3f}s)')
 
 
 if __name__ == "__main__":

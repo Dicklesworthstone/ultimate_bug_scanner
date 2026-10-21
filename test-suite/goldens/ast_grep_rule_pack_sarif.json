@@ -1805,7 +1805,7 @@
           "sgconfig-tsx.yml"
         ],
         "fixture": "test-suite/js",
-        "result_count": 199,
+        "result_count": 198,
         "result_rule_ids": [
           "js.async.await-no-try",
           "js.async.dangling-promise",

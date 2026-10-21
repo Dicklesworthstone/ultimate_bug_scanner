@@ -215,8 +215,8 @@ def read_source(root, path, root_id):
             raise ProtocolError('Source must be a file')
         for part in parts[:-1]:
             child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
-            os.close(directory)
-            directory = child
+            previous, directory = directory, child
+            os.close(previous)
         descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=directory)
         with os.fdopen(descriptor, 'rb') as stream:
             def stamp(value):
@@ -257,6 +257,8 @@ class ReportIndex:
                 or any(not isinstance(item, dict) for item in (*failed, *scanners))):
             raise ProtocolError('Scanner failure metadata is malformed')
         failures = list(failed)
+        if report.get('module_error'):
+            failures.append(report)
         for scanner in scanners:
             if not isinstance(scanner.get('status', 'ok'), str):
                 raise ProtocolError('Scanner status is malformed')
@@ -551,8 +553,8 @@ class BufferWorkspace:
                     raise ProtocolError('Unsafe buffer workspace path')
                 mode = flags if index < len(parts) - 1 else final_flags | os.O_NONBLOCK | os.O_NOFOLLOW
                 child = os.open(part, mode, dir_fd=descriptor)
-                os.close(descriptor)
-                descriptor = child
+                previous, descriptor = descriptor, child
+                os.close(previous)
             result, descriptor = descriptor, None
             return result
         finally:

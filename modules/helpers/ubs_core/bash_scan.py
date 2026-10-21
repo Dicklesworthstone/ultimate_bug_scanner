@@ -77,6 +77,40 @@ _NATIVE_AST_EQUIVALENTS = {
     "bash.security.mktemp-dry-run": "bash.security.mktemp_dry_run",
 }
 
+_HEREDOC_HEADER = re.compile(r"(?<!<)<<(-?)\s*(?:'([^']+)'|\"([^\"]+)\"|\\([a-zA-Z_0-9]+)|([a-zA-Z_0-9]+))")
+
+
+def _unquoted_heredoc_header(line: str) -> re.Match | None:
+    """Find an operator outside literal shell words, not their data.
+
+    The caller excludes command substitutions. This is a quote/escape check
+    for a physical source line, not a replacement for the Bash parser.
+    A later, genuine redirection on the same line must still be recognized.
+    """
+    quote = ""
+    escaped = False
+    for offset, character in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if character == "\\" and quote != "'":
+            escaped = True
+            continue
+        if quote:
+            if character == quote:
+                quote = ""
+            continue
+        if character in {"'", '"'}:
+            quote = character
+            continue
+        if character == "#" and (offset == 0 or line[offset - 1].isspace()
+                                  or line[offset - 1] in ";|&()"):
+            break
+        match = _HEREDOC_HEADER.match(line, offset)
+        if match is not None:
+            return match
+    return None
+
 
 def slug_for_category(category: int) -> str:
     return _CATEGORY_SLUGS.get(category, f"cat-{category}")
@@ -252,18 +286,20 @@ def scan_files_native(
             if not stripped or stripped.startswith("#"):
                 continue
 
-            # Check if this line starts a heredoc for subsequent lines
-            m_hd = re.search(r"(?<!<)<<(-?)\s*(?:'([^']+)'|\"([^\"]+)\"|\\([a-zA-Z_0-9]+)|([a-zA-Z_0-9]+))", line)
+            is_print_line = bool(re.match(r"^\s*(?:echo|printf|log|warn|warning|info|error|debug)\b", line))
+            has_subshell = bool(re.search(r"\$\(|`", line))
+            is_static_print = is_print_line and not has_subshell
+
+            # Quoted shell text does not start a heredoc in this script.
+            # Keep genuine unquoted redirections, including those following
+            # an earlier quoted look-alike on the same output command.
+            m_hd = _unquoted_heredoc_header(line) if not has_subshell else _HEREDOC_HEADER.search(line)
             if m_hd:
                 delim = m_hd.group(2) or m_hd.group(3) or m_hd.group(4) or m_hd.group(5)
                 if delim:
                     in_heredoc = True
                     heredoc_delimiter = delim
                     heredoc_strip_tabs = (m_hd.group(1) == "-")
-
-            is_print_line = bool(re.match(r"^\s*(?:echo|printf|log|warn|warning|info|error|debug)\b", line))
-            has_subshell = bool(re.search(r"\$\(|`", line))
-            is_static_print = is_print_line and not has_subshell
 
             if is_posix_sh and 1 not in skip and (cand is None or "bash.syntax.posix_bashism" in cand):
                 # Check for bashisms in POSIX sh

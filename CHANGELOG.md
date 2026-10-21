@@ -16,6 +16,122 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Fixed
 
+- Python SQL analysis transfers immutable nonlocal cells through private list
+  helpers, including recursive calls and exception prefixes. Calls before a
+  helper is cleared in `finally` retain the executed definition's identity;
+  escaped callables and mutable cell aliases remain incomplete. Generator
+  iteration over a copied slice preserves the original list's ownership.
+- Regex import escape checks reuse the existing binding index instead of
+  traversing the full source again; module-table and dynamic-loader escapes
+  still invalidate regex result proofs at the same analysis limit.
+- Python SQL analysis invalidates builtin return-shape proofs when reflective
+  `getattr` calls can expose frame dictionaries, including computed names,
+  expanded arguments, escaped callable aliases and explicit reflective
+  attribute factories. Replacing `enumerate` through those dictionaries can
+  no longer hide interpolated SQL values.
+- Native Bash checks keep scanning after heredoc-looking text in literal output,
+  assignments and command arguments. Quoted headers and trailing comments cannot
+  hide later executable code; genuine redirections on the same line still
+  exclude their data bodies.
+- Python SQL analysis distinguishes read-only generator projections from their
+  construction inputs and lookup indexes from selected values. Supported
+  read-only streaming loops recheck late bindings on each backedge; unsupported
+  deferred effects still report incomplete analysis.
+- Read-only `next()` values, defaults, generator unpacking and reducer results
+  retain SQL facts. Proved local builtin lists support eager `append`/`extend`
+  and in-place concatenation. Unresolved list aliases report incomplete
+  analysis instead of dropping values written through those aliases.
+- Exact builtin collection shapes survive flow joins and project through
+  dynamic, nested and starred unpacking. Collection concatenation retains
+  risky contents without hiding SQL string construction after unpacking.
+- Immutable tuple elements retain bounded nested shapes through private-list
+  updates, indexing and unpacking. Empty contents remain distinct from unknown
+  contents; recursively wrapped tuple types widen to a finite fixed point.
+  Supported genuine standard-library regex matches preserve numeric offsets;
+  shadowed factories, patched modules and escaped imports provide no type proof.
+- Pattern matching keeps alternative branch stores separate and projects
+  destructured captures from their elements. Proved local list pops preserve
+  returned SQL facts without treating a truth test as an escaping alias.
+- SQLite regression witnesses run test-authored programs in isolated child
+  interpreters, preserve their actual results and retain failure diagnostics.
+- Python SQL analysis retains findings discovered before an unsupported flow,
+  then reports the original incomplete-analysis error. Canonical and standalone
+  JSON/SARIF reports keep that evidence without returning a successful scan.
+- Standalone SARIF reports retain module failure reasons, including failures
+  omitted from a combined report's failure list. An error flag remains a failed
+  invocation even when another status field says the analysis completed.
+- SQL consumer resolution recognizes exception and pattern bindings that shadow
+  builtins. Short-circuit generator consumers check captured helper effects;
+  unresolved lexical frames and cursor changes remain explicitly incomplete.
+- Stable same-file eager consumers retain yielded SQL values, return/finally
+  results and callee sinks in an isolated lexical frame. Unsupported cursor
+  retention, caller-heap writes and SQL-bearing opaque calls remain incomplete.
+- Sealed self-recursive closures solve captured-list effects and return values
+  to a fixed point under the existing analysis budget, including writes before exceptions.
+  Sibling closures use their defining lexical cells and actual call inputs;
+  an uncalled definition does not execute its SQL sinks. A later unsupported
+  effect preserves already discovered callee findings in the partial report.
+  Nonreturning recursive calls retain valid branch, handler and optimized-assert
+  bypasses rather than hiding a reachable sink.
+  List mutations during later argument evaluation refuse analysis instead of
+  treating an earlier reference as an immutable value snapshot.
+- Validated mutually recursive sibling closures use the existing summary
+  worklist for shared-list effects and return values. Calls retain their real
+  lexical owner and require every group definition to have executed. Escaped
+  functions and unresolved shadowed cells remain incomplete. A caught exception
+  preserves private-list ownership only when the callee's exit store proves it;
+  actual escapes still revoke that proof.
+- Constant-integer list `insert` and `__setitem__` writes retain SQL contents
+  without changing previously captured scalar values. Escaping, reflected and
+  unbound builtin-list mutator capabilities report incomplete analysis until
+  their receiver effects can be modeled; they cannot silently certify a scan.
+- Indexed assignment, annotation, augmentation and supported slice writes retain
+  possible SQL contents in private builtin lists. Loop, comprehension and
+  destructuring targets apply the same stores in Python evaluation order.
+  Rebound or escaped receivers, generator-valued stores and mutations during
+  iteration remain explicitly incomplete rather than hiding an unsafe query.
+- Direct builtin `enumerate` keeps its integer index separate from yielded SQL
+  contents. Mutable-builtin namespace access invalidates that shape proof.
+  Sealed local closures transfer supported indexed-list writes without allowing
+  a captured list to escape as another object's lookup key.
+- Python frame dictionaries invalidate builtin index-shape and validator binding
+  proofs: replacing a callable through `f_builtins` or `f_globals` cannot hide
+  SQL carried by its return value, including aliased frame access.
+- Help, findings merge, SARIF conversion and suppression load without importing
+  the scanner registry. They preserve independently produced findings when an
+  analyzer import fails; scans and self-tests still fail on that broken registry.
+- Literal-string `join` and stable same-file helpers whose returns all construct
+  exact builtin strings retain that shape during list-slice writes. Their SQL
+  facts and call effects still apply. Decorators, replaced callables, generators
+  and custom string-subclass iteration cannot inherit this proof. A single
+  formatted value may preserve a subclass returned by `__format__` unless its
+  operand is proved an exact builtin primitive. Supported local helpers are
+  interpreted with their actual call inputs to retain returned text provenance.
+- Exact builtin numeric arithmetic, unmodified builtin `len`, and sequence
+  repetition preserve their result shapes and SQL contents through list writes.
+  Repeated lists own their newly allocated outer storage. Builtin `enumerate`
+  also retains integer indexes with positional or keyword `start`; custom
+  arithmetic, opaque repetition counts and replaced length functions do not
+  inherit those proofs. Eager call effects and existing analysis limits remain.
+- Closed numeric list trees retain their primitive element types through
+  tracked child aliases and supported numeric writes, appends and pops. This
+  allows numeric parser-frame stacks to complete SQL analysis. Nonnumeric
+  writes, unknown helper borrows and untracked alias exports remain explicitly
+  incomplete; an escaped object cannot recover an earlier private type proof.
+- Python SQL suppression uses statement-owned comments and exact rule ids.
+  Marker text in strings, unrelated statements or another rule's scope no longer
+  hides SQL findings. Valid multiline comments suppress their owning statement;
+  suppression does not remove modeled effects or incomplete-analysis failures.
+- LDAP receiver analysis distinguishes stable local builtin sets from directory
+  connections and revokes that proof for rebinding and reflective mutation.
+- Editor directory walks transfer descriptor ownership before closing the parent,
+  so a reported parent-close error does not leak the newly opened child.
+- Editor diagnostics retain a root-level module error as incomplete analysis,
+  even when the producer reports `status: ok` and exits successfully. Available
+  findings remain visible, and incomplete reports still require a valid ledger.
+
+---
+
 - Installed runners resolve JSON/JSONL/SARIF conversion helpers from their
   selected module directory, preserving findings when the executable and
   modules live in separate directories. Failed SARIF conversion exits 2.

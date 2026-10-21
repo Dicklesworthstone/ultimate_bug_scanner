@@ -92,7 +92,7 @@ class SavedGroups(unittest.TestCase):
     def send(self, method, params=None, **extra):
         self.server.handle({'jsonrpc': '2.0', 'method': method, 'params': params or {}, **extra})
 
-    def open(self, path, text=None):
+    def open_document(self, path, text=None):
         self.send('textDocument/didOpen', {'textDocument': {
             'uri': path.as_uri(), 'version': 1, 'languageId': 'python',
             'text': path.read_text(encoding='utf-8') if text is None else text}})
@@ -118,7 +118,10 @@ class SavedGroups(unittest.TestCase):
 
     def calls(self):
         path = self.scanner.with_suffix('.jsonl')
-        records = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+        try:
+            records = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            self.fail(f'Cannot read scanner call log {path}: {exc}; retained evidence: {self.work}')
         return [record for record in records if record['phase'] == 'start']
 
     def selected(self, call):
@@ -149,12 +152,12 @@ class SavedGroups(unittest.TestCase):
                 if 'id' in message and ('result' in message or 'error' in message)}
 
     def open_pair(self):
-        self.open(self.helper)
-        self.open(self.caller)
+        self.open_document(self.helper)
+        self.open_document(self.caller)
 
     def test_single_saved_document_keeps_immediate_dispatch_and_policy(self):
         self.server.policy = ('--profile=strict', '--fail-on-warning')
-        self.open(self.caller)
+        self.open_document(self.caller)
         self.server.tick()
         self.assertEqual(len(self.server.active), 1)
         self.wait()
@@ -211,8 +214,8 @@ class SavedGroups(unittest.TestCase):
         self.assert_bug()
 
     def test_dirty_peer_prevents_a_false_clean_caller(self):
-        self.open(self.helper, text='unsaved SOURCE\n')
-        self.open(self.caller)
+        self.open_document(self.helper, text='unsaved SOURCE\n')
+        self.open_document(self.caller)
         self.wait()
         self.assertEqual(self.calls(), [])
         self.assertEqual([item['code'] for item in self.diagnostics(self.helper)], ['ubs.unsaved'])
@@ -248,7 +251,7 @@ class SavedGroups(unittest.TestCase):
         self.assertEqual(self.diagnostics(self.helper), [])
 
     def test_closing_last_document_does_not_launch_an_empty_scan(self):
-        self.open(self.caller)
+        self.open_document(self.caller)
         self.wait()
         before = len(self.calls())
         self.close_document(self.caller)
@@ -259,14 +262,14 @@ class SavedGroups(unittest.TestCase):
 
     def test_opening_peer_cancels_an_obsolete_solo_scan(self):
         self.helper.write_text('SLOW\n', encoding='utf-8')
-        self.open(self.helper)
+        self.open_document(self.helper)
         deadline = time.monotonic() + 3
         while not self.calls() and time.monotonic() < deadline:
             self.server.tick()
             time.sleep(0.01)
         self.assertTrue(self.calls(), 'Initial scanner did not start')
         token = next(iter(self.server.active.values()))[2]
-        self.open(self.caller)
+        self.open_document(self.caller)
         self.assertTrue(token.is_set(), 'The old solo scan remains eligible after selection changed')
         self.change(self.helper, 'SOURCE\n')
         self.helper.write_text('SOURCE\n', encoding='utf-8')
@@ -377,7 +380,10 @@ class SavedGroups(unittest.TestCase):
                         headers = dict(line.split(b':', 1) for line in bytes(buffer[:end]).split(b'\r\n'))
                         length = int(headers[b'Content-Length'].strip())
                         if len(buffer) >= end + 4 + length:
-                            message = json.loads(bytes(buffer[end + 4:end + 4 + length]))
+                            try:
+                                message = json.loads(bytes(buffer[end + 4:end + 4 + length]))
+                            except json.JSONDecodeError as exc:
+                                self.fail(f'Invalid LSP JSON frame: {exc}; retained evidence: {self.work}')
                             del buffer[:end + 4 + length]
                             transcript.append(message)
                             if predicate(message):

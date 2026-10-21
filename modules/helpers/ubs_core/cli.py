@@ -204,9 +204,6 @@ def _run_layer_cmd(layer: str, args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    # Populate the registry before dispatch; analyzer modules self-register on import.
-    from ubs_core import analyzers  # noqa: F401  (side-effect import)
-
     parser = _build_parser()
     args = parser.parse_args(argv)
 
@@ -267,6 +264,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.layer == "suppress":
         return _run_suppress(args)
+
+    # Only scanning needs the analyzer registry. Reporting must still retain
+    # findings from independent modules when an analyzer import has failed.
+    # Self-tests and explain load their own registries when they need them.
+    from ubs_core import analyzers  # noqa: F401  (side-effect import)
 
     if args.layer != "scan":
         try:

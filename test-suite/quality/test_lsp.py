@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import errno
 import json
 import os
 from pathlib import Path
@@ -78,7 +79,7 @@ class Fixture(unittest.TestCase):
     def send(self, method, params=None, **extra):
         self.server.handle({'jsonrpc': '2.0', 'method': method, 'params': params or {}, **extra})
 
-    def open(self, text=None, version=1, uri=None):
+    def open_document(self, text=None, version=1, uri=None):
         self.send('textDocument/didOpen', {'textDocument': {'uri': uri or self.uri,
                   'version': version, 'languageId': 'python', 'text': text if text is not None else self.source.read_text()}})
 
@@ -105,7 +106,10 @@ class Fixture(unittest.TestCase):
 
     def calls(self):
         file = self.work / 'calls'
-        return [json.loads(line) for line in file.read_text().splitlines()] if file.exists() else []
+        try:
+            return [json.loads(line) for line in file.read_text().splitlines()] if file.exists() else []
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            self.fail(f'Cannot read scanner call log {file}: {exc}')
 
     def running(self):
         until = time.monotonic() + 3
@@ -197,7 +201,7 @@ class SourceTests(Fixture):
 class DiagnosticsTests(Fixture):
     def test_saved_open_publishes_rule_range_version_and_original_policy(self):
         self.source.write_text('value = "🦀"\nBUG 🦀\n')
-        self.open()
+        self.open_document()
         self.wait()
         report = self.reports()[-1]
         self.assertEqual(report['version'], 1)
@@ -210,7 +214,7 @@ class DiagnosticsTests(Fixture):
         self.assertEqual(call['cwd'], str(self.root))
 
     def test_unsaved_open_never_runs_scanner_or_changes_disk(self):
-        self.open(text='BUG unsaved\n')
+        self.open_document(text='BUG unsaved\n')
         self.wait()
         self.assertEqual(self.calls(), [])
         self.assertEqual(self.reports()[-1]['diagnostics'][0]['code'], 'ubs.unsaved')
@@ -218,7 +222,7 @@ class DiagnosticsTests(Fixture):
 
     def test_change_invalidates_old_diagnostics_and_save_runs_new_bytes(self):
         self.source.write_text('BUG\n')
-        self.open()
+        self.open_document()
         self.wait()
         self.change('clean\n')
         self.wait()
@@ -232,7 +236,7 @@ class DiagnosticsTests(Fixture):
 
     def test_obsolete_scan_is_cancelled_and_never_published(self):
         self.source.write_text('SLOW clean\n')
-        self.open()
+        self.open_document()
         old = self.running()
         self.change('BUG latest\n')
         marker = len(self.messages)
@@ -248,11 +252,11 @@ class DiagnosticsTests(Fixture):
 
     def test_close_cancels_work_clears_diagnostics_and_reopen_is_new_generation(self):
         self.source.write_text('SLOW\n')
-        self.open()
+        self.open_document()
         old = self.running()
         self.send('textDocument/didClose', {'textDocument': {'uri': self.uri}})
         self.source.write_text('BUG\n')
-        self.open(version=1)
+        self.open_document(version=1)
         self.wait()
         self.assertEqual(self.reports()[-1]['diagnostics'][0]['code'], 'python.test.bug')
         with self.assertRaises(ProcessLookupError):
@@ -264,7 +268,7 @@ class DiagnosticsTests(Fixture):
                 if self.uri in self.server.documents:
                     self.send('textDocument/didClose', {'textDocument': {'uri': self.uri}})
                 self.source.write_text(text)
-                self.open()
+                self.open_document()
                 self.wait()
                 self.assertEqual(self.reports()[-1]['diagnostics'][0]['code'], expected)
 
@@ -275,12 +279,12 @@ class DiagnosticsTests(Fixture):
                     self.send('textDocument/didClose', {'textDocument': {'uri': self.uri}})
                 self.server.timeout = 0.15
                 self.source.write_text(text)
-                self.open()
+                self.open_document()
                 self.wait()
                 self.assertEqual(self.reports()[-1]['diagnostics'][0]['code'], 'ubs.unverified')
 
     def test_source_changed_between_completion_and_publication_is_not_clean(self):
-        self.open()
+        self.open_document()
         # Dispatch exactly once. running() also ticks completion and can publish
         # a fast scan before this test reaches the intended publication gap.
         self.server.tick()
@@ -313,16 +317,16 @@ class DiagnosticsTests(Fixture):
 
     def test_document_and_memory_limits_do_not_launch_extra_scans(self):
         with patch.object(lsp, 'MAX_DOCUMENTS', 0):
-            self.open()
+            self.open_document()
         self.assertEqual(self.server.documents, {})
         with patch.object(lsp, 'MAX_TEXT_TOTAL', 2):
-            self.open()
+            self.open_document()
         self.assertEqual(self.server.documents, {})
         self.assertEqual(self.calls(), [])
 
     def test_invalid_change_cannot_leave_earlier_scan_eligible(self):
         self.source.write_text('SLOW\n')
-        self.open()
+        self.open_document()
         self.running()
         self.send('textDocument/didChange', {'textDocument': {'uri': self.uri, 'version': 2},
                   'contentChanges': [{'range': {}, 'text': 'BUG'}]})
@@ -331,7 +335,7 @@ class DiagnosticsTests(Fixture):
 
     def test_shutdown_is_responsive_during_scan_and_method_errors_are_typed(self):
         self.source.write_text('SLOW\n')
-        self.open()
+        self.open_document()
         old = self.running()
         self.send('textDocument/hover', {}, id=8)
         self.assertEqual(self.messages[-1]['error']['code'], -32601)
@@ -344,7 +348,7 @@ class DiagnosticsTests(Fixture):
         self.assertEqual(self.server.exit_code, 0)
 
     def test_invalid_change_then_save_cannot_verify_an_old_buffer(self):
-        self.open()
+        self.open_document()
         self.wait()
         self.send('textDocument/didChange', {'textDocument': {'uri': self.uri, 'version': 2},
                   'contentChanges': [{'range': {}, 'text': 'BUG'}]})
@@ -437,7 +441,7 @@ class RealScannerTests(Fixture):
         self.server.scanner = ROOT / 'ubs'
         self.server.timeout = 120
         self.source.write_text('eval(input())\n')
-        self.open()
+        self.open_document()
         self.wait(timeout=150)
         self.assertIn('python.taint.eval', [d['code'] for d in self.reports()[-1]['diagnostics']])
         self.change('value = 1\n')
@@ -445,6 +449,51 @@ class RealScannerTests(Fixture):
         self.save()
         self.wait(timeout=150)
         self.assertEqual(self.reports()[-1]['diagnostics'], [])
+
+
+class DirectoryDescriptorOwnershipTests(unittest.TestCase):
+    def test_child_is_closed_when_parent_close_reports_failure(self):
+        artifacts = ROOT / 'test-suite/artifacts'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        root = Path(tempfile.mkdtemp(prefix='lsp-descriptor-handoff-', dir=artifacts))
+        (root / 'child').mkdir()
+        source = root / 'child/item.py'
+        source.write_text('value = 1\n', encoding='utf-8')
+        info = root.stat()
+        root_id = (info.st_dev, info.st_ino)
+        workspace = lsp.BufferWorkspace(root, root_id, {}, threading.Event(), time.monotonic() + 10)
+        real_open, real_close = os.open, os.close
+        for name, operation in (
+                ('saved-source', lambda: lsp.read_source(root, source, root_id)),
+                ('buffer-source', lambda: workspace.open_original(Path('child/item.py')))):
+            with self.subTest(operation=name):
+                allocated, close_calls = [], []
+                def tracking_open(*args, **kwargs):
+                    descriptor = real_open(*args, **kwargs)
+                    allocated.append(descriptor)
+                    return descriptor
+                def reported_close_error(descriptor):
+                    close_calls.append(descriptor)
+                    real_close(descriptor)
+                    if len(close_calls) == 1:
+                        # Model a reported close error after the kernel has
+                        # released the fd; never retry closing that number.
+                        raise OSError(errno.EIO, 'injected reported parent-close failure')
+                try:
+                    with patch.object(lsp.os, 'open', tracking_open), patch.object(lsp.os, 'close', reported_close_error):
+                        with self.assertRaises(OSError) as raised:
+                            operation()
+                    self.assertEqual(len(allocated), 2, allocated)
+                    for descriptor in allocated:
+                        with self.assertRaises(OSError, msg=f'{name} leaked child descriptor {descriptor}'):
+                            os.fstat(descriptor)
+                    self.assertEqual(raised.exception.errno, errno.EIO)
+                finally:
+                    for descriptor in allocated:
+                        try:
+                            real_close(descriptor)
+                        except OSError:
+                            pass
 
 
 if __name__ == '__main__':

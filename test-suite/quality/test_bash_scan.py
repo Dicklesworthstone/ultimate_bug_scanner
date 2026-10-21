@@ -8,6 +8,7 @@ processes; exercise the production native detector and finding parsers.
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import os
 import shutil
@@ -16,6 +17,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -23,6 +25,13 @@ from unittest.mock import Mock, patch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "modules" / "helpers"))
 from ubs_core import bash_rules, bash_scan
+
+
+def decode_report(test: unittest.TestCase, text: str, context: str = "Bash report"):
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        test.fail(f"{context} is not valid JSON: {exc}\n{text}")
 
 
 class BashFindingCoverageTest(unittest.TestCase):
@@ -69,7 +78,50 @@ class BashFindingCoverageTest(unittest.TestCase):
         return counts, run
 
     def records(self):
-        return [json.loads(line) for line in self.sink.getvalue().splitlines()]
+        return [decode_report(self, line, "native finding") for line in self.sink.getvalue().splitlines()]
+
+    def test_printed_heredoc_headers_do_not_hide_following_code(self) -> None:
+        headers = (
+            ("double", 'printf \'%s\\n\' "<<\'REMOTE\'"'),
+            ("single", "printf '%s\\n' '<<REMOTE'"),
+            ("echo", 'echo "<<REMOTE"'),
+            ("assignment", 'header="cat <<\'REMOTE\'"'),
+            ("argument", ': "<<REMOTE"'),
+            ("escaped-quote", 'printf \'%s\\n\' "escaped\\\" <<REMOTE"'),
+            ("comment", "printf '%s\\n' ok # <<'REMOTE'"),
+            ("here-string", 'printf \'%s\\n\' "<<REMOTE" <<< "input"'),
+            ("real-after-printed", 'printf \'%s\\n\' "<<FAKE" <<\'REAL\'\n'
+             'eval "$heredoc_data"\n((heredoc_data++))\nREAL'),
+            ("real", 'cat <<\'REAL\'\neval "$heredoc_data"\n((heredoc_data++))\nREAL'),
+        )
+        for label, header in headers:
+            with self.subTest(header=label):
+                started = time.monotonic()
+                print(f"[bash-printed-heredoc:{label}] RUN", flush=True)
+                source = "#!/usr/bin/env bash\nset -e\ncounter=0\n" + header + "\n"
+                line = len(source.splitlines()) + 1
+                source += '((counter++))\neval "$payload"\nprintf unreachable\\n\n'
+                self.script = self.root / (label + ".sh")
+                self.script.write_text(source, encoding="utf-8")
+                result = subprocess.run(["bash", str(self.script)], text=True,
+                                        capture_output=True, timeout=10, check=False)
+                self.script.with_suffix(".stdout").write_text(result.stdout, encoding="utf-8")
+                self.script.with_suffix(".stderr").write_text(result.stderr, encoding="utf-8")
+                self.sink, self.reported = io.StringIO(), set()
+                self.native()
+                try:
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertEqual(result.stderr, "", result.stdout + result.stderr)
+                    self.assertNotIn("unreachable", result.stdout)
+                    self.assertEqual({(record["rule"], record["line"]) for record in self.records()}, {
+                        ("bash.arithmetic.post_increment_set_e", line),
+                        ("bash.security.eval_variable", line + 1),
+                    }, self.sink.getvalue())
+                except AssertionError:
+                    print(f"[bash-printed-heredoc:{label}] FAIL\nstdout={result.stdout!r}\n"
+                          f"stderr={result.stderr!r}\nfindings={self.sink.getvalue()}", flush=True)
+                    raise
+                print(f"[bash-printed-heredoc:{label}] PASS ({time.monotonic() - started:.3f}s)", flush=True)
 
     def test_custom_rule_survives_native_finding_on_same_line(self) -> None:
         self.native()
@@ -193,12 +245,13 @@ class BashFindingCoverageTest(unittest.TestCase):
 
     def run_main(self, output, *, warm=None):
         """Exercise the real status/sink orchestration with controlled cache IO."""
+        testcase = self
         class Capture(io.StringIO):
             @property
             def by_file(self):
                 records = {}
                 for line in self.getvalue().splitlines():
-                    record = json.loads(line)
+                    record = decode_report(testcase, line, "captured finding")
                     records.setdefault(record["path"], []).append(record)
                 return records
 
@@ -235,7 +288,7 @@ class BashFindingCoverageTest(unittest.TestCase):
             if warm is None:
                 args.append("--no-shellcheck")
             code = bash_scan.main(args)
-        return code, json.loads(summary.read_text()), cache
+        return code, decode_report(self, summary.read_text(), "Bash summary"), cache
 
     def test_malformed_ast_output_marks_summary_partial_and_is_not_cached(self) -> None:
         code, summary, cache = self.run_main(json.dumps(self.diagnostic()) + '\n{"truncated":\n')
@@ -402,7 +455,8 @@ class BashShellcheckBatchTest(unittest.TestCase):
         )
         cache.stats = {"hits": len(files), "misses": 0, "hit_rate": 1}
         file_list, summary = self.root / "files", self.root / "summary.json"
-        file_list.write_bytes(b"".join(os.fsencode(path) + b"\0" for path in files))
+        encoded_files = [os.fsencode(path) + b"\0" for path in files]
+        file_list.write_bytes(b"".join(encoded_files))
         env = {"UBS_PREFILTER_FILE": "", "UBS_CACHE_FILE": "", "UBS_PROFILE": "0"}
         with patch("ubs_core.cache.ScanCache", return_value=cache), \
                 patch.dict(os.environ, env), \
@@ -508,8 +562,11 @@ python3(){
             "UBS_TEST_FORCE_NO_AST_GREP": "0",
         })
         env.update(env_extra or {})
+        descriptor, wrapper_path = tempfile.mkstemp(prefix="ubs-bash-wrapper-", suffix=".sh", dir=self.root)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as wrapper:
+            wrapper.write(bootstrap + source)
         return subprocess.run(
-            ["bash", "-c", bootstrap + source, "ubs-bash", str(self.script), *args],
+            ["bash", wrapper_path, str(self.script), *args],
             env=env, cwd=self.root, capture_output=True, text=True,
             timeout=15, check=False,
         )
@@ -661,10 +718,55 @@ class BashPolicyIntegrationTest(unittest.TestCase):
             capture_output=True, text=True, timeout=120, check=False,
         )
 
+    def test_printed_header_findings_survive_real_json_and_sarif(self) -> None:
+        self.script.write_text('#!/usr/bin/env bash\nset -e\ncounter=0\n'
+                               'printf \'%s\\n\' "cat <<\'REMOTE\'"\n((counter++))\n', encoding="utf-8")
+        rule = "bash.arithmetic.post_increment_set_e"
+        for entry in ("ubs", "modules/ubs-bash.sh"):
+            for fmt in ("json", "sarif"):
+                label = entry.replace("/", "-") + "-" + fmt
+                with self.subTest(entry=entry, format=fmt):
+                    print(f"[bash-printed-header-cli:{label}] RUN", flush=True)
+                    command = [str(ROOT / entry), "--ci", "--fail-on-warning", "--format=" + fmt]
+                    if entry == "ubs":
+                        command.extend(("--only=bash", "--no-cache"))
+                    command.append(str(self.project))
+                    started = time.monotonic()
+                    result = subprocess.run(command, cwd=self.root, env=dict(self.env, UBS_NO_CACHE="1"),
+                                            capture_output=True, text=True, timeout=120, check=False)
+                    for stream in ("stdout", "stderr"):
+                        (self.root / (label + "." + stream)).write_text(getattr(result, stream), encoding="utf-8")
+                    (self.root / (label + ".run.json")).write_text(json.dumps({
+                        "command": command, "status": result.returncode,
+                        "elapsed_seconds": time.monotonic() - started,
+                        "helper_sha256": hashlib.sha256((ROOT / "modules/helpers/ubs_core/bash_scan.py").read_bytes()).hexdigest(),
+                        "source_sha256": hashlib.sha256(self.script.read_bytes()).hexdigest(),
+                    }), encoding="utf-8")
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    try:
+                        document = json.loads(result.stdout)
+                    except json.JSONDecodeError as exc:
+                        self.fail(f"{label} invalid JSON: {exc}\n{result.stdout}\n{result.stderr}")
+                    if fmt == "json":
+                        scans = document["scanners"] if entry == "ubs" else [document]
+                        self.assertEqual([(scan["status"], scan["files"]) for scan in scans], [("ok", 1)])
+                        actual = [(row.get("rule_id", row.get("rule")), row["line"])
+                                  for row in document["findings"] if row.get("rule_id", row.get("rule")) == rule]
+                    else:
+                        self.assertEqual(document["version"], "2.1.0")
+                        for run in document["runs"]:
+                            for invocation in run.get("invocations", []):
+                                self.assertIs(invocation["executionSuccessful"], True)
+                        actual = [(row["ruleId"], place["physicalLocation"]["region"]["startLine"])
+                                  for run in document["runs"] for row in run["results"] if row["ruleId"] == rule
+                                  for place in row["locations"]]
+                    self.assertEqual(actual, [(rule, 5)], result.stdout + result.stderr)
+                    print(f"[bash-printed-header-cli:{label}] PASS ({time.monotonic() - started:.3f}s)", flush=True)
+
     def test_custom_policy_survives_native_finding_in_real_module(self) -> None:
         result = self.invoke()
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        doc = json.loads(result.stdout)
+        doc = decode_report(self, result.stdout)
         self.assertEqual(doc["status"], "ok")
         self.assertGreaterEqual(doc["critical"], 2)
         self.assertTrue({"bash.security.curl_pipe_bash", "custom-no-curl"}.issubset(
@@ -678,7 +780,7 @@ class BashPolicyIntegrationTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertIn("custom-no-curl", result.stdout)
                 if fmt in ("json", "sarif"):
-                    json.loads(result.stdout)
+                    decode_report(self, result.stdout)
 
     def test_relative_custom_policy_path_survives_workspace_changes(self) -> None:
         result = self.invoke(meta=True, relative=True)
@@ -694,7 +796,7 @@ class BashPolicyIntegrationTest(unittest.TestCase):
         )
         second = self.invoke()
         self.assertEqual(second.returncode, 1, second.stdout + second.stderr)
-        rules = {r["rule"] for r in json.loads(second.stdout)["findings"]}
+        rules = {r["rule"] for r in decode_report(self, second.stdout)["findings"]}
         self.assertIn("custom-no-bash", rules)
         self.assertNotIn("custom-no-curl", rules)
 
@@ -702,7 +804,7 @@ class BashPolicyIntegrationTest(unittest.TestCase):
         self.policy.write_text("id: broken\nlanguage: bash\nrule: [\n", encoding="utf-8")
         result = self.invoke()
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        doc = json.loads(result.stdout)
+        doc = decode_report(self, result.stdout)
         self.assertEqual(doc["status"], "partial")
         self.assertEqual(doc["module_error"], "ANALYZER_ERROR")
         self.assertIn("bash.security.curl_pipe_bash", {r["rule"] for r in doc["findings"]})
@@ -724,7 +826,7 @@ class BashPolicyIntegrationTest(unittest.TestCase):
             timeout=120, check=False,
         )
         self.assertIn(result.returncode, (0, 1), result.stdout + result.stderr)
-        doc = json.loads(result.stdout)
+        doc = decode_report(self, result.stdout)
         self.assertEqual(doc["status"], "ok")
         self.assertTrue({"bash.robustness.cd_without_exit", "bash.shellcheck.SC2086"}.issubset(
             {r["rule"] for r in doc["findings"]}))
@@ -732,7 +834,7 @@ class BashPolicyIntegrationTest(unittest.TestCase):
     def test_meta_rejects_invalid_policy_before_detection_in_every_language(self) -> None:
         empty = self.root / "empty"
         empty.mkdir()
-        contract = json.loads((ROOT / "modules/contract.json").read_text())
+        contract = decode_report(self, (ROOT / "modules/contract.json").read_text(), "module contract")
         for lang in contract["modules"]:
             for value, reason in (("", "invalid-rules-directory"),
                                   (str(self.root / "absent"), "invalid-rules-directory"),
@@ -745,7 +847,7 @@ class BashPolicyIntegrationTest(unittest.TestCase):
                         text=True, timeout=30, check=False,
                     )
                     self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                    self.assertEqual(json.loads(result.stdout)["reason"], reason)
+                    self.assertEqual(decode_report(self, result.stdout)["reason"], reason)
 
     def test_elixir_custom_rules_are_forwarded_by_meta_runner(self) -> None:
         project = self.root / "elixir-project"
@@ -764,7 +866,7 @@ class BashPolicyIntegrationTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("custom-elixir-policy", result.stdout)
-        self.assertGreater(json.loads(result.stdout)["totals"]["critical"], 0)
+        self.assertGreater(decode_report(self, result.stdout)["totals"]["critical"], 0)
 
 
 if __name__ == "__main__":

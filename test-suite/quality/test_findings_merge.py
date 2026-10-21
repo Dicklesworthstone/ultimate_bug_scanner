@@ -83,6 +83,73 @@ class FindingsMergeTests(unittest.TestCase):
         except json.JSONDecodeError as exc:
             self.fail(f"merged report is not valid JSON: {exc}")
 
+    def test_reporting_survives_a_broken_analyzer_registry(self) -> None:
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        root = Path(tempfile.mkdtemp(prefix="ubs-cli-registry-", dir=artifacts))
+        helpers = root / "helpers"
+        package = helpers / "ubs_core"
+        shutil.copytree(HELPERS_DIR / "ubs_core", package,
+                        ignore=shutil.ignore_patterns("analyzers", "__pycache__"))
+        (package / "analyzers").mkdir()
+        (package / "analyzers" / "__init__.py").write_text(
+            'raise RuntimeError("registry-fault-probe")\n', encoding="utf-8")
+        source = root / "sample.py"
+        source.write_text("value = 1\n" * 17, encoding="utf-8")
+        record = decode_report(self, SINK_PY.splitlines()[0], "registry probe finding fixture")
+        record["path"] = str(source)
+        sink = root / "python.findings.json"
+        sink.write_text(json.dumps(record) + "\n", encoding="utf-8")
+        combined = root / "combined.json"
+        combined.write_text(json.dumps({
+            "language": "python", "status": "partial", "exit_code": 2,
+            "scanners": [{"language": "python", "files": 1, "critical": 0,
+                          "warning": 1, "info": 0, "status": "partial"}],
+            "totals": {"files": 1, "critical": 0, "warning": 1, "info": 0},
+        }), encoding="utf-8")
+        files = root / "files.nul"
+        files.write_bytes(os.fsencode(source) + b"\0")
+        env = dict(os.environ, PYTHONPATH=str(helpers), PYTHONDONTWRITEBYTECODE="1")
+
+        def run(label, *arguments):
+            result = subprocess.run([sys.executable, "-m", "ubs_core", *arguments],
+                                    cwd=root, env=env, text=True, capture_output=True,
+                                    timeout=30, check=False)
+            (root / (label + ".stdout")).write_text(result.stdout, encoding="utf-8")
+            (root / (label + ".stderr")).write_text(result.stderr, encoding="utf-8")
+            return result
+
+        with self.subTest(command="help"):
+            result = run("help", "--help")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("findings-merge", result.stdout)
+        with self.subTest(command="merge"):
+            result = run("merge", "findings-merge", "--tmp-dir", str(root),
+                         "--combined", str(combined), "--project-dir", str(root))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            findings = self.read_report(combined)["findings"]
+            self.assertEqual([(f["rule_id"], f["file"], f["line"]) for f in findings],
+                             [(record["rule"], str(source), 17)])
+        with self.subTest(command="sarif"):
+            result = run("sarif", "findings-sarif", "--combined", str(combined), "--findings", str(sink))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = decode_report(self, result.stdout, "registry-independent SARIF")
+            findings = [finding for entry in report["runs"] for finding in entry["results"]]
+            self.assertEqual([finding["ruleId"] for finding in findings], [record["rule"]])
+            self.assertTrue(all(not entry["invocations"][0]["executionSuccessful"] for entry in report["runs"]))
+        with self.subTest(command="suppress"):
+            result = run("suppress", "suppress", "--lang", "python", "--findings", str(sink))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual([decode_report(self, row, "registry-independent suppression")
+                              for row in result.stdout.splitlines()], [record])
+        for label, arguments in (("scan", ("scan", "--lang", "python", "--files-from", str(files))),
+                                 ("self-test", ("--self-test",))):
+            with self.subTest(command=label):
+                result = run(label, *arguments)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("registry-fault-probe", result.stderr)
+
     def test_installed_layout_preserves_findings_across_formats(self) -> None:
         artifacts = REPO_ROOT / "test-suite" / "artifacts"
         artifacts.mkdir(parents=True, exist_ok=True)
@@ -1107,6 +1174,37 @@ class FindingsMergeTests(unittest.TestCase):
         inv = run["invocations"][0]
         self.assertFalse(inv["executionSuccessful"])
         self.assertEqual(inv["toolExecutionNotifications"][0]["descriptor"]["id"], "ubs/module-timeout")
+
+    def test_sarif_preserves_standalone_and_unlisted_failure_reasons(self) -> None:
+        finding = {"rule": "py.security.sql-injection", "severity": "critical",
+                   "path": "sample.py", "line": 2, "message": "known SQL bug"}
+        for status in ("partial", "error", "ok"):
+            for combined in (False, True):
+                with self.subTest(status=status, combined=combined):
+                    summary = {"language": "python", "status": status,
+                               "module_error": "ANALYZER_ERROR", "message": "SQLFlowLimit: incomplete",
+                               "findings": [finding]}
+                    document = {"status": "ok", "scanners": [summary],
+                                "findings": [dict(finding, language="python")]} if combined else summary
+                    report = to_sarif(document)
+                    self.assertEqual(sum(len(run["results"]) for run in report["runs"]), 1)
+                    invocation = report["runs"][0]["invocations"][0]
+                    self.assertIs(invocation["executionSuccessful"], False)
+                    self.assertEqual(invocation["exitCode"], 2)
+                    notices = invocation["toolExecutionNotifications"]
+                    self.assertEqual(len(notices), 1)
+                    self.assertIn("SQLFlowLimit: incomplete", notices[0]["message"]["text"])
+                    expected = "partial" if status == "partial" else "error"
+                    self.assertEqual(notices[0]["descriptor"]["id"], "ubs/module-" + expected)
+        complete = to_sarif({"language": "python", "status": "ok", "findings": [finding]})
+        self.assertNotIn("invocations", complete["runs"][0])
+        root_failure = {"status": "ok", "module_error": "ANALYZER_ERROR",
+                        "message": "root analysis failed", "scanners": [{"language": "python", "status": "ok"}],
+                        "findings": [dict(finding, language="python")]}
+        invocation = to_sarif(root_failure)["runs"][0]["invocations"][0]
+        self.assertIs(invocation["executionSuccessful"], False)
+        self.assertEqual(invocation["toolExecutionNotifications"][0]["message"]["text"],
+                         "unknown: error — root analysis failed")
 
     def test_sarif_emits_partial_fingerprints(self) -> None:
         doc = {

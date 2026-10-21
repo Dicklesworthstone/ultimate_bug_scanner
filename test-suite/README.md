@@ -79,6 +79,26 @@ uv run python test-suite/python/tests/test_resource_helper.py
 
 It should report leaks for file handles, subprocesses, sockets, and asyncio tasks in the buggy sample while remaining silent on the clean counterpart.
 
+Python SQL value capture and sink selection have dedicated regression suites:
+
+```bash
+uv run python test-suite/quality/test_python_sql_value_capture.py -v
+uv run python test-suite/quality/test_python_sql_sink_arguments.py -v
+```
+
+These compare finding IDs and locations through the module and runner in JSON
+and SARIF. SQLite witnesses also execute test-authored programs against an
+in-memory database in separate Python processes; row counts come from actual
+queries. Child failures, malformed output and timeouts fail the test, with
+diagnostics retained under `test-suite/artifacts/`. Python's isolated mode
+keeps fixture definitions out of the runner; it is not a sandbox for untrusted
+programs.
+
+The SQL cases include generator defaults and exhaustion, list ownership and
+escapes, and actual SQLite attacks through aliased lists. Unsupported alias
+mutations must report incomplete analysis; an empty finding list is not a pass
+for those cases. The complete suites above retain the module/runner CLI checks.
+
 To exercise the Go helper + module integration end-to-end, stick with the manifest harness:
 
 ```

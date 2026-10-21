@@ -111,13 +111,96 @@ def _keyword_values(node, names):
 
 
 class _LDAPInjectionAnalyzer(ast.NodeVisitor):
-    def __init__(self, lines, suppressions):
+    def __init__(self, lines, tree, suppressions):
         self.lines = lines
         self.suppressions = suppressions
         self.tainted_values = set()
         self.safe_values = set()
         self.issue_lines = []
         self.seen_lines = set()
+        self.set_receivers = set()
+        nodes = tuple(ast.walk(tree))
+        self.external_names = {name for node in nodes if isinstance(node, (ast.Global, ast.Nonlocal))
+                               for name in node.names}
+        self.dynamic_names = any(
+            isinstance(node, ast.Name) and node.id in {
+                'globals', 'locals', 'vars', 'exec', 'eval', '__builtins__', 'currentframe', '_getframe'}
+            or isinstance(node, ast.Attribute) and node.attr in {
+                'f_locals', 'f_globals', '__dict__', '__globals__', '__closure__',
+                'cell_contents', 'currentframe', '_getframe'}
+            or isinstance(node, ast.ImportFrom) and any(
+                alias.name in {'currentframe', '_getframe'} for alias in node.names)
+            for node in nodes)
+        self.builtin_set = not self.dynamic_names and 'set' not in self.external_names
+        for node in nodes:
+            if (isinstance(node, ast.Name) and node.id == 'set' and isinstance(node.ctx, (ast.Store, ast.Del))
+                    or isinstance(node, ast.arg) and node.arg == 'set'
+                    or isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node.name == 'set'
+                    or isinstance(node, ast.MatchMapping) and node.rest == 'set'
+                    or isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == 'set'
+                    or isinstance(node, ast.Attribute) and node.attr == 'set' and isinstance(node.ctx, (ast.Store, ast.Del))
+                    or isinstance(node, ast.Call) and _call_name(node.func).rsplit('.', 1)[-1] in {
+                        'setattr', 'delattr', '__setattr__', '__delattr__'}):
+                self.builtin_set = False
+            if isinstance(node, (ast.Import, ast.ImportFrom)) and any(
+                    (alias.asname or alias.name.split('.')[0]) == 'set' or alias.name == '*'
+                    for alias in node.names):
+                self.builtin_set = False
+
+    def local_set_receivers(self, function):
+        """Prove builtin set identity, never infer LDAP safety from a name.
+
+        A single function-local binding cannot change type through an alias.
+        Rebindings, parameters, deferred nonlocal writes and frame reflection
+        invalidate that proof. Constructor shadowing affects set(), while a
+        set display intrinsically constructs the builtin type.
+        """
+        if self.dynamic_names:
+            return set()
+        arguments = [*function.args.posonlyargs, *function.args.args, *function.args.kwonlyargs]
+        arguments += [arg for arg in (function.args.vararg, function.args.kwarg) if arg is not None]
+        counts = {argument.arg: 1 for argument in arguments}
+        candidates, pending = set(), list(function.body)
+        while pending:
+            node = pending.pop()
+            names = []
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                counts[node.name] = counts.get(node.name, 0) + 1
+                if isinstance(node, ast.ClassDef):
+                    pending.extend([*node.decorator_list, *node.bases, *node.keywords])
+                else:
+                    pending.extend([*node.decorator_list, *node.args.defaults,
+                                    *(value for value in node.args.kw_defaults if value is not None)])
+                    pending.extend(argument.annotation for argument in
+                                   [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs,
+                                    *(arg for arg in (node.args.vararg, node.args.kwarg) if arg is not None)]
+                                   if argument.annotation is not None)
+                    if node.returns is not None:
+                        pending.append(node.returns)
+                continue
+            if isinstance(node, ast.Lambda):
+                pending.extend([*node.args.defaults, *(value for value in node.args.kw_defaults if value is not None)])
+                continue
+            if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                names.append(node.id)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                names.extend(alias.asname or alias.name.split('.')[0] for alias in node.names)
+            elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node.name:
+                names.append(node.name)
+            elif isinstance(node, ast.MatchMapping) and node.rest:
+                names.append(node.rest)
+            for name in names:
+                counts[name] = counts.get(name, 0) + 1
+            target = node.targets[0] if isinstance(node, ast.Assign) and len(node.targets) == 1 else (
+                node.target if isinstance(node, ast.AnnAssign) else None)
+            if isinstance(target, ast.Name):
+                value = node.value
+                if (isinstance(value, (ast.Set, ast.SetComp))
+                        or self.builtin_set and isinstance(value, ast.Call)
+                        and isinstance(value.func, ast.Name) and value.func.id == 'set'):
+                    candidates.add(target.id)
+            pending.extend(ast.iter_child_nodes(node))
+        return {name for name in candidates if counts.get(name) == 1 and name not in self.external_names}
 
     def remember_issue(self, line_no):
         if self.suppressions.is_suppressed(line_no, RULE_ID) or line_no in self.seen_lines:
@@ -176,12 +259,14 @@ class _LDAPInjectionAnalyzer(ast.NodeVisitor):
     def visit_FunctionDef(self, node):
         old_safe = set(self.safe_values)
         old_tainted = set(self.tainted_values)
+        old_sets, self.set_receivers = self.set_receivers, self.local_set_receivers(node)
         self.safe_values.clear()
         self.tainted_values.clear()
         for stmt in node.body:
             self.visit(stmt)
         self.safe_values = old_safe
         self.tainted_values = old_tainted
+        self.set_receivers = old_sets
 
     def visit_AsyncFunctionDef(self, node):
         self.visit_FunctionDef(node)
@@ -226,7 +311,9 @@ class _LDAPInjectionAnalyzer(ast.NodeVisitor):
         values = []
         if short in LDAP_SEARCH_METHODS or short in LDAP_CONSTRUCTORS or name in LDAP_CONSTRUCTORS:
             values.extend(self.search_filter_args(node, short))
-        if short in LDAP_DN_METHODS:
+        builtin_add = (short == 'add' and isinstance(node.func, ast.Attribute)
+                       and isinstance(node.func.value, ast.Name) and node.func.value.id in self.set_receivers)
+        if short in LDAP_DN_METHODS and not builtin_add:
             values.extend(self.dn_args(node, short))
         if values and any(self.expr_contains_taint(value) for value in values):
             self.remember_issue(node.lineno)
@@ -244,7 +331,7 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
         except Exception:
             continue
         lines = text.splitlines()
-        analyzer = _LDAPInjectionAnalyzer(lines, suppressions.index(path, text))
+        analyzer = _LDAPInjectionAnalyzer(lines, tree, suppressions.index(path, text))
         analyzer.visit(tree)
         for line_no in analyzer.issue_lines:
             yield path, line_no, 1, _source_line(lines, line_no)[:240]

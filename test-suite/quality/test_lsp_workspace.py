@@ -44,8 +44,8 @@ class WorkspaceTests(Fixture):
         self.sink_uri = self.sink.as_uri()
 
     def prepare(self):
-        self.open()
-        self.open(uri=self.sink_uri, text='SINK\n')
+        self.open_document()
+        self.open_document(uri=self.sink_uri, text='SINK\n')
 
     def group(self, id=11):
         self.send('workspace/executeCommand', {'command': 'ubs.scanOpenDocuments'}, id=id)
@@ -254,8 +254,8 @@ class RealGroupedScannerTests(Fixture):
         self.source.write_text('from helper import run\nrun(input())\n')
         helper = self.root / 'helper.py'
         helper.write_text('def run(value):\n    eval(value)\n')
-        self.open()
-        self.open(uri=helper.as_uri(), text=helper.read_text())
+        self.open_document()
+        self.open_document(uri=helper.as_uri(), text=helper.read_text())
         self.send('workspace/executeCommand', {'command': 'ubs.scanOpenDocuments'}, id=30)
         self.wait(timeout=150)
         diagnostics = self.reports(helper.as_uri())[-1]['diagnostics']

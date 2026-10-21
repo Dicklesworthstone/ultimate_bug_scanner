@@ -175,6 +175,27 @@ class PartialReports(unittest.TestCase):
         self.report['scanners'] = [{'language': 'python', 'status': 'timeout', 'message': 'timed out'}]
         self.assert_partial(self.direct(code=0))
 
+    def test_root_module_error_prevents_false_complete_top_level_ok(self):
+        report = dict(self.report, status='ok', failed_modules=[], scanners=[],
+                      module_error='ROOT_FAILURE', message='root producer failed')
+        for flag in (True, 'ROOT_FAILURE'):
+            for code in (0, 1):
+                with self.subTest(flag=flag, code=code):
+                    diagnostics = self.direct(dict(report, module_error=flag), code=code)
+                    self.assert_partial(diagnostics)
+                    self.assertIn('root producer failed', diagnostics[0]['message'])
+        complete = self.direct(dict(report, module_error=False), code=0)
+        self.assertEqual([item['code'] for item in complete], ['python.test.known-bug'])
+        self.assertTrue(all('ubsAnalysisStatus' not in item.get('data', {}) for item in complete))
+        missing = {'status': 'ok', 'module_error': 'ROOT_FAILURE',
+                   'totals': {'files': 1, 'critical': 0, 'warning': 0, 'info': 0}}
+        with self.assertRaises(lsp.ProtocolError):
+            self.direct(missing, code=0)
+        self.configure(report, code=0)
+        results = self.scan(self.a, self.b)
+        self.assert_partial(results[self.a.as_uri()][0])
+        self.assert_partial(results[self.b.as_uri()][0], expected=())
+
     def test_incomplete_empty_peer_gets_visible_marker(self):
         self.assert_partial(self.direct(path=self.b), expected=())
 
@@ -393,7 +414,10 @@ class PartialReports(unittest.TestCase):
                         fields = dict(row.split(b':', 1) for row in bytes(wire[:end]).split(b'\r\n'))
                         size = int(fields[b'Content-Length'])
                         if len(wire) >= end + 4 + size:
-                            item = json.loads(bytes(wire[end + 4:end + 4 + size]))
+                            try:
+                                item = json.loads(bytes(wire[end + 4:end + 4 + size]))
+                            except json.JSONDecodeError as exc:
+                                self.fail(f'Invalid LSP JSON frame: {exc}; retained evidence: {self.work}')
                             del wire[:end + 4 + size]
                             transcript.append(item)
                             if predicate(item):

@@ -999,12 +999,25 @@ def to_sarif(
     # the failed-invocation identity, not decoration: consumers use it to tell
     # an environment failure (2) apart from a findings result, and dropping it
     # made a failed run look merely unsuccessful.
-    if str(doc.get("status") or "ok") != "ok" or doc.get("failed_modules"):
-        failed = doc.get("failed_modules") or []
+    failed = doc.get("failed_modules") or []
+    if not failed:
+        # Standalone modules carry their failure on the summary itself,
+        # without the meta-runner's failed_modules envelope. Preserve that
+        # reason too; an unsuccessful invocation with no notification is
+        # insufficient to explain why available findings are incomplete.
+        summaries = doc.get("scanners")
+        candidates = summaries if isinstance(summaries, list) else [doc]
+        failed = [summary for summary in candidates if isinstance(summary, dict)
+                  and (str(summary.get("status") or "ok") != "ok" or summary.get("module_error"))]
+    if str(doc.get("status") or "ok") != "ok" or failed or doc.get("module_error"):
+        if not failed:
+            failed = [doc]
         notifications = []
         for fmod in failed:
             if isinstance(fmod, dict):
                 st = str(fmod.get("status") or "error")
+                if st == "ok":
+                    st = "error"
                 flang = str(fmod.get("language") or "unknown")
                 msg = str(fmod.get("message") or fmod.get("module_error") or "module did not complete")
                 notifications.append({

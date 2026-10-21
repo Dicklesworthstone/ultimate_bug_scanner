@@ -18,6 +18,7 @@ import tempfile
 import textwrap
 from collections import Counter
 from pathlib import Path
+from urllib.parse import quote_from_bytes
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 UBS = REPO_ROOT / "ubs"
@@ -2017,6 +2018,69 @@ def describe_failed_modules(entries: object) -> str:
     return "; ".join(parts)
 
 
+def expected_sarif_uri(path: str) -> str:
+    """Express JSON's native path in SARIF's URI representation, without resolving it.
+
+    SARIF 2.1.0 sections 3.10.1/3.10.2 require URI escaping and file URIs.
+    Encode the expected path instead of decoding the observed URI: stripping
+    authorities or decoding twice would silently identify different files.
+    Never resolve symlinks, dot segments, case, or relative paths here.
+    """
+    if path.startswith("file://"):
+        return path
+    encoded = quote_from_bytes(os.fsencode(path), safe="/")
+    return "file://" + encoded if path.startswith("/") else encoded
+
+
+def check_sarif_uri_identity_boundaries() -> None:
+    # Literal URI expectations are independent of the production renderer.
+    cases = (
+        ("", ""),
+        ("/src/source.py", "file:///src/source.py"),
+        ("src/source.py", "src/source.py"),
+        ("/src/source #100%?.py", "file:///src/source%20%23100%25%3F.py"),
+        ("src/café.py", "src/caf%C3%A9.py"),
+        ("/src/\udcff.py", "file:///src/%FF.py"),
+        ("src/a%2Fb.py", "src/a%252Fb.py"),
+        ("src/a/b.py", "src/a/b.py"),
+        ("file:///src/a%20b.py", "file:///src/a%20b.py"),
+        ("file://remote/src/a.py", "file://remote/src/a.py"),
+        ("src:a.py", "src%3Aa.py"),
+        ("./src/a.py", "./src/a.py"),
+        ("src/../a.py", "src/../a.py"),
+        ("src//a.py", "src//a.py"),
+    )
+    for path, uri in cases:
+        assert expected_sarif_uri(path) == uri, (repr(path), uri)
+
+    # These plausible corruptions MUST remain unequal in the parity Counter.
+    # In particular, percent-escaped separators and remote authorities cannot
+    # be erased by a convenient URI-to-path normalization.
+    unequal = (
+        ("/src/a.py", "/src/a.py"),
+        ("/src/a.py", "file://remote/src/a.py"),
+        ("file://remote/src/a.py", "file:///src/a.py"),
+        ("file://remote/src/a.py", "file://other/src/a.py"),
+        ("/src/a.py", "file:///src/b.py"),
+        ("src/a.py", "file:///src/a.py"),
+        ("src/a%2Fb.py", "src/a%2Fb.py"),
+        ("src/a%2Fb.py", "src/a/b.py"),
+        ("src/a/b.py", "src/a%2Fb.py"),
+        ("src/a%252Fb.py", "src/a%252Fb.py"),
+        ("src/a b.py", "src/a+b.py"),
+        ("src/a#b.py", "src/a#b.py"),
+        ("src/a?b.py", "src/a?b.py"),
+        ("src/A.py", "src/a.py"),
+        ("./src/a.py", "src/a.py"),
+        ("src/../a.py", "a.py"),
+        ("src//a.py", "src/a.py"),
+    )
+    for path, wrong_uri in unequal:
+        assert expected_sarif_uri(path) != wrong_uri, (repr(path), wrong_uri)
+    report("sarif_uri_identity_boundaries", True,
+           f"{len(cases)} exact URI expectations; {len(unequal)} distinct locations rejected")
+
+
 def test_findings_parity_all_langs() -> None:
     # K2: findings parity — meta-runner --format=json includes per-finding records
     # for every module. SARIF also retains the separate AST evidence exposed
@@ -2265,7 +2329,7 @@ def test_findings_parity_all_langs() -> None:
                         level = "none"
                     path = finding.get("file", finding.get("path", ""))
                     expected[(
-                        finding.get("rule_id", finding.get("rule", "")), path,
+                        finding.get("rule_id", finding.get("rule", "")), expected_sarif_uri(path),
                         max(1, finding.get("line", 1) or 1) if path else 0,
                         max(1, finding.get("col", 1) or 1) if path else 0,
                         level, finding.get("message", ""), scope, finding.get("count")
@@ -2834,6 +2898,7 @@ def main() -> int:
         test_staged_scans_index_only,
         test_diff_scans_modified_only,
         test_skip_polyglot_mapping,
+        check_sarif_uri_identity_boundaries,
         check_findings_parity_all_langs,
         test_baseline_new_only,
         test_doctor_json_schema,

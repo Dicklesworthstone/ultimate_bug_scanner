@@ -3340,9 +3340,15 @@ class Second {
         context = f'exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}'
         self.assertEqual(proc.returncode, 2, context)
         report = self.decode_report(proc)
-        self.assertEqual(report['status'], 'error', context)
-        self.assertTrue(report['failed_modules'], context)
-        self.assertIn('capture-state', proc.stdout + proc.stderr, context)
+        self.assertEqual(report['status'], 'partial', context)
+        self.assertEqual(report['exit_code'], 2, context)
+        self.assertEqual(len(report['failed_modules']), 1, context)
+        failure = report['failed_modules'][0]
+        self.assertEqual((failure['language'], failure['status'], failure['module_error']),
+                         ('kotlin', 'partial', 'ANALYZER_ERROR'), context)
+        self.assertIn(str(bad_path), failure['message'], context)
+        self.assertIn('capture-state', failure['message'], context)
+        self.assertIn('analysis is incomplete', failure['message'], context)
 
     def test_kotlin_nonlocal_writes_preserve_symbolic_escape_polarity(self):
         safe = ('var path = "fixed"\n'
@@ -3384,9 +3390,15 @@ class Second {
         context = f'exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}'
         self.assertEqual(proc.returncode, 2, context)
         report = self.decode_report(proc)
-        self.assertEqual(report['status'], 'error', context)
-        self.assertTrue(report['failed_modules'], context)
-        self.assertIn('capture-state', proc.stdout + proc.stderr, context)
+        self.assertEqual(report['status'], 'partial', context)
+        self.assertEqual(report['exit_code'], 2, context)
+        self.assertEqual(len(report['failed_modules']), 1, context)
+        failure = report['failed_modules'][0]
+        self.assertEqual((failure['language'], failure['status'], failure['module_error']),
+                         ('kotlin', 'partial', 'ANALYZER_ERROR'), context)
+        self.assertIn(str(bad_path), failure['message'], context)
+        self.assertIn('capture-state', failure['message'], context)
+        self.assertIn('analysis is incomplete', failure['message'], context)
 
     def test_original_real_cli_scope_reductions(self):
         fixtures = {

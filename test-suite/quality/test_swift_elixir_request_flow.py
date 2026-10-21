@@ -1212,6 +1212,56 @@ class SwiftLifecycleBindings(LoggedCase):
                   }
                 }
             '''),
+            # do/catch is modeled now. Retain each former refusal as an exact
+            # leak oracle and pair it with cleanup on every reachable exit.
+            ('resource_acquired_inside_catch_scope', '''
+                import Foundation
+                func start() {
+                    do {
+                        let timer: Timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                    } catch { }
+                }
+            '''),
+            ('resource_acquired_inside_catch_scope_cleanup', '''
+                import Foundation
+                func start() {
+                    do {
+                        let timer: Timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                        timer.invalidate()
+                    } catch { }
+                }
+            '''),
+            ('resource_acquired_inside_catch_arm', '''
+                import Foundation
+                func start() {
+                    do { try work() } catch {
+                        let timer: Timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                    }
+                }
+            '''),
+            ('resource_acquired_inside_catch_arm_cleanup', '''
+                import Foundation
+                func start() {
+                    do { try work() } catch {
+                        let timer: Timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                        timer.invalidate()
+                    }
+                }
+            '''),
+            ('selected_resource_crosses_catch_scope', '''
+                import Foundation
+                func start() {
+                    let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                    do { try work(); timer.invalidate() } catch { }
+                }
+            '''),
+            ('selected_resource_crosses_catch_scope_cleanup', '''
+                import Foundation
+                func start() {
+                    let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                    do { try work(); timer.invalidate() } catch { timer.invalidate() }
+                }
+            '''),
         )
         for name, body in cases:
             source = textwrap.dedent(body).strip('\n') + '\n'
@@ -1247,29 +1297,6 @@ class SwiftLifecycleBindings(LoggedCase):
     @staticmethod
     def incomplete_cases():
         return {
-            'resource_acquired_inside_catch_scope': '''
-                import Foundation
-                func start() {
-                    do {
-                        let timer: Timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
-                    } catch { }
-                }
-            ''',
-            'resource_acquired_inside_catch_arm': '''
-                import Foundation
-                func start() {
-                    do { try work() } catch {
-                        let timer: Timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
-                    }
-                }
-            ''',
-            'selected_resource_crosses_catch_scope': '''
-                import Foundation
-                func start() {
-                    let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
-                    do { try work(); timer.invalidate() } catch { }
-                }
-            ''',
             'malformed_catch_scope': '''
                 import Foundation
                 func start() {

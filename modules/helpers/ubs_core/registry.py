@@ -85,6 +85,9 @@ def register(analyzer: Analyzer) -> Analyzer:
 
 
 def get(layer: str, lang: Lang) -> list[Analyzer]:
+    from .analyzers import load
+
+    load(lang)
     try:
         return list(_REGISTRY[(layer, lang)])
     except KeyError:
@@ -92,6 +95,9 @@ def get(layer: str, lang: Lang) -> list[Analyzer]:
 
 
 def all_analyzers() -> Iterator[Analyzer]:
+    from .analyzers import load
+
+    load()
     for key in sorted(_REGISTRY):
         yield from _REGISTRY[key]
 
@@ -101,7 +107,10 @@ def analyzers_for_layer(layer: str) -> list[Analyzer]:
 
 
 def analyzers_for_lang(lang: Lang) -> list[Analyzer]:
-    return [a for a in all_analyzers() if a.lang == lang]
+    from .analyzers import load
+
+    load(lang)
+    return [a for key in sorted(_REGISTRY) for a in _REGISTRY[key] if a.lang == lang]
 
 
 def _coerce_finding(raw: dict) -> dict:

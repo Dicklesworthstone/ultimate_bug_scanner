@@ -275,6 +275,23 @@ CASES = (
           # Ecto.Adapters.SQL.query!(ApplicationRepo, "SELECT '#{params["name"]}'")
           ~S(Ecto.Adapters.SQL.query!(ApplicationRepo, "SELECT '#{params["name"]}'"))
         end'''),
+    # The supported Phoenix controller entrypoint does not sanitize params or
+    # change the fully qualified Ecto call. Keep the original macro case as a
+    # finding oracle, paired with actual parameter binding through the same use.
+    Case('unexpanded_controller_macro', '''
+        defmodule Handler do
+          use MyWeb, :controller
+          def handle(conn, params) do
+            Ecto.Adapters.SQL.query!(ApplicationRepo, params["sql"]) # sql
+          end
+        end'''),
+    Case('controller_macro_bound_values', '''
+        defmodule Handler do
+          use MyWeb, :controller
+          def handle(conn, params) do
+            Ecto.Adapters.SQL.query!(ApplicationRepo, "SELECT $1::text", [params["sql"]])
+          end
+        end'''),
 )
 
 PARTIAL = (
@@ -292,9 +309,9 @@ PARTIAL = (
           sql = Unknown.quote(params["sql"])
           Ecto.Adapters.SQL.query!(ApplicationRepo, sql)
         end'''),
-    Case('unexpanded_controller_macro', '''
+    Case('unknown_macro_entrypoint', '''
         defmodule Handler do
-          use MyWeb, :controller
+          use MyWeb, :custom_query_handler
           def handle(conn, params) do
             Ecto.Adapters.SQL.query!(ApplicationRepo, params["sql"])
           end

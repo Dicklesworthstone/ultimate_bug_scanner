@@ -1043,10 +1043,22 @@ class _Flow:
         parser = body[0].value
         if not (parsed != parameter and isinstance(parser, ast.Call)
                 and isinstance(parser.func, ast.Name) and parser.func.id not in {parsed, parameter}
-                and _qualified(parser.func, state.bindings) == 'urllib.parse.urlparse'
                 and _qualified(parser.func, self.engine.globals.bindings) == 'urllib.parse.urlparse'
                 and len(parser.args) == 1 and not parser.keywords
                 and isinstance(parser.args[0], ast.Name) and parser.args[0].id == parameter):
+            return
+        # The predicate reads its defining module. A caller's compact state
+        # may omit urlparse when it only calls this predicate indirectly.
+        # Resolve that global exactly as a normal call does, retaining any
+        # active rebinding, mutation or unknown closure rather than blessing
+        # the spelling of the parser.
+        parser_name = parser.func.id
+        if (parser_name in self.engine.locals[function]
+                or parser_name in self.engine.closures[function]):
+            return
+        parser_binding = next((value for key, _, _, value in self.global_arguments(function, state)
+                               if key == '@global:' + parser_name), None)
+        if parser_binding != 'urllib.parse.urlparse':
             return
         condition = body[1].value
         if not (isinstance(condition, ast.BoolOp) and isinstance(condition.op, ast.And)

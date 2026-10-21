@@ -883,7 +883,28 @@ BUILDER_CASES = (
     ''')),
 )
 
-ALL_CASES = CASES + REVIEW_CASES + BATCH_CASES + BUILDER_CASES
+ARRAY_CASES = (
+    # An initializer's query text is still query text when read from its only
+    # element. These cases exercise data provenance, not mutable heap updates.
+    Case("sql_array_state", handle(f"""
+        String input = {SOURCE};
+        String[] queries = new String[] {{ {QUERY} }};
+        statement.executeQuery(queries[0]); // SQL_EXEC
+    """)),
+    Case("sql_array_static", handle(f"""
+        String input = {SOURCE};
+        String[] queries = new String[] {{ "select 1" }};
+        statement.executeQuery(queries[0]);
+    """)),
+    Case("sql_array_rebound_to_static", handle(f"""
+        String input = {SOURCE};
+        String[] queries = new String[] {{ {QUERY} }};
+        queries = new String[] {{ "select 1" }};
+        statement.executeQuery(queries[0]);
+    """)),
+)
+
+ALL_CASES = CASES + REVIEW_CASES + BATCH_CASES + BUILDER_CASES + ARRAY_CASES
 BY_NAME = {case.name: case for case in ALL_CASES}
 
 INCOMPLETE_CASES = (
@@ -985,9 +1006,10 @@ INCOMPLETE_CASES = (
             }}
         }});
     """, "HttpExchange exchange, Statement statement, java.util.concurrent.Executor executor")),
-    Case("sql_array_state", handle(f"""
+    Case("sql_array_element_write", handle(f"""
         String input = {SOURCE};
-        String[] queries = new String[] {{ {QUERY} }};
+        String[] queries = new String[] {{ "select 1" }};
+        queries[0] = {QUERY};
         statement.executeQuery(queries[0]);
     """)),
     Case("batch_helper_mutation", '''

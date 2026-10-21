@@ -162,6 +162,47 @@ if approved(target):
     requests.get(target)
 ''')
 
+    def test_helper_url_guard_preserves_parser_binding_and_failure_paths(self):
+        validator = '''
+def validate(target):
+    if not approved(target):
+        raise ValueError("blocked")
+    return target
+'''
+        for body, rules in (
+            ('return validate(target)', ()),
+            ('checked = validate(target)\n    return checked', ()),
+            ('validate(target)\n    return input()', ('ssrf',)),
+            ('try:\n        return validate(target)\n    except ValueError:\n        return target', ('ssrf',)),
+        ):
+            with self.subTest(body=body):
+                self.assert_rules(self.url_guard_source() + validator +
+                                  '\ndef forward(target):\n    ' + body +
+                                  '\nrequests.get(forward(input()))\n', *rules)
+        # A restored module binding must not certify the earlier call made
+        # while the parser was replaced.
+        self.assert_rules(self.url_guard_source() + validator + '''
+saved_parser = urlparse
+urlparse = unknown_parser
+requests.get(validate(input()))
+urlparse = saved_parser
+''', 'ssrf')
+        # A same-named closure is a different binding from the module import.
+        self.assert_rules('''
+import requests
+from urllib.parse import urlparse
+HOSTS = {"api.example.com"}
+def forward(target, parser):
+    urlparse = parser
+    def approved(value):
+        parsed = urlparse(value)
+        return parsed.scheme == "https" and parsed.hostname in HOSTS
+    if not approved(target):
+        raise ValueError("blocked")
+    return target
+requests.get(forward(input(), unknown_parser))
+''', 'ssrf')
+
     def test_url_guard_requires_both_exact_checks_and_a_real_parser(self):
         suffix = '''
 target = input()

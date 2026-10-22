@@ -18,7 +18,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="321f20751bfb6ca5232bf0b105530ac311f2918d7238ade26370562d523e5543"
+UBS_LIB_CHECKSUM="f7d6d1be7d64ef5505bbb265eb0b4b8746639401aa10afb1dce9e681d6749cb0"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -76,10 +76,10 @@ TEMP_PATHS=()
 # shellcheck disable=SC2329
 cleanup() {
   IFS=${ORIG_IFS}
-  [[ "${KEEP_TEMP}" -eq 1 ]] && return 0
+  [[ "${KEEP_TEMP}" == "1" ]] && return 0
   local p
   for p in "${TEMP_PATHS[@]:-}"; do
-    [[ -n "$p" && "$p" != "/" && "$p" != "." ]] && rm -rf -- "$p" 2>/dev/null || true
+    [[ -n "$p" && "$p" != "/" && "$p" != "." ]] && ubs_remove_temp -rf -- "$p" 2>/dev/null || true
   done
 }
 trap cleanup EXIT
@@ -199,6 +199,13 @@ if [[ "${UBS_PROFILE:-}" == "loose" ]]; then
 fi
 
 print_usage() {
+  (
+  # compat31 forces Bash to spool here-documents to auto-unlinked files.
+  # Keep regex compatibility in the caller; only this literal stream uses
+  # the current shell's pipe-backed redirection behavior in retention mode.
+  if [[ "${UBS_KEEP_TEMP:-0}" == "1" ]]; then
+    BASH_COMPAT="${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"
+  fi
   cat >&2 <<USAGE
 Usage: $(basename "$0") [options] [PROJECT_DIR] [OUTPUT_FILE]
 
@@ -235,6 +242,7 @@ Args:
   OUTPUT_FILE             File to save the report (optional)
 contract: v2
 USAGE
+  )
 }
 
 while [[ $# -gt 0 ]]; do
@@ -297,6 +305,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ "$LIST_CATEGORIES" -eq 1 ]]; then
+  (
+  if [[ "${UBS_KEEP_TEMP:-0}" == "1" ]]; then
+    BASH_COMPAT="${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"
+  fi
   cat <<'CAT'
 1 None/Defensive  2 Numeric/Arithmetic  3 Collections  4 Comparison/Type
 5 Async/Await     6 Error Handling      7 Security     8 Functions/Scope
@@ -305,6 +317,7 @@ if [[ "$LIST_CATEGORIES" -eq 1 ]]; then
 17 Typing         18 Module Usage       19 Lifecycle   20 Extra Analyzers
 21 Deprecations   22 Packaging/Config   23 Notebooks
 CAT
+  )
   exit 0
 fi
 
@@ -327,7 +340,7 @@ generate(Path('$tmp_rules'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' else Non
     cp "$tmp_rules"/rules/*.yml "$tmp_rules"/*.yml "$DUMP_RULES_DIR/" 2>/dev/null || true
   fi
   ( set +o pipefail; awk 'BEGIN{FS=":"}/^id:[[:space:]]*/{gsub(/^[[:space:]]*id:[[:space:]]*/,"");print;}' "$tmp_rules"/rules/*.yml "$tmp_rules"/*.yml 2>/dev/null || true ) | LC_ALL=C sort -u
-  rm -rf "$tmp_rules" 2>/dev/null || true
+  ubs_remove_temp -rf "$tmp_rules" 2>/dev/null || true
   exit 0
 fi
 
@@ -346,7 +359,7 @@ if [[ "$FORMAT" == "json" || "$FORMAT" == "sarif" ]]; then
 fi
 
 EXCLUDE_DIRS=(venv .venv env .env __pycache__ .git .mypy_cache .pytest_cache .ruff_cache .tox .nox build dist .eggs *.egg-info site-packages)
-if [[ -n "$EXTRA_EXCLUDES" ]]; then IFS=',' read -r -a _X <<<"$EXTRA_EXCLUDES"; EXCLUDE_DIRS+=("${_X[@]}"); fi
+if [[ -n "$EXTRA_EXCLUDES" ]]; then IFS=',' read -r -a _X < <(printf '%s\n' "$EXTRA_EXCLUDES"); EXCLUDE_DIRS+=("${_X[@]}"); fi
 
 HAS_UV=0
 UVX_CMD=()
@@ -379,7 +392,11 @@ run_uv_tool_text() {
   # The shared launcher owns its isolated tool group and stops it on module
   # cancellation too. Spool/copy all output, including evidence before failure.
   ubs_resolve_helpers_dir helpers_dir || helpers_dir="$SCRIPT_DIR/helpers"
-  PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 - "$tool" "$UV_TIMEOUT" "${command_args[@]}" <<'PYUVTOOL' || rc=$?
+  (
+  if [[ "${UBS_KEEP_TEMP:-0}" == "1" ]]; then
+    BASH_COMPAT="${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"
+  fi
+  PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 - "$tool" "$UV_TIMEOUT" "${command_args[@]}" <<'PYUVTOOL'
 from pathlib import Path
 import shutil
 import sys
@@ -405,6 +422,7 @@ for error in errors:
     print(error, file=sys.stderr)
 sys.exit(2 if errors else status)
 PYUVTOOL
+  ) || rc=$?
   UV_TOOL_STATUS="$rc"
   return 0
 }
@@ -434,7 +452,22 @@ run_v2_uv_tools_py(){
     return 0
   fi
   local TOOL ruff_stdout ruff_stderr ruff_trimmed ruff_count ruff_parsed ruff_rc _EXC _ign_pats _pat _match _pa_input _tool_out
-  IFS=',' read -r -a UVLIST <<< "$UV_TOOLS"
+  IFS=',' read -r -a UVLIST < <(printf '%s\n' "$UV_TOOLS")
+  # Optional analyzers/provisioners own caches and scratch outside UBS. Check
+  # the selected available tools before launching any of them in this mode.
+  if [[ "${UBS_KEEP_TEMP:-0}" == "1" ]]; then
+    for TOOL in "${UVLIST[@]}"; do
+      case "$TOOL" in
+        ruff|bandit|pip-audit|mypy|detect-secrets|safety)
+          if [[ "$HAS_UV" -eq 1 ]] || command -v "$TOOL" >/dev/null 2>&1; then
+            echo "ERROR: UBS_KEEP_TEMP=1 cannot retain optional $TOOL/uv scratch; select --no-uv for static analysis or disable category 20." >&2
+            record_uv_tool_failure "$TOOL refused: UBS_KEEP_TEMP=1 cannot retain external analyzer scratch"
+            return 2
+          fi
+          ;;
+      esac
+    done
+  fi
   for TOOL in "${UVLIST[@]}"; do
     case "$TOOL" in
       ruff)
@@ -452,7 +485,11 @@ run_v2_uv_tools_py(){
         ruff_parsed=0
         if command -v python3 >/dev/null 2>&1 && [[ -s "$ruff_stdout" ]]; then
           ruff_parsed=1
-          ruff_count=$(python3 - "$ruff_stdout" <<'PYRUFF'
+          ruff_count=$(
+          if [[ "${UBS_KEEP_TEMP:-0}" == "1" ]]; then
+            BASH_COMPAT="${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"
+          fi
+          python3 - "$ruff_stdout" <<'PYRUFF'
 import json, sys
 try:
     data = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -502,7 +539,7 @@ PYRUFF
           print_finding "info" "$ruff_count" "Ruff emitted findings" "Review ruff output above"
           UV_EXTRA_INFO=$((UV_EXTRA_INFO + ruff_count))
         fi
-        rm -f "$ruff_stdout" "$ruff_stderr" 2>/dev/null || true
+        ubs_remove_temp -f "$ruff_stdout" "$ruff_stderr" 2>/dev/null || true
         ;;
       bandit)
         print_subheader "bandit (security)"
@@ -515,7 +552,7 @@ PYRUFF
           fi
         done
         if [[ -n "$EXTRA_EXCLUDES" ]]; then
-          IFS=',' read -r -a _ign_pats <<< "$EXTRA_EXCLUDES"
+          IFS=',' read -r -a _ign_pats < <(printf '%s\n' "$EXTRA_EXCLUDES")
           for _pat in "${_ign_pats[@]}"; do
             [[ "$_pat" != *'*'* && "$_pat" != *'?'* && "$_pat" != *'['* ]] && continue
             while IFS= read -r _match; do
@@ -539,7 +576,7 @@ PYRUFF
           print_finding "warn" 1 "Bandit did not complete (exit $UV_TOOL_STATUS)" "Security coverage is incomplete for this scan"
           record_uv_tool_failure "bandit exited $UV_TOOL_STATUS"
         fi
-        rm -f "$_tool_out" 2>/dev/null || true
+        ubs_remove_temp -f "$_tool_out" 2>/dev/null || true
         ;;
       pip-audit)
         print_subheader "pip-audit (dependencies)"
@@ -570,7 +607,7 @@ PYRUFF
           print_finding "warn" 1 "pip-audit did not complete (exit $UV_TOOL_STATUS)" "Dependency coverage is incomplete for this scan"
           record_uv_tool_failure "pip-audit exited $UV_TOOL_STATUS"
         fi
-        rm -f "$_tool_out" 2>/dev/null || true
+        ubs_remove_temp -f "$_tool_out" 2>/dev/null || true
         ;;
       mypy)
         print_subheader "mypy (type-check)"
@@ -601,8 +638,12 @@ run_v2_legacy_parity_bridges_py(){
   local analyzer_errors="${7:-0}"
   local files_n bridge_rc=0
   files_n="$(tr -dc '\0' <"$list_file" 2>/dev/null | wc -c)"
+  (
+  if [[ "${UBS_KEEP_TEMP:-0}" == "1" ]]; then
+    BASH_COMPAT="${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"
+  fi
   python3 - "$sink" "$text_out" "$files_n" "${FAIL_ON_WARNING:-0}" "$skip_csv" \
-    "$py_exit" "$extra_info" "$analyzer_errors" <<'PYV2BRIDGE' || bridge_rc=$?
+    "$py_exit" "$extra_info" "$analyzer_errors" <<'PYV2BRIDGE'
 import json
 import sys
 
@@ -688,6 +729,7 @@ else:
         exit_code = 1
 sys.exit(exit_code)
 PYV2BRIDGE
+  ) || bridge_rc=$?
   return "$bridge_rc"
 }
 
@@ -709,7 +751,7 @@ run_contract_v2_py(){
   if [[ -n "$CATEGORY_WHITELIST" ]]; then
     local keep="" c allowed w
     local -a _wl
-    IFS=',' read -r -a _wl <<<"$CATEGORY_WHITELIST"
+    IFS=',' read -r -a _wl < <(printf '%s\n' "$CATEGORY_WHITELIST")
     for c in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23; do
       allowed=0
       for w in "${_wl[@]}"; do [[ "$w" == "$c" ]] && allowed=1; done
@@ -768,7 +810,11 @@ generate(Path('$ast_rule_dir'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' else 
     printf 'ubs-python: analysis incomplete: %s\n' "${UV_TOOL_ERRORS[@]}" >&2
     # The JSON summary must not claim a completed scan either.
     if [[ -n "$v2_json_out" && -f "$v2_json_out" ]] && command -v python3 >/dev/null 2>&1; then
-      UBS_UV_TOOL_ERRORS="$(printf '%s; ' "${UV_TOOL_ERRORS[@]}")" python3 - "$v2_json_out" <<'PYUVSTATUS' || true
+      (
+      if [[ "${UBS_KEEP_TEMP:-0}" == "1" ]]; then
+        BASH_COMPAT="${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"
+      fi
+      UBS_UV_TOOL_ERRORS="$(printf '%s; ' "${UV_TOOL_ERRORS[@]}")" python3 - "$v2_json_out" <<'PYUVSTATUS'
 import json, os, sys
 path = sys.argv[1]
 try:
@@ -786,6 +832,7 @@ with open(path, "w", encoding="utf-8") as fh:
     json.dump(doc, fh, ensure_ascii=False)
     fh.write("\n")
 PYUVSTATUS
+      ) || true
     fi
   fi
 
@@ -801,7 +848,7 @@ PYUVSTATUS
 
   if [[ -n "$text_out" ]]; then
     cat "$text_out" 2>/dev/null || true
-    rm -f "$text_out" 2>/dev/null || true
+    ubs_remove_temp -f "$text_out" 2>/dev/null || true
   fi
   if [[ -n "$v2_json_out" && "$FORMAT" == "json" ]]; then
     cat "$v2_json_out" 2>/dev/null || true
@@ -819,7 +866,7 @@ PYUVSTATUS
     fi
   fi
   if [[ -n "$v2_json_out" ]]; then
-    rm -f "$v2_json_out" 2>/dev/null || true
+    ubs_remove_temp -f "$v2_json_out" 2>/dev/null || true
   fi
   if [[ -n "$REPORT_JSON" ]]; then
     # K2: the sink IS the findings record stream.
@@ -828,8 +875,8 @@ PYUVSTATUS
   if [[ "$delivery_failed" -eq 1 ]]; then
     exit_code=2
   fi
-  rm -f "$list_file" "$sink" 2>/dev/null || true
-  [[ -n "$ast_rule_dir" ]] && rm -rf -- "$ast_rule_dir" 2>/dev/null || true
+  ubs_remove_temp -f "$list_file" "$sink" 2>/dev/null || true
+  [[ -n "$ast_rule_dir" ]] && ubs_remove_temp -rf -- "$ast_rule_dir" 2>/dev/null || true
   return "$exit_code"
 }
 

@@ -697,7 +697,7 @@ class PrefilterAdmissionTests(unittest.TestCase):
                     stderr.close()
                     raise OSError("capture close failed")
 
-            with patch.object(external_tools.tempfile, "TemporaryFile", side_effect=[stdout, BrokenClose()]), \
+            with patch.object(external_tools, "temporary_file", side_effect=[stdout, BrokenClose()]), \
                     patch("sys.stderr", io.StringIO()) as log:
                 result = run_prefilter([self.target], self.index)
             self.assertTrue(stdout.closed)

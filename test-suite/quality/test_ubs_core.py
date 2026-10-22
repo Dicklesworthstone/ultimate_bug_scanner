@@ -332,6 +332,249 @@ class UbsCoreIoTests(unittest.TestCase):
         self.assertEqual(reg3, "int d = 4;")
 
 
+class KeepTempHelperTests(unittest.TestCase):
+    """Real retention-mode helper operations; every artifact is left in place."""
+
+    def setUp(self) -> None:
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        self.root = Path(tempfile.mkdtemp(prefix="ubs-keep-helper-", dir=artifacts))
+        self.saved_environment = {key: os.environ.get(key)
+                                  for key in ("UBS_KEEP_TEMP", "TMPDIR", "TEMP", "TMP")}
+        self.saved_tempdir = tempfile.tempdir
+        os.environ["UBS_KEEP_TEMP"] = "1"
+        for key in ("TMPDIR", "TEMP", "TMP"):
+            os.environ[key] = str(self.root)
+        tempfile.tempdir = str(self.root)
+
+    def tearDown(self) -> None:
+        tempfile.tempdir = self.saved_tempdir
+        for key, value in self.saved_environment.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def test_directories_survive_normal_and_exceptional_exit(self) -> None:
+        from ubs_core.io import temporary_directory
+
+        with temporary_directory(prefix="success-") as success:
+            (Path(success) / "evidence.txt").write_text("completed\n", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "retention probe"):
+            with temporary_directory(prefix="failure-") as failure:
+                (Path(failure) / "evidence.txt").write_text("partial\n", encoding="utf-8")
+                raise RuntimeError("retention probe")
+        self.assertEqual((Path(success) / "evidence.txt").read_text(encoding="utf-8"), "completed\n")
+        self.assertEqual((Path(failure) / "evidence.txt").read_text(encoding="utf-8"), "partial\n")
+
+    def test_named_and_anonymous_streams_retain_closed_bytes(self) -> None:
+        from ubs_core.io import temporary_file
+
+        for named in (False, True):
+            with self.subTest(named=named):
+                with temporary_file(mode="w+", encoding="utf-8", named=named) as stream:
+                    path = Path(stream.name)
+                    stream.write("retained \u03bb\n")
+                    stream.seek(0)
+                    self.assertEqual(stream.read(), "retained \u03bb\n")
+                self.assertTrue(stream.closed)
+                self.assertEqual(path.read_text(encoding="utf-8"), "retained \u03bb\n")
+                with self.assertRaisesRegex(RuntimeError, "stream unwind"):
+                    with temporary_file(mode="w+", encoding="utf-8", named=named) as failed:
+                        failed_path = Path(failed.name)
+                        failed.write("partial stream\n")
+                        raise RuntimeError("stream unwind")
+                self.assertTrue(failed.closed)
+                self.assertEqual(failed_path.read_text(encoding="utf-8"), "partial stream\n")
+
+    def test_fresh_process_avoids_tempdir_probe_and_rejects_invalid_override(self) -> None:
+        script = r'''
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+sys.path.insert(0, sys.argv[1])
+from ubs_core.io import temporary_directory, temporary_file
+assert tempfile.tempdir is None
+def reject_deletion(event, arguments):
+    if event in {"os.remove", "os.rmdir"}:
+        raise AssertionError(f"unexpected deletion: {event} {arguments!r}")
+sys.addaudithook(reject_deletion)
+root = Path(sys.argv[2])
+with temporary_directory(prefix="fresh-dir-") as directory:
+    (Path(directory) / "evidence.txt").write_text("fresh", encoding="utf-8")
+with temporary_file(mode="w+", encoding="utf-8", prefix="fresh-file-") as stream:
+    stream.write("fresh")
+    filename = stream.name
+assert tempfile.tempdir is None
+assert Path(directory).parent == root
+assert Path(filename).parent == root
+assert Path(filename).read_text(encoding="utf-8") == "fresh"
+os.environ["TMPDIR"] = str(root / "does-not-exist")
+try:
+    with temporary_directory():
+        raise AssertionError("invalid TMPDIR accepted")
+except NotADirectoryError:
+    pass
+else:
+    raise AssertionError("invalid TMPDIR did not fail")
+print(json.dumps({"directory": directory, "filename": filename}))
+'''
+        command = [sys.executable, "-B", "-c", script, str(HELPERS_DIR), str(self.root)]
+        result = subprocess.run(command, cwd=self.root, text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}")
+        evidence = json.loads(result.stdout)
+        self.assertTrue(Path(evidence["directory"]).is_dir())
+        self.assertTrue(Path(evidence["filename"]).is_file())
+
+    def test_real_failed_subprocess_retains_stdout_stderr_and_exit(self) -> None:
+        from ubs_core.external_tools import run_command_stream
+
+        errors = []
+        command = [sys.executable, "-B", "-c",
+                   "import sys; sys.stdout.buffer.write(b'finding\\n'); "
+                   "sys.stderr.buffer.write(b'diagnostic\\n'); sys.exit(7)"]
+        with run_command_stream("retention probe", command, self.root, 10, errors) as output:
+            self.assertIsNotNone(output, errors)
+            self.assertEqual(output.returncode, 7)
+            self.assertEqual(output.stdout.read(), b"finding\n")
+            self.assertEqual(output.stderr, "diagnostic\n")
+            self.assertIsNotNone(output.stderr_stream)
+            stdout_path = Path(output.stdout.name)
+            stderr_path = Path(output.stderr_stream.name)
+        self.assertEqual(errors, [])
+        self.assertEqual(stdout_path.read_bytes(), b"finding\n")
+        self.assertEqual(stderr_path.read_bytes(), b"diagnostic\n")
+
+    def test_merge_retains_staging_and_spool_without_changing_findings(self) -> None:
+        from ubs_core.findings_merge import merge
+
+        source = self.root / "sample.py"
+        source.write_text("eval(value)\n", encoding="utf-8")
+        summary = self.root / "combined.json"
+        original = {"scanners": [{"language": "python", "critical": 1, "warning": 0, "info": 0}],
+                    "totals": {"critical": 1, "warning": 0, "info": 0}}
+        summary.write_text(json.dumps(original), encoding="utf-8")
+        original_inode = summary.stat().st_ino
+        sink = self.root / "python.findings.json"
+        sink.write_text(json.dumps({"rule": "python.taint.eval", "path": str(source),
+                                    "line": 1, "col": 1, "severity": "critical",
+                                    "message": "untrusted evaluation"}) + "\n", encoding="utf-8")
+        self.assertEqual(merge(self.root, summary, project_dir=self.root), 1)
+        report = json.loads(summary.read_text(encoding="utf-8"))
+        self.assertEqual(report["totals"], original["totals"])
+        self.assertEqual(len(report["findings"]), 1)
+        self.assertEqual(report["findings"][0]["rule_id"], "python.taint.eval")
+        self.assertEqual(report["findings"][0]["severity"], "critical")
+        self.assertEqual(report["findings"][0]["message"], "untrusted evaluation")
+        if os.name == "posix":
+            self.assertNotEqual(summary.stat().st_ino, original_inode)
+        self.assertEqual(len(list(self.root.glob(".ubs-findings-*"))), 1)
+        spools = list(self.root.glob("ubs-findings-*"))
+        self.assertEqual(len(spools), 1)
+        self.assertEqual(json.loads(spools[0].read_text(encoding="utf-8")), report["findings"][0])
+
+        invalid = self.root / "invalid"
+        invalid.mkdir()
+        failed_summary = invalid / "combined.json"
+        original_bytes = json.dumps(original).encode("utf-8")
+        failed_summary.write_bytes(original_bytes)
+        (invalid / "python.findings.json").write_text("{not-json}\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "invalid findings sink"):
+            merge(invalid, failed_summary, project_dir=self.root)
+        self.assertEqual(failed_summary.read_bytes(), original_bytes)
+        self.assertEqual(len(list(self.root.glob("ubs-findings-*"))), 2)
+
+    def test_sqlite_spills_retain_rows_and_journals_after_close(self) -> None:
+        import sqlite3
+        from ubs_core.findings_merge import _BaselineFilter, _OccurrenceOrdinals
+
+        ordinals = _OccurrenceOrdinals()
+        try:
+            for index in range(4100):
+                self.assertEqual(ordinals.next(f"file-{index}", "rule", "statement"), 0)
+            self.assertEqual(ordinals.next("file-0", "rule", "statement"), 1)
+            ordinal_path = Path(ordinals._db.execute("PRAGMA database_list").fetchone()[2])
+            self.assertEqual(ordinals._db.execute("PRAGMA journal_mode").fetchone(), ("persist",))
+            self.assertEqual(ordinals._db.execute("PRAGMA cache_size").fetchone(), (-2048,))
+        finally:
+            ordinals.close()
+        self.assertTrue(Path(str(ordinal_path) + "-journal").is_file())
+        connection = sqlite3.connect(ordinal_path.as_uri() + "?mode=ro", uri=True)
+        try:
+            self.assertEqual(connection.execute("SELECT count(*) FROM counts").fetchone(), (4100,))
+            self.assertEqual(connection.execute("SELECT n FROM counts WHERE path = ?", ("file-0",)).fetchone(), (2,))
+        finally:
+            connection.close()
+
+        baseline_path = self.root / "baseline.json"
+        baseline_path.write_text(json.dumps([f"fp-{index}" for index in range(4100)]), encoding="utf-8")
+        baseline = _BaselineFilter(baseline_path)
+        try:
+            finding = {"fingerprint": "fp-0", "lang": "python", "severity": "warning"}
+            self.assertIsNone(baseline.retain(finding))
+            self.assertEqual(baseline.retain(finding), finding)
+            database_path = Path(baseline._db.execute("PRAGMA database_list").fetchone()[2])
+            self.assertEqual(baseline._db.execute("PRAGMA temp_store").fetchone(), (2,))
+        finally:
+            baseline.close()
+        self.assertTrue(Path(str(database_path) + "-journal").is_file())
+        connection = sqlite3.connect(database_path.as_uri() + "?mode=ro", uri=True)
+        try:
+            self.assertEqual(connection.execute("SELECT count(*) FROM allowances").fetchone(), (4100,))
+            self.assertEqual(connection.execute("SELECT remaining FROM allowances WHERE fingerprint = ?",
+                                                (b"fp-0",)).fetchone(), ("0",))
+        finally:
+            connection.close()
+
+    def test_cache_pruning_and_failed_atomic_write_retain_evidence(self) -> None:
+        from ubs_core.cache import atomic_write_json, prune_cache
+
+        cache = self.root / "cache"
+        cache.mkdir()
+        entry = cache / "entry.json"
+        entry.write_text('{"critical": 1}\n', encoding="utf-8")
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            self.assertEqual(prune_cache(cache, prune_all=True), (0, 0))
+        self.assertIn("cache pruning skipped", stderr.getvalue())
+        self.assertEqual(entry.read_text(encoding="utf-8"), '{"critical": 1}\n')
+
+        # A directory destination is a real publication failure, without an
+        # injected exception or a platform-dependent permission simulation.
+        destination = cache / "directory.json"
+        destination.mkdir()
+        atomic_write_json(destination, {"partial": True})
+        retained = list(cache.glob(".tmp.*"))
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(json.loads(retained[0].read_text(encoding="utf-8")), {"partial": True})
+        self.assertTrue(destination.is_dir())
+
+    def test_guarded_json_readers_report_bad_tail_and_retain_valid_prefix(self) -> None:
+        from ubs_core.external_tools import GoFindings, _ReportErrors, _json_stream
+
+        source = self.root / "source.go"
+        source.write_text("package fixture\n", encoding="utf-8")
+        vet_prefix = json.dumps({"fixture": {"printf": [
+            {"posn": f"{source}:1:1", "message": "valid prefix diagnostic"}
+        ]}}).encode("utf-8") + b"\n"
+        for tail in (b'{"bad":tru}', b'{"bad":"\xff"}', b'NaN'):
+            with self.subTest(tail=tail):
+                stream_errors = []
+                records = list(_json_stream(io.BytesIO(b'{"valid":1}\n' + tail),
+                                            "reader probe", _ReportErrors(stream_errors, "reader probe")))
+                self.assertEqual(records, [{"valid": 1}])
+                self.assertTrue(any("invalid or truncated JSON report" in error for error in stream_errors))
+
+                sink, vet_errors = io.StringIO(), []
+                GoFindings([source], self.root, sink).vet(io.BytesIO(vet_prefix + tail), vet_errors)
+                row = json.loads(sink.getvalue())
+                self.assertEqual(row["message"], "valid prefix diagnostic")
+                self.assertEqual(row["severity"], "warning")
+                self.assertTrue(any("invalid or truncated JSON report" in error for error in vet_errors))
+
+
 class UbsCoreLexerTests(unittest.TestCase):
     def test_span_and_interval(self) -> None:
         s1 = Span(10, 20)
@@ -2381,7 +2624,7 @@ class AstIngestionTests(unittest.TestCase):
         self.executable(self.payload(self.diagnostic()))
         errors = []
         with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
-            with patch.object(self.tools.tempfile, "TemporaryFile", side_effect=[stdout, stderr]):
+            with patch.object(self.tools, "temporary_file", side_effect=[stdout, stderr]):
                 with self.assertRaisesRegex(OSError, "consumer failed"):
                     with self.tools.run_command_stream("test analyzer", [str(self.binary)], self.root, 5, errors) as output:
                         self.assertIsNotNone(output)
@@ -2403,7 +2646,7 @@ class AstIngestionTests(unittest.TestCase):
                     stderr.close()
                     raise OSError("capture close failed")
 
-            with patch.object(self.tools.tempfile, "TemporaryFile", side_effect=[stdout, BrokenClose()]):
+            with patch.object(self.tools, "temporary_file", side_effect=[stdout, BrokenClose()]):
                 with self.assertRaisesRegex(OSError, "consumer failed"):
                     with self.tools.run_command_stream("test analyzer", [str(self.binary)], self.root, 5, errors):
                         raise OSError("consumer failed")
@@ -2423,7 +2666,7 @@ class AstIngestionTests(unittest.TestCase):
                 def seek(self, *args):
                     raise OSError("capture seek failed")
 
-            with patch.object(self.tools.tempfile, "TemporaryFile", side_effect=[BrokenSeek(), stderr]):
+            with patch.object(self.tools, "temporary_file", side_effect=[BrokenSeek(), stderr]):
                 with self.tools.run_command_stream("test analyzer", [str(self.binary)], self.root, 5, errors) as output:
                     self.assertIsNone(output)
             self.assertTrue(stdout.closed)
@@ -2434,7 +2677,7 @@ class AstIngestionTests(unittest.TestCase):
     def test_second_capture_open_failure_closes_first_handle_without_launching(self) -> None:
         with tempfile.TemporaryFile() as first:
             errors = []
-            with patch.object(self.tools.tempfile, "TemporaryFile", side_effect=[first, OSError("capture full")]), \
+            with patch.object(self.tools, "temporary_file", side_effect=[first, OSError("capture full")]), \
                     patch.object(self.tools.subprocess, "Popen") as launch:
                 with self.tools.run_command_stream("test analyzer", [str(self.binary)], self.root, 5, errors) as output:
                     self.assertIsNone(output)
@@ -2499,7 +2742,7 @@ class AstIngestionTests(unittest.TestCase):
                 def read(self, *args):
                     raise OSError("stderr capture failed")
 
-            with patch.object(self.tools.tempfile, "TemporaryFile", side_effect=[stdout, BrokenRead()]):
+            with patch.object(self.tools, "temporary_file", side_effect=[stdout, BrokenRead()]):
                 records = list(self.tools.scan_ast_config(self.config, [self.source], errors))
             self.assertTrue(stdout.closed)
             self.assertTrue(stderr.closed)

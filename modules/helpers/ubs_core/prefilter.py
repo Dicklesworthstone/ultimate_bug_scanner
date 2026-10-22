@@ -505,11 +505,11 @@ def run_prefilter(
         except (OSError, RuntimeError) as exc:
             return bypass(f"cannot resolve selected input ({exc})")
 
-    import tempfile
     from ubs_core.external_tools import iter_output_lines, run_command_stream
+    from ubs_core.io import temporary_file
 
     try:
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix="ubs_prefilter_lits_") as tf:
+        with temporary_file(mode="w", encoding="utf-8", prefix="ubs_prefilter_lits_", named=True) as tf:
             if any(not lit or any(c in lit for c in "\r\n\0") for lit in index.all_literals):
                 return bypass("literal cannot be represented in a line-oriented search")
             tf.write("\n".join(re.escape(lit) for lit in index.all_literals) + "\n")

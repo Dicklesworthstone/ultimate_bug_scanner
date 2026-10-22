@@ -11,7 +11,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="321f20751bfb6ca5232bf0b105530ac311f2918d7238ade26370562d523e5543"
+UBS_LIB_CHECKSUM="f7d6d1be7d64ef5505bbb265eb0b4b8746639401aa10afb1dce9e681d6749cb0"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -247,7 +247,7 @@ if [[ "$LIST_RULES" -eq 1 ]]; then
     done
   fi
   ( set +o pipefail; awk 'BEGIN{FS=":"}/^id:[[:space:]]*/{gsub(/^[[:space:]]*id:[[:space:]]*/,"");print;}' "$tmp_rules"/rules/*.yml "$tmp_rules"/rules/*.yaml "$tmp_rules"/*.yml 2>/dev/null || true ) | LC_ALL=C sort -u
-  rm -rf "$tmp_rules" 2>/dev/null || true
+  ubs_remove_temp -rf "$tmp_rules" 2>/dev/null || true
   exit 0
 fi
 
@@ -262,7 +262,7 @@ run_contract_v2_bash(){
     printf '%s\0' "$PROJECT_DIR" >"$list_file" || { echo "ERROR: cannot write the scan file list; analysis is incomplete" >&2; return 2; }
   elif ! ubs_list_files "$PROJECT_DIR" --ext "$INCLUDE_EXT" ${EXTRA_EXCLUDES:+--exclude "$EXTRA_EXCLUDES"} ${FILES_FROM:+--files-from "$FILES_FROM"} >"$list_file"; then
     echo "ERROR: contract-v2 file list failed" >&2
-    rm -f "$list_file" "$sink" 2>/dev/null || true
+    ubs_remove_temp -f "$list_file" "$sink" 2>/dev/null || true
     return 2
   fi
 
@@ -270,7 +270,7 @@ run_contract_v2_bash(){
   if [[ -n "$ONLY_CATEGORIES" ]]; then
     local keep="" c allowed w
     local -a _wl
-    IFS=',' read -r -a _wl <<<"$ONLY_CATEGORIES"
+    IFS=',' read -r -a _wl < <(printf '%s\n' "$ONLY_CATEGORIES")
     for c in 1 2 3 4 5 6; do
       allowed=0
       for w in "${_wl[@]}"; do [[ "$w" == "$c" ]] && allowed=1; done
@@ -291,7 +291,7 @@ run_contract_v2_bash(){
     if generate_bash_rules "$created_ast_dir" "$helpers_dir"; then
       ast_rule_dir="$created_ast_dir"
     else
-      rm -rf "$created_ast_dir" 2>/dev/null || true
+      ubs_remove_temp -rf "$created_ast_dir" 2>/dev/null || true
       echo "ERROR: failed to generate AST rules; refusing an incomplete scan" >&2
       return 2
     fi
@@ -336,7 +336,7 @@ run_contract_v2_bash(){
     else
       cat "$text_out" 2>/dev/null || true
     fi
-    rm -f "$text_out" 2>/dev/null || true
+    ubs_remove_temp -f "$text_out" 2>/dev/null || true
   fi
 
   if [[ -n "$v2_json_out" && "$FORMAT" == "json" ]]; then
@@ -358,13 +358,13 @@ run_contract_v2_bash(){
   fi
 
   if [[ -n "$v2_json_out" ]]; then
-    rm -f "$v2_json_out" 2>/dev/null || true
+    ubs_remove_temp -f "$v2_json_out" 2>/dev/null || true
   fi
   if [[ -n "$REPORT_JSON" ]]; then
     cp "$sink" "$REPORT_JSON" 2>/dev/null || true
   fi
-  rm -f "$list_file" "$sink" 2>/dev/null || true
-  [[ -n "$created_ast_dir" ]] && rm -rf -- "$created_ast_dir" 2>/dev/null || true
+  ubs_remove_temp -f "$list_file" "$sink" 2>/dev/null || true
+  [[ -n "$created_ast_dir" ]] && ubs_remove_temp -rf -- "$created_ast_dir" 2>/dev/null || true
   return "$exit_code"
 }
 

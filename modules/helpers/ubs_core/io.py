@@ -7,12 +7,84 @@ the NDJSON finding sinks.
 from __future__ import annotations
 
 import ast
+from contextlib import contextmanager
 from functools import lru_cache
 import json
+import os
 import re
 import sys
+import tempfile
 from pathlib import Path
-from typing import Iterable, Iterator, Sequence
+from typing import IO, Iterable, Iterator, Sequence
+
+
+def keep_temp_enabled() -> bool:
+    """Whether this process must retain its scratch files and directories."""
+    return os.environ.get("UBS_KEEP_TEMP") == "1"
+
+
+def retained_temp_root() -> str:
+    """Choose existing scratch storage without tempfile's create/unlink probe.
+
+    The first existing candidate is authoritative: if creating scratch there
+    fails, propagate that error rather than testing writability by deleting a
+    probe file or silently selecting a different filesystem.
+    """
+    for key in ("TMPDIR", "TEMP", "TMP"):
+        candidate = os.environ.get(key)
+        if candidate:
+            if not Path(candidate).is_dir():
+                raise NotADirectoryError(f"{key} is not an existing scratch directory: {candidate}")
+            return candidate
+    candidates = []
+    if os.name == "nt":
+        candidates.extend((os.path.expanduser(r"~\AppData\Local\Temp"),
+                           os.path.join(os.environ.get("SYSTEMROOT", r"C:\Windows"), "Temp"),
+                           r"C:\TEMP", r"C:\TMP", r"\TEMP", r"\TMP"))
+    else:
+        candidates.extend(("/tmp", "/var/tmp", "/usr/tmp"))
+    for candidate in candidates:
+        if Path(candidate).is_dir():
+            return candidate
+    candidate = os.getcwd()
+    if Path(candidate).is_dir():
+        return candidate
+    raise FileNotFoundError("no existing scratch directory; set TMPDIR for UBS_KEEP_TEMP=1")
+
+
+@contextmanager
+def temporary_directory(*, prefix: str = "ubs-", dir: Path | str | None = None) -> Iterator[str]:
+    """Create private scratch, retaining it on success and failure when requested.
+
+    Use mkdtemp in retention mode so no TemporaryDirectory finalizer can
+    remove the directory after its context has unwound.
+    """
+    if keep_temp_enabled():
+        yield tempfile.mkdtemp(prefix=prefix, dir=dir if dir is not None else retained_temp_root())
+    else:
+        with tempfile.TemporaryDirectory(prefix=prefix, dir=dir) as scratch:
+            yield scratch
+
+
+def temporary_file(*, mode: str = "w+b", encoding: str | None = None,
+                   prefix: str = "ubs-", suffix: str = "",
+                   dir: Path | str | None = None, named: bool = False) -> IO:
+    """Return a closable scratch stream whose backing file can be retained.
+
+    Anonymous TemporaryFile streams disappear even without an explicit
+    unlink. Named files with delete=False keep the same seek/read/write
+    lifecycle while leaving captured evidence available after close. The
+    caller owns the returned stream and must close it, usually with `with`.
+    """
+    if keep_temp_enabled():
+        return tempfile.NamedTemporaryFile(mode=mode, encoding=encoding, prefix=prefix,  # ubs:ignore[python.lifecycle.file_handle] - transfers retained stream ownership; caller closes it.
+                                           suffix=suffix, dir=dir if dir is not None else retained_temp_root(),
+                                           delete=False)
+    if named:
+        return tempfile.NamedTemporaryFile(mode=mode, encoding=encoding, prefix=prefix,  # ubs:ignore[python.lifecycle.file_handle] - transfers named stream ownership; caller closes it.
+                                           suffix=suffix, dir=dir)
+    return tempfile.TemporaryFile(mode=mode, encoding=encoding, prefix=prefix,  # ubs:ignore[python.lifecycle.file_handle] - transfers anonymous stream ownership; caller closes it.
+                                  suffix=suffix, dir=dir)
 
 
 @lru_cache(maxsize=1)

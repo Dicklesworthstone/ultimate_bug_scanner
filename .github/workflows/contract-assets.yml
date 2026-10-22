@@ -203,7 +203,7 @@ jobs:
       - name: Install suite dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq ripgrep rsync shellcheck python3-yaml python3-jsonschema
+          sudo apt-get install -y jq ripgrep rsync shellcheck strace libseccomp2 python3-yaml python3-jsonschema
           npm install --global @ast-grep/cli
       - name: Apply the same immutable candidate patches
         env:

@@ -17,7 +17,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="321f20751bfb6ca5232bf0b105530ac311f2918d7238ade26370562d523e5543"
+UBS_LIB_CHECKSUM="f7d6d1be7d64ef5505bbb265eb0b4b8746639401aa10afb1dce9e681d6749cb0"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -65,7 +65,7 @@ cleanup() {
   local ec=$?
   if [[ ${#TMP_FILES[@]} -gt 0 ]]; then
     for f in "${TMP_FILES[@]}"; do
-      [[ -e "$f" ]] && rm -rf -- "$f" 2>/dev/null || true
+      [[ -e "$f" ]] && ubs_remove_temp -rf -- "$f" 2>/dev/null || true
     done
   fi
   exit "$ec"
@@ -449,9 +449,9 @@ if [[ "$LIST_RULES" -eq 1 ]]; then
 from pathlib import Path
 import shutil
 import sys
-import tempfile
+from ubs_core.io import temporary_directory
 from ubs_core.rust_rules import generate
-with tempfile.TemporaryDirectory() as td:
+with temporary_directory(prefix="ubs-rust-rules.") as td:
     rule_dir = Path(td)
     m = generate(rule_dir)
     if sys.argv[1]:
@@ -473,7 +473,7 @@ category_enabled() {
   local cat=$1
   if [ -n "$ONLY_CATEGORIES" ]; then
     local -a only_arr
-    IFS=',' read -r -a only_arr <<< "$ONLY_CATEGORIES"
+    IFS=',' read -r -a only_arr < <(printf '%s\n' "$ONLY_CATEGORIES")
     for o in "${only_arr[@]}"; do
       if [ "$o" = "$cat" ]; then return 0; fi
     done
@@ -481,7 +481,7 @@ category_enabled() {
   fi
   if [ -n "$SKIP_CATEGORIES" ]; then
     local -a skip_arr
-    IFS=',' read -r -a skip_arr <<< "$SKIP_CATEGORIES"
+    IFS=',' read -r -a skip_arr < <(printf '%s\n' "$SKIP_CATEGORIES")
     for s in "${skip_arr[@]}"; do
       if [ "$s" = "$cat" ]; then return 1; fi
     done
@@ -935,6 +935,17 @@ run_contract_v2_rust(){
 
   check_cargo
 
+  # Cargo and its plugins manage their own build/audit scratch. UBS cannot
+  # retain that storage, so refuse only when an enabled phase would launch.
+  if [[ "${UBS_KEEP_TEMP:-0}" == "1" && "$RUN_CARGO" -eq 1 && "$HAS_CARGO" -eq 1 ]]; then
+    if category_enabled 13 \
+      || { category_enabled 12 && [[ "$HAS_FMT" -eq 1 || "$HAS_CLIPPY" -eq 1 ]]; } \
+      || { category_enabled 14 && [[ "$HAS_AUDIT" -eq 1 || "$HAS_DENY" -eq 1 || "$HAS_UDEPS" -eq 1 || "$HAS_OUTDATED" -eq 1 ]]; }; then
+      echo "ERROR: UBS_KEEP_TEMP=1 cannot retain Cargo/plugin scratch; select --no-cargo for static analysis or disable the Cargo categories." >&2
+      return 2
+    fi
+  fi
+
   if [[ -f "$PROJECT_DIR" ]]; then
     printf '%s\0' "$PROJECT_DIR" >"$list_file" || { echo "ERROR: cannot write the scan file list; analysis is incomplete" >&2; return 2; }
   elif ! ubs_list_files "$PROJECT_DIR" --ext "$INCLUDE_EXT" ${EXTRA_EXCLUDES:+--exclude "$EXTRA_EXCLUDES"} ${FILES_FROM:+--files-from "$FILES_FROM"} >"$list_file"; then
@@ -947,7 +958,7 @@ run_contract_v2_rust(){
   if [[ -n "$ONLY_CATEGORIES" ]]; then
     local keep="" c allowed w
     local -a _wl
-    IFS=',' read -r -a _wl <<<"$ONLY_CATEGORIES"
+    IFS=',' read -r -a _wl < <(printf '%s\n' "$ONLY_CATEGORIES")
     for c in $(seq 1 24); do
       allowed=0
       for w in "${_wl[@]}"; do [[ "$w" == "$c" ]] && allowed=1; done
@@ -1090,7 +1101,7 @@ PYV2FIND
     say "${GREEN}${CHECK} Summary JSON: ${CYAN}$SUMMARY_JSON${RESET}"
   fi
 
-  [[ -n "$rule_dir" ]] && rm -rf -- "$rule_dir" 2>/dev/null || true
+  [[ -n "$rule_dir" ]] && ubs_remove_temp -rf -- "$rule_dir" 2>/dev/null || true
   return "$exit_code"
 }
 

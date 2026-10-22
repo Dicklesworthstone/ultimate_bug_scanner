@@ -42,7 +42,55 @@ set -Eeuo pipefail
 shopt -s lastpipe || true
 trap '' SIGPIPE 2>/dev/null || true
 
-UBS_VERSION="5.5.12"
+# Retention is an explicit lifetime policy, never a detector or integrity bypass.
+case "${UBS_KEEP_TEMP:-0}" in
+  0|1) export UBS_KEEP_TEMP="${UBS_KEEP_TEMP:-0}" ;;
+  *) echo 'ERROR: UBS_KEEP_TEMP must be 0 or 1.' >&2; exit 2 ;;
+esac
+ubs_remove_temp(){
+  [[ "$UBS_KEEP_TEMP" == "1" ]] && return 0
+  command rm "$@"
+}
+ubs_remove_empty_temp_dir(){
+  [[ "$UBS_KEEP_TEMP" == "1" ]] && return 0
+  command rmdir "$@"
+}
+if [[ "$UBS_KEEP_TEMP" == "1" ]]; then
+  # Bash <= 5.0 and legacy compatibility always unlink heredoc backing files.
+  if (( BASH_VERSINFO[0] < 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] < 1) )); then
+    echo 'ERROR: UBS_KEEP_TEMP=1 requires Bash >= 5.1 for pipe-backed heredocs.' >&2
+    exit 2
+  fi
+  # Level 50 is selected through BASH_COMPAT; it is not a shopt option.
+  case "${BASH_COMPAT:-}" in
+    [0-4]*|50*|5.0*)
+      echo 'ERROR: UBS_KEEP_TEMP=1 requires modern Bash compatibility (BASH_COMPAT >= 5.1).' >&2
+      exit 2 ;;
+  esac
+  for _ubs_compat in 31 32 40 41 42 43 44; do
+    if shopt -q "compat$_ubs_compat"; then
+      echo 'ERROR: UBS_KEEP_TEMP=1 requires modern Bash compatibility (BASH_COMPAT >= 5.1).' >&2
+      exit 2
+    fi
+  done
+  unset _ubs_compat
+  # Tool installation and service lifetimes are outside the retained scan contract.
+  export UBS_NO_AUTO_UPDATE=1
+  if [[ "${FORCE_SELF_UPDATE:-0}" != "0" ]]; then
+    echo 'ERROR: UBS_KEEP_TEMP=1 does not support FORCE_SELF_UPDATE.' >&2
+    exit 2
+  fi
+  for _ubs_arg in "$@"; do
+    case "$_ubs_arg" in
+      serve|--client|daemon|doctor|--doctor|--update|--update-modules)
+        printf 'ERROR: UBS_KEEP_TEMP=1 supports scans, not %s.\n' "$_ubs_arg" >&2
+        exit 2 ;;
+    esac
+  done
+  unset _ubs_arg
+fi
+
+UBS_VERSION="5.5.13"
 # The optional service is a release executable, not a command trusted via PATH.
 # scripts/update_checksums.py keeps this pin in sync with ubs-daemon.
 UBS_DAEMON_SHA256="617d8d283c2caac455991cff4ef67b7e36be9933e989130bdeae0e935b30e8a0"
@@ -120,19 +168,19 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='1d4c3f011a0f7163bc9feaf18a22746fc4559c72feff16bb5aff7471395726fb'
-  [cpp]='b27c38ca5292ad35bce30e2bcbd9108515c3d9a313170b7987d9b14a9fd0186b'
-  [csharp]='7edce44f58ce2cd90e57992a63b19e63d891f288ea13395984739bc4efde4b75'
-  [elixir]='81a4093d385ca3c1eb94bf97cd57bbc14ecbead5cfa873591d6064387ba01862'
-  [golang]='b477f4d7910c2ec137431ad6aaab58f9cf5f5cda1300b96dc59ea5e9565633ea'
-  [java]='9e06a875bb90ef23e3a3eae6bf5bebb27690a896c2b5f21a0ed859ad2ca1c7b1'
-  [js]='d8bd02fa715e09fc630c16956b750b538233fec9413b609f66511f164a1d1693'
-  [kotlin]='aa02cd6ecf65148309ef9bf3373cddb60fa6c28a8ea77eda3c80e953f50920cf'
-  [php]='bcc0822533c34e3c7f74478fcc49b5f0c4e1b5183a2595371020cddba2f4b6d8'
-  [python]='86fa1e0436f9869ee45dbdbc938f58276442b8257fdc2598860d909b34ac48d6'
-  [ruby]='34fd2ec7e3016b2dbe74c6f8441d6c7b311a8fc796816e5c6d678293d8d73a2a'
-  [rust]='17dc1e5d82973004a94e01cc2a32ac450b2c2ed3c5c81a814a48ddafe0a59563'
-  [swift]='9dc0625f7c9a4f4d66f883e6d453937db1ea9214ec6d6654ab87130fe7df30f3'
+  [bash]='b9fbd63e1fb831180d3246ee3586de9a247e5c7478611a559b236039a250ed90'
+  [cpp]='37d1675b0236915f4a1770803d901ae5c6ae226876ff9ae25fbf5a620be82ed0'
+  [csharp]='cd6dea82a61214f6e8511b97c66df024014648bd24b2715fc26f8b3be1293bf1'
+  [elixir]='ab51f309e2df3cbaf80d18272e3e974742889f952ae792f484beb3e277e77857'
+  [golang]='cd160214184762b9e2e7ab3e0b2bc48e01673cb5eddce699a9718b9d8b965645'
+  [java]='efb22bf4afffa8e3c6f66232ac96a2900ec863dc847ccfb2fcf530e335185b2a'
+  [js]='07c44e22dcb76927c544c1faed03b2dd97b8fc9fe68d1494004698e56ceee0cf'
+  [kotlin]='87950893c5506a350ebf88ae5547bd56bf0f10470a1fe8fd9ced1056ce1f05f9'
+  [php]='1194b3167853dac58ea661aedfc3e98d4619dcb02df84f384b282ea6837f97d7'
+  [python]='5ae43307f4aed74407693f96cb5a7a72f1c84cea52099b58ebdc17846b7a0819'
+  [ruby]='3a6b916e9ab75a03b1e41e1dc562f328235f92bf3f5400ab826b4bc282ab4f9f'
+  [rust]='b9ba33d8d86243afc93f91d894fd5c18be83a56efe8e1cadc614f46bb1f6884b'
+  [swift]='51fe35654d8b18e1b50228e5e94f4b509445d12f0c0b105a6aa68f6acb820c84'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -248,7 +296,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/analyzers/taint_swift_traversal.py']='f4108f46a3eef70b21033a37c0c3ccf393921b62d07ce855dce391bcee45c8ec'
   ['helpers/ubs_core/bash_rules.py']='21fb455e701160e12575b478819d8f52254bca2d672d6962992a93d8c186a20c'
   ['helpers/ubs_core/bash_scan.py']='aa224e5c69fb20539d1868f42a95b46c11eedf1b7c0ff6727d459acbe80c08ef'
-  ['helpers/ubs_core/cache.py']='76acddcfa36b58482502358035ac2e55e231a70fbfcd7c5a0a3fb825404acac4'
+  ['helpers/ubs_core/cache.py']='6fd060c27570c178c46015005fcc429b36518f1de77aa4abf3718165af53ce1e'
   ['helpers/ubs_core/cli.py']='f0025ee2506bb5fe128adc971a321e2bc005ee35a8c3b658785108e8ff94ff49'
   ['helpers/ubs_core/cpp_detectors/__init__.py']='b74840d5af31f44ac13703f3c66f6968af4207c9ce08f3c0ae1010cd62c4fabd'
   ['helpers/ubs_core/cpp_detectors/archive_entry.py']='dd83df898f3c856fa769aaa754e172afc2607b22202a9984dd11802bb429b44e'
@@ -310,8 +358,8 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/elixir_rules.py']='3f8ca9a8d1cd898588005bb925b5b931d8d3947d41e7c235c48b9d8033ed65e4'
   ['helpers/ubs_core/elixir_scan.py']='211b76527f9b803507420e5abc7618bf89c801bac64bc474d8978d31c34dc331'
   ['helpers/ubs_core/explain.py']='982cb9be27bb4d5d7cc4afde2f7f0cba57ab4b7804d79c963b70f6aff21a8306'
-  ['helpers/ubs_core/external_tools.py']='f63cf0efc4ec190b063025ad5e2240c2ce15627d95d80852c6042358061e8e73'
-  ['helpers/ubs_core/findings_merge.py']='c93eef918277c9c5b33a33845a7b41be9f2fe420403525d33140227169b7ce5f'
+  ['helpers/ubs_core/external_tools.py']='4a66691cffa87c4c4b8191ac7355fee395d3b0369a288e381a11522accc69a48'
+  ['helpers/ubs_core/findings_merge.py']='a592789f727296e332a1b79f441a20234f8f7686ed738de5152fc4981781b6fa'
   ['helpers/ubs_core/go_ast.py']='f459406b41a7aa4b5fd0af7cce5a961811d0bffd499fb99825ed631ec96d0f0d'
   ['helpers/ubs_core/go_detectors/__init__.py']='70cc7219036b6d704d9a9e9414c623b4d0eb65ef26e12aac19c8ba6aa055ba41'
   ['helpers/ubs_core/go_detectors/archive_extraction.py']='f0b25a44ccf1b0f374feb9e8fc7486b618eccf817348151d1a0583b7496fe6a7'
@@ -335,7 +383,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/go_patterns/misc.py']='d23874e0fd10bc3538fd0c9b4eae998dbcb3076dd66020a6c764c7bb297506bd'
   ['helpers/ubs_core/go_rules.py']='a11e1036d06d313c102fda792f9842af7af69ad6250ec9dcb0c21ceaddc00ce1'
   ['helpers/ubs_core/go_scan.py']='56be3c22a3fe325ba24087b2c8e37c9da9959df9b2a8930d508e9605ffb085b1'
-  ['helpers/ubs_core/io.py']='f398594f6d9fa3f5042b7dd10d89cc6ee22cff1335ac6621a23ca1526ebf9149'
+  ['helpers/ubs_core/io.py']='98b33056e732a07ecc5b5b38afa5d889cdb8bdbbba20c3ae73d165219706a3fd'
   ['helpers/ubs_core/java_ast.py']='50091504b3eed28240dea483b631b9bf47c45993ca1f2f9ff6daec6744eaecef'
   ['helpers/ubs_core/java_detectors/__init__.py']='ef52ffa7d353633e7bb1d1caa697c3b3bf83c6d7dc1ec111a3a4b71e2aa2d8f0'
   ['helpers/ubs_core/java_detectors/_common.py']='658ef921d7248ee9e95e3dff0887092e1133debe67c2b2b62aa21b7447584c73'
@@ -380,7 +428,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/lexer.py']='8ad2f1ebf45306e74042efa330052a765b345568194570dff5480af215531023'
   ['helpers/ubs_core/php_frontend.py']='301b810b4addcc0c6c055cce15c2e0fdbf505cbd9ecd159d9a3975f3a77c8658'
   ['helpers/ubs_core/php_scan.py']='92349ae54795e4d1dbbc6ffd5846273ad11b33ed9cb006432ccea9f5efe57724'
-  ['helpers/ubs_core/prefilter.py']='1eafeecb4e0441bee498c3291ef5af67856124d8b9d765849150b80d5d5a7259'
+  ['helpers/ubs_core/prefilter.py']='adda4a20eab6cf84bcb9691b9767af76bf46d0eba90bf0e4c000fd97a8996d6f'
   ['helpers/ubs_core/py_ast.py']='e5da8b583cfd381b89b8ed64c17058c1c2c06030cb1b826e61a9ceed3f644765'
   ['helpers/ubs_core/py_detectors/__init__.py']='15eb6a55a8b3c0f2df0336576e593a7ce9af5e0685800262cba9b54b7d8c22f4'
   ['helpers/ubs_core/py_detectors/_pathlike.py']='90b1b71bce5606f1a5684c9122fc14ac27bbbf5ba4ebf455343e29145a0b2e1c'
@@ -479,7 +527,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/rust_detectors/tls_indirect.py']='120501344abdcddf96e6a40c7b4b38617dd0649b83cfc81a0863f38027b0a755'
   ['helpers/ubs_core/rust_detectors/unbounded_request_body.py']='72eaedc5e99846eadaab246cb6398dc189f541ca14ae62e8a305a316bde69f5f'
   ['helpers/ubs_core/rust_rules.py']='d35a4d6cb061f0eb7ff70a799b415414016a3ce8e10c8331e8a9ee4b484be211'
-  ['helpers/ubs_core/rust_scan.py']='a62325887353a85de746d0ddc2616627b6b9a3788ef843fa6a9ea46b37f40562'
+  ['helpers/ubs_core/rust_scan.py']='18bad9f7c59f18739578da1d5321e5917a1c1d108b2199c82d08fa2412b1dc75'
   ['helpers/ubs_core/scheduler.py']='662a2555f571e9cc6fba5755103948fa8b8e8b87f8d9038686225ccf6b6405bb'
   ['helpers/ubs_core/selftest.py']='6ca3dd5e5534edc0b8a10e9aac1f80834f0d79b661c50c28bd00b33eb85bff08'
   ['helpers/ubs_core/shards.py']='cdc6ecab42bd962e65bb1ac1dc5e3f20b87c4d68632617286a2991274c0c98f7'
@@ -504,7 +552,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='77a16e60dce843652c053d069dcbffce17c8ffae543bf77693d2e8254a3967de'
   ['helpers/ubs_core/taint_flow.py']='828316f978026b562f13a62e86abfefa83e5dfc802cc97151ecda6de107e16f2'
-  ['lib/ubs-common.sh']='321f20751bfb6ca5232bf0b105530ac311f2918d7238ade26370562d523e5543'
+  ['lib/ubs-common.sh']='f7d6d1be7d64ef5505bbb265eb0b4b8746639401aa10afb1dce9e681d6749cb0'
 )
 
 # contract.json as shipped by earlier releases (sha256 -> first tag), kept out
@@ -541,7 +589,7 @@ need_cmd(){
 
 # Temp paths created before TMPDIR_RUN exists (the python3 shim, the scan file
 # list). early_cleanup runs from the EXIT trap until cleanup() takes over and
-# calls it too, so a refusal or early exit leaves nothing behind.
+# calls it too. Retention also applies to refusals and early exits.
 EARLY_TMP_PATHS=()
 TMPDIR_RUN=""
 ensure_tmpdir_run(){
@@ -555,10 +603,10 @@ ensure_tmpdir_run(){
 early_cleanup(){
   local p
   for p in "${EARLY_TMP_PATHS[@]}"; do
-    [[ -n "$p" && -e "$p" && "$p" != "/" ]] && rm -rf "$p" 2>/dev/null
+    [[ -n "$p" && -e "$p" && "$p" != "/" ]] && ubs_remove_temp -rf "$p" 2>/dev/null
   done
   if [[ -n "${TMPDIR_RUN:-}" && -d "$TMPDIR_RUN" && "$TMPDIR_RUN" != "/" ]]; then
-    rm -rf "$TMPDIR_RUN" 2>/dev/null || true
+    ubs_remove_temp -rf "$TMPDIR_RUN" 2>/dev/null || true
   fi
   return 0
 }
@@ -1787,14 +1835,14 @@ PYCONFIG
   while IFS=$'\t' read -r key value; do
     if [[ "$key" == "skip" ]]; then
       local -a tokens=()
-      IFS=',' read -r -a tokens <<<"$value"
+      IFS=',' read -r -a tokens < <(printf '%s\n' "$value")
       for token in "${tokens[@]}"; do
         if [[ "$token" == *.* ]] && ! category_slug_to_num "${token%%.*}" "${token#*.}" >/dev/null; then
           refuse_scan "invalid-config" "Invalid skip category '$token' in ${SCAN_CONFIG_PATH:-.ubs.json}" ""
         fi
       done
     fi
-  done <<<"$records"
+  done < <(printf '%s\n' "$records")
   while IFS=$'\t' read -r key value; do
     case "$key" in
       only) [[ -n "${CLI_SCAN_SETTINGS[only]:-}" ]] || ONLY_LANGS="$value" ;;
@@ -1814,7 +1862,7 @@ PYCONFIG
         fi ;;
       digest) SCAN_CONFIG_DIGEST="$value" ;;
     esac
-  done <<<"$records"
+  done < <(printf '%s\n' "$records")
   return 0
 }
 
@@ -1931,6 +1979,9 @@ Environment Variables:
   CI=true                     Disable the opt-in auto-update check (like --ci)
   UBS_ENABLE_AUTO_UPDATE=1    Opt in to the 24h auto-update check
   UBS_NO_AUTO_UPDATE=1        Force-disable auto-update (like --no-auto-update)
+  UBS_KEEP_TEMP=1             Retain scanner scratch for Rust/Python/JS/Bash scans;
+                              unsupported languages and update/service modes exit 2.
+                              Use TMPDIR to choose storage. Caller removes retained files.
   FORCE_SELF_UPDATE=1         Force an immediate verified self-update check
   UBS_SKIP_TYPE_NARROWING=1   Skip the type-narrowing helpers (like --skip-type-narrowing)
   UBS_RULES=DIR[:DIR...]      Custom rule directories used when no --rules is given
@@ -2094,6 +2145,7 @@ cat <<'JSON'
     {"name": "UBS_SKIP_TYPE_NARROWING", "value": "1", "description": "Skip the type-narrowing helpers."},
     {"name": "UBS_ENABLE_AUTO_UPDATE", "value": "1", "description": "Opt in to the 24h auto-update check."},
     {"name": "UBS_NO_AUTO_UPDATE", "value": "1", "description": "Force-disable auto-update."},
+    {"name": "UBS_KEEP_TEMP", "value": "1", "description": "Retain scanner scratch for Rust/Python/JS/Bash; unsupported languages and update/service modes refuse with exit 2. Use TMPDIR to choose storage."},
     {"name": "UBS_RULES", "value": "DIR[:DIR...]", "description": "Custom rule directories (':'-separated, like PATH) used when no --rules is given; empty entries are ignored."},
     {"name": "UBS_NO_CACHE", "value": "1", "description": "Disable scan caching (like --no-cache)."},
     {"name": "UBS_CACHE_DIR", "value": "PATH", "description": "Override root directory for scan cache (like --cache-dir)."},
@@ -2727,10 +2779,10 @@ else
       --no-auto-update) export UBS_NO_AUTO_UPDATE=1; shift;;
       --staged) GIT_MODE="staged"; shift;;
       --diff|--git-diff) GIT_MODE="diff"; shift;;
-      --files=*) IFS=',' read -r -a _f <<<"${1#*=}"; SCAN_FILES+=("${_f[@]}"); SCAN_FILES_OPTION=1; shift;;
+      --files=*) IFS=',' read -r -a _f < <(printf '%s\n' "${1#*=}"); SCAN_FILES+=("${_f[@]}"); SCAN_FILES_OPTION=1; shift;;
       --files)
         if [[ $# -lt 2 ]]; then usage; exit 2; fi
-        shift; IFS=',' read -r -a _f <<<"$1"; SCAN_FILES+=("${_f[@]}"); SCAN_FILES_OPTION=1; shift;;
+        shift; IFS=',' read -r -a _f < <(printf '%s\n' "$1"); SCAN_FILES+=("${_f[@]}"); SCAN_FILES_OPTION=1; shift;;
       --profile=*)
         export UBS_PROFILE="${1#*=}"
         [[ "$UBS_PROFILE" != "1" ]] || PROFILE_TIMINGS=1
@@ -2961,7 +3013,7 @@ fi
 _rules_origin="--rules"
 if [[ "$USER_RULES_REQUESTED" -eq 0 && -n "${UBS_RULES:-}" && "$RUN_SCAN_GUARDS" -eq 1 ]]; then
   _rules_origin="UBS_RULES"
-  IFS=':' read -r -a _rules_entries <<<"$UBS_RULES"
+  IFS=':' read -r -a _rules_entries < <(printf '%s\n' "$UBS_RULES")
   for _rules_entry in "${_rules_entries[@]}"; do
     [[ -n "$_rules_entry" ]] && USER_RULES_SOURCES+=("$_rules_entry")
   done
@@ -3110,7 +3162,7 @@ PYRULES
   case "$_rules_status" in
     0) ;;
     3)
-      IFS=$'\t' read -r _ _dup_id _dup_first _dup_second <<<"$_custom_rule_report"
+      IFS=$'\t' read -r _ _dup_id _dup_first _dup_second < <(printf '%s\n' "$_custom_rule_report")
       refuse_scan "duplicate-rule-id" "Custom rule id '$_dup_id' is defined twice: $_dup_first and $_dup_second" "" \
         "One rule would silently shadow the other; rename or remove one of them."
       ;;
@@ -3145,7 +3197,7 @@ fi
 # `--exclude=js` would now silently skip a path named "js" (usually none), so
 # a value that names a language and matches no path is rejected with the fix.
 if [[ -n "$USER_EXCLUDE_PATTERNS" ]]; then
-  IFS=',' read -r -a _user_excludes <<<"$USER_EXCLUDE_PATTERNS"
+  IFS=',' read -r -a _user_excludes < <(printf '%s\n' "$USER_EXCLUDE_PATTERNS")
   for _pat in "${_user_excludes[@]}"; do
     case "${_pat,,}" in
       js|ts|javascript|typescript|python|py|cpp|c|c++|rust|rs|golang|go|java|kotlin|kt|ruby|rb|swift|csharp|cs|c#|dotnet|elixir|ex|bash|sh|php)
@@ -3188,7 +3240,7 @@ dir_size_mb_filtered(){
       # to the Python fallback which handles path-based patterns correctly.
       local has_path_pattern=0
       local -a pats=()
-      IFS=',' read -r -a pats <<<"$patterns_csv"
+      IFS=',' read -r -a pats < <(printf '%s\n' "$patterns_csv")
       for pat in "${pats[@]}"; do
         if [[ -n "$pat" ]]; then
           du_args+=( "--exclude=$pat" )
@@ -3280,7 +3332,7 @@ SCAN_DATA_EXTENSIONS="png,jpg,jpeg,gif,bmp,ico,webp,tif,tiff,psd,svg,heic,mp3,wa
 ignore_globs_for_rg(){
   local pat
   local -a pats
-  IFS=',' read -r -a pats <<<"${1:-}"
+  IFS=',' read -r -a pats < <(printf '%s\n' "${1:-}")
   for pat in "${pats[@]}"; do
     [[ -z "$pat" ]] && continue
     case "$pat" in
@@ -3507,7 +3559,7 @@ list_scan_files(){
     for g in "${globs[@]}"; do rg_args+=( -g "$g" ); done
     # rg exits 1 when nothing matched (an empty tree is a valid answer), 2 on error.
     (cd "$root" && rg "${rg_args[@]}" > "$raw" 2>/dev/null) || rg_rc=$?
-    if [[ "$rg_rc" -gt 1 ]]; then rm -f "$raw" 2>/dev/null; return 1; fi
+    if [[ "$rg_rc" -gt 1 ]]; then ubs_remove_temp -f "$raw" 2>/dev/null; return 1; fi
   else
     mode="walk"
     : > "$raw"
@@ -3807,10 +3859,10 @@ if per_lang_dir and os.path.isdir(per_lang_dir):
 print(len(kept), total, big, data, len(selected_files), selected_bytes)
 PY
 )"; then
-    rm -f "$raw" 2>/dev/null
+    ubs_remove_temp -f "$raw" 2>/dev/null
     return 1
   fi
-  rm -f "$raw" 2>/dev/null
+  ubs_remove_temp -f "$raw" 2>/dev/null
   printf '%s\n' "$stats"
 }
 
@@ -3841,7 +3893,7 @@ copy_file_list(){
     tar_rc="${tar_status[0]:-1}"; rc="${tar_status[1]:-1}"
     if [[ "$tar_rc" -ne 0 || "$rc" -ne 0 || -s "$err" ]]; then
       report_copy_failure tar "$tar_rc" "$err"
-      rm -rf "$dest" 2>/dev/null || true
+      ubs_remove_temp -rf "$dest" 2>/dev/null || true
       ensure_dir "$dest"
       return 1
     fi
@@ -3879,7 +3931,7 @@ sys.exit(1 if failed else 0)
 PY
     if [[ "$rc" -ne 0 ]]; then
       report_copy_failure python "$rc" "$err"
-      rm -rf "$dest" 2>/dev/null || true
+      ubs_remove_temp -rf "$dest" 2>/dev/null || true
       ensure_dir "$dest"
       return 1
     fi
@@ -4000,13 +4052,13 @@ build_scan_file_list(){
   # Never rediscover an unchecked checkout/cache file here.
   local contract_file="${DETECTION_CONTRACT_FILE:-}"
   if ! stats="$(list_scan_files "$scan_root" "$list" "$contract_file" "$TMPDIR_RUN" "$ONLY_LANGS" "$EXCLUDE_LANGS" "$INCLUDE_EXT")"; then
-    rm -f "$list" 2>/dev/null
+    ubs_remove_temp -f "$list" 2>/dev/null
     return 1
   fi
   local sel_count="" sel_bytes=""
-  read -r SCAN_LIST_COUNT SCAN_LIST_BYTES SCAN_LIST_SKIPPED_BIG SCAN_LIST_SKIPPED_DATA sel_count sel_bytes <<<"$stats"
+  read -r SCAN_LIST_COUNT SCAN_LIST_BYTES SCAN_LIST_SKIPPED_BIG SCAN_LIST_SKIPPED_DATA sel_count sel_bytes < <(printf '%s\n' "$stats")
   if [[ ! "$SCAN_LIST_COUNT" =~ ^[0-9]+$ || ! "$SCAN_LIST_BYTES" =~ ^[0-9]+$ ]]; then
-    rm -f "$list" 2>/dev/null
+    ubs_remove_temp -f "$list" 2>/dev/null
     SCAN_LIST_COUNT=0; SCAN_LIST_BYTES=0; SCAN_LIST_SKIPPED_BIG=0; SCAN_LIST_SKIPPED_DATA=0
     return 1
   fi
@@ -4071,7 +4123,7 @@ fi
 
 prepare_metrics_dir(){
   local dir="$1"
-  rm -rf "$dir" 2>/dev/null || true
+  ubs_remove_temp -rf "$dir" 2>/dev/null || true
   mkdir -p "$dir" 2>/dev/null || true
 }
 
@@ -4210,23 +4262,36 @@ prepare_index_workspace(){
   local repo_root="$1" scan_rel="$2" dest="$TMPDIR_RUN/git_scan"
   local snapshot base raw="$TMPDIR_RUN/index_changes.0" err="$TMPDIR_RUN/index_stderr.txt"
   local count rc=0
-  if ! snapshot="$(git -C "$repo_root" write-tree 2>"$err")"; then
-    report_copy_failure git 2 "$err"
-    refuse_scan "git-index-failed" "Could not snapshot the Git index; resolve unmerged entries before scanning" ""
-  fi
-  # An unborn branch has no HEAD tree. Comparing its index to an empty tree
-  # still scans every staged addition, including a first commit.
-  if ! base="$(git -C "$repo_root" rev-parse --verify 'HEAD^{tree}' 2>/dev/null)"; then
-    base="$(git -C "$repo_root" hash-object -t tree --stdin </dev/null)" || \
-      refuse_scan "git-index-failed" "Could not compute the empty Git tree" ""
-  fi
-  # Raw records include the destination object id and mode. Disabling rename
-  # detection makes every record one path and treats a rename as delete/add.
-  # Reading object ids from this snapshot also tolerates concurrent git adds.
-  if ! git -C "$repo_root" diff --raw -z --no-abbrev --no-renames --no-ext-diff \
-       --diff-filter=ACMRT "$base" "$snapshot" -- >"$raw" 2>"$err"; then
-    report_copy_failure git 2 "$err"
-    refuse_scan "git-index-failed" "Could not enumerate staged changes" ""
+  if [[ "$UBS_KEEP_TEMP" == "1" ]]; then
+    # write-tree creates and unlinks loose-object scratch inside .git. Read
+    # the index once instead: each raw record pins the immutable blob to scan,
+    # so later git adds or unstaged fixes cannot substitute different bytes.
+    # --cached also handles an unborn HEAD. Keep U records so conflicts fail
+    # explicitly rather than disappearing from the selected scan.
+    if ! GIT_OPTIONAL_LOCKS=0 git -C "$repo_root" diff --cached --raw -z --no-abbrev \
+         --no-renames --no-ext-diff --diff-filter=ACMRTU -- >"$raw" 2>"$err"; then
+      report_copy_failure git 2 "$err"
+      refuse_scan "git-index-failed" "Could not enumerate staged changes" ""
+    fi
+  else
+    if ! snapshot="$(git -C "$repo_root" write-tree 2>"$err")"; then
+      report_copy_failure git 2 "$err"
+      refuse_scan "git-index-failed" "Could not snapshot the Git index; resolve unmerged entries before scanning" ""
+    fi
+    # An unborn branch has no HEAD tree. Comparing its index to an empty tree
+    # still scans every staged addition, including a first commit.
+    if ! base="$(git -C "$repo_root" rev-parse --verify 'HEAD^{tree}' 2>/dev/null)"; then
+      base="$(git -C "$repo_root" hash-object -t tree --stdin </dev/null)" || \
+        refuse_scan "git-index-failed" "Could not compute the empty Git tree" ""
+    fi
+    # Raw records include the destination object id and mode. Disabling rename
+    # detection makes every record one path and treats a rename as delete/add.
+    # Reading object ids from this snapshot also tolerates concurrent git adds.
+    if ! git -C "$repo_root" diff --raw -z --no-abbrev --no-renames --no-ext-diff \
+         --diff-filter=ACMRT "$base" "$snapshot" -- >"$raw" 2>"$err"; then
+      report_copy_failure git 2 "$err"
+      refuse_scan "git-index-failed" "Could not enumerate staged changes" ""
+    fi
   fi
   ensure_ignore_matcher
   ensure_dir "$dest"
@@ -4252,6 +4317,8 @@ try:
         fields = records[offset].split()
         if len(fields) != 5 or not fields[0].startswith(b':'):
             raise ValueError('invalid Git raw diff record')
+        if fields[4] == b'U':
+            raise ValueError('unmerged Git index; resolve conflicts before scanning')
         mode, oid = fields[1], fields[3]
         # Symlinks and submodules are not source blobs. Never follow them to
         # files outside the snapshot, even when their names end in .py/.js.
@@ -4534,7 +4601,7 @@ prepare_files_workspace(){
   fi
 
   local dest="$TMPDIR_RUN/files_scan"
-  rm -rf "$dest" 2>/dev/null || true
+  ubs_remove_temp -rf "$dest" 2>/dev/null || true
   ensure_dir "$dest"
 
   say "${BLUE}${INFO} Preparing shadow workspace for $(( ${#resolved_files[@]} + ext_file_count )) file(s) and ${#dir_src[@]} directory target(s)${RESET}"
@@ -4688,7 +4755,7 @@ ast_grep_target_triple(){
 find_ast_grep_in_path(){
   [[ "${UBS_TEST_NO_PATH_AST_GREP:-0}" == "1" ]] && return 1
   local -a dirs
-  IFS=':' read -r -a dirs <<<"${PATH:-}"
+  IFS=':' read -r -a dirs < <(printf '%s\n' "${PATH:-}")
   local name dir candidate
   for name in ast-grep sg; do
     for dir in "${dirs[@]}"; do
@@ -4753,7 +4820,7 @@ install_tool_cache_binary(){
     stage="$(mktemp -d "${bin_path%/*}/.ubs-tool.XXXXXX")" || exit 1
     staged="$stage/${bin_path##*/}"
     # These traps belong to this subshell, not the runner or another installer.
-    trap 'rm -f -- "$staged"; rmdir -- "$stage"' EXIT
+    trap 'ubs_remove_temp -f -- "$staged"; ubs_remove_empty_temp_dir -- "$stage"' EXIT
     trap 'exit 1' HUP INT TERM
     if [[ "$archive" == *.zip ]]; then
       extract_zip_member "$archive" "$member" "$staged" || {
@@ -4826,6 +4893,10 @@ ensure_ast_grep_tool_cache(){
   fi
 
   if [[ "$need_download" -eq 1 ]]; then
+    if [[ "$UBS_KEEP_TEMP" == "1" ]]; then
+      say_err 'ERROR: UBS_KEEP_TEMP=1 requires an existing ast-grep installation or verified tool cache; automatic tool installation is disabled.'
+      return 1
+    fi
     [[ "${QUIET:-0}" -eq 0 ]] && say_err "${DIM}${INFO}${RESET} Downloading ast-grep ${AST_GREP_VERSION} (${target})..."
     local tmp_zip sha
     (
@@ -4834,7 +4905,7 @@ ensure_ast_grep_tool_cache(){
         say_err "${RED}$X failed to create temp file for ast-grep download${RESET}"
         exit 1
       }
-      trap 'rm -f -- "$tmp_zip"' EXIT
+      trap 'ubs_remove_temp -f -- "$tmp_zip"' EXIT
       trap 'exit 1' HUP INT TERM
       if ! download_url_to_file "$url" "$tmp_zip"; then
         say_err "${RED}${X}${RESET} failed to download ast-grep: $url"
@@ -4862,6 +4933,10 @@ ensure_ast_grep_tool_cache(){
     echo "$bin_path"
     return 0
   fi
+  if [[ "$UBS_KEEP_TEMP" == "1" ]]; then
+    say_err 'ERROR: UBS_KEEP_TEMP=1 will not repair the ast-grep tool cache; install ast-grep before scanning.'
+    return 1
+  fi
   install_tool_cache_binary "$zip_path" "$bin_name" "$bin_path" verify_ast_grep_bin || return $?
   echo "$bin_path"
 }
@@ -4885,6 +4960,10 @@ ensure_toon_tool_cache(){
   if [[ -x "$bin_path" ]] && looks_like_toon_rust_encoder "$bin_path"; then
     echo "$bin_path"
     return 0
+  fi
+  if [[ "$UBS_KEEP_TEMP" == "1" ]]; then
+    say_err 'ERROR: UBS_KEEP_TEMP=1 requires an existing toon encoder; automatic tool installation is disabled.'
+    return 1
   fi
   if ! checksum_tool_name >/dev/null 2>&1; then
     say_err "${RED}${X}${RESET} Environment error: need sha256sum, shasum, or openssl to verify the toon encoder download"
@@ -4913,7 +4992,7 @@ ensure_toon_tool_cache(){
     [[ "${QUIET:-0}" -eq 0 ]] && say_err "${DIM}${INFO}${RESET} Downloading toon_rust ${TOON_VERSION} (${asset})..."
     (
       tmp="$(mktemp "$tool_root/.ubs-toon.XXXXXX")" || exit 1
-      trap 'rm -f -- "$tmp"' EXIT
+      trap 'ubs_remove_temp -f -- "$tmp"' EXIT
       trap 'exit 1' HUP INT TERM
       if ! download_url_to_file "$url" "$tmp"; then
         say_err "${RED}${X}${RESET} failed to download the toon encoder: $url"
@@ -5022,17 +5101,17 @@ verify_ast_grep_bin(){
   # ast-grep metavariables must reach the pattern parser as literal dollar signs.
   # shellcheck disable=SC2016
   if "$bin" run -p '$X = $Y' "$tmpfile" --json=stream >/dev/null 2>&1; then
-    [[ -n "$tmpdir" && "$tmpdir" != "/" ]] && rm -rf "$tmpdir" 2>/dev/null || true
+    [[ -n "$tmpdir" && "$tmpdir" != "/" ]] && ubs_remove_temp -rf "$tmpdir" 2>/dev/null || true
     return 0
   fi
   # The legacy form uses the same literal ast-grep metavariables.
   # shellcheck disable=SC2016
   if "$bin" --pattern '$X = $Y' "$tmpfile" --json=stream >/dev/null 2>&1; then
-    [[ -n "$tmpdir" && "$tmpdir" != "/" ]] && rm -rf "$tmpdir" 2>/dev/null || true
+    [[ -n "$tmpdir" && "$tmpdir" != "/" ]] && ubs_remove_temp -rf "$tmpdir" 2>/dev/null || true
     return 0
   fi
 
-  [[ -n "$tmpdir" && "$tmpdir" != "/" ]] && rm -rf "$tmpdir" 2>/dev/null || true
+  [[ -n "$tmpdir" && "$tmpdir" != "/" ]] && ubs_remove_temp -rf "$tmpdir" 2>/dev/null || true
   return 1
 }
 
@@ -5157,7 +5236,7 @@ if __name__ == "__main__":
     main()
 PY
   python3 "$py_script" "$MODULE_DIR/helpers" "${1:-}"
-  rm -f "$py_script"
+  ubs_remove_temp -f "$py_script"
 }
 
 should_verify_module_path(){
@@ -5351,18 +5430,18 @@ run_doctor(){
       cache_stats_json="$(PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core.cache doctor --prune-cache --all 2>/dev/null || true)"
       if [[ -n "$cache_stats_json" ]]; then
         local pruned_bytes pruned_entries
-        pruned_bytes="$(jq -r '.pruned_bytes // 0' <<<"$cache_stats_json" 2>/dev/null || echo 0)"
-        pruned_entries="$(jq -r '.pruned_entries // 0' <<<"$cache_stats_json" 2>/dev/null || echo 0)"
+        pruned_bytes="$(jq -r '.pruned_bytes // 0' < <(printf '%s\n' "$cache_stats_json") 2>/dev/null || echo 0)"
+        pruned_entries="$(jq -r '.pruned_entries // 0' < <(printf '%s\n' "$cache_stats_json") 2>/dev/null || echo 0)"
         doctor_report "scan-cache-prune" ok "Pruned $pruned_entries scan cache entries ($pruned_bytes bytes)"
       fi
     else
       cache_stats_json="$(PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core.cache doctor 2>/dev/null || true)"
       if [[ -n "$cache_stats_json" ]]; then
         local c_bytes c_entries c_keys c_base
-        c_bytes="$(jq -r '.size_bytes // 0' <<<"$cache_stats_json" 2>/dev/null || echo 0)"
-        c_entries="$(jq -r '.entries_count // 0' <<<"$cache_stats_json" 2>/dev/null || echo 0)"
-        c_keys="$(jq -r '.keys_count // 0' <<<"$cache_stats_json" 2>/dev/null || echo 0)"
-        c_base="$(jq -r '.cache_dir // ""' <<<"$cache_stats_json" 2>/dev/null || echo "")"
+        c_bytes="$(jq -r '.size_bytes // 0' < <(printf '%s\n' "$cache_stats_json") 2>/dev/null || echo 0)"
+        c_entries="$(jq -r '.entries_count // 0' < <(printf '%s\n' "$cache_stats_json") 2>/dev/null || echo 0)"
+        c_keys="$(jq -r '.keys_count // 0' < <(printf '%s\n' "$cache_stats_json") 2>/dev/null || echo 0)"
+        c_base="$(jq -r '.cache_dir // ""' < <(printf '%s\n' "$cache_stats_json") 2>/dev/null || echo "")"
         doctor_report "scan-cache" ok "Scan cache: $c_entries entries across $c_keys cache keys ($c_bytes bytes, ${c_base:-default})"
       fi
     fi
@@ -5553,7 +5632,7 @@ apply_ignore_filters(){
 # reorganized.
 suggest_ignore_candidates(){
   local threshold=200
-  IFS=',' read -r -a defaults <<<"$DEFAULT_IGNORES"
+  IFS=',' read -r -a defaults < <(printf '%s\n' "$DEFAULT_IGNORES")
   say "${BLUE}${INFO}${RESET} Ignore suggestions (directories with >${threshold} files not already default-ignored):"
   find "$PROJECT_DIR" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | while read -r d; do
     local base
@@ -5588,7 +5667,7 @@ single_file_paths(){
           else . end)' "$file" > "$file.tmp" 2>/dev/null; then
         mv "$file.tmp" "$file"
       else
-        rm -f "$file.tmp" 2>/dev/null
+        ubs_remove_temp -f "$file.tmp" 2>/dev/null
       fi
       ;;
     *)
@@ -5860,7 +5939,7 @@ select_langs(){
   # apply --only / --exclude
   local filtered=() i w
   if [[ -n "$ONLY_LANGS" ]]; then
-    IFS=',' read -r -a want <<<"$ONLY_LANGS"
+    IFS=',' read -r -a want < <(printf '%s\n' "$ONLY_LANGS")
     for i in "${detected[@]}"; do
       for w in "${want[@]}"; do [[ "$i" == "$w" ]] && filtered+=("$i"); done
     done
@@ -5877,7 +5956,7 @@ select_langs(){
     filtered=("${detected[@]}")
   fi
   if [[ -n "$EXCLUDE_LANGS" ]]; then
-    IFS=',' read -r -a drop <<<"$EXCLUDE_LANGS"
+    IFS=',' read -r -a drop < <(printf '%s\n' "$EXCLUDE_LANGS")
     local keep=()
     for i in "${filtered[@]}"; do
       local skip=0; for d in "${drop[@]}"; do [[ "$i" == "$d" || "$(normalize_lang "$d")" == "$i" ]] && skip=1; done
@@ -5933,11 +6012,11 @@ download_module(){
       fi
     else
       say "${RED}$X neither curl nor wget available${RESET}"
-      rm -f "$tmp" 2>/dev/null || true
+      ubs_remove_temp -f "$tmp" 2>/dev/null || true
       return 1
     fi
     if [[ -n "$err_msg" ]]; then
-      rm -f "$tmp" 2>/dev/null || true
+      ubs_remove_temp -f "$tmp" 2>/dev/null || true
       if [[ "$idx" -lt "$total" ]]; then
         say "${YELLOW}${WARN}${RESET} ${err_msg} from ${label}; trying main fallback..."
         continue
@@ -5947,7 +6026,7 @@ download_module(){
     fi
     # sanity checks
     if [ ! -s "$tmp" ]; then
-      rm -f "$tmp" 2>/dev/null || true
+      ubs_remove_temp -f "$tmp" 2>/dev/null || true
       if [[ "$idx" -lt "$total" ]]; then
         say "${YELLOW}${WARN}${RESET} empty module file for $lang from ${label}; trying main fallback..."
         continue
@@ -5957,7 +6036,7 @@ download_module(){
     fi
     head="$(head -n 1 "$tmp" | tr -d '\r')"
     if [[ ! "$head" =~ ^#! ]]; then
-      rm -f "$tmp" 2>/dev/null || true
+      ubs_remove_temp -f "$tmp" 2>/dev/null || true
       if [[ "$idx" -lt "$total" ]]; then
         say "${YELLOW}${WARN}${RESET} module missing shebang for $lang from ${label}; trying main fallback..."
         continue
@@ -5978,7 +6057,7 @@ download_module(){
       fi
       if [[ -n "${VERIFY_MODULE_ERR:-}" ]]; then
         err_msg="${VERIFY_MODULE_ERR}"
-        rm -f "$tmp" 2>/dev/null || true
+        ubs_remove_temp -f "$tmp" 2>/dev/null || true
         if [[ "$idx" -lt "$total" ]]; then
           say "${YELLOW}${WARN}${RESET} module ${BOLD}$lang${RESET} from ${label} failed verification (${err_msg}); trying main fallback..."
           continue
@@ -5989,7 +6068,7 @@ download_module(){
     fi
     if ! mv "$tmp" "$path"; then
       say "${RED}$X failed to finalize module ${BOLD}$lang${RESET} to ${DIM}$path${RESET}"
-      rm -f "$tmp" 2>/dev/null || true
+      ubs_remove_temp -f "$tmp" 2>/dev/null || true
       return 1
     fi
     chmod +x "$path" 2>/dev/null || true
@@ -6048,11 +6127,11 @@ download_helper_asset(){
       fi
     else
       say "${RED}$X neither curl nor wget available${RESET}"
-      rm -f "$tmp" 2>/dev/null || true
+      ubs_remove_temp -f "$tmp" 2>/dev/null || true
       return 1
     fi
     if [[ -n "$err_msg" ]]; then
-      rm -f "$tmp" 2>/dev/null || true
+      ubs_remove_temp -f "$tmp" 2>/dev/null || true
       if [[ "$idx" -lt "$total" ]]; then
         say "${YELLOW}${WARN}${RESET} ${err_msg} from ${label}; trying main fallback..."
         continue
@@ -6063,7 +6142,7 @@ download_helper_asset(){
     local empty_sha="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     if [[ "${HELPER_CHECKSUMS[$rel]:-}" != "$empty_sha" ]] && [ ! -s "$tmp" ]; then
       VERIFY_HELPER_ERR="checksum mismatch for $rel (empty helper file)"
-      rm -f "$tmp" 2>/dev/null || true
+      ubs_remove_temp -f "$tmp" 2>/dev/null || true
       if [[ "$idx" -lt "$total" ]]; then
         say "${YELLOW}${WARN}${RESET} empty helper file for $rel from ${label}; trying main fallback..."
         continue
@@ -6084,7 +6163,7 @@ download_helper_asset(){
       fi
       if [[ -n "${VERIFY_HELPER_ERR:-}" ]]; then
         err_msg="${VERIFY_HELPER_ERR}"
-        rm -f "$tmp" 2>/dev/null || true
+        ubs_remove_temp -f "$tmp" 2>/dev/null || true
         if [[ "$idx" -lt "$total" ]]; then
           say "${YELLOW}${WARN}${RESET} helper ${BOLD}$rel${RESET} from ${label} failed verification (${err_msg}); trying main fallback..."
           continue
@@ -6095,7 +6174,7 @@ download_helper_asset(){
     fi
     if ! mv "$tmp" "$path"; then
       say "${RED}$X failed to finalize helper ${BOLD}$rel${RESET} to ${DIM}$path${RESET}"
-      rm -f "$tmp" 2>/dev/null || true
+      ubs_remove_temp -f "$tmp" 2>/dev/null || true
       return 1
     fi
     return 0
@@ -6148,7 +6227,7 @@ ensure_helper_asset(){
       say "${YELLOW}${WARN}${RESET} cached helper $rel failed verification (${VERIFY_HELPER_ERR:-corrupt}); refreshing..."
       VERIFY_HELPER_ERR=""
       if ! download_helper_asset "$rel" "$path"; then
-        rm -f "$path" 2>/dev/null || true
+        ubs_remove_temp -f "$path" 2>/dev/null || true
         # download_helper_asset verifies before installing: a fetched-but-mismatching
         # helper surfaces here as a checksum error and must fail closed.
         [[ "${VERIFY_HELPER_ERR:-}" == *"checksum mismatch"* ]] && return 2
@@ -6160,7 +6239,7 @@ ensure_helper_asset(){
         # Fail closed: a helper that still does not match the pinned digest
         # after a fresh download is never executed.
         say "${RED}$X helper $rel still fails verification after re-download (${VERIFY_HELPER_ERR:-corrupt}); refusing to run it${RESET}"
-        rm -f "$path" 2>/dev/null || true
+        ubs_remove_temp -f "$path" 2>/dev/null || true
         return 2
       fi
     fi
@@ -6453,7 +6532,7 @@ check_and_update_self(){
   # shellcheck disable=SC2064
   # RETURN traps are global, so the trap clears itself after firing once;
   # `|| true` keeps a failed rmdir from tripping the ERR trap (errtrace).
-  trap "rm -f '$work_dir/SHA256SUMS' '$work_dir/SHA256SUMS.minisig' '$work_dir/ubs' '$work_dir/ubs-daemon'; rmdir '$work_dir' 2>/dev/null || true; trap - RETURN" RETURN
+  trap "ubs_remove_temp -f '$work_dir/SHA256SUMS' '$work_dir/SHA256SUMS.minisig' '$work_dir/ubs' '$work_dir/ubs-daemon'; ubs_remove_empty_temp_dir '$work_dir' 2>/dev/null || true; trap - RETURN" RETURN
 
   # 1. Fetch the release checksum manifest (fail closed — no manifest, no update).
   local sums_file="$work_dir/SHA256SUMS"
@@ -6556,7 +6635,7 @@ check_and_update_self(){
       fi
       if ! cp "$work_dir/ubs-daemon" "$daemon_stage" || ! chmod 0644 "$daemon_stage" \
           || ! mv -f -- "$daemon_stage" "$daemon_target"; then
-        rm -f -- "$daemon_stage"
+        ubs_remove_temp -f -- "$daemon_stage"
         self_update_fail "cannot publish release daemon"; return $?
       fi
     fi
@@ -6568,7 +6647,7 @@ check_and_update_self(){
       return $?
     fi
     if ! cp "$new_self" "$tmp_self" 2>/dev/null; then
-      rm -f "$tmp_self"
+      ubs_remove_temp -f "$tmp_self"
       self_update_fail "failed to stage verified update"
       return $?
     fi
@@ -6581,7 +6660,7 @@ check_and_update_self(){
     install_mode="$(stat -c '%a' "$self_path" 2>/dev/null || stat -f '%OLp' "$self_path" 2>/dev/null)" || install_mode=""
     [[ "$install_mode" =~ ^[0-7]{3,4}$ ]] || install_mode=755
     if ! chmod "$install_mode" "$tmp_self" 2>/dev/null; then
-      rm -f "$tmp_self"
+      ubs_remove_temp -f "$tmp_self"
       self_update_fail "failed to set mode $install_mode on staged update"
       return $?
     fi
@@ -6603,13 +6682,13 @@ check_and_update_self(){
       fi
       # Clean up staged artifacts now: exec replaces the process, so the
       # RETURN trap never fires on this path.
-      rm -f "$work_dir/SHA256SUMS" "$work_dir/SHA256SUMS.minisig" "$work_dir/ubs" "$work_dir/ubs-daemon"
-      rmdir "$work_dir" 2>/dev/null || true
+      ubs_remove_temp -f "$work_dir/SHA256SUMS" "$work_dir/SHA256SUMS.minisig" "$work_dir/ubs" "$work_dir/ubs-daemon"
+      ubs_remove_empty_temp_dir "$work_dir" 2>/dev/null || true
       # Otherwise (opt-in auto-update ahead of real work) hand the user's
       # original command line to the new version.
       exec "$self_path" ${UBS_ORIGINAL_ARGS[@]+"${UBS_ORIGINAL_ARGS[@]}"}
     else
-      rm -f "$tmp_self"
+      ubs_remove_temp -f "$tmp_self"
       self_update_fail "failed to replace $self_path"
       return $?
     fi
@@ -6710,13 +6789,13 @@ kill_module_pgroups(){
   while IFS= read -r pg; do
     [[ "$pg" =~ ^[0-9]+$ ]] || continue
     kill -TERM -"$pg" 2>/dev/null || true
-  done <<< "$pgs"
+  done < <(printf '%s\n' "$pgs")
   # Give the groups a brief chance to exit on TERM, then hard-kill any survivors.
   sleep 1 2>/dev/null || true
   while IFS= read -r pg; do
     [[ "$pg" =~ ^[0-9]+$ ]] || continue
     kill -KILL -"$pg" 2>/dev/null || true
-  done <<< "$pgs"
+  done < <(printf '%s\n' "$pgs")
 }
 
 # shellcheck disable=SC2317,SC2329  # invoked via the EXIT trap and from on_interrupt
@@ -6731,7 +6810,7 @@ cleanup(){
   early_cleanup
   local dir="${TMPDIR_RUN:-}"
   [[ -n "$dir" && "$dir" != "/" ]] || return 0
-  rm -rf "$dir" 2>/dev/null || true
+  ubs_remove_temp -rf "$dir" 2>/dev/null || true
 }
 # On interrupt/termination, tear down any in-flight module process groups first
 # (so their cargo/ast-grep grandchildren don't reparent and survive), clean up,
@@ -7091,7 +7170,7 @@ warn_ambiguous_skip(){
   local -a active_langs=("$@")
   [[ -z "$skip_csv" ]] && return 0
   [[ "${#active_langs[@]}" -lt 2 ]] && return 0
-  IFS=',' read -r -a _wac <<<"$skip_csv"
+  IFS=',' read -r -a _wac < <(printf '%s\n' "$skip_csv")
   local cat lang line
   say_err ""
   say_err "${YELLOW}${WARN} WARNING:${RESET} bare --skip=${skip_csv} silences DIFFERENT categories in each language module."
@@ -7117,7 +7196,7 @@ warn_ambiguous_skip(){
 resolve_skip_categories(){
   [[ -z "${UBS_SKIP_CATEGORIES:-}" ]] && return 0
   local -a tokens
-  IFS=',' read -r -a tokens <<<"$UBS_SKIP_CATEGORIES"
+  IFS=',' read -r -a tokens < <(printf '%s\n' "$UBS_SKIP_CATEGORIES")
   local -a bare_nums=()
   local tok
   for tok in "${tokens[@]}"; do
@@ -8495,12 +8574,12 @@ deliver_file(){
     return 1
   }
   if ! cat "$src" >"$tmp" 2>/dev/null; then
-    rm -f "$tmp" 2>/dev/null || true
+    ubs_remove_temp -f "$tmp" 2>/dev/null || true
     say_err "${RED}${X}${RESET} Cannot write the requested ${label}: $dest"
     return 1
   fi
   if [[ -d "$dest" ]] || ! mv -f "$tmp" "$dest" 2>/dev/null; then
-    rm -f "$tmp" 2>/dev/null || true
+    ubs_remove_temp -f "$tmp" 2>/dev/null || true
     say_err "${RED}${X}${RESET} Cannot replace the requested ${label}: $dest"
     return 1
   fi
@@ -8664,8 +8743,21 @@ say "${WHITE}Format:${RESET}  ${CYAN}$FORMAT${RESET}"
 
 # One post-processing script per run (bead C3b); defined above, used by run_lang.
 if need_cmd python3; then write_postprocess_script; fi
-read -r -a langs <<<"$(select_langs)"
+read -r -a langs < <(printf '%s\n' "$(select_langs)")
 if [[ ${#langs[@]} -eq 0 ]]; then emit_no_langs_result; fi
+if [[ "$UBS_KEEP_TEMP" == "1" ]]; then
+  for L in "${langs[@]}"; do
+    case "$L" in
+      rust|python|js|bash) ;;
+      *)
+        say_err "ERROR: UBS_KEEP_TEMP=1 does not support $L; supported languages: rust, python, js, bash."
+        emit_error_envelope "environment" "error" "retention-unsupported-language" \
+          "UBS_KEEP_TEMP=1 does not support $L; supported languages: rust, python, js, bash" \
+          '"failed_modules":[]'
+        exit 2 ;;
+    esac
+  done
+fi
 say "${WHITE}Detected:${RESET} ${CYAN}${langs[*]}${RESET}"
 
 # --list-categories: print each selected module's category table and exit 0.
@@ -8760,7 +8852,7 @@ if need_cmd python3; then
   _ordered_json="$(PYTHONPATH="$_sched_hdir${PYTHONPATH:+:$_sched_hdir}" python3 -m ubs_core.scheduler order \
     --langs "$_sched_langs" --files-dir "$TMPDIR_RUN" --slots "$NUM_SLOTS" 2>/dev/null || true)"
   if [[ -n "$_ordered_json" ]] && need_cmd jq; then
-    readarray -t _ordered_langs < <(jq -r '.ordered_langs[]' <<<"$_ordered_json" 2>/dev/null || true)
+    readarray -t _ordered_langs < <(jq -r '.ordered_langs[]' < <(printf '%s\n' "$_ordered_json") 2>/dev/null || true)
     if [[ ${#_ordered_langs[@]} -eq ${#langs[@]} ]]; then
       langs=("${_ordered_langs[@]}")
     fi
@@ -8769,7 +8861,7 @@ if need_cmd python3; then
         if [[ "$_timeout_secs" =~ ^[0-9]+$ && -n "${MODULE_PATHS[$_timeout_lang]:-}" ]]; then
           MODULE_TIMEOUTS["$_timeout_lang"]="$_timeout_secs"
         fi
-      done < <(jq -r '.timeouts | to_entries[] | [.key, .value] | @tsv' <<<"$_ordered_json" 2>/dev/null || true)
+      done < <(jq -r '.timeouts | to_entries[] | [.key, .value] | @tsv' < <(printf '%s\n' "$_ordered_json") 2>/dev/null || true)
     fi
   fi
 fi
@@ -9358,7 +9450,7 @@ def deliver(path, payload, label):
     except (OSError, ValueError) as exc:
         errors.append(f"{label} ({path}): {exc}")
     finally:
-        if staged is not None:
+        if staged is not None and os.environ.get("UBS_KEEP_TEMP") != "1":
             try:
                 staged.unlink()
             except OSError:

@@ -23,7 +23,6 @@ import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from contextlib import contextmanager
@@ -32,6 +31,7 @@ from io import BytesIO, StringIO
 from pathlib import Path
 from typing import BinaryIO, Iterator, Sequence, TextIO
 
+from ubs_core.io import temporary_directory, temporary_file
 from ubs_core.suppression import SourceSuppressions
 
 OUTPUT_LIMIT = 16 * 1024 * 1024
@@ -128,8 +128,8 @@ def run_command_stream(tool: str, argv: Sequence[str], root: Path, timeout: floa
     stdout = stderr = None
     try:
         try:
-            stdout = tempfile.TemporaryFile()
-            stderr = tempfile.TemporaryFile()
+            stdout = temporary_file(prefix="ubs-tool-stdout-")
+            stderr = temporary_file(prefix="ubs-tool-stderr-")
             # The only tainted argv reaching here is the operator's
             # UBS_AST_GREP_BIN override (scan_ast_config); argv is a list, no shell.
             proc = subprocess.Popen(  # ubs:ignore[python.taint.command] - executable comes from operator configuration, not request input.
@@ -537,7 +537,7 @@ def scan_custom_rules(rules_dir: str | Path, paths: Sequence[Path], sink: TextIO
         return 0
     suppressions = SourceSuppressions(lang)
     written = 0
-    with tempfile.TemporaryDirectory(prefix="ubs-custom-rules-") as tmp:
+    with temporary_directory(prefix="ubs-custom-rules-") as tmp:
         config = Path(tmp) / "sgconfig.yml"
         # JSON strings are valid YAML scalars for any path spelling.
         config.write_text("ruleDirs: " + json.dumps([str(p.resolve()) for p in rules]) + "\n",
@@ -923,7 +923,7 @@ class _JSONReportReader:
                     break
         # Decode only after framing: a later invalid byte never prevents
         # earlier, independently complete diagnostics from being delivered.
-        return json.loads(raw.decode("utf-8"), parse_constant=self.invalid_constant)
+        return json.loads(raw.decode("utf-8"), parse_constant=self.invalid_constant)  # ubs:ignore[py.parsing.json-loads-no-try] - _json_stream and GoFindings.vet catch and report decoding errors.
 
     def members(self) -> Iterator[str]:
         self.expect(b"{")

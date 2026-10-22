@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.5.12-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.5.13-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -1167,6 +1167,7 @@ Environment Variables:
                            Numeric 0/1 leaves project severity unchanged; strict|loose overrides it
   UBS_SKIP_SIZE_CHECK      Skip directory size guard entirely (set to 1)
   UBS_ALLOW_NO_SCAN        Exit 0 instead of 3 when nothing was scanned (set to 1)
+  UBS_KEEP_TEMP=1          Retain scanner scratch for Rust/Python/JS/Bash; see below
 
 Arguments:
   PROJECT_DIR              Directory to scan (default: current directory)
@@ -1185,6 +1186,31 @@ Exit Codes:
                            This is NOT a pass. Set UBS_ALLOW_NO_SCAN=1 to restore the legacy exit-0
                            behaviour for callers that intentionally scan mixed/unsupported trees.
 ```
+
+**Retaining scan scratch**
+
+Set `UBS_KEEP_TEMP=1` to retain scanner-owned workspaces, rule files, captured
+tool output, merge staging, and spill databases after successful, failed, or
+interrupted Rust, Python, JavaScript/TypeScript, and Bash scans. Set `TMPDIR`
+to an existing writable directory to choose where scratch accumulates; retained
+files can contain source code and findings, so use private storage. The caller
+manages its later removal. Retention does not change detectors, severity, module
+verification, or scan exit codes, and it disables scan-cache pruning.
+Staged scans read immutable blob IDs directly from the index, retaining the
+indexed version even when the working file differs. They reject unmerged
+entries and avoid Git's temporary-object cleanup during tree creation.
+
+This mode requires Bash >= 5.1 in its modern compatibility mode and supports
+static analysis. Older Bash creates and unlinks heredoc backing files internally.
+Select `--no-cargo` for Rust projects with
+enabled Cargo phases and `--no-uv` for direct Python text scans that would run
+optional auditors. Build and auditor processes manage their own temporary files
+and are refused rather than silently skipped. Other languages, service and
+doctor commands, forced updates, and automatic tool installation are outside
+this contract and refuse with exit 2. Install required tools before scanning.
+Ordinary scans without this environment variable retain their existing cleanup
+behavior. Retention does not authorize overwriting input files: requested report
+and baseline destinations still use the existing atomic publication rules.
 
 **Machine-readable failures**
 

@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.io import keep_temp_enabled, temporary_file
 from ubs_core.lexer import strip_comments_and_strings
 from ubs_core.suppression import SourceSuppressions
 
@@ -1312,7 +1313,7 @@ def run_narrowing(scan: Scan, skip_type_narrowing: bool) -> list[Hit]:
             # narrower result as a finished one (#111).
             issues = _narrowing_regex_over_list(scan)
     finally:
-        if guard_json is not None:
+        if guard_json is not None and not keep_temp_enabled():
             guard_json.unlink(missing_ok=True)
     hits: list[Hit] = []
     # The guard pass walks the whole project, but only the files being
@@ -1366,9 +1367,13 @@ def _emit_guard_matches(project_dir: Path) -> tuple[Path | None, bool]:
     ast_grep = _ast_grep_bin()
     if ast_grep is None:
         return None, False
-    fd, tmp_path = tempfile.mkstemp(prefix="ubs-v2-rust-guards-", suffix=".jsonl")
-    os.close(fd)
-    tmp = Path(tmp_path)
+    if keep_temp_enabled():
+        with temporary_file(prefix="ubs-v2-rust-guards-", suffix=".jsonl") as scratch:
+            tmp = Path(scratch.name)
+    else:
+        fd, tmp_path = tempfile.mkstemp(prefix="ubs-v2-rust-guards-", suffix=".jsonl")
+        os.close(fd)
+        tmp = Path(tmp_path)
     patterns = (
         "if let Some($BIND) = $SOURCE { $BODY }",
         "if let Ok($BIND) = $SOURCE { $BODY }",

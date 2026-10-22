@@ -18,12 +18,13 @@ import json
 import os
 import re
 import sqlite3
-import tempfile
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote
+
+from ubs_core.io import keep_temp_enabled, temporary_directory, temporary_file
 
 SCANNER_SUMMARY_KEYS = {"language", "project", "files", "critical", "warning", "info", "timestamp", "status", "version"}
 
@@ -300,6 +301,48 @@ class _BaselineAllowance:
     count: int
 
 
+def _open_spill_database(prefix: str) -> tuple[sqlite3.Connection, bool]:
+    """Keep large ledgers on disk without SQLite deleting retained scratch.
+
+    PERSIST retains the rollback journal; MEMORY temp storage prevents hidden
+    disposable sort/materialization files. The ledger queries below are all
+    single-row primary-key operations, so that setting does not move the
+    ledger into memory or replace the bounded disk-backed page cache.
+    """
+    if not keep_temp_enabled():
+        return sqlite3.connect(""), False
+    with temporary_file(prefix=prefix, suffix=".sqlite3") as scratch:
+        filename = scratch.name
+    connection = sqlite3.connect(filename)
+    try:
+        options = {row[0] for row in connection.execute("PRAGMA compile_options")}
+        if "TEMP_STORE=0" in options:
+            raise sqlite3.OperationalError("SQLite cannot retain scratch with TEMP_STORE=0")
+        mode = connection.execute("PRAGMA journal_mode = PERSIST").fetchone()
+        limit = connection.execute("PRAGMA journal_size_limit = -1").fetchone()
+        connection.execute("PRAGMA temp_store = MEMORY")
+        temp_store = connection.execute("PRAGMA temp_store").fetchone()
+        if mode != ("persist",) or limit != (-1,) or temp_store != (2,):
+            raise sqlite3.OperationalError("SQLite could not enable retained scratch storage")
+    except BaseException:
+        connection.close()
+        raise
+    return connection, True
+
+
+def _close_spill_database(connection: sqlite3.Connection, retained: bool) -> None:
+    try:
+        try:
+            if retained:
+                # Keep the derived ledger, not just an empty database whose
+                # last transaction was rolled back when its connection closed.
+                connection.commit()
+        finally:
+            connection.close()
+    except sqlite3.Error as exc:
+        raise ValueError(f"cannot close findings scratch database: {exc}") from exc
+
+
 class _BaselineFilter:
     """Match already-known occurrences, not just equal fingerprint strings.
 
@@ -316,6 +359,7 @@ class _BaselineFilter:
         self._allowances: dict[tuple[str, str, str], _BaselineAllowance] = {}
         self._remaining: dict[tuple[str, str, str], int] = {}
         self._db: sqlite3.Connection | None = None
+        self._retained_db = False
         self._size = 0
         self._closed = False
         try:
@@ -369,9 +413,9 @@ class _BaselineFilter:
                 raise ValueError(f"baseline has conflicting records for fingerprint {key[-1]}")
             return  # Duplicate records are not additional occurrence credit.
         if self._db is None and self._size >= self.MEMORY_LIMIT:
-            # Private, automatically removed on close; never an in-memory DB.
+            # Private disk storage; retained only when explicitly requested.
             # Counts are decimal TEXT because JSON integers can exceed int64.
-            self._db = sqlite3.connect("")
+            self._db, self._retained_db = _open_spill_database("ubs-baseline-")
             self._db.execute("PRAGMA cache_size = -2048")
             self._db.execute(
                 "CREATE TABLE allowances (channel BLOB, lang BLOB, fingerprint BLOB, "
@@ -392,10 +436,11 @@ class _BaselineFilter:
         self._size += 1
 
     def close(self) -> None:
-        if self._db is not None:
-            self._db.close()
-            self._db = None
         self._closed = True
+        if self._db is not None:
+            connection = self._db
+            self._db = None
+            _close_spill_database(connection, self._retained_db)
 
     def retain(self, finding: dict, channel: str = "counted") -> dict | None:
         if self._closed:
@@ -484,12 +529,14 @@ class _OccurrenceOrdinals:
 
     Small scans stay in memory. After 4096 distinct statements, an ephemeral
     on-disk SQLite table holds the counters, including statements seen before
-    the spill. The table lasts for exactly one merge and never caches findings.
+    the spill. The table belongs to one merge and never caches findings;
+    retention mode leaves its scratch database for inspection after close.
     """
 
     def __init__(self) -> None:
         self._counts: dict[tuple[str, str, str], int] = {}
         self._db: sqlite3.Connection | None = None
+        self._retained_db = False
 
     def next(self, path: str, rule: str, statement: str) -> int:
         key = (path, rule, statement)
@@ -498,9 +545,7 @@ class _OccurrenceOrdinals:
                 ordinal = self._counts.get(key, 0)
                 self._counts[key] = ordinal + 1
                 return ordinal
-            # An empty filename requests a private temporary database, not an
-            # in-memory database; sqlite removes it when the connection closes.
-            self._db = sqlite3.connect("")
+            self._db, self._retained_db = _open_spill_database("ubs-ordinals-")
             self._db.execute("PRAGMA cache_size = -2048")
             self._db.execute("CREATE TABLE counts (path TEXT, rule TEXT, statement TEXT, n INTEGER, "
                              "PRIMARY KEY (path, rule, statement)) WITHOUT ROWID")
@@ -515,7 +560,9 @@ class _OccurrenceOrdinals:
 
     def close(self) -> None:
         if self._db is not None:
-            self._db.close()
+            connection = self._db
+            self._db = None
+            _close_spill_database(connection, self._retained_db)
 
 
 def _validate_project_record(rec: dict) -> None:
@@ -686,7 +733,7 @@ def merge(
         # The normalized ledger can be much larger than its source tree. Keep
         # it on disk throughout: neither raw records, normalized records nor
         # the final serialized document need a whole-report in-memory copy.
-        with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as findings:
+        with temporary_file(mode="w+", encoding="utf-8", prefix="ubs-findings-") as findings:
             for sink in sorted(Path(tmp_dir).glob("*.findings.json")):
                 lang = sink.name.split(".", 1)[0]
                 saw_record = False
@@ -753,7 +800,7 @@ def merge(
                 # Publish only after all records have been normalized and the
                 # full JSON is written. A read, validation or disk-write error
                 # must leave the original summary usable for a partial report.
-                with tempfile.TemporaryDirectory(prefix=".ubs-findings-", dir=combined_path.parent) as stage_dir:
+                with temporary_directory(prefix=".ubs-findings-", dir=combined_path.parent) as stage_dir:
                     staged = Path(stage_dir) / "combined.json"
                     with staged.open("w", encoding="utf-8") as output:
                         output.write("{")
@@ -774,9 +821,11 @@ def merge(
     except (OSError, sqlite3.Error) as exc:
         raise ValueError(f"cannot assemble findings: {exc}") from exc
     finally:
-        ordinals.close()
-        if baseline is not None:
-            baseline.close()
+        try:
+            ordinals.close()
+        finally:
+            if baseline is not None:
+                baseline.close()
     return count
 
 

@@ -12,6 +12,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Added
 
+- Opt-in `UBS_KEEP_TEMP=1` retains scanner scratch across static Rust, Python,
+  JavaScript/TypeScript, and Bash scans, including error paths and helper spill
+  databases. Unsupported languages and cleanup-capable build, auditor, update,
+  and service operations refuse explicitly. Linux regression scans check real
+  bug and clean controls under a kernel deletion guard and syscall tracing.
+
 - Kotlin category 13 now follows request data into JDBC SQL execution, including Java synthetic properties, source-local helper summaries, SQL captured by prepared statements and statement-owned batch queues. Static SQL with actual value binding stays clean. Named arguments, literal defaults and multiline expression bodies retain helper flow; unsupported receiver and default semantics report incomplete analysis. JSON and SARIF retain source-to-sink evidence, and the SQL work limit participates in cache invalidation.
 
 ### Fixed

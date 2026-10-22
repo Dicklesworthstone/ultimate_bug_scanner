@@ -19,10 +19,36 @@ if [[ -n "${UBS_COMMON_LOADED:-}" ]]; then
   # shellcheck disable=SC2317
   return 0 2>/dev/null || exit 0
 fi
-UBS_COMMON_LOADED=1
 # Read by the modules and quality/test_ubs_common.py after sourcing.
 # shellcheck disable=SC2034
 UBS_COMMON_VERSION="1"
+
+if [[ "${UBS_KEEP_TEMP:-0}" == "1" ]]; then
+  if (( BASH_VERSINFO[0] < 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] < 1) )); then
+    echo 'ERROR: UBS_KEEP_TEMP=1 requires Bash >= 5.1 for pipe-backed heredocs.' >&2
+    if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then exit 2; else return 2; fi
+  fi
+  case "${BASH_COMPAT:-}" in
+    [0-4]*|50*|5.0*)
+      echo 'ERROR: UBS_KEEP_TEMP=1 requires modern Bash compatibility (BASH_COMPAT >= 5.1).' >&2
+      if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then exit 2; else return 2; fi ;;
+  esac
+  for _ubs_common_compat in 31 32 40 41 42 43 44; do
+    if shopt -q "compat$_ubs_common_compat"; then
+      echo 'ERROR: UBS_KEEP_TEMP=1 requires modern Bash compatibility (BASH_COMPAT >= 5.1).' >&2
+      if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then exit 2; else return 2; fi
+    fi
+  done
+  unset _ubs_common_compat
+fi
+UBS_COMMON_LOADED=1
+
+# Preserve scanner-owned scratch when callers explicitly request retention.
+# Keep normal rm flags/status and leave detector and publication logic alone.
+ubs_remove_temp(){
+  [[ "${UBS_KEEP_TEMP:-0}" == "1" ]] && return 0
+  command rm "$@"
+}
 
 # ── Locale ──────────────────────────────────────────────────────────────────
 # Child tools (sort, grep, awk, rg) must see the C locale for byte-stable
@@ -87,12 +113,12 @@ ubs_deliver_file(){
     return 1
   fi
   if ! cat -- "$src" >"$tmp" 2>/dev/null; then
-    rm -f -- "$tmp" 2>/dev/null || true
+    ubs_remove_temp -f -- "$tmp" 2>/dev/null || true
     printf '✗ cannot write the requested %s: %s\n' "$label" "$dest" >&2
     return 1
   fi
   if ! mv -f -- "$tmp" "$dest" 2>/dev/null; then
-    rm -f -- "$tmp" 2>/dev/null || true
+    ubs_remove_temp -f -- "$tmp" 2>/dev/null || true
     printf '✗ cannot replace the requested %s: %s\n' "$label" "$dest" >&2
     return 1
   fi
@@ -292,7 +318,7 @@ declare -g -A UBS_COMMON_HELPER_CHECKSUMS=(
   ['helpers/ubs_core/analyzers/taint_swift_traversal.py']='f4108f46a3eef70b21033a37c0c3ccf393921b62d07ce855dce391bcee45c8ec'
   ['helpers/ubs_core/bash_rules.py']='21fb455e701160e12575b478819d8f52254bca2d672d6962992a93d8c186a20c'
   ['helpers/ubs_core/bash_scan.py']='aa224e5c69fb20539d1868f42a95b46c11eedf1b7c0ff6727d459acbe80c08ef'
-  ['helpers/ubs_core/cache.py']='76acddcfa36b58482502358035ac2e55e231a70fbfcd7c5a0a3fb825404acac4'
+  ['helpers/ubs_core/cache.py']='6fd060c27570c178c46015005fcc429b36518f1de77aa4abf3718165af53ce1e'
   ['helpers/ubs_core/cli.py']='f0025ee2506bb5fe128adc971a321e2bc005ee35a8c3b658785108e8ff94ff49'
   ['helpers/ubs_core/cpp_detectors/__init__.py']='b74840d5af31f44ac13703f3c66f6968af4207c9ce08f3c0ae1010cd62c4fabd'
   ['helpers/ubs_core/cpp_detectors/archive_entry.py']='dd83df898f3c856fa769aaa754e172afc2607b22202a9984dd11802bb429b44e'
@@ -354,8 +380,8 @@ declare -g -A UBS_COMMON_HELPER_CHECKSUMS=(
   ['helpers/ubs_core/elixir_rules.py']='3f8ca9a8d1cd898588005bb925b5b931d8d3947d41e7c235c48b9d8033ed65e4'
   ['helpers/ubs_core/elixir_scan.py']='211b76527f9b803507420e5abc7618bf89c801bac64bc474d8978d31c34dc331'
   ['helpers/ubs_core/explain.py']='982cb9be27bb4d5d7cc4afde2f7f0cba57ab4b7804d79c963b70f6aff21a8306'
-  ['helpers/ubs_core/external_tools.py']='f63cf0efc4ec190b063025ad5e2240c2ce15627d95d80852c6042358061e8e73'
-  ['helpers/ubs_core/findings_merge.py']='c93eef918277c9c5b33a33845a7b41be9f2fe420403525d33140227169b7ce5f'
+  ['helpers/ubs_core/external_tools.py']='4a66691cffa87c4c4b8191ac7355fee395d3b0369a288e381a11522accc69a48'
+  ['helpers/ubs_core/findings_merge.py']='a592789f727296e332a1b79f441a20234f8f7686ed738de5152fc4981781b6fa'
   ['helpers/ubs_core/go_ast.py']='f459406b41a7aa4b5fd0af7cce5a961811d0bffd499fb99825ed631ec96d0f0d'
   ['helpers/ubs_core/go_detectors/__init__.py']='70cc7219036b6d704d9a9e9414c623b4d0eb65ef26e12aac19c8ba6aa055ba41'
   ['helpers/ubs_core/go_detectors/archive_extraction.py']='f0b25a44ccf1b0f374feb9e8fc7486b618eccf817348151d1a0583b7496fe6a7'
@@ -379,7 +405,7 @@ declare -g -A UBS_COMMON_HELPER_CHECKSUMS=(
   ['helpers/ubs_core/go_patterns/misc.py']='d23874e0fd10bc3538fd0c9b4eae998dbcb3076dd66020a6c764c7bb297506bd'
   ['helpers/ubs_core/go_rules.py']='a11e1036d06d313c102fda792f9842af7af69ad6250ec9dcb0c21ceaddc00ce1'
   ['helpers/ubs_core/go_scan.py']='56be3c22a3fe325ba24087b2c8e37c9da9959df9b2a8930d508e9605ffb085b1'
-  ['helpers/ubs_core/io.py']='f398594f6d9fa3f5042b7dd10d89cc6ee22cff1335ac6621a23ca1526ebf9149'
+  ['helpers/ubs_core/io.py']='98b33056e732a07ecc5b5b38afa5d889cdb8bdbbba20c3ae73d165219706a3fd'
   ['helpers/ubs_core/java_ast.py']='50091504b3eed28240dea483b631b9bf47c45993ca1f2f9ff6daec6744eaecef'
   ['helpers/ubs_core/java_detectors/__init__.py']='ef52ffa7d353633e7bb1d1caa697c3b3bf83c6d7dc1ec111a3a4b71e2aa2d8f0'
   ['helpers/ubs_core/java_detectors/_common.py']='658ef921d7248ee9e95e3dff0887092e1133debe67c2b2b62aa21b7447584c73'
@@ -424,7 +450,7 @@ declare -g -A UBS_COMMON_HELPER_CHECKSUMS=(
   ['helpers/ubs_core/lexer.py']='8ad2f1ebf45306e74042efa330052a765b345568194570dff5480af215531023'
   ['helpers/ubs_core/php_frontend.py']='301b810b4addcc0c6c055cce15c2e0fdbf505cbd9ecd159d9a3975f3a77c8658'
   ['helpers/ubs_core/php_scan.py']='92349ae54795e4d1dbbc6ffd5846273ad11b33ed9cb006432ccea9f5efe57724'
-  ['helpers/ubs_core/prefilter.py']='1eafeecb4e0441bee498c3291ef5af67856124d8b9d765849150b80d5d5a7259'
+  ['helpers/ubs_core/prefilter.py']='adda4a20eab6cf84bcb9691b9767af76bf46d0eba90bf0e4c000fd97a8996d6f'
   ['helpers/ubs_core/py_ast.py']='e5da8b583cfd381b89b8ed64c17058c1c2c06030cb1b826e61a9ceed3f644765'
   ['helpers/ubs_core/py_detectors/__init__.py']='15eb6a55a8b3c0f2df0336576e593a7ce9af5e0685800262cba9b54b7d8c22f4'
   ['helpers/ubs_core/py_detectors/_pathlike.py']='90b1b71bce5606f1a5684c9122fc14ac27bbbf5ba4ebf455343e29145a0b2e1c'
@@ -523,7 +549,7 @@ declare -g -A UBS_COMMON_HELPER_CHECKSUMS=(
   ['helpers/ubs_core/rust_detectors/tls_indirect.py']='120501344abdcddf96e6a40c7b4b38617dd0649b83cfc81a0863f38027b0a755'
   ['helpers/ubs_core/rust_detectors/unbounded_request_body.py']='72eaedc5e99846eadaab246cb6398dc189f541ca14ae62e8a305a316bde69f5f'
   ['helpers/ubs_core/rust_rules.py']='d35a4d6cb061f0eb7ff70a799b415414016a3ce8e10c8331e8a9ee4b484be211'
-  ['helpers/ubs_core/rust_scan.py']='a62325887353a85de746d0ddc2616627b6b9a3788ef843fa6a9ea46b37f40562'
+  ['helpers/ubs_core/rust_scan.py']='18bad9f7c59f18739578da1d5321e5917a1c1d108b2199c82d08fa2412b1dc75'
   ['helpers/ubs_core/scheduler.py']='662a2555f571e9cc6fba5755103948fa8b8e8b87f8d9038686225ccf6b6405bb'
   ['helpers/ubs_core/selftest.py']='6ca3dd5e5534edc0b8a10e9aac1f80834f0d79b661c50c28bd00b33eb85bff08'
   ['helpers/ubs_core/shards.py']='cdc6ecab42bd962e65bb1ac1dc5e3f20b87c4d68632617286a2991274c0c98f7'
@@ -709,7 +735,7 @@ ubs_resolve_helpers_dir(){
             break
           fi
           _core_digests+=("${_core_digest,,}")
-        done <<< "$_core_batch"
+        done < <(printf '%s\n' "$_core_batch")
         (( _core_batch_valid && ${#_core_digests[@]} == ${#_core_files[@]} )) && _core_batch_ok=1
       fi
     fi
@@ -862,7 +888,7 @@ ubs_list_files(){
   local item pattern
   if [[ -n "$exts" ]]; then
     local -a ext_list
-    IFS=',' read -r -a ext_list <<<"$exts"
+    IFS=',' read -r -a ext_list < <(printf '%s\n' "$exts")
     for item in "${ext_list[@]}"; do
       item="${item#.}"
       [[ -z "$item" ]] && continue
@@ -895,7 +921,7 @@ ubs_list_files(){
   local -a prune_args=()
   if [[ -n "$excludes" ]]; then
     local -a ex_list
-    IFS=',' read -r -a ex_list <<<"$excludes"
+    IFS=',' read -r -a ex_list < <(printf '%s\n' "$excludes")
     for item in "${ex_list[@]}"; do
       [[ -z "$item" ]] && continue
       rg_args+=(-g "!${item}")

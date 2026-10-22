@@ -16,7 +16,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="321f20751bfb6ca5232bf0b105530ac311f2918d7238ade26370562d523e5543"
+UBS_LIB_CHECKSUM="f7d6d1be7d64ef5505bbb265eb0b4b8746639401aa10afb1dce9e681d6749cb0"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -76,10 +76,10 @@ cleanup_add() { [[ -n "${1:-}" ]] && TEMP_PATHS+=("$1"); }
 # shellcheck disable=SC2329
 cleanup() {
   IFS=${ORIG_IFS}
-  [[ "${KEEP_TEMP}" -eq 1 ]] && return 0
+  [[ "${KEEP_TEMP}" == "1" ]] && return 0
   local p
   for p in "${TEMP_PATHS[@]:-}"; do
-    [[ -n "$p" && "$p" != "/" && "$p" != "." ]] && rm -rf -- "$p" 2>/dev/null || true
+    [[ -n "$p" && "$p" != "/" && "$p" != "." ]] && ubs_remove_temp -rf -- "$p" 2>/dev/null || true
   done
 }
 trap cleanup EXIT
@@ -240,9 +240,9 @@ if [[ "$FORMAT" == "json" || "$FORMAT" == "sarif" ]]; then
   CI_MODE=1
 fi
 
-IFS=',' read -r -a _EXT_ARR <<<"$INCLUDE_EXT"
+IFS=',' read -r -a _EXT_ARR < <(printf '%s\n' "$INCLUDE_EXT")
 EXCLUDE_DIRS=(node_modules dist build out .next .nuxt .cache coverage .git vendor tmp temp .svelte-kit)
-if [[ -n "$EXTRA_EXCLUDES" ]]; then IFS=',' read -r -a _X <<<"$EXTRA_EXCLUDES"; EXCLUDE_DIRS+=("${_X[@]}"); fi
+if [[ -n "$EXTRA_EXCLUDES" ]]; then IFS=',' read -r -a _X < <(printf '%s\n' "$EXTRA_EXCLUDES"); EXCLUDE_DIRS+=("${_X[@]}"); fi
 
 # Silence options unused in contract-v2 for shellcheck
 : "$VERBOSE" "$DETAIL_LIMIT" "$JOBS" "$MAX_JSON_SAMPLES" "$USER_RULE_DIR" "$QUIET" "$CI_MODE" "$USE_COLOR"
@@ -501,7 +501,7 @@ else:
 sys.exit(exit_code)
 PYV2BRIDGE
   if [[ -n "$tn_raw" ]]; then
-    rm -f "$tn_raw" 2>/dev/null || true
+    ubs_remove_temp -f "$tn_raw" 2>/dev/null || true
   fi
   return "$bridge_rc"
 }
@@ -538,12 +538,12 @@ run_contract_v2_js(){
       echo -e "${RED}${BOLD}✗ Environment error: ast-grep is required for TS/TSX/JSX scans${RESET}"
       echo -e "${DIM}Without a syntax-aware AST engine, JS/TS scanning is too noisy to be trustworthy.${RESET}"
       echo -e "${DIM}Fix: install ast-grep (https://ast-grep.github.io/) or re-run the UBS installer.${RESET}"
-      rm -f "$list_file" "$sink" 2>/dev/null || true
+      ubs_remove_temp -f "$list_file" "$sink" 2>/dev/null || true
       return 2
     fi
     if [[ "$FORMAT" == "sarif" ]]; then
       echo -e "${RED}${BOLD}✗ Environment error: ast-grep rule pack unavailable for SARIF output${RESET}"
-      rm -f "$list_file" "$sink" 2>/dev/null || true
+      ubs_remove_temp -f "$list_file" "$sink" 2>/dev/null || true
       return 2
     fi
   fi
@@ -598,20 +598,20 @@ PYRULES
 
   if [[ -n "$text_out" ]]; then
     cat "$text_out" 2>/dev/null || true
-    rm -f "$text_out" 2>/dev/null || true
+    ubs_remove_temp -f "$text_out" 2>/dev/null || true
   fi
   if [[ -n "$v2_json_out" && "$FORMAT" == "json" ]]; then
     cat "$v2_json_out" 2>/dev/null || true
   fi
 
   if [[ -n "$v2_json_out" ]]; then
-    rm -f "$v2_json_out" 2>/dev/null || true
+    ubs_remove_temp -f "$v2_json_out" 2>/dev/null || true
   fi
   if [[ -n "$REPORT_JSON" ]]; then
     cp "$sink" "$REPORT_JSON" 2>/dev/null || true   # K2: the sink IS the findings record stream
   fi
-  rm -f "$list_file" "$sink" 2>/dev/null || true
-  [[ -n "$ast_rule_dir" ]] && rm -rf "$ast_rule_dir" 2>/dev/null || true
+  ubs_remove_temp -f "$list_file" "$sink" 2>/dev/null || true
+  [[ -n "$ast_rule_dir" ]] && ubs_remove_temp -rf "$ast_rule_dir" 2>/dev/null || true
   return "$exit_code"
 }
 

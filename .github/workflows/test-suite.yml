@@ -124,7 +124,7 @@ jobs:
       - name: Install system tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends jq ripgrep
+          sudo apt-get install -y --no-install-recommends jq ripgrep strace libseccomp2
       - name: Install ast-grep (npm)
         run: npm install -g @ast-grep/cli@0.45.3 >/dev/null
 

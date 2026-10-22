@@ -25,6 +25,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from ubs_core.io import keep_temp_enabled
+
 # Environment variables
 ENV_CACHE_DIR = "UBS_CACHE_DIR"
 ENV_NO_CACHE = "UBS_NO_CACHE"
@@ -81,7 +83,7 @@ def atomic_write_json(target_path: Path, data: Any) -> None:
     except OSError:
         pass
     finally:
-        if temp_path.is_file():
+        if not keep_temp_enabled() and temp_path.is_file():
             try:
                 temp_path.unlink()
             except OSError:
@@ -725,8 +727,12 @@ def prune_cache(
 ) -> tuple[int, int]:
     """Prune entries older than max_age_days (or all entries if prune_all).
 
-    Returns (freed_bytes, removed_count).
+    Returns (freed_bytes, removed_count). Retention mode leaves all entries
+    and directories intact, including an explicitly requested full prune.
     """
+    if keep_temp_enabled():
+        sys.stderr.write("[ubs_core] UBS_KEEP_TEMP=1: cache pruning skipped; entries retained\n")
+        return 0, 0
     root = base_dir or get_cache_base_dir()
     if not root.is_dir():
         return 0, 0

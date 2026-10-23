@@ -1183,6 +1183,66 @@ class SwiftScopedFlowTests(unittest.TestCase):
                 }
             ''')
 
+    def test_file_record_members_are_not_file_serving_obligations(self):
+        for access in ('file.name', 'file?.name', 'file!.name',
+                       'configuration.file.regularFileContents',
+                       'configuration.file?.regularFileContents'):
+            for policy in ('path', 'redirect'):
+                with self.subTest(access=access, policy=policy):
+                    self.check('''
+                        struct Reader {
+                            var body: some View {
+                                ForEach(attachments) { file in Text(%s) }
+                                alert(presenting: export) { request in consume(request.path) }
+                            }
+                        }
+                    ''' % access, policy=policy, suffix=access + policy)
+
+    def test_file_record_members_keep_real_field_sources_incomplete(self):
+        for source in ('req.query["path"]', 'request.query["path"]',
+                       'upload.filename', 'request'):
+            for policy in ('path', 'redirect'):
+                with self.subTest(source=source, policy=policy), self.assertRaisesRegex(ValueError, 'initialization.*incomplete'):
+                    self.check('''
+                        struct Reader {
+                            var body: some View {
+                                ForEach(attachments) { file in Text(file.name) }
+                                consume(%s)
+                            }
+                        }
+                        func incoming(req: Request) {}
+                    ''' % source, policy=policy, suffix=source.split('.')[0] + policy)
+
+    def test_file_record_members_do_not_hide_real_sinks(self):
+        for policy, sink in (('path', 'file(at: target)'),
+                             ('redirect', 'Response.redirect(to: target)')):
+            with self.subTest(policy=policy):
+                self.check('''
+                    func metadata() { let value = configuration.file.regularFileContents }
+                    func handle(req: Request) {
+                        let target = req.query["path"]
+                        %s
+                    }
+                ''' % sink, (4,), policy=policy, suffix=policy)
+
+    def test_file_operation_calls_aliases_and_captures_remain_obligations(self):
+        for index, call in enumerate((
+            'file(request)', 'file?(request)', 'file!(request)',
+            'file.callAsFunction(request)', 'file.self(request)',
+            'let reader = file; reader(request)',
+            'let reader = configuration.file; reader(request)',
+            'let reader = configuration.file.self; reader(request)',
+            'consume([file])', 'consume(file)',
+            'let value = configuration.file.name; file(request)',
+            r'consume("value-\(file(request))")',
+            'file.readFile(request)', 'file?.write(to: request)',
+            'file.name; consume(request.query["path"])',
+        )):
+            for policy in ('path', 'redirect'):
+                with self.subTest(call=call, policy=policy), self.assertRaisesRegex(ValueError, 'closure.*incomplete'):
+                    self.check('func submit() { let request = UUID(); Task { %s } }' % call,
+                               policy=policy, suffix=str(index) + policy)
+
     def test_api_write_without_destination_is_not_a_file_sink_obligation(self):
         for index, call in enumerate((
             'panel.write("/api/billing", body: request)',

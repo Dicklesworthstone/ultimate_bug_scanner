@@ -435,7 +435,7 @@ class SwiftParser:
             if declarations and owner:
                 # Stored fields/accessors require an object state model. Never
                 # silently discard an executable request source in this region.
-                if any(token.kind == 'code' and token.value in {'req', 'request'} for token in part):
+                if swift_source_tokens(part):
                     raise ValueError('Swift request-derived type initialization needs field analysis; analysis is incomplete')
                 continue
             if first in {'import', 'typealias', 'case', '@'}:
@@ -781,6 +781,22 @@ def swift_flow_obligation(tokens):
     for index, value in enumerate(code):
         if value == 'write' and code_tokens[index].start in non_file_writes:
             continue
+        if value == 'file':
+            # A record receiver (file.name / configuration.file.contents)
+            # and a closure's binding token are not calls to the file-serving
+            # operation. Keep bare values, aliases, direct/optional calls,
+            # explicit callable access and every other source/sink witness.
+            # Only code tokens participate: literal text cannot prove a use.
+            position = index + 1
+            if position < len(code) and code[position] in {'?', '!'}:
+                position += 1
+            if (position + 1 < len(code) and code[position] == '.'
+                    and re.fullmatch(r'[A-Za-z_]\w*', code[position + 1])
+                    and code[position + 1] not in {'self', 'callAsFunction'}):
+                continue
+            if (index > 0 and code[index - 1] == '{'
+                    and index + 1 < len(code) and code[index + 1] == 'in'):
+                continue
         # A collection append's argument label is not Foundation's URL reader.
         # Actual reads elsewhere and request member/type witnesses still activate
         # analysis, including a read nested inside the appended expression.

@@ -675,6 +675,21 @@ class CallbackSummaryTests(SourceTest):
         contexts = [key for key in engine.summaries if isinstance(key, tuple)]
         self.assertEqual(len(contexts), 1, contexts)
 
+    def test_first_namespace_publication_preserves_temporary_global_callbacks(self):
+        for initial, active, expected in [('print', 'eval', {'eval'}), ('eval', 'print', set())]:
+            with self.subTest(initial=initial, active=active):
+                source = (f'dispatch = {initial}\n'
+                          'def apply(value): return dispatch(value)\n'
+                          'saved = dispatch\n'
+                          f'dispatch = {active}\n'
+                          'apply(input())\n'
+                          'dispatch = saved\n')
+                engine = taint_py._Analysis(ast.parse(source))
+                effects = engine.analyze()
+                self.assertEqual({key[0] for key in effects}, expected)
+                contexts = [key[1] for key in engine.summaries if isinstance(key, tuple)]
+                self.assertEqual(contexts, [(('@global:dispatch', active),)])
+
     def test_cpython_callback_and_capture_oracles(self):
         cases = [
             ('def apply(cb, value): cb(value)\napply(eval, input())', ['untrusted']),

@@ -645,6 +645,12 @@ class _State(dict):
                 and self.heap == other.heap and self.mutated == other.mutated
                 and self.reachable == other.reachable)
 
+    def __ne__(self, other):
+        # dict implements its own inequality, which otherwise compares only
+        # value facts and bypasses our equality. A changed callable, heap or
+        # alias must invalidate summaries even when scalar taint is unchanged.
+        return not self == other
+
 
 def _join_states(*states):
     reachable = [state for state in states if state is not None and state.reachable]
@@ -3120,25 +3126,19 @@ class _Analysis:
         self.functions = [node for node in nodes if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))]
         self.generators = set()
         self.locals = {}
+        raw_used = {}
         for scope in [tree, *self.functions]:
             body = tuple(_scope_nodes(scope))
             self.locals[scope] = _local_names(scope, body)
-            if scope is not tree and any(isinstance(node, (ast.Yield, ast.YieldFrom)) for node in body):
-                self.generators.add(scope)
+            if scope is not tree:
+                raw_used[scope] = _used_names(scope, body)
+                if any(isinstance(node, (ast.Yield, ast.YieldFrom)) for node in body):
+                    self.generators.add(scope)
         for node in nodes:
             if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
                 self.locals[node] = {child.id for generator in node.generators
                                      for child in ast.walk(generator.target)
                                      if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)}
-        self.generators = set()
-        self.locals[tree] = _local_names(tree)
-        raw_used = {}
-        for function in self.functions:
-            fn_nodes = list(_scope_nodes(function))
-            if any(isinstance(node, (ast.Yield, ast.YieldFrom)) for node in fn_nodes):
-                self.generators.add(function)
-            self.locals[function] = _local_names(function, fn_nodes)
-            raw_used[function] = _used_names(function, fn_nodes)
         self.global_names = self.locals[tree]
         # Formal globals are lexical constants, not concrete heap facts.
         # Reusing their immutable traces preserves paths and lets state joins
@@ -3192,10 +3192,11 @@ class _Analysis:
             f'@global:{name}': self.global_symbols[name][1]
             for name in self.global_names
         }
-        self.refresh_globals(self.globals)
+        self.refresh_globals(self.globals, ready=False)
 
-    def refresh_globals(self, globals_):
+    def refresh_globals(self, globals_, *, ready=True):
         self.globals = globals_
+        self.namespace_ready = ready
         bindings = globals_.bindings
         self.base_global_values = {
             f'@global:{name}': bindings.get(name)
@@ -3367,20 +3368,23 @@ class _Analysis:
         items = ((name, values.get(name)) for name in candidate_keys) if candidate_keys is not None else values.items()
         for name, binding in items:
             if name.startswith('@global:'):
-                # A class namespace is a mutable object. A caller may replace
-                # one of its methods after a helper's definition, so neither
-                # the helper's original nor the module's final class binding
-                # can certify this invocation. Include the finite class value
-                # (or its revoked/unknown alternative) in the summary context.
+                # A caller may replace a global callable or class method and
+                # restore it later. The module's final binding cannot certify
+                # a call made while that identity was replaced. Preserve the
+                # finite identity (including its revoked/unknown alternative)
+                # through helper calls, just as for callback parameters.
                 if owner_fn is None:
                     owner_fn = self.owner(function)
                     owner_bindings = owner_fn.globals.bindings
+                # The initial empty namespace is not a nominal binding. Its
+                # first publication (also used by import-cycle priming) makes
+                # these comparisons meaningful; the module then runs again.
+                if not owner_fn.namespace_ready:
+                    continue
                 gname = name[8:]
                 nominal = owner_bindings.get(gname)
-                if (not isinstance(binding, (frozenset, ast.ClassDef, _BoundClassMethod))
-                        and not isinstance(nominal, (frozenset, ast.ClassDef, _BoundClassMethod))):
-                    continue
-                if not any(isinstance(value, (ast.ClassDef, _BoundClassMethod))
+                if not any(isinstance(value, (str, ast.FunctionDef, ast.AsyncFunctionDef,
+                                              ast.Lambda, ast.ClassDef, _BoundClassMethod))
                            for value in (*_binding_choices(binding), *_binding_choices(nominal))):
                     continue
             elif binding is None or isinstance(binding, _SymbolicValue):
@@ -3454,7 +3458,7 @@ class _Analysis:
             # Imported higher-order helpers may call a callback defined by
             # this module. Publish this pass's namespace before solving those
             # contexts, and iterate again when initialization facts change.
-            changed = globals_ != self.globals
+            changed = not self.namespace_ready or globals_ != self.globals
             if changed:
                 solved.clear()  # Every job of this module starts from the namespace.
             self.refresh_globals(globals_)

@@ -21,6 +21,24 @@ sys.path.insert(0, str(ROOT / 'modules' / 'helpers'))
 from ubs_core.analyzers import taint_py
 
 SHAPES = {
+    # The module's value facts are unchanged when the factory's second
+    # callable alternative becomes known. Its binding still invalidates
+    # handlers solved against the earlier, harmless-only namespace.
+    'late_global_callable': {'app.py': '''
+import os
+def harmless(value):
+    return None
+def build():
+    callback = harmless
+    if condition:
+        callback = get_executor()
+    return callback
+def get_executor():
+    return os.system
+command = build()
+def handler():
+    command(input())
+'''},
     # Caller solved before a callee chain whose summaries settle one per pass.
     'late_dependency': {'app.py': '''
 import os
@@ -181,6 +199,7 @@ def f():
 }
 
 EXPECTED = {
+    'late_global_callable': {('app.py', 13)},
     'late_dependency': {('app.py', 11)},
     'mutual_recursion': {('app.py', 11)},
     'rotating_loop': {('app.py', 7)},
@@ -247,6 +266,49 @@ class Factory:
                           for node in engine.imports], ['os', 'builtins', 'mod'])
         self.assertEqual(engine.functions, [node for node in ast.walk(tree)
                          if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))])
+
+    def test_namespace_changes_recompute_handlers_without_new_value_facts(self):
+        source = SHAPES['late_global_callable']['app.py']
+        for callback, expected in [('os.system', {('app.py', 13)}), ('harmless', set())]:
+            with self.subTest(callback=callback):
+                findings = self.scan({'app.py': source.replace('return os.system', f'return {callback}')})
+                self.assertEqual({(path, line) for path, _, line, _, _ in findings}, expected, findings)
+
+    def test_state_inequality_observes_non_value_flow_facts(self):
+        original = taint_py._State({'value': taint_py.CLEAN}, {'callback': 'print'})
+        mutations = (
+            lambda state: state.bindings.update(callback='eval'),
+            lambda state: state.references.update(value=frozenset({'object'})),
+            lambda state: state.heap.update(object=frozenset({taint_py.TaintTrace('input')})),
+            lambda state: state.mutated.add('object'),
+            lambda state: setattr(state, 'reachable', False),
+        )
+        self.assertEqual(original, original.copy())
+        self.assertFalse(original != original.copy())
+        for mutate in mutations:
+            changed = original.copy()
+            mutate(changed)
+            self.assertFalse(original == changed)
+            self.assertTrue(original != changed)
+
+    def test_temporary_global_callable_binding_survives_nested_helpers(self):
+        for initial, active, expected in (
+            ('print', 'os.system', {('app.py', 4)}),
+            ('os.system', 'print', set()),
+        ):
+            with self.subTest(initial=initial, active=active):
+                findings = self.scan({'app.py': f'''import os
+runner = {initial}
+def invoke(value):
+    return runner(value)
+def forward(value):
+    return invoke(value)
+saved = runner
+runner = {active}
+forward(input())
+runner = saved
+'''})
+                self.assertEqual({(path, line) for path, _, line, _, _ in findings}, expected, findings)
 
     def test_prepared_scopes_keep_closure_flow_through_shadowing_comprehension(self):
         for actual, expected in [('input()', {('app.py', 7)}), ('"safe"', set())]:

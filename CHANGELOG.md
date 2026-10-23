@@ -28,6 +28,11 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Fixed
 
+- Python taint analysis refreshes helper summaries when callable identities,
+  aliases, heap facts or reachability change without new scalar taint. Temporary
+  global callable replacements remain specific to their invocation even after
+  restoration, and unpublished module namespaces do not create redundant call
+  contexts. Syntax preparation also reuses each lexical scope walk.
 - Ruby response-header checks track scoped values, helpers, aliases and branches
   through the shared flow engine. Safety requires actual CR/LF removal, verified
   encoding or dominating rejection; later concatenation and interpolation

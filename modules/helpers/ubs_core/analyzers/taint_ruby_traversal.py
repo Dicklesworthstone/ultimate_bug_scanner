@@ -46,11 +46,14 @@ SINK_RE = re.compile(
     r'|\b(?:send_file|serve_file|download_file|write_file_response)\s*\(?'
     r'|\brender\s+(?:file|template):',
 )
-PROOF_TAGS = frozenset({'url-host', 'url-scheme', 'contained-path', 'redirect-slash-prefix', 'redirect-not-double-slash', 'safe-redirect'})
-VALUE_TAGS = PROOF_TAGS | frozenset({'canonical-path', 'parsed-uri', 'basename-path', 'not-dot-name', 'exact-literal', 'sql-bound-value', 'sql-integer-value'})
+HEADER_PROOFS = frozenset({'header-no-cr', 'header-no-lf'})
+HEADER_ENTRIES = frozenset({'header-entry-value', 'header-entry-location', 'header-entry-key'})
+PROOF_TAGS = frozenset({'url-host', 'url-scheme', 'contained-path', 'redirect-slash-prefix', 'redirect-not-double-slash', 'safe-redirect'}) | HEADER_PROOFS
+VALUE_TAGS = PROOF_TAGS | HEADER_ENTRIES | frozenset({'canonical-path', 'parsed-uri', 'basename-path', 'not-dot-name', 'exact-literal', 'sql-bound-value', 'sql-integer-value'})
 PATH_RULE = 'ruby.taint.path_traversal'
 URL_RULE = 'ruby.taint.outbound_url'
 REDIRECT_RULE = 'ruby.redirect.open'
+HEADER_RULE = 'ruby.header-injection.response'
 EVAL_RULE = 'ruby.security.eval-family'
 DISPATCH_RULE = 'ruby.security.dynamic-dispatch'
 COMMAND_RULE = 'ruby.security.backticks-interpolated'
@@ -60,7 +63,7 @@ API_CONSTANTS = frozenset(tuple(name.split('::')) for name in (
     'File', 'IO', 'FileUtils', 'Dir', 'Pathname', 'URI', 'OpenURI',
     'Net', 'Net::HTTP', 'Addressable', 'Addressable::URI', 'Rack', 'Rack::Request',
     'Faraday', 'HTTParty', 'RestClient', 'Excon', 'HTTP', 'Typhoeus', 'Curl',
-    'ActiveRecord', 'ActiveRecord::Base', 'Arel',
+    'ActiveRecord', 'ActiveRecord::Base', 'Arel', 'CGI', 'ERB', 'ERB::Util', 'Rack::Utils',
 ))
 # ActiveRecord::ConnectionAdapters::DatabaseStatements: query text is the
 # first positional operand, independently of log names and value bindings.
@@ -1271,6 +1274,8 @@ class RubyEngine:
             return constant(tokens[1].value, 'symbol')
         if len(tokens) == 1:
             token = tokens[0]
+            if self.policy == 'header' and token.kind == 'regex':
+                return retag(constant(token.value, 'header-regex'), add=frozenset({'exact-literal'}))
             if token.kind in {'literal', 'number'} or token.value in {'nil', 'true', 'false'}:
                 return constant(token.value, token.kind)
             if token.kind == 'words':
@@ -1306,6 +1311,13 @@ class RubyEngine:
             tokens = tokens[:-2]
         if len(tokens) == 1 and tokens[0].kind == 'literal':
             value = self.fresh(value, 'string', tokens[0].start)
+            if self.policy == 'header':
+                decoded = self.header_literal(tokens[0])
+                if decoded is not None:
+                    value = join(value, retag(constant(decoded, 'header-string'),
+                                             add=frozenset({'exact-literal'})))
+                else:
+                    value = join(value, shape('header-unknown-literal', tokens[0].start))
         elif len(tokens) == 1 and tokens[0].kind == 'words':
             items = join(*(self.fresh(constant(word), 'string', tokens[0].start + index)
                            for index, word in enumerate(tokens[0].value.split())))
@@ -1316,6 +1328,140 @@ class RubyEngine:
         if shared:
             value = frozenset(replace(trace, tags=trace.tags | frozenset({'shared-allocation'}))
                               if trace.kind in {'object', 'member'} else trace for trace in value)
+        return value
+
+    def header_literal(self, token):
+        """Decode only a bounded Ruby string subset used by CR/LF checks.
+
+        Single-quoted '\\r' is two ordinary characters. Unknown Ruby escapes
+        cannot establish sanitization merely because their spelling contains r/n.
+        """
+        spelling = self.text[token.start:token.end]
+        single = spelling.startswith("'") or spelling.startswith('%q')
+        if not (single or spelling.startswith('"') or spelling.startswith('%Q')):
+            return None
+        decoded, cursor = [], 0
+        lexer = RubyLexer(token.value) if token.parts else None
+        escapes = {'r': '\r', 'n': '\n', 't': '\t', '\\': '\\', '"': '"', "'": "'"}
+        while cursor < len(token.value):
+            char = token.value[cursor]
+            if lexer is not None and token.value.startswith('#{', cursor):
+                cursor = lexer.interpolation_end(cursor + 2, len(token.value)) + 1
+                continue
+            if char != '\\':
+                decoded.append(char)
+                cursor += 1
+                continue
+            if cursor + 1 >= len(token.value):
+                return None
+            following = token.value[cursor + 1]
+            if single and following not in {"'", '\\'}:
+                decoded.extend(('\\', following))
+            elif following in escapes:
+                decoded.append(escapes[following])
+            else:
+                return None
+            cursor += 2
+        return ''.join(decoded)
+
+    @staticmethod
+    def header_constant(value, kind):
+        constants = {trace.key[1] for trace in value
+                     if trace.kind == 'constant' and trace.key[0] == kind
+                     and 'exact-literal' in trace.tags}
+        if len(constants) != 1 or tainted(value) or any(
+                trace.kind == 'object' and trace.key[0] != 'string' for trace in value):
+            return None
+        return next(iter(constants))
+
+    @staticmethod
+    def header_regex_chars(pattern):
+        # A CRLF pair does not reject isolated CR or LF. Restrict proofs to
+        # unanchored single-character alternatives; negated classes and
+        # arbitrary regex programs stay unproven.
+        if pattern in {r'[\r\n]', r'[\n\r]', r'\r|\n', r'\n|\r', r'[[:cntrl:]]'}:
+            return frozenset({'\r', '\n'})
+        if pattern in {r'\r', r'[\r]'}:
+            return frozenset({'\r'})
+        if pattern in {r'\n', r'[\n]'}:
+            return frozenset({'\n'})
+        return frozenset()
+
+    @staticmethod
+    def header_tags(chars):
+        return frozenset('header-no-cr' if char == '\r' else 'header-no-lf'
+                         for char in chars if char in {'\r', '\n'})
+
+    def header_added_controls(self, value):
+        """Remove proofs when composition adds literal controls back to a value.
+
+        Keep facts from composed constants even without exact-literal status.
+        A later deletion/encoding or guard tags those facts too, so stripped
+        characters do not reappear merely because their original spelling is
+        still retained for provenance.
+        """
+        invalid = frozenset()
+        for trace in value:
+            if trace.kind == 'constant' and trace.key[0] == 'header-string':
+                invalid |= self.header_tags(trace.key[1]) - trace.tags
+            elif trace.kind == 'shape' and trace.key[0] == 'header-unknown-literal':
+                invalid |= HEADER_PROOFS - trace.tags
+        return invalid
+
+    def header_string_call(self, name, receiver, arguments, token):
+        method = name.rsplit('.', 1)[-1]
+        encoders = {'CGI.escape', 'CGI.escapeURIComponent', 'Rack::Utils.escape',
+                    'Rack::Utils.escape_path', 'ERB::Util.url_encode', 'URI.encode_www_form_component'}
+        if name in encoders and arguments:
+            return self.fresh(retag(arguments[0], add=HEADER_PROOFS,
+                                    remove=VALUE_TAGS - HEADER_PROOFS), 'string', token.start)
+        kinds = {trace.key[0] for trace in receiver if trace.kind == 'object'}
+        if not kinds or not kinds <= {'string', 'request'}:
+            return None
+        removed = frozenset()
+        if method == 'delete' and arguments:
+            sets = [self.header_constant(argument, 'header-string') for argument in arguments]
+            if all(value is not None and not any(char in value for char in {'^', '-', '\\'})
+                   for value in sets):
+                removed = frozenset.intersection(*(frozenset(value) for value in sets))
+        elif method in {'tr', 'tr_s', 'gsub'} and len(arguments) == 2:
+            replacement = self.header_constant(arguments[1], 'header-string')
+            if replacement is not None and not any(char in replacement for char in {'\r', '\n', '\\'}):
+                if method == 'gsub':
+                    pattern = self.header_constant(arguments[0], 'header-regex')
+                    removed = self.header_regex_chars(pattern)
+                else:
+                    selected = self.header_constant(arguments[0], 'header-string')
+                    if selected is not None and not any(char in selected for char in {'^', '-', '\\'}):
+                        removed = frozenset(selected)
+        tags = self.header_tags(removed)
+        if tags:
+            return self.fresh(retag(receiver, add=tags, remove=VALUE_TAGS - HEADER_PROOFS),
+                              'string', token.start)
+        return None
+
+    @staticmethod
+    def header_location(value):
+        names = {trace.key[1].lower() for trace in value if trace.kind == 'constant'
+                 and trace.key[0] in {'literal', 'symbol'} and 'exact-literal' in trace.tags}
+        return names == {'location'} and not tainted(value) and all(
+            trace.kind == 'constant' and 'exact-literal' in trace.tags
+            or trace.kind == 'object' and trace.key[0] == 'string' for trace in value)
+
+    def header_mapping(self, tokens, state, depth):
+        value = CLEAN
+        for part in split_tokens(tokens, {','}):
+            pair = split_tokens(part, {'=>', ':'})
+            if len(pair) != 2:
+                value = join(value, self.expression(part, state, depth + 1))
+                continue
+            key = (constant(pair[0][0].value, 'symbol')
+                   if len(pair[0]) == 1 and pair[0][0].kind == 'code' and part[1].value == ':'
+                   else self.expression(pair[0], state, depth + 1))
+            item = self.expression(pair[1], state, depth + 1)
+            tag = 'header-entry-location' if self.header_location(key) else 'header-entry-value'
+            value = join(value, retag(key, remove=HEADER_ENTRIES, add=frozenset({'header-entry-key'})),
+                         retag(item, remove=HEADER_ENTRIES, add=frozenset({tag})))
         return value
 
     def returned_objects(self, value, arguments, offset):
@@ -1438,6 +1584,7 @@ class RubyEngine:
     def record(self, offset, value, operation=''):
         unsafe = frozenset(trace for trace in tainted(value)
                            if ('contained-path' not in trace.tags if self.policy == 'path'
+                               else not HEADER_PROOFS <= trace.tags if self.policy == 'header'
                                else not ({'url-host', 'url-scheme'} <= trace.tags
                                          or (self.policy == 'redirect'
                                              and ({'redirect-slash-prefix', 'redirect-not-double-slash'} <= trace.tags
@@ -1446,8 +1593,10 @@ class RubyEngine:
                                     and ('not-dot-name' in trace.tags or operation == 'send_file'
                                          or re.fullmatch(r'(?:File|IO)\.(?:read|binread|write|binwrite|open|truncate)', operation))))
         if unsafe:
-            label = 'file sink' if self.policy == 'path' else 'redirect sink' if self.policy == 'redirect' else 'outbound URL sink'
-            rule = PATH_RULE if self.policy == 'path' else REDIRECT_RULE if self.policy == 'redirect' else URL_RULE
+            label = ('file sink' if self.policy == 'path' else 'response header' if self.policy == 'header'
+                     else 'redirect sink' if self.policy == 'redirect' else 'outbound URL sink')
+            rule = (PATH_RULE if self.policy == 'path' else HEADER_RULE if self.policy == 'header'
+                    else REDIRECT_RULE if self.policy == 'redirect' else URL_RULE)
             site = (rule, offset)
             self.effects[site] = join(self.effects.get(site, CLEAN), advance(unsafe, self.step(offset, 'sink', label)))
 
@@ -1630,6 +1779,35 @@ class RubyEngine:
         sql_result = self.active_record_call(name, receiver, arguments, token, state)
         if sql_result is not None:
             return sql_result
+        if self.policy == 'header':
+            if name in {'self.response', 'response'} and not arguments:
+                return shape('response', token.start)
+            if name in {'self.headers', 'headers'} and not arguments:
+                return shape('response-headers', token.start)
+            if has_shape(receiver, 'response') and method == 'headers' and not arguments:
+                return shape('response-headers', token.start)
+            sanitized = self.header_string_call(name, receiver, arguments, token)
+            if sanitized is not None:
+                return sanitized
+            if has_shape(receiver, 'response-headers') and method in {'dup', 'clone', 'merge'}:
+                detached = frozenset(trace for trace in join(receiver, *arguments)
+                                     if not (trace.kind == 'shape' and trace.key[0] == 'response-headers'))
+                return self.fresh(detached, 'array', token.start, shallow=True)
+            response_map = has_shape(receiver, 'response-headers') or has_shape(receiver, 'response')
+            if response_map and method in {'store', '[]=', 'set', 'set_header', 'add_header'}:
+                if len(arguments) >= 2 and not self.header_location(arguments[0]):
+                    self.record(token.start, arguments[1], name)
+                return arguments[1] if len(arguments) >= 2 else CLEAN
+            if response_map and method in {'merge!', 'update'}:
+                for argument in arguments:
+                    values = frozenset(trace for trace in argument
+                                       if not trace.tags & {'header-entry-key', 'header-entry-location'})
+                    self.record(token.start, values, name)
+                return receiver
+            if name in {'send_data', 'send_file', 'self.send_data', 'self.send_file'}:
+                for argument in arguments:
+                    if any(trace.kind == 'keyword' and trace.key == ('filename',) for trace in argument):
+                        self.record(token.start, argument, name)
         kinds = {trace.key[0] for trace in receiver if trace.kind == 'object'}
         if kinds and kinds <= {'string', 'request'} and method == 'to_i' and len(arguments) <= 1:
             return self.fresh(retag(value, add=frozenset({'sql-integer-value'}),
@@ -1736,7 +1914,7 @@ class RubyEngine:
             target = 1 if name == 'HTTP.request' else 0
             if is_sink and target < len(positional):
                 self.record(token.start, join(receiver, positional[target]))
-        else:
+        elif self.policy == 'path':
             sink = re.fullmatch(r'(File|IO|FileUtils|Dir)\.(\w+[!?]?)', name)
             indexes = ()
             if sink:
@@ -1809,7 +1987,12 @@ class RubyEngine:
             parts = split_tokens(tokens, operators)
             if len(parts) > 1:
                 preserved = frozenset({'sql-integer-value', 'safe-redirect'}) if '||' in operators else frozenset({'sql-integer-value'})
-                combined = retag(self.invalidate_sql_binding(join(*(self.expression(part, state, depth + 1) for part in parts))),
+                if self.policy == 'header' and operators in ({'||', 'or'}, {'+', '-', '*', '/', '..'}):
+                    preserved |= HEADER_PROOFS
+                combined = join(*(self.expression(part, state, depth + 1) for part in parts))
+                if self.policy == 'header' and '+' in operators:
+                    preserved -= self.header_added_controls(combined)
+                combined = retag(self.invalidate_sql_binding(combined),
                                  remove=VALUE_TAGS - preserved)
                 if '+' in operators and all(parts):
                     return self.fresh(retag(self.without_sql_api(combined),
@@ -1820,8 +2003,16 @@ class RubyEngine:
             self.budget.spend()
             token = tokens[cursor]
             if token.kind in {'template', 'dynamic'}:
-                atom = retag(self.invalidate_sql_binding(join(*(self.expression(part, state, depth + 1) for part in token.parts))),
-                             remove=VALUE_TAGS - frozenset({'sql-integer-value'}))
+                preserved = frozenset({'sql-integer-value'}) | (HEADER_PROOFS if self.policy == 'header' else frozenset())
+                atom = join(*(self.expression(part, state, depth + 1) for part in token.parts))
+                if self.policy == 'header':
+                    decoded = self.header_literal(token)
+                    static = (constant(decoded, 'header-string') if decoded is not None
+                              else shape('header-unknown-literal', token.start))
+                    atom = join(atom, static)
+                    preserved -= self.header_added_controls(atom)
+                atom = retag(self.invalidate_sql_binding(atom),
+                             remove=VALUE_TAGS - preserved)
                 if token.kind == 'dynamic' and tainted(atom):
                     atom = self.execution_sink(token.start, atom, COMMAND_RULE,
                                                'request-derived shell command', state)
@@ -1835,7 +2026,9 @@ class RubyEngine:
                 name = ''
             elif token.value in {'(', '[', '{'}:
                 end = closing_token(tokens, cursor)
-                atom = join(*(self.expression(part, state, depth + 1) for part in split_tokens(tokens[cursor + 1:end], {','})))
+                atom = (self.header_mapping(tokens[cursor + 1:end], state, depth)
+                        if self.policy == 'header' and token.value == '{'
+                        else join(*(self.expression(part, state, depth + 1) for part in split_tokens(tokens[cursor + 1:end], {','}))))
                 if token.value in {'[', '{'}:
                     atom = self.collection(atom, token.start)
                     if token.value == '{':
@@ -1898,7 +2091,8 @@ class RubyEngine:
                         cursor = len(tokens)
                     if has_shape(atom, 'request') and member.value in {'params', 'query', 'get', 'post', 'GET', 'POST'}:
                         atom = shape('request-params', member.start)
-                    elif has_shape(atom, 'request') and member.value in {'headers', 'env'}:
+                    elif has_shape(atom, 'request') and (member.value in {'headers', 'env'}
+                                                       or self.policy == 'header' and member.value == 'cookies'):
                         atom = shape('request-headers' if member.value == 'headers' else 'environment', member.start)
                     elif has_shape(atom, 'request') and member.value in {'path', 'path_info', 'fullpath', 'original_fullpath', 'query_string', 'url', 'referer', 'referrer', 'host', 'host_with_port', 'raw_host_with_port', 'domain', 'subdomain', 'subdomains', 'port', 'remote_ip', 'ip', 'get_header'}:
                         atom = self.source(token.start, name)
@@ -1928,7 +2122,26 @@ class RubyEngine:
                                if all_required else frozenset.intersection(*(proof.get(name, frozenset()) for proof in proofs)))
                         for name in names}
         text = token_text(tokens)
-        if self.policy in {'url', 'redirect'}:
+        if self.policy == 'header' and not truth:
+            # The rejection must dominate this exact local value. Merely
+            # mentioning a newline or calling a safe-looking helper proves
+            # nothing about the value ultimately written into the response.
+            if len(tokens) >= 5 and re.fullmatch(r'[A-Za-z_]\w*', tokens[0].value):
+                cursor = 1
+                if token_text(tokens[cursor:cursor + 2]) == '.to_s':
+                    cursor += 2
+                if (cursor + 3 < len(tokens) and tokens[cursor].value == '.'
+                        and tokens[cursor + 1].value in {'include?', 'match?'}
+                        and tokens[cursor + 2].value == '('
+                        and closing_token(tokens, cursor + 2) == len(tokens) - 1):
+                    operand = self.literal_value(tokens[cursor + 3:-1])
+                    if tokens[cursor + 1].value == 'include?':
+                        text_value = self.header_constant(operand, 'header-string')
+                        chars = {text_value} if text_value in {'\r', '\n'} else set()
+                    else:
+                        chars = self.header_regex_chars(self.header_constant(operand, 'header-regex'))
+                    return {tokens[0].value: self.header_tags(chars)}
+        elif self.policy in {'url', 'redirect'}:
             equal = split_tokens(tokens, {'==' if truth else '!='})
             if len(equal) == 2:
                 for member, literal in (equal, equal[::-1]):
@@ -1965,7 +2178,7 @@ class RubyEngine:
                     double_slash = re.fullmatch(r'([A-Za-z_]\w*)(?:\.to_s)?\.start_with\?\([\'\"](?://|/\\)[\'\"]\)', text)
                     if double_slash:
                         return {double_slash.group(1): frozenset({'redirect-not-double-slash'})}
-        elif truth:
+        elif self.policy == 'path' and truth:
             prefix = re.fullmatch(r'([A-Za-z_]\w*)\.start_with\?\(([A-Za-z_]\w*)\+((?:::)?File::SEPARATOR|[\'\"]/[\'\"])\)', text)
             equality = re.fullmatch(r'([A-Za-z_]\w*)==([A-Za-z_]\w*)', text)
             match = prefix or equality
@@ -2186,6 +2399,16 @@ class RubyEngine:
                         raise ValueError('Request-derived Ruby instance/global state needs heap analysis; analysis is incomplete')
                     state[name] = advance(value, self.step(lhs[0].start, 'assign', name))
                 else:
+                    if self.policy == 'header':
+                        opening = next((i for i, token in enumerate(lhs) if token.value == '['
+                                        and closing_token(lhs, i) == len(lhs) - 1), None)
+                        if opening is not None:
+                            receiver = self.expression(lhs[:opening], state)
+                            key = self.expression(lhs[opening + 1:-1], state)
+                            if has_shape(receiver, 'response-headers') or has_shape(receiver, 'response'):
+                                if not self.header_location(key):
+                                    self.record(lhs[0].start, value, 'response header assignment')
+                                continue
                     if self.policy == 'redirect' and re.fullmatch(r'(?:response(?:\.headers)?|headers)\[\'location\'\]', token_text(lhs), re.IGNORECASE):
                         self.record(lhs[0].start, value, 'response[Location]')
                     name = lhs[0].value
@@ -2289,6 +2512,7 @@ class RubyEngine:
                                         or self.policy == 'redirect' and (
                                             'parsed-uri' in trace.tags
                                             or tags <= frozenset({'url-host', 'url-scheme', 'redirect-slash-prefix', 'redirect-not-double-slash'}))
+                                        or self.policy == 'header' and tags <= HEADER_PROOFS
                                         or self.policy == 'path' and ('canonical-path' in trace.tags or tags == frozenset({'not-dot-name'})))
                                     else frozenset({trace}) for trace in state.get(name, CLEAN)))
             return state
@@ -2392,7 +2616,9 @@ class RubyEngine:
                 self.parameter_values = dict(enumerate(key[1]))
                 state = {'@reachable': constant('reachable'),
                          'params': shape('request-params', function.key), 'env': shape('environment', function.key),
-                         **({'cookies': shape('request-params', function.key)} if self.policy == 'redirect' else {}),
+                         **({'cookies': shape('request-params', function.key)} if self.policy in {'redirect', 'header'} else {}),
+                         **({'headers': shape('response-headers', function.key),
+                             'response': shape('response', function.key)} if self.policy == 'header' else {}),
                          **{name: shape('request', function.key) for name in ('request', 'req', 'rack_request')}}
                 if function.owner in self.sql_models and (function.singleton or function.scope):
                     state['self'] = shape('active-record-model', function.owner)

@@ -404,11 +404,13 @@ def run_analyzers(
                 errors.append(f"{path}: {analyzer.name}: {type(exc).__name__}: {exc}")
 
 
-def run_detectors(files: Sequence[Path], sink, skip: set[int] | None = None) -> None:
+def run_detectors(files: Sequence[Path], sink, skip: set[int] | None = None,
+                  errors: list[str] | None = None) -> None:
     """Run ubs_core.ruby_detectors.* modules (legacy heredoc detector ports).
 
     Protocol (single-rule modules): RULE_ID, CATEGORY, TITLE, SEVERITY,
-    DESCRIPTION and ``find(files)`` yielding (path, line, col, detail).
+    DESCRIPTION and ``find(files)`` yielding (path, line, col, detail), with
+    an optional fifth element for semantic evidence.
     """
     import importlib
     import pkgutil
@@ -420,8 +422,10 @@ def run_detectors(files: Sequence[Path], sink, skip: set[int] | None = None) -> 
             continue
         try:
             module = importlib.import_module(f"ubs_core.ruby_detectors.{module_info.name}")
-        except Exception as exc:  # legacy heredoc failures degraded gracefully too
-            sys.stderr.write(f"[ubs_core.ruby_scan] detector module {module_info.name} failed: {exc}\n")
+        except Exception as exc:
+            if errors is None:
+                raise
+            errors.append(f"detector {module_info.name}: {exc}")
             continue
         find = getattr(module, "find", None)
         if find is None:
@@ -436,23 +440,27 @@ def run_detectors(files: Sequence[Path], sink, skip: set[int] | None = None) -> 
         }
         if skip and spec["category"] in skip:
             continue
-        for hit in find(files):
-            if len(hit) == 4:
-                path, line_no, col, detail = hit
-            else:
-                path, line_no, col, detail = hit[0], hit[1], hit[2], hit[3]
-            slug = slug_for_category(spec["category"])
-            title = spec["title"]
-            sink.write(json.dumps({
-                "rule": rule_id,
-                "category_id": f"ruby.{slug}",
-                "path": str(path),
-                "line": int(line_no),
-                "col": int(col),
-                "severity": spec["severity"],
-                "message": f"{title} — {detail}"[:300] if detail else title,
-                "suppressed": False,
-            }, ensure_ascii=False) + "\n")
+        for file in files:
+            try:
+                for hit in find([file]):
+                    path, line_no, col, detail = hit[:4]
+                    slug = slug_for_category(spec["category"])
+                    title = spec["title"]
+                    sink.write(json.dumps({
+                        "rule": rule_id,
+                        "category_id": f"ruby.{slug}",
+                        "path": str(path),
+                        "line": int(line_no),
+                        "col": int(col),
+                        "severity": spec["severity"],
+                        "message": f"{title} — {detail}"[:300] if detail else title,
+                        "suppressed": False,
+                        **({"extras": hit[4]} if len(hit) > 4 and isinstance(hit[4], dict) else {}),
+                    }, ensure_ascii=False) + "\n")
+            except Exception as exc:
+                if errors is None:
+                    raise
+                errors.append(f"detector {module_info.name} ({file}): {exc}")
 
 
 def _finding_title(rule: str, count: int, message: str) -> str:
@@ -659,7 +667,7 @@ def main(argv: list[str] | None = None) -> int:
 
         capturing_sink = CapturingSink()
         counters = scan_patterns(patterns, files_to_scan, capturing_sink, skip, prefilter=prefilter_res)
-        run_detectors(files_to_scan, capturing_sink, skip)
+        run_detectors(files_to_scan, capturing_sink, skip, errors=scan_errors)
         run_analyzers(files_to_scan, capturing_sink, skip, enable_new=args.enable_new_analyzers,
                       prefilter=prefilter_res, errors=scan_errors)
         if args.ast_rule_dir:

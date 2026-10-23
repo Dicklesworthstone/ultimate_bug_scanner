@@ -22,6 +22,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Fixed
 
+- Ruby response-header checks track scoped values, helpers, aliases and branches
+  through the shared flow engine. Safety requires actual CR/LF removal, verified
+  encoding or dominating rejection; later concatenation and interpolation
+  invalidate safety when they reintroduce controls. Local hashes and response
+  bodies stay separate from header sinks, findings retain source-to-sink traces,
+  and failed analysis reports partial results while preserving other findings.
 - Java/Kotlin response-header checks follow actual values, local helper returns,
   assignments and reachable branches instead of trusting sanitizer names.
   CR/LF safety requires complete removal, URL-component encoding or a dominating

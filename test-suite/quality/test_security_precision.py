@@ -2188,6 +2188,74 @@ def expected_lines(path: Path, marker: str) -> list[int]:
 
 
 class HardcodedSecretsSymbolicConstantTests(unittest.TestCase):
+    def hits(self, source: str) -> list[int]:
+        with tempfile.TemporaryDirectory(prefix="ubs_fetch_credentials_") as tmp:
+            target = Path(tmp) / "request.ts"
+            target.write_text(source, encoding="utf-8")
+            return [line for line, _ in sec_hardcoded_secrets.scan_file_findings(target)]
+
+    def test_fetch_credentials_modes_are_not_secret_material(self) -> None:
+        for mode in ("omit", "same-origin", "include"):
+            for key in ("credentials", '"credentials"', "'credentials'"):
+                for quote in ('"', "'", '`'):
+                    with self.subTest(mode=mode, key=key, quote=quote):
+                        value = f"{quote}{mode}{quote}"
+                        self.assertEqual(self.hits(
+                            f"await fetch(path, {{ {key}: {value}, headers: {{ Accept: 'application/json' }} }});\n"
+                        ), [])
+
+    def test_multiline_and_standalone_request_options_are_clean(self) -> None:
+        self.assertEqual(self.hits(
+            "const init: RequestInit = {\n"
+            "  credentials: /* Fetch cookie policy */ 'same-origin',\n"
+            "  headers: { Accept: 'application/json' },\n"
+            "};\n"
+            "await fetch(path, init);\n"
+            "const request = new Request(path, { credentials: 'same-origin' });\n"
+        ), [])
+
+    def test_mode_text_does_not_exempt_other_secret_locations(self) -> None:
+        cases = (
+            "const credentials = 'same-origin';",
+            "this.credentials = 'same-origin';",
+            "const config = { password: 'same-origin' };",
+            "const config = { apiKey: 'same-origin' };",
+            "const config = { clientCredentials: 'same-origin' };",
+            "const config = { CREDENTIALS: 'same-origin' };",
+            "const config = { credentials: 'same-origin-secret' };",
+            "const config = { credentials: ' same-origin ' };",
+            "const config = { credentials: 'same-origin' + suffix };",
+            "const config = { credentials: process.env.CREDENTIALS || 'same-origin' };",
+            "const config = { credentials: process.env['API_KEY'] ?? 'same-origin' };",
+        )
+        for source in cases:
+            with self.subTest(source=source):
+                self.assertEqual(self.hits(source + '\n'), [1])
+
+    def test_mode_property_does_not_hide_adjacent_or_nested_secrets(self) -> None:
+        cases = (
+            "credentials: 'same-origin', apiKey: 'live-key-973bc621'",
+            "apiKey: 'live-key-973bc621', credentials: 'same-origin'",
+            "credentials: 'same-origin', headers: { apiKey: 'live-key-973bc621' }",
+            "credentials: 'same-origin', method: 'POST', password: 'live-key-973bc621'",
+            "credentials: 'same-origin', 'apiKey': 'live-key-973bc621'",
+            "credentials: 'same-origin', headers: { Accept: 'application/json' }, password: 'live-key-973bc621'",
+        )
+        for properties in cases:
+            with self.subTest(properties=properties):
+                self.assertEqual(self.hits(f"await fetch(path, {{ {properties} }});\n"), [1])
+
+    def test_later_properties_ignore_inert_punctuation(self) -> None:
+        cases = (
+            "const config = { credentials: 'same-origin', note: \"{ password: 'live-key-973bc621' }\" };",
+            "const config = { credentials: 'same-origin', note: `{ password: 'live-key-973bc621' }` };",
+            "const config = { credentials: 'same-origin', pattern: /{ password: 'live-key-973bc621' }/ };",
+            "const config = { credentials: 'same-origin' /* , password: 'live-key-973bc621' */ };",
+        )
+        for source in cases:
+            with self.subTest(source=source):
+                self.assertEqual(self.hits(source + '\n'), [])
+
     def test_error_code_dictionary_is_clean(self) -> None:
         findings = list(sec_hardcoded_secrets.scan_file_findings(JS_SECURITY / "error-code-constants-clean.mjs"))
         self.assertEqual(findings, [])

@@ -1,13 +1,11 @@
 """ubs_core.analyzers.sec_hardcoded_secrets — hardcoded secrets/credentials
 (bead A4-js security wave, bead 0xjg.4).
 
-Verbatim port of the legacy ubs-js.sh heredoc "Hardcoded secrets/credentials":
-same literal/env-fallback/declaration/property/assignment regexes, same
-sensitive-name normalization and placeholder filtering, same 14-line statement
+Based on the legacy ubs-js.sh heredoc "Hardcoded secrets/credentials", with
+sensitive-name normalization, placeholder filtering and a 14-line statement
 window. Suppression uses the shared lexical statement policy and exact public
-rule. The heredoc's os.walk over
-the project is replaced by iteration over ``RunContext.files``; per-file match
-logic is unchanged.
+rule. The heredoc's os.walk over the project is replaced by iteration over
+``RunContext.files``.
 
 Legacy emission: print_finding "critical" / "Possible hardcoded secrets". The
 legacy title rides in the message so the contract-v2 text renderer surfaces it
@@ -19,6 +17,12 @@ symbolic error/enum code, not secret material. The exemption applies only to
 the declaration/property/assignment paths — a literal fallback for a
 secret-bearing ``process.env`` variable stays reported whatever its shape,
 because the code would run with that literal as the secret.
+
+The exact ``credentials`` object property also accepts Fetch's public mode
+values. This is a field/value exception, not a global literal exemption:
+variables, other secret-bearing fields and environment fallbacks stay checked.
+Property values are inspected without consuming later properties, and lexical
+masking keeps punctuation inside strings/comments from creating fake fields.
 """
 from __future__ import annotations
 
@@ -26,6 +30,7 @@ import re
 from pathlib import Path
 from typing import Iterable, Iterator
 
+from ubs_core.lexer import javascript_lexical_views
 from ubs_core.registry import Analyzer, RunContext, register
 from ubs_core.suppression import SourceSuppressions
 
@@ -46,7 +51,7 @@ declaration_re = re.compile(
     r'\b(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*(.+)'
 )
 property_re = re.compile(
-    r'(?:^|[{,]\s*)([A-Za-z_$][\w$]*|[\'"][^\'"]+[\'"])\s*:\s*(.+)'
+    r'(?:^|[{,]\s*)([A-Za-z_$][\w$]*|[\'"][^\'"]+[\'"])\s*:\s*(?=(.+))'
 )
 assignment_re = re.compile(
     r'(?:^|[;\s])(?:this\.)?([A-Za-z_$][\w$]*)\s*=\s*(.+)'
@@ -82,6 +87,7 @@ placeholder_values = {
 # mixed-alphanumeric run (sk_live_4f8a2b91cd77e530, AKIAIOSFODNN7EXAMPLE) never
 # qualifies.
 symbolic_constant_re = re.compile(r'^[A-Z]+(?:[_-](?:[A-Z]+|[0-9]+))+$')
+fetch_credentials_modes = frozenset({'omit', 'same-origin', 'include'})
 
 
 def strip_line_comments(source_line: str) -> str:
@@ -208,17 +214,37 @@ def env_fallback_literal(statement: str) -> str:
     return ""
 
 
+def is_fetch_credentials_mode(name: str, expr: str) -> bool:
+    """Recognize the complete standard option value, never a secret fallback."""
+    if name.strip('"\'') != 'credentials':
+        return False
+    match = direct_literal_re.match(expr)
+    if not match or unquote_literal(match.group(1)) not in fetch_credentials_modes:
+        return False
+    remainder = expr[match.end():].lstrip()
+    return not remainder or remainder[0] in ',}'
+
+
 def assignment_literal(statement: str) -> str:
+    source, code = javascript_lexical_views(statement)
     for regex in (declaration_re, property_re, assignment_re):
-        for match in regex.finditer(statement):
+        for match in regex.finditer(source):
             name, expr = match.group(1), match.group(2)
+            if regex is property_re:
+                # A real colon remains in the code view even for quoted keys;
+                # colons in strings, regexes and template text are masked.
+                colon = source.find(':', match.end(1), match.start(2))
+                if colon < 0 or code[colon] != ':':
+                    continue
+                if is_fetch_credentials_mode(name, expr):
+                    continue
             if is_sensitive_name(name) and first_direct_literal(expr):
                 return match.group(0)
     return ""
 
 
 def scan_file_findings(path: Path) -> Iterator[tuple[int, str]]:
-    """Yield (line_number, sample_text) per detection; heredoc-identical."""
+    """Yield (line_number, sample_text) per detection."""
     try:
         source_text = path.read_text(encoding='utf-8', errors='ignore')
     except Exception:

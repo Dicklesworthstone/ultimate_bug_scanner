@@ -28,6 +28,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Fixed
 
+- Ruby archive extraction follows entry names through scoped helpers, aliases
+  and branches to actual extraction and filesystem writes. Only validation of
+  the selected destination proves containment; safe-looking names and unrelated
+  guards cannot hide unsafe writes. Fixed destinations and archive names used
+  only as file contents stay clean; unsupported archive operations report
+  incomplete analysis.
 - Python taint analysis deduplicates recursive context keys and preserves
   explicit callable overrides, preventing non-converging self-scans. Allow-list
   indexing and unchanged-global handling avoid repeated work; the whole-repo

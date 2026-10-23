@@ -2439,7 +2439,7 @@ class RubyElixirSecuritySuppressionTests(unittest.TestCase):
          '  Zip::File.open(archive_path) do |zip|\n'
          '    zip.each do |entry|\n'
          '      name = entry.name\n\n'
-         '      target = File.join(destination, name)\n'
+         '      entry.extract(File.join(destination, name))\n'
          '    end\n  end\nend\n'),
         ('ruby', 'security_randomness', 'ruby.security.non-crypto-random', 2, 4, [4],
          'def sample\n  rng = Random.new(7)\n\n  otp = rng.rand(1_000_000)\nend\n'),
@@ -2475,7 +2475,7 @@ class RubyElixirSecuritySuppressionTests(unittest.TestCase):
     FIXTURES = {
         ('ruby', 'archive_extraction'): (
             'archive_extraction_buggy/zip_slip.rb', 'archive_extraction_clean/zip_slip_safe.rb',
-            [9, 19, 28, 37, 46]),
+            [10, 11, 20, 21, 29, 30, 38, 39, 47, 48]),
         ('ruby', 'security_randomness'): (
             'security_randomness_buggy/tokens.rb', 'security_randomness_clean/tokens.rb',
             [3, 8, 13, 18, 23]),

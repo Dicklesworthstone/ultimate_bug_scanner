@@ -3168,6 +3168,405 @@ class RubyResponseHeaderFlowTests(LoggedCase):
         self.assertEqual(rows[0]['extras']['taint_path'][-1]['kind'], 'sink')
 
 
+class RubyArchiveExtractionFlowTests(unittest.TestCase):
+    """Archive names are values; only actual writes own archive findings."""
+
+    def check_source(self, source, expected):
+        from ubs_core.ruby_detectors import archive_extraction
+
+        source = textwrap.dedent(source).strip('\n') + '\n'
+        issues = []
+        archive_extraction.analyze(source.splitlines(), issues, 'archive.rb')
+        self.assertEqual(tuple(row[1] for row in issues), expected,
+                         {'source': source, 'findings': issues})
+        return issues
+
+    def check_entry(self, body, expected):
+        body = textwrap.indent(textwrap.dedent(body).strip('\n'), '    ')
+        source = ('Zip::File.open("input.zip") do |zip|\n'
+                  '  zip.each do |entry|\n' + body + '\n  end\nend\n')
+        return self.check_source(source, tuple(line + 2 for line in expected))
+
+    def test_identity_helper_names_do_not_change_security(self):
+        for name in ('safe_destination', 'validate_archive_entry', 'relay'):
+            with self.subTest(name=name):
+                self.check_source(f'''
+                    def {name}(value)
+                      value
+                    end
+                    Zip::File.open("input.zip") do |zip|
+                      zip.each do |entry|
+                        destination = File.join("/srv/out", entry.name)
+                        destination = {name}(destination)
+                        entry.extract(destination)
+                      end
+                    end
+                ''', (8,))
+
+    def test_literal_overwrite_and_path_construction_are_clean(self):
+        self.check_entry('''
+            destination = entry.name
+            destination = "/srv/out/fixed.txt"
+            File.write(destination, "fixed data")
+        ''', ())
+        self.check_entry('destination = File.join("/srv/out", entry.name)', ())
+
+    def test_unrelated_guard_and_nonterminating_rejection_do_not_sanitize(self):
+        self.check_entry('''
+            audit = File.expand_path("/srv/out/fixed.txt")
+            raise "blocked" unless audit.start_with?("/srv/out/")
+            destination = File.join("/srv/out", entry.name)
+            entry.extract(destination)
+        ''', (4,))
+        self.check_entry('''
+            destination = File.expand_path(entry.name, "/srv/out")
+            unless destination.start_with?("/srv/out/")
+              warn "outside"
+            end
+            File.write(destination, "fixed data")
+        ''', (5,))
+
+    def test_normalization_and_sibling_prefix_are_insufficient(self):
+        self.check_entry('''
+            destination = File.expand_path(entry.name, "/srv/out")
+            File.write(destination, "fixed data")
+        ''', (2,))
+        self.check_entry('''
+            base = File.expand_path("/srv/out")
+            destination = File.expand_path(entry.name, base)
+            raise "outside" unless destination.start_with?(base)
+            File.write(destination, "fixed data")
+        ''', (4,))
+
+    def test_literal_prefix_requires_an_absolute_separator_boundary(self):
+        for prefix, expected in (('/srv/unpack/', ()), ('/srv/unpack', (3,)),
+                                 ('srv/unpack/', (3,))):
+            with self.subTest(prefix=prefix):
+                self.check_entry(f'''
+                    output = File.expand_path(entry.name, "/srv/unpack")
+                    raise "bad" unless output.start_with?("{prefix}")
+                    entry.extract(output)
+                ''', expected)
+
+    def test_separator_guard_protects_the_exact_canonical_value(self):
+        self.check_entry('''
+            base = File.expand_path("/srv/out")
+            destination = File.expand_path(entry.name, base)
+            raise "outside" unless destination.start_with?(base + File::SEPARATOR)
+            File.write(destination, "fixed data")
+        ''', ())
+        self.check_entry('''
+            base = File.expand_path("/srv/out")
+            destination = entry.name
+            raise "outside" unless destination.start_with?(base + File::SEPARATOR)
+            File.write(destination, "fixed data")
+        ''', (4,))
+        self.check_entry('''
+            base = File.expand_path("/srv/out")
+            destination = File.expand_path(entry.name, base)
+            raise "outside" unless destination.start_with?(base + File::SEPARATOR)
+            File.write(entry.name, "fixed data")
+        ''', (4,))
+
+    def test_guard_order_reassignment_and_concatenation(self):
+        self.check_entry('''
+            base = File.expand_path("/srv/out")
+            destination = File.expand_path(entry.name, base)
+            File.write(destination, "fixed data")
+            raise "outside" unless destination.start_with?(base + File::SEPARATOR)
+        ''', (3,))
+        for replacement in ('entry.name', 'destination + entry.name'):
+            with self.subTest(replacement=replacement):
+                self.check_entry(f'''
+                    base = File.expand_path("/srv/out")
+                    destination = File.expand_path(entry.name, base)
+                    raise "outside" unless destination.start_with?(base + File::SEPARATOR)
+                    destination = {replacement}
+                    File.write(destination, "fixed data")
+                ''', (5,))
+
+    def test_real_selected_validator_and_helper_sink(self):
+        self.check_source('''
+            def validated(root, name)
+              base = File.expand_path(root)
+              output = File.expand_path(name, base)
+              raise "blocked" unless output.start_with?(base + File::SEPARATOR)
+              output
+            end
+            def save(output)
+              File.binwrite(output, "data")
+            end
+            Zip::File.open("input.zip").each do |entry|
+              save(validated("/srv/out", entry.name))
+            end
+        ''', ())
+        self.check_source('''
+            def save(output)
+              File.binwrite(output, "data")
+            end
+            Zip::File.open("input.zip").each do |entry|
+              save(entry.name)
+            end
+        ''', (2,))
+
+    def test_untrusted_root_cannot_validate_an_entry_path(self):
+        for root in ('entry.name', 'params[:root]'):
+            with self.subTest(root=root):
+                self.check_entry(f'''
+                    base = File.expand_path({root})
+                    destination = File.expand_path(entry.name, base)
+                    raise "outside" unless destination.start_with?(base + File::SEPARATOR)
+                    File.write(destination, "fixed data")
+                ''', (4,))
+
+    def test_entry_identity_flows_through_helpers_and_constant_aliases(self):
+        self.check_source('''
+            ArchiveZip = Zip::File
+            def relay(value)
+              value
+            end
+            ArchiveZip.open("input.zip") do |zip|
+              relay(zip).each do |item|
+                File.write(relay(item).name, "data")
+              end
+            end
+        ''', (7,))
+
+    def test_entry_names_do_not_escape_their_scope_or_trust_lookalikes(self):
+        self.check_source('''
+            def inspect_archive
+              Zip::File.open("input.zip").each do |entry|
+                name = entry.name
+              end
+            end
+            def unrelated(name)
+              File.write(name, "data")
+            end
+            text = 'Zip::File.open("input.zip"); File.write(entry.name, "data")'
+        ''', ())
+        self.check_source('''
+            module Local
+              module Zip
+                class File
+                  def self.open(path)
+                    ["fixed"]
+                  end
+                end
+              end
+              Zip::File.open("input.zip") do |zip|
+                zip.each do |entry|
+                  ::File.write(entry.name, "data")
+                end
+              end
+            end
+        ''', ())
+
+    def test_tar_reader_and_zip_stream_have_entry_contracts(self):
+        self.check_source('''
+            Gem::Package::TarReader.new(io) do |tar|
+              tar.each_entry do |entry|
+                File.binwrite(entry.full_name, entry.read)
+              end
+            end
+        ''', (3,))
+        self.check_source('''
+            Zip::InputStream.open("input.zip") do |stream|
+              while (entry = stream.get_next_entry)
+                File.binwrite(entry.name, stream.read)
+              end
+            end
+        ''', (3,))
+
+    def test_literal_overwrite_is_only_definite_on_all_paths(self):
+        self.check_entry('''
+            destination = entry.name
+            if condition
+              destination = "/srv/out/fixed.txt"
+            end
+            File.write(destination, "data")
+        ''', (5,))
+        self.check_entry('''
+            destination = entry.name
+            if condition
+              destination = "/srv/out/fixed.txt"
+            else
+              destination = "/srv/out/other.txt"
+            end
+            File.write(destination, "data")
+        ''', ())
+
+    def test_mutating_a_validated_alias_invalidates_the_write(self):
+        self.check_entry('''
+            base = File.expand_path("/srv/out")
+            destination = File.expand_path(entry.name, base)
+            raise "outside" unless destination.start_with?(base + File::SEPARATOR)
+            other = destination
+            other.replace(entry.name)
+            File.write(destination, "data")
+        ''', (6,))
+
+    def test_modern_rubyzip_bounds_the_entry_but_not_the_caller_root(self):
+        self.check_entry('entry.extract(entry.name, destination_directory: "/srv/out")', ())
+        self.check_entry('entry.extract', ())
+        self.check_entry('zip.extract(entry.name)', ())
+        for root in ('entry.name', 'params[:root]'):
+            with self.subTest(root=root):
+                self.check_entry(f'entry.extract("fixed.txt", destination_directory: {root})', (1,))
+        self.check_entry('zip.extract(entry.name, entry.name)', (1,))
+
+    def test_path_arguments_are_separate_from_data_and_copy_sources(self):
+        self.check_entry('File.write("/srv/out/fixed.txt", entry.name)', ())
+        self.check_entry('FileUtils.cp(entry.name, "/srv/out/fixed.txt")', ())
+        self.check_entry('FileUtils.cp("fixed.txt", entry.name)', (1,))
+
+    def test_validated_parent_is_only_mkdir_p_preparation(self):
+        for operation, expected in (
+                ('FileUtils.mkdir_p(File.dirname(destination))', ()),
+                ('File.write(File.dirname(destination), "data")', (4,)),
+                ('FileUtils.cp("fixed.txt", File.dirname(destination))', (4,)),
+                ('FileUtils.mkdir_p(File.dirname(destination + entry.name))', (4,)),
+                ('FileUtils.mkdir_p(File.dirname(File.dirname(destination)))', (4,)),
+                ('FileUtils.mkdir_p(builder.dirname(destination))', (4,))):
+            with self.subTest(operation=operation):
+                self.check_entry(f'''
+                    base = File.expand_path("/srv/out")
+                    destination = File.expand_path(entry.name, base)
+                    raise "outside" unless destination.start_with?(base + File::SEPARATOR)
+                    {operation}
+                ''', expected)
+
+    def test_parent_permission_does_not_survive_transformation_or_wrong_guard(self):
+        self.check_entry('''
+            base = File.expand_path("/srv/out")
+            destination = File.expand_path(entry.name, base)
+            raise "outside" unless destination.start_with?(base + File::SEPARATOR)
+            parent = File.dirname(destination)
+            parent = parent + entry.name
+            FileUtils.mkdir_p(parent)
+        ''', (6,))
+        self.check_entry('''
+            base = File.expand_path("/srv/out")
+            audit = File.expand_path("fixed.txt", base)
+            destination = File.expand_path(entry.name, base)
+            raise "outside" unless audit.start_with?(base + File::SEPARATOR)
+            FileUtils.mkdir_p(File.dirname(destination))
+        ''', (5,))
+
+    def test_suppression_belongs_to_the_actual_sink(self):
+        self.check_entry('''
+            destination = entry.name # ubs:ignore[ruby.archive-extraction.path]
+            File.write(destination, "data")
+        ''', (2,))
+        self.check_entry('File.write(entry.name, "data") # ubs:ignore[ruby.archive-extraction.path]', ())
+        self.check_entry('File.write(entry.name, "data") # ubs:ignore[unrelated.rule]', (1,))
+
+    def test_witness_points_from_entry_name_to_actual_sink(self):
+        rows = self.check_entry('''
+            destination = entry.name
+            File.write(destination, "data")
+        ''', (2,))
+        path = rows[0][4]['taint_path']
+        self.assertEqual((path[0]['kind'], path[0]['line']), ('source', 3))
+        self.assertEqual((path[-1]['kind'], path[-1]['line']), ('sink', 4))
+        self.assertEqual(rows[0][4]['source_count'], 1)
+
+    def test_incomplete_archive_analysis_keeps_independent_findings(self):
+        from ubs_core.ruby_detectors import archive_extraction
+
+        source = '''Zip::File.open("input.zip").each do |entry|
+  File.write(entry.name, "data")
+end
+Zip::File.open_buffer(bytes).each do |entry|
+  File.write(entry.name, "data")
+end'''
+        findings = archive_extraction.flow_findings(source.splitlines(), 'archive.rb')
+        self.assertEqual(next(findings)[1], 2)
+        with self.assertRaisesRegex(ValueError, 'incomplete'):
+            list(findings)
+
+    def test_malformed_archive_blocks_are_incomplete(self):
+        from ubs_core.ruby_detectors import archive_extraction
+
+        with self.assertRaisesRegex(ValueError, 'incomplete'):
+            archive_extraction.analyze(['Zip::File.open("input.zip") do |zip|'], [], 'archive.rb')
+
+
+@unittest.skipUnless(os.environ.get('UBS_RUBY_TAINT_E2E') == '1',
+                     'set UBS_RUBY_TAINT_E2E=1 for actual CLI scans')
+class RubyArchivePublicTests(unittest.TestCase):
+    """Public archive checks also run from exported source without .git."""
+
+    def test_module_and_runner_json_sarif_keep_locations_and_partial_status(self):
+        rule = 'ruby.archive-extraction.path'
+        artifact = ROOT / 'test-suite/artifacts/ruby-archive-flow' / uuid.uuid4().hex[:12]
+        artifact.mkdir(parents=True)
+        unsafe = ('def safe_destination(value)\n  value\nend\n'
+                  'Zip::File.open("input.zip").each do |entry|\n'
+                  '  output = safe_destination(File.join("/srv/unpack", entry.name))\n'
+                  '  File.binwrite(output, "data")\nend\n')
+        clean = ('Zip::File.open("input.zip").each do |entry|\n'
+                 '  root = File.expand_path("/srv/unpack")\n'
+                 '  output = File.expand_path(entry.name, root)\n'
+                 '  raise "outside" unless output.start_with?(root + File::SEPARATOR)\n'
+                 '  File.binwrite(output, "data")\nend\n')
+        cases = (('unsafe', unsafe, (6,), False), ('clean', clean, (), False),
+                 ('partial', unsafe + 'Zip::File.open_buffer(bytes)\n', (6,), True))
+        env = {**os.environ, 'UBS_NO_AUTO_UPDATE': '1', 'UBS_ENABLE_AUTO_UPDATE': '0',
+               'UBS_NO_CACHE': '1', 'CI': '1', 'NO_COLOR': '1',
+               'XDG_DATA_HOME': str(artifact / 'data'),
+               'XDG_CONFIG_HOME': str(artifact / 'config'),
+               'XDG_CACHE_HOME': str(artifact / 'cache'), 'PYTHONDONTWRITEBYTECODE': '1'}
+        for label, source, expected, partial in cases:
+            selected = artifact / (label + '.rb')
+            selected.write_text(source, encoding='utf-8')
+            for module in (True, False):
+                for fmt in ('json', 'sarif'):
+                    with self.subTest(case=label, module=module, format=fmt):
+                        prefix = (('bash', str(ROOT / 'modules/ubs-ruby.sh'), '--no-bundler')
+                                  if module else ('bash', str(ROOT / 'ubs'), '--only=ruby'))
+                        command = (*prefix, '--ci', '--format=' + fmt, str(selected))
+                        result = subprocess.run(command, cwd=artifact, env=env, text=True,
+                                                capture_output=True, timeout=180)
+                        output = artifact / f'{label}-{module}-{fmt}'
+                        output.with_suffix('.stdout').write_text(result.stdout, encoding='utf-8')
+                        output.with_suffix('.stderr').write_text(result.stderr, encoding='utf-8')
+                        self.assertEqual(result.returncode, 2 if partial else int(bool(expected)),
+                                         (command, result.stdout, result.stderr))
+                        try:
+                            payload = json.loads(result.stdout)
+                        except json.JSONDecodeError as error:
+                            self.fail(f'Invalid archive {fmt} output: {error}; stderr={result.stderr}')
+                        if fmt == 'json':
+                            self.assertEqual(payload['status'], 'partial' if partial else 'ok', payload)
+                            rows = [row for row in payload['findings']
+                                    if row['rule' if module else 'rule_id'] == rule]
+                            self.assertEqual(tuple(row['line'] for row in rows), expected, payload)
+                            count = payload['critical'] if module else payload['totals']['critical']
+                            self.assertEqual(count, len(expected), payload)
+                            for row in rows:
+                                self.assertEqual(Path(row['path' if module else 'file']).name,
+                                                 selected.name, row)
+                                self.assertEqual(row['extras']['taint_path'][-1]['kind'], 'sink', row)
+                        else:
+                            rows = [row for run in payload['runs'] for row in run.get('results', [])
+                                    if row['ruleId'] == rule]
+                            sites = tuple(row['locations'][0]['physicalLocation']['region']['startLine']
+                                          for row in rows)
+                            self.assertEqual(sites, expected, payload)
+                            invocations = [item for run in payload['runs']
+                                           for item in run.get('invocations', [])]
+                            if partial:
+                                self.assertTrue(invocations, payload)
+                                self.assertTrue(all(item['executionSuccessful'] is False
+                                                    for item in invocations), payload)
+                            else:
+                                # Successful module SARIF need not contain an
+                                # invocation; a reported failure is never OK.
+                                self.assertTrue(all(item.get('executionSuccessful') is not False
+                                                    for item in invocations), payload)
+                        print('RUBY_ARCHIVE_PUBLIC', label, module, fmt, 'PASS', flush=True)
+
+
 class RubyOpenRedirectFlowTests(unittest.TestCase):
     def _lines(self, code: str) -> tuple[int, ...]:
         from ubs_core.ruby_detectors import open_redirect

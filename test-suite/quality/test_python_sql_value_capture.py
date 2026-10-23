@@ -841,6 +841,132 @@ class SQLValueCaptureTests(unittest.TestCase):
                 self.assertEqual(actual, rows)
                 self.inspect('sqlite-generator-' + name, source, expected)
 
+    def test_signed_literal_list_indices_preserve_sql(self):
+        unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
+        safe = '"SELECT count(*) FROM users WHERE name = \'alice\'"'
+        for spelling, index in (('negative', '-1'), ('positive', '+0'), ('nested', '--0')):
+            for operation in ('insert', '__setitem__', 'pop'):
+                for kind, query, expected_rows in (('unsafe', unsafe, 2), ('static', safe, 1)):
+                    name = f'signed-index-{spelling}-{operation}-{kind}'
+                    if operation == 'pop':
+                        body = f'    queries = [{query}]\n    selected = queries.pop({index})\n'
+                        selected = 'selected'
+                    else:
+                        body = f'    queries = [{safe}]\n    queries.{operation}({index}, {query})\n'
+                        selected = 'queries[0]'
+                    source = program(body + f'    return cursor.execute({selected}).fetchone()[0]\n')
+                    with self.subTest(case=name):
+                        self.assertEqual(sqlite_witness(self.artifacts, name, source)['rows'], expected_rows)
+                        self.inspect(name, source, ((CRITICAL, 4),) if kind == 'unsafe' else ())
+
+    def test_signed_numeric_list_insert_retains_value_flow(self):
+        for index in ('-1', '+0', '--0'):
+            source = program('    indices = [0]\n'
+                             f'    indices.insert({index}, 0)\n'
+                             '    queries = [f"SELECT count(*) FROM users WHERE name = \'{user}\'"]\n'
+                             '    return cursor.execute(queries[indices[0]]).fetchone()[0]\n')
+            with self.subTest(index=index):
+                name = 'signed-numeric-' + index
+                self.assertEqual(sqlite_witness(self.artifacts, name, source)['rows'], 2)
+                self.inspect(name, source, ((CRITICAL, 5),))
+
+    def test_signed_indices_do_not_grant_escaped_list_ownership(self):
+        for index in ('-1', '+0'):
+            source = program('    queries = []\n    alias = queries\n'
+                             f'    queries.insert({index}, f"SELECT count(*) FROM users WHERE name = \'{{user}}\'")\n'
+                             '    return cursor.execute(alias[0]).fetchone()[0]\n')
+            name = 'signed-escaped-' + index
+            with self.subTest(index=index):
+                self.assertEqual(sqlite_witness(self.artifacts, name, source)['rows'], 2)
+                path = self.artifacts / (name + '.py')
+                path.write_text(source, encoding='utf-8')
+                with self.assertRaisesRegex(detector.SQLFlowLimit, 'list mutation.*incomplete'):
+                    list(detector.find([path]))
+        for index in ('user', '-user', 'int("0")', '-1.0'):
+            source = program('    queries = ["SELECT 1"]\n'
+                             f'    queries.insert({index}, f"SELECT {{user}}")\n'
+                             '    cursor.execute(queries[0])\n')
+            path = self.artifacts / ('opaque-index-' + hashlib.sha256(index.encode()).hexdigest()[:12] + '.py')
+            path.write_text(source, encoding='utf-8')
+            with self.subTest(opaque=index), self.assertRaisesRegex(detector.SQLFlowLimit, 'list mutation.*incomplete'):
+                list(detector.find([path]))
+
+    def test_fromkeys_captures_key_and_default_sql_separately(self):
+        unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
+        safe = '"SELECT count(*) FROM users WHERE name = \'alice\'"'
+        for role in ('keys', 'default'):
+            for kind, query, rows in (('unsafe', unsafe, 2), ('static', safe, 1)):
+                constructor = (f'dict.fromkeys({query} for item in [1])' if role == 'keys' else
+                               f'dict.fromkeys(("chosen" for item in [1]), {query})')
+                selected = 'list(mapping)[0]' if role == 'keys' else 'mapping["chosen"]'
+                source = program(f'    mapping = {constructor}\n'
+                                 f'    return cursor.execute({selected}).fetchone()[0]\n')
+                name = f'fromkeys-{role}-{kind}'
+                with self.subTest(case=name):
+                    self.assertEqual(sqlite_witness(self.artifacts, name, source)['rows'], rows)
+                    self.inspect(name, source, ((CRITICAL, 3),) if kind == 'unsafe' else ())
+        for name, constructor, expected in (
+                ('select-keys', 'dict.fromkeys((f"SELECT {user}" for item in [1]), "1")', ()),
+                ('select-values', 'dict.fromkeys(("chosen" for item in [1]), f"name = {user}")', ((CRITICAL, 3),))):
+            with self.subTest(select=name):
+                self.inspect('fromkeys-' + name,
+                             program(f'    mapping = {constructor}\n    qs.extra(select=mapping)\n'), expected)
+
+    def test_fromkeys_consumes_once_after_eager_default(self):
+        unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
+        safe = '"SELECT count(*) FROM users WHERE name = \'alice\'"'
+        cases = (
+            ('write', f'    query = {safe}\n'
+             f'    dict.fromkeys((query := {unsafe}) for item in [1])\n'
+             '    return cursor.execute(query).fetchone()[0]\n', 2, ((CRITICAL, 4),)),
+            ('default-first', f'    query = {unsafe}\n'
+             f'    mapping = dict.fromkeys((query for item in [1]), (query := {safe}))\n'
+             '    return cursor.execute(list(mapping)[0]).fetchone()[0]\n', 1, ()),
+            ('exhausted-alias', f'    query = {safe}\n'
+             f'    pending = ((query := {unsafe}) for item in [1])\n'
+             '    alias = pending\n    dict.fromkeys(pending)\n'
+             f'    query = {safe}\n    dict.fromkeys(alias)\n'
+             '    return cursor.execute(query).fetchone()[0]\n', 1, ()),
+        )
+        for name, body, rows, expected in cases:
+            source = program(body)
+            with self.subTest(case=name):
+                self.assertEqual(sqlite_witness(self.artifacts, 'fromkeys-' + name, source)['rows'], rows)
+                self.inspect('fromkeys-' + name, source, expected)
+
+    def test_fromkeys_refuses_rebound_callable_and_heap_callbacks(self):
+        unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
+        safe = '"SELECT count(*) FROM users WHERE name = \'alice\'"'
+        substitute = ('    class Substitute:\n        @staticmethod\n'
+                      '        def fromkeys(values):\n'
+                      f'            return {{"chosen": {unsafe}}}\n')
+        cases = (
+            ('shadowed', substitute + '    dict = Substitute\n'
+             '    mapping = dict.fromkeys("chosen" for item in [1])\n'
+             '    return cursor.execute(mapping["chosen"]).fetchone()[0]\n'),
+            ('builtin-rebound', '    import builtins\n' + substitute +
+             '    original = builtins.dict\n    try:\n        builtins.dict = Substitute\n'
+             '        mapping = dict.fromkeys("chosen" for item in [1])\n'
+             '        return cursor.execute(mapping["chosen"]).fetchone()[0]\n'
+             '    finally:\n        builtins.dict = original\n'),
+            ('mutable-default', f'    shared = [{unsafe}]\n'
+             '    mapping = dict.fromkeys(("chosen" for item in [1]), shared)\n'
+             '    return cursor.execute(mapping["chosen"][0]).fetchone()[0]\n'),
+            ('hash-callback', f'    query = {safe}\n'
+             '    class Key:\n        def __hash__(self):\n            nonlocal query\n'
+             f'            query = {unsafe}\n            return 0\n'
+             '    dict.fromkeys(Key() for item in [1])\n'
+             '    return cursor.execute(query).fetchone()[0]\n'),
+        )
+        for name, body in cases:
+            source = program(body)
+            with self.subTest(case=name):
+                self.assertEqual(sqlite_witness(self.artifacts, 'fromkeys-' + name, source)['rows'], 2)
+                path = self.artifacts / ('fromkeys-' + name + '.py')
+                path.write_text(source, encoding='utf-8')
+                with self.assertRaises(detector.SQLFlowLimit):
+                    list(detector.find([path]))
+
     def test_exclusive_list_consumers_preserve_sql_and_reject_aliases(self):
         cases = (
             ('extend-sql', '    queries = []\n    queries.extend(f"SELECT {user}" for item in [1])\n    cursor.execute(queries[0])\n', ((CRITICAL, 4),)),

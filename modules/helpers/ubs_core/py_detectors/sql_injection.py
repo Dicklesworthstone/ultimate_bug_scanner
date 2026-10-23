@@ -2087,6 +2087,34 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             return True
         if not arguments and not receiver:
             return False
+        if (isinstance(node.func, ast.Attribute) and node.func.attr == 'fromkeys'
+                and isinstance(node.func.value, ast.Name) and node.func.value.id == 'dict'):
+            bindings = self.ownership_bindings()
+            if (not self.builtin_is_unshadowed('dict') or bindings.dynamic_namespace
+                    or bindings.builtin_namespace):
+                raise SQLFlowLimit('SQL dict.fromkeys binding is unresolved; analysis is incomplete')
+            if (len(node.args) not in {1, 2} or node.keywords
+                    or any(isinstance(argument, ast.Starred) for argument in node.args)
+                    or len(arguments) != 1 or arguments[0][0] is not node.args[0]):
+                raise SQLFlowLimit('SQL dict.fromkeys call shape is unresolved; analysis is incomplete')
+            # Python captures the shared default before draining the keys.
+            # Mutable/default-generator aliases need a separate heap model.
+            default = (self.value_facts(node.args[1]) if len(node.args) == 2 else
+                       self.with_kinds((None, None, None, False, 'static'), 'none'))
+            if self.fact_kinds(default)[0] not in {'str', 'number', 'none'}:
+                raise SQLFlowLimit('SQL dict.fromkeys default alias is unresolved; analysis is incomplete')
+            references = arguments[0][1]
+            exhausted = all(self.generator_phases.get(identity) == frozenset({'done'})
+                            for identity in references)
+            keys = self.materialize_generators(references, consumer_can_raise=True)
+            # Arbitrary key hashing/equality can mutate enclosing SQL state.
+            # Exact primitive keys cannot dispatch those callbacks.
+            if not exhausted and self.fact_kinds(keys)[0] not in {'str', 'number', 'none'}:
+                raise SQLFlowLimit('SQL dict.fromkeys key callbacks are unresolved; analysis is incomplete')
+            combined = self.join_value_facts(keys, default)
+            self._evaluated_values[node] = self.with_kinds(
+                (combined[0], combined[1], default[1], combined[3], combined[4]), 'dict')
+            return True
         if isinstance(node.func, ast.Name) and self.builtin_is_unshadowed(node.func.id):
             name = node.func.id
             if (name in {'min', 'max', 'sorted'} and len(node.args) == 1
@@ -2563,6 +2591,15 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         self._evaluated_values[call] = self.join_value_facts(*returned)
         return True
 
+    def literal_list_index(self, value):
+        # Python represents -1/+1 as unary expressions, not Constant nodes.
+        # These exact integer operations cannot run an overloaded __index__
+        # or arithmetic callback. Unknown expressions retain the refusal path.
+        while isinstance(value, ast.UnaryOp) and isinstance(value.op, (ast.UAdd, ast.USub)):
+            self.step()
+            value = value.operand
+        return isinstance(value, ast.Constant) and type(value.value) is int
+
     def list_update(self, node):
         receiver = node.func.value if isinstance(node.func, ast.Attribute) else None
         if (receiver is not None and node.func.attr == 'pop' and self.borrowed_child_read(receiver)
@@ -2573,8 +2610,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 and not node.keywords and not any(isinstance(arg, ast.Starred) for arg in node.args)):
             indexed = node.func.attr in {'insert', '__setitem__'}
             arity = 2 if indexed else 0 if node.func.attr == 'pop' else 1
-            if (len(node.args) != arity or indexed and not (
-                    isinstance(node.args[0], ast.Constant) and type(node.args[0].value) is int)):
+            if len(node.args) != arity or indexed and not self.literal_list_index(node.args[0]):
                 raise SQLFlowLimit('SQL numeric list call shape is unresolved; analysis is incomplete')
             if node.func.attr == 'pop':
                 if self.record_fields(numeric) and numeric[1] == 1:
@@ -2594,8 +2630,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id in self.exclusive_lists
                 and not node.keywords
-                and (not node.args or len(node.args) == 1
-                     and isinstance(node.args[0], ast.Constant) and type(node.args[0].value) is int)
+                and (not node.args or len(node.args) == 1 and self.literal_list_index(node.args[0]))
                 and not self.generator_refs(self.value_facts(node.func.value))):
             # A builtin list pop does not export the list itself. The returned
             # element still carries its SQL facts. Keep the receiver's may
@@ -2609,8 +2644,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 and len(node.args) == (2 if node.func.attr in {'insert', '__setitem__'} else 1)
                 and not node.keywords and not any(isinstance(arg, ast.Starred) for arg in node.args)):
             return False
-        if (node.func.attr in {'insert', '__setitem__'}
-                and not (isinstance(node.args[0], ast.Constant) and type(node.args[0].value) is int)):
+        if node.func.attr in {'insert', '__setitem__'} and not self.literal_list_index(node.args[0]):
             return False
         argument = node.args[-1]
         if (self._generator_scope[-1], node.func.value.id) in self._argument_list_reads:

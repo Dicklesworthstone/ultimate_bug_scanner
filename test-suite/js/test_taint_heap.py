@@ -424,6 +424,38 @@ class JavaScriptHeapTests(unittest.TestCase):
         self.check('const alias = Object; alias.assign = external; const o = {html: req.query.html}; '
                    'Object.assign(o, {html: "hello"}); res.send(o.html);', 'xss')
 
+    def test_prior_prototype_override_reaches_called_function(self):
+        self.check('Array.prototype.push = external; function output() { const a = []; '
+                   'res.send(a.push(req.query.html)); } output();', 'xss')
+
+    def test_called_helper_mutates_shared_prototype(self):
+        self.check('function replace() { Array.prototype.push = external; } replace(); '
+                   'const a = []; res.send(a.push(req.query.html));', 'xss')
+
+    def test_native_method_is_captured_before_argument_mutation(self):
+        self.check('const a = []; function input() { a.push = external; return req.query.html; } '
+                   'res.send(a.push(input()));')
+
+    def test_native_assign_is_captured_before_argument_mutation(self):
+        self.check('const target = {html: req.query.html}; '
+                   'function source() { Object.assign = external; return {html: "safe"}; } '
+                   'Object.assign(target, source()); res.send(target.html);')
+
+    def test_assign_expands_target_and_source_arguments(self):
+        self.check('const target = {html: "safe"}; '
+                   'Object.assign(...[target, {html: req.query.html}]); '
+                   'res.send(target.html);', 'xss')
+
+    def test_assign_spread_keeps_later_definite_overwrite(self):
+        self.check('const target = {html: req.query.html}; '
+                   'Object.assign(...[target, {html: "safe"}]); '
+                   'res.send(target.html);')
+
+    def test_accessor_descriptor_is_not_a_clean_value_write(self):
+        self.check('const target = {html: req.query.html}; '
+                   'Object.defineProperty(target, "html", {get() { return req.query.html; }}); '
+                   'res.send(target.html);', 'xss')
+
     def test_unchanged_legacy_selftests(self):
         for name, check in taint_js.SELF_TESTS:
             with self.subTest(name=name):

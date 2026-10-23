@@ -480,27 +480,35 @@ class _Fact(frozenset):
     can refer to it before a later property write introduces any source.
     """
 
-    def __new__(cls, traces=(), refs=()):
+    def __new__(cls, traces=(), refs=(), *, absent=False):
         value = super().__new__(cls, traces)
         object.__setattr__(value, 'refs', frozenset(refs))
+        object.__setattr__(value, 'absent', absent)
         return value
 
     def __setattr__(self, name, value):
         raise AttributeError('taint facts are immutable')
 
     def __bool__(self):
-        return bool(len(self) or self.refs)
+        return bool(len(self) or self.refs or self.absent)
 
     def __eq__(self, other):
         return (isinstance(other, frozenset) and frozenset.__eq__(self, other)
-                and self.refs == getattr(other, 'refs', frozenset()))
+                and self.refs == getattr(other, 'refs', frozenset())
+                and self.absent == getattr(other, 'absent', False))
 
     def __ne__(self, other):
         return not self == other
 
     def __hash__(self):
         # Retain the frozenset hash for ordinary scalar facts.
-        return hash((frozenset(self), self.refs)) if self.refs else frozenset.__hash__(self)
+        return (hash((frozenset(self), self.refs, self.absent))
+                if self.refs or self.absent else frozenset.__hash__(self))
+
+
+# A missing property is not a present property whose value happens to be clean.
+# Preserve this bit through branch joins and shallow copies, never as taint.
+_ABSENT = _Fact(absent=True)
 
 
 def _refs(fact):
@@ -546,7 +554,8 @@ def _join(*facts):
             previous = traces.get(trace)
             if previous is None or (len(trace.path), trace.path) < (len(previous.path), previous.path):
                 traces[trace] = trace
-    return _Fact(traces.values(), frozenset().union(*(_refs(fact) for fact in nonempty)))
+    return _Fact(traces.values(), frozenset().union(*(_refs(fact) for fact in nonempty)),
+                 absent=any(getattr(fact, 'absent', False) for fact in nonempty))
 
 
 def _step(fact, name):
@@ -556,7 +565,7 @@ def _step(fact, name):
         if len(path) > PATH_LIMIT:
             path = (path[0], *path[-(PATH_LIMIT - 1):])
         traces.append(_Trace(trace.origin, path))
-    return _Fact(traces, _refs(fact))
+    return _Fact(traces, _refs(fact), absent=getattr(fact, 'absent', False))
 
 
 class _State(dict):
@@ -632,7 +641,7 @@ def _join_states(*states):
         # the object exists contribute its property values.
         objects = [state.heap[ref] for state in states if ref in state.heap]
         keys = set().union(*(slots.keys() for slots in objects))
-        result.heap[ref] = {key: _join(*(slots.get(key, frozenset()) for slots in objects)) for key in keys}
+        result.heap[ref] = {key: _join(*(slots.get(key, slots.get(None, _ABSENT)) for slots in objects)) for key in keys}
     result.weak_refs = set().union(*(state.weak_refs for state in states))
     result.written_cells = set().union(*(state.written_cells for state in states))
     for key in set().union(*(state.binding_kinds.keys() for state in states)):
@@ -1278,6 +1287,15 @@ class _Flow:
                                            captured_require=captured_require)
         if imported is not None:
             return imported
+        if name in {'Object', 'Array', 'Reflect'} and not any(
+                local == name and begin == key[1]
+                for begin, _end, local in self.engine.binding_regions[key[0]]):
+            # These identities are shared by aliases. A spelling-based check
+            # cannot notice writes through `const ctor = Object`.
+            ref, prototype = ('builtin', name), ('builtin', name + '.prototype')
+            state.heap.setdefault(ref, {'prototype': _Fact(refs=(prototype,))})
+            state.heap.setdefault(prototype, {})
+            return _Fact(refs=(ref,))
         if self.scope.parent is not None:
             scope = self.scope.parent if self.parameter_context else self.scope
             position = self.scope.start if self.parameter_context else None
@@ -1383,10 +1401,13 @@ class _Flow:
             slots = state.heap.get(ref, {})
             if key == 'length' and ref in state.array_lengths:
                 continue  # array length is a count, not attacker-provided text
+            index, length = self.array_index(key), state.array_lengths.get(ref)
+            if index is not None and length is not None and index >= length:
+                continue  # truncated elements and out-of-bounds reads are undefined
             if key is None:
                 result = _join(result, *slots.values())
             else:
-                result = _join(result, slots.get(key, frozenset()), slots.get(None, frozenset()))
+                result = _join(result, slots.get(key, slots.get(None, _ABSENT)))
         return result
 
     def read_access(self, parsed, state, evaluate_keys=True):
@@ -1412,6 +1433,7 @@ class _Flow:
             selectors = selectors[consumed:]
         else:
             fact = self.reference(root, state)
+        path = root
         for key, expression in selectors:
             selected = frozenset()
             if expression is not None:
@@ -1424,15 +1446,30 @@ class _Flow:
             fact = self.property(fact, key, state)
             if unknown:
                 fact = _join(fact, selected)
+            path = path + '.' + key if path is not None and key is not None else None
+            if unknown and path in state:
+                fact = state[path]
         return fact
 
-    def write_property(self, fact, key, value, state, *, initialize_export=False):
+    def write_property(self, fact, key, value, state, *, initialize_export=False, optional=False):
         refs = _refs(fact)
         strong = (len(refs) == 1 and key is not None and not frozenset(fact)
                   and not refs & state.weak_refs)
         for ref in refs:
             slots = state.heap.setdefault(ref, {})
-            slots[key] = value if strong else _join(slots.get(key, frozenset()), value)
+            old = slots.get(key, slots.get(None, _ABSENT))
+            present = _Fact(value, _refs(value))
+            if key is None:
+                # An unknown property may override every currently named key.
+                # A later definite write can still replace that key precisely.
+                for known in tuple(slots):
+                    if known is not None:
+                        prior = slots[known]
+                        joined = _join(prior, present)
+                        slots[known] = _Fact(joined, _refs(joined), absent=getattr(prior, 'absent', False))
+            joined = present if strong and not optional else _join(old, present)
+            slots[key] = _Fact(joined, _refs(joined), absent=(key is None or
+                (not (strong and not optional) and getattr(old, 'absent', False))))
             owner = self.engine.commonjs_namespace_refs.get(ref)
             if owner is not None and not initialize_export:
                 # A namespace export is a property of a shared ordinary
@@ -1451,6 +1488,12 @@ class _Flow:
                 length = state.array_lengths[ref]
                 if key is None or key == 'length':
                     state.array_lengths[ref] = None
+                    if key is None:
+                        # A computed property write can replace a method.
+                        # Element spreads use the wildcard slot directly and
+                        # must not be mistaken for prototype/method writes.
+                        for method in ('push', 'unshift', 'pop', 'shift', 'reverse', 'join'):
+                            slots[method] = _join(slots.get(method, _ABSENT), present)
                 elif self.array_index(key) is not None and length is not None:
                     state.array_lengths[ref] = max(length, int(key) + 1)
 
@@ -1735,7 +1778,7 @@ class _Flow:
         array = code[start] == '['
         unknown_offset = False
         length = 0
-        for index, (left, right) in enumerate(_chunks(code, start + 1, end - 1)):
+        for left, right in _chunks(code, start + 1, end - 1):
             raw = text[left:right].strip()
             if not raw:
                 if array and right < end - 1:
@@ -1746,19 +1789,47 @@ class _Flow:
                 begin = left + text[left:right].index('...') + 3
                 spread = self.value(begin, right, state)
                 if array:
-                    unknown_offset = True
-                    slots[None] = _join(slots.get(None, frozenset()),
-                                        _materialize(spread, state.heap, budget=self.engine.budget))
+                    refs = _refs(spread)
+                    lengths = [state.array_lengths.get(parent) for parent in refs]
+                    if (not unknown_offset and refs and not frozenset(spread)
+                            and lengths[0] is not None
+                            and all(size == lengths[0] for size in lengths)):
+                        # Spread copies element values, including borrowed
+                        # object identities, into new outer array slots.
+                        self.engine.budget.spend(lengths[0])
+                        offset = length - 1
+                        for position in range(lengths[0]):
+                            slots[str(offset + position)] = self.property(spread, str(position), state)
+                        length += lengths[0] - 1
+                    else:
+                        unknown_offset = True
+                        # Even an unknown-length array yields its elements,
+                        # not a materialized scalar that loses their aliases.
+                        values = (self.property(spread, None, state)
+                                  if refs and all(parent in state.array_lengths for parent in refs)
+                                  else _materialize(spread, state.heap, budget=self.engine.budget))
+                        slots[None] = _join(slots.get(None, frozenset()), values)
                 else:
                     refs = _refs(spread)
-                    if len(refs) == 1 and not frozenset(spread):
-                        slots.update(state.heap.get(next(iter(refs)), {}))
-                    else:
-                        slots[None] = _join(slots.get(None, frozenset()),
-                                            _materialize(spread, state.heap, budget=self.engine.budget))
+                    objects = [state.heap.get(parent, {}) for parent in refs]
+                    wildcard = _join(frozenset(spread), *(obj.get(None, frozenset()) for obj in objects))
+                    if wildcard:
+                        for key, old in tuple(slots.items()):
+                            merged = _join(old, wildcard)
+                            slots[key] = _Fact(merged, _refs(merged), absent=getattr(old, 'absent', False))
+                        slots[None] = _Fact(_join(slots.get(None, frozenset()), wildcard),
+                                            _refs(_join(slots.get(None, frozenset()), wildcard)), absent=True)
+                    for key in set().union(*(obj.keys() for obj in objects)) - {None}:
+                        incoming = self.property(spread, key, state)
+                        definite = not frozenset(spread) and all(
+                            key in obj and not getattr(obj[key], 'absent', False) for obj in objects)
+                        old = slots.get(key, slots.get(None, _ABSENT))
+                        merged = incoming if definite else _join(old, incoming)
+                        slots[key] = _Fact(merged, _refs(merged),
+                                           absent=not definite and getattr(old, 'absent', False))
                 continue
             if array:
-                key, begin = (None if unknown_offset else str(index)), left
+                key, begin = (None if unknown_offset else str(length - 1)), left
             else:
                 _, colon = next(_chunks(code, left, right, ':'))
                 key = self.property_key(text[left:colon])
@@ -1772,78 +1843,136 @@ class _Flow:
                             self.value(opening + 1, closing, state)
                 begin = colon + 1 if colon < right else left
             value = self.value(begin, right, state)
-            slots[key] = _join(slots.get(key, frozenset()), value) if key is None else value
+            if key is None and not array:
+                for known, old in tuple(slots.items()):
+                    merged = _join(old, value)
+                    slots[known] = _Fact(merged, _refs(merged), absent=getattr(old, 'absent', False))
+            merged = _join(slots.get(key, frozenset()), value) if key is None else value
+            slots[key] = _Fact(merged, _refs(merged), absent=key is None)
         # Repeated visits to a loop allocation site summarize all its objects;
         # do not discard earlier aliases when the site is evaluated again.
         previous = state.heap.get(ref)
         if previous is not None:
             state.weak_refs.add(ref)
-            slots = {key: _join(previous.get(key, frozenset()), slots.get(key, frozenset()))
+            slots = {key: _join(previous.get(key, _ABSENT), slots.get(key, _ABSENT))
                      for key in previous.keys() | slots.keys()}
         state.heap[ref] = slots
         if array:
             state.array_lengths[ref] = None if unknown_offset or previous is not None else length
         return _Fact(refs=(ref,))
 
-    def mutation_call(self, name, arguments, facts, state):
-        """Model ordinary built-in mutators without treating counts as data.
+    def native_target(self, name, state):
+        """Capture GetValue(callee) before arguments can replace a method."""
+        receiver_name, dot, method = name.rpartition('.')
+        if not dot:
+            return None
+        parts = receiver_name.split('.')
+        receiver = self.reference(parts[0], state) if dot else frozenset()
+        for key in parts[1:]:
+            receiver = self.property(receiver, key, state)
+        refs = _refs(receiver)
+        object_native = (refs == {('builtin', 'Object')} and not frozenset(receiver)
+                         and method not in state.heap.get(('builtin', 'Object'), {})
+                         and None not in state.heap.get(('builtin', 'Object'), {}))
+        if object_native and method in {'assign', 'defineProperty'}:
+            return 'object', receiver, method
+        prototype = state.heap.get(('builtin', 'Array.prototype'), {})
+        if (method in {'push', 'unshift', 'pop', 'shift', 'reverse', 'join'}
+                and refs and not frozenset(receiver) and method not in prototype and None not in prototype
+                and all(ref in state.array_lengths and method not in state.heap[ref] for ref in refs)):
+            return 'array', receiver, method
+        return None
+
+    def mutation_call(self, native, arguments, facts, state, prepared):
+        """Model captured native functions, preserving the live receiver heap.
 
         Exact lengths widen to unknown at branch/loop disagreement. No length
         counter can grow forever in the worklist, and uncertain aliases never
         receive a destructive strong update.
         """
-        if name == 'Object.assign' and state.bindings.get('Object', 'imported') == 'imported' and facts:
-            target = facts[0]
+        if native is None:
+            return None
+        kind, receiver, method = native
+        actual, uncertain, _missing, _kinds = prepared
+        values = [value for value, _missing in actual]
+        if kind == 'object' and method == 'assign' and values:
+            # Spread evaluation yields individual arguments, not one object
+            # containing the union of every value in the spread expression.
+            target = values[0] if uncertain != 0 else _join(*values)
             if not _refs(target):
                 return None
-            for source in facts[1:]:
+            first_source = 1 if uncertain != 0 else 0
+            for index, source in enumerate(values[first_source:], first_source):
                 refs = _refs(source)
-                keys = set().union(*(state.heap.get(ref, {}).keys() for ref in refs))
+                objects = [state.heap.get(ref, {}) for ref in refs]
+                wildcard = _join(frozenset(source), *(obj.get(None, frozenset()) for obj in objects))
+                if wildcard:
+                    self.write_property(target, None, wildcard, state)
+                keys = set().union(*(obj.keys() for obj in objects)) - {None}
                 for key in keys:
                     incoming = self.property(source, key, state)
                     # Missing keys on an alternative source must retain the
                     # target's old value; Object.assign does not delete them.
-                    if len(refs) != 1 or frozenset(source):
-                        incoming = _join(incoming, self.property(target, key, state))
-                    self.write_property(target, key, incoming, state)
-                if frozenset(source):
-                    self.write_property(target, None, frozenset(source), state)
+                    definite = (uncertain is None or index < uncertain) and refs and not frozenset(source) and all(
+                        key in obj and not getattr(obj[key], 'absent', False) for obj in objects)
+                    self.write_property(target, key, incoming, state, optional=not definite)
             return target
-        receiver_name, dot, method = name.rpartition('.')
-        if not dot or method not in {'push', 'unshift', 'pop', 'shift', 'reverse'}:
+        if kind == 'object' and method == 'defineProperty' and len(values) >= 3 and uncertain is None:
+            # An expanded key has no single source range here. Keep it unknown
+            # rather than confusing an entire spread with the property name.
+            key = (self.property_key(self.engine.text[slice(*arguments[1])])
+                   if len(arguments) >= 2 and not any(
+                       self.engine.text[left:right].lstrip().startswith('...')
+                       for left, right in arguments[:2]) else None)
+            descriptor = values[2]
+            refs = _refs(descriptor)
+            definite = refs and not frozenset(descriptor) and all(
+                'value' in state.heap.get(ref, {}) and
+                not getattr(state.heap[ref]['value'], 'absent', False) for ref in refs)
+            # Accessors are outside this lexical heap model. Their lack of a
+            # value field is not evidence that an old property became clean.
+            self.write_property(values[0], key, self.property(descriptor, 'value', state),
+                                state, optional=not definite)
+            return values[0]
+        if kind != 'array':
             return None
-        parts = receiver_name.split('.')
-        receiver = self.reference(parts[0], state)
-        for key in parts[1:]:
-            receiver = self.property(receiver, key, state)
         refs = _refs(receiver)
-        if not refs or any(ref not in state.array_lengths or method in state.heap[ref] for ref in refs):
-            return None
         returned = frozenset()
-        spread = any(self.engine.text[left:right].lstrip().startswith('...') for left, right in arguments)
         for ref in refs:
             slots = state.heap[ref]
             length = state.array_lengths[ref]
             precise = len(refs) == 1 and ref not in state.weak_refs and length is not None
             numeric = {key: value for key, value in slots.items() if self.array_index(key) is not None}
-            if method in {'push', 'unshift'}:
-                if not facts:
+            if method == 'join':
+                elements = (_join(*numeric.values(), slots.get(None, frozenset()))
+                            if length != 0 else frozenset())
+                returned = _join(returned, _materialize(elements, state.heap, budget=self.engine.budget))
+                if length is None or length > 1:
+                    returned = _join(returned, *values[:1] if uncertain is None else values)
+            elif method in {'push', 'unshift'}:
+                if not values:
                     continue
-                if not precise or spread:
-                    slots[None] = _join(slots.get(None, frozenset()), *facts,
+                if not precise or uncertain is not None:
+                    prefix = (values[:uncertain] if uncertain is not None else values) if precise else []
+                    if method == 'unshift':
+                        for key in numeric:
+                            slots.pop(key)
+                    slots[None] = _join(slots.get(None, frozenset()), *values[len(prefix):],
                                         *numeric.values() if method == 'unshift' else ())
+                    for offset, value in enumerate(prefix):
+                        slots[str((length if method == 'push' else 0) + offset)] = value
                     state.array_lengths[ref] = None
                 else:
                     if method == 'unshift':
                         for key in numeric:
                             slots.pop(key)
-                        slots.update({str(int(key) + len(facts)): value for key, value in numeric.items()})
-                    for offset, value in enumerate(facts):
+                        slots.update({str(int(key) + len(values)): value for key, value in numeric.items()})
+                    for offset, value in enumerate(values):
                         slots[str((length if method == 'push' else 0) + offset)] = value
-                    state.array_lengths[ref] = length + len(facts)
+                    state.array_lengths[ref] = length + len(values)
             elif method in {'pop', 'shift'}:
                 if not precise:
-                    returned = _join(returned, *slots.values())
+                    returned = _join(returned, *numeric.values(), slots.get(None, frozenset()))
                 elif length:
                     index = str(length - 1) if method == 'pop' else '0'
                     returned = _join(returned, slots.pop(index, frozenset()), slots.get(None, frozenset()))
@@ -1859,6 +1988,8 @@ class _Flow:
                     slots.update({str(length - int(key) - 1): value for key, value in numeric.items() if int(key) < length})
                 else:
                     slots[None] = _join(slots.get(None, frozenset()), *numeric.values())
+                    for key in numeric:
+                        slots.pop(key)
         return receiver if method == 'reverse' else returned
 
     def operand_snapshot(self, start, end, state):
@@ -2223,6 +2354,19 @@ class _Flow:
                 fact = _join(old, fact)
             if receiver is not None and _refs(receiver):
                 self.write_property(receiver, key, _step(fact, target), evaluated)
+                if key == 'length' and assignment.group(1) == '=':
+                    literal = text[rhs:end].strip()
+                    refs = _refs(receiver)
+                    if (literal.isdecimal() and len(literal) <= 10 and int(literal) <= 4294967295
+                            and len(refs) == 1 and not frozenset(receiver) and not refs & evaluated.weak_refs):
+                        ref = next(iter(refs))
+                        if ref in evaluated.array_lengths:
+                            size = int(literal)
+                            evaluated.array_lengths[ref] = size
+                            for slot in tuple(evaluated.heap[ref]):
+                                index = self.array_index(slot)
+                                if index is not None and index >= size:
+                                    evaluated.heap[ref].pop(slot)
             else:
                 self.assign(target, fact, evaluated, start, self.callable(rhs, end, evaluated),
                             self.binding_input(rhs, end, evaluated) if assignment.group(1) == '=' else None)
@@ -2317,10 +2461,8 @@ class _Flow:
             sink_binding = state.bindings.get(callee_name, 'imported')
             if self.engine.relative_import(self.scope, receiver):
                 binding = None
-            if isinstance(callee, _Scope) and not callee.generator:
-                argument_facts, prepared = self.evaluate_arguments(arguments, state)
-            else:
-                argument_facts = [self.value(left, right, state) for left, right in arguments]
+            native = self.native_target(callee_name, state) if not isinstance(callee, _Scope) else None
+            argument_facts, prepared = self.evaluate_arguments(arguments, state)
             if isinstance(callee, _Scope) and callee.generator:
                 # A generator call creates an iterator; it does not execute
                 # the body. Iterator advancement is outside this call model.
@@ -2399,7 +2541,7 @@ class _Flow:
                     if not (deferred and thrown is not None):
                         self.apply_writes(writes, callee, bound, state, incoming)
             else:
-                mutation = self.mutation_call(callee_name, arguments, argument_facts, state)
+                mutation = self.mutation_call(native, arguments, argument_facts, state, prepared)
                 call_fact = _join(*argument_facts)
                 if '.' in callee_name:
                     call_fact = _join(call_fact, self.reference(receiver, state))
@@ -2918,6 +3060,7 @@ class _Engine:
         self.heap_calls = {}
         self.widened_calls, self.exact_calls, self.recursive = {}, defaultdict(list), set()
         self.current_task = None
+        self.heap_solve_depth = 0
         self.pending, self.queued = deque(), set()
         self.binding_regions = {}
         for scope in self.scopes:
@@ -2998,6 +3141,7 @@ class _Engine:
                                        *(default for _, _, default, _ in scope.params
                                          if default is not None),
                                        *(pattern for _, _, _, pattern in scope.params)])
+            or re.search(r'\b(?:Object|Array|Reflect)\b', scope.code[scope.body_start:scope.body_end])
         }
         # Shadowing identifies a lexical cell; it does not prove that the
         # cell contains a defined value. These functions need the same finite
@@ -3313,7 +3457,8 @@ class _Engine:
                 state[name], state.owners[name] = state.cells[key], key
                 state.bindings[name] = incoming.bindings.get(name)
         # Copy only reachable objects, preserving borrowed identities and cycles.
-        pending = list(frozenset().union(*(_refs(fact) for fact in (*bound.values(), *state.cells.values()))))
+        pending = [*(ref for ref in incoming.heap if ref[0] == 'builtin'),
+                   *frozenset().union(*(_refs(fact) for fact in (*bound.values(), *state.cells.values())))]
         while pending:
             ref = pending.pop()
             if ref in state.heap:
@@ -3375,7 +3520,18 @@ class _Engine:
                                     ancestors | {callee})
                 self.heap_calls[signature] = context
                 self.exact_calls[(callee, rule)].append(context)
-                self.enqueue(context)
+                # Register before solving: a nested recursive call can
+                # supersede this exact context and must requeue its caller.
+                context.readers.add(task)
+                # An unseen acyclic call has no result yet. Solve it before
+                # consuming bottom, otherwise each successive helper call
+                # restarts its entire caller from the beginning. Deep call
+                # chains still use the iterative worklist, as do recursive
+                # widened contexts. Both paths retain the same work budget.
+                if self.heap_solve_depth < 16:
+                    self.solve_heap(context)
+                else:
+                    self.enqueue(context)
         # Borrowed means borrowed by this caller: a joined widened input also
         # holds the callee's own allocations from its recursive calls.
         context.readers.add(task)
@@ -3440,6 +3596,8 @@ class _Engine:
         self.budget.spend(1 + _heap_work(output.heap))
 
         def fresh(ref):
+            if ref[0] == 'builtin':
+                return ref
             if _collapsed(ref):
                 return ref
             # Tagged sites (binding-rest and CommonJS namespaces) have a string
@@ -3458,7 +3616,8 @@ class _Engine:
         renamed = {ref: ref if ref in incoming.heap else fresh(ref) for ref in output.heap}
 
         def translate(fact):
-            return _Fact(fact, (renamed.get(ref, ref) for ref in _refs(fact)))
+            return _Fact(fact, (renamed.get(ref, ref) for ref in _refs(fact)),
+                         absent=getattr(fact, 'absent', False))
 
         # All translations use the same pre-call input. A swap must not read
         # an already-updated slot; borrowed objects keep their caller identity.
@@ -3467,12 +3626,12 @@ class _Engine:
             groups[new].append(old)
         for new, originals in groups.items():
             keys = set().union(*(output.heap[old].keys() for old in originals))
-            slots = {key: _join(*(translate(output.heap[old].get(key, frozenset()))
+            slots = {key: _join(*(translate(output.heap[old].get(key, output.heap[old].get(None, _ABSENT)))
                                   for old in originals)) for key in keys}
             collision = any(old not in incoming.heap for old in originals) and new in state.heap
             if collision:
                 previous = state.heap[new]
-                slots = {key: _join(previous.get(key, frozenset()), slots.get(key, frozenset()))
+                slots = {key: _join(previous.get(key, previous.get(None, _ABSENT)), slots.get(key, slots.get(None, _ABSENT)))
                          for key in previous.keys() | slots.keys()}
             collapsed = len(originals) > 1 or collision or _collapsed(new)
             if collapsed or any(old in output.weak_refs for old in originals):
@@ -3537,7 +3696,8 @@ class _Engine:
             # Borrowed objects remain observable through caller aliases even
             # after a formal is rebound. Local allocations only escape through
             # a returned value, an exception, or a write to a captured cell.
-            pending = [*context.incoming.heap, *_refs(value)]
+            pending = [*context.incoming.heap, *_refs(value),
+                       *(ref for ref in store.heap if ref[0] == 'builtin')]
             for fact in changes.values():
                 pending.extend(_refs(fact))
             heap = {}
@@ -3739,6 +3899,22 @@ class _Engine:
                     result = _join(result, resolved)
         return result
 
+    def solve_heap(self, context):
+        if context.superseded:
+            return
+        caller = self.current_task
+        self.current_task = context
+        self.heap_solve_depth += 1
+        try:
+            result = self.analyze_heap(context)
+            if context.result != result:
+                context.result = result
+                for reader in context.readers:
+                    self.enqueue(reader)
+        finally:
+            self.heap_solve_depth -= 1
+            self.current_task = caller
+
     def rule_findings(self, rule):
         """Publish a rule's evidence only after its fixed point is resolved."""
         found = {}
@@ -3748,13 +3924,7 @@ class _Engine:
             self.queued.discard(task)
             self.current_task = task
             if isinstance(task, _HeapCall):
-                if task.superseded:
-                    continue
-                result = self.analyze_heap(task)
-                if task.result != result:
-                    task.result = result
-                    for reader in task.readers:
-                        self.enqueue(reader)
+                self.solve_heap(task)
                 continue
             scope = task
             before = self.final_states.get((scope, rule))

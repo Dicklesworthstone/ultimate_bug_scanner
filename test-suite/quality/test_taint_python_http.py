@@ -293,6 +293,32 @@ except HostFailure as HOSTS:
     requests.get(target)
 ''', 'ssrf')
 
+    def test_url_allowlists_keep_independent_mutation_and_binding_proofs(self):
+        source = '''
+import requests
+from urllib.parse import urlparse
+PRIMARY = {"api.example.com"}
+SECONDARY = ("images.example.com",)
+def primary_allowed(value):
+    parsed = urlparse(value)
+    return parsed.scheme == "https" and parsed.hostname in PRIMARY
+def secondary_allowed(value):
+    parsed = urlparse(value)
+    return parsed.scheme == "https" and parsed.hostname in SECONDARY
+SECONDARY = (input(),)
+first = input()
+if not primary_allowed(first):
+    raise ValueError("blocked")
+requests.get(first)
+second = input()
+if not secondary_allowed(second):
+    raise ValueError("blocked")
+requests.get(second)
+'''
+        findings = self.assert_rules(source, 'ssrf')
+        self.assertEqual(len(findings), 1, findings)
+        self.assertEqual(findings[0]['line'], source.strip().splitlines().index('requests.get(second)') + 1)
+
     def test_async_execution_and_framework_inputs(self):
         self.assert_rules('''
             import requests, asyncio

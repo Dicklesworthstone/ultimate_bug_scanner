@@ -2012,7 +2012,7 @@ class LoggedCase(unittest.TestCase):
         cls.artifact = ROOT / 'test-suite/artifacts/ruby-taint-dataflow' / (cls.__name__ + '-' + uuid.uuid4().hex[:12])
         cls.artifact.mkdir(parents=True)
         identity = {'python': sys.version, 'executable': sys.executable,
-                    'head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
+                    'head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True, timeout=30).strip(),
                     'helpers': {str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
                                 for path in sorted((HELPERS / 'ubs_core').rglob('*ruby*.py'))}}
         (cls.artifact / 'source-identity.json').write_text(json.dumps(identity, indent=2) + '\n')
@@ -2448,6 +2448,8 @@ class RubyPublicTests(LoggedCase):
         command = [*executable, '--ci', '--format=' + fmt, *extra, str(target)]
         env = {**os.environ, 'UBS_NO_AUTO_UPDATE': '1', 'UBS_ENABLE_AUTO_UPDATE': '0',
                'CI': '1', 'NO_COLOR': '1', 'UBS_CACHE_DIR': str(self.artifact / 'cache'),
+               'XDG_DATA_HOME': str(self.artifact / 'data'),
+               'XDG_CONFIG_HOME': str(self.artifact / 'config'),
                'PYTHONDONTWRITEBYTECODE': '1'}
         started = time.monotonic()
         # Artifact directories vary per attempt; the actual project/cwd must
@@ -2510,6 +2512,76 @@ class RubyPublicTests(LoggedCase):
                     result, payload = self.scan(directory / fmt, target, fmt)
                     self.assert_findings(result, payload, case, fmt, target)
                     print('RUBY_TAINT_PUBLIC', name, fmt, 'PASS', flush=True)
+
+    def test_response_header_flow_module_and_meta_json_sarif(self):
+        names = {'header_direct', 'header_literal_overwrite', 'header_safe_named_identity',
+                 'header_selected_sink_helper', 'header_clean_helper', 'header_response_alias',
+                 'header_local_hash_is_not_response', 'header_partial_delete_is_unsafe',
+                 'header_single_quoted_escapes_are_not_crlf', 'header_html_escape_does_not_remove_crlf',
+                 'header_regex_guard', 'header_guard_on_unrelated_value',
+                 'header_sanitized_alias_mutation', 'header_source_suppression_keeps_flow'}
+        for case in (case for case in HEADER_CASES if case.name in names):
+            directory = self.artifact / case.name
+            directory.mkdir(exist_ok=True)
+            target = directory / 'selected source.rb'
+            target.write_text(case.source)
+            (directory / 'unselected.rb').write_text('headers["X-Unselected"] = params[:name]\n')
+            for module in (False, True):
+                for fmt in ('json', 'sarif'):
+                    with self.subTest(case=case.name, module=module, format=fmt):
+                        result, payload = self.scan(directory / f'{module}-{fmt}', target, fmt, module=module)
+                        self.assertEqual(result.returncode, int(bool(case.lines)), (result.stdout, result.stderr))
+                        if fmt == 'json':
+                            self.assertEqual(payload['status'], 'ok', payload)
+                            self.assertEqual(payload['critical'] if module else payload['totals']['critical'],
+                                             len(case.lines), payload)
+                            rows = [row for row in payload['findings']
+                                    if row['rule' if module else 'rule_id'] == HEADER]
+                            self.assertEqual([row['line'] for row in rows], list(case.lines), payload)
+                            for row in rows:
+                                self.assertEqual(Path(row['path' if module else 'file']).name, target.name)
+                                self.assertEqual(row['extras']['taint_path'][-1]['kind'], 'sink', row)
+                        else:
+                            rows = [row for run in payload['runs'] for row in run.get('results', [])]
+                            self.assertEqual([(row['ruleId'], row['locations'][0]['physicalLocation']['region']['startLine'])
+                                              for row in rows if row['ruleId'] == HEADER],
+                                             [(HEADER, line) for line in case.lines], payload)
+                        print('RUBY_HEADER_PUBLIC', case.name, module, fmt, 'PASS', flush=True)
+
+    def test_response_header_cache_suppression_and_partial(self):
+        directory = self.artifact / 'header-cache-policy'
+        directory.mkdir()
+        target = directory / 'handler.rb'
+        for attempt, source, expected in (
+                (0, 'headers["X-Name"] = params[:name]', 1),
+                (1, 'headers["X-Name"] = params[:name]', 1),
+                (2, r'headers["X-Name"] = params[:name].delete("\r\n")', 0),
+                (3, r'headers["X-Name"] = params[:name].delete("\r\n")', 0)):
+            if attempt in (0, 2):
+                target.write_text(source + '\n')
+            result, payload = self.scan(directory / str(attempt), target)
+            self.assertEqual(result.returncode, expected, (result.stdout, result.stderr))
+            self.assertEqual((payload['status'], payload['totals']['critical']), ('ok', expected), payload)
+            self.assertEqual(payload['scanners'][0]['extras']['profile']['cache_hits'], int(attempt in (1, 3)), payload)
+        for label, suffix, options, expected in (
+                ('suppressed', ' # ubs:ignore[ruby.header-injection.response]', (), 0),
+                ('unrelated', ' # ubs:ignore[ruby.redirect.open]', (), 1),
+                ('skipped', '', ('--skip=6',), 0)):
+            target.write_text('headers["X-Name"] = params[:name]' + suffix + '\n')
+            result, payload = self.scan(directory / label, target, extra=options, module=True)
+            self.assertEqual(result.returncode, expected, (result.stdout, result.stderr))
+            self.assertEqual((payload['status'], payload['critical']), ('ok', expected), payload)
+        target.write_text('def show\n  headers["X-Name"] = params[:name]\n')
+        for attempt, fmt in enumerate(('json', 'json', 'sarif')):
+            result, payload = self.scan(directory / f'partial-{attempt}', target, fmt)
+            self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+            if fmt == 'json':
+                self.assertEqual(payload['status'], 'partial', payload)
+                self.assertTrue(any(row.get('module_error') == 'ANALYZER_ERROR'
+                                    for row in payload['failed_modules']), payload)
+            else:
+                self.assertTrue(all(invocation['executionSuccessful'] is False
+                                    for run in payload['runs'] for invocation in run['invocations']), payload)
 
     def test_sql_query_binding_reaches_module_and_meta_json_sarif(self):
         names = ('sql_exec_query_binds_do_not_fix_query_text', 'sql_genuine_query_binds',
@@ -2850,6 +2922,250 @@ class RubyPublicTests(LoggedCase):
             self.assertEqual(payload['status'], 'partial', payload)
             self.assertTrue(any(row.get('language') == 'ruby' and row.get('module_error') == 'ANALYZER_ERROR'
                                 for row in payload.get('failed_modules', [])), payload)
+
+
+HEADER = 'ruby.header-injection.response'
+HEADER_CASES = (
+    Case('header_direct', HEADER, 'headers["X-Name"] = params[:name]', (1,)),
+    Case('header_literal_overwrite', HEADER, '''
+        value = params[:name]
+        value = "fixed"
+        headers["X-Name"] = value''', ()),
+    Case('header_safe_named_identity', HEADER, '''
+        def safe_header(value)
+          value
+        end
+        headers["X-Name"] = safe_header(params[:name])''', (4,)),
+    Case('header_selected_sink_helper', HEADER, '''
+        def publish(value)
+          response.set_header("X-Name", value)
+        end
+        publish(params[:name])''', (2,)),
+    Case('header_clean_helper', HEADER, r'''
+        def clean_header(value)
+          value.to_s.delete("\r\n")
+        end
+        headers["X-Name"] = clean_header(params[:name])''', ()),
+    Case('header_one_branch_is_unsafe', HEADER, r'''
+        value = params[:name]
+        if flag
+          value = value.delete("\r\n")
+        end
+        headers["X-Name"] = value''', (5,)),
+    Case('header_local_overwrite_does_not_leak_between_methods', HEADER, '''
+        def first
+          value = params[:name]
+        end
+        def second
+          value = "fixed"
+          headers["X-Name"] = value
+        end''', ()),
+    Case('header_response_alias', HEADER, '''
+        output = response.headers
+        output.store("X-Name", params[:name])''', (2,)),
+    Case('header_local_hash_is_not_response', HEADER, '''
+        headers = {}
+        headers["X-Name"] = params[:name]''', ()),
+    Case('header_unrelated_body_is_not_filename', HEADER,
+         'send_data params[:body], filename: "report.csv"', ()),
+    Case('header_filename_is_sink', HEADER,
+         'send_data "body", filename: cookies[:name]', (1,)),
+    Case('header_partial_delete_is_unsafe', HEADER,
+         r'headers["X-Name"] = params[:name].delete("\n")', (1,)),
+    Case('header_single_quoted_escapes_are_not_crlf', HEADER,
+         r'''headers["X-Name"] = params[:name].delete('\r\n')''', (1,)),
+    Case('header_html_escape_does_not_remove_crlf', HEADER,
+         'headers["X-Name"] = CGI.escape_html(params[:name])', (1,)),
+    Case('header_gsub_crlf_pair_leaves_isolated_newlines', HEADER,
+         r'headers["X-Name"] = params[:name].gsub(/\r\n/, "")', (1,)),
+    Case('header_sub_removes_only_first_match', HEADER,
+         r'headers["X-Name"] = params[:name].sub(/[\r\n]/, "")', (1,)),
+    Case('header_negated_character_class_keeps_crlf', HEADER,
+         r'headers["X-Name"] = params[:name].gsub(/[^\r\n]/, "")', (1,)),
+    Case('header_unsafe_replacement', HEADER,
+         r'headers["X-Name"] = params[:name].gsub(/[\r\n]/, "\n")', (1,)),
+    Case('header_delete_both', HEADER,
+         r'headers["X-Name"] = params[:name].delete("\r\n")', ()),
+    Case('header_chained_delete', HEADER,
+         r'headers["X-Name"] = params[:name].delete("\r").delete("\n")', ()),
+    Case('header_gsub_both', HEADER,
+         r'headers["X-Name"] = params[:name].gsub(/[\r\n]/, "")', ()),
+    Case('header_tr_both', HEADER,
+         r'headers["X-Name"] = params[:name].tr("\r\n", " ")', ()),
+    Case('header_delete_intersection_is_not_union', HEADER,
+         r'headers["X-Name"] = params[:name].delete("\r\n", "\n")', (1,)),
+    Case('header_domination_guard', HEADER, r'''
+        value = params[:name]
+        raise "invalid" if value.include?("\r") || value.include?("\n")
+        headers["X-Name"] = value''', ()),
+    Case('header_regex_guard', HEADER, r'''
+        value = params[:name]
+        return if value.to_s.match?(/[\r\n]/)
+        headers["X-Name"] = value''', ()),
+    Case('header_guard_on_unrelated_value', HEADER, r'''
+        value = params[:name]
+        other = params[:other]
+        raise "invalid" if other.match?(/[\r\n]/)
+        headers["X-Name"] = value''', (4,)),
+    Case('header_nonterminating_guard', HEADER, r'''
+        value = params[:name]
+        warn "invalid" if value.match?(/[\r\n]/)
+        headers["X-Name"] = value''', (3,)),
+    Case('header_guard_reassignment', HEADER, r'''
+        value = params[:name]
+        return if value.match?(/[\r\n]/)
+        value = params[:other]
+        headers["X-Name"] = value''', (4,)),
+    Case('header_guard_after_write', HEADER, r'''
+        value = params[:name]
+        headers["X-Name"] = value
+        return if value.match?(/[\r\n]/)''', (2,)),
+    Case('header_safe_interpolation', HEADER, r'''
+        value = params[:name].delete("\r\n")
+        headers["Content-Disposition"] = "attachment; filename=#{value}"''', ()),
+    Case('header_concat_reintroduces_crlf', HEADER, r'''
+        value = params[:name].delete("\r\n")
+        headers["X-Name"] = value + "\r\nInjected: yes"''', (2,)),
+    Case('header_interpolation_reintroduces_crlf', HEADER, r'''
+        value = params[:name].delete("\r\n")
+        headers["X-Name"] = "#{value}\r\nInjected: yes"''', (2,)),
+    Case('header_concat_reintroduces_cr_only', HEADER, r'''
+        value = params[:name].delete("\r\n")
+        headers["X-Name"] = "prefix\r" + value''', (2,)),
+    Case('header_interpolation_reintroduces_lf_only', HEADER, r'''
+        value = params[:name].delete("\r\n")
+        headers["X-Name"] = "prefix\n#{value}"''', (2,)),
+    Case('header_nested_literal_interpolation', HEADER, r'''
+        value = params[:name].delete("\r\n")
+        headers["X-Name"] = "#{value}#{"\n"}"''', (2,)),
+    Case('header_composed_constant_suffix', HEADER, r'''
+        suffix = "\r" + "\nInjected: yes"
+        value = params[:name].delete("\r\n")
+        headers["X-Name"] = value + suffix''', (3,)),
+    Case('header_unresolved_literal_escape', HEADER, r'''
+        value = params[:name].delete("\r\n")
+        headers["X-Name"] = value + "\x0aInjected: yes"''', (2,)),
+    Case('header_controls_added_after_guard', HEADER, r'''
+        value = params[:name]
+        return if value.match?(/[\r\n]/)
+        headers["X-Name"] = "#{value}\rInjected: yes"''', (3,)),
+    Case('header_safe_concat', HEADER, r'''
+        value = params[:name].delete("\r\n")
+        headers["X-Name"] = "prefix" + value + ".txt"''', ()),
+    Case('header_sanitizer_inside_interpolation', HEADER,
+         r'headers["X-Name"] = "#{params[:name].delete("\r\n")}"', ()),
+    Case('header_sanitized_composite_value', HEADER, r'''
+        value = (params[:name] + "\r\n").delete("\r\n")
+        headers["X-Name"] = "prefix" + value''', ()),
+    Case('header_sanitized_constant_suffix', HEADER, r'''
+        suffix = "\r\n".delete("\r\n")
+        value = params[:name].delete("\r\n")
+        headers["X-Name"] = value + suffix''', ()),
+    Case('header_partly_sanitized_constant_suffix', HEADER, r'''
+        suffix = "\r\n".delete("\r")
+        value = params[:name].delete("\r\n")
+        headers["X-Name"] = value + suffix''', (3,)),
+    Case('header_single_quoted_suffix_is_safe', HEADER, r'''
+        value = params[:name].delete("\r\n")
+        headers["X-Name"] = value + '\r\n' ''', ()),
+    Case('header_single_quoted_interpolation_is_inert', HEADER, r'''
+        value = params[:name].delete("\r\n")
+        headers["X-Name"] = value + '#{params[:name]}' ''', ()),
+    Case('header_sanitize_after_reintroduction', HEADER, r'''
+        value = params[:name].delete("\r\n")
+        headers["X-Name"] = "#{value}\r\n".delete("\r\n")''', ()),
+    Case('header_interpolated_constant_suffix', HEADER, r'''
+        suffix = "#{"prefix"}\n"
+        value = params[:name].delete("\r\n")
+        headers["X-Name"] = value + suffix''', (3,)),
+    Case('header_url_encoding', HEADER,
+         'headers["X-Name"] = ERB::Util.url_encode(params[:name])', ()),
+    Case('header_shadowed_encoder', HEADER, '''
+        module CGI
+          def self.escape(raw)
+            raw
+          end
+        end
+        headers["X-Name"] = CGI.escape(params[:name])''', (6,)),
+    Case('header_sanitized_alias_mutation', HEADER, r'''
+        value = params[:name].delete("\r\n")
+        other = value
+        other << params[:suffix]
+        headers["X-Name"] = value''', (4,)),
+    Case('header_location_has_separate_rule', HEADER,
+         'response.headers["Location"] = params[:next]', ()),
+    Case('header_merge_preserves_non_location_values', HEADER, '''
+        headers.merge!({"Location" => url_from(params[:next]), "X-Name" => params[:name]})''', (1,)),
+    Case('header_source_suppression_keeps_flow', HEADER, '''
+        value = params[:name] # ubs:ignore ruby.header-injection.response
+        headers["X-Name"] = value''', (2,)),
+    Case('header_sink_suppression', HEADER,
+         'headers["X-Name"] = params[:name] # ubs:ignore ruby.header-injection.response', ()),
+    Case('header_lexical_decoy', HEADER,
+         '''text = 'headers["X-Name"] = params[:name]' ''', ()),
+)
+
+
+class RubyResponseHeaderFlowTests(LoggedCase):
+    def test_scoped_response_header_cases(self):
+        from ubs_core.ruby_detectors import response_header_injection
+
+        for case in HEADER_CASES:
+            with self.subTest(case=case.name):
+                issues = []
+                started = time.monotonic()
+                response_header_injection.analyze(case.source.splitlines(), issues, 'controller.rb')
+                (self.artifact / (case.name + '.json')).write_text(json.dumps({
+                    'case': case.name, 'source': case.source, 'expected_lines': case.lines,
+                    'source_sha256': hashlib.sha256(case.source.encode()).hexdigest(),
+                    'elapsed': time.monotonic() - started, 'findings': issues,
+                }, indent=2) + '\n')
+                self.assertEqual(tuple(row[1] for row in issues), case.lines, issues)
+
+    def test_self_receivers_and_request_cookies(self):
+        from ubs_core.ruby_detectors import response_header_injection
+
+        for source in ('self.response.headers["X-Name"] = request.cookies[:name]',
+                       'self.headers.store("X-Name", params[:name])'):
+            with self.subTest(source=source):
+                issues = []
+                response_header_injection.analyze([source], issues, 'controller.rb')
+                self.assertEqual(tuple(row[1] for row in issues), (1,), issues)
+
+    def test_detached_header_copies_are_not_response_writes(self):
+        from ubs_core.ruby_detectors import response_header_injection
+
+        for initializer in ('response.headers.dup', 'headers.clone', 'headers.merge({})'):
+            with self.subTest(initializer=initializer):
+                issues = []
+                source = f'copy = {initializer}\ncopy["X-Name"] = params[:name]'
+                response_header_injection.analyze(source.splitlines(), issues, 'controller.rb')
+                self.assertEqual(issues, [])
+
+    def test_malformed_and_expanded_inputs_are_incomplete(self):
+        from ubs_core.ruby_detectors import response_header_injection
+
+        for source in ('def show\nheaders["X-Name"] = params[:name]',
+                       'args = params[:args]\nresponse.set_header(*args)'):
+            with self.subTest(source=source), self.assertRaisesRegex(ValueError, 'incomplete'):
+                response_header_injection.analyze(source.splitlines(), [], 'controller.rb')
+
+    def test_detector_failure_preserves_findings_from_other_files(self):
+        from ubs_core import ruby_scan
+
+        bad = self.artifact / 'bad.rb'
+        good = self.artifact / 'good.rb'
+        bad.write_text('def show\nheaders["X-Name"] = params[:name]\n')
+        good.write_text('headers["X-Name"] = params[:name]\n')
+        sink, errors = io.StringIO(), []
+        ruby_scan.run_detectors([bad, good], sink, errors=errors)
+        self.assertTrue(any('response_header_injection' in error and 'incomplete' in error for error in errors), errors)
+        try:
+            rows = [json.loads(line) for line in sink.getvalue().splitlines()]
+        except json.JSONDecodeError as error:
+            self.fail(f'Ruby detector emitted invalid JSON: {error}')
+        self.assertEqual([(row['rule'], row['path'], row['line']) for row in rows], [(HEADER, str(good), 1)])
+        self.assertEqual(rows[0]['extras']['taint_path'][-1]['kind'], 'sink')
 
 
 class RubyOpenRedirectFlowTests(unittest.TestCase):

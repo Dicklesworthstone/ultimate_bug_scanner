@@ -1,6 +1,7 @@
 """Module-local call/return and recursive summary regressions."""
 import ast
 import unittest
+from unittest.mock import patch
 from test_taint_python_dataflow import SourceTest
 from ubs_core.analyzers import taint_py
 
@@ -674,6 +675,54 @@ class CallbackSummaryTests(SourceTest):
         engine.analyze()
         contexts = [key for key in engine.summaries if isinstance(key, tuple)]
         self.assertEqual(len(contexts), 1, contexts)
+
+    def test_first_namespace_publication_preserves_temporary_global_callbacks(self):
+        for initial, active, expected in [('print', 'eval', {'eval'}), ('eval', 'print', set())]:
+            with self.subTest(initial=initial, active=active):
+                source = (f'dispatch = {initial}\n'
+                          'def apply(value): return dispatch(value)\n'
+                          'saved = dispatch\n'
+                          f'dispatch = {active}\n'
+                          'apply(input())\n'
+                          'dispatch = saved\n')
+                engine = taint_py._Analysis(ast.parse(source))
+                effects = engine.analyze()
+                self.assertEqual({key[0] for key in effects}, expected)
+                contexts = [key[1] for key in engine.summaries if isinstance(key, tuple)]
+                self.assertEqual(contexts, [(('@global:dispatch', active),)])
+
+    def test_recursive_global_override_contexts_are_finite(self):
+        for initial, active, expected in [('print', 'eval', {'eval'}), ('eval', 'print', set()),
+                                           ('eval', 'None', set()), ('eval', 'unknown', set())]:
+            with self.subTest(initial=initial, active=active):
+                source = (f'dispatch = {initial}\n'
+                          'def forward(value):\n'
+                          '    if condition:\n'
+                          '        return forward(value)\n'
+                          '    return dispatch(value)\n'
+                          'saved = dispatch\n'
+                          f'dispatch = {active}\n'
+                          'forward(input())\n'
+                          'dispatch = saved\n')
+                engine = taint_py._Analysis(ast.parse(source))
+                initialize = taint_py._Flow.__init__
+                passes = []
+
+                def count_passes(flow, owner, scope):
+                    if isinstance(scope, ast.Module):
+                        passes.append(len(owner.summaries))
+                        # A duplicate global used to grow each recursive
+                        # context indefinitely. Fail deterministically rather
+                        # than hang the suite or impose a production depth cap.
+                        self.assertLess(len(passes), 30, passes)
+                    initialize(flow, owner, scope)
+
+                with patch.object(taint_py._Flow, '__init__', count_passes):
+                    effects = engine.analyze()
+                self.assertEqual({key[0] for key in effects}, expected)
+                contexts = [key[1] for key in engine.summaries if isinstance(key, tuple)]
+                binding = None if active in {'None', 'unknown'} else active
+                self.assertEqual(contexts, [(('@global:dispatch', binding),)])
 
     def test_cpython_callback_and_capture_oracles(self):
         cases = [

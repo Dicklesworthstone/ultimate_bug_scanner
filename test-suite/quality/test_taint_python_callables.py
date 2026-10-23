@@ -657,6 +657,60 @@ class BoundClassMethodFlowTests(SourceTest):
 
 @unittest.skipUnless(os.environ.get('UBS_TAINT_E2E') == '1', 'Set UBS_TAINT_E2E=1 for real CLI scans')
 class CallableCliTests(unittest.TestCase):
+    def test_settled_global_callable_is_visible_in_json_and_sarif(self):
+        source = '''import os
+def harmless(value):
+    return None
+def build():
+    callback = harmless
+    if condition:
+        callback = get_executor()
+    return callback
+def get_executor():
+    return os.system
+command = build()
+def handler():
+    command(input())
+'''
+        artifacts = ROOT / 'test-suite' / 'artifacts' / 'python-callable-effects'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        for name, text, expected in (
+            ('late-global-sink', source, True),
+            ('late-global-clean', source.replace('return os.system', 'return harmless'), False),
+            ('late-global-suppressed', source.replace('command(input())',
+                 'command(input())  # ubs:ignore[python.taint.command]'), False),
+        ):
+            with tempfile.TemporaryDirectory(prefix='ubs-global-callable-') as tmp:
+                target = Path(tmp) / 'route.py'
+                target.write_text(text, encoding='utf-8')
+                for output in ('json', 'sarif'):
+                    with self.subTest(case=name, format=output):
+                        result = subprocess.run(
+                            [str(ROOT / 'ubs'), str(target), '--only=python', '--ci',
+                             '--skip=1,2,3,4,5,6,8,9,10,11,12,13,14,15,16,17,18,19,20,21',
+                             f'--format={output}'],
+                            cwd=tmp, text=True, capture_output=True, timeout=90,
+                            env=dict(os.environ, UBS_NO_AUTO_UPDATE='1', UBS_NO_CACHE='1'))
+                        (artifacts / f'{name}-{output}.json').write_text(result.stdout, encoding='utf-8')
+                        (artifacts / f'{name}-{output}.stderr.log').write_text(result.stderr, encoding='utf-8')
+                        self.assertEqual(result.returncode, int(expected), result.stdout + result.stderr)
+                        report = json.loads(result.stdout)
+                        if output == 'json':
+                            self.assertEqual(report['status'], 'ok', report)
+                            findings = [(item['rule_id'], item['line']) for item in report.get('findings', [])
+                                        if item['rule_id'].startswith(('py.taint.', 'python.taint.'))]
+                            self.assertEqual(report['totals']['critical'], int(expected), report)
+                        else:
+                            self.assertEqual(report['version'], '2.1.0', report)
+                            self.assertTrue(report['runs'], report)
+                            findings = [(item['ruleId'], item['locations'][0]['physicalLocation']['region']['startLine'])
+                                        for run in report['runs'] for item in run.get('results', [])
+                                        if item['ruleId'].startswith(('py.taint.', 'python.taint.'))]
+                            self.assertFalse(any(invocation.get('executionSuccessful') is False
+                                                 for run in report['runs']
+                                                 for invocation in run.get('invocations', [])), report)
+                        self.assertEqual(findings, [('python.taint.command', 13)] if expected else [], report)
+
     def test_real_json_and_sarif_preserve_callable_flows_and_clean_controls(self):
         cases = (
             ('alias', 'run = eval if condition else print\nrun(input())\n', 'eval'),

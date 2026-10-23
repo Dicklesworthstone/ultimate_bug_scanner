@@ -12,6 +12,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Added
 
+- Elixir error handling now follows non-bang File results through local helpers,
+  bindings, branches, matches and synchronous callbacks. Discarded or overwritten
+  results produce `ex.error.unhandled-file-result`; correctly handled or returned
+  results stay clean. Unsupported result consumers, deferred callbacks and module
+  attribute storage report incomplete analysis instead of a successful clean scan.
+
 - Opt-in `UBS_KEEP_TEMP=1` retains scanner scratch across static Rust, Python,
   JavaScript/TypeScript, and Bash scans, including error paths and helper spill
   databases. Unsupported languages and cleanup-capable build, auditor, update,
@@ -22,6 +28,39 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Fixed
 
+- Python taint analysis deduplicates recursive context keys and preserves
+  explicit callable overrides, preventing non-converging self-scans. Allow-list
+  indexing and unchanged-global handling avoid repeated work; the whole-repo
+  latency target remains open.
+- Java/Kotlin SSRF checks follow request-derived destinations through local
+  helpers, branches, reassignments and JDK request-builder aliases. Scheme and
+  exact-host validation must protect the same URI/URL value; helper names and
+  unrelated checks confer no safety. Request bodies and headers stay separate
+  from destinations, builder copies and immutable requests retain their own
+  state, and Kotlin annotated parameters are recognized as sources. Unsupported
+  URI-template expansion and escaping builder state report incomplete analysis.
+- Python file checks recognize explicit cleanup of raw descriptors when the
+  same binding is closed immediately or by a guaranteed `finally` block.
+  Ownership registration requires a visible, earlier standard-library import;
+  unrelated, conditional and late cleanup imports cannot hide descriptor leaks.
+  Conditional cleanup, rebinding and exceptions before close remain reported.
+- Python taint analysis refreshes helper summaries when callable identities,
+  aliases, heap facts or reachability change without new scalar taint. Temporary
+  global callable replacements remain specific to their invocation even after
+  restoration, and unpublished module namespaces do not create redundant call
+  contexts. Syntax preparation also reuses each lexical scope walk.
+- Ruby response-header checks track scoped values, helpers, aliases and branches
+  through the shared flow engine. Safety requires actual CR/LF removal, verified
+  encoding or dominating rejection; later concatenation and interpolation
+  invalidate safety when they reintroduce controls. Local hashes and response
+  bodies stay separate from header sinks, findings retain source-to-sink traces,
+  and failed analysis reports partial results while preserving other findings.
+- Java/Kotlin response-header checks follow actual values, local helper returns,
+  assignments and reachable branches instead of trusting sanitizer names.
+  CR/LF safety requires complete removal, URL-component encoding or a dominating
+  rejection of both characters. Partial replacements, regex backreferences,
+  Kotlin template replacements and later control-character concatenation retain
+  findings; constant overwrites and verified safe values stay clean.
 - Python SQL analysis transfers immutable nonlocal cells through private list
   helpers, including recursive calls and exception prefixes. Calls before a
   helper is cleared in `finally` retain the executed definition's identity;

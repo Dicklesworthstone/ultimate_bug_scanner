@@ -28,7 +28,8 @@ or ``.open()`` on a path — that is not managed, where managed means any of:
 - it is assigned to a name (or attribute) that has ``.close()`` called on it
   somewhere in the file;
 - an integer descriptor from resolved ``os.open`` is immediately registered
-  with a live ``ExitStack`` or transferred to a resolved ``os.fdopen`` context.
+  with a live ``ExitStack``, transferred to a resolved ``os.fdopen`` context,
+  or closed by an immediate ``os.close`` or an unconditional ``finally``.
 
 Passing the handle straight to another call does *not* manage it:
 ``json.load(open(p))`` leaks the file object and is still reported. The
@@ -104,16 +105,30 @@ def _owned_descriptors(tree: ast.AST) -> tuple[set[int], set[int]]:
     """
     nodes = tuple(ast.walk(tree))
     parents = {child: parent for parent in nodes for child in ast.iter_child_nodes(parent)}
+    scope_types = (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+    pattern_bindings = tuple(getattr(ast, kind) for kind in ('MatchAs', 'MatchStar', 'MatchMapping')
+                             if hasattr(ast, kind))
+
+    def scope_of(node):
+        parent = parents.get(node)
+        while parent is not None and not isinstance(parent, scope_types):
+            parent = parents.get(parent)
+        return parent
+
     aliases: dict[str, str] = {}
+    imports: dict[str, list[ast.AST]] = {}
     for node in nodes:
         if isinstance(node, ast.Import):
             for name in node.names:
                 if name.name in {'os', 'contextlib'}:
                     aliases[name.asname or name.name] = name.name
-        elif isinstance(node, ast.ImportFrom) and node.module in {'os', 'contextlib'}:
+                    imports.setdefault(name.asname or name.name, []).append(node)
+        elif (isinstance(node, ast.ImportFrom) and not node.level
+              and node.module in {'os', 'contextlib'}):
             for name in node.names:
                 if name.name in {'open', 'close', 'fdopen', 'ExitStack'}:
                     aliases[name.asname or name.name] = f'{node.module}.{name.name}'
+                    imports.setdefault(name.asname or name.name, []).append(node)
 
     def root_name(node):
         while isinstance(node, ast.Attribute):
@@ -128,6 +143,11 @@ def _owned_descriptors(tree: ast.AST) -> tuple[set[int], set[int]]:
             invalid.add(node.arg)
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             invalid.add(node.name)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            invalid.add(node.name)
+        elif isinstance(node, pattern_bindings):
+            invalid.update(name for name in (getattr(node, 'name', None), getattr(node, 'rest', None))
+                           if name)
         elif isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
             invalid.add(root_name(node))
         elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in {
@@ -135,8 +155,11 @@ def _owned_descriptors(tree: ast.AST) -> tuple[set[int], set[int]]:
             invalid.update(aliases)
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
             for name in node.names:
+                if name.name == '*':
+                    invalid.update(aliases)
                 local = name.asname or name.name.split('.')[0]
-                actual = name.name if isinstance(node, ast.Import) else f'{node.module}.{name.name}'
+                actual = (name.name if isinstance(node, ast.Import)
+                          else '.' * node.level + f'{node.module}.{name.name}')
                 if local in aliases and aliases[local] != actual:
                     invalid.add(local)
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in aliases:
@@ -152,7 +175,24 @@ def _owned_descriptors(tree: ast.AST) -> tuple[set[int], set[int]]:
 
     def qualified(node):
         if isinstance(node, ast.Name):
-            return aliases.get(node.id, '')
+            # An import in another function or an unexecuted branch cannot
+            # establish cleanup. Function bodies also cannot see class locals.
+            owner = scope_of(node)
+            scope = owner
+            while scope is not None:
+                if not isinstance(scope, ast.ClassDef) or scope is owner:
+                    local_imports = [origin for origin in imports.get(node.id, ())
+                                     if scope_of(origin) is scope]
+                    if local_imports:
+                        # A later or conditional function-local import still
+                        # shadows an earlier import in an enclosing scope.
+                        if any(parents.get(origin) is scope
+                               and (origin.lineno, origin.col_offset) < (node.lineno, node.col_offset)
+                               for origin in local_imports):
+                            return aliases.get(node.id, '')
+                        return ''
+                scope = scope_of(scope)
+            return ''
         if isinstance(node, ast.Attribute):
             base = qualified(node.value)
             return f'{base}.{node.attr}' if base else ''
@@ -207,11 +247,74 @@ def _owned_descriptors(tree: ast.AST) -> tuple[set[int], set[int]]:
                 yield from statement_blocks(value)
 
     def allocation_name(statement):
-        if (isinstance(statement, ast.Assign) and len(statement.targets) == 1
-                and isinstance(statement.targets[0], ast.Name)
-                and id(statement.value) in descriptors):
-            return statement.targets[0].id
+        target = None
+        if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+            target = statement.targets[0]
+        elif (isinstance(statement, ast.AnnAssign)
+              and isinstance(scope_of(statement), (ast.FunctionDef, ast.AsyncFunctionDef))):
+            # Local variable annotations are not evaluated. Module/class
+            # annotations can run code before the following cleanup begins.
+            target = statement.target
+        if isinstance(target, ast.Name) and id(statement.value) in descriptors:
+            return target.id
         return ''
+
+    def closes(statement, name):
+        call = statement.value if isinstance(statement, ast.Expr) else None
+        return (isinstance(call, ast.Call) and qualified(call.func) == 'os.close'
+                and len(call.args) == 1 and not call.keywords
+                and isinstance(call.args[0], ast.Name) and call.args[0].id == name)
+
+    def stable_binding(allocation, name, statements):
+        # A captured/global binding or frame-dictionary write may change the
+        # descriptor behind an otherwise unmodified local name.
+        owner = scope_of(allocation)
+        for child in ast.walk(owner):
+            if isinstance(child, ast.Nonlocal) and name in child.names:
+                return False
+            if (isinstance(child, ast.Global) and name in child.names
+                    and (isinstance(owner, ast.Module) or scope_of(child) is owner)):
+                return False
+            if isinstance(child, ast.Attribute) and child.attr in {'f_locals', 'f_globals', '__globals__'}:
+                return False
+        for statement in statements:
+            for child in ast.walk(statement):
+                if (isinstance(child, ast.Name) and child.id == name
+                        and isinstance(child.ctx, (ast.Store, ast.Del))):
+                    return False
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and child.name == name:
+                    return False
+                if isinstance(child, ast.ExceptHandler) and child.name == name:
+                    return False
+                if isinstance(child, (ast.Import, ast.ImportFrom)) and any(
+                        (alias.asname or alias.name.split('.')[0]) == name for alias in child.names):
+                    return False
+                if (isinstance(child, pattern_bindings)
+                        and name in (getattr(child, 'name', None), getattr(child, 'rest', None))):
+                    return False
+        return True
+
+    def finally_closes(allocation, statement, *, inside=False):
+        name = allocation_name(allocation)
+        if not (name and isinstance(statement, ast.Try) and statement.finalbody
+                and closes(statement.finalbody[0], name)):
+            return False
+        body = statement.body[1:] if inside else statement.body
+        return stable_binding(allocation, name, (*body, *statement.handlers, *statement.orelse))
+
+    # Only an immediate close or a first, unconditional finally close proves
+    # cleanup. Calls before close can raise; rebinding the integer closes a
+    # different resource. Each allocation keeps its own ownership obligation.
+    for parent in nodes:
+        for _, block in ast.iter_fields(parent):
+            if not isinstance(block, list) or not all(isinstance(child, ast.stmt) for child in block):
+                continue
+            for allocation, following in zip(block, block[1:]):
+                name = allocation_name(allocation)
+                if name and (closes(following, name) or finally_closes(allocation, following)):
+                    managed.add(id(allocation.value))
+        if isinstance(parent, ast.Try) and parent.body and finally_closes(parent.body[0], parent, inside=True):
+            managed.add(id(parent.body[0].value))
 
     # fdopen takes ownership only when closefd is true. Require an immediate
     # first context expression with inert arguments: an earlier context or a

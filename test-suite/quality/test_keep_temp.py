@@ -186,6 +186,41 @@ def is_wrapper_exec(line: str) -> bool:
             and words[1] == '"bash"' and words[2] == json.dumps(str(ROOT / "ubs")))
 
 
+def open_process_descriptor(pid: int) -> int:
+    """Use a real Linux pidfd even when managed Python omits its binding."""
+    if hasattr(os, "pidfd_open"):
+        return os.pidfd_open(pid)
+    library = ctypes.CDLL(None, use_errno=True)
+    try:
+        call = library.pidfd_open
+    except AttributeError as exc:
+        raise RuntimeError("genuine interrupt check requires Linux pidfd_open") from exc
+    call.argtypes = [ctypes.c_int, ctypes.c_uint]
+    call.restype = ctypes.c_int
+    descriptor = call(pid, 0)
+    if descriptor == -1:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return descriptor
+
+
+def signal_process_descriptor(descriptor: int, signum: int) -> None:
+    """Signal the opened process identity; never fall back to a numeric PID."""
+    if hasattr(signal, "pidfd_send_signal"):
+        signal.pidfd_send_signal(descriptor, signum)
+        return
+    library = ctypes.CDLL(None, use_errno=True)
+    try:
+        call = library.pidfd_send_signal
+    except AttributeError as exc:
+        raise RuntimeError("genuine interrupt check requires Linux pidfd_send_signal") from exc
+    call.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint]
+    call.restype = ctypes.c_int
+    if call(descriptor, signum, None, 0) == -1:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
 def interrupt_live_analyzer(process: subprocess.Popen, run: Path) -> dict:
     """Signal only the owned wrapper after a real JS analyzer exec is observed."""
     offsets: dict[Path, int] = {}
@@ -207,20 +242,20 @@ def interrupt_live_analyzer(process: subprocess.Popen, run: Path) -> dict:
                         try:
                             status = Path(f"/proc/{pid}/status").read_text()
                             if re.search(rf"^PPid:\s+{process.pid}$", status, re.MULTILINE):
-                                wrapper_fd = os.pidfd_open(pid)
+                                wrapper_fd = open_process_descriptor(pid)
                                 evidence["wrapper_pid"] = pid
                         except (FileNotFoundError, ProcessLookupError):
                             continue  # The observed process already exited.
                     if '"ubs_core.js_scan"' in line:
                         evidence["analyzer_pid"] = pid
             if wrapper_fd is not None and evidence["analyzer_pid"] is not None:
-                signal.pidfd_send_signal(wrapper_fd, signal.SIGINT)
+                signal_process_descriptor(wrapper_fd, signal.SIGINT)
                 evidence["sent"] = True
                 return evidence
             if time.monotonic() >= deadline:
                 if wrapper_fd is None:
                     raise AssertionError("no owned UBS wrapper observed before interrupt deadline")
-                signal.pidfd_send_signal(wrapper_fd, signal.SIGTERM)
+                signal_process_descriptor(wrapper_fd, signal.SIGTERM)
                 evidence["deadline_termination"] = True
                 return evidence
             time.sleep(0.05)
@@ -389,10 +424,11 @@ class KeepTempCliTests(unittest.TestCase):
         started = time.monotonic()
         interrupt_evidence = None
         if interrupt:
-            if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
-                raise AssertionError("genuine interrupt check requires Linux pidfd support")
-            probe = os.pidfd_open(os.getpid())
-            os.close(probe)  # Capability check only; no signal or deletion probe.
+            probe = open_process_descriptor(os.getpid())
+            try:
+                signal_process_descriptor(probe, 0)  # Check permission; deliver no signal.
+            finally:
+                os.close(probe)
             # Persistent streams also retain diagnostics if observation itself
             # raises, and cannot block a real analyzer on a full capture pipe.
             with (run / "stdout.json").open("w", encoding="utf-8") as stdout_file, \

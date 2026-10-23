@@ -810,16 +810,19 @@ def check_inline_suppression_alias_shell_guard(tmpdir: Path) -> None:
     assert samples(module.stdout) == expected, details
 
     # Keep the whole production function, including its SINGLE_FILE_TARGET
-    # grep optimization. Only need_cmd's command lookup is supplied by this
-    # wrapper; the actual helper import, Rust language, stdin and filesystem
+    # grep optimization and its actual cleanup dependency. Only need_cmd's
+    # lookup is supplied here; the helper import, Rust language and filesystem
     # source all reach the production path.
     runner_source = UBS_BIN.read_text(encoding="utf-8")
+    cleanup = re.search(r"^ubs_remove_temp\(\)\{\n.*?^\}\n", runner_source, re.M | re.S)
+    assert cleanup is not None, "production cleanup function not found"
     function = "apply_inline_suppressions(){" + runner_source.split(
         "apply_inline_suppressions(){", 1,
     )[1].split("\nshould_verify_module_path(){", 1)[0]
     wrapper = root / "inline_wrapper.sh"
     wrapper.write_text(
         'set -e\nneed_cmd(){ command -v "$1" >/dev/null; }\n'
+        + 'UBS_KEEP_TEMP="${UBS_KEEP_TEMP:-0}"\n' + cleanup.group(0)
         + function
         + '\nMODULE_DIR="$1"\nSINGLE_FILE_TARGET="$2"\napply_inline_suppressions rust\n',
         encoding="utf-8",

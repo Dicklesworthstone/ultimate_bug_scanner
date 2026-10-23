@@ -28,6 +28,11 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Fixed
 
+- Python file checks recognize explicit cleanup of raw descriptors when the
+  same binding is closed immediately or by a guaranteed `finally` block.
+  Ownership registration requires a visible, earlier standard-library import;
+  unrelated, conditional and late cleanup imports cannot hide descriptor leaks.
+  Conditional cleanup, rebinding and exceptions before close remain reported.
 - Python taint analysis refreshes helper summaries when callable identities,
   aliases, heap facts or reachability change without new scalar taint. Temporary
   global callable replacements remain specific to their invocation even after

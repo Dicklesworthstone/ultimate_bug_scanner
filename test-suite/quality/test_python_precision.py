@@ -884,6 +884,108 @@ class OpenMissingWithTests(unittest.TestCase):
             with self.subTest(source=unsafe):
                 self.assertEqual(len(run_detector(io_open_checks, {'unsafe.py': unsafe})), 1)
 
+    def test_raw_descriptor_explicit_cleanup_preserves_real_leaks(self) -> None:
+        cases = (
+            ('adjacent_close', 'fd = os.open(path, 0)\nos.close(fd)\n', ()),
+            ('annotated_close', 'fd: int = os.open(path, 0)\nos.close(fd)\n', ()),
+            ('finally_close', 'fd = os.open(path, 0)\ntry:\n    consume(fd)\nfinally:\n    os.close(fd)\n', ()),
+            ('finally_annotated', 'fd: int = os.open(path, 0)\ntry:\n    return os.read(fd, 10)\nfinally:\n    os.close(fd)\n', ()),
+            ('allocate_in_try', 'try:\n    fd = os.open(path, 0)\n    consume(fd)\nfinally:\n    os.close(fd)\n', ()),
+            ('exception_before_finally', 'fd = os.open(path, 0)\ntry:\n    raise ValueError("failed")\nexcept ValueError:\n    return\nfinally:\n    os.close(fd)\n', ()),
+            ('after_cleanup_can_raise', 'fd = os.open(path, 0)\ntry:\n    consume(fd)\nfinally:\n    os.close(fd)\n    may_raise()\n', ()),
+            ('borrowed_wrapper', 'fd = os.open(path, 0)\ntry:\n    with os.fdopen(fd, "rb", closefd=False) as handle:\n        consume(handle)\nfinally:\n    os.close(fd)\n', ()),
+            ('copied_value_keeps_original', 'fd = os.open(path, 0)\ntry:\n    captured = fd\n    consume(captured)\nfinally:\n    os.close(fd)\n', ()),
+            ('conditional_close', 'fd = os.open(path, 0)\nif ready:\n    os.close(fd)\n', (3,)),
+            ('conditional_finally', 'fd = os.open(path, 0)\ntry:\n    consume(fd)\nfinally:\n    if ready:\n        os.close(fd)\n', (3,)),
+            ('wrong_descriptor', 'fd = os.open(path, 0)\ntry:\n    consume(fd)\nfinally:\n    os.close(other)\n', (3,)),
+            ('reassigned_descriptor', 'fd = os.open(path, 0)\ntry:\n    fd = other\nfinally:\n    os.close(fd)\n', (3,)),
+            ('exception_rebinds_descriptor', 'fd = os.open(path, 0)\ntry:\n    consume(fd)\nexcept Exception as fd:\n    pass\nfinally:\n    os.close(fd)\n', (3,)),
+            ('import_rebinds_descriptor', 'fd = os.open(path, 0)\ntry:\n    from application import fd\nfinally:\n    os.close(fd)\n', (3,)),
+            ('pattern_rebinds_descriptor', 'fd = os.open(path, 0)\ntry:\n    match other:\n        case fd:\n            pass\nfinally:\n    os.close(fd)\n', (3,)),
+            ('pattern_star_rebinds_descriptor', 'fd = os.open(path, 0)\ntry:\n    match other:\n        case [*fd]:\n            pass\nfinally:\n    os.close(fd)\n', (3,)),
+            ('pattern_mapping_rebinds_descriptor', 'fd = os.open(path, 0)\ntry:\n    match other:\n        case {"key": value, **fd}:\n            pass\nfinally:\n    os.close(fd)\n', (3,)),
+            ('raise_before_cleanup', 'fd = os.open(path, 0)\ntry:\n    consume(fd)\nfinally:\n    may_raise()\n    os.close(fd)\n', (3,)),
+            ('captured_original_leaks', 'fd = os.open(path, 0)\ntry:\n    captured = fd\n    fd = other\nfinally:\n    os.close(fd)\n', (3,)),
+            ('only_second_allocation_closed', 'first = os.open(path, 0)\nfd = os.open(path, 0)\nos.close(fd)\n', (3,)),
+            ('borrowed_wrapper_leaks', 'fd = os.open(path, 0)\nwith os.fdopen(fd, "rb", closefd=False) as handle:\n    consume(handle)\n', (3,)),
+            ('closure_rebinds_descriptor', 'fd = -1\ndef replace():\n    nonlocal fd\n    fd = other\nfd = os.open(path, 0)\ntry:\n    replace()\nfinally:\n    os.close(fd)\n', (7,)),
+            ('frame_rebinds_descriptor', 'fd = os.open(path, 0)\ntry:\n    frame.f_locals["fd"] = other\nfinally:\n    os.close(fd)\n', (3,)),
+        )
+        for name, body, expected in cases:
+            source = ('import os\ndef operation(path, other, ready):\n'
+                      + textwrap.indent(body, '    '))
+            with self.subTest(case=name):
+                hits = run_detector(io_open_checks, {name + '.py': source})
+                self.assertEqual(tuple(row[1] for row in hits), expected, hits)
+
+    def test_explicit_descriptor_cleanup_resolves_imports(self) -> None:
+        for imports, allocate, release in (
+            ('import os', 'os.open', 'os.close'),
+            ('import os as posix', 'posix.open', 'posix.close'),
+            ('from os import open as allocate, close as release', 'allocate', 'release'),
+        ):
+            for cleanup in ('{release}(fd)\n',
+                            'try:\n    consume(fd)\nfinally:\n    {release}(fd)\n'):
+                source = (imports + '\ndef operation(path):\n'
+                          f'    fd = {allocate}(path, 0)\n'
+                          + textwrap.indent(cleanup.format(release=release), '    '))
+                with self.subTest(imports=imports, cleanup=cleanup):
+                    self.assertEqual(run_detector(io_open_checks, {'owned.py': source}), [])
+        shadowed = ('import os\nos.close = unknown\ndef operation(path):\n'
+                    '    fd = os.open(path, 0)\n'
+                    '    try:\n        consume(fd)\n    finally:\n        os.close(fd)\n')
+        self.assertEqual(tuple(row[1] for row in run_detector(io_open_checks, {'shadowed.py': shadowed})), (4,))
+
+    def test_descriptor_import_order_on_one_line(self) -> None:
+        for imports, allocate, release in (
+            ('import os', 'os.open', 'os.close'),
+            ('import os as posix', 'posix.open', 'posix.close'),
+            ('from os import open as allocate, close as release', 'allocate', 'release'),
+        ):
+            for cleanup, expected in ((f'{release}(fd)', ()), ('fd.close()', (1,))):
+                source = f'{imports}; fd = {allocate}(path, 0); {cleanup}\n'
+                with self.subTest(imports=imports, cleanup=cleanup):
+                    hits = run_detector(io_open_checks, {'one_line.py': source})
+                    self.assertEqual(tuple(row[1] for row in hits), expected, hits)
+
+    def test_descriptor_cleanup_import_must_be_visible_and_executed(self) -> None:
+        cases = (
+            ('unrelated_function', 'def unrelated():\n    from os import close as release\n', '', (6,)),
+            ('conditional_import', 'if False:\n    from os import close as release\n', '', (6,)),
+            ('unrelated_class', 'class Other:\n    from os import close as release\n', '', (6,)),
+            ('local_import', '', '    from os import close as release\n', ()),
+        )
+        for name, before, local, expected in cases:
+            source = ('import os, contextlib\n' + before + 'def operation(path):\n' + local
+                      + '    with contextlib.ExitStack() as resources:\n'
+                      '        fd = os.open(path, 0)\n'
+                      '        resources.callback(release, fd)\n')
+            with self.subTest(case=name):
+                hits = run_detector(io_open_checks, {name + '.py': source})
+                self.assertEqual(tuple(row[1] for row in hits), expected, hits)
+        late = ('import os, contextlib\ndef operation(path):\n'
+                '    with contextlib.ExitStack() as resources:\n'
+                '        fd = os.open(path, 0)\n'
+                '        resources.callback(release, fd)\n'
+                '    from os import close as release\n')
+        self.assertEqual(tuple(row[1] for row in run_detector(io_open_checks, {'late.py': late})), (4,))
+
+    def test_descriptor_cleanup_rejects_shadowed_closer(self) -> None:
+        cases = (
+            ('late_local_shadow', 'def work(path):\n    with contextlib.ExitStack() as stack:\n        fd = os.open(path, 0)\n        stack.callback(release, fd)\n    from os import close as release\n', 5),
+            ('conditional_local_shadow', 'def work(path):\n    if False:\n        from os import close as release\n    with contextlib.ExitStack() as stack:\n        fd = os.open(path, 0)\n        stack.callback(release, fd)\n', 7),
+            ('exception_capture', 'def work(path):\n    try:\n        raise ValueError()\n    except Exception as release:\n        with contextlib.ExitStack() as stack:\n            fd = os.open(path, 0)\n            stack.callback(release, fd)\n', 8),
+            ('match_capture', 'def work(path, other):\n    match other:\n        case release:\n            with contextlib.ExitStack() as stack:\n                fd = os.open(path, 0)\n                stack.callback(release, fd)\n', 7),
+            ('star_capture', 'def work(path, other):\n    match other:\n        case [*release]:\n            with contextlib.ExitStack() as stack:\n                fd = os.open(path, 0)\n                stack.callback(release, fd)\n', 7),
+            ('mapping_capture', 'def work(path, other):\n    match other:\n        case {"key": value, **release}:\n            with contextlib.ExitStack() as stack:\n                fd = os.open(path, 0)\n                stack.callback(release, fd)\n', 7),
+            ('star_import', 'from unknown import *\nwith contextlib.ExitStack() as stack:\n    fd = os.open(path, 0)\n    stack.callback(release, fd)\n', 5),
+        )
+        for name, body, line in cases:
+            source = 'import os, contextlib\nfrom os import close as release\n' + body
+            with self.subTest(case=name):
+                hits = run_detector(io_open_checks, {name + '.py': source})
+                self.assertEqual(tuple(row[1] for row in hits), (line,), hits)
+
 
 # ─────────────────────── json.loads without a handler ───────────────────────
 class OpenNoEncodingCalleeTests(unittest.TestCase):

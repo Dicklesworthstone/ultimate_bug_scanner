@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -508,6 +509,13 @@ class SQLValueCaptureTests(unittest.TestCase):
             ('captured-value', '    query = f"SELECT {user}"\n    pending = (item for item in [query])\n    query = "SELECT 1"\n    cursor.execute(next(pending))\n', ((CRITICAL, 5),)),
             ('filtered-value', '    pending = (f"SELECT {user}" for item in [1] if False)\n    cursor.execute(next(pending, "SELECT 1"))\n', ()),
             ('parser-index', '    index = next((i for i in range(len(rows)) if rows[i].value == "="), None)\n    return index\n', ()),
+            # Repeated read-only projection is supported; discarded SQL text
+            # is not a sink, and later yields must retain their current risk.
+            ('repeated-unused', '    pending = (f"SELECT {user}" for item in rows)\n    next(pending)\n    next(pending)\n', ()),
+            ('repeated-unsafe', '    pending = (f"SELECT {user}" for item in [1, 2])\n    next(pending)\n    cursor.execute(next(pending))\n', ((CRITICAL, 4),)),
+            ('repeated-safe', '    pending = ("SELECT 1" for item in [1, 2])\n    next(pending)\n    cursor.execute(next(pending))\n', ()),
+            ('repeated-late-unsafe', '    query = "SELECT 1"\n    pending = (query for item in [1, 2])\n    next(pending)\n    query = f"SELECT {user}"\n    cursor.execute(next(pending))\n', ((CRITICAL, 6),)),
+            ('repeated-late-safe', '    query = f"SELECT {user}"\n    pending = (query for item in [1, 2])\n    next(pending)\n    query = "SELECT 1"\n    cursor.execute(next(pending))\n', ()),
         )
         for name, body, expected in cases:
             with self.subTest(case=name):
@@ -518,7 +526,6 @@ class SQLValueCaptureTests(unittest.TestCase):
             '    pending = ((query := f"SELECT {user}") for item in rows)\n    next(pending, None)\n',
             '    pending = (cursor.execute(f"SELECT {user}") for item in rows)\n    next(pending, None)\n',
             '    pending = (f"SELECT {user}" for item in rows)\n    next(pending)\n    list(pending)\n',
-            '    pending = (f"SELECT {user}" for item in rows)\n    next(pending)\n    next(pending)\n',
             '    pending = (f"SELECT {user}" for item in rows)\n    next = unknown\n    next(pending)\n',
             '    pending = (f"SELECT {user}" for item in rows)\n    alias = pending\n    next(pending)\n    tuple(alias)\n',
             '    other = (f"SELECT {user}" for item in rows)\n    pending = (list(other) for item in [1])\n    next(pending)\n',
@@ -544,7 +551,7 @@ class SQLValueCaptureTests(unittest.TestCase):
             with self.subTest(case=name):
                 source = program(f'    return cursor.execute({expression}).fetchone()[0]\n')
                 namespace = {}
-                exec(compile(source, '<test-authored-next>', 'exec'), namespace)
+                exec(compile(source, '<test-authored-next>', 'exec'), namespace)  # ubs:ignore[py.security.eval-exec-usage,py.eval-exec] Only literal test-authored source; no external input.
                 with closing(sqlite3.connect(':memory:')) as connection:
                     connection.execute('CREATE TABLE users(name TEXT)')
                     connection.executemany('INSERT INTO users VALUES (?)', [('alice',), ('bob',)])
@@ -798,6 +805,10 @@ class SQLValueCaptureTests(unittest.TestCase):
             ('filtered', f'    query = {unsafe}\n    pending = ((query := {fixed}) for item in [1] if False)\n    list(pending)\n    return cursor.execute(query).fetchone()[0]\n', 2, ((CRITICAL, 5),)),
             ('closed', f'    query = {unsafe}\n    pending = ((query := {fixed}) for item in [1])\n    pending.close()\n    list(pending)\n    return cursor.execute(query).fetchone()[0]\n', 2, ((CRITICAL, 6),)),
             ('next-value', f'    pending = ({unsafe} for item in [1])\n    return cursor.execute(next(pending)).fetchone()[0]\n', 2, ((CRITICAL, 3),)),
+            ('next-repeated-unsafe', f'    pending = ({unsafe} for item in [1, 2])\n    next(pending)\n    return cursor.execute(next(pending)).fetchone()[0]\n', 2, ((CRITICAL, 4),)),
+            ('next-repeated-safe', f'    pending = ({fixed} for item in [1, 2])\n    next(pending)\n    return cursor.execute(next(pending)).fetchone()[0]\n', 1, ()),
+            ('next-repeated-late-unsafe', f'    query = {fixed}\n    pending = (query for item in [1, 2])\n    next(pending)\n    query = {unsafe}\n    return cursor.execute(next(pending)).fetchone()[0]\n', 2, ((CRITICAL, 6),)),
+            ('next-repeated-late-safe', f'    query = {unsafe}\n    pending = (query for item in [1, 2])\n    next(pending)\n    query = {fixed}\n    return cursor.execute(next(pending)).fetchone()[0]\n', 1, ()),
             ('next-empty-default', f'    pending = ({fixed} for item in [])\n    return cursor.execute(next(pending, {unsafe})).fetchone()[0]\n', 2, ((CRITICAL, 3),)),
             ('next-parameterized', '    pending = ("SELECT count(*) FROM users WHERE name = ?" for item in [1])\n    return cursor.execute(next(pending), (user,)).fetchone()[0]\n', 0, ()),
             ('unpack-value', f'    query, = ({unsafe} for item in [1])\n    return cursor.execute(query).fetchone()[0]\n', 2, ((CRITICAL, 3),)),

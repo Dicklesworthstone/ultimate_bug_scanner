@@ -78,9 +78,9 @@ class SSRFEngine(RedirectEngine):
                                                if ANNOTATED_PARAM_RE.search(self.code[low:high]))
         self.active_state = None
         self.non_http = frozenset()
-        if path.suffix.lower() == '.java' and re.search(r'\.\s*execute\s*\(', self.code):
+        if path.suffix.lower() in {'.java', '.kt', '.kts'} and re.search(r'\.\s*execute\s*\(', self.code):
             from ubs_core.analyzers.taint_java_sql import non_http_execute_sites
-            self.non_http = non_http_execute_sites(text)
+            self.non_http = non_http_execute_sites(text, kotlin=path.suffix.lower() in {'.kt', '.kts'})
 
     @staticmethod
     def data(value):

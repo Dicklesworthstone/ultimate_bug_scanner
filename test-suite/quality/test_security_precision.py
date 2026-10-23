@@ -513,6 +513,139 @@ class JVMArchiveDataflowTests(unittest.TestCase):
                                     self.assertTrue(all(item.get("executionSuccessful") is not False for item in invocations), context)
 
 
+@unittest.skipUnless(os.environ.get("UBS_SPRING_SQL_E2E") == "1",
+                     "set UBS_SPRING_SQL_E2E=1 for actual Spring SQL CLI scans")
+class SpringSqlPublicTests(unittest.TestCase):
+    """The SQL text and bound values have different roles at Spring sinks."""
+
+    @classmethod
+    def setUpClass(cls):
+        artifacts = REPO_ROOT / "test-suite" / "artifacts" / "spring-sql-public"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        cls.root = Path(tempfile.mkdtemp(prefix="run-", dir=artifacts))
+
+    @staticmethod
+    def programs(language, clean):
+        fixtures = (
+            ("ListProbe", "org.springframework.jdbc.core.JdbcOperations",
+             'jdbc.queryForList(sql, request.getParameter("id"));',
+             '"SELECT id FROM users WHERE id = ?"'),
+            ("NamedProbe", "org.springframework.jdbc.core.namedparam.NamedParameterJdbcOperations",
+             'jdbc.queryForList(sql, java.util.Map.of("id", request.getParameter("id")));',
+             '"SELECT id FROM users WHERE id = :id"'),
+            ("ExecuteProbe", "org.springframework.jdbc.core.JdbcTemplate",
+             'jdbc.execute(sql);', '"CREATE TABLE example (id integer)"'),
+        )
+        result = []
+        for name, api, call, literal in fixtures:
+            value = literal if clean else 'request.getParameter("query")'
+            imports = 'import jakarta.servlet.http.HttpServletRequest;\nimport ' + api + ';\n'
+            receiver = api.rsplit(".", 1)[-1]
+            if language == "java":
+                text = (imports + 'class ' + name + ' {\n'
+                        '  void run(HttpServletRequest request, ' + receiver + ' jdbc) {\n'
+                        '    String sql = ' + value + ';\n    ' + call + '\n  }\n}\n')
+                suffix, line = ".java", 6
+            else:
+                text = (imports + 'fun run(request: HttpServletRequest, jdbc: ' + receiver + ') {\n'
+                        '    val sql = ' + value + ';\n    ' + call + '\n}\n')
+                suffix, line = ".kt", 5
+            result.append((name + suffix, text, line))
+        return result
+
+    def test_module_and_runner_exact_sql_sites_and_partial_results(self):
+        for language in ("java", "kotlin"):
+            rule = language + ".security.sql-injection"
+            for label in ("unsafe", "clean", "partial"):
+                directory = self.root / (language + "-" + label)
+                directory.mkdir()
+                programs = self.programs(language, label == "clean")
+                expected = [] if label == "clean" else sorted(
+                    (name, rule, line, 5, "critical") for name, _text, line in programs)
+                for name, source, _line in programs:
+                    (directory / name).write_text(source, encoding="utf-8")
+                if label == "partial":
+                    # A broken selected neighbor must not erase the three
+                    # independently supported findings or claim a clean scan.
+                    suffix = ".java" if language == "java" else ".kt"
+                    broken = programs[0][1].replace("ListProbe", "Broken") + "{\n"
+                    (directory / ("Broken" + suffix)).write_text(broken, encoding="utf-8")
+                env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", UBS_NO_AUTO_UPDATE="1",
+                           UBS_ENABLE_AUTO_UPDATE="0", UBS_NO_CACHE="1", ENABLE_UV_TOOLS="0",
+                           CI="1", NO_COLOR="1", UBS_CACHE_DIR=str(directory / "cache"),
+                           XDG_CACHE_HOME=str(directory / "xdg-cache"),
+                           XDG_CONFIG_HOME=str(directory / "config"), XDG_DATA_HOME=str(directory / "data"))
+                for surface in ("module", "runner"):
+                    for format_ in ("json", "sarif"):
+                        case = "-".join((language, label, surface, format_))
+                        with self.subTest(case=case):
+                            entry = (REPO_ROOT / "modules" / ("ubs-" + language + ".sh")
+                                     if surface == "module" else REPO_ROOT / "ubs")
+                            selection = ("--only=" + ("4" if language == "java" else "13")
+                                         if surface == "module" else "--only=" + language)
+                            command = ["bash", str(entry), selection, "--format=" + format_, "--ci", str(directory)]
+                            print("[spring-sql-" + case + "] RUN", flush=True)
+                            started = time.monotonic()
+                            proc = subprocess.run(command, cwd=directory, env=env, capture_output=True,
+                                                  text=True, timeout=180)
+                            elapsed = time.monotonic() - started
+                            output = directory / (surface + "-" + format_)
+                            output.with_suffix(".stdout").write_text(proc.stdout, encoding="utf-8")
+                            output.with_suffix(".stderr").write_text(proc.stderr, encoding="utf-8")
+                            sources = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                                       for path in directory.glob("*.java" if language == "java" else "*.kt")}
+                            tools = {path: hashlib.sha256((REPO_ROOT / path).read_bytes()).hexdigest()
+                                     for path in ("ubs", "modules/helpers/ubs_core/analyzers/taint_java_sql.py",
+                                                  "modules/helpers/ubs_core/analyzers/taint_kotlin_sql.py")}
+                            output.with_suffix(".receipt.json").write_text(json.dumps({
+                                "case": case, "command": command, "exit": proc.returncode, "seconds": elapsed,
+                                "sources": sources, "tools": tools, "python": sys.version,
+                                "ast_grep": shutil.which("ast-grep"),
+                            }, indent=2), encoding="utf-8")
+                            context = f"{command!r}\nexit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+                            self.assertEqual(proc.returncode, 2 if label == "partial" else int(bool(expected)), context)
+                            try:
+                                report = json.loads(proc.stdout)
+                            except json.JSONDecodeError as error:
+                                self.fail(f"Invalid scanner JSON: {error}\n{context}")
+                            if format_ == "json":
+                                self.assertEqual(report["status"], "partial" if label == "partial" else "ok", context)
+                                rows = report.get("findings", [])
+                                actual = []
+                                for row in rows:
+                                    path = Path(row["path" if surface == "module" else "file"])
+                                    self.assertEqual(path.resolve().parent, directory, context)
+                                    actual.append((path.name, row["rule" if surface == "module" else "rule_id"],
+                                                   row["line"], row["col"], row["severity"]))
+                                    evidence = row["extras"]["taint_path"]
+                                    self.assertEqual((evidence[0]["kind"], evidence[0]["line"]),
+                                                     ("source", row["line"] - 1), context)
+                                    self.assertEqual((evidence[-1]["kind"], evidence[-1]["line"]),
+                                                     ("sink", row["line"]), context)
+                                totals = report if surface == "module" else report["totals"]
+                                self.assertEqual((totals["critical"], totals["warning"], totals["info"]),
+                                                 (len(expected), 0, 0), context)
+                            else:
+                                actual = []
+                                for run in report["runs"]:
+                                    for row in run.get("results", []):
+                                        location = row["locations"][0]["physicalLocation"]
+                                        path = sarif_location_path(location["artifactLocation"]["uri"], directory).resolve()
+                                        self.assertEqual(path.parent, directory, context)
+                                        self.assertEqual(row["level"], "error", context)
+                                        actual.append((path.name, row["ruleId"], location["region"]["startLine"],
+                                                       location["region"]["startColumn"], "critical"))
+                                        self.assertTrue(row.get("codeFlows"), context)
+                                invocations = [item for run in report["runs"] for item in run.get("invocations", [])]
+                                if label == "partial":
+                                    self.assertTrue(invocations, context)
+                                    self.assertTrue(all(item["executionSuccessful"] is False for item in invocations), context)
+                                else:
+                                    self.assertTrue(all(item.get("executionSuccessful") is not False for item in invocations), context)
+                            self.assertEqual(sorted(actual), expected, context)
+                            print(f"[spring-sql-{case}] PASS ({elapsed:.3f}s)", flush=True)
+
+
 class JVMOutboundDataflowTests(unittest.TestCase):
     """An HTTP destination is a value, not all text in a nearby statement."""
 

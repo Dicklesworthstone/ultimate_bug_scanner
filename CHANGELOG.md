@@ -28,6 +28,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Fixed
 
+- Java/Kotlin SQL analysis recognizes selected Spring JdbcTemplate/JdbcOperations
+  and NamedParameterJdbcTemplate/NamedParameterJdbcOperations execution APIs.
+  Scoped receiver identity and helper flow distinguish query text from separately
+  bound values: parameters never sanitize a request-derived query. Genuine Spring
+  SQL execution is excluded from HTTP sinks, while unsupported creator/callback
+  forms retain an explicit incomplete-analysis result.
+
 - Java/Kotlin archive extraction follows entry identity and extraction targets
   through scoped helper summaries, branches and supported iteration. Findings
   belong to actual filesystem writes, with source-to-sink witnesses; path

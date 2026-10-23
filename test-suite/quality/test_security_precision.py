@@ -24,6 +24,7 @@ with the true positives the rule exists for:
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import os
 import re
@@ -31,6 +32,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -202,6 +204,214 @@ func sessionToken() -> String {
         clean = REPO_ROOT / "test-suite/swift/security_randomness_clean/Tokens.swift"
         self.assertEqual([row[1] for row in self.findings(buggy.read_text())], [5, 9, 13, 14, 18, 22, 23])
         self.assertEqual(self.findings(clean.read_text()), [])
+
+
+class JVMHeaderDataflowTests(unittest.TestCase):
+    """Header safety belongs to the value and branch, never a helper's name."""
+
+    @classmethod
+    def setUpClass(cls):
+        artifacts = REPO_ROOT / "test-suite/artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        cls.root = Path(tempfile.mkdtemp(prefix="jvm-header-flow-", dir=artifacts))
+
+    @staticmethod
+    def cases(language):
+        declaration = "String" if language == "java" else "var"
+        thrown = 'throw new IllegalArgumentException("bad");' if language == "java" else 'throw IllegalArgumentException("bad");'
+        source = declaration + ' value = request.getParameter("value");\n'
+        unsafe = 'response.setHeader("X-Value", value); // expect-finding\n'
+        safe = 'response.setHeader("X-Value", value);\n'
+        guard = 'if (value.contains("\\r") || value.contains("\\n")) { ' + thrown + ' }\n'
+        identity = ('String safeHeaderValue(String raw) { return raw; }' if language == "java" else
+                    'fun safeHeaderValue(raw: String): String { return raw }')
+        strip = ('String clean(String raw) { return raw.replace("\\r", "").replace("\\n", ""); }'
+                 if language == "java" else
+                 'fun clean(raw: String): String { return raw.replace("\\r", "").replace("\\n", "") }')
+        recursive = ('String relay(String raw, boolean repeat) { if (repeat) return relay(raw, false); return raw; }'
+                     if language == "java" else
+                     'fun relay(raw: String, repeat: Boolean): String { if (repeat) return relay(raw, false); return raw }')
+        writer = ('void write(String raw, HttpServletResponse response) {\n' if language == "java" else
+                  'fun write(raw: String, response: HttpServletResponse) {\n')
+        writer += 'response.setHeader("X-Value", raw); // expect-finding\n}\n'
+        cases = [
+            ("direct", source + unsafe, ""),
+            ("safe_name_identity", declaration + ' value = safeHeaderValue(request.getParameter("value"));\n' + unsafe, identity),
+            ("renamed_identity", declaration + ' value = identity(request.getParameter("value"));\n' + unsafe,
+             identity.replace("safeHeaderValue", "identity")),
+            ("recursive_identity", declaration + ' value = relay(request.getParameter("value"), enabled);\n' + unsafe, recursive),
+            ("selected_helper_sink", 'write(request.getParameter("value"), response);\n', writer),
+            ("selected_helper_safe_argument", 'write(request.getParameter("value").replace("\\r", "").replace("\\n", ""), response);\n',
+             writer.replace(" // expect-finding", "")),
+            ("constant_overwrite", source + 'value = "fixed";\n' + safe, ""),
+            ("branch_overwrite", source + 'if (enabled) { value = "fixed"; }\n' + unsafe, ""),
+            ("both_branches_overwrite", source + 'if (enabled) { value = "first"; } else { value = "second"; }\n' + safe, ""),
+            ("real_reject", source + guard + safe, ""),
+            ("partial_reject", source + 'if (value.contains("\\r")) { ' + thrown + ' }\n' + unsafe, ""),
+            ("fallthrough_check", source + 'if (value.contains("\\r") || value.contains("\\n")) { log("bad"); }\n' + unsafe, ""),
+            ("different_value_check", source + declaration + ' other = request.getParameter("other");\n' +
+             guard.replace("value.contains", "other.contains") + unsafe, ""),
+            ("rebound_after_guard", source + guard + 'value = request.getParameter("other");\n' + unsafe, ""),
+            ("guarded_branch_only", source + 'if (!value.contains("\\r") && !value.contains("\\n")) {\n' +
+             safe + '} else {\n' + unsafe + '}\n', ""),
+            ("helper_real_strip", declaration + ' value = clean(request.getParameter("value"));\n' + safe, strip),
+            ("inline_real_strip", source + 'value = value.replace("\\r", "").replace("\\n", "");\n' + safe, ""),
+            ("strip_one_character", source + 'value = value.replace("\\r", "");\n' + unsafe, ""),
+            ("replace_first_is_not_safe", source + 'value = value.replaceFirst("[\\r\\n]", "");\n' + unsafe, ""),
+            ("unrelated_strip_argument", source + 'response.setHeader("X-Value".replace("\\r", "").replace("\\n", ""), value); // expect-finding\n', ""),
+            ("partial_strip_in_helper", declaration + ' value = clean(request.getParameter("value"));\n' + unsafe,
+             strip.replace('.replace("\\n", "")', "")),
+            ("sanitized_and_raw_concat", source + 'value = value.replace("\\r", "").replace("\\n", "") + request.getParameter("other");\n' + unsafe, ""),
+            ("guard_then_control_concat", source + guard + 'value = value + "\\r\\n";\n' + unsafe, ""),
+            ("guard_then_control_append", source + guard + 'value += "\\r\\n";\n' + unsafe, ""),
+            ("guard_then_safe_prefix", source + guard + 'value = "prefix=" + value;\n' + safe, ""),
+            ("encoded_value", source + 'value = URLEncoder.encode(value, StandardCharsets.UTF_8);\n' + safe, ""),
+            ("unknown_safe_named_helper", declaration + ' value = sanitizeHeader(request.getParameter("value"));\n' + unsafe, ""),
+            ("inert_guard_text", source + declaration + ' decoy = "\\r\\n throw return";\n' + unsafe, ""),
+        ]
+        if language == "java":
+            cases.extend([
+                ("indexof_reject", source + "if (value.indexOf('\\r') >= 0 || value.indexOf('\\n') >= 0) { " + thrown + " }\n" + safe, ""),
+                ("regex_strip", source + 'value = value.replaceAll("[\\r\\n]", "");\n' + safe, ""),
+                ("regex_reinserts_match", source + 'value = value.replaceAll("[\\r\\n]", "$0");\n' + unsafe, ""),
+            ])
+        else:
+            cases.extend([
+                ("require_reject", source + "require(!value.contains('\\r') && !value.contains('\\n'))\n" + safe, ""),
+                ("named_header_arguments", source + 'response.header(value = value, name = "X-Value"); // expect-finding\n', ""),
+                ("template_replacement_reintroduces_controls", source + 'val replacement = request.getParameter("other");\n' +
+                 'value = value.replace("\\n", "").replace("\\r", "$replacement");\n' + unsafe, ""),
+                ("braced_template_replacement_reintroduces_controls", source + 'val replacement = request.getParameter("other");\n' +
+                 'value = value.replace("\\n", "").replace("\\r", "${replacement}");\n' + unsafe, ""),
+            ])
+        return cases
+
+    @staticmethod
+    def program(language, body, helper=""):
+        imports = "\n".join((
+            "import javax.servlet.http.HttpServletRequest;", "import javax.servlet.http.HttpServletResponse;",
+            "import java.net.URLEncoder;", "import java.nio.charset.StandardCharsets;"))
+        signature = ("void handle(HttpServletRequest request, HttpServletResponse response, boolean enabled)" if language == "java" else
+                     "fun handle(request: HttpServletRequest, response: HttpServletResponse, enabled: Boolean)")
+        if language == "kotlin" and "response.header(value =" in body:
+            imports = imports.replace("javax.servlet.http.HttpServletResponse", "io.ktor.server.response.ApplicationResponse")
+            imports += "\nimport io.ktor.server.response.header;"
+            signature = signature.replace("HttpServletResponse", "ApplicationResponse")
+        return imports + "\nclass HeaderProbe {\n" + helper + "\n" + signature + " {\n" + body + "}\n}\n"
+
+    def test_value_and_control_flow(self):
+        from ubs_core.java_detectors import header_injection
+
+        for language in ("java", "kotlin"):
+            for name, body, helper in self.cases(language):
+                with self.subTest(language=language, case=name):
+                    text = self.program(language, body, helper)
+                    path = self.root / (language + "-" + name + (".java" if language == "java" else ".kt"))
+                    path.write_text(text, encoding="utf-8")
+                    rule = language + ".security.header-injection"
+                    findings = list(header_injection.find([path], language=language, rule_id=rule))
+                    expected = [number for number, line in enumerate(text.splitlines(), 1) if "// expect-finding" in line]
+                    (path.with_suffix(path.suffix + ".result.json")).write_text(
+                        json.dumps({"expected_lines": expected, "findings": findings}, default=str, indent=2), encoding="utf-8")
+                    self.assertEqual([row[1] for row in findings], expected, findings)
+
+    def test_original_header_fixtures(self):
+        from ubs_core.java_detectors import header_injection
+
+        cases = (
+            ("java", "java/security/HeaderInjectionBuggy.java", [13, 18, 23, 30, 35, 40]),
+            ("java", "java/security/HeaderInjectionClean.java", []),
+            ("java", "java/security/HeaderInjectionMultilineBuggy.java", [9]),
+            ("java", "java/security/HeaderInjectionMultilineClean.java", []),
+            ("kotlin", "kotlin/header_injection_buggy/HeaderInjectionBuggy.kt", [22, 27, 32]),
+            ("kotlin", "kotlin/header_injection_clean/HeaderInjectionClean.kt", []),
+        )
+        for language, relative, expected in cases:
+            with self.subTest(path=relative):
+                findings = list(header_injection.find([REPO_ROOT / "test-suite" / relative],
+                                                     language=language, rule_id=language + ".security.header-injection"))
+                self.assertEqual([row[1] for row in findings], expected, findings)
+
+    def test_shadowed_encoder_does_not_confer_safety(self):
+        from ubs_core.java_detectors import header_injection
+
+        for language in ("java", "kotlin"):
+            body = next(body for name, body, _ in self.cases(language) if name == "encoded_value")
+            text = self.program(language, body).replace("import java.net.URLEncoder;", "")
+            text += ('class URLEncoder { static String encode(String raw, Object charset) { return raw; } }\n'
+                     if language == "java" else
+                     'object URLEncoder { fun encode(raw: String, charset: Any): String { return raw } }\n')
+            path = self.root / ("shadowed-encoder." + ("java" if language == "java" else "kt"))
+            path.write_text(text, encoding="utf-8")
+            hits = list(header_injection.find([path], language=language, rule_id=language + ".security.header-injection"))
+            expected = [number for number, line in enumerate(text.splitlines(), 1) if 'response.setHeader(' in line]
+            self.assertEqual([row[1] for row in hits], expected, hits)
+
+    def test_unsupported_control_flow_is_explicit(self):
+        from ubs_core.java_detectors import header_injection
+        from ubs_core.taint_flow import AnalysisLimit
+
+        text = self.program("java", 'String value = request.getParameter("value");\n'
+                            'switch (value) { default: response.setHeader("X-Value", value); }')
+        path = self.root / "unsupported.java"
+        path.write_text(text, encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            list(header_injection.find([path]))
+        engine = header_injection.HeaderEngine(path, self.program("java",
+            'response.setHeader("X-Value", request.getParameter("value"));'))
+        engine.budget.remaining = 0
+        with self.assertRaises(AnalysisLimit):
+            engine.analyze()
+
+    def test_module_and_runner_json_sarif(self):
+        for language in ("java", "kotlin"):
+            for name, body, helper in self.cases(language):
+                positive = "safe_name_identity" if language == "java" else "template_replacement_reintroduces_controls"
+                if name not in {positive, "constant_overwrite"}:
+                    continue
+                text = self.program(language, body, helper)
+                directory = self.root / (language + "-" + name + "-cli")
+                directory.mkdir()
+                path = directory / ("HeaderProbe.java" if language == "java" else "HeaderProbe.kt")
+                path.write_text(text, encoding="utf-8")
+                expected = [number for number, line in enumerate(text.splitlines(), 1) if "// expect-finding" in line]
+                for surface in ("module", "runner"):
+                    for format_ in ("json", "sarif"):
+                        with self.subTest(language=language, case=name, surface=surface, format=format_):
+                            entry = (REPO_ROOT / "modules" / ("ubs-" + language + ".sh")
+                                     if surface == "module" else REPO_ROOT / "ubs")
+                            command = (str(entry), "--only=4" if surface == "module" else "--only=" + language,
+                                       "--format=" + format_, "--ci", str(path))
+                            started = time.monotonic()
+                            proc = subprocess.run(command, cwd=directory, capture_output=True, text=True, timeout=180,
+                                                  env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1", UBS_NO_AUTO_UPDATE="1",
+                                                           UBS_NO_CACHE="1", ENABLE_UV_TOOLS="0"))
+                            label = surface + "-" + format_
+                            (directory / (label + ".stdout")).write_text(proc.stdout, encoding="utf-8")
+                            (directory / (label + ".stderr")).write_text(proc.stderr, encoding="utf-8")
+                            (directory / (label + ".command.json")).write_text(json.dumps({
+                                "command": command, "exit": proc.returncode, "seconds": time.monotonic() - started,
+                                "source_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                            }, indent=2), encoding="utf-8")
+                            context = f"exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+                            self.assertEqual(proc.returncode, int(bool(expected)), context)
+                            try:
+                                report = json.loads(proc.stdout)
+                            except json.JSONDecodeError as error:
+                                self.fail(f"Invalid scanner JSON: {error}\n{context}")
+                            rule = language + ".security.header-injection"
+                            if format_ == "json":
+                                records = report.get("findings", []) if surface == "runner" else report["findings"]
+                                key = "rule_id" if surface == "runner" else "rule"
+                                actual = [(row[key], row["line"], row["severity"]) for row in records]
+                                self.assertEqual(actual, [(rule, line, "critical") for line in expected], context)
+                                totals = report["totals"] if surface == "runner" else report
+                                self.assertEqual((totals["critical"], totals["warning"]), (len(expected), 0), context)
+                            else:
+                                records = [row for run in report["runs"] for row in run.get("results", [])]
+                                actual = [(row["ruleId"], row["locations"][0]["physicalLocation"]["region"]["startLine"],
+                                           row["level"]) for row in records]
+                                self.assertEqual(actual, [(rule, line, "error") for line in expected], context)
 
 
 class JavaRulePrecisionTests(unittest.TestCase):

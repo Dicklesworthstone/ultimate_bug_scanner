@@ -22,6 +22,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Fixed
 
+- Java/Kotlin response-header checks follow actual values, local helper returns,
+  assignments and reachable branches instead of trusting sanitizer names.
+  CR/LF safety requires complete removal, URL-component encoding or a dominating
+  rejection of both characters. Partial replacements, regex backreferences,
+  Kotlin template replacements and later control-character concatenation retain
+  findings; constant overwrites and verified safe values stay clean.
 - Python SQL analysis transfers immutable nonlocal cells through private list
   helpers, including recursive calls and exception prefixes. Calls before a
   helper is cleared in `finally` retain the executed definition's identity;

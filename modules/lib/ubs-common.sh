@@ -364,6 +364,7 @@ declare -g -A UBS_COMMON_HELPER_CHECKSUMS=(
   ['helpers/ubs_core/elixir_detectors/_common.py']='ffedf7e7db651bb0738e999fa2cb6f175cd97b52fa3bc857a809be54ac887eee'
   ['helpers/ubs_core/elixir_detectors/archive_extraction.py']='697d4e657aed76d3192d20ed29d679386c932b79893cd7e0e53241f44a28a72c'
   ['helpers/ubs_core/elixir_detectors/config_runtime_exs.py']='015a6946ce0ae56280e14bcbbdc756a78f1aca1cd3410193dd84edfd7b48dcb1'
+  ['helpers/ubs_core/elixir_detectors/file_result.py']='7b372cd2af0c72b792a2567bb1c79b9529a8484a812b7a6d5aca3e8e2fe3136e'
   ['helpers/ubs_core/elixir_detectors/hardcoded_secrets.py']='c7dd4284a1f478da2adc133c4fdbeb9d8517b4c4a741858304553394b254179a'
   ['helpers/ubs_core/elixir_detectors/mix_lockfile.py']='68fda905182218603ad78cfa65910d9b219cc9bcea34c8fadd6c1a749106b5ed'
   ['helpers/ubs_core/elixir_detectors/outbound_url.py']='13cc62e617f4e7bf2094f8bef3f24879f11551b4923fabe42cac05b643066b1b'

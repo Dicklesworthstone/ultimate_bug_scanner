@@ -12,6 +12,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Added
 
+- Elixir error handling now follows non-bang File results through local helpers,
+  bindings, branches, matches and synchronous callbacks. Discarded or overwritten
+  results produce `ex.error.unhandled-file-result`; correctly handled or returned
+  results stay clean. Unsupported result consumers, deferred callbacks and module
+  attribute storage report incomplete analysis instead of a successful clean scan.
+
 - Opt-in `UBS_KEEP_TEMP=1` retains scanner scratch across static Rust, Python,
   JavaScript/TypeScript, and Bash scans, including error paths and helper spill
   databases. Unsupported languages and cleanup-capable build, auditor, update,

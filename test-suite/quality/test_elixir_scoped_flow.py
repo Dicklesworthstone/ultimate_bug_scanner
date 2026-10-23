@@ -1251,3 +1251,413 @@ class ElixirLifecycleTests(unittest.TestCase):
                 result, payload, target = self.execute(case, extra=extra, attempt=attempt, cached=True)
                 self.assert_complete(case, 'python', result, payload, target, expected=expected)
                 self.assertEqual(payload['extras']['profile']['cache_hits'], expected_hits, payload)
+
+
+class ElixirFileResultTests(unittest.TestCase):
+    """Independent result-observation contracts for actual non-bang File APIs."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.artifacts = ROOT / 'test-suite/artifacts' / ('elixir-file-results-' + uuid.uuid4().hex)
+        cls.artifacts.mkdir(parents=True)
+
+    def source(self, name, source):
+        target = self.artifacts / (name + '.ex')
+        target.write_text(textwrap.dedent(source).strip() + '\n', encoding='utf-8')
+        return target
+
+    def check(self, source, expected=(), name=None):
+        from ubs_core.elixir_detectors.file_result import scan_file_findings
+        target = self.source(name or self.id().rsplit('.', 1)[-1], source)
+        findings = list(scan_file_findings(target))
+        target.with_suffix('.findings.json').write_text(json.dumps(findings, indent=2), encoding='utf-8')
+        self.assertEqual([(line, call) for line, _, call in findings], list(expected), findings)
+        for line, column, call in findings:
+            self.assertGreater(column, 0)
+            self.assertIn(call.split('.')[-1], target.read_text(encoding='utf-8').splitlines()[line - 1])
+        return target
+
+    def test_discarded_and_unused_assigned_results(self):
+        self.check('''
+            def save do
+              File.write("settings.json", "{}")
+              result = File.read("settings.json")
+              :ok
+            end
+        ''', ((2, 'File.write'), (3, 'File.read')))
+
+    def test_returning_result_or_alias_transfers_obligation(self):
+        self.check('''
+            def read, do: File.read("settings.json")
+            def save do
+              result = File.write("settings.json", "{}")
+              copy = result
+              copy
+            end
+        ''')
+
+    def test_rebinding_does_not_lose_old_obligation(self):
+        self.check('''
+            def save do
+              result = File.read("settings.json")
+              result = File.write("settings.json", "{}")
+              result
+            end
+        ''', ((2, 'File.read'),))
+
+    def test_exact_success_matches_propagate_failure(self):
+        self.check('''
+            def save do
+              {:ok, text} = File.read("settings.json")
+              :ok = File.write("copy.json", text)
+              :done
+            end
+        ''')
+
+    def test_case_observes_actual_result(self):
+        self.check('''
+            def save do
+              case File.write("settings.json", "{}") do
+                :ok -> :saved
+                {:error, reason} -> {:failed, reason}
+              end
+            end
+        ''')
+
+    def test_unrelated_case_cannot_observe_result(self):
+        self.check('''
+            def save(other) do
+              result = File.write("settings.json", "{}")
+              case other do
+                :ok -> :saved
+                {:error, reason} -> {:failed, reason}
+              end
+            end
+        ''', ((2, 'File.write'),))
+
+    def test_catch_all_error_path_still_loses_failure(self):
+        self.check('''
+            def save do
+              case File.read("settings.json") do
+                {:ok, content} -> content
+                _ -> :ok
+              end
+            end
+        ''', ((2, 'File.read'),))
+
+    def test_with_failure_transfers_when_returned(self):
+        self.check('''
+            def save do
+              with {:ok, content} <- File.read("settings.json"),
+                   :ok <- File.write("copy.json", content) do
+                :saved
+              end
+            end
+        ''')
+
+    def test_with_failure_cannot_be_lost_after_block(self):
+        self.check('''
+            def save do
+              with :ok <- File.write("settings.json", "{}") do
+                :saved
+              end
+              :ok
+            end
+        ''', ((2, 'File.write'),))
+
+    def test_early_exception_is_not_successful_discard(self):
+        self.check('''
+            def save do
+              result = File.write("settings.json", "{}")
+              raise "save aborted"
+            end
+        ''')
+
+    def test_condition_must_inspect_status_not_truthiness(self):
+        self.check('''
+            def save do
+              result = File.write("settings.json", "{}")
+              if result, do: :saved, else: :failed
+            end
+        ''', ((2, 'File.write'),))
+        self.check('''
+            def save do
+              result = File.write("settings.json", "{}")
+              if result == :ok, do: :saved, else: :failed
+            end
+        ''', name='status_comparison')
+        self.check('''
+            def read do
+              result = File.read("settings.json")
+              if result == :ok, do: :read, else: :failed
+            end
+        ''', ((2, 'File.read'),), name='unrelated_tuple_status_comparison')
+
+    def test_conditional_observation_must_cover_every_path(self):
+        self.check('''
+            def save(enabled) do
+              result = File.write("settings.json", "{}")
+              if enabled do
+                :ok = result
+              end
+              :ok
+            end
+        ''', ((2, 'File.write'),))
+
+    def test_helper_identity_and_consumer_follow_actual_bindings(self):
+        self.check('''
+            defmodule Writer do
+              defp save, do: File.write("settings.json", "{}")
+              def run do
+                save()
+                :ok
+              end
+            end
+        ''', ((2, 'File.write'),))
+        self.check('''
+            defmodule Writer do
+              defp observed(:ok), do: :saved
+              defp observed({:error, reason}), do: {:failed, reason}
+              def run, do: observed(File.write("settings.json", "{}"))
+            end
+        ''', name='helper_observes')
+
+    def test_aliases_imports_and_same_named_user_modules(self):
+        self.check('''
+            defmodule Writer do
+              alias File, as: Disk
+              import File, only: [write: 2]
+              def run do
+                Disk.read("settings.json")
+                write("settings.json", "{}")
+                :ok
+              end
+            end
+        ''', ((5, 'File.read'), (6, 'File.write')))
+        self.check('''
+            defmodule MyFile do
+              def write(_path, _text), do: :ok
+            end
+            defmodule Writer do
+              alias MyFile, as: File
+              def run do
+                File.write("settings.json", "{}")
+                :ok
+              end
+            end
+        ''', name='user_module_not_file')
+
+    def test_selected_import_does_not_override_local_function(self):
+        self.check('''
+            defmodule Writer do
+              import File, only: [write: 2]
+              defp write(_path, _text), do: :ok
+              def run do
+                write("settings.json", "{}")
+                :ok
+              end
+            end
+        ''')
+
+    def test_import_is_scoped_to_selected_arity_and_definition(self):
+        self.check('''
+            defmodule Writer do
+              import File, only: [write: 2]
+              def first do
+                write("settings.json", "{}")
+                :ok
+              end
+              import File, only: [read: 1]
+              def second, do: read("settings.json")
+            end
+        ''', ((4, 'File.write'),))
+        from ubs_core.elixir_detectors.file_result import scan_file_findings
+        path = self.source('wrong_import_arity', '''
+            defmodule Writer do
+              import File, only: [write: 3]
+              def run do
+                write("settings.json", "{}")
+                :ok
+              end
+            end
+        ''')
+        with self.assertRaisesRegex(ValueError, 'incomplete'):
+            list(scan_file_findings(path))
+
+    def test_selected_api_contracts_and_zero_arity_syntax(self):
+        calls = (
+            'File.copy("a", "b")', 'File.cp("a", "b")', 'File.rename("a", "b")',
+            'File.rm("a")', 'File.mkdir("a")', 'File.mkdir_p("a")',
+            'File.stat("a")', 'File.ls()', 'File.ls',
+        )
+        source = 'def run do\n' + ''.join('  ' + call + '\n' for call in calls) + '  :ok\nend'
+        expected = tuple((line, call.split('(')[0]) for line, call in enumerate(calls, 2))
+        self.check(source, expected)
+
+    def test_bang_predicate_comment_and_string_controls(self):
+        self.check('''
+            def run do
+              # File.read("unreachable")
+              text = "File.write(path, data)"
+              File.write!("settings.json", text)
+              File.exists?("settings.json")
+              :ok
+            end
+        ''')
+
+    def test_rule_scoped_suppression_preserves_other_result(self):
+        self.check('''
+            def run do
+              File.write("a", "x") # ubs:ignore ex.error.unhandled-file-result
+              File.write("b", "x")
+              :ok
+            end
+        ''', ((3, 'File.write'),))
+
+    def test_literal_callback_execution_and_result_collections(self):
+        self.check('''
+            def run do
+              Enum.each(["a", "b"], fn path -> File.write(path, "x") end)
+            end
+        ''', ((2, 'File.write'),))
+        self.check('''
+            def run do
+              Enum.map(["a", "b"], fn path -> File.write(path, "x") end)
+            end
+        ''', name='returned_result_collection')
+        self.check('''
+            def run do
+              unused = fn -> File.write("a", "x") end
+              :ok
+            end
+        ''', name='unexecuted_callback')
+
+    def test_many_independent_calls_do_not_fork_success_error_states(self):
+        source = 'def run do\n' + ''.join('  File.write("x", "y")\n' for _ in range(40)) + '  :ok\nend'
+        self.check(source, tuple((line, 'File.write') for line in range(2, 42)))
+
+    def test_unknown_consumer_malformed_source_and_budget_are_incomplete(self):
+        from ubs_core.elixir_detectors.file_result import scan_file_findings
+        for name, source in (
+            ('unknown_consumer', 'def run, do: External.handle(File.write("x", "y"))'),
+            ('malformed', 'def run do\n File.write("x", "y")\n'),
+            ('async_transfer', 'def run, do: Task.async(fn -> File.write("x", "y") end)'),
+            ('file_callback', 'def run, do: File.cp("x", "y", fn _, _ -> true end)'),
+            ('deferred_collection', 'def run do\n result = File.write("x", "y")\n [fn -> result end]\nend'),
+            ('module_attribute', 'defmodule Config do\n @result File.read("x")\n def run, do: :ok\nend'),
+            ('replaced_module_attribute', 'defmodule Config do\n @result File.read("x")\n @result :ok\n def run, do: :ok\nend'),
+        ):
+            with self.subTest(name=name):
+                path = self.source(name, source)
+                with self.assertRaises(ValueError):
+                    list(scan_file_findings(path))
+        path = self.source('budget', 'def run, do: File.write("x", "y")')
+        with self.assertRaises(AnalysisLimit):
+            list(scan_file_findings(path, Budget(remaining=1)))
+
+    def public_scan(self, path, label, *, runner=False, output='json', extra=()):
+        executable = ROOT / ('ubs' if runner else 'modules/ubs-elixir.sh')
+        command = [str(executable), '--format=' + output, '--no-color', '--ci', '--fail-on-warning',
+                   '--skip=1,3,4,5,6,7,8,9,10,11,12,13,14,15,16', *extra, str(path)]
+        environment = dict(os.environ, UBS_NO_AUTO_UPDATE='1', UBS_NO_HISTORY='1',
+                           XDG_CACHE_HOME=str(self.artifacts / 'cache'),
+                           XDG_DATA_HOME=str(self.artifacts / 'data'))
+        started = time.monotonic()
+        result = subprocess.run(command, cwd=self.artifacts, env=environment,
+                                text=True, capture_output=True, timeout=120)
+        (self.artifacts / (label + '.run.json')).write_text(json.dumps({
+            'command': command, 'exit': result.returncode, 'elapsed': time.monotonic() - started,
+            'source_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+            'tool_sha256': hashlib.sha256(executable.read_bytes()).hexdigest(),
+            'stdout': result.stdout, 'stderr': result.stderr,
+        }, indent=2), encoding='utf-8')
+        context = (command, result.returncode, result.stdout, result.stderr)
+        try:
+            payload = json.loads(result.stdout)
+        except ValueError:
+            self.fail(context)
+        return result, payload, context
+
+    def test_public_module_and_runner_json_sarif_preserve_exact_findings(self):
+        from urllib.parse import unquote, urlparse
+        source = self.source('public_positive', '''
+            defmodule Writer do
+              def run do
+                File.write("settings.json", "{}")
+                value = File.read("settings.json")
+                :ok
+              end
+            end
+        ''')
+        rule = 'ex.error.unhandled-file-result'
+        for runner in (False, True):
+            for output in ('json', 'sarif'):
+                with self.subTest(runner=runner, output=output):
+                    result, payload, context = self.public_scan(
+                        source, f'positive-{runner}-{output}', runner=runner, output=output)
+                    self.assertEqual(result.returncode, 1, context)
+                    if output == 'json':
+                        self.assertEqual(payload['status'], 'ok', context)
+                        totals = payload.get('totals', payload)
+                        self.assertEqual((totals['critical'], totals['warning'], totals['info']), (0, 2, 0), context)
+                        records = payload['findings']
+                        rule_key, path_key = ('rule_id', 'file') if runner else ('rule', 'path')
+                        actual = [(item[rule_key], item['line'], item['col'], item['severity']) for item in records]
+                        self.assertTrue(all(Path(item[path_key]).resolve() == source.resolve() for item in records), context)
+                    else:
+                        records = [item for run in payload['runs'] for item in run.get('results', [])]
+                        actual = [(item['ruleId'], item['locations'][0]['physicalLocation']['region']['startLine'],
+                                   item['locations'][0]['physicalLocation']['region']['startColumn'], item['level'])
+                                  for item in records]
+                        self.assertTrue(all(Path(unquote(urlparse(item['locations'][0]['physicalLocation']
+                                                                 ['artifactLocation']['uri']).path)).resolve() == source.resolve()
+                                            for item in records), context)
+                    self.assertEqual(sorted(actual), [(rule, 3, 5, 'warning'), (rule, 4, 13, 'warning')], context)
+
+    def test_public_clean_category_selection_and_warm_cache(self):
+        clean = self.source('public_clean', '''
+            defmodule Writer do
+              def run do
+                {:ok, text} = File.read("settings.json")
+                :ok = File.write("copy.json", text)
+                :done
+              end
+            end
+        ''')
+        bad = self.source('unselected_sibling', 'def run do\n File.write("x", "y")\n :ok\nend')
+        for runner in (False, True):
+            for output in ('json', 'sarif'):
+                with self.subTest(runner=runner, output=output):
+                    result, payload, context = self.public_scan(
+                        clean, f'clean-{runner}-{output}', runner=runner, output=output)
+                    self.assertEqual(result.returncode, 0, context)
+                    findings = payload.get('findings', []) if output == 'json' else [
+                        item for run in payload['runs'] for item in run.get('results', [])]
+                    self.assertEqual(findings, [], context)
+        for index in range(2):
+            result, payload, context = self.public_scan(bad, f'cache-{index}')
+            self.assertEqual(result.returncode, 1, context)
+            self.assertEqual([(item['rule'], item['line']) for item in payload['findings']],
+                             [('ex.error.unhandled-file-result', 2)], context)
+            self.assertEqual(payload['extras']['profile']['cache_hits'], index, context)
+        result, payload, context = self.public_scan(bad, 'category-disabled', extra=('--skip=2',))
+        self.assertEqual(result.returncode, 0, context)
+        self.assertEqual(payload['findings'], [], context)
+
+    def test_unknown_result_consumer_is_partial_in_public_formats(self):
+        source = self.source('public_unknown', '''
+            defmodule Writer do
+              def run, do: External.handle(File.write("x", "y"))
+            end
+        ''')
+        for output in ('json', 'sarif'):
+            with self.subTest(output=output):
+                result, payload, context = self.public_scan(source, 'unknown-' + output, output=output)
+                self.assertEqual(result.returncode, 2, context)
+                if output == 'json':
+                    self.assertEqual(payload['status'], 'partial', context)
+                    self.assertIn('incomplete', payload['message'].lower(), context)
+                else:
+                    invocations = [item for run in payload['runs'] for item in run.get('invocations', [])]
+                    self.assertTrue(invocations, context)
+                    self.assertTrue(all(item['executionSuccessful'] is False for item in invocations), context)

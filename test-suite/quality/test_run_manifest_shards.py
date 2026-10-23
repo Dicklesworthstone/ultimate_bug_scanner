@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -16,6 +17,50 @@ import run_manifest  # noqa: E402
 
 
 class ShardTests(unittest.TestCase):
+    @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX child processes")
+    def test_timeout_stops_descendants_and_preserves_failure_output(self) -> None:
+        """A failed case must not leave its scanner children running behind the next case."""
+        artifact_root = TEST_ROOT / "artifacts"
+        artifact_root.mkdir(exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix="manifest-timeout-tree-", dir=artifact_root))
+        receiver = scratch / "receiver"
+        ready, late = scratch / "child-started", scratch / "child-survived"
+        receiver.write_text(
+            f"#!{sys.executable}\n"
+            "import os, signal, time\n"
+            "from pathlib import Path\n"
+            "if os.fork() == 0:\n"
+            "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "    os.close(1)\n"
+            "    os.close(2)\n"
+            f"    Path({str(ready)!r}).write_text('started')\n"
+            "    time.sleep(4)\n"
+            f"    Path({str(late)!r}).write_text('survived')\n"
+            "    os._exit(0)\n"
+            "print('scanner-started', flush=True)\n"
+            "time.sleep(10)\n"
+        )
+        receiver.chmod(0o700)
+        manifest = scratch / "manifest.json"
+        manifest.write_text(json.dumps({"defaults": {
+            "ubs_bin": str(receiver), "artifacts_dir": str(scratch / "reports"),
+        }, "cases": [{"id": "timeout-tree", "path": str(scratch), "language": "python",
+                      "description": "A timed-out scanner must stop its owned child processes.",
+                      "expect": {"exit_code": "zero"}}]}))
+        proc = subprocess.run(
+            [sys.executable, str(TEST_ROOT / "run_manifest.py"), "--manifest", str(manifest), "--case-timeout", "1"],
+            capture_output=True, text=True, cwd=scratch, timeout=15,
+        )
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        report = scratch / "reports/timeout-tree"
+        self.assertTrue((report / "result.json").exists(), proc.stdout + proc.stderr)
+        self.assertTrue(json.loads((report / "result.json").read_text())["timed_out"])
+        self.assertIn("scanner-started", (report / "stdout.log").read_text())
+        self.assertIn("Timed out after 1", (report / "stderr.log").read_text())
+        self.assertTrue(ready.exists(), "The real child must have started; no zero-run green")
+        time.sleep(4)
+        self.assertFalse(late.exists(), "Timed-out scanner child continued writing after the case ended")
+
     def test_symbolic_exit_requires_both_process_status_and_counts(self) -> None:
         """A clean-looking partial run or an unsafe exit-0 must stay red."""
         for expected, actual, critical, accepted in (

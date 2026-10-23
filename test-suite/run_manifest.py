@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -27,6 +28,32 @@ EXPECT_SUBSTRING_KEYS = (
     "require_substrings_stderr",
     "forbid_substrings_stderr",
 )
+
+
+def run_case_command(cmd: List[str], env: Dict[str, str], timeout: float | None) -> subprocess.CompletedProcess[str]:
+    """Keep a timed-out local scanner tree from running behind the next case.
+
+    This owns only the local process group; remote build cancellation remains
+    the responsibility of the remote runner.
+    """
+    with subprocess.Popen(
+        cmd, cwd=REPO_ROOT, text=True, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, env=env, start_new_session=os.name == "posix",
+    ) as proc:
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except BaseException:
+            try:
+                if os.name == "posix":
+                    os.killpg(proc.pid, signal.SIGKILL)
+                else:
+                    proc.kill()
+            except ProcessLookupError:
+                pass
+            # TimeoutExpired already retains the bytes received before the
+            # deadline. Do not drain pipes held by a detached descendant here.
+            raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
 
 def load_manifest(path: Path) -> Dict[str, Any]:
@@ -870,14 +897,7 @@ def main() -> None:
                     pass
             env["PATH"] = f"{shim_dir}{os.pathsep}{env.get('PATH', '')}"
         try:
-            proc = subprocess.run(
-                cmd,
-                cwd=REPO_ROOT,
-                text=True,
-                capture_output=True,
-                env=env,
-                timeout=args.case_timeout if args.case_timeout > 0 else None,
-            )
+            proc = run_case_command(cmd, env, args.case_timeout if args.case_timeout > 0 else None)
         except subprocess.TimeoutExpired as exc:
             duration = time.time() - start
             stdout_path.write_text(timeout_output(exc.stdout))

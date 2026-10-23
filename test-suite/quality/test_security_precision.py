@@ -206,6 +206,446 @@ func sessionToken() -> String {
         self.assertEqual(self.findings(clean.read_text()), [])
 
 
+class JVMArchiveDataflowTests(unittest.TestCase):
+    """Archive names reach actual destinations under value-specific root proofs."""
+
+    @classmethod
+    def setUpClass(cls):
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        cls.root = Path(tempfile.mkdtemp(prefix="jvm-archive-", dir=artifacts))
+
+    @staticmethod
+    def program(language, body, helper=""):
+        signature = ("void unpack(ZipEntry entry, HttpServletRequest request, boolean enabled, Path destination)" if language == "java" else
+                     "fun unpack(entry: ZipEntry, request: HttpServletRequest, enabled: Boolean, destination: Path)")
+        return ("import java.nio.file.Path;\nimport java.nio.file.Paths;\nimport java.nio.file.Files;\n"
+                "import java.io.File;\nimport java.io.FileOutputStream;\nimport java.io.RandomAccessFile;\n"
+                "import java.util.zip.ZipEntry;\nimport java.util.zip.ZipFile;\n"
+                "import javax.servlet.http.HttpServletRequest;\nclass ArchiveProbe {\n" + helper + "\n" +
+                signature + " {\n" + body + "\n}\n}\n")
+
+    @staticmethod
+    def cases(language):
+        path = "Path" if language == "java" else "var"
+        string = "String" if language == "java" else "var"
+        name = "entry.getName()" if language == "java" else "entry.name"
+        root = path + ' root = Paths.get("/srv/out").toAbsolutePath().normalize();\n'
+        source = path + ' target = root.resolve(' + name + ');\n'
+        canonical = source.replace(');', ').normalize();')
+        reject = 'throw new IllegalArgumentException("outside");' if language == "java" else 'throw IllegalArgumentException("outside");'
+        guard = 'if (!target.startsWith(root)) { ' + reject + ' }\n'
+        unsafe = 'Files.writeString(target, "data"); // expect-finding\n'
+        safe = 'Files.writeString(target, "data");\n'
+        identity = ('Path safeDestination(Path value) { return value; }' if language == "java" else
+                    'fun safeDestination(value: Path): Path { return value }')
+        checked = (('Path checked(Path root, String name) {\n' if language == "java" else
+                    'fun checked(root: Path, name: String): Path {\n') +
+                   path + ' target = root.resolve(name).normalize();\n' + guard + 'return target;\n}')
+        checked_sink = checked.replace('Path checked(', 'void checked(').replace('): Path {', ') {').replace(
+            'return target;', unsafe.rstrip())
+        untrusted_root = root.replace('"/srv/out"', 'request.getParameter("root")')
+        cases = [
+            ("direct_destination", root + source + unsafe, ""),
+            ("construction_only", root + source, ""),
+            ("identity_helper_name_is_not_proof", root + source +
+             'Files.writeString(safeDestination(target), "data"); // expect-finding\n', identity),
+            ("unknown_helper_name_is_not_proof", root + source +
+             'Files.writeString(safeDestination(target), "data"); // expect-finding\n', ""),
+            ("literal_overwrite", root + source + 'target = Paths.get("/srv/out/fixed");\n' + safe, ""),
+            ("one_branch_overwrite", root + source + 'if (enabled) { target = Paths.get("/srv/out/fixed"); }\n' + unsafe, ""),
+            ("both_branches_overwrite", root + source +
+             'if (enabled) { target = Paths.get("/srv/out/a"); } else { target = Paths.get("/srv/out/b"); }\n' + safe, ""),
+            ("normalization_alone", root + canonical + unsafe, ""),
+            ("same_target_rejecting_guard", root + canonical + guard + safe, ""),
+            ("positive_guard", root + canonical + 'if (target.startsWith(root)) {\n' + safe + '}\n', ""),
+            ("fallthrough_guard", root + canonical + 'if (!target.startsWith(root)) { audit(); }\n' + unsafe, ""),
+            ("post_sink_guard", root + canonical + unsafe + guard, ""),
+            ("conditional_guard", root + canonical + 'if (enabled) {\n' + guard + '}\n' + unsafe, ""),
+            ("wrong_receiver_guard", root + canonical + path + ' audit = root.resolve("fixed").normalize();\n' +
+             guard.replace('!target.', '!audit.') + unsafe, ""),
+            ("target_reassigned_after_guard", root + canonical + guard + 'target = root.resolve(' + name + ');\n' + unsafe, ""),
+            ("immutable_alias_guard", root + canonical + path + ' alias = target;\n' +
+             guard.replace('!target.', '!alias.') + safe, ""),
+            ("alias_reassigned_before_guard", root + canonical + path + ' alias = target;\n'
+             'alias = root.resolve("fixed").normalize();\n' + guard.replace('!target.', '!alias.') + unsafe, ""),
+            ("target_reassigned_before_alias_guard", root + canonical + path + ' alias = target;\n'
+             'target = root.resolve(' + name + ');\n' + guard.replace('!target.', '!alias.') + unsafe, ""),
+            ("alias_created_before_target_guard", root + canonical + path + ' alias = target;\n' + guard +
+             safe.replace('(target,', '(alias,'), ""),
+            ("checked_helper_trusted_root", root + path + ' target = checked(root, ' + name + ');\n' + safe, checked),
+            ("checked_helper_attacker_root", untrusted_root + path + ' target = checked(root, ' + name + ');\n' + unsafe, checked),
+            ("checked_sink_attacker_root", untrusted_root + 'checked(root, ' + name + ');\n', checked_sink),
+            ("checked_sink_trusted_root", root + 'checked(root, ' + name + ');\n', checked_sink.replace(' // expect-finding', '')),
+            ("direct_attacker_root", untrusted_root + canonical + guard + unsafe, ""),
+            ("trusted_actual_guard_root", untrusted_root + canonical +
+             'root = Paths.get("/srv/out").toAbsolutePath().normalize();\n' + guard + safe, ""),
+            ("request_only_not_archive_rule", root + source.replace(name, 'request.getParameter("name")') + safe, ""),
+            ("copy_source_only", root + source + 'Files.copy(target, root.resolve("fixed"));\n', ""),
+            ("copy_destination", root + source + 'Files.copy(root.resolve("fixed"), target); // expect-finding\n', ""),
+            ("move_destination", root + source + 'Files.move(root.resolve("fixed"), target); // expect-finding\n', ""),
+            ("content_argument", root + 'Files.writeString(root.resolve("fixed"), ' + name + ');\n', ""),
+            ("output_stream_destination", root + source +
+             ('new ' if language == "java" else '') + 'FileOutputStream(target.toFile()); // expect-finding\n', ""),
+            ("readonly_random_access", root + source +
+             ('new ' if language == "java" else '') + 'RandomAccessFile(target.toFile(), "r");\n', ""),
+            ("writable_random_access", root + source +
+             ('new ' if language == "java" else '') + 'RandomAccessFile(target.toFile(), "rw"); // expect-finding\n', ""),
+            ("contained_parent_preparation", root + canonical + guard + 'Files.createDirectories(target.getParent());\n' + safe, ""),
+            ("contained_parent_write_is_not_proven", root + canonical + guard +
+             'Files.writeString(target.getParent(), "data"); // expect-finding\n', ""),
+            ("contained_parent_nonrecursive_mkdir", root + canonical + guard +
+             'Files.createDirectory(target.getParent()); // expect-finding\n', ""),
+            ("twice_parent_preparation", root + canonical + guard +
+             'Files.createDirectories(target.getParent().getParent()); // expect-finding\n', ""),
+            ("canonical_string_separator_guard", root + string + ' base = root.toFile().getCanonicalPath();\n' +
+             string + ' target = root.resolve(' + name + ').toFile().getCanonicalPath();\n' +
+             guard.replace('startsWith(root)', 'startsWith(base + File.separator)') +
+             ('new ' if language == "java" else '') + 'FileOutputStream(target);\n', ""),
+            ("canonical_string_unsafe_prefix", root + string + ' base = root.toFile().getCanonicalPath();\n' +
+             string + ' target = root.resolve(' + name + ').toFile().getCanonicalPath();\n' +
+             guard.replace('startsWith(root)', 'startsWith(base)') +
+             ('new ' if language == "java" else '') + 'FileOutputStream(target); // expect-finding\n', ""),
+            ("literal_entry_constructor", root +
+             ('ZipEntry local = new ' if language == "java" else 'val local = ') + 'ZipEntry("fixed");\n' +
+             source.replace(name, 'local.getName()') + safe, ""),
+            ("tainted_entry_constructor", root +
+             ('ZipEntry local = new ' if language == "java" else 'val local = ') + 'ZipEntry(' + name + ');\n' +
+             source.replace(name, 'local.getName()') + unsafe, ""),
+        ]
+        if language == "kotlin":
+            cases.append(("require_guard", root + canonical + 'require(target.startsWith(root))\n' + safe, ""))
+        return cases
+
+    def scan(self, language, name, source):
+        from ubs_core.java_detectors import archive_extraction
+
+        path = self.root / (language + "-" + name + (".java" if language == "java" else ".kt"))
+        path.write_text(source, encoding="utf-8")
+        findings = list(archive_extraction.find([path], language=language, rule_id=language + ".security.archive-extraction"))
+        return path, findings
+
+    def test_value_root_and_destination_semantics(self):
+        for language in ("java", "kotlin"):
+            for name, body, helper in self.cases(language):
+                with self.subTest(language=language, case=name):
+                    source = self.program(language, body, helper)
+                    _, findings = self.scan(language, name, source)
+                    expected = [number for number, line in enumerate(source.splitlines(), 1) if "// expect-finding" in line]
+                    self.assertEqual([row[1] for row in findings], expected, findings)
+
+    def test_original_archive_fixtures_at_actual_sinks(self):
+        from ubs_core.java_detectors import archive_extraction
+
+        for language, relative, expected in (
+                ("java", "java/security/ArchiveExtractionBuggy.java", [17, 20, 21, 31, 34]),
+                ("java", "java/security/ArchiveExtractionClean.java", []),
+                ("kotlin", "kotlin/archive_extraction_buggy/zip_slip.kt", [12, 14, 16, 27, 34]),
+                ("kotlin", "kotlin/archive_extraction_clean/zip_slip_safe.kt", [])):
+            with self.subTest(path=relative):
+                findings = list(archive_extraction.find([REPO_ROOT / "test-suite" / relative],
+                    language=language, rule_id=language + ".security.archive-extraction"))
+                self.assertEqual([row[1] for row in findings], expected, findings)
+
+    def test_archive_identity_selected_helper_and_iteration(self):
+        for language in ("java", "kotlin"):
+            helper = ("ZipEntry relay(ZipEntry value) { return value; }" if language == "java" else
+                      "fun relay(value: ZipEntry): ZipEntry { return value }")
+            body = ("ZipEntry forwarded = relay(entry);" if language == "java" else "val forwarded = relay(entry)")
+            body += '\nFiles.writeString(Paths.get("/srv/out").resolve(forwarded.getName()), "data"); // expect-finding\n'
+            source = self.program(language, body, helper)
+            _, findings = self.scan(language, "entry-helper", source)
+            self.assertEqual([row[1] for row in findings], [number for number, line in enumerate(source.splitlines(), 1)
+                                                         if "// expect-finding" in line])
+        source = self.program("kotlin", 'val zip = ZipFile("archive.zip")\n'
+            'for (item in zip.entries()) {\n'
+            'Files.writeString(Paths.get("/srv/out").resolve(item.name), "data"); // expect-finding\n}\n')
+        _, findings = self.scan("kotlin", "for-loop", source)
+        expected = [number for number, line in enumerate(source.splitlines(), 1) if "// expect-finding" in line]
+        self.assertEqual([row[1] for row in findings], expected, findings)
+
+    def test_suppression_belongs_to_the_actual_sink(self):
+        for language in ("java", "kotlin"):
+            _, body, helper = self.cases(language)[0]
+            rule = language + ".security.archive-extraction"
+            for owner, marker, expected in (
+                    ("source", "ubs:ignore[" + rule + "]", True),
+                    ("sink", "ubs:ignore[" + rule + "]", False),
+                    ("sink", "ubs:ignore[unrelated.rule]", True)):
+                with self.subTest(language=language, owner=owner, marker=marker):
+                    changed = body.replace("// expect-finding", "// " + marker) if owner == "sink" else body.replace(
+                        ');\nFiles.writeString', '); // ' + marker + '\nFiles.writeString')
+                    _, findings = self.scan(language, "suppressed-" + owner + str(expected), self.program(language, changed, helper))
+                    self.assertEqual(len(findings), int(expected), findings)
+
+    def test_annotated_request_root_is_not_a_trusted_helper_argument(self):
+        for language in ("java", "kotlin"):
+            body, helper = next((body, helper) for name, body, helper in self.cases(language)
+                                if name == "checked_helper_attacker_root")
+            source = self.program(language, body.replace('request.getParameter("root")', 'rootName'), helper)
+            source = source.replace("Path destination", "@RequestParam String rootName") if language == "java" else source.replace(
+                "destination: Path", "@RequestParam rootName: String")
+            _, findings = self.scan(language, "annotated-root", source)
+            expected = [number for number, line in enumerate(source.splitlines(), 1) if "// expect-finding" in line]
+            self.assertEqual([row[1] for row in findings], expected, findings)
+
+    def test_unrelated_entry_types_do_not_become_archive_sources(self):
+        for language in ("java", "kotlin"):
+            _, body, _ = self.cases(language)[0]
+            source = self.program(language, body).replace("import java.util.zip.ZipEntry;", "import example.ZipEntry;")
+            _, findings = self.scan(language, "unrelated-entry", source)
+            self.assertEqual(findings, [])
+
+    def test_unsupported_archive_state_is_partial_and_keeps_independent_findings(self):
+        from ubs_core.java_detectors import archive_extraction
+        from ubs_core.taint_flow import AnalysisLimit
+
+        for language in ("java", "kotlin"):
+            _, body, _ = self.cases(language)[0]
+            source = self.program(language, body + '\nexternal(entry);\n')
+            path = self.root / ("unknown-state." + ("java" if language == "java" else "kt"))
+            path.write_text(source, encoding="utf-8")
+            findings = []
+            with self.assertRaisesRegex(AnalysisLimit, "archive state escapes"):
+                findings.extend(archive_extraction.find([path], language=language))
+            self.assertEqual([row[1] for row in findings], [number for number, line in enumerate(source.splitlines(), 1)
+                                                         if "// expect-finding" in line], findings)
+            engine = archive_extraction.ArchiveEngine(path, self.program(language, body))
+            engine.budget.remaining = 0
+            with self.assertRaises(AnalysisLimit):
+                engine.analyze()
+
+    def test_malformed_or_unsupported_files_keep_independent_supported_findings(self):
+        from ubs_core.java_detectors import archive_extraction
+
+        for language in ("java", "kotlin"):
+            _, body, _ = self.cases(language)[0]
+            source = self.program(language, body)
+            supported, expected = self.scan(language, "supported", source)
+            invalid = self.root / ("malformed." + ("java" if language == "java" else "kt"))
+            invalid.write_text(source + "{", encoding="utf-8")
+            findings = []
+            with self.assertRaisesRegex(ValueError, "incomplete"):
+                findings.extend(archive_extraction.find([invalid, supported], language=language))
+            self.assertEqual(findings, expected)
+
+    def test_source_to_actual_sink_witness(self):
+        from ubs_core.java_detectors import archive_extraction
+
+        _, body, _ = self.cases("java")[0]
+        source = self.program("java", body)
+        path, _ = self.scan("java", "witness", source)
+        facts = archive_extraction.ArchiveEngine(path, source).analyze()
+        sink = next(number for number, line in enumerate(source.splitlines(), 1) if "// expect-finding" in line)
+        origin = next(number for number, line in enumerate(source.splitlines(), 1) if "entry.getName()" in line)
+        self.assertEqual(list(facts), [sink])
+        for fact in facts.values():
+            for trace in fact:
+                self.assertEqual((trace.evidence[0].line, trace.evidence[0].kind), (origin, "source"))
+                self.assertEqual((trace.evidence[-1].line, trace.evidence[-1].kind), (sink, "sink"))
+
+    @unittest.skipUnless(os.environ.get("UBS_JVM_ARCHIVE_E2E") == "1",
+                         "set UBS_JVM_ARCHIVE_E2E=1 for actual CLI scans")
+    def test_module_and_runner_json_sarif_and_partial_status(self):
+        for language in ("java", "kotlin"):
+            rule = language + ".security.archive-extraction"
+            selected_cases = {name: (body, helper) for name, body, helper in self.cases(language)}
+            unsafe, helper = selected_cases["identity_helper_name_is_not_proof"]
+            clean, clean_helper = selected_cases["checked_helper_trusted_root"]
+            cases = (("unsafe", unsafe, helper, False), ("clean", clean, clean_helper, False),
+                     ("partial", unsafe + "\nexternal(entry);\n", helper, True))
+            for label, body, helper, partial in cases:
+                directory = self.root / (language + "-" + label + "-cli")
+                directory.mkdir()
+                source = self.program(language, body, helper)
+                path = directory / ("ArchiveProbe.java" if language == "java" else "ArchiveProbe.kt")
+                path.write_text(source, encoding="utf-8")
+                expected = [number for number, line in enumerate(source.splitlines(), 1) if "// expect-finding" in line]
+                env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", UBS_NO_AUTO_UPDATE="1", UBS_ENABLE_AUTO_UPDATE="0",
+                           UBS_NO_CACHE="1", ENABLE_UV_TOOLS="0", CI="1", NO_COLOR="1",
+                           XDG_CACHE_HOME=str(directory / "cache"), XDG_CONFIG_HOME=str(directory / "config"),
+                           XDG_DATA_HOME=str(directory / "data"))
+                for surface in ("module", "runner"):
+                    for format_ in ("json", "sarif"):
+                        with self.subTest(language=language, case=label, surface=surface, format=format_):
+                            entry = (REPO_ROOT / "modules" / ("ubs-" + language + ".sh")
+                                     if surface == "module" else REPO_ROOT / "ubs")
+                            command = ("bash", str(entry), "--only=4" if surface == "module" else "--only=" + language,
+                                       "--format=" + format_, "--ci", str(path))
+                            started = time.monotonic()
+                            proc = subprocess.run(command, cwd=directory, capture_output=True, text=True, timeout=180, env=env)
+                            output = directory / (surface + "-" + format_)
+                            output.with_suffix(".stdout").write_text(proc.stdout, encoding="utf-8")
+                            output.with_suffix(".stderr").write_text(proc.stderr, encoding="utf-8")
+                            output.with_suffix(".command.json").write_text(json.dumps({
+                                "command": command, "exit": proc.returncode, "seconds": time.monotonic() - started,
+                                "source_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                            }, indent=2), encoding="utf-8")
+                            context = f"exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+                            self.assertEqual(proc.returncode, 2 if partial else int(bool(expected)), context)
+                            try:
+                                report = json.loads(proc.stdout)
+                            except json.JSONDecodeError as error:
+                                self.fail(f"Invalid scanner JSON: {error}\n{context}")
+                            if format_ == "json":
+                                self.assertEqual(report["status"], "partial" if partial else "ok", context)
+                                rule_key = "rule" if surface == "module" else "rule_id"
+                                rows = [row for row in report.get("findings", []) if row[rule_key] == rule]
+                                self.assertEqual([(row["line"], row["severity"]) for row in rows],
+                                                 [(line, "critical") for line in expected], context)
+                                for row in rows:
+                                    self.assertEqual(Path(row["path" if surface == "module" else "file"]).resolve(), path, context)
+                                    self.assertIn("archive filesystem destination", row["message"], context)
+                                totals = report if surface == "module" else report["totals"]
+                                self.assertEqual((totals["critical"], totals["warning"]), (len(expected), 0), context)
+                            else:
+                                rows = [row for run in report["runs"] for row in run.get("results", []) if row["ruleId"] == rule]
+                                sites = [row["locations"][0]["physicalLocation"] for row in rows]
+                                self.assertEqual([(site["region"]["startLine"], row["level"]) for site, row in zip(sites, rows)],
+                                                 [(line, "error") for line in expected], context)
+                                for site in sites:
+                                    self.assertEqual(sarif_location_path(site["artifactLocation"]["uri"], directory).resolve(), path, context)
+                                invocations = [item for run in report["runs"] for item in run.get("invocations", [])]
+                                if partial:
+                                    self.assertTrue(invocations, context)
+                                    self.assertTrue(all(item["executionSuccessful"] is False for item in invocations), context)
+                                else:
+                                    self.assertTrue(all(item.get("executionSuccessful") is not False for item in invocations), context)
+
+
+@unittest.skipUnless(os.environ.get("UBS_SPRING_SQL_E2E") == "1",
+                     "set UBS_SPRING_SQL_E2E=1 for actual Spring SQL CLI scans")
+class SpringSqlPublicTests(unittest.TestCase):
+    """The SQL text and bound values have different roles at Spring sinks."""
+
+    @classmethod
+    def setUpClass(cls):
+        artifacts = REPO_ROOT / "test-suite" / "artifacts" / "spring-sql-public"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        cls.root = Path(tempfile.mkdtemp(prefix="run-", dir=artifacts))
+
+    @staticmethod
+    def programs(language, clean):
+        fixtures = (
+            ("ListProbe", "org.springframework.jdbc.core.JdbcOperations",
+             'jdbc.queryForList(sql, request.getParameter("id"));',
+             '"SELECT id FROM users WHERE id = ?"'),
+            ("NamedProbe", "org.springframework.jdbc.core.namedparam.NamedParameterJdbcOperations",
+             'jdbc.queryForList(sql, java.util.Map.of("id", request.getParameter("id")));',
+             '"SELECT id FROM users WHERE id = :id"'),
+            ("ExecuteProbe", "org.springframework.jdbc.core.JdbcTemplate",
+             'jdbc.execute(sql);', '"CREATE TABLE example (id integer)"'),
+        )
+        result = []
+        for name, api, call, literal in fixtures:
+            value = literal if clean else 'request.getParameter("query")'
+            imports = 'import jakarta.servlet.http.HttpServletRequest;\nimport ' + api + ';\n'
+            receiver = api.rsplit(".", 1)[-1]
+            if language == "java":
+                text = (imports + 'class ' + name + ' {\n'
+                        '  void run(HttpServletRequest request, ' + receiver + ' jdbc) {\n'
+                        '    String sql = ' + value + ';\n    ' + call + '\n  }\n}\n')
+                suffix, line = ".java", 6
+            else:
+                text = (imports + 'fun run(request: HttpServletRequest, jdbc: ' + receiver + ') {\n'
+                        '    val sql = ' + value + ';\n    ' + call + '\n}\n')
+                suffix, line = ".kt", 5
+            result.append((name + suffix, text, line))
+        return result
+
+    def test_module_and_runner_exact_sql_sites_and_partial_results(self):
+        for language in ("java", "kotlin"):
+            rule = language + ".security.sql-injection"
+            for label in ("unsafe", "clean", "partial"):
+                directory = self.root / (language + "-" + label)
+                directory.mkdir()
+                programs = self.programs(language, label == "clean")
+                expected = [] if label == "clean" else sorted(
+                    (name, rule, line, 5, "critical") for name, _text, line in programs)
+                for name, source, _line in programs:
+                    (directory / name).write_text(source, encoding="utf-8")
+                if label == "partial":
+                    # A broken selected neighbor must not erase the three
+                    # independently supported findings or claim a clean scan.
+                    suffix = ".java" if language == "java" else ".kt"
+                    broken = programs[0][1].replace("ListProbe", "Broken") + "{\n"
+                    (directory / ("Broken" + suffix)).write_text(broken, encoding="utf-8")
+                env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", UBS_NO_AUTO_UPDATE="1",
+                           UBS_ENABLE_AUTO_UPDATE="0", UBS_NO_CACHE="1", ENABLE_UV_TOOLS="0",
+                           CI="1", NO_COLOR="1", UBS_CACHE_DIR=str(directory / "cache"),
+                           XDG_CACHE_HOME=str(directory / "xdg-cache"),
+                           XDG_CONFIG_HOME=str(directory / "config"), XDG_DATA_HOME=str(directory / "data"))
+                for surface in ("module", "runner"):
+                    for format_ in ("json", "sarif"):
+                        case = "-".join((language, label, surface, format_))
+                        with self.subTest(case=case):
+                            entry = (REPO_ROOT / "modules" / ("ubs-" + language + ".sh")
+                                     if surface == "module" else REPO_ROOT / "ubs")
+                            selection = ("--only=" + ("4" if language == "java" else "13")
+                                         if surface == "module" else "--only=" + language)
+                            command = ["bash", str(entry), selection, "--format=" + format_, "--ci", str(directory)]
+                            print("[spring-sql-" + case + "] RUN", flush=True)
+                            started = time.monotonic()
+                            proc = subprocess.run(command, cwd=directory, env=env, capture_output=True,
+                                                  text=True, timeout=180)
+                            elapsed = time.monotonic() - started
+                            output = directory / (surface + "-" + format_)
+                            output.with_suffix(".stdout").write_text(proc.stdout, encoding="utf-8")
+                            output.with_suffix(".stderr").write_text(proc.stderr, encoding="utf-8")
+                            sources = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                                       for path in directory.glob("*.java" if language == "java" else "*.kt")}
+                            tools = {path: hashlib.sha256((REPO_ROOT / path).read_bytes()).hexdigest()
+                                     for path in ("ubs", "modules/helpers/ubs_core/analyzers/taint_java_sql.py",
+                                                  "modules/helpers/ubs_core/analyzers/taint_kotlin_sql.py")}
+                            output.with_suffix(".receipt.json").write_text(json.dumps({
+                                "case": case, "command": command, "exit": proc.returncode, "seconds": elapsed,
+                                "sources": sources, "tools": tools, "python": sys.version,
+                                "ast_grep": shutil.which("ast-grep"),
+                            }, indent=2), encoding="utf-8")
+                            context = f"{command!r}\nexit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+                            self.assertEqual(proc.returncode, 2 if label == "partial" else int(bool(expected)), context)
+                            try:
+                                report = json.loads(proc.stdout)
+                            except json.JSONDecodeError as error:
+                                self.fail(f"Invalid scanner JSON: {error}\n{context}")
+                            if format_ == "json":
+                                self.assertEqual(report["status"], "partial" if label == "partial" else "ok", context)
+                                rows = report.get("findings", [])
+                                actual = []
+                                for row in rows:
+                                    path = Path(row["path" if surface == "module" else "file"])
+                                    self.assertEqual(path.resolve().parent, directory, context)
+                                    actual.append((path.name, row["rule" if surface == "module" else "rule_id"],
+                                                   row["line"], row["col"], row["severity"]))
+                                    evidence = row["extras"]["taint_path"]
+                                    self.assertEqual((evidence[0]["kind"], evidence[0]["line"]),
+                                                     ("source", row["line"] - 1), context)
+                                    self.assertEqual((evidence[-1]["kind"], evidence[-1]["line"]),
+                                                     ("sink", row["line"]), context)
+                                totals = report if surface == "module" else report["totals"]
+                                self.assertEqual((totals["critical"], totals["warning"], totals["info"]),
+                                                 (len(expected), 0, 0), context)
+                            else:
+                                actual = []
+                                for run in report["runs"]:
+                                    for row in run.get("results", []):
+                                        location = row["locations"][0]["physicalLocation"]
+                                        path = sarif_location_path(location["artifactLocation"]["uri"], directory).resolve()
+                                        self.assertEqual(path.parent, directory, context)
+                                        self.assertEqual(row["level"], "error", context)
+                                        actual.append((path.name, row["ruleId"], location["region"]["startLine"],
+                                                       location["region"]["startColumn"], "critical"))
+                                        self.assertTrue(row.get("codeFlows"), context)
+                                invocations = [item for run in report["runs"] for item in run.get("invocations", [])]
+                                if label == "partial":
+                                    self.assertTrue(invocations, context)
+                                    self.assertTrue(all(item["executionSuccessful"] is False for item in invocations), context)
+                                else:
+                                    self.assertTrue(all(item.get("executionSuccessful") is not False for item in invocations), context)
+                            self.assertEqual(sorted(actual), expected, context)
+                            print(f"[spring-sql-{case}] PASS ({elapsed:.3f}s)", flush=True)
+
+
 class JVMOutboundDataflowTests(unittest.TestCase):
     """An HTTP destination is a value, not all text in a nearby statement."""
 

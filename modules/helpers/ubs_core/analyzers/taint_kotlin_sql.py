@@ -65,6 +65,8 @@ def policy_limits() -> tuple[int, int, int]:
 class KotlinJdbcSource(jdbc.JdbcSource):
     """Adapt Kotlin lexical bindings to the shared JDBC receiver interface."""
 
+    kotlin = True
+
     def __init__(self, text: str):
         self.model = KotlinCoroutines(text)
         self.text, self.code = text, self.model.code
@@ -244,6 +246,9 @@ class KotlinSqlEngine(jdbc.SqlEngine):
         supers = {
             "java.sql.PreparedStatement": {"java.sql.Statement"},
             "java.sql.CallableStatement": {"java.sql.PreparedStatement", "java.sql.Statement"},
+            "org.springframework.jdbc.core.JdbcTemplate": {"org.springframework.jdbc.core.JdbcOperations"},
+            "org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate": {
+                "org.springframework.jdbc.core.namedparam.NamedParameterJdbcOperations"},
             "jakarta.servlet.http.HttpServletRequest": {"jakarta.servlet.ServletRequest"},
             "javax.servlet.http.HttpServletRequest": {"javax.servlet.ServletRequest"},
             "com.sun.net.httpserver.HttpsExchange": {"com.sun.net.httpserver.HttpExchange"},

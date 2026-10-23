@@ -1235,6 +1235,195 @@ class JavaSqlDirectTests(unittest.TestCase):
             "cases": receipts}, indent=2) + "\n", encoding="utf-8")
 
 
+class SpringSqlDirectTests(unittest.TestCase):
+    """SQL argument roles from the actual Spring JDBC interfaces.
+
+    https://docs.spring.io/spring-framework/docs/current/javadoc-api/org/springframework/jdbc/core/JdbcOperations.html
+    https://docs.spring.io/spring-framework/docs/current/javadoc-api/org/springframework/jdbc/core/namedparam/NamedParameterJdbcOperations.html
+    """
+    imports = ("import jakarta.servlet.http.HttpServletRequest;\n"
+               "import org.springframework.jdbc.core.JdbcTemplate;\n"
+               "import org.springframework.jdbc.core.JdbcOperations;\n"
+               "import org.springframework.jdbc.core.RowMapper;\n"
+               "import org.springframework.jdbc.core.PreparedStatementCallback;\n"
+               "import org.springframework.jdbc.core.PreparedStatementCreator;\n"
+               "import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;\n"
+               "import org.springframework.jdbc.core.namedparam.NamedParameterJdbcOperations;\n"
+               "import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;\n"
+               "import org.springframework.web.client.RestTemplate;\n"
+               "import org.springframework.web.client.ResponseExtractor;\n"
+               "import org.springframework.http.HttpMethod;\n"
+               "import java.util.Map;\n")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.artifacts = artifact_directory("spring-direct")
+
+    def check(self, label, body, *, incomplete=False, anchor=None):
+        from ubs_core.analyzers import taint_java_sql
+        from ubs_core.java_detectors import ssrf_outbound_url
+        source = self.imports + "class Controller {\n" + textwrap.dedent(body).strip() + "\n}\n"
+        path = self.artifacts / (label + ".java")
+        path.write_text(source, encoding="utf-8")
+        if incomplete:
+            with self.assertRaisesRegex(ValueError, "incomplete"):
+                taint_java_sql.analyze_source(path, source)
+            return
+        rows = taint_java_sql.analyze_source(path, source)
+        expected = [(line, text.index(anchor) + 1 if anchor else len(text) - len(text.lstrip()) + 1)
+                    for line, text in enumerate(source.splitlines(), 1) if "// SQL_EXEC" in text]
+        self.assertEqual([(row["line"], row["col"]) for row in rows], expected, source)
+        for row in rows:
+            self.assertEqual((row["rule"], row["severity"], row["category_id"]),
+                             (RULE, "critical", "java.security"))
+            self.assertEqual(row["extras"]["source_count"], 1)
+            witness = row["extras"]["taint_path"]
+            self.assertIn("source", {step["kind"] for step in witness})
+            self.assertEqual((witness[-1]["line"], witness[-1]["col"], witness[-1]["kind"]),
+                             (row["line"], row["col"], "sink"))
+        outbound = list(ssrf_outbound_url.find([path]))
+        self.assertEqual([row[1] for row in outbound],
+                         [line for line, text in enumerate(source.splitlines(), 1) if "// SSRF_EXEC" in text], source)
+        (self.artifacts / (label + ".json")).write_text(json.dumps({
+            "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+            "expected": expected, "findings": rows,
+            "ssrf": [(str(found), line, col, detail) for found, line, col, detail in outbound],
+        }, indent=2) + "\n", encoding="utf-8")
+
+    def test_selected_spring_api_sql_arguments(self):
+        classic = (
+            "database.execute(sql)", "database.query(sql, mapper)",
+            "database.queryForList(sql, bound)", "database.queryForObject(sql, String.class, bound)",
+            "database.queryForMap(sql, bound)", "database.queryForRowSet(sql, bound)",
+            "database.queryForStream(sql, mapper, bound)", "database.update(sql, bound)",
+        )
+        named = (
+            "database.execute(sql, bindings, callback)", "database.query(sql, bindings, mapper)",
+            "database.queryForList(sql, bindings)", "database.queryForObject(sql, bindings, String.class)",
+            "database.queryForMap(sql, bindings)", "database.queryForRowSet(sql, bindings)",
+            "database.queryForStream(sql, bindings, mapper)", "database.update(sql, bindings)",
+        )
+        for receiver, calls in (("JdbcTemplate", classic), ("JdbcOperations", classic),
+                                ("NamedParameterJdbcTemplate", named), ("NamedParameterJdbcOperations", named)):
+            for index, call in enumerate(calls):
+                with self.subTest(receiver=receiver, call=call):
+                    self.check(f"{receiver}_{index}", f'''
+                        void handle(HttpServletRequest request, {receiver} database,
+                                    RowMapper<String> mapper, PreparedStatementCallback<Object> callback) {{
+                            String sql = request.getParameter("sql");
+                            String bound = request.getParameter("bound");
+                            Map<String, Object> bindings = Map.of("id", bound);
+                            {call}; // SQL_EXEC
+                        }}
+                    ''')
+
+    def test_bindings_are_data_and_literal_overwrite_is_clean(self):
+        self.check("bindings", '''
+            String fixed(String ignored) { return "SELECT 1"; }
+            void handle(HttpServletRequest request, JdbcTemplate database,
+                        NamedParameterJdbcOperations named, RowMapper<String> mapper) {
+                String input = request.getParameter("name");
+                database.queryForList("SELECT name FROM users WHERE name = ?", input);
+                database.query("SELECT name FROM users WHERE name = ?", mapper, input);
+                named.queryForList("SELECT name FROM users WHERE name = :name", Map.of("name", input));
+                String sql = request.getParameter("sql");
+                sql = "SELECT 1";
+                database.execute(sql);
+                database.execute(fixed(input));
+            }
+        ''')
+
+    def test_constructor_alias_and_selected_helper_flow(self):
+        self.check("factories", '''
+            void handle(HttpServletRequest request, javax.sql.DataSource source, boolean choose) {
+                var database = new JdbcTemplate(source);
+                var alias = selected(database);
+                String sql = "SELECT 1";
+                if (choose) { sql = request.getParameter("sql"); }
+                alias.queryForList(sql); // SQL_EXEC
+                alias.execute(sql); // SQL_EXEC
+                selected(database).execute(sql); // SQL_EXEC
+                send(database, sql);
+            }
+            JdbcTemplate selected(JdbcTemplate database) { return database; }
+            void send(JdbcOperations database, String sql) {
+                database.update(sql); // SQL_EXEC
+            }
+        ''')
+        self.check("named_accessor", '''
+            void handle(HttpServletRequest request, javax.sql.DataSource source) {
+                var named = new NamedParameterJdbcTemplate(source);
+                var database = named.getJdbcOperations();
+                database.execute(request.getParameter("sql")); // SQL_EXEC
+            }
+        ''')
+
+    def test_fake_shadowed_and_unknown_sql_are_clean(self):
+        self.check("shadowed", '''
+            static class JdbcTemplate { void queryForList(String value) {} }
+            void handle(HttpServletRequest request, JdbcTemplate database) {
+                database.queryForList(request.getParameter("sql"));
+            }
+        ''')
+        self.check("unknown_string", '''
+            void handle(JdbcOperations database, String sql) {
+                database.execute(sql);
+                database.queryForList(sql);
+            }
+        ''')
+
+    def test_selected_callbacks_batches_and_unknown_receiver_escape_are_incomplete(self):
+        bodies = (
+            '''void handle(JdbcOperations database, PreparedStatementCreator creator, RowMapper<String> mapper) {
+                database.query(creator, mapper);
+            }''',
+            '''void handle(HttpServletRequest request, JdbcTemplate database, RowMapper<String> mapper) {
+                database.query(connection -> connection.prepareStatement(request.getParameter("sql")), mapper);
+            }''',
+            '''void handle(HttpServletRequest request, JdbcTemplate database) {
+                String sql = database.queryForObject("SELECT 1", (row, index) -> request.getParameter("sql"));
+                database.queryForList(sql);
+            }''',
+            '''void handle(HttpServletRequest request, JdbcTemplate database) {
+                String sql = database.queryForObject("SELECT 1", new RowMapper<String>() {
+                    public String mapRow(java.sql.ResultSet row, int index) { return request.getParameter("sql"); }
+                });
+                database.queryForList(sql);
+            }''',
+            '''void handle(HttpServletRequest request, JdbcOperations database) {
+                database.batchUpdate("SELECT 1", request.getParameter("sql"));
+            }''',
+            '''void handle(HttpServletRequest request, NamedParameterJdbcOperations database) {
+                database.batchUpdate(request.getParameter("sql"), new Map[]{Map.of("id", 7)});
+            }''',
+            '''void handle(HttpServletRequest request, JdbcTemplate database) {
+                external(database).queryForList(request.getParameter("sql"));
+            }''',
+        )
+        for index, body in enumerate(bodies):
+            with self.subTest(index=index):
+                self.check(f"unsupported_{index}", body, incomplete=True)
+
+    def test_http_helper_return_and_overload_remain_http(self):
+        self.check("http_helper", '''
+            JdbcTemplate selected(JdbcTemplate database) { return database; }
+            RestTemplate selected(RestTemplate client) { return client; }
+            void handle(HttpServletRequest request, RestTemplate client, ResponseExtractor<String> extractor) {
+                var http = selected(client);
+                http.execute(request.getParameter("url"), HttpMethod.GET, null, extractor); // SSRF_EXEC
+            }
+        ''')
+        # Receiver classification stays independent of enabling SQL or its
+        # limits, so a disabled SQL category cannot turn a database into HTTP.
+        with patch.dict(os.environ, {"UBS_JAVA_SQL_MAX_STEPS": "invalid"}):
+            from ubs_core.analyzers.taint_java_sql import non_http_execute_sites
+            source = self.imports + '''class Controller {
+                void handle(JdbcTemplate database) { selected(database).execute("SELECT 1"); }
+                JdbcTemplate selected(JdbcTemplate database) { return database; }
+            }'''
+            self.assertEqual(len(non_http_execute_sites(source)), 1)
+
+
 class JavaSqlPublicTests(unittest.TestCase):
     scan = tls.JavaTlsVerifierTests.scan
     assert_json = tls.JavaTlsVerifierTests.assert_json

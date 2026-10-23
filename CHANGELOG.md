@@ -28,6 +28,33 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Fixed
 
+- Java/Kotlin SQL analysis recognizes selected Spring JdbcTemplate/JdbcOperations
+  and NamedParameterJdbcTemplate/NamedParameterJdbcOperations execution APIs.
+  Scoped receiver identity and helper flow distinguish query text from separately
+  bound values: parameters never sanitize a request-derived query. Genuine Spring
+  SQL execution is excluded from HTTP sinks, while unsupported creator/callback
+  forms retain an explicit incomplete-analysis result.
+
+- Java/Kotlin archive extraction follows entry identity and extraction targets
+  through scoped helper summaries, branches and supported iteration. Findings
+  belong to actual filesystem writes, with source-to-sink witnesses; path
+  construction alone stays clean. Containment checks must protect the same
+  target under a trusted root, including roots passed through helpers. Escaped
+  archive objects and unsupported analysis report incomplete scan status.
+
+- Python header injection follows header names and values through scoped helper
+  summaries and branches. Encoder identity, option values, CR/LF removal and
+  dominating rejection checks determine safety; shadowed encoders, decoding,
+  effectful guards and formatting that can reintroduce control characters no
+  longer hide unsafe sinks. Unsupported candidate code reports incomplete
+  analysis, and a structural sink filter avoids unnecessary whole-file flow work.
+
+- Ruby archive extraction follows entry names through scoped helpers, aliases
+  and branches to actual extraction and filesystem writes. Only validation of
+  the selected destination proves containment; safe-looking names and unrelated
+  guards cannot hide unsafe writes. Fixed destinations and archive names used
+  only as file contents stay clean; unsupported archive operations report
+  incomplete analysis.
 - Python taint analysis deduplicates recursive context keys and preserves
   explicit callable overrides, preventing non-converging self-scans. Allow-list
   indexing and unchanged-global handling avoid repeated work; the whole-repo

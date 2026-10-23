@@ -584,5 +584,151 @@ class KotlinSqlTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
+class SpringKotlinSqlTests(unittest.TestCase):
+    imports = ("import org.springframework.jdbc.core.JdbcTemplate\n"
+               "import org.springframework.jdbc.core.JdbcOperations\n"
+               "import org.springframework.jdbc.core.RowMapper\n"
+               "import org.springframework.jdbc.core.PreparedStatementCreator\n"
+               "import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate\n"
+               "import org.springframework.jdbc.core.namedparam.NamedParameterJdbcOperations\n"
+               "import org.springframework.web.client.RestTemplate\n"
+               "import org.springframework.web.client.ResponseExtractor\n"
+               "import org.springframework.http.HttpMethod\n")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.artifacts = ROOT / "test-suite/artifacts/kotlin-sql" / (cls.__name__ + "-" + uuid.uuid4().hex[:12])
+        cls.artifacts.mkdir(parents=True)
+
+    def check(self, case, *, incomplete=False, following=""):
+        from ubs_core.analyzers import taint_kotlin_sql
+        from ubs_core.java_detectors import ssrf_outbound_url
+        source = self.imports + case.source + textwrap.dedent(following)
+        path = self.artifacts / (case.name + ".kt")
+        path.write_text(source, encoding="utf-8")
+        if incomplete:
+            with self.assertRaisesRegex(ValueError, "incomplete"):
+                taint_kotlin_sql.analyze_source(path, source)
+            return
+        findings = taint_kotlin_sql.analyze_source(path, source)
+        expected = [(line, len(text) - len(text.lstrip()) + 1)
+                    for line, text in enumerate(source.splitlines(), 1) if "// SQL_EXEC" in text]
+        self.assertEqual([(row["line"], row["col"]) for row in findings], expected, source)
+        for row in findings:
+            self.assertEqual((row["rule"], row["severity"], row["category_id"]),
+                             (RULE, "critical", "kotlin.sql"))
+            self.assertEqual(row["extras"]["source_count"], 1)
+            witness = row["extras"]["taint_path"]
+            self.assertIn("source", {step["kind"] for step in witness})
+            self.assertEqual((witness[-1]["line"], witness[-1]["col"], witness[-1]["kind"]),
+                             (row["line"], row["col"], "sink"))
+        outbound = list(ssrf_outbound_url.find([path]))
+        self.assertEqual([row[1] for row in outbound],
+                         [line for line, text in enumerate(source.splitlines(), 1) if "// SSRF_EXEC" in text], source)
+        (self.artifacts / (case.name + ".json")).write_text(json.dumps({
+            "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+            "expected": expected, "findings": findings,
+            "ssrf": [(str(found), line, col, detail) for found, line, col, detail in outbound],
+        }, indent=2) + "\n", encoding="utf-8")
+
+    def test_import_alias_named_bindings_and_bound_values(self):
+        cases = (
+            Case("spring_import_alias", '''
+                val sql = request.getParameter("sql")
+                database.queryForList(sql, request.getParameter("bound")) // SQL_EXEC
+                database.execute(sql) // SQL_EXEC
+            ''', "request: HttpServletRequest, database: Database",
+                 imports="import org.springframework.jdbc.core.JdbcTemplate as Database"),
+            Case("spring_named_template", '''
+                val sql = request.getParameter("sql")
+                database.queryForList(sql, mapOf("id" to 7)) // SQL_EXEC
+            ''', "request: HttpServletRequest, database: NamedParameterJdbcTemplate"),
+            Case("spring_named_interface", '''
+                val input = request.getParameter("name")
+                val sql = "SELECT name FROM users WHERE name = '$input'"
+                database.update(sql, mapOf("id" to 7)) // SQL_EXEC
+            ''', "request: HttpServletRequest, database: NamedParameterJdbcOperations"),
+            Case("spring_fixed_bound", '''
+                val input = request.getParameter("name")
+                database.queryForList("SELECT name FROM users WHERE name = ?", input)
+                database.update("UPDATE users SET name = ?", input)
+                named.queryForList("SELECT name FROM users WHERE name = :name", mapOf("name" to input))
+                var sql = request.getParameter("sql")
+                sql = "SELECT 1"
+                database.execute(sql)
+                database.execute(fixed(input))
+            ''', "request: HttpServletRequest, database: JdbcOperations, named: NamedParameterJdbcOperations",
+                 helpers='fun fixed(ignored: String?): String = "SELECT 1"'),
+            Case("spring_unknown_string", '''
+                database.execute(sql)
+                database.queryForList(sql)
+            ''', "database: JdbcOperations, sql: String"),
+            Case("spring_fake_receiver", '''
+                database.queryForList(request.getParameter("sql"))
+            ''', "request: HttpServletRequest, database: Recorder",
+                 helpers="class Recorder { fun queryForList(sql: String?) {} }"),
+        )
+        for case in cases:
+            with self.subTest(case=case.name):
+                self.check(case)
+
+    def test_constructor_alias_branch_and_helper_receiver_flow(self):
+        self.check(Case("spring_factories", '''
+            val database = JdbcTemplate(source)
+            val alias = selected(database)
+            var sql = "SELECT 1"
+            if (choose) { sql = request.getParameter("sql") }
+            alias.queryForList(sql) // SQL_EXEC
+            alias.execute(sql) // SQL_EXEC
+            selected(database).execute(sql) // SQL_EXEC
+            send(database, sql)
+        ''', "request: HttpServletRequest, source: javax.sql.DataSource, choose: Boolean"), following='''
+            fun selected(database: JdbcTemplate): JdbcTemplate = database
+            fun send(database: JdbcOperations, sql: String) {
+                database.update(sql) // SQL_EXEC
+            }
+        ''')
+        self.check(Case("spring_named_accessor", '''
+            val named = NamedParameterJdbcTemplate(source)
+            val database = named.getJdbcOperations()
+            database.execute(request.getParameter("sql")) // SQL_EXEC
+        ''', "request: HttpServletRequest, source: javax.sql.DataSource"))
+
+    def test_nullable_callbacks_batches_and_unknown_escapes_are_incomplete(self):
+        cases = (
+            Case("spring_nullable", 'database?.queryForList(request.getParameter("sql"))',
+                 "request: HttpServletRequest, database: JdbcTemplate?"),
+            Case("spring_creator", "database.query(creator, mapper)",
+                 "database: JdbcOperations, creator: PreparedStatementCreator, mapper: RowMapper<String>"),
+            Case("spring_mapper_result", '''
+                val sql = database.queryForObject("SELECT 1") { row, index -> request.getParameter("sql") }
+                database.queryForList(sql)
+            ''', "request: HttpServletRequest, database: JdbcTemplate"),
+            Case("spring_extractor_result", '''
+                val sql = database.query("SELECT 1", org.springframework.jdbc.core.ResultSetExtractor {
+                    request.getParameter("sql")
+                })
+                database.queryForList(sql)
+            ''', "request: HttpServletRequest, database: JdbcTemplate"),
+            Case("spring_batch", 'database.batchUpdate("SELECT 1", request.getParameter("sql"))',
+                 "request: HttpServletRequest, database: JdbcOperations"),
+            Case("spring_unknown_escape", 'external(database).queryForList(request.getParameter("sql"))',
+                 "request: HttpServletRequest, database: JdbcTemplate"),
+        )
+        for case in cases:
+            with self.subTest(case=case.name):
+                self.check(case, incomplete=True)
+
+    def test_http_helper_overload_remains_http(self):
+        self.check(Case("spring_http_helper", '''
+            val http = selected(client)
+            http.execute(request.getParameter("url"), HttpMethod.GET, null, extractor) // SSRF_EXEC
+        ''', "request: HttpServletRequest, client: RestTemplate, extractor: ResponseExtractor<String>",
+             helpers='''
+                fun selected(database: JdbcTemplate): JdbcTemplate = database
+                fun selected(client: RestTemplate): RestTemplate = client
+             '''))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

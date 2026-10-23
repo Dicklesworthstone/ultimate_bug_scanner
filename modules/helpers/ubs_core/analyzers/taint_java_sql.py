@@ -2,7 +2,7 @@
 
 Reuse the finite JVM CFG and local call summaries. JDBC objects and captured
 prepared SQL are distinct facts: setters bind values, never rewrite SQL text.
-Only genuine java.sql receivers and selected JDK/Servlet request APIs qualify. Static
+Only genuine JDBC/Spring receivers and selected JDK/Servlet request APIs qualify. Static
 strings have explicit identities, while unknown values remain unknown; absence
 of request taint is not proof that a legacy concatenation warning is redundant.
 
@@ -17,6 +17,12 @@ toString and setLength(0) track mutable contents separately from aliases and
 immutable query snapshots. Cross-call mutable object effects, repeated
 allocation sites, other builder mutations, callbacks and SQL-bearing heap
 state retain an explicit incomplete-analysis result.
+
+Selected Spring JdbcOperations and NamedParameterJdbcOperations implementations
+execute argument zero as SQL text. Positional and named bindings are separate
+data arguments, even when an unsafe query also supplies them. Creator/callback
+overloads and Spring batches need distinct semantics and remain explicitly
+incomplete rather than being treated as bound SQL.
 """
 from __future__ import annotations
 
@@ -44,6 +50,17 @@ _BATCH_MUTATE = frozenset({"addBatch", "clearBatch"})
 _EXECUTE = frozenset({"execute", "executeQuery", "executeUpdate", "executeLargeUpdate"}) | _BATCH_EXECUTE
 _PREPARED = frozenset({"java.sql.PreparedStatement", "java.sql.CallableStatement"})
 _STATEMENTS = _PREPARED | {"java.sql.Statement"}
+_SPRING_CLASSIC = frozenset({"org.springframework.jdbc.core.JdbcTemplate",
+                             "org.springframework.jdbc.core.JdbcOperations"})
+_SPRING_NAMED = frozenset({"org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate",
+                           "org.springframework.jdbc.core.namedparam.NamedParameterJdbcOperations"})
+_SPRING = _SPRING_CLASSIC | _SPRING_NAMED
+_SPRING_TEMPLATES = frozenset({"org.springframework.jdbc.core.JdbcTemplate",
+                              "org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate"})
+_SPRING_SQL = frozenset({"execute", "query", "queryForObject", "queryForList", "queryForMap",
+                         "queryForRowSet", "queryForStream", "update"})
+_SPRING_UNSUPPORTED = frozenset({"batchUpdate", "call"})
+_SPRING_CREATOR_OVERLOADS = frozenset({"execute", "query", "queryForStream", "update"})
 _HTTP = frozenset({"com.sun.net.httpserver.HttpExchange", "com.sun.net.httpserver.HttpsExchange"})
 _SERVLET = frozenset({"jakarta.servlet.ServletRequest", "javax.servlet.ServletRequest"})
 _SERVLET_HTTP = frozenset({"jakarta.servlet.http.HttpServletRequest", "javax.servlet.http.HttpServletRequest"})
@@ -54,16 +71,18 @@ _SERVLET_HTTP_ARITY = {
 _EXECUTORS = frozenset({"java.util.concurrent.Executor", "java.util.concurrent.ExecutorService",
                         "java.util.concurrent.ScheduledExecutorService"})
 _BUILDERS = frozenset({"java.lang.StringBuilder", "java.lang.StringBuffer"})
-_OBJECTS = _STATEMENTS | _HTTP | _SERVLET | _SERVLET_HTTP | _BUILDERS | {"java.sql.Connection"}
+_OBJECTS = _STATEMENTS | _SPRING | _HTTP | _SERVLET | _SERVLET_HTTP | _BUILDERS | {"java.sql.Connection"}
 _APIS = _OBJECTS | _EXECUTORS | {"java.lang.String", "java.lang.CharSequence", "java.lang.Object",
                                "java.net.URI", "com.sun.net.httpserver.Headers",
                                "java.lang.Integer", "java.lang.Long"}
 _TYPE_PREFIX = "sql:type:"
 _PREPARED_SQL = "sql:prepared-query"
 _ARGUMENT_OBJECT = "sql:argument-object"
-_SINK_RE = re.compile(r"\.\s*(?:executeQuery|executeUpdate|executeLargeUpdate|executeBatch|executeLargeBatch|execute)\s*\(")
+_SINK_RE = re.compile(r"\.\s*(?:executeQuery|executeUpdate|executeLargeUpdate|executeBatch|executeLargeBatch|execute|"
+                      r"queryForObject|queryForList|queryForMap|queryForRowSet|queryForStream|query|update|batchUpdate|call)\s*\(")
 _BATCH_RE = re.compile(r"\.\s*(?:addBatch|clearBatch|executeBatch|executeLargeBatch)\s*\(")
-_SQL_OPERATION_RE = re.compile(r"\.\s*(?:executeQuery|executeUpdate|executeLargeUpdate|executeBatch|executeLargeBatch|execute|addBatch|clearBatch)\s*\(")
+_SQL_OPERATION_RE = re.compile(r"\.\s*(?:executeQuery|executeUpdate|executeLargeUpdate|executeBatch|executeLargeBatch|execute|addBatch|clearBatch|"
+                               r"queryForObject|queryForList|queryForMap|queryForRowSet|queryForStream|query|update|batchUpdate|call)\s*\(")
 _MEMBER_CALL_RE = re.compile(r"\.\s*[A-Za-z_$][\w$]*\s*\(")
 _SOURCE_RE = re.compile(
     r"\b[A-Za-z_$][\w$]*\s*\.\s*(?P<method>getRequestURI|getRequestHeaders|getParameter|"
@@ -106,6 +125,8 @@ def _request_result_type(types: frozenset[str], method: str, arity: int) -> str 
 
 class JdbcSource(VerifierSource):
     """Use the existing bounded Java import/declaration and shadowing index."""
+
+    kotlin = False
 
     def __init__(self, text: str, limits: tuple[int, int, int]):
         super().__init__(text, max_tokens=limits[0], max_nesting=limits[1], policy="SQL")
@@ -182,16 +203,36 @@ class JdbcSource(VerifierSource):
         if self.code[high - 1:high] == ")":
             opening = self.reverse_pairs.get(high - 1)
             if opening is not None:
-                constructor = re.fullmatch(r"new\s+([\w.$]+)\s*", self.code[low:opening])
+                constructor = re.fullmatch(r"(?:new\s+)?([\w.$]+)\s*", self.code[low:opening])
                 if constructor:
-                    actual = self.resolve_type(constructor.group(1), low)
-                    if actual in _BUILDERS:
+                    position = low + constructor.start(1)
+                    actual = self.constructor_type(constructor.group(1), position)
+                    if actual in _BUILDERS | _SPRING_TEMPLATES:
                         return actual
                 method = re.search(r"\.\s*(createStatement|prepareStatement|prepareCall)\s*$", self.code[low:opening])
                 if method and self.receiver_type(low, low + method.start(), depth=depth + 1) == "java.sql.Connection":
                     return {"createStatement": "java.sql.Statement", "prepareStatement": "java.sql.PreparedStatement",
                             "prepareCall": "java.sql.CallableStatement"}[method.group(1)]
+                method = re.search(r"\.\s*getJdbcOperations\s*$", self.code[low:opening])
+                if (method and not self.code[opening + 1:high - 1].strip()
+                        and self.receiver_type(low, low + method.start(), depth=depth + 1) in _SPRING_NAMED):
+                    return "org.springframework.jdbc.core.JdbcOperations"
         return None
+
+    def constructor_type(self, name: str, position: int) -> str | None:
+        if not self.kotlin and not re.search(r"\bnew\s*$", self.code[:position]):
+            return None
+        if self.kotlin and self.binding(name.split(".", 1)[0], position) is not None:
+            return None
+        return self.resolve_type(name, position)
+
+    def has_spring_receiver(self) -> bool:
+        """Keep flow-inferred aliases/factories eligible before CFG evaluation."""
+        if any(self.resolve_type(binding.type_name, binding.declaration) in _SPRING
+               for bindings in self.bindings.values() for binding in bindings):
+            return True
+        return any(self.constructor_type(match.group(1), match.start(1)) in _SPRING_TEMPLATES
+                   for match in re.finditer(r"\b([A-Za-z_$][\w.$]*)\s*\(", self.code))
 
     def nominal_type(self, spelling: str, position: int) -> tuple | None:
         """Identity for exact overload selection, including local class scope.
@@ -207,6 +248,15 @@ class JdbcSource(VerifierSource):
                  if name == spelling and low < position < high]
         if local:
             return ("local", *min(local, key=lambda item: item[1] - item[0]))
+        # Imported external types have a nominal identity even when no SQL
+        # behavior is modeled for them. This can select a RestTemplate helper
+        # overload without borrowing the JdbcTemplate overload's summary.
+        root, _, tail = spelling.partition(".")
+        if not any(name == root and low < position < high for name, low, high in self.classes):
+            if root in self.imports:
+                return ("external", self.imports[root] + ("." + tail if tail else ""))
+            if "." in spelling:
+                return ("external", spelling)
         return None
 
     def argument_type(self, low: int, high: int) -> tuple | None:
@@ -230,11 +280,17 @@ class JdbcSource(VerifierSource):
         for match in _SINK_RE.finditer(self.code):
             start = self.receiver_start(match.start())
             actual = self.receiver_type(start, match.start())
-            if actual not in _STATEMENTS:
+            if actual not in _STATEMENTS | _SPRING:
                 continue
             opening = match.end() - 1
             arguments = self.code[opening + 1:self.pairs[opening]].strip()
             method = re.search(r"[A-Za-z]+", match.group()).group()
+            if actual in _SPRING:
+                if method in _SPRING_SQL | _SPRING_UNSUPPORTED:
+                    sites[match.start()] = (start, actual, method)
+                continue
+            if method not in _EXECUTE:
+                continue
             if method in _BATCH_EXECUTE:
                 if arguments:
                     continue
@@ -260,16 +316,62 @@ def jdbc_execution_sites(text: str) -> dict[int, tuple[int, str, str]]:
     return JdbcSource(text, defaults).execution_sites()
 
 
-def non_http_execute_sites(text: str) -> frozenset[int]:
-    """Known JDBC/concurrency execute calls are not outbound HTTP requests."""
+def non_http_execute_sites(text: str, *, kotlin: bool = False) -> frozenset[int]:
+    """Known JDBC/Spring/concurrency execute calls are not HTTP requests."""
     if not re.search(r"\.\s*execute\s*\(", text):
         return frozenset()
-    source = JdbcSource(text, tuple(LIMIT_DEFAULTS.values()))
+    if kotlin:
+        from ubs_core.analyzers.taint_kotlin_sql import KotlinJdbcSource, KotlinSqlEngine
+        source = KotlinJdbcSource(text)
+        engine_type = KotlinSqlEngine
+    else:
+        source = JdbcSource(text, tuple(LIMIT_DEFAULTS.values()))
+        engine_type = SqlEngine
     sites = set()
-    for match in re.finditer(r"\.\s*execute\s*\(", source.code):
+    candidates = list(re.finditer(r"\.\s*execute\s*\(", source.code))
+    for match in candidates:
         start = source.receiver_start(match.start())
-        if source.receiver_type(start, match.start()) in _STATEMENTS | _EXECUTORS:
+        if source.receiver_type(start, match.start()) in _STATEMENTS | _SPRING | _EXECUTORS:
             sites.add(match.start())
+    if len(sites) == len(candidates) or not source.has_spring_receiver():
+        return frozenset(sites)
+
+    class ReceiverEngine(engine_type):
+        """Prove selected helper returns without enabling SQL findings.
+
+        Join receiver identities over the bounded graph. An unresolved or
+        HTTP alternative prevents suppression; one possible Spring receiver
+        is not sufficient. SQL callbacks/batches need no execution semantics
+        here because this pass classifies only the receiver of execute().
+        """
+        def call_sink(self, name, call, value, offset, bindings):
+            if name.rsplit(".", 1)[-1] != "execute":
+                return False
+            if name.startswith("."):
+                dot = offset
+                receiver = value - join(*call.values)
+            else:
+                root = name.rpartition(".")[0]
+                receiver, _ = self._receiver(root, offset, bindings, self.contexts[-1][3])
+                dot = self.code.rfind(".", offset, self.code.find("(", offset))
+            receivers[dot] = join(receivers.get(dot, CLEAN), receiver)
+            return False
+
+    receivers = {}
+    try:
+        engine = ReceiverEngine(Path("receiver.kt" if kotlin else "receiver.java"), text,
+                                source, tuple(LIMIT_DEFAULTS.values()))
+        engine.analyze()
+        # Forward-declared helpers initially have empty summaries. Classify
+        # once more using the converged summaries, under the same budget.
+        receivers.clear()
+        engine.analyze()
+    except (AnalysisLimit, ValueError):
+        # An incomplete identity proof cannot exclude an HTTP candidate.
+        return frozenset(sites)
+    for dot, receiver in receivers.items():
+        if receiver and all(_types((trace,)) & (_STATEMENTS | _SPRING | _EXECUTORS) for trace in receiver):
+            sites.add(dot)
     return frozenset(sites)
 
 
@@ -531,15 +633,33 @@ class SqlEngine(Engine):
         if len(keys) == 1:
             state.pop(next(iter(keys)), None)
 
+    def _spring_sql_text(self, call):
+        """Separate String SQL overloads from executable/opaque creators.
+
+        A literal nested inside an unknown creator is not its return type.
+        Known String bindings and selected helper results retain their type;
+        wholly literal helper returns can also prove the String overload.
+        """
+        if not call.values:
+            return False
+        if self.jdbc.argument_type(*call.spans[0]) == ("api", "java.lang.String"):
+            return True
+        value = _data(call.values[0])
+        if "java.lang.String" in _types(value):
+            return True
+        return bool(value) and all(trace.kind == "literal" and len(trace.key) == 2
+                                  and self.text[int(trace.key[1]):int(trace.key[1]) + 1] == '"'
+                                  for trace in value)
+
     def call_sink(self, name, call, value, offset, bindings):
         arguments = call.values
         method = name.rsplit(".", 1)[-1]
-        if method not in _EXECUTE | _BATCH_MUTATE:
+        if method not in _EXECUTE | _BATCH_MUTATE | _SPRING_SQL | _SPRING_UNSUPPORTED:
             return False
         if name.startswith("."):
             start = self.jdbc.receiver_start(offset)
             actual = self.jdbc.receiver_type(start, offset)
-            inferred = _types(value) & _STATEMENTS
+            inferred = _types(value) & (_STATEMENTS | _SPRING)
             types = inferred or (frozenset({actual}) if actual else frozenset())
             receiver = value
         else:
@@ -547,6 +667,28 @@ class SqlEngine(Engine):
             state = self.contexts[-1][3]
             receiver, types = self._receiver(root, offset, bindings, state)
             start = offset
+        if types & _SPRING:
+            if method in _SPRING_UNSUPPORTED:
+                raise ValueError(f"Spring JDBC {method} needs batch/callback SQL semantics; analysis is incomplete")
+            if method not in _SPRING_SQL:
+                return False
+            opening = self.code.find("(", offset)
+            following = self.parser.skip(self.parser.pairs[opening] + 1, len(self.code))
+            if (any("->" in self.code[low:high]
+                    or self.parser.kotlin and "{" in self.code[low:high]
+                    or re.search(r"\bnew\s+[\w.$]+(?:\s*<[^{};]*>)?\s*\([^{};]*\)\s*\{", self.code[low:high])
+                    for low, high in call.spans)
+                    or self.parser.kotlin and self.code[following:following + 1] == "{"):
+                raise ValueError("Spring JDBC inline callback needs callback result/effect analysis; analysis is incomplete")
+            if not arguments or (types & _SPRING_CLASSIC and method in _SPRING_CREATOR_OVERLOADS
+                                 and not self._spring_sql_text(call)):
+                raise ValueError(f"Spring JDBC {method} callback or unresolved SQL overload needs argument-type analysis; analysis is incomplete")
+            # Named/positional bindings, mappers and generated-key arguments
+            # never replace or sanitize the SQL text in argument zero.
+            self.record(start, _data(arguments[0]))
+            return False
+        if method not in _EXECUTE | _BATCH_MUTATE:
+            return False
         if method in _BATCH_EXECUTE | _BATCH_MUTATE:
             self._batch_call(method, arguments, receiver, types, start, self.contexts[-1][3])
             return False
@@ -679,12 +821,20 @@ class SqlEngine(Engine):
                 actual = "java.sql.PreparedStatement" if method == "prepareStatement" else "java.sql.CallableStatement"
                 captured = retag(_data(arguments[0]), add=frozenset({_PREPARED_SQL}))
                 return join(self._object(actual, offset), advance(captured, self.step(offset, "prepare", method)))
+        if types & _SPRING:
+            if types & _SPRING_NAMED and method == "getJdbcOperations" and not arguments:
+                return self._object("org.springframework.jdbc.core.JdbcOperations", offset)
+            if method in _SPRING_SQL:
+                return CLEAN
         if types & _STATEMENTS and (method in _EXECUTE | _BATCH_MUTATE or method.startswith("set") or
                                     method in {"close", "clearParameters", "getWarnings", "clearWarnings"}):
             return CLEAN
         return None
 
     def external_call(self, name, arguments, value, offset, bindings, state):
+        actual = self.jdbc.constructor_type(name, offset)
+        if actual in _SPRING_TEMPLATES:
+            return self._object(actual, offset)
         constructed = self._builder_constructor(name, arguments, offset, state)
         if constructed is not None:
             return constructed
@@ -698,6 +848,8 @@ class SqlEngine(Engine):
             return self._string_value(arguments[0], state, offset)
         if any(_types(argument) & _BUILDERS for argument in arguments):
             raise ValueError("SQL builder passed to an unresolved call may mutate or escape; analysis is incomplete")
+        if any(_types(argument) & _SPRING for argument in arguments):
+            raise ValueError("Spring JDBC receiver passed to an unresolved call needs object-flow analysis; analysis is incomplete")
         if self.batch_sites and any(_types(argument) & _STATEMENTS for argument in arguments):
             raise ValueError("JDBC statement passed to an unresolved call may mutate its batch; analysis is incomplete")
         if method in {"parseInt", "parseLong"} and arguments and self.jdbc.resolve_type(root, offset) in {
@@ -840,7 +992,7 @@ class SqlAnalysis:
 @lru_cache(maxsize=16)
 def _analyze(path: Path, text: str, limits: tuple[int, int, int]) -> SqlAnalysis:
     source = JdbcSource(text, limits)
-    if not source.execution_sites():
+    if not source.execution_sites() and not source.has_spring_receiver():
         return SqlAnalysis(())
     engine = SqlEngine(path, text, source, limits)
     effects = engine.analyze()

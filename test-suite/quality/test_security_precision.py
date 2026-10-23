@@ -206,6 +206,282 @@ func sessionToken() -> String {
         self.assertEqual(self.findings(clean.read_text()), [])
 
 
+class JVMOutboundDataflowTests(unittest.TestCase):
+    """An HTTP destination is a value, not all text in a nearby statement."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.root = Path(tempfile.mkdtemp(prefix="ubs-jvm-outbound-", dir="/tmp"))
+
+    @staticmethod
+    def program(language, body, helper="", fields=""):
+        signature = ("void handle(HttpServletRequest request, boolean enabled)" if language == "java" else
+                     "fun handle(request: HttpServletRequest, enabled: Boolean)")
+        return ("import java.net.URI;\nimport java.net.URL;\nimport java.net.http.HttpRequest;\n"
+                "import java.util.Set;\nimport javax.servlet.http.HttpServletRequest;\nclass OutboundProbe {\n" +
+                fields + "\n" + helper + "\n" + signature + " {\n" + body + "}\n}\n")
+
+    @staticmethod
+    def cases(language):
+        declaration = "String" if language == "java" else "var"
+        uri = "URI" if language == "java" else "var"
+        reject = 'throw new IllegalArgumentException("blocked");' if language == "java" else 'throw IllegalArgumentException("blocked");'
+        source = declaration + ' target = request.getParameter("url");\n'
+        parsed = uri + ' target = URI.create(request.getParameter("url"));\n'
+        safe = 'client.get(target);\n'
+        unsafe = 'client.get(target); // expect-finding\n'
+        scheme = '"https".equals(target.getScheme())' if language == "java" else 'target.scheme == "https"'
+        host = '"api.example.com".equals(target.getHost())' if language == "java" else 'target.host == "api.example.com"'
+        guard = 'if (!(' + scheme + ') || !(' + host + ')) { ' + reject + ' }\n'
+        identity = ('String safeURL(String value) { return value; }' if language == "java" else
+                    'fun safeURL(value: String): String { return value }')
+        constant = ('String endpoint(String value) { return "https://api.example.com"; }' if language == "java" else
+                    'fun endpoint(value: String): String { return "https://api.example.com" }')
+        origin = ('String endpoint() { return request.getParameter("url"); }' if language == "java" else
+                  'fun endpoint(): String { return request.getParameter("url") }')
+        validating = (('String endpoint(String raw) {\n' if language == "java" else
+                       'fun endpoint(raw: String): String {\n') + parsed.replace('request.getParameter("url")', 'raw') +
+                      guard + 'return target.toString();\n}')
+        cases = [
+            ("direct", source + unsafe, ""),
+            ("identity_safe_name", source + 'client.get(safeURL(target)); // expect-finding\n', identity),
+            ("renamed_identity", source + 'client.get(relay(target)); // expect-finding\n', identity.replace("safeURL", "relay")),
+            ("constant_helper_discards_input", 'client.get(endpoint(request.getParameter("url")));\n', constant),
+            ("helper_returns_request", 'client.get(endpoint()); // expect-finding\n', origin),
+            ("unknown_safe_named_helper", 'client.get(validateOutboundUrl(request.getParameter("url"))); // expect-finding\n', ""),
+            ("constant_overwrite", source + 'target = "https://api.example.com";\n' + safe, ""),
+            ("conditional_constant_overwrite", source + 'if (enabled) { target = "https://api.example.com"; }\n' + unsafe, ""),
+            ("both_branches_overwrite", source + 'if (enabled) { target = "https://api.example.com"; } else { target = "https://hooks.example.com"; }\n' + safe, ""),
+            ("full_guard", parsed + guard + safe, ""),
+            ("scheme_only_guard", parsed + 'if (!(' + scheme + ')) { ' + reject + ' }\n' + unsafe, ""),
+            ("host_only_guard", parsed + 'if (!(' + host + ')) { ' + reject + ' }\n' + unsafe, ""),
+            ("unsafe_host_suffix", parsed + guard.replace(host, 'target.getHost().endsWith("example.com")') + unsafe, ""),
+            ("fallthrough_guard", parsed + guard.replace(reject, 'log("blocked");') + unsafe, ""),
+            ("unrelated_uri_guard", parsed + uri + ' audit = URI.create("https://api.example.com");\n' +
+             guard.replace("target.", "audit.") + unsafe, ""),
+            ("reassignment_after_guard", parsed + guard + 'target = URI.create(request.getParameter("other"));\n' + unsafe, ""),
+            ("guarded_alias", parsed + guard + uri + ' alias = target;\nclient.get(alias);\n', ""),
+            ("alias_before_guard", parsed + uri + ' alias = target;\n' + guard + 'client.get(alias);\n', ""),
+            ("positive_branch_guard", parsed + 'if (' + scheme + ' && ' + host + ') {\n' + safe + '} else {\n' + unsafe + '}\n', ""),
+            ("real_helper_validation", 'client.get(endpoint(request.getParameter("url")));\n', validating),
+            ("renamed_real_helper", 'client.get(ordinary(request.getParameter("url")));\n', validating.replace("endpoint", "ordinary")),
+            ("helper_partial_validation", 'client.get(endpoint(request.getParameter("url"))); // expect-finding\n', validating.replace(guard, 'if (!(' + scheme + ')) { ' + reject + ' }\n')),
+            ("resolve_overrides_authority", uri + ' target = URI.create("https://api.example.com/").resolve(request.getParameter("url"));\n' + unsafe, ""),
+            ("resolve_invalidates_guard", parsed + guard + 'target = target.resolve(request.getParameter("other"));\n' + unsafe, ""),
+            ("resolve_then_validate", uri + ' target = URI.create("https://api.example.com/").resolve(request.getParameter("url"));\n' + guard + safe, ""),
+            ("string_change_invalidates_guard", parsed + guard + 'client.get("https://" + target.toString()); // expect-finding\n', ""),
+            ("helper_unknown_transformation", parsed + guard + 'client.get(transform(target.toString())); // expect-finding\n',
+             ('String transform(String value) { return mystery(value); }' if language == "java" else
+              'fun transform(value: String): String { return mystery(value) }')),
+            ("direct_open_stream", 'new URL(request.getParameter("url")).openStream(); // expect-finding\n' if language == "java" else
+             'URL(request.getParameter("url")).openStream(); // expect-finding\n', ""),
+            ("request_body_is_not_destination", 'restTemplate.postForObject("https://api.example.com", request.getParameter("payload"), String.class);\n', ""),
+            ("post_destination_is_first_argument", 'restTemplate.postForObject(request.getParameter("url"), "fixed", String.class); // expect-finding\n', ""),
+            ("uri_path_query_are_not_destination", uri + ' target = ' + ('new ' if language == "java" else '') +
+             'URI("https", null, "api.example.com", -1, request.getParameter("path"), request.getParameter("query"), null);\n' + safe, ""),
+            ("uri_component_host_is_destination", uri + ' target = ' + ('new ' if language == "java" else '') +
+             'URI("https", null, request.getParameter("host"), -1, "/", null, null);\n' + unsafe, ""),
+            ("uri_component_port_is_destination", uri + ' target = ' + ('new ' if language == "java" else '') +
+             'URI("https", null, "api.example.com", parseInt(request.getParameter("port")), "/", null, null);\n' + unsafe, ""),
+            ("uri_null_host_path_can_supply_authority", uri + ' target = ' + ('new ' if language == "java" else '') +
+             'URI("https", null, null, -1, request.getParameter("path"), null, null);\n' + unsafe, ""),
+            ("uri_null_authority_path_can_supply_authority", uri + ' target = ' + ('new ' if language == "java" else '') +
+             'URI("https", null, request.getParameter("path"), null, null);\n' + unsafe, ""),
+            ("uri_short_null_host_path_can_supply_authority", uri + ' target = ' + ('new ' if language == "java" else '') +
+             'URI("https", null, request.getParameter("path"), null);\n' + unsafe, ""),
+            ("uri_unknown_host_path_can_supply_authority", uri + ' target = ' + ('new ' if language == "java" else '') +
+             'URI("https", host, request.getParameter("path"), null);\n' + unsafe, ""),
+            ("inert_check_comment", source + '// URI.create(target); getHost(); getScheme(); throw\n' + unsafe, ""),
+        ]
+        if language == "kotlin":
+            cases.extend([
+                ("template_change_invalidates_guard", parsed + guard + 'client.get("https://$target"); // expect-finding\n', ""),
+                ("named_url_operand", source + 'client.get(body = "fixed", urlString = target); // expect-finding\n', ""),
+            ])
+        return cases
+
+    def check_source(self, language, name, text):
+        from ubs_core.java_detectors import ssrf_outbound_url
+
+        path = self.root / (language + "-" + name + (".java" if language == "java" else ".kt"))
+        path.write_text(text, encoding="utf-8")
+        rows = list(ssrf_outbound_url.find([path], language=language, rule_id=language + ".security.ssrf-outbound-url"))
+        expected = [number for number, line in enumerate(text.splitlines(), 1) if "// expect-finding" in line]
+        self.assertEqual([(Path(row[0]), row[1], row[2]) for row in rows], [(path, line, 1) for line in expected], rows)
+        return path, expected
+
+    def test_value_and_control_flow(self):
+        for language in ("java", "kotlin"):
+            for name, body, helper in self.cases(language):
+                with self.subTest(language=language, case=name):
+                    self.check_source(language, name, self.program(language, body, helper))
+
+    def test_builder_destination_state(self):
+        for language in ("java", "kotlin"):
+            builder = "HttpRequest.Builder" if language == "java" else "var"
+            request = "HttpRequest" if language == "java" else "var"
+            clean = builder + ' builder = HttpRequest.newBuilder(URI.create("https://api.example.com"));\n'
+            unsafe = builder + ' builder = HttpRequest.newBuilder(URI.create(request.getParameter("url")));\n'
+            badbuild = 'builder.build(); // expect-finding\n'
+            cases = [
+                ("header_is_not_destination", clean + 'builder.header("X-Value", request.getParameter("value"));\nbuilder.build();\n'),
+                ("fluent_header_is_not_destination", request + ' outgoing = HttpRequest.newBuilder(URI.create("https://api.example.com"))\n.header("X-Value", request.getParameter("value")).build();\nclient.send(outgoing, handler);\n'),
+                ("body_is_not_destination", clean + 'builder.POST(HttpRequest.BodyPublishers.ofString(request.getParameter("body")));\nbuilder.build();\n'),
+                ("destination_survives_headers", unsafe + 'builder.header("X-Value", "fixed");\n' + badbuild),
+                ("destination_overwrite", unsafe + 'builder.uri(URI.create("https://api.example.com"));\nbuilder.build();\n'),
+                ("unsafe_destination_mutation", clean + 'builder.uri(URI.create(request.getParameter("url")));\n' + badbuild),
+                ("conditional_mutation", unsafe + 'if (enabled) { builder.uri(URI.create("https://api.example.com")); }\n' + badbuild),
+                ("alias_mutation", clean + builder + ' alias = builder;\nalias.uri(URI.create(request.getParameter("url")));\n' + badbuild),
+                ("alias_overwrite", unsafe + builder + ' alias = builder;\nalias.uri(URI.create("https://api.example.com"));\nbuilder.build();\n'),
+                ("fluent_alias_mutation", clean + builder + ' alias = builder;\nalias.header("X-Value", "fixed").uri(URI.create(request.getParameter("url")));\n' + badbuild),
+                ("copied_builder_is_distinct", unsafe + builder + ' copy = builder.copy();\ncopy.uri(URI.create("https://api.example.com"));\n' + badbuild + 'copy.build();\n'),
+                ("copy_retains_destination", unsafe + builder + ' copy = builder.copy();\nbuilder.uri(URI.create("https://api.example.com"));\ncopy.build(); // expect-finding\n'),
+                ("request_is_immutable_snapshot", clean + request + ' outgoing = builder.build();\nbuilder.uri(URI.create(request.getParameter("url")));\nclient.send(outgoing, handler);\n' + badbuild),
+                ("request_snapshot_retains_destination", unsafe + request + ' outgoing = builder.build(); // expect-finding\nbuilder.uri(URI.create("https://api.example.com"));\nclient.send(outgoing, handler); // expect-finding\n'),
+                ("send_async", unsafe + 'client.sendAsync(builder.build(), handler); // expect-finding\n'),
+                ("joined_receiver_overwrite", clean.replace(' builder =', ' first =') +
+                 unsafe.replace(' builder =', ' second =') + builder + ' selected = first;\n' +
+                 'if (enabled) { selected = first; } else { selected = second; }\n' +
+                 'selected.uri(URI.create("https://api.example.com"));\nselected.build();\n' +
+                 'second.build(); // expect-finding\n'),
+                ("other_joined_alias_stays_weak", clean.replace(' builder =', ' first =') +
+                 unsafe.replace(' builder =', ' second =') + builder + ' selected = first;\n' +
+                 builder + ' other = second;\n' +
+                 'if (enabled) { selected = first; other = second; } else { selected = second; other = first; }\n' +
+                 'selected.uri(URI.create("https://api.example.com"));\nselected.build();\n' +
+                 'other.build(); // expect-finding\n'),
+            ]
+            for name, body in cases:
+                with self.subTest(language=language, case=name):
+                    self.check_source(language, name, self.program(language, body))
+
+    def test_factory_and_allowlist_identity(self):
+        for language in ("java", "kotlin"):
+            fields = ('private static final Set<String> HOSTS = Set.of("api.example.com");' if language == "java" else
+                      'private val HOSTS = setOf("api.example.com")')
+            reject = 'throw new IllegalArgumentException();' if language == "java" else 'throw IllegalArgumentException();'
+            parsed = ('URI' if language == "java" else 'var') + ' target = URI.create(request.getParameter("url"));\n'
+            guard = ('if (!"https".equals(target.getScheme()) || !HOSTS.contains(target.getHost()))' if language == "java" else
+                     'if (target.scheme != "https" || target.host !in HOSTS)') + ' { ' + reject + ' }\n'
+            clean = self.program(language, parsed + guard + 'client.get(target);\n', fields=fields)
+            with self.subTest(language=language, case="verified_host_set"):
+                self.check_source(language, "host_set", clean)
+            unsafe = clean.replace('client.get(target);', 'client.get(target); // expect-finding')
+            for name, text in (
+                ("foreign_uri_import", unsafe.replace('import java.net.URI;', 'import example.URI;')),
+                ("local_uri_factory", unsafe.replace(parsed, ('Object URI = factory;\n' if language == "java" else
+                                                              'val URI = factory;\n') + parsed)),
+                ("field_uri_factory", unsafe.replace(fields, fields + ('\nObject URI;' if language == "java" else '\nval URI: Factory'))),
+                ("local_host_set", unsafe.replace(parsed, ('Set<String> HOSTS = requestHosts;\n' if language == "java" else
+                                                           'val HOSTS = requestHosts;\n') + parsed)),
+                ("mutated_host_set", unsafe.replace(parsed, 'HOSTS.add(request.getParameter("host"));\n' + parsed)),
+                ("foreign_set_factory", unsafe.replace('import java.util.Set;', 'import example.Set;')),
+            ):
+                with self.subTest(language=language, case=name):
+                    self.check_source(language, name, text)
+
+    def test_original_ssrf_fixtures(self):
+        from ubs_core.java_detectors import ssrf_outbound_url
+
+        for language, name, expected in (
+            ("java", "java/security/SsrfBuggy.java", [20, 21, 26, 31, 36, 43, 50]),
+            ("java", "java/security/SsrfClean.java", []),
+            ("kotlin", "kotlin/ssrf_buggy/RequestUrls.kt", [20, 25]),
+            ("kotlin", "kotlin/ssrf_clean/RequestUrlsSafe.kt", []),
+        ):
+            with self.subTest(path=name):
+                rows = list(ssrf_outbound_url.find([REPO_ROOT / "test-suite" / name], language=language,
+                                                  rule_id=language + ".security.ssrf-outbound-url"))
+                self.assertEqual([row[1] for row in rows], expected, rows)
+
+    def test_annotated_parameters_are_scoped_sources(self):
+        for language in ("java", "kotlin"):
+            for annotation in ("RequestParam", "RequestHeader", "QueryParam", "PathVariable", "CookieValue"):
+                signature = ("void annotated(@" + annotation + " String target)" if language == "java" else
+                             "fun annotated(@" + annotation + " target: String)")
+                helper = signature + ' {\nclient.get(target); // expect-finding\n}\n'
+                body = ('String' if language == "java" else 'val') + ' target = "https://api.example.com";\nclient.get(target);\n'
+                with self.subTest(language=language, annotation=annotation):
+                    self.check_source(language, "annotated-" + annotation, self.program(language, body, helper))
+
+    def test_unsupported_state_and_budget_are_explicit(self):
+        from ubs_core.java_detectors import ssrf_outbound_url
+        from ubs_core.taint_flow import AnalysisLimit
+
+        cases = (
+            ('restTemplate.getForObject("https://{host}/", String.class, request.getParameter("host"));', ""),
+            ('HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create("https://api.example.com"));\n'
+             'change(builder, request.getParameter("url"));\nbuilder.build();',
+             'void change(HttpRequest.Builder builder, String target) { builder.uri(URI.create(target)); }'),
+            ('HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create("https://api.example.com"));\n'
+             'unknown(builder, request.getParameter("url"));\nbuilder.build();', ""),
+            ('switch (request.getParameter("url")) { default: client.get(request.getParameter("other")); }', ""),
+        )
+        for index, (body, helper) in enumerate(cases):
+            with self.subTest(case=index):
+                path = self.root / ("unsupported-" + str(index) + ".java")
+                path.write_text(self.program("java", body, helper), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "incomplete"):
+                    list(ssrf_outbound_url.find([path]))
+        engine = ssrf_outbound_url.SSRFEngine(self.root / "budget.java", self.program("java",
+            'client.get(request.getParameter("url"));'))
+        engine.budget.remaining = 0
+        with self.assertRaises(AnalysisLimit):
+            engine.analyze()
+
+    def test_module_and_runner_json_sarif(self):
+        for language in ("java", "kotlin"):
+            for name, body, helper in self.cases(language):
+                if name not in {"identity_safe_name", "real_helper_validation"}:
+                    continue
+                text = self.program(language, body, helper)
+                directory = self.root / (language + "-" + name + "-cli")
+                directory.mkdir()
+                path = directory / ("OutboundProbe.java" if language == "java" else "OutboundProbe.kt")
+                path.write_text(text, encoding="utf-8")
+                expected = [number for number, line in enumerate(text.splitlines(), 1) if "// expect-finding" in line]
+                for surface in ("module", "runner"):
+                    for format_ in ("json", "sarif"):
+                        with self.subTest(language=language, case=name, surface=surface, format=format_):
+                            entry = (REPO_ROOT / "modules" / ("ubs-" + language + ".sh")
+                                     if surface == "module" else REPO_ROOT / "ubs")
+                            command = (str(entry), "--only=4" if surface == "module" else "--only=" + language,
+                                       "--format=" + format_, "--ci", str(path))
+                            started = time.monotonic()
+                            proc = subprocess.run(command, cwd=directory, capture_output=True, text=True, timeout=180,
+                                                  env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1", UBS_NO_AUTO_UPDATE="1",
+                                                           UBS_NO_CACHE="1", ENABLE_UV_TOOLS="0"))
+                            label = surface + "-" + format_
+                            (directory / (label + ".stdout")).write_text(proc.stdout, encoding="utf-8")
+                            (directory / (label + ".stderr")).write_text(proc.stderr, encoding="utf-8")
+                            (directory / (label + ".command.json")).write_text(json.dumps({
+                                "command": command, "exit": proc.returncode, "seconds": time.monotonic() - started,
+                                "source_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                            }, indent=2), encoding="utf-8")
+                            context = f"exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+                            self.assertEqual(proc.returncode, int(bool(expected)), context)
+                            try:
+                                report = json.loads(proc.stdout)
+                            except json.JSONDecodeError as error:
+                                self.fail(f"Invalid scanner JSON: {error}\n{context}")
+                            rule = language + ".security.ssrf-outbound-url"
+                            if format_ == "json":
+                                records = report.get("findings", []) if surface == "runner" else report["findings"]
+                                key = "rule_id" if surface == "runner" else "rule"
+                                actual = [(row[key], row["line"], row["severity"]) for row in records]
+                                self.assertEqual(actual, [(rule, line, "critical") for line in expected], context)
+                                totals = report["totals"] if surface == "runner" else report
+                                self.assertEqual((totals["critical"], totals["warning"]), (len(expected), 0), context)
+                            else:
+                                records = [row for run in report["runs"] for row in run.get("results", [])]
+                                unexpected = [row for row in records if row.get("ruleId") != rule
+                                              and row.get("level", "warning") in {"error", "warning"}]
+                                self.assertEqual(unexpected, [], context)
+                                actual = [(row["ruleId"], row["locations"][0]["physicalLocation"]["region"]["startLine"],
+                                           row["level"]) for row in records if row["ruleId"] == rule]
+                                self.assertEqual(actual, [(rule, line, "error") for line in expected], context)
+
+
 class JVMHeaderDataflowTests(unittest.TestCase):
     """Header safety belongs to the value and branch, never a helper's name."""
 

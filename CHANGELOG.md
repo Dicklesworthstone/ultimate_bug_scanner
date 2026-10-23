@@ -28,6 +28,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Fixed
 
+- Java/Kotlin SSRF checks follow request-derived destinations through local
+  helpers, branches, reassignments and JDK request-builder aliases. Scheme and
+  exact-host validation must protect the same URI/URL value; helper names and
+  unrelated checks confer no safety. Request bodies and headers stay separate
+  from destinations, builder copies and immutable requests retain their own
+  state, and Kotlin annotated parameters are recognized as sources. Unsupported
+  URI-template expansion and escaping builder state report incomplete analysis.
 - Python file checks recognize explicit cleanup of raw descriptors when the
   same binding is closed immediately or by a guaranteed `finally` block.
   Ownership registration requires a visible, earlier standard-library import;

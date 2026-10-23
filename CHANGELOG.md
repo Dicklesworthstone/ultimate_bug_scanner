@@ -28,6 +28,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Fixed
 
+- Python header injection follows header names and values through scoped helper
+  summaries and branches. Encoder identity, option values, CR/LF removal and
+  dominating rejection checks determine safety; shadowed encoders, decoding,
+  effectful guards and formatting that can reintroduce control characters no
+  longer hide unsafe sinks. Unsupported candidate code reports incomplete
+  analysis, and a structural sink filter avoids unnecessary whole-file flow work.
+
 - Ruby archive extraction follows entry names through scoped helpers, aliases
   and branches to actual extraction and filesystem writes. Only validation of
   the selected destination proves containment; safe-looking names and unrelated

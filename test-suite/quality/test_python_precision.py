@@ -46,7 +46,7 @@ if str(HELPERS_DIR) not in sys.path:
 
 from ubs_core.io import iter_ndjson_lines, parse_ndjson_lines, read_ndjson, source_line  # noqa: E402
 from ubs_core.py_detectors import division, index_arithmetic, io_open_checks, is_literal  # noqa: E402
-from ubs_core.py_detectors import json_loads, ldap_injection  # noqa: E402
+from ubs_core.py_detectors import header_injection, json_loads, ldap_injection  # noqa: E402
 from ubs_core.py_detectors import missing_returns  # noqa: E402
 from ubs_core.py_detectors import sql_injection  # noqa: E402
 from ubs_core.py_patterns.debug_typing import PATTERNS as DEBUG_PATTERNS  # noqa: E402
@@ -1925,6 +1925,406 @@ class LDAPReceiverIdentityTests(unittest.TestCase):
                 }, indent=2) + '\n', encoding='utf-8')
                 self.assertEqual(actual, expected)
                 print(f'[{name}] PASS ({time.perf_counter() - started:.3f}s)')
+
+
+class HeaderInjectionFlowTests(unittest.TestCase):
+    """Header decisions must follow actual values, callees and control flow."""
+
+    @classmethod
+    def setUpClass(cls):
+        artifacts = REPO_ROOT / 'test-suite/artifacts'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        cls.work = Path(tempfile.mkdtemp(prefix='python-header-flow-', dir=artifacts))
+
+    def check_cases(self, cases):
+        for name, source in cases.items():
+            with self.subTest(case=name):
+                source = textwrap.dedent(source).lstrip('\n')
+                path = self.work / f'{name}.py'
+                path.write_text(source, encoding='utf-8')
+                expected = [index for index, line in enumerate(source.splitlines(), 1)
+                            if '# header-finding' in line]
+                actual = list(header_injection.find([path]))
+                self.assertEqual([hit[1] for hit in actual], expected)
+                self.assertTrue(all(hit[0] == path and hit[2] > 0 for hit in actual))
+
+    def test_helper_bodies_scope_and_overwrites(self):
+        self.check_cases({
+            'fake-sanitizer': '''
+                def sanitize_header_value(value): return value
+                response.headers['X'] = sanitize_header_value(request.args['x'])  # header-finding
+            ''',
+            'safe-imported-wrapper': '''
+                from urllib.parse import quote as encode
+                def prepare(value): return encode(value, safe='')
+                response.headers['X'] = prepare(request.args['x'])
+            ''',
+            'identity-retains-caller-proof': '''
+                from urllib.parse import quote
+                def identity(value): return value
+                response.headers['X'] = identity(quote(request.args['x']))
+            ''',
+            'helper-sink': '''
+                def emit(value): response.headers['X'] = value  # header-finding
+                emit(request.args['x'])
+            ''',
+            'overwritten-source': '''
+                value = request.args['x']
+                value = 'fixed'
+                response.headers['X'] = value
+            ''',
+            'conditional-overwrite': '''
+                value = request.args['x']
+                if enabled: value = 'fixed'
+                response.headers['X'] = value  # header-finding
+            ''',
+            'unrelated-same-name': '''
+                from urllib.parse import quote
+                def first(value):
+                    def quote(value): return value
+                    return quote(value)
+                def second(value): return quote(value)
+                response.headers['X'] = first(request.args['x'])  # header-finding
+                response.headers['Y'] = second(request.args['x'])
+            ''',
+        })
+
+    def test_both_control_characters_require_dominating_proof(self):
+        self.check_cases({
+            'reject-both': r'''
+                def checked(value):
+                    if '\r' in value or '\n' in value: raise ValueError('header')
+                    return value
+                response.headers['X'] = checked(request.args['x'])
+            ''',
+            'reject-only-cr': r'''
+                def checked(value):
+                    if '\r' in value: raise ValueError('header')
+                    return value
+                response.headers['X'] = checked(request.args['x'])  # header-finding
+            ''',
+            'reject-pair-only': r'''
+                value = request.args['x']
+                if '\r' in value and '\n' in value: raise ValueError('header')
+                response.headers['X'] = value  # header-finding
+            ''',
+            'other-value-guard': r'''
+                value = request.args['x']
+                other = request.args['y']
+                if '\r' in other or '\n' in other: raise ValueError('header')
+                response.headers['X'] = value  # header-finding
+            ''',
+            'post-sink-guard': r'''
+                value = request.args['x']
+                response.headers['X'] = value  # header-finding
+                if '\r' in value or '\n' in value: raise ValueError('header')
+            ''',
+            'guarded-reassignment': r'''
+                value = request.args['x']
+                if '\r' in value or '\n' in value: raise ValueError('header')
+                value = request.args['y']
+                response.headers['X'] = value  # header-finding
+            ''',
+            'positive-guard': r'''
+                value = request.args['x']
+                if '\r' not in value and '\n' not in value:
+                    response.headers['X'] = value
+            ''',
+            'guard-operand-rebinds-value': r'''
+                value = request.args['old']
+                if '\r' not in value and '\n' not in value and (value := request.args['fresh']):
+                    response.headers['X'] = value  # header-finding
+            ''',
+            'caught-rejection': r'''
+                value = request.args['x']
+                try:
+                    if '\r' in value or '\n' in value: raise ValueError('header')
+                except ValueError:
+                    pass
+                response.headers['X'] = value  # header-finding
+            ''',
+        })
+
+    def test_replacement_proofs_transfer_across_helpers(self):
+        self.check_cases({
+            'direct-replacement-chain': r'''
+                response.headers['X'] = request.args['x'].replace('\r', '').replace('\n', '')
+            ''',
+            'split-replacement-proof': r'''
+                def remove_lf(value): return value.replace('\n', '')
+                response.headers['X'] = remove_lf(request.args['x'].replace('\r', ''))
+            ''',
+            'bounded-replacement': r'''
+                response.headers['X'] = request.args['x'].replace('\r', '', 1).replace('\n', '')  # header-finding
+            ''',
+            'negative-count-replacement': r'''
+                response.headers['X'] = request.args['x'].replace('\r', '', -1).replace('\n', '')
+            ''',
+            'replace-pair-only': r'''
+                response.headers['X'] = request.args['x'].replace('\r\n', '')  # header-finding
+            ''',
+            'replacement-introduces-control': r'''
+                from urllib.parse import quote
+                response.headers['X'] = quote(request.args['x']).replace('x', '\n')  # header-finding
+            ''',
+        })
+
+    def test_encoder_identity_options_and_decoding(self):
+        self.check_cases({
+            'trusted-encoder-alias': '''
+                from urllib.parse import quote_plus as escaped
+                response.headers['X'] = escaped(request.args['x'])
+            ''',
+            'trusted-module-alias': '''
+                from urllib import parse as encoder
+                response.headers['X'] = encoder.quote(request.args['x'], safe='')
+            ''',
+            'trusted-filename': '''
+                from werkzeug.utils import secure_filename as clean
+                send_file('fixed.pdf', download_name=clean(request.args['x']))
+            ''',
+            'unsafe-safe-argument': r'''
+                from urllib.parse import quote
+                response.headers['X'] = quote(request.args['x'], safe='\r\n')  # header-finding
+            ''',
+            'unknown-safe-argument': '''
+                from urllib.parse import quote
+                response.headers['X'] = quote(request.args['x'], safe=configuration)  # header-finding
+            ''',
+            'shadowed-import': '''
+                from urllib.parse import quote
+                quote = lambda value: value
+                response.headers['X'] = quote(request.args['x'])  # header-finding
+            ''',
+            'decode-in-helper': '''
+                from urllib.parse import quote, unquote
+                def decoded(value): return unquote(value)
+                response.headers['X'] = decoded(quote(request.args['x']))  # header-finding
+            ''',
+            'reencode-after-decode': '''
+                from urllib.parse import quote, unquote
+                def rebuilt(value): return quote(unquote(value))
+                response.headers['X'] = rebuilt(quote(request.args['x']))
+            ''',
+        })
+
+    def test_control_reintroduction_invalidates_old_proofs(self):
+        expressions = {
+            'literal-control': r"safe + '\r\n'",
+            'chr-control': 'safe + chr(13) + chr(10)',
+            'fstring-chr-control': 'f"{safe}{chr(13)}{chr(10)}"',
+            'fstring-character-format': 'f"{safe}{13:c}{10:c}"',
+            'format-character-control': '"{}{:c}{:c}".format(safe, 13, 10)',
+            'format-container-selector': r'''"{0[safe]}{0[bad]}".format({'safe': safe, 'bad': '\r\nInjected: yes'})''',
+            'percent-character-control': 'safe + "%c%c" % (13, 10)',
+            'percent-width-character-control': 'safe + "%05c%05c" % (13, 10)',
+            'container-projection-control': r'''safe + {'good': safe, 'bad': '\r\n'}['bad']''',
+            'helper-control': 'append_control(safe)',
+        }
+        self.check_cases({name: (
+            'from urllib.parse import quote\n'
+            'def append_control(value): return value + "\\r"\n'
+            'safe = quote(request.args["x"])\n'
+            f'response.headers["X"] = {expression}  # header-finding\n'
+        ) for name, expression in expressions.items()})
+        self.check_cases({'fixed-composition': '''
+            from urllib.parse import quote
+            def add_suffix(value): return value + '.txt'
+            safe = quote(request.args['x'])
+            response.headers['X'] = f'attachment; filename="{add_suffix(safe)}"'
+        '''})
+
+    def test_namespace_mutations_and_captured_originals(self):
+        mutations = {
+            'direct-namespace-write': "encoder.quote = lambda value: value",
+            'setattr-namespace-write': "setattr(encoder, 'quote', lambda value: value)",
+            'dict-namespace-write': "encoder.__dict__['quote'] = lambda value: value",
+            'global-helper-write': "def change(): encoder.quote = lambda value: value\nchange()",
+            'parameter-helper-write': "def change(module): module.quote = lambda value: value\nchange(encoder)",
+        }
+        self.check_cases({name: (
+            'import urllib.parse as encoder\n'
+            'saved = encoder.quote\n'
+            f'{mutation}\n'
+            'response.headers["X"] = encoder.quote(request.args["x"])  # header-finding\n'
+            'response.headers["Y"] = saved(request.args["y"])\n'
+        ) for name, mutation in mutations.items()})
+        self.check_cases({
+            'star-shadows-import': '''
+                from urllib.parse import quote
+                from unknown import *
+                response.headers['X'] = quote(request.args['x'])  # header-finding
+            ''',
+            'mutation-before-another-helper': '''
+                import urllib.parse as encoder
+                def change(): encoder.quote = lambda value: value
+                def emit(value): response.headers['X'] = encoder.quote(value)  # header-finding
+                def run():
+                    change()
+                    emit(request.args['x'])
+            ''',
+            'callee-captured-before-mutating-argument': '''
+                import urllib.parse as encoder
+                def change():
+                    encoder.quote = lambda value: value
+                    return request.args['x']
+                response.headers['X'] = encoder.quote(change())
+            ''',
+        })
+
+    def test_names_values_aliases_and_factory_sinks(self):
+        self.check_cases({
+            'header-name-assignment': '''
+                response.headers[request.args['key']] = 'fixed'  # header-finding
+            ''',
+            'header-name-factory': '''
+                from flask import Response
+                Response('ok', headers={request.args['key']: 'fixed'})  # header-finding
+            ''',
+            'header-name-method': '''
+                response.headers.add(request.args['key'], 'fixed')  # header-finding
+            ''',
+            'header-object-alias': '''
+                headers_alias = response.headers
+                headers_alias['X'] = request.args['x']  # header-finding
+            ''',
+            'header-alias-helper': '''
+                def emit(mapping, value): mapping['X'] = value  # header-finding
+                emit(response.headers, request.args['x'])
+            ''',
+            'response-object-alias': '''
+                from django.http import HttpResponse as Reply
+                result = Reply('ok')
+                result[request.args['key']] = 'fixed'  # header-finding
+            ''',
+            'ordinary-dictionary': '''
+                data = {}
+                data['Content-Disposition'] = request.args['x']
+            ''',
+        })
+
+    def test_existing_security_fixtures_keep_exact_locations(self):
+        security = REPO_ROOT / 'test-suite/python/security'
+        buggy = security / 'header_injection_buggy.py'
+        clean = security / 'header_injection_clean.py'
+        self.assertEqual([hit[1] for hit in header_injection.find([buggy])],
+                         [7, 14, 20, 25, 30, 31, 37, 43, 48, 53])
+        self.assertEqual(list(header_injection.find([clean])), [])
+
+    def test_helper_sink_retains_source_to_sink_witness(self):
+        source = self.work / 'helper-witness.py'
+        source.write_text('def emit(value): response.headers["X"] = value\n'
+                          'emit(request.args["x"])\n', encoding='utf-8')
+        findings = list(header_injection.find([source]))
+        self.assertEqual([item[1] for item in findings], [1])
+        self.assertIn('request.args', findings[0][3])
+        self.assertIn('emit()', findings[0][3])
+        self.assertIn('response header', findings[0][3])
+
+    def test_sink_scoped_suppression_and_structural_prefilter(self):
+        from unittest import mock
+        self.check_cases({'header-suppressions': '''
+            value = request.args['x']  # ubs:ignore[py.security.header-injection]
+            response.headers['X'] = value  # header-finding
+            response.headers['Y'] = value  # ubs:ignore[py.security.header-injection]
+            response.headers['Z'] = value  # ubs:ignore[py.sql-injection]  # header-finding
+        '''})
+        irrelevant = self.work / 'no-header-sink.py'
+        irrelevant.write_text('text = "response.headers[value] = request.args"\n'
+                              'tree = ast.parse(text, filename=path)\n'
+                              'index.formatter_headers[line] = parsed\n', encoding='utf-8')
+        with mock.patch.object(header_injection, '_HeaderAnalysis') as analyzer:
+            self.assertEqual(list(header_injection.find([irrelevant])), [])
+            analyzer.assert_not_called()
+
+    def test_parse_and_budget_failures_keep_independent_findings(self):
+        from unittest import mock
+        bad = self.work / 'malformed.py'
+        good = self.work / 'independent.py'
+        bad.write_text('response.headers[ = request.args["x"]\n', encoding='utf-8')
+        good.write_text('response.headers["X"] = request.args["x"]\n', encoding='utf-8')
+        for paths in ([bad, good], [good, bad]):
+            findings = header_injection.find(paths)
+            self.assertEqual(next(findings)[:3], (good, 1, 1))
+            with self.assertRaisesRegex(RuntimeError, 'incomplete header analysis.*SyntaxError'):
+                next(findings)
+        with mock.patch.object(header_injection, 'MAX_FLOW_STEPS', 1):
+            with self.assertRaisesRegex(RuntimeError, 'incomplete header analysis.*evaluation steps'):
+                list(header_injection.find([good]))
+
+
+@unittest.skipUnless(os.environ.get('UBS_PY_HEADER_E2E') == '1',
+                     'set UBS_PY_HEADER_E2E=1 for actual header CLI scans')
+class HeaderInjectionPublicTests(unittest.TestCase):
+    def test_module_and_runner_json_sarif_preserve_findings_and_partial_status(self):
+        artifacts = REPO_ROOT / 'test-suite/artifacts'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        work = Path(tempfile.mkdtemp(prefix='python-header-public-', dir=artifacts))
+        unsafe = ('def sanitize_header_value(value):\n    return value\n'
+                  'def view(request, response):\n'
+                  '    response.headers["X"] = sanitize_header_value(request.args["x"])\n')
+        clean = ('from urllib.parse import quote as encoded\n'
+                 'def prepare(value): return encoded(value, safe="")\n'
+                 'def view(request, response):\n'
+                 '    response.headers["X"] = prepare(request.args["x"])\n')
+        env = {**os.environ, 'UBS_NO_AUTO_UPDATE': '1', 'UBS_ENABLE_AUTO_UPDATE': '0',
+               'UBS_NO_CACHE': '1', 'CI': '1', 'NO_COLOR': '1',
+               'XDG_DATA_HOME': str(work / 'data'), 'XDG_CONFIG_HOME': str(work / 'config'),
+               'XDG_CACHE_HOME': str(work / 'cache'), 'PYTHONDONTWRITEBYTECODE': '1'}
+        skip = '--skip=' + ','.join(str(i) for i in range(1, 24) if i != 7)
+        for label, source, expected, partial in (
+                ('unsafe', unsafe, [4], False), ('clean', clean, [], False),
+                ('partial', unsafe, [4], True)):
+            selected = work / label
+            selected.mkdir()
+            path = selected / 'view.py'
+            path.write_text(source, encoding='utf-8')
+            if partial:
+                (selected / 'malformed.py').write_text('response.headers[ = input()\n', encoding='utf-8')
+            for module in (True, False):
+                for fmt in ('json', 'sarif'):
+                    with self.subTest(case=label, module=module, format=fmt):
+                        prefix = (('bash', str(REPO_ROOT / 'modules/ubs-python.sh'), '--no-uv')
+                                  if module else ('bash', str(REPO_ROOT / 'ubs'), '--only=python'))
+                        command = (*prefix, '--ci', '--format=' + fmt, skip, str(selected))
+                        result = subprocess.run(command, cwd=work, env=env, capture_output=True,
+                                                text=True, timeout=180)
+                        output = work / f'{label}-{module}-{fmt}'
+                        output.with_suffix('.stdout').write_text(result.stdout, encoding='utf-8')
+                        output.with_suffix('.stderr').write_text(result.stderr, encoding='utf-8')
+                        self.assertEqual(result.returncode, 2 if partial else int(bool(expected)),
+                                         (command, result.stdout, result.stderr))
+                        payload = json.loads(result.stdout)
+                        if fmt == 'json':
+                            self.assertEqual(payload['status'], 'partial' if partial else 'ok', payload)
+                            rows = [row for row in payload.get('findings', [])
+                                    if row['rule' if module else 'rule_id'] == header_injection.RULE_ID]
+                            samples = ([sample for row in rows for sample in row['samples']]
+                                       if module else rows)
+                            self.assertEqual([row['line'] for row in samples], expected, payload)
+                            self.assertEqual(payload['critical'] if module else payload['totals']['critical'],
+                                             len(expected), payload)
+                            for sample in samples:
+                                self.assertEqual(Path(sample['file']).name, path.name)
+                            for row in rows:
+                                message = row['title' if module else 'message']
+                                self.assertIn('request.args', message)
+                                self.assertIn('response header', message)
+                        else:
+                            rows = [row for run in payload['runs'] for row in run.get('results', [])
+                                    if row['ruleId'] == header_injection.RULE_ID]
+                            self.assertEqual([row['locations'][0]['physicalLocation']['region']['startLine']
+                                              for row in rows], expected, payload)
+                            invocations = [item for run in payload['runs']
+                                           for item in run.get('invocations', [])]
+                            if partial:
+                                self.assertTrue(invocations, payload)
+                                self.assertTrue(all(item['executionSuccessful'] is False for item in invocations),
+                                                payload)
+                            else:
+                                self.assertTrue(all(item.get('executionSuccessful') is not False
+                                                    for item in invocations), payload)
+                        print('PYTHON_HEADER_PUBLIC', label, module, fmt, 'PASS', flush=True)
 
 
 if __name__ == "__main__":

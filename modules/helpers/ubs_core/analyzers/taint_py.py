@@ -3064,6 +3064,8 @@ class _Flow:
 
 
 class _Analysis:
+    flow_class = _Flow
+
     def __init__(self, tree, project=None):
         self.tree = tree
         self.project = project
@@ -3363,7 +3365,7 @@ class _Analysis:
                     provider_globals = (global_bound if owner is self else
                                         {f'@global:{key}': owner.globals.value(key) for key in owner.globals})
                     provider_inputs = bound.get(provider, {}) if owner is self else owner.framework_values.get(provider, {})
-                    incoming = _Flow.substitute(delivered, {**provider_globals, **provider_inputs}, provider.name + '()')
+                    incoming = self.flow_class.substitute(delivered, {**provider_globals, **provider_inputs}, provider.name + '()')
                     previous = bound[function].get(name, CLEAN)
                     updated = join_facts(previous, incoming)
                     if updated != previous:
@@ -3490,7 +3492,7 @@ class _Analysis:
         solved = {}  # summary key -> (reads, writes, flow) of the job's last solve
         while True:
             previous_contexts = len(self.summaries)
-            module = _Flow(self, self.tree)
+            module = self.flow_class(self, self.tree)
             globals_ = module.block(self.tree.body, _State())
             if globals_ is None:
                 # Keep definitions and global facts established before a
@@ -3524,7 +3526,7 @@ class _Analysis:
                 namespace = globals_ if owner is self else owner.globals
                 local = owner.locals[function]
                 used = owner.used_names[function]
-                flow = _Flow(owner, function)
+                flow = owner.flow_class(owner, function)
                 state = _State({name: owner.global_symbols[name][0]
                                 for name in owner.global_names if name in used and name not in local},
                                {name: target for name, target in namespace.bindings.items()
@@ -3835,7 +3837,7 @@ class _Project:
         # function body and cannot read a peer member under deferred_cycle's
         # initializer contract. Qualified lookups then see complete namespaces.
         for engine in component:
-            engine.refresh_globals(_Flow(engine, engine.tree).block(engine.tree.body, _State()) or _State())
+            engine.refresh_globals(engine.flow_class(engine, engine.tree).block(engine.tree.body, _State()) or _State())
         self.ready.update(component)
         self.solving = set(component)
         try:

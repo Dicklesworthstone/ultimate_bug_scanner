@@ -2086,7 +2086,8 @@ class _Flow:
                     tuple(sorted(values.items())))
                 self.expression_references[node] = NO_REFERENCES
                 return CLEAN
-            summary = self.engine.call_summary(function, values, summary_keys)
+            overrides = self.context_globals if owner is self.engine else ()
+            summary = self.engine.call_summary(function, values, summary_keys, overrides)
             for kind, line, column, label, fact in summary.effects:
                 propagated = self.substitute(fact, bound, call_name)
                 propagated = frozenset(trace for trace in propagated if not _safe_for(trace, kind, label))
@@ -3092,6 +3093,7 @@ class _Analysis:
         # membership testing. Rebinding, mutation, aliasing or passing the set
         # to an opaque call invalidates it throughout this conservative model.
         self.url_allowlists = set()
+        allowlist_targets = []
         for statement in tree.body:
             if not (isinstance(statement, ast.Assign) and len(statement.targets) == 1
                     and isinstance(statement.targets[0], ast.Name)
@@ -3100,26 +3102,43 @@ class _Analysis:
                         and isinstance(item.value, str) and item.value
                         for item in statement.value.elts)):
                 continue
-            target = statement.targets[0]
-            uses = [node for node in nodes if isinstance(node, ast.Name) and node.id == target.id
-                    and node is not target]
-            rebound = any(
-                isinstance(node, ast.arg) and node.arg == target.id
-                or _pattern_capture(node) == target.id
-                or isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
-                                     ast.ExceptHandler)) and node.name == target.id
-                or isinstance(node, (ast.Import, ast.ImportFrom)) and any(
-                    alias.name == '*' or (alias.asname or alias.name.split('.')[0]) == target.id
-                    for alias in node.names)
-                or isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                    and node.func.id in {'exec', 'eval', 'globals', 'locals', 'vars'}
-                for node in nodes)
-            if not rebound and uses and all(isinstance(node.ctx, ast.Load)
+            allowlist_targets.append(statement.targets[0])
+        if allowlist_targets:
+            # Large analyzers define many constant sets. Index the immutable
+            # syntax once rather than rescanning every node for every set;
+            # all invalidating scopes and dynamic namespace writes still count.
+            uses_by_name = {target.id: [] for target in allowlist_targets}
+            rebound_names = set()
+            dynamic_namespace = False
+            for node in nodes:
+                if isinstance(node, ast.Name):
+                    if node.id in uses_by_name:
+                        uses_by_name[node.id].append(node)
+                elif isinstance(node, ast.arg):
+                    rebound_names.add(node.arg)
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+                                       ast.ExceptHandler)):
+                    rebound_names.add(node.name)
+                elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                    for alias in node.names:
+                        if alias.name == '*':
+                            dynamic_namespace = True
+                        rebound_names.add(alias.asname or alias.name.split('.')[0])
+                elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                      and node.func.id in {'exec', 'eval', 'globals', 'locals', 'vars'}):
+                    dynamic_namespace = True
+                elif (capture := _pattern_capture(node)) is not None:
+                    rebound_names.add(capture)
+            for target in allowlist_targets:
+                if dynamic_namespace or target.id in rebound_names:
+                    continue
+                uses = [node for node in uses_by_name[target.id] if node is not target]
+                if uses and all(isinstance(node.ctx, ast.Load)
                     and isinstance(self.parents.get(node), ast.Compare)
                     and len(self.parents[node].ops) == 1
                     and isinstance(self.parents[node].ops[0], ast.In)
                     and self.parents[node].comparators == [node] for node in uses):
-                self.url_allowlists.add(target.id)
+                    self.url_allowlists.add(target.id)
         self.call_sites = {node: _expanded_call(node) for node in nodes if isinstance(node, ast.Call)}
         self.imports = tuple(node for node in nodes if isinstance(node, (ast.Import, ast.ImportFrom)))
         self.method_calls = {}
@@ -3353,7 +3372,7 @@ class _Analysis:
             if not changed:
                 return bound
 
-    def call_summary(self, function, values, candidate_keys=None):
+    def call_summary(self, function, values, candidate_keys=None, global_overrides=()):
         """Request a symbolic summary for known callback identities.
 
         Facts, heaps and evidence paths are NOT context keys. Only finite
@@ -3365,7 +3384,11 @@ class _Analysis:
         context = []
         owner_fn = None
         owner_bindings = None
-        items = ((name, values.get(name)) for name in candidate_keys) if candidate_keys is not None else values.items()
+        # Candidate names can come from both a lexical global and an inherited
+        # callback context. They describe one mapping, not repeated arguments:
+        # retaining duplicate entries creates a fresh, longer context on every
+        # recursive call even though no callable identity changed.
+        items = ((name, values.get(name)) for name in dict.fromkeys(candidate_keys)) if candidate_keys is not None else values.items()
         for name, binding in items:
             if name.startswith('@global:'):
                 # A caller may replace a global callable or class method and
@@ -3383,9 +3406,21 @@ class _Analysis:
                     continue
                 gname = name[8:]
                 nominal = owner_bindings.get(gname)
-                if not any(isinstance(value, (str, ast.FunctionDef, ast.AsyncFunctionDef,
-                                              ast.Lambda, ast.ClassDef, _BoundClassMethod))
-                           for value in (*_binding_choices(binding), *_binding_choices(nominal))):
+                explicit_override = gname in global_overrides
+                if (binding is nominal
+                        and not isinstance(binding, (frozenset, _BoundClassMethod))
+                        and not explicit_override
+                        and gname in owner_bindings
+                        and gname not in owner_fn.locals[function]
+                        and gname not in owner_fn.closures[function]):
+                    # Ordinary unchanged globals do not distinguish a call.
+                    # Avoid constructing choices only to discard them below;
+                    # bound receivers and alternatives still need normalization.
+                    continue
+                if not explicit_override and not any(
+                        isinstance(value, (str, ast.FunctionDef, ast.AsyncFunctionDef,
+                                           ast.Lambda, ast.ClassDef, _BoundClassMethod))
+                        for value in (*_binding_choices(binding), *_binding_choices(nominal))):
                     continue
             elif binding is None or isinstance(binding, _SymbolicValue):
                 continue
@@ -3401,10 +3436,16 @@ class _Analysis:
             if name.startswith('@global:'):
                 joined_choice = _join_bindings(*choices)
                 if (joined_choice is nominal
+                        and not explicit_override
                         and gname in owner_bindings
                         and gname not in owner_fn.locals[function]
                         and gname not in owner_fn.closures[function]):
                     continue
+                # A contextual call keeps its explicit overrides through
+                # recursion, even if provisional module initialization now
+                # happens to match them. The base summary may still describe
+                # the preceding namespace; merging into it would import stale
+                # effects into an otherwise independent recursive context.
                 context.append((name, joined_choice))
             elif any(value is not None for value in choices):
                 context.append((name, _join_bindings(*choices)))

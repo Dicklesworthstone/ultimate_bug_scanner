@@ -28,6 +28,10 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Fixed
 
+- Python taint analysis deduplicates recursive context keys and preserves
+  explicit callable overrides, preventing non-converging self-scans. Allow-list
+  indexing and unchanged-global handling avoid repeated work; the whole-repo
+  latency target remains open.
 - Java/Kotlin SSRF checks follow request-derived destinations through local
   helpers, branches, reassignments and JDK request-builder aliases. Scheme and
   exact-host validation must protect the same URI/URL value; helper names and

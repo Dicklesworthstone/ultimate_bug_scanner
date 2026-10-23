@@ -433,6 +433,7 @@ def run_analyzers(
     from ubs_core import analyzers  # noqa: F401  (populate registry)
     from ubs_core.registry import analyzers_for_lang
 
+    hook_suppressions = SourceSuppressions("javascript")
     for analyzer in analyzers_for_lang("javascript"):
         if prefilter is not None and analyzer.name != 'taint_js':
             target_files = prefilter.filter_files_for_analyzer(analyzer.name, files)
@@ -444,6 +445,15 @@ def run_analyzers(
         try:
             for finding in analyzer.run(ctx):
                 if skip and _record_category(finding) in skip:
+                    continue
+                # The legacy hook detector returns raw findings. Apply the public
+                # rule-scoped comment contract before publishing or caching them;
+                # its underlying detector and raw parity checks remain unchanged.
+                if analyzer.name == "spec_hooks" and hook_suppressions.is_suppressed(
+                    str(finding.get("path", "")),
+                    int(finding.get("line", 0) or 0),
+                    str(finding.get("rule", "")),
+                ):
                     continue
                 sink.write(json.dumps({
                     "rule": finding.get("rule", ""),

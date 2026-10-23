@@ -195,6 +195,43 @@ class ScanTests(unittest.TestCase):
             self.assertEqual(sink_path.read_text(), "")
 
 
+class HookPublicationSuppressionTests(unittest.TestCase):
+    def findings(self, marker):
+        from ubs_core.js_scan import run_analyzers
+
+        artifacts = REPO_ROOT / "test-suite/artifacts/hook-publication"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="case-", dir=artifacts) as tmp:
+            source = Path(tmp) / "component.tsx"
+            source.write_text(
+                "export function Widget({ userId }) {\n"
+                + marker
+                + "  useEffect(() => { consume(userId); }, []);\n}\n",
+                encoding="utf-8",
+            )
+            sink = io.StringIO()
+            run_analyzers([source], sink)
+            return [json.loads(line) for line in sink.getvalue().splitlines()]
+
+    def test_matching_comment_suppresses_only_the_named_hook_rule(self):
+        records = self.findings("  // ubs:ignore[js.hooks.missing-critical] -- intentional mount snapshot\n")
+        self.assertFalse(any(record["rule"] == "js.hooks.missing-critical" for record in records))
+        self.assertTrue(any(record["rule"] == "js.hooks.missing-warning" for record in records))
+
+    def test_unmarked_wrong_rule_and_string_markers_keep_the_defect(self):
+        for marker in (
+            "",
+            "  // ubs:ignore[js.hooks.unstable]\n",
+            '  const note = "ubs:ignore[js.hooks.missing-critical]";\n',
+            "  // ubs:ignore[js.hooks.missing-critical]\n  const unrelated = 1;\n",
+        ):
+            with self.subTest(marker=marker):
+                records = self.findings(marker)
+                critical = [record for record in records if record["rule"] == "js.hooks.missing-critical"]
+                self.assertEqual(len(critical), 1, records)
+                self.assertEqual(critical[0]["message"], "Add userId to the dependency array")
+
+
 class AnalyzerFailureTests(unittest.TestCase):
     def run(self, result=None):
         started = time.monotonic()

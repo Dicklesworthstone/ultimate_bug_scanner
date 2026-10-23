@@ -1213,6 +1213,26 @@ class SwiftScopedFlowTests(unittest.TestCase):
                         func incoming(req: Request) {}
                     ''' % source, policy=policy, suffix=source.split('.')[0] + policy)
 
+    def test_uninitialized_filename_field_is_a_binding_not_an_input_read(self):
+        for declaration in ('let filename: String', 'private let filename: String?',
+                            'var originalFilename: String'):
+            with self.subTest(declaration=declaration):
+                self.check('''
+                    struct Upload { %s }
+                    func handle(req: Request) {
+                        _ = file(at: req.query["path"])
+                    }
+                ''' % declaration, (3,), policy='path', suffix=str(len(declaration)))
+        for declaration in ('let filename: Request', 'let request: Request',
+                            'var filename: String { upload.filename }',
+                            'let value = upload.filename',
+                            r'let value = "copy-\(upload.filename)"'):
+            with self.subTest(declaration=declaration), self.assertRaisesRegex(ValueError, 'initialization.*incomplete'):
+                self.check('''
+                    struct Upload { %s }
+                    func handle(req: Request) { _ = file(at: req.query["path"]) }
+                ''' % declaration, policy='path', suffix=str(len(declaration)))
+
     def test_file_record_members_do_not_hide_real_sinks(self):
         for policy, sink in (('path', 'file(at: target)'),
                              ('redirect', 'Response.redirect(to: target)')):

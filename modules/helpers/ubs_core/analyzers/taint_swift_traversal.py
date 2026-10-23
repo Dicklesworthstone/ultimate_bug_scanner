@@ -435,7 +435,15 @@ class SwiftParser:
             if declarations and owner:
                 # Stored fields/accessors require an object state model. Never
                 # silently discard an executable request source in this region.
-                if swift_source_tokens(part):
+                source_region = part
+                binding = self.uninitialized(tokens[head:finish])
+                if (binding is not None and binding.value not in {'req', 'request'}
+                        and not any(token.kind == 'code' and token.value == '{' for token in part)):
+                    # A typed stored-field binding is not an executable read
+                    # of upload.filename. Keep attributes and the type as
+                    # witnesses, and retain the conservative request fields.
+                    source_region = (*tokens[start:head], *tokens[head + 2:finish])
+                if swift_source_tokens(source_region):
                     raise ValueError('Swift request-derived type initialization needs field analysis; analysis is incomplete')
                 continue
             if first in {'import', 'typealias', 'case', '@'}:

@@ -5648,7 +5648,7 @@ class ArchiveProbe {
         String value = entry.getName();
         int padding = 0;
         padding++;
-        destination.resolve(value);
+        java.nio.file.Files.writeString(destination.resolve(value), "data");
     }
 }
 ''', (('destination.resolve(value)', 'destination.resolve("fixed")'),)),
@@ -5927,7 +5927,7 @@ fun extract(destination: Path, entry: ZipEntry) {
     val value = entry.getName();
     val padding = 0;
     println(padding);
-    destination.resolve(value);
+    java.nio.file.Files.writeString(destination.resolve(value), "data");
 }
 ''', ('destination.resolve(value)', 'destination.resolve("fixed")')),
             ('header-injection', 6, 3, '''import com.sun.net.httpserver.HttpExchange

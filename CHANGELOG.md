@@ -28,6 +28,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Fixed
 
+- Java/Kotlin archive extraction follows entry identity and extraction targets
+  through scoped helper summaries, branches and supported iteration. Findings
+  belong to actual filesystem writes, with source-to-sink witnesses; path
+  construction alone stays clean. Containment checks must protect the same
+  target under a trusted root, including roots passed through helpers. Escaped
+  archive objects and unsupported analysis report incomplete scan status.
+
 - Python header injection follows header names and values through scoped helper
   summaries and branches. Encoder identity, option values, CR/LF removal and
   dominating rejection checks determine safety; shadowed encoders, decoding,

@@ -507,6 +507,7 @@ class Summary:
 
 
 class Engine:
+    parser_type = Parser
     source_re = SOURCE_RE
     sink_re = SINK_RE
     sink_label = 'file sink'
@@ -516,7 +517,7 @@ class Engine:
         # FindingSink canonicalizes source locations; evidence and source keys
         # must identify that same file when selection used a symlink alias.
         self.path, self.text = path.resolve(), text
-        self.parser = Parser(text, path.suffix.lower() in {'.kt', '.kts'}, self.source_re, self.sink_re)
+        self.parser = self.parser_type(text, path.suffix.lower() in {'.kt', '.kts'}, self.source_re, self.sink_re)
         self.code = self.parser.code
         self.lines = [0, *(index + 1 for index, char in enumerate(text) if char == '\n')]
         self.budget = Budget()
@@ -1003,6 +1004,10 @@ class Engine:
             return None
         return lhs, cursor, cursor + operator.end(), end, operator.group(1)
 
+    def adapter_graph(self, statement, following, bindings, reads, node, block, edges,
+                      break_to, continue_to, unwind):
+        raise AnalysisLimit('Unsupported Java/Kotlin adapter statement; analysis is incomplete')
+
     def graph(self, function):
         actions, edges = {}, {}
         scope = {name: 'capture:' + name for name in function.captures}
@@ -1029,6 +1034,10 @@ class Engine:
                 kind, span = statement.kind, (statement.start, statement.end)
                 targets = () if entry is None else (entry,)
                 if kind == 'definition':
+                    continue
+                if kind == 'adapter':
+                    entry = self.adapter_graph(statement, entry, local, reads, node, block, edges,
+                                               break_to, continue_to, unwind)
                     continue
                 if kind == 'require':
                     name = re.match(r'\s*(require|check)\b', self.code[statement.start:statement.end]).group(1)

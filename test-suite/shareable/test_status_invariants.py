@@ -96,7 +96,8 @@ def make_workspace(tmpdir: Path) -> tuple[Path, Path]:
     return target, bin_dir
 
 
-def run_scan(target: Path, bin_dir: Path, args: list[str], env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+def run_scan(target: Path, bin_dir: Path, args: list[str], env: dict[str, str],
+             only: str = "python,bash") -> subprocess.CompletedProcess[str]:
     merged = os.environ.copy()
     merged.update({
         "NO_COLOR": "1",
@@ -108,7 +109,7 @@ def run_scan(target: Path, bin_dir: Path, args: list[str], env: dict[str, str]) 
     })
     merged.update(env)
     return subprocess.run(
-        [str(UBS_BIN), "--only=python,bash", *args, str(target)],
+        [str(UBS_BIN), f"--only={only}", *args, str(target)],
         cwd=REPO_ROOT, capture_output=True, text=True, env=merged, check=False,
         timeout=180,
     )
@@ -251,6 +252,30 @@ def check_allow_partial_exits_on_findings(tmpdir: Path) -> None:
                   f"expected {expected_exit}, got {text_proc.returncode}\n{text_blob[-600:]}")
             check(f"{name}/text-status-line", "Status: partial" in text_blob,
                   "no 'Status: partial' line in text output")
+
+    # Nothing completed either when the only requested module timed out,
+    # crashed or printed no usable report. The run is "partial", but no
+    # scanner has findings to exit on, so accepting it would exit 0 for a
+    # file that was never scanned. It exits 2, and the envelope says so.
+    for case_id, stub_env, expected_status, _ in MATRIX:
+        if expected_status != "partial":
+            continue
+        name = f"allow-partial/only-module-failed/{case_id}"
+        proc = run_scan(clean_target, bin_dir, ["--format=json"], {**stub_env, **allow}, only="python")
+        try:
+            doc = json.loads(proc.stdout)
+        except ValueError:
+            check(f"{name}/json-parses", False, f"stdout is not JSON: {proc.stdout[:200]}")
+            continue
+        check(f"{name}/exit-2", proc.returncode == 2,
+              f"expected 2, got {proc.returncode}\n{(proc.stdout + proc.stderr)[-600:]}")
+        check(f"{name}/exit-code-claim", doc.get("exit_code") == 2,
+              f"exit_code={doc.get('exit_code')!r} but the process returned {proc.returncode}")
+        check(f"{name}/not-accepted", "Partial run accepted" not in proc.stderr, proc.stderr[-400:])
+
+        text_proc = run_scan(clean_target, bin_dir, [], {**stub_env, **allow}, only="python")
+        check(f"{name}/text-exit-2", text_proc.returncode == 2,
+              f"expected 2, got {text_proc.returncode}\n{(text_proc.stdout + text_proc.stderr)[-600:]}")
 
     # Nothing completed: the only requested module could not run. There are no
     # findings to exit on, so the run stays an error with exit 2, and the

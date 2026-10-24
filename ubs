@@ -8305,10 +8305,11 @@ qualify_combined_json(){
     reason="$(incomplete_run_reason)"
     # UBS_ALLOW_PARTIAL=1 is an explicit opt-in to a findings-based exit for
     # a partial run, so the document must not claim an exit code the process
-    # will not return. An "error" run has no completed scanner to take
-    # findings from and exits 2 either way.
+    # will not return. A run with no completed scanner to take findings from
+    # (an "error" run, or a partial one whose only modules timed out or
+    # crashed) exits 2 either way.
     if [[ "${FINDINGS_MERGE_FAILED:-0}" -eq 1 || "${UBS_ALLOW_PARTIAL:-0}" != "1" \
-          || "$run_status" == "error" ]]; then
+          || "$run_status" == "error" || "${USABLE_SCANNERS:-0}" -eq 0 ]]; then
       exit_code=2
     fi
   fi
@@ -9311,7 +9312,7 @@ case "$FORMAT" in
 	    say_err "${RED}${X}${RESET} Findings assembly failed. Exit 2 — the requested results are incomplete."
 	    status=2
 	  elif [[ "${UBS_ALLOW_PARTIAL:-0}" == "1" && "$RUN_STATUS" == "partial" \
-	        && "$REPORT_FAILED" -eq 0 && -n "$desired" ]]; then
+	        && "$REPORT_FAILED" -eq 0 && -n "$desired" && "${USABLE_SCANNERS:-0}" -gt 0 ]]; then
 	    # Issue #186: the wait loop above folded the failed module's own exit
 	    # code (2 for a partial module, anything else for a crash) into
 	    # $status, and the findings check only ever raises it, so accepting the
@@ -9321,8 +9322,9 @@ case "$FORMAT" in
 	    status="$desired"
 	  elif [[ "${UBS_ALLOW_PARTIAL:-0}" == "1" ]]; then
 	    # Nothing to take a findings-based exit from: no scanner completed
-	    # (status "error"), or the findings totals or the requested report
-	    # could not be produced.
+	    # (status "error", or every requested module timed out or crashed),
+	    # or the findings totals or the requested report could not be
+	    # produced. A run that scanned nothing must not exit 0.
 	    say_err "${RED}${X}${RESET} Run ${RUN_STATUS}: $(printf '%s' "$FAILED_MODULES_JSON" | jq -r 'map(.language + ": " + .status) | join(", ")' 2>/dev/null || printf '%s' "${ENV_ERROR_LANGS[*]:-}"). Exit 2 — UBS_ALLOW_PARTIAL=1 found no completed result to take a findings-based exit from."
 	    status=2
 	  else

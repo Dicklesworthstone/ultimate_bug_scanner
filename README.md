@@ -74,7 +74,8 @@ something usable came back) or `error` (a module could not run at all and no oth
 result), and pre-scan refusals are an error envelope with exit 2 (see
 "Machine-readable failures" below). The status field, the human status line and the exit code always
 agree: anything other than `ok` exits 2. `UBS_ALLOW_PARTIAL=1` makes a `partial` run exit on the findings of
-the scanners that completed instead (0 clean, 1 findings); an `error` run has none and still exits 2.
+the scanners that completed instead (0 clean, 1 findings). A run in which no scanner completed (an `error` run,
+or one whose only requested modules timed out or crashed) has none and still exits 2.
 
 Checkouts also expose the optional local service through `ubs serve --repo .`,
 `ubs --client --repo . src/main.py`, and `ubs daemon status|stop|cancel --repo .`.

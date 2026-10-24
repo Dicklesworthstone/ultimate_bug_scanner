@@ -3532,20 +3532,26 @@ class _Engine:
                 # An unseen acyclic call has no result yet. Solve it before
                 # consuming bottom, otherwise each successive helper call
                 # restarts its entire caller from the beginning. Deep call
-                # chains still use the iterative worklist, as does a recursive
-                # backedge. Both paths retain the same work budget.
+                # chains still use the iterative worklist, as do recursive
+                # widened contexts. Both paths retain the same work budget.
                 if self.heap_solve_depth < 16:
                     self.solve_heap(context)
                 else:
                     self.enqueue(context)
-        if context.dirty and context not in self.solving and self.heap_solve_depth < 16:
-            # The same holds for a widened summary whose input is new or just
-            # grew: solve it before this read. Read stale, every later change
-            # to a helper inside a recursion re-ran the whole recursive body,
-            # so the body was solved once per helper update instead of once
-            # per change to its own input. A summary being solved right now (a
-            # recursive backedge) keeps its place on the worklist. This solve
-            # also covers its queued entry, which the worklist then skips.
+        if (context.dirty and context.result is not None and getattr(task, 'widened', False)
+                and context not in self.solving and self.heap_solve_depth < 16):
+            # A helper summary read from inside a recursion (the reader is
+            # itself widened) whose input grew since its last solve is solved
+            # again before this read. Read stale, every helper update re-ran
+            # the whole recursive body, which was then solved once per helper
+            # update instead of once per change to its own input. New
+            # summaries, and entry summaries read from outside a recursion,
+            # stay on the worklist: solving those eagerly too saved a little
+            # work on small recursions, but explored large minified files
+            # depth first, so they took up to 1.7x as long to reach their work
+            # limit. A summary being solved right now (a recursive backedge)
+            # keeps its place as well. This solve covers the summary's queued
+            # entry, which the worklist then skips.
             self.queued.discard(context)
             self.solve_heap(context)
         # Borrowed means borrowed by this caller: a joined widened input also

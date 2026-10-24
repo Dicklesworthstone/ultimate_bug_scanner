@@ -168,19 +168,19 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='f9751aa5a764b1626928ea6977a7413cfdd3fcc10f6549fdb4d9c651158e8dc1'
-  [cpp]='caeb00dd23dccca2cbecbb0d899652af78d00982c702a8b0724a52ed734ce0a4'
-  [csharp]='3cae677d499e1bb12836416b2f73a40e22918c2aa0884473b98638f2c78600a0'
-  [elixir]='04d193ca5e27683441261d443c5d73365fc6c1020d44af89b6e3ffcd94d99a1c'
-  [golang]='b4336b63189256b7ed4d9ab02ed04011c3df72a6d3f788a4411c7d6bfc11d52d'
-  [java]='86a475187fb95da43e382b5e6ffdc439baccda397d178a724b0d8487ce3fd024'
-  [js]='60f99ee49388fd61de7029fe5c3363a5c52a1b917631a4dad6e42bcb2d013f9a'
-  [kotlin]='ea5e829e533796e8e5107044c14145ef7c4530967fd004690236cc5aeb8c7f0e'
-  [php]='23c94613731474e12a1e234055c19552718df53fa35bdfa8457d19d2419bbc8a'
-  [python]='159ded0bee0f73a0441daf7b0722c3d9ab1609e20c43e81e3b8581ce8d993bd7'
-  [ruby]='4d3a54ebe305c9231d33e3fec732dcf9ece36e8c19c0e6454df4c12edbc9e3e5'
-  [rust]='a1fae201ad3f1a8a1f23c29cbcccc997c2b96bc3f5ab8a1bac6e6e25333b4242'
-  [swift]='506bbcc593d7a000008154d48cf6bbc91872667dadc3413cbc9a8c4bab34e963'
+  [bash]='d3801ab25853d891cc407fc298bf1453a7f0df8e95d89c8cb2feb1353af0ecb8'
+  [cpp]='72ed6348708d9f1240089003751acc27caa1915cebff1d3a98579b9f4dff5c64'
+  [csharp]='fcd92faad840d965028e4fe4e788c2ffbfa466df860c3c51750d319f985cf94c'
+  [elixir]='0bb29768499cadcede0e0f1bd9358317a208825e9f7d64e8d3e53bcb1cc3bc2a'
+  [golang]='c7c9b877a145ba23bdb83710295d8c5690c821113934d14e9eeff9c50ee47234'
+  [java]='92d836f97e0b994861c033b3ba01bd5bf9b91d8d85bc9254aa6f944b005cd8fd'
+  [js]='a213420b97002100b90421cbb49e23cefb7d6b201bcd76e303ed99568a19b4f6'
+  [kotlin]='b48070bc347fe80a04541cbfd61ef420c6dca0b0f4dc4ecd06ee866c27f72a24'
+  [php]='6303ee1e094d1988655925c8ea310d3c4b7257ebc80168a0c221187b315955ac'
+  [python]='f218d830ac16a93d46de2f3aaad499f5d590112e080349f4c0344b35dae8d14f'
+  [ruby]='0db8d3582f030af8a6485f0f0555b05707c06234c6b3aa4e86804bc87a8d9dd1'
+  [rust]='28c03293eaa0669573cba461a8ce54215b5a2d68c7e3782e23099f7358d4975a'
+  [swift]='6c7487c659438f535538d6768e38146ee57b37bd1f5a9a89d5773a9cdff1fcd2'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -358,7 +358,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/elixir_patterns/security_rg.py']='551c5357954168766253ec46bf2095b7497d500c01d2a71fbbb77849461c51c9'
   ['helpers/ubs_core/elixir_rules.py']='3f8ca9a8d1cd898588005bb925b5b931d8d3947d41e7c235c48b9d8033ed65e4'
   ['helpers/ubs_core/elixir_scan.py']='211b76527f9b803507420e5abc7618bf89c801bac64bc474d8978d31c34dc331'
-  ['helpers/ubs_core/explain.py']='982cb9be27bb4d5d7cc4afde2f7f0cba57ab4b7804d79c963b70f6aff21a8306'
+  ['helpers/ubs_core/explain.py']='af565bc8ebe3c42521bf669787980b6a1b7ada8f83b8d08f9985828d0668415c'
   ['helpers/ubs_core/external_tools.py']='4a66691cffa87c4c4b8191ac7355fee395d3b0369a288e381a11522accc69a48'
   ['helpers/ubs_core/findings_merge.py']='a592789f727296e332a1b79f441a20234f8f7686ed738de5152fc4981781b6fa'
   ['helpers/ubs_core/go_ast.py']='f459406b41a7aa4b5fd0af7cce5a961811d0bffd499fb99825ed631ec96d0f0d'
@@ -553,7 +553,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='77a16e60dce843652c053d069dcbffce17c8ffae543bf77693d2e8254a3967de'
   ['helpers/ubs_core/taint_flow.py']='828316f978026b562f13a62e86abfefa83e5dfc802cc97151ecda6de107e16f2'
-  ['lib/ubs-common.sh']='01863aeb2aeb3c52207718bc8f8d55998338159bcb05f94837af688e0ee5d232'
+  ['lib/ubs-common.sh']='c8cf0e1e290bb0c2d42c537681484ecf923c47d74b20abcf40349c143c13509a'
 )
 
 # contract.json as shipped by earlier releases (sha256 -> first tag), kept out
@@ -2534,13 +2534,29 @@ explain_rule(){
   local self_dir helpers_dir repo_root
   self_dir="$(dirname "${BASH_SOURCE[0]}")"
   helpers_dir="$self_dir/modules/helpers"
-  if [[ ! -d "$helpers_dir" && -d "${MODULE_DIR:-}/helpers" ]]; then
+  if [[ ! -f "$helpers_dir/ubs_core/explain.py" && -f "${MODULE_DIR:-}/helpers/ubs_core/explain.py" ]]; then
     helpers_dir="${MODULE_DIR:-}/helpers"
   fi
   repo_root="$(cd "$self_dir" 2>/dev/null && pwd -P)" || repo_root="$self_dir"
 
   if ! need_cmd python3; then
     say_err "${RED}${X}${RESET} python3 is required for ubs explain"
+    return 2
+  fi
+  # An installed runner reads rules from the helpers in its module cache, which
+  # the first scan (or doctor --fix) downloads. Without them there is no rule
+  # catalog, and every ID would look unknown (issue #187).
+  if [[ ! -f "$helpers_dir/ubs_core/explain.py" ]]; then
+    local missing="the UBS helper modules are not installed (looked in ${MODULE_DIR:-$self_dir/modules}/helpers); install them with: ubs doctor --fix"
+    local arg want_json=0 prev=""
+    for arg in "$@"; do
+      if [[ "$arg" == "--format=json" || ( "$prev" == "--format" && "$arg" == "json" ) ]]; then want_json=1; fi
+      prev="$arg"
+    done
+    if [[ "$want_json" -eq 1 ]]; then
+      printf '{"error":"%s","exit_code":2}\n' "$(json_escape "$missing")"
+    fi
+    say_err "${RED}${X}${RESET} ubs explain: $missing"
     return 2
   fi
 

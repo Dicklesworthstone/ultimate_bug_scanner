@@ -340,5 +340,107 @@ class ExplainRuleTests(unittest.TestCase):
         self._run_with_logging(case_id, _test)
 
 
+class InstalledLayoutExplainTests(unittest.TestCase):
+    """`ubs explain` from an installed runner (issue #187).
+
+    install.sh puts the runner in a bin directory and the helpers in the module
+    cache under $XDG_DATA_HOME; neither detectors.yml nor test-suite/ is
+    installed. The catalog used to be read from "<runner dir>/modules/helpers",
+    so every documented rule ID came back unknown with no suggestions. Each
+    test builds that layout in a temporary directory, with every location the
+    runner reads pinned there and PYTHONPATH cleared, so nothing can fall back
+    to this checkout.
+    """
+
+    DOCUMENTED_IDS = (
+        "py.security.open-redirect",
+        "cs.security.sql-injection",
+        "php.security.sql-injection",
+        "py.io.open-no-encoding",
+    )
+
+    def setUp(self) -> None:
+        import shutil
+        import tempfile
+
+        self.root = Path(tempfile.mkdtemp(prefix="ubs-explain-installed-"))
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.bin_dir = self.root / "bin"
+        self.bin_dir.mkdir()
+        shutil.copy2(UBS_BIN, self.bin_dir / "ubs")
+        self.module_dir = self.root / "data" / "ubs" / "modules"
+        self.module_dir.mkdir(parents=True)
+        self.copy_helpers = lambda: shutil.copytree(
+            HELPERS_DIR, self.module_dir / "helpers",
+            ignore=shutil.ignore_patterns("__pycache__"))
+
+    def run_installed(self, args: list[str]) -> subprocess.CompletedProcess:
+        env = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+        env.update({
+            "HOME": str(self.root / "home"),
+            "XDG_DATA_HOME": str(self.root / "data"),
+            "XDG_CONFIG_HOME": str(self.root / "config"),
+            "XDG_CACHE_HOME": str(self.root / "cache"),
+            "NO_COLOR": "1",
+            "UBS_NO_AUTO_UPDATE": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        })
+        return subprocess.run(
+            [str(self.bin_dir / "ubs"), "explain", *args],
+            cwd=self.root, env=env, capture_output=True, text=True, timeout=60,
+        )
+
+    def test_documented_rules_explain_from_the_module_cache(self) -> None:
+        self.copy_helpers()
+        for rule_id in self.DOCUMENTED_IDS:
+            with self.subTest(rule=rule_id):
+                proc = self.run_installed([rule_id, "--format=json"])
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                doc = json.loads(proc.stdout)
+                self.assertEqual(doc["rule_id"], rule_id)
+                self.assertTrue(doc["message"])
+                self.assertTrue(doc["remediation"])
+                self.assertIn(doc["severity"], ("critical", "warning", "info"))
+                # Fixtures live in test-suite/, which an installation lacks.
+                self.assertIsNone(doc["buggy_fixture"])
+                self.assertIsNone(doc["clean_fixture"])
+
+        text = self.run_installed(["py.security.open-redirect"])
+        self.assertEqual(text.returncode, 0, text.stderr)
+        self.assertIn("Rule:        py.security.open-redirect", text.stdout)
+        self.assertIn("source checkout", text.stdout)
+
+        near = self.run_installed(["py.security.open_redirect", "--format=json"])
+        self.assertEqual(near.returncode, 2)
+        self.assertIn("py.security.open-redirect", json.loads(near.stdout)["suggestions"])
+
+    def test_missing_helpers_report_a_repair_not_an_unknown_rule(self) -> None:
+        proc = self.run_installed(["py.security.open-redirect", "--format=json"])
+        self.assertEqual(proc.returncode, 2)
+        doc = json.loads(proc.stdout)
+        self.assertEqual(doc["exit_code"], 2)
+        self.assertIn("ubs doctor --fix", doc["error"])
+        self.assertNotIn("Unknown rule", proc.stdout + proc.stderr)
+
+        text = self.run_installed(["py.security.open-redirect"])
+        self.assertEqual(text.returncode, 2)
+        self.assertIn("ubs doctor --fix", text.stderr)
+        self.assertNotIn("Unknown rule", text.stdout + text.stderr)
+
+    def test_empty_catalog_is_reported_as_broken_installation(self) -> None:
+        from ubs_core import explain
+
+        original = explain.build_catalog
+        explain.build_catalog = lambda _root: {}
+        try:
+            rc, out, err = explain.explain_rule("py.security.open-redirect", repo_root=REPO_ROOT,
+                                                output_format="json")
+        finally:
+            explain.build_catalog = original
+        self.assertEqual(rc, 2)
+        self.assertIn("ubs doctor --fix", json.loads(out)["error"])
+        self.assertNotIn("Unknown rule", out + err)
+
+
 if __name__ == "__main__":
     unittest.main()

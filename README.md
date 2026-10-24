@@ -2854,6 +2854,8 @@ ubs explain open_redirect                           # Fuzzy match / suggestions 
 
 Unknown rule IDs exit 2 with nearest fuzzy and token match suggestions so agents and developers can self-correct immediately.
 
+An installed `ubs` reads rules from the helper modules in its module cache (downloaded by the first scan or by `ubs doctor --fix`; without them `explain` says so and exits 2). Fixture examples come from `test-suite/`, so only a source checkout shows them.
+
 ---
 
 ## 🧪 **Test Suite Infrastructure**

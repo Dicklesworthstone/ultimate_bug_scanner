@@ -125,6 +125,12 @@ SRC_EXTS = {
     ".c", ".h", ".hh", ".hpp", ".hxx", ".rb", ".swift", ".cs", ".ex", ".exs", ".sh", ".bash", ".php", ".phtml",
 }
 
+# The ubs_core package this module belongs to. Rule modules are read from here,
+# not from a repository root: an installed runner keeps its helpers in the
+# module cache, apart from the runner and from detectors.yml, so a catalog
+# built from "<runner dir>/modules/helpers" was empty there (issue #187).
+PACKAGE_DIR = Path(__file__).resolve().parent
+
 IGNORE_FILE_NAMES = {
     "CMakeLists.txt", "Cargo.lock", "Cargo.toml", "go.mod", "go.sum",
     "package.json", "package-lock.json", "tsconfig.json",
@@ -232,7 +238,12 @@ def _extract_file_excerpt(file_path: Path, max_lines: int = 40) -> str:
 
 
 def build_catalog(repo_root: Path) -> dict[str, dict[str, Any]]:
-    """Aggregate rule metadata across detectors.yml, ubs_core, and test-suite/manifest.json."""
+    """Aggregate rule metadata from detectors.yml and the ubs_core rule modules.
+
+    The rule modules come from this package wherever it is installed. A source
+    checkout at ``repo_root`` adds the detectors.yml registry (families and the
+    manifest cases that supply fixture examples); an installation has none.
+    """
     catalog: dict[str, dict[str, Any]] = {}
 
     # 1. detectors.yml registry (authoritative for family, display, manifest cases)
@@ -271,8 +282,8 @@ def build_catalog(repo_root: Path) -> dict[str, dict[str, Any]]:
                 rec["remediation"] = fam_rem
                 rec["manifest_cases"] = list(m_cases)
 
-    # 2. *_detectors modules in modules/helpers/ubs_core
-    helpers_core = repo_root / "modules" / "helpers" / "ubs_core"
+    # 2. *_detectors modules in this ubs_core package
+    helpers_core = PACKAGE_DIR
     if helpers_core.is_dir():
         for dpath in helpers_core.glob("*_detectors"):
             for pyfile in dpath.glob("*.py"):
@@ -528,6 +539,15 @@ def explain_rule(
         )
         return 2, "", usage_text
 
+    if not catalog:
+        # Every installed ubs_core contributes rules, so an empty catalog is a
+        # broken installation, never an unknown rule.
+        err_msg = (f"the rule catalog is empty: no UBS rule modules could be loaded from {PACKAGE_DIR}; "
+                   "reinstall the helpers with: ubs doctor --fix")
+        if output_format == "json":
+            return 2, json.dumps({"error": err_msg, "exit_code": 2}, indent=2) + "\n", f"Error: {err_msg}\n"
+        return 2, "", f"Error: {err_msg}\n"
+
     target_id = rule_id.strip()
     rule_data: dict[str, Any] | None = catalog.get(target_id)
 
@@ -650,7 +670,11 @@ def explain_rule(
         out_lines.append("")
 
     if not buggy_fixture and not clean_fixture:
-        out_lines.append(f"{DIM}No fixture examples registered for this rule.{RESET}")
+        if manifest_path.exists():
+            out_lines.append(f"{DIM}No fixture examples registered for this rule.{RESET}")
+        else:
+            out_lines.append(f"{DIM}Fixture examples come from the test suite of a source checkout; "
+                             f"this installation does not include it.{RESET}")
         out_lines.append("")
 
     return 0, "\n".join(out_lines) + "\n", ""

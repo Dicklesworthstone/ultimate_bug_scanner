@@ -849,12 +849,18 @@ def check_timeout_envelope() -> None:
         detail += f" (stdout not JSON: {exc})"
     report("timeout_envelope", ok, detail, proc if not ok else None)
 
-    # UBS_ALLOW_PARTIAL=1 restores the findings-based exit but the envelope still says partial.
+    # UBS_ALLOW_PARTIAL=1 exits on the findings of the scanners that completed
+    # (test_status_invariants covers that with a healthy second module). Here
+    # the only requested module timed out, so nothing was scanned and there
+    # are no findings to exit on: the run still exits 2, the envelope says
+    # partial and claims exit_code 2, and stderr says why the opt-in did not
+    # apply (issue #186).
     proc2 = run(["--only=python", "--ci", "--format=json", str(REPO_ROOT / "test-suite" / "python")], env={**env, "UBS_ALLOW_PARTIAL": "1"})
     ok2 = False
     try:
         doc2 = json.loads(proc2.stdout)
-        ok2 = proc2.returncode in (0, 1) and doc2.get("status") == "partial" and "UBS_ALLOW_PARTIAL=1" in proc2.stderr
+        ok2 = (proc2.returncode == 2 and doc2.get("status") == "partial" and doc2.get("exit_code") == 2
+               and "UBS_ALLOW_PARTIAL=1 found no completed result" in proc2.stderr)
     except Exception:  # noqa: BLE001
         pass
     report("timeout_allow_partial", ok2, f"exit={proc2.returncode}", proc2 if not ok2 else None)

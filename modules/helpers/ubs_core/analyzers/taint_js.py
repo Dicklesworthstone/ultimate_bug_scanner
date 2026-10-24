@@ -3538,17 +3538,20 @@ class _Engine:
                     self.solve_heap(context)
                 else:
                     self.enqueue(context)
-        if (context.dirty and context.result is not None and getattr(task, 'widened', False)
+        if (context.dirty and getattr(task, 'widened', False)
                 and context not in self.solving and self.heap_solve_depth < 16):
             # A helper summary read from inside a recursion (the reader is
-            # itself widened) whose input grew since its last solve is solved
-            # again before this read. Read stale, every helper update re-ran
-            # the whole recursive body, which was then solved once per helper
-            # update instead of once per change to its own input. New
-            # summaries, and entry summaries read from outside a recursion,
-            # stay on the worklist: solving those eagerly too saved a little
-            # work on small recursions, but explored large minified files
-            # depth first, so they took up to 1.7x as long to reach their work
+            # itself widened) is solved before this read when its input is
+            # new or grew since its last solve, as an unseen exact call is
+            # above. Read as bottom or stale, every helper update re-ran the
+            # whole recursive body, which was then solved once per helper
+            # update instead of once per change to its own input. A new
+            # helper needs this as much as a grown one: queued, a walker
+            # calling a few small helpers from its recursion, and some
+            # minified bundles that completed before, ran out of work. Entry
+            # summaries read from outside a recursion stay on the worklist:
+            # solving those eagerly too explored large minified files depth
+            # first, so they took up to 1.7x as long to reach their work
             # limit. A summary being solved right now (a recursive backedge)
             # keeps its place as well. This solve covers the summary's queued
             # entry, which the worklist then skips.

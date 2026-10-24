@@ -1010,11 +1010,11 @@ class RecursiveGraphWalkerCostTests(unittest.TestCase):
     being solved, which supersedes that exact entry. The widened summary the
     entry had started, and every helper context below it, were still solved
     to their own fixed point although nothing could read them any more.
-    A helper summary inside the recursion whose input grew was also only
-    queued, so `visit` read its stale result and re-ran its whole body after
-    each helper update. The reporter's file needed 1.42x the work limit (712k
-    units) and stopped `partial`; it now needs 0.88x (441k), with the same
-    finding and trace.
+    A helper summary inside the recursion, new or with grown input, was also
+    only queued, so `visit` read its bottom or stale result and re-ran its
+    whole body after each helper update. The reporter's file needed 1.42x the
+    work limit (712k units) and stopped `partial`; it now needs 0.64x (320k),
+    with the same finding and trace.
     """
 
     PROGRAM = """'use strict';
@@ -1111,9 +1111,10 @@ module.exports = { analyse, handler };
         elapsed = time.perf_counter() - started
         self.assertEqual(findings, [self.FINDING])
         self.assertTrue(budgets)
-        # Deterministic: 0.88 on every hash seed. The old 1.42 cannot pass.
+        # Deterministic: 0.64 on every hash seed. The old 1.42 cannot pass,
+        # nor can 0.88 from re-solving only grown helpers eagerly.
         used = max((limit - budget.remaining) / limit for budget, limit in budgets)
-        self.assertLess(used, 0.95, f'graph walker used {used:.2f}x its work limit')
+        self.assertLess(used, 0.8, f'graph walker used {used:.2f}x its work limit')
         # About 0.2 s here; generous for loaded CI hosts.
         self.assertLess(elapsed, 15.0, f'graph walker took {elapsed:.1f}s')
 
@@ -1136,6 +1137,59 @@ module.exports = { analyse, handler };
             self.assertEqual([(item['rule_id'], item['line']) for item in report['findings']
                               if item['rule_id'].startswith('javascript.taint.')],
                              [('javascript.taint.command', 63)], report)
+
+    # The same walker with four more one-line helpers called from `visit`.
+    # Each is a new helper summary inside the recursion; queueing new helpers
+    # and solving only grown ones before the read took this file to the work
+    # limit (exactly 1.0x), and each added helper cost about 0.03x more.
+    HELPERS_PROGRAM = PROGRAM.replace(
+        "  function visit(name, trail, depth) {\n",
+        "  function mark(node, tag) {\n"
+        "    node.meta.tags.push(tag);\n"
+        "  }\n\n"
+        "  function record(kind, node) {\n"
+        "    order.push(kind + ':' + node.name);\n"
+        "  }\n\n"
+        "  function flag(node, dep) {\n"
+        "    node.meta.tags.push('cyclic:' + dep);\n"
+        "  }\n\n"
+        "  function deepen(node, depth) {\n"
+        "    node.meta.depth = Math.max(node.meta.depth, depth);\n"
+        "  }\n\n"
+        "  function visit(name, trail, depth) {\n",
+    ).replace(
+        "    node.meta.depth = Math.max(node.meta.depth, depth);\n    const next",
+        "    mark(node, 'seen:' + depth);\n    deepen(node, depth);\n    const next",
+    ).replace(
+        "if (options.strict && child && child.cyclic) node.meta.tags.push('cyclic:' + dep);",
+        "if (options.strict && child && child.cyclic) flag(node, dep);",
+    ).replace("    order.push(node.name);\n", "    record('done', node);\n")
+
+    def test_more_helpers_inside_the_recursion_stay_inside_the_budget(self):
+        # Every replacement above applied: four helpers, each called once.
+        self.assertEqual(self.HELPERS_PROGRAM.count('function '), 9, self.HELPERS_PROGRAM)
+        for call in ("    mark(node, 'seen:' + depth);", '    deepen(node, depth);',
+                     'child.cyclic) flag(node, dep);', "    record('done', node);"):
+            self.assertEqual(self.HELPERS_PROGRAM.count(call), 1, call)
+        budgets = []
+        original = taint_js.Budget
+
+        def measure(limit):
+            budget = original(limit)
+            budgets.append((budget, limit))
+            return budget
+
+        with tempfile.TemporaryDirectory(prefix='ubs-graph-') as scratch:
+            path = Path(scratch) / 'graph.js'
+            path.write_text(self.HELPERS_PROGRAM, encoding='utf-8')
+            with patch.object(taint_js, 'Budget', side_effect=measure):
+                findings = list(taint_js.scan_file_findings(path))
+        line = self.HELPERS_PROGRAM[:self.HELPERS_PROGRAM.index("execFileSync('echo'")].count('\n') + 1
+        self.assertEqual(findings, [('js.taint.command', line, 3,
+                                     'req.query.graph -> spec -> name -> child_process exec')])
+        # Deterministic: 0.74 on every hash seed.
+        used = max((limit - budget.remaining) / limit for budget, limit in budgets)
+        self.assertLess(used, 0.9, f'graph walker with helpers used {used:.2f}x its work limit')
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "GNU time reports peak RSS in KiB")

@@ -427,6 +427,27 @@ class InstalledLayoutExplainTests(unittest.TestCase):
         self.assertIn("ubs doctor --fix", text.stderr)
         self.assertNotIn("Unknown rule", text.stdout + text.stderr)
 
+    def test_helpers_left_by_an_older_release_report_a_repair(self) -> None:
+        # `ubs --update` replaces only the runner. Until the next scan refreshes
+        # the module cache, its explain.py is the previous release's, which read
+        # the catalog from the runner's directory and answered "Unknown rule"
+        # for every ID. The runner must not run a cached explain.py whose digest
+        # it does not pin.
+        self.copy_helpers()
+        stale = self.module_dir / "helpers" / "ubs_core" / "explain.py"
+        stale.write_text('import sys\nprint("Unknown rule")\nsys.exit(2)\n', encoding="utf-8")
+        proc = self.run_installed(["py.security.open-redirect", "--format=json"])
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        doc = json.loads(proc.stdout)
+        self.assertEqual(doc["exit_code"], 2)
+        self.assertIn("ubs doctor --fix", doc["error"])
+        self.assertNotIn("Unknown rule", proc.stdout + proc.stderr)
+
+        text = self.run_installed(["py.security.open-redirect"])
+        self.assertEqual(text.returncode, 2)
+        self.assertIn("do not match this ubs version", text.stderr)
+        self.assertNotIn("Unknown rule", text.stdout + text.stderr)
+
     def test_empty_catalog_is_reported_as_broken_installation(self) -> None:
         from ubs_core import explain
 

@@ -2545,18 +2545,32 @@ explain_rule(){
   fi
   # An installed runner reads rules from the helpers in its module cache, which
   # the first scan (or doctor --fix) downloads. Without them there is no rule
-  # catalog, and every ID would look unknown (issue #187).
+  # catalog, and every ID would look unknown (issue #187). A cache left by an
+  # older release looks the same: `ubs --update` replaces only the runner, and
+  # until the next scan refreshes the helpers, the old explain.py still reads
+  # its catalog from the runner's directory. A cached explain.py must therefore
+  # match the digest this runner pins for it.
+  local problem=""
   if [[ ! -f "$helpers_dir/ubs_core/explain.py" ]]; then
-    local missing="the UBS helper modules are not installed (looked in ${MODULE_DIR:-$self_dir/modules}/helpers); install them with: ubs doctor --fix"
+    problem="the UBS helper modules are not installed (looked in ${MODULE_DIR:-$self_dir/modules}/helpers); install them with: ubs doctor --fix"
+  elif [[ "$helpers_dir" != "$self_dir/modules/helpers" && "${UBS_ALLOW_UNVERIFIED_HELPERS:-0}" != "1" ]]; then
+    local want="${HELPER_CHECKSUMS[helpers/ubs_core/explain.py]:-}" got=""
+    got="$(python3 -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' \
+      "$helpers_dir/ubs_core/explain.py" 2>/dev/null)" || got=""
+    if [[ -n "$want" && "$got" != "$want" ]]; then
+      problem="the cached UBS helper modules in $helpers_dir do not match this ubs version (out of date or modified); refresh them with: ubs doctor --fix"
+    fi
+  fi
+  if [[ -n "$problem" ]]; then
     local arg want_json=0 prev=""
     for arg in "$@"; do
       if [[ "$arg" == "--format=json" || ( "$prev" == "--format" && "$arg" == "json" ) ]]; then want_json=1; fi
       prev="$arg"
     done
     if [[ "$want_json" -eq 1 ]]; then
-      printf '{"error":"%s","exit_code":2}\n' "$(json_escape "$missing")"
+      printf '{"error":"%s","exit_code":2}\n' "$(json_escape "$problem")"
     fi
-    say_err "${RED}${X}${RESET} ubs explain: $missing"
+    say_err "${RED}${X}${RESET} ubs explain: $problem"
     return 2
   fi
 

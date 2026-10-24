@@ -770,7 +770,11 @@ class _HeapCall:
     superseded: bool = False
     root: object = None
     widened_parent: object = None
-    readers: set = field(default_factory=set)
+    # New or grown input that no solve has seen yet (widened summaries).
+    dirty: bool = False
+    # Insertion-ordered: requeue order, and with it the work a component
+    # spends, must not depend on object addresses or the hash seed.
+    readers: dict = field(default_factory=dict)
 
 
 @dataclass(**({'slots': True} if sys.version_info >= (3, 10) else {}))
@@ -2160,7 +2164,7 @@ class _Flow:
                                               frozenset(), call_location, bound=bound)
             for dependency, callers in self.engine.dependents.items():
                 if dependency[1] == self.rule and callee in callers:
-                    callers.add(self.scope)
+                    callers[self.scope] = None
 
         for index, (names, rest, default, pattern) in enumerate(callee.params):
             incoming = _join(*(fact for fact, _ in actual[index:])) if rest else (actual[index][0] if index < len(actual) else frozenset())
@@ -2480,7 +2484,7 @@ class _Flow:
                         self.engine.enqueue(caller)
                 deferred = callee.asynchronous and not re.search(r'\bawait\s*$', code[start:match_start])
                 sole_local_call = (code[start:match_start].strip() in {'', 'await'} and closing + 1 == end)
-                self.engine.dependents[(callee, self.rule)].add(self.scope)
+                self.engine.dependents[(callee, self.rule)][self.scope] = None
                 throw_count = len(self.throws)
                 try:
                     bound = self.bind(callee, prepared, state, match_start)
@@ -2521,7 +2525,7 @@ class _Flow:
                     # Revisit that context if the summary changes later, not
                     # just the independently analyzed lexical caller.
                     if self.engine.current_task is not None:
-                        self.engine.dependents[(callee, self.rule)].add(self.engine.current_task)
+                        self.engine.dependents[(callee, self.rule)][self.engine.current_task] = None
                     returned, effects, writes, normal, thrown, throw_writes = self.engine.summaries.get(
                         (callee, self.rule), (frozenset(), {}, {}, False, None, {}))
                     call_fact = self.substitute(returned, callee, bound, incoming)
@@ -3056,11 +3060,13 @@ class _Engine:
         if self.source_free:
             return
         self.summaries, self.final_states = {}, {}
-        self.dependents = defaultdict(set)
+        # Ordered sets (dict keys), like _HeapCall.readers.
+        self.dependents = defaultdict(dict)
         self.heap_calls = {}
         self.widened_calls, self.exact_calls, self.recursive = {}, defaultdict(list), set()
         self.current_task = None
         self.heap_solve_depth = 0
+        self.solving = set()
         self.pending, self.queued = deque(), set()
         self.binding_regions = {}
         for scope in self.scopes:
@@ -3336,7 +3342,7 @@ class _Engine:
         if owner not in self.module_roots or (owner is root and not captured_require):
             return None
         if task is not None:
-            self.dependents[(owner, rule)].add(task)
+            self.dependents[(owner, rule)][task] = None
         if key in state.cells:
             return state.cells[key]
         source = self.final_states.get((owner, rule))
@@ -3398,7 +3404,7 @@ class _Engine:
                         return None
                     source = self.final_states.get((owner, rule))
                     if self.current_task is not None:
-                        self.dependents[(owner, rule)].add(self.current_task)
+                        self.dependents[(owner, rule)][self.current_task] = None
                     targets.append(source.bindings.get(key[2]) if source is not None else None)
                 return targets[0] if all(target is targets[0] for target in targets) else None
         if parts[0] in state.bindings:
@@ -3413,7 +3419,7 @@ class _Engine:
             owner, _, local = key
             task = self.current_task
             if task is not None:
-                self.dependents[(owner, rule)].add(task)
+                self.dependents[(owner, rule)][task] = None
             source = self.final_states.get((owner, rule))
             return source.bindings.get(local) if source is not None else None
         if len(parts) == 1:
@@ -3522,19 +3528,29 @@ class _Engine:
                 self.exact_calls[(callee, rule)].append(context)
                 # Register before solving: a nested recursive call can
                 # supersede this exact context and must requeue its caller.
-                context.readers.add(task)
+                context.readers[task] = None
                 # An unseen acyclic call has no result yet. Solve it before
                 # consuming bottom, otherwise each successive helper call
                 # restarts its entire caller from the beginning. Deep call
-                # chains still use the iterative worklist, as do recursive
-                # widened contexts. Both paths retain the same work budget.
+                # chains still use the iterative worklist, as does a recursive
+                # backedge. Both paths retain the same work budget.
                 if self.heap_solve_depth < 16:
                     self.solve_heap(context)
                 else:
                     self.enqueue(context)
+        if context.dirty and context not in self.solving and self.heap_solve_depth < 16:
+            # The same holds for a widened summary whose input is new or just
+            # grew: solve it before this read. Read stale, every later change
+            # to a helper inside a recursion re-ran the whole recursive body,
+            # so the body was solved once per helper update instead of once
+            # per change to its own input. A summary being solved right now (a
+            # recursive backedge) keeps its place on the worklist. This solve
+            # also covers its queued entry, which the worklist then skips.
+            self.queued.discard(context)
+            self.solve_heap(context)
         # Borrowed means borrowed by this caller: a joined widened input also
         # holds the callee's own allocations from its recursive calls.
-        context.readers.add(task)
+        context.readers[task] = None
         if context.result is None:
             return frozenset(), {}, False, frozenset(), None
         returned, effects, writes, output, thrown, throw_writes, exceptional = context.result
@@ -3576,6 +3592,7 @@ class _Engine:
                 context = _HeapCall(callee, rule, location, dict(bound), incoming, ancestors,
                                     widened=True, root=root, widened_parent=caller)
                 self.widened_calls[key] = context
+                context.dirty = True
                 self.enqueue(context)
                 return context
         joined_bound = {name: _join(context.bound.get(name, frozenset()), bound.get(name, frozenset()))
@@ -3589,6 +3606,7 @@ class _Engine:
                 or not ancestors <= context.ancestors):
             context.bound, context.incoming = joined_bound, joined
             context.ancestors = context.ancestors | ancestors
+            context.dirty = True
             self.enqueue(context)
         return context
 
@@ -3899,12 +3917,33 @@ class _Engine:
                     result = _join(result, resolved)
         return result
 
+    def abandoned(self, context):
+        """A superseded entry also abandons every summary it started.
+
+        A widened summary keyed by a superseded exact entry, and each helper
+        context below it, is unreachable: the entry's callers re-run through
+        the recursion's own widened summary. Solving them anyway repeats the
+        whole recursion once per superseded entry.
+        """
+        chain, current = [], context
+        while current is not None and not current.superseded:
+            chain.append(current)
+            root = current.root[1] if current.widened and current.widened_parent is None else None
+            current = current.widened_parent if current.widened_parent is not None else (
+                root if isinstance(root, _HeapCall) else None)
+        if current is None:
+            return False
+        for dead in chain:
+            dead.superseded = True
+        return True
+
     def solve_heap(self, context):
-        if context.superseded:
+        if self.abandoned(context):
             return
         caller = self.current_task
         self.current_task = context
         self.heap_solve_depth += 1
+        self.solving.add(context)
         try:
             result = self.analyze_heap(context)
             if context.result != result:
@@ -3912,6 +3951,10 @@ class _Engine:
                 for reader in context.readers:
                     self.enqueue(reader)
         finally:
+            # Input that grew during this solve (a recursive backedge) is
+            # already back on the worklist; only later growth is dirty.
+            context.dirty = False
+            self.solving.discard(context)
             self.heap_solve_depth -= 1
             self.current_task = caller
 
@@ -3921,6 +3964,9 @@ class _Engine:
         while self.pending:
             self.budget.spend()
             task = self.pending.popleft()
+            if task not in self.queued:
+                # heap_call already solved this widened summary on demand.
+                continue
             self.queued.discard(task)
             self.current_task = task
             if isinstance(task, _HeapCall):

@@ -1003,6 +1003,142 @@ class WidenedSummaryTests(unittest.TestCase):
                                    'add({ v: "safe" });\nadd({ v: req.query.x });\nres.send(out[0].v);\n'), [])
 
 
+class RecursiveGraphWalkerCostTests(unittest.TestCase):
+    """A recursive graph walker over shared collections finishes inside its budget (GH #188).
+
+    The first call into `visit` from outside becomes recursive while it is
+    being solved, which supersedes that exact entry. The widened summary the
+    entry had started, and every helper context below it, were still solved
+    to their own fixed point although nothing could read them any more.
+    Widened helper summaries inside the recursion were also only queued, so
+    `visit` read their stale results and re-ran its whole body after each
+    helper update. The reporter's file needed 1.42x the work limit (712k
+    units) and stopped `partial`; it now needs 0.66x (330k), with the same
+    finding and trace.
+    """
+
+    PROGRAM = """'use strict';
+const { execFileSync } = require('node:child_process');
+
+// A dependency-graph walker: one recursive closure over shared collections.
+function analyse(graph, options) {
+  const seen = new Set();
+  const order = [];
+  const errors = [];
+  const cache = {};
+
+  function note(kind, node, extra) {
+    errors.push({ kind, node: node.name, extra, at: order.length });
+  }
+
+  function resolve(name, trail) {
+    const node = graph.nodes[name];
+    if (!node) {
+      note('missing', { name }, trail.slice());
+      return undefined;
+    }
+    return node;
+  }
+
+  function visit(name, trail, depth) {
+    if (cache[name]) return cache[name];
+    if (trail.includes(name)) {
+      note('cycle', { name }, trail.concat(name));
+      return { name, cyclic: true };
+    }
+    const node = resolve(name, trail);
+    if (!node) return undefined;
+    if (seen.has(name)) return node;
+    seen.add(name);
+    node.meta.depth = Math.max(node.meta.depth, depth);
+    const next = trail.concat(name);
+    const kids = [];
+    for (const dep of node.deps) {
+      const child = visit(dep, next, depth + 1);
+      if (child) kids.push(child);
+      if (options.strict && child && child.cyclic) node.meta.tags.push('cyclic:' + dep);
+    }
+    order.push(node.name);
+    const result = { name, kids, depth: node.meta.depth };
+    cache[name] = result;
+    return result;
+  }
+
+  const tree = [];
+  for (const root of graph.roots) {
+    const r = visit(root, [], 0);
+    if (r) tree.push(r);
+  }
+  return { tree, order, errors };
+}
+
+function handler(req) {
+  const spec = JSON.parse(req.query.graph);
+  const nodes = {};
+  for (const [name, deps] of Object.entries(spec)) {
+    nodes[name] = { name, deps: deps.slice(), meta: { depth: 0, tags: [] } };
+  }
+  const result = analyse({ nodes, roots: Object.keys(spec) }, {});
+  execFileSync('echo', [result.order.join(' ')]);
+}
+
+module.exports = { analyse, handler };
+"""
+
+    FINDING = ('js.taint.command', 63, 3, 'req.query.graph -> spec -> name -> child_process exec')
+
+    def scan(self):
+        with tempfile.TemporaryDirectory(prefix='ubs-graph-') as scratch:
+            path = Path(scratch) / 'graph.js'
+            path.write_text(self.PROGRAM, encoding='utf-8')
+            return list(taint_js.scan_file_findings(path))
+
+    def test_command_finding_keeps_its_trace(self):
+        self.assertEqual(self.scan(), [self.FINDING])
+
+    def test_work_and_time_stay_well_inside_the_budget(self):
+        budgets = []
+        original = taint_js.Budget
+
+        def measure(limit):
+            budget = original(limit)
+            budgets.append((budget, limit))
+            return budget
+
+        started = time.perf_counter()
+        with patch.object(taint_js, 'Budget', side_effect=measure):
+            findings = self.scan()
+        elapsed = time.perf_counter() - started
+        self.assertEqual(findings, [self.FINDING])
+        self.assertTrue(budgets)
+        # Deterministic: 0.66 on every hash seed. 0.8 leaves headroom for
+        # unrelated engine changes; the old 1.42 cannot pass.
+        used = max((limit - budget.remaining) / limit for budget, limit in budgets)
+        self.assertLess(used, 0.8, f'graph walker used {used:.2f}x its work limit')
+        # About 0.2 s here; generous for loaded CI hosts.
+        self.assertLess(elapsed, 15.0, f'graph walker took {elapsed:.1f}s')
+
+    def test_public_cli_reports_a_complete_scan(self):
+        artifacts = REPO_ROOT / 'test-suite/artifacts/js-recursive-graph-walker'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='cli-', dir=artifacts) as scratch:
+            root = Path(scratch)
+            source = root / 'graph.js'
+            source.write_text(self.PROGRAM, encoding='utf-8')
+            result = subprocess.run(
+                [str(REPO_ROOT / 'ubs'), str(source), '--ci', '--format=json', '--only=js'], cwd=root,
+                env={**os.environ, 'UBS_NO_AUTO_UPDATE': '1', 'UBS_NO_CACHE': '1'},
+                capture_output=True, text=True, timeout=60)
+            (artifacts / 'stdout.log').write_text(result.stdout)
+            (artifacts / 'stderr.log').write_text(result.stderr)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(report['status'], 'ok', report)
+            self.assertEqual([(item['rule_id'], item['line']) for item in report['findings']
+                              if item['rule_id'].startswith('javascript.taint.')],
+                             [('javascript.taint.command', 63)], report)
+
+
 @unittest.skipUnless(sys.platform.startswith("linux"), "GNU time reports peak RSS in KiB")
 class SinkFreeComponentCostTests(unittest.TestCase):
     def test_large_sink_free_import_component_stays_bounded(self) -> None:

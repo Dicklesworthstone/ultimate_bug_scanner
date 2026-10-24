@@ -206,6 +206,78 @@ def check_matrix(tmpdir: Path) -> None:
                   "a complete run must not print an incomplete status line")
 
 
+def check_allow_partial_exits_on_findings(tmpdir: Path) -> None:
+    """UBS_ALLOW_PARTIAL=1 makes a partial run exit on findings (issue #186).
+
+    The wait loop folds each module's own exit code into the run's status, so
+    a partial module left it at 2 (or 7 for a crash), and accepting the
+    partial run only changed the message: a run whose completed scanners found
+    nothing critical still exited 2. Every partial row of the matrix is run
+    twice, once with the real bash critical (exit 1) and once with a clean
+    shell file (exit 0), in JSON and text. The envelope keeps `status:
+    partial` and must not carry an `exit_code` the process does not return.
+    """
+    work = tmpdir / "allow-partial"
+    target, bin_dir = make_workspace(work)
+    clean_target = work / "clean-project"
+    clean_target.mkdir(parents=True, exist_ok=True)
+    (clean_target / "clean.py").write_text("value = 1\n", encoding="utf-8")
+    (clean_target / "ok.sh").write_text('#!/bin/bash\nprintf "%s\\n" "ok"\n', encoding="utf-8")
+    allow = {"UBS_ALLOW_PARTIAL": "1"}
+
+    for case_id, stub_env, expected_status, _ in MATRIX:
+        if expected_status != "partial":
+            continue
+        for label, tree, expected_exit in (("findings", target, 1), ("clean", clean_target, 0)):
+            name = f"allow-partial/{case_id}/{label}"
+            proc = run_scan(tree, bin_dir, ["--format=json"], {**stub_env, **allow})
+            try:
+                doc = json.loads(proc.stdout)
+            except ValueError:
+                check(f"{name}/json-parses", False, f"stdout is not JSON: {proc.stdout[:200]}")
+                continue
+            check(f"{name}/exit-code", proc.returncode == expected_exit,
+                  f"expected {expected_exit}, got {proc.returncode}\n{(proc.stdout + proc.stderr)[-600:]}")
+            check(f"{name}/status-still-partial", doc.get("status") == "partial",
+                  f"status={doc.get('status')!r}")
+            check(f"{name}/no-exit-code-claim", "exit_code" not in doc,
+                  f"exit_code={doc.get('exit_code')!r} but the process returned {proc.returncode}")
+            check(f"{name}/acceptance-reported", "Partial run accepted" in proc.stderr,
+                  proc.stderr[-400:])
+
+            text_proc = run_scan(tree, bin_dir, [], {**stub_env, **allow})
+            text_blob = text_proc.stdout + text_proc.stderr
+            check(f"{name}/text-exit-code", text_proc.returncode == expected_exit,
+                  f"expected {expected_exit}, got {text_proc.returncode}\n{text_blob[-600:]}")
+            check(f"{name}/text-status-line", "Status: partial" in text_blob,
+                  "no 'Status: partial' line in text output")
+
+    # Nothing completed: the only requested module could not run. There are no
+    # findings to exit on, so the run stays an error with exit 2, and the
+    # envelope says so.
+    merged = os.environ.copy()
+    merged.update({
+        "NO_COLOR": "1", "CI": "1", "UBS_NO_AUTO_UPDATE": "1", "UBS_ENABLE_AUTO_UPDATE": "0",
+        "UBS_NO_CACHE": "1", "STUB_MODE": "clean", "STUB_EXIT": "2", **allow,
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+    })
+    proc = subprocess.run(
+        [str(UBS_BIN), "--only=python", "--format=json", str(clean_target)],
+        cwd=REPO_ROOT, capture_output=True, text=True, env=merged, check=False, timeout=180,
+    )
+    try:
+        doc = json.loads(proc.stdout)
+    except ValueError:
+        check("allow-partial/error-run/json-parses", False, f"stdout is not JSON: {proc.stdout[:200]}")
+        return
+    check("allow-partial/error-run/exit-2", proc.returncode == 2,
+          f"expected 2, got {proc.returncode}\n{proc.stderr[-400:]}")
+    check("allow-partial/error-run/status", doc.get("status") == "error",
+          f"status={doc.get('status')!r}")
+    check("allow-partial/error-run/exit-code-claim", doc.get("exit_code") == 2,
+          f"exit_code={doc.get('exit_code')!r} but the process returned {proc.returncode}")
+
+
 def check_new_only_preserves_execution_state(tmpdir: Path) -> None:
     """--new-only filters findings; it must not filter the failure."""
     target, bin_dir = make_workspace(tmpdir / "new-only")
@@ -473,6 +545,7 @@ def main() -> int:
     tmpdir = Path(tempfile.mkdtemp(prefix="ubs-status-invariants-"))
     try:
         check_matrix(tmpdir)
+        check_allow_partial_exits_on_findings(tmpdir)
         check_new_only_preserves_execution_state(tmpdir)
         check_incomplete_scan_refuses_baseline(tmpdir)
         check_analyzer_failure_is_never_a_clean_module(tmpdir)

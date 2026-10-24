@@ -73,7 +73,8 @@ Every machine format prints exactly one document (or one JSONL stream) on stdout
 something usable came back) or `error` (a module could not run at all and no other scanner produced a
 result), and pre-scan refusals are an error envelope with exit 2 (see
 "Machine-readable failures" below). The status field, the human status line and the exit code always
-agree: anything other than `ok` exits 2 unless `UBS_ALLOW_PARTIAL=1`.
+agree: anything other than `ok` exits 2. `UBS_ALLOW_PARTIAL=1` makes a `partial` run exit on the findings of
+the scanners that completed instead (0 clean, 1 findings); an `error` run has none and still exits 2.
 
 Checkouts also expose the optional local service through `ubs serve --repo .`,
 `ubs --client --repo . src/main.py`, and `ubs daemon status|stop|cancel --repo .`.

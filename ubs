@@ -2299,7 +2299,7 @@ cat <<'JSON'
           "failed_modules": {"type": "array", "items": {"$ref": "#/$defs/failed_module"}},
           "error": {"enum": ["environment", "analysis"], "description": "environment = tooling/dependency failure; analysis = explicit incomplete semantic coverage; both retain exit 2"},
           "reason": {"type": "string", "description": "module-failed | module-incomplete | analysis-incomplete; present when status is not ok"},
-          "exit_code": {"const": 2, "description": "the exit status that accompanies an incomplete run; omitted under UBS_ALLOW_PARTIAL=1"},
+          "exit_code": {"const": 2, "description": "the exit status that accompanies an incomplete run; omitted when UBS_ALLOW_PARTIAL=1 accepts a partial run (the exit is then findings-based)"},
           "message": {"type": "string", "description": "present when status is not ok"},
           "scanners": {"type": "array", "items": {"$ref": "#/$defs/scanner"}},
           "totals": {"$ref": "#/$defs/totals"},
@@ -8287,9 +8287,12 @@ qualify_combined_json(){
   if [[ "$run_status" != "ok" ]]; then
     message="$(incomplete_run_message)"
     reason="$(incomplete_run_reason)"
-    # UBS_ALLOW_PARTIAL=1 is an explicit opt-in to a findings-based exit, so
-    # the document must not claim an exit code the process will not return.
-    if [[ "${FINDINGS_MERGE_FAILED:-0}" -eq 1 || "${UBS_ALLOW_PARTIAL:-0}" != "1" ]]; then
+    # UBS_ALLOW_PARTIAL=1 is an explicit opt-in to a findings-based exit for
+    # a partial run, so the document must not claim an exit code the process
+    # will not return. An "error" run has no completed scanner to take
+    # findings from and exits 2 either way.
+    if [[ "${FINDINGS_MERGE_FAILED:-0}" -eq 1 || "${UBS_ALLOW_PARTIAL:-0}" != "1" \
+          || "$run_status" == "error" ]]; then
       exit_code=2
     fi
   fi
@@ -9095,6 +9098,11 @@ incomplete_run_message(){
 # ─────────────────────────────────────────────────────────────────────────────
 # Emit unified result
 # ─────────────────────────────────────────────────────────────────────────────
+# REPORT_FAILED: the requested output itself could not be produced, which
+# UBS_ALLOW_PARTIAL=1 never turns into a findings-based exit. `desired` (the
+# findings-based exit) stays empty unless the totals were actually read.
+REPORT_FAILED=0
+desired=""
 case "$FORMAT" in
   json)
     [[ "$HAS_ENV_ERROR" -eq 1 ]] && emit_env_error_report
@@ -9107,6 +9115,7 @@ case "$FORMAT" in
         emit_error_envelope "environment" "error" "$(incomplete_run_reason)" "$(incomplete_run_message)" \
           "\"failed_modules\":$(env_error_langs_json)"
         status=2
+        REPORT_FAILED=1
       elif ! merge_json_scanners; then
         say "${RED}$X could not produce combined JSON${RESET}"
         [[ "$status" -lt 1 ]] && status=1
@@ -9122,6 +9131,7 @@ case "$FORMAT" in
         emit_error_envelope "environment" "error" "$(incomplete_run_reason)" "$(incomplete_run_message)" \
           "\"failed_modules\":$(env_error_langs_json)"
         status=2
+        REPORT_FAILED=1
       else
         say "${RED}$X could not produce JSONL output${RESET}"
         [[ "$status" -lt 1 ]] && status=1
@@ -9131,12 +9141,13 @@ case "$FORMAT" in
   sarif)
     [[ "$HAS_ENV_ERROR" -eq 1 ]] && emit_env_error_report
     if generate_combined_json; then
-      emit_combined_sarif || status=2
+      emit_combined_sarif || { status=2; REPORT_FAILED=1; }
     else
       if [[ "$RUN_STATUS" != "ok" ]]; then
         emit_error_envelope "environment" "error" "$(incomplete_run_reason)" "$(incomplete_run_message)" \
           "\"failed_modules\":$(env_error_langs_json)"
         status=2
+        REPORT_FAILED=1
       else
         merge_sarif_runs
       fi
@@ -9151,6 +9162,7 @@ case "$FORMAT" in
     if [[ -n "$toon_problem" ]]; then
       refuse_toon_without_encoder "$toon_problem"
       status=2
+      REPORT_FAILED=1
     elif generate_combined_json; then
       emit_combined_json | "$TOON_BIN" --encode
     else
@@ -9158,6 +9170,7 @@ case "$FORMAT" in
         emit_error_envelope "environment" "error" "$(incomplete_run_reason)" "$(incomplete_run_message)" \
           "\"failed_modules\":$(env_error_langs_json)"
         status=2
+        REPORT_FAILED=1
       elif ! merge_json_scanners | "$TOON_BIN" --encode; then
         say "${RED}$X could not produce TOON output${RESET}"
         [[ "$status" -lt 1 ]] && status=1
@@ -9281,8 +9294,21 @@ case "$FORMAT" in
 	  if [[ "${FINDINGS_MERGE_FAILED:-0}" -eq 1 ]]; then
 	    say_err "${RED}${X}${RESET} Findings assembly failed. Exit 2 — the requested results are incomplete."
 	    status=2
-	  elif [[ "${UBS_ALLOW_PARTIAL:-0}" == "1" ]]; then
+	  elif [[ "${UBS_ALLOW_PARTIAL:-0}" == "1" && "$RUN_STATUS" == "partial" \
+	        && "$REPORT_FAILED" -eq 0 && -n "$desired" ]]; then
+	    # Issue #186: the wait loop above folded the failed module's own exit
+	    # code (2 for a partial module, anything else for a crash) into
+	    # $status, and the findings check only ever raises it, so accepting the
+	    # partial run used to change the message but not the exit. The exit is
+	    # now the findings-based one the modules that completed support.
 	    say_err "${YELLOW}${WARN}${RESET} Partial run accepted because UBS_ALLOW_PARTIAL=1 ($(printf '%s' "$FAILED_MODULES_JSON" | jq -r 'map(.language + ": " + .status) | join(", ")' 2>/dev/null || printf '%s' "${ENV_ERROR_LANGS[*]:-}")); exit code reflects the modules that completed."
+	    status="$desired"
+	  elif [[ "${UBS_ALLOW_PARTIAL:-0}" == "1" ]]; then
+	    # Nothing to take a findings-based exit from: no scanner completed
+	    # (status "error"), or the findings totals or the requested report
+	    # could not be produced.
+	    say_err "${RED}${X}${RESET} Run ${RUN_STATUS}: $(printf '%s' "$FAILED_MODULES_JSON" | jq -r 'map(.language + ": " + .status) | join(", ")' 2>/dev/null || printf '%s' "${ENV_ERROR_LANGS[*]:-}"). Exit 2 — UBS_ALLOW_PARTIAL=1 found no completed result to take a findings-based exit from."
+	    status=2
 	  else
 	    say_err "${RED}${X}${RESET} Partial run: $(printf '%s' "$FAILED_MODULES_JSON" | jq -r 'map(.language + ": " + .status) | join(", ")' 2>/dev/null || printf '%s' "${ENV_ERROR_LANGS[*]:-}"). Exit 2 — not every requested language was scanned. Set UBS_ALLOW_PARTIAL=1 to accept partial results."
 	    status=2

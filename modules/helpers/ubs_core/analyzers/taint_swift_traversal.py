@@ -436,11 +436,12 @@ class SwiftParser:
                 # Stored fields/accessors require an object state model. Never
                 # silently discard an executable request source in this region.
                 source_region = part
-                binding = self.uninitialized(tokens[head:finish])
-                if (binding is not None and binding.value not in {'req', 'request'}
-                        and not any(token.kind == 'code' and token.value == '{' for token in part)):
-                    # A typed stored-field binding is not an executable read
-                    # of upload.filename. Keep attributes and the type as
+                if (head + 2 < finish and tokens[head].value in {'let', 'var'}
+                        and re.fullmatch(r'[A-Za-z_]\w*', tokens[head + 1].value)
+                        and tokens[head + 1].value not in {'req', 'request'}
+                        and tokens[head + 2].value in {':', '='}):
+                    # A field's declared name is not a read of upload.filename.
+                    # Keep attributes, types, initializers and getter bodies as
                     # witnesses, and retain the conservative request fields.
                     source_region = (*tokens[start:head], *tokens[head + 2:finish])
                 if swift_source_tokens(source_region):

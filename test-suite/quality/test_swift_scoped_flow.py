@@ -1213,9 +1213,11 @@ class SwiftScopedFlowTests(unittest.TestCase):
                         func incoming(req: Request) {}
                     ''' % source, policy=policy, suffix=source.split('.')[0] + policy)
 
-    def test_uninitialized_filename_field_is_a_binding_not_an_input_read(self):
+    def test_filename_field_binding_is_not_an_input_read(self):
         for declaration in ('let filename: String', 'private let filename: String?',
-                            'var originalFilename: String'):
+                            'var originalFilename: String',
+                            'let filename = "fixed.txt"',
+                            'var filename: String { "fixed.txt" }'):
             with self.subTest(declaration=declaration):
                 self.check('''
                     struct Upload { %s }

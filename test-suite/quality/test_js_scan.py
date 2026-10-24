@@ -1498,5 +1498,62 @@ class MetaRunnerRegressionTests(unittest.TestCase):
 
 
 
+class EvalPatternTests(unittest.TestCase):
+    """GH #189: js.security.eval reported every call of an identifier ending
+    in "eval" (`executeKbRetrieval(`) and the word "eval (" in comments and
+    strings as a critical. The shipped patterns run as the engine runs them."""
+
+    def lines(self, rule_id: str, src: str) -> list[int]:
+        patterns = [p for p in load_patterns() if p.rule_id == rule_id]
+        self.assertEqual(len(patterns), 1)
+        self.assertTrue(patterns[0].code_only)
+        with tempfile.TemporaryDirectory(prefix="ubs-js189-") as tmp:
+            path = Path(tmp) / "repro.ts"
+            path.write_text(src, encoding="utf-8")
+            sink = io.StringIO()
+            scan_patterns(patterns, [path], sink, skip=set())
+        return [json.loads(line)["line"] for line in sink.getvalue().splitlines()]
+
+    def test_real_eval_calls_report(self) -> None:
+        src = "\n".join([
+            "eval(code);",                       # 1
+            "const r = eval (expr);",            # 2
+            "window.eval(code);",                # 3
+            "globalThis . eval (code);",         # 4
+            "frame.contentWindow.eval(code);",   # 5: another realm's eval
+            "const t = `${eval(x)}`;",           # 6: interpolation is code
+            "run(); eval",                       # 7: the call opens on the next line
+            "  (code);",
+            "x = 1; eval(y); // eval (comment)", # 9: code before the comment
+        ]) + "\n"
+        self.assertEqual(self.lines("js.security.eval", src), [1, 2, 3, 4, 5, 6, 7, 9])
+
+    def test_identifier_tails_and_prose_do_not_report(self) -> None:
+        src = "\n".join([
+            "export async function executeKbRetrieval(userId: string, query: string) {}",
+            "const chunks = await executeKbRetrieval(userId, query);",
+            "await makeFakeRunDualRetrieval(x); corruptRagRetrieval(y);",
+            "const text = await page.$eval('#id', (el) => el.textContent);",
+            "const ü = retrïeval(x);",
+            "// against a real eval (the promptfoo run)",
+            'const d = "golden set for greenwashing detection eval (detection + severity judges)";',
+            "const e = `template eval (text)`;",
+            "/* eval(code) in a block comment */",
+            "const re = /eval(uate)?/;",
+            "Eval(x); // JS has no global Eval",
+        ]) + "\n"
+        self.assertEqual(self.lines("js.security.eval", src), [])
+
+    def test_new_function_reads_code_only(self) -> None:
+        src = "\n".join([
+            "const f = new Function('a', 'return a');",  # 1
+            "const g = new  Function (body);",           # 2
+            "// never use new Function() here",
+            'log("avoid new Function(code)");',
+            "const k = new FunctionRegistry();",
+        ]) + "\n"
+        self.assertEqual(self.lines("js.security.new-function", src), [1, 2])
+
+
 if __name__ == "__main__":
     unittest.main()

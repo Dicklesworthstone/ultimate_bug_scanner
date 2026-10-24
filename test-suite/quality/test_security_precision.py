@@ -4221,5 +4221,39 @@ class CSharpSecuritySuppressionTests(unittest.TestCase):
                     self.assertEqual([row[1] for row in self.findings(detector, text)], [4])
 
 
+class EvalRuleIdentifierBoundaryTests(unittest.TestCase):
+    """GH #189 siblings: regex eval rules in other languages match the eval
+    call itself, not the tail of a longer identifier."""
+
+    @staticmethod
+    def matching(pattern: re.Pattern[str], lines: list[str]) -> list[str]:
+        return [line for line in lines if pattern.search(line)]
+
+    def test_elixir_code_eval_needs_a_left_boundary(self) -> None:
+        from ubs_core.elixir_patterns.security_rg import PATTERNS as ELIXIR_PATTERNS
+
+        [rule] = [p for p in ELIXIR_PATTERNS if p.rule_id == "ex.security.code-eval"]
+        lines = [
+            "Code.eval_string(input)",
+            "{result, _} = Code.eval_quoted(ast)",
+            "Code.eval_file(path)",
+            "MyCode.eval_string(input)",
+            "XCode.eval_file(path)",
+        ]
+        self.assertEqual(self.matching(rule.regex, lines), lines[:3])
+
+    def test_python_and_ruby_eval_rules_keep_their_boundaries(self) -> None:
+        from ubs_core.ruby_patterns.security_rg import PATTERNS as RUBY_PATTERNS
+
+        [py_rule] = [p for p in PATTERNS if p.rule_id == "py.security.eval-exec-usage"]
+        self.assertEqual(self.matching(py_rule.regex, [
+            "eval(expr)", "exec(code)", "retrieval(x)", "myexec(code)", "model.eval(x)",
+        ]), ["eval(expr)", "exec(code)"])
+        [rb_rule] = [p for p in RUBY_PATTERNS if p.rule_id == "ruby.security.eval-family"]
+        self.assertEqual(self.matching(rb_rule.regex, [
+            "eval(code)", "obj.instance_eval(code)", "retrieval(x)", "my_class_eval(code)",
+        ]), ["eval(code)", "obj.instance_eval(code)"])
+
+
 if __name__ == "__main__":
     unittest.main()

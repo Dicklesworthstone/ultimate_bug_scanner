@@ -13,8 +13,8 @@ Four of the category 7 pipelines are ast-grep-primary in the legacy module
 5711-5712); the rg FALLBACK variants are ported here per the v2 layering
 (ast-grep coverage lives in the consolidated rule packs).
 
-Deliberate divergences from the literal shell text (both verified by the
-parity run, see bead report):
+Deliberate divergences from the literal shell text (verified by the parity
+run, see bead report, except where a GH issue is cited):
 - The legacy `grep -Ev "^[[:space:]]*(//|/\*|\*)"` comment post-filters are
   INERT under rg mode: with `--with-filename --line-number` every output line
   is prefixed `path:line:` so the `^`-anchored filter never matches (grep -R -n
@@ -31,6 +31,11 @@ parity run, see bead report):
 - [^,\n]+ / [^)\n]* replace the legacy [^,]+ / [^)]* spans: rg is
   line-oriented and cannot match across newlines, while the engine's
   whole-text finditer can; the \n exclusion restores rg's line scope.
+- eval() and new Function() read executable code only, and eval() needs an
+  identifier boundary (GH #189). The legacy `(^|[^"'])[Ee]val\s*\(` only
+  refused a quote before the name, so a call of any identifier ending in
+  "eval" (`executeKbRetrieval(`) and the word "eval (" in comments and
+  strings reported a critical.
 """
 from __future__ import annotations
 
@@ -41,23 +46,34 @@ from ubs_core.js_scan import Pattern
 PATTERNS: list[Pattern] = [
     # ── CATEGORY 7: SECURITY VULNERABILITIES ──────────────────────────────
     # ubs-js.sh 5577-5587: rg fallback "(^|[^\"'])[Ee]val[[:space:]]*\("
-    # (ast-grep-primary 5579-5580). re.MULTILINE keeps the legacy per-line
-    # `^` anchor under the engine's whole-text finditer.
+    # (ast-grep-primary 5579-5580), tightened for GH #189: `eval` must be a
+    # whole identifier, so `eval(`, `eval (`, `window.eval(`,
+    # `globalThis . eval (` and `frame.contentWindow.eval(` count, while the
+    # tail of a longer name (`executeKbRetrieval(`, Puppeteer's `$eval(`)
+    # does not. JS identifiers may hold `$` and Unicode letters, hence
+    # `[\w$]`. Member calls still count, as they did before. code_only blanks
+    # comments, strings and regex literals, so prose such as "a real eval
+    # (the promptfoo run)" is not a call; `${eval(x)}` interpolation is code.
     Pattern(
         category=7,
         rule_id="js.security.eval",
         title="eval() ALLOWS ARBITRARY CODE EXECUTION",
-        regex=re.compile(r"(^|[^\"'])[Ee]val\s*\(", re.MULTILINE),
+        regex=re.compile(r"(?<![\w$])eval\s*\("),
         thresholds=((0, "critical"),),
+        code_only=True,
     ),
     # ubs-js.sh 5596-5602: rg fallback
     # "(^|[^\"'])\bnew[[:space:]]+Function[[:space:]]*\(" (ast-grep-primary 5598).
+    # The quote guard only kept the opening of a string out; code_only keeps
+    # comments and string text such as "never use new Function()" out
+    # entirely (GH #189).
     Pattern(
         category=7,
         rule_id="js.security.new-function",
         title="new Function() enables code injection",
-        regex=re.compile(r"(^|[^\"'])\bnew\s+Function\s*\(", re.MULTILINE),
+        regex=re.compile(r"\bnew\s+Function\s*\("),
         thresholds=((0, "critical"),),
+        code_only=True,
     ),
     # ubs-js.sh 5610-5617: rg fallback "\.innerHTML[[:space:]]*="
     # (ast-grep-primary 5612) with the live `grep -v -E

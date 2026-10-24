@@ -31,8 +31,10 @@ PATTERNS: list[Pattern] = [
         category=4,
         rule_id="ex.security.code-eval",
         title="Dynamic code evaluation (Code.eval_*)",
-        # legacy 2495: `Code\.eval_(string|quoted|file)\b`, critical >0.
-        regex=re.compile(r"Code\.eval_(string|quoted|file)\b"),
+        # legacy 2495: `Code\.eval_(string|quoted|file)\b`, critical >0, plus
+        # a left identifier boundary (GH #189): `MyCode.eval_string(` is
+        # another module's function, not Code.eval_string.
+        regex=re.compile(r"(?<!\w)Code\.eval_(string|quoted|file)\b"),
         thresholds=((0, "critical"),),
     ),
     Pattern(

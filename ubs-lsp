@@ -499,6 +499,22 @@ def scan(scanner, root, documents, root_id, timeout, cancel, policy=()):
 
 MAX_WORKSPACE_BYTES = 128 * 1024 * 1024
 MAX_WORKSPACE_ENTRIES = 20000
+# These documented settings do not select inputs for local Git queries.
+# Keep names explicit; transport/auth helpers and unknown overrides stay out.
+BUFFER_GIT_ALLOWED_ENV = frozenset({
+    'GIT_PAGER', 'GIT_EDITOR', 'GIT_SEQUENCE_EDITOR',
+    'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_AUTHOR_DATE',
+    'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL', 'GIT_COMMITTER_DATE',
+})
+# Only documented trace output destinations use these scalar values to disable
+# tracing or write to stderr. Paths, inherited descriptors and sockets could
+# write outside the private snapshot; trace modifiers are not exempted.
+BUFFER_GIT_STDERR_TRACE_ENV = frozenset({
+    'GIT_TRACE', 'GIT_TRACE_FSMONITOR', 'GIT_TRACE_PACK_ACCESS',
+    'GIT_TRACE_PACKET', 'GIT_TRACE_PERFORMANCE', 'GIT_TRACE_REFS',
+    'GIT_TRACE_SETUP', 'GIT_TRACE_SHALLOW', 'GIT_TRACE_CURL',
+    'GIT_TRACE2', 'GIT_TRACE2_EVENT', 'GIT_TRACE2_PERF',
+})
 
 
 def file_stamp(info):
@@ -602,10 +618,16 @@ class BufferWorkspace:
 
     def validate_configuration(self):
         self.check()
-        # A pager only changes presentation; all other Git overrides remain
-        # unsupported so snapshots cannot silently use redirected inputs.
-        if any(key.startswith('GIT_') and key != 'GIT_PAGER' for key in os.environ):
-            raise ProtocolError('Buffer snapshots do not support redirected Git environments')
+        # Repository, index, object, discovery and configuration overrides stay
+        # unsupported. Preserve the caller's permitted environment unchanged.
+        unsupported = [key for key, value in os.environ.items()
+                       if key.startswith('GIT_') and key not in BUFFER_GIT_ALLOWED_ENV
+                       and not (key == 'GIT_TERMINAL_PROMPT' and value.lower() in {'0', 'false'})
+                       and not (key in BUFFER_GIT_STDERR_TRACE_ENV
+                                and value.lower() in {'', '0', 'false', '1', '2', 'true'})]
+        if unsupported:
+            raise ProtocolError('Buffer snapshots do not support redirected Git environments or unsupported overrides: '
+                                + ', '.join(sorted(unsupported)))
         if any((parent / '.git').exists() for parent in self.original.parents):
             # A self-contained nested repository does not inherit its parent's
             # selection/configuration. An empty .git directory is NOT proof:

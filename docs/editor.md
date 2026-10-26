@@ -146,13 +146,36 @@ validation share the scan deadline. There is no silent truncation or fallback
 to disk analysis when snapshot creation fails.
 
 All symlinks and special files in the copied tree are refused. Linked worktrees,
-Git alternate/object-directory redirections, `GIT_*` environment overrides,
-and path-dependent repository Git configuration are rejected conservatively.
+Git alternate/object-directory redirections, repository/configuration environment
+overrides, and path-dependent repository Git configuration are rejected conservatively.
 A served subdirectory that inherits a parent Git repository is not accepted in
 snapshot mode. Ordinary self-contained Git roots are supported. Keep the
 system temporary directory outside `--repo`; an in-repository temporary base
 is rejected before creating snapshot files. These restrictions may make saved
 mode more suitable for large or symlink-heavy projects.
+
+Buffer mode permits these ordinary Git preferences without changing or removing
+their values: `GIT_PAGER`, `GIT_EDITOR`, `GIT_SEQUENCE_EDITOR`, and the
+`GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_AUTHOR_DATE`, `GIT_COMMITTER_NAME`,
+`GIT_COMMITTER_EMAIL`, and `GIT_COMMITTER_DATE` identity settings. For example,
+`GIT_EDITOR=true` does not prevent unsaved-buffer diagnostics.
+`GIT_TERMINAL_PROMPT` is accepted only when explicitly disabled with `0` or
+`false` (case-insensitive).
+
+The documented trace destinations `GIT_TRACE`, `GIT_TRACE_FSMONITOR`,
+`GIT_TRACE_PACK_ACCESS`, `GIT_TRACE_PACKET`, `GIT_TRACE_PERFORMANCE`,
+`GIT_TRACE_REFS`, `GIT_TRACE_SETUP`, `GIT_TRACE_SHALLOW`, `GIT_TRACE_CURL`,
+`GIT_TRACE2`, `GIT_TRACE2_EVENT`, and `GIT_TRACE2_PERF` accept only an empty value,
+`0`, `false`, `1`, `2`, or `true`. Boolean spellings are case-insensitive. These
+values disable tracing or direct it to stderr; trace file paths, other file
+descriptors, sockets, and unknown trace variables remain unsupported.
+
+All other `GIT_*` overrides remain rejected, including `GIT_CONFIG*`,
+`GIT_DIR`, `GIT_WORK_TREE`, index/object/discovery controls, and SSH or
+credential-helper settings such as `GIT_SSH_COMMAND` and `GIT_ASKPASS`.
+The diagnostic names unsupported variables without exposing their values.
+These checks run before scanner startup and again before reusing an incremental
+workspace. They do not change the trusted-tool boundary described above.
 
 Snapshot mode is not warmed in-process analysis and makes no latency claim.
 It copies context again for each accepted scan. Only open documents are targets;

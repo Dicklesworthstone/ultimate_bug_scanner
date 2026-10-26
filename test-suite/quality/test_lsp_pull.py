@@ -5,6 +5,7 @@ third-party packages, or changes to the scanned checkout are required.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 import importlib.machinery
 import importlib.util
 import json
@@ -14,6 +15,7 @@ import selectors
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -27,12 +29,18 @@ loader.exec_module(lsp)
 
 # Explicit scanner protocol double: its marker vocabulary is NOT a UBS rule.
 SCANNER = r'''#!/usr/bin/env python3
-import json, os, pathlib, sys, time
+import json, os, pathlib, subprocess, sys, time
 args = sys.argv[1:]
 paths = [pathlib.Path(value) for value in args[args.index('--') + 1:]]
 texts = [path.read_text() for path in paths]
+call = {'args': args, 'cwd': os.getcwd(), 'texts': texts}
+if os.environ.get('UBS_PULL_TEST_GIT') == '1':
+    git = subprocess.run(['git', 'rev-parse', '--show-toplevel'], capture_output=True,
+                         text=True, check=True, timeout=5)
+    call.update(git_root=git.stdout.strip(), git_traced=bool(git.stderr),
+                git_environment=sorted(key for key in os.environ if key.startswith('GIT_')))
 with open(os.environ['UBS_PULL_TEST_CALLS'], 'a') as output:
-    output.write(json.dumps({'args': args, 'cwd': os.getcwd(), 'texts': texts}) + '\n')
+    output.write(json.dumps(call) + '\n')
 if any('SLOW' in text for text in texts):
     time.sleep(30)
 if any('DELAY' in text for text in texts):
@@ -49,11 +57,18 @@ findings = [{'rule_id': 'python.test.marker', 'message': 'test-only unsafe marke
              'file': str(path), 'line': number, 'severity': 'critical'}
             for path, text in zip(paths, texts)
             for number, line in enumerate(text.splitlines(), 1) if 'BUG' in line]
-print(json.dumps({'status': 'ok', 'project': os.getcwd(), 'findings': findings,
+partial = any('PARTIAL' in text for text in texts)
+print(json.dumps({'status': 'partial' if partial else 'ok', 'project': os.getcwd(), 'findings': findings,
                   'totals': {'files': len(paths), 'critical': len(findings), 'warning': 0, 'info': 0}}))
 print('scanner stderr must never enter the LSP stream', file=sys.stderr)
-sys.exit(1 if findings else 0)
+sys.exit(2 if partial else 1 if findings else 0)
 '''
+
+TRACE_SINKS = (
+    'GIT_TRACE', 'GIT_TRACE_FSMONITOR', 'GIT_TRACE_PACK_ACCESS', 'GIT_TRACE_PACKET',
+    'GIT_TRACE_PERFORMANCE', 'GIT_TRACE_REFS', 'GIT_TRACE_SETUP', 'GIT_TRACE_SHALLOW',
+    'GIT_TRACE_CURL', 'GIT_TRACE2', 'GIT_TRACE2_EVENT', 'GIT_TRACE2_PERF',
+)
 
 
 class PullFixture(unittest.TestCase):
@@ -70,8 +85,12 @@ class PullFixture(unittest.TestCase):
         self.scanner.write_text(SCANNER)
         self.scanner.chmod(0o755)
         self.call_file = self.work / 'calls'
-        environment = patch.dict(os.environ, {'UBS_PULL_TEST_CALLS': str(self.call_file),
-                                              'PYTHONDONTWRITEBYTECODE': '1'})
+        # The fixture must not inherit an unrelated repository redirect. Tests
+        # of Git settings below inject their environment after this isolation.
+        environment = patch.dict(os.environ, {
+            **{key: value for key, value in os.environ.items() if not key.startswith('GIT_')},
+            'UBS_PULL_TEST_CALLS': str(self.call_file), 'PYTHONDONTWRITEBYTECODE': '1',
+        }, clear=True)
         environment.start()
         self.addCleanup(environment.stop)
         self.messages = []
@@ -348,6 +367,7 @@ class DocumentPullTests(PullFixture):
         self.assertIn(0, self.server.pulls)
         self.assertEqual(self.result(0)['kind'], 'full')
 
+    @patch.dict(os.environ, {'GIT_EDITOR': 'true'})
     def test_incremental_buffer_pull_uses_snapshot_and_does_not_edit_checkout(self):
         self.server.close()
         self.server = lsp.Server(self.root, self.scanner, self.messages.append, timeout=2,
@@ -364,6 +384,99 @@ class DocumentPullTests(PullFixture):
         self.pull(11, previous=report['resultId'])
         self.assertEqual(self.result(11)['kind'], 'unchanged')
         self.assertEqual(len(self.calls()), 2)
+
+
+class BufferGitEnvironmentTests(PullFixture):
+    def setUp(self):
+        super().setUp()
+        # Real nested repositories exercise the Git resolver before copying.
+        for root in (self.work, self.root):
+            subprocess.run(['git', 'init', '--quiet', '--template=', str(root)],
+                           check=True, capture_output=True, timeout=10)
+        self.server.close()
+        self.server = lsp.Server(self.root, self.scanner, self.messages.append, timeout=5,
+                                 buffer_mode=True, incremental_workspace=True)
+        self.addCleanup(self.server.close)
+
+    def validate_environment(self):
+        workspace = lsp.BufferWorkspace(self.root, self.server.root_id, {},
+                                       threading.Event(), time.monotonic() + 5)
+        workspace.validate_configuration()
+
+    def test_trace_values_and_disabled_terminal_prompt_have_exact_boundaries(self):
+        original = dict(os.environ)
+        for name in TRACE_SINKS:
+            for value in ('', '0', 'false', '1', '2', 'true', 'TRUE', 'FALSE'):
+                with self.subTest(name=name, value=value), patch.dict(os.environ, {name: value}):
+                    self.validate_environment()
+            for value in (' 1', '1 ', '01', '3', '9', '/dev/stderr', str(self.source),
+                          'af_unix:stream:/private/trace-socket'):
+                with self.subTest(name=name, value=value), patch.dict(os.environ, {name: value}), \
+                        self.assertRaisesRegex(lsp.ProtocolError, name):
+                    self.validate_environment()
+        for value in ('0', 'false', 'FALSE'):
+            with self.subTest(prompt=value), patch.dict(os.environ, {'GIT_TERMINAL_PROMPT': value}):
+                self.validate_environment()
+        for value in ('', '1', 'true', 'yes', 'no', 'off', ' false'):
+            with self.subTest(prompt=value), patch.dict(os.environ, {'GIT_TERMINAL_PROMPT': value}), \
+                    self.assertRaisesRegex(lsp.ProtocolError, 'GIT_TERMINAL_PROMPT'):
+                self.validate_environment()
+        self.assertEqual(self.source.read_text(), 'clean\n')
+        self.assertEqual(self.calls(), [])
+        self.assertTrue(dict(os.environ) == original, 'validation must not alter the parent environment')
+
+    def test_redirects_helpers_and_unknown_overrides_refuse_cold_and_warm_pulls(self):
+        private_value = '/private/GIT_ENV_VALUE_MUST_NOT_APPEAR'
+        environments = [{name: private_value} for name in (
+            'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR',
+            'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+            'GIT_NAMESPACE', 'GIT_CEILING_DIRECTORIES', 'GIT_DISCOVERY_ACROSS_FILESYSTEM',
+            'GIT_SHALLOW_FILE', 'GIT_REPLACE_REF_BASE', 'GIT_ATTR_SOURCE',
+            'GIT_CONFIG', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_PARAMETERS',
+            'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_SSH_VARIANT', 'GIT_ASKPASS',
+        )]
+        environments.extend((
+            {'GIT_CONFIG_NOSYSTEM': '1'},
+            {'GIT_CONFIG_COUNT': '0'},
+            {'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'core.worktree',
+             'GIT_CONFIG_VALUE_0': private_value},
+            {'GIT_CONFIG_KEY_0': 'core.worktree'},
+            {'GIT_CONFIG_VALUE_0': private_value},
+            {'GIT_LITERAL_PATHSPECS': '1'}, {'GIT_ICASE_PATHSPECS': '1'},
+            {'GIT_TERMINAL_PROMPT': '1'}, {'GIT_TRACE': str(self.source)},
+            {'GIT_TRACE2_EVENT': private_value}, {'GIT_TRACE': '3'},
+            {'GIT_TRACE2': 'af_unix:stream:' + private_value},
+            {'GIT_PAGER_UNKNOWN': 'cat'}, {'GIT_EDITOR_UNKNOWN': 'true'},
+            {'GIT_TRACE_UNKNOWN': '1'}, {'GIT_TRACE2_ENV_VARS': 'PATH'},
+        ))
+        self.start()
+        self.open(text='BUG unsaved\n')
+        request = 10
+        for environment in environments:
+            for warm in (False, True):
+                with self.subTest(names=sorted(environment), warm=warm):
+                    previous = None
+                    if warm:
+                        with patch.dict(os.environ, {'GIT_EDITOR': 'true'}):
+                            self.pull(request)
+                            report = self.result(request)
+                        self.assertEqual(report['items'][0]['code'], 'python.test.marker')
+                        self.assertIsNotNone(self.server.workspace_cache.retained)
+                        previous = report['resultId']
+                        request += 1
+                    calls = len(self.calls())
+                    with patch.dict(os.environ, {'GIT_EDITOR': 'true', **environment}):
+                        self.pull(request, previous=previous)
+                        report = self.result(request)
+                    request += 1
+                    self.assertEqual(report['kind'], 'full')
+                    self.assertEqual([item['code'] for item in report['items']], ['ubs.unverified'])
+                    message = report['items'][0]['message']
+                    self.assertTrue(message.endswith(', '.join(sorted(environment))), message)
+                    self.assertNotIn(private_value, message)
+                    self.assertEqual(len(self.calls()), calls, 'refusal must precede scanner startup')
+                    self.assertIsNone(self.server.workspace_cache.retained)
+                    self.assertEqual(self.source.read_text(), 'clean\n')
 
 
 class PullRefreshTests(PullFixture):
@@ -437,8 +550,11 @@ class PullRefreshTests(PullFixture):
 
 
 class PullWireTests(PullFixture):
-    def test_real_stdio_adapter_full_unchanged_and_shutdown(self):
-        process = subprocess.Popen([sys.executable, str(LSP), '--repo', str(self.root), '--scanner', str(self.scanner)],
+    @contextmanager
+    def adapter(self, *, mode='saved', environment=None):
+        process = subprocess.Popen([sys.executable, str(LSP), '--repo', str(self.root),
+                                    '--scanner', str(self.scanner), '--buffer-mode=' + mode],
+                                   env=dict(os.environ, **(environment or {})),
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         parser = lsp.Framer()
         received = []
@@ -465,27 +581,118 @@ class PullWireTests(PullFixture):
                             else:
                                 stderr.extend(chunk)
                     self.fail('No wire reply: ' + repr(received) + repr(bytes(stderr)))
-                send('initialize', {'rootUri': self.root.as_uri(), 'capabilities': {'textDocument': {'diagnostic': {}}}}, id=1)
-                self.assertIn('diagnosticProvider', response(1)['result']['capabilities'])
-                send('initialized')
-                send('textDocument/didOpen', {'textDocument': {'uri': self.uri, 'languageId': 'python', 'version': 1, 'text': 'clean\n'}})
-                send('textDocument/diagnostic', {'textDocument': {'uri': self.uri}}, id=2)
-                first = response(2)['result']
-                self.assertEqual(first['items'], [])
-                send('textDocument/diagnostic', {'textDocument': {'uri': self.uri}, 'previousResultId': first['resultId']}, id=3)
-                self.assertEqual(response(3)['result']['kind'], 'unchanged')
-                send('shutdown', id=4)
-                self.assertIsNone(response(4)['result'])
+                yield send, response
+                send('shutdown', id=999)
+                self.assertIsNone(response(999)['result'])
                 send('exit')
                 self.assertEqual(process.wait(timeout=3), 0)
                 self.assertEqual(stderr, b'')
-                self.assertEqual(len(self.calls()), 2)
         finally:
             if process.poll() is None:
                 process.kill()
             process.wait()
             for stream in (process.stdin, process.stdout, process.stderr):
                 stream.close()
+
+    def initialize_wire(self, send, response, text):
+        send('initialize', {'rootUri': self.root.as_uri(), 'capabilities': {'textDocument': {'diagnostic': {}}}}, id=1)
+        self.assertIn('diagnosticProvider', response(1)['result']['capabilities'])
+        send('initialized')
+        send('textDocument/didOpen', {'textDocument': {'uri': self.uri, 'languageId': 'python',
+                                                       'version': 1, 'text': text}})
+
+    def test_real_stdio_adapter_full_unchanged_and_shutdown(self):
+        with self.adapter() as (send, response):
+            self.initialize_wire(send, response, 'clean\n')
+            send('textDocument/diagnostic', {'textDocument': {'uri': self.uri}}, id=2)
+            first = response(2)['result']
+            self.assertEqual(first['items'], [])
+            send('textDocument/diagnostic', {'textDocument': {'uri': self.uri},
+                                            'previousResultId': first['resultId']}, id=3)
+            self.assertEqual(response(3)['result']['kind'], 'unchanged')
+            self.assertEqual(len(self.calls()), 2)
+
+    def test_buffer_wire_editor_identity_and_trace_preserve_findings_partial_and_reuse(self):
+        for root in (self.work, self.root):
+            subprocess.run(['git', 'init', '--quiet', '--template=', str(root)],
+                           check=True, capture_output=True, timeout=10)
+        environment = {
+            'GIT_PAGER': 'cat', 'GIT_EDITOR': 'false', 'GIT_SEQUENCE_EDITOR': 'false',
+            'GIT_AUTHOR_NAME': 'UBS Test', 'GIT_AUTHOR_EMAIL': 'author@example.invalid',
+            'GIT_AUTHOR_DATE': '2026-10-26T00:00:00Z',
+            'GIT_COMMITTER_NAME': 'UBS Test', 'GIT_COMMITTER_EMAIL': 'committer@example.invalid',
+            'GIT_COMMITTER_DATE': '2026-10-26T00:00:00Z', 'GIT_TERMINAL_PROMPT': 'FALSE',
+            **dict.fromkeys(TRACE_SINKS, 'TRUE'), 'UBS_PULL_TEST_GIT': '1',
+        }
+        def original_tree():
+            return {path.relative_to(self.root): (path.read_bytes(), lsp.file_stamp(path.stat()))
+                    for path in self.root.rglob('*') if path.is_file()}
+        before = original_tree()
+        for mode in ('snapshot', 'incremental'):
+            with self.subTest(mode=mode):
+                start = len(self.calls())
+                with self.adapter(mode=mode, environment=environment) as (send, response):
+                    self.initialize_wire(send, response, 'BUG unsaved 🦀\n')
+                    send('textDocument/diagnostic', {'textDocument': {'uri': self.uri}}, id=2)
+                    first = response(2)['result']
+                    self.assertEqual([item['code'] for item in first['items']], ['python.test.marker'])
+                    self.assertEqual(first['items'][0]['data'], {'ubsSourceMode': 'buffer'})
+                    send('textDocument/diagnostic', {'textDocument': {'uri': self.uri},
+                                                    'previousResultId': first['resultId']}, id=3)
+                    self.assertEqual(response(3)['result'], {'kind': 'unchanged', 'resultId': first['resultId']})
+                    for version, text in ((2, 'clean unsaved\n'), (3, 'PARTIAL BUG unsaved\n'),
+                                          (4, 'BUG after partial\n')):
+                        send('textDocument/didChange', {'textDocument': {'uri': self.uri, 'version': version},
+                                                       'contentChanges': [{'text': text}]})
+                        send('textDocument/diagnostic', {'textDocument': {'uri': self.uri},
+                                                        'previousResultId': first['resultId']}, id=version + 2)
+                        report = response(version + 2)['result']
+                        self.assertEqual(report['kind'], 'full')
+                        self.assertNotEqual(report['resultId'], first['resultId'])
+                        expected = ([] if version == 2 else ['ubs.incomplete-analysis', 'python.test.marker']
+                                    if version == 3 else ['python.test.marker'])
+                        self.assertEqual([item['code'] for item in report['items']], expected)
+                        if version == 3:
+                            self.assertTrue(all(item['data'] == {
+                                'ubsSourceMode': 'buffer', 'ubsAnalysisStatus': 'partial',
+                            } for item in report['items']))
+                calls = self.calls()[start:]
+                self.assertEqual([call['texts'] for call in calls], [
+                    ['BUG unsaved 🦀\n'], ['BUG unsaved 🦀\n'], ['clean unsaved\n'],
+                    ['PARTIAL BUG unsaved\n'], ['BUG after partial\n'],
+                ])
+                for call in calls:
+                    self.assertEqual(call['git_root'], call['cwd'])
+                    self.assertNotEqual(call['cwd'], str(self.root))
+                    self.assertTrue(call['git_traced'])
+                    self.assertEqual(call['git_environment'],
+                                     sorted(key for key in environment if key.startswith('GIT_')))
+                if mode == 'incremental':
+                    self.assertEqual(len({call['cwd'] for call in calls[:-1]}), 1)
+                    self.assertNotEqual(calls[-1]['cwd'], calls[0]['cwd'], 'partial input leases are discarded')
+                else:
+                    self.assertEqual(len({call['cwd'] for call in calls}), 5)
+                self.assertEqual(original_tree(), before)
+
+    def test_buffer_wire_refuses_helper_config_and_external_trace_overrides(self):
+        for environment in (
+            {'GIT_SSH_COMMAND': 'never-executed-helper'},
+            {'GIT_ASKPASS': 'never-executed-helper'},
+            {'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'core.worktree',
+             'GIT_CONFIG_VALUE_0': '/private/not-reported-value'},
+            {'GIT_TRACE': str(self.source)},
+        ):
+            with self.subTest(names=sorted(environment)), self.adapter(
+                    mode='incremental', environment={'GIT_EDITOR': 'true', **environment}) as (send, response):
+                self.initialize_wire(send, response, 'BUG unsaved\n')
+                send('textDocument/diagnostic', {'textDocument': {'uri': self.uri}}, id=2)
+                report = response(2)['result']
+                self.assertEqual(report['kind'], 'full')
+                self.assertEqual([item['code'] for item in report['items']], ['ubs.unverified'])
+                self.assertTrue(report['items'][0]['message'].endswith(', '.join(sorted(environment))))
+                self.assertNotIn('not-reported-value', report['items'][0]['message'])
+                self.assertEqual(self.calls(), [])
+                self.assertEqual(self.source.read_text(), 'clean\n')
 
 
 if __name__ == '__main__':

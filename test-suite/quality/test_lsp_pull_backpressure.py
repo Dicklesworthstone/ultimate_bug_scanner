@@ -199,6 +199,7 @@ class PullDeliveryTests(PullFixture):
             self.assertNotIn('result', self.response(request_id))
         self.assertEqual(self.server.pull_reply_bytes, 0)
 
+    @patch.dict('os.environ', {'GIT_EDITOR': 'true', 'GIT_TRACE': '2', 'GIT_TERMINAL_PROMPT': '0'})
     def test_buffer_context_change_invalidates_stalled_reply(self):
         self.server.close()
         self.server = lsp.Server(self.root, self.scanner, self.messages.append, timeout=5,

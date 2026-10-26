@@ -131,6 +131,281 @@ def check_output_flag_json() -> None:
         report("output_flag_json", ok, f"exit={proc.returncode}", proc)
 
 
+def _pattern_counts_workspace(label: str) -> Path:
+    artifacts = REPO_ROOT / "test-suite" / "artifacts" / "python-pattern-counts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix=f"{label}-", dir=artifacts))
+
+
+def _pattern_counts_source(count: int) -> str:
+    return "import re\n" + "".join(
+        f'PATTERN_{index} = re.compile(r"(a+)+$")\n'
+        f"def function_{index}(one, two, three, four, five, six, seven):\n"
+        "    return one\n"
+        for index in range(count)
+    )
+
+
+def _pattern_counts_env(tmp: Path) -> dict[str, str]:
+    scratch = tmp / "scratch"
+    scratch.mkdir()
+    return {
+        "ENABLE_UV_TOOLS": "0", "UBS_NO_CACHE": "1", "UBS_PROFILE": "0",
+        "UBS_KEEP_TEMP": "1", "TMPDIR": str(scratch),
+        "XDG_DATA_HOME": str(tmp / "data"), "XDG_CACHE_HOME": str(tmp / "cache"),
+    }
+
+
+def _stable_pattern_output(node):
+    """Exclude only run timestamps and opt-in timing/cache telemetry."""
+    if isinstance(node, dict):
+        return {key: _stable_pattern_output(value) for key, value in node.items()
+                if key not in {"timestamp", "scanner_timestamp", "finding_timestamp", "profile"}}
+    if isinstance(node, list):
+        return [_stable_pattern_output(value) for value in node]
+    return node
+
+
+def check_python_pattern_counts_formats() -> None:
+    """Public counts are a sidecar; real findings, samples and exits stay intact."""
+    import jsonschema  # type: ignore
+
+    tmp = _pattern_counts_workspace("formats")
+    env = _pattern_counts_env(tmp)
+    source = tmp / "source.py"
+    source.write_text(_pattern_counts_source(4), encoding="utf-8")
+    schema = parse_json_document(run(["--schema=python-pattern-counts"]).stdout)
+    validator = jsonschema.Draft202012Validator(schema)
+    for fmt in ("json", "jsonl", "text", "sarif"):
+        flags = [str(source), "--only=python", "--ci", "--no-config",
+                 "--ignore-file=/dev/null", "--fail-on-warning", f"--format={fmt}"]
+        ordinary = run(flags, cwd=tmp, env=env)
+        sidecar = tmp / f"counts-{fmt}.json"
+        exported = run([*flags, "--python-pattern-counts", sidecar.name], cwd=tmp, env=env)
+        write_case_artifacts(f"python_pattern_counts_{fmt}_ordinary", ordinary)
+        write_case_artifacts(f"python_pattern_counts_{fmt}_exported", exported)
+        doc = parse_json_document(sidecar.read_text(encoding="utf-8"))
+        validator.validate(doc)
+        rules = {rule["rule_id"]: rule for rule in doc["rules"]}
+        expected_rules = ("py.functions.high-param-count", "py.regex.nested-quantifiers")
+        ok = ordinary.returncode == exported.returncode == 1 and doc["complete"] is True
+        ok = ok and doc["status"] == "ok" and not doc["errors"] and len(doc["files"]) == 1
+        for rule_id in expected_rules:
+            rule = rules[rule_id]
+            ok = ok and rule["count"] == 4 and rule["reported_severity"] == "warning"
+            ok = ok and rule["thresholds"] == [{"min_count_exclusive": 3, "severity": "warning"}]
+            ok = ok and [item["count"] for item in doc["counts"] if item["rule_id"] == rule_id] == [4]
+        if fmt == "json":
+            before, after = map(parse_json_document, (ordinary.stdout, exported.stdout))
+            ok = ok and _stable_pattern_output(before) == _stable_pattern_output(after)
+            findings = {finding["rule_id"]: finding for finding in after["scanners"][0]["findings"]}
+            ok = ok and all(findings[rid]["count"] == 4 and len(findings[rid]["samples"]) == 3
+                            for rid in expected_rules)
+            sample_files = {sample["file"] for rid in expected_rules for sample in findings[rid]["samples"]}
+            ok = ok and {item["file"] for item in doc["files"]} == sample_files
+        elif fmt == "jsonl":
+            before, after = ([parse_json_document(line) for line in proc.stdout.splitlines() if line.strip()]
+                             for proc in (ordinary, exported))
+            ok = ok and _stable_pattern_output(before) == _stable_pattern_output(after)
+        elif fmt == "sarif":
+            before, after = map(parse_json_document, (ordinary.stdout, exported.stdout))
+            ok = ok and _stable_pattern_output(before) == _stable_pattern_output(after)
+        else:
+            # Text timestamps are dynamic even in CI mode; all other bytes must
+            # remain identical, including the existing text preview limits.
+            normalize = lambda text: re.sub(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", "TIMESTAMP", text)
+            ok = ok and normalize(ordinary.stdout) == normalize(exported.stdout)
+        report(f"python_pattern_counts_{fmt}", ok,
+               f"ordinary/export exits={ordinary.returncode}/{exported.returncode}; sparse rows={len(doc['counts'])}", exported)
+
+    direct_sidecar = tmp / "counts-module.json"
+    direct_env = {**os.environ, **env, "NO_COLOR": "1"}
+    direct = subprocess.run(
+        [str(REPO_ROOT / "modules" / "ubs-python.sh"), str(source), "--ci", "--no-uv",
+         "--format=json", "--fail-on-warning", f"--python-pattern-counts={direct_sidecar}"],
+        cwd=tmp, env=direct_env, capture_output=True, text=True, timeout=120,
+    )
+    write_case_artifacts("python_pattern_counts_direct_module", direct)
+    direct_doc = parse_json_document(direct_sidecar.read_text(encoding="utf-8"))
+    validator.validate(direct_doc)
+    direct_rules = {rule["rule_id"]: rule for rule in direct_doc["rules"]}
+    report("python_pattern_counts_direct_module",
+           direct.returncode == 1 and direct_doc["complete"] is True
+           and all(direct_rules[rid]["count"] == 4 for rid in expected_rules),
+           f"exit={direct.returncode}", direct)
+
+
+def check_python_pattern_counts_selected_and_staged() -> None:
+    """Count coverage follows actual selected/index bytes and original paths."""
+    tmp = _pattern_counts_workspace("selected")
+    env = _pattern_counts_env(tmp)
+    project = tmp / "project"
+    project.mkdir()
+    run_git(["init", "-q"], cwd=project)
+    first, second, outside = [project / name for name in ("first file.py", "second.py", "outside.py")]
+    for path, count in ((first, 1), (second, 2), (outside, 8)):
+        path.write_text(_pattern_counts_source(count), encoding="utf-8")
+    run_git(["add", "--", first.name, second.name, outside.name], cwd=project)
+    run_git(["-c", "user.name=UBS Test", "-c", "user.email=ubs-test@example.invalid",
+             "-c", "commit.gpgsign=false", "commit", "-qm", "count fixture"], cwd=project)
+    counts = tmp / "selected.json"
+    proc = run([str(first), str(second), "--only=python", "--ci", "--no-config",
+                "--ignore-file=/dev/null", "--format=json", f"--python-pattern-counts={counts}"],
+               cwd=project, env=env)
+    write_case_artifacts("python_pattern_counts_selected", proc)
+    selected = parse_json_document(counts.read_text(encoding="utf-8"))
+    rules = {rule["rule_id"]: rule for rule in selected["rules"]}
+    expected = {str(first), str(second)}
+    ok = proc.returncode == 0 and selected["complete"] is True
+    ok = ok and {entry["file"] for entry in selected["files"]} == expected
+    ok = ok and all(entry["file"] in expected for entry in selected["counts"])
+    ok = ok and rules["py.functions.high-param-count"]["count"] == 3
+    ok = ok and rules["py.functions.high-param-count"]["reported_severity"] is None
+    report("python_pattern_counts_selected", ok,
+           f"exit={proc.returncode}; files={selected['files']}", proc)
+
+    first.write_text(_pattern_counts_source(4), encoding="utf-8")
+    run_git(["add", "--", first.name], cwd=project)
+    first.write_text("VALUE = 0\n", encoding="utf-8")
+    (project / "untracked.py").write_text(_pattern_counts_source(8), encoding="utf-8")
+    staged_counts = tmp / "staged.json"
+    staged = run(["--staged", "--only=python", "--ci", "--no-config", "--format=jsonl",
+                  "--ignore-file=/dev/null", f"--python-pattern-counts={staged_counts}"],
+                 cwd=project, env=env)
+    write_case_artifacts("python_pattern_counts_staged", staged)
+    staged_doc = parse_json_document(staged_counts.read_text(encoding="utf-8"))
+    staged_rules = {rule["rule_id"]: rule for rule in staged_doc["rules"]}
+    staged_ok = staged.returncode == 0 and staged_doc["complete"] is True
+    staged_ok = staged_ok and staged_doc["files"] == [{"file": str(first)}]
+    staged_ok = staged_ok and all(entry["file"] == str(first) for entry in staged_doc["counts"])
+    staged_ok = staged_ok and staged_rules["py.functions.high-param-count"]["count"] == 4
+    staged_ok = staged_ok and staged_rules["py.functions.high-param-count"]["reported_severity"] == "warning"
+    staged_ok = staged_ok and first.read_text(encoding="utf-8") == "VALUE = 0\n"
+    report("python_pattern_counts_staged", staged_ok,
+           f"exit={staged.returncode}; files={staged_doc['files']}", staged)
+
+
+def check_python_pattern_counts_partial_and_unavailable() -> None:
+    """Incomplete and unavailable exports never masquerade as complete zeroes."""
+    import jsonschema  # type: ignore
+
+    tmp = _pattern_counts_workspace("partial")
+    env = _pattern_counts_env(tmp)
+    source, broken = tmp / "source.py", tmp / "broken.py"
+    source.write_text(_pattern_counts_source(1), encoding="utf-8")
+    broken.write_text("def broken(:\n", encoding="utf-8")
+    sidecar = tmp / "partial.json"
+    proc = run([str(source), str(broken), "--only=python", "--ci", "--no-config",
+                "--ignore-file=/dev/null", "--format=json", f"--python-pattern-counts={sidecar}"],
+               cwd=tmp, env=env)
+    write_case_artifacts("python_pattern_counts_partial", proc)
+    doc = parse_json_document(sidecar.read_text(encoding="utf-8"))
+    schema = parse_json_document(run(["--schema=python-pattern-counts"]).stdout)
+    jsonschema.Draft202012Validator(schema).validate(doc)
+    ok = proc.returncode == 2 and doc["status"] == "partial" and doc["complete"] is False
+    ok = ok and bool(doc["errors"]) and any(
+        row["rule_id"] == "py.functions.high-param-count" and row["count"] == 1
+        for row in doc["counts"]
+    )
+    report("python_pattern_counts_partial", ok, f"exit={proc.returncode}; errors={len(doc['errors'])}", proc)
+
+    sentinel = "previous count report\n"
+    previous = tmp / "previous.json"
+    previous.write_text(sentinel, encoding="utf-8")
+    empty = tmp / "empty"
+    empty.mkdir()
+    unavailable = run([str(empty), "--only=python", "--ci", "--no-config", "--format=json",
+                       f"--python-pattern-counts={previous}"], cwd=tmp, env=env)
+    write_case_artifacts("python_pattern_counts_no_python", unavailable)
+    unavailable_doc = parse_json_document(unavailable.stdout)
+    unavailable_ok = unavailable.returncode == 2
+    unavailable_ok = unavailable_ok and unavailable_doc["reason"] == "python-pattern-counts-unavailable"
+    unavailable_ok = unavailable_ok and previous.read_text(encoding="utf-8") == sentinel
+    report("python_pattern_counts_no_python", unavailable_ok, f"exit={unavailable.returncode}", unavailable)
+
+    # A stale/third-party module can complete its ordinary report without
+    # implementing this export. The runner must refuse to reuse a previous file.
+    bin_dir = tmp / "bin"
+    bin_dir.mkdir()
+    module = bin_dir / "ubs-python"
+    module.write_text('#!/usr/bin/env bash\nprintf \'%s\\n\' \'{"language":"python","files":1,"critical":0,"warning":0,"info":0,"status":"ok","findings":[]}\'\n', encoding="utf-8")
+    module.chmod(0o755)
+    missing = run([str(source), "--only=python", "--ci", "--no-config", "--format=json",
+                   f"--python-pattern-counts={previous}"], cwd=tmp,
+                  env={**env, "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}"})
+    write_case_artifacts("python_pattern_counts_missing_export", missing)
+    missing_ok = missing.returncode == 2 and "pattern count" in missing.stderr.lower()
+    missing_ok = missing_ok and previous.read_text(encoding="utf-8") == sentinel
+    report("python_pattern_counts_missing_export", missing_ok, f"exit={missing.returncode}", missing)
+
+
+def check_python_pattern_counts_delivery_errors() -> None:
+    tmp = _pattern_counts_workspace("delivery")
+    env = _pattern_counts_env(tmp)
+    source = tmp / "source.py"
+    source.write_text(_pattern_counts_source(1), encoding="utf-8")
+    previous = tmp / "previous.json"
+    sentinel = "previous count report\n"
+    previous.write_text(sentinel, encoding="utf-8")
+    alias = tmp / "alias.json"
+    alias.symlink_to(previous)
+    cases = [
+        ["--python-pattern-counts"], ["--python-pattern-counts="], ["--python-pattern-counts=-"],
+        ["--python-pattern-counts=previous.json", "--report-json=./previous.json"],
+        ["--python-pattern-counts=previous.json", "--also=json:alias.json"],
+        ["--python-pattern-counts=previous.json", "--output=alias.json"],
+    ]
+    failures = []
+    for index, flags in enumerate(cases):
+        proc = run([str(source), "--ci", "--no-config", "--format=json", *flags], cwd=tmp, env=env)
+        write_case_artifacts(f"python_pattern_counts_invalid_{index}", proc)
+        if proc.returncode != 2 or "--python-pattern-counts" not in proc.stderr or "Finished python (" in proc.stderr:
+            failures.append(f"case {index}: exit={proc.returncode}")
+    ok = not failures and previous.read_text(encoding="utf-8") == sentinel
+    report("python_pattern_counts_invalid_destinations", ok, "; ".join(failures), proc)
+
+    blocked = tmp / "blocked"
+    blocked.write_text("parent is a file\n", encoding="utf-8")
+    failed = run([str(source), "--only=python", "--ci", "--no-config", "--format=json",
+                  "--python-pattern-counts=blocked/counts.json", "--also=json:ordinary.json"],
+                 cwd=tmp, env=env)
+    write_case_artifacts("python_pattern_counts_delivery_failure", failed)
+    ordinary = parse_json_document((tmp / "ordinary.json").read_text(encoding="utf-8"))
+    failed_ok = failed.returncode == 2 and "pattern count" in failed.stderr.lower()
+    failed_ok = failed_ok and ordinary["status"] == "ok" and blocked.read_text(encoding="utf-8") == "parent is a file\n"
+    report("python_pattern_counts_delivery_failure", failed_ok, f"exit={failed.returncode}", failed)
+
+
+def check_module_docs_singleton_scope() -> None:
+    """A Python-only flag is checked for Python, with missing/unknown negatives."""
+    import contextlib
+    import importlib.util
+    import io
+
+    spec = importlib.util.spec_from_file_location("pattern_count_docs_claims", REPO_ROOT / "scripts" / "check_docs_claims.py")
+    checker = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(checker)
+    tmp = _pattern_counts_workspace("docs")
+    modules = tmp / "modules"
+    modules.mkdir()
+    readme = modules / "README.md"
+    checker.ROOT = tmp
+    results = []
+    for label, named, accepted in (("valid", "python", True), ("missing", "python", False), ("unknown", "unknown", True)):
+        readme.write_text(
+            "current modules: `python`, `js`\n```\nOptions:\n"
+            f"--python-pattern-counts=FILE counts ({named})\n```\n", encoding="utf-8",
+        )
+        checker.module_parser_flags = lambda: {"python": {"--python-pattern-counts"} if accepted else set(), "js": set()}
+        checker.FAILURES.clear()
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            checker.check_module_readme()
+        results.append((label, bool(checker.FAILURES), output.getvalue()))
+    ok = [failed for _, failed, _ in results] == [False, True, True]
+    report("module_docs_singleton_scope", ok, "; ".join(f"{label}: rejected={failed}" for label, failed, _ in results))
+
+
 def check_also_reports_same_scan() -> None:
     """All export formats retain the same findings without invoking modules again."""
     artifact_root = REPO_ROOT / "test-suite" / "artifacts" / "also-reports"
@@ -2857,6 +3132,11 @@ def main() -> int:
         check_no_color_strips_ansi,
         check_output_file_positional,
         check_output_flag_json,
+        check_python_pattern_counts_formats,
+        check_python_pattern_counts_selected_and_staged,
+        check_python_pattern_counts_partial_and_unavailable,
+        check_python_pattern_counts_delivery_errors,
+        check_module_docs_singleton_scope,
         check_also_reports_same_scan,
         check_jsonl_snapshot_timestamps,
         check_also_text_and_baseline,

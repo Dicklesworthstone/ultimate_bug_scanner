@@ -1,9 +1,214 @@
 """Module-local call/return and recursive summary regressions."""
 import ast
+import json
+import os
+from pathlib import Path
+import random
+import subprocess
+import sys
+import tempfile
+import time
 import unittest
 from unittest.mock import patch
 from test_taint_python_dataflow import SourceTest
 from ubs_core.analyzers import taint_py
+
+
+def subprocess_chain(count, *, safe=False, order=None):
+    """The public GH #192 reproducer; scanned source is never executed."""
+    out = ['import os', 'import subprocess', 'import sys', '']
+    for index in range(count) if order is None else order:
+        successor = (f'step{index + 1}(runner, repo, env, paths, argv)'
+                     if index + 1 < count else 'None')
+        out += [
+            f'def step{index}(runner, repo, env, paths, argv):',
+            "    cmd = ['git', '-C', repo] + list(argv) + [p for p in paths if p]",
+            '    env = dict(env or {})' if safe else '    env = dict(env or os.environ)',
+            f"    env['STEP'] = str({index})",
+            '    r = runner(cmd, env=env, capture_output=True, text=True, timeout=30)',
+            '    if r.returncode:',
+            "        out = subprocess.run(['sh', '-c', 'echo ' + r.stdout], env=env, capture_output=True, text=True)",
+            '        paths = [line for line in out.stdout.splitlines() if line]',
+            "    with open(os.path.join(repo, paths[0] if paths else 'x'), encoding='utf-8') as fh:",
+            '        argv = argv + [fh.read(10)]',
+            f'    return {successor}',
+            '',
+        ]
+    entry = ("    step0(subprocess.run, 'repo', {}, ['file'], ['status'])" if safe else
+             "    step0(subprocess.run, sys.argv[1], None, sys.argv[2:], ['status'])")
+    out += ["if __name__ == '__main__':", entry, '']
+    return '\n'.join(out) + '\n'
+
+
+def scan_cost_worker(max_summaries):
+    """A fresh analyzer process with a deterministic transfer-work ceiling."""
+    source = sys.stdin.read()
+    engine = taint_py._Analysis(ast.parse(source))
+    original = taint_py._Flow.summary
+    solves = 0
+
+    def count_summary(flow):
+        nonlocal solves
+        solves += 1
+        if solves > max_summaries:
+            raise AssertionError(f'Function solve budget exceeded: {solves} > {max_summaries}')
+        return original(flow)
+
+    with patch.object(taint_py._Flow, 'summary', count_summary):
+        effects = engine.analyze()
+    print(json.dumps({'effects': sorted(effects), 'solves': solves,
+                      'functions': len(engine.functions)}))
+
+
+class SummaryScalingTests(unittest.TestCase):
+    """Bound real transfer work without relaxing source-to-sink detection.
+
+    A subprocess deadline also catches a nonterminating fixpoint that never
+    finishes even one function. It is deliberately generous; the main gate
+    is the number of complete function solves, independent of CPU speed.
+    """
+
+    def scan(self, source, *, max_summaries):
+        result = subprocess.run(
+            [sys.executable, '-B', str(Path(__file__).resolve()),
+             '--scan-cost-worker', str(max_summaries)],
+            input=source, text=True, capture_output=True, timeout=25,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        try:
+            report = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            self.fail(f'Invalid scan-cost report: {error}\n{result.stdout}\n{result.stderr}')
+        self.assertLessEqual(report['solves'], max_summaries, report)
+        return {tuple(effect) for effect in report['effects']}
+
+    @staticmethod
+    def expected_process_sinks(count):
+        return {(kind, line + 12 * index, column, label)
+                for index in range(count)
+                for kind, line, column, label in (
+                    ('command', 9, 9, 'subprocess executable'),
+                    ('command', 11, 15, 'subprocess execution'))}
+
+    def test_reported_subprocess_chains_keep_every_sink_with_bounded_work(self):
+        for count in (50, 100, 200):
+            with self.subTest(functions=count):
+                source = subprocess_chain(count)
+                self.assertEqual(len(source.splitlines()), 12 * count + 7)
+                effects = self.scan(source, max_summaries=12 * count)
+                self.assertEqual(effects, self.expected_process_sinks(count))
+
+    def test_clean_call_chains_do_not_acquire_taint_from_summary_reuse(self):
+        for count in (50, 200):
+            with self.subTest(functions=count):
+                self.assertEqual(self.scan(subprocess_chain(count, safe=True),
+                                           max_summaries=12 * count), set())
+
+    def test_call_graph_cost_does_not_depend_on_definition_order(self):
+        count = 80
+        shuffled = list(range(count))
+        random.Random(192).shuffle(shuffled)
+        for order in (list(reversed(range(count))), shuffled):
+            with self.subTest(order=order[:5]):
+                self.assertEqual(self.scan(subprocess_chain(count, order=order),
+                                           max_summaries=12 * count),
+                                 self.expected_process_sinks(count))
+
+    def test_recursive_and_cyclic_return_summaries_preserve_safe_and_unsafe_calls(self):
+        count = 16
+        bodies = [f'def f{index}(value):\n'
+                  + ('    if stop:\n        return value\n' if index == count - 1 else '')
+                  + f'    return f{(index + 1) % count}(value)\n'
+                  for index in range(count)]
+        recursive = ['def f0(value):\n'
+                     '    if stop:\n'
+                     '        return value\n'
+                     '    return f0(value)\n']
+        for functions in (recursive, bodies):
+            for actual in ('input()', "'trusted'"):
+                source = '\n'.join(functions) + f'\neval(f0({actual}))\n'
+                with self.subTest(functions=len(functions), actual=actual):
+                    effects = self.scan(source, max_summaries=12 * len(functions))
+                    expected = {('eval', len(source.splitlines()), 1, 'eval')} if actual == 'input()' else set()
+                    self.assertEqual(effects, expected)
+
+    def test_ordinary_stdlib_files_finish_without_a_partial_analysis(self):
+        # Read the interpreter's shipped source, never import/execute the code
+        # being analyzed. These cover real parser, filesystem and process code.
+        stdlib = Path(subprocess.__file__).resolve().parent
+        for name in ('argparse', 'subprocess', 'shutil', 'tarfile'):
+            with self.subTest(module=name):
+                source = (stdlib / f'{name}.py').read_text(encoding='utf-8')
+                # Generous operation bound; unlike the chain test this allows
+                # ordinary recursive frameworks and definition-time writers.
+                functions = sum(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+                                for node in ast.walk(ast.parse(source)))
+                self.scan(source, max_summaries=100 * max(functions, 1))
+
+    def test_real_staged_scan_analyzes_indexed_chain_with_clean_worktree(self):
+        root = Path(__file__).resolve().parents[2]
+        artifacts = root / 'test-suite' / 'artifacts'
+        artifacts.mkdir(exist_ok=True)
+        run = Path(tempfile.mkdtemp(prefix='python-taint-precommit-', dir=artifacts))
+        project = run / 'project'
+        project.mkdir()
+        for name in ('tmp', 'config', 'cache', 'data', 'state'):
+            (run / name).mkdir()
+        env = {key: value for key, value in os.environ.items() if not key.startswith('UBS_')}
+        env.update(UBS_KEEP_TEMP='1', UBS_NO_CACHE='1', UBS_NO_AUTO_UPDATE='1',
+                   UBS_ENABLE_AUTO_UPDATE='0', PYTHONDONTWRITEBYTECODE='1', NO_COLOR='1',
+                   TMPDIR=str(run / 'tmp'), TMP=str(run / 'tmp'), TEMP=str(run / 'tmp'),
+                   XDG_CONFIG_HOME=str(run / 'config'), XDG_CACHE_HOME=str(run / 'cache'),
+                   XDG_DATA_HOME=str(run / 'data'), XDG_STATE_HOME=str(run / 'state'))
+
+        def git(*arguments):
+            result = subprocess.run(['git', '-c', 'core.hooksPath=/dev/null', *arguments],
+                                    cwd=project, env=env, text=True, capture_output=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            return result.stdout
+
+        git('init', '--initial-branch=main')
+        git('-c', 'user.name=UBS Regression', '-c', 'user.email=ubs-test@example.invalid',
+            '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-m', 'Fixture base')
+        count = 220
+        source = project / 'gated_push.py'
+        source.write_text(subprocess_chain(count), encoding='utf-8')
+        git('add', 'gated_push.py')
+        indexed = git('show', ':gated_push.py')
+        self.assertEqual(len(indexed.splitlines()), 2647)
+        clean_worktree = "print('clean unstaged worktree')\n"
+        source.write_text(clean_worktree, encoding='utf-8')
+        index_before = (project / '.git' / 'index').read_bytes()
+        command = ['bash', str(root / 'ubs'), '--staged', '--only=python', '--ci',
+                   '--format=json', '--no-cache', '--no-auto-update',
+                   f'--module-dir={root / "modules"}', str(project)]
+        started = time.monotonic()
+        result = subprocess.run(command, cwd=project, env=env, text=True,
+                                capture_output=True, timeout=60)
+        elapsed = time.monotonic() - started
+        (run / 'stdout.json').write_text(result.stdout, encoding='utf-8')
+        (run / 'stderr.log').write_text(result.stderr, encoding='utf-8')
+        (run / 'receipt.json').write_text(json.dumps({'command': command,
+            'seconds': elapsed, 'exit': result.returncode, 'functions': count,
+            'lines': len(indexed.splitlines())}, indent=2) + '\n', encoding='utf-8')
+        context = f'artifacts={run}\n{result.stdout}\n{result.stderr}'
+        self.assertEqual(result.returncode, 1, context)
+        try:
+            report = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            self.fail(f'Invalid staged scan report: {error}\n{context}')
+        self.assertEqual(report['status'], 'ok', context)
+        self.assertEqual(report.get('failed_modules', []), [], context)
+        self.assertEqual(report['totals']['files'], 1, context)
+        findings = [finding for finding in report['findings']
+                    if finding['rule_id'] == 'python.taint.command']
+        self.assertEqual(len(findings), 2 * count, context)
+        self.assertEqual({(finding['line'], finding['col']) for finding in findings},
+                         {(line, column) for _, line, column, _ in self.expected_process_sinks(count)}, context)
+        self.assertEqual({Path(finding['file']).name for finding in findings}, {'gated_push.py'}, context)
+        self.assertEqual((project / '.git' / 'index').read_bytes(), index_before)
+        self.assertEqual(source.read_text(encoding='utf-8'), clean_worktree)
+        self.assertEqual(git('show', ':gated_push.py'), indexed)
 
 
 class FunctionSummaryTests(SourceTest):
@@ -739,11 +944,17 @@ class CallbackSummaryTests(SourceTest):
                 # This is an independent Python semantic oracle, not analyzer
                 # execution of scanned code. Only fixed authored fixtures run;
                 # eval/input are harmless collectors, not real builtins.
-                namespace = {'__builtins__': {}, 'input': lambda: 'untrusted', 'eval': events.append}
-                exec(compile(source, '<safe-callback-oracle>', 'exec'), namespace)
+                def collect(value):
+                    events.append(value)
+
+                namespace = {'__builtins__': {}, 'input': lambda: 'untrusted', 'eval': collect}
+                exec(compile(source, '<safe-callback-oracle>', 'exec'), namespace)  # ubs:ignore[py.security.eval-exec-usage,py.eval-exec] - fixed authored fixtures, empty builtins, inert collectors above
                 self.assertEqual(events, expected)
                 self.assert_rules(source, *(['eval'] if 'untrusted' in expected else []))
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    if len(sys.argv) == 3 and sys.argv[1] == '--scan-cost-worker':
+        scan_cost_worker(int(sys.argv[2]))
+    else:
+        unittest.main(verbosity=2)

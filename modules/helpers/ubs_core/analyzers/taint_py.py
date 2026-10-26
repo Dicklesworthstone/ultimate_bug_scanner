@@ -33,13 +33,14 @@ import os
 import re
 import sys
 from bisect import bisect_right
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Union
 
 from ubs_core.registry import Analyzer, RunContext, register
 from ubs_core.suppression import build_index
+from ubs_core.taint_flow import AnalysisLimit, Budget
 
 ROOT: Path = Path()
 BASE_DIR: Path = Path()
@@ -1727,9 +1728,14 @@ class _Flow:
                 values[key] = captured.bindings.get(name)
 
     @staticmethod
-    def substitute(fact, bound, call_name):
+    def substitute(fact, bound, call_name, *, budget=None):
         if not fact:
             return CLEAN
+        if budget is not None:
+            # Charge the actual expansion, including parameter substitutions.
+            # A single call can carry many transitive sink/mutation facts.
+            budget.spend(len(fact) + sum(len(bound.get(trace.parameter, CLEAN))
+                                        for trace in fact if trace.parameter is not None))
         result = CLEAN
         for trace in fact:
             if trace.parameter is None:
@@ -1757,21 +1763,21 @@ class _Flow:
                         replacement = values.get(operand.parameter)
                         if isinstance(replacement, (_LiteralString, _SymbolicValue)):
                             operand = replacement
-                    operands.append((operand, self.substitute(fact, bound, call_name)))
+                    operands.append((operand, self.substitute(fact, bound, call_name, budget=self.engine.budget)))
                 choices.append(_ArgumentVector(tuple(operands)))
             elif isinstance(target, _BoundCallable):
                 actual = frozenset().union(*(self._lookup_refs(references, ref) if isinstance(ref, str)
                                              else frozenset({node}) for ref in target.references))
-                choices.append(_BoundCallable(target.name, actual, self.substitute(target.receiver, bound, call_name)))
+                choices.append(_BoundCallable(target.name, actual, self.substitute(target.receiver, bound, call_name, budget=self.engine.budget)))
             elif isinstance(target, _BoundClassMethod):
                 actual = frozenset().union(*(
                     self._lookup_refs(references, ref) if isinstance(ref, str)
                     else frozenset({ref if isinstance(ref, ast.ClassDef) else node})
                     for ref in target.references))
                 choices.append(_BoundClassMethod(target.function, target.owner, actual,
-                                                 self.substitute(target.receiver, bound, call_name), target.valid))
+                                                 self.substitute(target.receiver, bound, call_name, budget=self.engine.budget), target.valid))
             elif isinstance(target, _DeferredCall):
-                arguments = tuple((name, self.substitute(fact, bound, call_name))
+                arguments = tuple((name, self.substitute(fact, bound, call_name, budget=self.engine.budget))
                                   for name, fact in target.arguments)
                 actual = tuple((name, frozenset().union(*(
                     self._lookup_refs(references, ref) if isinstance(ref, str) else frozenset({node})
@@ -2089,7 +2095,7 @@ class _Flow:
             overrides = self.context_globals if owner is self.engine else ()
             summary = self.engine.call_summary(function, values, summary_keys, overrides)
             for kind, line, column, label, fact in summary.effects:
-                propagated = self.substitute(fact, bound, call_name)
+                propagated = self.substitute(fact, bound, call_name, budget=self.engine.budget)
                 propagated = frozenset(trace for trace in propagated if not _safe_for(trace, kind, label))
                 key = (kind, line, column, label)
                 if propagated:
@@ -2098,9 +2104,9 @@ class _Flow:
                 exceptional = state.copy()
                 for parameter, written in exception.mutations:
                     self.mutate(self._lookup_refs(references, parameter),
-                                self.substitute(written, bound, call_name), exceptional)
+                                self.substitute(written, bound, call_name, budget=self.engine.budget), exceptional)
                 self.pending.append(_Completion(
-                    'raise', exceptional, self.substitute(exception.value, bound, call_name),
+                    'raise', exceptional, self.substitute(exception.value, bound, call_name, budget=self.engine.budget),
                     frozenset({node}),
                     '@exception:' + exception.exception_type if exception.exception_type else None,
                     exception.exception_type,
@@ -2109,14 +2115,14 @@ class _Flow:
                 state.reachable = False
                 return CLEAN
             for parameter, written in summary.mutations:
-                fact = self.substitute(written, bound, call_name)
+                fact = self.substitute(written, bound, call_name, budget=self.engine.budget)
                 self.mutate(self._lookup_refs(references, parameter), fact, state)
             returned_refs = frozenset().union(*(self._lookup_refs(references, parameter)
                                                for parameter in summary.returned_references))
             self.expression_references[node] = returned_refs or frozenset({node})
             self.expression_bindings[node] = self.substitute_binding(
                 summary.returned_binding, bound, references, node, call_name, values)
-            returned = self.substitute(summary.returned, bound, call_name)
+            returned = self.substitute(summary.returned, bound, call_name, budget=self.engine.budget)
             if function in self.engine.generators:
                 self.generator_returns[node] = returned
                 self.generator_return_references[node] = returned_refs
@@ -2125,7 +2131,7 @@ class _Flow:
                     summary.yielded_binding, bound, references, node, call_name, values)
                 self.expression_references[node] = frozenset().union(*(
                     self._lookup_refs(references, parameter) for parameter in summary.yielded_references))
-                return self.substitute(summary.yielded, bound, call_name)
+                return self.substitute(summary.yielded, bound, call_name, budget=self.engine.budget)
             return returned
         deferred = [target for expression in [*node.args, *keyword_nodes.values()]
                     for target in _binding_choices(self.expression_bindings.get(expression))
@@ -2346,6 +2352,7 @@ class _Flow:
     def expr(self, node, state):
         if node is None or not state.reachable:
             return CLEAN
+        self.engine.budget.spend()
         if isinstance(node, ast.Constant):
             self.expression_references.pop(node, None)
             self.expression_bindings[node] = _LiteralString(node.value) if isinstance(node.value, str) else None
@@ -2772,6 +2779,7 @@ class _Flow:
         return state if state is not None and state.reachable else None
 
     def statement(self, node, state):
+        self.engine.budget.spend()
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             # Decorator expressions run before defaults. Preserve the real
             # router identity even if a later default rebinds its name.
@@ -3069,6 +3077,9 @@ class _Analysis:
     def __init__(self, tree, project=None):
         self.tree = tree
         self.project = project
+        # Import-cycle fallback can disable the resolver without disabling
+        # rollback of incomplete writes to shared definition/summary tables.
+        self.journal = project.journal if project is not None else None
         self.function_owners = {}
         self.globals = _State()
         self.summaries = {}
@@ -3090,6 +3101,11 @@ class _Analysis:
         # selected source here adds substantial setup cost before any flow is
         # analyzed, without providing new information.
         nodes = tuple(ast.walk(tree))
+        # An exhausted analysis is an explicit failure, never a clean result.
+        # Scale with syntax size, while charging transfers and fact expansion
+        # rather than only the number of outer fixed-point iterations.
+        self.work_limit = max(500_000, 128 * len(nodes))
+        self.budget = Budget(self.work_limit)
         self.parents = {child: parent for parent in nodes for child in ast.iter_child_nodes(parent)}
         # A literal allow-list is a proof only if every other use is exact
         # membership testing. Rebinding, mutation, aliasing or passing the set
@@ -3146,12 +3162,16 @@ class _Analysis:
         self.method_calls = {}
         self.functions = [node for node in nodes if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))]
         self.generators = set()
+        self.definition_writers = set()
         self.locals = {}
         raw_used = {}
         for scope in [tree, *self.functions]:
             body = tuple(_scope_nodes(scope))
             self.locals[scope] = _local_names(scope, body)
             if scope is not tree:
+                if any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda))
+                       for node in body):
+                    self.definition_writers.add(scope)
                 raw_used[scope] = _used_names(scope, body)
                 if any(isinstance(node, (ast.Yield, ast.YieldFrom)) for node in body):
                     self.generators.add(scope)
@@ -3331,9 +3351,16 @@ class _Analysis:
 
     def define(self, table, node, value):
         """Record a definition-time table entry; a reused job replays it."""
-        getattr(self, table)[node] = value
+        self.publish(table, node, value)
         if self.writes is not None:
             self.writes.append((table, node, value))
+
+    def publish(self, table, key, value):
+        destination = getattr(self, table)
+        if self.journal is not None:
+            self.journal.setdefault((id(destination), key),
+                                    (destination, key, destination.get(key, _MISSING)))
+        destination[key] = value
 
     def framework_bound(self, globals_):
         """Solve local dependency values on the same finite taint lattice.
@@ -3353,6 +3380,7 @@ class _Analysis:
         }
         global_bound = {f'@global:{name}': globals_.value(name) for name in globals_}
         while True:
+            self.budget.spend()
             changed = False
             for function, inputs in self.framework_inputs.items():
                 for name, description in inputs.items():
@@ -3365,7 +3393,8 @@ class _Analysis:
                     provider_globals = (global_bound if owner is self else
                                         {f'@global:{key}': owner.globals.value(key) for key in owner.globals})
                     provider_inputs = bound.get(provider, {}) if owner is self else owner.framework_values.get(provider, {})
-                    incoming = self.flow_class.substitute(delivered, {**provider_globals, **provider_inputs}, provider.name + '()')
+                    incoming = self.flow_class.substitute(delivered, {**provider_globals, **provider_inputs},
+                                                         provider.name + '()', budget=self.budget)
                     previous = bound[function].get(name, CLEAN)
                     updated = join_facts(previous, incoming)
                     if updated != previous:
@@ -3454,7 +3483,10 @@ class _Analysis:
         if len(context) > 1:
             context.sort(key=lambda item: item[0])
         key = (function, tuple(context)) if context else function
-        summary = self.summaries.setdefault(key, FunctionSummary())
+        summary = self.summaries.get(key)
+        if summary is None:
+            summary = FunctionSummary()
+            self.publish('summaries', key, summary)
         if self.reads is not None:
             self.reads[('summaries', key)] = summary
         return summary
@@ -3467,6 +3499,70 @@ class _Analysis:
             if stale:
                 return False
         return True
+
+    def solve_function(self, function, context):
+        """Solve one summary, keeping definition-time collectors exception safe."""
+        owner = self.owner(function)
+        reads = {('framework_inputs', function): owner.framework_inputs.get(function)}
+        writes = []
+        owner.reads, owner.writes = reads, writes
+        try:
+            owner.budget.spend()
+            namespace = owner.globals
+            local = owner.locals[function]
+            used = owner.used_names[function]
+            flow = owner.flow_class(owner, function)
+            state = _State({name: owner.global_symbols[name][0]
+                            for name in owner.global_names if name in used and name not in local},
+                           {name: target for name, target in namespace.bindings.items()
+                            if name in used and name not in local})
+            state.references.update({name: owner.global_symbols[name][1]
+                                     for name in owner.global_names if name in used and name not in local})
+            for name in local:
+                state.bindings[name] = None
+            arguments = function.args
+            params = [*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs]
+            params.extend(arg for arg in (arguments.vararg, arguments.kwarg) if arg is not None)
+            for arg in params:
+                state[arg.arg] = frozenset({TaintTrace(arg.arg, parameter=arg.arg, path=(arg.arg,))})
+                description = owner.framework_inputs.get(function, {}).get(arg.arg)
+                if description is not None and description.kind == 'request':
+                    state.bindings[arg.arg] = '@request:' + description.name
+                else:
+                    state.bindings[arg.arg] = _SymbolicValue(arg.arg)
+                state.references[arg.arg] = frozenset({arg.arg})
+            for name in owner.closures[function]:
+                state[name] = frozenset({TaintTrace(name, parameter=f'@free:{name}', path=(name,))})
+                state.bindings[name] = _SymbolicValue(f'@free:{name}')
+                state.references[name] = frozenset({f'@free:{name}'})
+            if context:
+                ctx_globals = []
+                for name, binding in context:
+                    raw = name.removeprefix('@free:').removeprefix('@global:')
+                    if name.startswith('@global:') and raw in owner.global_symbols and raw not in local:
+                        state.setdefault(raw, owner.global_symbols[raw][0])
+                        state.references.setdefault(raw, owner.global_symbols[raw][1])
+                        ctx_globals.append(raw)
+                    state.bindings[raw] = binding
+                if ctx_globals:
+                    flow.context_globals = tuple(ctx_globals)
+            if isinstance(function, ast.Lambda):
+                flow.exception_states.append(None)
+                flow.returned = flow.expr(function.body, state)
+                exceptional = flow.exception_states.pop()
+                if exceptional is not None:
+                    flow.pending.append(_Completion('raise', exceptional))
+                flow.normal_state = state if state.reachable else None
+                flow.returned_references.update(flow.expression_references.get(function.body, NO_REFERENCES))
+                flow.returned_bindings.append(flow.expression_bindings.get(function.body))
+            else:
+                if function.name in used and function.name not in local and function.name not in state.bindings:
+                    state.bindings[function.name] = function
+                flow.normal_state, completed = flow.capture(function.body, state, exceptions=True)
+                flow.pending.extend(completed)
+            return reads, writes, flow, flow.summary()
+        finally:
+            owner.reads = owner.writes = None
 
     def analyze(self):
         # A summary contains only finite source/parameter/sanitizer facts.
@@ -3490,7 +3586,17 @@ class _Analysis:
         # none of those changed since its last solve, solving it again yields
         # the same summary and the same flow, so the previous ones are reused.
         solved = {}  # summary key -> (reads, writes, flow) of the job's last solve
+        readers = defaultdict(dict)
+
+        def parts(key):
+            return key if isinstance(key, tuple) else (key, ())
+
+        def reorderable(key):
+            function, _ = parts(key)
+            return key not in inherited and function not in self.owner(function).definition_writers
+
         while True:
+            self.budget.spend()
             previous_contexts = len(self.summaries)
             module = self.flow_class(self, self.tree)
             globals_ = module.block(self.tree.body, _State())
@@ -3504,102 +3610,115 @@ class _Analysis:
             changed = not self.namespace_ready or globals_ != self.globals
             if changed:
                 solved.clear()  # Every job of this module starts from the namespace.
+                readers.clear()
             self.refresh_globals(globals_)
-            flows = [module]
-            jobs = [(function, (), function) for function in self.functions]
-            jobs.extend((key[0], key[1], key) for key in list(self.summaries)
-                        if isinstance(key, tuple) and key not in inherited)
-            for function, context, summary_key in jobs:
+            jobs = [*self.functions, *(key for key in self.summaries
+                                      if isinstance(key, tuple) and key not in inherited)]
+            pending, queued, dirty = deque(), set(), set()
+
+            def enqueue(key):
+                if reorderable(key):
+                    dirty.add(key)
+                    if key not in queued:
+                        pending.append(key)
+                        queued.add(key)
+
+            def solve(summary_key):
+                function, context = parts(summary_key)
                 owner = self.owner(function)
                 previous = solved.get(summary_key)
                 if previous is not None and owner.reads_current(previous[0]):
                     # Replay its definition-time writes, in job order, so later
                     # jobs read exactly what a fresh solve would have left.
                     for table, node, value in previous[1]:
-                        getattr(owner, table)[node] = value
-                    if not context:
-                        flows.append(previous[2])
-                    continue
-                reads = {('framework_inputs', function): owner.framework_inputs.get(function)}
-                writes = []
-                owner.reads, owner.writes = reads, writes
-                namespace = globals_ if owner is self else owner.globals
-                local = owner.locals[function]
-                used = owner.used_names[function]
-                flow = owner.flow_class(owner, function)
-                state = _State({name: owner.global_symbols[name][0]
-                                for name in owner.global_names if name in used and name not in local},
-                               {name: target for name, target in namespace.bindings.items()
-                                if name in used and name not in local})
-                state.references.update({name: owner.global_symbols[name][1]
-                                         for name in owner.global_names if name in used and name not in local})
-                for name in local:
-                    state.bindings[name] = None
-                arguments = function.args
-                params = [*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs]
-                params.extend(arg for arg in (arguments.vararg, arguments.kwarg) if arg is not None)
-                for arg in params:
-                    state[arg.arg] = frozenset({TaintTrace(arg.arg, parameter=arg.arg, path=(arg.arg,))})
-                    description = owner.framework_inputs.get(function, {}).get(arg.arg)
-                    if description is not None and description.kind == 'request':
-                        state.bindings[arg.arg] = '@request:' + description.name
-                    else:
-                        state.bindings[arg.arg] = _SymbolicValue(arg.arg)
-                    state.references[arg.arg] = frozenset({arg.arg})
-                for name in owner.closures[function]:
-                    state[name] = frozenset({TaintTrace(name, parameter=f'@free:{name}', path=(name,))})
-                    state.bindings[name] = _SymbolicValue(f'@free:{name}')
-                    state.references[name] = frozenset({f'@free:{name}'})
-                if context:
-                    ctx_globals = []
-                    for name, binding in context:
-                        raw = name.removeprefix('@free:').removeprefix('@global:')
-                        if name.startswith('@global:') and raw in owner.global_symbols and raw not in local:
-                            state.setdefault(raw, owner.global_symbols[raw][0])
-                            state.references.setdefault(raw, owner.global_symbols[raw][1])
-                            ctx_globals.append(raw)
-                        state.bindings[raw] = binding
-                    if ctx_globals:
-                        flow.context_globals = tuple(ctx_globals)
-                if isinstance(function, ast.Lambda):
-                    # Analyze lambda bodies once per fixed-point pass, not by
-                    # recursively interpreting their call sites on our stack.
-                    flow.exception_states.append(None)
-                    flow.returned = flow.expr(function.body, state)
-                    exceptional = flow.exception_states.pop()
-                    if exceptional is not None:
-                        flow.pending.append(_Completion('raise', exceptional))
-                    flow.normal_state = state if state.reachable else None
-                    flow.returned_references.update(flow.expression_references.get(function.body, NO_REFERENCES))
-                    flow.returned_bindings.append(flow.expression_bindings.get(function.body))
-                else:
-                    if function.name in used and function.name not in local and function.name not in state.bindings:
-                        state.bindings[function.name] = function
-                    flow.normal_state, completed = flow.capture(function.body, state, exceptions=True)
-                    flow.pending.extend(completed)
-                summary = flow.summary()
-                owner.reads = owner.writes = None
+                        owner.publish(table, node, value)
+                    return False
+                if previous is not None:
+                    for table, key in previous[0]:
+                        if table == 'summaries':
+                            readers[key].pop(summary_key, None)
+                reads, writes, flow, summary = self.solve_function(function, context)
                 solved[summary_key] = (reads, writes, flow)
+                for table, key in reads:
+                    if table == 'summaries':
+                        readers[key][summary_key] = None
+                        if key not in solved and reorderable(key):
+                            enqueue(key)
+                            # Keep the caller pending while a newly discovered
+                            # dependency is still at bottom. Otherwise a chain
+                            # of fresh callback contexts propagates each
+                            # provisional prefix all the way back to its root.
+                            if key != summary_key:
+                                enqueue(summary_key)
                 if summary != self.summaries.get(summary_key, FunctionSummary()):
-                    self.summaries[summary_key] = summary
-                    changed = True
-                # Contextual effects belong to their calling invocation, not
-                # an invented standalone/framework entry into a foreign scope.
-                if not context:
-                    flows.append(flow)
+                    self.publish('summaries', summary_key, summary)
+                    for reader in readers[summary_key]:
+                        enqueue(reader)
+                    return True
+                return False
+
+            # Definition-time writes still happen in the original job order.
+            # Only jobs without such writes may move ahead of their readers.
+            # This preserves defaults/class tables even when contextual jobs
+            # publish different definitions at the same syntax location.
+            for key in jobs:
+                if reorderable(key):
+                    enqueue(key)
+                else:
+                    if solve(key):
+                        changed = True
+
+            # Follow observed summary dependencies before re-solving a caller.
+            # Newly requested callback contexts join this same worklist. An
+            # explicit stack handles long chains; an active back edge uses the
+            # current approximation and requeues its readers on change.
+            active, stack = set(), []
+            while pending or stack:
+                self.budget.spend()
+                if not stack:
+                    key = pending.popleft()
+                    queued.remove(key)
+                    if key not in dirty:
+                        continue
+                    stack.append(key)
+                    active.add(key)
+                key = stack[-1]
+                previous = solved.get(key)
+                dependency = None
+                if previous is not None:
+                    for table, candidate in previous[0]:
+                        if table == 'summaries' and candidate in dirty and candidate not in active:
+                            dependency = candidate
+                            break
+                if dependency is not None:
+                    stack.append(dependency)
+                    active.add(dependency)
+                    continue
+                stack.pop()
+                active.remove(key)
+                if key in dirty:
+                    dirty.remove(key)
+                    if solve(key):
+                        changed = True
+
             if not changed and len(self.summaries) == previous_contexts:
                 self.refresh_globals(globals_)
                 effects = {}
                 framework_bound = self.framework_bound(globals_)
                 self.framework_values = framework_bound
+                global_bound = {f'@global:{name}': globals_.value(name) for name in globals_}
+                # Contextual effects belong to their calling invocation, not
+                # an invented standalone/framework entry into a foreign scope.
+                flows = [module, *(solved[function][2] for function in self.functions)]
                 for flow in flows:
+                    bound = global_bound
+                    if flow is not module and framework_bound.get(flow.scope):
+                        bound = {**global_bound, **framework_bound[flow.scope]}
                     for key, fact in flow.effects.items():
                         if flow is not module:
-                            bound = {f'@global:{name}': globals_.value(name) for name in globals_}
                             # Framework invocation is a separate entry point;
                             # summaries remain symbolic for ordinary callers.
-                            bound.update(framework_bound.get(flow.scope, {}))
-                            fact = flow.substitute(fact, bound, _call_name(flow.scope))
+                            fact = flow.substitute(fact, bound, _call_name(flow.scope), budget=self.budget)
                         concrete = frozenset(trace for trace in fact if trace.parameter is None
                                              and not _safe_for(trace, key[0], key[3]))
                         if concrete:
@@ -3619,6 +3738,7 @@ class _Project:
     """
 
     def __init__(self, files, root=None):
+        self.journal = {}
         self.sources = []
         self.modules = {}
         self.namespaces = set()
@@ -3893,22 +4013,42 @@ class _Project:
 
     def findings(self):
         effects = {}
+        failures, failed_components = [], 0
+        paths = {engine: path for path, _, engine, _ in self.sources}
         for component in self.components():
-            cyclic = len(component) > 1 or component[0] in self.dependencies(component[0])
-            if cyclic and self.deferred_cycle(component):
-                for key, fact in self.analyze_cycle(component).items():
+            self.journal.clear()
+            try:
+                cyclic = len(component) > 1 or component[0] in self.dependencies(component[0])
+                if cyclic and self.deferred_cycle(component):
+                    completed = self.analyze_cycle(component)
+                else:
+                    if cyclic:
+                        # Opaque imports are confined to the actual cycle.
+                        for engine in component:
+                            engine.project = None
+                    completed = {}
+                    for engine in component:
+                        for key, fact in engine.analyze().items():
+                            completed[key] = join_facts(completed.get(key, CLEAN), fact)
+                        self.ready.add(engine)
+                for key, fact in completed.items():
                     effects[key] = join_facts(effects.get(key, CLEAN), fact)
-                continue
-            if cyclic:
-                # Do not pretend to execute a cyclic import's partially
-                # initialized modules. Keep this fallback within the actual
-                # cycle, never disabling cross-file analysis in its callers.
-                for engine in component:
-                    engine.project = None
-            for engine in component:
-                for key, fact in engine.analyze().items():
-                    effects[key] = join_facts(effects.get(key, CLEAN), fact)
-                self.ready.add(engine)
+            except AnalysisLimit as exc:
+                # A failed callback solve can also have written a foreign
+                # context in the shared table. Never let later modules reuse
+                # that provisional bottom summary as a completed result.
+                for table, key, previous in self.journal.values():
+                    if previous is _MISSING:
+                        table.pop(key, None)
+                    else:
+                        table[key] = previous
+                self.ready.difference_update(component)
+                failed_components += 1
+                if len(failures) < 3:
+                    names = ', '.join(str(paths[engine]) for engine in component[:3])
+                    failures.append(f'{names}: {exc}')
+            finally:
+                self.journal.clear()
         starts = [offset for _, _, _, offset in self.sources]
         indexes = {path: build_index(text, lang='python') for path, text, _, _ in self.sources}
         for (kind, line, column, label), fact in sorted(effects.items(), key=lambda item: (item[0][1], item[0][2], item[0][0])):
@@ -3919,6 +4059,12 @@ class _Project:
                 continue
             trace = min(fact, key=lambda item: (len(item.path), item.path, item.source))
             yield path, rule, line, column, ' -> '.join((*trace.path, label))
+        if failed_components:
+            omitted = (f'; and {failed_components - len(failures)} more failed components'
+                       if failed_components > len(failures) else '')
+            raise AnalysisLimit(
+                f'Python taint analysis is incomplete in {failed_components} component(s): '
+                + '; '.join(failures) + omitted)
 
 
 def should_skip(path: Path) -> bool:
@@ -3958,14 +4104,21 @@ def main(argv=None) -> int:
     ROOT = Path(argv[1]).resolve()
     BASE_DIR = ROOT if ROOT.is_dir() else ROOT.parent
     issues = defaultdict(lambda: {'count': 0, 'samples': []})
-    for path, rule, line, _col, description in _Project(iter_files(ROOT), BASE_DIR).findings():
-        bucket = issues[rule]
-        bucket['count'] += 1
-        if len(bucket['samples']) < 3:
-            bucket['samples'].append(f'{path.relative_to(BASE_DIR)}:{line} {description}')
+    incomplete = None
+    try:
+        for path, rule, line, _col, description in _Project(iter_files(ROOT), BASE_DIR).findings():
+            bucket = issues[rule]
+            bucket['count'] += 1
+            if len(bucket['samples']) < 3:
+                bucket['samples'].append(f'{path.relative_to(BASE_DIR)}:{line} {description}')
+    except AnalysisLimit as exc:
+        incomplete = str(exc)
     for rule_id, data in issues.items():
         samples = ','.join(data['samples'])
         print(f"{rule_id}\t{data['count']}\t{samples}")
+    if incomplete is not None:
+        print(incomplete, file=sys.stderr)
+        return 2
     return 0
 
 

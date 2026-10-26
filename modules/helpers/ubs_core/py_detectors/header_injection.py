@@ -134,7 +134,14 @@ def _module_refs(binding):
 
 class _HeaderFlow(flow._Flow):
     @staticmethod
-    def substitute(fact, bound, call_name):
+    def substitute(fact, bound, call_name, *, budget=None):
+        if not fact:
+            return flow.CLEAN
+        if budget is not None:
+            # Header summaries share the Python engine's work bound while
+            # retaining their domain-specific proof/revocation semantics.
+            budget.spend(len(fact) + sum(len(bound.get(trace.parameter, flow.CLEAN))
+                                        for trace in fact if trace.parameter is not None))
         result = flow.CLEAN
         for trace in fact:
             if trace.parameter is None:
@@ -456,7 +463,7 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
             if not _has_sink(tree):
                 continue
             effects = _HeaderAnalysis(tree).analyze()
-        except (OSError, UnicodeError, SyntaxError, RecursionError, RuntimeError) as exc:
+        except (OSError, UnicodeError, SyntaxError, RecursionError, RuntimeError, flow.AnalysisLimit) as exc:
             errors.append(f'{path}: {type(exc).__name__}: {exc}')
             continue
         lines = text.splitlines()

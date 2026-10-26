@@ -10,15 +10,22 @@ reuse disabled, and the cross-module shapes must report the known flow.
 from __future__ import annotations
 
 import ast
+import contextlib
+import io
+import json
+import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'modules' / 'helpers'))
 from ubs_core.analyzers import taint_py
+from ubs_core.taint_flow import AnalysisLimit, Budget
 
 SHAPES = {
     # The module's value facts are unchanged when the factory's second
@@ -456,6 +463,334 @@ os.system(apply(relay, "safe"))
         state.references['value'] = taint_py.NO_REFERENCES
         compare()
         compare()
+
+
+class WorkLimitCompletionTests(unittest.TestCase):
+    """A work limit bounds analysis without manufacturing a clean result."""
+
+    def setUp(self):
+        artifacts = ROOT / 'test-suite' / 'artifacts'
+        artifacts.mkdir(exist_ok=True)
+        self.root = Path(tempfile.mkdtemp(prefix='python-taint-limit-', dir=artifacts))
+
+    def run(self, result=None):
+        print(f'[{self.id()}] RUN', flush=True)
+        started = time.monotonic()
+        result = super().run(result)
+        failed = any(test is self or getattr(test, 'test_case', None) is self
+                     for test, _ in result.failures + result.errors)
+        print(f'[{self.id()}] {"FAIL" if failed else "PASS"} '
+              f'({time.monotonic() - started:.3f}s)', flush=True)
+        return result
+
+    def source(self, name, text):
+        path = self.root / name
+        path.write_text(text, encoding='utf-8')
+        return path
+
+    def test_tabular_entrypoint_keeps_findings_and_returns_incomplete(self):
+        from ubs_core.taint_flow import Budget
+
+        first = self.source('a_first.py', 'eval(input())\n')
+        failed = self.source('m_failed.py', 'eval(input())\n')
+        last = self.source('z_last.py', 'eval(input())\n')
+        budgets = iter((Budget(), Budget(0), Budget()))
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch.object(taint_py, 'Budget', side_effect=lambda _limit: next(budgets)), \
+                patch.object(taint_py, 'iter_files', return_value=iter((first, failed, last))), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            status = taint_py.main(['taint_py', str(self.root)])
+        self.assertEqual(status, 2)
+        rule, count, samples = stdout.getvalue().rstrip('\n').split('\t')
+        self.assertEqual((rule, count), ('py.taint.eval', '2'))
+        self.assertIn('a_first.py:1', samples)
+        self.assertIn('z_last.py:1', samples)
+        self.assertNotIn('m_failed.py:1', samples)
+        self.assertIn('m_failed.py', stderr.getvalue())
+        self.assertIn('work limit exceeded', stderr.getvalue())
+
+    def test_recursive_and_loop_work_limits_raise_instead_of_returning_clean(self):
+        sources = {
+            'recursive.py': '''def relay(value):
+    if condition:
+        return relay(value)
+    return value
+eval(relay(input()))
+''',
+            'mutual.py': '''def left(value):
+    return right(value)
+def right(value):
+    if condition:
+        return left(value)
+    return value
+eval(left(input()))
+''',
+            'loop.py': '''def forward():
+    a = "safe"
+    b = "safe"
+    c = input()
+    while condition:
+        eval(a)
+        a = b
+        b = c
+forward()
+''',
+        }
+        for name, source in sources.items():
+            with self.subTest(shape=name):
+                path = self.source(name, source)
+                findings = list(taint_py.scan_file_findings(path))
+                self.assertEqual([rule for rule, *_ in findings], ['py.taint.eval'], findings)
+                with patch.object(taint_py, 'Budget', return_value=Budget(0)), \
+                        self.assertRaises(AnalysisLimit) as raised:
+                    list(taint_py.scan_file_findings(path))
+                self.assertIn('work limit exceeded', str(raised.exception))
+                self.assertIn('incomplete', str(raised.exception))
+
+    def test_default_budget_preserves_recursive_cross_module_callback_domains(self):
+        files = [
+            self.source('left.py', '''import right
+def relay(callback, value, n):
+    if n:
+        return right.relay(callback, value, n - 1)
+    return callback(value)
+'''),
+            self.source('right.py', '''import left
+def relay(callback, value, n):
+    return left.relay(callback, value, n)
+'''),
+            self.source('app.py', '''import html
+import left
+value = left.relay(html.escape, input(), 3)
+HttpResponse(value)
+eval(value)
+clean = left.relay(html.escape, "safe", 3)
+eval(clean)
+'''),
+        ]
+        findings = list(taint_py._Project(files, self.root).findings())
+        self.assertEqual([(path.name, rule, line) for path, rule, line, _, _ in findings],
+                         [('app.py', 'py.taint.eval', 5)], findings)
+        self.assertIn('input', findings[0][-1])
+
+    def test_failed_import_cycle_keeps_completed_and_later_component_findings(self):
+        # Engine creation follows the selected file order. The failing engine
+        # belongs to a genuine import SCC; its peer must not publish a partial
+        # namespace as a successfully analyzed dependency.
+        files = [
+            self.source('a_first.py', 'eval(input())\n'),
+            self.source('b_left.py', '''import c_right
+def relay(value):
+    return c_right.relay(value)
+'''),
+            self.source('c_right.py', '''import b_left
+def relay(value):
+    if condition:
+        return b_left.relay(value)
+    return value
+'''),
+            self.source('z_last.py', 'eval(input())\n'),
+        ]
+        for failed_index in (1, 2):
+            with self.subTest(failed_module=files[failed_index].name):
+                budgets = [Budget() for _ in files]
+                budgets[failed_index] = Budget(0)
+                findings = []
+                with patch.object(taint_py, 'Budget', side_effect=budgets), \
+                        self.assertRaises(AnalysisLimit) as raised:
+                    project = taint_py._Project(files, self.root)
+                    findings.extend(project.findings())
+                self.assertEqual([(path.name, rule, line) for path, rule, line, _, _ in findings],
+                                 [('a_first.py', 'py.taint.eval', 1),
+                                  ('z_last.py', 'py.taint.eval', 1)], findings)
+                self.assertIn(files[failed_index].name, str(raised.exception))
+                self.assertIn('work limit exceeded', str(raised.exception))
+                failed_engines = {engine for path, _, engine, _ in project.sources
+                                  if path.name in {'b_left.py', 'c_right.py'}}
+                self.assertFalse(project.ready & failed_engines,
+                                 'A failed import component cannot publish completed namespaces')
+
+    def test_python_scan_reports_native_budget_failure_and_does_not_cache_it(self):
+        # Run the production Python driver, including its real registered
+        # analyzers, findings sink, error envelope and cache admission barrier.
+        # Only the available taint work is constrained; no producer is replaced.
+        from ubs_core import py_scan
+
+        files = [
+            self.source('a_first.py', 'eval(input())\n'),
+            self.source('m_recursive.py', '''def relay(value):
+    if condition:
+        return relay(value)
+    return value
+eval(relay(input()))
+'''),
+            self.source('z_last.py', 'eval(input())\n'),
+        ]
+        selected = self.root / 'files'
+        selected.write_bytes(b''.join([os.fsencode(path) + b'\0' for path in files]))
+        sink, report, text = (self.root / name for name in ('sink.jsonl', 'report.json', 'report.txt'))
+        environment = {key: value for key, value in os.environ.items()
+                       if not key.startswith(('UBS_', 'XDG_'))}
+        environment.update(UBS_CACHE_DIR=str(self.root / 'cache'), UBS_NO_CACHE='0',
+                           UBS_PROFILE='1', PYTHONDONTWRITEBYTECODE='1')
+        args = ['--files-from', str(selected), '--sink', str(sink), '--json-out', str(report),
+                '--text-out', str(text), '--project-dir', str(self.root), '--jobs', '1',
+                '--skip', ','.join(str(number) for number in range(1, 24) if number != 7)]
+
+        def scan():
+            stderr = io.StringIO()
+            with patch.dict(os.environ, environment, clear=True), contextlib.redirect_stderr(stderr):
+                code = py_scan.main(args)
+            try:
+                document = json.loads(report.read_text(encoding='utf-8'))
+                records = [json.loads(line) for line in sink.read_text(encoding='utf-8').splitlines()]
+            except json.JSONDecodeError as exc:
+                self.fail(f'Invalid scan output: {exc}\n{stderr.getvalue()}')
+            return code, document, records, text.read_text(encoding='utf-8'), stderr.getvalue()
+
+        for attempt in range(2):
+            with self.subTest(attempt=attempt), \
+                    patch.object(taint_py, 'Budget', side_effect=[Budget(), Budget(0), Budget()]):
+                result = scan()
+            code, document, records, rendered, stderr = result
+            self.assertEqual(code, 2, result)
+            self.assertEqual(document['status'], 'partial', result)
+            self.assertEqual(document['module_error'], 'ANALYZER_ERROR', result)
+            self.assertIn('work limit exceeded', stderr, result)
+            self.assertIn('m_recursive.py', stderr, result)
+            self.assertNotIn('good:', rendered, result)
+            self.assertEqual(document['profile']['cache_hits'], 0, result)
+            self.assertEqual([(Path(row['path']).name, row['rule'], row['line'])
+                              for row in records if row['rule'].startswith('python.taint.')],
+                             [('a_first.py', 'python.taint.eval', 1),
+                              ('z_last.py', 'python.taint.eval', 1)], result)
+            self.assertFalse(list((self.root / 'cache').glob('*/files/**/*.json')),
+                             'A partial taint scan must not admit fresh cache entries')
+
+        # Recover with the same source and the normal budget. All three
+        # positives must survive both a cold file pass and a warm file cache.
+        for hits in (0, 3):
+            result = scan()
+            code, document, records, _, _ = result
+            self.assertEqual(code, 1, result)
+            self.assertEqual(document['status'], 'ok', result)
+            self.assertEqual(document['profile']['cache_hits'], hits, result)
+            self.assertEqual([(Path(row['path']).name, row['rule'], row['line'])
+                              for row in records if row['rule'].startswith('python.taint.')],
+                             [('a_first.py', 'python.taint.eval', 1),
+                              ('m_recursive.py', 'python.taint.eval', 5),
+                              ('z_last.py', 'python.taint.eval', 1)], result)
+
+    def test_failed_foreign_context_is_not_reused_as_a_completed_summary(self):
+        files = [
+            self.source('aa_lib.py', 'def apply(callback, value):\n    return callback(value)\n'),
+            self.source('bb_failed.py', '''from aa_lib import apply
+apply(eval, input())
+'''),
+            self.source('zz_later.py', '''import sys
+from aa_lib import apply
+apply(eval, sys.argv[1])
+'''),
+        ]
+        project = taint_py._Project(files, self.root)
+        engines = {path.name: engine for path, _, engine, _ in project.sources}
+        library = engines['aa_lib.py']
+        later = engines['zz_later.py']
+        initialize = taint_py._Flow.__init__
+        analyze = taint_py._Analysis.analyze
+        interrupted = False
+
+        def stop_first_context(flow, engine, scope):
+            nonlocal interrupted
+            if (engine is library and library in project.ready
+                    and getattr(scope, 'name', '') == 'apply' and not interrupted):
+                # The module's base summary is complete; a caller has just
+                # requested a new callback-specific summary. Exhaust the real
+                # owner budget at that boundary, leaving a provisional shared
+                # key for failure recovery to invalidate.
+                interrupted = True
+                library.budget.spend(library.budget.remaining + 1)
+            initialize(flow, engine, scope)
+
+        def allow_later_component(engine):
+            if engine is later:
+                # Give the next caller enough work to independently finish.
+                # If it mistakes the failed context for an inherited completed
+                # summary, it will silently reuse bottom and miss this sink.
+                library.budget = Budget()
+            return analyze(engine)
+
+        findings = []
+        with patch.object(taint_py._Flow, '__init__', stop_first_context), \
+                patch.object(taint_py._Analysis, 'analyze', allow_later_component), \
+                self.assertRaises(AnalysisLimit) as raised:
+            findings.extend(project.findings())
+        self.assertTrue(interrupted, 'The test must reach a specialized foreign callback context')
+        self.assertIn('bb_failed.py', str(raised.exception))
+        self.assertIn(later, project.ready)
+        self.assertEqual([(path.name, rule, line) for path, rule, line, _, _ in findings],
+                         [('aa_lib.py', 'py.taint.eval', 2)], findings)
+        self.assertIn('sys.argv', findings[0][-1])
+        self.assertNotIn('input', findings[0][-1])
+        self.assertIsNone(library.reads)
+        self.assertIsNone(library.writes)
+
+    def test_cli_bounds_natural_callback_context_explosion_without_losing_other_files(self):
+        # A transposition and a rotation generate all permutations of eight
+        # distinct callbacks. The source is small, but exact context discovery
+        # has factorial growth. Exercise the default work limit through the
+        # real CLI, with neither mocked budgets nor a test-only runtime knob.
+        names = [f'cb{index}' for index in range(8)]
+        swapped = [names[1], names[0], *names[2:]]
+        rotated = [*names[1:], names[0]]
+        lines = [f'def rotate({", ".join(names)}, value):',
+                 '    if condition_a:',
+                 f'        return rotate({", ".join(swapped)}, value)',
+                 '    if condition_b:',
+                 f'        return rotate({", ".join(rotated)}, value)',
+                 '    return cb0(value)', '']
+        for index in range(8):
+            lines.extend([f'def ident{index}(value):', '    return value', ''])
+        arguments = ', '.join(f'ident{index}' for index in range(8))
+        lines.extend([f'eval(rotate({arguments}, input()))', ''])
+        sources = self.root / 'sources'
+        sources.mkdir()
+        self.source('sources/a_first.py', 'eval(input())\n')
+        self.source('sources/m_callbacks.py', '\n'.join(lines))
+        self.source('sources/z_last.py', 'eval(input())\n')
+        temporary = self.root / 'temporary'
+        temporary.mkdir()
+        environment = {key: value for key, value in os.environ.items()
+                       if not key.startswith(('UBS_', 'XDG_'))}
+        environment.update(UBS_CACHE_DIR=str(self.root / 'cache'), UBS_NO_CACHE='0',
+                           UBS_PROFILE='1', UBS_NO_AUTO_UPDATE='1', UBS_KEEP_TEMP='1',
+                           PYTHONDONTWRITEBYTECODE='1', TMPDIR=str(temporary))
+        skip = ','.join(str(number) for number in range(1, 24) if number != 7)
+        try:
+            result = subprocess.run([str(ROOT / 'ubs'), str(sources), '--only=python',
+                                     '--ci', '--format=json', '--skip-python=' + skip],
+                                    cwd=self.root, env=environment, capture_output=True,
+                                    text=True, timeout=30)
+        except subprocess.TimeoutExpired as exc:
+            self.fail(f'Unbounded callback-context expansion: {exc}')
+        (self.root / 'native-result.json').write_text(result.stdout, encoding='utf-8')
+        (self.root / 'native-stderr.log').write_text(result.stderr, encoding='utf-8')
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        try:
+            report = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            self.fail(f'Invalid partial scan output: {exc}\n{result.stdout}\n{result.stderr}')
+        self.assertEqual(report['status'], 'partial', report)
+        self.assertEqual(report['totals']['files'], 3, report)
+        self.assertIn('work limit exceeded', result.stdout + result.stderr)
+        self.assertIn('m_callbacks.py', result.stdout + result.stderr)
+        self.assertEqual(report['profile']['cache_hits'], 0, report)
+        self.assertEqual([(Path(row['file']).name, row['rule_id'], row['line'])
+                          for row in report['findings'] if row['rule_id'].startswith('python.taint.')],
+                         [('a_first.py', 'python.taint.eval', 1),
+                          ('z_last.py', 'python.taint.eval', 1)], report)
+        self.assertFalse(list((self.root / 'cache').glob('*/files/**/*.json')),
+                         'A naturally exhausted scan must not admit partial cache entries')
 
 
 if __name__ == '__main__':

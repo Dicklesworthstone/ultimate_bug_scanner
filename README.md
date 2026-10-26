@@ -1878,6 +1878,36 @@ Each module maps its tool-specific severity strings, numeric levels, and legacy 
 - Content-hash cache of previous results: bead ultimate_bug_scanner-q150.4
 ```
 
+#### Python call-chain analysis and work limits
+
+Python security category 7 reuses function summaries and schedules changed
+callees before their callers, including newly discovered callback contexts.
+Long subprocess chains no longer require a whole-file pass for each link.
+Recursive calls still converge through summary dependencies; there is no
+call-depth cutoff. Definition-time defaults and class metadata retain their
+ordered updates, and sink-specific sanitizers and mutation effects remain
+part of the summaries.
+
+Each selected source has a work budget of `max(500000, 128 * AST node count)`.
+Transfers, summary scheduling, and fact substitution consume that budget.
+If it is exhausted, UBS reports an explicit incomplete analysis naming the
+affected component: the normal result is `status: partial` and exit 2.
+Completed findings from independent components remain in the report, failed
+summary writes are rolled back, and the partial scan is not cached as complete.
+This limit reports missing coverage; it does not turn an unfinished scan into
+a clean result.
+
+The regressions for [issue #192](https://github.com/Dicklesworthstone/ultimate_bug_scanner/issues/192)
+cover 50/100/200-function subprocess chains, shuffled definitions, recursion,
+import cycles, standard-library files, and an actual staged scan whose worktree
+differs from the index. They check bounded function-solve counts as well as
+all expected sink locations. A separate native CLI test exhausts the default
+budget with recursive callback permutations and checks partial-result reporting.
+
+Installed scans also batch the checksums of cached helpers in one hash process.
+Every invocation still verifies the pinned bytes; failed or malformed batches
+and missing or mismatched assets use the per-file verification and repair path.
+
 ---
 
 ## 🏆 **Comparison with Other Tools**

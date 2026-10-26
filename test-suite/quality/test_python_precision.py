@@ -2252,6 +2252,26 @@ class HeaderInjectionFlowTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'incomplete header analysis.*evaluation steps'):
                 list(header_injection.find([good]))
 
+    def test_shared_work_limit_keeps_earlier_and_later_header_findings(self):
+        from unittest import mock
+        from ubs_core.taint_flow import Budget
+
+        paths = [self.work / name for name in ('before-limit.py', 'at-limit.py', 'after-limit.py')]
+        for path in paths:
+            path.write_text('def emit(value): response.headers["X"] = value\n'
+                            'emit(request.args["x"])\n', encoding='utf-8')
+        findings = []
+        with mock.patch.object(header_injection.flow, 'Budget',
+                               side_effect=[Budget(), Budget(0), Budget()]), \
+                self.assertRaisesRegex(RuntimeError, 'incomplete header analysis.*AnalysisLimit') as raised:
+            findings.extend(header_injection.find(paths))
+        self.assertEqual([(path.name, line, column) for path, line, column, _ in findings],
+                         [('before-limit.py', 1, 18), ('after-limit.py', 1, 18)])
+        self.assertTrue(all('request.args' in detail and 'response header' in detail
+                            for _, _, _, detail in findings), findings)
+        self.assertIn('at-limit.py', str(raised.exception))
+        self.assertIn('work limit exceeded', str(raised.exception))
+
 
 @unittest.skipUnless(os.environ.get('UBS_PY_HEADER_E2E') == '1',
                      'set UBS_PY_HEADER_E2E=1 for actual header CLI scans')

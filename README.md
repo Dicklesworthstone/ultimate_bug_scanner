@@ -141,6 +141,7 @@ const zipCode = parseInt(userInput);  // 💥 "08" becomes 0 in old browsers (oc
 - `--category=resource-lifecycle` focuses the scanners on Python/Go/Java resource hygiene (context managers, defer symmetry, try-with-resources). UBS automatically narrows the language set to those with lifecycle packs enabled and suppresses unrelated categories.
 - `--comparison=<baseline.json>` diff the latest combined summary against a stored run. Deltas feed into console output, JSON, HTML, and SARIF automation metadata so CI can detect regressions.
 - `--report-json=<file>` writes an enriched summary (project, totals, git metadata, optional comparison block) that you can archive or share with teammates/CI.
+- `--python-pattern-counts=<file>` writes unthresholded per-file/per-rule Python pattern counts, with threshold, severity, context and completeness metadata. See the [count contract](#python-pattern-count-export); this is independent of capped finding samples.
 - `--html-report=<file>` emits a standalone HTML preview showing totals, trends vs. baseline, and per-language breakdowns—ideal for attaching to PRs or chat updates.
 - `--also=FORMAT:FILE` writes another rendering of the same scan, including the full findings ledger. Repeat it for JSON, JSONL, SARIF, or TOON; each selected module runs once. The primary `--format` still controls stdout. Relative destinations use the invocation directory, and two reports cannot target the same file. TOON requires the same verified encoder as `--format=toon`.
 - All shareable outputs inject GitHub permalinks when UBS is run inside a git repo with a GitHub remote. Text output annotates `path:line` references, stdout JSON gains `git.*` metadata plus a `permalink` on every finding sample, and merged SARIF runs carry `properties.permalink` on each result location together with `versionControlProvenance` and `automationDetails` keyed by the comparison id. Permalinks are relative to the repository root even when you scan a subdirectory.
@@ -1117,6 +1118,7 @@ Git Integration:
 Output Control:
   --format=FMT             Output format: text|json|jsonl|sarif|toon (default: text)
   --beads-jsonl=FILE      Write JSONL summary alongside normal output for Beads/"strung"
+  --python-pattern-counts=FILE  Write unthresholded Python pattern counts as JSON
   --no-color               Force disable ANSI colors
   OUTPUT_FILE              Save report to file (auto-tees to stdout)
 
@@ -1310,6 +1312,106 @@ ubs -v --fail-on-warning --exclude=legacy --include-ext=js,ts,tsx . report.txt
 {"type":"scanner","project":"/path/to/project","language":"python","files":42,"critical":1,"warning":3,"info":12,"timestamp":"2025-11-22T09:04:20Z"}
 {"type":"totals","project":"/path/to/project","files":99,"critical":1,"warning":3,"info":27,"timestamp":"2025-11-22T09:04:22Z"}
 ```
+
+### Python pattern count export
+
+Python pattern findings use **distinct matching lines across the selected input**
+to choose a rule's severity. A complete scan can therefore have matching lines
+without reporting a finding. For example, `py.functions.high-param-count` and
+`py.regex.nested-quantifiers` each require **more than three matching lines** to
+report warnings. This is an occurrence threshold, not a threshold on the number
+of files. One or three matching lines produce no finding for that rule; four
+produce a warning count of four. Empty-file padding does not change those counts.
+Other rules have different thresholds or additional context conditions.
+
+Request a separate, unthresholded count report when consuming these measurements:
+
+```bash
+ubs src --only=python --ci --format=json \
+    --python-pattern-counts=pattern-counts.json
+ubs --schema=python-pattern-counts
+
+# The direct Python module supports the same sidecar.
+modules/ubs-python.sh src --ci --no-uv --python-pattern-counts=pattern-counts.json
+
+# Nonzero counts, including rules with no exported finding:
+jq '.counts[] | [.file, .rule_id, .count]' pattern-counts.json
+# The rule's selected-input total, thresholds and effective finding severity:
+jq '.rules[] | select(.rule_id == "py.functions.high-param-count")' pattern-counts.json
+```
+
+The option works alongside text, JSON, JSONL, SARIF and TOON output from `ubs`.
+It does not change ordinary findings, warning totals, the three-sample JSON
+preview limit, or severity-based exit policy. Report delivery errors still exit
+2, as with other requested exports. Relative destinations are relative to the
+invocation directory, and report destinations must be distinct.
+Python must be among the selected scanners. If no Python scanner runs, or a
+module cannot produce the requested export, the request exits 2 and leaves any
+previous destination unchanged.
+
+The JSON document uses `schema: "ubs.python-pattern-counts/1"` and contains:
+
+| Field | Contract |
+| --- | --- |
+| `files` | Sorted selected Python-module input paths as `{ "file": "…" }`, including inputs with zero pattern matches. Selection, exclusions and category skipping still apply. |
+| `counts` | Sparse `{ "file": "…", "rule_id": "…", "count": N }` records for **nonzero** local counts, sorted by file and rule. Counts are not truncated by the sample limit. |
+| `rules` | Every loaded, active Python pattern rule, including rules with zero matches. Each entry has its rule/category IDs, title, selected-input `count`, threshold ladder, threshold scope, resolved severities and context decision. |
+| `skipped_categories` | Category numbers excluded from this run; their rules are not represented as evaluated zeroes. |
+| `status`, `complete`, `errors` | `ok` / `true` / `[]` only after the Python analysis completes. Available evidence from an incomplete Python analysis is `partial` / `false` with diagnostics. This is conservative: a failure in another Python analysis layer also prevents a complete count report. |
+| `count_unit`, `count_stage`, `zero_counts` | Explicit markers for distinct match-start lines, counting after source suppression and before context/thresholds, and the sparse-zero rule described below. |
+| `excluded_layers` | Detectors, registry analyzers, ast-grep (including custom AST rules) and external tools are outside this export. It is a Python **pattern-rule** contract, not an inventory of every Python finding. |
+
+**Counting and zeroes.** A count is the number of distinct physical source lines
+on which a rule's matches **start**, once per `(file, rule_id, line)`.
+Two matches on one line count once; a multiline match counts its start line,
+not every line it spans. Existing rule-specific source views, exclusions and
+post-filters remain in effect: most rules blank strings, some inspect strings,
+and code-only rules also blank comments. The export reuses the same retained
+source-local match facts on cold and warm caches.
+
+An absent `counts` record means zero **only when `complete` is true and both the
+file and rule are listed in `files` and `rules`**. An excluded file, skipped rule,
+unsupported analysis layer or incomplete run must not be inferred to have zero
+matches. `complete` covers the selected input; it does not claim coverage of
+unselected repository files. A missing sidecar after an error is not a zero-count
+report, and a previous report at that destination must not be mistaken for the
+current run.
+
+**Suppression.** “Unthresholded” does not mean “unsuppressed.” Python's shared
+source suppression index removes matches before raw counts and thresholds are
+computed. Bare `# ubs:ignore` covers the applicable statement; scoped markers
+such as `# ubs:ignore[py.functions.high-param-count]` affect only the named rule.
+Trailing, immediately preceding, multiline-statement and supported
+formatter-relocated markers use the same statement-interval semantics as normal
+findings. A marker inside a string is not a suppression. Suppressed matches are
+not exported or counted, including during cache replay.
+
+**Thresholds and context.** `rules[].thresholds` is an ordered ladder of
+`{ "min_count_exclusive": N, "severity": "warning" }` entries. The first entry
+for which the selected-input count is **greater than** `N` wins.
+`threshold_severity` records that result or `null` when no threshold is met.
+`reported_severity` is the same severity only when the rule's context is also
+eligible; otherwise it is `null`. These are selected-input decisions, not a
+severity independently recalculated from each file's count. On incomplete runs
+they describe the available evidence and are not final completeness claims.
+
+`context.gate` and `context.suppress_when` are either `null` or objects containing
+the regex, its Python regex flags and whether it matched. These conditions use
+**raw text across all selected files**, including comments, literals and files
+with no candidate match. A required gate must match somewhere; a suppressor
+matching anywhere makes the rule ineligible. Source suppression of a finding
+does not remove text from this context evidence. Raw counts remain visible
+when such a condition prevents ordinary findings. For example, the existing
+`py.async.un-awaited-paths` suppressor can be satisfied by `await` text in a
+different selected file.
+
+**Additivity boundary.** For complete runs of the same unchanged files, rule
+definitions and local filtering options, these source-local counts can be
+summed over disjoint file selections. Ordinary finding counts and severities
+remain scope-dependent because of thresholds and context gates. This is not a
+promise of additivity for cross-file detectors, taint/data-flow analyses, other
+languages, or arbitrary source concatenation: concatenation can change syntax,
+string/comment boundaries, statement suppression and file-role exclusions.
 
 ### **Custom AST-Grep Rules**
 

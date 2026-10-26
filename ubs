@@ -168,24 +168,24 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='846cae3ae31ae1f7a38dac12081b72559045fbd3db6b45d3d61a3ac9468fd308'
-  [cpp]='1e6a756b828dc2794061a9110a1c2e1a11d8ec96ef855e3662f00aa358ac7493'
-  [csharp]='36174474fc368e00aa9b335f72a99185a8ece433408cf725ed8aa20b5bff339c'
-  [elixir]='c89135018e465c2da556e94801281b50cfb3a8bcc27f1580f55b2f06684b8a6e'
-  [golang]='6c492c3e6b80fe0b1134621f76c010e7f511cba88a5e033d7f7105b0c124a304'
-  [java]='b82750d0fd2163f545c5eee28939444cf7cc53a4b2d8505bdbcfb202d8fdc3ce'
-  [js]='e0337727a625c68e7125fcdf4efd7feb8b986e6472a99c0d1090038387150bab'
-  [kotlin]='1b8c53434e6a2a804a049675b17f951d7a6fcba2edcaaf759582498cdeb21ec4'
-  [php]='6bc3a4363e10c577acb2b2ae42db4454988899b5ea6e9e21d199473080c5c036'
-  [python]='84b49e3d4676723a249c28496a65a23c6ab53acc01ff896424365c57e5077d90'
-  [ruby]='9ef31ec60a27586e74364adc654cc55ec7e4b4793b2c7d2ced479ef74b3e6ba4'
-  [rust]='92726aa8a66d042c0c041004610a477261d9ab6a9461aeb0e944a733d92bdb2a'
-  [swift]='e4d70a0edbe9438475865a398c349840754935637e05842357199d33e54868b5'
+  [bash]='5783895c1163972dc1a96b30b44e65c58e033c07fda8fd4bef58f5d8fe7a00ea'
+  [cpp]='3be02566fedd07ec4cc86c49d5015c002cca8386aba6eb3537ab795f6e41780d'
+  [csharp]='82bb803a65e3f9f8af16bf173be10f9a5540e8ffe59a7ae90e44fce780aecf35'
+  [elixir]='c78de479b931b5241a66dd80419157cb40f7403e90b6aad0192f6835aeb6a830'
+  [golang]='c952210d9af87c8bc5b5aeeade70c518d8435fcf445ee4035d2a6fb522cd368f'
+  [java]='197c50fe1150617cc4e5f789e03359fd60f530c5bba58d1a6c8941cdbd9075a2'
+  [js]='e90c74118d38aec249d2456e85feb8cb52af5b3fb4ccfc2f2e7421ed56fbf3ab'
+  [kotlin]='84e80dda7927f4987f67d16b2db9a1918f581365257babdf733d340ec10d5edc'
+  [php]='8bd2a19097cdf05f547aefc5346045371d76a4198c2d77d4f3a4d87e64e6ecbb'
+  [python]='99855400d9f799a43282ce47309e9f5acc3c2576d69f975e65441e2c16690dfa'
+  [ruby]='b1931692b87eef3cb4e65aa73be1cfbe2dccfb51038b1e54189ad7a96ae1c04e'
+  [rust]='d6a5e5787250793a5204ed12aad6a3e65de410fdc3e8e75e09e2063c9bc1cb75'
+  [swift]='99cb9265594300503a1ed6d0464c5dc2de5c76f93cd0b91afd6c9eccad4bd700'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
 declare -A HELPER_CHECKSUMS=(
-  ['contract.json']='b3fee512c49997b09cb12faf749d350fdcbed8583f39e0c19340557afb14ecaa'
+  ['contract.json']='41c98b992a999da70a21350ba240e7854d805381aee51844c4f2f93641a922b6'
   ['helpers/async_task_handles_csharp.py']='d5b029f8fe9452fafba22a9bd6a26db9952b8072fdee224d976f140c824af93d'
   ['helpers/cfg_test_only_modules_rust.py']='27dbd7f843d546c07743bf642f4dfa9912f0c205007c583c5e18d6b52fa39e68'
   ['helpers/resource_lifecycle_cpp.py']='886611236e8230551ad302bc2b91894935adb29f427dff92c5e0e18370e9f582'
@@ -480,7 +480,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/py_patterns/quality.py']='d2e5a31537312523a9e342b642db37e9a87cc6c1ab0d4f4bfd05ea922ab6885c'
   ['helpers/ubs_core/py_patterns/security_rg.py']='72add761922edef8a654d3e7798aa9393db604d0c7bc24c067300871018e8ffb'
   ['helpers/ubs_core/py_rules.py']='e35ae329bddcaed0a0e9d4244b9907455d00d76abe9d46d3dad2a69a1313db13'
-  ['helpers/ubs_core/py_scan.py']='0337b1825905c3a48dec5d6b3fa882a28783b289f768936e083814f25333bbe5'
+  ['helpers/ubs_core/py_scan.py']='fb4ba168d28de2d5d1ed1c939228ebab4a0e65c9e86ca63202c7cb1659f71ee4'
   ['helpers/ubs_core/registry.py']='85a9d845279594b19097e8f576f6d4a5fea86eed8d29e7c577cb0abcf36027e1'
   ['helpers/ubs_core/ruby_ast.py']='fe4372cbd257e2725e4fd584dfa6cffa338a17b252962ea6062f5c22c152d472'
   ['helpers/ubs_core/ruby_detectors/__init__.py']='7b5ef3809ebd50136d741ade03d1c56b4b16053753dd79a8d90dd9021ebb0db7'
@@ -553,7 +553,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='77a16e60dce843652c053d069dcbffce17c8ffae543bf77693d2e8254a3967de'
   ['helpers/ubs_core/taint_flow.py']='828316f978026b562f13a62e86abfefa83e5dfc802cc97151ecda6de107e16f2'
-  ['lib/ubs-common.sh']='9fb33b59cc5097adaa34df9d4ca8e348f26dd87e1eb85976215ef15763ac8632'
+  ['lib/ubs-common.sh']='bb1402e96f5f5d54f9d1ba4b1f76459d37f482ff5dfc911182770b27b13c1b25'
 )
 
 # contract.json as shipped by earlier releases (sha256 -> first tag), kept out
@@ -1537,6 +1537,7 @@ COMPARISON_FILE=""
 SAVE_BASELINE_FILE=""
 NEW_ONLY=0
 REPORT_JSON_PATH=""
+PYTHON_PATTERN_COUNTS_PATH=""
 HTML_REPORT_PATH=""
 GIT_MODE=""  # staged, diff, or empty
 SCAN_FILES=()  # explicit target list from --files or multiple positional args (files and/or directories)
@@ -1880,7 +1881,7 @@ Usage: ubs [options] [PROJECT_DIR]
        ubs doctor [options]
        ubs sessions [--entries N] [--raw]
        ubs robot-docs [guide|commands|examples|exit-codes|formats|env|config|all]   (JSON for agents)
-       ubs --schema[=json|jsonl|sarif|toon|error|doctor|config|all]                (JSON Schema)
+       ubs --schema[=json|jsonl|sarif|toon|error|doctor|config|python-pattern-counts|all] (JSON Schema)
 
 Options:
   --format=FMT            text|json|jsonl|sarif|toon (default: text)
@@ -1917,6 +1918,8 @@ Options:
                           (reporting only: the diff annotates the shareable
                           report; exit code still reflects CURRENT totals)
   --report-json=FILE      Write combined summary JSON to FILE
+  --python-pattern-counts=FILE
+                         Export unthresholded per-file Python pattern counts as JSON
   --html-report=FILE      Emit shareable HTML report to FILE
   --beads-jsonl=FILE      Also write combined findings to JSONL for Beads/strung
   --jsonl-summary-only    JSONL output: emit only summary counts, no individual findings
@@ -2018,7 +2021,7 @@ USAGE
 # ─────────────────────────────────────────────────────────────────────────────
 # Machine-readable self-description (bead K1)
 #   ubs robot-docs [guide|commands|examples|exit-codes|formats|env|all]
-#   ubs --schema[=json|jsonl|sarif|toon|error|doctor|all]
+#   ubs --schema[=json|jsonl|sarif|toon|error|doctor|config|python-pattern-counts|all]
 # Both print ONE JSON document on stdout (stderr for diagnostics) and exit 0;
 # an unknown topic/format exits 2. schema_version changes when a field is
 # removed or its meaning changes; additions keep the version.
@@ -2051,7 +2054,7 @@ cat <<'JSON'
       {"name": "sessions", "usage": "ubs sessions [--entries N] [--raw]", "description": "Show recent installer session summaries."},
       {"name": "explain", "usage": "ubs explain <rule-id> [--format=text|json]", "description": "Explain a rule: message, remediation, fixture examples, confidence, category."},
       {"name": "robot-docs", "usage": "ubs robot-docs [guide|commands|examples|exit-codes|formats|env|all]", "description": "This document (JSON on stdout)."},
-      {"name": "--schema", "usage": "ubs --schema[=json|jsonl|sarif|toon|error|doctor|all]", "description": "JSON Schema (draft 2020-12) for each output format."}
+      {"name": "--schema", "usage": "ubs --schema[=json|jsonl|sarif|toon|error|doctor|config|python-pattern-counts|all]", "description": "JSON Schema (draft 2020-12) for each output format and the Python pattern count export."}
     ],
     "flags": [
       {"name": "--format", "args": "FMT", "example": "--format=json", "description": "Output format: text (default), json, jsonl, sarif, toon."},
@@ -2089,6 +2092,7 @@ cat <<'JSON'
       {"name": "--save-baseline", "args": "FILE", "example": "--save-baseline=baseline.json", "description": "Save the current scan findings and totals to FILE as a baseline."},
       {"name": "--new-only", "args": null, "example": "--new-only", "description": "Report only findings not present in the baseline (diff mode)."},
       {"name": "--report-json", "args": "FILE", "example": "--report-json=summary.json", "description": "Write the combined summary JSON to FILE."},
+      {"name": "--python-pattern-counts", "args": "FILE", "example": "--python-pattern-counts=counts.json", "description": "Export unthresholded per-file Python pattern counts and threshold/context/completeness metadata to a separate JSON file. Python must be selected. Findings, samples and findings-based exits are unchanged; unavailable or undeliverable exports exit 2. See --schema=python-pattern-counts."},
       {"name": "--also", "args": "FMT:FILE", "example": "--also=sarif:report.sarif", "description": "Render the same scan to an additional JSON, JSONL, SARIF or TOON file. Repeatable; no module is scanned again. Distinct report destinations are required; delivery failures exit 2."},
       {"name": "--html-report", "args": "FILE", "example": "--html-report=report.html", "description": "Write a shareable HTML report."},
       {"name": "--beads-jsonl", "args": "FILE", "example": "--beads-jsonl=findings.jsonl", "description": "Write findings as JSONL for Beads/strung."},
@@ -2341,6 +2345,81 @@ cat <<'JSON'
       }
     }
   },
+  "python-pattern-counts": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "UBS opt-in Python pattern counts (--python-pattern-counts=FILE)",
+    "description": "Source-local distinct match-start-line counts after source suppression and before selected-input context gates and severity thresholds. This separate artifact does not change findings, samples, totals or finding-based exits and does not describe other analysis layers. Missing rows mean zero only for listed files and rules when complete is true.",
+    "type": "object",
+    "required": ["schema", "language", "version", "project", "status", "complete", "errors", "count_unit", "count_stage", "zero_counts", "files", "skipped_categories", "rules", "counts", "excluded_layers"],
+    "properties": {
+      "schema": {"const": "ubs.python-pattern-counts/1"},
+      "language": {"const": "python"},
+      "version": {"type": "string"},
+      "project": {"type": "string"},
+      "status": {"enum": ["ok", "partial"]},
+      "complete": {"type": "boolean"},
+      "errors": {"type": "array", "items": {"type": "string"}},
+      "count_unit": {"const": "distinct-match-start-lines"},
+      "count_stage": {"const": "after-source-suppression-before-context-and-thresholds"},
+      "zero_counts": {"const": "implicit-for-listed-files-and-rules-when-complete"},
+      "files": {"type": "array", "uniqueItems": true, "items": {"type": "object", "required": ["file"], "properties": {"file": {"type": "string"}}}},
+      "skipped_categories": {"type": "array", "uniqueItems": true, "items": {"type": "integer"}},
+      "rules": {"type": "array", "items": {"$ref": "#/$defs/rule"}},
+      "counts": {"type": "array", "items": {"$ref": "#/$defs/file_rule_count"}},
+      "excluded_layers": {"const": ["detectors", "registry-analyzers", "ast-grep", "external-tools"]}
+    },
+    "oneOf": [
+      {"properties": {"complete": {"const": true}, "status": {"const": "ok"}, "errors": {"maxItems": 0}}},
+      {"properties": {"complete": {"const": false}, "status": {"const": "partial"}}}
+    ],
+    "$defs": {
+      "severity": {"enum": ["critical", "warning", "info"]},
+      "nullable_severity": {"enum": ["critical", "warning", "info", null]},
+      "count": {"type": "integer", "minimum": 0},
+      "matcher": {
+        "type": "object",
+        "required": ["regex", "flags", "matched"],
+        "properties": {"regex": {"type": "string"}, "flags": {"type": "integer"}, "matched": {"type": "boolean"}}
+      },
+      "context": {
+        "type": "object",
+        "required": ["scope", "gate", "suppress_when", "eligible"],
+        "properties": {
+          "scope": {"const": "selected-input-raw-text"},
+          "gate": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/matcher"}]},
+          "suppress_when": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/matcher"}]},
+          "eligible": {"type": "boolean"}
+        }
+      },
+      "rule": {
+        "type": "object",
+        "required": ["rule_id", "category_id", "title", "thresholds", "threshold_scope", "count", "threshold_severity", "reported_severity", "context"],
+        "properties": {
+          "rule_id": {"type": "string"},
+          "category_id": {"type": "string"},
+          "title": {"type": "string"},
+          "thresholds": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["min_count_exclusive", "severity"],
+              "properties": {"min_count_exclusive": {"type": "integer"}, "severity": {"$ref": "#/$defs/severity"}}
+            }
+          },
+          "threshold_scope": {"const": "selected-input"},
+          "count": {"$ref": "#/$defs/count"},
+          "threshold_severity": {"$ref": "#/$defs/nullable_severity"},
+          "reported_severity": {"$ref": "#/$defs/nullable_severity"},
+          "context": {"$ref": "#/$defs/context"}
+        }
+      },
+      "file_rule_count": {
+        "type": "object",
+        "required": ["file", "rule_id", "count"],
+        "properties": {"file": {"type": "string"}, "rule_id": {"type": "string"}, "count": {"type": "integer", "minimum": 1}}
+      }
+    }
+  },
   "jsonl": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "title": "ubs --format=jsonl (one object per line)",
@@ -2509,7 +2588,7 @@ emit_schema(){
     return 2
   fi
   case "$fmt" in
-    json|jsonl|sarif|doctor|config) ;;
+    json|jsonl|sarif|doctor|config|python-pattern-counts) ;;
     toon) fmt="json" ;;
     error)
       schema_document | jq --arg id "$UBS_SCHEMA_ID_BASE/error.schema.json" --arg sv "$UBS_SCHEMA_VERSION" '
@@ -2523,7 +2602,7 @@ emit_schema(){
         + {toon: {"$ref": ($base + "/json.schema.json"), description: "TOON is tru-encoded json; validate the decoded document against the json schema."}}'
       return 0 ;;
     *)
-      say_err "${RED}${X}${RESET} unknown --schema format: $fmt (json|jsonl|sarif|toon|error|doctor|config|all)"
+      say_err "${RED}${X}${RESET} unknown --schema format: $fmt (json|jsonl|sarif|toon|error|doctor|config|python-pattern-counts|all)"
       return 2 ;;
   esac
   schema_document | jq --arg key "$fmt" --arg base "$UBS_SCHEMA_ID_BASE" --arg sv "$UBS_SCHEMA_VERSION" '
@@ -2766,6 +2845,17 @@ else
       --report-json)
         if [[ $# -lt 2 ]]; then usage; exit 2; fi
         shift; REPORT_JSON_PATH="$1"; shift;;
+      --python-pattern-counts=*)
+        PYTHON_PATTERN_COUNTS_PATH="${1#*=}"
+        if [[ -z "$PYTHON_PATTERN_COUNTS_PATH" || "$PYTHON_PATTERN_COUNTS_PATH" == "-" ]]; then
+          say_err "ERROR: --python-pattern-counts requires a nonempty file path"; exit 2
+        fi
+        shift;;
+      --python-pattern-counts)
+        if [[ $# -lt 2 || -z "${2:-}" || "${2:-}" == "-" || "${2:-}" == --* ]]; then
+          say_err "ERROR: --python-pattern-counts requires a nonempty file path"; exit 2
+        fi
+        PYTHON_PATTERN_COUNTS_PATH="$2"; shift 2;;
       --html-report=*) HTML_REPORT_PATH="${1#*=}"; shift;;
       --html-report)
         if [[ $# -lt 2 ]]; then usage; exit 2; fi
@@ -2940,10 +3030,14 @@ else
     load_scan_config
     if [[ "$UBS_PROFILE" == "strict" ]]; then FAIL_ON_WARNING=1; fi
   fi
-  if [[ ${#ALSO_PATHS[@]} -gt 0 ]]; then
+  if [[ -n "$PYTHON_PATTERN_COUNTS_PATH" && ( "$LIST_CATEGORIES" -eq 1 || "$SHOW_VERSION" -eq 1 || "$UPDATE_ONLY" -eq 1 ) ]]; then
+    say_err "ERROR: --python-pattern-counts requires a scan, not a listing, version or update request"
+    exit 2
+  fi
+  if [[ ${#ALSO_PATHS[@]} -gt 0 || -n "$PYTHON_PATTERN_COUNTS_PATH" ]]; then
     # Reject aliases before --output can truncate a file or any scan starts.
     # A destination cannot represent two different reports at once.
-    if ! python3 - "$OUTPUT_FILE" "$SAVE_BASELINE_FILE" "$REPORT_JSON_PATH" \
+    if ! python3 - "$PYTHON_PATTERN_COUNTS_PATH" "$OUTPUT_FILE" "$SAVE_BASELINE_FILE" "$REPORT_JSON_PATH" \
         "$HTML_REPORT_PATH" "$BEADS_JSONL_PATH" "${ALSO_PATHS[@]}" <<'PYALSO'
 import os
 from pathlib import Path
@@ -2951,6 +3045,10 @@ import sys
 
 seen = []
 try:
+    if sys.argv[1]:
+        target = Path(sys.argv[1])
+        if target.exists() and not target.is_file():
+            raise ValueError("pattern counts destination must be a regular file")
     for raw in sys.argv[1:]:
         if not raw:
             continue
@@ -2960,7 +3058,8 @@ try:
                 raise ValueError(f"report destinations refer to the same file: {raw}")
         seen.append(path)
 except (OSError, RuntimeError, ValueError) as exc:
-    print(f"ubs: invalid --also output: {exc}", file=sys.stderr)
+    option = "--python-pattern-counts" if sys.argv[1] else "--also"
+    print(f"ubs: invalid {option} output: {exc}", file=sys.stderr)
     raise SystemExit(2)
 PYALSO
     then
@@ -7627,6 +7726,52 @@ def restore_json_file(path: str, a):
         return None
 
 
+def restore_pattern_counts(a) -> int:
+    """Restore a fresh count sidecar without rewriting regexes or diagnostics."""
+    try:
+        target = Path(a.json)
+        doc = json.loads(target.read_text(encoding="utf-8"))
+        if (not isinstance(doc, dict) or doc.get("schema") != "ubs.python-pattern-counts/1"
+                or doc.get("language") != "python" or not isinstance(doc.get("complete"), bool)
+                or doc.get("status") not in ("ok", "partial")
+                or doc["complete"] != (doc["status"] == "ok")
+                or not isinstance(doc.get("errors"), list)
+                or not all(isinstance(error, str) for error in doc["errors"])
+                or (doc["complete"] and doc["errors"])
+                or not all(isinstance(doc.get(key), list) for key in ("files", "rules", "counts"))):
+            raise ValueError("invalid Python pattern count document")
+        for row in doc["files"] + doc["counts"]:
+            if not isinstance(row, dict) or not isinstance(row.get("file"), str):
+                raise ValueError("pattern count file entries require a file path")
+        for row in doc["counts"]:
+            if (not isinstance(row.get("rule_id"), str)
+                    or type(row.get("count")) is not int or row["count"] < 1):
+                raise ValueError("pattern count entries require a rule and positive count")
+        doc = restore_json_doc(doc, a)
+        if not a.single_file:
+            for row in doc["files"] + doc["counts"]:
+                row["file"] = restore_workspace(row["file"], a)
+        doc["project"] = a.project
+        doc["files"].sort(key=lambda row: row["file"])
+        doc["counts"].sort(key=lambda row: (row["file"], row["rule_id"]))
+        try:
+            summary = json.loads(Path(a.raw).read_text(encoding="utf-8"))
+            state = summary.get("status", "ok") if isinstance(summary, dict) else "unknown"
+        except (OSError, ValueError):
+            state = "unknown"
+        if state != "ok":
+            doc["complete"] = False
+            doc["status"] = "partial"
+            reason = f"Python module completion status: {state}"
+            if reason not in doc["errors"]:
+                doc["errors"].append(reason)
+        target.write_text(json.dumps(doc, ensure_ascii=False) + "\n", encoding="utf-8")
+        return 0
+    except (OSError, ValueError) as exc:
+        print(f"ubs: cannot prepare the requested Python pattern count export: {exc}", file=sys.stderr)
+        return 2
+
+
 def restore_findings_file(path: str, a):
     """Restore the NDJSON sink one record at a time, without loading it all.
 
@@ -7783,6 +7928,8 @@ def main() -> int:
     for name in ("mode", "lang", "raw", "txt", "json", "sarif", "findings", "metrics_dir", "workspace", "source", "single_file", "timestamp", "project", "no_suppress", "blob_base", "toplevel", "helpers_dir", "mirror_map", "require_marker"):
         ap.add_argument("--" + name.replace("_", "-"), default="")
     a = ap.parse_args()
+    if a.mode == "pattern-counts":
+        return restore_pattern_counts(a)
     if a.mode == "text":
         lines = text_lines(a.raw)
         if a.no_suppress != "1":
@@ -7993,6 +8140,11 @@ run_lang(){
   fi
   if [[ "$lang" == "golang" && ${#GO_MODULE_ARGS[@]} -gt 0 ]]; then
     args+=("${GO_MODULE_ARGS[@]}")
+  fi
+  if [[ "$lang" == "python" && -n "$PYTHON_PATTERN_COUNTS_PATH" ]]; then
+    # A module writes only into this run's private workspace. Restore paths
+    # and deliver to the requested destination after the scan has finished.
+    args+=("--python-pattern-counts=$TMPDIR_RUN/python.pattern-counts")
   fi
   if [[ -n "$GLOBAL_EXCLUDE_PATTERNS" && ${#SCAN_FILES[@]} -eq 0 ]]; then
     args+=("--exclude=$GLOBAL_EXCLUDE_PATTERNS")
@@ -8661,6 +8813,20 @@ deliver_file(){
   return 0
 }
 
+write_python_pattern_counts(){
+  [[ -n "$PYTHON_PATTERN_COUNTS_PATH" ]] || return 0
+  local staged="$TMPDIR_RUN/python.pattern-counts"
+  if [[ ! -s "$staged" || ! -f "$TMPDIR_RUN/postprocess.py" ]]; then
+    say_err "ERROR: the requested Python pattern count export is unavailable; no new report was produced"
+    return 1
+  fi
+  if ! postprocess_module pattern-counts python "$TMPDIR_RUN/python.json" "" "$staged" "" "" ""; then
+    say_err "ERROR: the requested Python pattern count export could not be prepared; the previous destination is unchanged"
+    return 1
+  fi
+  deliver_file "$staged" "$PYTHON_PATTERN_COUNTS_PATH" "Python pattern counts"
+}
+
 render_additional_format(){
   local fmt="$1" no_scan="$2" problem
   if [[ "$fmt" == "toon" ]]; then
@@ -8819,6 +8985,13 @@ say "${WHITE}Format:${RESET}  ${CYAN}$FORMAT${RESET}"
 # One post-processing script per run (bead C3b); defined above, used by run_lang.
 if need_cmd python3; then write_postprocess_script; fi
 read -r -a langs < <(printf '%s\n' "$(select_langs)")
+if [[ -n "$PYTHON_PATTERN_COUNTS_PATH" && " ${langs[*]} " != *" python "* ]]; then
+  say_err "ERROR: --python-pattern-counts is unavailable because no Python scanner was selected"
+  emit_error_envelope "environment" "error" "python-pattern-counts-unavailable" \
+    "The requested Python pattern count export requires a selected Python scanner" \
+    '"failed_modules":[]'
+  exit 2
+fi
 if [[ ${#langs[@]} -eq 0 ]]; then emit_no_langs_result; fi
 if [[ "$UBS_KEEP_TEMP" == "1" ]]; then
   for L in "${langs[@]}"; do
@@ -8894,7 +9067,13 @@ for L in "${langs[@]}"; do
   p="$(resolve_module_path "$L")"
   # Environment error (exit 2): the module or its helpers could not be
   # obtained or failed checksum verification; nothing was scanned.
-  ensure_module "$L" "$p" || { say "${RED}$X failed to ensure module for $L${RESET}"; exit 2; }
+  if ! ensure_module "$L" "$p"; then
+    say "${RED}$X failed to ensure module for $L${RESET}"
+    if [[ "$L" == "python" && -n "$PYTHON_PATTERN_COUNTS_PATH" ]]; then
+      say_err "ERROR: the requested Python pattern count export is unavailable because the Python module could not be loaded"
+    fi
+    exit 2
+  fi
   MODULE_PATHS["$L"]="$p"
 done
 
@@ -9386,6 +9565,7 @@ case "$FORMAT" in
 	  fi
 	fi
 
+write_python_pattern_counts || status=2
 write_additional_reports || status=2
 
 if [[ -n "$BEADS_JSONL_PATH" ]]; then

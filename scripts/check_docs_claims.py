@@ -293,7 +293,7 @@ def check_module_readme() -> None:
         # The repeated ", name" group has a mandatory literal ", " separator that
         # [a-z] cannot produce, so the parse is unique and backtracking
         # is linear. ubs:ignore[py.regex.nested-quantifiers]
-        subset_m = re.search(r"\(([a-z]+(?:, [a-z]+)+)\)", rest)
+        subset_m = re.search(r"\(([a-z]+(?:, [a-z]+)*)\)", rest)
         same_m = re.search(r"same modules as (--[a-z-]+)", rest)
         if except_m:
             expected -= {except_m.group(1)}

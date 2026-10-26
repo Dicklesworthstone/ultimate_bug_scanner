@@ -474,6 +474,102 @@ def reconcile_pattern_records(patterns: Sequence[Pattern], records: Sequence[dic
     return result
 
 
+def pattern_count_report(
+    patterns: Sequence[Pattern],
+    records: Sequence[dict],
+    files: Sequence[Path],
+    skip: frozenset[int] | set[int] = frozenset(),
+    *,
+    errors: Sequence[str] = (),
+    project: str = "",
+    version: str = "",
+) -> dict:
+    """Export retained pattern facts without turning them into findings.
+
+    ``records`` must already have passed source suppression, but not selected-
+    input reconciliation. A count is the number of distinct physical match-
+    start lines for one selected file and rule, after the rule's source filters.
+    Global context gates and severity thresholds only affect the rule metadata;
+    neither can erase these source-local counts. Other scanner layers are not
+    part of this contract.
+
+    Rows are sparse: a missing pair is zero only when both the file and rule
+    are listed and ``complete`` is true. Any analysis failure conservatively
+    makes omissions unknown. Stable ordering and the absence of cache/timing
+    fields make equivalent cold and warm exports identical.
+    """
+    selected = {str(path) for path in files}
+    active = {pattern.rule_id: pattern for pattern in patterns if pattern.category not in skip}
+    lines: dict[tuple[str, str], set[int]] = {}
+    gates: set[str] = set()
+    suppressors: set[str] = set()
+    for record in records:
+        rule = record.get("rule", "")
+        path = record.get("path", "")
+        if rule not in active or path not in selected:
+            continue
+        kind = record.get(_PATTERN_CACHE_KIND)
+        if kind == "match":
+            lines.setdefault((path, rule), set()).add(int(record["line"]))
+        elif kind == "context":
+            if record.get("gate"):
+                gates.add(rule)
+            if record.get("suppress"):
+                suppressors.add(rule)
+
+    counts = [{"file": path, "rule_id": rule, "count": len(numbers)}
+              for (path, rule), numbers in sorted(lines.items())]
+    totals: dict[str, int] = {}
+    for row in counts:
+        totals[row["rule_id"]] = totals.get(row["rule_id"], 0) + row["count"]
+
+    def context_fact(regex: re.Pattern[str] | None, matched: bool) -> dict | None:
+        if regex is None:
+            return None
+        return {"regex": regex.pattern, "flags": int(regex.flags), "matched": matched}
+
+    rules = []
+    for rule, pattern in sorted(active.items()):
+        count = totals.get(rule, 0)
+        eligible = ((pattern.gate_regex is None or rule in gates)
+                    and (pattern.suppress_when_regex is None or rule not in suppressors))
+        threshold_severity = resolve_severity(pattern, count)
+        rules.append({
+            "rule_id": rule,
+            "category_id": f"python.{slug_for_category(pattern.category)}",
+            "title": pattern.title,
+            "thresholds": [{"min_count_exclusive": minimum, "severity": severity}
+                           for minimum, severity in pattern.thresholds],
+            "threshold_scope": "selected-input",
+            "count": count,
+            "threshold_severity": threshold_severity,
+            "reported_severity": threshold_severity if eligible else None,
+            "context": {
+                "scope": "selected-input-raw-text",
+                "gate": context_fact(pattern.gate_regex, rule in gates),
+                "suppress_when": context_fact(pattern.suppress_when_regex, rule in suppressors),
+                "eligible": eligible,
+            },
+        })
+    return {
+        "schema": "ubs.python-pattern-counts/1",
+        "language": "python",
+        "version": version,
+        "project": project,
+        "status": "partial" if errors else "ok",
+        "complete": not errors,
+        "errors": list(errors),
+        "count_unit": "distinct-match-start-lines",
+        "count_stage": "after-source-suppression-before-context-and-thresholds",
+        "zero_counts": "implicit-for-listed-files-and-rules-when-complete",
+        "excluded_layers": ["detectors", "registry-analyzers", "ast-grep", "external-tools"],
+        "files": [{"file": path} for path in sorted(selected)],
+        "skipped_categories": sorted(skip),
+        "rules": rules,
+        "counts": counts,
+    }
+
+
 def _analysis_error(errors: list[str] | None, stage: str, exc: BaseException) -> None:
     """Keep failures separate from findings; direct APIs still raise by default."""
     if errors is None:
@@ -944,6 +1040,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ast-rule-dir", default="", help="consolidated ast-grep rule dir (sgconfig-*.yml + manifest.json)")
     parser.add_argument("--text-out", default="", help="write the legacy-format text report here")
     parser.add_argument("--json-out", default="", help="write the UBS summary JSON document here")
+    parser.add_argument("--pattern-counts-out", default="",
+                        help="write unthresholded per-file Python pattern counts as JSON")
     parser.add_argument("--project", default="", help="project path recorded in the json summary")
     parser.add_argument("--version", default="", help="module version recorded in the json summary")
     parser.add_argument("--fail-on-warning", action="store_true")
@@ -1085,7 +1183,12 @@ def main(argv: list[str] | None = None) -> int:
     # Suppress only emitted findings, preserving source facts and helper flow.
     # Recheck cached records too, before project-wide severity thresholds and
     # the common sink determine every report, total and exit status.
-    all_recs = reconcile_pattern_records(patterns, suppressions.filter(all_recs))
+    all_recs = suppressions.filter(all_recs)
+    count_report = pattern_count_report(
+        patterns, all_recs, files, skip,
+        project=args.project or args.project_dir, version=args.version,
+    ) if args.pattern_counts_out else None
+    all_recs = reconcile_pattern_records(patterns, all_recs)
 
     # Include cached files and suppression reads in the completion barrier.
     # A changed input cannot be certified clean merely because its old version
@@ -1094,6 +1197,16 @@ def main(argv: list[str] | None = None) -> int:
     for path in files:
         if source_versions.get(path) != final_versions.get(path):
             scan_errors.append(f"source changed during analysis: {path}")
+
+    if count_report is not None:
+        count_report.update(status="partial" if scan_errors else "ok",
+                            complete=not scan_errors, errors=list(scan_errors))
+        try:
+            Path(args.pattern_counts_out).write_text(
+                json.dumps(count_report, ensure_ascii=False) + "\n", encoding="utf-8",
+            )
+        except OSError as exc:
+            _analysis_error(scan_errors, "pattern count export", exc)
 
     with open(args.sink, "w", encoding="utf-8") as sink_file:
         for r in all_recs:

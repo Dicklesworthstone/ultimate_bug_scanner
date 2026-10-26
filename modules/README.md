@@ -17,6 +17,7 @@ Options:
 --include-ext=CSV  extra file extensions to scan
 --skip=CSV         skip category numbers (numbers differ per module)
 --report-json=FILE write NDJSON findings sink to FILE
+--python-pattern-counts=FILE write unthresholded per-file/per-rule counts as JSON (python)
 --files-from=FILE  NUL-separated file list to scan (meta-runner contract v2 hand-off)
 --rules=DIR        run custom ast-grep rules alongside the module's native checks (all modules)
 --list-rules       print generated ast-grep rule ids (native security ids for PHP) and exit
@@ -29,6 +30,14 @@ Options:
 The block above is rendered from `modules/contract.json` by `scripts/gen_module_readme.py` (the machine-readable contract: flags with their module lists, formats, exit codes, environment, summary keys, and per-module extensions and manifest files). `scripts/check_docs_claims.py` verifies the contract against every module's argument parser and fails when the block or the contract drifts. Flags a single module adds beyond the shared set are listed per module in the contract (`extra_flags`); `ubs-<lang>.sh --help` prints them. Contract v2 (shared library, `--files-from`, one findings schema) lands module by module with the A4 ports and is recorded per module as `contract: 2`.
 
 New module: `scripts/new-module.sh <lang> --extensions a,b` scaffolds a contract-v2 module with fixtures and manifest cases (see AGENTS.md, "Adding a language module").
+
+The Python module's `--python-pattern-counts=FILE` writes the same versioned JSON
+count sidecar as the meta-runner, independently of `--format`. It includes
+below-threshold counts and selected-input severity/context metadata; it does not
+expand finding samples or change the finding totals. See the
+[Python pattern count contract](../README.md#python-pattern-count-export) for
+distinct-line counting, source suppression, context gates and completeness.
+`ubs --schema=python-pattern-counts` prints its JSON Schema.
 
 Responsibilities:
 - Detect files for the given language

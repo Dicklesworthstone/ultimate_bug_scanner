@@ -27,6 +27,7 @@ import time
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HELPERS_DIR = REPO_ROOT / "modules" / "helpers"
@@ -1476,6 +1477,403 @@ class IncrementalCacheTests(unittest.TestCase):
             self.assertEqual(warm, cold)
 
         self._run_with_logging(case_id, _test)
+
+
+class PythonPatternCountExportTests(unittest.TestCase):
+    """GH #191: unthresholded pattern facts are independent of report samples."""
+
+    PARAM_RULE = "py.functions.high-param-count"
+    REGEX_RULE = "py.regex.nested-quantifiers"
+
+    def setUp(self) -> None:
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        self.root = Path(tempfile.mkdtemp(prefix="python-pattern-counts-", dir=artifacts))
+        self.project = self.root / "project"
+        self.project.mkdir()
+        self.run_number = 0
+        self.env = {key: value for key, value in os.environ.items()
+                    if not key.startswith(("UBS_", "XDG_"))}
+        self.env.update({
+            "PYTHONPATH": str(HELPERS_DIR),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "UBS_NO_AUTO_UPDATE": "1",
+            "UBS_KEEP_TEMP": "1",
+            "UBS_CACHE_DIR": str(self.root / "cache"),
+            "ENABLE_UV_TOOLS": "0",
+            "TMPDIR": str(self.root),
+        })
+
+    def run(self, result=None):
+        print(f"[{self.id()}] RUN", flush=True)
+        started = time.monotonic()
+        result = super().run(result)
+        failed = any(test is self or getattr(test, "test_case", None) is self
+                     for test, _ in result.failures + result.errors)
+        print(f"[{self.id()}] {'FAIL' if failed else 'PASS'} "
+              f"({time.monotonic() - started:.3f}s)", flush=True)
+        return result
+
+    def decode_json(self, text: str, context: str):
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as exc:
+            self.fail(f"{context}: invalid JSON: {exc}\n{text[:2000]}")
+
+    @staticmethod
+    def function(name: str) -> str:
+        return (f"def {name}(one, two, three, four, five, six, seven):\n"
+                "    return one\n")
+
+    def source(self, name: str, text: str) -> Path:
+        path = self.project / name
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def scan(self, files: list[Path], *, export: bool = True,
+             no_cache: bool = False, fail_on_warning: bool = False,
+             skip: str = "", expected_hits: int | None = None,
+             complete: bool = True):
+        self.run_number += 1
+        output = self.root / f"run-{self.run_number:02d}"
+        output.mkdir()
+        sink = output / "findings.ndjson"
+        summary = output / "summary.json"
+        report = output / "report.txt"
+        counts = output / "pattern-counts.json"
+        args = [sys.executable, "-B", "-m", "ubs_core.py_scan",
+                "--sink", str(sink), "--json-out", str(summary),
+                "--text-out", str(report), "--project-dir", str(self.project),
+                "--skip", skip, "--jobs", "1"]
+        if export:
+            args.extend(["--pattern-counts-out", str(counts)])
+        if fail_on_warning:
+            args.append("--fail-on-warning")
+        env = {**self.env, "UBS_NO_CACHE": str(int(no_cache)),
+               "UBS_CACHE_FILE": str(output / "cache.json"),
+               "UBS_PREFILTER_FILE": str(output / "prefilter.json")}
+        proc = subprocess.run(
+            args, input=b"".join(os.fsencode(path) + b"\0" for path in files),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.root,
+            env=env, timeout=180,
+        )
+        (output / "stdout.log").write_bytes(proc.stdout)
+        (output / "stderr.log").write_bytes(proc.stderr)
+        context = (f"run {self.run_number}: exit={proc.returncode}\n"
+                   f"stdout:\n{proc.stdout.decode(errors='replace')}\n"
+                   f"stderr:\n{proc.stderr.decode(errors='replace')}")
+        self.assertIn(proc.returncode, (0, 1) if complete else (2,), context)
+        self.assertEqual(proc.stdout, b"", context)
+        doc = self.decode_json(summary.read_text(), context)
+        records = [self.decode_json(line, context) for line in sink.read_text().splitlines()]
+        self.assertEqual(doc["status"], "ok" if complete else "partial", context)
+        self.assertEqual(doc["files"], len(files), context)
+        for severity in ("critical", "warning", "info"):
+            self.assertEqual(doc[severity], sum(row["severity"] == severity for row in records), context)
+        expected_exit = int(doc["critical"] > 0 or (fail_on_warning and doc["warning"] > 0))
+        self.assertEqual(proc.returncode, expected_exit if complete else 2, context)
+        if expected_hits is not None:
+            profile = doc["extras"]["profile"]
+            self.assertEqual(profile["cache_hits"], expected_hits, context)
+            self.assertEqual(profile["cache_misses"], len(files) - expected_hits, context)
+        for row in records:
+            self.assertFalse(any(key.startswith("_ubs_") for key in row), context)
+        if export:
+            self.assertTrue(counts.is_file(), context)
+            raw = self.decode_json(counts.read_text(), context)
+            self.assertEqual(raw["schema"], "ubs.python-pattern-counts/1", context)
+            self.assertEqual(raw["language"], "python", context)
+            self.assertEqual(raw["complete"], complete, context)
+            self.assertEqual(raw["status"], doc["status"], context)
+            self.assertEqual(raw["count_unit"], "distinct-match-start-lines", context)
+            self.assertEqual(raw["count_stage"],
+                             "after-source-suppression-before-context-and-thresholds", context)
+            self.assertEqual(raw["zero_counts"],
+                             "implicit-for-listed-files-and-rules-when-complete", context)
+            self.assertEqual(raw["files"], [{"file": str(path)} for path in sorted(set(files))], context)
+            self.assertTrue(all(row["count"] > 0 for row in raw["counts"]), context)
+            self.assertEqual(raw["counts"], sorted(raw["counts"], key=lambda row: (row["file"], row["rule_id"])))
+            if complete:
+                self.assertEqual(raw["errors"], [], context)
+            else:
+                self.assertTrue(raw["errors"], context)
+        else:
+            self.assertFalse(counts.exists(), context)
+            raw = None
+        return {"exit": proc.returncode, "summary": doc, "records": records,
+                "text": report.read_text(), "raw": raw, "context": context}
+
+    @staticmethod
+    def public_result(result):
+        summary = result["summary"]
+        return (result["exit"], result["records"],
+                {key: summary[key] for key in ("critical", "warning", "info", "findings", "report")})
+
+    def rule(self, result, rule_id: str):
+        found = [row for row in result["raw"]["rules"] if row["rule_id"] == rule_id]
+        self.assertEqual(len(found), 1, result["context"])
+        return found[0]
+
+    def counts_for(self, result, rule_id: str):
+        return {row["file"]: row["count"] for row in result["raw"]["counts"]
+                if row["rule_id"] == rule_id}
+
+    def assert_rule(self, result, rule_id: str, counts: dict[Path, int], severity: str | None):
+        row = self.rule(result, rule_id)
+        self.assertEqual(row["count"], sum(counts.values()), result["context"])
+        self.assertEqual(self.counts_for(result, rule_id),
+                         {str(path): count for path, count in counts.items() if count}, result["context"])
+        self.assertEqual(row["threshold_severity"], severity, result["context"])
+        self.assertEqual(row["reported_severity"], severity, result["context"])
+        self.assertEqual(row["thresholds"], [{"min_count_exclusive": 3, "severity": "warning"}],
+                         result["context"])
+        self.assertEqual(row["context"], {"scope": "selected-input-raw-text", "gate": None,
+                                          "suppress_when": None, "eligible": True}, result["context"])
+
+    def test_one_three_four_matches_keep_findings_samples_and_exit_policy(self) -> None:
+        for count in (1, 3, 4):
+            with self.subTest(matches=count):
+                source = self.source(f"matches-{count}.py", "import re\n" + "".join(
+                    f'REGEX{index} = re.compile(r"(a+)+$")\n' + self.function(f"f{index}")
+                    for index in range(count)))
+                # A normal scan primes the cache without the export option.
+                default = self.scan([source], export=False, fail_on_warning=True, expected_hits=0)
+                warm = self.scan([source], fail_on_warning=True, expected_hits=1)
+                cold = self.scan([source], no_cache=True, fail_on_warning=True, expected_hits=0)
+                self.assertEqual(self.public_result(default), self.public_result(warm))
+                self.assertEqual(self.public_result(default), self.public_result(cold))
+                self.assertEqual(warm["raw"], cold["raw"])
+                for result in (warm, cold):
+                    for rule in (self.PARAM_RULE, self.REGEX_RULE):
+                        self.assert_rule(result, rule, {source: count}, "warning" if count > 3 else None)
+                        findings = [row for row in result["summary"]["findings"] if row["rule"] == rule]
+                        if count > 3:
+                            self.assertEqual(len(findings), 1)
+                            self.assertEqual(findings[0]["count"], count)
+                            self.assertEqual(len(findings[0]["samples"]), 3)
+                        else:
+                            self.assertEqual(findings, [])
+                    self.assertEqual(result["summary"]["warning"], 2 * count if count > 3 else 0)
+                    self.assertEqual(result["exit"], int(count > 3))
+                # Warning policy stays opt-in, independently of raw counts.
+                permissive = self.scan([source], expected_hits=1)
+                self.assertEqual(permissive["exit"], 0)
+                self.assertEqual(permissive["raw"], warm["raw"])
+
+    def test_separate_concatenated_selected_and_empty_padded_sources(self) -> None:
+        files, sources = [], []
+        summed = {self.PARAM_RULE: 0, self.REGEX_RULE: 0}
+        for index, letter in enumerate("abcdefghijklmn"):
+            source = (f'import re\nREGEX = re.compile(r"({letter}+)+$")\n' if index < 4 else "")
+            source += self.function(letter)
+            path = self.source(f"part {letter}.py", source)
+            files.append(path)
+            sources.append(source)
+            result = self.scan([path], expected_hits=0)
+            self.assert_rule(result, self.PARAM_RULE, {path: 1}, None)
+            self.assert_rule(result, self.REGEX_RULE, {path: int(index < 4)}, None)
+            self.assertEqual(result["summary"]["warning"], 0)
+            for rule in summed:
+                summed[rule] += self.rule(result, rule)["count"]
+
+        batch = self.scan(files, expected_hits=14)
+        self.assert_rule(batch, self.PARAM_RULE, dict.fromkeys(files, 1), "warning")
+        self.assert_rule(batch, self.REGEX_RULE, dict.fromkeys(files[:4], 1), "warning")
+        self.assertEqual(batch["summary"]["warning"], 18)
+        combined_path = self.source("combined.py", "\n".join(sources))
+        combined = self.scan([combined_path], expected_hits=0)
+        self.assert_rule(combined, self.PARAM_RULE, {combined_path: 14}, "warning")
+        self.assert_rule(combined, self.REGEX_RULE, {combined_path: 4}, "warning")
+        self.assertEqual(combined["summary"]["warning"], 18)
+        for rule, count in summed.items():
+            self.assertEqual(self.rule(batch, rule)["count"], count)
+            self.assertEqual(self.rule(combined, rule)["count"], count)
+            for result in (batch, combined):
+                finding = next(row for row in result["summary"]["findings"] if row["rule"] == rule)
+                self.assertEqual(len(finding["samples"]), 3)
+
+        for selected in (files[:3], list(reversed(files[:4])), [files[-1]]):
+            with self.subTest(selected=[path.name for path in selected]):
+                result = self.scan(selected, expected_hits=len(selected))
+                severity = "warning" if len(selected) > 3 else None
+                self.assert_rule(result, self.PARAM_RULE, dict.fromkeys(selected, 1), severity)
+                regex_files = [path for path in selected if path in files[:4]]
+                self.assert_rule(result, self.REGEX_RULE, dict.fromkeys(regex_files, 1),
+                                 "warning" if len(regex_files) > 3 else None)
+                self.assertTrue(all(Path(row["file"]) in selected for row in result["raw"]["counts"]))
+
+        empty = [self.source(f"empty-{index}.py", "") for index in range(13)]
+        padded = self.scan([files[0], *empty], expected_hits=1)
+        warm = self.scan([files[0], *empty], expected_hits=14)
+        self.assertEqual(padded["raw"], warm["raw"])
+        for rule in summed:
+            self.assert_rule(padded, rule, {files[0]: 1}, None)
+        self.assertEqual(padded["summary"]["warning"], 0)
+        zero = self.scan(empty, expected_hits=13)
+        self.assertEqual(zero["raw"]["counts"], [])
+        self.assertTrue(zero["raw"]["rules"])
+        self.assertTrue(all(row["count"] == 0 for row in zero["raw"]["rules"]))
+
+    def test_distinct_matching_lines_are_not_regex_occurrences(self) -> None:
+        for count in (1, 3, 4):
+            source = self.source(f"double-{count}.py", "import re\n" + "".join(
+                f'REGEX{index} = (re.compile(r"(a+)+$"), re.compile(r"(b+)+$"))\n'
+                for index in range(count)))
+            result = self.scan([source], expected_hits=0)
+            self.assert_rule(result, self.REGEX_RULE, {source: count}, "warning" if count > 3 else None)
+            self.assertEqual(result["summary"]["warning"], count if count > 3 else 0)
+            warm = self.scan([source], expected_hits=1)
+            self.assertEqual(result["raw"], warm["raw"])
+
+    def test_source_suppressions_apply_before_raw_counts_and_survive_cache_edits(self) -> None:
+        source = self.source("suppressed.py", "import re\n" +
+            "def bare(one, two, three, four, five, six, seven):  # ubs:ignore\n    return one\n" +
+            f"# ubs:ignore[{self.PARAM_RULE}]\n" + self.function("scoped") +
+            f"# ubs:ignore[{self.REGEX_RULE}]\n" + self.function("unrelated") +
+            'def literal(one, two, three, four, five, six, seven):\n    return "# ubs:ignore"\n' +
+            'REGEX1 = re.compile(r"(a+)+$")  # ubs:ignore\n' +
+            f"# ubs:ignore[{self.REGEX_RULE}]\n" + 'REGEX2 = re.compile(r"(b+)+$")\n' +
+            f'REGEX3 = re.compile(r"(c+)+$")  # ubs:ignore[{self.PARAM_RULE}]\n' +
+            'REGEX4 = re.compile(r"(d+)+$"); note = "# ubs:ignore"\n' +
+            'MULTILINE = re.compile(\n    r"(e+)+$"\n' +
+            f")  # ubs:ignore[{self.REGEX_RULE}]\n" +
+            'def multiline(one, two, three, four, five, six,\n' +
+            f"              seven):  # ubs:ignore[{self.PARAM_RULE}]\n    return one\n")
+        cold = self.scan([source], expected_hits=0)
+        warm = self.scan([source], expected_hits=1)
+        disabled = self.scan([source], no_cache=True, expected_hits=0)
+        for result in (cold, warm, disabled):
+            for rule in (self.PARAM_RULE, self.REGEX_RULE):
+                self.assert_rule(result, rule, {source: 2}, None)
+            self.assertEqual(result["summary"]["warning"], 0)
+        self.assertEqual(cold["raw"], warm["raw"])
+        self.assertEqual(cold["raw"], disabled["raw"])
+        self.source("suppressed.py", "import re\n" + "".join(
+            f'REGEX{index} = re.compile(r"(a+)+$")\n' + self.function(f"f{index}")
+            for index in range(4)))
+        changed = self.scan([source], expected_hits=0)
+        replay = self.scan([source], expected_hits=1)
+        for result in (changed, replay):
+            for rule in (self.PARAM_RULE, self.REGEX_RULE):
+                self.assert_rule(result, rule, {source: 4}, "warning")
+            self.assertEqual(result["summary"]["warning"], 8)
+        self.assertEqual(changed["raw"], replay["raw"])
+
+    def test_selected_raw_context_does_not_erase_source_local_counts(self) -> None:
+        rule = "py.async.un-awaited-paths"
+        idle = self.source("idle.py", "async def idle():\n    return 1\n")
+        # Current pattern semantics use raw context, even a marked comment in
+        # a sibling with no candidate match. Counts describe that distinction.
+        context = self.source("context.py", "# await completion  # ubs:ignore\nVALUE = 1\n")
+        self.scan([idle], expected_hits=0)
+        self.scan([context], expected_hits=0)
+        for selected, eligible in (([idle, context], False), ([idle], True),
+                                   ([context, idle], False), ([context], False)):
+            with self.subTest(selected=[path.name for path in selected]):
+                result = self.scan(selected, expected_hits=len(selected))
+                row = self.rule(result, rule)
+                self.assertEqual(self.counts_for(result, rule), {str(idle): 1} if idle in selected else {})
+                self.assertEqual(row["count"], int(idle in selected))
+                self.assertEqual(row["threshold_severity"], "warning" if idle in selected else None)
+                self.assertEqual(row["reported_severity"], "warning" if eligible else None)
+                self.assertEqual(row["context"]["eligible"], eligible)
+                self.assertIsNone(row["context"]["gate"])
+                self.assertEqual(row["context"]["suppress_when"]["matched"], context in selected)
+                self.assertEqual(row["context"]["suppress_when"]["regex"], r"\bawait\b")
+        self.source("context.py", "VALUE = 2\n")
+        changed = self.scan([idle, context], expected_hits=1)
+        warm = self.scan([idle, context], expected_hits=2)
+        self.assertEqual(changed["raw"], warm["raw"])
+        self.assertEqual(self.rule(changed, rule)["reported_severity"], "warning")
+        self.assertEqual(self.counts_for(changed, rule), {str(idle): 1})
+
+    def test_gates_metadata_and_nonpattern_records_use_retained_facts(self) -> None:
+        from ubs_core.py_scan import Pattern, pattern_count_report, reconcile_pattern_records, scan_patterns
+
+        source = self.source("source.py", "print(value)\nprint(other)\n")
+        gate = self.source("gate.py", "FEATURE = 'feature_enabled'\n")
+        silencer = self.source("silencer.py", "# paused  # ubs:ignore\n")
+        pattern = Pattern(11, "py.debug.gated-print", "Gated prints", re.compile(r"print\("),
+                          ((1, "warning"),), gate_regex=re.compile(r"\bfeature_enabled\b"),
+                          suppress_when_regex=re.compile(r"\bpaused\b"))
+        with patch.dict(os.environ, self.env, clear=True):
+            cache = ScanCache("python", self.project, rulepack_hash="raw-count-gate")
+            for path in (source, gate, silencer):
+                sink = CapturingSink()
+                scan_patterns([pattern], [path], sink, set(), defer_global_checks=True)
+                cache.store_scanned_files([path], sink.by_file)
+            for selected, eligible in (([source], False), ([source, gate], True),
+                                       ([source, gate, silencer], False)):
+                with self.subTest(selected=[path.name for path in selected]):
+                    cached, missing = cache.partition_files(selected)
+                    self.assertEqual(missing, [])
+                    facts = [record for path in selected for record in cached[path]]
+                    facts.append({"rule": "python.future.project", "path": str(source),
+                                  "line": 1, "severity": "critical", "message": "not a pattern"})
+                    report = pattern_count_report([pattern], facts, selected)
+                    duplicate = pattern_count_report([pattern], [*facts, *facts], selected)
+                    self.assertEqual(report, duplicate, "one source line must count only once")
+                    self.assertEqual(report["counts"], [{"file": str(source), "rule_id": pattern.rule_id,
+                                                         "count": 2}])
+                    self.assertEqual(len(report["rules"]), 1)
+                    row = report["rules"][0]
+                    self.assertEqual(row["count"], 2)
+                    self.assertEqual(row["threshold_severity"], "warning")
+                    self.assertEqual(row["reported_severity"], "warning" if eligible else None)
+                    self.assertEqual(row["context"]["eligible"], eligible)
+                    self.assertEqual(row["context"]["gate"]["matched"], gate in selected)
+                    self.assertEqual(row["context"]["suppress_when"]["matched"], silencer in selected)
+                    ordinary = reconcile_pattern_records([pattern], facts)
+                    self.assertEqual(sum(r["rule"] == pattern.rule_id for r in ordinary), 2 if eligible else 0)
+                    self.assertTrue(any(r["rule"] == "python.future.project" for r in ordinary))
+
+    def test_relative_selected_paths_have_their_own_stable_cache_context(self) -> None:
+        source = self.source("space in name.py", self.function("wide"))
+        absolute = self.scan([source], expected_hits=0)
+        self.assert_rule(absolute, self.PARAM_RULE, {source: 1}, None)
+        relative = Path("project") / source.name
+        # Cache identity includes the producer's path spelling, so a different
+        # spelling is cold. Its subsequent replay must export identical rows.
+        relative_cold = self.scan([relative], expected_hits=0)
+        warm = self.scan([relative], expected_hits=1)
+        cold = self.scan([relative], no_cache=True, expected_hits=0)
+        self.assert_rule(warm, self.PARAM_RULE, {relative: 1}, None)
+        self.assertEqual(relative_cold["raw"], warm["raw"])
+        self.assertEqual(warm["raw"], cold["raw"])
+
+    def test_skipped_categories_are_not_exported_as_zero_counts(self) -> None:
+        source = self.source("skipped.py", "import re\n" + "".join(
+            f'REGEX{index} = re.compile(r"(a+)+$")\n' + self.function(f"f{index}")
+            for index in range(4)))
+        for skip, absent, present in (("8", self.PARAM_RULE, self.REGEX_RULE),
+                                      ("15", self.REGEX_RULE, self.PARAM_RULE)):
+            with self.subTest(skip=skip):
+                cold = self.scan([source], skip=skip, expected_hits=0)
+                warm = self.scan([source], skip=skip, expected_hits=1)
+                self.assertEqual(cold["raw"], warm["raw"])
+                self.assertEqual(cold["raw"]["skipped_categories"], [int(skip)])
+                self.assertNotIn(absent, {row["rule_id"] for row in cold["raw"]["rules"]})
+                self.assertNotIn(absent, {row["rule_id"] for row in cold["raw"]["counts"]})
+                self.assert_rule(cold, present, {source: 4}, "warning")
+                self.assertEqual(cold["summary"]["warning"], 4)
+
+    def test_incomplete_counts_are_labeled_partial_and_do_not_admit_cache_entries(self) -> None:
+        good = self.source("good.py", self.function("wide"))
+        bad = self.source("bad.py", "def broken(:\n")
+        default = self.scan([good, bad], export=False, complete=False, expected_hits=0)
+        partial = self.scan([good, bad], complete=False, expected_hits=0)
+        self.assertEqual(self.public_result(default), self.public_result(partial))
+        self.assertEqual(self.counts_for(partial, self.PARAM_RULE), {str(good): 1})
+        self.assertTrue(any("syntax" in error.lower() for error in partial["raw"]["errors"]))
+        missing = self.project / "missing.py"
+        unreadable = self.scan([good, missing], complete=False, expected_hits=0)
+        self.assertEqual(self.counts_for(unreadable, self.PARAM_RULE), {str(good): 1})
+        self.assertTrue(any(str(missing) in error for error in unreadable["raw"]["errors"]))
+        self.assertFalse(list((self.root / "cache").glob("*/files/**/*.json")))
+        self.source("bad.py", "VALUE = 1\n")
+        recovered = self.scan([good, bad], expected_hits=0)
+        warm = self.scan([good, bad], expected_hits=2)
+        self.assertEqual(recovered["raw"], warm["raw"])
 
 
 if __name__ == "__main__":

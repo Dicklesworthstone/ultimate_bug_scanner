@@ -40,6 +40,7 @@
     "uv_tools"
   ],
   "findings_schema": "ubs --schema=json (scanners[].findings[] with title/severity/count/samples[file,line,code]); per-finding records via --report-json (js, python) or --emit-findings-json (csharp) until bead K2",
+  "python_pattern_counts_schema": "ubs --schema=python-pattern-counts: opt-in --python-pattern-counts=FILE JSON sidecar (ubs.python-pattern-counts/1). Sparse per-file/per-rule distinct match-start line counts after source suppression, before selected-input context gates and severity thresholds. Lists selected files, active rules, thresholds, resolved severities and conservative completeness. Does not include detectors, registry analyzers, ast-grep or external tools; does not change findings, samples or severity-based exit policy.",
   "rule_id_grammar": "<lang>.<family>.<name> (e.g. js.async.dangling-promise, py.json.loads-no-try); category ids are <lang>.<slug> (e.g. js.debug, python.security)",
   "flags": [
     {
@@ -115,6 +116,13 @@
       "modules": "all",
       "documented": true,
       "doc": "write NDJSON findings sink to FILE"
+    },
+    {
+      "flag": "--python-pattern-counts",
+      "value": "FILE",
+      "modules": ["python"],
+      "documented": true,
+      "doc": " write unthresholded per-file/per-rule counts as JSON (python)"
     },
     {
       "flag": "--files-from",
@@ -266,6 +274,7 @@
         "--max-file-size",
         "--max-samples",
         "--no-uv",
+        "--python-pattern-counts",
         "--rules",
         "--summary-json",
         "--timeout-seconds",

@@ -18,7 +18,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="9fb33b59cc5097adaa34df9d4ca8e348f26dd87e1eb85976215ef15763ac8632"
+UBS_LIB_CHECKSUM="bb1402e96f5f5d54f9d1ba4b1f76459d37f482ff5dfc911182770b27b13c1b25"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -175,6 +175,7 @@ UV_TIMEOUT="${UV_TIMEOUT:-1200}"
 SUMMARY_JSON=""
 UBS_PY_VERSION="$(cat "$(dirname "${BASH_SOURCE[0]:-$0}")/../VERSION" 2>/dev/null || echo unknown)"
 REPORT_JSON=""
+PYTHON_PATTERN_COUNTS=""
 MAX_JSON_SAMPLES=3
 TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-0}"
 LIST_CATEGORIES=0
@@ -232,6 +233,8 @@ Options:
   --uv-tools=CSV          Which uv tools to run (default: $UV_TOOLS)
   --summary-json=FILE     Also write machine-readable summary JSON
   --report-json=FILE      Also write a machine-readable JSON findings report to FILE
+  --python-pattern-counts=FILE
+                         Export unthresholded per-file Python pattern counts as JSON
   --max-samples=N         Cap code samples per finding in the JSON report (default: 3)
   --max-detailed=N        Cap number of detailed code samples (default: $MAX_DETAILED)
   -h, --help              Show help
@@ -270,6 +273,17 @@ while [[ $# -gt 0 ]]; do
     --uv-tools=*) UV_TOOLS="${1#*=}"; shift;;
     --summary-json=*) SUMMARY_JSON="${1#*=}"; shift;;
     --report-json=*) REPORT_JSON="${1#*=}"; shift;;
+    --python-pattern-counts=*)
+      PYTHON_PATTERN_COUNTS="${1#*=}"
+      if [[ -z "$PYTHON_PATTERN_COUNTS" || "$PYTHON_PATTERN_COUNTS" == "-" ]]; then
+        echo "ERROR: --python-pattern-counts requires a nonempty file path" >&2; exit 2
+      fi
+      shift;;
+    --python-pattern-counts)
+      if [[ $# -lt 2 || -z "${2:-}" || "${2:-}" == "-" || "${2:-}" == --* ]]; then
+        echo "ERROR: --python-pattern-counts requires a nonempty file path" >&2; exit 2
+      fi
+      PYTHON_PATTERN_COUNTS="$2"; shift 2;;
     --max-samples=*) MAX_JSON_SAMPLES="${1#*=}"; shift;;
     --max-detailed=*) MAX_DETAILED="${1#*=}"; shift;;
     --files-from=*) FILES_FROM="${1#*=}"; shift;;
@@ -303,6 +317,45 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ -n "$PYTHON_PATTERN_COUNTS" ]]; then
+  if [[ "$LIST_CATEGORIES" -eq 1 || "$LIST_RULES" -eq 1 ]]; then
+    echo "ERROR: --python-pattern-counts requires a scan, not --list-categories or --list-rules" >&2
+    exit 2
+  fi
+  # Reject aliases before a positional output can truncate a destination.
+  # Raw counts are a separate artifact, never another view of the findings.
+  if ! (
+    if [[ "${UBS_KEEP_TEMP:-0}" == "1" ]]; then
+      BASH_COMPAT="${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"
+    fi
+    python3 - "$PYTHON_PATTERN_COUNTS" "$OUTPUT_FILE" "$SUMMARY_JSON" "$REPORT_JSON" <<'PYPATTERNPATHS'
+import os
+from pathlib import Path
+import sys
+
+seen = []
+try:
+    target = Path(sys.argv[1])
+    if target.exists() and not target.is_file():
+        raise ValueError("pattern counts destination must be a regular file")
+    for raw in sys.argv[1:]:
+        if not raw:
+            continue
+        path = Path(raw).resolve()
+        for previous in seen:
+            if path == previous or (path.exists() and previous.exists() and os.path.samefile(path, previous)):
+                raise ValueError(f"report destinations refer to the same file: {raw}")
+        seen.append(path)
+except (OSError, RuntimeError, ValueError) as exc:
+    print(f"ubs-python: invalid --python-pattern-counts output: {exc}", file=sys.stderr)
+    raise SystemExit(2)
+PYPATTERNPATHS
+  )
+  then
+    exit 2
+  fi
+fi
 
 if [[ "$LIST_CATEGORIES" -eq 1 ]]; then
   (
@@ -734,7 +787,7 @@ PYV2BRIDGE
 }
 
 run_contract_v2_py(){
-  local list_file sink exit_code=0 text_out="" v2_json_out=""
+  local list_file sink exit_code=0 text_out="" v2_json_out="" pattern_counts_out=""
   list_file="$(mktemp 2>/dev/null || mktemp -t ubs-pyv2-list.XXXXXX)" || { echo "ERROR: cannot allocate temporary file list; analysis is incomplete" >&2; return 2; }
   sink="$(mktemp 2>/dev/null || mktemp -t ubs-pyv2-sink.XXXXXX)" || { echo "ERROR: cannot allocate temporary findings sink; analysis is incomplete" >&2; return 2; }
   local helpers_dir=""
@@ -760,6 +813,13 @@ run_contract_v2_py(){
     v2_skip="${SKIP_CATEGORIES:+$SKIP_CATEGORIES,}$keep"
   fi
   local -a scan_args=(--files-from "$list_file" --sink "$sink" --project-dir "$PROJECT_DIR")
+  if [[ -n "$PYTHON_PATTERN_COUNTS" ]]; then
+    pattern_counts_out="$(mktemp 2>/dev/null || mktemp -t ubs-pyv2-counts.XXXXXX)" || {
+      echo "ERROR: cannot allocate the requested Python pattern count export" >&2; return 2;
+    }
+    TEMP_PATHS+=("$pattern_counts_out")
+    scan_args+=(--pattern-counts-out "$pattern_counts_out")
+  fi
   [[ -n "$v2_skip" ]] && scan_args+=(--skip "$v2_skip")
   [[ "${FAIL_ON_WARNING:-0}" -eq 1 ]] && scan_args+=(--fail-on-warning)
   [[ "${JOBS:-0}" -gt 0 ]] && scan_args+=(--jobs "$JOBS")
@@ -871,6 +931,49 @@ PYUVSTATUS
   if [[ -n "$REPORT_JSON" ]]; then
     # K2: the sink IS the findings record stream.
     ubs_deliver_file "$sink" "$REPORT_JSON" "findings report" || delivery_failed=1
+  fi
+  if [[ -n "$PYTHON_PATTERN_COUNTS" ]]; then
+    if [[ -s "$pattern_counts_out" ]] && (
+      if [[ "${UBS_KEEP_TEMP:-0}" == "1" ]]; then
+        BASH_COMPAT="${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"
+      fi
+      python3 - "$pattern_counts_out" "$exit_code" "${UV_TOOL_ERRORS[*]:-}" <<'PYPATTERNRESULT'
+import json
+from pathlib import Path
+import sys
+
+path, module_exit, tool_errors = sys.argv[1:]
+try:
+    target = Path(path)
+    doc = json.loads(target.read_text(encoding="utf-8"))
+    if (not isinstance(doc, dict) or doc.get("schema") != "ubs.python-pattern-counts/1"
+            or doc.get("language") != "python" or not isinstance(doc.get("complete"), bool)
+            or doc.get("status") not in ("ok", "partial")
+            or doc["complete"] != (doc["status"] == "ok")
+            or not isinstance(doc.get("errors"), list)
+            or not all(isinstance(error, str) for error in doc["errors"])
+            or (doc["complete"] and doc["errors"])
+            or not all(isinstance(doc.get(key), list) for key in ("files", "rules", "counts"))):
+        raise ValueError("invalid Python pattern count document")
+    if module_exit not in ("0", "1"):
+        doc["complete"] = False
+        doc["status"] = "partial"
+        reason = f"Python module did not complete (exit {module_exit})"
+        if tool_errors:
+            reason += f": {tool_errors}"
+        if reason not in doc["errors"]:
+            doc["errors"].append(reason)
+    target.write_text(json.dumps(doc, ensure_ascii=False) + "\n", encoding="utf-8")
+except (OSError, ValueError) as exc:
+    print(f"ubs-python: cannot prepare the requested pattern count export: {exc}", file=sys.stderr)
+    raise SystemExit(2)
+PYPATTERNRESULT
+    ); then
+      ubs_deliver_file "$pattern_counts_out" "$PYTHON_PATTERN_COUNTS" "Python pattern counts" || delivery_failed=1
+    else
+      echo "ERROR: the requested Python pattern count export is unavailable; no new report was produced" >&2
+      delivery_failed=1
+    fi
   fi
   if [[ "$delivery_failed" -eq 1 ]]; then
     exit_code=2

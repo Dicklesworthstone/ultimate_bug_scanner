@@ -6361,7 +6361,46 @@ ensure_cached_helpers(){
   local failures=0
   local rel
   local verification_failures=0
+  local -A batch_verified=()
+  # An installed scan verifies hundreds of helpers, even for a one-line
+  # target. Hash healthy cached assets together, just as the standalone
+  # module does, instead of starting a process for every file (issue #192).
+  # This is per invocation: no mtime or persistent cache can authorize code.
+  # Missing files, mismatches and unusable batch output still go through the
+  # existing per-file verifier/repair path below, including its diagnostics.
+  if [[ "$mode" == "scan" && "$UPDATE_MODULES" -eq 0 ]] && need_cmd sha256sum; then
+    local -a batch_files=() batch_rels=() batch_digests=()
+    local batch_output="" batch_line batch_digest batch_index batch_valid=1
+    for rel in "${HELPER_ASSETS[@]:-}"; do
+      if [[ -n "$rel" && -n "${HELPER_CHECKSUMS[$rel]:-}" && -f "$MODULE_DIR/$rel" ]]; then
+        batch_files+=("$MODULE_DIR/$rel")
+        batch_rels+=("$rel")
+      fi
+    done
+    if (( ${#batch_files[@]} > 0 )) && batch_output="$(sha256sum -- "${batch_files[@]}" 2>/dev/null)"; then
+      # sha256sum escapes newlines/backslashes in filenames and prefixes the
+      # corresponding line with a backslash. Only the ordered digests matter.
+      while IFS= read -r batch_line; do
+        batch_digest="${batch_line#\\}"
+        batch_digest="${batch_digest%%[[:space:]]*}"
+        if [[ ! "$batch_digest" =~ ^[0-9a-fA-F]{64}$ ]]; then
+          batch_valid=0
+          break
+        fi
+        batch_digests+=("${batch_digest,,}")
+      done < <(printf '%s\n' "$batch_output")
+      if (( batch_valid && ${#batch_digests[@]} == ${#batch_files[@]} )); then
+        for batch_index in "${!batch_rels[@]}"; do
+          rel="${batch_rels[$batch_index]}"
+          if [[ "${batch_digests[$batch_index]}" == "${HELPER_CHECKSUMS[$rel]}" ]]; then
+            batch_verified["$rel"]=1
+          fi
+        done
+      fi
+    fi
+  fi
   for rel in "${HELPER_ASSETS[@]:-}"; do
+    [[ -n "$rel" && -n "${batch_verified[$rel]:-}" ]] && continue
     local helper_rc=0
     ensure_helper_asset "$rel" || helper_rc=$?
     if [[ "$helper_rc" -eq 0 ]]; then

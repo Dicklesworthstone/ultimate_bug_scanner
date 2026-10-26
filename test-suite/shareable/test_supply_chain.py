@@ -314,6 +314,84 @@ def check_healthy_cache_scans() -> None:
         report("healthy_cache_scans", ok, f"exit={proc.returncode}", proc)
 
 
+def check_cached_helper_batch_verification() -> None:
+    """Healthy startup hashes the whole cache once; malformed batches retry.
+
+    Count actual hash-tool invocations in an installed scan, not elapsed time.
+    Escaped filenames must retain their digest association. A second scan
+    after tampering must recheck the bytes, regardless of the prior success.
+    """
+    real_hash = shutil.which("sha256sum")
+    if real_hash is None:
+        report("cached_helper_batch_verification", True, "skipped: sha256sum unavailable")
+        return
+    artifacts = REPO_ROOT / "test-suite/artifacts/supply-chain-batch"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix="cache space\\and\nnewline-", dir=artifacts))
+    sb = Sandbox(tmp)
+    # All cache assets are present; this check must not depend on downloads.
+    shutil.copy2(MODULES / "contract.json", sb.module_dir / "contract.json")
+    tools_dir = tmp / "tools"
+    tools_dir.mkdir()
+    hash_log = tmp / "hash-calls.log"
+    wrapper = tools_dir / "sha256sum"
+    wrapper.write_text(
+        "#!/usr/bin/env bash\n"
+        'printf "%s\\n" "$#" >> "$UBS_TEST_BATCH_HASH_LOG"\n'
+        'if [[ "$#" -gt 2 ]]; then\n'
+        '  case "$UBS_TEST_BATCH_HASH_MODE" in\n'
+        '    malformed) printf "invalid-digest\\n"; exit 0 ;;\n'
+        '    truncated) exec ' + shlex.quote(real_hash) + ' -- "$2" ;;\n'
+        '    failed) exit 1 ;;\n'
+        '  esac\n'
+        'fi\n'
+        'exec ' + shlex.quote(real_hash) + ' "$@"\n',
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    environment = {
+        "PATH": str(tools_dir) + os.pathsep + os.environ.get("PATH", ""),
+        "UBS_TEST_BATCH_HASH_LOG": str(hash_log),
+        "UBS_NO_CACHE": "1",
+        "UBS_ALLOW_UNVERIFIED_HELPERS": "0",
+        "XDG_CACHE_HOME": str(tmp / "user-cache"),
+        "XDG_CONFIG_HOME": str(tmp / "user-config"),
+    }
+    for mode in ("healthy", "malformed", "truncated", "failed"):
+        hash_log.write_text("", encoding="utf-8")
+        started = time.monotonic()
+        proc = sb.run(*environment.items(), ("UBS_TEST_BATCH_HASH_MODE", mode))
+        counts = [int(line) for line in hash_log.read_text(encoding="utf-8").splitlines()]
+        try:
+            doc = json.loads(proc.stdout)
+            complete = doc.get("status") == "ok" and doc.get("totals", {}).get("files") == 1
+        except ValueError:
+            complete = False
+        batched = any(count > 100 for count in counts)
+        # Healthy verification must remain bounded in processes. Unusable
+        # output must force per-file checks rather than authorize the cache.
+        expected_calls = len(counts) < 10 if mode == "healthy" else len(counts) > 100
+        ok = proc.returncode in (0, 1) and complete and batched and expected_calls
+        (tmp / f"{mode}.stdout.log").write_text(proc.stdout, encoding="utf-8")
+        (tmp / f"{mode}.stderr.log").write_text(proc.stderr, encoding="utf-8")
+        report("cached_helper_batch_" + mode, ok,
+               f"exit={proc.returncode} hashes={len(counts)} elapsed={time.monotonic() - started:.3f}s", proc)
+
+    # Edited, tracked source must still fail closed after a clean scan. The
+    # isolated Git fixture also ensures a repair cannot conceal this check.
+    subprocess.run(["git", "init", "-q", "-b", "main", str(tmp)], check=True,
+                   capture_output=True, timeout=30)
+    subprocess.run(["git", "-C", str(tmp), "add", "cache/" + CORE_ASSET],
+                   check=True, capture_output=True, timeout=30)
+    helper = sb.module_dir / CORE_ASSET
+    before = helper.read_bytes() + TAMPER_SUFFIX.encode()
+    helper.write_bytes(before)
+    proc = sb.run(*environment.items(), ("UBS_TEST_BATCH_HASH_MODE", "healthy"))
+    combined = proc.stdout + proc.stderr
+    ok = proc.returncode == 2 and "checksum mismatch" in combined and helper.read_bytes() == before
+    report("cached_helper_batch_rechecks_tampering", ok, f"exit={proc.returncode}", proc)
+
+
 def check_tampered_helper_refreshed_from_clean_source() -> None:
     # A corrupted cache entry is repaired from the (clean) source and the scan proceeds.
     with tempfile.TemporaryDirectory(prefix="ubs-sc-") as tmp:
@@ -897,6 +975,7 @@ def main() -> int:
         check_checkout_doctor_fix_preserves_source_helpers,
         check_installed_runner_preserves_tracked_module_dir_helpers,
         check_healthy_cache_scans,
+        check_cached_helper_batch_verification,
         check_tampered_helper_refreshed_from_clean_source,
         check_tampered_helper_refused,
         check_tampered_lib_refreshed_from_clean_source,

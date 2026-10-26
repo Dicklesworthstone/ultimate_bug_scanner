@@ -32,9 +32,11 @@ import operator
 import os
 import re
 import sys
+import tokenize
 from bisect import bisect_right
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Union
 
@@ -461,18 +463,26 @@ def join_facts(*facts: Fact) -> Fact:
     return frozenset(traces.values())
 
 
+@lru_cache(maxsize=1024)
+def _advance_trace(source, parameter, sanitizers, path, steps, limit):
+    """Cache a complete immutable witness transformation, including its limit."""
+    path = list(path)
+    for step in steps:
+        if not path or path[-1] != step:
+            path.append(step)
+    if len(path) > limit:
+        path = [path[0], *path[-(limit - 1):]]
+    return TaintTrace(source, parameter, sanitizers, tuple(path))
+
+
 def _advance(fact: Fact, *steps: str) -> Fact:
     if not fact or not steps:
         return fact
     traces = []
     for trace in fact:
-        path = list(trace.path)
-        for step in steps:
-            if not path or path[-1] != step:
-                path.append(step)
-        if len(path) > PATH_LIMIT:
-            path = [path[0], *path[-(PATH_LIMIT - 1):]]
-        traces.append(TaintTrace(trace.source, trace.parameter, trace.sanitizers, tuple(path)))
+        # Trace equality omits paths; every witness field is a cache input.
+        traces.append(_advance_trace(
+            trace.source, trace.parameter, trace.sanitizers, trace.path, steps, PATH_LIMIT))
     return frozenset(traces)
 
 
@@ -1736,7 +1746,7 @@ class _Flow:
             # A single call can carry many transitive sink/mutation facts.
             budget.spend(len(fact) + sum(len(bound.get(trace.parameter, CLEAN))
                                         for trace in fact if trace.parameter is not None))
-        result = CLEAN
+        incoming_facts = []
         for trace in fact:
             if trace.parameter is None:
                 incoming = frozenset({trace})
@@ -1746,8 +1756,8 @@ class _Flow:
                     incoming = _sanitize(incoming, sanitizer)
                 steps = trace.path[1:] if trace.parameter.startswith('@') else trace.path
                 incoming = _advance(incoming, call_name, *steps)
-            result = join_facts(result, incoming)
-        return result
+            incoming_facts.append(incoming)
+        return join_facts(*incoming_facts)
 
     def substitute_binding(self, binding, bound, references, node, call_name, values):
         if binding is None:
@@ -3750,6 +3760,18 @@ class _Analysis:
                 return effects
 
 
+def _parse_source(path):
+    """Decode Python source faithfully and make input failures explicit."""
+    try:
+        with tokenize.open(path) as source:
+            text = source.read()
+        return text, ast.parse(text, filename=str(path))
+    except (OSError, UnicodeError, SyntaxError, ValueError, RecursionError, LookupError) as exc:
+        raise AnalysisLimit(
+            f'Cannot analyze Python source {path}: {type(exc).__name__}: {exc}; analysis is incomplete'
+        ) from exc
+
+
 class _Project:
     """Resolve only selected Python source files; never search sys.path/import code.
 
@@ -3764,6 +3786,8 @@ class _Project:
     def __init__(self, files, root=None):
         self.journal = {}
         self.sources = []
+        self.input_failures = []
+        self.failed_inputs = 0
         self.modules = {}
         self.namespaces = set()
         self.keys = {}
@@ -3779,9 +3803,11 @@ class _Project:
                 continue
             seen.add(path)
             try:
-                text = path.read_text(encoding='utf-8')
-                tree = ast.parse(text, filename=str(path))
-            except (OSError, UnicodeError, SyntaxError, ValueError):
+                text, tree = _parse_source(path)
+            except AnalysisLimit as exc:
+                self.failed_inputs += 1
+                if len(self.input_failures) < 3:
+                    self.input_failures.append(str(exc))
                 continue
             ast.increment_lineno(tree, offset)
             engine = _Analysis(tree, self)
@@ -4083,12 +4109,18 @@ class _Project:
                 continue
             trace = min(fact, key=lambda item: (len(item.path), item.path, item.source))
             yield path, rule, line, column, ' -> '.join((*trace.path, label))
+        problems = []
+        if self.failed_inputs:
+            omitted = (f'; and {self.failed_inputs - len(self.input_failures)} more failed inputs'
+                       if self.failed_inputs > len(self.input_failures) else '')
+            problems.append(f'{self.failed_inputs} input(s): '
+                            + '; '.join(self.input_failures) + omitted)
         if failed_components:
             omitted = (f'; and {failed_components - len(failures)} more failed components'
                        if failed_components > len(failures) else '')
-            raise AnalysisLimit(
-                f'Python taint analysis is incomplete in {failed_components} component(s): '
-                + '; '.join(failures) + omitted)
+            problems.append(f'{failed_components} component(s): ' + '; '.join(failures) + omitted)
+        if problems:
+            raise AnalysisLimit('Python taint analysis is incomplete in ' + '; '.join(problems))
 
 
 def should_skip(path: Path) -> bool:
@@ -4165,11 +4197,7 @@ _MESSAGE = {
 
 def scan_file_findings(path: Path):
     """Yield each reachable source-to-sink flow once at its sink location."""
-    try:
-        text = path.read_text(encoding='utf-8')
-        tree = ast.parse(text, filename=str(path))
-    except (OSError, UnicodeError, SyntaxError, ValueError):
-        return
+    text, tree = _parse_source(path)
     suppressions = build_index(text, lang='python')
     effects = _Analysis(tree).analyze()
     for (kind, line, column, label), fact in sorted(effects.items(), key=lambda item: (item[0][1], item[0][2], item[0][0])):

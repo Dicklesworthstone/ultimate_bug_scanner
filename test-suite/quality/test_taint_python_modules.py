@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'modules' / 'helpers'))
 from ubs_core.analyzers import taint_py
 from ubs_core.registry import RunContext
+from ubs_core.taint_flow import AnalysisLimit
 
 
 class PythonModuleTests(unittest.TestCase):
@@ -476,7 +477,11 @@ class PythonModuleTests(unittest.TestCase):
             self.assertEqual(self.scan(sources, disabled=[rule]), [])
 
     def test_malformed_buffer_cannot_swallow_next_file(self):
-        got = self.scan({'broken.py': '"""unterminated', 'app.py': 'eval(input())'})
+        files = self.write({'broken.py': '"""unterminated', 'app.py': 'eval(input())'})
+        got = []
+        with self.assertRaisesRegex(AnalysisLimit, 'incomplete.*broken.py.*SyntaxError'):
+            got.extend(taint_py.run(RunContext(lang='python', files=files,
+                                              profile={'project_dir': str(self.root)})))
         self.assertEqual(self.sites(got), [('app.py', 1, 'python.taint.eval')])
 
     def test_module_variables_and_saved_callable(self):

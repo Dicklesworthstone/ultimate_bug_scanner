@@ -142,7 +142,7 @@ class _HeaderFlow(flow._Flow):
             # retaining their domain-specific proof/revocation semantics.
             budget.spend(len(fact) + sum(len(bound.get(trace.parameter, flow.CLEAN))
                                         for trace in fact if trace.parameter is not None))
-        result = flow.CLEAN
+        incoming_facts = []
         for trace in fact:
             if trace.parameter is None:
                 incoming = frozenset({trace})
@@ -154,8 +154,8 @@ class _HeaderFlow(flow._Flow):
                     incoming = flow._sanitize(incoming, sanitizer)
                 steps = trace.path[1:] if trace.parameter.startswith('@') else trace.path
                 incoming = flow._advance(incoming, call_name, *steps)
-            result = flow.join_facts(result, incoming)
-        return result
+            incoming_facts.append(incoming)
+        return flow.join_facts(*incoming_facts)
 
     def effect(self, kind, node, label, fact):
         if kind == 'header' and fact:
@@ -458,8 +458,7 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
         if path.suffix.lower() not in {'.py', '.pyi'}:
             continue
         try:
-            text = path.read_text(encoding='utf-8')
-            tree = ast.parse(text, filename=str(path))
+            text, tree = flow._parse_source(path)
             if not _has_sink(tree):
                 continue
             effects = _HeaderAnalysis(tree).analyze()

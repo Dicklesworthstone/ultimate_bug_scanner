@@ -1900,6 +1900,18 @@ contexts and active import cycles still receive their required analysis. The
 worklist retains dependency metadata and the latest effects while releasing
 completed functions' temporary expression, heap, and completion states.
 
+Summary substitution joins expanded facts once, avoiding repeated copies of
+a growing result. A 1,024-entry cache reuses immutable witness transformations;
+its key includes source, parameter, sanitizer proofs, the complete evidence
+path, appended steps, and the path limit. It retains no analysis or AST state,
+and cache hits still consume the same analysis work budget.
+
+Taint and response-header analysis honor Python encoding cookies and UTF-8
+byte-order marks. Unreadable, undecodable, or invalid selected sources report
+incomplete coverage instead of disappearing from a successful scan. Input
+errors are counted with bounded diagnostics, and findings from independent
+valid inputs are emitted before the incomplete result.
+
 SQL analysis first decodes and parses every selected Python source. If the
 whole syntax tree contains no call from the detector's modeled SQL sink
 families, it skips the SQL dataflow pass. Nested bodies and definition-time

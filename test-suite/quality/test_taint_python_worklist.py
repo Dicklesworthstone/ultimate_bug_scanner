@@ -26,6 +26,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'modules' / 'helpers'))
 from ubs_core.analyzers import taint_py
+from ubs_core.py_detectors import header_injection
 from ubs_core.taint_flow import AnalysisLimit, Budget
 
 SHAPES = {
@@ -722,6 +723,228 @@ def handler():
                                          f'{count} functions retained {peak[0]} complete Flow objects')
 
 
+class SummarySubstitutionTests(unittest.TestCase):
+    """Substitution preserves evidence and proof domains with linear join work."""
+
+    def run(self, result=None):
+        print(f'[{self.id()}] RUN', flush=True)
+        started = time.monotonic()
+        result = super().run(result)
+        failed = any(test is self or getattr(test, 'test_case', None) is self
+                     for test, _ in result.failures + result.errors)
+        print(f'[{self.id()}] {"FAIL" if failed else "PASS"} '
+              f'({time.monotonic() - started:.3f}s)', flush=True)
+        return result
+
+    def assert_exact_facts(self, actual, expected):
+        # Fact equality excludes paths, so compare the complete witness too.
+        self.assertEqual({(trace.source, trace.parameter, trace.sanitizers, trace.path)
+                          for trace in actual}, expected)
+
+    def test_exact_witnesses_and_sanitizer_domains_survive_substitution(self):
+        trace = taint_py.TaintTrace
+        fact = frozenset({
+            trace('formal-p', parameter='p', sanitizers=frozenset({'xss'}),
+                  path=('p', 'detour')),
+            trace('formal-q', parameter='q', sanitizers=frozenset({'xss'}), path=('q',)),
+            trace('cmd', parameter='@global:cmd', sanitizers=frozenset({'command'}),
+                  path=('cmd', 'field')),
+            trace('fixed', sanitizers=frozenset({'sql'}), path=('fixed', 'stored')),
+            trace('missing', parameter='missing', path=('missing',)),
+        })
+        bound = {
+            'p': frozenset({trace('user', path=('user', 'long'))}),
+            'q': frozenset({trace('user', path=('user',))}),
+            '@global:cmd': frozenset({trace('cli', sanitizers=frozenset({'sql'}), path=('cli',))}),
+        }
+        expected = {
+            ('user', None, frozenset({'xss'}), ('user', 'helper()', 'q')),
+            ('cli', None, frozenset({'command', 'sql'}), ('cli', 'helper()', 'field')),
+            ('fixed', None, frozenset({'sql'}), ('fixed', 'stored')),
+        }
+        for engine in (taint_py._Flow, header_injection._HeaderFlow):
+            with self.subTest(engine=engine.__name__):
+                self.assert_exact_facts(engine.substitute(fact, bound, 'helper()'), expected)
+
+    def test_header_reset_revokes_old_proofs_before_reestablishing_them(self):
+        trace = taint_py.TaintTrace
+        cr, lf, reset = 'header:cr', 'header:lf', 'header:reset'
+        fact = frozenset({
+            trace('p', parameter='p', path=('p',)),
+            trace('q', parameter='q', sanitizers=frozenset({reset}), path=('q',)),
+            trace('r', parameter='@free:r', sanitizers=frozenset({reset, cr}),
+                  path=('r', 'tail')),
+            trace('s', parameter='s', sanitizers=frozenset({reset, cr, lf}), path=('s',)),
+        })
+        encoded = frozenset({trace('request', sanitizers=frozenset({cr, lf, 'sql'}),
+                                   path=('request',))})
+        bound = {name: encoded for name in ('p', 'q', '@free:r', 's')}
+        result = header_injection._HeaderFlow.substitute(fact, bound, 'header()')
+        self.assert_exact_facts(result, {
+            ('request', None, frozenset({cr, lf, 'sql'}), ('request', 'header()', 'p')),
+            ('request', None, frozenset({reset, 'sql'}), ('request', 'header()', 'q')),
+            ('request', None, frozenset({reset, cr, 'sql'}), ('request', 'header()', 'tail')),
+            ('request', None, frozenset({reset, cr, lf, 'sql'}), ('request', 'header()', 's')),
+        })
+        self.assertEqual({item.path[-1] for item in result if header_injection._safe(item)},
+                         {'p', 's'})
+
+    def test_work_limit_charges_actual_expansion_before_joining(self):
+        trace = taint_py.TaintTrace
+        fact = frozenset({
+            trace('p', parameter='p'), trace('q', parameter='q'),
+            trace('missing', parameter='missing'), trace('concrete', path=('concrete',)),
+        })
+        bound = {
+            'p': frozenset({trace('a', path=('a',)), trace('b', path=('b',))}),
+            'q': frozenset({trace('c', path=('c',))}),
+        }
+        # Four summary traces plus three actual traces; a missing binding
+        # expands to no facts, and the concrete trace has no actual argument.
+        expected = {
+            ('a', None, frozenset(), ('a', 'call()')),
+            ('b', None, frozenset(), ('b', 'call()')),
+            ('c', None, frozenset(), ('c', 'call()')),
+            ('concrete', None, frozenset(), ('concrete',)),
+        }
+        for engine in (taint_py._Flow, header_injection._HeaderFlow):
+            with self.subTest(engine=engine.__name__):
+                budget = Budget(7)
+                self.assert_exact_facts(engine.substitute(fact, bound, 'call()', budget=budget),
+                                        expected)
+                self.assertEqual(budget.remaining, 0)
+                exhausted = Budget(6)
+                with patch.object(taint_py, 'join_facts', wraps=taint_py.join_facts) as join:
+                    with self.assertRaisesRegex(AnalysisLimit, 'work limit exceeded.*incomplete'):
+                        engine.substitute(fact, bound, 'call()', budget=exhausted)
+                    join.assert_not_called()
+                self.assertEqual(exhausted.remaining, -1)
+                empty = Budget(0)
+                self.assertIs(engine.substitute(taint_py.CLEAN, bound, 'call()', budget=empty),
+                              taint_py.CLEAN)
+                self.assertEqual(empty.remaining, 0)
+
+    def test_fact_visits_scale_linearly_with_summary_size(self):
+        trace = taint_py.TaintTrace
+        join = taint_py.join_facts
+        for count in (32, 128):
+            fact = frozenset(trace(f'formal{index}', parameter=f'p{index}',
+                                   sanitizers=frozenset({'xss'}) if index % 2 else frozenset(),
+                                   path=(f'p{index}',)) for index in range(count))
+            bound = {f'p{index}': frozenset({trace(f'source{index}', path=(f'source{index}',))})
+                     for index in range(count)}
+            expected = {
+                (f'source{index}', None, frozenset({'xss'}) if index % 2 else frozenset(),
+                 (f'source{index}', 'apply()', f'p{index}')) for index in range(count)
+            }
+            for engine in (taint_py._Flow, header_injection._HeaderFlow):
+                with self.subTest(engine=engine.__name__, traces=count):
+                    visited = [0]
+
+                    def observe(*facts):
+                        visited[0] += sum(len(part) for part in facts)
+                        return join(*facts)
+
+                    budget = Budget(2 * count)
+                    with patch.object(taint_py, 'join_facts', observe):
+                        actual = engine.substitute(fact, bound, 'apply()', budget=budget)
+                    self.assert_exact_facts(actual, expected)
+                    self.assertEqual(budget.remaining, 0)
+                    self.assertLessEqual(
+                        visited[0], 2 * count,
+                        f'{count} summary traces caused {visited[0]} joined fact visits')
+
+    def test_advance_cache_keeps_equal_facts_with_distinct_witnesses_separate(self):
+        memo = taint_py._advance_trace
+        memo.cache_clear()
+        self.addCleanup(memo.cache_clear)
+        left = taint_py.TaintTrace('request', sanitizers=frozenset({'xss'}),
+                                   path=('request', 'left'))
+        right = taint_py.TaintTrace('request', sanitizers=frozenset({'xss'}),
+                                    path=('request', 'right'))
+        self.assertEqual(left, right, 'Evidence must remain outside semantic lattice equality')
+        expected_left = {('request', None, frozenset({'xss'}),
+                          ('request', 'left', 'sink()'))}
+        expected_right = {('request', None, frozenset({'xss'}),
+                           ('request', 'right', 'sink()'))}
+        self.assert_exact_facts(taint_py._advance(frozenset({left}), 'sink()'), expected_left)
+        self.assert_exact_facts(taint_py._advance(frozenset({right}), 'sink()'), expected_right)
+        self.assertEqual(memo.cache_info().misses, 2)
+        self.assert_exact_facts(taint_py._advance(frozenset({left}), 'sink()'), expected_left)
+        self.assertEqual(memo.cache_info().hits, 1)
+
+    def test_advance_cache_keys_every_trace_field_steps_and_path_limit(self):
+        memo = taint_py._advance_trace
+        memo.cache_clear()
+        self.addCleanup(memo.cache_clear)
+        trace = taint_py.TaintTrace
+        path = ('root', 'a', 'b', 'c')
+        xss, command = frozenset({'xss'}), frozenset({'command'})
+        cases = (
+            (trace('source', 'p', xss, path), ('call()', 'value'), 5,
+             ('source', 'p', xss, ('root', 'b', 'c', 'call()', 'value'))),
+            (trace('other', 'p', xss, path), ('call()', 'value'), 5,
+             ('other', 'p', xss, ('root', 'b', 'c', 'call()', 'value'))),
+            (trace('source', None, xss, path), ('call()', 'value'), 5,
+             ('source', None, xss, ('root', 'b', 'c', 'call()', 'value'))),
+            (trace('source', 'p', command, path), ('call()', 'value'), 5,
+             ('source', 'p', command, ('root', 'b', 'c', 'call()', 'value'))),
+            (trace('source', 'p', xss, path), ('other()',), 5,
+             ('source', 'p', xss, ('root', 'a', 'b', 'c', 'other()'))),
+            (trace('source', 'p', xss, path), ('call()', 'value'), 3,
+             ('source', 'p', xss, ('root', 'call()', 'value'))),
+        )
+        for value, steps, limit, expected in cases:
+            with self.subTest(expected=expected), patch.object(taint_py, 'PATH_LIMIT', limit):
+                self.assert_exact_facts(taint_py._advance(frozenset({value}), *steps),
+                                        {expected})
+        self.assertEqual(memo.cache_info().misses, len(cases))
+
+    def test_advance_cache_is_bounded_and_warm_hits_do_not_refund_work(self):
+        memo = taint_py._advance_trace
+        memo.cache_clear()
+        self.addCleanup(memo.cache_clear)
+        self.assertEqual(memo.cache_info().maxsize, 1024)
+        trace = taint_py.TaintTrace
+        oldest = frozenset({trace('oldest', path=('oldest',))})
+        taint_py._advance(oldest, 'hop()')
+        for index in range(1024):
+            source = f'entry{index}'
+            newest = frozenset({trace(source, path=(source,))})
+            taint_py._advance(newest, 'hop()')
+        self.assertEqual(memo.cache_info().currsize, 1024)
+        misses = memo.cache_info().misses
+        self.assert_exact_facts(taint_py._advance(oldest, 'hop()'),
+                                {('oldest', None, frozenset(), ('oldest', 'hop()'))})
+        self.assertEqual(memo.cache_info().misses, misses + 1, 'The oldest entry must be evicted')
+        hits = memo.cache_info().hits
+        taint_py._advance(newest, 'hop()')
+        self.assertEqual(memo.cache_info().hits, hits + 1)
+        self.assertEqual(memo.cache_info().currsize, 1024)
+
+        fact = frozenset({trace('p', parameter='p', path=('p',))})
+        bound = {'p': frozenset({trace('warm_input', path=('warm_input',))})}
+        expected = {('warm_input', None, frozenset(), ('warm_input', 'call()', 'p'))}
+        for engine in (taint_py._Flow, header_injection._HeaderFlow):
+            with self.subTest(engine=engine.__name__):
+                first = Budget(2)
+                self.assert_exact_facts(engine.substitute(fact, bound, 'call()', budget=first),
+                                        expected)
+                self.assertEqual(first.remaining, 0)
+                hits = memo.cache_info().hits
+                warm = Budget(2)
+                self.assert_exact_facts(engine.substitute(fact, bound, 'call()', budget=warm),
+                                        expected)
+                self.assertEqual(warm.remaining, 0)
+                self.assertGreater(memo.cache_info().hits, hits)
+                hits = memo.cache_info().hits
+                exhausted = Budget(1)
+                with self.assertRaisesRegex(AnalysisLimit, 'work limit exceeded.*incomplete'):
+                    engine.substitute(fact, bound, 'call()', budget=exhausted)
+                self.assertEqual(exhausted.remaining, -1)
+                self.assertEqual(memo.cache_info().hits, hits)
+
+
 class WorkLimitCompletionTests(unittest.TestCase):
     """A work limit bounds analysis without manufacturing a clean result."""
 
@@ -1048,6 +1271,233 @@ apply(eval, sys.argv[1])
                           ('z_last.py', 'python.taint.eval', 1)], report)
         self.assertFalse(list((self.root / 'cache').glob('*/files/**/*.json')),
                          'A naturally exhausted scan must not admit partial cache entries')
+
+
+class PythonInputAdmissionTests(unittest.TestCase):
+    """Real source decoding and partial results, without filesystem fixtures."""
+
+    def setUp(self):
+        import tokenize
+
+        self.root = Path('/__ubs_virtual_taint_inputs__')
+        self.contents = {}
+        original_open = io.open
+
+        def virtual_open(file, mode='r', buffering=-1, encoding=None, errors=None,
+                         newline=None, closefd=True, opener=None):
+            if any(flag in mode for flag in 'wax+'):
+                raise AssertionError(f'Input-admission tests must not write files: {file}')
+            path = Path(os.fsdecode(file)) if not isinstance(file, int) else None
+            if path is None or not path.is_relative_to(self.root):
+                return original_open(file, mode, buffering, encoding, errors,
+                                     newline, closefd, opener)
+            if path not in self.contents:
+                raise FileNotFoundError(2, 'virtual source does not exist', str(path))
+            contents = self.contents[path]
+            if isinstance(contents, OSError):
+                raise contents
+            stream = io.BytesIO(contents)
+            if 'b' in mode:
+                return stream
+            return io.TextIOWrapper(stream, encoding=encoding, errors=errors, newline=newline)
+
+        # Path.read_text and tokenize.open take different low-level open paths.
+        # Byte streams retain TextIOWrapper's real codec/BOM/error behavior.
+        for module, name in ((io, 'open'), (tokenize, '_builtin_open')):
+            opened = patch.object(module, name, virtual_open)
+            opened.start()
+            self.addCleanup(opened.stop)
+
+    def source(self, name, contents):
+        path = self.root / name
+        self.contents[path] = contents.encode('utf-8') if isinstance(contents, str) else contents
+        return path
+
+    @staticmethod
+    def sites(findings):
+        return [(path.name, rule, line, column) for path, rule, line, column, _ in findings]
+
+    def incomplete_project(self, files):
+        project = taint_py._Project(files, self.root)
+        findings = []
+        with self.assertRaises(AnalysisLimit) as raised:
+            findings.extend(project.findings())
+        self.assertIn('incomplete', str(raised.exception))
+        return findings, str(raised.exception)
+
+    def test_encodings_keep_real_taint_safe_values_and_suppressions(self):
+        for name, prefix, line in (
+                ('latin1.py', b'# coding: latin-1\nlabel = "caf\xe9"\n', 3),
+                ('bom.py', b'\xef\xbb\xbf', 1)):
+            path = self.source(name, prefix + b'eval(input())\neval("fixed")\n'
+                               b'eval(input())  # ubs:ignore\n')
+            with self.subTest(encoding=name):
+                self.assertEqual([(rule, row, column) for rule, row, column, _
+                                  in taint_py.scan_file_findings(path)],
+                                 [('py.taint.eval', line, 1)])
+                self.assertEqual(self.sites(taint_py._Project([path], self.root).findings()),
+                                 [(name, 'py.taint.eval', line, 1)])
+
+    def test_encoded_selected_modules_keep_imported_flow_and_clean_controls(self):
+        helper = self.source('helper.py', b'# coding: latin-1\nlabel = "caf\xe9"\n'
+                             b'def relay(value):\n    return value\n')
+        app = self.source('app.py', b'\xef\xbb\xbffrom helper import relay\n'
+                          b'eval(relay(input()))\n')
+        for files in ([app, helper], [helper, app]):
+            with self.subTest(order=[path.name for path in files]):
+                self.assertEqual(self.sites(taint_py._Project(files, self.root).findings()),
+                                 [('app.py', 'py.taint.eval', 2, 1)])
+        self.source('helper.py', b'# coding: latin-1\nlabel = "caf\xe9"\n'
+                    b'def relay(value):\n    return "fixed"\n')
+        self.assertEqual(list(taint_py._Project([app, helper], self.root).findings()), [])
+
+    def test_standalone_read_decode_codec_and_parse_failures_are_explicit(self):
+        paths = [self.root / 'missing.py',
+                 self.source('denied.py', PermissionError('source read denied')),
+                 self.source('invalid.py', b'def invalid(:  # ubs:ignore\n    pass\n'),
+                 self.source('undecodable.py', b'label = "\xff"\n'),
+                 self.source('unknown-codec.py', b'# coding: unknown_codec\nvalue = 1\n'),
+                 self.source('binary-codec.py', b'# coding: hex_codec\nvalue = 1\n'),
+                 self.source('null.py', b'value = \x00\n')]
+        for path in paths:
+            with self.subTest(source=path.name):
+                with self.assertRaises(AnalysisLimit) as raised:
+                    list(taint_py.scan_file_findings(path))
+                self.assertIn(path.name, str(raised.exception))
+                self.assertIn('Cannot analyze Python source', str(raised.exception))
+                self.assertIn('incomplete', str(raised.exception))
+
+    def test_project_retains_independent_findings_around_failed_inputs(self):
+        files = [self.source('a_first.py', 'eval(input())\n'),
+                 self.source('b_decode.py', b'label = "\xff"\n'),
+                 self.source('c_read.py', PermissionError('source read denied')),
+                 self.source('d_syntax.py', 'def invalid(:\n    pass\n'),
+                 self.source('z_last.py', 'eval(input())\n')]
+        findings, message = self.incomplete_project(files)
+        self.assertEqual(self.sites(findings),
+                         [('a_first.py', 'py.taint.eval', 1, 1),
+                          ('z_last.py', 'py.taint.eval', 1, 1)])
+        self.assertIn('3 input(s)', message)
+        for path in files[1:-1]:
+            self.assertIn(path.name, message)
+
+    def test_all_bad_inputs_deduplicate_and_bound_diagnostics(self):
+        missing = self.root / 'missing.py'
+        findings, message = self.incomplete_project([missing, missing])
+        self.assertEqual(findings, [])
+        self.assertIn('1 input(s)', message)
+        self.assertNotIn('2 input(s)', message)
+        files = [self.source(f'bad-{index}.py', 'def invalid(:\n    pass\n')
+                 for index in range(8)]
+        findings, message = self.incomplete_project([path for path in files for _ in range(2)])
+        self.assertEqual(findings, [])
+        self.assertIn('8 input(s)', message)
+        self.assertIn('5 more failed inputs', message)
+        self.assertLess(len(message), 1800)
+        for path in files[:3]:
+            self.assertIn(path.name, message)
+        self.assertNotIn(files[-1].name, message)
+
+    def test_parser_recursion_is_partial_and_preserves_later_sources(self):
+        files = [self.source('a_first.py', 'eval(input())\n'),
+                 self.source('deep.py', 'eval(input())\n'),
+                 self.source('z_last.py', 'eval(input())\n')]
+        original_parse = ast.parse
+
+        def parse(source, filename='<unknown>', *args, **kwargs):
+            if filename == str(files[1]):
+                raise RecursionError('compiler depth probe')
+            return original_parse(source, filename, *args, **kwargs)
+
+        with patch.object(ast, 'parse', side_effect=parse):
+            with self.assertRaisesRegex(AnalysisLimit, 'RecursionError.*incomplete'):
+                list(taint_py.scan_file_findings(files[1]))
+            findings, message = self.incomplete_project(files)
+        self.assertEqual(self.sites(findings),
+                         [('a_first.py', 'py.taint.eval', 1, 1),
+                          ('z_last.py', 'py.taint.eval', 1, 1)])
+        self.assertIn('deep.py', message)
+        self.assertIn('compiler depth probe', message)
+
+    def test_input_and_component_failures_are_both_reported(self):
+        files = [self.source('a_first.py', 'eval(input())\n'),
+                 self.source('b_invalid.py', 'def invalid(:\n    pass\n'),
+                 self.source('m_limited.py', 'eval(input())\n'),
+                 self.source('z_last.py', 'eval(input())\n')]
+        with patch.object(taint_py, 'Budget', side_effect=[Budget(), Budget(0), Budget()]):
+            findings, message = self.incomplete_project(files)
+        self.assertEqual(self.sites(findings),
+                         [('a_first.py', 'py.taint.eval', 1, 1),
+                          ('z_last.py', 'py.taint.eval', 1, 1)])
+        for detail in ('1 input(s)', 'b_invalid.py', '1 component(s)',
+                       'm_limited.py', 'work limit exceeded'):
+            self.assertIn(detail, message)
+
+    def test_registry_retains_records_and_reports_input_failure(self):
+        from ubs_core import py_scan
+        from ubs_core.registry import Analyzer, RunContext
+
+        files = [self.source('a_first.py', 'eval(input())\n'),
+                 self.source('bad.py', PermissionError('source read denied')),
+                 self.source('z_last.py', 'eval(input())\n')]
+        registered = [Analyzer('taint', 'python', 'taint_py', taint_py.run)]
+        sink, errors = io.StringIO(), []
+        py_scan.run_analyzers(files, sink, taint=True, errors=errors,
+                              project_dir=str(self.root), registered=registered)
+        records = [json.loads(line) for line in sink.getvalue().splitlines()]
+        self.assertEqual([(Path(row['path']).name, row['rule'], row['line']) for row in records],
+                         [('a_first.py', 'python.taint.eval', 1),
+                          ('z_last.py', 'python.taint.eval', 1)])
+        self.assertEqual(len(errors), 1)
+        self.assertIn('taint_py (selected project): AnalysisLimit', errors[0])
+        self.assertIn('bad.py', errors[0])
+        sink = io.StringIO()
+        with self.assertRaises(AnalysisLimit):
+            py_scan.run_analyzers(files, sink, taint=True, project_dir=str(self.root),
+                                  registered=registered)
+        self.assertEqual(len(sink.getvalue().splitlines()), 2)
+        context = RunContext(lang='python', files=files, profile={
+            'project_dir': str(self.root), 'disabled_rules': ['python.taint.eval', 'py.taint.eval']})
+        suppressed = []
+        with self.assertRaisesRegex(AnalysisLimit, 'bad.py'):
+            suppressed.extend(taint_py.run(context))
+        self.assertEqual(suppressed, [], 'Disabled findings must not disable input failure reporting')
+
+    def test_legacy_entrypoint_keeps_rows_and_returns_incomplete(self):
+        files = [self.source('a_first.py', 'eval(input())\n'),
+                 self.source('bad.py', PermissionError('source read denied')),
+                 self.source('z_last.py', 'eval(input())\n')]
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch.object(taint_py, 'iter_files', return_value=iter(files)), \
+                patch.object(taint_py, 'ROOT', self.root), \
+                patch.object(taint_py, 'BASE_DIR', self.root), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = taint_py.main(['taint_py.py', str(self.root)])
+        self.assertEqual(code, 2)
+        self.assertTrue(stdout.getvalue().startswith('py.taint.eval\t2\t'), stdout.getvalue())
+        self.assertIn('bad.py', stderr.getvalue())
+        self.assertIn('incomplete', stderr.getvalue())
+
+    def test_header_reader_keeps_encoded_findings_and_partial_results(self):
+        from ubs_core.py_detectors import header_injection
+
+        files = []
+        for name, prefix, line in (
+                ('header-latin1.py', b'# coding: latin-1\nlabel = "caf\xe9"\n', 3),
+                ('header-bom.py', b'\xef\xbb\xbf', 1)):
+            path = self.source(name, prefix + b'response.headers["X-User"] = input()\n'
+                               b'response.headers["X-Safe"] = "fixed"\n'
+                               b'response.headers["X-Ignored"] = input()  # ubs:ignore\n')
+            files.append(path)
+            with self.subTest(encoding=name):
+                self.assertEqual([(found.name, row, column) for found, row, column, _
+                                  in header_injection.find([path])], [(name, line, 1)])
+        broken = self.source('header-bad.py', b'# coding: unknown_codec\nvalue = 1\n')
+        findings = []
+        with self.assertRaisesRegex(RuntimeError, 'incomplete header analysis.*header-bad.py'):
+            findings.extend(header_injection.find([files[0], broken, files[1]]))
+        self.assertEqual([(found.name, row) for found, row, _, _ in findings],
+                         [('header-latin1.py', 3), ('header-bom.py', 1)])
 
 
 if __name__ == '__main__':

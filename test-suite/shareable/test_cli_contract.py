@@ -494,6 +494,248 @@ def check_jsonl_snapshot_timestamps() -> None:
     report('jsonl_snapshot_timestamps', True, 'detailed/summary/legacy share one snapshot; provenance retained')
 
 
+def _jsonl_evidence_workspace(label: str) -> Path:
+    artifacts = REPO_ROOT / "test-suite" / "artifacts" / "jsonl-evidence"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix=f"{label}-", dir=artifacts)).resolve()
+
+
+def _render_jsonl_evidence(root: Path, document: dict, *, new_only: bool = False) -> subprocess.CompletedProcess:
+    """Exercise the actual formatter with a supplied canonical document."""
+    source = UBS.read_text(encoding="utf-8")
+    marker = "write_jsonl_summary(){\n"
+    assert source.count(marker) == 1
+    start = source.index(marker)
+    renderer = source[start:source.index("\n}\n", start) + 3]
+    driver = root / "render.sh"
+    driver.write_text(
+        '#!/usr/bin/env bash\nset -Eeuo pipefail\n'
+        'generate_combined_json(){ return 0; }\n'
+        'need_cmd(){ command -v "$1" >/dev/null; }\n'
+        + renderer + '\nwrite_jsonl_summary ""\n', encoding="utf-8",
+    )
+    combined = root / "combined.json"
+    combined.write_text(json.dumps(document), encoding="utf-8")
+    env = {**os.environ, "TMPDIR_RUN": str(root), "COMBINED_JSON_FILE": str(combined),
+           "SOURCE_PROJECT_DIR": str(root), "JSONL_DETAIL": "1", "NEW_ONLY": "1" if new_only else "0"}
+    return subprocess.run(["bash", str(driver)], env=env, capture_output=True,
+                          text=True, timeout=30, check=False)
+
+
+def check_jsonl_preserves_canonical_fields() -> None:
+    root = _jsonl_evidence_workspace("canonical")
+    snapshot, original = "2030-01-01T00:00:02Z", "2030-01-01T00:00:00Z"
+    source = {"lang": "python", "rule_id": "py.source", "severity": "critical",
+              "file": "src/source.py", "line": 4, "col": 2, "message": "unsafe", "title": "specific title",
+              "fingerprint": "source", "suppressed": False, "timestamp": original,
+              "extras": {"nested": {"labels": ["α", None, False, {"empty": []}]}, "zero": 0},
+              "type": "producer-type", "project": "producer-project", "language": "producer-language"}
+    suppressed = {**source, "fingerprint": "suppressed", "suppressed": True, "extras": {}}
+    aggregate = {"lang": "python", "rule_id": "py.aggregate", "severity": "warning",
+                 "file": "", "line": 0, "message": "weighted", "fingerprint": "aggregate",
+                 "scope": "project_aggregate", "count": 7, "suppressed": False}
+    note = {"lang": "python", "rule_id": "py.note", "severity": "info", "file": "", "line": 0,
+            "message": "project note", "fingerprint": "note", "scope": "project", "count": 0,
+            "suppressed": False, "note": {"detail": "public canonical metadata"}}
+    findings = [source, suppressed, aggregate, note]
+    counts = {"files": 1, "critical": 1, "warning": 7, "info": 0}
+    document = {"project": str(root), "timestamp": snapshot, "status": "partial",
+                "failed_modules": [{"language": "python", "status": "partial"}],
+                "findings": findings, "totals": counts,
+                "scanners": [{"language": "python", "status": "partial", "timestamp": original, **counts}]}
+    proc = _render_jsonl_evidence(root, document)
+    write_case_artifacts("jsonl_preserves_canonical_fields", proc)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    rows = [parse_json_document(line) for line in proc.stdout.splitlines()]
+    emitted = [row for row in rows if row["type"] == "finding"]
+    assert len(emitted) == len(findings), rows
+    for before, after in zip(findings, emitted):
+        for key, value in before.items():
+            if key not in {"lang", "timestamp", "type", "project", "language"}:
+                assert after.get(key) == value, (key, before, after)
+        assert after["language"] == before["lang"] and "lang" not in after, after
+        assert after["type"] == "finding" and after["project"] == str(root), after
+        assert after["count"] == before.get("count", 1), after
+        assert ("extras" in after) == ("extras" in before), after
+        assert after.get("finding_timestamp") == before.get("timestamp"), after
+    assert all(row["timestamp"] == snapshot for row in rows), rows
+    assert rows[-1]["status"] == "partial" and rows[-1]["failed_modules"] == document["failed_modules"], rows
+    for severity in ("critical", "warning", "info"):
+        active = sum(row["count"] for row in emitted if row["severity"] == severity and not row["suppressed"])
+        assert active == counts[severity] == rows[-1][severity], rows
+    # A baseline can remove all canonical records while compatibility previews
+    # still describe the original scan. An unfiltered empty ledger may instead
+    # accompany a legacy summary with report-only AST evidence.
+    preview = {"severity": "critical", "title": "legacy preview", "count": 1, "samples": []}
+    filtered = {**document, "findings": [], "totals": {**counts, "critical": 0, "warning": 0},
+                "scanners": [{**document["scanners"][0], "critical": 0, "warning": 0, "findings": [preview]}]}
+    for canonical_present, new_only, expected in ((True, True, 0), (True, False, 1), (False, False, 1)):
+        view = dict(filtered)
+        if not canonical_present:
+            view.pop("findings")
+        result = _render_jsonl_evidence(root, view, new_only=new_only)
+        assert result.returncode == 0, result.stdout + result.stderr
+        records = [parse_json_document(line) for line in result.stdout.splitlines()]
+        locations = [row for row in records if row["type"] == "finding"]
+        assert len(locations) == expected, records
+    report("jsonl_preserves_canonical_fields", True,
+           "evidence, weights, notes, suppression and snapshot preserved; baseline-filtered empty ledger is authoritative")
+
+
+def check_jsonl_legacy_advisory_fallback() -> None:
+    """A report-only AST channel does not replace a legacy counted summary."""
+    helpers = REPO_ROOT / "modules" / "helpers"
+    if str(helpers) not in sys.path:
+        sys.path.insert(0, str(helpers))
+    from ubs_core.findings_merge import merge
+
+    root = _jsonl_evidence_workspace("legacy-advisory")
+    source = root / "source.py"
+    source.write_text("value = 1\n", encoding="utf-8")
+    preview = {"rule_id": "legacy.counted", "severity": "critical", "title": "Legacy finding",
+               "count": 1, "samples": [{"file": str(source), "line": 1, "code": "value = 1"}]}
+    advisory = {"rule": "py.advisory", "path": str(source), "line": 1, "col": 1,
+                "severity": "info", "message": "Report-only evidence"}
+    counts = {"files": 1, "critical": 1, "warning": 0, "info": 0}
+    for ast_records in ([], [advisory]):
+        combined = root / "combined.json"
+        combined.write_text(json.dumps({
+            "project": str(root), "timestamp": "2030-01-01T00:00:00Z", "status": "ok",
+            "failed_modules": [], "totals": counts,
+            "scanners": [{"language": "python", "status": "ok", **counts,
+                          "findings": [preview], "extras": {"ast_findings": ast_records}}],
+        }), encoding="utf-8")
+        assert merge(root, combined, project_dir=root) == 0
+        document = parse_json_document(combined.read_text(encoding="utf-8"))
+        assert document["findings"] == [], document
+        result = _render_jsonl_evidence(root, document)
+        assert result.returncode == 0, result.stdout + result.stderr
+        rows = [parse_json_document(line) for line in result.stdout.splitlines()]
+        findings = [row for row in rows if row["type"] == "finding"]
+        assert len(findings) == 1 and findings[0]["rule_id"] == "legacy.counted", rows
+        assert findings[0]["count"] == rows[-1]["critical"] == 1, rows
+        assert rows[-1]["info"] == 0 and rows[-1]["status"] == "ok", rows
+    report("jsonl_legacy_advisory_fallback", True,
+           "actual merger keeps legacy counted previews with empty or populated report-only AST evidence")
+
+
+def check_jsonl_real_taint_evidence() -> None:
+    """Real Java core evidence, then explicitly separate runner protocol controls."""
+    root = _jsonl_evidence_workspace("java-core")
+    scratch = root / "scratch"
+    scratch.mkdir()
+    source = root / "Endpoint.java"
+    source.write_text(
+        'import com.sun.net.httpserver.HttpExchange;\nimport java.sql.Statement;\n'
+        'class Endpoint {\n'
+        '    void handle(HttpExchange request, Statement statement) throws Exception {\n'
+        '        String input = request.getRequestURI().getQuery();\n'
+        '        String sql = "SELECT * FROM users WHERE name=\'" + input + "\'";\n'
+        '        statement.executeQuery(sql);\n    }\n}\n', encoding="utf-8",
+    )
+    file_list, sink, summary = root / "files.nul", root / "java.findings.json", root / "java.json"
+    file_list.write_bytes(os.fsencode(source) + b"\0")
+    helpers = REPO_ROOT / "modules" / "helpers"
+    env = {**os.environ, "PYTHONPATH": str(helpers), "UBS_NO_CACHE": "1", "UBS_KEEP_TEMP": "1",
+           "TMPDIR": str(scratch), "XDG_CACHE_HOME": str(root / "cache"),
+           "XDG_DATA_HOME": str(root / "data"), "ENABLE_UV_TOOLS": "0"}
+    core = subprocess.run(
+        [sys.executable, "-B", "-m", "ubs_core.java_scan", "--files-from", str(file_list),
+         "--sink", str(sink), "--json-out", str(summary), "--project-dir", str(root), "--project", str(root)],
+        env=env, capture_output=True, text=True, timeout=60, check=False,
+    )
+    write_case_artifacts("jsonl_real_taint_core", core)
+    assert core.returncode == 1, core.stdout + core.stderr
+    scanner = parse_json_document(summary.read_text(encoding="utf-8"))
+    counts = {key: scanner[key] for key in ("files", "critical", "warning", "info")}
+    assert scanner["status"] == "ok" and counts == {"files": 1, "critical": 1, "warning": 0, "info": 0}, scanner
+    if str(helpers) not in sys.path:
+        sys.path.insert(0, str(helpers))
+    from ubs_core.findings_merge import merge, to_sarif
+
+    combined = root / "combined.json"
+    combined.write_text(json.dumps({"project": str(root), "timestamp": scanner["timestamp"],
+        "status": "ok", "failed_modules": [], "scanners": [scanner], "totals": counts}), encoding="utf-8")
+    assert merge(root, combined, project_dir=root) == 1
+    document = parse_json_document(combined.read_text(encoding="utf-8"))
+    finding = document["findings"][0]
+    expected_path = [
+        {"path": str(source), "line": 5, "col": 24, "kind": "source", "label": "request.getRequestURI("},
+        {"path": str(source), "line": 5, "col": 16, "kind": "assign", "label": "input"},
+        {"path": str(source), "line": 6, "col": 16, "kind": "assign", "label": "sql"},
+        {"path": str(source), "line": 7, "col": 9, "kind": "sink", "label": "JDBC SQL execution"},
+    ]
+    assert finding["rule_id"] == "java.security.sql-injection" and finding["extras"]["taint_path"] == expected_path, finding
+    proc = _render_jsonl_evidence(root, document)
+    write_case_artifacts("jsonl_real_taint_evidence", proc)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    rows = [parse_json_document(line) for line in proc.stdout.splitlines()]
+    emitted = next(row for row in rows if row["type"] == "finding")
+    assert emitted.get("extras") == finding["extras"], (finding, emitted)
+    sarif_finding = to_sarif(document)["runs"][0]["results"][0]
+    assert sarif_finding["properties"]["extras"] == emitted["extras"], sarif_finding
+    flow = sarif_finding["codeFlows"][0]["threadFlows"][0]["locations"]
+    assert [(step["location"]["physicalLocation"]["region"]["startLine"], step["kinds"][0])
+            for step in flow] == [(5, "source"), (5, "assign"), (6, "assign"), (7, "sink")], flow
+
+    # A PATH module is an explicit protocol double replaying the real Java
+    # producer's record. This tests runner transport, not native Java dispatch.
+    probe = root / "transport.py"
+    probe.write_text("# Module-protocol transport fixture.\n", encoding="utf-8")
+    replay = root / "replay-summary.json"
+    replay.write_text(json.dumps({**scanner, "language": "python"}), encoding="utf-8")
+    bin_dir = root / "bin"
+    bin_dir.mkdir()
+    module = bin_dir / "ubs-python"
+    module.write_text(
+        '#!/usr/bin/env bash\nset -euo pipefail\n'
+        'if [[ "${1:-}" == "--help" ]]; then\n  echo "contract: v2"\n  exit 0\nfi\n'
+        'for arg in "$@"; do\n'
+        '  case "$arg" in\n'
+        '    --report-json=*) cat "$UBS_TEST_EVIDENCE_SINK" > "${arg#*=}" ;;\n'
+        '  esac\ndone\n'
+        'cat "$UBS_TEST_EVIDENCE_SUMMARY"\nexit 1\n', encoding="utf-8",
+    )
+    module.chmod(0o755)
+    env.update(PATH=f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+               UBS_TEST_EVIDENCE_SINK=str(sink), UBS_TEST_EVIDENCE_SUMMARY=str(replay))
+    common = [str(probe), "--only=python", "--ci", "--no-config", "--ignore-file=/dev/null",
+              "--no-cache", f"--module-dir={REPO_ROOT / 'modules'}"]
+    for primary in ("json", "jsonl"):
+        result = run([*common, f"--format={primary}", f"--also=json:{primary}-copy.json",
+                      f"--also=jsonl:{primary}-copy.jsonl", f"--also=sarif:{primary}-copy.sarif",
+                      f"--beads-jsonl={primary}-beads.jsonl"], cwd=root, env=env)
+        write_case_artifacts(f"jsonl_evidence_transport_{primary}", result)
+        assert result.returncode == 1, result.stdout + result.stderr
+        copied = parse_json_document((root / f"{primary}-copy.json").read_text(encoding="utf-8"))
+        jsonl_text = (root / f"{primary}-copy.jsonl").read_text(encoding="utf-8")
+        assert jsonl_text == (root / f"{primary}-beads.jsonl").read_text(encoding="utf-8"), result.stderr
+        if primary == "jsonl":
+            assert result.stdout == jsonl_text, result.stdout
+        else:
+            assert parse_json_document(result.stdout) == copied
+        transport = [parse_json_document(line) for line in jsonl_text.splitlines()]
+        record = next(row for row in transport if row["type"] == "finding")
+        assert record["extras"] == copied["findings"][0]["extras"] == finding["extras"], record
+        assert record["fingerprint"] == copied["findings"][0]["fingerprint"] and record["count"] == 1, record
+        assert all(row["timestamp"] == copied["timestamp"] for row in transport), transport
+        assert copied["totals"] == counts and copied["status"] == "ok", copied
+        exported_sarif = parse_json_document((root / f"{primary}-copy.sarif").read_text(encoding="utf-8"))
+        assert exported_sarif["runs"][0]["results"][0]["properties"]["extras"] == finding["extras"]
+    baseline = (root / "json-copy.json").read_bytes()
+    filtered = run([*common, "--format=jsonl", "--baseline=json-copy.json", "--new-only",
+                    "--also=json:filtered.json", "--also=jsonl:filtered.jsonl"], cwd=root, env=env)
+    write_case_artifacts("jsonl_evidence_transport_baseline", filtered)
+    assert filtered.returncode == 0, filtered.stdout + filtered.stderr
+    remaining = [parse_json_document(line) for line in filtered.stdout.splitlines()]
+    assert not any(row["type"] == "finding" for row in remaining), remaining
+    assert (root / "json-copy.json").read_bytes() == baseline
+    assert all(remaining[-1][severity] == 0 for severity in ("critical", "warning", "info")), remaining
+    assert filtered.stdout == (root / "filtered.jsonl").read_text(encoding="utf-8")
+    report("jsonl_real_taint_evidence", True,
+           "real Java source→assign→sink evidence; JSON/JSONL/SARIF and protocol --also/Beads/baseline parity")
+
+
 def check_also_text_and_baseline() -> None:
     artifact_root = REPO_ROOT / "test-suite" / "artifacts" / "also-reports"
     artifact_root.mkdir(parents=True, exist_ok=True)
@@ -3139,6 +3381,9 @@ def main() -> int:
         check_module_docs_singleton_scope,
         check_also_reports_same_scan,
         check_jsonl_snapshot_timestamps,
+        check_jsonl_preserves_canonical_fields,
+        check_jsonl_legacy_advisory_fallback,
+        check_jsonl_real_taint_evidence,
         check_also_text_and_baseline,
         check_also_invalid_destinations,
         check_also_delivery_and_empty_scan,

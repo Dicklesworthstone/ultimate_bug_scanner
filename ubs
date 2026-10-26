@@ -2131,7 +2131,7 @@ cat <<'JSON'
   ],
   "formats": {
     "json": {"description": "One object: project, timestamp, status (ok|partial), failed_modules[], scanners[] (per-language summary with findings[] and status ok|timeout|error), totals{critical,warning,info,files}. Environment errors and refusals print an error envelope instead; no supported language prints a result object with exit_code 3.", "schema": "ubs --schema=json"},
-    "jsonl": {"description": "One JSON object per line: type=finding (per finding, with language), type=scanner (per language summary), type=totals (last line, carries status/failed_modules), or type=error (envelope).", "schema": "ubs --schema=jsonl"},
+    "jsonl": {"description": "One JSON object per line: type=finding (canonical finding fields, including analyzer extras, with language), type=scanner (per language summary), type=totals (last line, carries status/failed_modules), or type=error (envelope).", "schema": "ubs --schema=jsonl"},
     "sarif": {"description": "SARIF 2.1.0; one run per module. Partial runs and errors set runs[].invocations[0].executionSuccessful=false with toolExecutionNotifications (descriptor ids ubs/module-timeout, ubs/module-error, ubs/<refusal-or-error-reason>).", "schema": "ubs --schema=sarif"},
     "toon": {"description": "The json document encoded with toon_rust's tru. Without a usable toon_rust encoder (toon or tru on PATH, TOON_TRU_BIN/TOON_BIN, or the tool cache filled by 'ubs doctor --fix'/install.sh) the run exits 2 with the error envelope (reason toon-encoder-missing) instead of printing JSON labelled as TOON.", "schema": "ubs --schema=toon"},
     "text": {"description": "Human report; Combined Summary at the end (Files/Critical/Warning/Info, Status: partial when applicable)."}
@@ -2444,6 +2444,7 @@ cat <<'JSON'
           "title": {"type": "string"},
           "description": {"type": "string"},
           "samples": {"type": "array"},
+          "extras": {"type": "object", "description": "Public analyzer evidence from the canonical finding, preserved unchanged; may include an ordered taint_path."},
           "timestamp": {"type": "string", "description": "Combined scan snapshot timestamp."},
           "finding_timestamp": {"type": "string", "description": "Original finding timestamp when supplied by its module."}
         },
@@ -8731,19 +8732,22 @@ write_jsonl_summary(){
   if [[ "${JSONL_DETAIL:-1}" -eq 1 ]]; then
     # Detailed mode: emit each finding as its own JSONL line.
     # K2: top-level findings[] (contract-v2 NDJSON sinks) take precedence —
-    # one record per sample with rule id, location, fingerprint, suppression.
-    if jq -e '((.findings // []) | length) > 0' "$COMBINED_JSON_FILE" >/dev/null 2>&1; then
+    # Preserve the public canonical record, including nested analyzer evidence.
+    # Only transport fields and timestamp/language aliases belong to JSONL.
+    # A baseline-filtered empty ledger is authoritative: falling back would
+    # resurrect unfiltered previews. Without --new-only, report-only AST data
+    # can create an empty ledger alongside valid legacy counted findings.
+    if jq -e --argjson new_only "${NEW_ONLY:-0}" '
+      (((.findings // []) | length) > 0)
+      or ($new_only == 1 and (.findings | type) == "array")
+    ' "$COMBINED_JSON_FILE" >/dev/null 2>&1; then
       jq -c --arg project "$SOURCE_PROJECT_DIR" --arg ts "$ts" '
-        .findings[] |
-        ({type:"finding", project:$project, timestamp:$ts, language:.lang,
-          rule_id:.rule_id, category_id:.category_id, severity:.severity,
-          confidence:.confidence, file:.file, line:.line, col:.col,
-          message:.message, remediation:.remediation, fix:.fix,
-          fingerprint:.fingerprint, suppressed:.suppressed,
-          title:(.message // .rule_id),
-          count:(if has("count") then .count else 1 end)}
-         + (if has("scope") then {scope:.scope} else {} end)
-         + (if .timestamp != null then {finding_timestamp:.timestamp} else {} end))
+        .findings[] as $finding |
+        (($finding | del(.lang, .timestamp))
+         + {type:"finding", project:$project, timestamp:$ts, language:$finding.lang,
+            title:($finding.title // $finding.message // $finding.rule_id),
+            count:(if $finding | has("count") then $finding.count else 1 end)}
+         + (if $finding.timestamp != null then {finding_timestamp:$finding.timestamp} else {} end))
       ' "$COMBINED_JSON_FILE" >"$tmp" 2>/dev/null || return 1
     else
       jq -c --arg project "$SOURCE_PROJECT_DIR" --arg ts "$ts" '

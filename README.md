@@ -260,7 +260,7 @@ ubs --ci --only=python --category=resource-lifecycle \
 
 `latest.json` now contains the git metadata (repo URL, commit, blob_base) plus a `comparison.delta` block, and `latest.html` renders a lightweight dashboard summarising the deltas. SARIF uploads also pick up the comparison id so repeating runs in CI stay grouped by automation id.
 
-To publish SARIF and keep the complete JSON and JSONL findings from one scan:
+To publish SARIF and keep JSON and JSONL copies of the reported findings from one scan:
 
 ```bash
 ubs . --ci --format=sarif --output=report.sarif \
@@ -268,6 +268,22 @@ ubs . --ci --format=sarif --output=report.sarif \
 ```
 
 Every rendering shares the same findings, baseline filtering, and scan-completion state. Partial scans still export the available evidence and retain exit 2; an empty scan exports its explicit no-coverage result and retains exit 3. A failed additional export exits 2, names the failed path, preserves its previous report, and still attempts the other requested exports.
+
+Detailed JSONL preserves the public canonical finding fields, including nested
+analyzer evidence in `extras` (such as an ordered `extras.taint_path`), project
+scope, explicit counts including zero, and suppression flags. JSONL uses
+`language` for the canonical `lang` field. Its `type`, `project` and `timestamp`
+describe the export; a finding's original timestamp becomes `finding_timestamp`.
+Evidence fields absent from the canonical finding remain absent.
+
+With `--new-only`, an empty canonical findings array emits no finding records,
+even when scanner summaries retain previews from before baseline filtering.
+Ordinary legacy summaries still use their available finding previews. Their
+sample limits, rule thresholds and exit policy stay unchanged; JSONL export
+does not imply complete occurrence coverage for every analyzer or additivity
+for analyses that depend on cross-file context. The separate
+[Python pattern-count export](#python-pattern-count-export) defines its own
+distinct-line count and completeness contract.
 
 ---
 

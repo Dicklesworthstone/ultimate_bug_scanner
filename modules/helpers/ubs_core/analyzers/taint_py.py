@@ -3588,6 +3588,13 @@ class _Analysis:
         # expression/heap states belong to the solve, not the summary cache.
         solved = {}  # summary key -> (reads, writes, latest base effects)
         readers = defaultdict(dict)
+        # A write-free job can read defaults produced by a writer context.
+        # Moving all writers ahead of it changes that read even when writer
+        # order itself stays unchanged. Newly requested contexts may belong
+        # to foreign owners, so retain the whole source-order snapshot when
+        # any selected owner can write shared definition-time tables.
+        allow_reordering = not (self.definition_writers or any(
+            owner.definition_writers for owner in set(self.function_owners.values())))
 
         def parts(key):
             return key if isinstance(key, tuple) else (key, ())
@@ -3602,7 +3609,8 @@ class _Analysis:
                 # nonreturning bottom summaries. Importers only need to solve
                 # new callback contexts; active import cycles still converge.
                 return False
-            return key not in inherited and function not in owner.definition_writers
+            return (allow_reordering and key not in inherited
+                    and function not in owner.definition_writers)
 
         while True:
             self.budget.spend()

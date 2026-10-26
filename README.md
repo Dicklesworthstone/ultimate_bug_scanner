@@ -1880,13 +1880,20 @@ Each module maps its tool-specific severity strings, numeric levels, and legacy 
 
 #### Python call-chain analysis and work limits
 
-Python security category 7 reuses function summaries and schedules changed
-callees before their callers, including newly discovered callback contexts.
-Long subprocess chains no longer require a whole-file pass for each link.
-Recursive calls still converge through summary dependencies; there is no
-call-depth cutoff. Definition-time defaults and class metadata retain their
-ordered updates, and sink-specific sanitizers and mutation effects remain
-part of the summaries.
+Python security category 7 reuses function summaries. When selected function
+bodies contain no nested function, lambda, or class definitions, it schedules
+changed callees before their callers, including newly discovered callback
+contexts. Long subprocess chains on this path no longer require a whole-file
+pass for each link. Recursive calls still converge through summary dependencies;
+there is no call-depth cutoff.
+
+If any selected function owner can define nested callables or classes, UBS
+retains the original source-order passes. A reader of a captured default must
+stay between the writes that surround it; processing all writers first can
+hide a tainted value already returned by an earlier callback. This conservative
+path also covers imported helpers and can offer less scheduling speedup.
+Sink-specific sanitizers, mutation effects, work budgets, and incomplete-result
+handling remain active on both paths.
 
 Completed imported base summaries are reused across callers; new callback
 contexts and active import cycles still receive their required analysis. The
@@ -2091,6 +2098,18 @@ ubs .
 - **Go** – Category 9 now flags bearer tokens, webhook signatures, HMAC/MAC digests, CSRF values, API keys, and password-reset secrets compared with `==` or `!=` instead of `hmac.Equal`, `subtle.ConstantTimeCompare`, or a reviewed constant-time helper. It also catches JWT verification bypasses such as `ParseUnverified`, `SigningMethodNone`, `WithoutClaimsValidation`, `jwt.Parse` / `ParseWithClaims` callbacks that trust claims without signing-method validation, verified JWTs that omit issuer/audience claim binding, request-derived reverse proxy targets flowing into `httputil.NewSingleHostReverseProxy`, `ProxyRequest.SetURL`, or `Director` URL mutation without HTTPS plus host allow-list validation, and request/form/header values interpolated into SQL execution or query-builder strings instead of passed as parameters.
 - **Kotlin** – The Java-family module scans `.kt`/`.kts` sources for `if (value == null)` guards that merely log and keep running before hitting `value!!`, and its security pass now catches request/Ktor params, request paths, and upload filenames flowing into file read/write/serve/delete sinks, request-derived values flowing into response headers without CR/LF safety, request-derived query/header URLs flowing into Ktor-style HTTP client calls, zip extraction that writes `entry.name` / `entry.path` into destination paths without containment checks, and security-sensitive tokens, CSRF nonces, API keys, OTPs, reset codes, and invite codes built from `kotlin.random.Random`, `java.util.Random`, `ThreadLocalRandom`, `UUID.randomUUID`, or predictable time material instead of `SecureRandom`.
 - **Swift** – The dedicated `ubs-swift` module now ships the guard-`let` helper directly, so optional chaining/Objective‑C bridging heuristics fire even when you run `ubs --only=swift` locally (no piggybacking on the Java module). It catches cases where code logs and keeps going before force-unwrapping `value!`, protecting iOS/macOS pipelines that blend Swift + ObjC. The Swift security pass also tracks request query, route, URL path, and upload filename values into file read/write/serve/delete sinks unless they are reduced to a basename or pass a standardized root-containment check, flags request-derived redirect targets that reach redirects or `Location` headers without local-url or host allow-list validation, flags request/header/cookie/content values reaching non-`Location` response headers without CR/LF stripping/rejection, encoding, or a header-safe helper, flags request-derived outbound URLs that reach URLSession, URLRequest handoffs, blocking URL reads, or HTTP clients without https scheme and host allow-list validation, and now flags security-sensitive tokens, CSRF nonces, API keys, OTPs, salts, and reset/invite codes built from non-cryptographic Swift randomness or predictable time/process material instead of `SecRandomCopyBytes` or CryptoKit-backed helpers.
+
+#### Python constant-time comparisons
+
+Python flags ordinary equality comparisons involving secret material. For
+[issue #193](https://github.com/Dicklesworthstone/ultimate_bug_scanner/issues/193),
+a function-local literal dictionary with a `signal` or `*_signal` field can
+establish that an ambiguous `*_sig` local holds a public uppercase categorical
+label. This requires a single binding and a mapping used only for literal-key
+reads; mutation, aliases, escapes, conditional bindings, and namespace or frame
+reflection prevent that proof. Unknown or dynamic signal data, security-qualified
+names, sensitive comparison operands, literal passwords and signatures, and
+keyed or unresolved digests retain their existing detection behavior.
 
 ### **Resource Lifecycle AST Coverage**
 

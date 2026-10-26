@@ -19,6 +19,13 @@ receiver cannot be resolved in the function. An unkeyed hashlib digest of
 non-secret bytes (``hashlib.sha256(payload).hexdigest()`` against a public
 manifest checksum) is an integrity check, not an authentication tag, and is
 not reported.
+
+Signal role (GH #193): a function-local, single-assignment ``*_sig`` read
+from a literal dictionary's ``signal``/``*_signal`` field can be a public
+categorical label. Only literal enum-like strings, immutable scalar aliases,
+and dictionaries with no writes or escapes establish that role. Unknown
+signal data, conditional/repeated bindings, security-qualified names, and a
+sensitive operand on either side of the comparison remain reported.
 """
 
 from __future__ import annotations
@@ -183,6 +190,165 @@ def value_names_non_secret_vocabulary(value):
     return vocabulary and not name_is_sensitive(name)
 
 
+def public_signal_bindings(function):
+    """Return assignment values with a proven local categorical signal role.
+
+    This is a deliberately narrow must-proof, separate from the analyzer's
+    existing branch traversal. Only direct statements in the function body
+    qualify, and every binding of a candidate name is counted across the
+    entire syntax tree, including branches and nested scopes. A second write,
+    parameter, import, capture, global/nonlocal declaration, or deletion rules
+    out that name even when it occurs after a comparison. Dictionaries must
+    be literal, single-bound, and used only for literal-key get/subscript
+    reads: aliases, mutation, and passing the dictionary to a call defeat the
+    proof. Namespace/frame reflection also defeats it, including references
+    later invoked through a local or import alias. No claim is made about
+    arbitrary .get("signal") calls, globals,
+    interprocedural values, or all possible public categorical expressions.
+    """
+    nodes = list(ast.walk(function))
+    parents = {child: node for node in nodes for child in ast.iter_child_nodes(node)}
+    writes = {}
+    loads = {}
+    excluded = set()
+    security_terms = STRONG_TERMS | WEAK_TERMS | QUALIFIER_TERMS
+    reflection_names = {
+        'locals', 'globals', 'vars', 'eval', 'exec', '__builtins__', '__dict__',
+        'getattr', '__getattribute__', 'currentframe', '_getframe',
+        '_current_frames', 'f_locals', 'f_globals', 'getouterframes',
+        'getinnerframes', 'stack', 'trace',
+    }
+    # Match captures arrived in 3.10 and type parameters in 3.12. The helper
+    # still runs on 3.9, where those AST classes do not exist.
+    named_bindings = tuple(
+        getattr(ast, kind) for kind in (
+            'MatchAs', 'MatchStar', 'TypeVar', 'ParamSpec', 'TypeVarTuple',
+        ) if hasattr(ast, kind)
+    )
+    mapping_pattern = getattr(ast, 'MatchMapping', ())
+    for node in nodes:
+        reference = (
+            node.id if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+            else node.attr if isinstance(node, ast.Attribute)
+            else node.name.rsplit('.', 1)[-1] if isinstance(node, ast.alias)
+            else None
+        )
+        if reference in reflection_names:
+            return {}
+        bound = []
+        if isinstance(node, ast.Name):
+            if isinstance(node.ctx, ast.Load):
+                loads.setdefault(node.id, []).append(node)
+            else:
+                bound.append(node.id)
+        elif isinstance(node, ast.arg):
+            bound.append(node.arg)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.append(node.name)
+        elif isinstance(node, ast.alias):
+            bound.append(node.asname or node.name.split('.')[0])
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            bound.append(node.name)
+        elif isinstance(node, named_bindings) and node.name:
+            bound.append(node.name)
+        elif isinstance(node, mapping_pattern) and node.rest:
+            bound.append(node.rest)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            excluded.update(node.names)
+        for name in bound:
+            writes[name] = writes.get(name, 0) + 1
+
+    def public_name(name, *, allow_sig=False):
+        terms = identifier_terms(name)
+        if allow_sig and terms and terms[-1] == 'sig':
+            terms = terms[:-1]
+        return not any(term in security_terms for term in terms)
+
+    def public_label(value):
+        text = const_string(value)
+        return (
+            text is not None
+            and re.fullmatch(r'[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*', text) is not None
+            and public_name(text)
+        )
+
+    def read_only_map(name):
+        for load in loads.get(name, ()):
+            parent = parents.get(load)
+            if (
+                isinstance(parent, ast.Subscript) and parent.value is load
+                and isinstance(parent.ctx, ast.Load)
+                and const_string(parent.slice) is not None
+            ):
+                continue
+            call = parents.get(parent)
+            if (
+                isinstance(parent, ast.Attribute) and parent.value is load
+                and parent.attr == 'get' and isinstance(call, ast.Call)
+                and call.func is parent and len(call.args) in (1, 2)
+                and not call.keywords and const_string(call.args[0]) is not None
+            ):
+                continue
+            return False
+        return True
+
+    maps = {}
+    public_values = set()
+    bindings = {}
+    for statement in function.body:
+        if isinstance(statement, ast.Assign) and all(
+            isinstance(target, ast.Name) for target in statement.targets
+        ):
+            names = [target.id for target in statement.targets]
+            value = statement.value
+        elif isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name):
+            names = [statement.target.id]
+            value = statement.value
+        else:
+            continue
+        eligible = {
+            name for name in names
+            if writes.get(name) == 1 and name not in excluded
+            and public_name(name, allow_sig=True)
+        }
+        if not eligible or value is None:
+            continue
+        if isinstance(value, ast.Dict) and len(names) == 1 and read_only_map(names[0]):
+            fields = {}
+            for key, item in zip(value.keys, value.values):
+                field = const_string(key)
+                if field is None:
+                    fields.clear()  # unpacking/dynamic keys may replace any field
+                    break
+                terms = identifier_terms(field)
+                fields[field] = (
+                    bool(terms) and terms[-1] == 'signal'
+                    and public_name(field) and public_label(item)
+                )  # the last literal occurrence wins for duplicate keys
+            maps[names[0]] = {field for field, public in fields.items() if public}
+            continue
+        public = isinstance(value, ast.Name) and value.id in public_values
+        receiver = key = None
+        if isinstance(value, ast.Subscript):
+            receiver, key = value.value, const_string(value.slice)
+        elif (
+            isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute)
+            and value.func.attr == 'get' and len(value.args) in (1, 2)
+            and not value.keywords
+            and (
+                len(value.args) == 1 or public_label(value.args[1])
+                or isinstance(value.args[1], ast.Constant) and value.args[1].value is None
+            )
+        ):
+            receiver, key = value.func.value, const_string(value.args[0])
+        if isinstance(receiver, ast.Name) and key in maps.get(receiver.id, ()):
+            public = True
+        if public:
+            bindings[value] = eligible
+            public_values.update(eligible)
+    return bindings
+
+
 def is_constant_display(node):
     """A tuple/list/set display built only from literals: `("a", "b")`."""
     return isinstance(node, (ast.Tuple, ast.List, ast.Set)) and all(
@@ -209,6 +375,7 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
         # Names whose secret-looking spelling is explained by a non-secret
         # binding (`sig = self._call_signature(node)`).
         self.explained_names = set()
+        self.public_signal_bindings = {}
         self.issues = []
         self.seen_lines = set()
 
@@ -291,17 +458,19 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
     def mark_assignment(self, names, value):
         value_sensitive = self.expr_is_sensitive(value)
         explained = not value_sensitive and value_names_non_secret_vocabulary(value)
+        public_signals = self.public_signal_bindings.get(value, ())
         unkeyed_hash = (
             isinstance(value, ast.Call)
             and self.is_unkeyed_hash_ctor(value)
             and not self.call_input_is_sensitive(value)
         )
         for name in names:
-            if value_sensitive or (name_is_sensitive(name) and not explained):
+            name_explained = explained or (not value_sensitive and name in public_signals)
+            if value_sensitive or (name_is_sensitive(name) and not name_explained):
                 self.sensitive_names.add(name)
             else:
                 self.sensitive_names.discard(name)
-            if explained:
+            if name_explained:
                 self.explained_names.add(name)
             else:
                 self.explained_names.discard(name)
@@ -314,9 +483,11 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
         old_sensitive = set(self.sensitive_names)
         old_unkeyed = set(self.unkeyed_hash_names)
         old_explained = set(self.explained_names)
+        old_public_signals = self.public_signal_bindings
         self.sensitive_names.clear()
         self.unkeyed_hash_names.clear()
         self.explained_names.clear()
+        self.public_signal_bindings = public_signal_bindings(node)
         for arg in list(node.args.posonlyargs) + list(node.args.args) + list(node.args.kwonlyargs):
             if name_is_sensitive(arg.arg):
                 self.sensitive_names.add(arg.arg)
@@ -329,6 +500,7 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
         self.sensitive_names = old_sensitive
         self.unkeyed_hash_names = old_unkeyed
         self.explained_names = old_explained
+        self.public_signal_bindings = old_public_signals
 
     def visit_AsyncFunctionDef(self, node):
         self.visit_FunctionDef(node)

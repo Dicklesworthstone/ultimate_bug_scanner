@@ -239,6 +239,55 @@ class WorklistReuseTests(unittest.TestCase):
             return sorted((str(path.relative_to(root)), rule, line, column, description)
                           for path, rule, line, column, description in taint_py._Project(files, root).findings())
 
+    def test_contextual_default_read_between_writes_preserves_value(self):
+        helpers = '''def factory(callback):
+    def target(value=callback()):
+        return value
+    return target
+def invoke(callback):
+    return callback()
+'''
+        application = '''import os
+def dirty():
+    return input()
+def clean():
+    return 'safe'
+def choose_clean():
+    return choose2()
+def choose2():
+    return choose3()
+def choose3():
+    return clean
+def main():
+    a = factory(dirty)
+    value = invoke(a)
+    b = factory(choose_clean())
+    os.system(value)
+main()
+'''
+        for dirty in (True, False):
+            selected = application if dirty else application.replace('a = factory(dirty)', 'a = factory(clean)')
+            standalone = helpers + selected
+            # The later factory call cannot replace a value already returned
+            # by the first closure. Execute only this authored witness, with
+            # input and the command sink replaced, to establish the control.
+            with patch('builtins.input', return_value='external-input'), patch('os.system') as sink:
+                exec(compile(standalone, 'default-order-witness.py', 'exec'), {})  # ubs:ignore[py.security.eval-exec-usage,py.eval-exec] - fixed authored witness; input and os.system are mocked
+            sink.assert_called_once_with('external-input' if dirty else 'safe')
+            cases = (
+                {'app.py': standalone},
+                {'helpers.py': helpers, 'app.py': 'from helpers import factory, invoke\n' + selected},
+            )
+            for sources in cases:
+                with self.subTest(dirty=dirty, files=tuple(sources)):
+                    findings = self.scan(sources)
+                    if not dirty:
+                        self.assertEqual(findings, [])
+                        continue
+                    line = sources['app.py'].splitlines().index('    os.system(value)') + 1
+                    self.assertEqual(findings, [('app.py', 'py.taint.command', line, 5,
+                                               'input( -> target() -> value -> subprocess execution')])
+
     def test_prepared_syntax_preserves_child_scopes_and_deferred_imports(self):
         tree = ast.parse('''
 import os as system

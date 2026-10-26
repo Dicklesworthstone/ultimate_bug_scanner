@@ -742,19 +742,14 @@ def run_analyzers(
                 _analysis_error(errors, f"{analyzer.name} ({scope})", exc)
 
 
-def _run_detector(module_name: str, files: Sequence[Path], sink,
-                  skip: set[int] | None, errors: list[str] | None) -> None:
-    """Run one detector over the complete selected project."""
+def _detector_specifications(module_name: str):
+    """Load the same rule metadata for scheduling and detector execution."""
     import importlib
 
-    try:
-        module = importlib.import_module(f"ubs_core.py_detectors.{module_name}")
-    except (Exception, SystemExit) as exc:
-        _analysis_error(errors, f"detector module {module_name}", exc)
-        return
+    module = importlib.import_module(f"ubs_core.py_detectors.{module_name}")
     find = getattr(module, "find", None)
     if find is None:
-        return
+        return None, {}
     if hasattr(module, "RULES"):
         specs = {
             spec[0]: {"category": int(spec[1]), "title": str(spec[2]),
@@ -770,6 +765,19 @@ def _run_detector(module_name: str, files: Sequence[Path], sink,
             "severity": str(getattr(module, "SEVERITY", "warning")),
             "description": str(getattr(module, "DESCRIPTION", "")),
         }}
+    return find, specs
+
+
+def _run_detector(module_name: str, files: Sequence[Path], sink,
+                  skip: set[int] | None, errors: list[str] | None) -> None:
+    """Run one detector over the complete selected project."""
+    try:
+        find, specs = _detector_specifications(module_name)
+    except (Exception, SystemExit) as exc:
+        _analysis_error(errors, f"detector module {module_name}", exc)
+        return
+    if find is None:
+        return
     if skip:
         specs = {rid: spec for rid, spec in specs.items()
                  if spec["category"] not in skip}
@@ -874,6 +882,23 @@ def run_detectors(files: Sequence[Path], sink, skip: set[int] | None = None,
         for name in names:
             _run_detector(name, files, sink, skip, errors)
         return
+
+    if skip:
+        # A disabled detector used to start a fresh interpreter only to return
+        # immediately after importing its rule metadata. Check that metadata
+        # once in the supervisor. Unknown and malformed modules still report
+        # incomplete analysis; only a valid, fully disabled detector is omitted.
+        selected = []
+        for name in names:
+            try:
+                _find, specs = _detector_specifications(name)
+                if any(spec["category"] not in skip for spec in specs.values()):
+                    selected.append(name)
+            except (Exception, SystemExit) as exc:
+                _analysis_error(errors, f"detector module {name}", exc)
+        names = selected
+        if not names:
+            return
 
     from concurrent.futures import ThreadPoolExecutor
 

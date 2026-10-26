@@ -1929,6 +1929,14 @@ its key includes source, parameter, sanitizer proofs, the complete evidence
 path, appended steps, and the path limit. It retains no analysis or AST state,
 and cache hits still consume the same analysis work budget.
 
+Within each call, a separate cache retains up to 256 parameter-trace expansions
+shared by downstream sink, mutation, exception, and returned-value summaries.
+It distinguishes complete formal witnesses and immutable actual argument facts,
+including their evidence paths. Once full, it computes additional expansions
+normally; the capacity never limits coverage. The cache is released after that
+call's summary projection, and response-header proofs retain their own
+revocation semantics. Cached expansions consume the original work budget.
+
 Taint and response-header analysis honor Python encoding cookies and UTF-8
 byte-order marks. Unreadable, undecodable, or invalid selected sources report
 incomplete coverage instead of disappearing from a successful scan. Input
@@ -1967,6 +1975,12 @@ budget with recursive callback permutations and checks partial-result reporting.
 Installed scans also batch the checksums of cached helpers in one hash process.
 Every invocation still verifies the pinned bytes; failed or malformed batches
 and missing or mismatched assets use the per-file verification and repair path.
+
+When categories are skipped, parallel Python detector scheduling checks rule
+metadata before starting workers. A detector whose rules are all disabled
+needs no child interpreter. Enabled detectors still receive the full selected
+file set, and missing or malformed detector metadata reports incomplete
+analysis while independent detectors retain their findings.
 
 ---
 

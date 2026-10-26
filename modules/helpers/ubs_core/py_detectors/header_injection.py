@@ -134,28 +134,17 @@ def _module_refs(binding):
 
 class _HeaderFlow(flow._Flow):
     @staticmethod
-    def substitute(fact, bound, call_name, *, budget=None):
-        if not fact:
-            return flow.CLEAN
-        if budget is not None:
-            # Header summaries share the Python engine's work bound while
-            # retaining their domain-specific proof/revocation semantics.
-            budget.spend(len(fact) + sum(len(bound.get(trace.parameter, flow.CLEAN))
-                                        for trace in fact if trace.parameter is not None))
-        incoming_facts = []
-        for trace in fact:
-            if trace.parameter is None:
-                incoming = frozenset({trace})
-            else:
-                incoming = bound.get(trace.parameter, flow.CLEAN)
-                if _RESET in trace.sanitizers:
-                    incoming = _revoke(incoming)
-                for sanitizer in trace.sanitizers - {_RESET}:
-                    incoming = flow._sanitize(incoming, sanitizer)
-                steps = trace.path[1:] if trace.parameter.startswith('@') else trace.path
-                incoming = flow._advance(incoming, call_name, *steps)
-            incoming_facts.append(incoming)
-        return flow.join_facts(*incoming_facts)
+    def substitute_trace(trace, actual, call_name):
+        # The call-local cache uses this domain's transformation. Revocation
+        # must happen before new proofs, for both cached and direct expansion.
+        if trace.parameter is None:
+            return frozenset({trace})
+        if _RESET in trace.sanitizers:
+            actual = _revoke(actual)
+        for sanitizer in trace.sanitizers - {_RESET}:
+            actual = flow._sanitize(actual, sanitizer)
+        steps = trace.path[1:] if trace.parameter.startswith('@') else trace.path
+        return flow._advance(actual, call_name, *steps)
 
     def effect(self, kind, node, label, fact):
         if kind == 'header' and fact:

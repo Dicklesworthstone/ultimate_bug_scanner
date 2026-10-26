@@ -1192,6 +1192,234 @@ class SummarySubstitutionTests(unittest.TestCase):
                 self.assertEqual(exhausted.remaining, -1)
                 self.assertEqual(memo.cache_info().hits, hits)
 
+    def test_call_substitution_tracks_changed_argument_environments(self):
+        trace = taint_py.TaintTrace
+        formal = frozenset({trace('formal', parameter='p', sanitizers=frozenset({'xss'}),
+                                   path=('p', 'member'))})
+        left = frozenset({trace('request', sanitizers=frozenset({'sql'}),
+                                 path=('request', 'left'))})
+        right = frozenset({trace('request', sanitizers=frozenset({'sql'}),
+                                  path=('request', 'right'))})
+        self.assertEqual(left, right, 'Actual lattice equality must not erase different witnesses')
+        cases = (
+            (left, {('request', None, frozenset({'sql', 'xss'}),
+                     ('request', 'left', 'helper()', 'p', 'member'))}),
+            (taint_py.CLEAN, set()),
+            (right, {('request', None, frozenset({'sql', 'xss'}),
+                      ('request', 'right', 'helper()', 'p', 'member'))}),
+            (frozenset({trace('other', parameter='argument', path=('other',))}),
+             {('other', 'argument', frozenset({'xss'}), ('other', 'helper()', 'p', 'member'))}),
+            (left, {('request', None, frozenset({'sql', 'xss'}),
+                     ('request', 'left', 'helper()', 'p', 'member'))}),
+        )
+        for engine in (taint_py._Flow, header_injection._HeaderFlow):
+            with self.subTest(engine=engine.__name__):
+                bound = {}
+                budget = Budget(20)
+                memo = taint_py._CallSubstitution(engine.substitute_trace, bound, 'helper()', budget)
+                self.assertIs(memo(formal), taint_py.CLEAN)
+                for actual, expected in cases:
+                    bound['p'] = actual
+                    before = budget.remaining
+                    self.assert_exact_facts(memo(formal), expected)
+                    self.assertEqual(budget.remaining, before - 1 - len(actual))
+                bound.clear()
+                self.assertIs(memo(formal), taint_py.CLEAN)
+
+    def test_call_substitution_keys_formal_witnesses_and_path_limits(self):
+        trace = taint_py.TaintTrace
+        actual = frozenset({trace('request', path=('request', 'origin'))})
+        bound = {name: actual for name in ('p', '@global:p', '@free:p')}
+        first = trace('p', parameter='p', path=('p', 'first'))
+        second = trace('p', parameter='p', path=('p', 'second'))
+        self.assertEqual(first, second, 'Formal lattice equality must not erase different witnesses')
+        cases = (
+            (first, 8, frozenset(), ('request', 'origin', 'helper()', 'p', 'first')),
+            (second, 8, frozenset(), ('request', 'origin', 'helper()', 'p', 'second')),
+            (trace('p', parameter='@global:p', path=('p', 'member')), 8,
+             frozenset(), ('request', 'origin', 'helper()', 'member')),
+            (trace('p', parameter='@free:p', path=('p', 'member')), 8,
+             frozenset(), ('request', 'origin', 'helper()', 'member')),
+            (trace('p', parameter='p', sanitizers=frozenset({'command'}), path=('p', 'first')), 8,
+             frozenset({'command'}), ('request', 'origin', 'helper()', 'p', 'first')),
+            (first, 3, frozenset(), ('request', 'p', 'first')),
+            (first, 8, frozenset(), ('request', 'origin', 'helper()', 'p', 'first')),
+        )
+        for engine in (taint_py._Flow, header_injection._HeaderFlow):
+            with self.subTest(engine=engine.__name__):
+                memo = taint_py._CallSubstitution(engine.substitute_trace, bound, 'helper()', Budget(40))
+                for formal, limit, proofs, path in cases:
+                    with self.subTest(path=path), patch.object(taint_py, 'PATH_LIMIT', limit):
+                        self.assert_exact_facts(memo(frozenset({formal})),
+                                                {('request', None, proofs, path)})
+                other = taint_py._CallSubstitution(engine.substitute_trace, bound, 'other()', Budget(2))
+                self.assert_exact_facts(other(frozenset({first})),
+                                        {('request', None, frozenset(),
+                                          ('request', 'origin', 'other()', 'p', 'first'))})
+
+    def test_call_substitution_keeps_header_revocation_separate(self):
+        trace = taint_py.TaintTrace
+        cr, lf, reset = 'header:cr', 'header:lf', 'header:reset'
+        actual = frozenset({trace('request', sanitizers=frozenset({cr, lf, 'sql'}),
+                                  path=('request',))})
+        formal = frozenset({trace('p', parameter='p', sanitizers=frozenset({reset, cr}),
+                                   path=('p',))})
+        bound = {'p': actual}
+        cases = (
+            (taint_py._Flow, frozenset({reset, cr, lf, 'sql'})),
+            (header_injection._HeaderFlow, frozenset({reset, cr, 'sql'})),
+        )
+        memos = [(engine, proofs, taint_py._CallSubstitution(
+            engine.substitute_trace, bound, 'same()', Budget(6))) for engine, proofs in cases]
+        for _ in range(3):
+            for engine, proofs, memo in memos:
+                with self.subTest(engine=engine.__name__):
+                    expected = {('request', None, proofs, ('request', 'same()', 'p'))}
+                    self.assert_exact_facts(memo(formal), expected)
+                    self.assert_exact_facts(engine.substitute(formal, bound, 'same()'), expected)
+
+    def test_call_substitution_reuses_expansion_without_refunding_work(self):
+        trace = taint_py.TaintTrace
+        formal = frozenset({trace('p', parameter='p', path=('p',))})
+        bound = {'p': frozenset({trace('first', path=('first',)),
+                                trace('second', path=('second',))})}
+        expected = {(source, None, frozenset(), (source, 'helper()', 'p'))
+                    for source in ('first', 'second')}
+        for engine in (taint_py._Flow, header_injection._HeaderFlow):
+            with self.subTest(engine=engine.__name__), \
+                    patch.object(engine, 'substitute_trace', wraps=engine.substitute_trace) as transform:
+                budget = Budget(8)
+                memo = taint_py._CallSubstitution(transform, bound, 'helper()', budget)
+                self.assert_exact_facts(memo(formal), expected)
+                self.assertEqual(budget.remaining, 5)
+                self.assertEqual(transform.call_count, 1)
+                self.assert_exact_facts(memo(formal), expected)
+                self.assertEqual(budget.remaining, 2)
+                self.assertEqual(transform.call_count, 1, 'The same expansion should be reused')
+                with self.assertRaisesRegex(AnalysisLimit, 'work limit exceeded.*incomplete'):
+                    memo(formal)
+                self.assertEqual(budget.remaining, -1)
+                self.assertEqual(transform.call_count, 1)
+                empty = taint_py._CallSubstitution(transform, bound, 'helper()', Budget(0))
+                self.assertIs(empty(taint_py.CLEAN), taint_py.CLEAN)
+                self.assertEqual(transform.call_count, 1)
+
+    def test_call_substitution_bounds_retention_and_keeps_overflow_correct(self):
+        trace = taint_py.TaintTrace
+        formal = frozenset({trace('p', parameter='p', path=('p',))})
+        for engine in (taint_py._Flow, header_injection._HeaderFlow):
+            with self.subTest(engine=engine.__name__):
+                transformations = [0]
+
+                def transform(formal_trace, actual, call_name):
+                    transformations[0] += 1
+                    return engine.substitute_trace(formal_trace, actual, call_name)
+
+                bound = {'p': frozenset({trace('first', path=('first',))})}
+                retained = weakref.ref(bound['p'])
+                memo = taint_py._CallSubstitution(transform, bound, 'helper()', Budget(1000))
+                self.assertEqual(memo.CACHE_LIMIT, 256)
+                self.assert_exact_facts(memo(formal),
+                                        {('first', None, frozenset(), ('first', 'helper()', 'p'))})
+                for index in range(memo.CACHE_LIMIT + 16):
+                    source = f'source-{index}'
+                    bound['p'] = frozenset({trace(source, path=(source,))})
+                    self.assert_exact_facts(memo(formal),
+                                            {(source, None, frozenset(), (source, 'helper()', 'p'))})
+                    self.assertLessEqual(len(memo.cache), memo.CACHE_LIMIT)
+                self.assertEqual(len(memo.cache), memo.CACHE_LIMIT)
+                # The key uses object identity: retaining the actual fact is
+                # necessary to keep that identity from being recycled.
+                self.assertIsNotNone(retained())
+                bound['p'] = retained()
+                before = transformations[0]
+                self.assert_exact_facts(memo(formal),
+                                        {('first', None, frozenset(), ('first', 'helper()', 'p'))})
+                self.assertEqual(transformations[0], before)
+
+    def test_call_substitution_reduces_reported_chain_expansions(self):
+        from test_taint_python_summaries import subprocess_chain
+
+        def uncached(_transform, bound, call_name, budget):
+            return lambda fact: taint_py._Flow.substitute(fact, bound, call_name, budget=budget)
+
+        def scan(source, cached):
+            engine = taint_py._Analysis(ast.parse(source))
+            expanded = [0]
+            advance = taint_py._advance
+
+            def observe(fact, *steps):
+                expanded[0] += len(fact)
+                return advance(fact, *steps)
+
+            taint_py._advance_trace.cache_clear()
+            with contextlib.ExitStack() as patches:
+                patches.enter_context(patch.object(taint_py, '_advance', observe))
+                if not cached:
+                    patches.enter_context(patch.object(taint_py, '_CallSubstitution', uncached))
+                effects = engine.analyze()
+            witnesses = {key: {(item.source, item.parameter, item.sanitizers, item.path) for item in fact}
+                         for key, fact in effects.items()}
+            return witnesses, engine.budget.remaining, expanded[0]
+
+        self.addCleanup(taint_py._advance_trace.cache_clear)
+        for count in (12, 24):
+            for safe in (False, True):
+                with self.subTest(functions=count, safe=safe):
+                    source = subprocess_chain(count, safe=safe)
+                    reference, reference_budget, reference_expansions = scan(source, False)
+                    actual, actual_budget, actual_expansions = scan(source, True)
+                    expected_sinks = set() if safe else {
+                        (kind, line + 12 * index, column, label)
+                        for index in range(count)
+                        for kind, line, column, label in (
+                            ('command', 9, 9, 'subprocess executable'),
+                            ('command', 11, 15, 'subprocess execution'))}
+                    self.assertEqual(set(actual), expected_sinks)
+                    self.assertEqual(actual, reference)
+                    self.assertEqual(actual_budget, reference_budget)
+                    self.assertLess(actual_expansions, reference_expansions,
+                                    'Transitive summary projection must reuse repeated trace expansions')
+                    print(f'[{self.id()}] functions={count} safe={safe} '
+                          f'expanded={reference_expansions}->{actual_expansions}', flush=True)
+
+    def test_call_substitution_preserves_repeated_recursive_and_cyclic_scans(self):
+        bodies = (
+            ('step', 'def step(value):\n    if stop:\n        return value\n'
+                     '    return step(value)\n'),
+            ('first', 'def first(value):\n    if stop:\n        return value\n'
+                      '    return second(value)\ndef second(value):\n    return first(value)\n'),
+        )
+
+        def uncached(_transform, bound, call_name, budget):
+            return lambda fact: taint_py._Flow.substitute(fact, bound, call_name, budget=budget)
+
+        def witnesses(effects):
+            return {key: {(item.source, item.parameter, item.sanitizers, item.path) for item in fact}
+                    for key, fact in effects.items()}
+
+        for entry, body in bodies:
+            first_unsafe = None
+            for actual in ('input()', '"trusted"', 'input()'):
+                with self.subTest(entry=entry, actual=actual):
+                    source = body + f'eval({entry}({actual}))\n'
+                    reference = taint_py._Analysis(ast.parse(source))
+                    with patch.object(taint_py, '_CallSubstitution', uncached):
+                        expected_witnesses = witnesses(reference.analyze())
+                    candidate = taint_py._Analysis(ast.parse(source))
+                    effects = candidate.analyze()
+                    expected_sinks = {('eval', len(source.splitlines()), 1, 'eval')} \
+                        if actual == 'input()' else set()
+                    self.assertEqual(set(effects), expected_sinks)
+                    self.assertEqual(witnesses(effects), expected_witnesses)
+                    self.assertEqual(candidate.budget.remaining, reference.budget.remaining)
+                    if actual == 'input()':
+                        self.assertEqual({item.source for fact in effects.values() for item in fact},
+                                         {'input('})
+                        if first_unsafe is None:
+                            first_unsafe = witnesses(effects)
+                        self.assertEqual(witnesses(effects), first_unsafe)
+
 
 class WorkLimitCompletionTests(unittest.TestCase):
     """A work limit bounds analysis without manufacturing a clean result."""

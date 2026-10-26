@@ -260,6 +260,80 @@ class PythonCompletionTests(unittest.TestCase):
         self.assertEqual(self.decode_json(payload, 'worker payload')['rule'], 'py.security.sql-injection')
         self.assertEqual(errors, ['detector sql_injection: RuntimeError: worker detector failed'])
 
+    def test_parallel_category_selection_avoids_disabled_workers_without_losing_findings(self):
+        files = []
+        for index in range(8):
+            path = self.root / f"selected{index}.py"
+            path.write_text('import os\nimport json\nos.system(input())\n'
+                            'json.loads(payload)\n' +
+                            ''.join(f'value{line} = numerator / divisor\n' for line in range(4)))
+            files.append(path)
+        expected = io.StringIO()
+        py_scan.run_detectors(files, expected, skip={7}, jobs=1, errors=[])
+        expected_records = [self.decode_json(line, 'selected serial record')
+                            for line in expected.getvalue().splitlines()]
+        self.assertEqual(sum(row['rule'] == 'py.numeric.division-heavy'
+                             for row in expected_records), 32)
+        self.assertEqual(sum(row['rule'] == 'py.parsing.json-loads-no-try'
+                             for row in expected_records), 8)
+        enabled = {'division', 'index_arithmetic', 'io_open_checks', 'is_literal',
+                   'json_loads', 'missing_returns', 'mutation_during_iteration'}
+        for jobs in (2, 4):
+            target, errors = io.StringIO(), []
+            with self.subTest(jobs=jobs), patch.object(
+                    py_scan, '_detector_process', wraps=py_scan._detector_process) as worker:
+                py_scan.run_detectors(files, target, skip={7}, jobs=jobs, errors=errors)
+                self.assertEqual(errors, [])
+                self.assertEqual(target.getvalue(), expected.getvalue())
+                self.assertEqual({call.args[0] for call in worker.call_args_list}, enabled)
+                self.assertEqual(worker.call_count, len(enabled))
+                self.assertTrue(all(call.args[1] == files for call in worker.call_args_list))
+        with patch.object(py_scan, '_detector_process',
+                          side_effect=AssertionError('a disabled detector started a worker')):
+            target, errors = io.StringIO(), []
+            py_scan.run_detectors(files, target, skip=set(range(1, 24)), jobs=4, errors=errors)
+            self.assertEqual((target.getvalue(), errors), ('', []))
+
+    def test_parallel_category_selection_reports_invalid_metadata_and_keeps_siblings(self):
+        from types import SimpleNamespace
+
+        module = importlib.import_module('ubs_core.py_detectors.sql_injection')
+        files = []
+        for index in range(8):
+            path = self.root / f"metadata{index}.py"
+            path.write_text(''.join(f'value{line} = numerator / divisor\n' for line in range(4)))
+            files.append(path)
+        for skip in ({7}, set(range(1, 24))):
+            outputs = []
+            for jobs in (1, 2):
+                target, errors = io.StringIO(), []
+                with self.subTest(jobs=jobs, skip=skip), \
+                        patch.object(module, 'RULES', [('incomplete',)]), \
+                        patch('pkgutil.iter_modules', return_value=[
+                            SimpleNamespace(name='sql_injection'),
+                            SimpleNamespace(name='division'),
+                            SimpleNamespace(name='missing_detector_probe')]):
+                    py_scan.run_detectors(files, target, skip=skip, jobs=jobs, errors=errors)
+                records = [self.decode_json(line, 'sibling record')
+                           for line in target.getvalue().splitlines()]
+                self.assertEqual(len(records), 0 if 2 in skip else 32)
+                if 2 not in skip:
+                    self.assertEqual({row['rule'] for row in records}, {'py.numeric.division-heavy'})
+                    self.assertEqual({row['path'] for row in records}, {str(path) for path in files})
+                self.assertEqual(len(errors), 2)
+                self.assertTrue(any('sql_injection: IndexError:' in error for error in errors), errors)
+                self.assertTrue(any('missing_detector_probe: ModuleNotFoundError:' in error
+                                    for error in errors), errors)
+                outputs.append(records)
+            self.assertEqual(*outputs)
+        with patch.object(module, 'RULES', [('incomplete',)]), \
+                patch('pkgutil.iter_modules', return_value=[SimpleNamespace(name='sql_injection')]):
+            with self.assertRaises(IndexError):
+                py_scan.run_detectors(files, io.StringIO(), skip=set(range(1, 24)), jobs=2)
+        with patch('pkgutil.iter_modules', return_value=[SimpleNamespace(name='missing_detector_probe')]):
+            with self.assertRaises(ModuleNotFoundError):
+                py_scan.run_detectors(files, io.StringIO(), skip={7}, jobs=2)
+
     def test_detector_worker_deadline_terminates_a_stalled_child(self):
         stalled = self.root / 'stalled-python'
         stalled.write_text(f'#!{sys.executable}\nimport time\ntime.sleep(30)\n')

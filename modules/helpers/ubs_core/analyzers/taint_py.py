@@ -952,6 +952,50 @@ class FunctionSummary:
     exceptions: tuple[ExceptionSummary, ...] = ()
 
 
+class _CallSubstitution:
+    """Reuse immutable trace expansions within one call's summary projection."""
+
+    CACHE_LIMIT = 256
+
+    def __init__(self, transform, bound, call_name, budget):
+        self.transform = transform
+        self.bound = bound
+        self.call_name = call_name
+        self.budget = budget
+        self.cache = {}
+
+    def __call__(self, fact):
+        if not fact:
+            return CLEAN
+        # A cache hit saves computation, never analysis work accounting. Charge
+        # the same expansion before consulting the cache, including empty binds.
+        self.budget.spend(len(fact) + sum(len(self.bound.get(trace.parameter, CLEAN))
+                                        for trace in fact if trace.parameter is not None))
+        incoming_facts = []
+        for trace in fact:
+            if trace.parameter is None:
+                incoming_facts.append(frozenset({trace}))
+                continue
+            actual = self.bound.get(trace.parameter, CLEAN)
+            # Lattice equality deliberately omits witnesses. Key every formal
+            # field and retain the immutable actual fact with its identity: a
+            # changed argument or evidence path cannot reuse an earlier result,
+            # even if a caller changes the same bound mapping in place.
+            key = (trace.source, trace.parameter, trace.sanitizers, trace.path,
+                   id(actual), PATH_LIMIT)
+            cached = self.cache.get(key)
+            if cached is None:
+                incoming = self.transform(trace, actual, self.call_name)
+                # Stop admission at a fixed size. The cache dies with this call;
+                # long summaries still expand every remaining trace normally.
+                if len(self.cache) < self.CACHE_LIMIT:
+                    self.cache[key] = (actual, incoming)
+            else:
+                incoming = cached[1]
+            incoming_facts.append(incoming)
+        return join_facts(*incoming_facts)
+
+
 @dataclass
 class _Completion:
     """A pending exit, not yet committed to the function's summary.
@@ -1738,7 +1782,16 @@ class _Flow:
                 values[key] = captured.bindings.get(name)
 
     @staticmethod
-    def substitute(fact, bound, call_name, *, budget=None):
+    def substitute_trace(trace, actual, call_name):
+        if trace.parameter is None:
+            return frozenset({trace})
+        for sanitizer in trace.sanitizers:
+            actual = _sanitize(actual, sanitizer)
+        steps = trace.path[1:] if trace.parameter.startswith('@') else trace.path
+        return _advance(actual, call_name, *steps)
+
+    @classmethod
+    def substitute(cls, fact, bound, call_name, *, budget=None):
         if not fact:
             return CLEAN
         if budget is not None:
@@ -1746,22 +1799,14 @@ class _Flow:
             # A single call can carry many transitive sink/mutation facts.
             budget.spend(len(fact) + sum(len(bound.get(trace.parameter, CLEAN))
                                         for trace in fact if trace.parameter is not None))
-        incoming_facts = []
-        for trace in fact:
-            if trace.parameter is None:
-                incoming = frozenset({trace})
-            else:
-                incoming = bound.get(trace.parameter, CLEAN)
-                for sanitizer in trace.sanitizers:
-                    incoming = _sanitize(incoming, sanitizer)
-                steps = trace.path[1:] if trace.parameter.startswith('@') else trace.path
-                incoming = _advance(incoming, call_name, *steps)
-            incoming_facts.append(incoming)
-        return join_facts(*incoming_facts)
+        return join_facts(*(cls.substitute_trace(trace, bound.get(trace.parameter, CLEAN), call_name)
+                            for trace in fact))
 
-    def substitute_binding(self, binding, bound, references, node, call_name, values):
+    def substitute_binding(self, binding, bound, references, node, call_name, values, *, substitute=None):
         if binding is None:
             return None
+        if substitute is None:
+            substitute = _CallSubstitution(self.substitute_trace, bound, call_name, self.engine.budget)
         choices = []
         for target in _binding_choices(binding):
             if isinstance(target, _SymbolicValue):
@@ -1773,27 +1818,28 @@ class _Flow:
                         replacement = values.get(operand.parameter)
                         if isinstance(replacement, (_LiteralString, _SymbolicValue)):
                             operand = replacement
-                    operands.append((operand, self.substitute(fact, bound, call_name, budget=self.engine.budget)))
+                    operands.append((operand, substitute(fact)))
                 choices.append(_ArgumentVector(tuple(operands)))
             elif isinstance(target, _BoundCallable):
                 actual = frozenset().union(*(self._lookup_refs(references, ref) if isinstance(ref, str)
                                              else frozenset({node}) for ref in target.references))
-                choices.append(_BoundCallable(target.name, actual, self.substitute(target.receiver, bound, call_name, budget=self.engine.budget)))
+                choices.append(_BoundCallable(target.name, actual, substitute(target.receiver)))
             elif isinstance(target, _BoundClassMethod):
                 actual = frozenset().union(*(
                     self._lookup_refs(references, ref) if isinstance(ref, str)
                     else frozenset({ref if isinstance(ref, ast.ClassDef) else node})
                     for ref in target.references))
                 choices.append(_BoundClassMethod(target.function, target.owner, actual,
-                                                 self.substitute(target.receiver, bound, call_name, budget=self.engine.budget), target.valid))
+                                                 substitute(target.receiver), target.valid))
             elif isinstance(target, _DeferredCall):
-                arguments = tuple((name, self.substitute(fact, bound, call_name, budget=self.engine.budget))
+                arguments = tuple((name, substitute(fact))
                                   for name, fact in target.arguments)
                 actual = tuple((name, frozenset().union(*(
                     self._lookup_refs(references, ref) if isinstance(ref, str) else frozenset({node})
                     for ref in refs))) for name, refs in target.references)
                 captured_values = tuple((name, self.substitute_binding(value, bound, references,
-                                                                       node, call_name, values))
+                                                                       node, call_name, values,
+                                                                       substitute=substitute))
                                         for name, value in target.values)
                 choices.append(_DeferredCall(target.function, target.call, arguments, actual, captured_values))
             else:
@@ -2104,8 +2150,9 @@ class _Flow:
                 return CLEAN
             overrides = self.context_globals if owner is self.engine else ()
             summary = self.engine.call_summary(function, values, summary_keys, overrides)
+            substitute = _CallSubstitution(self.substitute_trace, bound, call_name, self.engine.budget)
             for kind, line, column, label, fact in summary.effects:
-                propagated = self.substitute(fact, bound, call_name, budget=self.engine.budget)
+                propagated = substitute(fact)
                 propagated = frozenset(trace for trace in propagated if not _safe_for(trace, kind, label))
                 key = (kind, line, column, label)
                 if propagated:
@@ -2114,9 +2161,9 @@ class _Flow:
                 exceptional = state.copy()
                 for parameter, written in exception.mutations:
                     self.mutate(self._lookup_refs(references, parameter),
-                                self.substitute(written, bound, call_name, budget=self.engine.budget), exceptional)
+                                substitute(written), exceptional)
                 self.pending.append(_Completion(
-                    'raise', exceptional, self.substitute(exception.value, bound, call_name, budget=self.engine.budget),
+                    'raise', exceptional, substitute(exception.value),
                     frozenset({node}),
                     '@exception:' + exception.exception_type if exception.exception_type else None,
                     exception.exception_type,
@@ -2125,23 +2172,23 @@ class _Flow:
                 state.reachable = False
                 return CLEAN
             for parameter, written in summary.mutations:
-                fact = self.substitute(written, bound, call_name, budget=self.engine.budget)
+                fact = substitute(written)
                 self.mutate(self._lookup_refs(references, parameter), fact, state)
             returned_refs = frozenset().union(*(self._lookup_refs(references, parameter)
                                                for parameter in summary.returned_references))
             self.expression_references[node] = returned_refs or frozenset({node})
             self.expression_bindings[node] = self.substitute_binding(
-                summary.returned_binding, bound, references, node, call_name, values)
-            returned = self.substitute(summary.returned, bound, call_name, budget=self.engine.budget)
+                summary.returned_binding, bound, references, node, call_name, values, substitute=substitute)
+            returned = substitute(summary.returned)
             if function in self.engine.generators:
                 self.generator_returns[node] = returned
                 self.generator_return_references[node] = returned_refs
                 self.generator_return_bindings[node] = self.expression_bindings[node]
                 self.expression_bindings[node] = self.substitute_binding(
-                    summary.yielded_binding, bound, references, node, call_name, values)
+                    summary.yielded_binding, bound, references, node, call_name, values, substitute=substitute)
                 self.expression_references[node] = frozenset().union(*(
                     self._lookup_refs(references, parameter) for parameter in summary.yielded_references))
-                return self.substitute(summary.yielded, bound, call_name, budget=self.engine.budget)
+                return substitute(summary.yielded)
             return returned
         deferred = [target for expression in [*node.args, *keyword_nodes.values()]
                     for target in _binding_choices(self.expression_bindings.get(expression))

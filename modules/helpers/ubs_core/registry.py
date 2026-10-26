@@ -127,17 +127,29 @@ def _coerce_finding(raw: dict) -> dict:
     return finding
 
 
-def run_layer(layer: str, ctx: RunContext) -> Iterator[dict]:
-    """Yield normalized findings for one layer and language."""
-    for analyzer in get(layer, ctx.lang):
+def _run_analyzer(
+    analyzer: Analyzer, ctx: RunContext, errors: list[str] | None,
+) -> Iterator[dict]:
+    """Keep completed records and sibling analyzers when a caller collects errors."""
+    try:
         for raw in analyzer.run(ctx):
             yield _coerce_finding(raw)
+    except (Exception, SystemExit) as exc:
+        if errors is None:
+            raise
+        scope = str(ctx.files[0]) if len(ctx.files) == 1 else f"{len(ctx.files)} selected files"
+        errors.append(f"{analyzer.name} ({scope}): {type(exc).__name__}: {exc}")
 
 
-def run_scan(ctx: RunContext) -> Iterator[dict]:
-    """Yield normalized findings across every layer registered for the language."""
+def run_layer(layer: str, ctx: RunContext, *, errors: list[str] | None = None) -> Iterator[dict]:
+    """Yield normalized findings for one layer; propagate failures by default."""
+    for analyzer in get(layer, ctx.lang):
+        yield from _run_analyzer(analyzer, ctx, errors)
+
+
+def run_scan(ctx: RunContext, *, errors: list[str] | None = None) -> Iterator[dict]:
+    """Yield every registered layer, optionally retaining failures separately."""
     for analyzer in analyzers_for_lang(ctx.lang):
-        for raw in analyzer.run(ctx):
-            finding = _coerce_finding(raw)
+        for finding in _run_analyzer(analyzer, ctx, errors):
             finding.setdefault("layer", analyzer.layer)
             yield finding

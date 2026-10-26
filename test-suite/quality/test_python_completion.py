@@ -781,6 +781,213 @@ class PythonCompletionTests(unittest.TestCase):
                         self.assertEqual(bool(entries), not failure)
 
 
+class CoreCliCompletionTests(unittest.TestCase):
+    """The generic helper CLI must retain findings when any worker is incomplete."""
+
+    def setUp(self):
+        artifacts = REPO_ROOT / "test-suite/artifacts"
+        artifacts.mkdir(exist_ok=True)
+        self.root = Path(tempfile.mkdtemp(prefix="core-cli-completion-", dir=artifacts))
+        self.env = {key: value for key, value in os.environ.items()
+                    if not key.startswith(("UBS_", "XDG_"))}
+        self.env.update(PYTHONDONTWRITEBYTECODE="1", PYTHONPATH=str(HELPERS))
+
+    def source(self, name, text):
+        path = self.root / name
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def invoke(self, files, *, layer="taint", lang="python", jobs=1,
+               file_output=False, in_process=False):
+        selected = self.root / "files.nul"
+        selected.write_bytes(b"".join(os.fsencode(path) + b"\0" for path in files))
+        args = [layer, "--lang", lang, "--files-from", str(selected), "--jobs", str(jobs)]
+        output = self.root / "findings.ndjson"
+        if file_output:
+            args.extend(["--out", str(output)])
+        if in_process:
+            from ubs_core import cli
+
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = cli.main(args)
+            stdout, stderr = stdout.getvalue(), stderr.getvalue()
+        else:
+            proc = subprocess.run([sys.executable, "-B", "-m", "ubs_core", *args],
+                                  cwd=self.root, env=self.env, text=True,
+                                  capture_output=True, timeout=60)
+            code, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
+        if file_output:
+            self.assertEqual(stdout, "", stderr)
+            payload = output.read_text(encoding="utf-8")
+        else:
+            payload = stdout
+        records = [json.loads(line) for line in payload.splitlines()]
+        self.assertNotIn("Traceback", stderr)
+        return code, records, stderr
+
+    def test_real_syntax_failure_keeps_independent_findings_and_output_file(self):
+        first = self.source("first.py", "eval(input())\n")
+        broken = self.source("broken.py", "def broken(:\n")
+        last = self.source("last.py", "eval(input())\n")
+        for layer in ("taint", "scan"):
+            for jobs in (1, 2, 4):
+                with self.subTest(layer=layer, jobs=jobs):
+                    code, rows, stderr = self.invoke([first, broken, last], layer=layer,
+                                                     jobs=jobs, file_output=jobs == 2)
+                    self.assertEqual(code, 2, stderr)
+                    self.assertEqual({(row["rule"], row["path"]) for row in rows},
+                                     {("python.taint.eval", str(first)),
+                                      ("python.taint.eval", str(last))})
+                    self.assertEqual(len(rows), 2)
+                    self.assertIn("analysis incomplete", stderr)
+                    self.assertIn("SyntaxError", stderr)
+                    self.assertIn(str(broken), stderr)
+
+    def test_missing_input_is_incomplete_with_empty_or_suppressed_findings(self):
+        missing = self.root / "missing.py"
+        suppressed = self.source("suppressed.py",
+                                 "eval(input())  # ubs:ignore[python.taint.eval]\n")
+        for files in ([missing], [suppressed, missing]):
+            for jobs in (1, 4):
+                with self.subTest(files=len(files), jobs=jobs):
+                    code, rows, stderr = self.invoke(files, jobs=jobs)
+                    self.assertEqual(code, 2, stderr)
+                    self.assertEqual(rows, [])
+                    self.assertIn("analysis incomplete", stderr)
+                    self.assertIn("FileNotFoundError", stderr)
+                    self.assertIn(str(missing), stderr)
+
+    def test_imported_source_retains_taint_for_every_requested_worker_count(self):
+        source = self.source("source.py", "def read_value():\n    return input()\n")
+        sink = self.source("sink.py", "from source import read_value\neval(read_value())\n")
+        for unsafe in (True, False):
+            if not unsafe:
+                source.write_text('def read_value():\n    return "trusted"\n', encoding="utf-8")
+            for layer in ("taint", "scan"):
+                baseline = None
+                for jobs in (1, 2, 4):
+                    with self.subTest(unsafe=unsafe, layer=layer, jobs=jobs):
+                        code, rows, stderr = self.invoke([source, sink], layer=layer, jobs=jobs)
+                        self.assertEqual(code, 0, stderr)
+                        self.assertEqual(stderr, "")
+                        expected = [("python.taint.eval", str(sink), 2)] if unsafe else []
+                        self.assertEqual([(row["rule"], row["path"], row["line"])
+                                          for row in rows], expected)
+                        if baseline is None:
+                            baseline = rows
+                        self.assertEqual(rows, baseline)
+
+    @staticmethod
+    def record(path, rule):
+        return {"rule": rule, "path": str(path), "line": 1}
+
+    def test_worker_failures_keep_earlier_records_other_shards_and_sibling_analyzers(self):
+        from ubs_core import cli, registry
+
+        for lang, layer in (("python", "guards"), ("javascript", "scan")):
+            extension = "py" if lang == "python" else "js"
+            files = [self.source(f"source_{index}.{extension}", "") for index in range(8)]
+            for fault in (None, "RuntimeError", "SystemExit", "ValueError"):
+                def broken(ctx):
+                    for path in ctx.files:
+                        yield self.record(path, "probe.before")
+                    if fault == "RuntimeError":
+                        raise RuntimeError("producer failed after findings")
+                    if fault == "SystemExit":
+                        raise SystemExit(0)
+                    if fault == "ValueError":
+                        yield {"rule": "malformed.finding"}
+
+                def healthy(ctx):
+                    for path in ctx.files:
+                        yield self.record(path, "probe.sibling")
+
+                registered = [Analyzer("guards", lang, "failing_producer", broken),
+                              Analyzer("guards" if layer == "guards" else "taint", lang,
+                                       "healthy_sibling", healthy)]
+                for jobs in (1, 2, 4):
+                    with self.subTest(lang=lang, fault=fault, jobs=jobs), \
+                         patch.object(cli, "get_analyzer", return_value=registered), \
+                         patch.object(registry, "get", return_value=registered), \
+                         patch.object(registry, "analyzers_for_lang", return_value=registered):
+                        code, rows, stderr = self.invoke(files, layer=layer, lang=lang,
+                                                         jobs=jobs, file_output=jobs == 4,
+                                                         in_process=True)
+                        self.assertEqual(code, 2 if fault else 0, stderr)
+                        self.assertCountEqual([(row["path"], row["rule"]) for row in rows],
+                                              [(str(path), rule) for path in files
+                                               for rule in ("probe.before", "probe.sibling")])
+                        if fault:
+                            self.assertIn("analysis incomplete", stderr)
+                            self.assertIn("failing_producer", stderr)
+                            self.assertIn(fault, stderr)
+                        else:
+                            self.assertEqual(stderr, "")
+
+    def test_registry_direct_call_still_raises_unless_errors_are_requested(self):
+        from ubs_core import registry
+
+        source = self.source("source.py", "")
+        ctx = registry.RunContext(lang="python", files=[source])
+        for exception in (RuntimeError("iteration failed"), SystemExit(0)):
+            def broken(context):
+                yield self.record(source, "probe.before")
+                raise exception
+
+            def healthy(context):
+                yield self.record(source, "probe.sibling")
+
+            registered = [Analyzer("guards", "python", "failing_producer", broken),
+                          Analyzer("guards", "python", "healthy_sibling", healthy)]
+            with patch.object(registry, "get", return_value=registered), \
+                 patch.object(registry, "analyzers_for_lang", return_value=registered):
+                for run in (lambda **kw: registry.run_layer("guards", ctx, **kw),
+                            lambda **kw: registry.run_scan(ctx, **kw)):
+                    with self.subTest(exception=type(exception).__name__, run=run):
+                        stream = run()
+                        self.assertEqual(next(stream)["rule"], "probe.before")
+                        with self.assertRaises(type(exception)):
+                            next(stream)
+                        errors = []
+                        self.assertEqual([row["rule"] for row in run(errors=errors)],
+                                         ["probe.before", "probe.sibling"])
+                        self.assertEqual(len(errors), 1)
+                        self.assertIn("failing_producer", errors[0])
+                        self.assertIn(type(exception).__name__, errors[0])
+
+    def test_registry_discovery_failure_reports_incomplete_in_every_dispatch_path(self):
+        from ubs_core import cli, registry
+
+        files = [self.source(f"empty_{index}.js", "") for index in range(3)]
+        for lang, layer in (("python", "guards"), ("javascript", "scan")):
+            for jobs in (1, 2):
+                with self.subTest(lang=lang, jobs=jobs), \
+                     patch.object(cli, "get_analyzer", return_value=[]), \
+                     patch.object(registry, "get", side_effect=ImportError("registry unavailable")), \
+                     patch.object(registry, "analyzers_for_lang",
+                                  side_effect=ImportError("registry unavailable")):
+                    code, rows, stderr = self.invoke(files, layer=layer, lang=lang,
+                                                     jobs=jobs, in_process=True)
+                    self.assertEqual(code, 2)
+                    self.assertEqual(rows, [])
+                    self.assertIn("analysis incomplete", stderr)
+                    self.assertIn("ImportError: registry unavailable", stderr)
+
+    def test_cli_setup_failure_is_explicit_and_does_not_pollute_stdout(self):
+        from ubs_core import cli
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = cli.main(["taint", "--lang", "python", "--files-from",
+                             str(self.root / "missing.nul")])
+        self.assertEqual(code, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("analysis incomplete", stderr.getvalue())
+        self.assertIn("FileNotFoundError", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
+
 class PythonMissingReturnSelectionTests(unittest.TestCase):
     """A project-wide deficit must never become a reusable source fact."""
 

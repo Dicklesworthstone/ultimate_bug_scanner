@@ -1903,8 +1903,15 @@ contexts. Long subprocess chains on this path no longer require a whole-file
 pass for each link. Recursive calls still converge through summary dependencies;
 there is no call-depth cutoff.
 
-If any selected function owner can define nested callables or classes, UBS
-retains the original source-order passes. A reader of a captured default must
+Selected modules share summary and definition metadata only within connected
+import groups. The groups include callbacks in both directions and namespace
+descendants exposed by imports, so package attributes and deferred imports
+keep their cross-file flows. Unrelated files no longer scan each other's
+summary tables. This grouping does not change module initialization order or
+which import cycles need conservative analysis.
+
+If any function owner in a group can define nested callables or classes, UBS
+retains the original source-order passes within that group. A reader of a captured default must
 stay between the writes that surround it; processing all writers first can
 hide a tainted value already returned by an earlier callback. This conservative
 path also covers imported helpers and can offer less scheduling speedup.
@@ -1927,6 +1934,12 @@ byte-order marks. Unreadable, undecodable, or invalid selected sources report
 incomplete coverage instead of disappearing from a successful scan. Input
 errors are counted with bounded diagnostics, and findings from independent
 valid inputs are emitted before the incomplete result.
+
+The generic `ubs_core taint` and `ubs_core scan` commands also keep the full
+selected Python project together when `--jobs` is requested. Splitting an
+import across file shards can hide a real flow. Failed analyzers retain their
+completed finding records and allow independent analyzers or shards to finish;
+the helper CLI then reports the failures on stderr and exits 2.
 
 SQL analysis first decodes and parses every selected Python source. If the
 whole syntax tree contains no call from the detector's modeled SQL sink

@@ -3825,24 +3825,30 @@ class _Project:
         for key in self.modules:
             self.namespaces.add(key)
             self.namespaces.update(parent for parent in key.parents if parent.is_relative_to(self.root))
+        self.paths = {engine: path for path, _, engine, _ in self.sources}
+        self.import_dependencies = {engine: self.dependencies(engine) for _, _, engine, _ in self.sources}
         self.owners = {function: engine for _, _, engine, _ in self.sources for function in engine.functions}
-        for _, _, engine, _ in self.sources:
-            engine.function_owners = self.owners
         self.module_references = {'@module:' + str(key) for key in self.namespaces}
         self.module_ref_map = {key: frozenset({key}) for key in self.module_references}
-        # AST-keyed metadata is safe to share. Module variable namespaces and
-        # framework entrypoint bindings remain separate per defining module.
-        for name in ('summaries', 'defaults', 'default_references', 'default_bindings', 'parents', 'locals', 'closures',
-                     'used_names', 'shadowed_globals', 'shadowed_global_values', 'active_globals',
-                     'class_members', 'class_callables'):
-            shared = {}
-            for _, _, engine, _ in self.sources:
-                shared.update(getattr(engine, name))
-            for _, _, engine, _ in self.sources:
-                setattr(engine, name, shared)
-        generators = set().union(*(engine.generators for _, _, engine, _ in self.sources))
-        for _, _, engine, _ in self.sources:
-            engine.generators = generators
+        # Only import-connected modules can exchange AST-backed callables.
+        # Keep callbacks in both directions together, but do not make every
+        # unrelated file scan their summaries or inherit their writer ordering.
+        # Variable namespaces and framework entries remain module-local.
+        for group in self.sharing_groups():
+            owners = {function: engine for engine in group for function in engine.functions}
+            for engine in group:
+                engine.function_owners = owners
+            for name in ('summaries', 'defaults', 'default_references', 'default_bindings', 'parents', 'locals', 'closures',
+                         'used_names', 'shadowed_globals', 'shadowed_global_values', 'active_globals',
+                         'class_members', 'class_callables'):
+                shared = {}
+                for engine in group:
+                    shared.update(getattr(engine, name))
+                for engine in group:
+                    setattr(engine, name, shared)
+            generators = set().union(*(engine.generators for engine in group))
+            for engine in group:
+                engine.generators = generators
 
     def module_reference(self, engine):
         key = self.keys.get(engine)
@@ -3853,7 +3859,7 @@ class _Project:
             key = self.keys.get(engine)
             if key is None:
                 return None
-            path = next(path for path, _, candidate, _ in self.sources if candidate is engine)
+            path = self.paths[engine]
             base = path.parent
             for _ in range(node.level - 1):
                 base = base.parent
@@ -3887,7 +3893,7 @@ class _Project:
         fallback: a module importing a cycle may also call independent helpers
         whose source, sink and mutation summaries must remain available.
         """
-        adjacency = {engine: self.dependencies(engine) for _, _, engine, _ in self.sources}
+        adjacency = self.import_dependencies
         order = {engine: str(path) for path, _, engine, _ in self.sources}
         indices, lowlinks = {}, {}
         active, stacked = set(), []
@@ -3923,6 +3929,74 @@ class _Project:
                         if member is engine:
                             break
                     yield sorted(component, key=order.__getitem__)
+
+    def sharing_groups(self):
+        """Keep every modeled callable exchange in one metadata component.
+
+        Imports can expose namespace descendants without an initialization
+        dependency: ``import pkg`` permits ``pkg.child.helper``. An unaliased
+        ``import pkg.first`` also exposes siblings through ``pkg``. Include
+        those potential exchanges here, without adding false import cycles
+        to the directed graph used for initialization and opaque fallbacks.
+        """
+        parents = {engine: engine for engine in self.import_dependencies}
+        sizes = {engine: 1 for engine in parents}
+
+        def representative(engine):
+            while parents[engine] is not engine:
+                parents[engine] = parents[parents[engine]]
+                engine = parents[engine]
+            return engine
+
+        def connect(left, right):
+            left, right = representative(left), representative(right)
+            if left is right:
+                return
+            if sizes[left] < sizes[right]:
+                left, right = right, left
+            parents[right] = left
+            sizes[left] += sizes[right]
+
+        # Index each namespace once. Repeated imports of a broad package
+        # should not repeatedly walk all its selected descendants.
+        namespace_members = defaultdict(list)
+        for engine, key in self.keys.items():
+            for prefix in (key, *key.parents):
+                if prefix in self.namespaces:
+                    namespace_members[prefix].append(engine)
+        connected_namespaces = set()
+
+        def expose(engine, key):
+            members = namespace_members.get(key, ())
+            if not members:
+                return
+            if key not in connected_namespaces:
+                for member in members[1:]:
+                    connect(members[0], member)
+                connected_namespaces.add(key)
+            connect(engine, members[0])
+
+        for engine, dependencies in self.import_dependencies.items():
+            for dependency in dependencies:
+                connect(engine, dependency)
+            for node in engine.imports:
+                if isinstance(node, ast.ImportFrom):
+                    key = self.import_key(engine, node, node.module or '')
+                    if key in self.namespaces:
+                        for alias in node.names:
+                            if alias.name != '*':
+                                expose(engine, key / alias.name)
+                else:
+                    for alias in node.names:
+                        key = self.import_key(engine, node, alias.name)
+                        if key in self.namespaces:
+                            exposed = key if alias.asname else self.import_key(
+                                engine, node, alias.name.split('.')[0])
+                            expose(engine, exposed)
+        groups = defaultdict(list)
+        for engine in parents:
+            groups[representative(engine)].append(engine)
+        yield from groups.values()
 
     def deferred_cycle(self, component):
         """Can every peer namespace be initialized before peer member access?
@@ -4064,11 +4138,11 @@ class _Project:
     def findings(self):
         effects = {}
         failures, failed_components = [], 0
-        paths = {engine: path for path, _, engine, _ in self.sources}
+        paths = self.paths
         for component in self.components():
             self.journal.clear()
             try:
-                cyclic = len(component) > 1 or component[0] in self.dependencies(component[0])
+                cyclic = len(component) > 1 or component[0] in self.import_dependencies[component[0]]
                 if cyclic and self.deferred_cycle(component):
                     completed = self.analyze_cycle(component)
                 else:

@@ -159,23 +159,43 @@ def _write_ndjson(findings_iter, out_path: str) -> int:
     return count
 
 
+def _report_incomplete(errors: list[str]) -> int:
+    for problem in errors:
+        print(f"ubs_core: analysis incomplete: {problem}", file=sys.stderr)
+    return 2 if errors else 0
+
+
 def _run_layer_cmd(layer: str, args: argparse.Namespace) -> int:
     files = _read_files_from(args.files_from)
     jobs = getattr(args, "jobs", 1) or 1
     rules = _load_json_option(args.rules)
     profile = _load_json_option(args.profile)
+    errors: list[str] = []
 
-    if jobs > 1 and len(files) > 1:
+    # Python's interprocedural summaries need the complete selected project.
+    # File shards must not split an import edge or silently lose its findings.
+    python_project = args.lang == "python" and layer in {"taint", "scan"}
+    if jobs > 1 and len(files) > 1 and not python_project:
         from ubs_core.shards import run_work_stealing
 
-        def _process_shard(shard_files: list[Path]) -> list[dict]:
+        def _process_shard(shard_files: list[Path]) -> list[tuple[list[dict], list[str]]]:
             ctx = RunContext(
                 lang=args.lang,
                 files=shard_files,
                 rules=rules,
                 profile=profile,
             )
-            return list(run_scan(ctx) if layer == "scan" else run_layer(layer, ctx))
+            records: list[dict] = []
+            problems: list[str] = []
+            try:
+                records.extend(run_scan(ctx, errors=problems) if layer == "scan"
+                               else run_layer(layer, ctx, errors=problems))
+            except (Exception, SystemExit) as exc:
+                # Registry/discovery failures can occur before an analyzer is
+                # entered. Return the shard's status with its completed records
+                # so one worker cannot discard every other worker's results.
+                problems.append(f"{layer} shard: {type(exc).__name__}: {exc}")
+            return [(records, problems)]
 
         if args.lang == 'javascript' and layer in {'taint', 'scan'}:
             # Module summaries require both endpoints in the same analysis.
@@ -188,9 +208,16 @@ def _run_layer_cmd(layer: str, args: argparse.Namespace) -> int:
             groups.extend([path] for path in files if path.resolve() not in grouped)
             del graph
             with ThreadPoolExecutor(max_workers=jobs) as executor:
-                findings = [finding for group in executor.map(_process_shard, groups) for finding in group]
+                outcomes = [outcome for group in executor.map(_process_shard, groups) for outcome in group]
         else:
-            findings = run_work_stealing(files, _process_shard, num_workers=jobs)
+            outcomes = run_work_stealing(files, _process_shard, num_workers=jobs)
+
+        def completed_findings():
+            for records, problems in outcomes:
+                errors.extend(problems)
+                yield from records
+
+        findings = completed_findings()
     else:
         ctx = RunContext(
             lang=args.lang,
@@ -198,9 +225,10 @@ def _run_layer_cmd(layer: str, args: argparse.Namespace) -> int:
             rules=rules,
             profile=profile,
         )
-        findings = run_scan(ctx) if layer == "scan" else run_layer(layer, ctx)
+        findings = (run_scan(ctx, errors=errors) if layer == "scan"
+                    else run_layer(layer, ctx, errors=errors))
     _write_ndjson(findings, args.out)
-    return 0
+    return _report_incomplete(errors)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -275,8 +303,13 @@ def main(argv: list[str] | None = None) -> int:
             get_analyzer(args.layer, args.lang)
         except KeyError as exc:
             parser.error(str(exc.args[0]))
+        except (Exception, SystemExit) as exc:
+            return _report_incomplete([f"analyzer registry: {type(exc).__name__}: {exc}"])
 
-    return _run_layer_cmd(args.layer, args)
+    try:
+        return _run_layer_cmd(args.layer, args)
+    except (Exception, SystemExit) as exc:
+        return _report_incomplete([f"{args.layer}: {type(exc).__name__}: {exc}"])
 
 
 if __name__ == "__main__":

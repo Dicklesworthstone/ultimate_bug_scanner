@@ -723,6 +723,254 @@ def handler():
                                          f'{count} functions retained {peak[0]} complete Flow objects')
 
 
+class ProjectSharingTests(unittest.TestCase):
+    """Unrelated files cost linear work; every modeled import keeps its facts."""
+
+    def setUp(self):
+        artifacts = ROOT / 'test-suite' / 'artifacts'
+        artifacts.mkdir(exist_ok=True)
+        self.root = Path(tempfile.mkdtemp(prefix='python-taint-sharing-', dir=artifacts))
+
+    def run(self, result=None):
+        print(f'[{self.id()}] RUN', flush=True)
+        started = time.monotonic()
+        result = super().run(result)
+        failed = any(test is self or getattr(test, 'test_case', None) is self
+                     for test, _ in result.failures + result.errors)
+        print(f'[{self.id()}] {"FAIL" if failed else "PASS"} '
+              f'({time.monotonic() - started:.3f}s)', flush=True)
+        return result
+
+    def project(self, name, sources):
+        root = self.root / name
+        root.mkdir()
+        files = []
+        for filename, source in sources.items():
+            path = root / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(source, encoding='utf-8')
+            files.append(path)
+        return taint_py._Project(files, root)
+
+    @staticmethod
+    def observe_work(project):
+        # Count entries actually visited or copied, independently of how the
+        # project groups its tables. Keep every existing sharing relationship.
+        counts = {'visited': 0, 'copied': 0, 'module_passes': {}}
+
+        class Summaries(dict):
+            def __iter__(self):
+                for key in super().__iter__():
+                    counts['visited'] += 1
+                    yield key
+
+            def copy(self):
+                counts['copied'] += len(self)
+                return super().copy()
+
+        tables = {}
+        for _, _, engine, _ in project.sources:
+            identity = id(engine.summaries)
+            if identity not in tables:
+                tables[identity] = Summaries(engine.summaries)
+            engine.summaries = tables[identity]
+        initialize = taint_py._Flow.__init__
+
+        def observe(flow, engine, scope):
+            if scope is engine.tree:
+                passes = counts['module_passes']
+                passes[engine] = passes.get(engine, 0) + 1
+            initialize(flow, engine, scope)
+
+        with patch.object(taint_py._Flow, '__init__', observe):
+            findings = list(project.findings())
+        return findings, counts
+
+    def test_unrelated_writer_does_not_repeat_chain_initialization(self):
+        writer = ('def outer():\n    def inner(value="safe"):\n'
+                  '        return value\n    return inner\n')
+        for count in (16, 64):
+            bodies = [f'def f{index}(value):\n'
+                      + (f'    return f{index + 1}(value)\n' if index + 1 < count
+                         else '    return value\n') for index in range(count)]
+            for unsafe in (True, False):
+                actual = 'input()' if unsafe else '"trusted"'
+                source = ''.join(bodies) + f'eval(f0({actual}))\n'
+                work = []
+                for extra in (False, True):
+                    with self.subTest(functions=count, unsafe=unsafe, unrelated_writer=extra):
+                        sources = {'a_writer.py': writer} if extra else {}
+                        sources['z_chain.py'] = source
+                        project = self.project(f'chain-{count}-{unsafe}-{extra}', sources)
+                        chain = next(engine for path, _, engine, _ in project.sources
+                                     if path.name == 'z_chain.py')
+                        findings, counts = self.observe_work(project)
+                        work.append(chain.work_limit - chain.budget.remaining)
+                        expected = {('z_chain.py', 'py.taint.eval', 2 * count + 1, 1)} if unsafe else set()
+                        self.assertEqual({(path.name, rule, line, column)
+                                          for path, rule, line, column, _ in findings}, expected, findings)
+                        self.assertLessEqual(counts['module_passes'][chain], 4, counts)
+                        self.assertLessEqual(counts['visited'], 8 * (count + 2), counts)
+                with self.subTest(functions=count, unsafe=unsafe, chain_work=work):
+                    self.assertEqual(work[0], work[1],
+                                     'An unreachable writer cannot consume the chain module work budget')
+
+    def test_independent_callback_modules_visit_only_linear_summary_entries(self):
+        source = ('def apply(callback, value):\n    return callback(value)\n'
+                  'def identity(value):\n    return value\n'
+                  'def clean(value):\n    return "trusted"\n'
+                  'eval(apply(identity, input()))\n'
+                  'eval(apply(clean, input()))\n')
+        for count in (16, 64):
+            with self.subTest(modules=count):
+                project = self.project(f'callbacks-{count}',
+                                       {f'm{index:03}.py': source for index in range(count)})
+                findings, counts = self.observe_work(project)
+                expected = {(f'm{index:03}.py', 'py.taint.eval', 7, 1) for index in range(count)}
+                self.assertEqual({(path.name, rule, line, column)
+                                  for path, rule, line, column, _ in findings}, expected, findings)
+                self.assertLessEqual(counts['visited'], 20 * count, counts)
+
+    def test_independent_import_cycles_copy_only_linear_summary_entries(self):
+        for count in (8, 32):
+            with self.subTest(cycles=count):
+                sources = {}
+                for index in range(count):
+                    left, right = f'g{index:03}_left', f'g{index:03}_right'
+                    sources[left + '.py'] = (
+                        f'import {right}\ndef relay(value):\n    if again:\n'
+                        f'        return {right}.relay(value)\n    return value\n')
+                    sources[right + '.py'] = (
+                        f'import {left}\ndef relay(value):\n    return {left}.relay(value)\n')
+                    sources[f'g{index:03}_app.py'] = (
+                        f'from {left} import relay\neval(relay(input()))\neval(relay("trusted"))\n')
+                project = self.project(f'cycles-{count}', sources)
+                findings, counts = self.observe_work(project)
+                expected = {(f'g{index:03}_app.py', 'py.taint.eval', 2, 1) for index in range(count)}
+                self.assertEqual({(path.name, rule, line, column)
+                                  for path, rule, line, column, _ in findings}, expected, findings)
+                self.assertLessEqual(counts['copied'], 8 * count, counts)
+
+    def test_namespace_exposure_keeps_implicit_descendants_and_siblings(self):
+        # The resolver can expose selected descendants without a direct
+        # initialization edge. This includes namespace packages, aliases,
+        # relative imports, and ambiguous file/package parent identities.
+        helper = 'def helper(value):\n    eval(value)\n'
+        cases = (
+            ({'pkg/child.py': helper}, 'zapp.py', 'import pkg\n', 'pkg.child'),
+            ({'pkg/first.py': 'value = 1\n', 'pkg/second.py': helper},
+             'zapp.py', 'import pkg.first\n', 'pkg.second'),
+            ({'pkg/child.py': helper}, 'zapp.py', 'import pkg as alias\n', 'alias.child'),
+            ({'pkg/first.py': 'value = 1\n', 'pkg/first/child.py': helper},
+             'zapp.py', 'import pkg.first as alias\n', 'alias.child'),
+            ({'pkg/child/deep.py': helper}, 'zapp.py', 'from pkg import child\n', 'child.deep'),
+            ({'pkg/child/deep.py': helper}, 'pkg/zapp.py', 'from . import child\n', 'child.deep'),
+            ({'pkg.py': 'value = 1\n', 'pkg/__init__.py': 'value = 2\n', 'pkg/child.py': helper},
+             'zapp.py', 'import pkg\n', 'pkg.child'),
+        )
+        for index, (modules, app, imported, target) in enumerate(cases):
+            for unsafe in (True, False):
+                with self.subTest(case=index, unsafe=unsafe):
+                    actual = 'input()' if unsafe else '"trusted"'
+                    sources = {**modules, app: imported + f'{target}.helper({actual})\n'}
+                    project = self.project(f'namespace-{index}-{unsafe}', sources)
+                    findings = sorted((str(path.relative_to(project.root)), rule, line, column, description)
+                                      for path, rule, line, column, description in project.findings())
+                    sink = next(name for name, source in modules.items() if source == helper)
+                    expected = [(sink, 'py.taint.eval', 2, 5,
+                                 'input( -> helper() -> value -> eval')] if unsafe else []
+                    self.assertEqual(findings, expected)
+
+    def test_namespace_foreign_writer_preserves_captured_default_order(self):
+        helpers = '''def factory(callback):
+    def target(value=callback()):
+        return value
+    return target
+def invoke(callback):
+    return callback()
+'''
+        application = '''import pkg
+factory = pkg.child.factory
+invoke = pkg.child.invoke
+import os
+def dirty():
+    return input()
+def clean():
+    return 'safe'
+def choose_clean():
+    return choose2()
+def choose2():
+    return choose3()
+def choose3():
+    return clean
+def main():
+    a = factory(dirty)
+    value = invoke(a)
+    b = factory(choose_clean())
+    os.system(value)
+main()
+'''
+        for unsafe in (True, False):
+            with self.subTest(unsafe=unsafe):
+                selected = application if unsafe else application.replace('a = factory(dirty)', 'a = factory(clean)')
+                project = self.project(f'default-{unsafe}', {'pkg/child.py': helpers, 'zapp.py': selected})
+                findings = [(path.name, rule, line, column, description)
+                            for path, rule, line, column, description in project.findings()]
+                # A later factory invocation cannot change a value already
+                # returned by the earlier closure. Keep its captured input.
+                expected = [('zapp.py', 'py.taint.command', 19, 5,
+                             'input( -> target() -> value -> subprocess execution')] if unsafe else []
+                self.assertEqual(findings, expected)
+
+    def test_failed_namespace_context_rolls_back_without_poisoning_other_groups(self):
+        project = self.project('rollback', {
+            'a_before.py': 'eval(input())\n',
+            'aa_pkg/lib.py': 'def apply(callback, value):\n    return callback(value)\n',
+            'bb_failed.py': 'import aa_pkg\naa_pkg.lib.apply(eval, input())\n',
+            'm_independent.py': 'eval(input())\n',
+            'zz_later.py': 'import sys\nimport aa_pkg\naa_pkg.lib.apply(eval, sys.argv[1])\n',
+        })
+        engines = {path.name: engine for path, _, engine, _ in project.sources}
+        library, later = engines['lib.py'], engines['zz_later.py']
+        initialize, analyze = taint_py._Flow.__init__, taint_py._Analysis.analyze
+        interrupted = False
+
+        def stop_first_context(flow, engine, scope):
+            nonlocal interrupted
+            if (engine is library and library in project.ready
+                    and getattr(scope, 'name', '') == 'apply' and not interrupted):
+                interrupted = True
+                library.budget.spend(library.budget.remaining + 1)
+            initialize(flow, engine, scope)
+
+        def allow_later_component(engine):
+            if engine is later:
+                library.budget = Budget()
+            return analyze(engine)
+
+        findings = []
+        with patch.object(taint_py._Flow, '__init__', stop_first_context), \
+                patch.object(taint_py._Analysis, 'analyze', allow_later_component), \
+                self.assertRaises(AnalysisLimit) as raised:
+            findings.extend(project.findings())
+        self.assertTrue(interrupted, 'The failure must occur during a new foreign callback solve')
+        self.assertIn('bb_failed.py', str(raised.exception))
+        self.assertIn('incomplete', str(raised.exception))
+        self.assertNotIn(engines['bb_failed.py'], project.ready)
+        self.assertIn(engines['m_independent.py'], project.ready)
+        self.assertIn(later, project.ready)
+        self.assertEqual({(str(path.relative_to(project.root)), rule, line, column)
+                          for path, rule, line, column, _ in findings},
+                         {('a_before.py', 'py.taint.eval', 1, 1),
+                          ('aa_pkg/lib.py', 'py.taint.eval', 2, 12),
+                          ('m_independent.py', 'py.taint.eval', 1, 1)}, findings)
+        description = next(description for path, _, _, _, description in findings if path.name == 'lib.py')
+        self.assertIn('sys.argv', description)
+        self.assertNotIn('input', description)
+        self.assertIsNone(library.reads)
+        self.assertIsNone(library.writes)
+
+
 class SummarySubstitutionTests(unittest.TestCase):
     """Substitution preserves evidence and proof domains with linear join work."""
 

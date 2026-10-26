@@ -1642,7 +1642,7 @@ class SQLValueCaptureTests(unittest.TestCase):
             with self.subTest(case=name):
                 self.assertEqual(sqlite_witness(self.artifacts, name, source)['rows'], rows)
                 self.inspect(name, source, ((CRITICAL, len(source.splitlines())),) if rows == 2 else ())
-        source = program(cases[0][1])
+        source = program(cases[0][1] + '    cursor.execute(queries[-1])\n')
         path = self.artifacts / 'recursive-budget.py'
         path.write_text(source, encoding='utf-8')
         with self.assertRaisesRegex(detector.SQLFlowLimit, 'budget.*incomplete'):

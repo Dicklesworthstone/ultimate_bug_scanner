@@ -1888,6 +1888,18 @@ call-depth cutoff. Definition-time defaults and class metadata retain their
 ordered updates, and sink-specific sanitizers and mutation effects remain
 part of the summaries.
 
+Completed imported base summaries are reused across callers; new callback
+contexts and active import cycles still receive their required analysis. The
+worklist retains dependency metadata and the latest effects while releasing
+completed functions' temporary expression, heap, and completion states.
+
+SQL analysis first decodes and parses every selected Python source. If the
+whole syntax tree contains no call from the detector's modeled SQL sink
+families, it skips the SQL dataflow pass. Nested bodies and definition-time
+calls are included in this check; matching calls retain full analysis even
+when their arguments are unknown. Read, decode, parse, and applicable analysis
+failures continue to report incomplete coverage.
+
 Each selected source has a work budget of `max(500000, 128 * AST node count)`.
 Transfers, summary scheduling, and fact substitution consume that budget.
 If it is exhausted, UBS reports an explicit incomplete analysis naming the

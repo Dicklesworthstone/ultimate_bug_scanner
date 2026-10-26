@@ -20,6 +20,7 @@ import sys
 import tempfile
 import time
 import unittest
+import weakref
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -463,6 +464,213 @@ os.system(apply(relay, "safe"))
         state.references['value'] = taint_py.NO_REFERENCES
         compare()
         compare()
+
+
+class CompletedSummaryReuseTests(unittest.TestCase):
+    """Completed libraries and compact job storage keep their full semantics."""
+
+    def setUp(self):
+        artifacts = ROOT / 'test-suite' / 'artifacts'
+        artifacts.mkdir(exist_ok=True)
+        self.root = Path(tempfile.mkdtemp(prefix='python-taint-completed-', dir=artifacts))
+
+    def run(self, result=None):
+        print(f'[{self.id()}] RUN', flush=True)
+        started = time.monotonic()
+        result = super().run(result)
+        failed = any(test is self or getattr(test, 'test_case', None) is self
+                     for test, _ in result.failures + result.errors)
+        print(f'[{self.id()}] {"FAIL" if failed else "PASS"} '
+              f'({time.monotonic() - started:.3f}s)', flush=True)
+        return result
+
+    def project(self, name, sources):
+        root = self.root / name
+        root.mkdir()
+        files = []
+        for filename, source in sources.items():
+            path = root / filename
+            path.write_text(source, encoding='utf-8')
+            files.append(path)
+        return taint_py._Project(files, root)
+
+    def test_ready_base_summaries_do_not_charge_each_importer_again(self):
+        solve = taint_py._Analysis.solve_function
+        for actual in ('input()', '"trusted"'):
+            budgets = []
+            for count in (1, 8):
+                with self.subTest(actual=actual, importers=count):
+                    sources = {'lib.py': 'def ident(value):\n    return value\n'}
+                    sources.update({f'app{index}.py':
+                                    'from lib import ident\ndef main():\n'
+                                    f'    eval(ident({actual}))\n'
+                                    for index in range(count)})
+                    project = self.project(f'{count}-{len(budgets)}-{actual == "input()"}', sources)
+                    library = next(engine for path, _, engine, _ in project.sources
+                                   if path.name == 'lib.py')
+                    ready_foreign, own = [], []
+
+                    def observe(engine, function, context):
+                        owner = engine.owner(function)
+                        if owner is library and not context:
+                            if engine is library:
+                                own.append(function)
+                            elif owner in project.ready and owner not in project.solving:
+                                ready_foreign.append(function.name)
+                        return solve(engine, function, context)
+
+                    with patch.object(taint_py._Analysis, 'solve_function', observe):
+                        findings = list(project.findings())
+                    budgets.append(library.work_limit - library.budget.remaining)
+                    expected = {(f'app{index}.py', 'py.taint.eval', 3, 5)
+                                for index in range(count)} if actual == 'input()' else set()
+                    self.assertEqual({(path.name, rule, line, column)
+                                      for path, rule, line, column, _ in findings}, expected, findings)
+                    self.assertTrue(own, 'The defining module must solve its base summary')
+                    self.assertEqual(ready_foreign, [],
+                                     'A completed base summary must not be solved once per importer')
+            with self.subTest(actual=actual, library_work=budgets):
+                self.assertEqual(budgets[0], budgets[1],
+                                 'Additional ordinary callers must not consume the completed library budget')
+
+    def test_imported_nonreturning_summary_keeps_reachable_sink(self):
+        solve = taint_py._Analysis.solve_function
+        for actual in ('input()', '"trusted"'):
+            with self.subTest(actual=actual):
+                project = self.project(str(actual == 'input()'), {
+                    'lib.py': 'def forever(value):\n    eval(value)\n'
+                              '    return forever(value)\n'
+                              'def never():\n    while True:\n        pass\n',
+                    'app.py': 'from lib import forever, never\ndef main():\n'
+                              f'    forever({actual})\n    eval(input())\n'
+                              'def quiet():\n    never()\n    eval(input())\n',
+                })
+                repeated = []
+
+                def observe(engine, function, context):
+                    owner = engine.owner(function)
+                    if (not context and owner is not engine and owner in project.ready
+                            and owner not in project.solving):
+                        repeated.append(function.name)
+                    return solve(engine, function, context)
+
+                with patch.object(taint_py._Analysis, 'solve_function', observe):
+                    findings = list(project.findings())
+                expected = {('lib.py', 'py.taint.eval', 2)} if actual == 'input()' else set()
+                self.assertEqual({(path.name, rule, line) for path, rule, line, _, _ in findings},
+                                 expected, findings)
+                self.assertEqual(repeated, [],
+                                 'A completed bottom summary is reusable even without a stored table entry')
+
+    def test_new_callback_contexts_are_solved_for_a_ready_library(self):
+        project = self.project('callbacks', {
+            'lib.py': 'def apply(callback, value):\n    return callback(value)\n',
+            'a.py': 'from lib import apply\nfrom html import escape\n'
+                    'from django.http import HttpResponse\ndef main():\n'
+                    '    HttpResponse(apply(escape, input()))\n'
+                    '    eval(apply(escape, input()))\n',
+            'b.py': 'from lib import apply\ndef ident(value):\n    return value\n'
+                    'def main():\n    eval(apply(ident, input()))\n',
+        })
+        library = next(engine for path, _, engine, _ in project.sources if path.name == 'lib.py')
+        solve = taint_py._Analysis.solve_function
+        contexts = set()
+
+        def observe(engine, function, context):
+            if context and engine.owner(function) is library and library in project.ready:
+                contexts.add(context)
+            return solve(engine, function, context)
+
+        with patch.object(taint_py._Analysis, 'solve_function', observe):
+            findings = list(project.findings())
+        self.assertEqual({(path.name, rule, line) for path, rule, line, _, _ in findings},
+                         {('a.py', 'py.taint.eval', 6), ('b.py', 'py.taint.eval', 5)}, findings)
+        self.assertEqual(len(contexts), 2,
+                         'Library readiness does not prove newly requested callback identities')
+
+    def test_active_import_cycle_does_not_freeze_provisional_base_summaries(self):
+        solve = taint_py._Analysis.solve_function
+        for actual in ('input()', '"trusted"'):
+            with self.subTest(actual=actual):
+                project = self.project(str(actual == 'input()'), {
+                    'a.py': 'import b\ndef first(value):\n    if stop:\n'
+                            '        return value\n    return b.second(value)\n',
+                    'b.py': 'import a\ndef second(value):\n    return a.first(value)\n',
+                    'main.py': f'import a\neval(a.first({actual}))\n',
+                })
+                active = []
+
+                def observe(engine, function, context):
+                    owner = engine.owner(function)
+                    if (not context and owner is not engine and owner in project.ready
+                            and owner in project.solving):
+                        active.append(function.name)
+                    return solve(engine, function, context)
+
+                with patch.object(taint_py._Analysis, 'solve_function', observe):
+                    findings = list(project.findings())
+                expected = {('main.py', 'py.taint.eval', 2)} if actual == 'input()' else set()
+                self.assertEqual({(path.name, rule, line) for path, rule, line, _, _ in findings},
+                                 expected, findings)
+                self.assertTrue(active,
+                                'Ready namespaces in a solving import cycle still have provisional summaries')
+
+    def test_latest_witness_survives_semantically_equal_summary_reuse(self):
+        # The factory first exposes its nested wrapper. A later pass learns
+        # that get_short can return leaf directly. The handler still has the
+        # same source and sink, but its fresh shortest witness improves.
+        source = '''def factory():
+    def wrapper(value):
+        return middle(value)
+    if mode:
+        return wrapper
+    return get_short()
+def middle(value):
+    return leaf(value)
+def get_short():
+    return leaf
+def leaf(value):
+    eval(value)
+def handler():
+    factory()(input())
+'''
+        engine = taint_py._Analysis(ast.parse(source))
+        effects = engine.analyze()
+        key = ('eval', 12, 5, 'eval')
+        self.assertEqual(set(effects), {key})
+        handler = next(function for function in engine.functions if function.name == 'handler')
+        self.assertEqual(engine.summaries[handler].effects[0][-1], effects[key])
+        # Semantic equality excludes paths; the table may keep its earlier
+        # longer witness. Final diagnostics must still use the latest solve.
+        self.assertEqual({trace.path for trace in effects[key]},
+                         {('input(', 'leaf()', 'value')})
+
+    def test_completed_jobs_release_full_flow_states(self):
+        initialize = taint_py._Flow.__init__
+        for count in (25, 50):
+            for actual in ('input()', '"trusted"'):
+                with self.subTest(functions=count, actual=actual):
+                    live = weakref.WeakSet()
+                    peak = [0]
+
+                    def observe(flow, engine, scope):
+                        initialize(flow, engine, scope)
+                        live.add(flow)
+                        peak[0] = max(peak[0], len(live))
+
+                    bodies = [f'def f{index}(value):\n'
+                              + (f'    return f{index + 1}(value)\n' if index + 1 < count
+                                 else '    return value\n') for index in range(count)]
+                    source = ''.join(bodies) + f'eval(f0({actual}))\n'
+                    with patch.object(taint_py._Flow, '__init__', observe):
+                        effects = taint_py._Analysis(ast.parse(source)).analyze()
+                    expected = {('eval', 2 * count + 1, 1, 'eval')} if actual == 'input()' else set()
+                    self.assertEqual(set(effects), expected)
+                    # Summaries retain everything needed by callers. Completed
+                    # jobs must release expression/heap/completion state; the
+                    # module and current solve need only a few live flows.
+                    self.assertLessEqual(peak[0], 4,
+                                         f'{count} functions retained {peak[0]} complete Flow objects')
 
 
 class WorkLimitCompletionTests(unittest.TestCase):

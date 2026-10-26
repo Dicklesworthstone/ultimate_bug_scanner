@@ -657,6 +657,12 @@ def call_name(node):
     return ''
 
 
+def sql_sink_name(node):
+    """Share the modeled sink families between admission and argument binding."""
+    short = call_name(node.func).rsplit('.', 1)[-1]
+    return short if short in EXECUTE_METHODS or short == 'extra' else ''
+
+
 def source_line(lines, line_no):
     idx = line_no - 1
     if 0 <= idx < len(lines):
@@ -3613,8 +3619,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             self.store_list_item(node.target, self.value_facts(value))
 
     def sql_argument(self, node):
-        name = call_name(node.func)
-        short = name.rsplit('.', 1)[-1]
+        short = sql_sink_name(node)
         if short in EXECUTE_METHODS:
             if node.args and not isinstance(node.args[0], ast.Starred):
                 return node.args[0]
@@ -3637,7 +3642,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         complete statements. Its select dictionary keys are result aliases;
         only the values are raw SQL. Do not inspect params/select_params.
         """
-        if call_name(node.func).rsplit('.', 1)[-1] != 'extra':
+        if sql_sink_name(node) != 'extra':
             argument = self.sql_argument(node)
             if argument is not None:
                 yield argument, 'statement'
@@ -4867,6 +4872,13 @@ def find(files: Sequence[Path], *, max_steps=100_000) -> Iterable[tuple[str, Pat
             tree = ast.parse(text, filename=str(path))
         except (OSError, UnicodeError, SyntaxError) as exc:
             raise SQLFlowLimit(f'Cannot analyze Python SQL source {path}: {exc}; analysis is incomplete') from exc
+        # Every emitted SQL finding goes through this same sink predicate.
+        # Walk all syntax, including deferred bodies and definition-time calls;
+        # a matching name admits full analysis regardless of its arguments.
+        # Decode and parse failures above must remain incomplete even when no
+        # sink can be recognized. Applicable SQL flow keeps its ordinary budget.
+        if not any(isinstance(node, ast.Call) and sql_sink_name(node) for node in ast.walk(tree)):
+            continue
         lines = text.splitlines()
         param_names, name_risk = build_provenance(tree)
         sanitizers = configured_sanitizers()

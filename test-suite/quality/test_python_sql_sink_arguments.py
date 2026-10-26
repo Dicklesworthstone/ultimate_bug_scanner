@@ -213,7 +213,7 @@ class SQLSinkArguments(unittest.TestCase):
     @unittest.skipIf(sys.version_info < (3, 11), 'except* syntax requires Python 3.11')
     def test_exception_groups_are_explicitly_incomplete(self):
         path = self.artifacts / 'exception_group.py'
-        path.write_text('try:\n    work()\nexcept* ValueError:\n    recover()\n', encoding='utf-8')
+        path.write_text('try:\n    cursor.execute(f"SELECT {user}")\nexcept* ValueError:\n    recover()\n', encoding='utf-8')
         with self.assertRaisesRegex(RuntimeError, r'except\*.*incomplete'):
             list(detector.find([path]))
 

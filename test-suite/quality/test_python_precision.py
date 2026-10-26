@@ -1892,6 +1892,131 @@ class SqlIdentifierSanitizerTests(unittest.TestCase):
         self.assertEqual(sql_injection.configured_sanitizers({}), frozenset())
 
 
+class SqlSinkAdmissionTests(unittest.TestCase):
+    """Irrelevant SQL flow does no transfer work; applicable flow stays intact."""
+
+    SINKS = ('execute', 'executemany', 'executescript', 'exec_driver_sql', 'raw',
+             'read_sql', 'read_sql_query', 'scalar', 'scalars', 'extra')
+
+    @classmethod
+    def setUpClass(cls):
+        artifacts = REPO_ROOT / 'test-suite/artifacts'
+        artifacts.mkdir(exist_ok=True)
+        cls.artifacts = Path(tempfile.mkdtemp(prefix='sql-admission-', dir=artifacts))
+
+    def source(self, name, contents):
+        path = self.artifacts / name
+        if isinstance(contents, bytes):
+            path.write_bytes(contents)
+        else:
+            path.write_text(textwrap.dedent(contents), encoding='utf-8')
+        return path
+
+    def test_subprocess_chains_and_stdlib_need_no_sql_transfer_work(self):
+        import argparse
+        from test_taint_python_summaries import subprocess_chain
+
+        paths = [self.source(f'chain-{count}.py', subprocess_chain(count))
+                 for count in (50, 100)]
+        paths.append(Path(argparse.__file__))
+        for path in paths:
+            with self.subTest(source=path.name):
+                # A zero transfer budget still requires decoding, parsing, and
+                # proving that no currently modeled SQL sink exists.
+                self.assertEqual(list(sql_injection.find([path], max_steps=0)), [])
+
+    def test_every_modeled_spelling_keeps_unsafe_and_parameterized_calls(self):
+        for spelling in self.SINKS:
+            for prefix in ('', 'cursor.'):
+                call = prefix + spelling
+                unsafe = ('where=[f"id = {user}"]' if spelling == 'extra'
+                          else 'f"SELECT {user}"')
+                safe = ('where=["id = %s"], params=[user]' if spelling == 'extra'
+                        else '"SELECT %s", (user,)')
+                for label, arguments in (('unsafe', unsafe), ('parameterized', safe)):
+                    path = self.source(f'{spelling}-{prefix or "bare"}-{label}.py',
+                                       f'def run(cursor, user):\n    {call}({arguments})\n')
+                    with self.subTest(sink=call, case=label):
+                        found = [(rule, line) for rule, _, line, _, _ in sql_injection.find([path])]
+                        expected = [(sql_injection.RULE_CRITICAL, 2)] if label == 'unsafe' else []
+                        self.assertEqual(found, expected)
+
+    def test_sink_names_admit_full_flow_even_without_identified_arguments(self):
+        for spelling in self.SINKS:
+            path = self.source(f'empty-{spelling}.py', f'cursor.{spelling}()\n')
+            with self.subTest(sink=spelling), self.assertRaisesRegex(
+                    sql_injection.SQLFlowLimit, 'budget.*incomplete'):
+                list(sql_injection.find([path], max_steps=0))
+
+    def test_nested_and_definition_time_sinks_remain_visible(self):
+        cases = {
+            'nested': ('def outer(cursor, user):\n    def inner():\n'
+                       '        cursor.execute(f"SELECT {user}")\n', 3),
+            'default': ('def outer(cursor, user):\n'
+                        '    def inner(query=cursor.execute(f"SELECT {user}")):\n'
+                        '        return query\n', 2),
+            'decorator': ('def outer(cursor, user):\n'
+                          '    @cursor.execute(f"SELECT {user}")\n'
+                          '    def inner():\n        return None\n', 2),
+            'comprehension': ('def run(cursor, user):\n'
+                              '    return [cursor.execute(f"SELECT {user}") for item in range(1)]\n', 2),
+        }
+        for name, (source, line) in cases.items():
+            path = self.source(name + '.py', source)
+            with self.subTest(case=name):
+                self.assertEqual([(rule, found_line) for rule, _, found_line, _, _
+                                  in sql_injection.find([path])],
+                                 [(sql_injection.RULE_CRITICAL, line)])
+
+    def test_configured_sanitizer_return_is_still_clean(self):
+        from unittest.mock import patch
+
+        path = self.source('sanitizer.py', 'def run(cursor, user):\n'
+                           '    cursor.execute(f"SELECT {quote_ident(user)}")\n')
+        with patch.dict(os.environ, {sql_injection.SANITIZER_ENV: ''}):
+            self.assertEqual([(rule, line) for rule, _, line, _, _ in sql_injection.find([path])],
+                             [(sql_injection.RULE_CRITICAL, 2)])
+        with patch.dict(os.environ, {sql_injection.SANITIZER_ENV: 'quote_ident'}):
+            self.assertEqual(list(sql_injection.find([path])), [])
+            with self.assertRaisesRegex(sql_injection.SQLFlowLimit, 'budget.*incomplete'):
+                list(sql_injection.find([path], max_steps=0))
+
+    def test_read_decode_and_parse_failures_cannot_be_certified_clean(self):
+        paths = [self.artifacts / 'missing.py',
+                 self.source('invalid.py', 'def invalid(:\n    pass\n'),
+                 self.source('undecodable.py', b'# coding: ascii\nvalue = "\xff"\n')]
+        for path in paths:
+            with self.subTest(source=path.name), self.assertRaisesRegex(
+                    sql_injection.SQLFlowLimit, 'Cannot analyze.*incomplete'):
+                list(sql_injection.find([path]))
+        encoded = self.source('latin1.py', ('# coding: latin-1\ndef run(cursor, user):\n'
+                              '    label = "caf\xe9"\n'
+                              '    cursor.execute(f"SELECT {user}")\n').encode('latin-1'))
+        self.assertEqual([(rule, line) for rule, _, line, _, _ in sql_injection.find([encoded])],
+                         [(sql_injection.RULE_CRITICAL, 4)])
+
+    @unittest.skipIf(sys.version_info < (3, 11), 'except* syntax requires Python 3.11')
+    def test_exception_group_without_sql_is_complete_and_with_sql_is_incomplete(self):
+        source = 'try:\n    work()\nexcept* ValueError:\n    recover()\n'
+        path = self.source('exception-group-no-sql.py', source)
+        self.assertEqual(list(sql_injection.find([path])), [])
+        applicable = self.source('exception-group-sql.py',
+                                 source + 'cursor.execute(f"SELECT {user}")\n')
+        with self.assertRaisesRegex(sql_injection.SQLFlowLimit, r'except\*.*incomplete'):
+            list(sql_injection.find([applicable]))
+
+    def test_recursive_work_limit_remains_for_applicable_sql(self):
+        source = ('def run(cursor, user):\n    queries = []\n'
+                  '    def add(value, depth):\n        if depth:\n            add(value, depth - 1)\n'
+                  '        else:\n            queries.append(value)\n'
+                  '    add(f"SELECT {user}", 3)\n')
+        path = self.source('recursive-no-sql.py', source)
+        self.assertEqual(list(sql_injection.find([path], max_steps=20)), [])
+        applicable = self.source('recursive-sql.py', source + '    cursor.execute(queries[-1])\n')
+        with self.assertRaisesRegex(sql_injection.SQLFlowLimit, 'budget.*incomplete'):
+            list(sql_injection.find([applicable], max_steps=20))
+
+
 class LDAPReceiverIdentityTests(unittest.TestCase):
     def test_builtin_sets_are_not_directory_connections(self):
         cases = (

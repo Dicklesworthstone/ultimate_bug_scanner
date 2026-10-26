@@ -3560,7 +3560,7 @@ class _Analysis:
                     state.bindings[function.name] = function
                 flow.normal_state, completed = flow.capture(function.body, state, exceptions=True)
                 flow.pending.extend(completed)
-            return reads, writes, flow, flow.summary()
+            return reads, writes, flow.summary()
         finally:
             owner.reads = owner.writes = None
 
@@ -3584,8 +3584,9 @@ class _Analysis:
         # Worklist: a job is a deterministic function of its namespace, the
         # summaries it requested and the definition-time tables it read. When
         # none of those changed since its last solve, solving it again yields
-        # the same summary and the same flow, so the previous ones are reused.
-        solved = {}  # summary key -> (reads, writes, flow) of the job's last solve
+        # the same summary and effects, so the previous ones are reused. Local
+        # expression/heap states belong to the solve, not the summary cache.
+        solved = {}  # summary key -> (reads, writes, latest base effects)
         readers = defaultdict(dict)
 
         def parts(key):
@@ -3593,7 +3594,15 @@ class _Analysis:
 
         def reorderable(key):
             function, _ = parts(key)
-            return key not in inherited and function not in self.owner(function).definition_writers
+            owner = self.owner(function)
+            if (not isinstance(key, tuple) and owner is not self
+                    and self.project is not None and owner in self.project.ready
+                    and owner not in solving):
+                # A ready module has solved every base function, including
+                # nonreturning bottom summaries. Importers only need to solve
+                # new callback contexts; active import cycles still converge.
+                return False
+            return key not in inherited and function not in owner.definition_writers
 
         while True:
             self.budget.spend()
@@ -3637,8 +3646,12 @@ class _Analysis:
                     for table, key in previous[0]:
                         if table == 'summaries':
                             readers[key].pop(summary_key, None)
-                reads, writes, flow, summary = self.solve_function(function, context)
-                solved[summary_key] = (reads, writes, flow)
+                reads, writes, summary = self.solve_function(function, context)
+                # Keep this solve's witness even if semantic summary equality
+                # avoids publication. Contextual effects are projected through
+                # their callers, so they need no second cached representation.
+                latest_effects = summary.effects if not context and owner is self else ()
+                solved[summary_key] = (reads, writes, latest_effects)
                 for table, key in reads:
                     if table == 'summaries':
                         readers[key][summary_key] = None
@@ -3709,16 +3722,19 @@ class _Analysis:
                 global_bound = {f'@global:{name}': globals_.value(name) for name in globals_}
                 # Contextual effects belong to their calling invocation, not
                 # an invented standalone/framework entry into a foreign scope.
-                flows = [module, *(solved[function][2] for function in self.functions)]
-                for flow in flows:
+                projections = [(self.tree, [(*key, fact) for key, fact in module.effects.items()])]
+                for function in self.functions:
+                    projections.append((function, solved[function][2]))
+                for scope, scope_effects in projections:
                     bound = global_bound
-                    if flow is not module and framework_bound.get(flow.scope):
-                        bound = {**global_bound, **framework_bound[flow.scope]}
-                    for key, fact in flow.effects.items():
-                        if flow is not module:
+                    if scope is not self.tree and framework_bound.get(scope):
+                        bound = {**global_bound, **framework_bound[scope]}
+                    for kind, line, column, label, fact in scope_effects:
+                        key = (kind, line, column, label)
+                        if scope is not self.tree:
                             # Framework invocation is a separate entry point;
                             # summaries remain symbolic for ordinary callers.
-                            fact = flow.substitute(fact, bound, _call_name(flow.scope), budget=self.budget)
+                            fact = self.flow_class.substitute(fact, bound, _call_name(scope), budget=self.budget)
                         concrete = frozenset(trace for trace in fact if trace.parameter is None
                                              and not _safe_for(trace, key[0], key[3]))
                         if concrete:

@@ -8,6 +8,8 @@ storyboard count are filesystem-gated derived checks.
 """
 from __future__ import annotations
 
+import os
+
 from ubs_core.swift_scan import Pattern
 from ubs_core.suppression import SourceSuppressions
 
@@ -85,7 +87,7 @@ def _packaging(ctx):
     suppressions = SourceSuppressions("swift")
     suppressions.index(manifest, text)
 
-    def _count(regex: str, rule_id: str) -> int:
+    def _count(regex: str, rule_id: str, hits: list[tuple[int, int]] | None) -> int:
         total = 0
         seen = set()
         for match in re.compile(regex).finditer(text):
@@ -96,30 +98,46 @@ def _packaging(ctx):
             if suppressions.is_suppressed(manifest, line_no, rule_id):
                 continue
             total += 1
+            if hits is not None:
+                column = match.start() - text.rfind("\n", 0, match.start())
+                hits.append((line_no, column))
         return total
 
-    branch = _count(r"\.branch\(|\.revision\(", "swift.packaging.branch-pins")
-    if branch:
-        yield {
-            "rule": "swift.packaging.branch-pins",
-            "category": 20,
-            "path": str(manifest), "line": 0,
-            "severity": "info",
-            "count": branch,
-            "title": "Branch/revision-based SPM dependencies",
-            "message": "Branch/revision-based SPM dependencies",
-        }
-    unsafe = _count(r"\.unsafeFlags\(", "swift.packaging.unsafe-flags")
-    if unsafe:
-        yield {
-            "rule": "swift.packaging.unsafe-flags",
-            "category": 20,
-            "path": str(manifest), "line": 0,
-            "severity": "warning",
-            "count": unsafe,
-            "title": "SPM unsafeFlags used",
-            "message": "SPM unsafeFlags used",
-        }
+    all_occurrences = os.environ.get("UBS_ALL_OCCURRENCES") == "1"
+    for regex, rule_id, severity, title in (
+        (r"\.branch\(|\.revision\(", "swift.packaging.branch-pins", "info",
+         "Branch/revision-based SPM dependencies"),
+        (r"\.unsafeFlags\(", "swift.packaging.unsafe-flags", "warning", "SPM unsafeFlags used"),
+    ):
+        # The inexpensive default keeps only the count. In occurrence mode
+        # retain the already matched, suppression-qualified sites, with the
+        # same distinct-line counting convention (two calls on one line are
+        # still one finding). Derived checks rerun after cache replay.
+        hits: list[tuple[int, int]] | None = [] if all_occurrences else None
+        count = _count(regex, rule_id, hits)
+        if not count:
+            continue
+        if hits is None:
+            yield {
+                "rule": rule_id,
+                "category": 20,
+                "path": str(manifest), "line": 0,
+                "severity": severity,
+                "count": count,
+                "title": title,
+                "message": title,
+            }
+        else:
+            for line_no, column in hits:
+                yield {
+                    "rule": rule_id,
+                    "category": 20,
+                    "path": str(manifest), "line": line_no, "col": column,
+                    "severity": severity,
+                    "count": 1,
+                    "title": title,
+                    "message": title,
+                }
 
 
 def _storyboards(ctx):

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -2087,7 +2088,9 @@ def check_robot_docs_flags_parse() -> None:
             # modules over the checkout's own modules/ directory (it reverted the
             # Python module once). Acceptance of both is covered elsewhere.
             continue
-        args = [example, "--only=python", "--ci", str(PY_CLEAN)]
+        # A documented example may include required companion flags, such as
+        # --format=jsonl --all-occurrences. Preserve its shell argument boundaries.
+        args = [*shlex.split(example), "--only=python", "--ci", str(PY_CLEAN)]
         if flag["name"] in ("--staged", "--diff"):
             args = [example, "--only=python", "--ci"]
         if flag["name"] == "--files":

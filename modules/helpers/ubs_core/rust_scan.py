@@ -764,6 +764,7 @@ class Scan:
         self.exclude_tests = exclude_tests
         self.skip = skip
         self.detail_limit = detail_limit
+        self.all_occurrences = os.environ.get("UBS_ALL_OCCURRENCES") == "1"
         self.jobs = max(1, int(jobs))
         self.files: list[Path] = [Path(f) for f in files]
         # Authoritative-file-set membership under BOTH spellings — the legacy
@@ -1028,7 +1029,7 @@ class Scan:
              title: str, hits: Sequence[Hit] | None = None,
              bucket_count: int | None = None, desc: str = "",
              sample_limit: int = 0, path: str = "", line: int = 1, col: int = 1,
-             subheader: str = "") -> None:
+             subheader: str = "", aggregate: bool = False) -> None:
         slug = _CATEGORY_SLUGS[category]
         if bucket_count is None:
             bucket_count = count
@@ -1043,6 +1044,30 @@ class Scan:
             "samples": samples,
         })
         subh = subheader or _RULE_TO_SUBHEADER.get(rule_id, "")
+        if self.all_occurrences and aggregate:
+            # Arithmetic correlations cannot identify the unmatched source
+            # sites. Keep their full weight without presenting a convenient
+            # first line as a proved occurrence, even when the weight is one.
+            record = {
+                "rule": rule_id,
+                "category_id": f"rust.{slug}",
+                "category": category,
+                "title": title,
+                "desc": desc,
+                "subheader": subh,
+                "scope": "project_aggregate",
+                "path": "", "line": 0, "col": 1,
+                "severity": severity,
+                "message": title,
+                "suppressed": False,
+                "count": bucket_count,
+                "sample_limit": sample_limit,
+            }
+            source = path or (hits[0].path if hits else "")
+            if source:
+                record["extras"] = {"aggregate_source": source}
+            self.records.append(record)
+            return
         if hits:
             for hit in hits:
                 record = {
@@ -1681,19 +1706,8 @@ def cat_3(scan: Scan, r: Renderer) -> None:
     r.subheader("std::thread::spawn within async")
     _sub(scan, r, scan.detector_hits("async_context", "thread_spawn"), "rust.async.thread-spawn-in-async", 3,
          "warning", "std::thread::spawn inside async fn", "", 3)
-    r.subheader("tokio::spawn usage (heuristic for detached tasks)")
-    spawn = scan.rg_lines(r"tokio::spawn\(", rule_id="rust.async.spawn-handle-heuristic")
-    handles = scan.rg_lines(r"JoinHandle<|\.await", rule_id="rust.async.spawn-handle-heuristic")
-    if spawn and len(handles) < len(spawn):
-        diff = len(spawn) - len(handles)
-        desc = "Ensure detached tasks handle errors appropriately"
-        r.finding("info", diff, "spawn without awaiting JoinHandle (heuristic)", desc)
-        p = spawn[0].path if spawn else (str(scan.files[0]) if scan.files else "")
-        l = spawn[0].line if spawn else 1
-        c = spawn[0].col if spawn else 1
-        scan.emit("rust.async.spawn-handle-heuristic", 3, "info", diff,
-                  "spawn without awaiting JoinHandle (heuristic)", bucket_count=diff,
-                  desc=desc, path=p, line=l, col=c)
+    if not scan.all_occurrences:
+        emit_spawn_handle_heuristic(scan, r)
     r.subheader("Async error path coverage")
     dropped = async_error_files(scan)
     if not dropped:
@@ -1708,7 +1722,22 @@ def cat_3(scan: Scan, r: Renderer) -> None:
             hit = Hit(path_str, 1, 1, f"tokio::spawn handles dropped: {missing}")
             r.finding("warning", 1, "tokio::spawn JoinHandle dropped", desc)
             scan.emit("rust.async.tokio-task-no-await", 3, "warning", 1,
-                      "tokio::spawn JoinHandle dropped", [hit])
+                      "tokio::spawn JoinHandle dropped", [hit], aggregate=True)
+
+
+def emit_spawn_handle_heuristic(scan: Scan, r: Renderer) -> None:
+    """The difference depends on the whole selection, including cache hits."""
+    r.subheader("tokio::spawn usage (heuristic for detached tasks)")
+    spawn = scan.rg_lines(r"tokio::spawn\(", rule_id="rust.async.spawn-handle-heuristic")
+    handles = scan.rg_lines(r"JoinHandle<|\.await", rule_id="rust.async.spawn-handle-heuristic")
+    if spawn and len(handles) < len(spawn):
+        diff = len(spawn) - len(handles)
+        desc = "Ensure detached tasks handle errors appropriately"
+        r.finding("info", diff, "spawn without awaiting JoinHandle (heuristic)", desc)
+        first = spawn[0]
+        scan.emit("rust.async.spawn-handle-heuristic", 3, "info", diff,
+                  "spawn without awaiting JoinHandle (heuristic)", bucket_count=diff,
+                  desc=desc, path=first.path, line=first.line, col=first.col, aggregate=True)
 
 
 def cat_4(scan: Scan, r: Renderer) -> None:
@@ -1924,6 +1953,9 @@ def cat_8(scan: Scan, r: Renderer) -> None:
 # Findings that describe the whole selection rather than one file: never
 # cached per file, never replayed (GH #150).
 _SELECTION_WIDE_RULES = frozenset({"rust.code-quality.tech-debt"})
+_OCCURRENCE_SELECTION_RULES = frozenset({
+    "rust.async.spawn-handle-heuristic", "rust.tests.test-todo",
+})
 
 
 def cat_9(scan: Scan, r: Renderer) -> None:
@@ -1944,10 +1976,12 @@ def cat_9(scan: Scan, r: Renderer) -> None:
     if total > 20:
         r.finding("warning", total, "Significant technical debt", breakdown)
         scan.emit("rust.code-quality.tech-debt", 9, "warning", total, "Significant technical debt",
+                  hits=markers if scan.all_occurrences else None,
                   bucket_count=total, desc=breakdown, path=p, line=l, col=c)
     elif total > 0:
         r.finding("info", total, "Technical debt markers present", breakdown)
         scan.emit("rust.code-quality.tech-debt", 9, "info", total, "Technical debt markers present",
+                  hits=markers if scan.all_occurrences else None,
                   bucket_count=total, desc=breakdown, path=p, line=l, col=c)
     else:
         r.finding("good", 0, "No TODO/FIXME/HACK markers found")
@@ -1980,16 +2014,23 @@ def cat_11(scan: Scan, r: Renderer) -> None:
         r.finding("info", len(ignored), "#[ignore] tests present - verify intent")
         scan.emit("rust.tests.ignored-tests", 11, "info", len(ignored),
                   "#[ignore] tests present - verify intent", ignored)
+    if not scan.all_occurrences:
+        emit_test_todo(scan, r)
+
+
+def emit_test_todo(scan: Scan, r: Renderer) -> None:
+    """Retain every counted stream entry, including overlapping windows."""
     r.subheader("todo!/unimplemented! in tests")
-    count, p, l = _test_todo_count(scan)
+    todo_hits: list[Hit] | None = [] if scan.all_occurrences else None
+    count, p, l = _test_todo_count(scan, todo_hits)
     if count > 0:
         r.finding("info", count, "todo!/unimplemented! seen near #[test]")
         scan.emit("rust.tests.test-todo", 11, "info", count,
                   "todo!/unimplemented! seen near #[test]", bucket_count=count,
-                  path=p, line=l)
+                  hits=todo_hits, path=p, line=l)
 
 
-def _test_todo_count(scan: Scan) -> tuple[int, str, int]:
+def _test_todo_count(scan: Scan, hits: list[Hit] | None = None) -> tuple[int, str, int]:
     """Legacy 9259: rg '#\\[test\\]' stream -> grep -A5 -E 'todo!|unimplemented!'
     over the rg OUTPUT lines (i.e. the next 5 '#[test]' stream lines), and
     overlapping blocks count a line twice — reproduce that faithfully."""
@@ -2006,13 +2047,16 @@ def _test_todo_count(scan: Scan) -> tuple[int, str, int]:
     found_first = False
     for idx in range(len(stream)):
         for path_str, line_no, line in stream[idx: idx + 6]:
-            if pattern.search(line):
+            match = pattern.search(line)
+            if match:
                 if scan.stream_line_allowed(path_str, line_no, line, "rust.tests.test-todo"):
                     if not found_first:
                         first_path = path_str
                         first_line = line_no
                         found_first = True
                     total += 1
+                    if hits is not None:
+                        hits.append(Hit(path_str, line_no, match.start() + 1, line))
     return total, first_path, first_line
 
 
@@ -2081,6 +2125,7 @@ def cat_19(scan: Scan, r: Renderer) -> None:
                 bucket_count=entry["delta"],
                 desc=entry["desc"],
                 path=file_path,
+                aggregate=True,
             )
     else:
         r.finding("good", 0, "All tracked resource acquisitions have matching cleanups")
@@ -2306,6 +2351,8 @@ def main(argv: list[str] | None = None) -> int:
     project_dir = Path(args.project_dir)
     skip = {int(p) for p in args.skip.split(",") if p.strip().isdigit()}
     scan = Scan(files, project_dir, args.exclude_tests, skip, args.detail_limit, jobs=args.jobs)
+    selection_wide_rules = (_SELECTION_WIDE_RULES | _OCCURRENCE_SELECTION_RULES
+                            if scan.all_occurrences else _SELECTION_WIDE_RULES)
     if args.exclude_tests:
         _apply_exclude_tests(scan)
 
@@ -2323,7 +2370,8 @@ def main(argv: list[str] | None = None) -> int:
         # Never replay a cached warning after its qualifying context disappears.
         extra=(f"exclude_tests={args.exclude_tests};skip_narrowing={args.skip_type_narrowing};"
                f"panic_context_v1={json.dumps(sorted(scan.integration_test_roots))};"
-               f"custom_rules={hash_rules_dir(args.custom_rules) if args.custom_rules else ''}"),
+               f"custom_rules={hash_rules_dir(args.custom_rules) if args.custom_rules else ''}"
+               + (";all_occurrences=1" if scan.all_occurrences else "")),
     )
     cached_findings, files_to_scan = cache.partition_files(original_files)
 
@@ -2383,6 +2431,11 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr.write(f"[ubs_core.rust_scan] narrowing failed: {exc}\n")
             narrowing_skip_note = None
             narrowing_failed = str(exc)
+            if scan.all_occurrences and 1 not in skip and not args.skip_type_narrowing:
+                # A full export cannot promise completed analysis when an
+                # enabled layer failed. Preserve the legacy default while
+                # preventing incomplete occurrence-mode cache entries.
+                scan.scan_errors.append(f"type narrowing did not complete: {exc}")
         else:
             narrowing_failed = ""
 
@@ -2415,9 +2468,12 @@ def main(argv: list[str] | None = None) -> int:
 
         by_file: dict[str, list[dict]] = {}
         for record in scan.records:
-            if record.get("rule") in _SELECTION_WIDE_RULES:
+            if record.get("rule") in selection_wide_rules:
                 continue
-            by_file.setdefault(record.get("path", ""), []).append(record)
+            source = record.get("path", "")
+            if scan.all_occurrences and record.get("scope") == "project_aggregate":
+                source = record.get("extras", {}).get("aggregate_source", "")
+            by_file.setdefault(source, []).append(record)
         # An incomplete analysis must never become the cached answer: the next
         # run would hit the cache and report the findings this one could not
         # produce as a clean, finished scan (#111).
@@ -2434,7 +2490,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Replay cached findings (for both partial and full cache hits)
     cached_records = [rec for recs in cached_findings.values() for rec in recs
-                      if rec.get("rule") not in _SELECTION_WIDE_RULES]
+                      if rec.get("rule") not in selection_wide_rules]
     if cached_records:
         replay_findings(scan, r, cached_records)
 
@@ -2451,6 +2507,15 @@ def main(argv: list[str] | None = None) -> int:
             at = next((index for index, record in enumerate(scan.records)
                        if _record_category(record) > 9), len(scan.records))
             scan.records[at:at] = added
+
+    if scan.all_occurrences:
+        # A selected file's cached records cannot prove selection-wide count
+        # differences or overlapping test-marker stream windows. Recompute
+        # these inexpensive checks once over the complete original selection.
+        if 3 not in skip:
+            emit_spawn_handle_heuristic(scan, r)
+        if 11 not in skip:
+            emit_test_todo(scan, r)
 
     prefilter_file = os.environ.get("UBS_PREFILTER_FILE")
     if prefilter_file:

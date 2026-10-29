@@ -90,7 +90,7 @@ if [[ "$UBS_KEEP_TEMP" == "1" ]]; then
   unset _ubs_arg
 fi
 
-UBS_VERSION="5.5.24"
+UBS_VERSION="5.5.25"
 # The optional service is a release executable, not a command trusted via PATH.
 # scripts/update_checksums.py keeps this pin in sync with ubs-daemon.
 UBS_DAEMON_SHA256="617d8d283c2caac455991cff4ef67b7e36be9933e989130bdeae0e935b30e8a0"
@@ -168,19 +168,19 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='763521e91f30b7feaaf41fe2e680d3da3251c7723b9e80dae7e33c484653d66d'
-  [cpp]='2bf66bcd4ed3e4f0bba7be3e76e60c45c998ca210f1b6bc6b2d11fe1ec8d1e29'
-  [csharp]='9f427320457644134c1702cbd87da128915e9b50508ce7ec77391ab499711aca'
-  [elixir]='fead50b0534896800df3bff182d9becd5738ad61913569343432ba68210048ef'
-  [golang]='379c8da140f46c60e74b6d3ef0e6351daa702c97a3f436a0fe433226461e3f18'
-  [java]='af566bdd0a34755f917b08edc486a5cc7df8d283ca76b8a4077517251ccfe55e'
-  [js]='720477d7bceb8b61411964feb80450c05ac81b79704ee3bf8d0d9edb82f156a6'
-  [kotlin]='3306adcb01b109261c6f1155d72a7e4f31f12eb53f636eb6f38759a02d1786b2'
-  [php]='1f75cd37f1c05d201861880c34543d7541228edb9fc380dba400ea3f088bc8e3'
-  [python]='376b0382b62c6b016317c42e4538f7cb039b6849dce03e2ea85a67bef200cb78'
-  [ruby]='f1bf8febcb6a83fd30c939158fa2994ccdf317c0887a1b1bb40afe9f88ec4081'
-  [rust]='7b492f8554e711eae9c1eae0c5e202d88477905e2dcbfcd40e96ffa6b4354164'
-  [swift]='cf3fc2fe1ade563008a576575375233c503cd79fd34b176cde3b787bb47470f6'
+  [bash]='1688f13317b87cefae82c261e3e56b7c4039592236fdcc6962ed9d8b3ec1e5df'
+  [cpp]='9dc5c10a82a1c01db752a486a3460ffb8ffe335e582b1f761222fbaf92f5bf1c'
+  [csharp]='916d2230e9b0fa1d7752f97931751faf35b389197049667db40c0dbb4cb88e24'
+  [elixir]='945d06a678575df7508e4596ce98f4c4d8e4e2e4b467e0444a560cdc379f2a85'
+  [golang]='074ed0ed134568bcc749ea3b0b1bef581c1a99d820d366ac944ccb1477ee6b61'
+  [java]='eb0e894b9e42af5875e93ba9af5a2ab1fbe38fbc12102bd7e1a5ccad43c0b4d7'
+  [js]='157af83903cccf0c06b4280292e3a2bc61a204a2a42521f6354805f552e7d2f1'
+  [kotlin]='174722b03323244c1a3e83410f3b205cffa4c870475338332ab2e3786e7056e8'
+  [php]='d65f131ab115bc102cebe79c1fe1b4124c262e286423b375cdf243d0cf105ad2'
+  [python]='b2d7491816878f3cf5bd1aafa93e6d4eb46353ec3a5709ea6403220160dc977e'
+  [ruby]='e9c20069186b369ecd6d2b98a5cd40b647952e4102dbe1362e06f0b005bf0ffd'
+  [rust]='bfa94a62b9de73380e46ec842dacfd160b7227055bc0fb763a1e5b2c7c623c9a'
+  [swift]='743b1773fadebc95b282468b165e1dc8c6da672107b3d85b38f54ba870c39c3d'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -297,7 +297,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/bash_rules.py']='21fb455e701160e12575b478819d8f52254bca2d672d6962992a93d8c186a20c'
   ['helpers/ubs_core/bash_scan.py']='aa224e5c69fb20539d1868f42a95b46c11eedf1b7c0ff6727d459acbe80c08ef'
   ['helpers/ubs_core/cache.py']='6fd060c27570c178c46015005fcc429b36518f1de77aa4abf3718165af53ce1e'
-  ['helpers/ubs_core/cli.py']='ffcacb475c996f148351690770e0ebd35ba44a513c656eb64d1e348f0d45cb66'
+  ['helpers/ubs_core/cli.py']='34a5c324970f1d2391fcada7de2ec7e0dedf11e0242b3ede0913a55645226237'
   ['helpers/ubs_core/cpp_detectors/__init__.py']='b74840d5af31f44ac13703f3c66f6968af4207c9ce08f3c0ae1010cd62c4fabd'
   ['helpers/ubs_core/cpp_detectors/archive_entry.py']='dd83df898f3c856fa769aaa754e172afc2607b22202a9984dd11802bb429b44e'
   ['helpers/ubs_core/cpp_detectors/async_errors.py']='e3c03636656ec7477e940520806c8080326ec7700b0e0cb6d702c8ef0a0ed713'
@@ -357,7 +357,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/elixir_patterns/phoenix.py']='533afcfc1a90e24ad2ce002a76d2433ef2203f7034de9047a84c7a67eb0f36a4'
   ['helpers/ubs_core/elixir_patterns/security_rg.py']='3e6987c5e596800f719506f50d5a203eb70942097ff98aa71321f63e53c186f7'
   ['helpers/ubs_core/elixir_rules.py']='3f8ca9a8d1cd898588005bb925b5b931d8d3947d41e7c235c48b9d8033ed65e4'
-  ['helpers/ubs_core/elixir_scan.py']='211b76527f9b803507420e5abc7618bf89c801bac64bc474d8978d31c34dc331'
+  ['helpers/ubs_core/elixir_scan.py']='6b9ef4f97ad0457bcc0e3dd0766d5ed6e7edb3c518da17ce5d1be782555bed64'
   ['helpers/ubs_core/explain.py']='af565bc8ebe3c42521bf669787980b6a1b7ada8f83b8d08f9985828d0668415c'
   ['helpers/ubs_core/external_tools.py']='4a66691cffa87c4c4b8191ac7355fee395d3b0369a288e381a11522accc69a48'
   ['helpers/ubs_core/findings_merge.py']='a592789f727296e332a1b79f441a20234f8f7686ed738de5152fc4981781b6fa'
@@ -427,6 +427,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/kotlin_rules.py']='6dd77c16cd9fbba0e555162e2a8f378858ce70b4d70668f64ec8142983ba3c35'
   ['helpers/ubs_core/kotlin_scan.py']='df870233b07e656cba3c82b146f8f7cac10679ee6011d0f70fd95d230b7338e5'
   ['helpers/ubs_core/lexer.py']='8ad2f1ebf45306e74042efa330052a765b345568194570dff5480af215531023'
+  ['helpers/ubs_core/occurrences.py']='f3d95ce879e55d75fdc2067aefb0ecd0021c5a685d5c848b711a4fe79a217561'
   ['helpers/ubs_core/php_frontend.py']='301b810b4addcc0c6c055cce15c2e0fdbf505cbd9ecd159d9a3975f3a77c8658'
   ['helpers/ubs_core/php_scan.py']='92349ae54795e4d1dbbc6ffd5846273ad11b33ed9cb006432ccea9f5efe57724'
   ['helpers/ubs_core/prefilter.py']='adda4a20eab6cf84bcb9691b9767af76bf46d0eba90bf0e4c000fd97a8996d6f'
@@ -528,7 +529,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/rust_detectors/tls_indirect.py']='120501344abdcddf96e6a40c7b4b38617dd0649b83cfc81a0863f38027b0a755'
   ['helpers/ubs_core/rust_detectors/unbounded_request_body.py']='72eaedc5e99846eadaab246cb6398dc189f541ca14ae62e8a305a316bde69f5f'
   ['helpers/ubs_core/rust_rules.py']='d35a4d6cb061f0eb7ff70a799b415414016a3ce8e10c8331e8a9ee4b484be211'
-  ['helpers/ubs_core/rust_scan.py']='18bad9f7c59f18739578da1d5321e5917a1c1d108b2199c82d08fa2412b1dc75'
+  ['helpers/ubs_core/rust_scan.py']='af4fb4f18009ce8020a31b4dd691d3860fce89e8aa2e8eee90082cec3c93f572'
   ['helpers/ubs_core/scheduler.py']='662a2555f571e9cc6fba5755103948fa8b8e8b87f8d9038686225ccf6b6405bb'
   ['helpers/ubs_core/selftest.py']='6ca3dd5e5534edc0b8a10e9aac1f80834f0d79b661c50c28bd00b33eb85bff08'
   ['helpers/ubs_core/shards.py']='cdc6ecab42bd962e65bb1ac1dc5e3f20b87c4d68632617286a2991274c0c98f7'
@@ -548,12 +549,12 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_patterns/debug_quality.py']='467066b5d51d8e0a523b6271407d36e9c44e2cfa5f15d597159011c81eb3137f'
   ['helpers/ubs_core/swift_patterns/errors_security.py']='6cc074c3909493dc6ea874ee8c5bc359ed07f1b6af657047cfb03d3d9db56539'
   ['helpers/ubs_core/swift_patterns/foundations.py']='c04908fa89c5bec54d1f88fd55c00da87114d7526b2f3a5e80aec288e52e125f'
-  ['helpers/ubs_core/swift_patterns/misc_cats.py']='42dbe1cfe9fe0a6b70c4e72ef53895eb05569fb09cef9e9ce6a2f634f0a6057d'
+  ['helpers/ubs_core/swift_patterns/misc_cats.py']='36b2aabee7e7acb2b7e41ddfaaf2d6a33be5901be68d11e2e54a53772efdf469'
   ['helpers/ubs_core/swift_patterns/threading_perf.py']='3282b7f8ddb9df8476c315872f828905bd3b71e539e8834289578d9bc7abdd46'
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='77a16e60dce843652c053d069dcbffce17c8ffae543bf77693d2e8254a3967de'
   ['helpers/ubs_core/taint_flow.py']='828316f978026b562f13a62e86abfefa83e5dfc802cc97151ecda6de107e16f2'
-  ['lib/ubs-common.sh']='377596ad84f1174a3f07f0ccf2a5690ae50c95aed5aa6b89ff661f65cde77eed'
+  ['lib/ubs-common.sh']='360d5fd737c8450c5ea8a95cab6dbc4c13f56410a6a639102e51106f09882bdc'
 )
 
 # contract.json as shipped by earlier releases (sha256 -> first tag), kept out
@@ -1109,6 +1110,7 @@ HELPER_ASSETS=(
   "helpers/ubs_core/kotlin_rules.py"
   "helpers/ubs_core/kotlin_scan.py"
   "helpers/ubs_core/lexer.py"
+  "helpers/ubs_core/occurrences.py"
   "helpers/ubs_core/php_frontend.py"
   "helpers/ubs_core/php_scan.py"
   "helpers/ubs_core/prefilter.py"
@@ -1552,6 +1554,10 @@ SHOW_VERSION=0
 BEADS_JSONL_PATH=""
 SUGGEST_IGNORE=0
 JSONL_DETAIL=1               # 1=include findings, 0=summary only (for backward compat)
+ALL_OCCURRENCES=0            # Explicit occurrence JSONL; ordinary previews stay capped.
+MAX_OCCURRENCES=100000       # Scan-wide export limit, independent of analysis budgets.
+MAX_OCCURRENCES_SET=0
+EMPTY_GIT_SELECTION=0
 
 # Tool cache / JS AST engine
 AST_GREP_BIN=""
@@ -1923,6 +1929,8 @@ Options:
   --html-report=FILE      Emit shareable HTML report to FILE
   --beads-jsonl=FILE      Also write combined findings to JSONL for Beads/strung
   --jsonl-summary-only    JSONL output: emit only summary counts, no individual findings
+  --all-occurrences       JSONL: export source occurrences with code, stable IDs and coverage
+  --max-occurrences=N     Limit occurrence records across the scan (default 100000; max 1000000)
   --suggest-ignore        Print large-directory ignore suggestions (without modifying files)
   --update                Update the installed ubs binary from the latest
                           verified release and exit (nonzero on failure)
@@ -2097,6 +2105,8 @@ cat <<'JSON'
       {"name": "--html-report", "args": "FILE", "example": "--html-report=report.html", "description": "Write a shareable HTML report."},
       {"name": "--beads-jsonl", "args": "FILE", "example": "--beads-jsonl=findings.jsonl", "description": "Write findings as JSONL for Beads/strung."},
       {"name": "--jsonl-summary-only", "args": null, "example": "--jsonl-summary-only", "description": "JSONL: emit only scanner/totals lines, no per-finding lines."},
+      {"name": "--all-occurrences", "args": null, "example": "--format=jsonl --all-occurrences", "description": "Opt-in source occurrence JSONL with stable occurrence_id, rule, severity, location, code, per-rule accounting and explicit occurrence_export completeness. Requires a primary or additional JSONL destination; incompatible with --jsonl-summary-only. Reuses full module ledgers and keeps sampled summaries and analysis thresholds unchanged."},
+      {"name": "--max-occurrences", "args": "N", "example": "--format=jsonl --all-occurrences --max-occurrences=10000", "description": "Scan-wide limit on emitted source occurrence records, from 1 to 1000000 (default 100000). Requires --all-occurrences. Counts and findings-based exits are unchanged; omitted records make occurrence_export.complete false and truncated true."},
       {"name": "--suggest-ignore", "args": null, "example": "--suggest-ignore", "description": "Print large-directory ignore suggestions without modifying files."},
       {"name": "--no-color", "args": null, "example": "--no-color", "description": "Disable ANSI colors (same as NO_COLOR=1)."},
       {"name": "--verbose", "args": null, "example": "-v", "description": "More code samples per finding (alias -v)."},
@@ -2131,7 +2141,7 @@ cat <<'JSON'
   ],
   "formats": {
     "json": {"description": "One object: project, timestamp, status (ok|partial), failed_modules[], scanners[] (per-language summary with findings[] and status ok|timeout|error), totals{critical,warning,info,files}. Environment errors and refusals print an error envelope instead; no supported language prints a result object with exit_code 3.", "schema": "ubs --schema=json"},
-    "jsonl": {"description": "One JSON object per line: type=finding (canonical finding fields, including analyzer extras, with language), type=scanner (per language summary), type=totals (last line, carries status/failed_modules), or type=error (envelope).", "schema": "ubs --schema=jsonl"},
+    "jsonl": {"description": "One JSON object per line: type=finding (canonical finding fields, including analyzer extras, with language), type=scanner (per language summary), type=totals (last line, carries status/failed_modules), or type=error (envelope). With --all-occurrences, source findings use schema ubs.occurrence/1 and include occurrence_id/code; type=rule_summary reconciles ledger weights and each scanner/totals has occurrence_export completeness. Only complete=true on the final totals proves a complete export for the selected analysis.", "schema": "ubs --schema=jsonl"},
     "sarif": {"description": "SARIF 2.1.0; one run per module. Partial runs and errors set runs[].invocations[0].executionSuccessful=false with toolExecutionNotifications (descriptor ids ubs/module-timeout, ubs/module-error, ubs/<refusal-or-error-reason>).", "schema": "ubs --schema=sarif"},
     "toon": {"description": "The json document encoded with toon_rust's tru. Without a usable toon_rust encoder (toon or tru on PATH, TOON_TRU_BIN/TOON_BIN, or the tool cache filled by 'ubs doctor --fix'/install.sh) the run exits 2 with the error envelope (reason toon-encoder-missing) instead of printing JSON labelled as TOON.", "schema": "ubs --schema=toon"},
     "text": {"description": "Human report; Combined Summary at the end (Files/Critical/Warning/Info, Status: partial when applicable)."}
@@ -2423,15 +2433,68 @@ cat <<'JSON'
   "jsonl": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "title": "ubs --format=jsonl (one object per line)",
-    "description": "Each line is one of: a finding, a per-language scanner summary, the totals line (always last on success), or an error envelope.",
+    "description": "Each line is a finding, a per-language scanner summary, the final totals line, or an error envelope. Opt-in --all-occurrences adds source occurrence fields, rule_summary lines and occurrence_export coverage. Default summaries remain sampled.",
     "oneOf": [
       {"$ref": "#/$defs/finding_line"},
+      {"$ref": "#/$defs/rule_summary_line"},
       {"$ref": "#/$defs/scanner_line"},
       {"$ref": "#/$defs/totals_line"},
       {"$ref": "#/$defs/error_line"}
     ],
     "$defs": {
       "count": {"type": "integer", "minimum": 0},
+      "occurrence_counts": {
+        "type": "object",
+        "required": ["reported", "accounted", "emitted", "omitted"],
+        "properties": {
+          "reported": {"$ref": "#/$defs/count"},
+          "accounted": {"$ref": "#/$defs/count"},
+          "emitted": {"$ref": "#/$defs/count"},
+          "omitted": {"$ref": "#/$defs/count"}
+        }
+      },
+      "occurrence_export": {
+        "type": "object",
+        "required": ["schema", "limit", "complete", "analysis_complete", "locations_complete", "truncated", "reported", "accounted", "emitted", "omitted", "unlocated", "code_unavailable", "code_truncated", "reasons", "counts"],
+        "properties": {
+          "schema": {"const": "ubs.occurrence-export/1"},
+          "limit": {"type": "integer", "minimum": 1, "maximum": 1000000},
+          "complete": {"type": "boolean"},
+          "analysis_complete": {"type": "boolean"},
+          "locations_complete": {"type": "boolean"},
+          "truncated": {"type": "boolean"},
+          "reported": {"$ref": "#/$defs/count"},
+          "accounted": {"$ref": "#/$defs/count"},
+          "emitted": {"$ref": "#/$defs/count"},
+          "omitted": {"$ref": "#/$defs/count"},
+          "unlocated": {"$ref": "#/$defs/count"},
+          "code_unavailable": {"$ref": "#/$defs/count"},
+          "code_truncated": {"$ref": "#/$defs/count"},
+          "reasons": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+          "counts": {
+            "type": "object", "required": ["critical", "warning", "info"],
+            "properties": {
+              "critical": {"$ref": "#/$defs/occurrence_counts"},
+              "warning": {"$ref": "#/$defs/occurrence_counts"},
+              "info": {"$ref": "#/$defs/occurrence_counts"}
+            }
+          }
+        }
+      },
+      "rule_summary_line": {
+        "type": "object",
+        "required": ["type", "language", "rule_id", "severity", "reported", "emitted", "omitted", "unlocated"],
+        "properties": {
+          "type": {"const": "rule_summary"},
+          "language": {"type": "string"},
+          "rule_id": {"type": "string", "minLength": 1},
+          "severity": {"enum": ["critical", "warning", "info"]},
+          "reported": {"$ref": "#/$defs/count", "description": "Active weighted findings in this rule's canonical ledger, not an inferred count from previews."},
+          "emitted": {"$ref": "#/$defs/count"},
+          "omitted": {"$ref": "#/$defs/count"},
+          "unlocated": {"$ref": "#/$defs/count"}
+        }
+      },
       "finding_line": {
         "type": "object",
         "required": ["type", "project", "language", "severity", "title", "count"],
@@ -2444,11 +2507,33 @@ cat <<'JSON'
           "title": {"type": "string"},
           "description": {"type": "string"},
           "samples": {"type": "array"},
+          "schema": {"const": "ubs.occurrence/1"},
+          "occurrence_id": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+          "rule_id": {"type": "string", "minLength": 1},
+          "file": {"type": "string"},
+          "line": {"type": "integer"},
+          "col": {"type": "integer"},
+          "code": {"type": "string", "maxLength": 4096},
+          "code_available": {"type": "boolean"},
+          "code_truncated": {"type": "boolean"},
           "extras": {"type": "object", "description": "Public analyzer evidence from the canonical finding, preserved unchanged; may include an ordered taint_path."},
           "timestamp": {"type": "string", "description": "Combined scan snapshot timestamp."},
           "finding_timestamp": {"type": "string", "description": "Original finding timestamp when supplied by its module."}
         },
-        "additionalProperties": true
+        "additionalProperties": true,
+        "allOf": [{
+          "if": {"required": ["schema"]},
+          "then": {
+            "required": ["occurrence_id", "rule_id", "file", "line", "col", "code", "code_available", "code_truncated"],
+            "properties": {
+              "count": {"const": 1},
+              "severity": {"enum": ["critical", "warning", "info"]},
+              "file": {"minLength": 1},
+              "line": {"minimum": 1},
+              "col": {"minimum": 1}
+            }
+          }
+        }]
       },
       "scanner_line": {
         "type": "object",
@@ -2463,7 +2548,8 @@ cat <<'JSON'
           "warning": {"$ref": "#/$defs/count"},
           "info": {"$ref": "#/$defs/count"},
           "timestamp": {"type": "string"},
-          "scanner_timestamp": {"type": "string", "description": "Original module timestamp; timestamp identifies the combined scan snapshot."}
+          "scanner_timestamp": {"type": "string", "description": "Original module timestamp; timestamp identifies the combined scan snapshot."},
+          "occurrence_export": {"$ref": "#/$defs/occurrence_export"}
         }
       },
       "totals_line": {
@@ -2476,13 +2562,14 @@ cat <<'JSON'
           "failed_modules": {"type": "array"},
           "error": {"enum": ["environment", "analysis"]},
           "reason": {"type": "string"},
-          "exit_code": {"const": 2},
+          "exit_code": {"enum": [0, 1, 2, 3]},
           "message": {"type": "string"},
           "files": {"$ref": "#/$defs/count"},
           "critical": {"$ref": "#/$defs/count"},
           "warning": {"$ref": "#/$defs/count"},
           "info": {"$ref": "#/$defs/count"},
-          "timestamp": {"type": "string"}
+          "timestamp": {"type": "string"},
+          "occurrence_export": {"$ref": "#/$defs/occurrence_export"}
         }
       },
       "error_line": {
@@ -2867,6 +2954,13 @@ else
         shift; BEADS_JSONL_PATH="$1"; shift;;
       --suggest-ignore) SUGGEST_IGNORE=1; shift;;
       --jsonl-summary-only) JSONL_DETAIL=0; shift;;
+      --all-occurrences) ALL_OCCURRENCES=1; shift;;
+      --max-occurrences=*) MAX_OCCURRENCES="${1#*=}"; MAX_OCCURRENCES_SET=1; shift;;
+      --max-occurrences)
+        if [[ $# -lt 2 ]]; then
+          say_err "ERROR: --max-occurrences requires an integer from 1 to 1000000"; exit 2
+        fi
+        MAX_OCCURRENCES="$2"; MAX_OCCURRENCES_SET=1; shift 2;;
       --ignore-file=*) IGNORE_FILE="${1#*=}"; shift;;
       --skip-size-check) SKIP_SIZE_CHECK=1; shift;;
       --module-dir=*) MODULE_DIR="${1#*=}"; shift;;
@@ -3030,6 +3124,26 @@ else
   if [[ "$SHOW_VERSION" -eq 0 && "$UPDATE_ONLY" -eq 0 ]]; then
     load_scan_config
     if [[ "$UBS_PROFILE" == "strict" ]]; then FAIL_ON_WARNING=1; fi
+  fi
+  if [[ "$MAX_OCCURRENCES_SET" -eq 1 && "$ALL_OCCURRENCES" -ne 1 ]]; then
+    say_err "ERROR: --max-occurrences requires --all-occurrences"; exit 2
+  fi
+  if [[ ! "$MAX_OCCURRENCES" =~ ^[1-9][0-9]{0,6}$ ]] || [[ "$MAX_OCCURRENCES" -gt 1000000 ]]; then
+    say_err "ERROR: --max-occurrences requires an integer from 1 to 1000000"; exit 2
+  fi
+  if [[ "$ALL_OCCURRENCES" -eq 1 ]]; then
+    if [[ "$JSONL_DETAIL" -ne 1 ]]; then
+      say_err "ERROR: --all-occurrences is incompatible with --jsonl-summary-only"; exit 2
+    fi
+    _has_occurrence_destination=0
+    [[ "$FORMAT" == "jsonl" || -n "$BEADS_JSONL_PATH" ]] && _has_occurrence_destination=1
+    for _also_format in "${ALSO_FORMATS[@]}"; do
+      [[ "$_also_format" == "jsonl" ]] && _has_occurrence_destination=1
+    done
+    if [[ "$_has_occurrence_destination" -ne 1 ]]; then
+      say_err "ERROR: --all-occurrences requires --format=jsonl, --also=jsonl:FILE or --beads-jsonl=FILE"; exit 2
+    fi
+    unset _has_occurrence_destination _also_format
   fi
   if [[ -n "$PYTHON_PATTERN_COUNTS_PATH" && ( "$LIST_CATEGORIES" -eq 1 || "$SHOW_VERSION" -eq 1 || "$UPDATE_ONLY" -eq 1 ) ]]; then
     say_err "ERROR: --python-pattern-counts requires a scan, not a listing, version or update request"
@@ -4512,6 +4626,12 @@ PY
   fi
   if [[ "$count" -eq 0 ]]; then
     say "${GREEN}${CHECK} No changed files to scan.${RESET}"
+    if [[ "$ALL_OCCURRENCES" -eq 1 ]]; then
+      EMPTY_GIT_SELECTION=1
+      FILTERED_PROJECT_DIR="$dest"
+      PROJECT_DIR="$dest"
+      return 0
+    fi
     exit 0
   fi
   FILTERED_PROJECT_DIR="$dest"
@@ -4599,6 +4719,13 @@ for raw in sys.stdin.buffer.read().split(b'\0'):
 
   if [[ ${#files[@]} -eq 0 ]]; then
     say "${GREEN}${CHECK} No changed files to scan.${RESET}"
+    if [[ "$ALL_OCCURRENCES" -eq 1 ]]; then
+      EMPTY_GIT_SELECTION=1
+      FILTERED_PROJECT_DIR="$TMPDIR_RUN/git_scan"
+      ensure_dir "$FILTERED_PROJECT_DIR"
+      PROJECT_DIR="$FILTERED_PROJECT_DIR"
+      return 0
+    fi
     exit 0
   fi
   
@@ -8175,6 +8302,9 @@ run_lang(){
   args+=("$lang_proj_dir")
   export UBS_PREFILTER_FILE="$TMPDIR_RUN/$lang.prefilter"
   export UBS_CACHE_FILE="$TMPDIR_RUN/$lang.cache"
+  # Only the explicit CLI flag enables extra occurrence retention. Producers
+  # keep their sampled previews and use full ledgers for this separate export.
+  export UBS_ALL_OCCURRENCES="$ALL_OCCURRENCES"
 
   case "$fmt" in
     json|jsonl|toon|sarif)
@@ -8724,6 +8854,27 @@ write_jsonl_summary(){
   local dest="$1"
   if ! generate_combined_json; then return 1; fi
   local tmp="$TMPDIR_RUN/combined.jsonl"
+  if [[ "${ALL_OCCURRENCES:-0}" -eq 1 ]]; then
+    local helpers_dir; helpers_dir="$(script_dir)/modules/helpers"
+    [[ -d "$helpers_dir/ubs_core" ]] || helpers_dir="$MODULE_DIR/helpers"
+    local -a occurrence_opts=(--combined "$COMBINED_JSON_FILE" --output "$tmp"
+      --tmp-dir "$TMPDIR_RUN"
+      --project-dir "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}"
+      --max-occurrences "${MAX_OCCURRENCES:-100000}")
+    if [[ "${GIT_MODE:-}" == "staged" && -n "${FILTERED_PROJECT_DIR:-}" ]]; then
+      occurrence_opts+=(--source-root "$FILTERED_PROJECT_DIR")
+    fi
+    if ! PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core occurrences \
+      "${occurrence_opts[@]}"; then
+      return 1
+    fi
+    if [[ -n "$dest" ]]; then
+      deliver_file "$tmp" "$dest" "Occurrence JSONL" || return 1
+    else
+      cat "$tmp"
+    fi
+    return 0
+  fi
   local ts
   if ! need_cmd jq; then return 1; fi
   ts="$(jq -r '.timestamp // empty' "$COMBINED_JSON_FILE")" || return 1
@@ -8895,6 +9046,7 @@ emit_no_langs_document(){
   local supported="${ALL_LANGS[*]}"
   local rc=3
   if [[ "${UBS_ALLOW_NO_SCAN:-0}" == "1" ]]; then rc=0; fi
+  [[ "${EMPTY_GIT_SELECTION:-0}" -eq 1 ]] && rc=0
   case "$FORMAT" in
     json|toon)
       local proj_e supported_json="" first=1 l
@@ -8913,6 +9065,20 @@ emit_no_langs_document(){
       ;;
     jsonl)
       local proj_e; proj_e="$(json_escape "$proj")"
+      if [[ "${ALL_OCCURRENCES:-0}" -eq 1 ]]; then
+        local result="no-supported-languages"
+        [[ "${EMPTY_GIT_SELECTION:-0}" -eq 1 ]] && result="no-changed-files"
+        jq -cn --arg project "$proj" --arg ts "${NO_SCAN_TIMESTAMP:-$(date_iso)}" --arg result "$result" \
+          --argjson rc "$rc" --argjson limit "$MAX_OCCURRENCES" '
+          {type:"totals", project:$project, timestamp:$ts, status:"ok", failed_modules:[],
+           result:$result, exit_code:$rc, files:0, critical:0, warning:0, info:0,
+           occurrence_export:{schema:"ubs.occurrence-export/1", limit:$limit,
+             complete:false, analysis_complete:false, locations_complete:false,
+             truncated:false, reported:0, accounted:0, emitted:0, omitted:0,
+             unlocated:0, code_unavailable:0, code_truncated:0, reasons:["no_files_scanned"],
+             counts:(["critical","warning","info"] | map({key:., value:{reported:0,accounted:0,emitted:0,omitted:0}}) | from_entries)}}'
+        return $?
+      fi
       printf '{"type":"no-supported-languages","project":"%s","detected_languages":[],"supported_languages":"%s"}\n' "$proj_e" "$(json_escape "$supported")"
       printf '{"type":"totals","project":"%s","files":0,"critical":0,"warning":0,"info":0}\n' "$proj_e"
       ;;
@@ -8933,11 +9099,27 @@ emit_no_langs_document(){
 
 emit_no_langs_result(){
   local rc=3
+  # All destinations describe one scan snapshot, including an empty selection.
+  local NO_SCAN_TIMESTAMP
+  NO_SCAN_TIMESTAMP="$(date_iso)"
   if [[ "${UBS_ALLOW_NO_SCAN:-0}" == "1" ]]; then rc=0; fi
+  [[ "${EMPTY_GIT_SELECTION:-0}" -eq 1 ]] && rc=0
   emit_no_langs_document "$FORMAT" || rc=2
   write_additional_reports 1 || rc=2
+  if [[ "${ALL_OCCURRENCES:-0}" -eq 1 && -n "$BEADS_JSONL_PATH" ]]; then
+    if emit_no_langs_document jsonl >"$TMPDIR_RUN/no-scan.jsonl"; then
+      deliver_file "$TMPDIR_RUN/no-scan.jsonl" "$BEADS_JSONL_PATH" "Occurrence JSONL" || rc=2
+    else
+      rc=2
+    fi
+  fi
   exit "$rc"
 }
+
+# Git's empty-selection fast path precedes report function definitions. In
+# occurrence mode defer its exit so every requested JSONL destination receives
+# an explicit no-coverage result instead of an apparently successful silence.
+if [[ "$EMPTY_GIT_SELECTION" -eq 1 ]]; then emit_no_langs_result; fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Banner & preflight

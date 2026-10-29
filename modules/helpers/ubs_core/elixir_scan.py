@@ -595,6 +595,17 @@ def main(argv: list[str] | None = None) -> int:
     skip = _skip_set(args)
 
     patterns, _failures = load_patterns()
+    unlocated_net_rules: set[str] = set()
+    if os.environ.get("UBS_ALL_OCCURRENCES") == "1":
+        from ubs_core.analyzers.lifecycle_elixir import REPLACED_RULES
+
+        # Legacy NET checks retain the first N main-pattern hits to carry
+        # their arithmetic count, not to identify which sites are unmatched.
+        # Lifecycle replacements have actual source evidence and are exempt.
+        unlocated_net_rules = {
+            pattern.rule_id for pattern in patterns
+            if pattern.diff_regexes and pattern.rule_id not in REPLACED_RULES
+        }
 
     from ubs_core.prefilter import build_prefilter_index, run_prefilter
     from ubs_core.registry import analyzers_for_lang
@@ -690,6 +701,17 @@ def main(argv: list[str] | None = None) -> int:
                 recs = capturing_sink.get_for_file(f)
             if recs:
                 for r in recs:
+                    if r.get("rule") in unlocated_net_rules:
+                        # Transform only the delivered sink, after caching
+                        # and replay: ordinary previews/cache entries retain
+                        # their behavior, while full export never calls an
+                        # arbitrary representative a proved source site.
+                        r = {
+                            **r, "scope": "project_aggregate", "count": 1,
+                            "path": "", "line": 0,
+                            "extras": {**r.get("extras", {}),
+                                       "aggregate_source": r.get("path", "")},
+                        }
                     sink_file.write(json.dumps(r, ensure_ascii=False) + "\n")
 
     cache_file = os.environ.get("UBS_CACHE_FILE") or (os.path.splitext(args.sink)[0] + ".cache")

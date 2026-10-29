@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.5.24-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.5.25-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -142,6 +142,7 @@ const zipCode = parseInt(userInput);  // 💥 "08" becomes 0 in old browsers (oc
 - `--comparison=<baseline.json>` diff the latest combined summary against a stored run. Deltas feed into console output, JSON, HTML, and SARIF automation metadata so CI can detect regressions.
 - `--report-json=<file>` writes an enriched summary (project, totals, git metadata, optional comparison block) that you can archive or share with teammates/CI.
 - `--python-pattern-counts=<file>` writes unthresholded per-file/per-rule Python pattern counts, with threshold, severity, context and completeness metadata. See the [count contract](#python-pattern-count-export); this is independent of capped finding samples.
+- `--all-occurrences` opts JSONL into individual source occurrences with code, stable identities and explicit completeness. `--max-occurrences=N` bounds the export without changing scan counts. See [complete occurrence export](#complete-occurrence-export).
 - `--html-report=<file>` emits a standalone HTML preview showing totals, trends vs. baseline, and per-language breakdowns—ideal for attaching to PRs or chat updates.
 - `--also=FORMAT:FILE` writes another rendering of the same scan, including the full findings ledger. Repeat it for JSON, JSONL, SARIF, or TOON; each selected module runs once. The primary `--format` still controls stdout. Relative destinations use the invocation directory, and two reports cannot target the same file. TOON requires the same verified encoder as `--format=toon`.
 - All shareable outputs inject GitHub permalinks when UBS is run inside a git repo with a GitHub remote. Text output annotates `path:line` references, stdout JSON gains `git.*` metadata plus a `permalink` on every finding sample, and merged SARIF runs carry `properties.permalink` on each result location together with `versionControlProvenance` and `automationDetails` keyed by the comparison id. Permalinks are relative to the repository root even when you scan a subdirectory.
@@ -283,7 +284,9 @@ sample limits, rule thresholds and exit policy stay unchanged; JSONL export
 does not imply complete occurrence coverage for every analyzer or additivity
 for analyses that depend on cross-file context. The separate
 [Python pattern-count export](#python-pattern-count-export) defines its own
-distinct-line count and completeness contract.
+distinct-line count and completeness contract. Request
+[`--all-occurrences`](#complete-occurrence-export) when a consumer needs every
+available source occurrence and an explicit check that none are missing.
 
 ---
 
@@ -1134,6 +1137,8 @@ Git Integration:
 Output Control:
   --format=FMT             Output format: text|json|jsonl|sarif|toon (default: text)
   --beads-jsonl=FILE      Write JSONL summary alongside normal output for Beads/"strung"
+  --all-occurrences      JSONL source occurrences, code, stable IDs and completeness
+  --max-occurrences=N    Scan-wide occurrence export limit (default 100000; max 1000000)
   --python-pattern-counts=FILE  Write unthresholded Python pattern counts as JSON
   --no-color               Force disable ANSI colors
   OUTPUT_FILE              Save report to file (auto-tees to stdout)
@@ -1328,6 +1333,138 @@ ubs -v --fail-on-warning --exclude=legacy --include-ext=js,ts,tsx . report.txt
 {"type":"scanner","project":"/path/to/project","language":"python","files":42,"critical":1,"warning":3,"info":12,"timestamp":"2025-11-22T09:04:20Z"}
 {"type":"totals","project":"/path/to/project","files":99,"critical":1,"warning":3,"info":27,"timestamp":"2025-11-22T09:04:22Z"}
 ```
+
+### Complete occurrence export
+
+For editor diagnostics and other machine consumers, request the opt-in JSONL
+occurrence interface:
+
+```bash
+ubs src --ci --format=jsonl --all-occurrences > occurrences.jsonl
+ubs src --ci --format=jsonl --all-occurrences --max-occurrences=10000
+ubs src --ci --format=json --all-occurrences --also=jsonl:occurrences.jsonl
+ubs --schema=jsonl
+```
+
+The flag requires a JSONL destination: `--format=jsonl`, `--also=jsonl:FILE`,
+or `--beads-jsonl=FILE`. It cannot be combined with `--jsonl-summary-only`.
+All requested renderings still come from one scan. The efficient sampled
+summaries remain the default, and the option does not change selected rules,
+severities, suppression, thresholds, or analyzer work limits. Python's separate
+`--python-pattern-counts=FILE` export remains unthresholded and independent.
+
+**Read the final totals record before accepting a complete diagnostic set.**
+Every scanner record and the final totals record contain an
+`occurrence_export` object with `schema: "ubs.occurrence-export/1"`.
+Only its `complete: true` promises that the selected analysis finished, counts
+reconcile exactly, and all counted occurrences were delivered with source
+locations and full available code. A missing final totals record, an error
+envelope, or absent completeness metadata never proves completeness.
+
+Empty staged/diff selections retain exit 0 but now deliver a final totals
+record to every requested JSONL destination, with `complete: false`,
+`analysis_complete: false`, and reason `no_files_scanned`. A selection with no
+supported language retains the existing exit 3 policy and the same explicit
+no-coverage metadata. Neither case is presented as a completed clean analysis.
+
+The stream contains these records in order:
+
+| Record | Contract |
+|--------|----------|
+| `type: "finding"`, `schema: "ubs.occurrence/1"` | One active source occurrence, always `count: 1`. Includes `occurrence_id`, `rule_id`, `language`, `severity`, `file`, `line`, `col`, `code`, `code_available`, and `code_truncated`, plus the canonical message, fingerprint and analyzer evidence. |
+| `type: "rule_summary"` | One language/rule/severity group with `reported`, `emitted`, `omitted`, and `unlocated`. Here `reported` is the active weighted canonical ledger count for this rule; missing ledger records cannot be attributed to a rule from samples. |
+| `type: "scanner"` | Existing per-language counts and execution status, failure details when present, and occurrence coverage for that language. |
+| `type: "totals"` | Last record: existing combined counts, status and failed modules, with scan-wide occurrence coverage. |
+
+Locations are one-based and use the original source paths. `code` is the physical
+source line without its CR/LF terminator; indentation is preserved. Python code
+decoding honors its encoding cookie. A staged scan reads code from the analyzed
+index snapshot, even when the working file has different contents. An unavailable
+line is `code: ""`, `code_available: false`; it is never replaced with a diagnostic
+message and presented as source text.
+
+`occurrence_id` has the form `sha256:<64 lowercase hexadecimal digits>`. Version 1
+hashes the language, rule, project-relative source path, line, column and canonical
+fingerprint. It is independent of timestamps, output limits and temporary scan
+directories, and is stable for repeated scans of the same unchanged input and
+options. Distinct counted occurrences remain distinct, including repeated text.
+IDs can change after source edits, line movement or changes to the selected
+analysis; they are not a cross-version semantic identity guarantee. The existing
+`fingerprint` retains its baseline semantics. Baseline filtering happens before
+export limits, and changing the export limit does not alter baseline contents.
+
+Coverage fields distinguish the execution result from the delivered locations:
+
+| Field | Meaning |
+|-------|---------|
+| `analysis_complete` | All selected analysis completed according to the scanner/run status. A partial analyzer can retain useful findings while this is false. |
+| `locations_complete` | Reported counts and ledger counts reconcile, and every counted source occurrence was emitted with a usable location. |
+| `complete` | Both dimensions above are complete and every emitted code line is available and untruncated. |
+| `reported` | Existing summary counts, summed across critical, warning and info. |
+| `accounted` | Active canonical ledger occurrences, including weighted aggregates. |
+| `emitted` | Number of concrete occurrence records actually emitted. |
+| `omitted` | Undelivered count, computed per severity as `max(reported, accounted) - emitted`. |
+| `unlocated` | Accounted occurrences for which a producer has no concrete source site. |
+| `code_unavailable`, `code_truncated` | Emitted source occurrences whose code could not be read or exceeded the text limit. |
+| `truncated` | The record limit or code text limit omitted requested output. |
+| `reasons` | Explicit reasons for incomplete coverage, including analysis failures, count mismatches, missing locations, output limits or code extraction limits. |
+| `counts` | The same `reported`, `accounted`, `emitted`, `omitted` accounting separately for `critical`, `warning`, and `info`. |
+
+For example, a complete 50-warning ledger exported with a limit of 10 has
+`reported: 50`, `accounted: 50`, `emitted: 10`, `omitted: 40`,
+`truncated: true`, and `complete: false`. Its scanner still reports 50 warnings.
+A completed analyzer can instead have `analysis_complete: true` with
+`locations_complete: false` when a rule reports an aggregate without identifying
+each source site. UBS does not fabricate locations to make these counts match.
+Zero-count project notes and suppressed records do not become occurrences;
+report-only AST evidence does not inflate the counted ledger.
+
+The exporter reuses the full finding sinks already produced by all shipped
+language modules. Summary previews stay capped. In occurrence mode, Rust's
+tech-debt/test-marker checks and Swift's package checks preserve their counted
+source sites before rendering. Rust's arithmetic spawn/handle and lifecycle
+heuristics, and Elixir's arithmetic net-count rules, remain explicitly unlocated
+aggregates. An enabled Rust type-narrowing analyzer failure marks occurrence-mode
+analysis partial and prevents reuse of that incomplete result from cache.
+Legacy or third-party
+producers with only sampled findings are reported incomplete when their counts
+cannot be accounted for; the exporter never falls back to summary samples and
+calls them complete.
+
+#### Bounds and consumer checks
+
+`--max-occurrences` accepts an integer from 1 through 1,000,000 and defaults to
+100,000 across the entire scan, rather than per file or language. It limits
+exported source records after analysis and baseline filtering. The exporter still
+reads the ledger to report exact omitted counts. It streams the ledger rather
+than materializing all occurrences in memory. Per-rule and scanner summaries
+remain available after the source-record cap is reached.
+At most 10,000 distinct language/rule/severity groups are accepted; exceeding
+that metadata bound fails the export explicitly and preserves its previous file.
+
+Each code field is limited to 4,096 decoded characters. A longer line sets
+`code_truncated: true` and makes the export incomplete. Code extraction keeps
+eight source readers, caches at most 1,024 requested lines, and has a separate
+256 Mi-character read-work budget. Python encoding detection reads at most
+64 KiB from each of the first two header lines. A read/decode failure or code
+work limit sets `code_available: false` and an explicit reason. These bounds
+do not change analyzer counts or relax any existing analysis budget.
+
+Finding-based exit codes remain unchanged by output caps. Analyzer failures still
+retain the existing partial-run exit policy; report delivery failures exit 2 and
+preserve a previous destination file. Consumers requiring a complete diagnostic
+set must also check the last record, for example:
+
+```bash
+jq -e -s '.[-1] | .type == "totals" and .occurrence_export.complete == true' occurrences.jsonl
+jq -c 'select(.type == "finding" and .schema == "ubs.occurrence/1") |
+       {occurrence_id, rule_id, severity, file, line, col, code}' occurrences.jsonl
+```
+
+Completeness is scoped to the selected inputs, rules and enabled analyses; it
+does not claim coverage of excluded files, skipped categories or all possible
+bugs. Cross-file thresholds remain selection-dependent, so combining separately
+scanned subsets is not generally equivalent to scanning their union.
 
 ### Python pattern count export
 

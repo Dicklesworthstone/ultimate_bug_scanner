@@ -94,6 +94,15 @@ def _build_parser() -> argparse.ArgumentParser:
     fs.add_argument("--repo", default="", help="git remote repository URI")
     fs.add_argument("--rev", default="", help="git commit SHA")
     fs.add_argument("--auto", default="", help="SARIF automation ID")
+    occurrences = sub.add_parser(
+        "occurrences", help="export bounded occurrence-level JSONL with completeness accounting",
+    )
+    occurrences.add_argument("--combined", required=True, help="canonical combined summary JSON")
+    occurrences.add_argument("--output", required=True, help="atomic JSONL output path")
+    occurrences.add_argument("--project-dir", default="", help="project directory for source paths")
+    occurrences.add_argument("--source-root", default="", help="analyzed source snapshot for staged scans")
+    occurrences.add_argument("--tmp-dir", default="", help="private run directory proving module findings sinks exist")
+    occurrences.add_argument("--max-occurrences", type=int, default=100000, help="maximum concrete source records")
     exp = sub.add_parser(
         "explain",
         help="explain a rule: message, remediation, fixture examples, confidence, category (bead K3)",
@@ -280,6 +289,18 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:
             print(f"findings-sarif: {exc}", file=sys.stderr)
             return 2
+
+    if args.layer == "occurrences":
+        from ubs_core.occurrences import export
+
+        try:
+            export(args.combined, args.output, project_dir=args.project_dir,
+                   source_root=args.source_root, max_occurrences=args.max_occurrences,
+                   tmp_dir=args.tmp_dir)
+        except (OSError, ValueError, RecursionError) as exc:
+            print(f"occurrences: {exc}", file=sys.stderr)
+            return 2
+        return 0
 
     if args.layer == "explain":
         from ubs_core.explain import run_explain_cli

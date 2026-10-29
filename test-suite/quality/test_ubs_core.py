@@ -6539,5 +6539,297 @@ class SwiftLexicalFrontendTests(unittest.TestCase):
                     self.assertEqual([r[1] for r in analyzer.scan_text(Path('F.swift'), source, Path('.'))], expected)
 
 
+class CompleteOccurrenceModuleTests(unittest.TestCase):
+    """Issue #190: producer locations survive opt-in collection and cache replay."""
+
+    def setUp(self) -> None:
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        self.root = Path(tempfile.mkdtemp(prefix="occurrence-modules-", dir=artifacts))
+        self.project = self.root / "project"
+        self.project.mkdir()
+        self.sequence = 0
+
+    def run(self, result=None):
+        print(f"[{self.id()}] RUN", flush=True)
+        started = time.monotonic()
+        result = super().run(result)
+        failed = any(test is self or getattr(test, "test_case", None) is self
+                     for test, _ in result.failures + result.errors)
+        print(f"[{self.id()}] {'FAIL' if failed else 'PASS'} "
+              f"({time.monotonic() - started:.3f}s)", flush=True)
+        return result
+
+    def native(self, language, paths, categories, *, complete):
+        self.sequence += 1
+        output = self.root / f"run-{self.sequence}"
+        output.mkdir()
+        files = output / "files.txt"
+        files.write_bytes(b"\0".join(os.fsencode(path) for path in paths) + b"\0")
+        sink, summary, stats = output / "findings.ndjson", output / "summary.json", output / "cache.json"
+        maximum = {"rust": 24, "swift": 23, "elixir": 16}[language]
+        command = [sys.executable, "-B", "-m", f"ubs_core.{language}_scan",
+                   "--files-from", str(files), "--sink", str(sink), "--json-out", str(summary),
+                   "--project-dir", str(self.project), "--skip",
+                   ",".join(str(number) for number in range(1, maximum + 1) if number not in categories)]
+        if language in ("rust", "swift"):
+            command.append("--skip-type-narrowing")
+        environment = {key: value for key, value in os.environ.items()
+                       if not key.startswith(("UBS_", "XDG_"))}
+        environment.update(PYTHONPATH=str(HELPERS_DIR), PYTHONDONTWRITEBYTECODE="1",
+                           UBS_NO_AUTO_UPDATE="1", UBS_KEEP_TEMP="1", UBS_NO_CACHE="0",
+                           UBS_ALL_OCCURRENCES="1" if complete else "0", UBS_PROFILE="1",
+                           UBS_CACHE_DIR=str(self.root / "cache"), UBS_CACHE_FILE=str(stats),
+                           TMPDIR=str(self.root))
+        process = subprocess.run(command, cwd=self.project, env=environment,
+                                 capture_output=True, text=True, timeout=60)
+        (output / "stdout.log").write_text(process.stdout, encoding="utf-8")
+        (output / "stderr.log").write_text(process.stderr, encoding="utf-8")
+        context = f"exit={process.returncode}\nstdout:\n{process.stdout}\nstderr:\n{process.stderr}"
+        self.assertIn(process.returncode, (0, 1), context)
+        try:
+            document = json.loads(summary.read_text(encoding="utf-8"))
+            records = [json.loads(line) for line in sink.read_text(encoding="utf-8").splitlines()]
+            cache = json.loads(stats.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            self.fail(f"Invalid native {language} result: {exc}\n{context}")
+        self.assertEqual(document["status"], "ok", context)
+        for severity in ("critical", "warning", "info"):
+            self.assertEqual(document[severity], sum(record.get("count", 1) for record in records
+                                                     if record["severity"] == severity),
+                             f"{records}\n{context}")
+        self.assertEqual(process.returncode, int(document["critical"] > 0), context)
+        return sorted(records, key=lambda record: json.dumps(record, sort_keys=True)), document, cache
+
+    def test_rust_marker_sites_preserve_thresholds_and_cache_modes(self):
+        first, second = self.project / "first.rs", self.project / "second.rs"
+        first.write_text("// TODO: first\n" * 12 + "// TODO FIXME: two counted markers\n"
+                         "// TODO: ignored ubs:ignore[rust.code-quality.tech-debt]\n", encoding="utf-8")
+        second.write_text("// HACK: second\n" * 9, encoding="utf-8")
+        paths = [first, second]
+        ordinary, before, _ = self.native("rust", paths, (9,), complete=False)
+        self.assertEqual(len(ordinary), 1, ordinary)
+        self.assertEqual((ordinary[0]["count"], ordinary[0]["severity"]), (23, "warning"))
+
+        records, after, cache = self.native("rust", paths, (9,), complete=True)
+        expected = [(str(first), line) for line in range(1, 13)] + [(str(first), 13)] * 2
+        expected += [(str(second), line) for line in range(1, 10)]
+        self.assertCountEqual([(record["path"], record["line"]) for record in records], expected)
+        self.assertEqual({record["severity"] for record in records}, {"warning"})
+        self.assertEqual({record.get("count", 1) for record in records}, {1})
+        self.assertEqual([before[key] for key in ("critical", "warning", "info")],
+                         [after[key] for key in ("critical", "warning", "info")])
+        self.assertEqual(cache["hits"], 0, "ordinary cache entries must not stand for full occurrences")
+        warm, _, cache = self.native("rust", paths, (9,), complete=True)
+        self.assertEqual(warm, records)
+        self.assertEqual(cache["hits"], 2)
+        restored, _, cache = self.native("rust", paths, (9,), complete=False)
+        self.assertEqual(restored, ordinary)
+        self.assertEqual(cache["hits"], 2)
+
+        subset, _, cache = self.native("rust", [first], (9,), complete=True)
+        self.assertEqual(cache["hits"], 1)
+        self.assertEqual(len(subset), 14)
+        self.assertEqual({record["severity"] for record in subset}, {"info"})
+        second.write_text("// HACK: changed selection\n", encoding="utf-8")
+        partial, _, cache = self.native("rust", paths, (9,), complete=True)
+        self.assertEqual(cache["hits"], 1)
+        self.assertEqual(len(partial), 15)
+        self.assertEqual({record["severity"] for record in partial}, {"info"})
+
+    def test_rust_test_stream_keeps_duplicate_counted_sites(self):
+        first, second = self.project / "first.rs", self.project / "second.rs"
+        first.write_text("#[test] fn first() { todo!(); }\n"
+                         "#[test] fn second() { unimplemented!(); }\n", encoding="utf-8")
+        second.write_text("#[test] fn third() { todo!(); }\n", encoding="utf-8")
+        paths = [first, second]
+        ordinary, _, _ = self.native("rust", paths, (11,), complete=False)
+        self.assertEqual([(record["rule"], record["count"]) for record in ordinary],
+                         [("rust.tests.test-todo", 6)])
+        records, _, _ = self.native("rust", paths, (11,), complete=True)
+        self.assertCountEqual([(record["path"], record["line"]) for record in records],
+                              [(str(first), 1)] + [(str(first), 2)] * 2 + [(str(second), 1)] * 3)
+        self.assertTrue(all(record.get("count", 1) == 1 for record in records))
+        warm, _, cache = self.native("rust", paths, (11,), complete=True)
+        self.assertEqual(cache["hits"], 2)
+        self.assertEqual(warm, records)
+        subset, _, cache = self.native("rust", [second], (11,), complete=True)
+        self.assertEqual(cache["hits"], 1)
+        self.assertEqual([(record["path"], record["line"]) for record in subset], [(str(second), 1)])
+
+    def test_rust_unlocated_counts_remain_aggregates_even_at_one(self):
+        source = self.project / "tasks.rs"
+        source.write_text("fn launch() {\n  let task = tokio::spawn(async {});\n"
+                          "  std::thread::spawn(|| {});\n  std::thread::spawn(|| {});\n}\n", encoding="utf-8")
+        ordinary, before, _ = self.native("rust", [source], (3, 19), complete=False)
+        self.assertTrue(all(record["path"] == str(source) for record in ordinary))
+        records, after, _ = self.native("rust", [source], (3, 19), complete=True)
+        expected = {
+            "rust.async.spawn-handle-heuristic": ("info", 1),
+            "rust.async.tokio-task-no-await": ("warning", 1),
+            "rust.resource-lifecycle.thread_join": ("critical", 2),
+            "rust.resource-lifecycle.tokio_spawn": ("warning", 1),
+        }
+        self.assertEqual({record["rule"]: (record["severity"], record["count"])
+                          for record in records}, expected)
+        for record in records:
+            self.assertEqual((record["scope"], record["path"], record["line"]),
+                             ("project_aggregate", "", 0))
+            self.assertEqual(record["extras"]["aggregate_source"], str(source))
+        self.assertEqual([before[key] for key in ("critical", "warning", "info")],
+                         [after[key] for key in ("critical", "warning", "info")])
+        warm, _, cache = self.native("rust", [source], (3, 19), complete=True)
+        self.assertEqual(cache["hits"], 1)
+        self.assertEqual(warm, records)
+        peer = self.project / "awaited.rs"
+        peer.write_text("async fn finish(task: Handle) { task.await; }\n", encoding="utf-8")
+        partial, _, cache = self.native("rust", [source, peer], (3, 19), complete=True)
+        self.assertEqual(cache["hits"], 1)
+        self.assertNotIn("rust.async.spawn-handle-heuristic", [record["rule"] for record in partial])
+        self.assertEqual([record for record in records if record["rule"] != "rust.async.spawn-handle-heuristic"],
+                         partial)
+
+    def test_swift_packaging_sites_recompute_after_source_cache_replay(self):
+        package, other = self.project / "Package.swift", self.project / "other.swift"
+        source = ("import PackageDescription\n// dependency pins\n"
+                  + 'let pin = .package(url: "https://example.invalid/dependency", .branch("main"))\n' * 7
+                  + 'let pair = (.revision("first"), .branch("second"))\n'
+                  + 'let ignored = .branch("ignored") // ubs:ignore[swift.packaging.branch-pins]\n// end pins\n'
+                  + "// target settings\n"
+                  + 'let setting = .unsafeFlags(["-Ounchecked"])\n' * 4
+                  + 'let ignoredSetting = .unsafeFlags(["-Ounchecked"]) // ubs:ignore[swift.packaging.unsafe-flags]\n')
+        package.write_text(source, encoding="utf-8")
+        other.write_text("let safe = 1\n", encoding="utf-8")
+        paths = [package, other]
+        ordinary, before, _ = self.native("swift", paths, (20,), complete=False)
+        self.assertCountEqual([(record["rule"], record["line"], record["count"]) for record in ordinary],
+                              [("swift.packaging.branch-pins", 0, 8), ("swift.packaging.unsafe-flags", 0, 4)])
+        records, after, cache = self.native("swift", paths, (20,), complete=True)
+        self.assertEqual(cache["hits"], 2, "derived packaging checks must rerun even on all cache hits")
+        expected = [("swift.packaging.branch-pins", line, "info") for line in range(3, 11)]
+        expected += [("swift.packaging.unsafe-flags", line, "warning") for line in range(14, 18)]
+        self.assertCountEqual([(record["rule"], record["line"], record["severity"]) for record in records], expected)
+        self.assertTrue(all(record["path"] == str(package) and record["count"] == 1 for record in records))
+        self.assertTrue(all(record["col"] > 0 for record in records))
+        self.assertEqual([before[key] for key in ("critical", "warning", "info")],
+                         [after[key] for key in ("critical", "warning", "info")])
+        warm, _, cache = self.native("swift", paths, (20,), complete=True)
+        self.assertEqual(warm, records)
+        self.assertEqual(cache["hits"], 2)
+        restored, _, _ = self.native("swift", paths, (20,), complete=False)
+        self.assertEqual(restored, ordinary)
+        package.write_text(source.replace('.branch("main")', '.exact("1.0")', 1), encoding="utf-8")
+        partial, _, cache = self.native("swift", paths, (20,), complete=True)
+        self.assertEqual(cache["hits"], 1)
+        self.assertCountEqual([(record["rule"], record["line"], record["severity"]) for record in partial], expected[1:])
+
+    def test_elixir_net_counts_are_unlocated_after_source_cache_replay(self):
+        source, manifest = self.project / "app.ex", self.project / "mix.exs"
+        source.write_text(
+            ':erlang.binary_to_term(payload, [:safe])\n'
+            ':erlang.binary_to_term(payload)\n'
+            ':ets.new(:first, [:set, read_concurrency: true])\n'
+            ':ets.new(:second, [:set])\n'
+            'System.cmd(command, ["x"])\n'
+            'System.cmd("ls", [])\n', encoding="utf-8")
+        manifest.write_text(
+            '[{:pinned, "~> 1.0"},\n'
+            ' {:first, path: "first"},\n'
+            ' {:second, path: "second"},\n'
+            ' {:third, path: "third"},\n'
+            ' {:fourth, path: "fourth"}]\n', encoding="utf-8")
+        expected = {
+            "ex.security.binary-to-term-unsafe": ("critical", 1),
+            "ex.security.shell-exec-review": ("info", 1),
+            "ex.concurrency.ets-read-concurrency": ("info", 1),
+            "ex.mix.unpinned-deps": ("info", 4),
+        }
+        paths = [source, manifest]
+        ordinary, before, _ = self.native("elixir", paths, (4, 7, 14), complete=False)
+        for rule, (severity, count) in expected.items():
+            found = [record for record in ordinary if record["rule"] == rule]
+            self.assertEqual(len(found), count, rule)
+            self.assertEqual({record["severity"] for record in found}, {severity}, rule)
+        # The incumbent count is valid, but its convenient first site can be
+        # safe. Full export must not silently certify that representative.
+        binary = next(record for record in ordinary
+                      if record["rule"] == "ex.security.binary-to-term-unsafe")
+        self.assertEqual(binary["line"], 1)
+
+        records, after, cache = self.native("elixir", paths, (4, 7, 14), complete=True)
+        self.assertEqual(cache["hits"], 2, "delivery must qualify ordinary cached representatives too")
+        for rule, (severity, count) in expected.items():
+            found = [record for record in records if record["rule"] == rule]
+            self.assertEqual(len(found), count, rule)
+            self.assertEqual({record["severity"] for record in found}, {severity}, rule)
+            for record in found:
+                self.assertEqual((record["scope"], record["count"], record["path"], record["line"]),
+                                 ("project_aggregate", 1, "", 0))
+                self.assertIn(record["extras"]["aggregate_source"], {str(path) for path in paths})
+        self.assertEqual([before[key] for key in ("critical", "warning", "info")],
+                         [after[key] for key in ("critical", "warning", "info")])
+        self.assertEqual([record for record in ordinary if record["rule"] not in expected],
+                         [record for record in records if record["rule"] not in expected])
+        warm, _, cache = self.native("elixir", paths, (4, 7, 14), complete=True)
+        self.assertEqual(cache["hits"], 2)
+        self.assertEqual(warm, records)
+        restored, _, cache = self.native("elixir", paths, (4, 7, 14), complete=False)
+        self.assertEqual(cache["hits"], 2)
+        self.assertEqual(restored, ordinary)
+
+    def test_rust_enabled_narrowing_failure_is_partial_and_not_cached(self):
+        from ubs_core import rust_scan
+
+        source = self.project / "app.rs"
+        source.write_text("fn main() {}\n", encoding="utf-8")
+        files = self.root / "files.txt"
+        files.write_bytes(os.fsencode(source) + b"\0")
+
+        def invoke(label, *, complete, fail=True, skipped=False, category_skipped=False):
+            output = self.root / label
+            output.mkdir()
+            summary, stats = output / "summary.json", output / "cache.json"
+            categories = range(1 if category_skipped else 2, 25)
+            arguments = ["--files-from", str(files), "--sink", str(output / "findings.ndjson"),
+                         "--json-out", str(summary), "--project-dir", str(self.project),
+                         "--quiet", "--skip", ",".join(map(str, categories))]
+            if skipped:
+                arguments.append("--skip-type-narrowing")
+            environment = {key: value for key, value in os.environ.items()
+                           if not key.startswith(("UBS_", "XDG_"))}
+            environment.update(UBS_ALL_OCCURRENCES="1" if complete else "0", UBS_NO_CACHE="0",
+                               UBS_KEEP_TEMP="1", UBS_CACHE_DIR=str(self.root / "cache"),
+                               UBS_CACHE_FILE=str(stats), TMPDIR=str(self.root))
+
+            def narrowing(_scan, skip_type_narrowing):
+                if fail and not skip_type_narrowing:
+                    raise RuntimeError("injected enabled narrowing failure")
+                return []
+
+            with patch.dict(os.environ, environment, clear=True), \
+                    patch.object(rust_scan, "run_narrowing", side_effect=narrowing), \
+                    patch.object(rust_scan.Scan, "load_ast_matches", return_value=None), \
+                    redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
+                exit_code = rust_scan.main(arguments)
+            return exit_code, json.loads(summary.read_text()), json.loads(stats.read_text())
+
+        exit_code, ordinary, _ = invoke("ordinary", complete=False)
+        self.assertEqual((exit_code, ordinary["status"]), (0, "ok"))
+        exit_code, failed, cache = invoke("failed", complete=True)
+        self.assertEqual((exit_code, failed["status"]), (2, "partial"))
+        self.assertEqual(failed["module_error"], "ANALYZER_ERROR")
+        self.assertIn("injected enabled narrowing failure", failed["message"])
+        self.assertEqual(cache["hits"], 0)
+        for label, options in (("explicit-skip", {"skipped": True}),
+                               ("category-skip", {"category_skipped": True})):
+            exit_code, document, _ = invoke(label, complete=True, **options)
+            self.assertEqual((exit_code, document["status"]), (0, "ok"))
+        exit_code, recovered, cache = invoke("recovered", complete=True, fail=False)
+        self.assertEqual((exit_code, recovered["status"]), (0, "ok"))
+        self.assertEqual(cache["hits"], 0, "an enabled failure must not become a completed cached answer")
+        exit_code, warm, cache = invoke("warm", complete=True, fail=False)
+        self.assertEqual((exit_code, warm["status"], cache["hits"]), (0, "ok", 1))
+
+
 if __name__ == "__main__":
     unittest.main()

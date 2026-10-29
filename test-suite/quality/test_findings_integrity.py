@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import io
+import os
 import subprocess
 import sys
 import tempfile
@@ -18,6 +19,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "modules" / "helpers"))
 from ubs_core.findings_merge import load_baseline_fingerprints, load_sink, merge, to_sarif
 from ubs_core import findings_merge
+from ubs_core import occurrences
 
 ARTIFACTS = REPO_ROOT / "test-suite" / "artifacts"
 
@@ -778,6 +780,331 @@ class StreamingBaselineTests(unittest.TestCase):
         self.assertEqual(result["findings"][0]["message"], "diagnostic 2")
         self.assertNotEqual(result["findings"][0]["fingerprint"], captured["fingerprint"])
         print(f"[baseline-stream-memory] PASS {measured['rss']} KiB ({time.monotonic() - started:.2f}s)", flush=True)
+
+
+class OccurrenceExportIntegrityTests(unittest.TestCase):
+    """Delivery and accounting boundaries independent of language heuristics."""
+
+    def setUp(self):
+        self.started = time.monotonic()
+        print(f"[{self.id()}] RUN", flush=True)
+        ARTIFACTS.mkdir(parents=True, exist_ok=True)
+        self.tmp = tempfile.TemporaryDirectory(prefix="occurrence-integrity-", dir=ARTIFACTS)
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.combined = self.root / "combined.json"
+        self.output = self.root / "out.jsonl"
+        (self.root / "app.py").write_text("one\n\ttwo\nthree\n", encoding="utf-8")
+
+    def tearDown(self):
+        print(f"[{self.id()}] END ({time.monotonic() - self.started:.3f}s)", flush=True)
+
+    def finding(self, line=1, **extra):
+        return {"lang": "python", "rule_id": "py.test.rule", "severity": "warning",
+                "file": "app.py", "line": line, "col": 1,
+                "fingerprint": f"existing-fingerprint-{line}", "suppressed": False,
+                "message": "test diagnostic", **extra}
+
+    def document(self, findings, *, warning=0, critical=0, info=0, status="ok"):
+        counts = {"warning": warning, "critical": critical, "info": info}
+        doc = {"project": str(self.root), "timestamp": "2026-10-28T00:00:00Z",
+               "status": status, "failed_modules": [], "findings": findings,
+               "scanners": [{"language": "python", "status": status, "files": 1,
+                             "timestamp": "2026-10-27T23:59:59Z", **counts}],
+               "totals": {"files": 1, **counts}}
+        self.combined.write_text(json.dumps(doc), encoding="utf-8")
+        return doc
+
+    def export(self, **options):
+        before = self.combined.read_bytes()
+        occurrences.export(self.combined, self.output, project_dir=self.root, **options)
+        self.assertEqual(self.combined.read_bytes(), before)
+        with self.output.open(encoding="utf-8") as source:
+            rows = [json.loads(line) for line in source]
+        self.assertEqual(rows[-1]["type"], "totals")
+        return rows
+
+    def test_limit_reconciles_counts_and_does_not_change_identities(self):
+        doc = self.document([self.finding(n) for n in (1, 2, 3)], warning=3)
+        short = self.export(max_occurrences=2)
+        short_findings = [r for r in short if r["type"] == "finding"]
+        self.assertEqual([r["code"] for r in short_findings], ["one", "\ttwo"])
+        metadata = short[-1]["occurrence_export"]
+        self.assertEqual((metadata["reported"], metadata["accounted"], metadata["emitted"], metadata["omitted"]),
+                         (3, 3, 2, 1))
+        self.assertTrue(metadata["analysis_complete"])
+        self.assertFalse(metadata["locations_complete"])
+        self.assertFalse(metadata["complete"])
+        self.assertIn("occurrence_limit", metadata["reasons"])
+        self.assertEqual(short[-2]["scanner_timestamp"], "2026-10-27T23:59:59Z")
+        doc["timestamp"] = "2026-10-29T00:00:00Z"
+        self.combined.write_text(json.dumps(doc), encoding="utf-8")
+        full = self.export(max_occurrences=3)
+        full_findings = [r for r in full if r["type"] == "finding"]
+        self.assertEqual([r["occurrence_id"] for r in short_findings],
+                         [r["occurrence_id"] for r in full_findings[:2]])
+        self.assertEqual(len({r["occurrence_id"] for r in full_findings}), 3)
+        self.assertTrue(all(r["occurrence_id"].startswith("sha256:") for r in full_findings))
+        self.assertEqual(full_findings[0]["title"], "test diagnostic")
+        self.assertTrue(full[-1]["occurrence_export"]["complete"])
+        self.assertEqual(full[-1]["status"], "ok")
+
+    def test_aggregate_counts_do_not_invent_source_occurrences(self):
+        self.document([
+            self.finding(extras={"taint_path": [{"kind": "source", "line": 1}]}),
+            self.finding(rule_id="py.project.weighted", scope="project_aggregate", file="", line=0, count=6),
+            self.finding(rule_id="py.project.note", scope="project", file="", line=0, count=0, severity="info"),
+            self.finding(suppressed=True),
+        ], warning=7)
+        rows = self.export()
+        found = [r for r in rows if r["type"] == "finding"]
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["count"], 1)
+        self.assertEqual(found[0]["extras"]["taint_path"], [{"kind": "source", "line": 1}])
+        rules = {r["rule_id"]: r for r in rows if r["type"] == "rule_summary"}
+        self.assertEqual(set(rules), {"py.test.rule", "py.project.weighted"})
+        self.assertEqual((rules["py.project.weighted"]["reported"], rules["py.project.weighted"]["emitted"],
+                          rules["py.project.weighted"]["omitted"], rules["py.project.weighted"]["unlocated"]),
+                         (6, 0, 6, 6))
+        metadata = rows[-1]["occurrence_export"]
+        self.assertEqual((metadata["reported"], metadata["accounted"], metadata["emitted"], metadata["unlocated"]),
+                         (7, 7, 1, 6))
+        self.assertFalse(metadata["complete"])
+        self.assertIn("unlocated_occurrences", metadata["reasons"])
+
+    def test_missing_ledger_cannot_fall_back_to_sampled_locations(self):
+        doc = self.document([], critical=50)
+        del doc["findings"]
+        doc["scanners"][0]["findings"] = [{"rule_id": "py.sampled", "count": 50,
+                                          "samples": [{"file": "app.py", "line": 1}]}]
+        self.combined.write_text(json.dumps(doc), encoding="utf-8")
+        rows = self.export()
+        self.assertFalse(any(r["type"] == "finding" for r in rows))
+        metadata = rows[-1]["occurrence_export"]
+        self.assertEqual((metadata["reported"], metadata["accounted"], metadata["omitted"]), (50, 0, 50))
+        self.assertFalse(metadata["complete"])
+        self.assertIn("missing_findings_ledger", metadata["reasons"])
+
+    def test_severity_mismatch_cannot_be_hidden_by_equal_total_counts(self):
+        self.document([self.finding()], critical=1)
+        metadata = self.export()[-1]["occurrence_export"]
+        self.assertEqual(metadata["reported"], metadata["accounted"])
+        self.assertEqual(metadata["counts"]["critical"], {"reported": 1, "accounted": 0, "emitted": 0, "omitted": 1})
+        self.assertEqual(metadata["counts"]["warning"], {"reported": 0, "accounted": 1, "emitted": 1, "omitted": 0})
+        self.assertFalse(metadata["complete"])
+        self.assertIn("count_mismatch", metadata["reasons"])
+
+    def test_scanner_mismatches_cannot_cancel_out_in_global_totals(self):
+        (self.root / "app.rb").write_text("puts 'hello'\n", encoding="utf-8")
+        doc = self.document([self.finding(), self.finding(lang="ruby", rule_id="rb.test.rule",
+                                                        file="app.rb", severity="critical")], critical=1, warning=1)
+        doc["scanners"][0]["warning"] = 0
+        doc["scanners"].append({"language": "ruby", "status": "ok", "files": 1,
+                                 "critical": 0, "warning": 1, "info": 0})
+        self.combined.write_text(json.dumps(doc), encoding="utf-8")
+        metadata = self.export()[-1]["occurrence_export"]
+        self.assertEqual(metadata["reported"], metadata["accounted"])
+        self.assertEqual(metadata["emitted"], 2)
+        self.assertFalse(metadata["locations_complete"])
+        self.assertFalse(metadata["complete"])
+        self.assertIn("scanner_count_mismatch", metadata["reasons"])
+
+    def test_empty_scan_requires_canonical_or_private_ledger_evidence(self):
+        doc = self.document([])
+        del doc["findings"]
+        self.combined.write_text(json.dumps(doc), encoding="utf-8")
+        metadata = self.export()[-1]["occurrence_export"]
+        self.assertFalse(metadata["complete"])
+        self.assertIn("missing_findings_ledger", metadata["reasons"])
+        (self.root / "python.findings.json").write_text("", encoding="utf-8")
+        metadata = self.export(tmp_dir=self.root)[-1]["occurrence_export"]
+        self.assertTrue(metadata["complete"])
+        self.assertEqual(metadata["reported"], 0)
+
+    def test_rule_group_limit_preserves_existing_destination(self):
+        self.output.write_text("previous report\n", encoding="utf-8")
+        previous = self.output.read_bytes()
+        self.document([self.finding(rule_id="py.first"), self.finding(rule_id="py.second")], warning=2)
+        with mock.patch.object(occurrences, "MAX_RULE_SUMMARIES", 1):
+            with self.assertRaisesRegex(ValueError, "exceeds 1 distinct rule summaries"):
+                self.export()
+        self.assertEqual(self.output.read_bytes(), previous)
+
+    def test_partial_analysis_and_unavailable_code_are_independent(self):
+        doc = self.document([self.finding()], warning=1, status="partial")
+        doc["failed_modules"] = [{"language": "python", "status": "partial",
+                                  "module_error": "ANALYZER_ERROR", "message": "invalid peer.py"}]
+        doc["scanners"][0].update(module_error="ANALYZER_ERROR", message="invalid peer.py")
+        self.combined.write_text(json.dumps(doc), encoding="utf-8")
+        rows = self.export()
+        metadata = rows[-1]["occurrence_export"]
+        self.assertFalse(metadata["analysis_complete"])
+        self.assertTrue(metadata["locations_complete"])
+        self.assertFalse(metadata["complete"])
+        self.assertEqual(rows[-2]["module_error"], "ANALYZER_ERROR")
+        self.assertEqual(rows[-1]["failed_modules"], doc["failed_modules"])
+        self.document([self.finding(file="missing.py")], warning=1)
+        rows = self.export()
+        metadata = rows[-1]["occurrence_export"]
+        self.assertTrue(metadata["analysis_complete"])
+        self.assertTrue(metadata["locations_complete"])
+        self.assertFalse(metadata["complete"])
+        self.assertEqual(metadata["code_unavailable"], 1)
+        self.assertFalse(rows[0]["code_available"])
+        self.assertEqual(rows[0]["code"], "")
+
+    def test_snapshot_code_honors_python_encoding_and_physical_lines(self):
+        snapshot = self.root / "snapshot"
+        snapshot.mkdir()
+        (snapshot / "app.py").write_bytes(b"# coding: latin-1\r\n  value = 'caf\xe9'\r\n")
+        (snapshot / "unicode.py").write_text("# header\r\nvalue = '\u2028'\f# same physical line\r\n", encoding="utf-8")
+        self.document([self.finding(2, file=str(self.root / "app.py")),
+                       self.finding(2, file=str(self.root / "unicode.py"), fingerprint="unicode")], warning=2)
+        rows = self.export(source_root=snapshot)
+        found = [r for r in rows if r["type"] == "finding"]
+        self.assertEqual([r["code"] for r in found], ["  value = 'café'", "value = '\u2028'\f# same physical line"])
+        self.assertTrue(rows[-1]["occurrence_export"]["complete"])
+        self.assertEqual(found[0]["file"], str(self.root / "app.py"))
+
+    def test_code_and_source_work_limits_are_explicit(self):
+        (self.root / "app.py").write_text("#" + "x" * 5000 + "\n", encoding="utf-8")
+        self.document([self.finding()], warning=1)
+        rows = self.export()
+        self.assertEqual(len(rows[0]["code"]), 4096)
+        self.assertTrue(rows[0]["code_truncated"])
+        metadata = rows[-1]["occurrence_export"]
+        self.assertTrue(metadata["locations_complete"])
+        self.assertFalse(metadata["complete"])
+        self.assertEqual(metadata["omitted"], 0)
+        self.assertEqual(metadata["code_truncated"], 1)
+        with mock.patch.object(occurrences, "SOURCE_WORK_LIMIT", 8):
+            rows = self.export()
+        self.assertFalse(rows[0]["code_available"])
+        self.assertEqual(rows[0]["code_reason"], "code_work_limit")
+        self.assertIn("code_work_limit", rows[-1]["occurrence_export"]["reasons"])
+        (self.root / "app.py").write_text("#" + "x" * 65536 + "\n", encoding="utf-8")
+        rows = self.export()
+        self.assertFalse(rows[0]["code_available"])
+        self.assertEqual(rows[0]["code_reason"], "encoding_header_limit")
+
+    def test_late_failure_preserves_prior_output(self):
+        self.output.write_text("prior complete report\n", encoding="utf-8")
+        previous = self.output.read_bytes()
+        self.document([self.finding(), self.finding(2, fingerprint="")], warning=2)
+        with self.assertRaisesRegex(ValueError, "fingerprint"):
+            self.export()
+        self.assertEqual(self.output.read_bytes(), previous)
+        self.document([self.finding()], warning=1)
+        with mock.patch.object(occurrences.os, "replace", side_effect=OSError("delivery failure")):
+            with self.assertRaisesRegex(OSError, "delivery failure"):
+                self.export()
+        self.assertEqual(self.output.read_bytes(), previous)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo") and hasattr(os, "O_NONBLOCK"), "POSIX FIFO")
+    def test_fifo_source_returns_incomplete_code_without_blocking(self):
+        source = self.root / "source.py"
+        os.mkfifo(source)
+        self.document([self.finding(file=str(source))], warning=1)
+        # Start the hang deadline after imports: a cold supported interpreter
+        # can take more than two seconds to import on a busy test worker.
+        program = (
+            "import signal\n"
+            "from ubs_core import occurrences\n"
+            "from ubs_core.cli import main\n"
+            "signal.alarm(2)\n"
+            "raise SystemExit(main())\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", program, "occurrences", "--combined", str(self.combined),
+             "--output", str(self.output), "--project-dir", str(self.root)],
+            env={**os.environ, "PYTHONPATH": str(REPO_ROOT / "modules" / "helpers"),
+                 "PYTHONDONTWRITEBYTECODE": "1"},
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        with self.output.open(encoding="utf-8") as exported:
+            rows = [json.loads(line) for line in exported]
+        self.assertEqual(rows[0]["code_reason"], "source_not_regular")
+        self.assertFalse(rows[0]["code_available"])
+        self.assertEqual(rows[-1]["occurrence_export"]["emitted"], 1)
+        self.assertFalse(rows[-1]["occurrence_export"]["complete"])
+
+    @unittest.skipUnless(hasattr(os, "mkfifo") and hasattr(os, "O_NONBLOCK"), "POSIX FIFO")
+    def test_fifo_replacement_after_stat_is_checked_on_open_descriptor(self):
+        source = self.root / "source.py"
+        os.mkfifo(source)
+        # Preserve a regular pre-stat path while supplying a real FIFO at
+        # open time, modeling a pathname replacement without a timing race.
+        program = (
+            "import os, pathlib, signal, sys\n"
+            "from unittest import mock\n"
+            "from ubs_core import occurrences\n"
+            "original_open = os.open\n"
+            "opened = []\n"
+            "def replaced(path, flags):\n"
+            "    if len(sys.argv) > 3:\n"
+            "        flags &= ~os.O_NONBLOCK\n"
+            "    descriptor = original_open(sys.argv[2], flags)\n"
+            "    opened.append(descriptor)\n"
+            "    return descriptor\n"
+            "signal.alarm(2)\n"
+            "with mock.patch.object(occurrences.os, 'open', side_effect=replaced):\n"
+            "    try:\n"
+            "        occurrences._SourceReader(pathlib.Path(sys.argv[1]), 'python')\n"
+            "    except occurrences._CodeUnavailable as exc:\n"
+            "        assert str(exc) == 'source_not_regular', str(exc)\n"
+            "    else:\n"
+            "        raise AssertionError('a FIFO descriptor was accepted')\n"
+            "assert len(opened) == 1\n"
+            "try:\n"
+            "    os.fstat(opened[0])\n"
+            "except OSError:\n"
+            "    pass\n"
+            "else:\n"
+            "    raise AssertionError('rejected descriptor leaked')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", program, str(self.root / "app.py"), str(source)],
+            env={**os.environ, "PYTHONPATH": str(REPO_ROOT / "modules" / "helpers"),
+                 "PYTHONDONTWRITEBYTECODE": "1"},
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        # The same deadline must reject an actual blocking FIFO open. This
+        # negative control keeps the hang regression independent of startup.
+        blocked = subprocess.run(
+            [sys.executable, "-c", program, str(self.root / "app.py"), str(source), "blocking"],
+            env={**os.environ, "PYTHONPATH": str(REPO_ROOT / "modules" / "helpers"),
+                 "PYTHONDONTWRITEBYTECODE": "1"},
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        import signal
+        self.assertEqual(blocked.returncode, -signal.SIGALRM, blocked.stdout + blocked.stderr)
+
+    def test_encoding_failure_closes_descriptor_and_regular_symlinks_still_work(self):
+        source = self.root / "encoded.py"
+        source.write_bytes(b"# coding: unknown-no-such-encoding\nvalue = 1\n")
+        descriptors = []
+        original_open = occurrences.os.open
+
+        def opened(path, flags):
+            descriptor = original_open(path, flags)
+            descriptors.append(descriptor)
+            return descriptor
+
+        with mock.patch.object(occurrences.os, "open", side_effect=opened):
+            with self.assertRaises(SyntaxError):
+                occurrences._SourceReader(source, "python")
+        self.assertEqual(len(descriptors), 1)
+        with self.assertRaises(OSError):
+            os.fstat(descriptors[0])
+        if hasattr(os, "symlink"):
+            link = self.root / "linked.py"
+            link.symlink_to(self.root / "app.py")
+            self.document([self.finding(file=str(link))], warning=1)
+            rows = self.export()
+            self.assertEqual(rows[0]["code"], "one")
+            self.assertTrue(rows[-1]["occurrence_export"]["complete"])
 
 
 if __name__ == "__main__":

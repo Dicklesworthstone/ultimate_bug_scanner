@@ -102,13 +102,14 @@ class OccurrenceExportTests(unittest.TestCase):
         (self.root / (label + ".exit")).write_text(str(result.returncode) + "\n", encoding="utf-8")
         return result
 
-    def git(self, *arguments: str) -> None:
+    def git(self, *arguments: str) -> str:
         result = subprocess.run(
             ["git", "-c", "core.hooksPath=" + str(self.root / "empty-hooks"), *arguments],
             cwd=self.project, env=self.env, capture_output=True, text=True,
             timeout=30, check=False,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return result.stdout
 
     @staticmethod
     def findings(rows, rule=None):
@@ -347,7 +348,9 @@ class OccurrenceExportTests(unittest.TestCase):
         self.assert_accounting(direct_rows)
         source.write_text("WORKTREE_ONLY = 99\n", encoding="utf-8")
         self.source("untracked.py", parameter_functions(8, "untracked"))
-        index_before = (self.project / ".git" / "index").read_bytes()
+        # git write-tree may refresh the index's cache-tree metadata. The
+        # staged modes, object IDs, conflict stages and paths must stay exact.
+        index_before = self.git("ls-files", "--stage", "-z")
         result = self.scan("staged", extra=("--staged",))
         self.assertEqual(result.returncode, 0, result.stderr)
         rows = self.stream(result.stdout)
@@ -362,7 +365,8 @@ class OccurrenceExportTests(unittest.TestCase):
             {row["occurrence_id"] for row in self.findings(direct_rows, PARAM_RULE)},
         )
         self.assertEqual(source.read_text(encoding="utf-8"), "WORKTREE_ONLY = 99\n")
-        self.assertEqual((self.project / ".git" / "index").read_bytes(), index_before)
+        self.assertEqual(self.git("ls-files", "--stage", "-z"), index_before)
+        self.assertEqual(self.git("show", f":{source.name}"), staged_text)
 
     def test_secondary_exports_keep_one_scan_counts_sarif_and_pattern_count_contracts(self):
         source = self.source("source.py", parameter_functions(5))

@@ -28,6 +28,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Fixed
 
+- Ruby path traversal analysis now follows proven `Pathname` receivers through
+  filesystem reads, writes, directory operations and selected helpers. It checks
+  both paths for rename/link operations, invalidates guards after path changes,
+  and keeps non-path arguments and unrelated receivers clean. Independent unsafe
+  and safe controls cover standalone and runner JSON/SARIF output.
+
 - Java/Kotlin SQL analysis recognizes selected Spring JdbcTemplate/JdbcOperations
   and NamedParameterJdbcTemplate/NamedParameterJdbcOperations execution APIs.
   Scoped receiver identity and helper flow distinguish query text from separately

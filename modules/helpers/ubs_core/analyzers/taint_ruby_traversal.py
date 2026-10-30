@@ -76,6 +76,16 @@ SQL_CONNECTION_ARITIES = {
 }
 SQL_API_SHAPES = frozenset({'active-record-model', 'active-record-connection',
                             'active-record-pool', 'active-record-relation', 'arel-sql-literal'})
+PATHNAME_FILESYSTEM_METHODS = frozenset({
+    'read', 'binread', 'readlines', 'each_line', 'write', 'binwrite', 'open',
+    'delete', 'unlink', 'truncate', 'rename', 'make_link', 'make_symlink',
+    'chmod', 'lchmod', 'chown', 'lchown', 'utime', 'lutime',
+    'mkdir', 'mkpath', 'rmdir', 'rmtree', 'entries', 'children', 'each_child',
+    'find', 'stat', 'lstat', 'ftype', 'size', 'size?', 'exist?', 'directory?',
+    'file?', 'symlink?', 'empty?', 'zero?', 'readable?', 'readable_real?',
+    'writable?', 'writable_real?', 'executable?', 'executable_real?',
+    'owned?', 'grpowned?', 'world_readable?', 'world_writable?',
+})
 RUBY_EXCEPTION_BASES = {
     'Exception': None, 'StandardError': 'Exception', 'RuntimeError': 'StandardError',
     'ArgumentError': 'StandardError', 'TypeError': 'StandardError', 'IOError': 'StandardError',
@@ -1591,7 +1601,7 @@ class RubyEngine:
                                                   or 'safe-redirect' in trace.tags))))
                            and not (self.policy == 'path' and 'basename-path' in trace.tags
                                     and ('not-dot-name' in trace.tags or operation == 'send_file'
-                                         or re.fullmatch(r'(?:File|IO)\.(?:read|binread|write|binwrite|open|truncate)', operation))))
+                                         or re.fullmatch(r'(?:File|IO|Pathname)\.(?:read|binread|write|binwrite|open|truncate)', operation))))
         if unsafe:
             label = ('file sink' if self.policy == 'path' else 'response header' if self.policy == 'header'
                      else 'redirect sink' if self.policy == 'redirect' else 'outbound URL sink')
@@ -1688,6 +1698,39 @@ class RubyEngine:
             if identities & (object_ids(fact) | object_ids(fact, members=True)):
                 self.mutations[index] = join(self.mutations.get(index, CLEAN), changed)
         return changed
+
+    def pathname_call(self, method, receiver, arguments, token):
+        """Resolve filesystem operands only on a constructed Pathname value.
+
+        Pathname's wrapper methods operate on the receiver, unlike File's
+        class methods. In particular read's length, write's data, chmod's mode
+        and chown's owner/group must never be mistaken for filesystem paths.
+        The construction shape alone is insufficient after a conversion or
+        an unknown call: the returned object's type must still be Pathname.
+        """
+        kinds = {trace.key[0] for trace in receiver if trace.kind == 'object'}
+        if self.policy != 'path' or not has_shape(receiver, 'pathname') or kinds != {'pathname'}:
+            return None
+        positional = [argument for argument in arguments
+                      if not any(trace.kind == 'keyword' for trace in argument)]
+        if method in PATHNAME_FILESYSTEM_METHODS:
+            self.record(token.start, receiver, 'Pathname.' + method)
+            if method in {'rename', 'make_link', 'make_symlink'} and positional:
+                self.record(token.start, positional[0], 'Pathname.' + method)
+            # File contents and syscall results are not Pathname objects.
+            # Preserve data provenance without letting a later .size/.read
+            # inherit the original receiver's filesystem API identity.
+            value = join(receiver, *arguments)
+            value = frozenset(trace for trace in value
+                              if not (trace.kind == 'shape' and trace.key[0] in {'pathname', 'canonical-path'}))
+            return self.fresh(retag(value, remove=VALUE_TAGS), 'unknown', token.start)
+        if method in {'parent', 'dirname', 'sub', 'sub_ext', 'relative_path_from'}:
+            # A different path cannot borrow a guard on the original value.
+            value = retag(join(receiver, *arguments), remove=VALUE_TAGS)
+            value = frozenset(trace for trace in value
+                              if not (trace.kind == 'shape' and trace.key[0] == 'canonical-path'))
+            return self.fresh(value, 'pathname', token.start)
+        return None
 
     def call(self, name, receiver, arguments, token, state):
         self.budget.spend()
@@ -1808,6 +1851,9 @@ class RubyEngine:
                 for argument in arguments:
                     if any(trace.kind == 'keyword' and trace.key == ('filename',) for trace in argument):
                         self.record(token.start, argument, name)
+        pathname_result = self.pathname_call(method, receiver, arguments, token)
+        if pathname_result is not None:
+            return pathname_result
         kinds = {trace.key[0] for trace in receiver if trace.kind == 'object'}
         if kinds and kinds <= {'string', 'request'} and method == 'to_i' and len(arguments) <= 1:
             return self.fresh(retag(value, add=frozenset({'sql-integer-value'}),

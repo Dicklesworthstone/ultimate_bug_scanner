@@ -403,6 +403,106 @@ CASES = (
         target = params[:file].then { |value| '/srv/app/files/health.txt' }
         File.read(target)''', ()),
     Case('path_direct', PATH, 'File.read(params[:file])', (1,)),
+    # Pathname wraps File/Dir with the path in the receiver. Its read/write
+    # arguments are data, lengths, modes or options, not additional paths.
+    Case('pathname_direct_read', PATH, 'Pathname.new(params[:file]).read', (1,)),
+    Case('pathname_open_mode_is_not_the_path', PATH, '''
+        target = Pathname.new(params[:file])
+        target.open('r')''', (2,)),
+    Case('pathname_fixed_path_with_request_body', PATH,
+         "Pathname.new('/srv/app/files/output.txt').write(params[:body])", ()),
+    Case('pathname_fixed_path_with_request_length', PATH,
+         "Pathname.new('/srv/app/files/input.txt').read(params[:length].to_i)", ()),
+    Case('pathname_literal_overwrite', PATH, '''
+        target = Pathname.new(params[:file])
+        target = Pathname.new('/srv/app/files/input.txt')
+        target.binread''', ()),
+    Case('pathname_join_is_not_containment', PATH, '''
+        target = Pathname.new('/srv/app/files').join(params[:file])
+        target.binread''', (2,)),
+    Case('pathname_normalization_is_not_containment', PATH, '''
+        target = Pathname.new('/srv/app/files').join(params[:file]).cleanpath
+        target.read''', (2,)),
+    Case('pathname_parent_preserves_request_path', PATH, '''
+        target = Pathname.new(params[:file]).parent
+        target.children''', (2,)),
+    Case('pathname_extension_change_preserves_request_path', PATH, '''
+        target = Pathname.new(params[:file]).sub_ext('.txt')
+        target.write('fixed contents')''', (2,)),
+    Case('pathname_alias_preserves_request_path', PATH, '''
+        target = Pathname.new(params[:file])
+        alias_path = target
+        target = Pathname.new('/srv/app/files/input.txt')
+        alias_path.read''', (4,)),
+    Case('pathname_constant_alias', PATH, '''
+        FSPath = Pathname
+        FSPath.new(params[:file]).read''', (2,)),
+    Case('pathname_selected_sink_helper', PATH, '''
+        def read_file(target)
+          target.read
+        end
+        read_file(Pathname.new(params[:file]))''', (2,)),
+    Case('pathname_selected_constant_helper', PATH, '''
+        def select_file(raw)
+          Pathname.new('/srv/app/files/input.txt')
+        end
+        select_file(params[:file]).read''', ()),
+    Case('pathname_branch_retains_unsafe_receiver', PATH, '''
+        target = Pathname.new('/srv/app/files/input.txt')
+        if flag
+          target = Pathname.new(params[:file])
+        end
+        target.read''', (5,)),
+    Case('pathname_rename_destination_is_a_path', PATH,
+         "Pathname.new('/srv/app/files/input.txt').rename(params[:destination])", (1,)),
+    Case('pathname_rename_source_is_a_path', PATH,
+         "Pathname.new(params[:source]).rename('/srv/app/files/output.txt')", (1,)),
+    Case('pathname_link_source_is_a_path', PATH,
+         "Pathname.new('/srv/app/files/link').make_link(params[:source])", (1,)),
+    Case('pathname_symlink_destination_is_a_path', PATH,
+         "Pathname.new(params[:destination]).make_symlink('/srv/app/files/input.txt')", (1,)),
+    Case('pathname_ownership_is_applied_to_receiver', PATH,
+         'Pathname.new(params[:file]).chown(1000, 1000)', (1,)),
+    Case('pathname_permissions_are_not_a_path', PATH,
+         "Pathname.new('/srv/app/files/input.txt').chmod(params[:mode].to_i)", ()),
+    Case('pathname_shadowed_class_is_not_filesystem', PATH, '''
+        class Pathname
+          def initialize(value)
+            nil
+          end
+          def read
+            'fixed contents'
+          end
+        end
+        Pathname.new(params[:file]).read''', ()),
+    Case('pathname_unrelated_read_receiver_is_not_filesystem', PATH, '''
+        class Reader
+          def read(value)
+            value
+          end
+        end
+        Reader.new.read(params[:file])''', ()),
+    Case('pathname_validated_string_constructor', PATH, f'''
+        base = File.expand_path('/srv/app/files')
+        target = File.expand_path(params[:file], base)
+        raise 'blocked' unless {PATH_CHECK}
+        Pathname.new(target).read''', ()),
+    Case('pathname_guard_on_unrelated_value', PATH, f'''
+        base = File.expand_path('/srv/app/files')
+        target = File.expand_path('input.txt', base)
+        raise 'blocked' unless {PATH_CHECK}
+        Pathname.new(params[:file]).read''', (4,)),
+    Case('pathname_read_result_is_not_a_pathname', PATH, '''
+        contents = Pathname.new(params[:file]).read
+        contents.size''', (1,)),
+    Case('pathname_basename_file_read', PATH,
+         'Pathname.new(params[:file]).basename.read', ()),
+    Case('pathname_basename_directory_is_not_safe', PATH,
+         'Pathname.new(params[:file]).basename.children', (1,)),
+    Case('pathname_sink_suppression', PATH,
+         'Pathname.new(params[:file]).read # ubs:ignore ruby.taint.path_traversal', ()),
+    Case('pathname_lexical_decoy', PATH,
+         "text = 'Pathname.new(params[:file]).read'\nputs text", ()),
     Case('path_safe_named_identity', PATH, '''
         def safe_path(value)
           value
@@ -2702,6 +2802,33 @@ class RubyPublicTests(LoggedCase):
                 with self.subTest(case=case.name, format=fmt):
                     result, payload = self.scan(directory / fmt, target, fmt)
                     self.assert_findings(result, payload, case, fmt, target)
+
+    def test_pathname_receivers_reach_module_and_runner_reports(self):
+        names = ('pathname_direct_read', 'pathname_fixed_path_with_request_body',
+                 'pathname_join_is_not_containment', 'pathname_selected_sink_helper',
+                 'pathname_rename_destination_is_a_path', 'pathname_constant_alias',
+                 'pathname_validated_string_constructor', 'pathname_shadowed_class_is_not_filesystem')
+        for name in names:
+            case = BY_NAME[name]
+            directory = self.artifact / name
+            directory.mkdir(exist_ok=True)
+            selected = directory / 'selected source.rb'
+            selected.write_text(case.source)
+            (directory / 'unselected.rb').write_text('Pathname.new(params[:file]).read\n')
+            for module in (False, True):
+                for fmt in ('json', 'sarif'):
+                    with self.subTest(case=name, module=module, format=fmt):
+                        result, payload = self.scan(directory / f'{module}-{fmt}', selected, fmt, module=module)
+                        if module and fmt == 'json':
+                            self.assertEqual(result.returncode, int(bool(case.lines)), (result.stdout, result.stderr))
+                            self.assertEqual(payload['status'], 'ok', payload)
+                            self.assertEqual(payload['critical'], len(case.lines), payload)
+                            findings = payload['findings']
+                            self.assertEqual(sorted((row['rule'], row['line']) for row in findings
+                                                    if row['rule'] in TARGET_RULES),
+                                             [(case.rule, line) for line in case.lines], payload)
+                        else:
+                            self.assert_findings(result, payload, case, fmt, selected)
 
     def test_constant_receiver_identity_reaches_json_and_sarif(self):
         for case in CONSTANT_RECEIVER_CASES:

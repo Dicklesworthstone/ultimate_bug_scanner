@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import selectors
 import shutil
@@ -1159,7 +1160,13 @@ def watch_config_path(root: Path, names: list[str]) -> str:
     try:
         # validate_scan passes each resolved file only once to the runner.
         # Duplicate names and internal aliases must keep that sole-file anchor.
-        paths = tuple(dict.fromkeys((root / name).resolve() for name in names))
+        try:
+            paths = tuple(dict.fromkeys((root / name).resolve() for name in names))
+        except (OSError, ValueError, RuntimeError):
+            # A saved source can temporarily become a cyclic/invalid link.
+            # The descriptor observer reports that as invalid and can resume
+            # after repair; policy discovery must not terminate the watcher.
+            paths = (root,)
         selected = paths[0] if len(paths) == 1 else root
         anchor = selected if selected.is_dir() else selected.parent
         if not anchor.is_relative_to(root):
@@ -1183,7 +1190,8 @@ def watch_config_path(root: Path, names: list[str]) -> str:
 
 def watch_inputs(root: Path, names: list[str], *, dependencies: tuple[str, ...] = (),
                  directories: tuple[str, ...] = (), monitor: InotifyEvents | None = None,
-                 scan_config: str | None = None) -> tuple[str, list[str]]:
+                 scan_config: str | None = None, discover_rules: bool = False,
+                 policy_inputs: list[str] | None = None) -> tuple[str, list[str]]:
     """Observe source files plus optional dependency trees without changing scan scope.
 
     Source paths must stay regular files. Dependency paths may be absent or
@@ -1193,8 +1201,10 @@ def watch_inputs(root: Path, names: list[str], *, dependencies: tuple[str, ...] 
     File opens are anchored to the repository descriptor, not a path checked
     before opening. A final metadata pass detects edits during the traversal.
     A selected-file watch also observes its discovered scan configuration.
-    This one internal policy input does not consume the caller's 256 dependency
-    slots. This observation is never permission to reuse a scanner result.
+    With discover_rules, active custom-rule projects and their ruleDirs join
+    this same bounded, descriptor-anchored graph using the policy bytes read
+    here. Automatic policy inputs do not consume explicit dependency slots.
+    This observation is never permission to reuse a scanner result.
     """
     digest = hashlib.sha256()
     errors = []
@@ -1204,6 +1214,10 @@ def watch_inputs(root: Path, names: list[str], *, dependencies: tuple[str, ...] 
     missing = []
     seen = set()
     marked_parents = set()
+    rule_inputs = set()
+    rule_source_paths = set()
+    rule_sources = set()
+    expanded_rule_sources = set()
     entries = 0
 
     def stamp(info):
@@ -1214,6 +1228,85 @@ def watch_inputs(root: Path, names: list[str], *, dependencies: tuple[str, ...] 
         message = f'{path}: {exc}'
         errors.append(message)
         digest.update(b'error\0' + message.encode('utf-8', 'replace'))
+
+    def add_rule_inputs(values, anchor, *, sources):
+        for name in values:
+            # Resolve aliases before '..', as the scanner does. Collapsing
+            # lexical parents first can observe a different rule directory.
+            path = anchor / name
+            resolved = path.resolve()
+            if not resolved.is_relative_to(root) or not path.is_relative_to(root):
+                raise ServiceError('custom rule input is outside the served repository; '
+                                   'serve a common parent with --repo')
+            new_source = sources and path not in rule_source_paths
+            if sources:
+                # Carry the lexical source role to its guarded directory
+                # open. An alias can retarget after this discovery resolve.
+                rule_source_paths.add(path)
+            if path in rule_inputs:
+                if new_source:
+                    pending.append((path, True, False, True))
+                continue
+            if len(rule_inputs) >= 256:
+                raise ServiceError('custom rule observation exceeds 256 directories')
+            rule_inputs.add(path)
+            pending.append((path, True, False, True))
+            if policy_inputs is not None:
+                # Keep caller-selected source aliases visible. Expanded
+                # ruleDirs are reported relative to their physical project.
+                display_path = path if sources else resolved
+                policy_inputs.append(display_path.relative_to(root).as_posix())
+
+    def expand_policy(path, contents, *, scan_policy):
+        if scan_policy:
+            # The runner validates the whole schema. Invalid JSON/schema must
+            # still reach that ordinary failure path, never select new rules.
+            try:
+                def unique_object(pairs):
+                    value = {}
+                    for key, item in pairs:
+                        if key in value:
+                            raise ValueError('Duplicate policy key')
+                        value[key] = item
+                    return value
+                policy = json.loads(contents.decode('utf-8'), object_pairs_hook=unique_object)
+            except (ValueError, UnicodeError, RecursionError):
+                return
+            values = policy.get('rules', []) if isinstance(policy, dict) else []
+            if not isinstance(values, list) or len(values) > 256 \
+                    or any(not isinstance(value, str) or not value or '\x00' in value for value in values):
+                return
+            if 'UBS_RULES' not in os.environ:
+                add_rule_inputs(values, path.parent, sources=True)
+            return
+        # Match the runner's bounded sgconfig ruleDirs syntax. Observe the
+        # source project as well as referenced directories: a config edit can
+        # select a different graph without changing .ubs.json or the source.
+        lines = contents.decode('utf-8').splitlines()
+        def unquote(value):
+            value = value.strip()
+            return value[1:-1] if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'" else value
+        for index, line in enumerate(lines):
+            match = re.match(r'^ruleDirs:[ \t]*(\[[^\]]*\])?[ \t]*(?:#.*)?$', line)
+            if match is None:
+                continue
+            if match.group(1):
+                values = [unquote(item) for item in match.group(1)[1:-1].split(',') if item.strip()]
+            else:
+                values = []
+                for item in lines[index + 1:]:
+                    if not item.strip() or item.lstrip().startswith('#'):
+                        continue
+                    listed = re.match(r'^[ \t]*-[ \t]+(.*?)[ \t]*(?:#.*)?$', item)
+                    if listed is None:
+                        break
+                    values.append(unquote(listed.group(1)))
+            values = [value for value in values if value]
+            if not values:
+                raise ServiceError('custom rule project must list ruleDirs')
+            add_rule_inputs(values, path.parent.resolve(), sources=False)
+            return
+        raise ServiceError('custom rule project must list ruleDirs')
 
     for values, recursive, optional, require_dir in ((names, False, False, False),
                                                     (directories, True, False, True),
@@ -1264,6 +1357,10 @@ def watch_inputs(root: Path, names: list[str], *, dependencies: tuple[str, ...] 
         root_identity = os.fstat(root_fd)
         if monitor is not None:
             monitor.add(root_fd)
+        if discover_rules and 'UBS_RULES' in os.environ:
+            # Even an explicitly empty value overrides the configured rules.
+            add_rule_inputs((value for value in os.environ['UBS_RULES'].split(':') if value),
+                            root, sources=True)
         while pending:
             path, recursive, optional, require_dir = pending.pop()
             entries += 1
@@ -1328,10 +1425,21 @@ def watch_inputs(root: Path, names: list[str], *, dependencies: tuple[str, ...] 
                         raise ServiceError('watched source is not a regular file or permitted directory')
                     if monitor is not None:
                         monitor.add(descriptor)
-                    if resolved in seen:
+                    selected_rule_source = require_dir and path in rule_source_paths
+                    if selected_rule_source:
+                        rule_sources.add(resolved)
+                    scan_policy = discover_rules and scan_config is not None and path == root / scan_config
+                    rule_policy = discover_rules and path.name in {'sgconfig.yml', 'sgconfig.yaml'} \
+                        and stat.S_ISREG(info.st_mode) and path.parent.resolve() in rule_sources \
+                        and (path.name == 'sgconfig.yml' or not (path.parent / 'sgconfig.yml').is_file())
+                    contents = bytearray() if scan_policy or rule_policy else None
+                    expand_source = selected_rule_source and resolved not in expanded_rule_sources
+                    if resolved in seen and contents is None and not expand_source:
                         continue
                     seen.add(resolved)
                     if stat.S_ISDIR(info.st_mode):
+                        if expand_source:
+                            expanded_rule_sources.add(resolved)
                         children = []
                         # scandir yields incrementally. Never allocate an
                         # unbounded list before applying the inventory budget.
@@ -1344,16 +1452,24 @@ def watch_inputs(root: Path, names: list[str], *, dependencies: tuple[str, ...] 
                     else:
                         if info.st_size > MAX_SNAPSHOT - total:
                             raise ServiceError('watched sources exceed the byte limit')
+                        if contents is not None and info.st_size > MAX_SCAN_CONFIG:
+                            raise ServiceError('watched policy exceeds 256 KiB')
                         while chunk := os.read(descriptor, min(65536, MAX_SNAPSHOT - total + 1)):
                             total += len(chunk)
                             if total > MAX_SNAPSHOT:
                                 raise ServiceError('watched sources exceed the byte limit')
                             digest.update(chunk)
+                            if contents is not None:
+                                if len(contents) + len(chunk) > MAX_SCAN_CONFIG:
+                                    raise ServiceError('watched policy exceeds 256 KiB')
+                                contents.extend(chunk)
                     if stamp(os.fstat(descriptor)) != current_stamp:
                         raise ServiceError('watched input changed while being read')
+                    if contents is not None:
+                        expand_policy(path, contents, scan_policy=scan_policy)
                 finally:
                     os.close(descriptor)
-            except (OSError, ServiceError, ValueError, RuntimeError) as exc:
+            except (OSError, ServiceError, ValueError, RuntimeError, UnicodeError) as exc:
                 invalid(path, exc)
             digest.update(b'\0')
         for path, resolved, link_stamp, current_stamp in checked:
@@ -1373,7 +1489,7 @@ def watch_inputs(root: Path, names: list[str], *, dependencies: tuple[str, ...] 
                 invalid(path, 'watched input appeared during observation')
         if identity(root) != (root_identity.st_dev, root_identity.st_ino):
             invalid(root, 'watched repository root changed during observation')
-    except (OSError, ValueError, RuntimeError) as exc:
+    except (OSError, ServiceError, ValueError, RuntimeError) as exc:
         invalid(root, exc)
     finally:
         os.close(root_fd)
@@ -1432,15 +1548,19 @@ def watch(root: Path, request: dict, timeout: float, interval: float, debounce: 
         nonlocal automatic_policy
         policy = watch_config_path(root, names)
         automatic_policy = (policy,)
+        rule_inputs = []
         options = {'monitor': monitor} if monitor is not None else {}
         if project_watch:
             # Watch the repository, not only the scan directory. Sibling
             # dependencies and root ignore/config files can affect a scan.
             # Both the root and selected target must remain directories.
             value, errors = watch_inputs(root, [], directories=tuple(dict.fromkeys(('.', *names))),
-                                         dependencies=dependencies, scan_config=policy, **options)
+                                         dependencies=dependencies, scan_config=policy,
+                                         discover_rules=True, policy_inputs=rule_inputs, **options)
         else:
-            value, errors = watch_inputs(root, names, dependencies=dependencies, scan_config=policy, **options)
+            value, errors = watch_inputs(root, names, dependencies=dependencies, scan_config=policy,
+                                         discover_rules=True, policy_inputs=rule_inputs, **options)
+        automatic_policy = (policy, *rule_inputs)
         current_policy = watch_config_path(root, names)
         if current_policy != policy:
             # A Git marker or an internal source link changed the discovery

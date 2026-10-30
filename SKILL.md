@@ -1,6 +1,6 @@
 ---
 name: ubs
-description: "Ultimate Bug Scanner - Pre-commit static analysis for AI coding workflows. 13 languages, including bounded PHP request-flow analysis, with language-specific detection categories and native or ast-grep analysis. The AI agent's quality gate."
+description: "Ultimate Bug Scanner - Pre-commit static analysis for AI coding workflows. 14 languages, including bounded PHP request-flow and PostgreSQL migration analysis, with language-specific detection categories and native or ast-grep analysis. The AI agent's quality gate."
 ---
 
 # UBS - Ultimate Bug Scanner

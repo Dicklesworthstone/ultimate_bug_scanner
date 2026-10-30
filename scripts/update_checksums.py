@@ -94,6 +94,7 @@ def main():
         "elixir": "ubs-elixir.sh",
         "bash": "ubs-bash.sh",
         "php": "ubs-php.sh",
+        "sql": "ubs-sql.sh",
     }
 
     new_checksums = {}

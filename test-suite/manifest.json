@@ -10,6 +10,32 @@
   },
   "cases": [
     {
+      "id": "sql-definer-buggy",
+      "description": "PostgreSQL SECURITY DEFINER migration retains caller search_path and PUBLIC execution.",
+      "path": "test-suite/sql/buggy",
+      "language": "sql",
+      "tags": ["sql", "security", "function-privileges", "buggy"],
+      "args": ["--only=sql", "--format=json", "--fail-on-warning"],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {"files": {"min": 1, "max": 1}, "critical": {"max": 0}, "warning": {"min": 2, "max": 2}, "info": {"max": 0}},
+        "rule_ids": {"min": {"sql.security.definer-search-path": 1, "sql.security.definer-public-execute": 1}}
+      }
+    },
+    {
+      "id": "sql-definer-clean",
+      "description": "PostgreSQL function hardening and revoke/grant occur before transaction publication.",
+      "path": "test-suite/sql/clean",
+      "language": "sql",
+      "tags": ["sql", "security", "function-privileges", "clean"],
+      "args": ["--only=sql", "--format=json", "--fail-on-warning"],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {"files": {"min": 1, "max": 1}, "critical": {"max": 0}, "warning": {"max": 0}, "info": {"max": 0}},
+        "rule_ids": {"forbid": ["sql.security.definer-search-path", "sql.security.definer-public-execute"]}
+      }
+    },
+    {
       "id": "js-core-buggy",
       "description": "Top-level JS regression bucket with 20 legacy bug patterns.",
       "path": "test-suite/buggy",

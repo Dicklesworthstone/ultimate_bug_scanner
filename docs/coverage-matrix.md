@@ -5,11 +5,11 @@
 
 ## Summary
 
-- **Detector Families**: 20
-- **Languages Supported**: 13
-- **Implemented Cells**: 141 (54.2%)
-- **Planned Cells**: 108 (41.5%)
-- **N/A Cells**: 11 (4.2%)
+- **Detector Families**: 21
+- **Languages Supported**: 14
+- **Implemented Cells**: 142 (48.3%)
+- **Planned Cells**: 141 (48.0%)
+- **N/A Cells**: 11 (3.7%)
 
 ## Matrix
 
@@ -18,28 +18,29 @@ Legend:
 - **○** Planned / In Progress
 - **—** Not Applicable for language runtime/ecosystem
 
-| Family | JS / TS | Python | Go | Rust | Java | Kotlin | C / C++ | Ruby | Swift | C# | Elixir | Bash | PHP |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Archive Extraction (Zip Slip) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ○ |
-| Async & Concurrency Hazards | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ○ | ✓ | ○ | ○ | ○ |
-| Command Injection | ○ | ✓ | ○ | ✓ | ✓ | ✓ | ○ | ○ | ✓ | ○ | ✓ | ✓ | ✓ |
-| Constant-Time Secret Comparison | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ |
-| Credentialed Wildcard CORS | ✓ | ✓ | ✓ | ✓ | ○ | ○ | — | ○ | ○ | ○ | ○ | — | ○ |
-| Deep Guard Correlation | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | — | ○ |
-| Disabled TLS Verification | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ |
-| HTTP Response Header Injection | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | ○ |
-| Hardcoded Secrets & Default Fallbacks | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ✓ | ○ | ○ |
-| Insecure Cookie Flags | ✓ | ✓ | ✓ | ○ | ○ | ○ | — | ○ | ○ | ○ | ○ | — | ○ |
-| Insecure Security Randomness | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ○ |
-| JWT Verification Bypass | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | — | ○ |
-| Open Redirect | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | ○ |
-| Path Traversal | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ |
-| Resource Lifecycle & Cleanup | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ○ | ✓ | ○ | ○ | ○ |
-| SQL Injection | ✓ | ✓ | ○ | ✓ | ○ | ○ | ○ | ○ | ○ | ✓ | ✓ | — | ✓ |
-| Server-Side Request Forgery (SSRF) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ○ |
-| Taint & Dataflow Engine | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ |
-| Type Narrowing & Safe Casting | ✓ | ○ | ○ | ✓ | ✓ | ✓ | ○ | ○ | ✓ | ✓ | ○ | — | ○ |
-| Unsafe Deserialization | ○ | ✓ | ○ | ○ | ○ | ○ | ○ | ✓ | ○ | ○ | ○ | — | ✓ |
+| Family | JS / TS | Python | Go | Rust | Java | Kotlin | C / C++ | Ruby | Swift | C# | Elixir | Bash | PHP | sql |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Archive Extraction (Zip Slip) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ |
+| Async & Concurrency Hazards | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ○ | ✓ | ○ | ○ | ○ | ○ |
+| Command Injection | ○ | ✓ | ○ | ✓ | ✓ | ✓ | ○ | ○ | ✓ | ○ | ✓ | ✓ | ✓ | ○ |
+| Constant-Time Secret Comparison | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ |
+| Credentialed Wildcard CORS | ✓ | ✓ | ✓ | ✓ | ○ | ○ | — | ○ | ○ | ○ | ○ | — | ○ | ○ |
+| Deep Guard Correlation | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | — | ○ | ○ |
+| Disabled TLS Verification | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ |
+| HTTP Response Header Injection | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | ○ | ○ |
+| Hardcoded Secrets & Default Fallbacks | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ✓ | ○ | ○ | ○ |
+| Insecure Cookie Flags | ✓ | ✓ | ✓ | ○ | ○ | ○ | — | ○ | ○ | ○ | ○ | — | ○ | ○ |
+| Insecure Security Randomness | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ |
+| JWT Verification Bypass | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | — | ○ | ○ |
+| Open Redirect | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | ○ | ○ |
+| Path Traversal | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ○ |
+| PostgreSQL Function Privileges | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ✓ |
+| Resource Lifecycle & Cleanup | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ○ | ✓ | ○ | ○ | ○ | ○ |
+| SQL Injection | ✓ | ✓ | ○ | ✓ | ○ | ○ | ○ | ○ | ○ | ✓ | ✓ | — | ✓ | ○ |
+| Server-Side Request Forgery (SSRF) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ |
+| Taint & Dataflow Engine | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ○ |
+| Type Narrowing & Safe Casting | ✓ | ○ | ○ | ✓ | ✓ | ✓ | ○ | ○ | ✓ | ✓ | ○ | — | ○ | ○ |
+| Unsafe Deserialization | ○ | ✓ | ○ | ○ | ○ | ○ | ○ | ✓ | ○ | ○ | ○ | — | ✓ | ○ |
 
 ## Family Details
 
@@ -248,6 +249,12 @@ Arbitrary file read or write via unvalidated directory path parameters
 - **PHP**: `php.security.dynamic-include` (cases: `php-buggy`, `php-clean`)
 
 **Planned:** Rust, Bash
+
+### PostgreSQL Function Privileges (`function_privileges`)
+Selected migration SECURITY DEFINER search-path and PUBLIC EXECUTE exposure; function bodies and external catalog state are outside the analysis.
+
+**Implemented:**
+- **sql**: `sql.security.definer-search-path`, `sql.security.definer-public-execute` (cases: `sql-definer-buggy`, `sql-definer-clean`)
 
 ### Resource Lifecycle & Cleanup (`resource_lifecycle`)
 Leak detection for unclosed handles, connections, timers, and streams

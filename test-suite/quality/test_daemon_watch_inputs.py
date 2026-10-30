@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import unittest
 from unittest.mock import patch
 
@@ -264,6 +265,194 @@ class InputObservationTests(SelectionFixture, unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertNotEqual(first, after)
 
+    def rule_graph(self, rules=('rules',), *, rule_project=None):
+        config = self.root / '.ubs.json'
+        config.write_text(json.dumps({'version': 1, 'rules': list(rules)}))
+        for name in rules:
+            directory = self.root / name
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / 'check.yml').write_text('id: example\nrule:\n  pattern: old\n')
+        if rule_project is not None:
+            (self.root / rules[0] / 'sgconfig.yml').write_text(rule_project)
+        return config
+
+    def observe_rules(self, *dependencies):
+        selected = []
+        value, errors = daemon.watch_inputs(self.root, ['a.py'], dependencies=dependencies,
+                                            scan_config='.ubs.json', discover_rules=True,
+                                            policy_inputs=selected)
+        return value, errors, selected
+
+    def test_active_rule_bytes_invalidate_without_changing_scan_sources(self):
+        config = self.rule_graph()
+        source_before, config_before = self.source.read_bytes(), config.read_bytes()
+        first, errors, selected = self.observe_rules()
+        self.assertEqual(errors, [])
+        self.assertEqual(selected, ['rules'])
+        rule = self.root / 'rules/check.yml'
+        info = rule.stat()
+        rule.write_text('id: example\nrule:\n  pattern: new\n')
+        os.utime(rule, ns=(info.st_atime_ns, info.st_mtime_ns))
+        after, errors, _ = self.observe_rules()
+        self.assertEqual(errors, [])
+        self.assertNotEqual(first, after)
+        self.assertEqual(self.source.read_bytes(), source_before)
+        self.assertEqual(config.read_bytes(), config_before)
+
+    def test_environment_rules_override_config_including_empty_value(self):
+        self.rule_graph(('configured', 'environment'))
+        with patch.dict(os.environ, {'UBS_RULES': 'environment'}):
+            first, errors, selected = self.observe_rules()
+            self.assertEqual(errors, [])
+            self.assertEqual(selected, ['environment'])
+            (self.root / 'configured/check.yml').write_text('unselected edit')
+            self.assertEqual(first, self.observe_rules()[0])
+            (self.root / 'environment/check.yml').write_text('active edit')
+            self.assertNotEqual(first, self.observe_rules()[0])
+        with patch.dict(os.environ, {'UBS_RULES': ''}):
+            first, errors, selected = self.observe_rules()
+            self.assertEqual((errors, selected), ([], []))
+            (self.root / 'configured/check.yml').write_text('another unselected edit')
+            self.assertEqual(first, self.observe_rules()[0])
+
+    def test_rule_project_references_sibling_and_config_retargeting_changes_graph(self):
+        self.rule_graph(('project',), rule_project="ruleDirs: ['../selected']\n")
+        selected = self.root / 'selected'
+        selected.mkdir()
+        (selected / 'check.yml').write_text('one')
+        other = self.root / 'other'
+        other.mkdir()
+        (other / 'check.yml').write_text('two')
+        first, errors, inputs = self.observe_rules()
+        self.assertEqual(errors, [])
+        self.assertEqual(inputs, ['project', 'selected'])
+        (selected / 'check.yml').write_text('changed')
+        self.assertNotEqual(first, self.observe_rules()[0])
+        (self.root / 'project/sgconfig.yml').write_text('ruleDirs:\n- ../other\n')
+        changed, errors, inputs = self.observe_rules()
+        self.assertEqual(errors, [])
+        self.assertEqual(inputs, ['project', 'other'])
+        (selected / 'check.yml').write_text('no longer selected')
+        self.assertEqual(changed, self.observe_rules()[0])
+
+    def test_preferred_yml_config_and_internal_alias_resolve_native_rule_base(self):
+        self.rule_graph(('actual/project',), rule_project='ruleDirs: [../selected]\n')
+        selected = self.root / 'actual/selected'
+        selected.mkdir()
+        (selected / 'check.yml').write_text('one')
+        (self.root / 'actual/project/sgconfig.yaml').write_text('ruleDirs: [../../../../outside]\n')
+        (self.root / 'alias').symlink_to('actual/project', target_is_directory=True)
+        (self.root / '.ubs.json').write_text('{"rules":["alias"]}')
+        before, errors, inputs = self.observe_rules()
+        self.assertEqual(errors, [])
+        self.assertEqual(inputs, ['alias', 'actual/selected'])
+        (selected / 'check.yml').write_text('two')
+        self.assertNotEqual(before, self.observe_rules()[0])
+
+    def test_rule_graph_cannot_follow_external_paths_or_special_files(self):
+        outside = self.work / 'private'
+        outside.mkdir()
+        (outside / 'secret.yml').write_text('PRIVATE')
+        self.rule_graph(('rules',), rule_project='ruleDirs: [../../private]\n')
+        reads = []
+        original = os.read
+        def read(descriptor, length):
+            value = original(descriptor, length)
+            reads.append(value)
+            return value
+        with patch.object(daemon.os, 'read', side_effect=read):
+            _, errors, _ = self.observe_rules()
+        self.assertTrue(any('outside the served repository' in error for error in errors), errors)
+        self.assertNotIn(b'PRIVATE', b''.join(reads))
+        (self.root / 'rules/sgconfig.yml').write_text('ruleDirs: [.]\n')
+        os.mkfifo(self.root / 'rules/pipe')
+        self.assertTrue(any('not a regular file' in error for error in self.observe_rules()[1]))
+
+    def test_edit_to_config_during_rule_read_rejects_mixed_policy_graph(self):
+        config = self.rule_graph()
+        rule = self.root / 'rules/check.yml'
+        rule.write_text('trigger')
+        original = os.read
+        changed = False
+        def edit(descriptor, length):
+            nonlocal changed
+            value = original(descriptor, length)
+            if value == b'trigger' and not changed:
+                changed = True
+                config.write_text('{"rules":[]}')
+            return value
+        with patch.object(daemon.os, 'read', side_effect=edit):
+            _, errors, _ = self.observe_rules()
+        self.assertTrue(changed)
+        self.assertTrue(any('during observation' in error for error in errors), errors)
+
+    def test_rule_source_alias_retarget_during_discovery_keeps_selected_project_edges(self):
+        self.rule_graph(('first/project', 'second/project'), rule_project='ruleDirs: [../shared]\n')
+        (self.root / '.ubs.json').write_text('{"rules":["alias"]}')
+        (self.root / 'second/project/sgconfig.yml').write_text('ruleDirs: [../shared]\n')
+        shared = self.root / 'second/shared'
+        shared.mkdir()
+        (shared / 'check.yml').write_text('selected sibling rule')
+        alias = self.root / 'alias'
+        alias.symlink_to('first/project', target_is_directory=True)
+        original = type(alias).resolve
+        changed = False
+        def retarget(path, *args, **kwargs):
+            nonlocal changed
+            value = original(path, *args, **kwargs)
+            if path == alias and not changed:
+                changed = True
+                alias.rename(self.work / 'previous-alias')
+                alias.symlink_to('second/project', target_is_directory=True)
+            return value
+        with patch.object(type(alias), 'resolve', retarget):
+            _, errors, inputs = self.observe_rules()
+        self.assertTrue(changed)
+        self.assertEqual(errors, [])
+        self.assertEqual(inputs, ['alias', 'second/shared'])
+
+    def test_parent_segments_follow_aliases_before_resolving_rule_directory(self):
+        self.rule_graph(('actual/project', 'actual/rules', 'rules'))
+        (self.root / 'alias').symlink_to('actual/project', target_is_directory=True)
+        (self.root / '.ubs.json').write_text('{"rules":["alias/../rules"]}')
+        before, errors, inputs = self.observe_rules()
+        self.assertEqual(errors, [])
+        self.assertEqual(inputs, ['alias/../rules'])
+        (self.root / 'actual/rules/check.yml').write_text('changed selected rule')
+        changed, errors, _ = self.observe_rules()
+        self.assertEqual(errors, [])
+        self.assertNotEqual(before, changed)
+        (self.root / 'rules/check.yml').write_text('unselected decoy')
+        self.assertEqual(changed, self.observe_rules()[0])
+
+    def test_rule_graph_budget_and_existing_dependency_overlap_are_bounded(self):
+        self.rule_graph()
+        before, errors, _ = self.observe_rules('rules')
+        self.assertEqual(errors, [])
+        (self.root / 'rules/check.yml').write_text('changed')
+        self.assertNotEqual(before, self.observe_rules('rules')[0])
+        with patch.object(daemon, 'MAX_SNAPSHOT', 5):
+            self.assertTrue(any('byte limit' in error for error in self.observe_rules()[1]))
+        with patch.dict(os.environ, {'UBS_RULES': ':'.join(f'policy-{i}' for i in range(257))}):
+            self.assertTrue(any('256 directories' in error for error in self.observe_rules()[1]))
+
+    @unittest.skipUnless(os.path.exists('/proc/self/fd'), 'Linux notification descriptor access is required')
+    def test_active_rule_edit_wakes_notifications_without_waiting_for_reconciliation(self):
+        self.rule_graph()
+        def read(monitor):
+            return daemon.watch_inputs(self.root, ['a.py'], scan_config='.ubs.json',
+                                       discover_rules=True, monitor=monitor)
+        observer = daemon.WatchObserver(read, 'inotify', 60)
+        self.addCleanup(observer.close)
+        first, errors = observer.read()
+        self.assertEqual(errors, [])
+        (self.root / 'rules/check.yml').write_text('rule content changed')
+        after, errors = observer.read()
+        self.assertEqual(errors, [])
+        self.assertNotEqual(first, after)
+        self.assertGreater(observer.event_batches, 0)
+        self.assertEqual(observer.byte_passes, 2)
+
 
 @unittest.skipUnless(os.name == 'posix', 'watch uses Unix service')
 class DependencyWatchTests(WatchFixture, unittest.TestCase):
@@ -477,6 +666,73 @@ class RealDirectoryWatchTests(WatchFixture, unittest.TestCase):
         self.assertEqual(ignored['exit_code'], 0, ignored)
         self.assertFalse(any(item['rule_id'] == 'python.taint.eval'
                              for item in json.loads(ignored['stdout']).get('findings', [])))
+
+
+@unittest.skipUnless(os.environ.get('UBS_DAEMON_E2E') == '1', 'set UBS_DAEMON_E2E=1 for the actual scanner')
+class RealRuleWatchTests(WatchFixture, unittest.TestCase):
+    def verify_rule_edit(self, origin, *, rule_project=False, alias_parent=False):
+        self.source.write_text('mark_me()\n')
+        self.init_git()
+        policy = self.root / 'policy'
+        policy.mkdir()
+        rule_dir = self.root / 'shared-rules' if rule_project else policy
+        selected_policy = 'policy'
+        if alias_parent:
+            (self.root / 'actual/project').mkdir(parents=True)
+            (self.root / 'alias').symlink_to('actual/project', target_is_directory=True)
+            rule_dir = self.root / 'actual/policy'
+            rule_dir.mkdir()
+            selected_policy = 'alias/../policy'
+        if rule_project:
+            rule_dir.mkdir()
+            (policy / 'sgconfig.yml').write_text('ruleDirs:\n  - ../shared-rules\n')
+        rule = rule_dir / 'marker.yml'
+        template = ('id: custom.watch-marker\nlanguage: python\nseverity: error\n'
+                    'message: selected watch policy\nrule:\n  pattern: %s($$$)\n')
+        rule.write_text(template % 'never_called')
+        config = self.root / '.ubs.json'
+        config.write_text(json.dumps({'version': 1, 'rules': [selected_policy] if origin == 'config' else []}))
+        if origin == 'environment':
+            self.env['UBS_RULES'] = 'policy'
+        source_before, config_before = self.source.read_bytes(), config.read_bytes()
+        self.start(scanner=ROOT / 'ubs')
+        self.start_watch(scanner=ROOT / 'ubs')
+        initial = self.event('result', timeout=60)
+        self.assertEqual(initial['exit_code'], 0, initial)
+        self.assertEqual(json.loads(initial['stdout'])['totals'],
+                         {'files': 1, 'critical': 0, 'warning': 0, 'info': 0})
+        rule.write_text(template % 'mark_me')
+        changed = self.event('result', timeout=15)
+        self.assertGreater(changed['generation'], initial['generation'])
+        self.assertFalse(changed['cached'])
+        cold = subprocess.run([str(ROOT / 'ubs'), '--ci', '--no-auto-update', '--format=json', 'a.py'],
+                              cwd=self.root, env=self.env, capture_output=True, text=True, timeout=60)
+        for code, raw in ((changed['exit_code'], changed['stdout']), (cold.returncode, cold.stdout)):
+            report = json.loads(raw)
+            self.assertEqual(code, 1, report)
+            self.assertEqual(report['status'], 'ok', report)
+            self.assertEqual(report['totals'], {'files': 1, 'critical': 1, 'warning': 0, 'info': 0})
+            self.assertEqual([(item['rule_id'], item['line'], item['severity'])
+                              for item in report['findings']], [('custom.watch-marker', 1, 'critical')])
+        self.assertEqual(changed['paths'], ['a.py'])
+        self.assertEqual(self.source.read_bytes(), source_before)
+        self.assertEqual(config.read_bytes(), config_before)
+        rule.write_text(template % 'never_called')
+        repaired = self.event('result', timeout=15)
+        self.assertEqual(repaired['exit_code'], 0, repaired)
+        self.assertGreater(repaired['generation'], changed['generation'])
+
+    def test_project_config_rule_edit_changes_actual_findings(self):
+        self.verify_rule_edit('config')
+
+    def test_environment_rule_edit_changes_actual_findings(self):
+        self.verify_rule_edit('environment')
+
+    def test_rule_project_sibling_directory_edit_changes_actual_findings(self):
+        self.verify_rule_edit('config', rule_project=True)
+
+    def test_alias_parent_rule_directory_edit_changes_actual_findings(self):
+        self.verify_rule_edit('config', alias_parent=True)
 
 
 if __name__ == '__main__':

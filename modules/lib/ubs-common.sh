@@ -207,7 +207,7 @@ if ! declare -p UBS_HELPER_CHECKSUMS >/dev/null 2>&1; then
   declare -g -A UBS_HELPER_CHECKSUMS=()
 fi
 declare -g -A UBS_COMMON_HELPER_CHECKSUMS=(
-  ['contract.json']='41c98b992a999da70a21350ba240e7854d805381aee51844c4f2f93641a922b6'
+  ['contract.json']='bec1c648b9661e8f76acd8a22e99937b04971d156439ebbc0b20ce7d04766d06'
   ['helpers/async_task_handles_csharp.py']='d5b029f8fe9452fafba22a9bd6a26db9952b8072fdee224d976f140c824af93d'
   ['helpers/cfg_test_only_modules_rust.py']='27dbd7f843d546c07743bf642f4dfa9912f0c205007c583c5e18d6b52fa39e68'
   ['helpers/resource_lifecycle_cpp.py']='886611236e8230551ad302bc2b91894935adb29f427dff92c5e0e18370e9f582'
@@ -380,7 +380,7 @@ declare -g -A UBS_COMMON_HELPER_CHECKSUMS=(
   ['helpers/ubs_core/elixir_patterns/security_rg.py']='3e6987c5e596800f719506f50d5a203eb70942097ff98aa71321f63e53c186f7'
   ['helpers/ubs_core/elixir_rules.py']='3f8ca9a8d1cd898588005bb925b5b931d8d3947d41e7c235c48b9d8033ed65e4'
   ['helpers/ubs_core/elixir_scan.py']='6b9ef4f97ad0457bcc0e3dd0766d5ed6e7edb3c518da17ce5d1be782555bed64'
-  ['helpers/ubs_core/explain.py']='af565bc8ebe3c42521bf669787980b6a1b7ada8f83b8d08f9985828d0668415c'
+  ['helpers/ubs_core/explain.py']='8e4546ee32e0d9ce06314b233e76033cea3078c5f5c8ecab69117e1ab3434cc0'
   ['helpers/ubs_core/external_tools.py']='4a66691cffa87c4c4b8191ac7355fee395d3b0369a288e381a11522accc69a48'
   ['helpers/ubs_core/findings_merge.py']='a592789f727296e332a1b79f441a20234f8f7686ed738de5152fc4981781b6fa'
   ['helpers/ubs_core/go_ast.py']='f459406b41a7aa4b5fd0af7cce5a961811d0bffd499fb99825ed631ec96d0f0d'
@@ -555,6 +555,7 @@ declare -g -A UBS_COMMON_HELPER_CHECKSUMS=(
   ['helpers/ubs_core/scheduler.py']='662a2555f571e9cc6fba5755103948fa8b8e8b87f8d9038686225ccf6b6405bb'
   ['helpers/ubs_core/selftest.py']='6ca3dd5e5534edc0b8a10e9aac1f80834f0d79b661c50c28bd00b33eb85bff08'
   ['helpers/ubs_core/shards.py']='cdc6ecab42bd962e65bb1ac1dc5e3f20b87c4d68632617286a2991274c0c98f7'
+  ['helpers/ubs_core/sql_scan.py']='ad9a437fa901c01254d1f914c8082f45bd997d9deed7cd99be61c6d1096ac4a0'
   ['helpers/ubs_core/suppression.py']='8c0116a4cc61ba76262f59770d5799af8ba29eb876c43cbe0a275ebdb8b9bd3e'
   ['helpers/ubs_core/swift_ast.py']='53b2d380aeca310005241d1c43756dbf00d730163c2abbba4f8b1dbfadf799d3'
   ['helpers/ubs_core/swift_detectors/__init__.py']='e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'

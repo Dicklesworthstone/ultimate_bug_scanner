@@ -202,6 +202,12 @@ class WatchTests(WatchFixture, unittest.TestCase):
         invalid = self.event('invalid')
         self.assertEqual(invalid['exit_code'], 2)
         self.assertEqual(len(self.calls()), 1)
+        self.source.rename(self.work / 'cyclic-link')
+        self.source.write_text('BUG repaired\n')
+        repaired = self.event('result')
+        self.assertEqual(repaired['exit_code'], 1)
+        self.assertGreater(repaired['generation'], invalid['generation'])
+        self.assertEqual(len(self.calls()), 2)
 
     def test_termination_cancels_own_scan_without_stopping_daemon(self):
         self.source.write_text('SLOW\n')

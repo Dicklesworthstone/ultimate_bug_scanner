@@ -12,6 +12,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Added
 
+- PostgreSQL SQL migrations now have a native bounded scanner for SECURITY
+  DEFINER search-path hazards and PUBLIC execution privileges. It models
+  overload signatures, grants/revokes, transaction publication and savepoints,
+  preserves explicit incomplete states, and participates in ordinary selection,
+  policy, incremental caching and machine reports. Independent semantic cases
+  and native JSON/SARIF fixtures cover unsafe migrations and hardened controls.
+
 - Elixir error handling now follows non-bang File results through local helpers,
   bindings, branches, matches and synchronous callbacks. Discarded or overwritten
   results produce `ex.error.unhandled-file-result`; correctly handled or returned
@@ -27,6 +34,11 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 - Kotlin category 13 now follows request data into JDBC SQL execution, including Java synthetic properties, source-local helper summaries, SQL captured by prepared statements and statement-owned batch queues. Static SQL with actual value binding stays clean. Named arguments, literal defaults and multiline expression bodies retain helper flow; unsupported receiver and default semantics report incomplete analysis. JSON and SARIF retain source-to-sink evidence, and the SQL work limit participates in cache invalidation.
 
 ### Fixed
+
+- File watching now observes active custom rules from project/environment policy
+  and sgconfig rule directories, including internal aliases, so rule-only edits
+  replace stale reports without expanding source selection. Cyclic source links
+  report invalid input and resume after repair instead of stopping the watcher.
 
 - Ruby path traversal analysis now follows proven `Pathname` receivers through
   filesystem reads, writes, directory operations and selected helpers. It checks

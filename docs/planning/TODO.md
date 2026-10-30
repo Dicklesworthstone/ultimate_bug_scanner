@@ -50,6 +50,7 @@ The user requested implementation of the reality-check plan and all remaining Be
 - [ ] `mj1j.2`: repair unsupported runtime constructs without raising the floor or removing analyzer registration; re-run floor and current-interpreter semantic tests; update verified digests/version.
 - [ ] `mj1j.3/.4`: independently probe and fix JVM redirect/path binding, safe-name identity bypass, literal reassignment, branches, selected helper summaries, dominating validation and invalidation; preserve exact public IDs.
 - [ ] `mj1j.5/.6`: independently probe and fix Ruby URL/path facts across assignments, methods/blocks and selected validators; cover both observed errors, lexical decoys and scope isolation.
+  - 2026-10-30: selected `Pathname` receivers now expose filesystem traversal through reads, writes, directory/metadata operations and helper flow. Independent baseline: 18 unsafe misses and 11 passing safe controls; all 29 cases now pass, together with 447 Ruby tests and 32 ordinary module/runner JSON/SARIF scans. Published on main in `ec507b7a`; broader Ruby coverage remains open.
 - [ ] `mj1j.15/.16`: qualify finished but dormant Java/Ruby/JS checks individually, wire ordinary CLI policy/counting, and test exact IDs, clean cases, deduplication, suppressions/profiles and JSON/SARIF agreement.
 
 ### Native language semantics and ownership
@@ -77,6 +78,7 @@ The user requested implementation of the reality-check plan and all remaining Be
 - [ ] `mj1j.31/.32`: bounded PHP request-to-sink module with PDO/mysqli binding and safe output contexts; coherent detection/contract/registry/ignore/profile/format/integrity integration.
   - 2026-10-10: native PHP/PHTML scanning adds six critical rules for SQL, command/code execution, includes, deserialization and output. The bounded local-flow slice includes PDO/mysqli template identity, context-specific escaping, explicit incomplete results and ordinary runner/report/cache integration. Independent unsafe and clean labels precede implementation; broader framework resolution and corpus calibration remain open, so the umbrella stays open.
 - [ ] `mj1j.33/.34`: PostgreSQL SQL lexer/parser and explicit function/privilege hazards; comments/identifiers/dollar quotes, dialect/version and dynamic-unknown controls.
+  - 2026-10-30: native PostgreSQL module implements selected migration function identity, search paths, PUBLIC execution privileges, transaction publication and savepoints. Independent unsafe/clean/unsupported cases precede implementation, with public JSON/SARIF, cache, suppression and selection checks. Cross-file migration ordering, deployed catalog proof, procedures, dynamic SQL and broader DML analysis remain open; this bounded slice does not close the umbrella.
 - [ ] `mj1j.35/.36`: HCL provider/resource-specific rules and selected literal/local provenance; unresolved variables/modules are unknown; safe/contradictory configuration controls.
 - [ ] `mj1j.39/.40`: validated persistent scan configuration with defaults/project/environment/CLI precedence; excludes/languages/rules, explicit errors and shared cache/daemon policy identity.
 

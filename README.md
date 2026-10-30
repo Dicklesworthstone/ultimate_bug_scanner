@@ -124,7 +124,7 @@ const zipCode = parseInt(userInput);  // 💥 "08" becomes 0 in old browsers (oc
 ## 🎯 **The Solution: Your 24/7 Bug Hunting Partner**
 
 ### 🧠 Language-Aware Meta-Runner
-- `ubs` auto-detects **JavaScript/TypeScript, Python, C/C++, Rust, Go, Java, Kotlin, Ruby, Swift, C#, Elixir, Bash, and PHP** in the same repo and fans out to per-language scanners.
+- `ubs` auto-detects **JavaScript/TypeScript, Python, C/C++, Rust, Go, Java, Kotlin, Ruby, Swift, C#, Elixir, Bash, PHP, and PostgreSQL SQL** in the same repo and fans out to per-language scanners.
 - Each scanner lives under `modules/ubs-<lang>.sh`, ships independently, and supports `--format text|json|jsonl|sarif|toon` for consistent downstream tooling.
 - Modules download lazily (PATH → repo `modules/` → cached under `${XDG_DATA_HOME:-$HOME/.local/share}/ubs/modules`) and are validated before execution.
 - Results from every language merge into one text/JSON/SARIF report via `jq`, so CI systems and AI agents only have to parse a single artifact.
@@ -244,6 +244,50 @@ limits per source are 100,000 tokens, 128 nesting levels and 500,000 analysis st
 configurable through `UBS_PHP_MAX_TOKENS`, `UBS_PHP_MAX_NESTING` and
 `UBS_PHP_MAX_STEPS`. PHP confidence remains `unknown` pending independent corpus
 calibration; fixture coverage is not a calibrated confidence score.
+
+#### PostgreSQL migration and function privileges
+
+`.sql`, `.psql`, and `.pgsql` files use a bounded PostgreSQL DDL analyzer without
+requiring a database, PostgreSQL executable, or ast-grep:
+
+```bash
+ubs --only=sql --fail-on-warning --format=json migrations/
+ubs --staged --format=sarif --fail-on-warning
+ubs explain sql.security.definer-public-execute
+```
+
+Two warning rules check `SECURITY DEFINER` functions: function-local search paths
+that permit object shadowing, and `PUBLIC EXECUTE` exposure. The analyzer tracks
+literal input signatures, PostgreSQL type aliases, overloads, named/default/OUT
+parameters, selected `ALTER FUNCTION` changes, grants/revokes, default execution
+privileges, transactions and savepoints. Creating and restricting a function in
+one transaction stays clean; revoking access after a commit retains the earlier
+exposure finding. Revoking a grant option does not revoke execution.
+
+Comments, quoted identifiers, strings and dollar-quoted bodies are separated
+lexically. A body containing fake DDL or suppression text cannot alter the outer
+migration. Actual SQL comments support `ubs:ignore[rule-id]`. SQL categories are
+`sql.search-path` (1) and `sql.privileges` (2); `--skip-sql=1` and persistent
+`.ubs.json` policy use the same selection. JSON, JSONL, SARIF, text, staged scans,
+baseline filtering and the normal incremental cache use the shared runner.
+
+The analysis covers each selected file in its own statement order. It does not
+infer migration order across files, execute function bodies, inspect a deployed
+catalog, or certify all database access controls. Fresh function defaults follow
+PostgreSQL's standard PUBLIC execution grant unless the selected migration changes
+it. Existing `CREATE OR REPLACE` ACLs, unproved schema CREATE privileges, role
+changes, dynamic SQL, psql includes, unsupported procedural DDL and malformed or
+budget-exhausted input produce explicit incomplete reports (exit 2). An empty
+search path is accepted only for the bounded SQL-body proof; unqualified relations
+still expose implicit temporary-schema lookup. Custom `--rules` for SQL are
+explicitly unsupported. No warning is emitted merely for ordinary `DELETE` or
+`UPDATE` statements. Limits are 4 MiB, 200,000 tokens, 10,000 statements and 2,000
+function identities and 64 retained savepoints per source. Confidence remains uncalibrated.
+
+The underlying privilege and search-path semantics follow PostgreSQL's
+[CREATE FUNCTION security guidance](https://www.postgresql.org/docs/current/sql-createfunction.html#SQL-CREATEFUNCTION-SECURITY),
+[search_path documentation](https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-SEARCH-PATH),
+and [REVOKE semantics](https://www.postgresql.org/docs/current/sql-revoke.html).
 
 #### Shareable output quickstart
 ```bash
@@ -1959,7 +2003,7 @@ If a helper is modified or corrupted, the scanner fails safely with remediation 
 
 ### **Unified Severity Normalization**
 
-All 13 language modules normalize their findings to a consistent severity scale, ensuring predictable output regardless of source language:
+All 14 language modules normalize their findings to a consistent severity scale, ensuring predictable output regardless of source language:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -2204,7 +2248,7 @@ Traditional linters were designed for **human developers** in **single-language 
 
 | Traditional Linting (Human-First) | UBS Approach (LLM-First) |
 |---|---|
-| **Goal:** Comprehensive coverage + auto-fix<br>**Speed:** 15-60 seconds acceptable<br>**Setup:** 30 min config per language<br>**Languages:** One tool per language<br>**False positives:** Must be <1% (frustrates humans)<br>**Output:** Human-readable prose | **Goal:** Critical bug detection + fast feedback<br>**Speed:** <5 seconds required<br>**Setup:** Zero config (instant start)<br>**Languages:** One scan for all 13 languages<br>**False positives:** 10-20% OK (LLMs filter instantly)<br>**Output:** Structured file:line for LLM parsing |
+| **Goal:** Comprehensive coverage + auto-fix<br>**Speed:** 15-60 seconds acceptable<br>**Setup:** 30 min config per language<br>**Languages:** One tool per language<br>**False positives:** Must be <1% (frustrates humans)<br>**Output:** Human-readable prose | **Goal:** Critical bug detection + fast feedback<br>**Speed:** <5 seconds required<br>**Setup:** Zero config (instant start)<br>**Languages:** One scan for all 14 languages<br>**False positives:** 10-20% OK (LLMs filter instantly)<br>**Output:** Structured file:line for LLM parsing |
 
 ### **2. LLMs Don't Need Auto-Fix—They ARE the Auto-Fix Engine**
 
@@ -2491,7 +2535,7 @@ Layer 4: Metrics collection  → Time-series quality tracking
 **This combination of speed + semantic understanding + correlation is unique.**
 
 **Unified multi-language runner:**
-- Auto-detects 13 languages in one scan
+- Auto-detects 14 languages in one scan
 - Parallel execution (Go + Python + Rust simultaneously)
 - Unified JSON/SARIF output for tooling
 - Module system with lazy download/caching
@@ -2622,7 +2666,7 @@ You wouldn't use a truck for a Formula 1 race. You wouldn't use a sports car to 
 These are fundamentally incompatible goals. ESLint would never accept "10-20% false positives are fine" or "skip auto-fix entirely."
 
 **2. Multi-language meta-runner**
-- The unified runner that auto-detects 13 languages is the core innovation
+- The unified runner that auto-detects 14 languages is the core innovation
 - This doesn't fit into any single linter's architecture
 - Each linter project has different maintainers, philosophies, release cycles
 
@@ -2785,7 +2829,7 @@ Use both.
 
 **A:** Probably! The module system makes it easy to add languages.
 
-**Current:** JavaScript/TypeScript, Python, Go, Rust, Java, Kotlin, C++, Ruby, Swift, C#, Elixir, Bash, PHP (13 languages)
+**Current:** JavaScript/TypeScript, Python, Go, Rust, Java, Kotlin, C++, Ruby, Swift, C#, Elixir, Bash, PHP, PostgreSQL SQL (14 languages)
 
 **Roadmap considerations:**
 - **Scala** - JVM ecosystem
@@ -2824,7 +2868,7 @@ But the core tool will always be free and open source.
 
 **This isn't trying to replace ESLint.** It's solving a different problem:
 
-> **"How do I give LLM coding agents the ability to self-audit across 13 languages with zero configuration overhead and sub-5-second feedback?"**
+> **"How do I give LLM coding agents the ability to self-audit across 14 languages with zero configuration overhead and sub-5-second feedback?"**
 
 No existing tool does this because:
 - Traditional linters are human-first (need auto-fix, low FP tolerance)
@@ -2934,28 +2978,29 @@ coverage/
 
 <!-- coverage:matrix -->
 
-| Detector Family | JS / TS | Python | Go | Rust | Java | Kotlin | C / C++ | Ruby | Swift | C# | Elixir | Bash | PHP |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Archive Extraction (Zip Slip) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ○ |
-| Async & Concurrency Hazards | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ○ | ✓ | ○ | ○ | ○ |
-| Command Injection | ○ | ✓ | ○ | ✓ | ✓ | ✓ | ○ | ○ | ✓ | ○ | ✓ | ✓ | ✓ |
-| Constant-Time Secret Comparison | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ |
-| Credentialed Wildcard CORS | ✓ | ✓ | ✓ | ✓ | ○ | ○ | — | ○ | ○ | ○ | ○ | — | ○ |
-| Deep Guard Correlation | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | — | ○ |
-| Disabled TLS Verification | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ |
-| HTTP Response Header Injection | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | ○ |
-| Hardcoded Secrets & Default Fallbacks | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ✓ | ○ | ○ |
-| Insecure Cookie Flags | ✓ | ✓ | ✓ | ○ | ○ | ○ | — | ○ | ○ | ○ | ○ | — | ○ |
-| Insecure Security Randomness | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ○ |
-| JWT Verification Bypass | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | — | ○ |
-| Open Redirect | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | ○ |
-| Path Traversal | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ |
-| Resource Lifecycle & Cleanup | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ○ | ✓ | ○ | ○ | ○ |
-| SQL Injection | ✓ | ✓ | ○ | ✓ | ○ | ○ | ○ | ○ | ○ | ✓ | ✓ | — | ✓ |
-| Server-Side Request Forgery (SSRF) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ○ |
-| Taint & Dataflow Engine | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ |
-| Type Narrowing & Safe Casting | ✓ | ○ | ○ | ✓ | ✓ | ✓ | ○ | ○ | ✓ | ✓ | ○ | — | ○ |
-| Unsafe Deserialization | ○ | ✓ | ○ | ○ | ○ | ○ | ○ | ✓ | ○ | ○ | ○ | — | ✓ |
+| Detector Family | JS / TS | Python | Go | Rust | Java | Kotlin | C / C++ | Ruby | Swift | C# | Elixir | Bash | PHP | sql |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Archive Extraction (Zip Slip) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ |
+| Async & Concurrency Hazards | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ○ | ✓ | ○ | ○ | ○ | ○ |
+| Command Injection | ○ | ✓ | ○ | ✓ | ✓ | ✓ | ○ | ○ | ✓ | ○ | ✓ | ✓ | ✓ | ○ |
+| Constant-Time Secret Comparison | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ |
+| Credentialed Wildcard CORS | ✓ | ✓ | ✓ | ✓ | ○ | ○ | — | ○ | ○ | ○ | ○ | — | ○ | ○ |
+| Deep Guard Correlation | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | — | ○ | ○ |
+| Disabled TLS Verification | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ |
+| HTTP Response Header Injection | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | ○ | ○ |
+| Hardcoded Secrets & Default Fallbacks | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ✓ | ○ | ○ | ○ |
+| Insecure Cookie Flags | ✓ | ✓ | ✓ | ○ | ○ | ○ | — | ○ | ○ | ○ | ○ | — | ○ | ○ |
+| Insecure Security Randomness | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ |
+| JWT Verification Bypass | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | — | ○ | ○ |
+| Open Redirect | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | ○ | ○ |
+| Path Traversal | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ○ |
+| PostgreSQL Function Privileges | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ✓ |
+| Resource Lifecycle & Cleanup | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ○ | ✓ | ○ | ○ | ○ | ○ |
+| SQL Injection | ✓ | ✓ | ○ | ✓ | ○ | ○ | ○ | ○ | ○ | ✓ | ✓ | — | ✓ | ○ |
+| Server-Side Request Forgery (SSRF) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ |
+| Taint & Dataflow Engine | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ○ |
+| Type Narrowing & Safe Casting | ✓ | ○ | ○ | ✓ | ✓ | ✓ | ○ | ○ | ✓ | ✓ | ○ | — | ○ | ○ |
+| Unsafe Deserialization | ○ | ✓ | ○ | ○ | ○ | ○ | ○ | ✓ | ○ | ○ | ○ | — | ✓ | ○ |
 
 *(Legend: **✓** Implemented with dual-sided regression test pairs; **○** Planned; **—** N/A. Full details in [`docs/coverage-matrix.md`](docs/coverage-matrix.md).)*
 

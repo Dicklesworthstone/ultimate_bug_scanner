@@ -52,9 +52,25 @@
     {
       "id": "php",
       "display": "PHP"
+    },
+    {
+      "id": "sql",
+      "display": "PostgreSQL SQL"
     }
   ],
   "families": {
+    "function_privileges": {
+      "display": "PostgreSQL Function Privileges",
+      "description": "Selected migration SECURITY DEFINER search-path and PUBLIC EXECUTE exposure; function bodies and external catalog state are outside the analysis.",
+      "detectors": {
+        "sql": {
+          "status": "implemented",
+          "rule_ids": ["sql.security.definer-search-path", "sql.security.definer-public-execute"],
+          "fixture_pair_ids": ["sql-definer"],
+          "manifest_cases": ["sql-definer-buggy", "sql-definer-clean"]
+        }
+      }
+    },
     "archive_extraction": {
       "display": "Archive Extraction (Zip Slip)",
       "description": "Path traversal during archive decompression / tar / zip extraction",

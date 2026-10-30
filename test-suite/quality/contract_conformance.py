@@ -59,6 +59,7 @@ DEFAULT_SNIPPETS: dict[str, str] = {
     "kt": "fun main() {}\n",
     "kts": "println(42)\n",
     "php": "<?php\nfunction clean(): int { return 42; }\n",
+    "sql": "SELECT 1;\n",
     "zig": "pub fn main() void {}\n",
 }
 

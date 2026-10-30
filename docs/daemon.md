@@ -221,7 +221,8 @@ source files being edited:
 ```
 
 The watcher observes the bytes and file identity of each **explicitly named
-file**, plus the automatically discovered `.ubs.json` policy described below.
+file**, plus the automatically discovered `.ubs.json` policy and its active
+custom-rule graph described below.
 The default polling interval is 0.25 seconds (`--watch-interval`, minimum
 0.1); a 0.3-second quiet period combines rapid saves into one scan (`--debounce`).
 Atomic replacement and same-size edits with restored mtimes trigger another
@@ -283,10 +284,29 @@ including its creation, edits, removal, and a change in its location after Git
 is initialized. A single resolved file uses its nearest Git worktree root, or
 its parent outside Git; multiple resolved files use the served directory's Git
 root, or the served directory outside Git. Duplicate names and internal aliases
-do not change this selection. This one automatic input does not consume the
+do not change this selection. Automatic policy inputs do not consume the
 256 explicit dependency slots or add source files to the scan. If the policy
 lies outside the served directory, watch mode reports an error directing you
 to serve and watch the Git worktree root with `--repo`.
+
+Active custom rules selected by `.ubs.json` or `UBS_RULES` are also observed
+automatically. On observing a rule-only edit, the watcher invalidates the previous
+report, cancels obsolete work, and runs a fresh scan with the same source targets.
+The watcher observes each rule directory recursively and follows the ordinary
+scanner's `sgconfig.yml` / `sgconfig.yaml` `ruleDirs` selection, including sibling
+directories inside the served root. Changes to that configuration rebuild the
+observed graph. An explicitly empty `UBS_RULES` overrides configured rules,
+matching the ordinary scanner. Events include the selected rule directories in
+`watch_inputs`.
+
+Rule discovery uses the policy bytes from the same descriptor-anchored observation
+as source files, with a final identity check to reject concurrent policy edits.
+The rule graph permits at most 256 discovered directories, shares the existing
+entry/content budgets, and limits each policy file to 256 KiB. Missing,
+unreadable, special-file or out-of-root rule inputs produce an `invalid` event
+instead of keeping an old clean report current. Serve a common parent when rules
+live beside the project. The watcher does not fetch rules or change the scanner's
+policy validation and analysis.
 
 Use repeatable `--watch-input=PATH` options to watch dependency files, entire
 dependency trees or policy files **without adding them to the scan targets**:
@@ -316,8 +336,9 @@ Every event includes `watch_inputs` separately from the unchanged scan `paths`.
 Dependency-only edits also cancel obsolete requests. A restored exact snapshot
 may reuse a valid report, but it is emitted under the new observation generation.
 
-This is not a warmed analysis engine. Beyond the automatic `.ubs.json` input,
-unnamed dependencies, other configuration, ignore files and tools do **not**
+This is not a warmed analysis engine. Beyond the automatic `.ubs.json` input
+and active custom-rule graph, unnamed source dependencies, other configuration,
+ignore files and tools do **not**
 trigger a new generation in explicit-file polling mode. Name in-repository
 inputs explicitly, or request a fresh scan after changing external inputs.
 Keep generated reports, cache directories and service sockets outside watched

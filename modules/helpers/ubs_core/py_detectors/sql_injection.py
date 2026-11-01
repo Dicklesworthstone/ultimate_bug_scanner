@@ -157,6 +157,7 @@ class SanitizerBindings:
         self._process_namespace_closed = None
         self._process_forwarders = set()
         self._instrumentation_lists = {}
+        self._possible_sql_imports = {}
         self.independent_functions = self._independent_functions()
         for scope in self.owner_scopes.values():
             scope['capture_barriers'] = frozenset(scope['capture_barriers'])
@@ -368,7 +369,8 @@ class SanitizerBindings:
                 callers[target[1]].add(function)
             elif (sql_sink_name(call)
                   or target and target[0] == 'import'
-                  and target[1].rsplit('.', 1)[-1] in EXECUTE_METHODS | {'extra'}):
+                  and target[1].rsplit('.', 1)[-1] in EXECUTE_METHODS | {'extra'}
+                  or self.unresolved_sql_aliases(call)):
                 effects.add(function)
         for node, scope in self.scope_of.items():
             if (not isinstance(node, ast.Attribute) or node in self.direct_callees
@@ -577,6 +579,126 @@ class SanitizerBindings:
             if not isinstance(child, ast.ClassDef):
                 while scope and isinstance(scope['node'], ast.ClassDef):
                     scope = scope['parent']
+        return None
+
+    def possible_sql_imports(self, node, seen=frozenset()):
+        """Retain possible import identities when a stable alias is unproved.
+
+        This is a refusal boundary, not an execution certificate. A saved
+        alias can still reference an imported SQL callable after that source
+        name is reassigned. The ordinary resolver intentionally rejects such
+        multi-binding cells; losing their possible SQL identity would make a
+        conditional replacement, or a capture before replacement, look clean.
+        """
+        if node in seen:
+            return frozenset()
+        if node in self._possible_sql_imports:
+            return self._possible_sql_imports[node]
+        self.budget[0] -= 1
+        if self.budget[0] < 0:
+            raise SQLFlowLimit('SQL alias resolution budget exceeded; analysis is incomplete')
+        seen = seen | {node}
+        possible = set()
+        if isinstance(node, ast.Name):
+            scope = self.sql_binding_cell(node.id, self.scope_of.get(node))
+            owners = [scope] if scope is not None else []
+            if node.id in self.indirect_rebindings:
+                for candidate in self.owner_scopes.values():
+                    self.budget[0] -= 1
+                    if self.budget[0] < 0:
+                        raise SQLFlowLimit('SQL alias cell budget exceeded; analysis is incomplete')
+                    if (node.id in candidate['capture_barriers']
+                            and self.sql_binding_cell(node.id, candidate) is scope):
+                        owners.append(candidate)
+            for owner in owners:
+                for candidate in owner['names'].get(node.id, ()):
+                    if candidate and candidate[0] == 'import':
+                        possible.add(candidate[1])
+                    elif candidate and candidate[0] == 'alias':
+                        possible.update(self.possible_sql_imports(candidate[1], seen))
+        elif isinstance(node, ast.Attribute):
+            possible.update(name + '.' + node.attr for name in self.possible_sql_imports(node.value, seen))
+        result = frozenset(possible)
+        # A recursive alias edge has a context-dependent visited set. Only
+        # memoize a complete root query, never a partial cycle projection.
+        if len(seen) == 1:
+            self._possible_sql_imports[node] = result
+        return result
+
+    def sql_binding_cell(self, name, scope):
+        """Locate the declared lexical cell, including global/nonlocal writes."""
+        while scope is not None:
+            self.budget[0] -= 1
+            if self.budget[0] < 0:
+                raise SQLFlowLimit('SQL alias cell budget exceeded; analysis is incomplete')
+            if name in scope['capture_barriers']:
+                nonlocal_cell = name in scope['nonlocal_names']
+                scope = scope['parent']
+                while scope is not None and (isinstance(scope['node'], ast.ClassDef)
+                                             or not nonlocal_cell and not isinstance(scope['node'], ast.Module)):
+                    scope = scope['parent']
+                continue
+            if name in scope['names'] or isinstance(scope['node'], ast.Module):
+                return scope
+            child = scope['node']
+            scope = scope['parent']
+            if not isinstance(child, ast.ClassDef):
+                while scope and isinstance(scope['node'], ast.ClassDef):
+                    scope = scope['parent']
+        return None
+
+    def unresolved_sql_aliases(self, call):
+        possible = frozenset(name.rsplit('.', 1)[-1] for name in self.possible_sql_imports(call.func)
+                             if name.rsplit('.', 1)[-1] in EXECUTE_METHODS | {'extra'})
+        if not possible:
+            return possible
+        target = self.resolve(call.func)
+        if target and target[0] == 'import':
+            return frozenset()
+        return possible
+
+    def plain_alias_replacement(self, call):
+        """A final direct definition can replace an import without dispatch.
+
+        This deliberately recognizes only returning an argument, a constant,
+        or an argument's builtin length. The caller must prove the latter's
+        actual object shape; a custom __len__ would still be opaque execution.
+        """
+        if (not isinstance(call.func, ast.Name) or self.dynamic_namespace or self.builtin_namespace
+                or self.reflective_member_writes or {'__code__', '__globals__'} & self.member_writes):
+            return None
+        scope = self.lexical_owner(call.func)
+        if scope is None or isinstance(scope['node'], ast.ClassDef):
+            return None
+        candidates = scope['names'].get(call.func.id, ())
+        target = candidates[-1] if candidates else None
+        if not target or target[0] != 'function':
+            return None
+        function = target[1]
+        if (not isinstance(function, ast.FunctionDef) or function.decorator_list
+                or self.parents.get(function) is not scope['node']
+                or function.end_lineno >= call.lineno):
+            return None
+        for reference in self.name_loads.get(call.func.id, ()):
+            self.budget[0] -= 1
+            if self.budget[0] < 0:
+                raise SQLFlowLimit('SQL alias ownership budget exceeded; analysis is incomplete')
+            if self.lexical_owner(reference) is scope and reference not in self.direct_callees:
+                return None
+        body = [statement for statement in function.body if not (
+            isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant)
+            and isinstance(statement.value.value, str))]
+        if len(body) != 1 or not isinstance(body[0], ast.Return):
+            return None
+        value = body[0].value
+        if value is None or isinstance(value, ast.Constant):
+            return function, None
+        if isinstance(value, ast.Name) and value.id in _all_parameters(function):
+            return function, None
+        if (isinstance(value, ast.Call) and self.resolve(value.func) == ('unbound', 'len')
+                and len(value.args) == 1 and not value.keywords and isinstance(value.args[0], ast.Name)
+                and value.args[0].id in _all_parameters(function)):
+            return function, value.args[0].id
         return None
 
     def closed_local_callable(self, function, active=frozenset()):
@@ -1472,6 +1594,24 @@ def call_name(node):
 def sql_sink_name(node, bindings=None):
     """Share the modeled sink families between admission and argument binding."""
     short = call_name(node.func).rsplit('.', 1)[-1]
+    if bindings is not None:
+        if (short not in EXECUTE_METHODS | {'extra'} and not any(
+                name.rsplit('.', 1)[-1] in EXECUTE_METHODS | {'extra'}
+                for name in bindings.possible_sql_imports(node.func))):
+            return ''
+        target = bindings.resolve(node.func)
+        if target and target[0] == 'import':
+            canonical = target[1].rsplit('.', 1)[-1]
+            if canonical in EXECUTE_METHODS | {'extra'}:
+                # Import aliases and stable local aliases retain the imported
+                # API's SQL slot. A bare spelling cannot establish this link:
+                # lexical shadowing or reassignment makes resolve refuse it.
+                short = canonical
+        elif bindings.unresolved_sql_aliases(node):
+            # Once an imported callable's identity is ambiguous, its old
+            # query/params contract is no longer a proven execution boundary.
+            # The visitor keeps all argument SQL facts and refuses explicitly.
+            return ''
     if short in EXECUTE_METHODS | {'extra'} and bindings is not None and bindings.non_database_callable(node):
         return ''
     return short if short in EXECUTE_METHODS or short == 'extra' else ''
@@ -4459,8 +4599,9 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             value = ast.copy_location(ast.BinOp(left=node.target, op=node.op, right=node.value), node)
             self.store_list_item(node.target, self.value_facts(value))
 
-    def sql_argument(self, node):
-        short = sql_sink_name(node, self.ownership_bindings())
+    def sql_argument(self, node, short=None):
+        if short is None:
+            short = sql_sink_name(node, self.ownership_bindings())
         if short in EXECUTE_METHODS:
             if node.args and not isinstance(node.args[0], ast.Starred):
                 return node.args[0]
@@ -4476,15 +4617,17 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                     return keyword.value
         return None
 
-    def sql_arguments(self, node):
+    def sql_arguments(self, node, short=None):
         """Yield SQL expressions and their statement/fragment/mapping context.
 
         Django extra(select, where, params, ...) accepts SQL fragments, not
         complete statements. Its select dictionary keys are result aliases;
         only the values are raw SQL. Do not inspect params/select_params.
         """
-        if sql_sink_name(node, self.ownership_bindings()) != 'extra':
-            argument = self.sql_argument(node)
+        if short is None:
+            short = sql_sink_name(node, self.ownership_bindings())
+        if short != 'extra':
+            argument = self.sql_argument(node, short)
             if argument is not None:
                 yield argument, 'statement'
             return
@@ -4511,7 +4654,8 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         # The sink's own first line is what a guard has to precede (GH #133).
         # Using the sink line rather than the interpolated value's line keeps
         # a guard written inside the same multi-line call from counting.
-        is_sink = bool(list(self.sql_arguments(node)))
+        uncertain_aliases = self.ownership_bindings().unresolved_sql_aliases(node)
+        is_sink = bool(list(self.sql_arguments(node))) or bool(uncertain_aliases)
         previous_sink = self.sink_lineno
         if is_sink:
             self.sink_lineno = node.lineno
@@ -4680,6 +4824,22 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             # find(), never execution.
             if is_sink:
                 self.classify_sink(node)
+            if uncertain_aliases:
+                replacement = self.ownership_bindings().plain_alias_replacement(node)
+                safe = replacement is not None and replacement[1] is None
+                if replacement is not None and replacement[1] is not None:
+                    argument = _bind_call_arguments(node, {'positional': _positional_parameters(replacement[0])}).get(
+                        replacement[1])
+                    safe = (argument is not None and not any(isinstance(value, ast.Starred) for value in node.args)
+                            and all(keyword.arg is not None for keyword in node.keywords)
+                            and self.value_kind(argument)[0] in {'str', 'list', 'tuple', 'set', 'dict', 'range', 'number', 'none'})
+                if not safe and any(
+                        self.sql_risk(argument, require_sql='extra' not in uncertain_aliases) is not None
+                        for argument in [*node.args, *(keyword.value for keyword in node.keywords)]):
+                    # An unknown replacement has no verified query/params
+                    # contract. It may execute a value from any argument,
+                    # including one that the imported API would have bound.
+                    raise SQLFlowLimit('SQL aliased execution binding is unresolved; analysis is incomplete')
         finally:
             self.sink_lineno = previous_sink
             self._iterated_lists = enclosing_iterations
@@ -5731,14 +5891,19 @@ def find(files: Sequence[Path], *, max_steps=100_000) -> Iterable[tuple[str, Pat
         # a matching name admits full analysis regardless of its arguments.
         # Decode and parse failures above must remain incomplete even when no
         # sink can be recognized. Applicable SQL flow keeps its ordinary budget.
-        if not any(isinstance(node, ast.Call) and sql_sink_name(node) for node in ast.walk(tree)):
+        if not any(isinstance(node, ast.Call) and sql_sink_name(node)
+                   or isinstance(node, ast.Attribute) and node.attr in EXECUTE_METHODS | {'extra'}
+                   or isinstance(node, ast.ImportFrom) and any(
+                       alias.name in EXECUTE_METHODS | {'extra'} for alias in node.names)
+                   for node in ast.walk(tree)):
             continue
         lines = text.splitlines()
         param_names, name_risk = build_provenance(tree)
         sanitizers = configured_sanitizers()
         budget = [max_steps]
         bindings = SanitizerBindings(tree, configured_sanitizer_targets(), budget)
-        if not any(sql_sink_name(call, bindings) for call in bindings.calls):
+        if not any(sql_sink_name(call, bindings) or bindings.unresolved_sql_aliases(call)
+                   for call in bindings.calls):
             continue
         summaries = build_sanitizer_summaries(tree, sanitizers, text=text, budget=budget, bindings=bindings)
         analyzer = SQLInjectionAnalyzer(

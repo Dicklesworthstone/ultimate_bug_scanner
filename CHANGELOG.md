@@ -27,6 +27,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Fixed
 
+- Python SQL execution retains its API identity through stable import and
+  module-member aliases, including keyword query arguments. Lexical shadows
+  and verified plain replacements stay distinct. Conditional rebinding,
+  captured aliases and mutated imported members remain explicitly incomplete
+  when dynamic SQL reaches an unresolved callable; such calls cannot borrow
+  the original API's parameter-binding contract.
+
 - Python's SQL detector takes syntax evidence from literal strings and tracked
   values. Identifiers such as `call`, `select` and `update` no longer create
   SQL templates; interpolated SQL still produces the existing findings.

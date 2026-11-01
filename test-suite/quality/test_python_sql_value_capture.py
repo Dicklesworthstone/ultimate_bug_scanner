@@ -1206,6 +1206,95 @@ class SQLValueCaptureTests(unittest.TestCase):
         self.inspect('local-execute-next-to-db', source
                      + 'def count(cursor, user):\n    cursor.execute(f"SELECT {user}")\n', ((CRITICAL, 9),))
 
+    def test_imported_sql_sink_aliases_keep_query_provenance(self):
+        for name, prefix, call in (
+                ('direct', 'from db_driver import execute as send\n', 'send(f"SELECT {user}")'),
+                ('keyword', 'from db_driver import execute as send\n', 'send(query=f"SELECT {user}")'),
+                ('chain', 'from db_driver import execute as send\nforward = send\n',
+                 'forward(f"SELECT {user}")'),
+                ('module-member', 'import db_driver as driver\nsend = driver.execute\n',
+                 'send(f"SELECT {user}")'),
+                ('dataframe', 'from pandas import read_sql_query as read\n',
+                 'read(sql=f"SELECT {user}", con=connection)'),
+                ('extra-where', 'from db_driver import extra as clauses\n',
+                 'clauses(where=[f"name = {user}"])'),
+                ('extra-select', 'from db_driver import extra as clauses\n',
+                 'clauses(select={"chosen": f"name = {user}"})')):
+            source = prefix + 'def run(user):\n    return ' + call + '\n'
+            with self.subTest(alias=name):
+                self.inspect('imported-sql-' + name, source, ((CRITICAL, len(source.splitlines())),))
+        self.inspect('imported-sql-unknown',
+                     'from db_driver import execute as send\nfrom settings import VALUE\n'
+                     'send(f"SELECT {VALUE}")\n', ((WARNING, 3),))
+
+    def test_imported_sql_aliases_preserve_bound_data_and_scope(self):
+        prefix = 'from db_driver import execute as send\n'
+        for name, body in (
+                ('bound', 'def run(user):\n    return send("SELECT ?", (f"SELECT {user}",))\n'),
+                ('keyword-bound', 'def run(user):\n'
+                 '    return send(query="SELECT ?", params=[f"SELECT {user}"])\n'),
+                ('constant', 'send(f"SELECT {1}")\n'),
+                ('shadowed', 'def run(send, user):\n    return send(f"SELECT {user}")\n'),
+                ('reassigned-static', 'def identity(value):\n    return value\n'
+                 'send = identity\ndef run(user):\n    return send("SELECT 1")\n'),
+                ('unused', 'def ordinary(values):\n    return dict.fromkeys(item for item in values)\n')):
+            with self.subTest(alias=name):
+                self.inspect('imported-sql-clean-' + name, prefix + body, ())
+        self.inspect('imported-extra-bound', 'from db_driver import extra as clauses\n'
+                     'def run(user):\n    return clauses(where=["name = %s"], params=[f"SELECT {user}"])\n', ())
+        self.inspect('imported-extra-select-key', 'from db_driver import extra as clauses\n'
+                     'def run(user):\n    return clauses(select={f"SELECT {user}": "1"})\n', ())
+
+    def test_rebound_sql_import_aliases_cannot_silently_lose_execution(self):
+        for name, prefix, call in (
+                ('conditional', 'from db_driver import execute as send\n'
+                 'if configured:\n    send = replacement\n', 'send(f"SELECT {user}")'),
+                ('captured', 'from db_driver import execute as send\nsaved = send\n'
+                 'send = replacement\n', 'saved(f"SELECT {user}")'),
+                ('namespace', 'import pandas as pd\nsaved = pd.read_sql\n'
+                 'pd.read_sql = replacement\n', 'saved(f"SELECT {user}", connection)'),
+                ('keyword', 'from db_driver import execute as send\n'
+                 'if configured:\n    send = replacement\n', 'send(query=f"SELECT {user}")'),
+                ('extra', 'from db_driver import extra as send\n'
+                 'if configured:\n    send = replacement\n', 'send(where=[f"name = {user}"])'),
+                ('original-spelling', 'from db_driver import execute\n'
+                 'if configured:\n    execute = replacement\n', 'execute("SELECT ?", [f"SELECT {user}"])'),
+                ('module-member-bound', 'import db_driver as driver\ndriver.execute = replacement\n',
+                 'driver.execute("SELECT ?", [f"SELECT {user}"])')):
+            source = prefix + 'def run(user):\n    return ' + call + '\n'
+            path = self.artifacts / ('ambiguous-sql-alias-' + name + '.py')
+            path.write_text(source, encoding='utf-8')
+            with self.subTest(alias=name), self.assertRaisesRegex(
+                    detector.SQLFlowLimit, 'aliased execution binding.*incomplete'):
+                list(detector.find([path]))
+        source = ('from db_driver import execute as send\nif configured:\n    send = replacement\n'
+                  'def run(user):\n    return send("SELECT ?", (f"SELECT {user}",))\n')
+        path = self.artifacts / 'ambiguous-sql-alias-bound.py'
+        path.write_text(source, encoding='utf-8')
+        with self.assertRaisesRegex(detector.SQLFlowLimit, 'aliased execution binding.*incomplete'):
+            list(detector.find([path]))
+        for name, source in (
+                ('global', 'from pandas import read_sql as fetch\ndef run(connection, user, configured):\n'
+                 '    global fetch\n    if configured:\n        fetch = replacement\n'
+                 '    return fetch(f"SELECT {user}", connection)\n'),
+                ('nonlocal', 'def run(connection, user, configured):\n'
+                 '    from pandas import read_sql as fetch\n    def call():\n'
+                 '        nonlocal fetch\n        if configured:\n            fetch = replacement\n'
+                 '        return fetch(f"SELECT {user}", connection)\n    return call()\n')):
+            path = self.artifacts / ('sql-alias-' + name + '.py')
+            path.write_text(source, encoding='utf-8')
+            with self.subTest(cell=name), self.assertRaisesRegex(
+                    detector.SQLFlowLimit, 'aliased execution binding.*incomplete'):
+                list(detector.find([path]))
+        self.inspect('sql-alias-plain-replacement', 'from pandas import read_sql as fetch\n'
+                     'def fetch(value, connection):\n    return len(value)\n'
+                     'def run(connection, user):\n    return fetch(f"SELECT {user}", connection)\n', ())
+        path = self.artifacts / 'sql-alias-replacement-default.py'
+        path.write_text('from driver import execute as fetch\n'
+                        'def fetch(\n    value=fetch(f"SELECT {user}")\n):\n    return 1\n', encoding='utf-8')
+        with self.assertRaisesRegex(detector.SQLFlowLimit, 'aliased execution binding.*incomplete'):
+            list(detector.find([path]))
+
     def test_variadic_process_wrapper_matches_renamed_instrumentation(self):
         source = ('import subprocess\n\ndef wrap(run):\n    return run\n\n'
                   'def check(repo):\n    calls = []\n    def raw(*args):\n'

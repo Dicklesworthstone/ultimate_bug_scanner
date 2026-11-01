@@ -43,7 +43,7 @@ RAW_PROCESS_WRAPPER = textwrap.dedent('''\
         calls = []
         def raw(*args):
             calls.append(args)
-            return subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True)
+            return subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True, timeout=10, check=True)
         reads = [("rev-parse", "HEAD"), ("log", "-1")]
         cached = wrap(raw)
         before = [cached(*args).stdout for args in reads]
@@ -85,6 +85,12 @@ CASES = (
     ("application-method-field-sql", 'from backend import run_query\nclass Runner:\n    def execute(self, query):\n        self.saved = query\n        return run_query(self.saved)\n    def run(self, user):\n        return self.execute(f"SELECT {user}")\n', ((CRITICAL, 7),)),
     ("local-raw-process-wrapper", RAW_PROCESS_WRAPPER, ()),
     ("local-raw-opaque-sql", 'from backend import dispatch\ndef raw(*args):\n    return dispatch(*args)\ndef run(user):\n    raw(f"SELECT {user}")\n', ((CRITICAL, 5),)),
+    ("imported-sql-alias-positional", 'from pandas import read_sql as load_rows\ndef run(conn, user):\n    return load_rows(f"SELECT {user}", conn)\n', ((CRITICAL, 3),)),
+    ("imported-sql-alias-keyword", 'from pandas import read_sql as load_rows\ndef run(conn, user):\n    return load_rows(con=conn, sql=f"SELECT {user}")\n', ((CRITICAL, 3),)),
+    ("imported-sql-alias-bound-data", 'from pandas import read_sql as load_rows\ndef run(conn, user):\n    return load_rows("SELECT ?", conn, params=(f"SELECT {user}",))\n', ()),
+    ("imported-sql-alias-unproven", 'from pandas import read_sql as load_rows\nfrom settings import TABLE_NAME\nload_rows(f"SELECT * FROM {TABLE_NAME}", conn)\n', ((WARNING, 3),)),
+    ("imported-sql-alias-local-copy", 'from pandas import read_sql as load_rows\ndef run(conn, user):\n    fetch = load_rows\n    return fetch(sql=f"SELECT {user}", con=conn)\n', ((CRITICAL, 4),)),
+    ("imported-sql-alias-parameter-shadow", 'from pandas import read_sql as load_rows\ndef format_note(load_rows, user):\n    return load_rows(f"SELECT {user}")\n', ()),
     ("keyword-alias", 'def run(cursor, user):\n    query = f"SELECT {user}"\n    cursor.execute(query=query)\n', ((CRITICAL, 3),)),
     ("multiline", 'def run(cursor, user):\n    cursor.execute(\n        query=f"SELECT {user}"\n    )\n', ((CRITICAL, 2),)),
     ("bound-query", 'def run(cursor, user):\n    cursor.execute(query="SELECT * FROM users WHERE name = %s", params=(user,))\n', ()),
@@ -247,6 +253,80 @@ class SQLSinkArguments(unittest.TestCase):
 @unittest.skipUnless((ROOT / 'ubs').is_file() and (ROOT / 'modules/ubs-python.sh').is_file(),
                      'real CLI requires a full source checkout')
 class SQLSinkArgumentsCLI(unittest.TestCase):
+    def test_real_cli_unresolved_import_aliases_are_partial(self):
+        artifacts = ROOT / 'test-suite/artifacts'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        run = Path(tempfile.mkdtemp(prefix='python-sql-alias-partial-', dir=artifacts))
+        cases = (
+            ('ambiguous-query', 'from pandas import read_sql as fetch\n'
+             'if configured:\n    fetch = replacement\n'
+             'def run(conn, user):\n    return fetch(f"SELECT {user}", conn)\n', []),
+            ('ambiguous-second-argument', 'from backend import execute as fetch\n'
+             'if configured:\n    fetch = replacement\n'
+             'def run(user):\n    return fetch("SELECT ?", (f"SELECT {user}",))\n', []),
+            ('retained-before-ambiguity', 'from backend import execute as fetch\n'
+             'def run(cursor, user):\n    cursor.execute(f"SELECT {user}")\n'
+             '    fetch(f"SELECT {user}")\n'
+             'if configured:\n    fetch = replacement\n', [3]),
+        )
+        detector_hash = hashlib.sha256(Path(detector.__file__).read_bytes()).hexdigest()
+        for name, source, expected_lines in cases:
+            for entry in ('module', 'runner'):
+                for fmt in ('json', 'sarif'):
+                    with self.subTest(case=name, entry=entry, format=fmt):
+                        folder = run / f'{name}-{entry}-{fmt}'
+                        folder.mkdir()
+                        path = folder / 'case.py'
+                        path.write_text(source, encoding='utf-8')
+                        for child in ('tmp', 'cache', 'data'):
+                            (folder / child).mkdir()
+                        env = {key: value for key, value in os.environ.items()
+                               if not key.startswith('UBS_')}
+                        env.update(TMPDIR=str(folder / 'tmp'), XDG_CACHE_HOME=str(folder / 'cache'),
+                                   XDG_DATA_HOME=str(folder / 'data'), NO_COLOR='1',
+                                   PYTHONDONTWRITEBYTECODE='1', UBS_NO_AUTO_UPDATE='1',
+                                   UBS_KEEP_TEMP='1', ENABLE_UV_TOOLS='0')
+                        executable = ROOT / ('ubs' if entry == 'runner' else 'modules/ubs-python.sh')
+                        command = ['bash', str(executable), '--ci', '--no-color', '--format=' + fmt,
+                                   '--skip=' + ','.join(str(n) for n in range(1, 24) if n != 7),
+                                   '--only=python' if entry == 'runner' else '--no-uv', str(path)]
+                        started = time.perf_counter()
+                        try:
+                            result = subprocess.run(command, cwd=folder, env=env, capture_output=True,
+                                                    text=True, timeout=120, check=False)
+                        except subprocess.TimeoutExpired as exc:
+                            (folder / 'stdout.log').write_bytes(exc.stdout or b'')
+                            (folder / 'stderr.log').write_bytes(exc.stderr or b'')
+                            self.fail(f'CLI timeout; complete evidence: {folder}')
+                        (folder / 'stdout.log').write_text(result.stdout, encoding='utf-8')
+                        (folder / 'stderr.log').write_text(result.stderr, encoding='utf-8')
+                        (folder / 'run.json').write_text(json.dumps({
+                            'command': command, 'returncode': result.returncode,
+                            'detector_sha256': detector_hash,
+                            'source_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                            'elapsed_seconds': time.perf_counter() - started,
+                        }, indent=2) + '\n', encoding='utf-8')
+                        self.assertEqual(result.returncode, 2, f'{folder}\n{result.stdout}\n{result.stderr}')
+                        document = json.loads(result.stdout)
+                        self.assertIn('SQLFlowLimit', result.stdout, folder)
+                        self.assertIn('aliased execution binding', result.stdout, folder)
+                        if fmt == 'json':
+                            self.assertEqual(document['status'], 'partial', folder)
+                            scanners = document['scanners'] if entry == 'runner' else [document]
+                            self.assertEqual(len(scanners), 1, folder)
+                            self.assertEqual(scanners[0]['status'], 'partial', folder)
+                            actual = [sample['line'] for group in scanners[0]['findings']
+                                      if group.get('rule_id', group.get('rule')) == CRITICAL
+                                      for sample in group['samples']]
+                        else:
+                            self.assertTrue(any(invocation.get('executionSuccessful') is False
+                                                for scan in document['runs']
+                                                for invocation in scan.get('invocations', [])), folder)
+                            actual = [finding['locations'][0]['physicalLocation']['region']['startLine']
+                                      for scan in document['runs'] for finding in scan.get('results', [])
+                                      if finding['ruleId'] == CRITICAL]
+                        self.assertEqual(actual, expected_lines, folder)
+
     def test_real_cli_json_and_sarif(self):
         artifacts = ROOT / 'test-suite/artifacts'
         artifacts.mkdir(parents=True, exist_ok=True)
@@ -256,7 +336,10 @@ class SQLSinkArgumentsCLI(unittest.TestCase):
                     'fromkeys-mixed-primitives', 'fromkeys-tuple-default',
                     'fromkeys-tuple-bound', 'fromkeys-nested-tuple',
                     'application-method-fields', 'application-method-field-sql',
-                    'local-raw-process-wrapper', 'local-raw-opaque-sql'}
+                    'local-raw-process-wrapper', 'local-raw-opaque-sql',
+                    'imported-sql-alias-positional', 'imported-sql-alias-keyword',
+                    'imported-sql-alias-bound-data', 'imported-sql-alias-unproven',
+                    'imported-sql-alias-local-copy', 'imported-sql-alias-parameter-shadow'}
         tools = {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
                  for name in ('ubs', 'modules/ubs-python.sh',
                               'modules/helpers/ubs_core/py_detectors/sql_injection.py')}
@@ -278,7 +361,7 @@ class SQLSinkArgumentsCLI(unittest.TestCase):
                                    UBS_NO_AUTO_UPDATE='1', UBS_KEEP_TEMP='1', ENABLE_UV_TOOLS='0',
                                    UBS_SKIP_CATEGORIES=','.join(str(n) for n in range(1, 24) if n != 7))
                         executable = ROOT / ('ubs' if entry == 'runner' else 'modules/ubs-python.sh')
-                        command = ['bash', str(executable), '--ci', '--no-color', f'--format={format_name}',
+                        command = ['bash', str(executable), '--ci', '--fail-on-warning', '--no-color', f'--format={format_name}',
                                    '--skip=' + env['UBS_SKIP_CATEGORIES']]
                         command += ['--only=python'] if entry == 'runner' else ['--no-uv']
                         command.append(str(path))

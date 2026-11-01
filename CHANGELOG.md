@@ -60,6 +60,16 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
   exported closures, mutated imports, and file/path protocol callbacks keep
   their findings or explicit incomplete-analysis result.
 
+- Python SQL flow preserves hash/equality callback boundaries when building
+  dictionaries and sets. Custom keys that can change captured SQL state now
+  produce explicit incomplete analysis instead of a clean result; findings
+  from eagerly evaluated keys and values remain visible. Proven immutable
+  primitive keys, including mixed tuple keys, retain complete analysis.
+- Closed process-log helpers remain independent when a separate function
+  contains unsafe SQL. Private log proofs check primitive stored values and
+  every direct, aliased and identity-wrapped call; opaque objects, finalizers,
+  exported callables and altered defaults cannot erase SQL effects.
+
 - Python's I/O-in-loop rule checks that a candidate call actually repeats.
   Comments, loop-like identifier text, one write around a generator argument,
   and proven buffered EOF drains no longer produce performance warnings.

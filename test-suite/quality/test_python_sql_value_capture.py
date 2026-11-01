@@ -909,6 +909,204 @@ class SQLValueCaptureTests(unittest.TestCase):
             with self.subTest(opaque=index), self.assertRaisesRegex(detector.SQLFlowLimit, 'list mutation.*incomplete'):
                 list(detector.find([path]))
 
+    def test_collection_key_callbacks_remain_incomplete(self):
+        unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
+        constructors = (
+            ('dict-display', '{Key(): None, Key(): None}'),
+            ('set-display', '{Key(), Key()}'),
+            ('dict-comprehension', '{Key(): None for item in [1, 2]}'),
+            ('set-comprehension', '{Key() for item in [1, 2]}'),
+            ('set-generator', 'set(Key() for item in [1, 2])'),
+            ('frozenset-generator', 'frozenset(Key() for item in [1, 2])'),
+            ('set-list', 'set([Key(), Key()])'),
+            ('frozenset-list', 'frozenset([Key(), Key()])'),
+            ('dict-pairs', 'dict([(Key(), None), (Key(), None)])'),
+            ('fromkeys-list', 'dict.fromkeys([Key(), Key()])'),
+            ('set-expanded', 'set(*[[Key(), Key()]])'),
+        )
+        for protocol in ('hash', 'equality'):
+            effect = '            nonlocal query\n' + f'            query = {unsafe}\n'
+            key_type = ('    class Key:\n        def __hash__(self):\n'
+                        + (effect if protocol == 'hash' else '') + '            return 0\n'
+                        + '        def __eq__(self, other):\n'
+                        + (effect if protocol == 'equality' else '') + '            return False\n')
+            for name, constructor in constructors:
+                case = 'collection-' + protocol + '-' + name
+                source = program('    query = "SELECT count(*) FROM users WHERE name = \'alice\'"\n'
+                                 + key_type + f'    mapping = {constructor}\n'
+                                 + '    return cursor.execute(query).fetchone()[0]\n')
+                with self.subTest(callback=protocol, constructor=name):
+                    self.assertEqual(sqlite_witness(self.artifacts, case, source)['rows'], 2)
+                    path = self.artifacts / (case + '.py')
+                    path.write_text(source, encoding='utf-8')
+                    with self.assertRaisesRegex(detector.SQLFlowLimit, 'collection key callbacks.*incomplete'):
+                        list(detector.find([path]))
+
+    def test_collection_primitive_keys_keep_sql_provenance(self):
+        key_type = ('    class Key:\n        def __hash__(self): return 0\n'
+                    '        def __eq__(self, other): return False\n')
+        constructors = (
+            '{None: 0, 1: 1, "name": 2}', '{None, 1, "name"}',
+            '{key: None for key in [1, None, "name"]}', '{key for key in [1, None, "name"]}',
+            '{("one", "two"): None}', '{(("one", "two"),): None}', '{(): None}',
+            '{("one", 1, None): None}', '{key: None for key in [("one", 1), 2, None]}',
+            '{frozenset(value for value in ("one", "two")): None}',
+            '{"name" if user else 1: None}',
+            'set([1, None, "name"])', 'frozenset([1, None, "name"])',
+            'set(key for key in [1, None, "name"])', 'frozenset(key for key in [1, None, "name"])',
+            'dict([("one", None), (2, None)])', 'dict.fromkeys([1, None, "name"])',
+            '{Key(): None for item in []}', '{Key() for item in []}',
+            '{Key(): None for item in [1] if False}', '{Key() for item in [1] if False}',
+        )
+        for index, constructor in enumerate(constructors):
+            for label, query, expected in (
+                    ('static', '"SELECT 1"', ()),
+                    ('unsafe', 'f"SELECT {user}"', ((CRITICAL, 6),))):
+                source = program(key_type + f'    mapping = {constructor}\n'
+                                 + f'    cursor.execute({query})\n')
+                with self.subTest(constructor=constructor, query=label):
+                    self.inspect(f'collection-primitive-{index}-{label}', source, expected)
+
+    def test_collection_callback_refusal_preserves_eager_findings(self):
+        constructors = (
+            '{Key(): None, "last": cursor.execute(f"SELECT {user}")}',
+            '{Key(), cursor.execute(f"SELECT {user}")}',
+            '{Key(): cursor.execute(f"SELECT {user}") for item in [1]}',
+            '{(cursor.execute(f"SELECT {user}"), Key())[1] for item in [1]}',
+        )
+        for index, constructor in enumerate(constructors):
+            source = program('    cursor.execute(f"SELECT {user}")\n'
+                             '    class Key:\n        def __hash__(self):\n            return 0\n'
+                             + f'    mapping = {constructor}\n')
+            path = self.artifacts / f'collection-eager-findings-{index}.py'
+            path.write_text(source, encoding='utf-8')
+            hits = []
+            with self.subTest(constructor=constructor):
+                with self.assertRaisesRegex(detector.SQLFlowLimit, 'collection key callbacks.*incomplete'):
+                    for hit in detector.find([path]):
+                        hits.append((hit[0], hit[2]))
+                self.assertEqual(sorted(hits), [(CRITICAL, 2), (CRITICAL, 6)])
+        # An independent runtime witness pins the insertion/evaluation order
+        # that decides which already-executed SQL calls must survive refusal.
+        for expression, expected in (
+                ('{Key(): None, "last": mark()}', ['value', 'hash']),
+                ('{Key(), mark()}', ['value', 'hash']),
+                ('{Key(): mark() for item in [1, 2]}', ['value', 'hash', 'value', 'hash'])):
+            events = []
+
+            class Key:
+                def __hash__(self):
+                    events.append('hash')
+                    return 0
+
+            def mark():
+                events.append('value')
+                return None
+
+            with self.subTest(runtime=expression):
+                eval(expression, {'Key': Key, 'mark': mark})
+                self.assertEqual(events, expected)
+
+    def test_collection_key_replacements_and_captured_values_remain_incomplete(self):
+        unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
+        for name, install in (
+                ('attribute', '    Key.__hash__ = poison\n'),
+                ('setter', '    setattr(Key, "__hash__", poison)\n'),
+                ('finite-setter', '    field = "__hash__"\n    setattr(Key, field, poison)\n')):
+            for label, key, rows in (('callback', 'Key()', 2), ('primitive', '"ordinary"', 1)):
+                source = ('query = "SELECT count(*) FROM users WHERE name = \'alice\'"\n'
+                          'class Key:\n    pass\n'
+                          'def poison(self):\n    global query\n'
+                          + f'    query = {unsafe}\n    return 0\n'
+                          + 'def run(cursor, params, user_input, rows):\n'
+                          + '    global user\n    user = user_input\n' + install
+                          + f'    mapping = {{{key}: None}}\n'
+                          + '    return cursor.execute(query).fetchone()[0]\n')
+                case = 'collection-replaced-' + name + '-' + label
+                with self.subTest(replacement=name, keys=label):
+                    self.assertEqual(sqlite_witness(self.artifacts, case, source)['rows'], rows)
+                    if label == 'primitive':
+                        self.inspect(case, source, ())
+                    else:
+                        path = self.artifacts / (case + '.py')
+                        path.write_text(source, encoding='utf-8')
+                        with self.assertRaisesRegex(detector.SQLFlowLimit, 'collection key callbacks.*incomplete'):
+                            list(detector.find([path]))
+        for name, constructor in (
+                ('captured-before-value', '{key: (key := "ordinary")}'),
+                ('nested-tuple', '{(key,): None}')):
+            source = program('    class Key:\n        def __hash__(self): return 0\n'
+                             '    key = Key()\n' + f'    mapping = {constructor}\n'
+                             '    cursor.execute("SELECT 1")\n')
+            path = self.artifacts / ('collection-key-' + name + '.py')
+            path.write_text(source, encoding='utf-8')
+            with self.subTest(key=name), self.assertRaisesRegex(
+                    detector.SQLFlowLimit, 'collection key callbacks.*incomplete'):
+                list(detector.find([path]))
+        source = program('    mapping = dict.fromkeys(key for key in rows)\n'
+                         '    cursor.execute("SELECT 1")\n')
+        path = self.artifacts / 'collection-opaque-fromkeys.py'
+        path.write_text(source, encoding='utf-8')
+        with self.assertRaisesRegex(detector.SQLFlowLimit, 'fromkeys key callbacks.*incomplete'):
+            list(detector.find([path]))
+
+    def test_collection_constructor_aliases_keep_primitive_controls(self):
+        for constructor, setup, callee in (
+                ('set', '    build = set\n', 'build'),
+                ('frozenset', '    build = frozenset\n', 'build'),
+                ('dict', '    build = dict\n', 'build'),
+                ('fromkeys-alias', '    build = dict.fromkeys\n', 'build'),
+                ('dict-alias-fromkeys', '    build = dict\n', 'build.fromkeys'),
+                ('builtin-fromkeys', '    import builtins\n', 'builtins.dict.fromkeys'),
+                ('builtin-fromkeys-alias', '    import builtins\n    build = builtins.dict.fromkeys\n', 'build')):
+            for label, key, rows in (('callback', 'Key()', 2), ('primitive', '"ordinary"', 1),
+                                    ('generator-callback', 'Key()', 2),
+                                    ('generator-primitive', '"ordinary"', 1)):
+                element = f'({key}, None)' if constructor == 'dict' else key
+                items = f'({element} for item in [1])' if label.startswith('generator-') else f'[{element}]'
+                source = program('    query = "SELECT count(*) FROM users WHERE name = \'alice\'"\n'
+                                 '    class Key:\n        def __hash__(self):\n            nonlocal query\n'
+                                 '            query = f"SELECT count(*) FROM users WHERE name = \'{user}\'"\n'
+                                 '            return 0\n' + setup
+                                 + f'    mapping = {callee}({items})\n'
+                                 + '    return cursor.execute(query).fetchone()[0]\n')
+                case = 'collection-alias-' + constructor + '-' + label
+                with self.subTest(constructor=constructor, keys=label):
+                    self.assertEqual(sqlite_witness(self.artifacts, case, source)['rows'], rows)
+                    if label == 'primitive':
+                        self.inspect(case, source, ())
+                    else:
+                        # Aliases have no generator key-shape transfer yet.
+                        # Even this runtime-safe primitive generator refuses
+                        # beside visible callbacks; eager primitives stay clean.
+                        path = self.artifacts / (case + '.py')
+                        path.write_text(source, encoding='utf-8')
+                        with self.assertRaisesRegex(detector.SQLFlowLimit, 'collection key callbacks.*incomplete'):
+                            list(detector.find([path]))
+
+    def test_collection_string_subclasses_keep_callback_boundary(self):
+        for name, key, rows in (('conversion', 'str(Label())', 2),
+                                ('lone-format', 'f"{Label()}"', 2),
+                                ('joined-format', 'f"prefix{Label()}"', 1)):
+            source = program('    query = "SELECT count(*) FROM users WHERE name = \'alice\'"\n'
+                             '    class Key(str):\n        def __hash__(self):\n            nonlocal query\n'
+                             '            query = f"SELECT count(*) FROM users WHERE name = \'{user}\'"\n'
+                             '            return 0\n'
+                             '    class Label:\n        def __str__(self): return Key("field")\n'
+                             '        def __format__(self, spec): return Key("field")\n'
+                             + f'    mapping = {{{key}: None}}\n'
+                             + '    return cursor.execute(query).fetchone()[0]\n')
+            case = 'collection-string-subclass-' + name
+            with self.subTest(string=name):
+                self.assertEqual(sqlite_witness(self.artifacts, case, source)['rows'], rows)
+                if rows == 1:
+                    self.inspect(case, source, ())
+                else:
+                    path = self.artifacts / (case + '.py')
+                    path.write_text(source, encoding='utf-8')
+                    with self.assertRaisesRegex(detector.SQLFlowLimit, 'collection key callbacks.*incomplete'):
+                        list(detector.find([path]))
+
     def test_fromkeys_captures_key_and_default_sql_separately(self):
         unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
         safe = '"SELECT count(*) FROM users WHERE name = \'alice\'"'
@@ -1294,6 +1492,155 @@ class SQLValueCaptureTests(unittest.TestCase):
                         'def fetch(\n    value=fetch(f"SELECT {user}")\n):\n    return 1\n', encoding='utf-8')
         with self.assertRaisesRegex(detector.SQLFlowLimit, 'aliased execution binding.*incomplete'):
             list(detector.find([path]))
+
+    def test_local_raw_process_log_keeps_complete_analysis(self):
+        for imported, process in (('import subprocess\n', 'subprocess.run'),
+                                  ('import subprocess as child\n', 'child.run'),
+                                  ('from subprocess import run as command\n', 'command')):
+            for name in ('raw', 'execute', 'real_git'):
+                source = (imported + 'def wrap(run):\n    return run\n'
+                          'def check(repo):\n    calls = []\n'
+                          '    def ' + name + '(*args):\n'
+                          '        calls.append(args)\n'
+                          '        return ' + process + '(["git", *args], cwd=repo, capture_output=True, text=True)\n'
+                          '    reads = [("rev-parse", "HEAD"), ("log", "-1")]\n'
+                          '    cached = wrap(' + name + ')\n'
+                          '    before = [cached(*args).stdout for args in reads]\n'
+                          '    calls.clear()\n'
+                          '    assert not any(args in reads for args in calls)\n'
+                          '    expected = [' + name + '(*args) for args in reads]\n'
+                          '    assert before == [result.stdout for result in expected]\n')
+                label = 'raw-process-' + process.replace('.', '-') + '-' + name
+                with self.subTest(process=process, local_name=name):
+                    self.inspect(label, source, ())
+                    self.inspect(label + '-next-to-db', source
+                                 + 'def unsafe(cursor, user):\n    cursor.execute(f"SELECT {user}")\n',
+                                 ((CRITICAL, len(source.splitlines()) + 2),))
+
+    def test_local_raw_callable_exports_keep_sql_findings(self):
+        prefix = ('from backend import configure, wrap as external_wrap\n'
+                  'def wrap(value):\n    return value\n'
+                  'def impure(value):\n    configure(value)\n    return value\n'
+                  'def raw(query):\n    return len(query)\n')
+        for name, export in (
+                ('direct', 'configure(raw)\n'),
+                ('alias', 'saved = raw\nconfigure(saved)\n'),
+                ('identity-alias', 'saved = wrap(raw)\nalias = saved\nconfigure(alias)\n'),
+                ('container', 'held = [raw]\nconfigure(held)\n'),
+                ('impure-wrapper', 'saved = impure(raw)\n'),
+                ('opaque-wrapper', 'saved = external_wrap(raw)\n'),
+                ('defaults-export', 'configure(raw.__defaults__)\n'),
+                ('keyword-defaults-write', 'raw.__kwdefaults__ = replacement\n')):
+            source = prefix + export + 'def run(user):\n    return raw(f"SELECT {user}")\n'
+            with self.subTest(export=name):
+                self.inspect('raw-function-export-' + name, source, ((CRITICAL, len(source.splitlines())),))
+        source = ('from backend import configure\n'
+                  'def forward(query):\n    return len(query)\n'
+                  'configure(forward)\n'
+                  'def raw(query):\n    return forward(query)\n'
+                  'def run(user):\n    return raw(f"SELECT {user}")\n')
+        self.inspect('raw-exported-forwarding-helper', source, ((CRITICAL, 8),))
+        witness = ('def raw(query):\n    return len(query)\n'
+                   'def database_query(query):\n    return db.execute(query)\n'
+                   'def run(cursor, params, user, rows):\n'
+                   '    global db\n    db = cursor\n'
+                   '    raw.__code__ = database_query.__code__\n'
+                   '    return raw(f"SELECT count(*) FROM users WHERE name = \'{user}\'").fetchone()[0]\n')
+        self.assertEqual(sqlite_witness(self.artifacts, 'raw-export-code-replacement', witness)['rows'], 2)
+
+    def test_local_raw_process_binding_and_callback_controls(self):
+        for name, prefix, body in (
+                ('module-export', 'import subprocess\nconfigure(subprocess)\n',
+                 '    return subprocess.run([query])\n'),
+                ('module-alias-export', 'import subprocess\nchild = subprocess\nconfigure(child)\n',
+                 '    return subprocess.run([query])\n'),
+                ('function-export', 'from subprocess import run as command\nconfigure(command)\n',
+                 '    return command([query])\n'),
+                ('run-replaced', 'import subprocess\nsubprocess.run = send\n',
+                 '    return subprocess.run([query])\n'),
+                ('constructor-replaced', 'import subprocess\nsubprocess.Popen = send\n',
+                 '    return subprocess.run([query])\n'),
+                ('preexec-callback', 'import subprocess\n',
+                 '    return subprocess.run([query], preexec_fn=callback)\n'),
+                ('opaque-options', 'import subprocess\n',
+                 '    return subprocess.run([query], **options)\n'),
+                ('starred-process', 'import subprocess\n',
+                 '    return subprocess.run(*query)\n'),
+                ('opaque-forwarder', 'from backend import send\n', '    return send(query)\n'),
+                ('django', '', '    return Model.objects.raw(query)\n')):
+            source = prefix + 'def raw(query):\n' + body + 'def run(user):\n    return raw(f"SELECT {user}")\n'
+            with self.subTest(boundary=name):
+                self.inspect('raw-process-boundary-' + name, source, ((CRITICAL, len(source.splitlines())),))
+        for name, signature, body, invocation in (
+                ('varargs', '*args', 'callback(*args)', 'raw(f"SELECT {user}")'),
+                ('kwargs', '**options', 'callback(**options)', 'raw(raw_query=f"SELECT {user}")'),
+                ('keyword-only', '*, raw_query', 'callback(raw_query)', 'raw(raw_query=f"SELECT {user}")'),
+                ('keyword-after-default', 'unused=None, *, raw_query', 'callback(raw_query)',
+                 'raw(raw_query=f"SELECT {user}")')):
+            source = 'def raw(' + signature + '):\n    return ' + body + '\ndef run(user):\n    ' + invocation + '\n'
+            self.inspect('raw-variadic-boundary-' + name, source, ((CRITICAL, 4),))
+
+    def test_local_raw_logs_do_not_certify_opaque_consumers(self):
+        prefix = ('def run(opaque, user):\n    calls = []\n'
+                  '    def raw(query):\n        calls.append(query)\n'
+                  '    raw(f"SELECT {user}")\n')
+        for name, consumer in (
+                ('membership', '    return any(query in opaque for query in calls)\n'),
+                ('equality', '    return any(query == opaque for query in calls)\n'),
+                ('literal-opaque', '    return any(query in [opaque] for query in calls)\n'),
+                ('export', '    opaque(calls)\n'),
+                ('alias-export', '    saved = calls\n    opaque(saved)\n'),
+                ('mutated-after-clear', '    calls.clear()\n    calls.append(f"SELECT {user}")\n'
+                 '    assert not any(query in opaque for query in calls)\n'),
+                ('intervening-call', '    calls.clear()\n    opaque()\n'
+                 '    assert not any(query in opaque for query in calls)\n'),
+                ('effect-before-read', '    calls.clear()\n'
+                 '    assert opaque() or not any(query in opaque for query in calls)\n')):
+            with self.subTest(consumer=name):
+                if name == 'mutated-after-clear':
+                    path = self.artifacts / ('raw-log-consumer-' + name + '.py')
+                    path.write_text(prefix + consumer, encoding='utf-8')
+                    findings = []
+                    with self.assertRaisesRegex(detector.SQLFlowLimit, 'list mutation aliasing.*incomplete'):
+                        findings.extend(detector.find([path]))
+                    self.assertEqual([(item[0], item[2]) for item in findings], [(CRITICAL, 5)])
+                else:
+                    self.inspect('raw-log-consumer-' + name, prefix + consumer, ((CRITICAL, 5),))
+
+    def test_local_raw_logs_require_primitive_owned_inputs(self):
+        for name, imported, initializer, argument in (
+                ('primitive', '', '[]', 'f"SELECT {user}"'),
+                ('opaque-box', 'from backend import box\n', '[]', 'box(f"SELECT {user}")'),
+                ('prepopulated', 'from backend import box\n', '[box("SELECT 1")]', 'f"SELECT {user}"'),
+                ('subclass', 'from backend import RecordingList\n', 'RecordingList()', 'f"SELECT {user}"'),
+                ('visible-finalizer', 'class Finalizer:\n'
+                 '    def __init__(self, query):\n        self.query = query\n'
+                 '    def __del__(self):\n        callback(self.query)\n',
+                 '[]', 'Finalizer(f"SELECT {user}")')):
+            source = (imported + 'def run(user):\n    calls = ' + initializer + '\n'
+                      '    def raw(query):\n        calls.append(query)\n'
+                      '    raw(' + argument + ')\n'
+                      '    calls.clear()\n    assert not any(query in [] for query in calls)\n')
+            with self.subTest(input=name):
+                self.inspect('raw-log-input-' + name, source,
+                             () if name == 'primitive' else ((CRITICAL, len(imported.splitlines()) + 5),))
+        for name, preparation in (
+                ('opaque-alias-argument', '    cached(box(f"SELECT {user}"))\n'),
+                ('mutated-iterable', '    reads.append(box(f"SELECT {user}"))\n'
+                 '    unused = [cached(*args) for args in reads]\n'),
+                ('escaped-iterable', '    configure(reads)\n'
+                 '    unused = [cached(*args) for args in reads]\n')):
+            source = ('from backend import box, configure\n'
+                      'def wrap(value):\n    return value\n'
+                      'def run(user):\n    calls = []\n'
+                      '    def raw(*args):\n        calls.append(args)\n'
+                      '    reads = [("SELECT 1",)]\n    cached = wrap(raw)\n' + preparation
+                      + '    raw(f"SELECT {user}")\n'
+                      '    calls.clear()\n    assert not any(query in reads for query in calls)\n')
+            path = self.artifacts / ('raw-log-alias-boundary-' + name + '.py')
+            path.write_text(source, encoding='utf-8')
+            with self.subTest(alias=name), self.assertRaisesRegex(detector.SQLFlowLimit, 'closure.*incomplete'):
+                list(detector.find([path]))
 
     def test_variadic_process_wrapper_matches_renamed_instrumentation(self):
         source = ('import subprocess\n\ndef wrap(run):\n    return run\n\n'

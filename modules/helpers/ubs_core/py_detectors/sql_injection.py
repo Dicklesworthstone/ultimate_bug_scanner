@@ -154,9 +154,11 @@ class SanitizerBindings:
         self._escaped_classes = {}
         self._forwarding_cache = {}
         self._closed_function_cache = {}
+        self._closed_function_calls = {}
         self._process_namespace_closed = None
         self._process_forwarders = set()
         self._instrumentation_lists = {}
+        self._instrumentation_forwarders = set()
         self._possible_sql_imports = {}
         self.independent_functions = self._independent_functions()
         for scope in self.owner_scopes.values():
@@ -214,6 +216,10 @@ class SanitizerBindings:
                 resolved = self.resolve(argument)
                 if resolved and resolved[0] == 'import':
                     self.escaped_imports.add(resolved[1])
+        # Resolve deferred-body relevance only after namespace and escape
+        # capabilities are known. A proven local raw helper must not abort
+        # analysis of an independent function that really executes SQL.
+        self.independent_functions = self._independent_functions(resolve_calls=True)
 
     def attribute_name_options(self, node, seen=frozenset()):
         """Finite literal names on normal completion, never an arbitrary getter.
@@ -297,7 +303,7 @@ class SanitizerBindings:
                         or self.selector_has_opaque_effects(assignment.value, seen | {node}))
         return bool(self.key_callbacks)
 
-    def _independent_functions(self):
+    def _independent_functions(self, *, resolve_calls=False):
         """Deferred, unreferenced module helpers cannot affect an in-file sink.
 
         Keep any nested SQL spelling, namespace access, mutation of outer
@@ -314,13 +320,16 @@ class SanitizerBindings:
                     or len(scope['parent']['names'].get(function.name, ())) != 1
                     or function in self.local_sql_effects()):
                 continue
+            if resolve_calls and function in self.independent_functions:
+                independent.add(function)
+                continue
             relevant = False
             for statement in function.body:
                 for node in ast.walk(statement):
                     self.budget[0] -= 1
                     if self.budget[0] < 0:
                         raise SQLFlowLimit('SQL relevance budget exceeded; analysis is incomplete')
-                    if (isinstance(node, ast.Call) and sql_sink_name(node)
+                    if (isinstance(node, ast.Call) and sql_sink_name(node, self if resolve_calls else None)
                             or isinstance(node, (ast.Global, ast.Nonlocal))
                             or isinstance(node, ast.Name) and node.id in {
                                 '__builtins__', '__import__', 'globals', 'locals', 'vars', 'exec', 'eval'}):
@@ -711,7 +720,7 @@ class SanitizerBindings:
         owner = self.owner_scopes[function]['parent']
         if owner is None or isinstance(owner['node'], ast.ClassDef):
             return False  # a class attribute needs its owner's separate escape proof
-        pending, seen = [(owner, function.name)], set()
+        pending, seen, calls = [(owner, function.name)], set(), set()
         while pending:
             scope, name = pending.pop()
             key = scope['node'], name
@@ -746,6 +755,7 @@ class SanitizerBindings:
                         return False
                     value, parent = parent, self.parents.get(parent)
                 if isinstance(parent, ast.Call) and parent.func is value:
+                    calls.add(parent)
                     continue
                 if (isinstance(parent, (ast.Assign, ast.AnnAssign)) and parent.value is value
                         and self.parents.get(parent) is self.scope_of[parent]['node']):
@@ -755,6 +765,7 @@ class SanitizerBindings:
                         continue
                 return False
         self._closed_function_cache[function] = True
+        self._closed_function_calls[function] = frozenset(calls)
         return True
 
     def process_call(self, call, target):
@@ -797,7 +808,7 @@ class SanitizerBindings:
             self._process_namespace_closed = closed
         return self._process_namespace_closed
 
-    def primitive_process_argument(self, value, seen=frozenset(), *, immutable=False):
+    def primitive_process_argument(self, value, seen=frozenset(), *, immutable=False, parameters=frozenset()):
         """Reject path/file protocol objects at a process wrapper's call site."""
         self.budget[0] -= 1
         if self.budget[0] < 0:
@@ -810,18 +821,24 @@ class SanitizerBindings:
         if isinstance(value, (ast.Tuple, ast.List)):
             if immutable and isinstance(value, ast.List):
                 return False
-            return all(self.primitive_process_argument(item, seen, immutable=True) for item in value.elts)
+            return all(self.primitive_process_argument(item, seen, immutable=True, parameters=parameters)
+                       for item in value.elts)
         if isinstance(value, ast.Starred):
-            return self.primitive_process_argument(value.value, seen)
+            return self.primitive_process_argument(value.value, seen, parameters=parameters)
         if isinstance(value, ast.JoinedStr):
             return (len(value.values) != 1 or isinstance(value.values[0], ast.Constant)
                     or isinstance(value.values[0], ast.FormattedValue)
-                    and self.primitive_process_argument(value.values[0].value, seen))
+                    and self.primitive_process_argument(value.values[0].value, seen, parameters=parameters))
         if not isinstance(value, ast.Name):
             return False
         scope = self.lexical_owner(value)
         if scope is None or len(scope['names'].get(value.id, ())) != 1:
             return False
+        if (scope['node'], value.id) in parameters:
+            # This hypothesis is used only for a closed log writer. Every
+            # direct/alias/identity invocation must independently prove its
+            # actual inputs primitive before the certificate is accepted.
+            return True
         assignment = self.literal_assignments.get((scope['node'], value.id))
         if assignment is not None:
             if assignment.lineno >= value.lineno:
@@ -850,12 +867,44 @@ class SanitizerBindings:
                             and parent.comparators == [reference]):
                         continue
                     return False
-            return self.primitive_process_argument(assignment.value, seen, immutable=immutable)
+            return self.primitive_process_argument(assignment.value, seen, immutable=immutable, parameters=parameters)
         if isinstance(scope['node'], (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
             for generator in scope['node'].generators:
                 if value.id in binding_target_names(generator.target) and not generator.is_async:
-                    return self.primitive_process_argument(generator.iter, seen)
+                    return self.primitive_process_argument(generator.iter, seen, parameters=parameters)
         return False
+
+    def primitive_instrumentation_writer(self, call, function, roots):
+        """An emptied log cannot release opaque objects or forward SQL text."""
+        scope = self.lexical_owner(call.func.value)
+        if (scope is None or not isinstance(scope['node'], ast.FunctionDef)
+                or self.owner_scopes[function]['parent'] is not scope):
+            return False
+        parameters = frozenset((function, name) for name in roots
+                               if function.args.kwarg is None or name != function.args.kwarg.arg)
+        for reference in self.name_loads.get(call.func.value.id, ()):
+            if self.lexical_owner(reference) is not scope:
+                continue
+            member = self.parents.get(reference)
+            use = self.parents.get(member)
+            if (isinstance(member, ast.Attribute) and member.attr == 'append'
+                    and isinstance(use, ast.Call) and use.func is member):
+                if (self.scope_of[use] is not self.owner_scopes[function]
+                        or not self.primitive_process_argument(use.args[0], immutable=True, parameters=parameters)):
+                    # Another writer, an opaque conversion, or a deferred
+                    # append has no primitive-content ownership proof here.
+                    return False
+        return True
+
+    def primitive_instrumentation_calls(self, function, call):
+        defaults = [*function.args.defaults, *(value for value in function.args.kw_defaults if value is not None)]
+        if not all(self.primitive_process_argument(value, immutable=True) for value in defaults):
+            return False
+        calls = self._closed_function_calls.get(function, frozenset()) | {call}
+        return all(all(self.primitive_process_argument(value.value) if isinstance(value, ast.Starred)
+                       else self.primitive_process_argument(value, immutable=True) for value in invocation.args)
+                   and all(keyword.arg is not None and self.primitive_process_argument(keyword.value, immutable=True)
+                           for keyword in invocation.keywords) for invocation in calls)
 
     def cleared_list_iteration(self, reference, scope):
         """A direct builtin predicate sees the list just unconditionally cleared."""
@@ -951,7 +1000,8 @@ class SanitizerBindings:
             return self._forwarding_cache[cache_key]
         parameters = _positional_parameters(function)[1 if bound else 0:]
         roots = set(parameters[:1])
-        if not roots and function.args.vararg:
+        roots.update(argument.arg for argument in function.args.kwonlyargs)
+        if function.args.vararg:
             roots.add(function.args.vararg.arg)
         if function.args.kwarg:
             roots.add(function.args.kwarg.arg)
@@ -1059,10 +1109,16 @@ class SanitizerBindings:
                 if self.process_call(call, target):
                     self._process_forwarders.add(function)
                     continue
-                if self.instrumentation_append(call):
+                if (current is function and self.instrumentation_append(call)
+                        and self.primitive_instrumentation_writer(call, function, roots)):
+                    self._instrumentation_forwarders.add(function)
                     continue
                 if target and target[0] == 'function':
                     if target[1].args.vararg or target[1].args.kwarg:
+                        return True
+                    owner = self.owner_scopes[target[1]]['parent']
+                    if (owner is None or (self.class_escapes(owner['node'])
+                            if isinstance(owner['node'], ast.ClassDef) else not self.closed_local_callable(target[1]))):
                         return True
                     params = _positional_parameters(target[1])[1 if target[2] else 0:]
                     selected = {params[index] for index in positional if index < len(params)}
@@ -1093,7 +1149,7 @@ class SanitizerBindings:
 
     def non_database_callable(self, call):
         if (self.dynamic_namespace or self.builtin_namespace or self.reflective_member_writes
-                or {'__code__', '__globals__'} & self.member_writes):
+                or {'__code__', '__globals__', '__defaults__', '__kwdefaults__'} & self.member_writes):
             return False
         target = self.resolve(call.func)
         if not target or target[0] != 'function':
@@ -1108,6 +1164,9 @@ class SanitizerBindings:
         elif target[1].decorator_list or not self.closed_local_callable(target[1]):
             return False
         if target[1] in self.local_sql_effects() or self.forwards_to_unknown(target[1], target[2]):
+            return False
+        if (target[1] in self._instrumentation_forwarders
+                and not self.primitive_instrumentation_calls(target[1], call)):
             return False
         if target[1] in self._process_forwarders:
             return all(self.primitive_process_argument(value) for value in
@@ -1321,6 +1380,8 @@ class SanitizerBindings:
             return None
         if parent[0] == 'import':
             return ('import', parent[1] + '.' + node.attr)
+        if parent == ('unbound', 'dict') and node.attr == 'fromkeys':
+            return ('unbound', 'dict.fromkeys')
         if parent[0] in {'class', 'receiver'}:
             owner = parent[1]
             if owner.decorator_list or owner.bases or owner.keywords:
@@ -2787,13 +2848,108 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         if any(reference is not None for reference in references) and len(references) > 1:
             raise SQLFlowLimit('SQL numeric list conditional alias is unresolved; analysis is incomplete')
 
+    def has_collection_key_callbacks(self):
+        """Visible hashing/equality code cannot be discarded as an exception.
+
+        This extends the existing in-file effect boundary, not a heap proof
+        for arbitrary imported objects or opaque returns. The stricter
+        dict.fromkeys generator guard remains independent of this check.
+        """
+        cache = self._ownership_syntax
+        if 'collection_key_callbacks' not in cache:
+            bindings = self.ownership_bindings()
+            protocols = {'__hash__', '__eq__'}
+            visible = bool(protocols & bindings.member_writes)
+            for function in bindings.key_callbacks:
+                self.step()
+                visible |= function.name in protocols
+            if not visible:
+                for call in bindings.calls:
+                    self.step()
+                    if (call_name(call.func).rsplit('.', 1)[-1]
+                            in {'setattr', 'delattr', '__setattr__', '__delattr__'}
+                            and any(protocols & (bindings.attribute_name_options(argument) or frozenset())
+                                    for argument in call.args[:2])):
+                        visible = True
+                        break
+            cache['collection_key_callbacks'] = visible
+        return cache['collection_key_callbacks']
+
+    def check_collection_keys(self, values):
+        if not self.has_collection_key_callbacks():
+            return
+        for facts in values:
+            self.step()
+            kind, element = self.fact_kinds(facts)
+            shape = element if kind == 'frozenset' else self.element_shape((kind, element))
+            if not self.hash_safe_shape(shape):
+                raise SQLFlowLimit('SQL collection key callbacks are unresolved; analysis is incomplete')
+
+    def collection_key_facts(self, value, *, mapping=False):
+        """Captured keys of literal inputs; unknown objects keep no proof."""
+        self.step()
+        if isinstance(value, ast.Dict):
+            return [facts for key, item in zip(value.keys, value.values)
+                    for facts in (self.collection_key_facts(item, mapping=True) if key is None
+                                  else [self.value_facts(key)])]
+        if isinstance(value, (ast.List, ast.Tuple, ast.Set)):
+            keys = []
+            for item in value.elts:
+                self.step()
+                if isinstance(item, ast.Starred):
+                    keys.extend(self.collection_key_facts(item.value, mapping=mapping))
+                elif mapping:
+                    if isinstance(item, (ast.List, ast.Tuple)) and len(item.elts) == 2:
+                        keys.append(self.value_facts(item.elts[0]))
+                    else:
+                        keys.append((None, None, None, False, 'unknown'))
+                else:
+                    keys.append(self.value_facts(item))
+            return keys
+        if mapping:
+            return [(None, None, None, False, 'unknown')]
+        return [self.iteration_facts(value)]
+
+    def check_collection_constructor(self, node):
+        if not self.has_collection_key_callbacks():
+            return
+        target = self.ownership_bindings().resolve(node.func)
+        name = (target[1] if target and target[0] == 'unbound' else
+                target[1].removeprefix('builtins.') if target and target[0] == 'import'
+                and target[1].startswith('builtins.') else '')
+        fromkeys = (name == 'dict.fromkeys' or
+                    isinstance(node.func, ast.Attribute) and node.func.attr == 'fromkeys'
+                    and isinstance(node.func.value, ast.Name) and node.func.value.id == 'dict'
+                    and self.builtin_is_unshadowed('dict'))
+        if name not in {'dict', 'set', 'frozenset'} and not fromkeys:
+            return
+        if any(isinstance(argument, ast.Starred) for argument in node.args):
+            self.check_collection_keys([(None, None, None, False, 'unknown')])
+        if node.args and not isinstance(node.args[0], ast.Starred):
+            self.check_collection_keys(self.collection_key_facts(
+                node.args[0], mapping=name == 'dict'))
+        for keyword in node.keywords:
+            if keyword.arg is None:
+                self.check_collection_keys(self.collection_key_facts(keyword.value, mapping=True))
+
     def visit_Dict(self, node):
         # ast.iter_child_nodes lists all keys before all values. Python
         # instead evaluates each key immediately before its associated value.
+        keys = []
         for key, value in zip(node.keys, node.values):
             if key is not None:
                 self.visit(key)
+                keys.append(self.value_facts(key))
+            else:
+                # A ** expansion follows insertion of the preceding block.
+                self.check_collection_keys(keys)
+                keys = []
             self.visit(value)
+            if key is None and self.has_collection_key_callbacks():
+                self.check_collection_keys(self.collection_key_facts(value, mapping=True))
+        # Plain display expressions all run before BUILD_MAP hashes keys.
+        # Keep their known SQL findings before refusing callback effects.
+        self.check_collection_keys(keys)
         self.escape_lists([node])
 
     def visit_List(self, node):
@@ -2805,6 +2961,8 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
 
     def visit_Set(self, node):
         self.generic_visit(node)
+        if self.has_collection_key_callbacks():
+            self.check_collection_keys(self.collection_key_facts(node))
         self.escape_lists(node.elts)
 
     @staticmethod
@@ -2828,7 +2986,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                         part.pop(name, None)
         return restored
 
-    def visit_ListComp(self, node, *, captured=None, consumer_can_raise=False):
+    def visit_ListComp(self, node, *, captured=None, consumer_can_raise=False, hash_keys=False):
         """Evaluate eager comprehensions in loop/filter order and local scope.
 
         Literal lists/tuples have exact iteration counts. Dynamic iterables
@@ -2864,6 +3022,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 value = self.value_facts(node.value)
                 combined = self.join_value_facts(key, value)
                 facts = (combined[0], combined[1], value[1], combined[3], combined[4])
+                self.check_collection_keys([key])
                 # Hashing a nonliteral key may raise during insertion.
                 if not isinstance(node.key, ast.Constant):
                     self.note_possible_raise()
@@ -2871,6 +3030,8 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 self.visit(node.elt)
                 self.retire_numeric_arguments([node.elt])
                 facts = self.value_facts(node.elt)
+                if isinstance(node, ast.SetComp) or hash_keys:
+                    self.check_collection_keys([facts])
                 if isinstance(node, ast.SetComp) and not isinstance(node.elt, ast.Constant):
                     self.note_possible_raise()
             if consumer_can_raise:
@@ -3012,7 +3173,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                          if child in self._evaluated_values})
         return not any(node in self.generator_refs(facts) for captured in captures for facts in captured.values())
 
-    def materialize_generators(self, references, *, consumer_can_raise=False):
+    def materialize_generators(self, references, *, consumer_can_raise=False, hash_keys=False):
         """Fully consume selected same-scope generators using the eager engine.
 
         Generator identity and completion are stateful, whereas projected
@@ -3043,7 +3204,8 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 elif phase == 'fresh':
                     self._generator_running.add(identity)
                     try:
-                        self.visit_ListComp(identity, captured=captured, consumer_can_raise=consumer_can_raise)
+                        self.visit_ListComp(identity, captured=captured, consumer_can_raise=consumer_can_raise,
+                                            hash_keys=hash_keys)
                         value = self.value_facts(identity)
                         if self.generator_refs(value):
                             raise SQLFlowLimit('SQL generator-valued projection is unsupported; analysis is incomplete')
@@ -3144,7 +3306,8 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 refs = arguments[0][1]
                 if name in {'list', 'tuple', 'set', 'frozenset', 'sorted', 'min', 'max', 'sum'}:
                     facts = self.materialize_generators(
-                        refs, consumer_can_raise=name not in {'list', 'tuple'})
+                        refs, consumer_can_raise=name not in {'list', 'tuple'},
+                        hash_keys=name in {'set', 'frozenset'})
                     if name in {'list', 'tuple', 'set', 'frozenset', 'sorted'}:
                         facts = self.with_kinds(facts, 'list' if name == 'sorted' else name,
                                                 self.fact_kinds(facts)[0])
@@ -3211,6 +3374,10 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             return True
         references = receiver | frozenset().union(*(refs for _, refs in arguments))
         if all(identity is not None and not self.generator_has_sql_effects(identity) for identity in references):
+            # Known hash consumers can dispatch key callbacks even when the
+            # generator itself has no SQL effects. Aliases keep this opaque
+            # cursor boundary; the direct modeled consumers above are unchanged.
+            self.check_collection_constructor(node)
             # An opaque consumer of a read-only, non-SQL generator cannot
             # change a tracked SQL binding. Do not turn routine any()/sum()
             # idioms into file-wide failures. Its cursor is now unknown:
@@ -4755,6 +4922,8 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                     self.sealed_list_captures(target[1], allow_empty=True)
             handled = (list_plan is not None and self.local_list_effect_call(node, list_plan)
                        or self.sealed_closure_call(node) or self.generator_call(node) or joined is not None)
+            if not handled:
+                self.check_collection_constructor(node)
             if (self._consumer_calls or self._closure_worklist) and not handled and not is_sink and not copying_builtin and not known_builtin:
                 receiver = node.func.value if isinstance(node.func, ast.Attribute) else None
                 intrinsic_view = (receiver is not None and self.value_kind(receiver)[0] == 'dict'

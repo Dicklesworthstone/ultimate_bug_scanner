@@ -95,7 +95,9 @@ say "Self-scan gate: ./ubs . --ci --fail-on-warning"
 ubs_tmpdir="${TMPDIR:-/tmp}"
 ubs_tmpdir="${ubs_tmpdir%/}"
 self_scan_log="$(mktemp "$ubs_tmpdir/ubs-self-scan.XXXXXX")"
-if ! ./ubs . --ci --fail-on-warning >"$self_scan_log" 2>&1; then
+# Release safety is stricter than developer exit-code escape hatches: also
+# require complete, nonempty machine-readable results from every scanner.
+if ! python3 scripts/check_self_scan.py >"$self_scan_log" 2>&1; then
   echo "error: the UBS self-scan is red; refusing to cut $TAG" >&2
   echo "  reproduce with: ./ubs . --ci --fail-on-warning" >&2
   echo "  full log: $self_scan_log" >&2

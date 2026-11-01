@@ -27,6 +27,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Fixed
 
+- Python SQL builder wrappers retain unresolved return dependencies through
+  assignments, branches and containers. Visiting a helper no longer certifies
+  an unsupported inner query result. A separate closed string-shape proof
+  keeps ordinary length operations clean while preserving callback checks
+  and explicit incomplete analysis for unresolved SQL forwarding.
+
 - Python SQL flow retains queries built inside invoked local execution facades,
   including helper returns and captured templates. Unresolved forwarding and
   SQL-bearing heap or closure writes remain explicitly incomplete, while

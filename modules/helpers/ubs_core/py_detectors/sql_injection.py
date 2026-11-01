@@ -1976,6 +1976,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         self._consumer_calls = frozenset()
         self._facade_calls = frozenset()
         self._facade_results = set()
+        self._facade_return_complete = None
         self._list_effect_active = False
         self._list_effect_parameters = (None, frozenset())
         self._consumer_stable = {}
@@ -2750,6 +2751,14 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         if node.value is not None:
             self.visit(node.value)
         if self._return_slot is not None:
+            if (self._facade_return_complete is not None and node.value is not None
+                    and self.value_facts(node.value)[4] != 'static'
+                    and self.unresolved_facade_return(node.value)):
+                # Visiting a wrapper is not a completed projection of an
+                # unsupported inner result. Keep that returned dependency
+                # visible to its eventual consumer, including through a
+                # branch, local assignment or returned container.
+                self._facade_return_complete = False
             self.bind_value_facts([self._return_slot], self.value_facts(node.value) if node.value is not None
                                   else (None, None, None, False, 'static'))
         return {'return': self.sql_state()}
@@ -5311,6 +5320,10 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                   or statement.value is None
                   or not all(isinstance(value, ast.Name) for value in
                              (statement.targets if isinstance(statement, ast.Assign) else [statement.target]))):
+                if self.facade_string_return(function):
+                    # Exact string shape permits ordinary len/string uses,
+                    # but carries no SQL provenance or effect certificate.
+                    self._evaluated_values[call] = self.with_kinds(self.value_facts(call), 'str', 'str')
                 return False
         if not has_return:
             return False
@@ -5376,6 +5389,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         probe.func_stack = [node for node in probe._generator_scope if isinstance(node, ast.FunctionDef)]
         probe._comprehension_locals.clear()
         probe._facade_calls = self._facade_calls | {function}
+        probe._facade_return_complete = True
         probe._return_slot = '\0sql_return'
         for name, value in facts.items():
             probe.bind_value_facts([name], value)
@@ -5397,8 +5411,65 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         if any(self.generator_refs(value) for value in returned):
             raise SQLFlowLimit('SQL facade return cursor is unresolved; analysis is incomplete')
         self._evaluated_values[call] = self.join_value_facts(*returned)
-        self._facade_results.add(call)
+        if probe._facade_return_complete:
+            self._facade_results.add(call)
         return True
+
+    def facade_string_return(self, function):
+        """Exact local string writes can establish shape without text flow.
+
+        This is only called after the closed callable/namespace checks. A
+        loop can prevent bounded return projection while all its successful
+        returns still have builtin string type. Unknown assignments, class
+        instances, parameters and indirect cell writes retain no proof.
+        """
+        cache = self._ownership_syntax.setdefault('facade_string_returns', {})
+        if function in cache:
+            return cache[function]
+        bindings = self.ownership_bindings()
+        writes, returns, pending = {}, [], list(function.body)
+        while pending:
+            self.step()
+            node = pending.pop()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                continue
+            if isinstance(node, (ast.Yield, ast.YieldFrom, ast.Await)):
+                cache[function] = False
+                return False
+            if isinstance(node, ast.Return):
+                returns.append(node.value)
+            if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                parent = bindings.parents.get(node)
+                value = parent.value if isinstance(parent, (ast.Assign, ast.AnnAssign, ast.NamedExpr)) else None
+                writes.setdefault(node.id, []).append(value)
+            pending.extend(ast.iter_child_nodes(node))
+
+        def exact_string(node, seen=frozenset()):
+            self.step()
+            if isinstance(node, ast.Constant):
+                return isinstance(node.value, str)
+            if isinstance(node, ast.JoinedStr):
+                return len(node.values) > 1 or bool(node.values and isinstance(node.values[0], ast.Constant))
+            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+                return exact_string(node.left, seen) and exact_string(node.right, seen)
+            if isinstance(node, ast.IfExp):
+                return exact_string(node.body, seen) and exact_string(node.orelse, seen)
+            if (not isinstance(node, ast.Name) or node.id in seen
+                    or node.id in bindings.indirect_rebindings
+                    or node.id in _all_parameters(function)):
+                return False
+            owner = bindings.lexical_owner(node)
+            values = writes.get(node.id, ())
+            return (owner is not None and owner['node'] is function and bool(values)
+                    and len(values) == len(owner['names'].get(node.id, ()))
+                    and all(exact_string(value, seen | {node.id}) for value in values))
+
+        # Falling off the body returns None; require an explicit final return
+        # rather than treating an arbitrary loop/branch as total execution.
+        result = bool(function.body and isinstance(function.body[-1], ast.Return)
+                      and returns and all(exact_string(value) for value in returns))
+        cache[function] = result
+        return result
 
     def primitive_facade_call(self, call):
         """Prove a few ordinary operations on exact builtin values."""

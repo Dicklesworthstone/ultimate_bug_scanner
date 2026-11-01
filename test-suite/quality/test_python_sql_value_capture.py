@@ -1734,6 +1734,64 @@ class SQLValueCaptureTests(unittest.TestCase):
                     detector.SQLFlowLimit, 'facade forwarding call.*incomplete'):
                 list(detector.find([path]))
 
+    def test_sql_facade_builder_completion_keeps_unresolved_return_dependencies(self):
+        prefix = ('from backend import dispatch\ndef inner(value):\n'
+                  '    query = "SELECT 1"\n    for item in (value,):\n'
+                  '        query = f"SELECT {item}"\n    return query\n')
+        for name, helpers, body in (
+                ('direct', '', '    return inner(value)\n'),
+                ('assigned', '', '    query = inner(value)\n    return query\n'),
+                ('chain', 'def relay(value):\n    return inner(value)\n',
+                 '    return relay(value)\n'),
+                ('tuple', '', '    return (inner(value),)\n'),
+                ('mapping', '', '    return {"query": inner(value)}\n'),
+                ('branch', '', '    if value:\n        return inner(value)\n    return "SELECT 1"\n'),
+                ('conditional', '', '    return inner(value) if value else "SELECT 1"\n'),
+                ('formatted', '', '    return f"{inner(value)}"\n'),
+                ('opaque-effect-before-fixed-return', '',
+                 '    ignored = dispatch(inner(value))\n    return "SELECT 1"\n')):
+            source = (prefix + helpers + 'def outer(value):\n' + body
+                      + 'def raw(value):\n    return dispatch(outer(value))\n'
+                      + 'def run(user):\n    return raw(user)\n')
+            path = self.artifacts / ('facade-return-dependency-' + name + '.py')
+            path.write_text(source, encoding='utf-8')
+            with self.subTest(wrapper=name), self.assertRaisesRegex(
+                    detector.SQLFlowLimit, 'facade forwarding call.*incomplete'):
+                list(detector.find([path]))
+
+        # Successful primitive length is not permission to accept an
+        # arbitrary object's __len__ callback or a string subclass result.
+        source = ('from backend import dispatch\nclass Query(str):\n'
+                  '    def __len__(self):\n        dispatch(self)\n        return 0\n'
+                  'def inner(value):\n    query = "SELECT 1"\n    for item in (value,):\n'
+                  '        query = Query(f"SELECT {item}")\n    return query\n'
+                  'def outer(value):\n    return inner(value)\n'
+                  'def raw(value):\n    return len(outer(value))\n'
+                  'def run(user):\n    return raw(user)\n')
+        path = self.artifacts / 'facade-return-custom-length.py'
+        path.write_text(source, encoding='utf-8')
+        with self.assertRaisesRegex(detector.SQLFlowLimit, 'facade forwarding call.*incomplete'):
+            list(detector.find([path]))
+
+    def test_sql_facade_builder_completion_preserves_fixed_and_primitive_results(self):
+        for name, builder, body, consumer in (
+                ('length-consumer', 'f"SELECT {item}"', '    return inner(value)\n', 'len(outer(value))'),
+                ('numeric-return', 'f"SELECT {item}"', '    return len(inner(value))\n', 'dispatch(outer(value))'),
+                ('fixed-return', 'f"SELECT {item}"',
+                 '    ignored = inner(value)\n    return "SELECT 1"\n', 'dispatch(outer(value))'),
+                ('fixed-overwrite', 'f"SELECT {item}"',
+                 '    query = inner(value)\n    query = "SELECT 1"\n    return query\n', 'dispatch(outer(value))'),
+                ('constant-number', 'f"SELECT {item}"',
+                 '    ignored = inner(value)\n    return 7\n', 'dispatch(outer(value))'),
+                ('non-sql-return', 'f"Processed {item}"', '    return inner(value)\n', 'dispatch(outer(value))')):
+            source = ('from backend import dispatch\ndef inner(value):\n'
+                      '    query = "fixed"\n    for item in (value,):\n        query = ' + builder
+                      + '\n    return query\ndef outer(value):\n' + body
+                      + 'def raw(value):\n    return ' + consumer
+                      + '\ndef run(user):\n    return raw(user)\n')
+            with self.subTest(control=name):
+                self.inspect('facade-return-control-' + name, source, ())
+
     def test_sql_facade_heap_and_cell_effects_remain_explicit(self):
         for name, body in (
                 ('attribute', '    record.query = f"SELECT {value}"\n    return dispatch(record.query)\n'),

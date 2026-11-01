@@ -35,6 +35,16 @@ from ubs_core.py_detectors import sql_injection as detector
 CRITICAL = "py.security.sql-injection"
 WARNING = "py.security.sql-injection-unproven"
 
+NESTED_LOOP_BUILDER = (
+    'def inner(value):\n'
+    '    query = "SELECT 1"\n'
+    '    for item in (value,):\n'
+    '        query = f"SELECT {item}"\n'
+    '    return query\n'
+    'def outer(value):\n'
+    '    return inner(value)\n'
+)
+
 RAW_PROCESS_WRAPPER = textwrap.dedent('''\
     import subprocess
     def wrap(run):
@@ -92,6 +102,7 @@ CASES = (
     ("imported-sql-alias-local-copy", 'from pandas import read_sql as load_rows\ndef run(conn, user):\n    fetch = load_rows\n    return fetch(sql=f"SELECT {user}", con=conn)\n', ((CRITICAL, 4),)),
     ("imported-sql-alias-parameter-shadow", 'from pandas import read_sql as load_rows\ndef format_note(load_rows, user):\n    return load_rows(f"SELECT {user}")\n', ()),
     ("application-sql-builder-length", 'def make(value):\n    return f"SELECT {value}"\ndef execute(value):\n    return len(make(value))\ndef run(user):\n    return execute(user)\n', ()),
+    ("nested-sql-builder-length", NESTED_LOOP_BUILDER + 'def raw(value):\n    return len(outer(value))\ndef run(user):\n    return raw(user)\n', ()),
     ("keyword-alias", 'def run(cursor, user):\n    query = f"SELECT {user}"\n    cursor.execute(query=query)\n', ((CRITICAL, 3),)),
     ("multiline", 'def run(cursor, user):\n    cursor.execute(\n        query=f"SELECT {user}"\n    )\n', ((CRITICAL, 2),)),
     ("bound-query", 'def run(cursor, user):\n    cursor.execute(query="SELECT * FROM users WHERE name = %s", params=(user,))\n', ()),
@@ -276,6 +287,9 @@ class SQLSinkArgumentsCLI(unittest.TestCase):
              'def make(value):\n    return f"SELECT {value}"\n'
              'def raw(value):\n    return dispatch(make(value))\n'
              'def run(user):\n    return raw(user)\n', [], 'facade forwarding call'),
+            ('opaque-nested-loop-return', 'from backend import dispatch\n' + NESTED_LOOP_BUILDER
+             + 'def raw(value):\n    return dispatch(outer(value))\n'
+             'def run(user):\n    return raw(user)\n', [], 'facade forwarding call'),
             ('opaque-captured-template', 'from backend import dispatch\nTEMPLATE = "SELECT {}"\n'
              'def raw(value):\n    return dispatch(TEMPLATE.format(value))\n'
              'def run(user):\n    return raw(user)\n', [], 'facade forwarding call'),
@@ -356,6 +370,7 @@ class SQLSinkArgumentsCLI(unittest.TestCase):
                     'fromkeys-tuple-bound', 'fromkeys-nested-tuple',
                     'application-method-fields', 'application-method-field-sql',
                     'application-sql-builder-length',
+                    'nested-sql-builder-length',
                     'local-raw-process-wrapper', 'local-raw-opaque-sql',
                     'imported-sql-alias-positional', 'imported-sql-alias-keyword',
                     'imported-sql-alias-bound-data', 'imported-sql-alias-unproven',

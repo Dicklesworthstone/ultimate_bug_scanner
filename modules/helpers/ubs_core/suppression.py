@@ -20,10 +20,13 @@ or ordinary source tokens.
 from __future__ import annotations
 
 import re
+import sys
 from bisect import bisect_right
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from heapq import heappop, heappush
 from pathlib import Path
+from threading import RLock
 
 from ubs_core.lexer import javascript_lexical_views, strip_comments_and_strings
 
@@ -183,6 +186,105 @@ class SuppressionIndex:
             )
             for marker in self.markers
         )
+
+
+@dataclass(frozen=True)
+class _ParsedIndex:
+    """Immutable parse data; callers never share the mutable public index."""
+
+    intervals: tuple[Interval, ...]
+    markers: tuple[Marker, ...]
+    statements: tuple[Interval, ...]
+    formatter_headers: tuple[tuple[int, Interval], ...]
+    lookup: _IntervalLookup | None
+
+    @classmethod
+    def capture(cls, index: SuppressionIndex) -> _ParsedIndex:
+        return cls(tuple(index.intervals), tuple(index.markers), tuple(index.statements),
+                   tuple(index.formatter_headers.items()), index._lookup)
+
+    def materialize(self) -> SuppressionIndex:
+        index = SuppressionIndex(self.intervals, list(self.markers), self.statements,
+                                 dict(self.formatter_headers))
+        index._lookup = self.lookup
+        return index
+
+
+def _retained_size(value, seen: set[int] | None = None) -> int:
+    """Estimate the owned Python object graph, counting shared immutable nodes once."""
+    if seen is None:
+        seen = set()
+    identity = id(value)
+    if identity in seen:
+        return 0
+    seen.add(identity)
+    size = sys.getsizeof(value)
+    if isinstance(value, dict):
+        return size + sum(_retained_size(key, seen) + _retained_size(item, seen)
+                          for key, item in value.items())
+    if isinstance(value, (tuple, frozenset)):
+        return size + sum(_retained_size(item, seen) for item in value)
+    if isinstance(value, (_ParsedIndex, _IntervalLookup, Interval, Marker)):
+        return size + _retained_size(vars(value), seen)
+    return size
+
+
+class _ParseCache:
+    """Bound exact content reuse by entries, UTF-8 input size and retained objects.
+
+    Detector instances may read the same source independently. Paths, timestamps
+    and language aliases cannot establish identical parser input, so none is used
+    as a replacement for the exact (language, text) key. Oversized inputs are
+    parsed normally but never retained. The object budget also bounds short-line
+    sources whose interval tables are much larger than their input text.
+    """
+
+    def __init__(self, max_entries: int = 256, max_source_bytes: int = 8 * 1024 * 1024,
+                 max_retained_bytes: int = 32 * 1024 * 1024) -> None:
+        self.max_entries = max_entries
+        self.max_source_bytes = max_source_bytes
+        self.max_retained_bytes = max_retained_bytes
+        self.source_bytes = 0
+        self.retained_bytes = 0
+        self.entries: OrderedDict[tuple[str, str], tuple[int, int, _ParsedIndex]] = OrderedDict()
+        self.lock = RLock()
+
+    def get(self, key: tuple[str, str]) -> _ParsedIndex | None:
+        with self.lock:
+            entry = self.entries.get(key)
+            if entry is None:
+                return None
+            self.entries.move_to_end(key)
+            return entry[2]
+
+    def put(self, key: tuple[str, str], payload: _ParsedIndex) -> None:
+        if self.max_entries <= 0:
+            return
+        source_bytes = len(key[1].encode('utf-8', errors='surrogatepass'))
+        if source_bytes > self.max_source_bytes:
+            return
+        # Include a conservative allowance for the OrderedDict node, entry
+        # tuple and accounting integers, beyond the measured key/payload graph.
+        retained_bytes = _retained_size((key, payload)) + 256
+        if retained_bytes > self.max_retained_bytes:
+            return
+        with self.lock:
+            previous = self.entries.pop(key, None)
+            if previous is not None:
+                self.source_bytes -= previous[0]
+                self.retained_bytes -= previous[1]
+            self.entries[key] = (source_bytes, retained_bytes, payload)
+            self.source_bytes += source_bytes
+            self.retained_bytes += retained_bytes
+            while (len(self.entries) > self.max_entries
+                   or self.source_bytes > self.max_source_bytes
+                   or self.retained_bytes > self.max_retained_bytes):
+                _, oldest = self.entries.popitem(last=False)
+                self.source_bytes -= oldest[0]
+                self.retained_bytes -= oldest[1]
+
+
+_PARSE_CACHE = _ParseCache()
 
 
 class SourceSuppressions:
@@ -364,7 +466,18 @@ def _continues(code: str, paren_open: bool, lang: str) -> bool:
 
 
 def build_index(text: str, lang: str = "python") -> SuppressionIndex:
-    """Build the suppression index for one file's text."""
+    """Return an independent index, reusing only immutable exact-content parses."""
+    key = (lang, text)
+    payload = _PARSE_CACHE.get(key)
+    if payload is not None:
+        return payload.materialize()
+    index = _build_index(text, lang)
+    _PARSE_CACHE.put(key, _ParsedIndex.capture(index))
+    return index
+
+
+def _build_index(text: str, lang: str = "python") -> SuppressionIndex:
+    """Parse every interval and marker without consulting the reuse cache."""
     if lang.lower().strip() in _JAVASCRIPT_LANGS:
         # The JavaScript lexer already leaves a completed literal as an opaque
         # operand ("0"), so `value = request ?? "/"` keeps no dangling operator.

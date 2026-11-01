@@ -25,6 +25,7 @@ if str(HELPERS_DIR) not in sys.path:
 
 from ubs_core.csharp_scan import render_text  # noqa: E402
 from ubs_core import cpp_scan, java_scan, rust_scan, swift_scan  # noqa: E402
+from ubs_core import suppression as suppression_module  # noqa: E402
 from ubs_core.lexer import javascript_lexical_views, strip_comments_and_strings  # noqa: E402
 from ubs_core import rust_rules  # noqa: E402
 from ubs_core.analyzers import ctcompare_rust  # noqa: E402
@@ -2430,6 +2431,203 @@ class StatementBoundaryTests(unittest.TestCase):
         # A dangling binary operator still continues the statement.
         code = "total := a +\n    b // ubs:ignore[go.rule]\n"
         self.assertTrue(build_index(code, lang="go").is_suppressed(1, "go.rule"))
+
+
+class SuppressionParseCacheTests(unittest.TestCase):
+    """Reuse exact parse facts without retaining mutable caller state."""
+
+    @staticmethod
+    def snapshot(index):
+        return (tuple(index.intervals), tuple(index.statements), tuple(index.markers),
+                tuple(index.formatter_headers.items()), index._lookup)
+
+    def test_cold_and_reused_indexes_preserve_all_language_boundaries(self):
+        cases = (
+            ('python', PY_CODE),
+            ('ruby', 'value = if ready then\n  unsafe() # ubs:ignore[target.rule]\nend\nafter()\n'),
+            ('elixir', 'value = if ready do\n  unsafe() # ubs:ignore[target.rule]\nend\nafter()\n'),
+            ('bash', 'unsafe "$argument" # ubs:ignore[target.rule]\nafter\n'),
+            ('sql', "SELECT 'ubs:ignore'; -- ubs:ignore[target.rule]\nSELECT unsafe;\n"),
+            ('javascript', 'const decoy = /ubs:ignore/;\nuse(\n  value // ubs:ignore[target.rule]\n);\nafter();\n'),
+            ('typescript', 'const decoy = `ubs:ignore ${value}`;\nuse(value); // noqa\nafter();\n'),
+            ('java', 'if (ready)\n{ // ubs:ignore[target.rule]\n  use();\n}\nafter();\n'),
+            ('csharp', 'using (var item = acquire())\n{ // ubs:ignore[target.rule]\n  use();\n}\nafter();\n'),
+            ('cpp', 'use(R"tag(ubs:ignore)tag");\nuse(value); // ubs:ignore[target.rule]\nafter();\n'),
+            ('rust', 'use_value(r#"ubs:ignore"#);\nuse_value(value); // ubs:ignore[target.rule]\nafter();\n'),
+            ('golang', 'target := input +\n  "" // ubs:ignore[target.rule]\nafter()\n'),
+            ('kotlin', 'val target = input ?: "/" // ubs:ignore[target.rule]\nafter()\n'),
+            ('swift', 'let target = input ?? "/" // ubs:ignore[target.rule]\nafter()\n'),
+            ('php', '<?php\n$value = "ubs:ignore";\nunsafe($value); // ubs:ignore[target.rule]\nafter();\n'),
+            ('python', 'unsafe(\n # ubs:ignore[malformed!\n "ubs:ignore"\n'),
+            ('javascript', 'const invalid = `unterminated ubs:ignore\nunsafe(); // noqa\n'),
+        )
+        with patch.object(suppression_module, '_PARSE_CACHE', suppression_module._ParseCache()):
+            for language, source in cases:
+                with self.subTest(language=language, source=source):
+                    cold = build_index(source, language)
+                    reused = build_index(source, language)
+                    self.assertIsNot(cold, reused)
+                    self.assertEqual(self.snapshot(cold), self.snapshot(reused))
+                    for line in range(1, len(source.splitlines()) + 2):
+                        for rule in ('target.rule', 'other.rule', ''):
+                            self.assertEqual(cold.is_suppressed(line, rule), reused.is_suppressed(line, rule))
+
+    def test_mutating_cold_or_reused_shell_cannot_poison_later_indexes(self):
+        source = 'using (var item = acquire())\n{ // ubs:ignore[target.rule]\n  use();\n}\nafter();\n'
+        with patch.object(suppression_module, '_PARSE_CACHE', suppression_module._ParseCache()):
+            first = build_index(source, 'csharp')
+            expected = self.snapshot(first)
+            self.assertTrue(first.formatter_headers)
+            self.assertTrue(first.is_suppressed(1, 'target.rule'))
+            second = build_index(source, 'csharp')
+            first.markers.clear()
+            first.formatter_headers.clear()
+            first.intervals = (Interval(99, 100),)
+            first.statements = ()
+            first._lookup = None
+            second.markers.append(Marker(5, None))
+            second.formatter_headers[5] = Interval(5, 5)
+            second.intervals = []
+            second.statements = [Interval(1, 5)]
+            third = build_index(source, 'csharp')
+            self.assertEqual(self.snapshot(third), expected)
+            self.assertTrue(third.is_suppressed(1, 'target.rule'))
+            self.assertFalse(third.is_suppressed(5, 'other.rule'))
+            self.assertIsNot(third.markers, second.markers)
+            self.assertIsNot(third.formatter_headers, second.formatter_headers)
+
+    def test_exact_language_and_text_are_required_even_for_same_path(self):
+        marked = 'unsafe() # ubs:ignore[target.rule]\nafter()\n'
+        changed = 'unsafe() # ubs:ignore[other.rule]\nafter()\n'
+        with patch.object(suppression_module, '_PARSE_CACHE', suppression_module._ParseCache()):
+            before = SourceSuppressions('python').index('same.py', marked)
+            after = SourceSuppressions('python').index('same.py', changed)
+            javascript = SourceSuppressions('javascript').index('same.py', marked)
+            self.assertTrue(before.is_suppressed(1, 'target.rule'))
+            self.assertFalse(after.is_suppressed(1, 'target.rule'))
+            self.assertTrue(after.is_suppressed(1, 'other.rule'))
+            self.assertFalse(javascript.is_suppressed(1, 'target.rule'))
+
+    def test_language_spelling_keeps_the_existing_interval_contract(self):
+        source = 'if condition:\n    first()\n    second()\nafter()\n'
+        with patch.object(suppression_module, '_PARSE_CACHE', suppression_module._ParseCache()):
+            python = build_index(source, 'python')
+            different = build_index(source, 'Python')
+            self.assertIn(Interval(1, 3), python.intervals)
+            self.assertNotIn(Interval(1, 3), different.intervals)
+            self.assertEqual(self.snapshot(build_index(source, 'python')), self.snapshot(python))
+            self.assertEqual(self.snapshot(build_index(source, 'Python')), self.snapshot(different))
+
+    def test_lone_surrogate_does_not_make_budget_accounting_fail(self):
+        source = 'value = "\ud800" # ubs:ignore[target.rule]\nafter()\n'
+        cache = suppression_module._ParseCache()
+        with patch.object(suppression_module, '_PARSE_CACHE', cache):
+            first = build_index(source)
+            second = build_index(source)
+            self.assertEqual(self.snapshot(first), self.snapshot(second))
+            self.assertTrue(second.is_suppressed(1, 'target.rule'))
+            self.assertFalse(second.is_suppressed(2, 'target.rule'))
+            self.assertEqual(cache.source_bytes, len(source.encode('utf-8', errors='surrogatepass')))
+
+    def test_entry_limit_evicts_least_recently_used_content(self):
+        cache = suppression_module._ParseCache(max_entries=2)
+        sources = ('first() # ubs:ignore\n', 'second() # ubs:ignore\n', 'third() # ubs:ignore\n')
+        parser = suppression_module._build_index
+        with patch.object(suppression_module, '_PARSE_CACHE', cache), \
+                patch.object(suppression_module, '_build_index', wraps=parser) as parse:
+            build_index(sources[0]); build_index(sources[1]); build_index(sources[0])
+            self.assertEqual(parse.call_count, 2)
+            build_index(sources[2])
+            self.assertEqual(set(cache.entries), {('python', sources[0]), ('python', sources[2])})
+            build_index(sources[1])
+            self.assertEqual(parse.call_count, 4)
+            self.assertEqual(len(cache.entries), 2)
+
+    def test_source_byte_budget_evicts_entries_and_counts_utf8(self):
+        first = 'first("é") # ubs:ignore\n'
+        second = 'second("é") # ubs:ignore\n'
+        limit = len(first.encode('utf-8')) + len(second.encode('utf-8')) - 1
+        cache = suppression_module._ParseCache(max_entries=8, max_source_bytes=limit)
+        with patch.object(suppression_module, '_PARSE_CACHE', cache):
+            build_index(first); build_index(second)
+            self.assertEqual(set(cache.entries), {('python', second)})
+            self.assertEqual(cache.source_bytes, len(second.encode('utf-8')))
+            self.assertLessEqual(cache.source_bytes, limit)
+
+    def test_oversized_source_is_parsed_but_never_retained(self):
+        source = 'unsafe() # ubs:ignore[target.rule]\n' * 20
+        cache = suppression_module._ParseCache(max_source_bytes=64)
+        parser = suppression_module._build_index
+        with patch.object(suppression_module, '_PARSE_CACHE', cache), \
+                patch.object(suppression_module, '_build_index', wraps=parser) as parse:
+            for _ in range(2):
+                result = build_index(source)
+                self.assertTrue(result.is_suppressed(20, 'target.rule'))
+                self.assertFalse(result.is_suppressed(20, 'other.rule'))
+            self.assertEqual(parse.call_count, 2)
+            self.assertEqual(len(cache.entries), 0)
+            self.assertEqual((cache.source_bytes, cache.retained_bytes), (0, 0))
+
+    def test_retained_budget_bounds_interval_heavy_source_without_markers(self):
+        source = 'x\n' * 400
+        cache = suppression_module._ParseCache(max_source_bytes=4096, max_retained_bytes=4096)
+        with patch.object(suppression_module, '_PARSE_CACHE', cache):
+            result = build_index(source)
+            self.assertEqual(result._interval_for(200), Interval(200, 200))
+            self.assertEqual(len(result.statements), 400)
+            self.assertEqual(len(cache.entries), 0)
+            self.assertEqual((cache.source_bytes, cache.retained_bytes), (0, 0))
+
+    def test_parser_failures_are_not_cached_as_empty_indexes(self):
+        source = 'let value = "unterminated\nunsafe() // ubs:ignore\n'
+        cache = suppression_module._ParseCache()
+        parser = suppression_module._build_index
+        with patch.object(suppression_module, '_PARSE_CACHE', cache), \
+                patch.object(suppression_module, '_build_index', wraps=parser) as parse:
+            for _ in range(2):
+                with self.assertRaisesRegex(ValueError, 'Unterminated Swift string'):
+                    build_index(source, 'swift')
+            self.assertEqual(parse.call_count, 2)
+            self.assertEqual(len(cache.entries), 0)
+
+    def test_concurrent_callers_keep_mutations_and_budget_accounting_private(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        cache = suppression_module._ParseCache(max_entries=2, max_source_bytes=128)
+        sources = tuple(f'call_{number}() # ubs:ignore[target.rule]\nafter()\n' for number in range(3))
+
+        def run(number):
+            index = build_index(sources[number % len(sources)])
+            self.assertTrue(index.is_suppressed(1, 'target.rule'))
+            self.assertFalse(index.is_suppressed(2, 'other.rule'))
+            index.markers.append(Marker(2, None))
+            index.formatter_headers.clear()
+            return index
+
+        with patch.object(suppression_module, '_PARSE_CACHE', cache):
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                indexes = list(pool.map(run, range(24)))
+            self.assertEqual(len({id(index) for index in indexes}), 24)
+            for source in sources:
+                self.assertFalse(build_index(source).is_suppressed(2, 'other.rule'))
+            self.assertLessEqual(len(cache.entries), cache.max_entries)
+            self.assertLessEqual(cache.source_bytes, cache.max_source_bytes)
+            self.assertLessEqual(cache.retained_bytes, cache.max_retained_bytes)
+
+    def test_large_ordinary_source_remains_reusable(self):
+        source = '# ordinary source padding\n' * 13000 + 'unsafe() # ubs:ignore[target.rule]\n'
+        cache = suppression_module._ParseCache()
+        parser = suppression_module._build_index
+        with patch.object(suppression_module, '_PARSE_CACHE', cache), \
+                patch.object(suppression_module, '_build_index', wraps=parser) as parse:
+            first = build_index(source)
+            second = build_index(source)
+            self.assertGreater(len(source), 319000)
+            self.assertEqual(parse.call_count, 1)
+            self.assertTrue(first.is_suppressed(13001, 'target.rule'))
+            self.assertTrue(second.is_suppressed(13001, 'target.rule'))
+            self.assertLessEqual(cache.source_bytes, cache.max_source_bytes)
+            self.assertLessEqual(cache.retained_bytes, cache.max_retained_bytes)
 
 
 class RubyElixirSecuritySuppressionTests(unittest.TestCase):

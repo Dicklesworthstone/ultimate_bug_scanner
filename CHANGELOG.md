@@ -27,6 +27,15 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Fixed
 
+- Suppression parsing reuses immutable results for identical source text and
+  language across detector instances. Each caller receives independent mutable
+  markers and formatter metadata, so one rule cannot change another rule's
+  suppression decisions. Reuse is bounded by entry, source-byte and retained
+  object budgets; oversized inputs and parser failures keep their original
+  behavior. A live 375-file comparison preserves every parsed interval and
+  marker while reducing repeated parsing passes from about six seconds to
+  one tenth of a second, with a small first-pass admission cost.
+
 - Python SQL execution retains its API identity through stable import and
   module-member aliases, including keyword query arguments. Lexical shadows
   and verified plain replacements stay distinct. Conditional rebinding,

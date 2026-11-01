@@ -1727,5 +1727,43 @@ class SwiftScopedFlowTests(unittest.TestCase):
             ''', policy='path')
 
 
+class SwiftNarrowingOperators(unittest.TestCase):
+    """Comparison tokens and other bindings cannot stand in for an unwrap."""
+
+    def findings(self, tail):
+        from ubs_core.analyzers.narrowing_swift import scan_text
+        source = 'if value == nil { recordMissing() }\n' + tail
+        return scan_text(Path('Operators.swift'), source)
+
+    def test_comparison_is_not_a_forced_unwrap(self):
+        for tail in ('if value != nil { use(value) }',
+                     'if value != nil, ready, !reviewing { show() }',
+                     'use(othervalue!)'):
+            with self.subTest(tail=tail):
+                self.assertEqual(self.findings(tail), [])
+
+    def test_actual_unwrap_reports_its_site_after_comparisons(self):
+        for preceding in ('if value != nil { observe() }',
+                          'if value == nil { observe() }',
+                          'othervalue = replacement'):
+            with self.subTest(preceding=preceding):
+                found = self.findings(preceding + '\nuse(value!)')
+                negative = [item for item in found if item[0] == 'negative_nil_guard']
+                self.assertTrue(negative, found)
+                self.assertTrue(all(item[2:4] == (3, 5) for item in found), found)
+
+    def test_actual_assignment_keeps_the_existing_narrowing_boundary(self):
+        self.assertEqual(self.findings('value = replacement\nuse(value!)'), [])
+
+    def test_actual_unwrap_and_missing_guard_exit_remain_detected(self):
+        self.assertEqual([(item[0], item[2], item[3]) for item in self.findings('use(value!)')],
+                         [('negative_nil_guard', 2, 5)])
+        from ubs_core.analyzers.narrowing_swift import scan_text
+        findings = scan_text(Path('Operators.swift'),
+                             'guard let value = raw else { recordMissing() }\nuse(value)')
+        self.assertEqual([(item[0], item[2], item[3]) for item in findings],
+                         [('guard_let_no_exit', 1, 1)])
+
+
 if __name__ == '__main__':
     unittest.main()

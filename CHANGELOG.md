@@ -27,6 +27,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Fixed
 
+- Python SQL flow retains queries built inside invoked local execution facades,
+  including helper returns and captured templates. Unresolved forwarding and
+  SQL-bearing heap or closure writes remain explicitly incomplete, while
+  proven primitive operations and real APIs' bound data remain distinct.
+  A bounded lexical reachability solver reuses completed dependency proofs
+  without increasing analysis budgets or caching live value state.
+
 - Suppression parsing reuses immutable results for identical source text and
   language across detector instances. Each caller receives independent mutable
   markers and formatter metadata, so one rule cannot change another rule's

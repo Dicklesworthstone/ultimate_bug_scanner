@@ -160,6 +160,7 @@ class SanitizerBindings:
         self._instrumentation_lists = {}
         self._instrumentation_forwarders = set()
         self._possible_sql_imports = {}
+        self._sql_facade_flow = None
         self.independent_functions = self._independent_functions()
         for scope in self.owner_scopes.values():
             scope['capture_barriers'] = frozenset(scope['capture_barriers'])
@@ -418,6 +419,85 @@ class SanitizerBindings:
                     pending.append(caller)
         self._local_sql_effects = frozenset(effects)
         return self._local_sql_effects
+
+    def sql_facade_flow(self):
+        """Opaque forwards reached through invoked local SQL-family APIs.
+
+        An ordinary callback is not a database API by default. A local
+        execute/raw facade that constructs SQL internally, however, cannot
+        be certified harmless by inspecting only its caller's first value.
+        Reuse the lexical call graph and retain only groups with actual SQL
+        literal syntax. The flow visitor must still establish dynamic SQL
+        provenance before refusing an opaque call or discarded heap write.
+        """
+        if self._sql_facade_flow is not None:
+            return self._sql_facade_flow
+        self.local_sql_effects()
+        pending = []
+        for call in self.calls:
+            target = self.resolve(call.func)
+            if (target and target[0] == 'function'
+                    and (call_name(call.func).rsplit('.', 1)[-1] in EXECUTE_METHODS | {'extra'}
+                         or getattr(target[1], 'name', '') in EXECUTE_METHODS | {'extra'})):
+                pending.append(target[1])
+        functions, opaque = set(), set()
+        while pending:
+            function = pending.pop()
+            if function in functions:
+                continue
+            functions.add(function)
+            for call in self._function_calls.get(function, ()):
+                self.budget[0] -= 1
+                if self.budget[0] < 0:
+                    raise SQLFlowLimit('SQL facade call graph budget exceeded; analysis is incomplete')
+                target = self.resolve(call.func)
+                if target and target[0] == 'function':
+                    pending.append(target[1])
+                elif target and target[0] == 'class':
+                    for name in ('__new__', '__init__'):
+                        for member in self.owner_scopes[target[1]]['names'].get(name, ()):
+                            if member and member[0] == 'function':
+                                pending.append(member[1])
+                    opaque.add(call)
+                elif not (sql_sink_name(call, self) or self.unresolved_sql_aliases(call)
+                          or self.process_call(call, target)):
+                    opaque.add(call)
+        # Query templates may be module constants or lexical captures. Their
+        # ownership is broader than the called facade, while the actual
+        # forwarding check below still requires evaluated SQL provenance.
+        template_owners = {None}
+        for function in functions:
+            scope = self.owner_scopes[function]
+            while scope is not None:
+                self.budget[0] -= 1
+                if self.budget[0] < 0:
+                    raise SQLFlowLimit('SQL facade scope budget exceeded; analysis is incomplete')
+                if isinstance(scope['node'], (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                    template_owners.add(scope['node'])
+                scope = scope['parent']
+        has_template = False
+        if opaque:
+            for node in self.scope_of:
+                if not isinstance(node, ast.Constant) or not isinstance(node.value, str) or not SQL_RE.search(node.value):
+                    continue
+                if isinstance(self.parents.get(node), ast.Expr):
+                    continue  # a docstring is not query construction
+                if self.function_owner(node) in template_owners:
+                    has_template = True
+                    break
+        self._sql_facade_flow = (frozenset(functions), frozenset(opaque)) if has_template else (frozenset(), frozenset())
+        return self._sql_facade_flow
+
+    def function_owner(self, node):
+        scope = self.scope_of.get(node)
+        while scope is not None:
+            self.budget[0] -= 1
+            if self.budget[0] < 0:
+                raise SQLFlowLimit('SQL facade scope budget exceeded; analysis is incomplete')
+            if isinstance(scope['node'], (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                return scope['node']
+            scope = scope['parent']
+        return None
 
     def class_escapes(self, owner):
         if owner in self._escaped_classes:
@@ -1894,6 +1974,8 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         self._return_slot = None
         self._comprehension_locals = set()
         self._consumer_calls = frozenset()
+        self._facade_calls = frozenset()
+        self._facade_results = set()
         self._list_effect_active = False
         self._list_effect_parameters = (None, frozenset())
         self._consumer_stable = {}
@@ -3908,6 +3990,8 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         probe._closure_cell_writes = self._closure_cell_writes.copy()
         probe._comprehension_locals = self._comprehension_locals.copy()
         probe._consumer_calls = self._consumer_calls
+        probe._facade_calls = self._facade_calls
+        probe._facade_results = self._facade_results.copy()
         probe._list_effect_active = self._list_effect_active
         probe._list_effect_parameters = self._list_effect_parameters
         probe._consumer_stable = self._consumer_stable
@@ -4560,10 +4644,23 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         assignments, including exceptions and left-to-right target effects.
         """
         self.visit(target)
+        self.check_facade_store(target, facts)
         if isinstance(target, ast.Subscript):
             self.store_list_item(target, facts)
         else:
             self.bind_value_facts(binding_target_names(target), facts)
+
+    def check_facade_store(self, target, facts):
+        if facts[0] is None:
+            return
+        bindings = self.ownership_bindings()
+        function = bindings.function_owner(target)
+        if function not in bindings.sql_facade_flow()[0]:
+            return
+        if (isinstance(target, ast.Attribute)
+                or isinstance(target, ast.Subscript) and self.value_kind(target.value)[0] != 'list'
+                or isinstance(target, ast.Name) and target.id in bindings.owner_scopes[function]['capture_barriers']):
+            raise SQLFlowLimit('SQL facade heap or closure store is unresolved; analysis is incomplete')
 
     def store_list_item(self, target, facts):
         """Join possible contents of a private builtin list on item writes.
@@ -4708,6 +4805,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
 
     def visit_NamedExpr(self, node):
         self.visit(node.value)
+        self.check_facade_store(node.target, self.value_facts(node.value))
         self.escape_lists([node.value])
         self.mark_assignment(binding_target_names(node.target), node.value)
         self._evaluated_values[node] = self.value_facts(node.value)
@@ -4729,6 +4827,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             left = self.iteration_facts(node.target.value)
         self.visit(node.value)
         self.note_possible_raise()
+        self.check_facade_store(node.target, self.join_value_facts(left, self.value_facts(node.value)))
         if isinstance(node.target, ast.Name):
             if self.numeric_reference(node.target) is not None:
                 raise SQLFlowLimit('SQL numeric list augmented mutation is unsupported; analysis is incomplete')
@@ -4811,6 +4910,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             yield argument, 'select' if name == 'select' else 'fragment'
 
     def visit_Call(self, node):
+        self._facade_results.discard(node)
         known_builtin = (isinstance(node.func, ast.Name) and self.builtin_is_unshadowed(node.func.id)
                          and node.func.id in {'list', 'tuple', 'set', 'frozenset', 'sorted', 'min', 'max', 'sum',
                                               'any', 'all', 'iter', 'str', 'repr', 'bool', 'id', 'type'})
@@ -4924,6 +5024,9 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                        or self.sealed_closure_call(node) or self.generator_call(node) or joined is not None)
             if not handled:
                 self.check_collection_constructor(node)
+                # This is return provenance, not an effect certificate. Keep
+                # ordinary escape, callback and consumer-effect refusals.
+                self.facade_builder_result(node)
             if (self._consumer_calls or self._closure_worklist) and not handled and not is_sink and not copying_builtin and not known_builtin:
                 receiver = node.func.value if isinstance(node.func, ast.Attribute) else None
                 intrinsic_view = (receiver is not None and self.value_kind(receiver)[0] == 'dict'
@@ -5009,6 +5112,15 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                     # contract. It may execute a value from any argument,
                     # including one that the imported API would have bound.
                     raise SQLFlowLimit('SQL aliased execution binding is unresolved; analysis is incomplete')
+            if (node in self.ownership_bindings().sql_facade_flow()[1] and not handled
+                    and not is_sanitizer_call(node, self.sanitizers, self.bindings)
+                    and not self.primitive_facade_call(node)):
+                values = [*node.args, *(keyword.value for keyword in node.keywords)]
+                if isinstance(node.func, ast.Attribute):
+                    values.append(node.func.value)
+                if any(self.sql_risk(value) is not None or self.unresolved_facade_return(value)
+                       for value in values):
+                    raise SQLFlowLimit('SQL facade forwarding call is unresolved; analysis is incomplete')
         finally:
             self.sink_lineno = previous_sink
             self._iterated_lists = enclosing_iterations
@@ -5022,6 +5134,319 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         # store above must remain unvalidated when a handler catches failure.
         self.validated.update(call_validated_segments(
             node, self.text, self.sanitizers, self.sanitizer_summaries, stable, self.bindings))
+
+    def unresolved_facade_return(self, value):
+        """Refuse opaque consumption of an unmodeled SQL-producing result.
+
+        This is a may-dependency check, not a return-value or purity proof.
+        Follow returned expressions and their assignments, including loop
+        bindings, so richer helper bodies cannot silently drop constructed
+        SQL. Fixed returned text and discarded SQL-building work do not
+        create this boundary; successful value projections remain decisive.
+        """
+        bindings = self.ownership_bindings()
+        cache = self._ownership_syntax.setdefault('facade_return_queries', {})
+        # Only completed return projections affect this otherwise immutable
+        # lexical query. Include their identities so a static projection in
+        # one evaluation cannot suppress an unresolved result in another.
+        cache_key = value, frozenset(self._facade_results)
+        if cache_key in cache:
+            return cache[cache_key]
+        if 'facade_value_dependencies' not in self._ownership_syntax:
+            assignments, returns, augmented = {}, {}, set()
+            # One charged pass over the existing lexical index. Rewalking
+            # every callee body at each opaque use exhausts the ordinary
+            # budget in interpreters with many local helper calls.
+            for statement, scope in bindings.scope_of.items():
+                self.step()
+                if isinstance(statement, ast.Return) and statement.value is not None:
+                    returns.setdefault(scope['node'], []).append(statement.value)
+                if isinstance(statement, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+                    if statement.value is None:
+                        continue
+                    targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+                    expression = statement.value
+                elif isinstance(statement, (ast.For, ast.AsyncFor)):
+                    targets, expression = [statement.target], statement.iter
+                else:
+                    continue
+                for target in targets:
+                    owner = bindings.scope_of.get(target, scope)['node']
+                    for name in binding_target_names(target):
+                        key = owner, name
+                        assignments.setdefault(key, []).append(expression)
+                        if isinstance(statement, ast.AugAssign) and isinstance(statement.op, (ast.Add, ast.Mod)):
+                            augmented.add(key)
+            dynamic_updates = {key for key in augmented if
+                               any(not all_static_strings(expression) for expression in assignments[key])
+                               or hasattr(key[0], 'args') and key[1] in _all_parameters(key[0])}
+            self._ownership_syntax['facade_value_dependencies'] = assignments, returns, dynamic_updates
+        assignments, returns, dynamic_updates = self._ownership_syntax['facade_value_dependencies']
+        static = self._ownership_syntax.setdefault('facade_return_states', {})
+        targets = self._ownership_syntax.setdefault('facade_return_targets', {})
+        root = value, False, False
+
+        def solve(blocked, memo):
+            if root in memo:
+                return memo[root]
+            pending, edges, reverse, positive = [root], {}, {}, set()
+            while pending:
+                identity = pending.pop()
+                if identity in memo:
+                    if memo[identity]:
+                        positive.add(identity)
+                    continue
+                if identity in edges or static.get(identity) is False:
+                    continue
+                self.step()
+                node, dynamic, returned = identity
+                dependencies = []
+                edges[identity] = dependencies
+                if isinstance(node, ast.Constant):
+                    if returned and dynamic and isinstance(node.value, str) and SQL_RE.search(node.value):
+                        positive.add(identity)
+                    continue
+                if isinstance(node, ast.Name):
+                    owner = bindings.lexical_owner(node)
+                    if owner is not None:
+                        key = owner['node'], node.id
+                        dynamic = dynamic or key in dynamic_updates
+                        dependencies.extend((expression, dynamic, returned) for expression in assignments.get(key, ()))
+                else:
+                    if isinstance(node, ast.Call):
+                        if node in blocked or is_sanitizer_call(node, self.sanitizers, self.bindings):
+                            continue
+                        if node not in targets:
+                            targets[node] = bindings.resolve(node.func)
+                        target = targets[node]
+                        if (target and target[0] == 'unbound' and target[1] in {'len', 'id', 'type', 'bool'}
+                                and not bindings.dynamic_namespace and not bindings.builtin_namespace):
+                            continue  # these returned values are not SQL text
+                        if target and target[0] == 'function':
+                            dependencies.extend((expression, False, True) for expression in returns.get(target[1], ()))
+                        if isinstance(node.func, ast.Attribute) and node.func.attr in {'format', 'format_map'}:
+                            dynamic = dynamic or any(not isinstance(argument, ast.Constant) for argument in
+                                                     [*node.args, *(keyword.value for keyword in node.keywords)])
+                    elif isinstance(node, ast.JoinedStr):
+                        dynamic = dynamic or any(isinstance(part, ast.FormattedValue)
+                                                 and not isinstance(part.value, ast.Constant) for part in node.values)
+                    elif isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mod)):
+                        dynamic = dynamic or not all_static_strings(node)
+                    if isinstance(node, ast.IfExp):
+                        children = (node.body, node.orelse)
+                    elif isinstance(node, ast.Subscript):
+                        children = (node.value,)
+                    elif isinstance(node, ast.Dict):
+                        children = node.values
+                    else:
+                        children = ast.iter_child_nodes(node)
+                    dependencies.extend((child, dynamic, returned) for child in children)
+                for child in dependencies:
+                    reverse.setdefault(child, set()).add(identity)
+                    pending.append(child)
+            pending = list(positive)
+            while pending:
+                for parent in reverse.get(pending.pop(), ()):
+                    self.step()
+                    if parent not in positive:
+                        positive.add(parent)
+                        pending.append(parent)
+            # A cycle is negative only after its entire reachable component
+            # closes. Never memoize an unfinished recursive projection.
+            memo.update((identity, identity in positive) for identity in edges)
+            return root in positive
+
+        result = solve(frozenset(), static)
+        if result and self._facade_results:
+            contexts = self._ownership_syntax.setdefault('facade_return_contexts', {})
+            blocked = frozenset(self._facade_results)
+            result = solve(blocked, contexts.setdefault(blocked, {}))
+        cache[cache_key] = result
+        return result
+
+    def facade_builder_result(self, call):
+        """Transfer a closed local builder's actual returned SQL.
+
+        A string-shape summary cannot carry SQL constructed inside a helper.
+        Evaluate these bounded bodies in their lexical frame, using captured
+        argument values and only visible lexical cells. Never substitute a
+        caller's same-spelled local for an unrelated module or sibling cell.
+        Effects and protocol calls still pass through the normal visitor.
+        """
+        if not isinstance(call.func, ast.Name):
+            # The closed-local-callable proof below excludes class members;
+            # an attribute dispatch has no eligible builder frame here.
+            return False
+        bindings = self.ownership_bindings()
+        functions, _ = bindings.sql_facade_flow()
+        if not functions or bindings.function_owner(call) not in functions:
+            return False
+        target = self.ownership_call_target(call)
+        if not target or target[0] != 'function' or target[2] or target[1] not in functions:
+            return False
+        function = target[1]
+        if (not isinstance(function, ast.FunctionDef) or function.decorator_list
+                or function.args.vararg or function.args.kwarg
+                or bindings.dynamic_namespace or bindings.builtin_namespace
+                or {'__code__', '__globals__'} & bindings.member_writes
+                or not bindings.closed_local_callable(function)):
+            return False
+        body = [statement for statement in function.body if not (
+            isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant)
+            and isinstance(statement.value.value, str))]
+        if not body:
+            return False
+        pending, has_return = list(body), False
+        while pending:
+            self.step()
+            statement = pending.pop()
+            if isinstance(statement, ast.Return):
+                has_return = True
+            elif isinstance(statement, ast.If):
+                pending.extend(statement.body)
+                pending.extend(statement.orelse)
+            elif isinstance(statement, ast.Pass):
+                continue
+            elif (not isinstance(statement, (ast.Assign, ast.AnnAssign))
+                  or statement.value is None
+                  or not all(isinstance(value, ast.Name) for value in
+                             (statement.targets if isinstance(statement, ast.Assign) else [statement.target]))):
+                return False
+        if not has_return:
+            return False
+        nodes = [node for statement in body for node in ast.walk(statement)]
+        if any(isinstance(node, (ast.Lambda, ast.GeneratorExp, ast.ListComp, ast.SetComp, ast.DictComp,
+                                 ast.Yield, ast.YieldFrom, ast.Await, ast.NamedExpr)) for node in nodes):
+            return False
+        if function in self._facade_calls:
+            raise SQLFlowLimit('SQL facade return recursion is unresolved; analysis is incomplete')
+        if (any(isinstance(argument, ast.Starred) for argument in call.args)
+                or any(keyword.arg is None for keyword in call.keywords)
+                or any(not isinstance(default, ast.Constant) for default in function.args.defaults)
+                or any(default is not None and not isinstance(default, ast.Constant)
+                       for default in function.args.kw_defaults)):
+            return False
+        positional = _positional_parameters(function)
+        actual = _bind_call_arguments(call, {'positional': positional})
+        for name, default in zip(positional[len(positional) - len(function.args.defaults):], function.args.defaults):
+            actual.setdefault(name, default)
+        for argument, default in zip(function.args.kwonlyargs, function.args.kw_defaults):
+            if default is not None:
+                actual.setdefault(argument.arg, default)
+        if set(actual) != _all_parameters(function):
+            return False
+        facts = {name: self.value_facts(value) for name, value in actual.items()}
+        if any(self.generator_refs(value) for value in facts.values()):
+            return False
+        local = set(bindings.owner_scopes[function]['names'])
+        free = {node.id: node for node in nodes if isinstance(node, ast.Name)
+                and isinstance(node.ctx, ast.Load) and node.id not in local}
+        for name, reference in free.items():
+            owner = bindings.lexical_owner(reference)
+            visible = owner is not None and owner['node'] in self._generator_scope
+            if visible:
+                boundary = self._generator_scope.index(owner['node']) + 1
+                visible = not any(name in bindings.owner_scopes[scope]['names']
+                                  for scope in self._generator_scope[boundary:])
+            if visible:
+                facts[name] = self.value_facts(ast.Name(id=name, ctx=ast.Load()))
+            else:
+                # A stable literal remains available even when a caller
+                # shadows it. Mutable/unresolved free values have no proof.
+                assignment = bindings.literal_assignments.get((owner['node'], name)) if owner else None
+                literal = assignment.value if assignment is not None else None
+                if (owner is not None and len(owner['names'].get(name, ())) == 1
+                        and isinstance(literal, ast.Constant)):
+                    facts[name] = self.value_facts(literal)
+                else:
+                    facts[name] = (None, None, None, False, 'unknown')
+            if self.generator_refs(facts[name]):
+                return False
+        probe = self.flow_probe()
+        state = list(probe.sql_state())
+        for index in (0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14):
+            state[index].clear()
+        probe.restore_sql_state(tuple(state))
+        probe._evaluated_values.clear()
+        lexical, scope = [], bindings.owner_scopes[function]
+        while scope is not None:
+            lexical.append(scope['node'])
+            scope = scope['parent']
+        probe._generator_scope = tuple(reversed(lexical))
+        probe.func_stack = [node for node in probe._generator_scope if isinstance(node, ast.FunctionDef)]
+        probe._comprehension_locals.clear()
+        probe._facade_calls = self._facade_calls | {function}
+        probe._return_slot = '\0sql_return'
+        for name, value in facts.items():
+            probe.bind_value_facts([name], value)
+        try:
+            flow = probe.statements(body, probe.sql_state())
+        finally:
+            for identity, finding in probe._sink_risks.items():
+                previous = self._sink_risks.get(identity)
+                if previous is None or finding[0] == 'critical':
+                    self._sink_risks[identity] = finding
+        returned = []
+        if flow.get('return') is not None:
+            probe.restore_sql_state(flow['return'])
+            returned.append(probe.value_facts(ast.Name(id=probe._return_slot, ctx=ast.Load())))
+        if flow.get('normal') is not None:
+            returned.append(self.with_kinds((None, None, None, False, 'static'), 'none'))
+        if not returned:
+            raise SQLFlowLimit('SQL facade return completion is unresolved; analysis is incomplete')
+        if any(self.generator_refs(value) for value in returned):
+            raise SQLFlowLimit('SQL facade return cursor is unresolved; analysis is incomplete')
+        self._evaluated_values[call] = self.join_value_facts(*returned)
+        self._facade_results.add(call)
+        return True
+
+    def primitive_facade_call(self, call):
+        """Prove a few ordinary operations on exact builtin values."""
+        bindings = self.ownership_bindings()
+        if bindings.dynamic_namespace or bindings.builtin_namespace:
+            return False
+        target = bindings.resolve(call.func)
+        if (any(isinstance(argument, ast.Starred) for argument in call.args)
+                or any(keyword.arg is None for keyword in call.keywords)):
+            return False
+        primitive = {'str', 'number', 'none'}
+        if target == ('unbound', 'print'):
+            if bindings.reflective_member_writes or {'stdout', 'write', 'flush'} & bindings.member_writes:
+                return False
+            for keyword in call.keywords:
+                if keyword.arg == 'file':
+                    if not isinstance(keyword.value, ast.Constant) or keyword.value.value is not None:
+                        return False
+                elif keyword.arg not in {'sep', 'end', 'flush'} or self.value_kind(keyword.value)[0] not in primitive:
+                    return False
+            return all(self.value_kind(argument)[0] in primitive for argument in call.args)
+        if target == ('unbound', 'len'):
+            return (len(call.args) == 1 and not call.keywords
+                    and self.value_kind(call.args[0])[0] in primitive | {'list', 'tuple', 'set', 'dict', 'range'})
+        if target and target[0] == 'unbound' and target[1] in {'str', 'repr', 'ascii', 'bool', 'int', 'float', 'id', 'type'}:
+            return not call.keywords and all(self.value_kind(argument)[0] in primitive for argument in call.args)
+        if (isinstance(call.func, ast.Attribute) and self.value_kind(call.func.value)[0] == 'str'
+                and callable(getattr(str, call.func.attr, None))):
+            if call.func.attr == 'encode':
+                arguments = {'encoding': 'utf-8', 'errors': 'strict'}
+                if len(call.args) > 2 or any(keyword.arg not in arguments for keyword in call.keywords):
+                    return False
+                supplied = dict(zip(('encoding', 'errors'), call.args))
+                supplied.update((keyword.arg, keyword.value) for keyword in call.keywords)
+                if any(not isinstance(value, ast.Constant) or not isinstance(value.value, str)
+                       for value in supplied.values()):
+                    return False
+                arguments.update((name, value.value) for name, value in supplied.items())
+                if arguments['encoding'].lower().replace('_', '-') not in {'utf-8', 'utf8', 'ascii', 'latin-1', 'latin1'}:
+                    return False
+                if arguments['errors'] != 'strict' or any(
+                        call_name(candidate.func).rsplit('.', 1)[-1] == 'register_error'
+                        or bindings.resolve(candidate.func) == ('import', 'codecs.register_error')
+                        for candidate in bindings.calls):
+                    return False
+            return all(self.value_kind(value)[0] in primitive for value in
+                       [*call.args, *(keyword.value for keyword in call.keywords)])
+        return False
 
     def intrinsic_range_call(self, call):
         return (isinstance(call.func, ast.Name) and call.func.id == 'range'
@@ -6062,6 +6487,7 @@ def find(files: Sequence[Path], *, max_steps=100_000) -> Iterable[tuple[str, Pat
         # sink can be recognized. Applicable SQL flow keeps its ordinary budget.
         if not any(isinstance(node, ast.Call) and sql_sink_name(node)
                    or isinstance(node, ast.Attribute) and node.attr in EXECUTE_METHODS | {'extra'}
+                   or isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in EXECUTE_METHODS | {'extra'}
                    or isinstance(node, ast.ImportFrom) and any(
                        alias.name in EXECUTE_METHODS | {'extra'} for alias in node.names)
                    for node in ast.walk(tree)):
@@ -6071,8 +6497,8 @@ def find(files: Sequence[Path], *, max_steps=100_000) -> Iterable[tuple[str, Pat
         sanitizers = configured_sanitizers()
         budget = [max_steps]
         bindings = SanitizerBindings(tree, configured_sanitizer_targets(), budget)
-        if not any(sql_sink_name(call, bindings) or bindings.unresolved_sql_aliases(call)
-                   for call in bindings.calls):
+        if (not any(sql_sink_name(call, bindings) or bindings.unresolved_sql_aliases(call)
+                    for call in bindings.calls) and not bindings.sql_facade_flow()[1]):
             continue
         summaries = build_sanitizer_summaries(tree, sanitizers, text=text, budget=budget, bindings=bindings)
         analyzer = SQLInjectionAnalyzer(

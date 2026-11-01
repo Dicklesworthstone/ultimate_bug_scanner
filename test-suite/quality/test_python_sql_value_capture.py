@@ -1655,6 +1655,173 @@ class SQLValueCaptureTests(unittest.TestCase):
         self.inspect('raw-instrumentation-reported', source, ())
         self.inspect('raw-instrumentation-renamed', source.replace('raw', 'invoke_process'), ())
 
+    def test_sql_facades_cannot_drop_internally_created_sql_at_opaque_calls(self):
+        for name, source in (
+                ('direct', 'from backend import dispatch\ndef raw(value):\n'
+                 '    return dispatch(f"SELECT {value}")\ndef run(user):\n    return raw(user)\n'),
+                ('keyword', 'from backend import dispatch\ndef raw(*, value):\n'
+                 '    return dispatch(statement=f"SELECT {value}")\ndef run(user):\n    return raw(value=user)\n'),
+                ('second-parameter', 'from backend import dispatch\ndef raw(label, value):\n'
+                 '    return dispatch(f"SELECT {value}")\ndef run(user):\n    return raw("label", user)\n'),
+                ('closure', 'from backend import dispatch\ndef run(user):\n    def raw():\n'
+                 '        return dispatch(f"SELECT {user}")\n    return raw()\n'),
+                ('nested-forwarder', 'from backend import dispatch\ndef forward(value):\n'
+                 '    statement = f"SELECT {value}"\n    return dispatch(statement)\n'
+                 'def raw(value):\n    return forward(value)\ndef run(user):\n    return raw(user)\n'),
+                ('module-builder', 'from backend import dispatch\ndef make(value):\n'
+                 '    return f"SELECT {value}"\ndef raw(value):\n    return dispatch(make(value))\n'
+                 'def run(user):\n    return raw(user)\n'),
+                ('nested-builder', 'from backend import dispatch\ndef raw(value):\n'
+                 '    def make(item):\n        return f"SELECT {item}"\n'
+                 '    return dispatch(make(value))\ndef run(user):\n    return raw(user)\n'),
+                ('captured-builder', 'from backend import dispatch\ndef raw(value):\n'
+                 '    def make():\n        return f"SELECT {value}"\n'
+                 '    return dispatch(make())\ndef run(user):\n    return raw(user)\n'),
+                ('assigned-builder', 'from backend import dispatch\ndef make(*, item):\n'
+                 '    query = f"SELECT {item}"\n    return query\n'
+                 'def raw(value):\n    return dispatch(make(item=value))\n'
+                 'def run(user):\n    return raw(user)\n'),
+                ('conditional-builder', 'from backend import dispatch\ndef make(value):\n'
+                 '    if value:\n        return f"SELECT {value}"\n    return "SELECT 1"\n'
+                 'def raw(value):\n    return dispatch(make(value))\n'
+                 'def run(user):\n    return raw(user)\n'),
+                ('fallthrough-builder', 'from backend import dispatch\ndef make(value):\n'
+                 '    if value:\n        return f"SELECT {value}"\n'
+                 'def raw(value):\n    return dispatch(make(value))\n'
+                 'def run(user):\n    return raw(user)\n'),
+                ('loop-builder', 'from backend import dispatch\ndef make(value):\n'
+                 '    query = "SELECT 1"\n    for item in (value,):\n        query = f"SELECT {item}"\n'
+                 '    return query\ndef raw(value):\n    result = make(value)\n    return dispatch(result)\n'
+                 'def run(user):\n    return raw(user)\n'),
+                ('walrus-builder', 'from backend import dispatch\ndef make(value):\n'
+                 '    if (query := f"SELECT {value}"):\n        return query\n'
+                 'def raw(value):\n    return dispatch(make(value))\n'
+                 'def run(user):\n    return raw(user)\n'),
+                ('augmented-builder', 'from backend import dispatch\ndef make(value):\n'
+                 '    query = "SELECT "\n    for part in (value,):\n        query += part\n    return query\n'
+                 'def raw(value):\n    return dispatch(make(value))\n'
+                 'def run(user):\n    return raw(user)\n'),
+                ('aliased-builder', 'from backend import dispatch\ndef make(value):\n'
+                 '    return f"SELECT {value}"\nbuild = make\n'
+                 'def raw(value):\n    return dispatch(build(value))\n'
+                 'def run(user):\n    return raw(user)\n'),
+                ('builder-template-shadow', 'from backend import dispatch\nTEMPLATE = "SELECT {}"\n'
+                 'def make(value):\n    return TEMPLATE.format(value)\n'
+                 'def raw(value):\n    TEMPLATE = "message {}"\n    return dispatch(make(value))\n'
+                 'def run(user):\n    return raw(user)\n'),
+                ('builder-mutable-input', 'from backend import dispatch\ndef make(values, value):\n'
+                 '    ignored = values.append(f"SELECT {value}")\n    return "SELECT 1"\n'
+                 'def raw(value):\n    values = []\n    make(values, value)\n    return dispatch(values[0])\n'
+                 'def run(user):\n    return raw(user)\n'),
+                ('local-alias', 'from backend import dispatch\ndef raw(value):\n'
+                 '    return dispatch(f"SELECT {value}")\nsend = raw\ndef run(user):\n    return send(user)\n'),
+                ('format', 'from backend import dispatch\ndef raw(value):\n    template = "SELECT {}"\n'
+                 '    return dispatch(template.format(value))\ndef run(user):\n    return raw(user)\n'),
+                ('module-template', 'from backend import dispatch\nTEMPLATE = "SELECT {}"\n'
+                 'def raw(value):\n    return dispatch(TEMPLATE.format(value))\n'
+                 'def run(user):\n    return raw(user)\n'),
+                ('captured-template', 'from backend import dispatch\ndef run(user):\n'
+                 '    template = "SELECT {}"\n    def raw():\n'
+                 '        return dispatch(template.format(user))\n    return raw()\n'),
+                ('starred', 'from backend import dispatch\ndef raw(value):\n'
+                 '    arguments = (f"SELECT {value}",)\n    return dispatch(*arguments)\n'
+                 'def run(user):\n    return raw(user)\n'),
+                ('alternate-slot', 'from backend import dispatch\ndef raw(value):\n'
+                 '    return dispatch("SELECT ?", (f"SELECT {value}",))\ndef run(user):\n    return raw(user)\n')):
+            path = self.artifacts / ('opaque-facade-' + name + '.py')
+            path.write_text(source, encoding='utf-8')
+            with self.subTest(facade=name), self.assertRaisesRegex(
+                    detector.SQLFlowLimit, 'facade forwarding call.*incomplete'):
+                list(detector.find([path]))
+
+    def test_sql_facade_heap_and_cell_effects_remain_explicit(self):
+        for name, body in (
+                ('attribute', '    record.query = f"SELECT {value}"\n    return dispatch(record.query)\n'),
+                ('subscript', '    record["query"] = f"SELECT {value}"\n    return dispatch(record["query"])\n'),
+                ('augmented', '    record.query += f"SELECT {value}"\n    return dispatch(record.query)\n'),
+                ('nonlocal', '    query = "SELECT 1"\n    def build():\n        nonlocal query\n'
+                 '        query = f"SELECT {value}"\n    build()\n    return dispatch(query)\n'),
+                ('global', '    global query\n    query = f"SELECT {value}"\n    return dispatch(query)\n'),
+                ('walrus', '    global query\n    return dispatch((query := f"SELECT {value}"))\n')):
+            source = ('from backend import dispatch, record\ndef execute(value):\n' + body
+                      + 'def run(user):\n    return execute(user)\n')
+            path = self.artifacts / ('opaque-store-' + name + '.py')
+            path.write_text(source, encoding='utf-8')
+            with self.subTest(store=name), self.assertRaisesRegex(
+                    detector.SQLFlowLimit, 'facade heap or closure store.*incomplete'):
+                list(detector.find([path]))
+
+    def test_opaque_forwarding_does_not_turn_ordinary_applications_into_sql_sinks(self):
+        for name, prefix, function, call in (
+                ('ordinary-helper', 'from backend import dispatch\n', 'render', 'dispatch(f"SELECT {value}")'),
+                ('no-sql', 'from backend import dispatch\n', 'raw', 'dispatch(f"hello {value}")'),
+                ('static', 'from backend import dispatch\n', 'raw', 'dispatch("SELECT 1")'),
+                ('length', '', 'raw', 'len(f"SELECT {value}")'),
+                ('print', '', 'raw', 'print(f"SELECT {value}")'),
+                ('standard-encoding', '', 'raw', 'f"SELECT {value}".encode("utf-8")'),
+                ('process', 'import subprocess\n', 'raw', 'subprocess.run(["tool", f"SELECT {value}"])'),
+                ('bound', 'from driver import execute as dispatch\n', 'raw',
+                 'dispatch("SELECT ?", (f"SELECT {value}",))')):
+            source = (prefix + f'def {function}(value):\n    return ' + call
+                      + f'\ndef run(user):\n    return {function}(user)\n')
+            with self.subTest(application=name):
+                self.inspect('opaque-control-' + name, source, ())
+        for name, builder, operation in (
+                ('fixed-builder', '"SELECT 1"', 'dispatch(make(value))'),
+                ('message-builder', 'f"Processed {value}"', 'dispatch(make(value))'),
+                ('builder-length', 'f"SELECT {value}"', 'len(make(value))')):
+            source = ('from backend import dispatch\ndef make(value):\n    return ' + builder
+                      + '\ndef raw(value):\n    return ' + operation
+                      + '\ndef run(user):\n    return raw(user)\n')
+            with self.subTest(builder=name):
+                self.inspect('opaque-control-' + name, source, ())
+        self.inspect('opaque-control-discarded-loop-query',
+                     'from backend import dispatch\ndef make(value):\n'
+                     '    for item in (value,):\n        query = f"SELECT {item}"\n'
+                     '    return "SELECT 1"\ndef raw(value):\n    return dispatch(make(value))\n'
+                     'def run(user):\n    return raw(user)\n', ())
+        self.inspect('opaque-control-static-augmented-query',
+                     'from backend import dispatch\ndef make(value):\n'
+                     '    query = "SELECT"\n    for part in (value,):\n        query += " 1"\n'
+                     '    return query\ndef raw(value):\n    return dispatch(make(value))\n'
+                     'def run(user):\n    return raw(user)\n', ())
+        path = self.artifacts / 'opaque-print-writer.py'
+        path.write_text('from backend import writer\ndef raw(value):\n'
+                        '    return print(f"SELECT {value}", file=writer)\n'
+                        'def run(user):\n    return raw(user)\n', encoding='utf-8')
+        with self.assertRaisesRegex(detector.SQLFlowLimit, 'facade forwarding call.*incomplete'):
+            list(detector.find([path]))
+        for name, source in (
+                ('stdout-write', 'import sys\nfrom backend import dispatch\n'
+                 'sys.stdout.write = dispatch\ndef raw(value):\n    print(f"SELECT {value}")\n'
+                 'def run(user):\n    return raw(user)\n'),
+                ('custom-codec', 'def raw(value):\n    return f"SELECT {value}".encode("application_codec")\n'
+                 'def run(user):\n    return raw(user)\n'),
+                ('custom-errors', 'def raw(value):\n    return f"SELECT {value}".encode("ascii", "application_errors")\n'
+                 'def run(user):\n    return raw(user)\n'),
+                ('replaced-errors', 'from codecs import register_error as install\nfrom backend import handler\n'
+                 'install("strict", handler)\ndef raw(value):\n    return f"SELECT {value}".encode("ascii")\n'
+                 'def run(user):\n    return raw(user)\n')):
+            path = self.artifacts / ('opaque-protocol-' + name + '.py')
+            path.write_text(source, encoding='utf-8')
+            with self.subTest(protocol=name), self.assertRaisesRegex(
+                    detector.SQLFlowLimit, 'facade forwarding call.*incomplete'):
+                list(detector.find([path]))
+
+    def test_real_sqlite_opaque_facade_alternate_argument_witness(self):
+        facade = ('def raw(value):\n'
+                  '    return dispatch("SELECT ?", (f"SELECT count(*) FROM users WHERE name = \'{value}\'",))\n')
+        witness = ('def dispatch(query, values):\n    return database.execute(values[0])\n' + facade
+                   + 'def run(cursor, params, user, rows):\n    global database\n    database = cursor\n'
+                   '    return raw(user).fetchone()[0]\n')
+        self.assertEqual(sqlite_witness(self.artifacts, 'opaque-alternate-ordinary', witness, value='alice')['rows'], 1)
+        self.assertEqual(sqlite_witness(self.artifacts, 'opaque-alternate-injected', witness)['rows'], 2)
+        path = self.artifacts / 'opaque-alternate-unresolved.py'
+        path.write_text('from backend import dispatch\n' + facade
+                        + 'def run(user):\n    return raw(user)\n', encoding='utf-8')
+        with self.assertRaisesRegex(detector.SQLFlowLimit, 'facade forwarding call.*incomplete'):
+            list(detector.find([path]))
+
     def test_variadic_builtin_and_process_roles_require_primitive_actuals(self):
         for label, prefix, body in (
                 ('length', '', 'len(args)'),

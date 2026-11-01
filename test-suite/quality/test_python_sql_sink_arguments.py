@@ -91,6 +91,7 @@ CASES = (
     ("imported-sql-alias-unproven", 'from pandas import read_sql as load_rows\nfrom settings import TABLE_NAME\nload_rows(f"SELECT * FROM {TABLE_NAME}", conn)\n', ((WARNING, 3),)),
     ("imported-sql-alias-local-copy", 'from pandas import read_sql as load_rows\ndef run(conn, user):\n    fetch = load_rows\n    return fetch(sql=f"SELECT {user}", con=conn)\n', ((CRITICAL, 4),)),
     ("imported-sql-alias-parameter-shadow", 'from pandas import read_sql as load_rows\ndef format_note(load_rows, user):\n    return load_rows(f"SELECT {user}")\n', ()),
+    ("application-sql-builder-length", 'def make(value):\n    return f"SELECT {value}"\ndef execute(value):\n    return len(make(value))\ndef run(user):\n    return execute(user)\n', ()),
     ("keyword-alias", 'def run(cursor, user):\n    query = f"SELECT {user}"\n    cursor.execute(query=query)\n', ((CRITICAL, 3),)),
     ("multiline", 'def run(cursor, user):\n    cursor.execute(\n        query=f"SELECT {user}"\n    )\n', ((CRITICAL, 2),)),
     ("bound-query", 'def run(cursor, user):\n    cursor.execute(query="SELECT * FROM users WHERE name = %s", params=(user,))\n', ()),
@@ -253,24 +254,42 @@ class SQLSinkArguments(unittest.TestCase):
 @unittest.skipUnless((ROOT / 'ubs').is_file() and (ROOT / 'modules/ubs-python.sh').is_file(),
                      'real CLI requires a full source checkout')
 class SQLSinkArgumentsCLI(unittest.TestCase):
-    def test_real_cli_unresolved_import_aliases_are_partial(self):
+    def test_real_cli_unresolved_sql_execution_is_partial(self):
         artifacts = ROOT / 'test-suite/artifacts'
         artifacts.mkdir(parents=True, exist_ok=True)
         run = Path(tempfile.mkdtemp(prefix='python-sql-alias-partial-', dir=artifacts))
         cases = (
             ('ambiguous-query', 'from pandas import read_sql as fetch\n'
              'if configured:\n    fetch = replacement\n'
-             'def run(conn, user):\n    return fetch(f"SELECT {user}", conn)\n', []),
+             'def run(conn, user):\n    return fetch(f"SELECT {user}", conn)\n', [], 'aliased execution binding'),
             ('ambiguous-second-argument', 'from backend import execute as fetch\n'
              'if configured:\n    fetch = replacement\n'
-             'def run(user):\n    return fetch("SELECT ?", (f"SELECT {user}",))\n', []),
+             'def run(user):\n    return fetch("SELECT ?", (f"SELECT {user}",))\n', [], 'aliased execution binding'),
             ('retained-before-ambiguity', 'from backend import execute as fetch\n'
              'def run(cursor, user):\n    cursor.execute(f"SELECT {user}")\n'
              '    fetch(f"SELECT {user}")\n'
-             'if configured:\n    fetch = replacement\n', [3]),
+             'if configured:\n    fetch = replacement\n', [3], 'aliased execution binding'),
+            ('opaque-internal-query', 'from backend import dispatch\n'
+             'def raw(value):\n    return dispatch(f"SELECT {value}")\n'
+             'def run(user):\n    return raw(user)\n', [], 'facade forwarding call'),
+            ('opaque-builder-return', 'from backend import dispatch\n'
+             'def make(value):\n    return f"SELECT {value}"\n'
+             'def raw(value):\n    return dispatch(make(value))\n'
+             'def run(user):\n    return raw(user)\n', [], 'facade forwarding call'),
+            ('opaque-captured-template', 'from backend import dispatch\nTEMPLATE = "SELECT {}"\n'
+             'def raw(value):\n    return dispatch(TEMPLATE.format(value))\n'
+             'def run(user):\n    return raw(user)\n', [], 'facade forwarding call'),
+            ('opaque-heap-store', 'from backend import dispatch, record\n'
+             'def execute(value):\n    record.query = f"SELECT {value}"\n'
+             '    return dispatch(record.query)\n'
+             'def run(user):\n    return execute(user)\n', [], 'facade heap or closure store'),
+            ('retained-before-opaque-forward', 'from backend import dispatch\n'
+             'def raw(cursor, value):\n    cursor.execute(f"SELECT {value}")\n'
+             '    return dispatch(f"SELECT {value}")\n'
+             'def run(cursor, user):\n    return raw(cursor, user)\n', [3], 'facade forwarding call'),
         )
         detector_hash = hashlib.sha256(Path(detector.__file__).read_bytes()).hexdigest()
-        for name, source, expected_lines in cases:
+        for name, source, expected_lines, expected_error in cases:
             for entry in ('module', 'runner'):
                 for fmt in ('json', 'sarif'):
                     with self.subTest(case=name, entry=entry, format=fmt):
@@ -309,7 +328,7 @@ class SQLSinkArgumentsCLI(unittest.TestCase):
                         self.assertEqual(result.returncode, 2, f'{folder}\n{result.stdout}\n{result.stderr}')
                         document = json.loads(result.stdout)
                         self.assertIn('SQLFlowLimit', result.stdout, folder)
-                        self.assertIn('aliased execution binding', result.stdout, folder)
+                        self.assertIn(expected_error, result.stdout, folder)
                         if fmt == 'json':
                             self.assertEqual(document['status'], 'partial', folder)
                             scanners = document['scanners'] if entry == 'runner' else [document]
@@ -336,6 +355,7 @@ class SQLSinkArgumentsCLI(unittest.TestCase):
                     'fromkeys-mixed-primitives', 'fromkeys-tuple-default',
                     'fromkeys-tuple-bound', 'fromkeys-nested-tuple',
                     'application-method-fields', 'application-method-field-sql',
+                    'application-sql-builder-length',
                     'local-raw-process-wrapper', 'local-raw-opaque-sql',
                     'imported-sql-alias-positional', 'imported-sql-alias-keyword',
                     'imported-sql-alias-bound-data', 'imported-sql-alias-unproven',

@@ -141,8 +141,16 @@ class RoutingTests(unittest.TestCase):
                      'severity': 'warning', 'message': rule}, **fields)
 
     def report(self, records, **fields):
+        # Count only the unsuppressed ledger, not advisory AST records. Project
+        # records contribute their occurrence count; located records count once.
+        totals = {'files': 2, **{
+            severity: sum(record.get('count', 1) if record.get('scope') in ('project', 'project_aggregate') else 1
+                          for record in records
+                          if record.get('severity') == severity and record.get('suppressed') is not True)
+            for severity in ('critical', 'warning', 'info')
+        }}
         return dict({'status': 'ok', 'project': str(self.root),
-                     'totals': {'files': 2}, 'findings': records}, **fields)
+                     'totals': totals, 'findings': records}, **fields)
 
     def render(self, report, path, paths=None, **options):
         return lsp.report_diagnostics(report, path, self.root, '\ufeffvalue😀\nnext\n', 1,

@@ -1662,6 +1662,31 @@ class _Flow:
                         destination[name] = original[name]
                     else:
                         destination.pop(name, None)
+        if not isinstance(self.scope, ast.Module):
+            # Escaped raw callables still read their cells from the caller's
+            # namespace. Previously every scope eagerly included every name
+            # captured anywhere in the module, making unrelated closures
+            # retain quadratic state. Supply an omitted global only when an
+            # actual callee needs it, with the same symbolic identity and live
+            # heap as that earlier initialization. Names belonging to this
+            # scope (including deleted names) must keep their current state.
+            used = self.engine.used_names.get(self.scope, ())
+            for name in self.engine.closures.get(function, ()):
+                if (name not in self.engine.closure_names or name in used
+                        or name in namespace or name in namespace.bindings
+                        or name in namespace.references):
+                    continue
+                symbolic = self.engine.global_symbols.get(name)
+                binding = self.engine.globals.bindings.get(name, _MISSING)
+                if symbolic is None and binding is _MISSING:
+                    continue
+                if namespace is state:
+                    namespace = state.copy()
+                if symbolic is not None:
+                    namespace[name] = symbolic[0]
+                    namespace.references[name] = symbolic[1]
+                if binding is not _MISSING:
+                    namespace.bindings[name] = binding
         return namespace
 
     def definition_table(self, table, function):
@@ -1901,9 +1926,11 @@ class _Flow:
         # and references already observed by a completed context or prefix.
         budget.spend(len(references) + len(summary.mutations)
                      + len(summary.returned_references) + len(summary.yielded_references))
-        used = self.engine.owner(function).used_names[function]
+        owner = self.engine.owner(function)
+        used = owner.used_names[function]
         keys = dict.fromkeys(name for name in references
-                             if not name.startswith('@global:') or name[8:] in used)
+                             if not name.startswith('@global:') or name[8:] in used
+                             or name[8:] in owner.closure_names)
         keys.update(dict.fromkeys(summary.returned_references))
         keys.update(dict.fromkeys(summary.yielded_references))
         keys.update(dict.fromkeys(name for name, _fact in summary.mutations))
@@ -3442,9 +3469,19 @@ class _Analysis:
                 available.update(self.locals.get(parent, set()) & parent_captured.get(parent, set()))
                 parent = self.enclosing(parent)
             self.closures[function] = available - self.locals[function]
-        all_closures = set().union(*self.closures.values()) if self.closures else set()
+        # A cutoff can precede the invocation of an escaped closure. Keep the
+        # old conservative may-alias candidates once for incomplete recovery,
+        # rather than duplicating them in every completed function's state.
+        # This stays module-local when project structural tables are shared.
+        self.closure_names = frozenset().union(*self.closures.values())
         self.used_names = {
-            function: (raw_used[function] | self.locals[function] | all_closures)
+            # Child reads have already propagated to their lexical parents.
+            # A function also needs the cells available in its own enclosing
+            # scopes, including sibling helpers that it can call indirectly.
+            # Captures in an unrelated lexical tree are not dependencies:
+            # adding their module-wide union here retained O(functions^2)
+            # names before the first bounded transfer could run.
+            function: (raw_used[function] | self.locals[function] | self.closures[function])
             for function in self.functions
         }
         self.shadowed_globals = {
@@ -3848,12 +3885,21 @@ class _Analysis:
             local = owner.locals[function]
             used = owner.used_names[function]
             flow = owner.flow_class(owner, function)
-            state = _State({name: owner.global_symbols[name][0]
-                            for name in owner.global_names if name in used and name not in local},
-                           {name: target for name, target in namespace.bindings.items()
-                            if name in used and name not in local})
-            state.references.update({name: owner.global_symbols[name][1]
-                                     for name in owner.global_names if name in used and name not in local})
+            state = _State()
+            # Most functions read a few names in a potentially large module.
+            # Probe those dependencies rather than scanning all globals for
+            # every solve. Namespace bindings can also come from a star
+            # import, so retain them even without a static global symbol.
+            for name in used:
+                if name in local:
+                    continue
+                symbolic = owner.global_symbols.get(name)
+                if symbolic is not None:
+                    state[name] = symbolic[0]
+                    state.references[name] = symbolic[1]
+                binding = namespace.bindings.get(name, _MISSING)
+                if binding is not _MISSING:
+                    state.bindings[name] = binding
             for name in local:
                 state.bindings[name] = None
             arguments = function.args

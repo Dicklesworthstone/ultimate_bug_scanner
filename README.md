@@ -2227,6 +2227,30 @@ and 0.077–0.085 seconds per analyzer. Peak observed process RSS among bounded
 runs was 60,936 KiB (59.5 MiB); this is a measurement, not a memory guarantee.
 The large-file regressions retain their 45-second per-case deadlines.
 
+A further paired audit against `1d03868a` found a separate setup cost: each
+function retained all closure names in the module. Setup now retains lexical
+dependencies per function and supplies escaped-callable dependencies when they
+are read. Incomplete recovery keeps one shared closure-name set. With Python
+3.14.8 and the same 256 MiB address-space cap for both implementations:
+
+| Synthetic source | `1d03868a` | Scoped dependency setup |
+| --- | --- | --- |
+| 1,200 independent closure pairs, 4,801 lines | 2,881,200 retained names; 193,644 KiB RSS | 3,600 names; 48,660 KiB RSS |
+| 1,800 pairs, 7,201 lines | MemoryError during setup, before charged work | Complete; exact tail sink; 57,108 KiB RSS; 0.395 s |
+| 8,000 independent functions, 16,001 lines | Complete; 8.475 s | Complete; 3.136 s |
+
+All nine candidate runs completed with exact unsafe/clean expectations.
+Completed pairs charged identical work. The memory failure was imposed by
+the audit cap, not a native UBS diagnostic. Whole-module state snapshots
+still have superlinear cost; this change removes quadratic retained closure
+metadata and repeated namespace scans during function initialization.
+
+Parallel detector workers also send each completed finding before requesting
+the next result. A crash, timeout, missing final record, or malformed response
+retains the valid prefix and reports incomplete coverage. Such runs cannot
+populate a successful scan cache. The private worker protocol uses UTF-8
+independently of the caller's terminal encoding.
+
 The regressions for [issue #192](https://github.com/Dicklesworthstone/ultimate_bug_scanner/issues/192)
 cover 50/100/200-function subprocess chains, shuffled definitions, recursion,
 import cycles, standard-library files, and an actual staged scan whose worktree

@@ -1026,6 +1026,47 @@ def _local_names(scope, nodes=None) -> set[str]:
     return names
 
 
+def _direct_global_reads_only(scope):
+    """Whether executing a scope can read only its lexical global names.
+
+    This positive whitelist excludes calls and protocol dispatch. Nested
+    function bodies are deferred, but their defaults and annotations execute
+    now; decorators and type parameters keep the ordinary broad context.
+    """
+    if isinstance(scope, ast.AsyncFunctionDef):
+        return False
+    pending = [scope.body] if isinstance(scope, ast.Lambda) else list(scope.body)
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (ast.Name, ast.Constant, ast.Pass, ast.Global, ast.Nonlocal)):
+            continue
+        if isinstance(node, (ast.Return, ast.Expr)):
+            if node.value is not None:
+                pending.append(node.value)
+        elif isinstance(node, ast.Assign):
+            if not all(isinstance(target, ast.Name) for target in node.targets):
+                return False
+            pending.append(node.value)
+        elif isinstance(node, (ast.List, ast.Tuple)):
+            if not isinstance(node.ctx, ast.Load):
+                return False
+            pending.extend(node.elts)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            if getattr(node, 'decorator_list', ()) or getattr(node, 'type_params', ()):
+                return False
+            args = node.args
+            pending.extend(args.defaults)
+            pending.extend(value for value in args.kw_defaults if value is not None)
+            params = [*args.posonlyargs, *args.args, *args.kwonlyargs]
+            params.extend(arg for arg in (args.vararg, args.kwarg) if arg is not None)
+            pending.extend(arg.annotation for arg in params if arg.annotation is not None)
+            if getattr(node, 'returns', None) is not None:
+                pending.append(node.returns)
+        else:
+            return False
+    return True
+
+
 def _used_names(scope, scope_nodes=None) -> set[str]:
     names = set()
     if scope_nodes is None:
@@ -2039,10 +2080,17 @@ class _Flow:
             candidate_keys = dict.fromkeys(candidate_keys)
             candidate_keys.update((f'@global:{name}', None) for module, name in required
                                   if module is owner.tree)
+        direct_globals = (owner.used_names[function]
+                          if (function in owner.direct_global_functions
+                              and summary is not None and not summary.incomplete) else None)
         items = (((name, values.get(name)) for name in candidate_keys)
                  if candidate_keys is not None else values.items())
         pending = []
         for name, binding in items:
+            if (direct_globals is not None and name.startswith('@global:')
+                    and name[8:] not in direct_globals and name[8:] not in self.context_globals
+                    and (owner.tree, name[8:]) not in required):
+                continue
             if not any(isinstance(value, (_FunctionValue, _BoundCallable, _BoundClassMethod))
                        for value in _binding_choices(binding)):
                 continue
@@ -3662,6 +3710,7 @@ class _Analysis:
         self.functions = [node for node in nodes if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))]
         self.generators = set()
         self.definition_writers = set()
+        self.direct_global_functions = set()
         self.locals = {}
         raw_used = {}
         for scope in [tree, *self.functions]:
@@ -3676,6 +3725,8 @@ class _Analysis:
                        for node in body):
                     self.definition_writers.add(scope)
                 raw_used[scope] = _used_names(scope, body)
+                if _direct_global_reads_only(scope):
+                    self.direct_global_functions.add(scope)
                 if any(isinstance(node, (ast.Yield, ast.YieldFrom)) for node in body):
                     self.generators.add(scope)
         for node in nodes:
@@ -4097,6 +4148,8 @@ class _Analysis:
                 self.reads[('summaries', function)] = summary
             return summary
         context = []
+        direct_globals = (owner.used_names[function]
+                          if function in owner.direct_global_functions else None)
         owner_fn = None
         owner_bindings = None
         # Candidate names can come from both a lexical global and an inherited
@@ -4112,6 +4165,11 @@ class _Analysis:
             if name.startswith('@default:'):
                 continue  # Captures are carried by the enclosing callback identity.
             if name.startswith('@global:'):
+                gname = name[8:]
+                if (direct_globals is not None and gname not in direct_globals
+                        and gname not in global_overrides
+                        and (owner.tree, gname) not in capture_globals):
+                    continue
                 # A caller may replace a global callable or class method and
                 # restore it later. The module's final binding cannot certify
                 # a call made while that identity was replaced. Preserve the
@@ -4125,7 +4183,6 @@ class _Analysis:
                 # these comparisons meaningful; the module then runs again.
                 if not owner_fn.namespace_ready:
                     continue
-                gname = name[8:]
                 nominal = owner_bindings.get(gname)
                 explicit_override = gname in global_overrides
                 if (not explicit_override and (owner_fn.tree, gname) not in capture_globals

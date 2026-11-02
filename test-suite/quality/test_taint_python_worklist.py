@@ -1818,6 +1818,47 @@ class LargeModuleBudgetTests(unittest.TestCase):
 class CapturedDefaultValueTests(unittest.TestCase):
     """A function AST is shared; each evaluated default belongs to its creation."""
 
+    def test_repeated_factory_initialization_uses_bounded_summaries(self):
+        prefix = ('def factory(value):\n    def callback(arg=value):\n        return arg\n'
+                  '    return callback\ndef identity(value):\n    return value\n')
+        for count in (10, 50, 200):
+            for dirty in (False, True):
+                with self.subTest(count=count, dirty=dirty):
+                    lines = prefix.splitlines()
+                    lines += [f'saved{index} = factory("fixed")' for index in range(count)]
+                    expected = set()
+                    for index in range(count):
+                        actual = 'input()' if dirty else '"fixed"'
+                        lines += [f'def caller{index}():', f'    eval(identity({actual}))']
+                        if dirty:
+                            expected.add(('eval', len(lines), 5))
+                    engine = self.assert_sites('\n'.join(lines) + '\n', expected)
+                    self.assertLessEqual(engine.work_limit - engine.budget.remaining,
+                                         40 * count + 100)
+                    contexts = sum(isinstance(key, tuple) and key[0].name == 'factory'
+                                   for key in engine.summaries)
+                    self.assertLessEqual(contexts, 2)
+
+    def test_repeated_factory_defaults_keep_each_creation_value(self):
+        for count in (10, 50, 200):
+            for mode in ('clean', 'unsafe', 'mixed'):
+                with self.subTest(count=count, mode=mode):
+                    lines = ['def factory(value):', '    def target(captured=value):',
+                             '        return captured', '    return target']
+                    dirty = [mode == 'unsafe' or (mode == 'mixed' and index % 2 == 1)
+                             for index in range(count)]
+                    for index, unsafe in enumerate(dirty):
+                        actual = 'input()' if unsafe else '"fixed"'
+                        lines.append(f'saved{index} = factory({actual})')
+                    expected = set()
+                    for index, unsafe in enumerate(dirty):
+                        lines.append(f'eval(saved{index}())')
+                        if unsafe:
+                            expected.add(('eval', len(lines), 1))
+                    engine = self.assert_sites('\n'.join(lines) + '\n', expected)
+                    self.assertLessEqual(engine.work_limit - engine.budget.remaining,
+                                         40 * count + 100)
+
     def test_unrelated_captured_globals_do_not_expand_forward_summaries(self):
         prefixes = (
             'def factory(value):\n    def callback(arg=value):\n        return arg\n'
@@ -1934,6 +1975,72 @@ class CapturedDefaultValueTests(unittest.TestCase):
                 self.assertEqual({effect[:3] for effect in caught.exception.effects}, expected)
                 self.assertTrue(engine.failed_summaries[function].capture_globals)
                 self.assertGreater(engine.budget.remaining, 0)
+
+    def test_direct_global_filter_keeps_relevant_creation_and_deferred_reads(self):
+        shapes = (
+            ('def factory():\n    def target(captured=selected):\n        return captured\n'
+             '    return target\nselected=SOURCE\ncallback=factory()\n'
+             'selected="fixed"\neval(callback())\n', {('eval', 8, 1)}),
+            ('def fixed():\n    return "fixed"\ndef factory(value):\n'
+             '    def target(captured=value):\n        return selected(captured)\n'
+             '    return target\nselected=eval\ncallback=factory(SOURCE)\n'
+             'callback()\nselected=print\n', {('eval', 5, 16)}),
+            ('def factory():\n    def target(captured=selected):\n        captured(SOURCE)\n'
+             '    return target\nbox=[]\nselected=box.append\ncallback=factory()\n'
+             'selected=print\ncallback()\neval(box[0])\n', {('eval', 10, 1)}),
+        )
+        for index, (shape, expected) in enumerate(shapes):
+            for dirty in (False, True):
+                with self.subTest(shape=index, dirty=dirty):
+                    source = shape.replace('SOURCE', 'input()' if dirty else '"fixed"')
+                    engine = self.assert_sites(source, expected if dirty else set())
+                    factory = next(fn for fn in engine.functions if getattr(fn, 'name', None) == 'factory')
+                    self.assertIn(factory, engine.direct_global_functions)
+        source = ('import os, shlex\ndef passthrough(value): return value\n'
+                  'def factory(value):\n    return selected(value)\nselected=passthrough\n'
+                  'os.system(factory(input()))\nselected=shlex.quote\nos.system(factory(input()))\n')
+        self.assert_sites(source, {('command', 6, 1)})
+
+    def test_definition_header_calls_keep_indirect_global_contexts(self):
+        headers = (
+            'def factory():\n    def target(captured=read()):\n'
+            '        return captured\n    return target\n',
+            'def factory():\n    return lambda captured=read(): captured\n',
+        )
+        prefix = ('def fixed():\n    return "fixed"\ndef read():\n    return selected()\n')
+        for index, header in enumerate(headers):
+            for dirty in (False, True):
+                with self.subTest(header=index, dirty=dirty):
+                    source = (prefix + header + 'selected=' + ('input' if dirty else 'fixed')
+                              + '\ncallback=factory()\nselected=fixed\neval(callback())\n')
+                    expected = {('eval', len(source.splitlines()), 1)} if dirty else set()
+                    engine = self.assert_sites(source, expected)
+                    factory = next(fn for fn in engine.functions if getattr(fn, 'name', None) == 'factory')
+                    self.assertNotIn(factory, engine.direct_global_functions)
+
+    def test_factory_filter_preserves_imported_scalar_and_callback_defaults(self):
+        root = Path('/__ubs_factory_import_controls__')
+        helpers = (
+            'from values import selected\ndef factory():\n'
+            '    def target(captured=selected):\n        return captured\n    return target\n',
+            'def factory():\n    from values import selected\n'
+            '    def target(captured=selected):\n        return captured\n    return target\n',
+            'def factory():\n    from values import source\n'
+            '    def target(captured=source):\n        return captured()\n    return target\n',
+        )
+        app = 'from helpers import factory\ncallback=factory()\neval(callback())\n'
+        for index, helper in enumerate(helpers):
+            for dirty in (False, True):
+                with self.subTest(helper=index, dirty=dirty):
+                    values = ('selected=' + ('input()' if dirty else '"fixed"')
+                              + '\nsource=' + ('input' if dirty else '(lambda: "fixed")') + '\n')
+                    sources = {root / 'values.py': values, root / 'helpers.py': helper, root / 'app.py': app}
+                    with patch.object(taint_py, '_parse_source',
+                                      side_effect=lambda path: (sources[path], ast.parse(sources[path]))):
+                        findings = list(taint_py._Project(list(sources), root).findings())
+                    self.assertEqual({(path.name, rule, line, column)
+                                      for path, rule, line, column, _ in findings},
+                                     {('app.py', 'py.taint.eval', 3, 1)} if dirty else set())
 
     def assert_sites(self, source, expected, *, scope=None):
         settings = {'UBS_PYTHON_FLOW_SCOPE_STEPS': str(scope)} if scope is not None else {}

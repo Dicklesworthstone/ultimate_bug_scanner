@@ -2108,6 +2108,23 @@ inputs invalidate the reuse, including changed evidence witnesses; active
 import cycles keep the uncached path. A nested definition therefore no longer
 forces every settling call-chain link to execute unrelated module statements.
 
+Simple declaration/return factories also exclude unrelated globals from their
+summary contexts and captured-value projection. A cached syntax proof permits
+only direct lexical reads and checks nested definitions' executable headers;
+calls, decorators, class bodies, imports, control flow, and protocol-dispatch
+expressions keep the broader analysis. Relevant lexical and deferred-child
+reads, explicit global overrides, and observed module-qualified capture
+dependencies remain active. A growing module namespace therefore does not
+create a new factory context for every unrelated assignment. Regressions with
+10, 50, and 200 factory calls check exact unsafe, clean, and mixed-instance
+findings under the unchanged budgets.
+
+A paired 200-factory/200-caller fixture previously exhausted the factory's
+20,000-unit allowance after 422,409 total units. The restricted dependency
+selection completes with the same 200 exact findings in 6,646 total units and
+two factory solves. The comparison uses identical source and work limits;
+clean controls retain no taint findings.
+
 Completed imported base summaries are reused across callers; new callback
 contexts and active import cycles still receive their required analysis. The
 worklist retains dependency metadata and the latest effects while releasing

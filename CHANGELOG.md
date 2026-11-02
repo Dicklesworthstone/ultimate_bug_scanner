@@ -27,6 +27,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Fixed
 
+- Repeated initialization calls to simple Python factories no longer create
+  contexts for unrelated globals added later in the module. A conservative
+  syntax proof restricts pruning to direct lexical reads, retaining relevant
+  defaults, deferred child reads, explicit overrides, imported ownership,
+  and broad incomplete-analysis recovery. The unchanged-budget regressions
+  cover 10, 50, and 200 calls with unsafe, clean, and mixed captured values.
 - Python factory-created functions and lambdas retain their own evaluated
   default values, references, and callable identities. A later safe factory
   call no longer overwrites an earlier tainted callback. Symbolic default

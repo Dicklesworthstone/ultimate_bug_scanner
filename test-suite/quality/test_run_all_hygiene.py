@@ -35,6 +35,43 @@ def run_guard(repo: Path, script: str, mode: str) -> subprocess.CompletedProcess
     return subprocess.run(["bash", "-c", prog], cwd=repo, capture_output=True, text=True, env=env, timeout=60)  # ubs:ignore
 
 
+class RunAllTempDirectoryTest(unittest.TestCase):
+    def test_symlinked_scratch_uses_one_canonical_path_for_fixture_uris(self):
+        # macOS exposes /var through /private/var. A fixture URI using the
+        # alias cannot match the LSP server's canonical repository boundary.
+        work = Path(tempfile.mkdtemp(prefix="ubs-scratch-path-")).resolve()
+        actual = work / "physical"
+        actual.mkdir()
+        alias = work / "alias"
+        alias.symlink_to(actual, target_is_directory=True)
+        text = RUN_ALL.read_text(encoding="utf-8")
+        setup = text[text.index('DEFAULT_TMPDIR=""'):text.index('# CRITICAL:')]
+        env = {key: value for key, value in os.environ.items()
+               if key not in {"TMPDIR", "TMP", "TEMP", "UV_PROJECT_ENVIRONMENT"}}
+        env["TMPDIR"] = str(alias)
+        result = subprocess.run(["bash", "-c", setup + '\nprintf "%s\\n" "$TMPDIR" "$TMP" "$TEMP"'],  # ubs:ignore[py.security.command-injection] - fixed checked-in runner code; paths enter only through env, never shell text.
+                                cwd=work, env=env, text=True, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [str(actual)] * 3)
+        self.assertTrue(alias.is_symlink(), "normalization must preserve the caller's scratch alias")
+
+    def test_relative_scratch_does_not_follow_inherited_cdpath(self):
+        work = Path(tempfile.mkdtemp(prefix="ubs-scratch-cdpath-")).resolve()
+        actual = work / "scratch"
+        actual.mkdir()
+        elsewhere = work / "elsewhere"
+        (elsewhere / "scratch").mkdir(parents=True)
+        text = RUN_ALL.read_text(encoding="utf-8")
+        setup = text[text.index('DEFAULT_TMPDIR=""'):text.index('# CRITICAL:')]
+        env = {key: value for key, value in os.environ.items()
+               if key not in {"TMPDIR", "TMP", "TEMP", "UV_PROJECT_ENVIRONMENT"}}
+        env.update(TMPDIR="scratch", CDPATH=str(elsewhere))
+        result = subprocess.run(["bash", "-c", setup + '\nprintf "%s\\n" "$TMPDIR" "$TMP" "$TEMP"'],  # ubs:ignore[py.security.command-injection] - fixed checked-in runner code; paths enter only through env, never shell text.
+                                cwd=work, env=env, text=True, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [str(actual)] * 3)
+
+
 class RunAllHygieneGuardTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="ubs-hygiene-"))

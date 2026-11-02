@@ -24,6 +24,10 @@ if [[ -z "${TMPDIR:-}" || ! -d "$TMPDIR" || ! -w "$TMPDIR" ]]; then
   fi
 fi
 if [[ -n "${TMPDIR:-}" ]]; then
+  # macOS /var aliases /private/var. Fixture file URIs must use the same
+  # physical root as the scanner's repository boundary, without weakening it.
+  TMPDIR="$(CDPATH='' cd -- "$TMPDIR" && pwd -P)" || exit 1
+  export TMPDIR
   export TMP="${TMP:-$TMPDIR}"
   export TEMP="${TEMP:-$TMPDIR}"
 fi

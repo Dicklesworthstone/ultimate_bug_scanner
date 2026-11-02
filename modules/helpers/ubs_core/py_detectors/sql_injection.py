@@ -122,6 +122,14 @@ def is_sanitizer_call(node, sanitizers, bindings=None):
     return False
 
 
+REFLECTIVE_LOOKUPS = frozenset({
+    'getattr', '__getattribute__', '__getattr__', 'attrgetter', 'methodcaller',
+    'globals', 'locals', 'vars', 'eval', 'exec', '__builtins__', '__import__',
+    'builtins', '_getframe', 'currentframe', 'getouterframes', 'stack',
+    'f_globals', 'f_locals', 'f_builtins', '__dict__', 'modules', 'import_module', '*',
+})
+
+
 class SanitizerBindings:
     """Resolve selected stable imports and same-file helper definitions.
 
@@ -1255,7 +1263,7 @@ class SanitizerBindings:
 
     def _scope(self, node, parent):
         scope = {'node': node, 'parent': parent, 'names': {}, 'capture_barriers': set(),
-                 'nonlocal_names': set()}
+                 'nonlocal_names': set(), 'references': set(), 'reflective': False}
         self.owner_scopes[node] = scope
         return scope
 
@@ -1268,6 +1276,27 @@ class SanitizerBindings:
         if self.budget[0] < 0:
             raise SQLFlowLimit('SQL binding budget exceeded; analysis is incomplete')
         self.scope_of[node] = scope
+        if isinstance(node, ast.Attribute):
+            scope['references'].add(node.attr)
+            scope['reflective'] |= node.attr in REFLECTIVE_LOOKUPS
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            scope['references'].add(node.value)
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            scope['references'].add(node.id)
+            if node.id == 'getattr':
+                parent = self.parents.get(node)
+                # A direct literal selector names the only extra body it
+                # can reach. Its string is already in the reference index.
+                # Aliases and computed selectors still require full flow.
+                static_selector = (isinstance(parent, ast.Call) and parent.func is node
+                                   and len(parent.args) in {2, 3} and not parent.keywords
+                                   and not any(isinstance(arg, ast.Starred) for arg in parent.args)
+                                   and isinstance(parent.args[1], ast.Constant)
+                                   and isinstance(parent.args[1].value, str)
+                                   and parent.args[1].value not in REFLECTIVE_LOOKUPS)
+                scope['reflective'] |= not static_selector
+            else:
+                scope['reflective'] |= node.id in REFLECTIVE_LOOKUPS
         # These edges belong to the same charged binding-index pass. Reuse
         # them for import escape proofs instead of walking the entire file
         # again whenever the first regular-expression shape is requested.
@@ -1396,7 +1425,12 @@ class SanitizerBindings:
         if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
             self.member_writes.add(node.attr)
         if isinstance(node, (ast.Import, ast.ImportFrom)):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                scope['reflective'] |= bool(REFLECTIVE_LOOKUPS.intersection(node.module.split('.')))
             for alias in node.names:
+                # Keep the imported capability even when its local spelling
+                # hides a reflective lookup, e.g. attrgetter as select.
+                scope['reflective'] |= bool(REFLECTIVE_LOOKUPS.intersection(alias.name.split('.')))
                 if alias.name == '*':
                     self.dynamic_namespace = True
                     continue
@@ -1940,6 +1974,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         self._binding_site = None
         self._sink_risks = {}
         self._suppression_index = None
+        self._literal_statement_scopes = None
         self.remaining_steps = max_steps
         self._budget = [max_steps] if budget is None else budget
         self._pending_raise = None
@@ -2461,6 +2496,15 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         self.binding_sites[node.name] = frozenset({node})
         self.binding_sites[node] = frozenset({node})
         bindings = self.ownership_bindings()
+        parent = bindings.owner_scopes[node]['parent']
+        if (self._literal_statement_scopes is not None and node not in self._literal_statement_scopes
+                and parent is not None and (isinstance(parent['node'], ast.Module)
+                    or isinstance(parent['node'], ast.ClassDef) and parent['parent'] is not None
+                    and isinstance(parent['parent']['node'], ast.Module))):
+            # Literal SQL elsewhere cannot depend on this deferred body.
+            # Keep the SQL-bearing scope itself on the complete flow path,
+            # including its callback, generator and ownership refusals.
+            return
         if (node in bindings.independent_functions
                 and not bindings.dynamic_namespace and not bindings.builtin_namespace):
             return
@@ -4918,39 +4962,79 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 continue
             yield argument, 'select' if name == 'select' else 'fragment'
 
-    def has_only_literal_statements(self):
-        """Immutable SQL slots need no facts from unrelated program flow.
+    def literal_statement_scopes(self):
+        """Identify literal SQL owners whose unrelated bodies can be omitted.
 
         Inspect the complete lexical call inventory, including deferred bodies
         and definition-time expressions. Keep ambiguous execution aliases,
         opaque SQL facades, fragments, argument expansions and every computed
-        SQL value on the ordinary flow path. This is not a larger flow budget.
+        SQL value on the ordinary flow path. The owners still need full flow
+        analysis, including callback refusals. This is not a larger budget.
         """
         bindings = self.ownership_bindings()
         if bindings.sql_facade_flow()[1]:
-            return False
+            return None
         found = False
+        scopes = set()
         for call in bindings.calls:
             self.step()
             if bindings.unresolved_sql_aliases(call):
-                return False
+                return None
             short = sql_sink_name(call, bindings)
             if not short:
                 continue
             if (short == 'extra' or any(isinstance(arg, ast.Starred) for arg in call.args)
                     or any(keyword.arg is None for keyword in call.keywords)):
-                return False
+                return None
             keyword_slots = sum(keyword.arg in SQL_ARGUMENT_KEYWORDS.get(short, ())
                                 for keyword in call.keywords)
             if keyword_slots + bool(call.args) != 1:
-                return False
+                return None
             arguments = list(self.sql_arguments(call, short))
             if (not arguments or any(context != 'statement'
                     or not isinstance(argument, ast.Constant) or not isinstance(argument.value, str)
                     for argument, context in arguments)):
-                return False
+                return None
             found = True
-        return found
+            scope = bindings.scope_of[call]
+            while scope is not None:
+                self.step()
+                scopes.add(scope['node'])
+                scope = scope['parent']
+        if not found:
+            return None
+        # Retain referenced helpers and callbacks, including aliases and
+        # literal getattr names. Over-approximate equal spellings rather than
+        # treating an unresolved receiver as proof that a body is unrelated.
+        named, children = {}, {}
+        for owner, scope in bindings.owner_scopes.items():
+            self.step()
+            if isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                named.setdefault(owner.name, set()).add(owner)
+            if scope['parent'] is not None:
+                children.setdefault(scope['parent']['node'], []).append(owner)
+        pending, retained = list(scopes), set()
+        while pending:
+            owner = pending.pop()
+            if owner in retained:
+                continue
+            self.step()
+            retained.add(owner)
+            references = bindings.owner_scopes[owner]['references']
+            if bindings.owner_scopes[owner]['reflective']:
+                # Dynamic lookup in a retained scope needs the existing full
+                # visitor; no callable-name closure can be proved here.
+                return None
+            for name in references:
+                self.step()
+                pending.extend(named.get(name, ()))
+            for child in children.get(owner, ()):
+                if (isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+                        or not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+                        or getattr(child, 'decorator_list', ())
+                        or getattr(child, 'name', '').startswith('__')):
+                    pending.append(child)
+        return frozenset(retained)
 
     def visit_Call(self, node):
         self._facade_results.discard(node)
@@ -6617,8 +6701,7 @@ def find(files: Sequence[Path], *, max_steps=100_000) -> Iterable[tuple[str, Pat
             budget=budget,
             bindings=bindings,
         )
-        if analyzer.has_only_literal_statements():
-            continue
+        analyzer._literal_statement_scopes = analyzer.literal_statement_scopes()
         failure = None
         try:
             analyzer.visit(tree)

@@ -280,6 +280,36 @@ class SQLSinkArguments(unittest.TestCase):
         # one method caused every unrelated test body to consume SQL flow.
         self.assertEqual(list(detector.find([Path(__file__).with_name('test_ubs_core.py')])), [])
 
+    def test_literal_scope_admission_keeps_decorators_and_reflection(self):
+        closure = ('events = []\n'
+                   'def record(item):\n    events.append(item)\n    raise ValueError(item)\n'
+                   'record(value)\n')
+        worker = 'class Worker:\n    def collect(self):\n' + textwrap.indent(closure, '        ')
+        cases = (
+            ('decorated-function', 'def invoke(fn):\n    fn()\n    return fn\n'
+             '@invoke\ndef hidden():\n' + textwrap.indent(closure, '    ')),
+            ('decorated-method', 'def invoke(fn):\n    fn()\n    return fn\n'
+             'class Worker:\n    @invoke\n    def collect():\n' + textwrap.indent(closure, '        ')),
+            ('aliased-attrgetter', 'from operator import attrgetter as grab\n' + worker
+             + 'callback = grab("col" + "lect")(Worker())\ncallback()\n'),
+            ('aliased-methodcaller', 'from operator import methodcaller as call\n' + worker
+             + 'call("col" + "lect")(Worker())\n'),
+            ('attribute-protocol', worker + 'Worker().__getattribute__("col" + "lect")()\n'),
+            ('literal-getattr', worker + 'getattr(Worker(), "collect")()\n'),
+            ('aliased-getattr', worker + 'grab = getattr\ngrab(Worker(), "col" + "lect")()\n'),
+            ('literal-namespace', worker + 'getattr(Worker, "__dict__")["col" + "lect"](Worker())\n'),
+            ('literal-reflective-method', worker
+             + 'getattr(Worker(), "__getattribute__")("col" + "lect")()\n'),
+            ('expanded-selector', worker
+             + 'getattr(*(Worker, "__dict__"), "unused")["col" + "lect"](Worker())\n'),
+        )
+        for name, source in cases:
+            with self.subTest(case=name):
+                path = self.artifacts / ('literal-sql-reachable-' + name + '.py')
+                path.write_text('cursor.execute("SELECT 1")\n' + source, encoding='utf-8')
+                with self.assertRaisesRegex(detector.SQLFlowLimit, 'closure list ownership'):
+                    list(detector.find([path]))
+
     def test_literal_statements_do_not_hide_ambiguous_or_opaque_sql(self):
         for name, source, reason in (
                 ('ambiguous', 'from backend import execute as fetch\n'
@@ -288,7 +318,12 @@ class SQLSinkArguments(unittest.TestCase):
                  'aliased execution binding'),
                 ('facade', 'from backend import dispatch\n'
                  'def raw(value):\n    dispatch(f"SELECT {value}")\n'
-                 'def run(user):\n    raw(user)\n', 'facade forwarding call')):
+                 'def run(user):\n    raw(user)\n', 'facade forwarding call'),
+                ('same-scope-closure', 'def run(cursor, user):\n'
+                 '    events = []\n'
+                 '    def record(item):\n        events.append(item)\n        raise ValueError(item)\n'
+                 '    record(user)\n    cursor.execute("SELECT ?", (user,))\n',
+                 'closure list ownership')):
             with self.subTest(case=name):
                 path = self.artifacts / ('literal-sql-negative-' + name + '.py')
                 path.write_text('cursor.execute("SELECT 1")\n' + source, encoding='utf-8')
@@ -432,13 +467,14 @@ class SQLSinkArgumentsCLI(unittest.TestCase):
                         for child in ('tmp', 'home', 'cache'):
                             (folder / child).mkdir()
                         env = {key: value for key, value in os.environ.items() if not key.startswith('UBS_')}
+                        skip_categories = ','.join(str(n) for n in range(1, 24) if n != 7)
                         env.update(HOME=str(folder / 'home'), XDG_CACHE_HOME=str(folder / 'cache'),
                                    TMPDIR=str(folder / 'tmp'), NO_COLOR='1', PYTHONDONTWRITEBYTECODE='1',
                                    UBS_NO_AUTO_UPDATE='1', UBS_KEEP_TEMP='1', ENABLE_UV_TOOLS='0',
-                                   UBS_SKIP_CATEGORIES=','.join(str(n) for n in range(1, 24) if n != 7))
+                                   UBS_SKIP_CATEGORIES=skip_categories)
                         executable = ROOT / ('ubs' if entry == 'runner' else 'modules/ubs-python.sh')
                         command = ['bash', str(executable), '--ci', '--fail-on-warning', '--no-color', f'--format={format_name}',
-                                   '--skip=' + env['UBS_SKIP_CATEGORIES']]
+                                   '--skip=' + skip_categories]
                         command += ['--only=python'] if entry == 'runner' else ['--no-uv']
                         command.append(str(path))
                         started = time.perf_counter()

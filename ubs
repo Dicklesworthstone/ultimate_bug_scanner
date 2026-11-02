@@ -6623,7 +6623,11 @@ ensure_cached_helpers(){
     if [[ -n "$TMPDIR_RUN" && -d "$TMPDIR_RUN" ]] \
         && (( ${#batch_files[@]} > 0 )) \
         && batch_output="$TMPDIR_RUN/helper-checksums" \
-        && sha256sum --zero -- "${batch_files[@]}" >"$batch_output" 2>/dev/null; then
+        && (sha256sum --zero -- "${batch_files[@]}" >"$batch_output" 2>/dev/null
+            # Keep the hashing parent disposable, as in the per-file path.
+            # A killed batch falls through to the existing retry/diagnostics.
+            batch_rc=$?
+            exit "$batch_rc"); then
       # Darwin prints literal filename newlines in its default output. NUL
       # records work on both Darwin and GNU, and bind each digest to its path.
       while IFS= read -r -d '' batch_line; do

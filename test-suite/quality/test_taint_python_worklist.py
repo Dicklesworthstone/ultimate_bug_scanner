@@ -423,6 +423,170 @@ class Factory:
         self.assertEqual(engine.functions, [node for node in ast.walk(tree)
                          if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))])
 
+    def test_independent_closures_retain_only_linear_scope_dependencies(self):
+        for count in (64, 256):
+            prefix = ''.join(
+                f'def outer{index}(captured{index}):\n'
+                f'    def inner{index}():\n'
+                f'        return captured{index}\n'
+                f'    return inner{index}\n'
+                for index in range(count))
+            for unsafe in (True, False):
+                with self.subTest(function_pairs=count, unsafe=unsafe):
+                    source = prefix + ('eval(input())\n' if unsafe else 'eval("fixed")\n')
+                    engine = taint_py._Analysis(ast.parse(source))
+                    # Retaining every unrelated captured name in every scope
+                    # consumes quadratic memory before any budget is charged.
+                    retained = sum(len(names) for names in engine.used_names.values())
+                    self.assertLessEqual(retained, 4 * count)
+                    effects = engine.analyze()
+                    expected = {('eval', 4 * count + 1, 1)} if unsafe else set()
+                    self.assertEqual({key[:3] for key in effects}, expected)
+
+    def test_scope_dependencies_keep_transitive_closures_and_class_bodies(self):
+        bodies = (
+            '    alias = payload\n'
+            '    def leaf():\n        return alias\n'
+            '    def relay():\n        callback = leaf\n        return callback()\n'
+            '    def invoke():\n        def further():\n            return relay()\n'
+            '        return further()\n    return invoke()\n',
+            '    def leaf():\n        return payload\n'
+            '    def dispatch(callback):\n        return callback()\n'
+            '    return dispatch(leaf)\n',
+            '    def choose(value=payload):\n        return value\n'
+            '    return choose()\n',
+            '    class Local:\n        @staticmethod\n'
+            '        def value():\n            return payload\n'
+            '    return Local.value()\n',
+        )
+        for index, body in enumerate(bodies):
+            for unsafe in (True, False):
+                with self.subTest(shape=index, unsafe=unsafe):
+                    actual = 'input()' if unsafe else '"fixed"'
+                    source = ('payload = "unrelated global"\n'
+                              'def unrelated(noise):\n    def inner():\n        return noise\n'
+                              '    return inner\n'
+                              'def outer(payload):\n' + body + f'eval(outer({actual}))\n')
+                    effects = taint_py._Analysis(ast.parse(source)).analyze()
+                    expected = {('eval', len(source.splitlines()), 1)} if unsafe else set()
+                    self.assertEqual({key[:3] for key in effects}, expected, effects)
+
+    def test_lazy_scope_dependencies_keep_escaped_callable_flows(self):
+        shapes = (
+            'callback = maker(token)\ndef caller():\n    eval(callback())\n',
+            'callback = maker(token)\ndef first():\n    return second()\n'
+            'def second():\n    return callback\ndef caller():\n    eval(first()())\n',
+            'callback = maker(token)\ndef invoke(target):\n    return target()\n'
+            'def caller():\n    eval(invoke(callback))\n',
+            'def provide():\n    return maker(token)\ndef caller():\n    eval(provide()())\n',
+            'def provide():\n    yield maker(token)\ndef caller():\n'
+            '    for callback in provide():\n        eval(callback())\n',
+            'async def provide():\n    return maker(token)\nasync def caller():\n'
+            '    callback = await provide()\n    eval(callback())\n',
+            'callback = maker(token)\ndef invoke(target=callback):\n    return target()\n'
+            'def caller():\n    eval(invoke())\n',
+            'callback = maker(token)\ndef caller():\n'
+            '    values = [callback() for token in ("fixed",)]\n    eval(values[0])\n',
+        )
+        definition = ('def maker(token):\n    def read():\n        return token\n'
+                      '    return read\n')
+        for index, shape in enumerate(shapes):
+            for unsafe in (True, False):
+                with self.subTest(shape=index, unsafe=unsafe):
+                    actual = 'input()' if unsafe else '"fixed"'
+                    source = f'token = {actual}\n' + definition + shape
+                    effects = taint_py._Analysis(ast.parse(source)).analyze()
+                    expected = {('eval', len(source.splitlines()), 9 if index == 4 else 5)} if unsafe else set()
+                    self.assertEqual({key[:3] for key in effects}, expected, effects)
+
+        for unsafe in (True, False):
+            with self.subTest(live_heap=True, unsafe=unsafe):
+                actual = 'input()' if unsafe else '"fixed"'
+                source = ('token = []\n' + definition + 'callback = maker(token)\n'
+                          f'def populate():\n    token.append({actual})\n'
+                          'def caller():\n    populate()\n    eval(callback()[0])\n')
+                effects = taint_py._Analysis(ast.parse(source)).analyze()
+                expected = {('eval', len(source.splitlines()), 5)} if unsafe else set()
+                self.assertEqual({key[:3] for key in effects}, expected, effects)
+
+    def test_function_initialization_does_not_scan_unrelated_globals(self):
+        source = (''.join(f'unrelated{index} = {index}\n' for index in range(400))
+                  + 'important = input()\ndef selected():\n    return important\neval(selected())\n')
+        engine = taint_py._Analysis(ast.parse(source))
+        self.assertEqual({key[:3] for key in engine.analyze()}, {('eval', 404, 1)})
+        function = next(function for function in engine.functions if function.name == 'selected')
+        visits = []
+
+        class ObservedNames(set):
+            def __iter__(self):
+                visits.append(len(self))
+                return super().__iter__()
+
+        class ObservedBindings(dict):
+            def items(self):
+                visits.append(len(self))
+                return super().items()
+
+        engine.global_names = ObservedNames(engine.global_names)
+        engine.globals.bindings = ObservedBindings(engine.globals.bindings)
+        _reads, _writes, summary = engine.solve_function(function, ())
+        self.assertEqual(summary, engine.summaries[function])
+        self.assertLessEqual(sum(visits), 3 * len(engine.used_names[function]),
+                             'A tiny function cannot visit the whole module namespace per solve')
+
+    def test_compact_dependencies_keep_incomplete_escaped_aliases(self):
+        prefix = ('box = []\ndef maker(box):\n    def read():\n        return box\n'
+                  '    return read\ncallback = maker(box)\ndef expensive():\n'
+                  + ''.join(f'    padding{index} = {index}\n' for index in range(100))
+                  + '    return callback()\ndef caller():\n    alias = expensive()\n')
+        for unsafe in (True, False):
+            actual = 'input()' if unsafe else '"fixed"'
+            source = prefix + f'    alias.append({actual})\n    eval(box[0])\n'
+            for allowance in (5000, 20):
+                with self.subTest(unsafe=unsafe, allowance=allowance):
+                    engine = taint_py._Analysis(ast.parse(source))
+                    expensive = next(function for function in engine.functions if function.name == 'expensive')
+                    engine.scope_limits[expensive] = engine.scope_remaining[expensive] = allowance
+                    if allowance == 20:
+                        with self.assertRaises(AnalysisLimit) as raised:
+                            engine.analyze()
+                        self.assertIn('expensive', str(raised.exception))
+                        effects = raised.exception.effects
+                    else:
+                        effects = engine.analyze()
+                    expected = {('eval', len(source.splitlines()), 5)} if unsafe else set()
+                    self.assertEqual({key[:3] for key in effects}, expected, effects)
+
+    def test_function_initialization_keeps_dynamic_namespace_bindings(self):
+        # Resolver-provided bindings need not appear in the module's static
+        # assignment-name index, for example after a wildcard import.
+        for binding, expected in (('eval', {('eval', 2, 5)}), ('print', set())):
+            with self.subTest(binding=binding):
+                tree = ast.parse('def handler():\n    callback(input())\n')
+                engine = taint_py._Analysis(tree)
+                self.assertNotIn('callback', engine.global_symbols)
+                engine.refresh_globals(taint_py._State(bindings={'callback': binding}))
+                _reads, _writes, summary = engine.solve_function(tree.body[0], ())
+                self.assertEqual({effect[:3] for effect in summary.effects}, expected)
+
+    def test_lazy_closure_globals_do_not_cross_module_ownership(self):
+        root = Path('/__ubs_virtual_closure_names__')
+        sources = {
+            root / 'helpers.py': 'token = "fixed"\ndef maker(token):\n'
+                                 '    def read():\n        return token\n'
+                                 '    return read\ncallback = maker(token)\n',
+            root / 'app.py': 'from helpers import callback\ntoken = input()\n'
+                             'def caller():\n    eval(callback())\n',
+        }
+        with patch.object(taint_py, '_parse_source',
+                          side_effect=lambda path: (sources[path], ast.parse(sources[path]))):
+            project = taint_py._Project(sources, root)
+            engines = {path.name: engine for path, _text, engine, _offset in project.sources}
+            self.assertIn('token', engines['helpers.py'].closure_names)
+            self.assertNotIn('token', engines['app.py'].closure_names)
+            self.assertIs(engines['helpers.py'].closures, engines['app.py'].closures)
+            self.assertEqual(list(project.findings()), [])
+
     def test_namespace_changes_recompute_handlers_without_new_value_facts(self):
         source = SHAPES['late_global_callable']['app.py']
         for callback, expected in [('os.system', {('app.py', 13)}), ('harmless', set())]:

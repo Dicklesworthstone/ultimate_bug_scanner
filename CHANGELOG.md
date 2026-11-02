@@ -27,6 +27,17 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Fixed
 
+- Python function setup no longer copies every closure name into every
+  function. Lexical dependencies stay local; escaped-callable reads recover
+  their required symbolic globals lazily, and incomplete-call alias recovery
+  retains its conservative coverage. Function initialization probes required
+  names instead of scanning the entire module namespace for every solve.
+- Parallel Python detectors retain completed findings when a worker times out,
+  exits abruptly, or emits a malformed/truncated response. An explicit final
+  record is required for completion; incomplete runs still exit 2 and cannot
+  populate successful cache entries. The private protocol uses UTF-8 even
+  under ASCII or Latin-1 caller environments.
+
 - Python taint and HTTP response-header analysis address the large-module
   budget regression in GH #198. Source-order fixed-point passes reuse module
   initialization only while their namespace, observed inputs, and evidence

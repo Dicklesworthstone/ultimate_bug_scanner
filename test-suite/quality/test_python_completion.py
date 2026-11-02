@@ -343,6 +343,83 @@ class PythonCompletionTests(unittest.TestCase):
             with self.assertRaises(subprocess.TimeoutExpired):
                 py_scan._detector_process('division', [self.source], None)
 
+    def test_interrupted_workers_keep_real_header_findings_and_partial_status(self):
+        from types import SimpleNamespace
+
+        files = []
+        for index in range(8):
+            path = self.root / f'worker-prefix{index}.py'
+            source = ("from flask import request, Response\n"
+                      "value = request.args['name']\n"
+                      "Response(headers={'X-Name': value})\n") if index == 0 else ''
+            path.write_text(source + ''.join(
+                f'value{line} = numerator / divisor\n' for line in range(4)))
+            files.append(path)
+        original = py_scan.run_detectors
+
+        def selected_detectors(*args, **kwargs):
+            with patch('pkgutil.iter_modules', return_value=[
+                    SimpleNamespace(name='header_injection'), SimpleNamespace(name='division')]):
+                return original(*args, **kwargs)
+
+        for mode, diagnostic in (('exit17', 'worker exited 17'),
+                                 ('exit0', 'missing completion record'),
+                                 ('timeout', 'TimeoutExpired')):
+            worker = self.root / f'interrupted-worker-{mode}'
+            action = 'time.sleep(30)' if mode == 'timeout' else f'os._exit({17 if mode == "exit17" else 0})'
+            worker.write_text(
+                f'#!{sys.executable}\n'
+                'import os, time\n'
+                'from ubs_core.py_detectors import header_injection\n'
+                'from ubs_core.py_scan import _detector_worker\n'
+                'original = header_injection.find\n'
+                'def interrupted(files):\n'
+                '    for hit in original(files):\n'
+                '        yield hit\n'
+                f'        {action}\n'
+                'header_injection.find = interrupted\n'
+                '_detector_worker()\n')
+            worker.chmod(0o755)
+            with self.subTest(mode=mode), patch.object(sys, 'executable', str(worker)), \
+                    patch.dict(self.env, {'UBS_MODULE_TIMEOUT': '1'}), \
+                    patch.object(py_scan, 'run_detectors', side_effect=selected_detectors):
+                for _ in range(2):
+                    started = time.monotonic()
+                    result = self.scan(files=files, jobs=2)
+                    self.assertLess(time.monotonic() - started, 10, result)
+                    self.assert_partial(result, diagnostic)
+                    headers = [row for row in result[2] if row['rule'] == 'py.security.header-injection']
+                    self.assertEqual([(row['path'], row['line'], row['col']) for row in headers],
+                                     [(str(files[0]), 3, 1)], result)
+                    self.assertEqual(headers[0]['severity'], 'critical')
+                    self.assertEqual(sum(row['rule'] == 'py.numeric.division-heavy'
+                                         for row in result[2]), 32, result)
+
+    def test_worker_protocol_retains_only_valid_prefix_before_corruption(self):
+        from types import SimpleNamespace
+
+        record = self.finding(SimpleNamespace(files=[self.source]))
+        record['message'] = 'first\u0085second\u2028third\u2029fourth'
+        first = (json.dumps(['finding', record], ensure_ascii=False) + '\n').encode('utf-8')
+        complete = b'["complete", []]\n'
+        for index, tail in enumerate((b'', b'not JSON\n', b'\xff\n',
+                                      b'["finding", {"rule": "unfinished',
+                                      b'["finding", null]\n', b'["finding", {}]\n' + complete,
+                                      (json.dumps(['finding', {**record, 'rule': ''}]) + '\n').encode() + complete,
+                                      (json.dumps(['finding', {**record, 'line': '1'}]) + '\n').encode() + complete,
+                                      b'["complete", [null]]\n',
+                                      complete + first, complete + complete)):
+            worker = self.root / f'corrupt-prefix-worker{index}'
+            worker.write_text(f'#!{sys.executable}\nimport sys\n'
+                              f'sys.stdout.buffer.write({first + tail!r})\n')
+            worker.chmod(0o755)
+            with self.subTest(tail=tail), patch.object(sys, 'executable', str(worker)):
+                with self.assertRaisesRegex(ValueError, 'Invalid detector worker response') as raised:
+                    py_scan._detector_process('header_injection', [self.source], None)
+                payload = raised.exception.detector_records
+                self.assertEqual(self.decode_json(payload, 'retained worker prefix'), record)
+                self.assertEqual(raised.exception.detector_errors, [])
+
     def test_malformed_detector_protocol_fails_loudly(self):
         for request in ('not JSON', 'null', '[]'):
             with self.subTest(request=request), patch.object(sys, 'stdin', io.StringIO(request)):
@@ -356,14 +433,29 @@ class PythonCompletionTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'Invalid detector worker response'):
                     py_scan._detector_process('division', [self.source], None)
 
+    def test_detector_worker_protocol_uses_utf8_independent_of_parent_encoding(self):
+        self.source.write_text("from flask import request, Response\n"
+                               "Response(headers={'X-Name': request.args['name']})\n")
+        outputs = []
+        for encoding in ('utf-8', 'ascii', 'latin-1'):
+            with self.subTest(encoding=encoding), patch.dict(os.environ, {'PYTHONIOENCODING': encoding}):
+                records, errors = py_scan._detector_process('header_injection', [self.source], None)
+                self.assertEqual(errors, [])
+                finding = self.decode_json(records, 'encoded header worker finding')
+                self.assertEqual((finding['rule'], finding['line'], finding['col']),
+                                 ('py.security.header-injection', 2, 1))
+                outputs.append(finding)
+        self.assertEqual(outputs, [outputs[0]] * 3)
+
     def test_parallel_worker_capture_preserves_unicode_line_separators(self):
         from types import SimpleNamespace
 
         record = self.finding(SimpleNamespace(files=[self.source]))
         record['message'] = 'first\u0085second\u2028third\u2029fourth'
-        payload = json.dumps(record, ensure_ascii=False) + '\n'
+        payload = (json.dumps(['finding', record], ensure_ascii=False) + '\n'
+                   + json.dumps(['complete', []]) + '\n')
         worker = self.root / 'unicode-worker'
-        worker.write_text(f'#!{sys.executable}\nprint({json.dumps([payload, []])!r})\n')
+        worker.write_text(f'#!{sys.executable}\nimport sys\nsys.stdout.write({payload!r})\n')
         worker.chmod(0o755)
         target = io.StringIO()
         sink = CapturingSink(target)

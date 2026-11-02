@@ -2113,6 +2113,16 @@ contexts and active import cycles still receive their required analysis. The
 worklist retains dependency metadata and the latest effects while releasing
 completed functions' temporary expression, heap, and completion states.
 
+Functions and lambdas returned or yielded by a factory retain the facts,
+object references, and callable identities of their evaluated defaults.
+Creating another callback cannot replace an earlier callback's captured
+defaults. Explicit call arguments override those defaults, while later writes
+through a captured mutable object remain visible. Shared body summaries use
+symbolic default inputs, so different concrete values do not create a new
+summary context for every factory invocation. This also applies to awaited
+factories and generator completion values. Incomplete factories retain
+observed captured sources while revoking unfinished sanitizer guarantees.
+
 Summary substitution joins expanded facts once, avoiding repeated copies of
 a growing result. A 1,024-entry cache reuses immutable witness transformations;
 its key includes source, parameter, sanitizer proofs, the complete evidence
@@ -2163,6 +2173,15 @@ callback context. The default also accounts for module size because a small
 wrapper can project large summaries from a long downstream call chain.
 Increasing `UBS_MODULE_TIMEOUT` only changes the separate wall-clock timeout
 and cannot increase these work limits.
+
+Captured defaults and deferred async calls can share nested value graphs.
+Their immutable hashes are cached, and semantic/evidence comparisons reuse
+results for already compared object pairs within that comparison. A separate
+64-level captured-value shape limit protects recursive value operations;
+exceeding it reports incomplete analysis and retains established findings.
+This shape limit counts both captured functions and deferred calls. Ordinary
+function-call chains continue to use summary convergence without a call-depth
+cutoff.
 
 For example, a gate can pin both limits explicitly:
 

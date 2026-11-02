@@ -384,8 +384,10 @@ main()
                         self.assertEqual(findings, [])
                         continue
                     line = sources['app.py'].splitlines().index('    os.system(value)') + 1
+                    # Per-creation defaults cross invoke's callback summary;
+                    # retain that real call in the exact diagnostic witness.
                     self.assertEqual(findings, [('app.py', 'py.taint.command', line, 5,
-                                               'input( -> target() -> value -> subprocess execution')])
+                                               'input( -> invoke() -> target() -> value -> subprocess execution')])
 
     def test_prepared_syntax_preserves_child_scopes_and_deferred_imports(self):
         tree = ast.parse('''
@@ -1259,7 +1261,7 @@ main()
                 # A later factory invocation cannot change a value already
                 # returned by the earlier closure. Keep its captured input.
                 expected = [('zapp.py', 'py.taint.command', 19, 5,
-                             'input( -> target() -> value -> subprocess execution')] if unsafe else []
+                             'input( -> invoke() -> target() -> value -> subprocess execution')] if unsafe else []
                 self.assertEqual(findings, expected)
 
     def test_failed_namespace_context_rolls_back_without_poisoning_other_groups(self):
@@ -1811,6 +1813,426 @@ class LargeModuleBudgetTests(unittest.TestCase):
                     for domain in report.values():
                         self.assertLessEqual(domain['module_passes'], 8, report)
                         self.assertLessEqual(domain['function_passes'], 10 * domain['functions'], report)
+
+
+class CapturedDefaultValueTests(unittest.TestCase):
+    """A function AST is shared; each evaluated default belongs to its creation."""
+
+    def test_unrelated_captured_globals_do_not_expand_forward_summaries(self):
+        prefixes = (
+            'def factory(value):\n    def callback(arg=value):\n        return arg\n'
+            '    return callback\nsaved = factory("fixed")\n',
+            'box = []\nsaved = box.append\n',
+        )
+        for prefix in prefixes:
+            for count in (80, 200):
+                helpers = ''.join(
+                    f'def f{index}(value):\n    return '
+                    + (f'f{index + 1}(value)' if index + 1 < count else 'value') + '\n'
+                    for index in range(count)
+                )
+                for dirty in (False, True):
+                    with self.subTest(prefix=prefix, count=count, dirty=dirty):
+                        actual = 'input()' if dirty else '"fixed"'
+                        source = prefix + helpers + f'eval(f0({actual}))\n'
+                        sites = {('eval', len(source.splitlines()), 1)} if dirty else set()
+                        engine = self.assert_sites(source, sites)
+                        work = engine.work_limit - engine.budget.remaining
+                        self.assertLess(work, 150 * count, (count, dirty, work))
+                        contexts = sum(isinstance(key, tuple) for key in engine.summaries)
+                        self.assertLessEqual(contexts, count + 10)
+
+    def test_global_captures_follow_transitive_dependencies(self):
+        factory = ('def factory(value):\n    def callback(arg=value):\n        return arg\n'
+                   '    return callback\n')
+        helpers = ('def leaf():\n    return saved()\n'
+                   'def relay():\n    return leaf()\n')
+        shapes = (
+            factory + 'saved = factory(SOURCE)\n' + helpers + 'eval(relay())\n',
+            factory + 'box = []\nsaved = factory(box)\n' + helpers
+            + 'box.append(SOURCE)\neval(relay()[0])\n',
+            factory + 'saved = factory("fixed")\n' + helpers
+            + 'saved = factory(SOURCE)\nvalue = relay()\n'
+            + 'saved = factory("fixed")\neval(value)\n',
+        )
+        for index, shape in enumerate(shapes):
+            for dirty in (False, True):
+                with self.subTest(shape=index, dirty=dirty):
+                    source = shape.replace('SOURCE', 'input()' if dirty else '"fixed"')
+                    sites = {('eval', len(source.splitlines()), 1)} if dirty else set()
+                    self.assert_sites(source, sites)
+
+    def test_unrelated_captured_globals_are_not_selected_per_call(self):
+        for count in (50, 200):
+            for dirty in (False, True):
+                with self.subTest(count=count, dirty=dirty):
+                    lines = ['def identity(value):', '    return value']
+                    lines += [f'saved{index} = lambda captured="fixed": captured'
+                              for index in range(count)]
+                    expected = set()
+                    for index in range(count):
+                        lines += [f'def caller{index}():',
+                                  '    eval(identity(' + ('input()' if dirty else '"fixed"') + '))']
+                        if dirty:
+                            expected.add(('eval', len(lines), 5))
+                    selected = []
+                    original = taint_py._Analysis._call_summary
+
+                    def counted(engine, function, values, candidate_keys=None,
+                                global_overrides=(), capture_globals=frozenset()):
+                        if function.name == 'identity':
+                            keys = values if candidate_keys is None else candidate_keys
+                            selected.append(sum(key.startswith('@global:saved') for key in keys))
+                        return original(engine, function, values, candidate_keys,
+                                        global_overrides, capture_globals)
+
+                    with patch.object(taint_py._Analysis, '_call_summary', counted):
+                        engine = self.assert_sites('\n'.join(lines) + '\n', expected)
+                    self.assertTrue(selected)
+                    self.assertEqual(sum(selected), 0,
+                                     'Unused captured globals were scanned for each helper call')
+                    self.assertLessEqual(engine.work_limit - engine.budget.remaining,
+                                         40 * count + 200)
+
+    def test_global_capture_dependencies_preserve_module_ownership(self):
+        root = Path('/__ubs_default_capture_owners__')
+        helpers = ('def factory(value):\n    def target(arg=value):\n        return arg\n'
+                   '    return target\ndef leaf():\n    return saved()\n'
+                   'def relay():\n    return leaf()\n')
+        app = ('import left\nimport right\nsaved = "unrelated"\ndef run():\n'
+               '    eval(left.relay())\n    eval(right.relay())\n')
+        for left_dirty in (False, True):
+            with self.subTest(left_dirty=left_dirty):
+                sources = {root / 'app.py': app}
+                for name, dirty in (('left', left_dirty), ('right', not left_dirty)):
+                    value = 'input()' if dirty else '"fixed"'
+                    sources[root / (name + '.py')] = helpers + f'saved = factory({value})\n'
+                with patch.object(taint_py, '_parse_source',
+                                  side_effect=lambda path: (sources[path], ast.parse(sources[path]))):
+                    findings = list(taint_py._Project(list(sources), root).findings())
+                self.assertEqual({(path.name, rule, line, column)
+                                  for path, rule, line, column, _ in findings},
+                                 {('app.py', 'py.taint.eval', 5 if left_dirty else 6, 5)})
+
+    def test_interrupted_relay_retains_global_capture_dependencies(self):
+        for dirty in (False, True):
+            lines = ['saved = lambda arg=' + ('input()' if dirty else '"fixed"') + ': arg',
+                     'def leaf():', '    return saved()', 'def relay():',
+                     '    value = leaf()', '    if choice:', '        return value']
+            lines += ['    padding = "fixed"'] * 100
+            lines += ['    return "fixed"', 'eval(relay())']
+            source = '\n'.join(lines) + '\n'
+            expected = {('eval', len(lines), 1)} if dirty else set()
+            self.assert_sites(source, expected)
+            with self.subTest(dirty=dirty):
+                engine = taint_py._Analysis(ast.parse(source))
+                function = next(fn for fn in engine.functions if getattr(fn, 'name', None) == 'relay')
+                engine.scope_limits[function] = 60
+                engine.scope_remaining[function] = 60
+                with self.assertRaisesRegex(AnalysisLimit, 'relay.*function work limit') as caught:
+                    engine.analyze()
+                self.assertEqual({effect[:3] for effect in caught.exception.effects}, expected)
+                self.assertTrue(engine.failed_summaries[function].capture_globals)
+                self.assertGreater(engine.budget.remaining, 0)
+
+    def assert_sites(self, source, expected, *, scope=None):
+        settings = {'UBS_PYTHON_FLOW_SCOPE_STEPS': str(scope)} if scope is not None else {}
+        with patch.dict(os.environ, settings):
+            engine = taint_py._Analysis(ast.parse(source))
+            if scope == 60:
+                with self.assertRaisesRegex(AnalysisLimit, 'factory.*function work limit') as caught:
+                    engine.analyze()
+                effects = caught.exception.effects
+                for fact in effects.values():
+                    self.assertTrue(all(taint_py._INCOMPLETE_PROOF in trace.sanitizers for trace in fact))
+            else:
+                effects = engine.analyze()
+        actual = {(kind, line, column) for kind, line, column, _label in effects}
+        self.assertEqual(actual, expected, source)
+        return engine
+
+    def test_safe_and_unsafe_creations_keep_their_own_defaults(self):
+        factories = (
+            ('value', 'def factory(value):\n    def target(captured=value):\n        return captured\n    return target\n',
+             'input()', '"fixed"'),
+            ('lambda', 'def factory(value):\n    return lambda *, captured=value: captured\n',
+             'input()', '"fixed"'),
+            ('callback-result', 'def factory(callback):\n    def target(captured=callback()):\n        return captured\n    return target\n',
+             'input', 'fixed'),
+            ('callback-value', 'def factory(callback):\n    def target(captured=callback):\n        return captured()\n    return target\n',
+             'input', 'fixed'),
+            ('nested', 'def factory(value):\n    def inner(captured=value):\n        return captured\n'
+                       '    def target(callback=inner):\n        return callback()\n    return target\n',
+             'input()', '"fixed"'),
+        )
+        helpers = ('def fixed():\n    return "fixed"\ndef invoke(callback):\n    return callback()\n'
+                   'def relay(callback):\n    return invoke(callback)\n')
+        for name, factory, dirty, clean in factories:
+            for first_dirty in (False, True):
+                for invocation in ('{}()', 'invoke({})', 'relay({})'):
+                    with self.subTest(factory=name, first_dirty=first_dirty, invocation=invocation):
+                        first, second = (dirty, clean) if first_dirty else (clean, dirty)
+                        lines = (helpers + factory).splitlines()
+                        lines += [f'first = factory({first})', f'second = factory({second})',
+                                  f'eval({invocation.format("first")})', f'eval({invocation.format("second")})']
+                        expected_line = len(lines) - int(first_dirty)
+                        self.assert_sites('\n'.join(lines) + '\n', {('eval', expected_line, 1)})
+
+    def test_nested_framework_dependencies_keep_callable_identity(self):
+        for returned, expected in (('q', {('eval', 6, 9)}), ('"fixed"', set())):
+            with self.subTest(returned=returned):
+                source = ('from fastapi import Depends, Query\ndef build():\n'
+                          '    def obtain(q=Query()):\n'
+                          f'        return {returned}\n'
+                          '    def endpoint(code=Depends(obtain)):\n        eval(code)\n'
+                          '    return endpoint\n')
+                self.assert_sites(source, expected)
+
+    def test_explicit_arguments_override_captured_defaults(self):
+        factory = ('def factory(value):\n    def target(captured=value, *, named=value):\n'
+                   '        return captured + named\n    return target\n')
+        for invocation, dirty in (("callback('fixed', named='fixed')", False),
+                                  ("callback(captured='fixed', named='fixed')", False),
+                                  ("callback('fixed')", True),
+                                  ("callback(named='fixed')", True)):
+            with self.subTest(invocation=invocation):
+                lines = factory.splitlines() + ['callback = factory(input())', f'eval({invocation})']
+                self.assert_sites('\n'.join(lines) + '\n', {('eval', len(lines), 1)} if dirty else set())
+
+    def test_default_aliases_keep_late_heap_writes_and_bound_receivers(self):
+        shapes = (
+            'def factory(value):\n    def target(captured=value):\n        return captured\n    return target\n'
+            'box = []\ncallback = factory(box)\nother = factory([])\nbox.append(SOURCE)\neval(callback()[0])\n',
+            'def factory():\n    box = []\n    def target(captured=box):\n        return captured[0]\n'
+            '    box.append(SOURCE)\n    return target\neval(factory()())\n',
+            'def factory():\n    box = []\n    def target(captured=box):\n        return captured[0]\n'
+            '    try:\n        return target\n    finally:\n        box.append(SOURCE)\neval(factory()())\n',
+            'def factory(value):\n    def target(captured=value):\n        captured.append(SOURCE)\n    return target\n'
+            'def invoke(callback):\n    callback()\nbox = []\ncallback = factory(box)\n'
+            'other = factory([])\ninvoke(callback)\neval(box[0])\n',
+            'def factory(value):\n    def target(captured=value):\n        captured(SOURCE)\n    return target\n'
+            'def invoke(callback):\n    callback()\nbox = []\ncallback = factory(box.append)\n'
+            'other = factory(print)\ninvoke(callback)\neval(box[0])\n',
+        )
+        for index, shape in enumerate(shapes):
+            for dirty in (False, True):
+                with self.subTest(shape=index, dirty=dirty):
+                    source = shape.replace('SOURCE', 'input()' if dirty else '"fixed"')
+                    self.assert_sites(source, {('eval', len(source.splitlines()), 1)} if dirty else set())
+
+    def test_async_and_generator_paths_preserve_captured_defaults(self):
+        shapes = (
+            'import asyncio\ndef factory(value):\n    async def target(captured=value):\n        return captured\n'
+            '    return target\ncallback = factory(SOURCE)\nother = factory("fixed")\neval(asyncio.run(callback()))\n',
+            'import asyncio\nasync def factory(value):\n    def target(captured=value):\n        return captured\n'
+            '    return target\ncallback = asyncio.run(factory(SOURCE))\n'
+            'other = asyncio.run(factory("fixed"))\neval(callback())\n',
+            'def factory(value):\n    def target(captured=value):\n        return captured\n    yield target\n'
+            'for callback in factory(SOURCE):\n    other = factory("fixed")\n    eval(callback())\n',
+            'def factory(value):\n    def target(captured=value):\n        yield captured\n    return target\n'
+            'callback = factory(SOURCE)\nother = factory("fixed")\nfor value in callback():\n    eval(value)\n',
+            'def factory(value):\n    def target(captured=value):\n        yield "fixed"\n        return captured\n'
+            '    return target\ndef caller(callback):\n    value = yield from callback()\n    eval(value)\n'
+            'callback = factory(SOURCE)\nother = factory("fixed")\nfor ignored in caller(callback):\n    pass\n',
+        )
+        for index, shape in enumerate(shapes):
+            for dirty in (False, True):
+                with self.subTest(shape=index, dirty=dirty):
+                    source = shape.replace('SOURCE', 'input()' if dirty else '"fixed"')
+                    sink_line = next(line for line, text in enumerate(source.splitlines(), 1) if 'eval(' in text)
+                    column = 5 if index >= 2 else 1
+                    self.assert_sites(source, {('eval', sink_line, column)} if dirty else set())
+
+    def test_interrupted_factory_keeps_observed_default_sources(self):
+        factories = (
+            'def factory():\n    def target(captured=SOURCE):\n        return captured\n',
+            'def factory():\n    box = []\n    def target(captured=box):\n        return captured[0]\n'
+            '    box.append(SOURCE)\n',
+        )
+        for index, factory in enumerate(factories):
+            for dirty in (False, True):
+                lines = factory.replace('SOURCE', 'input()' if dirty else '"fixed"').splitlines()
+                lines += ['    if choice:', '        return target']
+                lines += ['    padding = "fixed"'] * 100
+                lines += ['    return target', 'eval(factory()())']
+                source = '\n'.join(lines) + '\n'
+                expected = {('eval', len(lines), 1)} if dirty else set()
+                for scope in (250000, 60):
+                    with self.subTest(factory=index, dirty=dirty, scope=scope):
+                        self.assert_sites(source, expected, scope=scope)
+
+    def test_concrete_default_facts_do_not_create_contexts(self):
+        prefix = ('def factory(value):\n    def target(captured=value):\n        return captured\n    return target\n'
+                  'def invoke(callback):\n    return callback()\n')
+        counts = []
+        for count in (8, 64):
+            lines = prefix.splitlines()
+            expected = set()
+            for index in range(count):
+                lines += [f'eval(invoke(factory({"input()" if index % 2 else repr("fixed")})))']
+                if index % 2:
+                    expected.add(('eval', len(lines), 1))
+            engine = self.assert_sites('\n'.join(lines) + '\n', expected)
+            counts.append((len(engine.summaries), engine.work_limit - engine.budget.remaining))
+        self.assertEqual(counts[0][0], counts[1][0], counts)
+        self.assertLessEqual(counts[1][1], 10 * counts[0][1], counts)
+
+    def test_recursive_default_contexts_report_limits_and_retain_findings(self):
+        source = ('def factory(callback):\n    def target(previous=callback):\n        return previous()\n'
+                  '    return target\ncallback = input\nwhile condition:\n'
+                  '    callback = factory(callback)\neval(callback())\n')
+        # Use an explicit scope allowance so this exercises scope recovery
+        # before the module's expanding callback environment uses its total.
+        with patch.dict(os.environ, {'UBS_PYTHON_FLOW_SCOPE_STEPS': '2000'}):
+            engine = taint_py._Analysis(ast.parse(source))
+        with self.assertRaisesRegex(AnalysisLimit, 'function work limit') as caught:
+            engine.analyze()
+        self.assertEqual({(kind, line, column) for kind, line, column, _ in caught.exception.effects},
+                         {('eval', 8, 1)})
+        self.assertGreater(engine.budget.remaining, 0)
+
+    def test_captured_value_construction_is_bounded_before_hashing(self):
+        lines = ['eval(input())', 'def factory():', '    previous = input']
+        for index in range(80):
+            lines += [f'    def step_{index}(captured=previous):', '        return captured()',
+                      f'    previous = step_{index}']
+        lines += ['    return previous', 'factory()']
+        engine = taint_py._Analysis(ast.parse('\n'.join(lines) + '\n'))
+        with self.assertRaisesRegex(AnalysisLimit, 'captured-default nesting exceeds 64 levels') as caught:
+            engine.analyze()
+        self.assertEqual({(kind, line, column) for kind, line, column, _ in caught.exception.effects},
+                         {('eval', 1, 1)})
+
+    def test_header_default_instances_keep_encoder_and_body_proofs(self):
+        sources = (
+            ('from urllib.parse import quote\ndef factory(value):\n'
+             '    def target(captured=value): return captured\n    return target\n'
+             'def view(request, response):\n    raw = factory(request.args["x"])\n'
+             '    safe = factory(quote(request.args["x"], safe=""))\n    fixed = factory("fixed")\n'
+             '    response.headers["raw"] = raw()\n    response.headers["safe"] = safe()\n'
+             '    response.headers["fixed"] = fixed()\n', {('header', 9, 5)}),
+            ('def factory(value):\n    def target(captured=value):\n'
+             '        return captured.replace("\\r", "").replace("\\n", "")\n    return target\n'
+             'def view(request, response):\n    safe = factory(request.args["x"])\n'
+             '    response.headers["safe"] = safe()\n', set()),
+        )
+        for source, expected in sources:
+            with self.subTest(expected=expected):
+                effects = header_injection._HeaderAnalysis(ast.parse(source)).analyze()
+                sites = {key[:3] for key, fact in effects.items()
+                         if any(not header_injection._safe(trace) for trace in fact)}
+                self.assertEqual(sites, expected)
+
+    def test_incomplete_header_factory_retains_captured_provenance(self):
+        for captured in ('input()', '"fixed"', 'quote(input(), safe="")'):
+            lines = ['from urllib.parse import quote', 'def factory():',
+                     f'    def target(captured={captured}): return captured',
+                     '    if choice: return target']
+            lines += ['    padding = "fixed"'] * 100
+            lines += ['    return target', 'def view(response):',
+                      '    response.headers["x"] = factory()()']
+            for scope in (250000, 60):
+                with self.subTest(captured=captured, scope=scope):
+                    with patch.dict(os.environ, {'UBS_PYTHON_FLOW_SCOPE_STEPS': str(scope)}):
+                        engine = header_injection._HeaderAnalysis(ast.parse('\n'.join(lines) + '\n'))
+                    if scope == 60:
+                        with self.assertRaisesRegex(AnalysisLimit, 'factory.*function work limit') as caught:
+                            engine.analyze()
+                        effects = caught.exception.effects
+                    else:
+                        effects = engine.analyze()
+                    sites = {key[:3] for key, fact in effects.items()
+                             if any(not header_injection._safe(trace) for trace in fact)}
+                    expected = ({('header', len(lines), 5)}
+                                if captured == 'input()' or (scope == 60 and captured != '"fixed"') else set())
+                    self.assertEqual(sites, expected)
+
+    def test_shared_capture_graph_comparison_and_hashing_are_bounded(self):
+        original_equal = taint_py._FunctionValue.__eq__
+        original_hash = taint_py._FunctionValue.__hash__
+        for depth in (8, 32):
+            with self.subTest(depth=depth):
+                visits = {'equal': 0, 'hash': 0}
+
+                def bounded_equal(left, right):
+                    visits['equal'] += 1
+                    self.assertLessEqual(visits['equal'], 64 * depth,
+                                         'Shared captured defaults expanded during equality')
+                    return original_equal(left, right)
+
+                def bounded_hash(value):
+                    visits['hash'] += 1
+                    self.assertLessEqual(visits['hash'], 64 * depth,
+                                         'A captured child was recursively rehashed')
+                    return original_hash(value)
+
+                source = ('eval(input())\nprevious = input\n'
+                          + 'previous = lambda left=previous, right=previous: left()\n' * depth)
+                with patch.object(taint_py._FunctionValue, '__eq__', bounded_equal), \
+                        patch.object(taint_py._FunctionValue, '__hash__', bounded_hash):
+                    self.assert_sites(source, {('eval', 1, 1)})
+
+    def test_mixed_coroutine_capture_depth_is_bounded(self):
+        source = ('eval(input())\nasync def defer(value): return value\nprevious = input\n'
+                  + ('waiting = defer(previous)\n'
+                     'previous = lambda captured=waiting: captured\n') * 33)
+        engine = taint_py._Analysis(ast.parse(source))
+        with self.assertRaisesRegex(AnalysisLimit, 'captured-default nesting exceeds 64 levels') as caught:
+            engine.analyze()
+        self.assertEqual({effect[:3] for effect in caught.exception.effects}, {('eval', 1, 1)})
+        self.assertGreater(engine.budget.remaining, 0)
+
+    def test_shared_capture_witness_comparison_preserves_evidence(self):
+        # Use independently evaluated values from the same real syntax, so
+        # identity alone cannot compare the captured graphs or their paths.
+        source = ('previous = input()\n'
+                  + 'previous = lambda left=previous, right=previous: left()\n' * 16)
+        tree = ast.parse(source)
+        first = taint_py._Analysis(tree)
+        second = taint_py._Analysis(tree)
+        first.analyze()
+        second.analyze()
+        left, right = first.globals.bindings['previous'], second.globals.bindings['previous']
+        visits = 0
+        original_equal = taint_py.TaintTrace.__eq__
+
+        def bounded_equal(a, b):
+            nonlocal visits
+            visits += 1
+            self.assertLessEqual(visits, 1024, 'Witness comparison revisited shared capture paths')
+            return original_equal(a, b)
+
+        with patch.object(taint_py.TaintTrace, '__eq__', bounded_equal):
+            self.assertTrue(taint_py._same_witness(left, right))
+        original_source = taint_py._Flow.source
+
+        def changed_source(flow, node, state, candidate=None):
+            facts = original_source(flow, node, state, candidate)
+            return frozenset(taint_py.TaintTrace(trace.source, trace.parameter, trace.sanitizers,
+                                                ('changed witness', *trace.path)) for trace in facts)
+
+        third = taint_py._Analysis(tree)
+        with patch.object(taint_py._Flow, 'source', changed_source):
+            third.analyze()
+        changed = third.globals.bindings['previous']
+        self.assertEqual(left, changed)
+        self.assertEqual(hash(left), hash(changed))
+        self.assertFalse(taint_py._same_witness(left, changed))
+        self.assertFalse(taint_py._same_namespace(first.globals, third.globals))
+
+    def test_imported_factories_preserve_default_creation_instances(self):
+        root = Path('/__ubs_default_capture_test__')
+        helpers = ('def factory(value):\n    def target(captured=value):\n        return captured\n'
+                   '    return target\ndef invoke(callback):\n    return callback()\n')
+        app = ('from helpers import factory, invoke\nfirst = factory(input())\nsecond = factory("fixed")\n'
+               'eval(invoke(first))\neval(invoke(second))\n')
+        sources = {root / 'helpers.py': helpers, root / 'app.py': app}
+        # Only parsing is virtualized; the real project resolver, summaries,
+        # module ownership, line mapping and report generation are exercised.
+        with patch.object(taint_py, '_parse_source', side_effect=lambda path: (sources[path], ast.parse(sources[path]))):
+            findings = list(taint_py._Project(list(sources), root).findings())
+        self.assertEqual({(path.name, rule, line, column) for path, rule, line, column, _ in findings},
+                         {('app.py', 'py.taint.eval', 4, 1)})
 
 
 class WorkLimitCompletionTests(unittest.TestCase):

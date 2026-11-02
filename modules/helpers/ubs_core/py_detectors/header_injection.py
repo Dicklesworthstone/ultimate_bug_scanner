@@ -148,7 +148,7 @@ class _HeaderFlow(flow._Flow):
     def incomplete_result(fact):
         # An unfinished helper could decode or append control characters.
         # Keep the reset marker so caller substitution revokes earlier proofs.
-        return _revoke(fact)
+        return _revoke(flow._Flow.incomplete_result(fact))
 
     def effect(self, kind, node, label, fact):
         if kind == 'header' and fact:
@@ -401,7 +401,7 @@ class _HeaderFlow(flow._Flow):
             sink = flow.join_facts(sink, *(keywords.get(key, flow.CLEAN) for key in FILENAME_KEYWORDS))
         self.effect('header', node, 'response header call', sink)
         local = isinstance(target, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
-                                    flow._BoundClassMethod))
+                                    flow._BoundClassMethod, flow._FunctionValue))
         if not local:
             for expression in (*node.args, *keyword_nodes.values()):
                 if _module_refs(self.expression_bindings.get(expression)):

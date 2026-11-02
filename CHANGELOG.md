@@ -27,6 +27,17 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Fixed
 
+- Python factory-created functions and lambdas retain their own evaluated
+  default values, references, and callable identities. A later safe factory
+  call no longer overwrites an earlier tainted callback. Symbolic default
+  inputs preserve summary reuse across concrete values; explicit overrides,
+  mutable aliases, async/generator paths, header proofs, and incomplete
+  factory recovery have exact-site regressions.
+- Captured function and deferred-call values cache immutable hashes and
+  compare shared subgraphs once per object pair, including evidence paths.
+  Mixed capture nesting has an explicit finite shape limit with partial
+  reporting and retained findings; ordinary call chains retain summary-based
+  convergence.
 - Python function setup no longer copies every closure name into every
   function. Lexical dependencies stay local; escaped-callable reads recover
   their required symbolic globals lazily, and incomplete-call alias recovery

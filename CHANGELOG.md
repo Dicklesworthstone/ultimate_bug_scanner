@@ -27,6 +27,23 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Fixed
 
+- Python taint and HTTP response-header analysis address the large-module
+  budget regression in GH #198. Source-order fixed-point passes reuse module
+  initialization only while their namespace, observed inputs, and evidence
+  remain unchanged; declaration replay preserves defaults and class bindings,
+  and active import cycles retain their conservative path. The header detector
+  no longer has a separate fixed 250,000-expression cutoff.
+- Python flow work is bounded both per source and cumulatively per function,
+  including repeated passes and callback contexts. Positive-integer
+  `UBS_PYTHON_FLOW_MAX_STEPS` and `UBS_PYTHON_FLOW_SCOPE_STEPS` overrides let
+  callers pin those limits independently of `UBS_MODULE_TIMEOUT`. Exhausted
+  functions no longer erase findings from independent functions; genuine
+  limits still produce partial results, exit 2, and scope/location diagnostics.
+  Public synthetic regressions retain 13 planted header findings in a
+  6,551-line module and check incomplete results with retained findings. The
+  reporter's private inputs remain unavailable, so their exact findings have
+  not been independently rerun.
+
 - Python SQL builder wrappers retain unresolved return dependencies through
   assignments, branches and containers. Visiting a helper no longer certifies
   an unsupported inner query result. A separate closed string-shape proof

@@ -1121,7 +1121,10 @@ def main(argv: list[str] | None = None) -> int:
         project_dir=args.project_dir or args.project or ".",
         skip=args.skip,
         custom_rules=args.ast_rule_dir,
-        extra=f"new_analyzers={args.enable_new_analyzers}",
+        extra=json.dumps({"new_analyzers": args.enable_new_analyzers,
+                          "flow_max_steps": os.environ.get("UBS_PYTHON_FLOW_MAX_STEPS"),
+                          "flow_scope_steps": os.environ.get("UBS_PYTHON_FLOW_SCOPE_STEPS")},
+                         sort_keys=True),
     )
     cached_findings, files_to_scan = cache.partition_files(files)
 

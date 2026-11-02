@@ -222,6 +222,104 @@ EXPECTED = {
 }
 
 
+def large_budget_source(line_count, *, unsafe=True):
+    """Public #198 fixture: many globals/defaults, a chain and a closure.
+
+    The unrelated nested definition used to disable dependency ordering for
+    the entire module. The last handler has thirteen distinct security sinks
+    and seven clean controls; the generated module is only ever analyzed.
+    """
+    prefix = [
+        'import os', 'import subprocess', 'import requests',
+        'from django.http import HttpResponse', 'from urllib.parse import quote',
+        'from html import escape', 'from shlex import quote as shell_quote',
+        'def unused_factory():', '    def inner(value="fixed"):',
+        '        return value', '    return inner',
+    ]
+    actual = 'input()' if unsafe else '"fixed"'
+    tail = [
+        'def planted():',
+        f'    value = stage0({actual})',
+        '    os.system(value)',
+        '    subprocess.run(value, shell=True)',
+        '    subprocess.run([value])',
+        '    eval(value)',
+        '    exec(value)',
+        '    cursor.execute(value)',
+        '    cursor.executemany(value, [])',
+        '    requests.get(value)',
+        '    requests.post(value)',
+        '    HttpResponse(value)',
+        '    HttpResponse(content=value)',
+        '    response.headers["X-User"] = value',
+        '    response.headers["X-Other"] = value',
+        '    os.system("printf %s " + shell_quote(value))',
+        '    subprocess.run(["echo", value])',
+        '    eval("1", {"value": value})',
+        '    cursor.execute("SELECT ?", (value,))',
+        '    requests.get("https://fixed.invalid/", params={"q": value})',
+        '    HttpResponse(escape(value))',
+        '    response.headers["X-Encoded"] = quote(value)',
+    ]
+    count = (line_count - len(prefix) - len(tail)) // 12
+    if count < 1:
+        raise ValueError('The fixture must contain at least one helper')
+    lines = list(prefix)
+    for index in range(count):
+        successor = f'stage{index + 1}(value)' if index + 1 < count else 'value'
+        lines.extend([
+            f'TOKEN{index} = "fixed"',
+            f'def stage{index}(value, marker=TOKEN{index}):',
+            '    label = marker', '    status = 0', '    low = 1',
+            '    high = 9', '    kind = "text"', '    enabled = True',
+            '    offset = 0', '    scale = 1', '    token = label',
+            f'    return {successor}',
+        ])
+    lines.extend(f'padding{index} = "fixed"'
+                 for index in range(line_count - len(lines) - len(tail)))
+    lines.extend(tail)
+    expected = {
+        ('command', line_count - len(tail) + 3, 5),
+        ('command', line_count - len(tail) + 4, 5),
+        ('command', line_count - len(tail) + 5, 5),
+        ('eval', line_count - len(tail) + 6, 5),
+        ('eval', line_count - len(tail) + 7, 5),
+        ('sql', line_count - len(tail) + 8, 5),
+        ('sql', line_count - len(tail) + 9, 5),
+        ('ssrf', line_count - len(tail) + 10, 5),
+        ('ssrf', line_count - len(tail) + 11, 5),
+        ('xss', line_count - len(tail) + 12, 5),
+        ('xss', line_count - len(tail) + 13, 5),
+        ('header', line_count - len(tail) + 14, 5),
+        ('header', line_count - len(tail) + 15, 5),
+    } if unsafe else set()
+    return '\n'.join(lines) + '\n', expected
+
+
+def large_budget_worker():
+    """Real flow evaluation in a fresh process with an external deadline."""
+    source = sys.stdin.read()
+    reports = {}
+    for name, engine_class in (('taint', taint_py._Analysis),
+                               ('header', header_injection._HeaderAnalysis)):
+        engine = engine_class(ast.parse(source))
+        initialize = taint_py._Flow.__init__
+        counts = {'module_passes': 0, 'function_passes': 0}
+
+        def observe(flow, owner, scope):
+            counts['module_passes' if scope is owner.tree else 'function_passes'] += 1
+            initialize(flow, owner, scope)
+
+        with patch.object(taint_py._Flow, '__init__', observe):
+            effects = engine.analyze()
+        sites = [(kind, line, column) for (kind, line, column, _), facts in effects.items()
+                 if kind != 'header' or any(not header_injection._safe(trace) for trace in facts)]
+        reports[name] = {**counts, 'sites': sorted(sites),
+                         'work': engine.work_limit - engine.budget.remaining,
+                         'functions': len(engine.functions)}
+    print(json.dumps(reports))
+
+
 def fresh_exception_join(flow, state):
     """Reference collector: join the entire state at every possible raise."""
     if state.reachable and flow.exception_states:
@@ -348,6 +446,84 @@ class Factory:
             mutate(changed)
             self.assertFalse(original == changed)
             self.assertTrue(original != changed)
+
+    def test_namespace_cache_accepts_fresh_literals_but_keeps_nested_witnesses(self):
+        # Lattice equality omits evidence intentionally, but a cached transfer
+        # must not freeze the earlier witness of a receiver, argument or heap
+        # value. Fresh equal literal wrappers, conversely, are unchanged input.
+        first = taint_py._State(bindings={'label': taint_py._LiteralString('fixed')})
+        equal = taint_py._State(bindings={'label': taint_py._LiteralString('fixed')})
+        self.assertIsNot(first.bindings['label'], equal.bindings['label'])
+        self.assertTrue(taint_py._same_namespace(first, equal))
+
+        tree = ast.parse('class Owner:\n    async def later(self, value):\n        return value\n'
+                         'pending = Owner.later(input())\n')
+        owner, function, call = tree.body[0], tree.body[0].body[0], tree.body[1].value
+        references = frozenset({'object'})
+        old = frozenset({taint_py.TaintTrace('input', path=('input', 'long', 'route'))})
+        new = frozenset({taint_py.TaintTrace('input', path=('input', 'short'))})
+        bindings = (
+            lambda fact: taint_py._BoundCallable('append', references, fact),
+            lambda fact: taint_py._BoundClassMethod(function, owner, references, fact),
+            lambda fact: taint_py._DeferredCall(function, call, (('value', fact),), ()),
+            lambda fact: taint_py._DeferredCall(function, call, (), (),
+                                                (('callback', taint_py._BoundCallable('append', references, fact)),)),
+            lambda fact: taint_py._ArgumentVector(((call, fact, taint_py._LiteralString('sh')),)),
+            lambda fact: frozenset({taint_py._BoundCallable('append', references, fact), None}),
+        )
+        for index, binding in enumerate(bindings):
+            with self.subTest(binding=index):
+                before = taint_py._State(bindings={'value': binding(old)})
+                after = taint_py._State(bindings={'value': binding(new)})
+                self.assertEqual(before, after, 'The witnesses deliberately describe equal lattice facts')
+                self.assertFalse(taint_py._same_namespace(before, after))
+                self.assertTrue(taint_py._same_namespace(before, before.copy()))
+        for table in ('value', 'heap'):
+            with self.subTest(table=table):
+                before, after = taint_py._State(), taint_py._State()
+                if table == 'value':
+                    before['value'], after['value'] = old, new
+                else:
+                    before.heap['object'], after.heap['object'] = old, new
+                self.assertEqual(before, after)
+                self.assertFalse(taint_py._same_namespace(before, after))
+
+    def test_module_cache_matches_fresh_composed_value_witnesses(self):
+        prefix = '''import os
+import subprocess
+import asyncio
+label = 'fixed'
+def unrelated():
+    def child(value=label):
+        return value
+    return child
+def source():
+    return indirect()
+def indirect():
+    return input()
+'''
+        tails = (
+            ('deferred', 'async def later(value):\n    os.system(value)\n'
+                         'pending = later(source())\nasyncio.run(pending)\n',
+             14, 5, 'input( -> later() -> value -> subprocess execution'),
+            ('vector', 'command = ["sh", "-c", source()]\nsubprocess.run(command)\n',
+             14, 1, 'input( -> subprocess execution'),
+            ('receiver', 'value = source()\nstored = value.format\nos.system(stored())\n',
+             15, 1, 'input( -> value -> subprocess execution'),
+        )
+        for name, tail, line, column, witness in tails:
+            for unsafe in (True, False):
+                with self.subTest(shape=name, unsafe=unsafe):
+                    source = prefix + tail
+                    if not unsafe:
+                        source = source.replace('return input()', 'return "fixed"')
+                    cached = self.scan({'app.py': source})
+                    with patch.object(taint_py._Analysis, 'reads_current', lambda self, reads: False), \
+                            patch.object(taint_py._Flow, 'possible_exception', fresh_exception_join):
+                        fresh = self.scan({'app.py': source})
+                    expected = [('app.py', 'py.taint.command', line, column, witness)] if unsafe else []
+                    self.assertEqual(cached, expected)
+                    self.assertEqual(cached, fresh)
 
     def test_temporary_global_callable_binding_survives_nested_helpers(self):
         for initial, active, expected in (
@@ -1421,6 +1597,58 @@ class SummarySubstitutionTests(unittest.TestCase):
                         self.assertEqual(witnesses(effects), first_unsafe)
 
 
+class LargeModuleBudgetTests(unittest.TestCase):
+    """An unrelated definition writer cannot starve late security findings."""
+
+    def test_nested_writer_does_not_replay_module_once_per_dependency(self):
+        for count in (32, 96):
+            for unsafe in (True, False):
+                source, expected = large_budget_source(12 * count + 33, unsafe=unsafe)
+                with self.subTest(functions=count, unsafe=unsafe):
+                    engine = taint_py._Analysis(ast.parse(source))
+                    initialize = taint_py._Flow.__init__
+                    passes = [0]
+
+                    def observe(flow, owner, scope):
+                        if scope is owner.tree:
+                            passes[0] += 1
+                        initialize(flow, owner, scope)
+
+                    with patch.object(taint_py._Flow, '__init__', observe):
+                        effects = engine.analyze()
+                    self.assertEqual({key[:3] for key in effects},
+                                     {site for site in expected if site[0] != 'header'})
+                    self.assertLessEqual(passes[0], 8,
+                                         'An unrelated closure must not force one module pass per helper')
+
+    def test_large_files_preserve_all_thirteen_sinks_and_clean_controls(self):
+        environment = {name: value for name, value in os.environ.items()
+                       if not name.startswith('UBS_')}
+        environment['PYTHONDONTWRITEBYTECODE'] = '1'
+        for line_count in (6568, 9696):
+            for unsafe in (True, False):
+                source, expected = large_budget_source(line_count, unsafe=unsafe)
+                with self.subTest(lines=line_count, unsafe=unsafe):
+                    self.assertEqual(len(source.splitlines()), line_count)
+                    try:
+                        result = subprocess.run(
+                            [sys.executable, '-B', str(Path(__file__).resolve()), '--large-budget-worker'],
+                            input=source, text=True, capture_output=True, env=environment, timeout=45,
+                        )
+                    except subprocess.TimeoutExpired as exc:
+                        self.fail(f'Large-module analysis failed to make bounded progress: {exc}')
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    try:
+                        report = json.loads(result.stdout)
+                    except json.JSONDecodeError as exc:
+                        self.fail(f'Invalid large-module analysis report: {exc}\n{result.stdout}\n{result.stderr}')
+                    sites = {tuple(site) for domain in report.values() for site in domain['sites']}
+                    self.assertEqual(sites, expected, report)
+                    for domain in report.values():
+                        self.assertLessEqual(domain['module_passes'], 8, report)
+                        self.assertLessEqual(domain['function_passes'], 10 * domain['functions'], report)
+
+
 class WorkLimitCompletionTests(unittest.TestCase):
     """A work limit bounds analysis without manufacturing a clean result."""
 
@@ -1443,6 +1671,208 @@ class WorkLimitCompletionTests(unittest.TestCase):
         path = self.root / name
         path.write_text(text, encoding='utf-8')
         return path
+
+    @staticmethod
+    def environment(**settings):
+        result = {name: value for name, value in os.environ.items()
+                  if not name.startswith(('UBS_', 'XDG_'))}
+        result.update(PYTHONDONTWRITEBYTECODE='1', UBS_KEEP_TEMP='1')
+        result.update(settings)
+        return result
+
+    def driver(self, files, environment):
+        from ubs_core import py_scan
+
+        selected = self.root / 'selected-files'
+        selected.write_bytes(b''.join(os.fsencode(path) + b'\0' for path in files))
+        sink, report = self.root / 'budget-findings.jsonl', self.root / 'budget-report.json'
+        arguments = ['--files-from', str(selected), '--sink', str(sink), '--json-out', str(report),
+                     '--project-dir', str(self.root), '--jobs', '1',
+                     '--skip', ','.join(str(number) for number in range(1, 24) if number != 7)]
+        stderr = io.StringIO()
+        with patch.dict(os.environ, environment, clear=True), contextlib.redirect_stderr(stderr):
+            code = py_scan.main(arguments)
+        try:
+            document = json.loads(report.read_text(encoding='utf-8'))
+            records = [json.loads(line) for line in sink.read_text(encoding='utf-8').splitlines()]
+        except json.JSONDecodeError as exc:
+            self.fail(f'Invalid budget report: {exc}\n{stderr.getvalue()}')
+        return code, document, records, stderr.getvalue()
+
+    def test_scope_limit_preserves_independent_sinks_in_the_same_file(self):
+        lines = ['def before():', '    eval(input())', 'def expensive():']
+        lines.extend(f'    value{index} = {index}' for index in range(300))
+        lines.extend(['def after():', '    eval(input())'])
+        path = self.source('same-file.py', '\n'.join(lines) + '\n')
+        expected = {('py.taint.eval', 2, 5), ('py.taint.eval', len(lines), 5)}
+        environment = self.environment(UBS_PYTHON_FLOW_SCOPE_STEPS='200',
+                                       UBS_PYTHON_FLOW_MAX_STEPS='100000')
+        findings = []
+        with patch.dict(os.environ, environment, clear=True), self.assertRaises(AnalysisLimit) as raised:
+            findings.extend(taint_py.scan_file_findings(path))
+        self.assertEqual({row[:3] for row in findings}, expected, findings)
+        for detail in ('expensive', '200', 'incomplete'):
+            self.assertIn(detail, str(raised.exception))
+        self.assertRegex(str(raised.exception), r'(?:lines?\s+|:)3(?:\D|$)')
+        self.assertEqual({key[:3] for key in raised.exception.effects},
+                         {('eval', 2, 5), ('eval', len(lines), 5)})
+
+        # A larger explicit, still finite allowance completes the same source
+        # without changing the independent sink identities or their evidence.
+        environment['UBS_PYTHON_FLOW_SCOPE_STEPS'] = '5000'
+        with patch.dict(os.environ, environment, clear=True):
+            complete = list(taint_py.scan_file_findings(path))
+        self.assertEqual(complete, findings)
+
+    def test_scope_allowance_is_shared_by_recursive_callback_contexts(self):
+        names = [f'cb{index}' for index in range(8)]
+        swapped, rotated = [names[1], names[0], *names[2:]], [*names[1:], names[0]]
+        lines = ['def before():', '    eval(input())',
+                 f'def rotate({", ".join(names)}, value):',
+                 '    if condition_a:', f'        return rotate({", ".join(swapped)}, value)',
+                 '    if condition_b:', f'        return rotate({", ".join(rotated)}, value)',
+                 '    return cb0(value)']
+        for index in range(8):
+            lines.extend([f'def ident{index}(value):', '    return value'])
+        arguments = ', '.join(f'ident{index}' for index in range(8))
+        lines.extend(['def expensive():', f'    return rotate({arguments}, input())',
+                      'def after():', '    eval(input())'])
+        path = self.source('callback-contexts.py', '\n'.join(lines) + '\n')
+        initialize = taint_py._Flow.__init__
+        solves = [0]
+
+        def observe(flow, engine, scope):
+            if getattr(scope, 'name', '') == 'rotate':
+                solves[0] += 1
+            initialize(flow, engine, scope)
+
+        environment = self.environment(UBS_PYTHON_FLOW_SCOPE_STEPS='2500',
+                                       UBS_PYTHON_FLOW_MAX_STEPS='1000000')
+        findings = []
+        with patch.dict(os.environ, environment, clear=True), \
+                patch.object(taint_py._Flow, '__init__', observe), self.assertRaises(AnalysisLimit) as raised:
+            findings.extend(taint_py.scan_file_findings(path))
+        self.assertEqual({row[:3] for row in findings},
+                         {('py.taint.eval', 2, 5), ('py.taint.eval', len(lines), 5)}, findings)
+        self.assertIn('rotate', str(raised.exception))
+        self.assertIn('2500', str(raised.exception))
+        self.assertGreater(solves[0], 1, 'The source must request specialized callback contexts')
+        self.assertLessEqual(solves[0], 100,
+                             'New callable permutations cannot reset the function work allowance')
+
+    def test_failed_context_preserves_previously_completed_base_effects(self):
+        source = '''def expensive(callback):
+    callback()
+    eval(input())
+def stop():
+    raise RuntimeError()
+def caller():
+    expensive(stop)
+def tail():
+    eval(input())
+'''
+        expected = {('eval', 3, 5), ('eval', 9, 5)}
+        self.assertEqual({key[:3] for key in taint_py._Analysis(ast.parse(source)).analyze()}, expected)
+        engine = taint_py._Analysis(ast.parse(source))
+        expensive = next(function for function in engine.functions if function.name == 'expensive')
+        # The generic solve completes in nine units; its nonreturning callback
+        # context then exhausts the cumulative scope allowance. An incomplete
+        # replacement summary must retain the base entry's established sink.
+        engine.scope_limits[expensive] = engine.scope_remaining[expensive] = 10
+        with self.assertRaises(AnalysisLimit) as raised:
+            engine.analyze()
+        self.assertEqual({key[:3] for key in raised.exception.effects}, expected)
+        self.assertIn('expensive', str(raised.exception))
+
+    def test_limited_import_cycle_keeps_completed_member_effects(self):
+        files = [
+            self.source('a.py', 'import b\ndef first():\n    eval(input())\n'),
+            self.source('b.py', 'import a\ndef hard():\n    x = input()\n'
+                                '    y = str(x)\n    return y\n'),
+            self.source('z.py', 'def last():\n    eval(input())\n'),
+        ]
+        project = taint_py._Project(files, self.root)
+        engines = {path.name: engine for path, _, engine, _ in project.sources}
+        owner = engines['b.py']
+        hard = next(function for function in owner.functions if function.name == 'hard')
+        owner.scope_limits[hard] = owner.scope_remaining[hard] = 2
+        findings = []
+        with self.assertRaises(AnalysisLimit) as raised:
+            findings.extend(project.findings())
+        self.assertEqual({(path.name, rule, line, column) for path, rule, line, column, _ in findings},
+                         {('a.py', 'py.taint.eval', 3, 5), ('z.py', 'py.taint.eval', 2, 5)}, findings)
+        self.assertIn('hard', str(raised.exception))
+        self.assertFalse(project.ready & {engines['a.py'], engines['b.py']},
+                         'Retained findings do not make a partial import cycle reusable')
+
+    def test_incomplete_helper_cannot_preserve_unproved_sanitizer_contract(self):
+        for actual, unsafe in (('input()', True), ('"fixed"', False)):
+            lines = ['import os', 'import shlex', 'def expensive(value):']
+            lines.extend(f'    local{index} = {index}' for index in range(300))
+            lines.extend(['    return decode_unknown(value)', 'def caller():',
+                          f'    os.system(expensive(shlex.quote({actual})))'])
+            path = self.source(f'incomplete-contract-{unsafe}.py', '\n'.join(lines) + '\n')
+            environment = self.environment(UBS_PYTHON_FLOW_SCOPE_STEPS='200',
+                                           UBS_PYTHON_FLOW_MAX_STEPS='100000')
+            findings = []
+            with self.subTest(unsafe=unsafe), patch.dict(os.environ, environment, clear=True), \
+                    self.assertRaises(AnalysisLimit) as raised:
+                findings.extend(taint_py.scan_file_findings(path))
+            expected = {('py.taint.command', len(lines), 5)} if unsafe else set()
+            self.assertEqual({row[:3] for row in findings}, expected, findings)
+            self.assertIn('expensive', str(raised.exception))
+            if unsafe:
+                self.assertIn('input', findings[0][-1])
+
+    def test_invalid_flow_limits_are_partial_native_reports(self):
+        path = self.source('invalid-budget.py', 'response.headers["X-User"] = input()\n')
+        for variable in ('UBS_PYTHON_FLOW_SCOPE_STEPS', 'UBS_PYTHON_FLOW_MAX_STEPS'):
+            for value in ('0', '-1', 'unbounded', '1.5'):
+                with self.subTest(variable=variable, value=value):
+                    environment = self.environment(UBS_NO_CACHE='1', **{variable: value})
+                    code, report, _records, diagnostic = self.driver([path], environment)
+                    self.assertEqual(code, 2, diagnostic)
+                    self.assertEqual(report['status'], 'partial', report)
+                    self.assertEqual(report['module_error'], 'ANALYZER_ERROR', report)
+                    self.assertIn(variable, diagnostic)
+
+    def test_budget_changes_invalidate_completed_header_cache_and_never_cache_partial(self):
+        lines = ['def expensive():']
+        lines.extend(f'    value{index} = {index}' for index in range(300))
+        lines.extend(['    response.headers["X-Expensive"] = input()',
+                      'def after():', '    response.headers["X-After"] = input()'])
+        path = self.source('cached-header.py', '\n'.join(lines) + '\n')
+        cache = self.root / 'budget-cache'
+        environment = self.environment(UBS_CACHE_DIR=str(cache), UBS_NO_CACHE='0', UBS_PROFILE='1',
+                                       UBS_PYTHON_FLOW_SCOPE_STEPS='5000', UBS_PYTHON_FLOW_MAX_STEPS='100000')
+
+        def sites(records):
+            return sorted(row['line'] for row in records if row['rule'] == header_injection.RULE_ID)
+
+        for hits in (0, 1):
+            result = self.driver([path], environment)
+            code, report, records, diagnostic = result
+            self.assertEqual((code, report['status']), (1, 'ok'), result)
+            self.assertEqual(report['profile']['cache_hits'], hits, result)
+            self.assertEqual(sites(records), [len(lines) - 2, len(lines)], diagnostic)
+        completed_entries = set(cache.glob('*/files/**/*.json'))
+        self.assertTrue(completed_entries, 'The high-budget control must create a reusable completed entry')
+
+        environment['UBS_PYTHON_FLOW_SCOPE_STEPS'] = '200'
+        for _attempt in range(2):
+            result = self.driver([path], environment)
+            code, report, records, diagnostic = result
+            self.assertEqual((code, report['status']), (2, 'partial'), result)
+            self.assertEqual(report['profile']['cache_hits'], 0, result)
+            self.assertEqual(sites(records), [len(lines)], diagnostic)
+            self.assertIn('expensive', diagnostic)
+            self.assertEqual(set(cache.glob('*/files/**/*.json')), completed_entries,
+                             'Changing the allowance must not admit a partial header report')
+
+        environment['UBS_PYTHON_FLOW_SCOPE_STEPS'] = '5000'
+        code, report, records, diagnostic = self.driver([path], environment)
+        self.assertEqual((code, report['status'], report['profile']['cache_hits']), (1, 'ok', 1), diagnostic)
+        self.assertEqual(sites(records), [len(lines) - 2, len(lines)], diagnostic)
 
     def test_tabular_entrypoint_keeps_findings_and_returns_incomplete(self):
         from ubs_core.taint_flow import Budget
@@ -1741,10 +2171,14 @@ apply(eval, sys.argv[1])
         self.assertIn('work limit exceeded', result.stdout + result.stderr)
         self.assertIn('m_callbacks.py', result.stdout + result.stderr)
         self.assertEqual(report['profile']['cache_hits'], 0, report)
+        # The bounded helper has an opaque return, so input still reaches its
+        # caller's eval at line 32. Retain that finding as well as both other
+        # files; partial status and the cache barrier must remain unchanged.
         # Top-level findings have no guaranteed order, so compare the taint rows sorted.
         self.assertEqual(sorted((Path(row['file']).name, row['rule_id'], row['line'])
                                 for row in report['findings'] if row['rule_id'].startswith('python.taint.')),
                          sorted([('a_first.py', 'python.taint.eval', 1),
+                                 ('m_callbacks.py', 'python.taint.eval', 32),
                                  ('z_last.py', 'python.taint.eval', 1)]), report)
         self.assertFalse(list((self.root / 'cache').glob('*/files/**/*.json')),
                          'A naturally exhausted scan must not admit partial cache entries')
@@ -1978,4 +2412,7 @@ class PythonInputAdmissionTests(unittest.TestCase):
 
 
 if __name__ == '__main__':
-    unittest.main()
+    if sys.argv[1:] == ['--large-budget-worker']:
+        large_budget_worker()
+    else:
+        unittest.main()

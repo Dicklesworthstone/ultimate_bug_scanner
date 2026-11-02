@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.5.27-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.5.28-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -1231,6 +1231,8 @@ Environment Variables:
   UBS_MAX_DIR_SIZE_MB      Max directory size in MB before refusing to scan (default: 1000)
   UBS_MAX_FILE_MB          Leave files above N MB out of whole-project scans (default: 8; 0 disables)
   UBS_PYTHON               Python >= 3.9 interpreter to use as python3 (Git Bash/Windows: `python` or `py -3` are tried automatically)
+  UBS_PYTHON_FLOW_MAX_STEPS   Override each Python taint/header analyzer's per-file work limit (positive integer)
+  UBS_PYTHON_FLOW_SCOPE_STEPS Override cumulative work per Python function, including callback contexts (positive integer)
   UBS_ALLOW_PARTIAL=1      Accept partial runs (timed-out/crashed module): exit on findings, not 2
   UBS_PROFILE=1            Add phase timings (list, fan-out, per module, merge, total ms) to json/toon output and the text summary
                            Numeric 0/1 leaves project severity unchanged; strict|loose overrides it
@@ -2099,6 +2101,13 @@ path also covers imported helpers and can offer less scheduling speedup.
 Sink-specific sanitizers, mutation effects, work budgets, and incomplete-result
 handling remain active on both paths.
 
+Source-order passes reuse the module's initialization transfer when its
+namespace and observed summary/definition inputs are unchanged. Replaying
+declaration writes preserves their original position in the pass. Changed
+inputs invalidate the reuse, including changed evidence witnesses; active
+import cycles keep the uncached path. A nested definition therefore no longer
+forces every settling call-chain link to execute unrelated module statements.
+
 Completed imported base summaries are reused across callers; new callback
 contexts and active import cycles still receive their required analysis. The
 worklist retains dependency metadata and the latest effects while releasing
@@ -2137,14 +2146,49 @@ calls are included in this check; matching calls retain full analysis even
 when their arguments are unknown. Read, decode, parse, and applicable analysis
 failures continue to report incomplete coverage.
 
-Each selected source has a work budget of `max(500000, 128 * AST node count)`.
-Transfers, summary scheduling, and fact substitution consume that budget.
-If it is exhausted, UBS reports an explicit incomplete analysis naming the
-affected component: the normal result is `status: partial` and exit 2.
-Completed findings from independent components remain in the report, failed
-summary writes are rolled back, and the partial scan is not cached as complete.
-This limit reports missing coverage; it does not turn an unfinished scan into
+Taint and response-header analysis use the same bounded work policy. They run
+separately and each has its own counters; the header detector has no additional
+fixed 250,000-expression cutoff. Transfers, summary scheduling, and fact
+substitution consume work units rather than elapsed seconds.
+
+| Environment variable | Work boundary | Default when unset |
+| --- | --- | --- |
+| `UBS_PYTHON_FLOW_MAX_STEPS` | Total work for one selected source, in each analyzer | `min(10000000, max(500000, 128 * AST node count))` |
+| `UBS_PYTHON_FLOW_SCOPE_STEPS` | Cumulative work for one function across passes and callback contexts | `min(250000, max(20000, 64 * scope AST node count, 8 * module AST node count))` |
+
+Overrides must be positive integers. Zero, negative, and malformed values fail
+analysis explicitly; there is no value that disables accounting. A function's
+allowance does not reset for each call, fixed-point pass, or newly discovered
+callback context. The default also accounts for module size because a small
+wrapper can project large summaries from a long downstream call chain.
+Increasing `UBS_MODULE_TIMEOUT` only changes the separate wall-clock timeout
+and cannot increase these work limits.
+
+For example, a gate can pin both limits explicitly:
+
+```bash
+UBS_PYTHON_FLOW_MAX_STEPS=1000000 \
+UBS_PYTHON_FLOW_SCOPE_STEPS=100000 \
+  ubs large.py --only=python --format=json --ci
+```
+
+If a function exhausts its allowance, independent functions can still finish
+and contribute their findings. An exhausted total-file budget stops remaining
+work for that source. Both outcomes report incomplete coverage: the normal
+result is `status: partial` and exit 2, even when security findings are present.
+Diagnostics identify the exhausted function and its local source-line range
+when the failure occurs within a function. Established findings remain in the
+report, failed summary writes are rolled back, and the partial scan is not
+cached as complete. A report with no findings and incomplete coverage is not
 a clean result.
+
+Public regressions for [issue #198](https://github.com/Dicklesworthstone/ultimate_bug_scanner/issues/198)
+exercise large generated modules, finite loops, interprocedural flows, planted
+security sinks, and deliberately exhausted limits. The header regression keeps
+all 13 planted header findings in a 6,551-line synthetic module, alongside an
+encoded-safe control. These fixtures reproduce the budget failure mechanism;
+the reporter's original private modules and planted payload are unavailable,
+so they do not establish a rerun of the reporter's original 13 findings.
 
 The regressions for [issue #192](https://github.com/Dicklesworthstone/ultimate_bug_scanner/issues/192)
 cover 50/100/200-function subprocess chains, shuffled definitions, recursion,

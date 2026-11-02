@@ -4918,6 +4918,40 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 continue
             yield argument, 'select' if name == 'select' else 'fragment'
 
+    def has_only_literal_statements(self):
+        """Immutable SQL slots need no facts from unrelated program flow.
+
+        Inspect the complete lexical call inventory, including deferred bodies
+        and definition-time expressions. Keep ambiguous execution aliases,
+        opaque SQL facades, fragments, argument expansions and every computed
+        SQL value on the ordinary flow path. This is not a larger flow budget.
+        """
+        bindings = self.ownership_bindings()
+        if bindings.sql_facade_flow()[1]:
+            return False
+        found = False
+        for call in bindings.calls:
+            self.step()
+            if bindings.unresolved_sql_aliases(call):
+                return False
+            short = sql_sink_name(call, bindings)
+            if not short:
+                continue
+            if (short == 'extra' or any(isinstance(arg, ast.Starred) for arg in call.args)
+                    or any(keyword.arg is None for keyword in call.keywords)):
+                return False
+            keyword_slots = sum(keyword.arg in SQL_ARGUMENT_KEYWORDS.get(short, ())
+                                for keyword in call.keywords)
+            if keyword_slots + bool(call.args) != 1:
+                return False
+            arguments = list(self.sql_arguments(call, short))
+            if (not arguments or any(context != 'statement'
+                    or not isinstance(argument, ast.Constant) or not isinstance(argument.value, str)
+                    for argument, context in arguments)):
+                return False
+            found = True
+        return found
+
     def visit_Call(self, node):
         self._facade_results.discard(node)
         known_builtin = (isinstance(node.func, ast.Name) and self.builtin_is_unshadowed(node.func.id)
@@ -6583,6 +6617,8 @@ def find(files: Sequence[Path], *, max_steps=100_000) -> Iterable[tuple[str, Pat
             budget=budget,
             bindings=bindings,
         )
+        if analyzer.has_only_literal_statements():
+            continue
         failure = None
         try:
             analyzer.visit(tree)

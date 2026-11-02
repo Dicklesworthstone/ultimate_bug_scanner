@@ -254,6 +254,47 @@ class SQLSinkArguments(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'budget.*incomplete'):
             analyzer.visit(tree)
 
+    def test_literal_statements_do_not_depend_on_unrelated_closure_ownership(self):
+        # A closure may need heap analysis, but cannot change a string literal
+        # in a separate SQL call. Keep the closure present, not suppressed.
+        unrelated = ('class Worker:\n'
+                     '    def collect(self, value):\n'
+                     '        events = []\n'
+                     '        def record(item):\n'
+                     '            events.append(item)\n'
+                     '            raise ValueError(item)\n'
+                     '        record(value)\n')
+        for name, statement in (
+                ('positional', 'cursor.execute("SELECT ?", (user,))'),
+                ('keyword', 'cursor.execute(query="SELECT ?", params=(user,))'),
+                ('import-alias', 'fetch("SELECT ?", conn, params=(user,))')):
+            with self.subTest(case=name):
+                path = self.artifacts / ('literal-closure-' + name + '.py')
+                path.write_text('from pandas import read_sql as fetch\n' + unrelated
+                                + 'def run(cursor, conn, user):\n    ' + statement + '\n',
+                                encoding='utf-8')
+                self.assertEqual(list(detector.find([path])), [])
+
+    def test_core_tests_literal_sql_fits_the_original_budget(self):
+        # This real source triggered the failure: fixed SQLite statements in
+        # one method caused every unrelated test body to consume SQL flow.
+        self.assertEqual(list(detector.find([Path(__file__).with_name('test_ubs_core.py')])), [])
+
+    def test_literal_statements_do_not_hide_ambiguous_or_opaque_sql(self):
+        for name, source, reason in (
+                ('ambiguous', 'from backend import execute as fetch\n'
+                 'if configured:\n    fetch = replacement\n'
+                 'def run(user):\n    fetch("SELECT ?", (f"SELECT {user}",))\n',
+                 'aliased execution binding'),
+                ('facade', 'from backend import dispatch\n'
+                 'def raw(value):\n    dispatch(f"SELECT {value}")\n'
+                 'def run(user):\n    raw(user)\n', 'facade forwarding call')):
+            with self.subTest(case=name):
+                path = self.artifacts / ('literal-sql-negative-' + name + '.py')
+                path.write_text('cursor.execute("SELECT 1")\n' + source, encoding='utf-8')
+                with self.assertRaisesRegex(detector.SQLFlowLimit, reason):
+                    list(detector.find([path]))
+
     @unittest.skipIf(sys.version_info < (3, 11), 'except* syntax requires Python 3.11')
     def test_exception_groups_are_explicitly_incomplete(self):
         path = self.artifacts / 'exception_group.py'

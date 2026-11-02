@@ -2178,17 +2178,54 @@ work for that source. Both outcomes report incomplete coverage: the normal
 result is `status: partial` and exit 2, even when security findings are present.
 Diagnostics identify the exhausted function and its local source-line range
 when the failure occurs within a function. Established findings remain in the
-report, failed summary writes are rolled back, and the partial scan is not
-cached as complete. A report with no findings and incomplete coverage is not
-a clean result.
+report after a function cutoff, including observed writes, return sources, and
+exception payloads projected through callers, aliases, awaited calls, and
+generator completions. Previously completed callback contexts contribute their
+observations before their contracts are revoked. Recovery consumes the
+remaining file allowance; it cannot certify
+sanitizer or return guarantees from unfinished code. A total-file cutoff
+retains already resolved concrete findings without completing unexplored code
+or new symbolic projections. Provisional summary writes are rolled back, and
+the partial scan is not cached as complete. A report with no findings and
+incomplete coverage is not a clean result.
 
 Public regressions for [issue #198](https://github.com/Dicklesworthstone/ultimate_bug_scanner/issues/198)
 exercise large generated modules, finite loops, interprocedural flows, planted
-security sinks, and deliberately exhausted limits. The header regression keeps
-all 13 planted header findings in a 6,551-line synthetic module, alongside an
+security sinks, and deliberately exhausted limits. Generated 6,568- and
+9,696-line modules each check the exact locations of 13 planted semantic
+findings (11 taint findings and two response-header findings), alongside seven
+safe controls and clean variants. A separate header regression keeps all 13
+planted header findings in a 6,551-line synthetic module, alongside an
 encoded-safe control. These fixtures reproduce the budget failure mechanism;
 the reporter's original private modules and planted payload are unavailable,
 so they do not establish a rerun of the reporter's original 13 findings.
+
+One paired benchmark on November 2, 2026 compared the same generated sources
+against main commit `3d95f029` and this bounded implementation using Python
+3.14.8. Both implementations ran sequentially in the same benchmark invocation
+with default analysis budgets. Times include parsing and direct helper
+analysis, not whole-CLI startup or other detectors. The fixtures come from
+`large_budget_source` in `test-suite/quality/test_taint_python_worklist.py`.
+
+| Source | Analyzer | `3d95f029` result / seconds | Bounded result / seconds |
+| --- | --- | --- | --- |
+| 6,568 lines, unsafe | Taint | Complete, 11/11 sites / 13.958 | Complete, 11/11 sites / 1.764 |
+| 6,568 lines, unsafe | Header | Partial, 0/2 sites / 6.445 | Complete, 2/2 sites / 2.021 |
+| 9,696 lines, unsafe | Taint | External benchmark deadline / 30.370 | Complete, 11/11 sites / 4.274 |
+| 9,696 lines, unsafe | Header | Partial, 0/2 sites / 8.330 | Complete, 2/2 sites / 5.040 |
+| 9,696 lines, clean | Taint | External benchmark deadline / 32.056 | Complete, no findings / 4.014 |
+| 9,696 lines, clean | Header | Partial / 8.121 | Complete, no findings / 3.260 |
+
+The baseline header failures reached its actual 250,000-expression limit.
+The baseline taint deadlines were imposed by the benchmark's 30-second timer,
+not by the scanner; the clean baseline also experienced scheduling contention
+and does not establish a speed ratio. On the 6,568-line taint case, module
+passes fell from 545 to 2 and charged work from 1,225,234 to 31,177 units.
+All 12 bounded runs completed with exact expected sites, including the 80-,
+417-, and 1,185-line cases. Those ordinary cases took about 0.006, 0.022–0.025,
+and 0.077–0.085 seconds per analyzer. Peak observed process RSS among bounded
+runs was 60,936 KiB (59.5 MiB); this is a measurement, not a memory guarantee.
+The large-file regressions retain their 45-second per-case deadlines.
 
 The regressions for [issue #192](https://github.com/Dicklesworthstone/ultimate_bug_scanner/issues/192)
 cover 50/100/200-function subprocess chains, shuffled definitions, recursion,

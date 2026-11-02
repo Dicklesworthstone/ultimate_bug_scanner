@@ -39,10 +39,15 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
   callers pin those limits independently of `UBS_MODULE_TIMEOUT`. Exhausted
   functions no longer erase findings from independent functions; genuine
   limits still produce partial results, exit 2, and scope/location diagnostics.
-  Public synthetic regressions retain 13 planted header findings in a
-  6,551-line module and check incomplete results with retained findings. The
-  reporter's private inputs remain unavailable, so their exact findings have
-  not been independently rerun.
+  Interrupted summaries preserve observed container writes, return sources,
+  and exception payloads through ordinary calls, aliases, awaited calls,
+  generator completions, and previously completed callback contexts without
+  trusting unfinished sanitizer guarantees. Recovery uses the remaining file
+  allowance. Public synthetic 6,568- and 9,696-line
+  modules check all 13 planted semantic findings and clean controls; a separate
+  6,551-line module retains 13 planted header findings. Forced-limit regressions
+  check partial reports with retained findings. The reporter's private inputs
+  remain unavailable, so their exact findings have not been independently rerun.
 
 - Python SQL builder wrappers retain unresolved return dependencies through
   assignments, branches and containers. Visiting a helper no longer certifies

@@ -78,6 +78,27 @@ class ReportTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(lsp.ProtocolError):
                 self.render(dict(self.report, findings=value))
 
+    def test_complete_reports_require_all_nonnegative_severity_counters(self):
+        for severity in ('critical', 'warning', 'info'):
+            report = copy.deepcopy(self.report)
+            del report['totals'][severity]
+            with self.subTest(severity=severity), self.assertRaises(lsp.ProtocolError):
+                self.render(dict(report, findings=[]))
+        for value in (None, False, '0', 0.0, -1):
+            report = copy.deepcopy(self.report)
+            report['totals']['warning'] = value
+            with self.subTest(value=value), self.assertRaises(lsp.ProtocolError):
+                self.render(dict(report, findings=[]))
+
+    def test_explicit_empty_ledger_cannot_hide_positive_scanner_counters(self):
+        for severity in ('critical', 'warning', 'info'):
+            report = copy.deepcopy(self.report)
+            report['scanners'] = [{'language': 'python', 'files': 1,
+                                   'critical': 0, 'warning': 0, 'info': 0}]
+            report['scanners'][0][severity] = 1
+            with self.subTest(severity=severity), self.assertRaises(lsp.ProtocolError):
+                self.render(dict(report, findings=[]))
+
     def test_partial_failed_and_no_target_reports_still_fail_closed(self):
         for report in (dict(self.report, status='partial'), dict(self.report, status='error'),
                        dict(self.report, failed_modules=['python']),

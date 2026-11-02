@@ -27,6 +27,23 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Fixed
 
+- Repeated initialization calls to simple Python factories no longer create
+  contexts for unrelated globals added later in the module. A conservative
+  syntax proof restricts pruning to direct lexical reads, retaining relevant
+  defaults, deferred child reads, explicit overrides, imported ownership,
+  and broad incomplete-analysis recovery. The unchanged-budget regressions
+  cover 10, 50, and 200 calls with unsafe, clean, and mixed captured values.
+- Python factory-created functions and lambdas retain their own evaluated
+  default values, references, and callable identities. A later safe factory
+  call no longer overwrites an earlier tainted callback. Symbolic default
+  inputs preserve summary reuse across concrete values; explicit overrides,
+  mutable aliases, async/generator paths, header proofs, and incomplete
+  factory recovery have exact-site regressions.
+- Captured function and deferred-call values cache immutable hashes and
+  compare shared subgraphs once per object pair, including evidence paths.
+  Mixed capture nesting has an explicit finite shape limit with partial
+  reporting and retained findings; ordinary call chains retain summary-based
+  convergence.
 - Python function setup no longer copies every closure name into every
   function. Lexical dependencies stay local; escaped-callable reads recover
   their required symbolic globals lazily, and incomplete-call alias recovery

@@ -284,22 +284,15 @@ class ReportIndex:
         totals = report.get('totals')
         if not isinstance(totals, dict) or type(totals.get('files')) is not int or totals['files'] < 1:
             raise ProtocolError('Scanner did not verify any source files')
-        if self.incomplete and any(type(totals.get(severity)) is not int or totals[severity] < 0
-                                   for severity in ('critical', 'warning', 'info')):
-            raise ProtocolError('Partial scanner report lacks valid severity counters')
+        if any(type(totals.get(severity)) is not int or totals[severity] < 0
+               for severity in ('critical', 'warning', 'info')):
+            raise ProtocolError('Scanner report lacks valid severity counters')
         records = report.get('findings')
         # A successful zero-count report may legitimately omit an empty sink.
         # Missing counters and malformed/positive ledgers are not that case.
         if 'findings' not in report and not self.incomplete and exit_code == 0 and all(
                 type(totals.get(severity)) is int and totals[severity] == 0
                 for severity in ('critical', 'warning', 'info')):
-            scanners = report.get('scanners', [])
-            if not isinstance(scanners, list) or any(
-                    not isinstance(scanner, dict) or any(
-                        type(scanner.get(severity, 0)) is not int or scanner.get(severity, 0) != 0
-                        for severity in ('critical', 'warning', 'info'))
-                    for scanner in scanners):
-                raise ProtocolError('Scanner counters disagree with the empty findings ledger')
             records = []
         ast_records = report.get('ast_findings', [])
         if not isinstance(records, list) or not isinstance(ast_records, list):
@@ -353,9 +346,19 @@ class ReportIndex:
                 self.by_path[owners.pop()].append((ordinal, finding))
                 self.located += 1
         for severity, available in accounted.items():
-            declared = totals.get(severity, 0)
-            if type(declared) is not int or not 0 <= declared <= available:
+            declared = totals[severity]
+            if declared > available:
                 raise ProtocolError('Scanner summary is not covered by its findings ledger')
+        # Per-scanner counters are another assertion about the same counted
+        # ledger. Validate them for every report shape, not only when findings
+        # is absent; otherwise an explicit empty array can make a positive
+        # scanner summary look clean to the editor.
+        for scanner in scanners:
+            self.check()
+            for severity, available in accounted.items():
+                declared = scanner.get(severity, 0)
+                if type(declared) is not int or not 0 <= declared <= available:
+                    raise ProtocolError('Scanner counters are not covered by its findings ledger')
         self.check()
 
     def check(self):

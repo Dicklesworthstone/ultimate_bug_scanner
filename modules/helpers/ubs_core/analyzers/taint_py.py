@@ -50,6 +50,7 @@ SKIP_DIRS = {'.git', '.venv', '__pycache__', 'node_modules', '.mypy_cache', '.py
 EXTS = {'.py', '.pyi'}
 PATH_LIMIT = 5
 _INCOMPLETE_PROOF = 'taint:incomplete'
+_MAX_CAPTURE_DEPTH = 64
 
 
 def _work_setting(name, default):
@@ -189,6 +190,8 @@ def _dependency_target(node, bindings, evaluated=None):
         target = evaluated.get(argument)
     else:
         target = bindings.get(argument.id) if isinstance(argument, ast.Name) else None
+    if isinstance(target, _FunctionValue):
+        target = target.function
     return target if isinstance(target, (ast.FunctionDef, ast.AsyncFunctionDef)) else None
 
 
@@ -327,15 +330,136 @@ class _ProcessInput:
     kind: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
+class _FunctionValue:
+    """One function creation owns its evaluated defaults.
+
+    The AST identifies the body, but does not identify a factory invocation.
+    Keep captured facts and aliases here, outside callable context keys.
+    """
+
+    function: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda
+    arguments: tuple = field(repr=False)
+    references: tuple = field(repr=False)
+    values: tuple = field(repr=False)
+    depth: int = field(init=False, compare=False)
+    _hash: int = field(init=False, compare=False, repr=False)
+
+    def __post_init__(self):
+        _capture_metadata(self)
+
+    def __hash__(self):
+        return self._hash
+
+    def __eq__(self, other):
+        if type(other) is not type(self):
+            return NotImplemented
+        return _same_analysis_value(self, other)
+
+
+@dataclass(frozen=True, eq=False)
 class _DeferredCall:
     """Known coroutine creation captures arguments, not execution effects."""
 
     function: ast.AsyncFunctionDef
     call: ast.Call
-    arguments: tuple
-    references: tuple
-    values: tuple = ()
+    arguments: tuple = field(repr=False)
+    references: tuple = field(repr=False)
+    values: tuple = field(default=(), repr=False)
+    depth: int = field(init=False, compare=False)
+    _hash: int = field(init=False, compare=False, repr=False)
+
+    def __post_init__(self):
+        _capture_metadata(self)
+
+    def __hash__(self):
+        return self._hash
+
+    def __eq__(self, other):
+        if type(other) is not type(self):
+            return NotImplemented
+        return _same_analysis_value(self, other)
+
+
+def _capture_metadata(value):
+    """Bound the mixed capture graph and cache its immutable semantic hash.
+
+    A coroutine can capture a function whose default is another coroutine.
+    Count both kinds, and hash each already-created child in constant time.
+    This also avoids repeated tuple hashing on Python versions before 3.14.
+    """
+    depth = 1 + max((child.depth for _, binding in value.values
+                     for child in (binding if isinstance(binding, frozenset) else (binding,))
+                     if isinstance(child, (_FunctionValue, _DeferredCall))), default=0)
+    if depth > _MAX_CAPTURE_DEPTH:
+        raise AnalysisLimit(f'Python captured-default nesting exceeds {_MAX_CAPTURE_DEPTH} levels')
+    object.__setattr__(value, 'depth', depth)
+    parts = (value.function, value.arguments, value.references, value.values)
+    if isinstance(value, _DeferredCall):
+        parts = (value.call, *parts)
+    object.__setattr__(value, '_hash', hash(parts))
+
+
+def _same_analysis_value(left, right, *, witness=False):
+    """Compare an immutable DAG once per pair, optionally retaining evidence.
+
+    Captures can share the same child through several defaults. Recursive
+    dataclass/tuple equality expands those edges exponentially even when
+    the graph itself is small. The memo belongs only to this comparison;
+    evidence checks share it with semantic matching of unordered choices.
+    """
+    if left is right:
+        return True
+    compared = {}
+
+    def same(a, b, evidence):
+        if a is b:
+            return True
+        key = (id(a), id(b), evidence)
+        previous = compared.get(key, _MISSING)
+        if previous is not _MISSING:
+            return previous
+        if isinstance(a, (_FunctionValue, _DeferredCall)):
+            result = (type(a) is type(b) and a._hash == b._hash
+                      and a.function is b.function
+                      and (not isinstance(a, _DeferredCall) or a.call is b.call)
+                      and same(a.arguments, b.arguments, evidence)
+                      and same(a.references, b.references, evidence)
+                      and same(a.values, b.values, evidence))
+        elif isinstance(b, (_FunctionValue, _DeferredCall)):
+            result = False
+        elif isinstance(a, TaintTrace):
+            result = a == b and (not evidence or a.path == b.path)
+        elif isinstance(a, tuple):
+            result = (isinstance(b, tuple) and len(a) == len(b)
+                      and all(same(x, y, evidence) for x, y in zip(a, b)))
+        elif isinstance(a, frozenset):
+            result = isinstance(b, frozenset) and len(a) == len(b)
+            if result:
+                buckets = {}
+                for candidate in b:
+                    buckets.setdefault(hash(candidate), []).append(candidate)
+                for item in a:
+                    matched = next((candidate for candidate in buckets.get(hash(item), ())
+                                    if same(item, candidate, False)), _MISSING)
+                    if matched is _MISSING or evidence and not same(item, matched, True):
+                        result = False
+                        break
+        elif isinstance(a, _BoundCallable):
+            result = (type(a) is type(b) and a.name == b.name and a.references == b.references
+                      and same(a.receiver, b.receiver, evidence))
+        elif isinstance(a, _BoundClassMethod):
+            result = (type(a) is type(b) and a.function is b.function and a.owner is b.owner
+                      and a.references == b.references and a.valid == b.valid
+                      and same(a.receiver, b.receiver, evidence))
+        elif isinstance(a, _ArgumentVector):
+            result = type(a) is type(b) and same(a.operands, b.operands, evidence)
+        else:
+            result = a == b
+        compared[key] = result
+        return result
+
+    return same(left, right, witness)
 
 
 @dataclass(frozen=True)
@@ -814,25 +938,7 @@ def _same_witness(left, right):
     Structured bindings can contain facts several layers down, however, and
     their ordinary equality deliberately omits the trace's evidence path.
     """
-    if left is right:
-        return True
-    if left != right:
-        return False
-    if isinstance(left, TaintTrace):
-        return left.path == right.path
-    if isinstance(left, frozenset):
-        matched = {value: value for value in right}
-        return all(_same_witness(value, matched[value]) for value in left)
-    if isinstance(left, tuple):
-        return all(_same_witness(a, b) for a, b in zip(left, right))
-    if isinstance(left, (_BoundCallable, _BoundClassMethod)):
-        return _same_witness(left.receiver, right.receiver)
-    if isinstance(left, _DeferredCall):
-        return (_same_witness(left.arguments, right.arguments)
-                and _same_witness(left.values, right.values))
-    if isinstance(left, _ArgumentVector):
-        return _same_witness(left.operands, right.operands)
-    return True
+    return _same_analysis_value(left, right, witness=True)
 
 
 def _same_namespace(left, right):
@@ -918,6 +1024,47 @@ def _local_names(scope, nodes=None) -> set[str]:
             if isinstance(node, (ast.Global, ast.Nonlocal)):
                 names.difference_update(node.names)
     return names
+
+
+def _direct_global_reads_only(scope):
+    """Whether executing a scope can read only its lexical global names.
+
+    This positive whitelist excludes calls and protocol dispatch. Nested
+    function bodies are deferred, but their defaults and annotations execute
+    now; decorators and type parameters keep the ordinary broad context.
+    """
+    if isinstance(scope, ast.AsyncFunctionDef):
+        return False
+    pending = [scope.body] if isinstance(scope, ast.Lambda) else list(scope.body)
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (ast.Name, ast.Constant, ast.Pass, ast.Global, ast.Nonlocal)):
+            continue
+        if isinstance(node, (ast.Return, ast.Expr)):
+            if node.value is not None:
+                pending.append(node.value)
+        elif isinstance(node, ast.Assign):
+            if not all(isinstance(target, ast.Name) for target in node.targets):
+                return False
+            pending.append(node.value)
+        elif isinstance(node, (ast.List, ast.Tuple)):
+            if not isinstance(node.ctx, ast.Load):
+                return False
+            pending.extend(node.elts)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            if getattr(node, 'decorator_list', ()) or getattr(node, 'type_params', ()):
+                return False
+            args = node.args
+            pending.extend(args.defaults)
+            pending.extend(value for value in args.kw_defaults if value is not None)
+            params = [*args.posonlyargs, *args.args, *args.kwonlyargs]
+            params.extend(arg for arg in (args.vararg, args.kwarg) if arg is not None)
+            pending.extend(arg.annotation for arg in params if arg.annotation is not None)
+            if getattr(node, 'returns', None) is not None:
+                pending.append(node.returns)
+        else:
+            return False
+    return True
 
 
 def _used_names(scope, scope_nodes=None) -> set[str]:
@@ -1035,6 +1182,8 @@ class FunctionSummary:
     # An exhausted body cannot certify a clean or nonreturning call. Its
     # callers retain opaque-call provenance and the scan stays incomplete.
     incomplete: bool = False
+    # Module identity matters: same-spelled globals in two files are distinct.
+    capture_globals: frozenset[tuple[ast.Module, str]] = frozenset()
 
 
 class _CallSubstitution:
@@ -1136,6 +1285,7 @@ class _Flow:
         # capture unwinds. Keep only their immutable observations for recovery
         # after a work limit; completed summaries still use the real exits.
         self.observed_returns = []
+        self.observed_return_bindings = []
         self.observed_raises = []
         self.yielded_references = set()
         self.returned_bindings = []
@@ -1149,6 +1299,7 @@ class _Flow:
         self.comprehension_budget = 64
         self.comprehension_environments = []
         self.context_globals = ()
+        self.capture_globals = set()
 
     def refine_url_guard(self, test, state, truth):
         """Recognize an exact, terminating local URL allow-list predicate.
@@ -1696,6 +1847,39 @@ class _Flow:
             self.engine.reads[(table, function)] = value
         return value if value is not None else {}
 
+    def function_value(self, function):
+        defaults = self.engine.defaults.get(function, {})
+        if not defaults or isinstance(self.engine.parents.get(function), (ast.Module, ast.ClassDef)):
+            return function
+        self.engine.budget.spend(len(defaults))
+        return _FunctionValue(function, tuple(defaults.items()),
+                              tuple(self.engine.default_references.get(function, {}).items()),
+                              tuple(self.engine.default_bindings.get(function, {}).items()))
+
+    def refresh_function_defaults(self, binding, heap, mutated):
+        """An escaping default retains mutations to its captured local object."""
+        if not isinstance(binding, (_FunctionValue, frozenset)):
+            return binding
+        choices = []
+        for value in _binding_choices(binding):
+            if isinstance(value, _FunctionValue):
+                self.engine.budget.spend(1 + len(value.arguments))
+                references = dict(value.references)
+                arguments = []
+                for name, fact in value.arguments:
+                    refs = references.get(name, NO_REFERENCES)
+                    self.engine.budget.spend(len(fact) + len(refs)
+                                             + sum(len(heap.get(ref, CLEAN)) for ref in refs))
+                    arguments.append((name, join_facts(fact, *(heap.get(ref, CLEAN) for ref in refs))))
+                values = []
+                for name, captured in value.values:
+                    if references.get(name, NO_REFERENCES) & mutated:
+                        captured = _without_object_contract(captured)
+                    values.append((name, self.refresh_function_defaults(captured, heap, mutated)))
+                value = _FunctionValue(value.function, tuple(arguments), value.references, tuple(values))
+            choices.append(value)
+        return _join_bindings(*choices)
+
     def global_arguments(self, function, state):
         """A helper reads its defining module, never a caller's same-name local."""
         owner = self.engine.owner(function)
@@ -1753,7 +1937,7 @@ class _Flow:
                 value = _without_object_contract(value)
             yield key, fact, refs, value
 
-    def bind(self, function, node, arguments, keywords, state, globals_snapshot=None):
+    def bind(self, function, node, arguments, keywords, state, globals_snapshot=None, captured_defaults=None):
         positional = [arg.arg for arg in (*function.args.posonlyargs, *function.args.args)]
         bound = {name: fact for name, fact in zip(positional, arguments)}
         for name, fact in keywords.items():
@@ -1763,8 +1947,10 @@ class _Flow:
         defaults.update((arg.arg, default) for arg, default in zip(function.args.kwonlyargs, function.args.kw_defaults)
                         if default is not None)
         if defaults:
-            default_facts = self.definition_table('defaults', function)
-            default_references = self.definition_table('default_references', function)
+            default_facts = (dict(captured_defaults.arguments) if captured_defaults is not None
+                             else self.definition_table('defaults', function))
+            default_references = (dict(captured_defaults.references) if captured_defaults is not None
+                                  else self.definition_table('default_references', function))
         for name, default in defaults.items():
             if name not in bound:
                 references = default_references.get(name, NO_REFERENCES)
@@ -1788,7 +1974,7 @@ class _Flow:
             bound[key] = fact
         return bound
 
-    def bind_references(self, function, node, keyword_nodes, state, globals_snapshot=None):
+    def bind_references(self, function, node, keyword_nodes, state, globals_snapshot=None, captured_defaults=None):
         """Bind references from evaluated argument snapshots, never re-read names.
 
         Variadic packs are new Python containers, not aliases to their values.
@@ -1802,7 +1988,9 @@ class _Flow:
         for name, expression in keyword_nodes.items():
             if name in accepted:
                 bound[name] = self.expression_references.get(expression, NO_REFERENCES)
-        for name, references in self.definition_table('default_references', function).items():
+        defaults = (captured_defaults.references if captured_defaults is not None
+                    else self.definition_table('default_references', function).items())
+        for name, references in defaults:
             bound.setdefault(name, references)
         expanded = frozenset().union(*(self.expression_references.get(arg, NO_REFERENCES)
                                       for arg in node.args if isinstance(arg, ast.Starred)))
@@ -1825,7 +2013,7 @@ class _Flow:
             return self.engine.project.module_ref_map.get(key, NO_REFERENCES)
         return NO_REFERENCES
 
-    def bind_values(self, function, node, keyword_nodes, state, globals_snapshot=None):
+    def bind_values(self, function, node, keyword_nodes, state, globals_snapshot=None, captured_defaults=None):
         positional = [arg.arg for arg in (*function.args.posonlyargs, *function.args.args)]
         bound = {name: self.expression_bindings.get(arg) for name, arg in zip(positional, node.args)}
         if any(isinstance(arg, ast.Starred) for arg in node.args):
@@ -1833,7 +2021,9 @@ class _Flow:
             bound.update((name, None) for name in positional)
         bound.update((name, self.expression_bindings.get(value)) for name, value in keyword_nodes.items()
                      if name is not None)
-        for name, value in self.definition_table('default_bindings', function).items():
+        defaults = (captured_defaults.values if captured_defaults is not None
+                    else self.definition_table('default_bindings', function).items())
+        for name, value in defaults:
             bound.setdefault(name, value)
         captured = self.closure_namespace(function, state)
         for name in self.engine.closures.get(function, ()):
@@ -1854,25 +2044,98 @@ class _Flow:
         """
         items = ((name, values.get(name)) for name in candidate_keys) if candidate_keys is not None else tuple(values.items())
         for name, binding in items:
-            if not isinstance(binding, _BoundClassMethod) and not (
-                isinstance(binding, frozenset) and any(isinstance(v, _BoundClassMethod) for v in binding)
+            if not isinstance(binding, (_BoundCallable, _BoundClassMethod)) and not (
+                isinstance(binding, frozenset) and any(isinstance(v, (_BoundCallable, _BoundClassMethod)) for v in binding)
             ):
                 continue
             choices = []
             receivers, refs = [], []
             for value in _binding_choices(binding):
-                if isinstance(value, _BoundClassMethod):
+                if isinstance(value, (_BoundCallable, _BoundClassMethod)):
                     receivers.append(join_facts(value.receiver, *(state.heap.get(ref, CLEAN)
                                                                   for ref in value.references)))
                     refs.append(value.references)
-                    value = _BoundClassMethod(value.function, value.owner, value.references, value.receiver,
-                                              value.valid and not bool(value.references & state.mutated))
+                    if isinstance(value, _BoundClassMethod):
+                        value = _BoundClassMethod(value.function, value.owner, value.references, value.receiver,
+                                                  value.valid and not bool(value.references & state.mutated))
                 choices.append(value)
             if refs:
                 slot = '@method:' + name
                 bound[slot] = join_facts(*receivers)
                 references[slot] = frozenset().union(*refs)
                 values[name] = _join_bindings(*choices)
+
+    def bind_function_defaults(self, bound, references, values, state, candidate_keys=None,
+                               *, function=None, summary=None):
+        """Project captured defaults through symbolic callback slots.
+
+        A callback summary can be shared by safe and unsafe factory results:
+        their body identity is the same, but their default values are not.
+        """
+        owner = self.engine.owner(function) if function is not None else self.engine
+        required = summary.capture_globals if summary is not None else frozenset()
+        if summary is not None and summary.incomplete:
+            candidate_keys = None
+        if candidate_keys is not None:
+            candidate_keys = dict.fromkeys(candidate_keys)
+            candidate_keys.update((f'@global:{name}', None) for module, name in required
+                                  if module is owner.tree)
+        direct_globals = (owner.used_names[function]
+                          if (function in owner.direct_global_functions
+                              and summary is not None and not summary.incomplete) else None)
+        items = (((name, values.get(name)) for name in candidate_keys)
+                 if candidate_keys is not None else values.items())
+        pending = []
+        for name, binding in items:
+            if (direct_globals is not None and name.startswith('@global:')
+                    and name[8:] not in direct_globals and name[8:] not in self.context_globals
+                    and (owner.tree, name[8:]) not in required):
+                continue
+            if not any(isinstance(value, (_FunctionValue, _BoundCallable, _BoundClassMethod))
+                       for value in _binding_choices(binding)):
+                continue
+            if (name.startswith('@global:') and summary is not None and not summary.incomplete
+                    and (owner.tree, name[8:]) not in required
+                    and name[8:] not in self.context_globals
+                    and _same_witness(binding, owner.globals.bindings.get(name[8:]))):
+                continue
+            pending.append((name, binding))
+        self.engine.budget.spend(len(pending))
+        while pending:
+            name, binding = pending.pop()
+            for value in _binding_choices(binding):
+                if isinstance(value, (_BoundCallable, _BoundClassMethod)):
+                    slot = '@method:' + name
+                    refs = value.references
+                    self.engine.budget.spend(1 + len(value.receiver) + len(refs)
+                                             + len(bound.get(slot, CLEAN))
+                                             + len(references.get(slot, NO_REFERENCES))
+                                             + sum(len(state.heap.get(ref, CLEAN)) for ref in refs))
+                    bound[slot] = join_facts(bound.get(slot, CLEAN), value.receiver,
+                                            *(state.heap.get(ref, CLEAN) for ref in refs))
+                    references[slot] = references.get(slot, NO_REFERENCES) | refs
+                    continue
+                if not isinstance(value, _FunctionValue):
+                    continue
+                self.engine.budget.spend(1 + len(value.arguments))
+                default_refs = dict(value.references)
+                default_values = dict(value.values)
+                for parameter, fact in value.arguments:
+                    slot = f'@default:{name}:{parameter}'
+                    refs = default_refs.get(parameter, NO_REFERENCES)
+                    self.engine.budget.spend(len(fact) + len(refs)
+                                             + len(bound.get(slot, CLEAN))
+                                             + len(references.get(slot, NO_REFERENCES))
+                                             + sum(len(state.heap.get(ref, CLEAN)) for ref in refs))
+                    bound[slot] = join_facts(bound.get(slot, CLEAN), fact,
+                                            *(state.heap.get(ref, CLEAN) for ref in refs))
+                    references[slot] = references.get(slot, NO_REFERENCES) | refs
+                    captured = default_values.get(parameter)
+                    self.engine.budget.spend(len(_binding_choices(captured))
+                                             + (len(_binding_choices(values[slot])) if slot in values else 0))
+                    values[slot] = (_join_bindings(values[slot], captured)
+                                    if slot in values else captured)
+                    pending.append((slot, captured))
 
     def resume_environment(self, function, bound, references, values, state):
         """Arguments are captured at creation; globals and cells are read later.
@@ -2008,7 +2271,7 @@ class _Flow:
                     for ref in target.references))
                 choices.append(_BoundClassMethod(target.function, target.owner, actual,
                                                  substitute(target.receiver), target.valid))
-            elif isinstance(target, _DeferredCall):
+            elif isinstance(target, (_DeferredCall, _FunctionValue)):
                 arguments = tuple((name, substitute(fact))
                                   for name, fact in target.arguments)
                 actual = tuple((name, frozenset().union(*(
@@ -2018,7 +2281,9 @@ class _Flow:
                                                                        node, call_name, values,
                                                                        substitute=substitute))
                                         for name, value in target.values)
-                choices.append(_DeferredCall(target.function, target.call, arguments, actual, captured_values))
+                choices.append(_DeferredCall(target.function, target.call, arguments, actual, captured_values)
+                               if isinstance(target, _DeferredCall)
+                               else _FunctionValue(target.function, arguments, actual, captured_values))
             else:
                 choices.append(target)
         return _join_bindings(*choices)
@@ -2108,7 +2373,9 @@ class _Flow:
         binding = self.expression_bindings.get(node.func)
         fallback_name = _qualified(node.func, state.bindings)
         receiver = (self.expression_facts.get(node.func.value, CLEAN)
-                    if isinstance(node.func, ast.Attribute) else CLEAN)
+                    if isinstance(node.func, ast.Attribute) else frozenset(
+                        trace for trace in self.expression_facts.get(node.func, CLEAN)
+                        if _INCOMPLETE_PROOF in trace.sanitizers))
         receiver_refs = (self.expression_references.get(node.func.value, NO_REFERENCES)
                          if isinstance(node.func, ast.Attribute) else NO_REFERENCES)
         arguments = [self.expr(arg, state) for arg in node.args]
@@ -2227,6 +2494,9 @@ class _Flow:
             name = target.name
             receiver_refs = target.references
             receiver = join_facts(target.receiver, *(state.heap.get(ref, CLEAN) for ref in receiver_refs))
+        captured_defaults = target if isinstance(target, _FunctionValue) else None
+        if captured_defaults is not None:
+            target = captured_defaults.function
         if isinstance(target, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
             function = target
             call_name = _call_name(function)
@@ -2237,9 +2507,9 @@ class _Flow:
                         and not isinstance(self.scope, ast.Module)
                         and not self.comprehension_environments
                         and (module_ref is None or (module_ref not in state.heap and module_ref not in state.mutated))):
-                    local_bound = self.bind(function, node, arguments, keywords, state, ())
-                    local_refs = self.bind_references(function, node, keyword_nodes, state, ())
-                    local_values = self.bind_values(function, node, keyword_nodes, state, ())
+                    local_bound = self.bind(function, node, arguments, keywords, state, (), captured_defaults)
+                    local_refs = self.bind_references(function, node, keyword_nodes, state, (), captured_defaults)
+                    local_values = self.bind_values(function, node, keyword_nodes, state, (), captured_defaults)
                     bound = owner.base_global_bound.copy()
                     references = owner.base_global_refs.copy()
                     values = owner.base_global_values.copy()
@@ -2295,9 +2565,9 @@ class _Flow:
                     )
                 else:
                     globals_snapshot = tuple(self.global_arguments(function, state))
-                    bound = self.bind(function, node, arguments, keywords, state, globals_snapshot)
-                    references = self.bind_references(function, node, keyword_nodes, state, globals_snapshot)
-                    values = self.bind_values(function, node, keyword_nodes, state, globals_snapshot)
+                    bound = self.bind(function, node, arguments, keywords, state, globals_snapshot, captured_defaults)
+                    references = self.bind_references(function, node, keyword_nodes, state, globals_snapshot, captured_defaults)
+                    values = self.bind_values(function, node, keyword_nodes, state, globals_snapshot, captured_defaults)
                     if state.mutated:
                         for name, refs in references.items():
                             if refs and (refs & state.mutated):
@@ -2327,6 +2597,10 @@ class _Flow:
                 return CLEAN
             overrides = self.context_globals if owner is self.engine else ()
             summary = self.engine.call_summary(function, values, summary_keys, overrides)
+            self.engine.budget.spend(len(summary.capture_globals))
+            self.capture_globals.update(summary.capture_globals)
+            self.bind_function_defaults(bound, references, values, state, receiver_keys,
+                                        function=function, summary=summary)
             substitute = _CallSubstitution(self.substitute_trace, bound, call_name, self.engine.budget)
             for kind, line, column, label, fact in summary.effects:
                 propagated = substitute(fact)
@@ -2604,6 +2878,14 @@ class _Flow:
             fact = state.value(node.id)
             self.expression_facts[node] = fact
             binding = state.bindings.get(node.id, _implicit_identity(node.id))
+            if (node.id in self.engine.global_names
+                    and node.id not in self.engine.locals.get(self.scope, ())
+                    and node.id not in self.engine.closures.get(self.scope, ())
+                    and not any(node.id in self.engine.locals[scope]
+                                for scope, _outer in self.comprehension_environments)
+                    and any(isinstance(value, (_FunctionValue, _BoundCallable))
+                            for value in _binding_choices(binding))):
+                self.capture_globals.add((self.engine.tree, node.id))
             refs = state.references.get(node.id, NO_REFERENCES)
             self.expression_references[node] = refs
             if state.mutated and (refs & state.mutated):
@@ -2668,7 +2950,7 @@ class _Flow:
                 if isinstance(name, str):
                     fact = join_facts(fact, self.source(node, state, name))
         elif isinstance(node, ast.Lambda):
-            binding = node
+            binding = self.function_value(node)
         elif isinstance(node, ast.NamedExpr):
             binding = self.expression_bindings.get(node.value)
         elif isinstance(node, ast.IfExp):
@@ -3061,7 +3343,7 @@ class _Flow:
                           else not descriptors or descriptors in (['staticmethod'], ['builtins.staticmethod']))
             self.engine.define('class_callables', node, descriptor)
             state[node.name] = CLEAN
-            state.bindings[node.name] = node
+            state.bindings[node.name] = self.function_value(node)
             state.references[node.name] = NO_REFERENCES
         elif isinstance(node, ast.ClassDef):
             for expression in (*node.bases, *node.decorator_list):
@@ -3141,6 +3423,7 @@ class _Flow:
             if not state.reachable:
                 return None
             self.observed_returns.append((value, self.expression_references.get(node.value, NO_REFERENCES)))
+            self.observed_return_bindings.append(self.expression_bindings.get(node.value))
             self.pending.append(_Completion('return', state.copy(), value,
                                             self.expression_references.get(node.value, NO_REFERENCES),
                                             self.expression_bindings.get(node.value)))
@@ -3300,6 +3583,9 @@ class _Flow:
             returned_bindings.append(None)  # Implicit `return None`.
         returned_binding = _join_bindings(*returned_bindings)
         yielded_binding = _join_bindings(*self.yielded_bindings)
+        if normal is not None:
+            returned_binding = self.refresh_function_defaults(returned_binding, normal.heap, normal.mutated)
+        yielded_binding = self.refresh_function_defaults(yielded_binding, self.mutations, self.mutations.keys())
         # finally may change an object after its return expression was read.
         # The object still returns, but its previous argv/process shape does
         # not. Keep this independent from whether the write added any taint.
@@ -3316,6 +3602,7 @@ class _Flow:
             yielded_binding=yielded_binding,
             can_return=normal is not None,
             exceptions=exceptions,
+            capture_globals=frozenset(self.capture_globals),
         )
 
 
@@ -3423,6 +3710,7 @@ class _Analysis:
         self.functions = [node for node in nodes if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))]
         self.generators = set()
         self.definition_writers = set()
+        self.direct_global_functions = set()
         self.locals = {}
         raw_used = {}
         for scope in [tree, *self.functions]:
@@ -3437,6 +3725,8 @@ class _Analysis:
                        for node in body):
                     self.definition_writers.add(scope)
                 raw_used[scope] = _used_names(scope, body)
+                if _direct_global_reads_only(scope):
+                    self.direct_global_functions.add(scope)
                 if any(isinstance(node, (ast.Yield, ast.YieldFrom)) for node in body):
                     self.generators.add(scope)
         for node in nodes:
@@ -3527,7 +3817,8 @@ class _Analysis:
             f'@global:{name}'
             for name in self.global_names
             if isinstance(bindings.get(name), (frozenset, ast.ClassDef, _BoundClassMethod))
-            and any(isinstance(v, (ast.ClassDef, _BoundClassMethod)) for v in _binding_choices(bindings.get(name)))
+            and any(isinstance(v, (ast.ClassDef, _BoundClassMethod))
+                    for v in _binding_choices(bindings.get(name)))
         )
 
     def owner(self, function):
@@ -3670,6 +3961,7 @@ class _Analysis:
                     if (key[0] if isinstance(key, tuple) else key) is function]
         effects, mutations = {}, {}
         returned, yielded, raised, returned_refs, yielded_refs = [], [], [], set(), set()
+        capture_globals = set()
 
         def retain_effects(items):
             for kind, line, column, label, fact in items:
@@ -3693,7 +3985,28 @@ class _Analysis:
                 if references is not None:
                     references.update(ref for ref in refs if isinstance(ref, str))
 
+        def retain_defaults(binding, facts, references):
+            pending = [binding]
+            while pending:
+                binding = pending.pop()
+                for value in _binding_choices(binding):
+                    if not isinstance(value, _FunctionValue):
+                        continue
+                    budget.spend(1 + len(value.arguments) + len(value.references) + len(value.values))
+                    default_refs = dict(value.references)
+                    for name, fact in value.arguments:
+                        refs = default_refs.get(name, NO_REFERENCES)
+                        budget.spend(len(fact) + len(refs))
+                        facts.append(fact)
+                        references.update(ref for ref in refs if isinstance(ref, str))
+                        if flow is not None:
+                            budget.spend(sum(len(flow.mutations.get(ref, CLEAN)) for ref in refs))
+                            facts.extend(flow.mutations.get(ref, CLEAN) for ref in refs)
+                    pending.extend(captured for _, captured in value.values)
+
         for summary in previous:
+            budget.spend(len(summary.capture_globals))
+            capture_globals.update(summary.capture_globals)
             retain_effects(summary.effects)
             retain_mutations(summary.mutations)
             budget.spend(len(summary.returned) + len(summary.yielded)
@@ -3702,18 +4015,26 @@ class _Analysis:
             yielded.append(summary.yielded)
             returned_refs.update(summary.returned_references)
             yielded_refs.update(summary.yielded_references)
+            retain_defaults(summary.returned_binding, returned, returned_refs)
+            retain_defaults(summary.yielded_binding, yielded, yielded_refs)
             for exception in summary.exceptions:
                 retain_mutations(exception.mutations)
                 budget.spend(1 + len(exception.value))
                 raised.append(exception.value)
         retain_effects(self.partial_scope_effects.get(function, ()))
         if flow is not None:
+            budget.spend(len(flow.capture_globals))
+            capture_globals.update(flow.capture_globals)
             retain_mutations(flow.mutations.items())
             budget.spend(len(flow.observed_returns))
             observations = [(flow.returned, flow.returned_references), *flow.observed_returns,
                             (flow.yielded, flow.yielded_references)]
             retain_observations(observations, returned, returned_refs)
             retain_observations(flow.observed_raises, raised)
+            for binding in (*flow.returned_bindings, *flow.observed_return_bindings):
+                retain_defaults(binding, returned, returned_refs)
+            for binding in flow.yielded_bindings:
+                retain_defaults(binding, yielded, yielded_refs)
         return FunctionSummary(
             returned=join_facts(*returned), yielded=join_facts(*yielded),
             effects=tuple((*key, fact) for key, fact in effects.items()),
@@ -3721,6 +4042,7 @@ class _Analysis:
             returned_references=frozenset(returned_refs), yielded_references=frozenset(yielded_refs),
             exceptions=(ExceptionSummary(None, join_facts(*raised)),) if raised else (),
             returned_binding=None, yielded_binding=None, can_return=True, incomplete=True,
+            capture_globals=frozenset(capture_globals),
         )
 
     def framework_bound(self, globals_):
@@ -3764,7 +4086,51 @@ class _Analysis:
             if not changed:
                 return bound
 
+    def callable_context(self, name, binding, *, captured=False):
+        """Finite callable identity with captured values replaced by slots."""
+        choices = []
+        for value in _binding_choices(binding):
+            if isinstance(value, _FunctionValue):
+                self.budget.spend(1 + len(value.arguments))
+                arguments, references, bindings = [], [], []
+                default_values = dict(value.values)
+                for parameter, _fact in value.arguments:
+                    slot = f'@default:{name}:{parameter}'
+                    symbolic = frozenset({TaintTrace(slot, parameter=slot, path=(slot,))})
+                    arguments.append((parameter, symbolic))
+                    references.append((parameter, frozenset({slot})))
+                    bindings.append((parameter, self.callable_context(
+                        slot, default_values.get(parameter), captured=True)))
+                value = _FunctionValue(value.function, tuple(arguments), tuple(references), tuple(bindings))
+            elif isinstance(value, (_BoundCallable, _BoundClassMethod)):
+                slot = '@method:' + name
+                symbolic = frozenset({TaintTrace(slot, parameter=slot, path=(slot,))})
+                value = (_BoundClassMethod(value.function, value.owner, frozenset({slot}), symbolic, value.valid)
+                         if isinstance(value, _BoundClassMethod)
+                         else _BoundCallable(value.name, frozenset({slot}), symbolic))
+            elif not isinstance(value, (str, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+                value = _SymbolicValue(name) if captured else None
+            choices.append(value)
+        return _join_bindings(*choices)
+
     def call_summary(self, function, values, candidate_keys=None, global_overrides=()):
+        # A provisional summary may discover a captured global only through
+        # another helper. Follow those ordinary summary dependencies until
+        # this call's context includes the captures it actually reads. Each
+        # read participates in the existing fixed point and every expansion
+        # adds a finite, module-qualified dependency.
+        required = frozenset()
+        while True:
+            summary = self._call_summary(function, values, candidate_keys,
+                                         global_overrides, required)
+            self.budget.spend(len(required) + len(summary.capture_globals))
+            missing = summary.capture_globals - required
+            if not missing:
+                return summary
+            required = required | missing
+
+    def _call_summary(self, function, values, candidate_keys=None, global_overrides=(),
+                      capture_globals=frozenset()):
         """Request a symbolic summary for known callback identities.
 
         Facts, heaps and evidence paths are NOT context keys. Only finite
@@ -3782,15 +4148,28 @@ class _Analysis:
                 self.reads[('summaries', function)] = summary
             return summary
         context = []
+        direct_globals = (owner.used_names[function]
+                          if function in owner.direct_global_functions else None)
         owner_fn = None
         owner_bindings = None
         # Candidate names can come from both a lexical global and an inherited
         # callback context. They describe one mapping, not repeated arguments:
         # retaining duplicate entries creates a fresh, longer context on every
         # recursive call even though no callable identity changed.
+        if candidate_keys is not None and capture_globals:
+            candidate_keys = dict.fromkeys(candidate_keys)
+            candidate_keys.update((f'@global:{name}', None) for module, name in capture_globals
+                                  if module is owner.tree)
         items = ((name, values.get(name)) for name in dict.fromkeys(candidate_keys)) if candidate_keys is not None else values.items()
         for name, binding in items:
+            if name.startswith('@default:'):
+                continue  # Captures are carried by the enclosing callback identity.
             if name.startswith('@global:'):
+                gname = name[8:]
+                if (direct_globals is not None and gname not in direct_globals
+                        and gname not in global_overrides
+                        and (owner.tree, gname) not in capture_globals):
+                    continue
                 # A caller may replace a global callable or class method and
                 # restore it later. The module's final binding cannot certify
                 # a call made while that identity was replaced. Preserve the
@@ -3804,11 +4183,15 @@ class _Analysis:
                 # these comparisons meaningful; the module then runs again.
                 if not owner_fn.namespace_ready:
                     continue
-                gname = name[8:]
                 nominal = owner_bindings.get(gname)
                 explicit_override = gname in global_overrides
+                if (not explicit_override and (owner_fn.tree, gname) not in capture_globals
+                        and any(isinstance(value, (_FunctionValue, _BoundCallable))
+                                for value in _binding_choices(binding))
+                        and _same_witness(binding, nominal)):
+                    continue
                 if (binding is nominal
-                        and not isinstance(binding, (frozenset, _BoundClassMethod))
+                        and not isinstance(binding, (frozenset, _BoundCallable, _BoundClassMethod, _FunctionValue))
                         and not explicit_override
                         and gname in owner_bindings
                         and gname not in owner_fn.locals[function]
@@ -3819,20 +4202,12 @@ class _Analysis:
                     continue
                 if not explicit_override and not any(
                         isinstance(value, (str, ast.FunctionDef, ast.AsyncFunctionDef,
-                                           ast.Lambda, ast.ClassDef, _BoundClassMethod))
+                                           ast.Lambda, ast.ClassDef, _BoundCallable, _BoundClassMethod, _FunctionValue))
                         for value in (*_binding_choices(binding), *_binding_choices(nominal))):
                     continue
             elif binding is None or isinstance(binding, _SymbolicValue):
                 continue
-            choices = []
-            for value in _binding_choices(binding):
-                if isinstance(value, _BoundClassMethod):
-                    slot = '@method:' + name
-                    symbolic = frozenset({TaintTrace(slot, parameter=slot, path=(slot,))})
-                    value = _BoundClassMethod(value.function, value.owner, frozenset({slot}), symbolic, value.valid)
-                elif not isinstance(value, (str, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
-                    value = None
-                choices.append(value)
+            choices = _binding_choices(self.callable_context(name, binding))
             if name.startswith('@global:'):
                 joined_choice = _join_bindings(*choices)
                 if (joined_choice is nominal

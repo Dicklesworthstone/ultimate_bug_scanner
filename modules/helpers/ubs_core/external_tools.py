@@ -75,6 +75,11 @@ def _process_group_running(pgid: int) -> bool:
         os.killpg(pgid, 0)
     except ProcessLookupError:
         return False
+    except PermissionError:
+        # Darwin can report EPERM while a killed group contains unreaped
+        # zombies. It can also mean a real signal denial. Keep polling until
+        # the group is gone; neither case proves that writers have stopped.
+        return True
     if sys.platform != "linux":
         return True
     try:
@@ -144,7 +149,9 @@ def run_command_stream(tool: str, argv: Sequence[str], root: Path, timeout: floa
                         os.killpg(proc.pid, signal.SIGKILL)
                     else:
                         proc.kill()
-                except ProcessLookupError:
+                except (ProcessLookupError, PermissionError):
+                    # EPERM is not success: wait/recheck below must still
+                    # prove the leader and group stopped within the grace.
                     pass
                 # Killing the group is asynchronous. Do not read through a
                 # live writer's shared file offset or wait indefinitely for an

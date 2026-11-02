@@ -1132,6 +1132,11 @@ class _Flow:
         self.expression_references = {}
         self.mutations = {}
         self.returned_references = set()
+        # Return completions may be replaced by finally or discarded while a
+        # capture unwinds. Keep only their immutable observations for recovery
+        # after a work limit; completed summaries still use the real exits.
+        self.observed_returns = []
+        self.observed_raises = []
         self.yielded_references = set()
         self.returned_bindings = []
         self.yielded_bindings = []
@@ -1882,6 +1887,58 @@ class _Flow:
         return frozenset(TaintTrace(trace.source, trace.parameter,
                                     frozenset({_INCOMPLETE_PROOF}), trace.path) for trace in fact)
 
+    def incomplete_call(self, node, function, summary, bound, references, receiver, state, substitute):
+        """Project observed writes without trusting the unfinished suffix."""
+        budget = self.engine.budget
+        for parameter, written in summary.mutations:
+            refs = self._lookup_refs(references, parameter)
+            fact = self.incomplete_result(substitute(written))
+            budget.spend(len(refs) * (1 + len(fact)))
+            self.mutate(refs, fact, state)
+
+        # The optimized binding contains every module global. Possible return
+        # aliases need only actual arguments/cells, globals used by this body,
+        # and references already observed by a completed context or prefix.
+        budget.spend(len(references) + len(summary.mutations)
+                     + len(summary.returned_references) + len(summary.yielded_references))
+        used = self.engine.owner(function).used_names[function]
+        keys = dict.fromkeys(name for name in references
+                             if not name.startswith('@global:') or name[8:] in used)
+        keys.update(dict.fromkeys(summary.returned_references))
+        keys.update(dict.fromkeys(summary.yielded_references))
+        keys.update(dict.fromkeys(name for name, _fact in summary.mutations))
+        possible_refs = []
+        for name in keys:
+            refs = self._lookup_refs(references, name)
+            budget.spend(len(refs) + len(bound.get(name, CLEAN))
+                         + sum(len(state.heap.get(ref, CLEAN)) for ref in refs))
+            fact = self.incomplete_result(join_facts(
+                bound.get(name, CLEAN), *(state.heap.get(ref, CLEAN) for ref in refs)))
+            budget.spend(len(refs) * (1 + len(fact)))
+            self.mutate(refs, fact, state)
+            possible_refs.append(refs)
+        returned_refs = frozenset().union(*possible_refs)
+        budget.spend(sum(len(fact) for fact in bound.values())
+                     + sum(len(state.heap.get(ref, CLEAN)) for ref in returned_refs))
+        unknown = join_facts(receiver, *bound.values(), substitute(summary.returned),
+                             substitute(summary.yielded),
+                             *(state.heap.get(ref, CLEAN) for ref in returned_refs))
+        self.expression_bindings[node] = None
+        self.expression_references[node] = returned_refs | frozenset({node})
+        raised = self.incomplete_result(join_facts(*(substitute(item.value) for item in summary.exceptions)))
+        if raised:
+            self.observed_raises.append((raised, NO_REFERENCES))
+            self.pending.append(_Completion('raise', state.copy(), raised))
+        self.possible_exception(state)
+        unknown = self.incomplete_result(unknown)
+        if function in self.engine.generators:
+            # yield-from reads StopIteration.value through a separate channel.
+            # An unfinished generator proves neither channel clean or absent.
+            self.generator_returns[node] = unknown
+            self.generator_return_references[node] = self.expression_references[node]
+            self.generator_return_bindings[node] = None
+        return unknown
+
     @classmethod
     def substitute(cls, fact, bound, call_name, *, budget=None):
         if not fact:
@@ -2254,23 +2311,17 @@ class _Flow:
                 # Resumed coroutines use an Await node, not a Call, and their
                 # values were captured at construction. Use the already bound
                 # environment without evaluating either syntax a second time.
-                self.engine.budget.spend(sum(len(fact) for fact in bound.values()))
-                unknown = join_facts(receiver, *bound.values())
-                self.expression_bindings[node] = None
-                self.expression_references[node] = frozenset({node})
-                for refs in references.values():
-                    self.mutate(refs, CLEAN, state)
-                self.possible_exception(state)
-                # Retain observed prefix sinks, but unfinished code may undo
-                # a sanitizer supplied by its caller. Its return is opaque.
-                return self.incomplete_result(unknown)
+                return self.incomplete_call(node, function, summary, bound, references,
+                                            receiver, state, substitute)
             for exception in summary.exceptions:
                 exceptional = state.copy()
                 for parameter, written in exception.mutations:
                     self.mutate(self._lookup_refs(references, parameter),
                                 substitute(written), exceptional)
+                raised = substitute(exception.value)
+                self.observed_raises.append((raised, frozenset({node})))
                 self.pending.append(_Completion(
-                    'raise', exceptional, substitute(exception.value),
+                    'raise', exceptional, raised,
                     frozenset({node}),
                     '@exception:' + exception.exception_type if exception.exception_type else None,
                     exception.exception_type,
@@ -3052,6 +3103,7 @@ class _Flow:
             failed = state.copy()
             value = self.expr(node.msg, failed)
             if failed.reachable:
+                self.observed_raises.append((value, self.expression_references.get(node.msg, NO_REFERENCES)))
                 self.pending.append(_Completion('raise', failed, value, exception_type='AssertionError'))
             if isinstance(node.test, ast.Constant) and not node.test.value:
                 return None
@@ -3061,6 +3113,7 @@ class _Flow:
             value = self.expr(node.value, state)
             if not state.reachable:
                 return None
+            self.observed_returns.append((value, self.expression_references.get(node.value, NO_REFERENCES)))
             self.pending.append(_Completion('return', state.copy(), value,
                                             self.expression_references.get(node.value, NO_REFERENCES),
                                             self.expression_bindings.get(node.value)))
@@ -3073,9 +3126,11 @@ class _Flow:
                 return None
             if node.exc is None and self.handled:
                 previous = self.handled[-1]
+                self.observed_raises.append((previous.value, previous.references))
                 self.pending.append(_Completion('raise', state.copy(), previous.value,
                                                 previous.references, previous.binding, previous.exception_type))
             else:
+                self.observed_raises.append((value, self.expression_references.get(node.exc, NO_REFERENCES)))
                 self.pending.append(_Completion('raise', state.copy(), value,
                                                 self.expression_references.get(node.exc, NO_REFERENCES),
                                                 self.expression_bindings.get(node.exc), exception_type))
@@ -3571,6 +3626,66 @@ class _Analysis:
             effects[key] = join_facts(effects.get(key, CLEAN), fact)
         return tuple((*key, fact) for key, fact in effects.items())
 
+    def interrupted_summary(self, function, flow, budget):
+        """Recover bounded observations across contexts, never their proofs."""
+        budget.spend(len(self.summaries))
+        previous = [summary for key, summary in self.summaries.items()
+                    if (key[0] if isinstance(key, tuple) else key) is function]
+        effects, mutations = {}, {}
+        returned, yielded, raised, returned_refs, yielded_refs = [], [], [], set(), set()
+
+        def retain_effects(items):
+            for kind, line, column, label, fact in items:
+                key = (kind, line, column, label)
+                budget.spend(1 + len(fact) + len(effects.get(key, CLEAN)))
+                effects[key] = join_facts(effects.get(key, CLEAN), fact)
+
+        def retain_mutations(items):
+            for ref, fact in items:
+                if isinstance(ref, str):
+                    budget.spend(1 + len(fact) + len(mutations.get(ref, CLEAN)))
+                    mutations[ref] = join_facts(mutations.get(ref, CLEAN), fact)
+
+        def retain_observations(items, facts, references=None):
+            budget.spend(len(items))
+            for fact, refs in items:
+                budget.spend(len(fact) + len(refs)
+                             + sum(len(flow.mutations.get(ref, CLEAN)) for ref in refs))
+                facts.append(fact)
+                facts.extend(flow.mutations.get(ref, CLEAN) for ref in refs)
+                if references is not None:
+                    references.update(ref for ref in refs if isinstance(ref, str))
+
+        for summary in previous:
+            retain_effects(summary.effects)
+            retain_mutations(summary.mutations)
+            budget.spend(len(summary.returned) + len(summary.yielded)
+                         + len(summary.returned_references) + len(summary.yielded_references))
+            returned.append(summary.returned)
+            yielded.append(summary.yielded)
+            returned_refs.update(summary.returned_references)
+            yielded_refs.update(summary.yielded_references)
+            for exception in summary.exceptions:
+                retain_mutations(exception.mutations)
+                budget.spend(1 + len(exception.value))
+                raised.append(exception.value)
+        retain_effects(self.partial_scope_effects.get(function, ()))
+        if flow is not None:
+            retain_mutations(flow.mutations.items())
+            budget.spend(len(flow.observed_returns))
+            observations = [(flow.returned, flow.returned_references), *flow.observed_returns,
+                            (flow.yielded, flow.yielded_references)]
+            retain_observations(observations, returned, returned_refs)
+            retain_observations(flow.observed_raises, raised)
+        return FunctionSummary(
+            returned=join_facts(*returned), yielded=join_facts(*yielded),
+            effects=tuple((*key, fact) for key, fact in effects.items()),
+            mutations=tuple(mutations.items()),
+            returned_references=frozenset(returned_refs), yielded_references=frozenset(yielded_refs),
+            exceptions=(ExceptionSummary(None, join_facts(*raised)),) if raised else (),
+            returned_binding=None, yielded_binding=None, can_return=True, incomplete=True,
+        )
+
     def framework_bound(self, globals_):
         """Solve local dependency values on the same finite taint lattice.
 
@@ -3790,8 +3905,25 @@ class _Analysis:
                     table.pop(key, None)
                 else:
                     table[key] = previous
-            owner.failed_scopes[function] = str(exc)
             owner.partial_scope_effects[function] = owner.interrupted_effects(function, flow)
+            owner.observed_effects[function] = owner.partial_scope_effects[function]
+            # Recovery consumes the remaining file allowance, not a fresh
+            # function allowance. Include completed callback contexts before
+            # invalidating them so their concrete observations survive too.
+            try:
+                failed = owner.interrupted_summary(function, flow, total_budget)
+            except AnalysisLimit as recovery:
+                # A caller may be solving a context owned by an already-ready
+                # imported module. Its outer failure collector belongs to this
+                # analysis, so retain the foreign prefix here as well.
+                self.observed_effects[function] = owner.partial_scope_effects[function]
+                raise AnalysisLimit(
+                    f'{owner.scope_name(function)}: UBS_PYTHON_FLOW_MAX_STEPS={owner.work_limit}: {recovery}',
+                    effects=recovery.effects,
+                ) from recovery
+            owner.failed_summaries[function] = failed
+            owner.failed_scopes[function] = str(exc)
+            owner.partial_scope_effects[function] = owner.failed_summaries[function].effects
             raise
         except AnalysisLimit as exc:
             self.observed_effects[function] = owner.interrupted_effects(function, flow)
@@ -3967,8 +4099,7 @@ class _Analysis:
                     # clean/nonreturning summary. Their readers must run again
                     # with the opaque-call continuation, not stale proof.
                     scope_effects = owner.partial_scope_effects.get(function, ())
-                    failed = FunctionSummary(effects=scope_effects, incomplete=True, can_return=True)
-                    owner.failed_summaries[function] = failed
+                    failed = owner.failed_summaries[function]
                     keys = [key for key in self.summaries if parts(key)[0] is function]
                     for key in dict.fromkeys([function, *keys]):
                         owner.publish('summaries', key, failed)

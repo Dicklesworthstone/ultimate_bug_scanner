@@ -1824,6 +1824,182 @@ def tail():
             if unsafe:
                 self.assertIn('input', findings[0][-1])
 
+    def assert_budgeted_mutation_sites(self, lines, kind, unsafe, *, column=5):
+        source = '\n'.join(lines) + '\n'
+        expected = {(kind, len(lines), column)} if unsafe else set()
+        engine_type = header_injection._HeaderAnalysis if kind == 'header' else taint_py._Analysis
+        for allowance in (5000, 100):
+            with self.subTest(scope_allowance=allowance):
+                environment = self.environment(UBS_PYTHON_FLOW_SCOPE_STEPS=str(allowance),
+                                               UBS_PYTHON_FLOW_MAX_STEPS='100000')
+                with patch.dict(os.environ, environment, clear=True):
+                    engine = engine_type(ast.parse(source))
+                    if allowance == 100:
+                        with self.assertRaises(AnalysisLimit) as raised:
+                            engine.analyze()
+                        self.assertIn('populate', str(raised.exception))
+                        self.assertIn('100', str(raised.exception))
+                        effects = raised.exception.effects
+                    else:
+                        effects = engine.analyze()
+                sites = {key[:3] for key, facts in effects.items()
+                         if key[0] != 'header' or any(not header_injection._safe(trace) for trace in facts)}
+                self.assertEqual(sites, expected, effects)
+                if unsafe:
+                    self.assertTrue(any('input' in trace.source for facts in effects.values() for trace in facts),
+                                    'The retained finding must have real external-input provenance')
+
+    def test_incomplete_mutations_reach_callers_through_aliases_and_await(self):
+        # The write precedes the cutoff. Ignoring the helper's return cannot
+        # erase it, and coroutine construction must defer it until the await.
+        modes = ('sync', 'await', 'run', 'return_alias', 'aliased_argument', 'symbolic_write')
+        for mode in modes:
+            for unsafe in (True, False):
+                with self.subTest(mode=mode, unsafe=unsafe):
+                    actual = 'input()' if unsafe else '"fixed"'
+                    is_async = mode in ('await', 'run')
+                    arguments = 'box, value' if mode == 'symbolic_write' else 'box'
+                    write = 'value' if mode == 'symbolic_write' else actual
+                    lines = ['import asyncio',
+                             f'{"async " if is_async else ""}def populate({arguments}):',
+                             f'    box.append({write})']
+                    lines.extend(f'    padding{index} = {index}' for index in range(100))
+                    lines.extend(['    return box',
+                                  f'{"async " if mode == "await" else ""}def caller():'])
+                    if mode == 'return_alias':
+                        lines.extend(['    result = populate([])', '    eval(result[0])'])
+                    else:
+                        lines.append('    box = []')
+                        if mode == 'await':
+                            lines.append('    await populate(box)')
+                        elif mode == 'run':
+                            lines.append('    asyncio.run(populate(box))')
+                        elif mode == 'aliased_argument':
+                            lines.extend(['    alias = box', '    populate(alias)'])
+                        elif mode == 'symbolic_write':
+                            lines.append(f'    populate(box, {actual})')
+                        else:
+                            lines.append('    populate(box)')
+                        lines.append('    eval(box[0])')
+                    self.assert_budgeted_mutation_sites(lines, 'eval', unsafe)
+
+    def test_incomplete_mutation_revokes_argument_encoding_proofs(self):
+        domains = (
+            ('command', 'shlex.quote', 'os.system(box[0])'),
+            ('header', 'urllib.parse.quote', 'response.headers["X-Result"] = box[0]'),
+        )
+        for kind, sanitizer, sink in domains:
+            for unsafe in (True, False):
+                with self.subTest(domain=kind, unsafe=unsafe):
+                    initial = f'{sanitizer}(input())' if unsafe else '"fixed"'
+                    write = 'input()' if unsafe else '"fixed"'
+                    lines = ['import os', 'import shlex', 'import urllib.parse', 'def populate(box):']
+                    lines.extend(f'    padding{index} = {index}' for index in range(100))
+                    # The unseen suffix can replace an encoded value. A partial
+                    # warning needs only the already-known argument provenance;
+                    # the fixed-input control has no external source to invent.
+                    lines.extend([f'    box[0] = {write}', 'def caller():', f'    box = [{initial}]',
+                                  '    populate(box)', f'    {sink}'])
+                    self.assert_budgeted_mutation_sites(lines, kind, unsafe)
+
+    def test_incomplete_return_keeps_possible_argument_aliases(self):
+        for unsafe in (True, False):
+            with self.subTest(unsafe=unsafe):
+                actual = 'input()' if unsafe else '"fixed"'
+                lines = ['def populate(box):', '    box.append("fixed")']
+                lines.extend(f'    padding{index} = {index}' for index in range(100))
+                lines.extend(['    return box', 'def caller():', '    box = []',
+                              '    result = populate(box)', f'    result.append({actual})',
+                              '    eval(box[0])'])
+                self.assert_budgeted_mutation_sites(lines, 'eval', unsafe)
+
+    def test_incomplete_return_keeps_observed_branch_sources(self):
+        for container in (False, True):
+            for unsafe in (True, False):
+                with self.subTest(container=container, unsafe=unsafe):
+                    actual = 'input()' if unsafe else '"fixed"'
+                    returned = f'[{actual}]' if container else actual
+                    lines = ['def populate():', '    if flag:', f'        return {returned}']
+                    lines.extend(f'    padding{index} = {index}' for index in range(100))
+                    lines.extend(['    return "fixed"', 'def caller():',
+                                  '    eval(populate()[0])' if container else '    eval(populate())'])
+                    # capture() must retain the completed branch's value when
+                    # a different reachable path exhausts the scope allowance.
+                    self.assert_budgeted_mutation_sites(lines, 'eval', unsafe)
+
+    def test_incomplete_generator_keeps_yield_from_completion_values_and_aliases(self):
+        for alias in (False, True):
+            for unsafe in (True, False):
+                with self.subTest(alias=alias, unsafe=unsafe):
+                    actual = 'input()' if unsafe else '"fixed"'
+                    lines = [f'def populate({"box" if alias else ""}):',
+                             '    if flag:', f'        return {"box" if alias else actual}',
+                             '    yield "fixed"']
+                    lines.extend(f'    padding{index} = {index}' for index in range(100))
+                    lines.extend([f'    return {"box" if alias else "None"}', 'def caller():'])
+                    if alias:
+                        lines.extend(['    box = []', '    result = yield from populate(box)',
+                                      f'    result.append({actual})', '    eval(box[0])'])
+                    else:
+                        lines.extend(['    result = yield from populate()', '    eval(result)'])
+                    # A generator has separate yielded-value and completion
+                    # channels. The retained return observation must reach
+                    # the value of yield-from, including its object identity.
+                    self.assert_budgeted_mutation_sites(lines, 'eval', unsafe)
+
+    def test_incomplete_exception_keeps_observed_payloads_in_callers(self):
+        for mode in ('explicit', 'assert', 'delegated'):
+            for unsafe in (True, False):
+                with self.subTest(mode=mode, unsafe=unsafe):
+                    actual = 'input()' if unsafe else '"fixed"'
+                    lines = ['def raises():', f'    raise ValueError({actual})'] if mode == 'delegated' else []
+                    lines.extend(['def populate():', '    if flag:'])
+                    if mode == 'assert':
+                        lines.append(f'        assert False, {actual}')
+                    elif mode == 'delegated':
+                        lines.append('        raises()')
+                    else:
+                        lines.append(f'        raise ValueError({actual})')
+                    lines.extend(f'    padding{index} = {index}' for index in range(100))
+                    exception = 'AssertionError' if mode == 'assert' else 'ValueError'
+                    lines.extend(['    return "fixed"', 'def caller():', '    try:', '        populate()',
+                                  f'    except {exception} as error:', '        eval(str(error))'])
+                    # The exceptional branch finishes before a different
+                    # reachable path exhausts its allowance. Its payload must
+                    # survive the incomplete summary and reach the handler.
+                    self.assert_budgeted_mutation_sites(lines, 'eval', unsafe, column=9)
+
+    def test_failed_context_keeps_mutations_of_an_earlier_completed_context(self):
+        source = '''def populate(callback, box):
+    callback(box)
+def dirty(box):
+    box.append(input())
+def stop(box):
+    raise RuntimeError()
+def first():
+    box = []
+    populate(dirty, box)
+    eval(box[0])
+def second():
+    populate(stop, [])
+'''
+        for unsafe in (True, False):
+            with self.subTest(unsafe=unsafe):
+                selected = source if unsafe else source.replace('input()', '"fixed"')
+                expected = {('eval', 10, 5)} if unsafe else set()
+                complete = taint_py._Analysis(ast.parse(selected)).analyze()
+                self.assertEqual({key[:3] for key in complete}, expected)
+                engine = taint_py._Analysis(ast.parse(selected))
+                populate = next(function for function in engine.functions if function.name == 'populate')
+                # Base plus dirty context use twelve units (ten for the clean
+                # control). The subsequent stop context needs five more. Its
+                # cutoff cannot erase the earlier context's established write.
+                engine.scope_limits[populate] = engine.scope_remaining[populate] = 14
+                with self.assertRaises(AnalysisLimit) as raised:
+                    engine.analyze()
+                self.assertEqual({key[:3] for key in raised.exception.effects}, expected)
+                self.assertIn('populate', str(raised.exception))
+
     def test_invalid_flow_limits_are_partial_native_reports(self):
         path = self.source('invalid-budget.py', 'response.headers["X-User"] = input()\n')
         for variable in ('UBS_PYTHON_FLOW_SCOPE_STEPS', 'UBS_PYTHON_FLOW_MAX_STEPS'):
@@ -2066,6 +2242,47 @@ eval(relay(input()))
                              [('a_first.py', 'python.taint.eval', 1),
                               ('m_recursive.py', 'python.taint.eval', 5),
                               ('z_last.py', 'python.taint.eval', 1)], result)
+
+    def test_file_limit_during_foreign_scope_recovery_keeps_prefix_findings(self):
+        library_source = 'def apply(callback):\n    eval(callback())\n' + ''.join(
+            f'    padding{index} = "fixed"\n' for index in range(100))
+        files = [self.source('aa_lib.py', library_source),
+                 self.source('bb_app.py', 'from aa_lib import apply\ndef callback():\n'
+                                         '    return input()\ndef run():\n    apply(callback)\n')]
+        project = taint_py._Project(files, self.root)
+        engines = {path.name: engine for path, _, engine, _ in project.sources}
+        library = engines['aa_lib.py']
+        apply = library.functions[0]
+        solve = taint_py._Analysis.solve_function
+        interrupted = False
+
+        def limit_context(engine, function, context):
+            nonlocal interrupted
+            if engine.owner(function) is library and context and not interrupted:
+                self.assertIn(library, project.ready)
+                interrupted = True
+                # The concrete callback's prefix establishes the sink before
+                # its scope allowance expires. Recovery then exhausts the
+                # small remaining file allowance while retaining summaries.
+                library.scope_limits[function] = library.scope_remaining[function] = 30
+                library.budget.remaining = 32
+            return solve(engine, function, context)
+
+        findings = []
+        with patch.object(taint_py._Analysis, 'solve_function', limit_context), \
+                self.assertRaises(AnalysisLimit) as raised:
+            findings.extend(project.findings())
+        self.assertTrue(interrupted)
+        self.assertEqual({(path.name, rule, line, column) for path, rule, line, column, _ in findings},
+                         {('aa_lib.py', 'py.taint.eval', 2, 5)}, findings)
+        self.assertIn('input', findings[0][-1])
+        for detail in ('aa_lib.py', 'apply', 'work limit'):
+            self.assertIn(detail, str(raised.exception))
+        self.assertLess(library.budget.remaining, 0)
+        self.assertNotIn(apply, library.failed_scopes,
+                         'Failed recovery cannot advertise a sentinel that was never constructed')
+        self.assertNotIn(engines['bb_app.py'], project.ready)
+        self.assertIsNone(library.local_journal)
 
     def test_failed_foreign_context_is_not_reused_as_a_completed_summary(self):
         files = [

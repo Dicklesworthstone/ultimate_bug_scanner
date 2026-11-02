@@ -95,6 +95,41 @@ class Fixture(unittest.TestCase):
 
 
 class ReuseTests(Fixture):
+    def test_nested_repository_is_resolved_once_for_cold_reused_and_changed_scope(self):
+        # Observe real Git invocations, including their actual resolver result.
+        # Repeated subprocess startup must not consume the snapshot deadline.
+        for root in (self.work, self.root):
+            subprocess.run(['git', 'init', '--quiet', '--template=', str(root)],
+                           check=True, capture_output=True, timeout=10)
+        resolve = ['git', '-C', str(self.root), 'rev-parse', '--show-toplevel']
+        phases = (
+            ('cold', False, self.documents('first')),
+            ('reuse', True, self.documents('second')),
+            ('changed selection', False, self.documents('third', **{'new.py': 'new buffer'})),
+        )
+        for name, reused, documents in phases:
+            with self.subTest(phase=name), patch.object(lsp.subprocess, 'run', wraps=subprocess.run) as invoked:
+                with self.workspace(documents=documents) as workspace:
+                    self.assertEqual(workspace.reused, reused)
+                    self.assertEqual((workspace.root / 'a.py').read_text(), documents[self.uri]['text'])
+                self.assertEqual([call.args[0] for call in invoked.call_args_list], [resolve])
+        self.assertEqual(self.source.read_text(), 'disk source\n')
+        self.assertFalse((self.root / 'new.py').exists())
+
+    def test_changed_selection_still_rejects_git_redirect_before_creating_snapshot(self):
+        with self.workspace() as first:
+            old_root = first.root
+        workspace = self.workspace(documents=self.documents(**{'new.py': 'new buffer'}))
+        with patch.dict(os.environ, {'GIT_DIR': str(self.work / 'other-repository')}):
+            with self.assertRaisesRegex(lsp.ProtocolError, 'unsupported overrides: GIT_DIR'):
+                with workspace:
+                    self.fail('Redirected Git configuration must not acquire a workspace')
+        self.assertIsNone(workspace.temporary)
+        self.assertIsNone(self.cache.retained)
+        self.assertFalse(old_root.exists())
+        self.assertEqual(self.source.read_text(), 'disk source\n')
+        self.assertFalse((self.root / 'new.py').exists())
+
     def test_unchanged_support_inode_is_retained_and_only_new_buffer_is_written(self):
         self.support.write_bytes(b'x' * 65536)
         original = (self.source.read_bytes(), lsp.file_stamp(self.source.stat()))

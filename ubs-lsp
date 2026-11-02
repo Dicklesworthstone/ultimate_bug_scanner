@@ -1027,7 +1027,7 @@ class BufferWorkspaceCache:
         try:
             if self.closed:
                 raise ProtocolError('Private buffer workspace cache is closed')
-            workspace.validate_configuration()
+            workspace.check()
             previous = self.retained
             selected = {doc['path'] for doc in workspace.documents.values()}
             same_scope = (previous is not None and workspace.original == previous.original
@@ -1035,6 +1035,10 @@ class BufferWorkspaceCache:
                           and selected == {doc['path'] for doc in previous.documents.values()}
                           and len(selected) == len(workspace.documents))
             if same_scope:
+                # Reuse validates before touching either tree. A fresh build
+                # performs its own validation before creating the snapshot;
+                # do not launch the same Git resolver twice on that path.
+                workspace.validate_configuration()
                 workspace.root, workspace.temporary = previous.root, previous.temporary
                 workspace.entries = dict(previous.entries)
                 workspace.missing = set(previous.missing)

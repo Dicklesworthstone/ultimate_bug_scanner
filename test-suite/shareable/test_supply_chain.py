@@ -341,7 +341,8 @@ def check_cached_helper_batch_verification() -> None:
         'if [[ "$#" -gt 2 ]]; then\n'
         '  case "$UBS_TEST_BATCH_HASH_MODE" in\n'
         '    malformed) printf "invalid-digest\\n"; exit 0 ;;\n'
-        '    truncated) exec ' + shlex.quote(real_hash) + ' -- "$2" ;;\n'
+        '    truncated) exec ' + shlex.quote(real_hash) + ' --zero -- "$3" ;;\n'
+        '    extra) ' + shlex.quote(real_hash) + ' "$@"; printf "unframed-tail"; exit 0 ;;\n'
         '    failed) exit 1 ;;\n'
         '  esac\n'
         'fi\n'
@@ -357,7 +358,7 @@ def check_cached_helper_batch_verification() -> None:
         "XDG_CACHE_HOME": str(tmp / "user-cache"),
         "XDG_CONFIG_HOME": str(tmp / "user-config"),
     }
-    for mode in ("healthy", "malformed", "truncated", "failed"):
+    for mode in ("healthy", "malformed", "truncated", "failed", "extra"):
         hash_log.write_text("", encoding="utf-8")
         started = time.monotonic()
         proc = sb.run(*environment.items(), ("UBS_TEST_BATCH_HASH_MODE", mode))

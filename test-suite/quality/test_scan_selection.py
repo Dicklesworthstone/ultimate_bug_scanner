@@ -961,6 +961,32 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class CachedHelperAllocationTest(unittest.TestCase):
+    def test_failed_batch_allocation_keeps_per_file_verification(self):
+        script = "\n".join([
+            "set -Euo pipefail",
+            "TMPDIR_RUN=; EARLY_TMP_PATHS=(); UPDATE_MODULES=0",
+            "HELPER_ASSETS=(contract.json)",
+            "declare -A HELPER_CHECKSUMS=([contract.json]=test-digest)",
+            "mktemp(){ return 1; }",
+            "need_cmd(){ return 0; }",
+            "ensure_helper_asset(){ printf 'verified:%s\\n' \"$1\"; }",
+            # Stop before any redirection if a regression attempts a batch
+            # after allocation failed, even when the test runs as root.
+            "set -T",
+            "trap 'case $BASH_COMMAND in \"sha256sum --zero\"*) exit 97;; esac' DEBUG",
+            bash_function("ensure_tmpdir_run"),
+            bash_function("ensure_cached_helpers"),
+            "ensure_cached_helpers scan || exit $?",
+            "[[ $HELPERS_READY == 1 && -z $TMPDIR_RUN ]]",
+        ])
+        env = dict(os.environ, MODULE_DIR=str(REPO_ROOT / "modules"))
+        result = run_helper(["bash", "-c", script], env=env, check=False, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "verified:contract.json")
+        self.assertEqual(result.stderr, "")
+
+
 class SizeGuardExcludeTest(unittest.TestCase):
     """The size guard must measure what the scan will actually select.
 

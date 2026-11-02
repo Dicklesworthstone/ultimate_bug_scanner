@@ -30,6 +30,11 @@ DESCRIPTION = ("Escape LDAP filter values with escape_filter_chars(), escape DN 
                "with escape_dn_chars(), or use fixed allow-lists before LDAP operations")
 
 REQUEST_NAMES = {'request'}
+# Pattern-binding AST nodes do not exist on the supported Python 3.9 runtime.
+_NAMED_BINDINGS = (ast.ExceptHandler,) + tuple(
+    getattr(ast, name) for name in ('MatchAs', 'MatchStar') if hasattr(ast, name))
+_MAPPING_BINDINGS = tuple(
+    getattr(ast, name) for name in ('MatchMapping',) if hasattr(ast, name))
 LDAP_SEARCH_METHODS = {
     'search', 'search_s', 'search_st', 'search_ext', 'search_ext_s',
     'paged_search', 'paged_search_s', 'paged_search_ext_s',
@@ -135,8 +140,8 @@ class _LDAPInjectionAnalyzer(ast.NodeVisitor):
         for node in nodes:
             if (isinstance(node, ast.Name) and node.id == 'set' and isinstance(node.ctx, (ast.Store, ast.Del))
                     or isinstance(node, ast.arg) and node.arg == 'set'
-                    or isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node.name == 'set'
-                    or isinstance(node, ast.MatchMapping) and node.rest == 'set'
+                    or isinstance(node, _NAMED_BINDINGS) and node.name == 'set'
+                    or isinstance(node, _MAPPING_BINDINGS) and node.rest == 'set'
                     or isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == 'set'
                     or isinstance(node, ast.Attribute) and node.attr == 'set' and isinstance(node.ctx, (ast.Store, ast.Del))
                     or isinstance(node, ast.Call) and _call_name(node.func).rsplit('.', 1)[-1] in {
@@ -185,9 +190,9 @@ class _LDAPInjectionAnalyzer(ast.NodeVisitor):
                 names.append(node.id)
             elif isinstance(node, (ast.Import, ast.ImportFrom)):
                 names.extend(alias.asname or alias.name.split('.')[0] for alias in node.names)
-            elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node.name:
+            elif isinstance(node, _NAMED_BINDINGS) and node.name:
                 names.append(node.name)
-            elif isinstance(node, ast.MatchMapping) and node.rest:
+            elif isinstance(node, _MAPPING_BINDINGS) and node.rest:
                 names.append(node.rest)
             for name in names:
                 counts[name] = counts.get(name, 0) + 1

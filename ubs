@@ -168,20 +168,20 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='a21a7fb9219658c6ab6cbd4fa43065cf188430a0606f9c9dd12f28321fe42599'
-  [cpp]='a8a2a165cc4d3791e99a280459cb8e8ab9f516904872d27b6bf28c1ab87ca3b5'
-  [csharp]='c8f820acd385ba2e5e468f3d2298381e5de12d3c2fa601231b7dc3658e61ead4'
-  [elixir]='5b22a7631ddf65411b58a76191da220fafe79bd51b34064436a134007a483d54'
-  [golang]='f659d3f200d92d1f789c5882069410c02eac191c2cc554e641608f8f4a3071d7'
-  [java]='15012f7c4ff4dc82ef01084f95a0ddbb467a365f9ae92feb28f35ad1a21eb215'
-  [js]='4f37f990892924d3efe387daa691f3d0eb2a40686690380978a0daf5665bbd2d'
-  [kotlin]='3473ab3465954720ecd37f20c99008a6ecc0043e8facd18a94d730191069a0ee'
-  [php]='cc1b97aa95c1045406b87683476e4e1bdb60f24d4edc6970fc7cb7ebf26abe5e'
-  [python]='49dc806cc5ad3f5ae5178c3cc9984d5ff30526f9d99fdb72e3581cae1a208f1b'
-  [ruby]='5ccc240da80afe5e56d2eac69410a27add1a350eac5793085282826e42fbede7'
-  [rust]='da8bdd7a6326469127ed50117113d5e69fcadcfed7a865d04b9c42d98f660000'
-  [sql]='f7ca450184075190c939c4dadaf109129d51815d7f770cccfaa8af8691c6d4f2'
-  [swift]='04627d14847e97e8cd00f22f4ef86e69b29f62866270ad3448da6204d4384af0'
+  [bash]='36d2fb103ddbcc8225112fa622b178f3b1d2d73b14916703e9947a849e6e5942'
+  [cpp]='da2a29112bfddfaa1ad7142ab7f778f8828b34e99173e9fba6a42bdf7ab69036'
+  [csharp]='0ec07772519d2e86f9b2d3b41bb712467b00e65b387d691c9b12aa1731f061ce'
+  [elixir]='87ca95421574f24436005fc6f9f9a4c3264f53f3f5d344ad5e0706578e7398af'
+  [golang]='7e0c813fc00a831f94718a0f5760f80681a441c7a3f2d48ec1cacdec3af42465'
+  [java]='61f2841ce343929bf827b8bc5a72f0c88e2801ccf415340c731f0bd58f7e502a'
+  [js]='8e97fbc8709e8a2ff5219b315938f9e9531ea2e085e0062cef4513dc6d20c20f'
+  [kotlin]='7d2c021b63bf0104e0a39b54ead0c8cbfa19e32a50ac8594429af11a5847291f'
+  [php]='6722de39b47467ba0b0c494f7f9999cf181d57850e79d30631dc9fd22333b8bf'
+  [python]='932810b730272cc38382447ebbdde8e82f7c9bf737c6c783adcffcd5e4427f81'
+  [ruby]='c0c6143ed9489e2c4fabeec4da4d4fc7c9c8a223f890a9dc8752007590aa4992'
+  [rust]='a9d57e65eb6f105ffc8bebdc21fee00cfc539a676df4e641d65b3c0010c03c24'
+  [sql]='621f539952770a561b7dcc9f73e43be857c8cb684b2e30a881eacdb5958e94e1'
+  [swift]='40e85259c3b3d3f757f8cf27dfaddb2a028103f74feeaea7eb51646c8ae590ef'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -455,7 +455,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/py_detectors/is_literal.py']='6d4d6c4c4df8816e561759e251d2c412e7b81a9c690a814b4c05a90f719bf4f8'
   ['helpers/ubs_core/py_detectors/json_loads.py']='4194a9f5a0704e0dfa3d30acc8c0553a46b4c02ab5f4408cf6851ff84e8ce5f7'
   ['helpers/ubs_core/py_detectors/jwt_verification.py']='d96ea02bb64da7dd9e5f5e6edb1c15f9c147f47c4628758d8e878693ee4d7284'
-  ['helpers/ubs_core/py_detectors/ldap_injection.py']='74e982dcf612dd27d7abe7587e4cfaa7b7cb49651b6d21f40a4a772f1b79c91f'
+  ['helpers/ubs_core/py_detectors/ldap_injection.py']='a78c3b006ddbfaa2f585eab296dcc93c8833412a0e041598cee8135447e192d8'
   ['helpers/ubs_core/py_detectors/mass_assignment.py']='b60fe05d739f80b061cbd3e4f2d564ea59d0b4049b4ed6fd0d93109716ec07f8'
   ['helpers/ubs_core/py_detectors/missing_returns.py']='f8766918f1f408b5ee4fae8a5c2df8e300ca203a3ec5ca200c04558365795cb5'
   ['helpers/ubs_core/py_detectors/mutation_during_iteration.py']='3857f060cbc9c627581875decb38e88ec64c879e8301bbc218accda1d67cde81'
@@ -556,7 +556,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='77a16e60dce843652c053d069dcbffce17c8ffae543bf77693d2e8254a3967de'
   ['helpers/ubs_core/taint_flow.py']='83b941e15357a6a593db1d7f77a099b1707090301f695445356bfcede4baef26'
-  ['lib/ubs-common.sh']='e06b5153b5edeee903b08dc2212f2a4ad0083ef144442bf066fac57677ac0c23'
+  ['lib/ubs-common.sh']='b9233e5d7b14a8b98a4f27fa05c8df780073ac30299256ebccbeecf4028699c2'
 )
 
 # contract.json as shipped by earlier releases (sha256 -> first tag), kept out
@@ -6619,18 +6619,26 @@ ensure_cached_helpers(){
         batch_rels+=("$rel")
       fi
     done
-    if (( ${#batch_files[@]} > 0 )) && batch_output="$(sha256sum -- "${batch_files[@]}" 2>/dev/null)"; then
-      # sha256sum escapes newlines/backslashes in filenames and prefixes the
-      # corresponding line with a backslash. Only the ordered digests matter.
-      while IFS= read -r batch_line; do
-        batch_digest="${batch_line#\\}"
-        batch_digest="${batch_digest%%[[:space:]]*}"
-        if [[ ! "$batch_digest" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    ensure_tmpdir_run
+    if [[ -n "$TMPDIR_RUN" && -d "$TMPDIR_RUN" ]] \
+        && (( ${#batch_files[@]} > 0 )) \
+        && batch_output="$TMPDIR_RUN/helper-checksums" \
+        && sha256sum --zero -- "${batch_files[@]}" >"$batch_output" 2>/dev/null; then
+      # Darwin prints literal filename newlines in its default output. NUL
+      # records work on both Darwin and GNU, and bind each digest to its path.
+      while IFS= read -r -d '' batch_line; do
+        batch_digest="${batch_line:0:64}"
+        batch_index="${#batch_digests[@]}"
+        if [[ ! "$batch_digest" =~ ^[0-9a-fA-F]{64}$ ]] \
+            || [[ "${batch_line:64:2}" != '  ' && "${batch_line:64:2}" != ' *' ]] \
+            || (( batch_index >= ${#batch_files[@]} )) \
+            || [[ "${batch_line:66}" != "${batch_files[$batch_index]}" ]]; then
           batch_valid=0
           break
         fi
         batch_digests+=("${batch_digest,,}")
-      done < <(printf '%s\n' "$batch_output")
+      done <"$batch_output"
+      [[ -z "$batch_line" ]] || batch_valid=0
       if (( batch_valid && ${#batch_digests[@]} == ${#batch_files[@]} )); then
         for batch_index in "${!batch_rels[@]}"; do
           rel="${batch_rels[$batch_index]}"

@@ -49,6 +49,46 @@ BASE_DIR: Path = Path()
 SKIP_DIRS = {'.git', '.venv', '__pycache__', 'node_modules', '.mypy_cache', '.pytest_cache', '.cache', 'build', 'dist'}
 EXTS = {'.py', '.pyi'}
 PATH_LIMIT = 5
+_INCOMPLETE_PROOF = 'taint:incomplete'
+
+
+def _work_setting(name, default):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise AnalysisLimit(f'{name} must be a positive integer; analysis is incomplete') from exc
+    if value <= 0:
+        raise AnalysisLimit(f'{name} must be a positive integer; analysis is incomplete')
+    return value
+
+
+class _ScopeLimit(AnalysisLimit):
+    """A function exhausted its allowance; independent scopes can continue."""
+
+
+class _ScopedBudget:
+    """Charge both the file and a function across all of its summary contexts."""
+
+    def __init__(self, engine, scope, total):
+        self.engine, self.scope, self.total = engine, scope, total
+
+    @property
+    def remaining(self):
+        return self.total.remaining
+
+    def spend(self, amount=1):
+        # Check the total first: a genuine file cutoff must still abort the
+        # component, including foreign callback work charged to its owner.
+        self.total.spend(amount)
+        remaining = self.engine.scope_remaining[self.scope] - amount
+        self.engine.scope_remaining[self.scope] = remaining
+        if remaining < 0:
+            limit = self.engine.scope_limits[self.scope]
+            raise _ScopeLimit(f'{self.engine.scope_name(self.scope)}: function work limit '
+                              f'exceeded ({limit} steps); analysis is incomplete')
 
 SOURCE_PATTERNS = [
     re.compile(r"request\.(?:args|get_json|json|form|values|data|body|GET|POST|query_params|path_params|headers|cookies|META)\b", re.IGNORECASE),
@@ -766,6 +806,48 @@ def _same_snapshot(left, right):
             and all(map(operator.is_, left[7], right[7])))
 
 
+def _same_witness(left, right):
+    """Compare immutable analysis values including non-lattice evidence.
+
+    Literal/import bindings are freshly allocated by module evaluation, so
+    identity alone would invalidate every cached pass containing constants.
+    Structured bindings can contain facts several layers down, however, and
+    their ordinary equality deliberately omits the trace's evidence path.
+    """
+    if left is right:
+        return True
+    if left != right:
+        return False
+    if isinstance(left, TaintTrace):
+        return left.path == right.path
+    if isinstance(left, frozenset):
+        matched = {value: value for value in right}
+        return all(_same_witness(value, matched[value]) for value in left)
+    if isinstance(left, tuple):
+        return all(_same_witness(a, b) for a, b in zip(left, right))
+    if isinstance(left, (_BoundCallable, _BoundClassMethod)):
+        return _same_witness(left.receiver, right.receiver)
+    if isinstance(left, _DeferredCall):
+        return (_same_witness(left.arguments, right.arguments)
+                and _same_witness(left.values, right.values))
+    if isinstance(left, _ArgumentVector):
+        return _same_witness(left.operands, right.operands)
+    return True
+
+
+def _same_namespace(left, right):
+    if left is right:
+        return True
+    if left != right:
+        return False
+    # State equality already covers reference sets, reachability and mutated
+    # identities. Only values, heap cells and bindings can carry evidence.
+    return all(_same_witness(value, other[name])
+               for values, other in ((left, right), (left.heap, right.heap),
+                                     (left.bindings, right.bindings))
+               for name, value in values.items())
+
+
 def _qualified(node: ast.AST, aliases: dict[str, object]) -> str:
     if isinstance(node, ast.Name):
         if node.id in aliases:
@@ -950,6 +1032,9 @@ class FunctionSummary:
     # raise or have sink effects without ever returning to its caller.
     can_return: bool = False
     exceptions: tuple[ExceptionSummary, ...] = ()
+    # An exhausted body cannot certify a clean or nonreturning call. Its
+    # callers retain opaque-call provenance and the scan stays incomplete.
+    incomplete: bool = False
 
 
 class _CallSubstitution:
@@ -1785,10 +1870,17 @@ class _Flow:
     def substitute_trace(trace, actual, call_name):
         if trace.parameter is None:
             return frozenset({trace})
-        for sanitizer in trace.sanitizers:
+        if _INCOMPLETE_PROOF in trace.sanitizers:
+            actual = _Flow.incomplete_result(actual)
+        for sanitizer in trace.sanitizers - {_INCOMPLETE_PROOF}:
             actual = _sanitize(actual, sanitizer)
         steps = trace.path[1:] if trace.parameter.startswith('@') else trace.path
         return _advance(actual, call_name, *steps)
+
+    @staticmethod
+    def incomplete_result(fact):
+        return frozenset(TaintTrace(trace.source, trace.parameter,
+                                    frozenset({_INCOMPLETE_PROOF}), trace.path) for trace in fact)
 
     @classmethod
     def substitute(cls, fact, bound, call_name, *, budget=None):
@@ -2158,6 +2250,20 @@ class _Flow:
                 key = (kind, line, column, label)
                 if propagated:
                     self.effects[key] = join_facts(self.effects.get(key, CLEAN), propagated)
+            if summary.incomplete:
+                # Resumed coroutines use an Await node, not a Call, and their
+                # values were captured at construction. Use the already bound
+                # environment without evaluating either syntax a second time.
+                self.engine.budget.spend(sum(len(fact) for fact in bound.values()))
+                unknown = join_facts(receiver, *bound.values())
+                self.expression_bindings[node] = None
+                self.expression_references[node] = frozenset({node})
+                for refs in references.values():
+                    self.mutate(refs, CLEAN, state)
+                self.possible_exception(state)
+                # Retain observed prefix sinks, but unfinished code may undo
+                # a sanitizer supplied by its caller. Its return is opaque.
+                return self.incomplete_result(unknown)
             for exception in summary.exceptions:
                 exceptional = state.copy()
                 for parameter, written in exception.mutations:
@@ -2894,7 +3000,9 @@ class _Flow:
                 for name in _local_names(node):
                     value = completed.bindings.get(name)
                     if isinstance(value, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        descriptor = self.engine.class_callables.get(value, False)
+                        descriptor = self.engine.class_callables.get(value)
+                        if self.engine.reads is not None:
+                            self.engine.reads[('class_callables', value)] = descriptor
                         value = (_ClassMethodDescriptor(value) if descriptor == 'class'
                                  else value if descriptor else None)
                     members[name] = value
@@ -3149,6 +3257,16 @@ class _Analysis:
         # entry it reads, so an unchanged job is not solved again.
         self.reads = None
         self.writes = None
+        self.local_journal = None
+        self.failed_scopes = {}
+        self.failed_summaries = {}
+        self.partial_scope_effects = {}
+        self.observed_effects = {}
+        self.scope_errors = []
+        self.scope_remaining = {}
+        self.scope_limits = {}
+        self.line_offset = 0
+        self.source_path = None
         self.default_references = {}
         self.default_bindings = {}
         self.class_members = {}
@@ -3162,7 +3280,9 @@ class _Analysis:
         # An exhausted analysis is an explicit failure, never a clean result.
         # Scale with syntax size, while charging transfers and fact expansion
         # rather than only the number of outer fixed-point iterations.
-        self.work_limit = max(500_000, 128 * len(nodes))
+        self.work_limit = _work_setting('UBS_PYTHON_FLOW_MAX_STEPS',
+                                       min(10_000_000, max(500_000, 128 * len(nodes))))
+        scope_override = _work_setting('UBS_PYTHON_FLOW_SCOPE_STEPS', None)
         self.budget = Budget(self.work_limit)
         self.parents = {child: parent for parent in nodes for child in ast.iter_child_nodes(parent)}
         # A literal allow-list is a proof only if every other use is exact
@@ -3227,6 +3347,10 @@ class _Analysis:
             body = tuple(_scope_nodes(scope))
             self.locals[scope] = _local_names(scope, body)
             if scope is not tree:
+                limit = (scope_override if scope_override is not None else
+                         min(250_000, max(20_000, 64 * len(body), 8 * len(nodes))))
+                self.scope_limits[scope] = limit
+                self.scope_remaining[scope] = limit
                 if any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda))
                        for node in body):
                     self.definition_writers.add(scope)
@@ -3418,7 +3542,34 @@ class _Analysis:
         if self.journal is not None:
             self.journal.setdefault((id(destination), key),
                                     (destination, key, destination.get(key, _MISSING)))
+        if self.local_journal is not None:
+            self.local_journal.setdefault((id(destination), key),
+                                          (destination, key, destination.get(key, _MISSING)))
         destination[key] = value
+
+    def scope_name(self, scope):
+        if isinstance(scope, ast.Module):
+            return '<module>'
+        names = [getattr(scope, 'name', '<lambda>')]
+        parent = self.enclosing(scope)
+        while parent is not None and not isinstance(parent, ast.Module):
+            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.append(parent.name)
+            parent = self.enclosing(parent)
+        start = scope.lineno - self.line_offset
+        end = getattr(scope, 'end_lineno', scope.lineno) - self.line_offset
+        prefix = f'{self.source_path}: ' if self.source_path is not None else ''
+        return f'{prefix}{".".join(reversed(names))} (lines {start}-{end})'
+
+    def interrupted_effects(self, function, flow):
+        """Keep established base findings when a later context is interrupted."""
+        effects = {}
+        previous = self.observed_effects.get(function, ())
+        prefix = ((*key, fact) for key, fact in flow.effects.items()) if flow is not None else ()
+        for kind, line, column, label, fact in (*previous, *prefix):
+            key = (kind, line, column, label)
+            effects[key] = join_facts(effects.get(key, CLEAN), fact)
+        return tuple((*key, fact) for key, fact in effects.items())
 
     def framework_bound(self, globals_):
         """Solve local dependency values on the same finite taint lattice.
@@ -3470,6 +3621,14 @@ class _Analysis:
         context starts at bottom and is solved by the normal fixed-point
         loop, never by recursively interpreting callees on the Python stack.
         """
+        owner = self.owner(function)
+        if function in owner.failed_scopes:
+            summary = owner.failed_summaries[function]
+            if self.summaries.get(function) is not summary:
+                self.publish('summaries', function, summary)
+            if self.reads is not None:
+                self.reads[('summaries', function)] = summary
+            return summary
         context = []
         owner_fn = None
         owner_bindings = None
@@ -3564,6 +3723,10 @@ class _Analysis:
         reads = {('framework_inputs', function): owner.framework_inputs.get(function)}
         writes = []
         owner.reads, owner.writes = reads, writes
+        total_budget = owner.budget
+        owner.budget = _ScopedBudget(owner, function, total_budget)
+        owner.local_journal = {}
+        flow = None
         try:
             owner.budget.spend()
             namespace = owner.globals
@@ -3619,10 +3782,48 @@ class _Analysis:
                 flow.normal_state, completed = flow.capture(function.body, state, exceptions=True)
                 flow.pending.extend(completed)
             return reads, writes, flow.summary()
+        except _ScopeLimit as exc:
+            # A failed body may have installed provisional callback contexts
+            # or nested defaults. Roll them back before other scopes run.
+            for table, key, previous in owner.local_journal.values():
+                if previous is _MISSING:
+                    table.pop(key, None)
+                else:
+                    table[key] = previous
+            owner.failed_scopes[function] = str(exc)
+            owner.partial_scope_effects[function] = owner.interrupted_effects(function, flow)
+            raise
+        except AnalysisLimit as exc:
+            self.observed_effects[function] = owner.interrupted_effects(function, flow)
+            raise AnalysisLimit(f'{owner.scope_name(function)}: {exc}', effects=exc.effects) from exc
         finally:
             owner.reads = owner.writes = None
+            owner.local_journal = None
+            owner.budget = total_budget
 
     def analyze(self):
+        try:
+            return self._analyze()
+        except AnalysisLimit as exc:
+            # Rendering already observed concrete facts is linear in retained
+            # work. Do not expand symbolic summaries after a total cutoff or
+            # present these incomplete results as reusable function contracts.
+            if not exc.effects:
+                effects = {}
+                for scope_effects in self.observed_effects.values():
+                    for kind, line, column, label, fact in scope_effects:
+                        concrete = frozenset(trace for trace in fact if trace.parameter is None
+                                             and not _safe_for(trace, kind, label))
+                        if concrete:
+                            key = (kind, line, column, label)
+                            effects[key] = join_facts(effects.get(key, CLEAN), concrete)
+                exc.effects = effects
+            if self.budget.remaining < 0:
+                location = str(self.source_path) if self.source_path is not None else '<module>'
+                exc.args = (f'{location}: UBS_PYTHON_FLOW_MAX_STEPS={self.work_limit}: {exc}',)
+            raise
+
+    def _analyze(self):
         # A summary contains only finite source/parameter/sanitizer facts.
         # Equality excludes evidence paths, so recursive helpers terminate
         # without a depth cap that would silently lose longer call chains.
@@ -3653,13 +3854,31 @@ class _Analysis:
         # any selected owner can write shared definition-time tables.
         allow_reordering = not (self.definition_writers or any(
             owner.definition_writers for owner in set(self.function_owners.values())))
+        # A nested definition preserves source-order jobs, but must not make
+        # every settling link of an unrelated call chain execute the entire
+        # module again. Cache the module transfer on its observed inputs just
+        # like a function job. Replaying its writes in place preserves the
+        # ordering of contextual defaults and class definitions. Active import
+        # cycles keep the uncached path because peer namespaces can change.
+        cache_module = not solving
+        previous_module = None
 
         def parts(key):
             return key if isinstance(key, tuple) else (key, ())
 
+        def replay(owner, writes):
+            for table, node, value in writes:
+                # Most declaration tables still hold these exact immutable
+                # values. No write or rollback entry is needed in that case;
+                # equality alone would discard a refreshed evidence witness.
+                if getattr(owner, table).get(node, _MISSING) is not value:
+                    owner.publish(table, node, value)
+
         def reorderable(key):
             function, _ = parts(key)
             owner = self.owner(function)
+            if function in owner.failed_scopes:
+                return False
             if (not isinstance(key, tuple) and owner is not self
                     and self.project is not None and owner in self.project.ready
                     and owner not in solving):
@@ -3673,12 +3892,37 @@ class _Analysis:
         while True:
             self.budget.spend()
             previous_contexts = len(self.summaries)
-            module = self.flow_class(self, self.tree)
-            globals_ = module.block(self.tree.body, _State())
-            if globals_ is None:
-                # Keep definitions and global facts established before a
-                # nonreturning call; they are still the callee's namespace.
-                globals_ = module.last_state if module.last_state is not None else _State()
+            reuse_module = False
+            if cache_module and previous_module is not None:
+                namespace, ready, reads, writes, module, globals_ = previous_module
+                reuse_module = (ready == self.namespace_ready
+                                and _same_namespace(namespace, self.globals)
+                                and self.reads_current(reads))
+            if reuse_module:
+                replay(self, writes)
+                # The equivalent current namespace is the same immutable
+                # cache input; retain its identity for subsequent sweeps.
+                previous_module = self.globals, ready, reads, writes, module, globals_
+            else:
+                namespace, ready = self.globals, self.namespace_ready
+                reads, writes = {}, []
+                saved_reads, saved_writes = self.reads, self.writes
+                self.reads, self.writes = reads, writes
+                try:
+                    module = self.flow_class(self, self.tree)
+                    try:
+                        globals_ = module.block(self.tree.body, _State())
+                    finally:
+                        self.observed_effects[self.tree] = tuple(
+                            (*key, fact) for key, fact in module.effects.items())
+                    if globals_ is None:
+                        # Keep definitions and global facts established before
+                        # a nonreturning call as the callee's namespace.
+                        globals_ = module.last_state if module.last_state is not None else _State()
+                finally:
+                    self.reads, self.writes = saved_reads, saved_writes
+                if cache_module:
+                    previous_module = namespace, ready, reads, writes, module, globals_
             # Imported higher-order helpers may call a callback defined by
             # this module. Publish this pass's namespace before solving those
             # contexts, and iterate again when initialization facts change.
@@ -3701,22 +3945,45 @@ class _Analysis:
             def solve(summary_key):
                 function, context = parts(summary_key)
                 owner = self.owner(function)
+                if function in owner.failed_scopes:
+                    effects = owner.partial_scope_effects.get(function, ()) if not context and owner is self else ()
+                    solved[summary_key] = ({}, [], effects)
+                    return False
                 previous = solved.get(summary_key)
                 if previous is not None and owner.reads_current(previous[0]):
                     # Replay its definition-time writes, in job order, so later
                     # jobs read exactly what a fresh solve would have left.
-                    for table, node, value in previous[1]:
-                        owner.publish(table, node, value)
+                    replay(owner, previous[1])
                     return False
                 if previous is not None:
                     for table, key in previous[0]:
                         if table == 'summaries':
                             readers[key].pop(summary_key, None)
-                reads, writes, summary = self.solve_function(function, context)
+                try:
+                    reads, writes, summary = self.solve_function(function, context)
+                except _ScopeLimit as exc:
+                    self.scope_errors.append(str(exc))
+                    # Revoke every context of this body, including a previous
+                    # clean/nonreturning summary. Their readers must run again
+                    # with the opaque-call continuation, not stale proof.
+                    scope_effects = owner.partial_scope_effects.get(function, ())
+                    failed = FunctionSummary(effects=scope_effects, incomplete=True, can_return=True)
+                    owner.failed_summaries[function] = failed
+                    keys = [key for key in self.summaries if parts(key)[0] is function]
+                    for key in dict.fromkeys([function, *keys]):
+                        owner.publish('summaries', key, failed)
+                        for reader in readers[key]:
+                            enqueue(reader)
+                    if owner is self:
+                        self.observed_effects[function] = scope_effects
+                    solved[summary_key] = ({}, [], scope_effects if not context and owner is self else ())
+                    return True
                 # Keep this solve's witness even if semantic summary equality
                 # avoids publication. Contextual effects are projected through
                 # their callers, so they need no second cached representation.
                 latest_effects = summary.effects if not context and owner is self else ()
+                if not context and owner is self:
+                    self.observed_effects[function] = latest_effects
                 solved[summary_key] = (reads, writes, latest_effects)
                 for table, key in reads:
                     if table == 'summaries':
@@ -3805,6 +4072,12 @@ class _Analysis:
                                              and not _safe_for(trace, key[0], key[3]))
                         if concrete:
                             effects[key] = join_facts(effects.get(key, CLEAN), concrete)
+                problems = list(dict.fromkeys([*self.scope_errors, *self.failed_scopes.values()]))
+                if problems:
+                    more = (f'; and {len(problems) - 8} more failed scopes'
+                            if len(problems) > 8 else '')
+                    raise AnalysisLimit('Python flow analysis is incomplete: '
+                                        + '; '.join(problems[:8]) + more, effects=effects)
                 return effects
 
 
@@ -3859,6 +4132,8 @@ class _Project:
                 continue
             ast.increment_lineno(tree, offset)
             engine = _Analysis(tree, self)
+            engine.line_offset = offset
+            engine.source_path = path
             self.sources.append((path, text, engine, offset))
             if path.suffix == '.py':
                 key = path.parent if path.name == '__init__.py' else path.with_suffix('')
@@ -4136,9 +4411,14 @@ class _Project:
             while True:
                 summaries = component[0].summaries.copy()
                 effects = {}
-                for engine in component:
-                    for key, fact in engine.analyze().items():
-                        effects[key] = join_facts(effects.get(key, CLEAN), fact)
+                try:
+                    for engine in component:
+                        for key, fact in engine.analyze().items():
+                            effects[key] = join_facts(effects.get(key, CLEAN), fact)
+                except AnalysisLimit as exc:
+                    for key, fact in effects.items():
+                        exc.effects[key] = join_facts(exc.effects.get(key, CLEAN), fact)
+                    raise
                 if summaries == component[0].summaries:
                     # Keep only the converged pass: an intermediate opaque
                     # return or provisional callable is not final evidence.
@@ -4189,6 +4469,7 @@ class _Project:
         paths = self.paths
         for component in self.components():
             self.journal.clear()
+            completed = {}
             try:
                 cyclic = len(component) > 1 or component[0] in self.import_dependencies[component[0]]
                 if cyclic and self.deferred_cycle(component):
@@ -4206,6 +4487,10 @@ class _Project:
                 for key, fact in completed.items():
                     effects[key] = join_facts(effects.get(key, CLEAN), fact)
             except AnalysisLimit as exc:
+                for key, fact in completed.items():
+                    effects[key] = join_facts(effects.get(key, CLEAN), fact)
+                for key, fact in exc.effects.items():
+                    effects[key] = join_facts(effects.get(key, CLEAN), fact)
                 # A failed callback solve can also have written a foreign
                 # context in the shared table. Never let later modules reuse
                 # that provisional bottom summary as a completed result.
@@ -4321,7 +4606,13 @@ def scan_file_findings(path: Path):
     """Yield each reachable source-to-sink flow once at its sink location."""
     text, tree = _parse_source(path)
     suppressions = build_index(text, lang='python')
-    effects = _Analysis(tree).analyze()
+    engine = _Analysis(tree)
+    engine.source_path = path
+    incomplete = None
+    try:
+        effects = engine.analyze()
+    except AnalysisLimit as exc:
+        effects, incomplete = exc.effects, exc
     for (kind, line, column, label), fact in sorted(effects.items(), key=lambda item: (item[0][1], item[0][2], item[0][0])):
         rule = f'py.taint.{kind}'
         if suppressions.is_suppressed(line, rule) or suppressions.is_suppressed(line, f'python.taint.{kind}'):
@@ -4329,6 +4620,8 @@ def scan_file_findings(path: Path):
         trace = min(fact, key=lambda item: (len(item.path), item.path, item.source))
         path_desc = ' -> '.join((*trace.path, label))
         yield rule, line, column, path_desc
+    if incomplete is not None:
+        raise incomplete
 
 
 def run(ctx: RunContext) -> Iterable[dict]:

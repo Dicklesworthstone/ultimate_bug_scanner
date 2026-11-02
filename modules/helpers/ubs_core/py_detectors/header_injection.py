@@ -52,8 +52,6 @@ _RESPONSE_OBJECT = '@header-object:response'
 _CR, _LF, _RESET = 'header:cr', 'header:lf', 'header:reset'
 _CONTROLS = frozenset({_CR, _LF})
 _CHAR_PERCENT = re.compile(r'%(?:\([^)]*\))?[#0\- +]*(?:\d+|\*)?(?:\.(?:\d+|\*))?[hlL]?c')
-# A cutoff is an explicit incomplete detector result, never a clean verdict.
-MAX_FLOW_STEPS = 250_000
 
 
 def _call_name(node):
@@ -146,6 +144,12 @@ class _HeaderFlow(flow._Flow):
         steps = trace.path[1:] if trace.parameter.startswith('@') else trace.path
         return flow._advance(actual, call_name, *steps)
 
+    @staticmethod
+    def incomplete_result(fact):
+        # An unfinished helper could decode or append control characters.
+        # Keep the reset marker so caller substitution revokes earlier proofs.
+        return _revoke(fact)
+
     def effect(self, kind, node, label, fact):
         if kind == 'header' and fact:
             # Keep proofs until caller substitution: an earlier operation in
@@ -218,9 +222,9 @@ class _HeaderFlow(flow._Flow):
     def expr(self, node, state):
         if node is None or not state.reachable:
             return flow.CLEAN
-        self.engine.steps += 1
-        if self.engine.steps > MAX_FLOW_STEPS:
-            raise RuntimeError(f'header flow exceeded {MAX_FLOW_STEPS} evaluation steps')
+        # The shared flow engine charges expression work, summary expansion,
+        # and per-scope work. A second file-wide expression counter starved
+        # unrelated functions in otherwise tractable large modules.
         fact = super().expr(node, state)
         binding = self.expression_bindings.get(node)
         if isinstance(node, ast.Name):
@@ -374,6 +378,12 @@ class _HeaderFlow(flow._Flow):
                 state.references[name] = flow.NO_REFERENCES
 
     def invoke(self, node, state, callee, inputs, *, resumed=None):
+        if resumed is not None:
+            # Resuming a local coroutine can use an Await node, which has no
+            # Call.func/args. Its body already owns header sinks and encoder
+            # operations; project that summary at the resume site without
+            # reclassifying or re-evaluating its original call syntax.
+            return super().invoke(node, state, callee, inputs, resumed=resumed)
         target = callee.binding
         name = target.name if isinstance(target, flow._BoundCallable) else target if isinstance(target, str) else callee.fallback_name
         name = name or ''
@@ -435,10 +445,6 @@ class _HeaderFlow(flow._Flow):
 class _HeaderAnalysis(flow._Analysis):
     flow_class = _HeaderFlow
 
-    def __init__(self, tree):
-        super().__init__(tree)
-        self.steps = 0
-
 
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
     suppressions = SourceSuppressions('python')
@@ -453,7 +459,12 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
             effects = _HeaderAnalysis(tree).analyze()
         except (OSError, UnicodeError, SyntaxError, RecursionError, RuntimeError, flow.AnalysisLimit) as exc:
             errors.append(f'{path}: {type(exc).__name__}: {exc}')
-            continue
+            # A bounded incomplete solve may still prove independent sinks.
+            # Emit those findings, then report failure after every file has
+            # had its turn; an exhausted scope must not erase later findings.
+            effects = exc.effects if isinstance(exc, flow.AnalysisLimit) else {}
+            if not effects:
+                continue
         lines = text.splitlines()
         directives = suppressions.index(path, text)
         seen = set()

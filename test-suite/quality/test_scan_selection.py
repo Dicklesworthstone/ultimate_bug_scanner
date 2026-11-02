@@ -100,11 +100,9 @@ def scanned_count(result) -> int:
     return summary(result)["totals"]["files"]
 
 
-def run_helper(command, **kwargs):
+def run_helper(command, *, env=None, timeout=HELPER_TIMEOUT, capture_output=True, **kwargs):
     """A bounded local child: a hung helper must fail the test, not the run."""
-    kwargs.setdefault("timeout", HELPER_TIMEOUT)
-    kwargs.setdefault("capture_output", True)
-    return subprocess.run(command, **kwargs)  # ubs:ignore[py.security.command-injection] Fixed repo sources and test-owned paths.
+    return subprocess.run(command, env=env, timeout=timeout, capture_output=capture_output, **kwargs)  # ubs:ignore[py.security.command-injection] Fixed repo sources and test-owned paths.
 
 
 def bash_function(name: str) -> str:

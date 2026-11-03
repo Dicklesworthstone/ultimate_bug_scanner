@@ -117,7 +117,7 @@ class ContractChecksums(unittest.TestCase):
                     self.assertEqual(actual, embedded, name)
                     compile(actual, name + " embedded parser", "exec")
                     syntax = subprocess.run(["bash", "-n", str(root / name)],
-                                            capture_output=True, text=True, check=False)
+                                            capture_output=True, text=True, check=False, timeout=15)
                     self.assertEqual(syntax.returncode, 0, syntax.stderr)
                 for name in ("modules/ubs-rust.sh", "scripts/new-module.sh"):
                     self.assertTrue((root / name).read_text().endswith(quoted_pin), name)

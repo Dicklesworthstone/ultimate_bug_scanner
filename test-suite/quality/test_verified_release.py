@@ -291,6 +291,10 @@ class VerifiedReleaseTests(unittest.TestCase):
     def test_real_installer_installs_authenticated_runner_without_refetching_manifest(self):
         (self.bundle / 'install.sh').write_bytes((ROOT / 'install.sh').read_bytes())
         (self.bundle / 'ubs').write_bytes((ROOT / 'ubs').read_bytes())
+        # This case isolates authenticated runner selection. Seed the genuine
+        # pinned assets so generation preparation needs no additional network.
+        shutil.copytree(ROOT / 'modules', self.home / '.local/share/ubs/modules',
+                        ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
         self.sign()
         # A file planted in the user's project must not override the signed
         # runner sitting next to the authenticated installer.
@@ -429,12 +433,27 @@ class VerifiedReleaseTests(unittest.TestCase):
         (self.bundle / 'VERSION').write_text(self.version + '\n')
         self.sign()
 
-    def test_real_installer_unsigned_update_control_reaches_reexec(self):
-        # This control proves that the transport exercises the actual update
-        # path, rather than succeeding because the newer installer is absent.
+    def test_real_installer_skips_unsigned_self_reexec_by_default(self):
+        self.prepare_unsigned_update()
+        self.env['UBS_INSTALLER_WORKDIR'] = str(self.root / 'verified-work')
+        flags = ['--easy-mode', '--skip-ast-grep', '--skip-ripgrep', '--skip-jq',
+                 '--skip-bun', '--skip-type-narrowing', '--skip-typos', '--skip-toon',
+                 '--skip-doctor', '--skip-hooks', '--no-path-modify',
+                 '--install-dir', str(self.home / 'installed')]
+        result = subprocess.run(['bash', str(self.bundle / 'install.sh'), *flags],
+                                cwd=self.project, env=self.env, capture_output=True,
+                                text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('Skipping unsigned installer self-update', result.stdout)
+        self.assertFalse(Path(self.env['UNSIGNED_EXEC_LOG']).exists())
+        self.assertFalse(self.fetches())
+
+    def test_explicit_insecure_installer_update_control_reaches_reexec(self):
+        # Keep a positive control proving that the same fixture does offer a
+        # newer unsigned installer; the default refusal is an integrity gate.
         self.prepare_unsigned_update()
         self.env['UBS_INSTALLER_WORKDIR'] = str(self.root / 'unverified-work')
-        result = subprocess.run(['bash', str(self.bundle / 'install.sh'), '--easy-mode'],
+        result = subprocess.run(['bash', str(self.bundle / 'install.sh'), '--easy-mode', '--insecure'],
                                 cwd=self.project, env=self.env, capture_output=True,
                                 text=True, timeout=60)
         self.assertEqual(result.returncode, 86, result.stdout + result.stderr)
@@ -492,9 +511,12 @@ class DaemonInstallTests(unittest.TestCase):
         (self.bundle / 'install.sh').write_bytes((ROOT / 'install.sh').read_bytes())
         (self.bundle / 'ubs').write_bytes((ROOT / 'ubs').read_bytes())
         (self.bundle / 'VERSION').write_text(self.version + '\n')
+        shutil.copytree(ROOT / 'modules', self.home / '.local/share/ubs/modules',
+                        ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
         self.sign()
         self.destination = self.home / 'bin'
         self.env['UBS_INSTALLER_WORKDIR'] = str(self.root / 'installer-work')
+        self.env['UBS_MINISIGN_PUBKEY'] = 'test-public-key'
         self.flags = ['--non-interactive', '--skip-ast-grep', '--skip-ripgrep', '--skip-jq',
                       '--skip-bun', '--skip-type-narrowing', '--skip-typos', '--skip-toon',
                       '--skip-doctor', '--skip-hooks', '--skip-version-check', '--no-path-modify',
@@ -605,6 +627,90 @@ class DaemonInstallTests(unittest.TestCase):
         self.invoke('--client', '--help')
         self.assertFalse({'ubs', 'ubs-daemon', 'SHA256SUMS'} & {item['name'] for item in self.fetches()})
 
+    def test_fresh_install_prepares_modules_even_when_doctor_is_skipped(self):
+        cache = self.home / '.local/share/ubs/modules'
+        cache.rename(self.bundle / 'modules')
+        self.direct_install()
+        generations = list((cache / '.ubs-releases').glob('*/.ubs-ready.json'))
+        self.assertEqual(len(generations), 1)
+        selected = generations[0].parent
+        for relative in ('contract.json', 'ubs-python.sh', 'ubs-js.sh', 'lib/ubs-common.sh',
+                         'helpers/ubs_core/__init__.py'):
+            self.assertEqual((selected / relative).read_bytes(),
+                             (ROOT / 'modules' / relative).read_bytes(), relative)
+        self.assertFalse((cache / 'contract.json').exists())
+        self.assertFalse(self.fetches(), 'local authenticated assets required a network request')
+        source = self.project / 'fresh.py'
+        source.write_text('value = 1\n')
+        scanned = self.invoke('--ci', '--no-auto-update', '--format=json', '--only=python', str(source))
+        self.assertEqual(self.decode_json(scanned.stdout)['status'], 'ok')
+
+    def test_failed_fresh_cache_download_cannot_publish_the_runner(self):
+        cache = self.home / '.local/share/ubs/modules'
+        cache.rename(self.bundle / 'modules')
+        (self.bundle / 'modules/contract.json').write_text('{"tampered":true}\n')
+        result = self.direct_install(expected=1)
+        self.assertIn('Release preparation failed', result.stderr)
+        self.assertNotIn('INSTALLATION COMPLETE', result.stdout)
+        self.assertFalse((self.destination / 'ubs').exists())
+        self.assertFalse(list(cache.glob('.ubs-releases/*/.ubs-ready.json')))
+        self.assertEqual((self.bundle / 'modules/contract.json').read_text(), '{"tampered":true}\n')
+
+    def test_direct_remote_install_requires_the_published_signature_key_by_default(self):
+        self.env.pop('UBS_MINISIGN_PUBKEY')
+        result = self.direct_install(remote=True, expected=1)
+        self.assertIn('Signature verification failed for SHA256SUMS', result.stderr)
+        self.assertFalse((self.destination / 'ubs').exists())
+        self.assertEqual([item['name'] for item in self.fetches()], ['SHA256SUMS', 'SHA256SUMS.minisig'])
+        verification = json.loads(Path(self.env['SIGNATURE_LOG']).read_text().splitlines()[0])
+        self.assertEqual(verification[verification.index('-P') + 1],
+                         'RWS+jJ7psytzl3v4znpraY9VWBQrICXBFmT3VwvxpTzbuV2Q/CBTDmVJ')
+
+    def test_unattended_cron_failure_and_retry_preserve_a_usable_installation(self):
+        config = self.home / '.config/ubs'
+        config.mkdir(parents=True)
+        (config / 'install.conf').write_text('auto_update=1\n')
+        crontab = self.root / 'crontab'
+        self.env.update(CRONTAB_SHIM_FILE=str(crontab), UBS_RELEASE_BASE=self.env['UBS_ARTIFACT_BASE'])
+        shim = self.bin / 'crontab'
+        shim.write_text('''#!/usr/bin/env bash
+case "${1:-}" in
+  -l) [[ ! -f "$CRONTAB_SHIM_FILE" ]] || cat "$CRONTAB_SHIM_FILE" ;;
+  -) cat > "$CRONTAB_SHIM_FILE" ;;
+  *) exit 1 ;;
+esac
+''')
+        shim.chmod(0o755)
+        self.flags.remove('--skip-hooks')
+        self.direct_install()
+        before = (self.destination / 'ubs').read_bytes()
+        candidate = (ROOT / 'ubs').read_text().replace(
+            f'UBS_VERSION="{self.version}"', 'UBS_VERSION="9999.0.0"')
+        (self.bundle / 'ubs').write_text(candidate)
+        self.sign()
+        jobs = [line for line in crontab.read_text().splitlines()
+                if '# Ultimate Bug Scanner Auto-Update' in line]
+        self.assertEqual(len(jobs), 1)
+        command = jobs[0].split(None, 5)[5].replace(r'\%', '%')
+        # Only the fixture transport's variables supplement a real minimal
+        # cron environment. The job itself must supply trust, Bash and PATH.
+        cron_env = {key: self.env[key] for key in
+                    ('HOME', 'RELEASE_FIXTURE', 'FETCH_LOG', 'SIGNATURE_LOG')}
+        cron_env.update(PATH='/usr/bin:/bin', MISSING_ASSET='ubs')
+        failed = subprocess.run(['/bin/sh', '-c', command], cwd=self.project, env=cron_env,
+                                capture_output=True, text=True, timeout=60)
+        self.assertEqual(failed.returncode, 1, failed.stdout + failed.stderr)
+        self.assertEqual((self.destination / 'ubs').read_bytes(), before)
+        source = self.project / 'cron.py'
+        source.write_text('value = 1\n')
+        self.invoke('--ci', '--no-auto-update', '--format=json', '--only=python', str(source))
+        cron_env.pop('MISSING_ASSET')
+        retried = subprocess.run(['/bin/sh', '-c', command], cwd=self.project, env=cron_env,
+                                 capture_output=True, text=True, timeout=60)
+        self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
+        self.assertEqual((self.destination / 'ubs').read_text(), candidate)
+        self.invoke('--ci', '--no-auto-update', '--format=json', '--only=python', str(source))
+
     def remove_companion(self):
         import re
         # Exercise the real bounded removal function. Full uninstall probes
@@ -620,6 +726,56 @@ class DaemonInstallTests(unittest.TestCase):
                            'success() { printf "%s\\n" "$*"; }\n'
                            + functions[0] + '\nuninstall_scanner_daemon "$1" ""\n')
         return self.command(['bash', str(harness), str(self.destination / 'ubs')])
+
+    def uninstall_private_fixture(self, *, expected=0):
+        # Exercise the full cleanup and lock handoff without inspecting a
+        # developer's real system installation or real crontab.
+        installer = self.root / 'uninstall.sh'
+        installer.write_text((self.bundle / 'install.sh').read_text().replace(
+            '/usr/local/bin', str(self.root / 'system-bin')))
+        crontab = self.bin / 'crontab'
+        crontab.write_text('#!/bin/sh\nexit 0\n')
+        crontab.chmod(0o755)
+        return self.command(['bash', str(installer), *self.flags, '--uninstall'],
+                            expected=expected)
+
+    @unittest.skipUnless(os.name == 'posix', 'POSIX uninstall lock handoff')
+    def test_uninstall_refuses_an_active_update_before_removing_any_assets(self):
+        import fcntl
+        self.direct_install()
+        runner = self.destination / 'ubs'
+        before = runner.read_bytes()
+        companion = self.generation()
+        payload = companion.read_bytes()
+        lock = runner.with_name(runner.name + '.update.lock')
+        with lock.open('rb') as descriptor:
+            fcntl.flock(descriptor.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = self.uninstall_private_fixture(expected=1)
+            self.assertIn('cannot safely uninstall while updates may be active', result.stderr)
+            self.assertNotIn('Uninstalling Ultimate Bug Scanner...', result.stdout)
+            self.assertEqual(runner.read_bytes(), before)
+            self.assertEqual(companion.read_bytes(), payload)
+            self.assertTrue((self.home / '.local/share/ubs/modules').is_dir())
+
+    @unittest.skipUnless(os.name == 'posix', 'POSIX uninstall lock handoff')
+    def test_uninstall_cannot_skip_locking_with_a_forged_environment(self):
+        self.direct_install()
+        before = (self.destination / 'ubs').read_bytes()
+        self.env['UBS_UNINSTALL_LOCKS'] = '[]'
+        result = self.uninstall_private_fixture(expected=1)
+        self.assertIn('missing uninstall update-lock descriptors', result.stderr)
+        self.assertEqual((self.destination / 'ubs').read_bytes(), before)
+
+    @unittest.skipUnless(os.name == 'posix', 'POSIX uninstall lock handoff')
+    def test_successful_uninstall_retires_the_publisher_lock_after_cache_cleanup(self):
+        self.direct_install()
+        runner = self.destination / 'ubs'
+        lock = runner.with_name(runner.name + '.update.lock')
+        self.assertTrue(lock.is_file())
+        self.uninstall_private_fixture()
+        self.assertFalse(runner.exists())
+        self.assertFalse(lock.exists())
+        self.assertFalse((self.home / '.local/share/ubs/modules').exists())
 
     def test_uninstall_removes_current_verified_companion_and_preserves_other_files(self):
         self.direct_install()
@@ -880,17 +1036,22 @@ class DaemonInstallTests(unittest.TestCase):
 
     def test_updated_runner_receives_original_scan_arguments(self):
         self.direct_install()
-        payload = (self.bundle / 'ubs-daemon').read_bytes()
-        pin = hashlib.sha256(payload).hexdigest()
-        (self.bundle / 'ubs').write_text(
-            '#!/usr/bin/env bash\nUBS_VERSION="9999.0.0"\n'
-            f'UBS_DAEMON_SHA256="{pin}"\n'
-            'exec python3 -c \'import json,sys; print(json.dumps(sys.argv[1:]))\' "$@"\n')
+        # Keep the complete release protocol and checksum tables. A tiny
+        # argv-only script is no longer a valid self-update target.
+        candidate = (ROOT / 'ubs').read_text().replace(
+            f'UBS_VERSION="{self.version}"', 'UBS_VERSION="9999.0.0"')
+        boundary = '# Run auto-update before main logic.'
+        self.assertEqual(candidate.count(boundary), 1)
+        candidate = candidate.replace(boundary,
+            'exec python3 -c \'import json,sys; print(json.dumps(sys.argv[1:]))\' '
+            '"${UBS_ORIGINAL_ARGS[@]}"\n\n' + boundary)
+        (self.bundle / 'ubs').write_text(candidate)
         self.sign()
         self.env.update(UBS_RELEASE_BASE=self.env['UBS_ARTIFACT_BASE'], FORCE_SELF_UPDATE='1')
         source = self.project / 'has space.py'
         source.write_text('value = 1\n')
-        flags = ['--ci', '--format=json', '--no-color', '--module-dir=' + str(ROOT / 'modules'), '--', str(source)]
+        flags = ['--ci', '--format=json', '--no-color',
+                 '--module-dir=' + str(self.home / '.local/share/ubs/modules'), '--', str(source)]
         result = self.invoke(*flags)
         self.assertEqual(self.decode_json(result.stdout), flags)
 

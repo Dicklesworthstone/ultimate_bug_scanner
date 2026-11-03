@@ -93,6 +93,11 @@ if [[ "$UBS_KEEP_TEMP" == "1" ]]; then
 fi
 
 UBS_VERSION="5.5.28"
+# Installed releases prepare a complete, version-bound cache before publication.
+# This literal marker is parsed as data by the updater, never evaluated remotely.
+UBS_RELEASE_GENERATIONS=1
+# The release manifest must be authenticated even in cron's empty environment.
+UBS_RELEASE_PUBKEY="RWS+jJ7psytzl3v4znpraY9VWBQrICXBFmT3VwvxpTzbuV2Q/CBTDmVJ"
 # The optional service is a release executable, not a command trusted via PATH.
 # scripts/update_checksums.py keeps this pin in sync with ubs-daemon.
 UBS_DAEMON_SHA256="281364f76d8afc3bbdf5e4f22afa5daf6905a38bb149478c79140370c6595f7f"
@@ -563,9 +568,10 @@ declare -A HELPER_CHECKSUMS=(
 
 # contract.json as shipped by earlier releases (sha256 -> first tag), kept out
 # of the generated blocks above on purpose. A cached contract with one of these
-# digests is a genuine but superseded asset: `ubs --update` from 5.4.x replaces
-# the runner but not the cached contract (issue #174). ensure_detection_contract
-# refreshes exactly these from this release; any other mismatch is corruption
+# digests is a genuine but superseded asset: older `ubs --update` replaces
+# the runner but not its cached dependencies (issues #174 and #199).
+# ensure_detection_contract migrates exactly these to a complete verified
+# generation; any other mismatch is corruption
 # and stays fatal (issue #129). Add the outgoing digest whenever a release
 # changes modules/contract.json.
 declare -A SUPERSEDED_CONTRACT_SHA256=(
@@ -575,6 +581,8 @@ declare -A SUPERSEDED_CONTRACT_SHA256=(
   ['636e49c1f9b0636e9fe5d2692252575ba9536ab81e4ee339d0d68686a318a746']='v5.4.8'
   ['93cd47cd7142c954c4d6a34a62e6786d1512762b9352098000c8415c86912203']='v5.4.10'
   ['406ecd66239cf0c23b2611c98bf1732114934e416c60d0edac6e20ca716129f8']='v5.4.16'
+  ['b3fee512c49997b09cb12faf749d350fdcbed8583f39e0c19340557afb14ecaa']='v5.5.3'
+  ['90b82afcc916b8f4608f1561be59fc874228028c40e957b42fba2791991ba970']='v5.5.26'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1493,6 +1501,14 @@ WORKSPACE_MIRROR_MAP=""
 IGNORE_MATCHER_DIR=""   # holds the generated ubs_ignore.py (ensure_ignore_matcher)
 MODULE_DIR_DEFAULT="${XDG_DATA_HOME:-$HOME/.local/share}/ubs/modules"
 MODULE_DIR="$MODULE_DIR_DEFAULT"
+MODULE_CACHE_ROOT=""
+MODULE_GENERATION_ACTIVE=0
+# Installer-only transaction options. They never initiate a scan or self-update.
+PREPARE_RELEASE_CACHE=""
+RELEASE_LOCAL_SOURCE=""
+RELEASE_PUBLISH_TARGET=""
+RELEASE_EXPECTED_SHA=""
+RELEASE_DAEMON_SOURCE="-"
 declare -A MODULE_PATHS=()
 UPDATE_MODULES=0
 JOBS="${JOBS:-0}"
@@ -2707,7 +2723,7 @@ emit_schema(){
 explain_rule(){
   local self_dir helpers_dir repo_root
   self_dir="$(dirname "${BASH_SOURCE[0]}")"
-  helpers_dir="$self_dir/modules/helpers"
+  helpers_dir="$(runtime_helpers_dir)"
   if [[ ! -f "$helpers_dir/ubs_core/explain.py" && -f "${MODULE_DIR:-}/helpers/ubs_core/explain.py" ]]; then
     helpers_dir="${MODULE_DIR:-}/helpers"
   fi
@@ -2834,9 +2850,12 @@ PY
 # exit before any parsing, locking, network or scanning.
 if [[ "${1:-}" == "explain" ]]; then
   shift
-  _explain_rc=0
-  explain_rule "$@" || _explain_rc=$?
-  exit "$_explain_rc"
+  # Installed rule explanations use the same verified generation as scans.
+  # Defer until generation selection is available; no scan setup is needed.
+  MODE="explain"
+  EXPLAIN_ARGS=("$@")
+  UPDATE_ONLY=1
+  set --
 elif [[ "${1:-}" == "robot-docs" ]]; then
   _self_doc_rc=0
   emit_robot_docs "${2:-all}" || _self_doc_rc=$?   # `||` keeps the ERR trap quiet on exit 2
@@ -2909,6 +2928,14 @@ else
       -v|--verbose) VERBOSE=1; shift;;
       -q|--quiet) QUIET=1; shift;;
       --update) UPDATE_ONLY=1; FORCE_SELF_UPDATE=1; shift;;
+      --prepare-release-cache=*)
+        PREPARE_RELEASE_CACHE="${1#*=}"
+        [[ -n "$PREPARE_RELEASE_CACHE" ]] || { say_err 'ERROR: --prepare-release-cache requires a directory'; exit 2; }
+        UPDATE_ONLY=1; shift;;
+      --release-source=*) RELEASE_LOCAL_SOURCE="${1#*=}"; shift;;
+      --publish-release=*) RELEASE_PUBLISH_TARGET="${1#*=}"; shift;;
+      --expected-runner-sha=*) RELEASE_EXPECTED_SHA="${1#*=}"; shift;;
+      --release-daemon=*) RELEASE_DAEMON_SOURCE="${1#*=}"; shift;;
       --no-cache) export UBS_NO_CACHE=1; shift;;
       --config=*) SCAN_CONFIG_PATH="${1#*=}"; SCAN_CONFIG_EXPLICIT=1; shift;;
       --config)
@@ -2970,10 +2997,10 @@ else
         MAX_OCCURRENCES="$2"; MAX_OCCURRENCES_SET=1; shift 2;;
       --ignore-file=*) IGNORE_FILE="${1#*=}"; shift;;
       --skip-size-check) SKIP_SIZE_CHECK=1; shift;;
-      --module-dir=*) MODULE_DIR="${1#*=}"; shift;;
+      --module-dir=*) MODULE_DIR="${1#*=}"; MODULE_DIR_EXPLICIT=1; shift;;
       --module-dir)
         if [[ $# -lt 2 ]]; then usage; exit 2; fi
-        shift; MODULE_DIR="$1"; shift;;
+        shift; MODULE_DIR="$1"; MODULE_DIR_EXPLICIT=1; shift;;
       --update-modules) UPDATE_MODULES=1; shift;;
       --jobs=*) JOBS="${1#*=}"; shift;;
       --skip-type-narrowing) SKIP_TYPE_NARROWING=1; shift;;
@@ -4399,6 +4426,59 @@ finalize_module_dir(){
   fi
 }
 
+release_manifest_arguments(){
+  # Pass this process's already-loaded pins. Reopening $0 here races an
+  # updater replacing that pathname while this shell is still running.
+  RELEASE_MANIFEST_ARGS=()
+  local key
+  for key in "${!MODULE_CHECKSUMS[@]}"; do
+    RELEASE_MANIFEST_ARGS+=("ubs-$key.sh=${MODULE_CHECKSUMS[$key]}")
+  done
+  for key in "${!HELPER_CHECKSUMS[@]}"; do
+    RELEASE_MANIFEST_ARGS+=("$key=${HELPER_CHECKSUMS[$key]}")
+  done
+}
+
+select_release_generation(){
+  local selected
+  MODULE_GENERATION_ACTIVE=0
+  # The normal checkout/legacy-cache path needs no Python startup. A present
+  # generation container, including a malicious symlink, must be validated.
+  if [[ ! -e "$MODULE_CACHE_ROOT/.ubs-releases" && ! -L "$MODULE_CACHE_ROOT/.ubs-releases" ]]; then
+    return 0
+  fi
+  release_manifest_arguments
+  selected="$(release_generation select-manifest "$MODULE_CACHE_ROOT" "$UBS_VERSION" \
+    "${RELEASE_MANIFEST_ARGS[@]}")" || return 2
+  MODULE_DIR="$selected"
+  [[ "$MODULE_DIR" == "$MODULE_CACHE_ROOT" ]] || MODULE_GENERATION_ACTIVE=1
+  return 0
+}
+
+prepare_current_release_generation(){
+  local operation="${1:-prepare-manifest}" selected
+  [[ "$UBS_RELEASE_GENERATIONS" -eq 1 ]] || return 2
+  release_manifest_arguments
+  selected="$(release_generation "$operation" "$MODULE_CACHE_ROOT" "$UBS_VERSION" \
+    "$REPO_RAW_BASE" "${RELEASE_MANIFEST_ARGS[@]}")" || return 2
+  MODULE_DIR="$selected"
+  MODULE_GENERATION_ACTIVE=1
+}
+
+runtime_helpers_dir(){
+  local bundled
+  if [[ "$MODULE_GENERATION_ACTIVE" -eq 1 ]]; then
+    printf '%s\n' "$MODULE_DIR/helpers"
+    return
+  fi
+  bundled="$(script_dir)/modules/helpers"
+  if [[ -d "$bundled/ubs_core" ]]; then
+    printf '%s\n' "$bundled"
+  else
+    printf '%s\n' "$MODULE_DIR/helpers"
+  fi
+}
+
 resolve_git_metadata(){
   local root
   if ! root=$(git -C "$SOURCE_PROJECT_DIR" rev-parse --show-toplevel 2>/dev/null); then
@@ -5691,13 +5771,22 @@ run_doctor(){
     doctor_report "module-cache-writable" err "Module cache is not writable: $MODULE_DIR"
   fi
 
-  # Incremental scan cache (bead C4)
-  if need_cmd python3; then
-    local helpers_dir
-    helpers_dir="$(dirname "${BASH_SOURCE[0]}")/modules/helpers"
-    if [[ ! -d "$helpers_dir" && -d "${MODULE_DIR:-}/helpers" ]]; then
-      helpers_dir="${MODULE_DIR:-}/helpers"
-    fi
+  # Never import cached Python code just to diagnose its integrity. In
+  # particular, doctor --fix used to execute ubs_core.cache before checking
+  # the package it was about to repair.
+  local helpers_dir helpers_verified=1 helper_rel
+  helpers_dir="$(runtime_helpers_dir)"
+  if [[ "$helpers_dir" == "$MODULE_DIR/helpers" ]]; then
+    for helper_rel in "${!HELPER_CHECKSUMS[@]}"; do
+      [[ "$helper_rel" == helpers/* ]] || continue
+      if ! verify_helper_checksum "$helper_rel" "$MODULE_DIR/$helper_rel"; then
+        helpers_verified=0
+        break
+      fi
+    done
+  fi
+  # Incremental scan cache (bead C4), only from already verified helpers.
+  if [[ "$helpers_verified" -eq 1 ]] && need_cmd python3; then
     local cache_stats_json
     if [[ "${DOCTOR_PRUNE_CACHE:-0}" -eq 1 ]]; then
       cache_stats_json="$(PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core.cache doctor --prune-cache --all 2>/dev/null || true)"
@@ -6165,6 +6254,9 @@ resolve_module_path(){
   local sd md
   sd="$(script_dir)"
   md="$MODULE_DIR"
+  # A published generation is the complete runtime for these loaded pins.
+  # Old sibling modules or PATH overrides must not split that transaction.
+  if [[ "$MODULE_GENERATION_ACTIVE" -eq 1 ]]; then echo "$md/$base.sh"; return 0; fi
   # Priority: PATH → local modules/ → XDG module dir
   if command -v "$base" >/dev/null 2>&1; then command -v "$base"; return 0; fi
   if [ -x "$sd/modules/$base.sh" ]; then echo "$sd/modules/$base.sh"; return 0; fi
@@ -6540,7 +6632,11 @@ ensure_detection_contract(){
     say_err "${RED}$X missing pinned checksum for contract.json; refusing to scan${RESET}"
     return 2
   fi
-  path="$(script_dir)/modules/$rel"
+  if [[ "$MODULE_GENERATION_ACTIVE" -eq 1 ]]; then
+    path="$MODULE_DIR/$rel"
+  else
+    path="$(script_dir)/modules/$rel"
+  fi
   if [[ ! -e "$path" && ! -L "$path" ]]; then
     path="$MODULE_DIR/$rel"
   fi
@@ -6578,14 +6674,14 @@ ensure_detection_contract(){
     # from this release and verify the download against this runner's pin;
     # unknown bytes (or a failed refresh) still refuse to scan (issue #129).
     local mismatch_err="${VERIFY_HELPER_ERR}" cached_sha="" superseded=""
-    if [[ "$path" == "$MODULE_DIR/$rel" ]] && ! is_checkout_helper "$path" \
+    if [[ "$MODULE_GENERATION_ACTIVE" -eq 0 && "$path" == "$MODULE_CACHE_ROOT/$rel" ]] && ! is_checkout_helper "$path" \
         && sha256_into cached_sha "$snapshot"; then
       superseded="${SUPERSEDED_CONTRACT_SHA256[$cached_sha]:-}"
     fi
     if [[ -n "$superseded" ]]; then
-      say_err "${YELLOW}${WARN}${RESET} cached contract.json is the ${superseded} release's (left by an update that replaced only the runner); refreshing it for v${UBS_VERSION}..."
+      say_err "${YELLOW}${WARN}${RESET} cached contract.json is the ${superseded} release's (left by an update that replaced only the runner); preparing verified dependencies for v${UBS_VERSION}..."
       VERIFY_HELPER_ERR=""
-      if download_helper_asset "$rel" "$path" && cp "$path" "$snapshot" \
+      if prepare_current_release_generation && cp "$MODULE_DIR/$rel" "$snapshot" \
           && verify_helper_checksum "$rel" "$snapshot"; then
         DETECTION_CONTRACT_FILE="$snapshot"
         return 0
@@ -6744,6 +6840,755 @@ ensure_module(){
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# The standalone runner embeds scripts/release_generation.py verbatim. The
+# release-generation regression suite checks source parity so installed
+# transactions exercise the same implementation as the focused fault tests.
+release_generation(){
+  python3 -I -S - "$@" <<'PYRELEASEGENERATION'
+#!/usr/bin/env python3
+"""Version-bound module generations for the UBS self-updater (issues #174/#199).
+
+This standard-library-only source is embedded verbatim in the standalone
+runner, with source-parity regression coverage. It is not downloaded or
+imported at run time: the release authentication gate authenticates the runner
+before its target manifest is read. No downloaded shell code is evaluated.
+Running scans pass their loaded
+checksum tables, rather than reopening a runner another updater can replace.
+"""
+from __future__ import annotations
+
+import contextlib
+import errno
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+from typing import Iterator, NamedTuple, Optional
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
+
+MAX_ASSET_BYTES = 32 * 1024 * 1024
+MAX_RUNNER_BYTES = 4 * 1024 * 1024
+GENERATION_DIRECTORY = ".ubs-releases"
+READY_FILE = ".ubs-ready.json"
+USER_AGENT = "ultimate_bug_scanner-agent"
+IS_WINDOWS = os.name == "nt"
+OPEN_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+OPEN_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+OPEN_BINARY = getattr(os, "O_BINARY", 0)
+# This is the literal contract pin in the released v5.4.17 runner. Recognizing
+# a known old contract permits migration, NOT execution of old/unverified
+# assets. An arbitrary damaged contract must still fail the ordinary gate.
+LEGACY_CONTRACTS = frozenset({
+    "406ecd66239cf0c23b2611c98bf1732114934e416c60d0edac6e20ca716129f8",
+})
+
+
+class UpdateError(ValueError):
+    """An update cannot safely be prepared or selected."""
+
+
+class Manifest(NamedTuple):
+    version: str
+    runner_sha256: str
+    assets: dict[str, str]
+
+
+def digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def is_reparse(info: os.stat_result) -> bool:
+    return bool(getattr(info, "st_file_attributes", 0)
+                & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+
+
+def require_regular(info: os.stat_result, path: Path) -> None:
+    if stat.S_ISLNK(info.st_mode) or is_reparse(info):
+        raise OSError(errno.ELOOP, "refusing a symlink or reparse point", str(path))
+    if stat.S_ISDIR(info.st_mode):
+        raise IsADirectoryError(errno.EISDIR, "expected a regular file", str(path))
+    if not stat.S_ISREG(info.st_mode):
+        raise UpdateError(f"not a regular file: {path}")
+
+
+def open_regular(path: Path, flags: int, mode: int = 0o600) -> int:
+    """No-follow open, with identity checks for native Windows without that flag.
+
+    Creation is exclusive even for a persistent lock's first open. Existing
+    files must remain the same non-reparse regular file across lstat/open/fstat;
+    the returned descriptor, never another pathname open, is read and hashed.
+    """
+    before = None
+    if flags & os.O_CREAT:
+        try:
+            descriptor = os.open(path, flags | os.O_EXCL | OPEN_NOFOLLOW | OPEN_NONBLOCK | OPEN_BINARY, mode)
+        except FileExistsError:
+            if flags & os.O_EXCL:
+                raise
+            return open_regular(path, flags & ~(os.O_CREAT | os.O_EXCL), mode)
+    else:
+        before = path.lstat()
+        require_regular(before, path)
+        descriptor = os.open(path, flags | OPEN_NOFOLLOW | OPEN_NONBLOCK | OPEN_BINARY, mode)
+    try:
+        opened = os.fstat(descriptor)
+        after = path.lstat()
+        require_regular(opened, path)
+        require_regular(after, path)
+        if ((before is not None and not os.path.samestat(before, opened))
+                or not os.path.samestat(opened, after)
+                or (not OPEN_NOFOLLOW and not opened.st_ino)):
+            raise UpdateError(f"file identity changed or unavailable while opening: {path}")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def set_file_mode(descriptor: int, path: Path, mode: int) -> None:
+    if hasattr(os, "fchmod"):
+        os.fchmod(descriptor, mode)
+    else:
+        # Native Windows before Python 3.13 has no fchmod. These paths are
+        # exclusively created private stage files; check identity around chmod.
+        before = path.lstat()
+        require_regular(before, path)
+        if not os.path.samestat(before, os.fstat(descriptor)):
+            raise UpdateError(f"staged file changed before setting mode: {path}")
+        os.chmod(path, mode)
+        after = path.lstat()
+        require_regular(after, path)
+        if not os.path.samestat(after, os.fstat(descriptor)):
+            raise UpdateError(f"staged file changed while setting mode: {path}")
+
+
+def read_regular(path: Path, limit: int = MAX_ASSET_BYTES) -> bytes:
+    """Hash/read the same opened regular file; never block on a FIFO."""
+    # The built-in opener owns the descriptor even if stream initialization
+    # fails (for example for a directory); fdopen(os.open(...)) can leak it.
+    with open(path, "rb", opener=lambda name, flags: open_regular(Path(name), flags)) as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            raise UpdateError(f"not a bounded regular file: {path}")
+        data = stream.read(limit + 1)
+    if len(data) > limit:
+        raise UpdateError(f"asset exceeds size limit: {path}")
+    return data
+
+
+def valid_asset_path(name: str) -> bool:
+    return bool(name) and all(
+        re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", part)
+        for part in name.split("/")
+    )
+
+
+def literal_table(text: str, declaration: str) -> dict[str, str]:
+    if len(re.findall(r"^" + re.escape(declaration[:-1]) + r".*$", text, re.M)) != 1:
+        raise UpdateError(f"missing or ambiguous {declaration}")
+    blocks = re.findall(r"^" + re.escape(declaration) + r"\n(.*?)^\)", text, re.M | re.S)
+    if len(blocks) != 1:
+        raise UpdateError(f"missing or ambiguous {declaration}")
+    entries: dict[str, str] = {}
+    for line in blocks[0].splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = re.fullmatch(r"\[(?:'([^']+)'|([A-Za-z0-9_-]+))\]='([0-9a-f]{64})'", line)
+        if match is None:
+            raise UpdateError(f"malformed entry in {declaration}: {line}")
+        key = match[1] or match[2]
+        if key in entries:
+            raise UpdateError(f"duplicate checksum: {key}")
+        entries[key] = match[3]
+    if not entries:
+        raise UpdateError(f"empty {declaration}")
+    return entries
+
+
+def validate_asset_map(assets: dict[str, str]) -> None:
+    if not {"contract.json", "lib/ubs-common.sh"} <= assets.keys():
+        raise UpdateError("manifest must pin contract.json and lib/ubs-common.sh")
+    if hmac.compare_digest(assets["contract.json"], digest(b"")):
+        raise UpdateError("target runner pins an empty contract.json")
+    folded: set[str] = set()
+    modules = 0
+    for name, expected in assets.items():
+        if not valid_asset_path(name) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+            raise UpdateError(f"unsafe asset pin: {name}")
+        if re.fullmatch(r"ubs-[a-z]+\.sh", name):
+            modules += 1
+        elif name != "contract.json" and not name.startswith(("helpers/", "lib/")):
+            raise UpdateError(f"invalid helper path: {name}")
+        key = name.casefold()
+        if key in folded:
+            raise UpdateError(f"colliding asset paths: {name}")
+        folded.add(key)
+    if not modules:
+        raise UpdateError("manifest must pin at least one module")
+    for name in folded:
+        parts = name.split("/")
+        if any("/".join(parts[:i]) in folded for i in range(1, len(parts))):
+            raise UpdateError(f"asset file/directory collision: {name}")
+
+
+def runner_version(source: bytes) -> str:
+    if not source or len(source) > MAX_RUNNER_BYTES:
+        raise UpdateError("empty or oversized runner")
+    versions = re.findall(r'^UBS_VERSION=(.*)$', source.decode("utf-8"), re.M)
+    if len(versions) != 1 or not re.fullmatch(r'"[0-9]+\.[0-9]+\.[0-9]+"', versions[0]):
+        raise UpdateError("missing or ambiguous runner version")
+    return versions[0][1:-1]
+
+
+def parse_manifest(source: bytes) -> Manifest:
+    """Accept only the runner's literal checksum tables, never shell syntax."""
+    version = runner_version(source)
+    text = source.decode("utf-8")
+    modules = literal_table(text, "declare -A MODULE_CHECKSUMS=(")
+    helpers = literal_table(text, "declare -A HELPER_CHECKSUMS=(")
+    inventories = re.findall(r"^HELPER_ASSETS=\(\n(.*?)^\)", text, re.M | re.S)
+    if len(inventories) != 1 or len(re.findall(r"^HELPER_ASSETS=.*$", text, re.M)) != 1:
+        raise UpdateError("missing or ambiguous HELPER_ASSETS")
+    listed = []
+    for line in inventories[0].splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = re.fullmatch(r"(['\"])([A-Za-z0-9_./-]+)\1", line)
+        if match is None:
+            raise UpdateError(f"nonliteral helper inventory entry: {line}")
+        listed.append(match[2])
+    if len(listed) != len(set(listed)) or set(listed) != set(helpers):
+        raise UpdateError("helper inventory does not match its checksum table")
+    languages = re.findall(r"^ALL_LANGS=\(([a-z ]+)\)$", text, re.M)
+    if (len(languages) != 1 or len(re.findall(r"^ALL_LANGS=.*$", text, re.M)) != 1
+            or len(languages[0].split()) != len(set(languages[0].split()))
+            or set(languages[0].split()) != set(modules)):
+        raise UpdateError("module inventory does not match its checksum table")
+    assets: dict[str, str] = {}
+    for language, expected in modules.items():
+        if not re.fullmatch(r"[a-z]+", language):
+            raise UpdateError(f"invalid language name: {language}")
+        assets[f"ubs-{language}.sh"] = expected
+    for name, expected in helpers.items():
+        if name in assets:
+            raise UpdateError(f"duplicate asset path: {name}")
+        assets[name] = expected
+    validate_asset_map(assets)
+    return Manifest(version, digest(source), assets)
+
+
+def manifest_from_arguments(version: str, entries: list[str]) -> Manifest:
+    """Consume the current shell's literal pins without rereading its pathname."""
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+        raise UpdateError("invalid runner version")
+    assets: dict[str, str] = {}
+    for entry in entries:
+        name, separator, expected = entry.partition("=")
+        if (not separator or not valid_asset_path(name) or name in assets
+                or not re.fullmatch(r"[0-9a-f]{64}", expected)):
+            raise UpdateError(f"unsafe, duplicate or malformed asset pin: {entry}")
+        assets[name] = expected
+    validate_asset_map(assets)
+    # The runtime manifest does not claim a runner-byte digest. That digest is
+    # used only when authenticating and publishing an actual candidate file.
+    return Manifest(version, "", assets)
+
+
+def manifest_bytes(manifest: Manifest) -> bytes:
+    return json.dumps({"version": manifest.version, "assets": manifest.assets},
+                      sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def manifest_identity(manifest: Manifest) -> str:
+    """Stable for the loaded pins even after the runner pathname is replaced."""
+    return digest(manifest_bytes(manifest))
+
+
+def ready_bytes(manifest: Manifest) -> bytes:
+    return (json.dumps({
+        "schema": 2,
+        "version": manifest.version,
+        "manifest_sha256": manifest_identity(manifest),
+        "assets": manifest.assets,
+    }, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def generation_path(root: Path, manifest: Manifest) -> Path:
+    return root / GENERATION_DIRECTORY / manifest_identity(manifest)
+
+
+def real_directory(path: Path, *, create: bool = False) -> None:
+    if create:
+        try:
+            path.mkdir(mode=0o755)
+        except FileExistsError:
+            pass
+        else:
+            # Ignore a restrictive caller umask only for our newly created
+            # directories; never broaden permissions on an existing cache.
+            path.chmod(0o755)
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or is_reparse(info):
+        raise UpdateError(f"refusing non-directory or symlink: {path}")
+
+
+def check_parents(root: Path, relative: str) -> Path:
+    current = root
+    for part in relative.split("/")[:-1]:
+        current = current / part
+        real_directory(current)
+    return root / relative
+
+
+def check_ready(path: Path, manifest: Manifest, *, complete: bool) -> None:
+    real_directory(path.parent)
+    real_directory(path)
+    if not hmac.compare_digest(read_regular(path / READY_FILE, MAX_RUNNER_BYTES), ready_bytes(manifest)):
+        raise UpdateError(f"incomplete or mismatched generation: {path}")
+    if complete:
+        for relative, expected in manifest.assets.items():
+            data = read_regular(check_parents(path, relative))
+            if not hmac.compare_digest(digest(data), expected):
+                raise UpdateError(f"checksum mismatch in prepared generation: {relative}")
+            if relative.startswith("ubs-") and relative.endswith(".sh"):
+                # Windows chmod/access do not implement POSIX executable bits;
+                # Git Bash executes the verified script through its interpreter.
+                access = os.R_OK if IS_WINDOWS else os.R_OK | os.X_OK
+                if not os.access(path / relative, access):
+                    raise UpdateError(f"module is not readable/executable: {relative}")
+        verify_dependency_pins(path, manifest)
+
+
+def verify_dependency_pins(path: Path, manifest: Manifest) -> None:
+    """A set of individually authentic files must also agree with each other."""
+    library = manifest.assets["lib/ubs-common.sh"]
+    for name in manifest.assets:
+        if not re.fullmatch(r"ubs-[a-z]+\.sh", name):
+            continue
+        source = read_regular(path / name).decode("utf-8")
+        declarations = re.findall(r"^UBS_LIB_CHECKSUM=(.*)$", source, re.M)
+        if len(declarations) != 1 or declarations[0] != f'"{library}"':
+            raise UpdateError(f"module has an inconsistent shared-library pin: {name}")
+    common = read_regular(check_parents(path, "lib/ubs-common.sh")).decode("utf-8")
+    transitive = literal_table(common, "declare -g -A UBS_COMMON_HELPER_CHECKSUMS=(")
+    expected = {name: checksum for name, checksum in manifest.assets.items()
+                if name != "lib/ubs-common.sh" and not re.fullmatch(r"ubs-[a-z]+\.sh", name)}
+    if transitive != expected:
+        raise UpdateError("shared-library helper pins do not match the authenticated runner")
+
+
+def sync_directory(path: Path) -> None:
+    real_directory(path)
+    if IS_WINDOWS:
+        # Python cannot portably open/fsync Windows directories. File contents
+        # are flushed and os.replace stays atomic; no power-loss claim is made.
+        return
+    with contextlib.ExitStack() as resources:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | OPEN_NOFOLLOW)
+        resources.callback(os.close, descriptor)
+        try:
+            os.fsync(descriptor)
+        except OSError as exc:
+            # Some POSIX filesystems do not implement directory fsync. The
+            # rename is still atomic; do not claim power-loss durability there.
+            if exc.errno not in (errno.EINVAL, errno.ENOTSUP):
+                raise
+
+
+def write_verified(path: Path, data: bytes, expected: str, *, executable: bool) -> None:
+    if not hmac.compare_digest(digest(data), expected):
+        raise UpdateError(f"checksum mismatch for {path.name}")
+    with open(path, "xb", opener=lambda name, flags: open_regular(Path(name), flags)) as stream:
+        stream.write(data)
+        stream.flush()
+        set_file_mode(stream.fileno(), path, 0o755 if executable else 0o644)
+        os.fsync(stream.fileno())
+
+
+def download(url: str, destination: Path, *, allow_override: bool) -> bytes:
+    proto = "=https,http,file" if allow_override else "=https"
+    if not allow_override and not url.startswith("https://"):
+        raise UpdateError("non-HTTPS asset source requires UBS_REPO_RAW_BASE")
+    try:
+        if shutil.which("curl"):
+            result = subprocess.run(
+                ["curl", "-fsSL", "--proto", proto, "--proto-redir", proto,
+                 "--user-agent", USER_AGENT,
+                 "--connect-timeout", "10", "--max-time", "30", "--max-filesize",
+                 str(MAX_ASSET_BYTES), "--retry", "2", "--retry-delay", "1",
+                 "-o", str(destination), "--", url],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE, check=False, timeout=100)
+        elif shutil.which("wget"):
+            result = subprocess.run(
+                ["wget", "-q", "--timeout=30", "--tries=3", "--user-agent", USER_AGENT,
+                 *([] if allow_override else ["--https-only", "--max-redirect=0"]),
+                 "-O", str(destination), "--", url],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE, check=False, timeout=100)
+        else:
+            raise UpdateError("neither curl nor wget is available")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise UpdateError(f"could not fetch {url}: {exc}") from exc
+    if result.returncode:
+        raise UpdateError(f"could not fetch {url} (exit {result.returncode})")
+    return read_regular(destination)
+
+
+@contextlib.contextmanager
+def exclusive_lock(descriptor: int) -> Iterator[None]:
+    if IS_WINDOWS:
+        if msvcrt is None:
+            raise UpdateError("native Windows update locking requires msvcrt")
+        # locking() starts at the current offset and may extend beyond EOF.
+        # LK_LOCK retries contention for ten seconds, then fails safely.
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        msvcrt.locking(descriptor, msvcrt.LK_LOCK, 1)
+        try:
+            yield
+        finally:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+    else:
+        if fcntl is None:
+            raise UpdateError("this platform has no supported update lock implementation")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def generation_lock(container: Path) -> Iterator[None]:
+    real_directory(container, create=True)
+    with contextlib.ExitStack() as resources:
+        descriptor = open_regular(container / ".prepare.lock", os.O_RDWR | os.O_CREAT)
+        resources.callback(os.close, descriptor)
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise UpdateError("generation lock is not a regular file")
+        with exclusive_lock(descriptor):
+            verify_lock_identity(descriptor, container / ".prepare.lock")
+            yield
+
+
+def verify_lock_identity(descriptor: int, path: Path) -> None:
+    """Reject a waiter whose lock was removed/recreated by a completed uninstall."""
+    try:
+        current = path.lstat()
+    except FileNotFoundError as exc:
+        raise UpdateError("update lock was removed while waiting; retry the operation") from exc
+    require_regular(current, path)
+    if not os.path.samestat(current, os.fstat(descriptor)):
+        raise UpdateError("update lock was replaced while waiting; retry the operation")
+
+
+def prepare_manifest(manifest: Manifest, root: Path, raw_base: str, *, allow_override: bool,
+                     local_source: Optional[Path] = None, repair: bool = False) -> Path:
+    """Publish one complete generation, without changing any active file.
+
+    The caller authenticates runner before calling this function and atomically
+    publishes it ONLY after this function succeeds. SIGKILL before the directory
+    rename leaves an unselectable .stage-* directory; after it, the generation
+    is complete but inactive until that runner is published. Old generations
+    and the legacy module directory are deliberately retained.
+    """
+    validate_asset_map(manifest.assets)
+    root.mkdir(parents=True, exist_ok=True)
+    root = root.resolve(strict=True)
+    target = generation_path(root, manifest)
+    container = root / GENERATION_DIRECTORY
+    with generation_lock(container):
+        existing = target.exists() or target.is_symlink()
+        if existing:
+            # Never replace or traverse a symlinked generation, even for repair.
+            real_directory(target)
+            try:
+                check_ready(target, manifest, complete=True)
+                return target
+            except (OSError, UpdateError):
+                if not repair:
+                    raise
+        stage = Path(tempfile.mkdtemp(prefix=".stage-", dir=container))
+        try:
+            scratch = stage / ".download"
+            for relative, expected in sorted(manifest.assets.items()):
+                data = b""
+                sources = [root]
+                if local_source is not None:
+                    sources.insert(0, local_source)
+                if existing:
+                    sources.insert(0, target)
+                for source_root in sources:
+                    try:
+                        real_directory(source_root)
+                        data = read_regular(check_parents(source_root, relative))
+                    except (OSError, UpdateError):
+                        data = b""
+                    if hmac.compare_digest(digest(data), expected):
+                        break
+                if not hmac.compare_digest(digest(data), expected):
+                    url = f"{raw_base.rstrip('/')}/v{manifest.version}/modules/{relative}"
+                    data = download(url, scratch, allow_override=allow_override)
+                    # Never retry a bad digest against main, disable integrity,
+                    # or fall back to a stale installed file.
+                    if not hmac.compare_digest(digest(data), expected):
+                        raise UpdateError(f"checksum mismatch for downloaded {relative}")
+                    scratch.unlink()
+                destination = stage / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                write_verified(destination, data, expected,
+                               executable=relative.startswith("ubs-") and relative.endswith(".sh"))
+            marker = ready_bytes(manifest)
+            write_verified(stage / READY_FILE, marker, digest(marker), executable=False)
+            # tempfile/umask must not produce an owner-only installation.
+            for directory, _, _ in os.walk(stage, topdown=False):
+                os.chmod(directory, 0o755)
+                sync_directory(Path(directory))
+            check_ready(stage, manifest, complete=True)
+            if existing:
+                # Explicit repair replaces only same-manifest assets, each by
+                # atomic rename after the ENTIRE repair set was verified. A
+                # healthy concurrent reader still sees the same pinned bytes;
+                # a damaged reader fails closed until its asset is repaired.
+                # The generation directory itself never disappears or moves.
+                parents = {target}
+                for relative in sorted(manifest.assets):
+                    parent = target
+                    for part in relative.split("/")[:-1]:
+                        parent = parent / part
+                        real_directory(parent, create=True)
+                        parents.add(parent)
+                    os.replace(stage / relative, target / relative)
+                for parent in sorted(parents, key=lambda path: len(path.parts), reverse=True):
+                    os.chmod(parent, 0o755)
+                    sync_directory(parent)
+                os.replace(stage / READY_FILE, target / READY_FILE)
+                sync_directory(target)
+            else:
+                os.rename(stage, target)
+            sync_directory(container)
+            check_ready(target, manifest, complete=True)
+            return target
+        finally:
+            # stage is uniquely owned by this invocation, never an active path.
+            if stage.exists():
+                shutil.rmtree(stage)
+
+
+def prepare(runner: Path, root: Path, raw_base: str, *, allow_override: bool,
+            local_source: Optional[Path] = None, repair: bool = False) -> Path:
+    source = read_regular(runner, MAX_RUNNER_BYTES)
+    manifest = parse_manifest(source)
+    if source.splitlines().count(b"UBS_RELEASE_GENERATIONS=1") != 1:
+        raise UpdateError("target runner does not support version-bound module generations")
+    return prepare_manifest(manifest, root, raw_base, allow_override=allow_override,
+                            local_source=local_source, repair=repair)
+
+
+def select_manifest(manifest: Manifest, root: Path) -> Path:
+    root = root.resolve()
+    container = root / GENERATION_DIRECTORY
+    if container.exists() or container.is_symlink():
+        real_directory(container)
+    target = generation_path(root, manifest)
+    if target.exists() or target.is_symlink():
+        # A ready marker is never an executable-byte authorization. Verify the
+        # complete graph before any scan/doctor consumer can import a helper.
+        # Explicit doctor repair runs prepare_manifest(repair=True) first.
+        check_ready(target, manifest, complete=True)
+        return target
+    return root
+
+
+def select(runner: Path, root: Path, raw_base: str, *, migrate_legacy: bool,
+           allow_override: bool) -> Path:
+    manifest = parse_manifest(read_regular(runner, MAX_RUNNER_BYTES))
+    root = root.resolve()
+    target = select_manifest(manifest, root)
+    if target != root:
+        return target
+    if migrate_legacy:
+        try:
+            contract_sha = digest(read_regular(root / "contract.json"))
+        except (OSError, UpdateError):
+            contract_sha = ""
+        if contract_sha in LEGACY_CONTRACTS and not hmac.compare_digest(contract_sha, manifest.assets["contract.json"]):
+            print("ubs: completing the installed release upgrade with verified module assets", file=sys.stderr)
+            return prepare(runner, root, raw_base, allow_override=allow_override)
+    return root
+
+
+def daemon_pin(source: bytes) -> str:
+    declarations = re.findall(r"^UBS_DAEMON_SHA256=(.*)$", source.decode("utf-8"), re.M)
+    if not declarations:
+        return ""
+    if len(declarations) != 1 or not re.fullmatch(r'"[0-9a-f]{64}"', declarations[0]):
+        raise UpdateError("missing or ambiguous daemon checksum")
+    return declarations[0][1:-1]
+
+
+@contextlib.contextmanager
+def publication_lock(installed: Path) -> Iterator[None]:
+    """Serialize generation preparation AND runner publication for one install."""
+    real_directory(installed.parent)
+    with contextlib.ExitStack() as resources:
+        descriptor = open_regular(installed.with_name(installed.name + ".update.lock"),
+                                  os.O_RDWR | os.O_CREAT)
+        resources.callback(os.close, descriptor)
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise UpdateError("update lock is not a regular file")
+        with exclusive_lock(descriptor):
+            verify_lock_identity(descriptor, installed.with_name(installed.name + ".update.lock"))
+            yield
+
+
+def publish_file(destination: Path, data: bytes, *, mode: int) -> None:
+    """Durably stage on the destination filesystem, then replace one pathname."""
+    descriptor, name = tempfile.mkstemp(prefix="." + destination.name + ".stage-",
+                                        dir=destination.parent)
+    stage = Path(name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            set_file_mode(stream.fileno(), stage, mode)
+            os.fsync(stream.fileno())
+        os.replace(stage, destination)
+        sync_directory(destination.parent)
+    finally:
+        if stage.exists():
+            stage.unlink()
+
+
+def publish(candidate: Path, root: Path, raw_base: str, installed: Path,
+            expected_current_sha: str, *, allow_override: bool,
+            daemon_source: Optional[Path] = None, local_source: Optional[Path] = None) -> Path:
+    """Publish an authenticated candidate only after all dependencies are ready.
+
+    Authentication belongs to the caller. The expected-current digest is a
+    compare-and-swap lease, not authentication of the candidate. Holding the
+    persistent publication lock prevents two cooperating updaters from mixing
+    generations; an external replacement invalidates the final lease check.
+    """
+    if expected_current_sha != "absent" and not re.fullmatch(r"[0-9a-f]{64}", expected_current_sha):
+        raise UpdateError("invalid expected installed runner digest")
+    source = read_regular(candidate, MAX_RUNNER_BYTES)
+    manifest = parse_manifest(source)
+    if source.splitlines().count(b"UBS_RELEASE_GENERATIONS=1") != 1:
+        raise UpdateError("target runner does not support version-bound module generations")
+    installed = installed.absolute()
+    with publication_lock(installed):
+        try:
+            current = read_regular(installed, MAX_RUNNER_BYTES)
+            current_sha = digest(current)
+        except FileNotFoundError:
+            current = None
+            current_sha = "absent"
+        if (not hmac.compare_digest(current_sha, expected_current_sha)
+                and (expected_current_sha == "absent" or not hmac.compare_digest(current_sha, manifest.runner_sha256))):
+            raise UpdateError("installed runner changed during update; retry with the current release")
+        mode = 0o755
+        if current is not None:
+            previous_version = runner_version(current)
+            if tuple(map(int, manifest.version.split("."))) < tuple(map(int, previous_version.split("."))):
+                raise UpdateError("refusing to downgrade the installed runner")
+            mode = stat.S_IMODE(installed.stat().st_mode)
+        daemon_expected = daemon_pin(source)
+        daemon_data = None
+        daemon_target = None
+        if daemon_expected:
+            daemon_target = installed.with_name(installed.name + ".daemon." + daemon_expected + ".py")
+            daemon_path = daemon_source if daemon_source is not None else daemon_target
+            daemon_data = read_regular(daemon_path, 512 * 1024)
+            if not hmac.compare_digest(digest(daemon_data), daemon_expected):
+                raise UpdateError("release daemon checksum mismatch")
+            if daemon_target.is_symlink() or (daemon_target.exists() and not daemon_target.is_file()):
+                raise UpdateError("unsafe daemon installation path")
+        target = prepare_manifest(manifest, root, raw_base, allow_override=allow_override,
+                                  local_source=local_source, repair=True)
+        # Recheck after downloads: a non-cooperating older updater may not use
+        # our lock. Never overwrite a runner that changed while we prepared.
+        try:
+            final_current_sha = digest(read_regular(installed, MAX_RUNNER_BYTES))
+        except FileNotFoundError:
+            final_current_sha = "absent"
+        if not hmac.compare_digest(final_current_sha, current_sha):
+            raise UpdateError("installed runner changed during preparation; verified assets retained for retry")
+        if daemon_data is not None and daemon_target is not None:
+            publish_file(daemon_target, daemon_data, mode=0o644)
+        check_ready(target, manifest, complete=True)
+        if not hmac.compare_digest(current_sha, manifest.runner_sha256):
+            publish_file(installed, source, mode=mode)
+        return target
+
+
+def main() -> int:
+    try:
+        override = bool(os.environ.get("UBS_REPO_RAW_BASE"))
+        args = sys.argv[1:]
+        if not args:
+            raise UpdateError("expected a release generation command")
+        command = args.pop(0)
+        if command == "select-manifest" and len(args) >= 3:
+            root, version, *entries = args
+            result = select_manifest(manifest_from_arguments(version, entries), Path(root))
+        elif command in ("prepare-manifest", "repair-manifest") and len(args) >= 4:
+            root, version, base, *entries = args
+            local_source = None
+            if entries and entries[0].startswith("--local-source="):
+                local_source = Path(entries.pop(0).partition("=")[2])
+            result = prepare_manifest(manifest_from_arguments(version, entries), Path(root), base,
+                                      allow_override=override, local_source=local_source,
+                                      repair=command == "repair-manifest")
+        elif command == "publish" and 5 <= len(args) <= 7:
+            candidate, root, base, installed, expected, *optional = args
+            daemon = Path(optional[0]) if optional and optional[0] != "-" else None
+            local_source = Path(optional[1]) if len(optional) > 1 and optional[1] != "-" else None
+            result = publish(Path(candidate), Path(root), base, Path(installed), expected,
+                             allow_override=override, daemon_source=daemon, local_source=local_source)
+        elif command in ("prepare", "select") and 3 <= len(args) <= 4:
+            runner, root, base, *optional = args
+            if command == "prepare":
+                local_source = Path(optional[0]) if optional and optional[0] not in ("0", "1", "-") else None
+                result = prepare(Path(runner), Path(root), base, allow_override=override,
+                                 local_source=local_source)
+            else:
+                result = select(Path(runner), Path(root), base,
+                                migrate_legacy=bool(optional and optional[0] == "1"),
+                                allow_override=override)
+        else:
+            raise UpdateError("invalid release generation command or arguments")
+        print(result)
+        return 0
+    except (OSError, UnicodeError, UpdateError) as exc:
+        print(f"ubs: release assets could not be verified: {exc}; refusing to use a mixed installation", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+PYRELEASEGENERATION
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Self-update logic
 # ─────────────────────────────────────────────────────────────────────────────
 # Report a self-update failure. Forced updates (`ubs --update`) must surface
@@ -6768,9 +7613,11 @@ self_update_fetch(){
     proto="=https,http,file"
   fi
   if need_cmd curl; then
-    curl -fsSL --proto "$proto" --retry 2 --retry-delay 1 -o "$2" "$1" 2>/dev/null
+    curl -fsSL --proto "$proto" --proto-redir "$proto" --user-agent ultimate_bug_scanner-agent \
+      --connect-timeout 10 --max-time 30 --max-filesize 4194304 \
+      --retry 2 --retry-delay 1 -o "$2" -- "$1" 2>/dev/null
   elif need_cmd wget; then
-    wget -q -O "$2" "$1" 2>/dev/null
+    wget -q --timeout=30 --tries=3 --user-agent=ultimate_bug_scanner-agent -O "$2" -- "$1" 2>/dev/null
   else
     return 1
   fi
@@ -6823,16 +7670,26 @@ check_and_update_self(){
     self_update_fail "installed binary is not writable: $self_path (re-run with sufficient permissions)"
     return $?
   fi
+  if is_checkout_helper "$MODULE_CACHE_ROOT/contract.json"; then
+    self_update_fail "module directory is source, not an installed cache: $MODULE_CACHE_ROOT"
+    return $?
+  fi
+  # A peer may finish an update while downloads are in progress. The final
+  # locked publication compares this digest instead of overwriting its work.
+  local original_sha
+  if ! sha256_into original_sha "$self_path"; then
+    self_update_fail "cannot hash the installed runner: $SHA256_ERR"
+    return $?
+  fi
   # Self-update pulls from the latest *release* artifacts and verifies the
-  # payload against the release SHA256SUMS (plus its minisign signature when
-  # UBS_MINISIGN_PUBKEY is configured) before replacing this script.
+  # payload against an authenticated release SHA256SUMS before replacing this
+  # script. The default public key is embedded, so cron keeps this protection.
   # Issue #87: it previously fetched unpinned, unverified main.
   local release_base="${UBS_RELEASE_BASE:-https://github.com/Dicklesworthstone/ultimate_bug_scanner/releases/latest/download}"
-  # An override supplies BOTH the payload and its SHA256SUMS, so the checksum
-  # gate alone cannot authenticate it. Never silent: warn loudly, and point at
-  # the one knob (minisign) that binds the manifest to a trusted key.
+  # A mirror supplies BOTH bytes and checksums. Only the independently trusted
+  # signing key authenticates them; a mirror never gets to choose that key.
   if [[ -n "${UBS_RELEASE_BASE:-}" ]]; then
-    say_err "${YELLOW}${WARN}${RESET} UBS_RELEASE_BASE override active: ${release_base} (checksums are fetched from the same base — set UBS_MINISIGN_PUBKEY to keep authenticity)"
+    say_err "${YELLOW}${WARN}${RESET} UBS_RELEASE_BASE override active: ${release_base} (release signature verification remains mandatory)"
   fi
   local last_check_file="${XDG_CACHE_HOME:-$HOME/.cache}/ubs/last_update_check"
   ensure_dir "$(dirname "$last_check_file")"
@@ -6874,29 +7731,36 @@ check_and_update_self(){
     return $?
   fi
 
-  # 2. Verify the manifest signature when a minisign public key is configured.
-  if [[ -n "${UBS_MINISIGN_PUBKEY:-}" ]]; then
-    if ! need_cmd minisign; then
-      self_update_fail "UBS_MINISIGN_PUBKEY is set but minisign is not installed"
-      return $?
-    fi
-    local sig_file="$work_dir/SHA256SUMS.minisig"
-    if ! self_update_fetch "$release_base/SHA256SUMS.minisig" "$sig_file" || [[ ! -s "$sig_file" ]]; then
-      self_update_fail "could not download SHA256SUMS.minisig from $release_base"
-      return $?
-    fi
-    if ! minisign -Vm "$sums_file" -P "$UBS_MINISIGN_PUBKEY" -x "$sig_file" >/dev/null 2>&1; then
-      self_update_fail "minisign signature verification failed for SHA256SUMS"
-      return $?
-    fi
+  # 2. Authenticate before reading any runner-controlled inventory or executing
+  # anything downloaded. No signature failure falls back to bare checksums.
+  local public_key="${UBS_MINISIGN_PUBKEY:-$UBS_RELEASE_PUBKEY}"
+  if ! need_cmd minisign; then
+    self_update_fail "minisign is required to authenticate releases; install minisign and retry (the current installation is unchanged)"
+    return $?
+  fi
+  local sig_file="$work_dir/SHA256SUMS.minisig"
+  if ! self_update_fetch "$release_base/SHA256SUMS.minisig" "$sig_file" || [[ ! -s "$sig_file" ]]; then
+    self_update_fail "could not download SHA256SUMS.minisig from $release_base"
+    return $?
+  fi
+  if ! minisign -Vm "$sums_file" -P "$public_key" -x "$sig_file" >/dev/null 2>&1; then
+    self_update_fail "minisign signature verification failed for SHA256SUMS"
+    return $?
   fi
 
   local expected_sum
-  expected_sum="$(grep -E "  ubs$" "$sums_file" | head -n1 | awk '{print $1}')"
-  if [[ -z "$expected_sum" ]]; then
-    self_update_fail "no entry for 'ubs' in release SHA256SUMS"
+  expected_sum="$(LC_ALL=C awk '
+    { sub(/\r$/, "") }
+    $2 == "ubs" || $2 == "*ubs" || $2 == "./ubs" || $2 == "*./ubs" {
+      count++
+      if (NF != 2 || length($1) != 64 || $1 ~ /[^[:xdigit:]]/) bad = 1
+      digest = tolower($1)
+    }
+    END { if (count != 1 || bad) exit 1; print digest }
+  ' "$sums_file")" || {
+    self_update_fail "missing, malformed or duplicate ubs checksum in release SHA256SUMS"
     return $?
-  fi
+  }
 
   # 3. Fetch the release ubs payload and verify it against the manifest.
   local new_self="$work_dir/ubs"
@@ -6915,20 +7779,25 @@ check_and_update_self(){
   fi
 
   local remote_version
-  remote_version=$(grep -oE 'UBS_VERSION="[0-9.]+"' "$new_self" | head -n1 | cut -d'"' -f2)
-  if [[ -z "$remote_version" ]]; then
+  remote_version="$(awk '/^UBS_VERSION=/ { count++; value=$0 }
+    END { if (count != 1) exit 1; print value }' "$new_self")" || remote_version=""
+  if [[ ! "$remote_version" =~ ^UBS_VERSION=\"([0-9]+\.[0-9]+\.[0-9]+)\"$ ]]; then
     self_update_fail "could not parse UBS_VERSION from downloaded release"
     return $?
   fi
+  remote_version="${BASH_REMATCH[1]}"
 
-  if [[ "$remote_version" != "$UBS_VERSION" ]]; then
+  # Even the same version must leave all dependencies verified. This repairs
+  # installations already stranded by an older runner-only updater.
+  if [[ -n "$remote_version" ]]; then
     if [[ "${QUIET:-0}" -eq 0 ]]; then
       say_err "${BLUE}${INFO}${RESET} Updating ubs from ${UBS_VERSION} to ${remote_version} (verified release)..."
     fi
 
-    # Publish the matching service first, retaining the old generation if
-    # fetching, verification or publication of either payload fails.
-    local daemon_declaration daemon_expected daemon_manifest daemon_actual daemon_target daemon_stage
+    # Authenticate the companion too, but publish neither executable until
+    # the complete target module generation has been prepared and verified.
+    local daemon_declaration daemon_expected daemon_manifest daemon_actual
+    local daemon_source="-"
     daemon_declaration="$(awk '/^UBS_DAEMON_SHA256=/ { count++; value=$0 }
       END { if (count > 1) exit 1; print value }' "$new_self")" || {
       self_update_fail "ambiguous daemon checksum in release"; return $?;
@@ -6959,58 +7828,26 @@ check_and_update_self(){
       if [[ "$daemon_actual" != "$daemon_expected" || $(wc -c < "$work_dir/ubs-daemon") -gt 524288 ]]; then
         self_update_fail "release daemon checksum or size mismatch"; return $?
       fi
-      daemon_target="${self_path}.daemon.${daemon_expected}.py"
-      if [[ -L "$daemon_target" || ( -e "$daemon_target" && ! -f "$daemon_target" ) ]]; then
-        self_update_fail "unsafe daemon installation path"; return $?
-      fi
-      if ! daemon_stage="$(mktemp "${self_path}.daemon.XXXXXX")"; then
-        self_update_fail "cannot stage release daemon"; return $?
-      fi
-      if ! cp "$work_dir/ubs-daemon" "$daemon_stage" || ! chmod 0644 "$daemon_stage" \
-          || ! mv -f -- "$daemon_stage" "$daemon_target"; then
-        ubs_remove_temp -f -- "$daemon_stage"
-        self_update_fail "cannot publish release daemon"; return $?
-      fi
+      daemon_source="$work_dir/ubs-daemon"
     fi
 
-    # Stage next to the target so the final mv is atomic (same filesystem).
-    local tmp_self
-    if ! tmp_self="$(mktemp "${self_path}.XXXXXX" 2>/dev/null)"; then
-      self_update_fail "cannot stage update next to $self_path (directory not writable?)"
-      return $?
-    fi
-    if ! cp "$new_self" "$tmp_self" 2>/dev/null; then
-      ubs_remove_temp -f "$tmp_self"
-      self_update_fail "failed to stage verified update"
-      return $?
-    fi
-    # Preserve the installed mode (default 0755) on the staged copy, and
-    # fail closed if it cannot be set: mktemp creates the file 0600, and a
-    # bare `chmod +x` under umask 022 yields 0711 — atomically mv'ing a
-    # non-readable file over the install breaks every non-owner caller
-    # (shell scripts need read permission to execute).
-    local install_mode
-    install_mode="$(stat -c '%a' "$self_path" 2>/dev/null || stat -f '%OLp' "$self_path" 2>/dev/null)" || install_mode=""
-    [[ "$install_mode" =~ ^[0-7]{3,4}$ ]] || install_mode=755
-    if ! chmod "$install_mode" "$tmp_self" 2>/dev/null; then
-      ubs_remove_temp -f "$tmp_self"
-      self_update_fail "failed to set mode $install_mode on staged update"
-      return $?
-    fi
-
-    # Move over current script
-    if mv "$tmp_self" "$self_path"; then
+    # The embedded helper reads candidate metadata as data. It serializes
+    # writers, checks the old runner digest, verifies every target asset in
+    # private staging, publishes the complete generation, and replaces the
+    # runner LAST with an atomic rename. Scans keep their loaded generation.
+    if release_generation publish "$new_self" "$MODULE_CACHE_ROOT" "$REPO_RAW_BASE" \
+        "$self_path" "$original_sha" "$daemon_source" >/dev/null; then
       if [[ "${QUIET:-0}" -eq 0 ]]; then
-        say_err "${GREEN}${CHECK}${RESET} Updated successfully."
+        say_err "${GREEN}${CHECK}${RESET} Updated successfully; runner and cached dependencies verified."
       fi
       # Update check timestamp
-      date +%s > "$last_check_file"
+      date +%s > "$last_check_file" 2>/dev/null || true
       # `ubs --update` asked for nothing beyond the update: it is done, and
       # the caller reports success and exits 0 (the RETURN trap cleans up).
       # Re-exec'ing here used to start the new binary with an empty argv
       # (parsing had consumed "$@"), which ran a full scan of the working
       # directory and returned the scan's exit code instead of the update's.
-      if [[ "${UPDATE_ONLY:-0}" -eq 1 ]]; then
+      if [[ "${UPDATE_ONLY:-0}" -eq 1 || "$actual_sum" == "$original_sha" ]]; then
         return 0
       fi
       # Clean up staged artifacts now: exec replaces the process, so the
@@ -7021,25 +7858,51 @@ check_and_update_self(){
       # original command line to the new version.
       exec "$self_path" ${UBS_ORIGINAL_ARGS[@]+"${UBS_ORIGINAL_ARGS[@]}"}
     else
-      ubs_remove_temp -f "$tmp_self"
-      self_update_fail "failed to replace $self_path"
+      self_update_fail "could not confirm publication of a complete verified release; retry after resolving the reported failure"
       return $?
     fi
-  else
-    if [[ "${FORCE_SELF_UPDATE:-0}" -eq 1 && "${QUIET:-0}" -eq 0 ]]; then
-      say_err "${GREEN}${CHECK}${RESET} Already up to date (v${UBS_VERSION})."
-    fi
-    # Update check timestamp even if no update found
-    date +%s > "$last_check_file"
   fi
 }
 
 finalize_module_dir
+MODULE_CACHE_ROOT="$MODULE_DIR"
 : # git metadata is computed lazily via ensure_git_metadata (bead C3)
 
+if [[ -n "$PREPARE_RELEASE_CACHE" ]]; then
+  # Only an installer which has already authenticated this candidate invokes
+  # this interface. It does not fetch a runner or execute downloaded assets.
+  _release_self="$(script_path)"
+  if [[ -n "$RELEASE_PUBLISH_TARGET" ]]; then
+    [[ -n "$RELEASE_EXPECTED_SHA" ]] || { say_err 'ERROR: --expected-runner-sha is required for publication'; exit 2; }
+    release_generation publish "$_release_self" "$PREPARE_RELEASE_CACHE" "$REPO_RAW_BASE" \
+      "$RELEASE_PUBLISH_TARGET" "$RELEASE_EXPECTED_SHA" "$RELEASE_DAEMON_SOURCE" "${RELEASE_LOCAL_SOURCE:--}"
+  else
+    release_generation prepare "$_release_self" "$PREPARE_RELEASE_CACHE" "$REPO_RAW_BASE" "${RELEASE_LOCAL_SOURCE:--}"
+  fi
+  exit $?
+fi
+if [[ -n "$RELEASE_LOCAL_SOURCE$RELEASE_PUBLISH_TARGET$RELEASE_EXPECTED_SHA" || "$RELEASE_DAEMON_SOURCE" != "-" ]]; then
+  say_err 'ERROR: release transaction options require --prepare-release-cache'
+  exit 2
+fi
+
 if [[ "$MODE" == "doctor" ]]; then
+  if [[ "$DOCTOR_FIX" -eq 1 && ! -e "$(script_dir)/.git" ]] \
+      && ! is_checkout_helper "$MODULE_CACHE_ROOT/contract.json"; then
+    # Explicit repair can replace damaged bytes, but only after the entire
+    # replacement has verified. Keep a legacy cache usable by older scans.
+    prepare_current_release_generation repair-manifest || exit 2
+  else
+    select_release_generation || exit 2
+  fi
   run_doctor "$DOCTOR_FIX" "$DOCTOR_FORMAT"
   exit $?
+fi
+if [[ "$MODE" == "explain" ]]; then
+  select_release_generation || exit 2
+  _explain_rc=0
+  explain_rule "${EXPLAIN_ARGS[@]}" || _explain_rc=$?
+  exit "$_explain_rc"
 fi
 
 # Run auto-update before main logic. `ubs --update` must exit nonzero when
@@ -7065,6 +7928,7 @@ fi
 # Execution / aggregation
 # ─────────────────────────────────────────────────────────────────────────────
 ensure_tmpdir_run
+select_release_generation || exit 2
 # Unlike the best-effort file listing, integrity failures must not be swallowed
 # by a conditional/|| true. Informational modes have already returned above.
 ensure_detection_contract || exit 2
@@ -8158,7 +9022,7 @@ postprocess_module(){
     --sarif "$sarif" --findings "$findings" --metrics-dir "$metrics" --workspace "$ws" \
     --source "$proj" --single-file "${SINGLE_FILE_TARGET:-}" --timestamp "$(date_iso)" --project "$proj" \
     --no-suppress "$no_suppress" --blob-base "${GIT_BLOB_BASE:-}" --toplevel "${GIT_TOPLEVEL:-}" \
-    --helpers-dir "${UBS_HELPERS_DIR:-$(dirname "${BASH_SOURCE[0]}")/modules/helpers}" \
+    --helpers-dir "${UBS_HELPERS_DIR:-$(runtime_helpers_dir)}" \
     --mirror-map "$WORKSPACE_MIRROR_MAP" --require-marker "$require_marker"
 }
 
@@ -8272,7 +9136,9 @@ run_lang(){
   export UBS_CONTRACT_V2_CSHARP="${UBS_CONTRACT_V2_CSHARP:-${UBS_CONTRACT_V2:-1}}"
   export UBS_CONTRACT_V2_ELIXIR="${UBS_CONTRACT_V2_ELIXIR:-${UBS_CONTRACT_V2:-1}}"
   local verified_dir=""
-  if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
+  if [[ "$MODULE_GENERATION_ACTIVE" -eq 1 ]]; then
+    verified_dir="$MODULE_DIR"
+  elif [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
     verified_dir="$UBS_VERIFIED_ASSET_DIR"
   elif [[ "${HELPERS_READY:-0}" -eq 1 && -n "${MODULE_DIR:-}" && -d "$MODULE_DIR" ]]; then
     verified_dir="$MODULE_DIR"
@@ -8718,8 +9584,7 @@ generate_combined_json(){
   # modules still on the per-category summary schema.
   # Checkout modules take precedence over the installed cache, just as in
   # resolve_module_path. A split installation has no runner-adjacent modules.
-  local helpers_dir; helpers_dir="$(script_dir)/modules/helpers"
-  [[ -d "$helpers_dir/ubs_core" ]] || helpers_dir="$MODULE_DIR/helpers"
+  local helpers_dir; helpers_dir="$(runtime_helpers_dir)"
   if [[ -d "$helpers_dir/ubs_core" ]]; then
     local need_findings_merge=0
     if [[ "$FORMAT" == "json" || "$FORMAT" == "jsonl" || "$FORMAT" == "sarif" || "$FORMAT" == "toon" ]]; then
@@ -8777,8 +9642,7 @@ emit_combined_json(){
 }
 
 emit_combined_sarif(){
-  local helpers_dir; helpers_dir="$(script_dir)/modules/helpers"
-  [[ -d "$helpers_dir/ubs_core" ]] || helpers_dir="$MODULE_DIR/helpers"
+  local helpers_dir; helpers_dir="$(runtime_helpers_dir)"
   if [[ -d "$helpers_dir/ubs_core" ]] && need_cmd python3; then
     local proj_real top_real
     proj_real="$(cd "$SOURCE_PROJECT_DIR" 2>/dev/null && pwd -P)" || proj_real="$SOURCE_PROJECT_DIR"
@@ -8897,8 +9761,7 @@ write_jsonl_summary(){
   if ! generate_combined_json; then return 1; fi
   local tmp="$TMPDIR_RUN/combined.jsonl"
   if [[ "${ALL_OCCURRENCES:-0}" -eq 1 ]]; then
-    local helpers_dir; helpers_dir="$(script_dir)/modules/helpers"
-    [[ -d "$helpers_dir/ubs_core" ]] || helpers_dir="$MODULE_DIR/helpers"
+    local helpers_dir; helpers_dir="$(runtime_helpers_dir)"
     local -a occurrence_opts=(--combined "$COMBINED_JSON_FILE" --output "$tmp"
       --tmp-dir "$TMPDIR_RUN"
       --project-dir "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}"
@@ -9328,8 +10191,7 @@ fi
 # scan can exceed 300s too. The same costs drive dispatch order and time bounds.
 declare -A MODULE_TIMEOUTS=()
 if need_cmd python3; then
-  _sched_hdir="$(dirname "${BASH_SOURCE[0]}")/modules/helpers"
-  [[ ! -d "$_sched_hdir" && -d "${MODULE_DIR:-}/helpers" ]] && _sched_hdir="${MODULE_DIR:-}/helpers"
+  _sched_hdir="$(runtime_helpers_dir)"
   _sched_langs="$(IFS=,; echo "${langs[*]}")"
   _ordered_json="$(PYTHONPATH="$_sched_hdir${PYTHONPATH:+:$_sched_hdir}" python3 -m ubs_core.scheduler order \
     --langs "$_sched_langs" --files-dir "$TMPDIR_RUN" --slots "$NUM_SLOTS" 2>/dev/null || true)"
@@ -9442,8 +10304,7 @@ PROFILE_FANOUT_MS=$(( $(now_ms) - _profile_fanout_t0 ))
 
 # Calculate and record per-slot utilization (bead C5)
 if need_cmd python3; then
-  _sched_hdir="$(dirname "${BASH_SOURCE[0]}")/modules/helpers"
-  [[ ! -d "$_sched_hdir" && -d "${MODULE_DIR:-}/helpers" ]] && _sched_hdir="${MODULE_DIR:-}/helpers"
+  _sched_hdir="$(runtime_helpers_dir)"
   _busy_joined="$(IFS=,; echo "${SLOT_BUSY_MS[*]}")"
   PYTHONPATH="$_sched_hdir${PYTHONPATH:+:$_sched_hdir}" python3 -m ubs_core.scheduler profile \
     --busy-ms "$_busy_joined" --makespan "$PROFILE_FANOUT_MS" --slots "$NUM_SLOTS" >"$TMPDIR_RUN/slots.profile" 2>/dev/null || true

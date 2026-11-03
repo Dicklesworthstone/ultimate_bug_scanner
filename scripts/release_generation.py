@@ -36,6 +36,7 @@ except ImportError:
 
 MAX_ASSET_BYTES = 32 * 1024 * 1024
 MAX_RUNNER_BYTES = 4 * 1024 * 1024
+MAX_DAEMON_BYTES = 512 * 1024
 GENERATION_DIRECTORY = ".ubs-releases"
 READY_FILE = ".ubs-ready.json"
 USER_AGENT = "ultimate_bug_scanner-agent"
@@ -310,7 +311,7 @@ def check_parents(root: Path, relative: str) -> Path:
     return root / relative
 
 
-def read_cached_asset(root: Path, relative: str) -> bytes:
+def read_cached_asset(root: Path, relative: str, limit: int = MAX_ASSET_BYTES) -> bytes:
     """Read cache bytes without admitting a changed or symlinked source tree.
 
     Cache contents are only candidates: the caller must still authenticate
@@ -330,7 +331,7 @@ def read_cached_asset(root: Path, relative: str) -> bytes:
                 or (not OPEN_NOFOLLOW and not info.st_ino)):
             raise UpdateError(f"unsafe cached asset directory: {parent}")
         identities.append((parent, info))
-    data = read_regular(root / relative)
+    data = read_regular(root / relative, limit)
     for parent, before in identities:
         after = parent.lstat()
         if (not stat.S_ISDIR(after.st_mode) or is_reparse(after)
@@ -495,7 +496,8 @@ def write_verified(path: Path, data: bytes, expected: str, *, executable: bool) 
         os.fsync(stream.fileno())
 
 
-def download(url: str, destination: Path, *, allow_override: bool) -> bytes:
+def download(url: str, destination: Path, *, allow_override: bool,
+             max_bytes: int = MAX_ASSET_BYTES) -> bytes:
     proto = "=https,http,file" if allow_override else "=https"
     if not allow_override and not url.startswith("https://"):
         raise UpdateError("non-HTTPS asset source requires UBS_REPO_RAW_BASE")
@@ -505,7 +507,7 @@ def download(url: str, destination: Path, *, allow_override: bool) -> bytes:
                 ["curl", "-fsSL", "--proto", proto, "--proto-redir", proto,
                  "--user-agent", USER_AGENT,
                  "--connect-timeout", "10", "--max-time", "30", "--max-filesize",
-                 str(MAX_ASSET_BYTES), "--retry", "2", "--retry-delay", "1",
+                 str(max_bytes), "--retry", "2", "--retry-delay", "1",
                  "-o", str(destination), "--", url],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE, check=False, timeout=100)
@@ -522,7 +524,7 @@ def download(url: str, destination: Path, *, allow_override: bool) -> bytes:
         raise UpdateError(f"could not fetch {url}: {exc}") from exc
     if result.returncode:
         raise UpdateError(f"could not fetch {url} (exit {result.returncode})")
-    return read_regular(destination)
+    return read_regular(destination, max_bytes)
 
 
 @contextlib.contextmanager
@@ -762,6 +764,108 @@ def publish_file(destination: Path, data: bytes, *, mode: int) -> None:
             stage.unlink()
 
 
+def daemon_target(installed: Path, expected: str) -> Path:
+    if not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise UpdateError("invalid loaded daemon checksum")
+    return installed.with_name(installed.name + ".daemon." + expected + ".py")
+
+
+def check_daemon(installed: Path, expected: str) -> Path:
+    """Verify exactly the companion the service loader will select, without imports.
+
+    The checksum comes from the already-running shell, never a reopened runner.
+    A present but damaged digest-named sidecar cannot authorize falling back to
+    a healthy adjacent source file; normal service startup refuses that case.
+    """
+    installed = installed.absolute()
+    target = daemon_target(installed, expected)
+    try:
+        target.lstat()
+    except FileNotFoundError:
+        target = installed.with_name("ubs-daemon")
+    data = read_cached_asset(installed.parent, target.name, MAX_DAEMON_BYTES)
+    if not hmac.compare_digest(digest(data), expected):
+        raise UpdateError(f"daemon companion checksum mismatch: {target}")
+    return target
+
+
+def require_installed_daemon_repair(installed: Path) -> None:
+    """Do not overwrite or shadow a source/exported checkout's companion.
+
+    The shell additionally rejects Git-tracked runners and companions, even
+    when they live below a checkout root. These adjacent markers cover source
+    exports without Git as well, before creating any lock or staging files.
+    """
+    real_directory(installed.parent)
+    for name in (".git", "modules"):
+        marker = installed.parent / name
+        try:
+            marker.lstat()
+        except FileNotFoundError:
+            continue
+        raise UpdateError("source-owned daemon companion cannot be automatically repaired")
+
+
+def require_safe_daemon_target(target: Path) -> None:
+    try:
+        info = target.lstat()
+    except FileNotFoundError:
+        return
+    require_regular(info, target)
+
+
+def repair_daemon(installed: Path, version: str, expected: str, raw_base: str, *,
+                  allow_override: bool) -> Path:
+    """Repair only the loaded release's installed companion, under its update lock.
+
+    The installed runner is reread only as a compare-and-swap lease. It cannot
+    supply a new trusted pin or version. All bytes are authenticated before an
+    atomic replacement on the destination filesystem; adjacent source bytes,
+    old companions and the runner itself are never replaced by this repair.
+    """
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+        raise UpdateError("invalid loaded runner version")
+    installed = installed.absolute()
+    target = daemon_target(installed, expected)
+    require_installed_daemon_repair(installed)
+    with publication_lock(installed):
+        require_installed_daemon_repair(installed)
+        current = read_regular(installed, MAX_RUNNER_BYTES)
+        if (runner_version(current) != version
+                or not hmac.compare_digest(daemon_pin(current), expected)):
+            raise UpdateError("installed runner no longer matches the loaded release; retry doctor")
+        current_sha = digest(current)
+        try:
+            return check_daemon(installed, expected)
+        except (OSError, UpdateError):
+            pass
+        require_safe_daemon_target(target)
+        data = None
+        try:
+            adjacent = read_cached_asset(installed.parent, "ubs-daemon", MAX_DAEMON_BYTES)
+        except (OSError, UpdateError):
+            pass
+        else:
+            if hmac.compare_digest(digest(adjacent), expected):
+                data = adjacent
+        if data is None:
+            # This directory is private and owned solely by this invocation.
+            # No candidate code is imported or executed, even for diagnosis.
+            with tempfile.TemporaryDirectory(prefix="." + installed.name + ".daemon-repair-",
+                                             dir=installed.parent) as temporary:
+                url = f"{raw_base.rstrip('/')}/v{version}/ubs-daemon"
+                data = download(url, Path(temporary) / "companion", allow_override=allow_override,
+                                max_bytes=MAX_DAEMON_BYTES)
+                if not hmac.compare_digest(digest(data), expected):
+                    raise UpdateError("downloaded daemon companion checksum mismatch")
+        if not hmac.compare_digest(digest(read_regular(installed, MAX_RUNNER_BYTES)), current_sha):
+            raise UpdateError("installed runner changed during daemon repair; retry doctor")
+        require_installed_daemon_repair(installed)
+        require_safe_daemon_target(target)
+        publish_file(target, data, mode=0o644)
+        return check_daemon(installed, expected)
+
+
 def publish(candidate: Path, root: Path, raw_base: str, installed: Path,
             expected_current_sha: str, *, allow_override: bool,
             daemon_source: Optional[Path] = None, local_source: Optional[Path] = None) -> Path:
@@ -815,7 +919,7 @@ def publish(candidate: Path, root: Path, raw_base: str, installed: Path,
         if daemon_expected:
             daemon_target = installed.with_name(installed.name + ".daemon." + daemon_expected + ".py")
             daemon_path = daemon_source if daemon_source is not None else daemon_target
-            daemon_data = read_regular(daemon_path, 512 * 1024)
+            daemon_data = read_regular(daemon_path, MAX_DAEMON_BYTES)
             if not hmac.compare_digest(digest(daemon_data), daemon_expected):
                 raise UpdateError("release daemon checksum mismatch")
             if daemon_target.is_symlink() or (daemon_target.exists() and not daemon_target.is_file()):
@@ -849,6 +953,12 @@ def main() -> int:
         if command == "select-manifest" and len(args) >= 3:
             root, version, *entries = args
             result = select_manifest(manifest_from_arguments(version, entries), Path(root))
+        elif command == "check-daemon" and len(args) == 2:
+            installed, expected = args
+            result = check_daemon(Path(installed), expected)
+        elif command == "repair-daemon" and len(args) == 4:
+            installed, version, expected, base = args
+            result = repair_daemon(Path(installed), version, expected, base, allow_override=override)
         elif command == "snapshot-helpers" and len(args) >= 4:
             source, destination, version, *entries = args
             result = snapshot_helpers(manifest_from_arguments(version, entries),

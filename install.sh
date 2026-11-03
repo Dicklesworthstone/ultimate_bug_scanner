@@ -3348,13 +3348,12 @@ determine_install_dir() {
   fi
 }
 
-install_scanner_daemon() {
+stage_scanner_daemon() {
   # The selected runner supplies the literal companion digest. Do not execute
   # either payload to inspect its release metadata.
-  local runner="$1" local_source="$2" script_path="$3" use_sudo="$4" source_base="$5"
-  local prepare_only="${6:-0}"
+  local runner="$1" local_source="$2" source_base="$3"
   SCANNER_DAEMON_STAGED=""
-  local declaration expected actual source staged target temporary
+  local declaration expected actual source staged
   declaration="$(awk '/^UBS_DAEMON_SHA256=/ { count++; value=$0 }
     END { if (count > 1) exit 1; print value }' "$runner")" || {
     error "Ambiguous daemon checksum in selected runner"; return 1;
@@ -3389,20 +3388,6 @@ install_scanner_daemon() {
     error "Daemon checksum or size mismatch; installed runner remains unchanged"; return 1
   fi
   SCANNER_DAEMON_STAGED="$staged"
-  # Generation-capable runners publish this companion and the complete cache
-  # under the same installation lock, replacing the runner last.
-  [[ "$prepare_only" -eq 1 ]] && return 0
-  target="${script_path}.daemon.${expected}.py"
-  if [[ -L "$target" || ( -e "$target" && ! -f "$target" ) ]]; then
-    error "Refusing an unsafe daemon installation path: $target"; return 1
-  fi
-  temporary="$($use_sudo mktemp "${script_path}.daemon.XXXXXX")" || return 1
-  if ! $use_sudo install -m 0644 "$staged" "$temporary" \
-      || ! $use_sudo mv -f -- "$temporary" "$target"; then
-    $use_sudo rm -f -- "$temporary"
-    error "Could not publish verified daemon; installed runner remains unchanged"; return 1
-  fi
-  success "Installed checksum-pinned scan service"
 }
 
 install_scanner() {
@@ -3576,43 +3561,32 @@ install_scanner() {
 
   local generation_declaration
   generation_declaration="$(awk '/^UBS_RELEASE_GENERATIONS=/ { count++; value=$0 }
-    END { if (count > 1) exit 1; print value }' "$temp_path")" || {
-    error "Ambiguous release generation declaration in selected runner"; return 1;
+    END { if (count != 1) exit 1; print value }' "$temp_path")" || {
+    error "Target runner does not support verified cache publication; select a transaction-capable release or the current source checkout"
+    return 1
   }
-  if [[ -n "$generation_declaration" ]]; then
-    if [[ "$generation_declaration" != "UBS_RELEASE_GENERATIONS=1" ]]; then
-      error "Unsupported release generation protocol in selected runner"; return 1
-    fi
-    # The authenticated candidate owns the asset manifest. Prepare every
-    # pinned dependency before changing an installed runner, even when the
-    # optional post-install doctor is disabled. The shared publisher also
-    # excludes self-updates and detects a concurrent change to this target.
-    install_scanner_daemon "$temp_path" "$local_source" "$script_path" "$use_sudo" "$daemon_source_base" 1 || return 1
-    local module_root="${XDG_DATA_HOME:-$HOME/.local/share}/ubs/modules"
-    local -a release_args=("--prepare-release-cache=$module_root"
-      "--publish-release=$script_path" "--expected-runner-sha=$expected_runner_sha")
-    if [[ -n "$SCANNER_DAEMON_STAGED" ]]; then
-      release_args+=("--release-daemon=$SCANNER_DAEMON_STAGED")
-    fi
-    if [[ -n "$local_source" && -d "$(dirname "$local_source")/modules" ]]; then
-      release_args+=("--release-source=$(dirname "$local_source")/modules")
-    fi
-    log "Preparing and verifying the complete module cache before publication..."
-    if ! $use_sudo env UBS_NO_AUTO_UPDATE=1 "$BASH" "$temp_path" "${release_args[@]}"; then
-      error "Release preparation failed; previous runner and module cache remain available"
-      return 1
-    fi
-  else
-    # An explicitly selected historical release predates generation support.
-    install_scanner_daemon "$temp_path" "$local_source" "$script_path" "$use_sudo" "$daemon_source_base" || return 1
-    local runner_stage
-    runner_stage="$($use_sudo mktemp "${script_path}.install.XXXXXX")" || return 1
-    if ! $use_sudo install -m 0755 "$temp_path" "$runner_stage" \
-        || ! $use_sudo mv -f -- "$runner_stage" "$script_path"; then
-      $use_sudo rm -f -- "$runner_stage"
-      error "Could not publish runner; previous installation remains unchanged"
-      return 1
-    fi
+  if [[ "$generation_declaration" != "UBS_RELEASE_GENERATIONS=1" ]]; then
+    error "Target runner does not support verified cache publication; select a supported release generation protocol"
+    return 1
+  fi
+  # Every target must prepare its complete pinned runtime. A fresh executable
+  # path can still share an older cache; neither --local, --insecure nor
+  # --skip-doctor makes a runner-only installation safe. The shared publisher
+  # serializes self-updates and checks the captured runner lease before commit.
+  stage_scanner_daemon "$temp_path" "$local_source" "$daemon_source_base" || return 1
+  local module_root="${XDG_DATA_HOME:-$HOME/.local/share}/ubs/modules"
+  local -a release_args=("--prepare-release-cache=$module_root"
+    "--publish-release=$script_path" "--expected-runner-sha=$expected_runner_sha")
+  if [[ -n "$SCANNER_DAEMON_STAGED" ]]; then
+    release_args+=("--release-daemon=$SCANNER_DAEMON_STAGED")
+  fi
+  if [[ -n "$local_source" && -d "$(dirname "$local_source")/modules" ]]; then
+    release_args+=("--release-source=$(dirname "$local_source")/modules")
+  fi
+  log "Preparing and verifying the complete module cache before publication..."
+  if ! $use_sudo env UBS_NO_AUTO_UPDATE=1 "$BASH" "$temp_path" "${release_args[@]}"; then
+    error "Release preparation failed; previous runner and module cache remain available"
+    return 1
   fi
 
   if [ -n "$use_sudo" ]; then

@@ -42,19 +42,39 @@ class InstallerPostVerifyTests(unittest.TestCase):
             flags.append('--skip-hooks')
         return flags
 
-    def prepare_installer(self, runner):
+    def prepare_installer(self, response='', *, smoke_exit=0):
         self.prepare_unsigned_update()
-        (self.bundle / 'ubs').write_text(runner)
+        runner_path = self.bundle / 'ubs'
+        runner = runner_path.read_text()
+        # Keep the real signed candidate, complete pins, and hidden publisher.
+        # These tests double only post-publication status responses; a marker
+        # on a fake runner must not stand in for preparing the actual runtime.
+        transaction_end = '''if [[ -n "$RELEASE_LOCAL_SOURCE$RELEASE_PUBLISH_TARGET$RELEASE_EXPECTED_SHA" || "$RELEASE_DAEMON_SOURCE" != "-" ]]; then
+  say_err 'ERROR: release transaction options require --prepare-release-cache'
+  exit 2
+fi
+'''
+        self.assertEqual(runner.count(transaction_end), 1,
+                         'Cannot locate the end of the real release transaction')
+        smoke_response = r'''
+# Fixture response for only install.sh's known smoke request. Other scans
+# retain the real scanner, and hidden release preparation exits above here.
+if [[ ${#UBS_ORIGINAL_ARGS[@]} -eq 4 \
+      && "${UBS_ORIGINAL_ARGS[0]:-}" == "--fail-on-warning" \
+      && "${UBS_ORIGINAL_ARGS[1]:-}" == "--ci" \
+      && "${UBS_ORIGINAL_ARGS[2]:-}" == "--only=js" \
+      && "${UBS_ORIGINAL_ARGS[3]:-}" == */ubs-smoke.* ]]; then
+  exit %d
+fi
+''' % smoke_exit
+        runner_path.write_text(runner.replace(
+            transaction_end, transaction_end + smoke_response + response + '\n', 1))
         self.env['UBS_INSTALLER_WORKDIR'] = str(self.root / 'work')
         self.sign()
 
     def test_failed_smoke_scan_is_not_reported_as_detection_success(self):
-        self.prepare_installer('''#!/usr/bin/env bash
-UBS_VERSION="''' + self.version + '''"
-case "${1:-}" in --help|-h|--version) exit 0 ;; esac
-exit 2
-''')
-        # The scanner protocol is the double in this status-handling test;
+        self.prepare_installer(smoke_exit=2)
+        # Only the smoke response is doubled in this status-handling test;
         # keep ast-grep available so the installer must actually run the smoke.
         ast_grep = self.bin / 'ast-grep'
         ast_grep.write_text('#!/usr/bin/env bash\necho "ast-grep 0.45.3"\n')
@@ -66,13 +86,11 @@ exit 2
         self.assertNotIn('INSTALLATION COMPLETE', result.stdout)
 
     def test_failed_cache_repair_cannot_print_installation_complete(self):
-        self.prepare_installer('''#!/usr/bin/env bash
-UBS_VERSION="''' + self.version + '''"
-if [[ "${1:-}" == doctor ]]; then
+        self.prepare_installer('''
+if [[ "$MODE" == doctor ]]; then
   printf '%s\\n' '{"status":"error","checks":[{"id":"helper:contract.json","status":"err","detail":"checksum mismatch"}]}'
   exit 2
 fi
-exit 0
 ''')
         result = self.run_verify('--artifact-dir', str(self.bundle), '--',
                                  *self.install_flags(self.home / 'installed', doctor=True), expected=1)
@@ -80,13 +98,11 @@ exit 0
         self.assertNotIn('INSTALLATION COMPLETE', result.stdout)
 
     def test_explicitly_skipped_optional_dependency_remains_a_warning(self):
-        self.prepare_installer('''#!/usr/bin/env bash
-UBS_VERSION="''' + self.version + '''"
-if [[ "${1:-}" == doctor ]]; then
+        self.prepare_installer('''
+if [[ "$MODE" == doctor ]]; then
   printf '%s\\n' '{"status":"error","checks":[{"id":"ast-grep","status":"err","detail":"not installed"}]}'
   exit 2
 fi
-exit 0
 ''')
         result = self.run_verify('--artifact-dir', str(self.bundle), '--',
                                  *self.install_flags(self.home / 'installed', doctor=True))
@@ -95,10 +111,9 @@ exit 0
 
     def test_cron_executes_with_trust_and_cache_configuration_and_replaces_legacy_job(self):
         log = self.root / 'cron-executed.json'
-        runner = '''#!/usr/bin/env bash
-UBS_VERSION="''' + self.version + '''"
-if [[ "${1:-}" == --update ]]; then
-  python3 - "$BASH" "$@" <<'PY'
+        response = '''
+if [[ "${UBS_ORIGINAL_ARGS[0]:-}" == --update ]]; then
+  python3 -I -S - "$BASH" "${UBS_ORIGINAL_ARGS[@]}" <<'PY'
 import json, os, pathlib, sys
 pathlib.Path(''' + repr(str(log)) + ''').write_text(json.dumps({
     'args': sys.argv[2:], 'bash': sys.argv[1],
@@ -107,10 +122,10 @@ pathlib.Path(''' + repr(str(log)) + ''').write_text(json.dumps({
     'cache': os.environ.get('XDG_CACHE_HOME'),
     'source': os.environ.get('UBS_RELEASE_BASE')}))
 PY
+  exit 0
 fi
-exit 0
 '''
-        self.prepare_installer(runner)
+        self.prepare_installer(response)
         destination = self.home / "bin'quoted%dir"
         data = self.home / 'data with spaces'
         data.mkdir()
@@ -166,7 +181,7 @@ esac
         self.assertFalse((self.project / 'should-not-exist').exists())
 
     def test_post_install_checks_run_the_installed_binary(self):
-        self.prepare_unsigned_update()
+        self.prepare_installer()
         stale_dir = self.root / 'stale-bin'
         stale_dir.mkdir()
         stale = stale_dir / 'ubs'

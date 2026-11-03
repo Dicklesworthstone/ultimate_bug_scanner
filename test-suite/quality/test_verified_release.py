@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -120,7 +121,11 @@ class VerifiedReleaseTests(unittest.TestCase):
             target.write_text(content)
             target.chmod(0o755)
         (self.bundle / 'install.sh').write_text(INSTALLER)
-        (self.bundle / 'ubs').write_text(f'#!/usr/bin/env bash\nUBS_VERSION="{self.version}"\nexit 0\n')
+        # This scanner belongs to the verifier-only installer protocol double.
+        # Every test that publishes a real runner replaces it with ROOT / 'ubs'.
+        (self.bundle / 'ubs').write_text(
+            f'#!/usr/bin/env bash\nUBS_VERSION="{self.version}"\n'
+            'UBS_RELEASE_GENERATIONS=1\nexit 0\n')
         (self.bundle / 'git_safety_guard.py').write_text('#!/usr/bin/env python3\nraise SystemExit(0)\n')
         (self.bundle / 'ubs-daemon').write_bytes((ROOT / 'ubs-daemon').read_bytes())
         self.sign()
@@ -232,7 +237,9 @@ class VerifiedReleaseTests(unittest.TestCase):
         for verifier in ('cosign', 'minisign'):
             with self.subTest(verifier=verifier):
                 self.env.update(UBS_VERIFY_WITH=verifier, UBS_MINISIGN_PUBKEY='test-public-key')
-                (self.bundle / 'ubs').write_text('#!/usr/bin/env bash\nUBS_VERSION="0.0.1"\nexit 0\n')
+                (self.bundle / 'ubs').write_text(
+                    '#!/usr/bin/env bash\nUBS_VERSION="0.0.1"\n'
+                    'UBS_RELEASE_GENERATIONS=1\nexit 0\n')
                 self.sign()
                 self.run_verify(expected=1)
                 self.assert_not_executed()
@@ -277,10 +284,44 @@ class VerifiedReleaseTests(unittest.TestCase):
 
     def test_cli_version_updates_identity_without_discarding_custom_mirror(self):
         self.version = '99.1.0-rc.2'
-        (self.bundle / 'ubs').write_text(f'#!/usr/bin/env bash\nUBS_VERSION="{self.version}"\nexit 0\n')
+        (self.bundle / 'ubs').write_text(
+            f'#!/usr/bin/env bash\nUBS_VERSION="{self.version}"\n'
+            'UBS_RELEASE_GENERATIONS=1\nexit 0\n')
         self.sign()
         self.run_verify('--version', 'v' + self.version)
         self.assertEqual(self.execution()['base'], self.env['UBS_ARTIFACT_BASE'])
+
+    def test_installation_requires_one_supported_generation_declaration(self):
+        declarations = (
+            '',
+            'UBS_RELEASE_GENERATIONS=0\n',
+            'UBS_RELEASE_GENERATIONS="1"\n',
+            'UBS_RELEASE_GENERATIONS=$(printf 1)\n',
+            'UBS_RELEASE_GENERATIONS=1\nUBS_RELEASE_GENERATIONS=1\n',
+        )
+        for declaration in declarations:
+            with self.subTest(declaration=declaration):
+                (self.bundle / 'ubs').write_text(
+                    f'#!/usr/bin/env bash\nUBS_VERSION="{self.version}"\n'
+                    + declaration + 'exit 0\n')
+                self.sign()
+                result = self.run_verify(expected=1)
+                self.assert_not_executed()
+                self.assertTrue(Path(self.env['SIGNATURE_LOG']).is_file())
+                self.assertIn('Target runner does not support verified cache publication',
+                              result.stderr)
+
+    def test_verify_only_authenticates_runner_without_generation_metadata(self):
+        # Authentication of historical releases remains useful even when the
+        # current installer cannot safely publish their runner/cache protocol.
+        (self.bundle / 'ubs').write_text(
+            f'#!/usr/bin/env bash\nUBS_VERSION="{self.version}"\nexit 0\n')
+        self.sign()
+        result = self.run_verify('--verify-only')
+        self.assert_not_executed()
+        self.assertTrue(Path(self.env['SIGNATURE_LOG']).is_file())
+        self.assertIn('no installer or scanner was executed', result.stdout)
+        self.assertEqual(list(self.temp_root.iterdir()), [])
 
     def test_explicit_insecure_mode_remains_explicit(self):
         self.env['BAD_SIGNATURE'] = '1'
@@ -430,6 +471,13 @@ class VerifiedReleaseTests(unittest.TestCase):
                         UNSIGNED_EXEC_LOG=str(self.root / 'unsigned-executed.log'),
                         UBS_INSTALLER_SELF_UPDATED='', UBS_NO_AUTO_UPDATE='0')
         (self.bundle / 'install.sh').write_bytes((ROOT / 'install.sh').read_bytes())
+        (self.bundle / 'ubs').write_bytes((ROOT / 'ubs').read_bytes())
+        (self.bundle / 'ubs-daemon').write_bytes((ROOT / 'ubs-daemon').read_bytes())
+        # Real installer success must use the actual cache preparation and
+        # publication protocol. Local verified bundles also supply this runtime
+        # when a caller selects a different XDG_DATA_HOME after preparation.
+        shutil.copytree(ROOT / 'modules', self.bundle / 'modules',
+                        ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
         (self.bundle / 'VERSION').write_text(self.version + '\n')
         self.sign()
 
@@ -462,6 +510,11 @@ class VerifiedReleaseTests(unittest.TestCase):
 
     def test_verified_real_installer_cannot_reexec_unsigned_main(self):
         self.prepare_unsigned_update()
+        # The remote variants receive a thin release, whereas local bundle
+        # variants stage bundle/modules. Seed genuine pinned cache assets for
+        # the remote path so both exercise real publication without network
+        # dependency downloads.
+        shutil.copytree(self.bundle / 'modules', self.home / '.local/share/ubs/modules')
         # A persistent config is loaded after early CLI flags. It must not
         # re-enable the update check inside an authenticated installation.
         config = self.home / '.config' / 'ubs'
@@ -576,6 +629,59 @@ class DaemonInstallTests(unittest.TestCase):
             shutil.copy2(self.bundle / 'install.sh', installer)
         return self.command(['bash', str(installer), *self.flags], expected=expected)
 
+    def remove_generation_declaration(self, runner):
+        # A complete real runner with its declaration removed is a controlled
+        # protocol fixture, not a frozen historical release. Its version, pins,
+        # executable implementation and companion remain genuine so the
+        # refusal cannot be attributed to a checksum or version disagreement.
+        lines = runner.read_text().splitlines(keepends=True)
+        declaration = 'UBS_RELEASE_GENERATIONS=1\n'
+        self.assertEqual(lines.count(declaration), 1)
+        runner.write_text(''.join(line for line in lines if line != declaration))
+
+    def published_payloads(self):
+        """Capture bytes, identity and permissions at publication destinations."""
+        result = {}
+        roots = (
+            ('bin', self.destination),
+            ('modules', self.home / '.local/share/ubs/modules'),
+        )
+        for label, directory in roots:
+            if not directory.exists():
+                continue
+            for path in sorted(directory.rglob('*')):
+                relative = label + '/' + path.relative_to(directory).as_posix()
+                metadata = path.lstat()
+                if stat.S_ISREG(metadata.st_mode):
+                    result[relative] = (
+                        'file', hashlib.sha256(path.read_bytes()).hexdigest(),
+                        stat.S_IMODE(metadata.st_mode), metadata.st_ino,
+                        metadata.st_mtime_ns,
+                    )
+                elif stat.S_ISDIR(metadata.st_mode):
+                    result[relative] = ('directory', stat.S_IMODE(metadata.st_mode))
+                elif stat.S_ISLNK(metadata.st_mode):
+                    result[relative] = ('symlink', os.readlink(path))
+                else:
+                    result[relative] = ('special', metadata.st_mode)
+        return result
+
+    def assert_publication_protocol_refused(self, result, before):
+        self.assertIn('Target runner does not support verified cache publication',
+                      result.stderr)
+        self.assertNotIn('INSTALLATION COMPLETE', result.stdout)
+        self.assertEqual(self.published_payloads(), before)
+
+    def assert_native_scan_usable(self):
+        source = self.project / 'publication-control.py'
+        source.write_text('eval(input())\n')
+        result = self.invoke('--ci', '--no-auto-update', '--format=json',
+                             '--only=python', str(source), expected=1, timeout=150)
+        findings = self.decode_json(result.stdout)['findings']
+        self.assertTrue(any(finding['rule_id'] == 'python.taint.eval'
+                            and finding['line'] == 1 for finding in findings),
+                        result.stdout + result.stderr)
+
     def start_service(self, runner=None):
         runner = runner or self.destination / 'ubs'
         runtime = self.root / 'runtime'
@@ -626,6 +732,74 @@ class DaemonInstallTests(unittest.TestCase):
         self.invoke('serve', '--help')
         self.invoke('--client', '--help')
         self.assertFalse({'ubs', 'ubs-daemon', 'SHA256SUMS'} & {item['name'] for item in self.fetches()})
+
+    def test_signed_markerless_runner_cannot_replace_working_installation(self):
+        self.direct_install()
+        self.assert_native_scan_usable()
+        before = self.published_payloads()
+        self.remove_generation_declaration(self.bundle / 'ubs')
+        self.sign()
+        # The same complete candidate is still authenticatable as data. The
+        # real installer's independent publication guard must reject it.
+        self.run_verify('--artifact-dir', str(self.bundle), '--verify-only')
+        previous_fetches = len(self.fetches())
+        result = self.direct_install(remote=True, expected=1)
+        self.assert_publication_protocol_refused(result, before)
+        requests = [entry['name'] for entry in self.fetches()[previous_fetches:]]
+        self.assertIn('SHA256SUMS.minisig', requests)
+        self.assertIn('ubs', requests)
+        self.assertNotIn('ubs-daemon', requests)
+        self.assert_native_scan_usable()
+
+    def test_signed_markerless_fresh_install_publishes_nothing_and_valid_retry_works(self):
+        cache = self.home / '.local/share/ubs/modules'
+        cache.rename(self.bundle / 'modules')
+        self.remove_generation_declaration(self.bundle / 'ubs')
+        self.sign()
+        before = self.published_payloads()
+        result = self.direct_install(remote=True, expected=1)
+        self.assert_publication_protocol_refused(result, before)
+        self.assertTrue(Path(self.env['SIGNATURE_LOG']).is_file())
+        self.assertFalse((self.destination / 'ubs').exists())
+        self.assertFalse(list(self.destination.glob('ubs.daemon.*.py')))
+        self.assertFalse(list(cache.glob('.ubs-releases/*/.ubs-ready.json')))
+        # Refusal leaves a fresh destination usable for a supported, complete
+        # installation. This retry must prepare its real runtime offline.
+        (self.bundle / 'ubs').write_bytes((ROOT / 'ubs').read_bytes())
+        self.sign()
+        previous_fetches = self.fetches()
+        self.direct_install()
+        self.assertEqual(self.fetches(), previous_fetches)
+        self.assertEqual(len(list(cache.glob('.ubs-releases/*/.ubs-ready.json'))), 1)
+        self.assert_native_scan_usable()
+
+    def test_explicit_local_cannot_bypass_generation_publication_requirement(self):
+        self.direct_install()
+        self.assert_native_scan_usable()
+        before = self.published_payloads()
+        self.remove_generation_declaration(self.bundle / 'ubs')
+        self.sign()
+        self.flags.append('--local')
+        previous_fetches = self.fetches()
+        result = self.direct_install(expected=1)
+        self.assert_publication_protocol_refused(result, before)
+        self.assertEqual(self.fetches(), previous_fetches)
+        self.assert_native_scan_usable()
+
+    def test_insecure_main_cannot_publish_markerless_runner_or_companion(self):
+        self.direct_install()
+        self.assert_native_scan_usable()
+        before = self.published_payloads()
+        # Use a distinct, correctly pinned companion so this also catches the
+        # old branch publishing a new sidecar before replacing the runner.
+        main, _ = self.prepare_main_payload()
+        self.remove_generation_declaration(main / 'ubs')
+        previous_fetches = len(self.fetches())
+        result = self.direct_install(remote=True, expected=1)
+        self.assert_publication_protocol_refused(result, before)
+        self.assertEqual(
+            [entry['name'] for entry in self.fetches()[previous_fetches:]], ['ubs'])
+        self.assert_native_scan_usable()
 
     def test_fresh_install_prepares_modules_even_when_doctor_is_skipped(self):
         cache = self.home / '.local/share/ubs/modules'

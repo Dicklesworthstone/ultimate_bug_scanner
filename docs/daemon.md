@@ -60,8 +60,15 @@ the newly installed implementation; an existing process retains its loaded code.
 the runner pin, then includes it in exported portable bundles. Local installs
 require the matching local companion without downloading a replacement.
 Host tools remain separate dependencies and no service starts automatically.
-An upgrade from a runner predating the service may require running the new
-installer once to provision its companion.
+`ubs doctor` verifies the same companion selected by the canonical service
+loader. A missing or damaged payload is an error, including when no daemon is
+running: the client needs that verified payload before one-shot fallback.
+Use `ubs doctor --fix` to restore an installed companion from its pinned release
+tag, or reuse an adjacent copy only when its exact bytes match the loaded pin.
+Repair verifies the complete download before atomically publishing it and
+refuses a runner that changed while repair was in progress. A failed companion
+download leaves the runner and existing companion unchanged. Source checkouts
+and portable source bundles require restoring their matching source instead.
 
 A missing daemon or a different invocation environment/scanner falls back to an
 ordinary scan. `--require-daemon` disables that fallback. Authentication, protocol

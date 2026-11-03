@@ -101,6 +101,19 @@ not an authenticated install.
 
 ## Runner and cache publication
 
+The current installer requires a target runner with the version-bound
+publication protocol (`UBS_RELEASE_GENERATIONS=1`). Historical runner-only
+targets are refused before publishing any runner, companion, or cache, including
+at a fresh destination, because that user may already have an incompatible
+cache. `--local`, `--insecure`, and `--skip-doctor` do not bypass this installer
+requirement. The authenticated `scripts/verify.sh` installation path checks the
+same protocol before executing the selected release's bundled installer.
+This restricts the target, not the starting installation: supported older
+installed runners and caches can still upgrade to a transaction-capable release.
+Historical artifacts remain inspectable with `scripts/verify.sh --verify-only`.
+Previously published installers do not gain these guarantees retroactively;
+normal release delivery requires a signed release containing the new protocol.
+
 A managed installation stores complete module generations below
 `$XDG_DATA_HOME/ubs/modules/.ubs-releases/` (normally
 `~/.local/share/ubs/modules/.ubs-releases/`). Their identities derive from the
@@ -150,6 +163,18 @@ Python startup; adjacent startup files and previously compiled bytecode cannot
 authorize diagnostic code. Ordinary scans reject damaged generations; they never
 authorize an arbitrary checksum mismatch as an old release.
 
+Doctor also verifies the exact service companion used by `ubs --client` and
+installed POSIX hooks. A missing or damaged companion makes diagnosis fail,
+even when a healthy adjacent or PATH replacement exists behind a damaged
+preferred sidecar. Explicit repair accepts only bytes matching the running
+runner's daemon pin, reuses a matching adjacent copy or fetches that release's
+tag, and atomically publishes the verified digest-named companion. It never
+imports candidate code. The existing publication lock and runner-digest lease
+prevent repair from claiming success across a concurrent runner replacement.
+Failed companion downloads preserve the existing runner and companion bytes;
+unsafe destination types and source-owned companions are refused without
+overwriting or shadowing them.
+
 For installed runners, `ubs --update-modules` forces a fresh download of
 every pinned runtime asset into private staging. It verifies the entire graph
 before applying the same atomic, same-pin replacements used by repair. Module
@@ -159,8 +184,13 @@ the existing generation; concurrent scans continue to use its pinned bytes.
 An explicit refresh can repair damaged assets or permissions, while ordinary
 scans continue to fail closed. Standalone runners with flat legacy caches
 prepare a new complete generation and leave the legacy files intact for older
-readers. Source checkouts and exported trees with bundled modules retain their
-existing source-owned refresh behavior.
+readers. Bundled source assets and Git-tracked files remain source-owned, even
+when an installed runner selects another checkout or linked worktree through
+`--module-dir`. A tracked module contract also protects new, untracked assets in
+that same source directory. Scans, forced refresh, and `doctor --fix` refuse to
+download over these files; mismatches or missing executable permissions require
+restoring the source or regenerating its pins. Untracked installed caches can
+still be repaired when they happen to reside inside an unrelated Git repository.
 
 Older runner-only updaters cannot acquire these transaction guarantees
 retroactively. The installed runner recognizes exact released contract digests

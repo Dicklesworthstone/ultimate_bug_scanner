@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import importlib.util
+import io
 import os
 from pathlib import Path
 import shutil
@@ -490,6 +491,294 @@ class ReleaseGeneration(unittest.TestCase):
         self.assert_complete(self.publish(daemon_source=daemon))
         published = self.installed.with_name(self.installed.name + f".daemon.{pin}.py")
         self.assertEqual(published.read_bytes(), good)
+
+    def daemon_fixture(self) -> tuple[bytes, str, Path]:
+        data = b"raise RuntimeError('diagnostic fixture must never be executed')\n"
+        pin = hashlib.sha256(data).hexdigest()
+        self.installed.write_bytes(self.candidate.read_bytes() + f'UBS_DAEMON_SHA256="{pin}"\n'.encode())
+        self.old_runner_bytes = self.installed.read_bytes()
+        (self.remote.parent / "ubs-daemon").write_bytes(data)
+        target = self.installed.with_name(self.installed.name + f".daemon.{pin}.py")
+        return data, pin, target
+
+    def daemon_download(self, url: str, destination: Path, *, allow_override: bool,
+                        max_bytes: int) -> bytes:
+        self.assertEqual(url, self.mirror.as_uri() + "/v5.5.1/ubs-daemon")
+        self.assertTrue(allow_override)
+        self.assertEqual(max_bytes, 512 * 1024)
+        data = (self.remote.parent / "ubs-daemon").read_bytes()
+        destination.write_bytes(data)
+        return data
+
+    def assert_file_metadata_unchanged(self, path: Path, before: os.stat_result) -> None:
+        after = path.stat()
+        self.assertEqual((before.st_ino, before.st_mode, before.st_size, before.st_mtime_ns, before.st_ctime_ns),
+                         (after.st_ino, after.st_mode, after.st_size, after.st_mtime_ns, after.st_ctime_ns))
+
+    def test_daemon_check_uses_loader_priority_without_running_or_repairing_anything(self) -> None:
+        good, pin, target = self.daemon_fixture()
+        adjacent = self.installed.with_name("ubs-daemon")
+        adjacent.write_bytes(good)
+        self.assertEqual(generation.check_daemon(self.installed, pin), adjacent)
+        target.write_bytes(b"bad preferred companion")
+        with self.assertRaisesRegex(generation.UpdateError, "checksum mismatch"):
+            generation.check_daemon(self.installed, pin)
+        self.assertEqual(target.read_bytes(), b"bad preferred companion")
+        self.assertFalse(self.installed.with_name(self.installed.name + ".update.lock").exists())
+        target.write_bytes(good)
+        adjacent.write_bytes(b"bad unused adjacent companion")
+        self.assertEqual(generation.check_daemon(self.installed, pin), target)
+        self.assert_old_intact()
+
+    def test_daemon_check_refuses_oversized_companions_and_malformed_loaded_pins(self) -> None:
+        _, pin, target = self.daemon_fixture()
+        target.write_bytes(b"x" * (512 * 1024 + 1))
+        with self.assertRaisesRegex(generation.UpdateError, "bounded regular"):
+            generation.check_daemon(self.installed, pin)
+        for value in ("", "../" + pin, pin.upper(), pin + "\n"):
+            with self.subTest(pin=value):
+                with self.assertRaisesRegex(generation.UpdateError, "invalid loaded daemon"):
+                    generation.check_daemon(self.installed, value)
+
+    def test_missing_daemon_repair_uses_current_release_pin_without_executing_candidate(self) -> None:
+        good, pin, target = self.daemon_fixture()
+        with mock.patch.object(generation, "download", side_effect=self.daemon_download) as fetch:
+            self.assertEqual(generation.repair_daemon(
+                self.installed, "5.5.1", pin, self.mirror.as_uri(), allow_override=True), target)
+        fetch.assert_called_once()
+        self.assertEqual(target.read_bytes(), good)
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o644)
+        self.assertEqual(generation.check_daemon(self.installed, pin), target)
+        self.assert_old_intact()
+
+    def test_daemon_repair_reuses_only_verified_adjacent_bytes_and_keeps_the_source(self) -> None:
+        good, pin, target = self.daemon_fixture()
+        target.write_bytes(b"damaged managed companion")
+        adjacent = self.installed.with_name("ubs-daemon")
+        adjacent.write_bytes(good)
+        before = adjacent.stat()
+        with mock.patch.object(generation, "download", side_effect=AssertionError("must work offline")):
+            self.assertEqual(generation.repair_daemon(
+                self.installed, "5.5.1", pin, "https://offline.invalid", allow_override=False), target)
+        self.assertEqual(target.read_bytes(), good)
+        self.assertEqual(adjacent.read_bytes(), good)
+        self.assert_file_metadata_unchanged(adjacent, before)
+        self.assert_old_intact()
+
+    def test_healthy_daemon_repair_does_not_download_or_rewrite_the_companion(self) -> None:
+        good, pin, target = self.daemon_fixture()
+        target.write_bytes(good)
+        before = target.stat()
+        with mock.patch.object(generation, "download", side_effect=AssertionError("unexpected fetch")), \
+                mock.patch.object(generation, "publish_file", side_effect=AssertionError("unexpected rewrite")):
+            self.assertEqual(generation.repair_daemon(
+                self.installed, "5.5.1", pin, "https://offline.invalid", allow_override=False), target)
+        self.assert_file_metadata_unchanged(target, before)
+        self.assert_old_intact()
+
+    def test_bad_or_failed_daemon_download_preserves_every_existing_file(self) -> None:
+        _, pin, target = self.daemon_fixture()
+        target.write_bytes(b"damaged managed companion")
+        adjacent = self.installed.with_name("ubs-daemon")
+        adjacent.write_bytes(b"locally edited adjacent source")
+        preserved = {path: (path.read_bytes(), path.stat()) for path in (target, adjacent, self.installed)}
+        for failure in (generation.UpdateError("could not fetch companion"), b"untrusted transport bytes"):
+            with self.subTest(failure=type(failure).__name__):
+                fetch = mock.Mock(side_effect=failure) if isinstance(failure, Exception) else mock.Mock(return_value=failure)
+                with mock.patch.object(generation, "download", fetch):
+                    with self.assertRaises(generation.UpdateError):
+                        generation.repair_daemon(self.installed, "5.5.1", pin, self.mirror.as_uri(),
+                                                 allow_override=True)
+                fetch.assert_called_once()
+                for path, (data, info) in preserved.items():
+                    self.assertEqual(path.read_bytes(), data)
+                    self.assert_file_metadata_unchanged(path, info)
+                self.assertFalse(list(self.root.glob(".*.daemon-repair-*")))
+
+    def test_daemon_repair_cannot_change_trust_to_a_new_runner_version_or_pin(self) -> None:
+        _, pin, target = self.daemon_fixture()
+        target.write_bytes(b"damaged companion")
+        for version, expected in (("5.5.0", pin), ("5.5.1", "0" * 64)):
+            with self.subTest(version=version, pin=expected):
+                with mock.patch.object(generation, "download", side_effect=AssertionError("stale lease fetched")):
+                    with self.assertRaisesRegex(generation.UpdateError, "no longer matches"):
+                        generation.repair_daemon(self.installed, version, expected, self.mirror.as_uri(),
+                                                 allow_override=True)
+                self.assertEqual(target.read_bytes(), b"damaged companion")
+        self.assert_old_intact()
+
+    def test_runner_replacement_during_daemon_download_invalidates_the_repair_lease(self) -> None:
+        _, pin, target = self.daemon_fixture()
+        target.write_bytes(b"damaged companion")
+        changed = self.old_runner_bytes + b"# concurrent runner publication\n"
+
+        def replace_runner(*args, **kwargs):
+            data = self.daemon_download(*args, **kwargs)
+            self.installed.write_bytes(changed)
+            return data
+
+        with mock.patch.object(generation, "download", side_effect=replace_runner):
+            with self.assertRaisesRegex(generation.UpdateError, "changed during daemon repair"):
+                generation.repair_daemon(self.installed, "5.5.1", pin, self.mirror.as_uri(),
+                                         allow_override=True)
+        self.assertEqual(self.installed.read_bytes(), changed)
+        self.assertEqual(target.read_bytes(), b"damaged companion")
+
+    def test_daemon_repair_refuses_source_and_exported_layouts_without_writing_anything(self) -> None:
+        good, pin, target = self.daemon_fixture()
+        adjacent = self.installed.with_name("ubs-daemon")
+        adjacent.write_bytes(b"edited source companion")
+        for marker_name in (".git", "modules"):
+            marker = self.installed.parent / marker_name
+            for symlink in (False, True):
+                with self.subTest(marker=marker_name, symlink=symlink):
+                    if symlink:
+                        marker.symlink_to(self.root / "missing source marker")
+                    else:
+                        marker.mkdir()
+                    with mock.patch.object(generation, "download", side_effect=AssertionError("source repair fetched")):
+                        with self.assertRaisesRegex(generation.UpdateError, "source-owned"):
+                            generation.repair_daemon(self.installed, "5.5.1", pin, self.mirror.as_uri(),
+                                                     allow_override=True)
+                    self.assertFalse(target.exists())
+                    self.assertFalse(self.installed.with_name(self.installed.name + ".update.lock").exists())
+                    self.assertEqual(adjacent.read_bytes(), b"edited source companion")
+                    if symlink:
+                        marker.unlink()
+                    else:
+                        marker.rmdir()
+        adjacent.write_bytes(good)
+        (self.root / "modules").mkdir()
+        self.assertEqual(generation.check_daemon(self.installed, pin), adjacent)
+
+    def test_source_marker_appearing_during_daemon_download_prevents_publication(self) -> None:
+        _, pin, target = self.daemon_fixture()
+
+        def become_source(*args, **kwargs):
+            data = self.daemon_download(*args, **kwargs)
+            (self.installed.parent / ".git").mkdir()
+            return data
+
+        with mock.patch.object(generation, "download", side_effect=become_source):
+            with self.assertRaisesRegex(generation.UpdateError, "source-owned"):
+                generation.repair_daemon(self.installed, "5.5.1", pin, self.mirror.as_uri(),
+                                         allow_override=True)
+        self.assertFalse(target.exists())
+        self.assert_old_intact()
+
+    def test_interrupted_daemon_publication_preserves_old_file_and_retry_repairs_it(self) -> None:
+        good, pin, target = self.daemon_fixture()
+        target.write_bytes(b"damaged companion")
+        before = target.stat()
+        with mock.patch.object(generation, "download", side_effect=self.daemon_download), \
+                mock.patch.object(generation.os, "replace", side_effect=OSError("publication interrupted")):
+            with self.assertRaisesRegex(OSError, "publication interrupted"):
+                generation.repair_daemon(self.installed, "5.5.1", pin, self.mirror.as_uri(),
+                                         allow_override=True)
+        self.assertEqual(target.read_bytes(), b"damaged companion")
+        self.assert_file_metadata_unchanged(target, before)
+        self.assertFalse(list(self.root.glob(".*.stage-*")))
+        with mock.patch.object(generation, "download", side_effect=self.daemon_download):
+            generation.repair_daemon(self.installed, "5.5.1", pin, self.mirror.as_uri(),
+                                     allow_override=True)
+        self.assertEqual(target.read_bytes(), good)
+        self.assert_old_intact()
+
+    def test_daemon_repair_readers_see_only_old_or_fully_verified_replacement(self) -> None:
+        good, pin, target = self.daemon_fixture()
+        target.write_bytes(b"damaged companion")
+        replace = generation.os.replace
+        boundaries = []
+
+        def observe_publication(source, destination):
+            self.assertEqual(Path(destination), target)
+            with self.assertRaisesRegex(generation.UpdateError, "checksum mismatch"):
+                generation.check_daemon(self.installed, pin)
+            self.assertEqual(Path(source).read_bytes(), good)
+            self.assertEqual(stat.S_IMODE(Path(source).stat().st_mode), 0o644)
+            with target.open("rb") as old_reader:
+                result = replace(source, destination)
+                self.assertEqual(old_reader.read(), b"damaged companion")
+            self.assertEqual(generation.check_daemon(self.installed, pin), target)
+            boundaries.append("atomic replacement verified")
+            return result
+
+        with mock.patch.object(generation, "download", side_effect=self.daemon_download), \
+                mock.patch.object(generation.os, "replace", side_effect=observe_publication):
+            generation.repair_daemon(self.installed, "5.5.1", pin, self.mirror.as_uri(),
+                                     allow_override=True)
+        self.assertEqual(boundaries, ["atomic replacement verified"])
+
+    def test_daemon_symlinks_and_nonregular_targets_fail_closed_without_fallback_or_repair(self) -> None:
+        good, pin, target = self.daemon_fixture()
+        adjacent = self.installed.with_name("ubs-daemon")
+        adjacent.write_bytes(good)
+        kinds = ("symlink", "directory", "fifo") if hasattr(os, "mkfifo") else ("symlink", "directory")
+        for kind in kinds:
+            with self.subTest(kind=kind):
+                if kind == "symlink":
+                    target.symlink_to(adjacent)
+                elif kind == "fifo":
+                    os.mkfifo(target)
+                else:
+                    target.mkdir()
+                with self.assertRaises((OSError, generation.UpdateError)):
+                    generation.check_daemon(self.installed, pin)
+                with mock.patch.object(generation, "download", side_effect=AssertionError("unsafe repair fetched")):
+                    with self.assertRaises((OSError, generation.UpdateError)):
+                        generation.repair_daemon(self.installed, "5.5.1", pin, self.mirror.as_uri(),
+                                                 allow_override=True)
+                self.assertEqual(adjacent.read_bytes(), good)
+                if kind == "directory":
+                    target.rmdir()
+                else:
+                    target.unlink()
+
+    def test_daemon_target_replaced_by_symlink_during_download_is_not_overwritten(self) -> None:
+        _, pin, target = self.daemon_fixture()
+        outside = self.root / "unrelated source"
+        outside.write_bytes(b"do not overwrite")
+
+        def replace_target(*args, **kwargs):
+            data = self.daemon_download(*args, **kwargs)
+            target.symlink_to(outside)
+            return data
+
+        with mock.patch.object(generation, "download", side_effect=replace_target):
+            with self.assertRaises(OSError):
+                generation.repair_daemon(self.installed, "5.5.1", pin, self.mirror.as_uri(),
+                                         allow_override=True)
+        self.assertTrue(target.is_symlink())
+        self.assertEqual(outside.read_bytes(), b"do not overwrite")
+
+    def test_daemon_download_bound_is_enforced_before_accepting_transport_output(self) -> None:
+        destination = self.root / "bounded download"
+
+        def oversized_transport(command, **kwargs):
+            self.assertEqual(command[command.index("--max-filesize") + 1], "2")
+            destination.write_bytes(b"too large")
+            return SimpleNamespace(returncode=0)
+
+        with mock.patch.object(generation.shutil, "which", return_value="curl"), \
+                mock.patch.object(generation.subprocess, "run", side_effect=oversized_transport):
+            with self.assertRaisesRegex(generation.UpdateError, "bounded regular"):
+                generation.download("https://example.invalid/ubs-daemon", destination,
+                                    allow_override=False, max_bytes=2)
+
+    def test_daemon_commands_use_loaded_cli_arguments_and_return_verified_path(self) -> None:
+        good, pin, target = self.daemon_fixture()
+        arguments = [str(SOURCE), "repair-daemon", str(self.installed), "5.5.1", pin, self.mirror.as_uri()]
+        output = io.StringIO()
+        with mock.patch.object(sys, "argv", arguments), contextlib.redirect_stdout(output), \
+                mock.patch.object(generation, "download", side_effect=self.daemon_download):
+            self.assertEqual(generation.main(), 0)
+        self.assertEqual(output.getvalue().strip(), str(target))
+        self.assertEqual(target.read_bytes(), good)
+        output = io.StringIO()
+        with mock.patch.object(sys, "argv", [str(SOURCE), "check-daemon", str(self.installed), pin]), \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(generation.main(), 0)
+        self.assertEqual(output.getvalue().strip(), str(target))
 
     def test_explicit_repair_verifies_all_assets_before_replacing_any(self) -> None:
         target = self.prepare()

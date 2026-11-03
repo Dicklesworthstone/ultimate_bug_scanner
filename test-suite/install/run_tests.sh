@@ -594,7 +594,7 @@ test_local_requires_flag() {
   # A ./ubs in the current directory is never installed implicitly (bead E4):
   # without --local the installer ignores it and goes for the release (which
   # fails here because the artifact base points at a dead port); with --local
-  # it installs exactly that file.
+  # it installs exactly that runner and prepares its verified runtime.
   echo "[TEST] local_requires_flag"
   local ctx
   ctx="$(mktemp_dir)"
@@ -603,12 +603,16 @@ test_local_requires_flag() {
   mkdir -p "$home/.local/bin" "$proj" "$inst"
   # Installer copied away from the checkout so the "repo checkout" rule does not apply.
   cp "$INSTALLER" "$inst/install.sh"
-  printf '#!/usr/bin/env bash\n# Ultimate Bug Scanner (fake local runner for the installer test)\ncase "${1:-}" in --version) echo "UBS Meta-Runner v0.0.0-local-test";; *) echo "fake ubs: $*";; esac\nexit 0\n' >"$proj/ubs"
+  # Use the actual protocol-capable runner and its pinned assets. An inert
+  # Bash stub cannot stand in for the installer's publication transaction.
+  cp "$ROOT_DIR/ubs" "$proj/ubs"
+  cp "$ROOT_DIR/ubs-daemon" "$proj/ubs-daemon"
+  cp -R "$ROOT_DIR/modules" "$proj/modules"
   chmod +x "$proj/ubs"
 
   local rc=0
-  rm -rf /tmp/ubs-install.lock 2>/dev/null || true
   (cd "$proj" && UBS_ARTIFACT_BASE="http://127.0.0.1:9/dead" UBS_INSTALLER_WORKDIR="$ctx/work.${RANDOM}${RANDOM}" \
+    TMPDIR="$ctx" UBS_NO_AUTO_UPDATE=1 XDG_DATA_HOME="$home/.local/share" XDG_CACHE_HOME="$home/.cache" XDG_CONFIG_HOME="$home/.config" \
     HOME="$home" PATH="$home/.local/bin:$PATH" SHELL=/bin/bash \
     bash "$inst/install.sh" --non-interactive --skip-ast-grep --skip-ripgrep --skip-jq --skip-typos --skip-toon --skip-doctor --skip-hooks \
       --skip-version-check --no-path-modify --install-dir "$home/.local/bin") >"$log" 2>&1 || rc=$?
@@ -620,14 +624,21 @@ test_local_requires_flag() {
   fi
 
   rc=0
-  rm -rf /tmp/ubs-install.lock 2>/dev/null || true
   (cd "$proj" && UBS_ARTIFACT_BASE="http://127.0.0.1:9/dead" UBS_INSTALLER_WORKDIR="$ctx/work.${RANDOM}${RANDOM}" \
+    TMPDIR="$ctx" UBS_NO_AUTO_UPDATE=1 XDG_DATA_HOME="$home/.local/share" XDG_CACHE_HOME="$home/.cache" XDG_CONFIG_HOME="$home/.config" \
     HOME="$home" PATH="$home/.local/bin:$PATH" SHELL=/bin/bash \
     bash "$inst/install.sh" --local --non-interactive --skip-ast-grep --skip-ripgrep --skip-jq --skip-typos --skip-doctor --skip-hooks \
       --skip-version-check --no-path-modify --install-dir "$home/.local/bin") >"$ctx/install-local.log" 2>&1 || rc=$?
   if [ "$rc" -ne 0 ] || ! cmp -s "$proj/ubs" "$home/.local/bin/ubs"; then
     echo "[FAIL] --local did not install ./ubs from the current directory (exit $rc, log: $ctx/install-local.log)"
     tail -n 30 "$ctx/install-local.log" || true
+    tests_failed=1
+    return 1
+  fi
+  local -a ready_markers
+  ready_markers=("$home/.local/share/ubs/modules/.ubs-releases/"*/.ubs-ready.json)
+  if [[ "${#ready_markers[@]}" -ne 1 || ! -f "${ready_markers[0]}" ]]; then
+    echo "[FAIL] --local did not publish one complete module generation (log: $ctx/install-local.log)"
     tests_failed=1
     return 1
   fi

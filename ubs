@@ -172,7 +172,7 @@ try:
             raise ValueError('ubs-daemon must be a regular file smaller than 512 KiB')
         source = stream.read(512 * 1024 + 1)
     if len(source) > 512 * 1024 or hashlib.sha256(source).hexdigest() != expected:
-        raise ValueError('ubs-daemon checksum mismatch; reinstall the matching release')
+        raise ValueError('ubs-daemon checksum mismatch; run ubs doctor --fix')
 except (OSError, ValueError) as exc:
     print(f'ubs: cannot load the verified local scan service: {exc}', file=sys.stderr)
     raise SystemExit(2)
@@ -2112,7 +2112,7 @@ cat <<'JSON'
       {"name": "serve", "usage": "ubs serve [--repo DIR] [--jobs N]", "description": "Start the verified local repository service explicitly on POSIX. Unchanged requests may reuse complete reports; changed files still run the ordinary scanner. Use ubs daemon watch for watching."},
       {"name": "--client", "usage": "ubs --client [--repo DIR] [--format=text|json|jsonl|sarif] [--fail-on-warning] -- PATH ...", "description": "Request a repository-confined service scan, or run the ordinary scanner when no service exists. Client scans use CI mode internally; --ci is not a client option."},
       {"name": "daemon", "usage": "ubs daemon status|stop|cancel|watch [--repo DIR]", "description": "Inspect or control the local service. Use ubs daemon COMMAND --help for the command-specific options."},
-      {"name": "doctor", "usage": "ubs doctor [--fix] [--format=text|json] [--module-dir=DIR]", "description": "Verify cached modules/helpers and the ast-grep toolchain; --fix re-downloads corrupted copies; --format=json emits structured checks."},
+      {"name": "doctor", "usage": "ubs doctor [--fix] [--format=text|json] [--module-dir=DIR]", "description": "Verify cached modules/helpers, the local service companion, and the ast-grep toolchain; --fix downloads verified replacements; --format=json emits structured checks."},
       {"name": "sessions", "usage": "ubs sessions [--entries N] [--raw]", "description": "Show recent installer session summaries."},
       {"name": "explain", "usage": "ubs explain <rule-id> [--format=text|json]", "description": "Explain a rule: message, remediation, fixture examples, confidence, category."},
       {"name": "robot-docs", "usage": "ubs robot-docs [guide|commands|examples|exit-codes|formats|env|all]", "description": "This document (JSON on stdout)."},
@@ -2805,7 +2805,7 @@ Usage: ubs doctor [options]
 Options:
   --format=FORMAT    Output format (text|json, default: text)
   --module-dir=DIR   Override the module cache directory (default: $MODULE_DIR_DEFAULT)
-  --fix              Automatically download or refresh cached modules
+  --fix              Repair cached modules and the verified service companion
   --prune-cache      Prune the Merkle incremental scan cache
   -h, --help         Show this help message
 DOC
@@ -4493,7 +4493,7 @@ select_release_generation(){
 
 should_refresh_release_generation(){
   [[ "$UPDATE_MODULES" -eq 1 ]] || return 1
-  is_checkout_helper "$MODULE_CACHE_ROOT/contract.json" && return 1
+  is_checkout_asset "$MODULE_CACHE_ROOT/contract.json" && return 1
   if [[ -e "$MODULE_CACHE_ROOT/.ubs-releases" || -L "$MODULE_CACHE_ROOT/.ubs-releases" ]]; then
     return 0
   fi
@@ -5789,6 +5789,39 @@ doctor_check_cached_helpers(){
   done
 }
 
+doctor_check_daemon(){
+  local fix="$1" runner detail
+  if ! runner="$(script_path)" || [[ -z "$runner" ]]; then
+    doctor_report "daemon" err "Cannot resolve this runner's service companion"
+    return
+  fi
+  # The service loader fails before one-shot fallback when its companion is
+  # missing or damaged. Verify the exact selected bytes without executing it.
+  if detail="$(release_generation check-daemon "$runner" "$UBS_DAEMON_SHA256" 2>&1)"; then
+    doctor_report "daemon" ok "Service companion checksum verified ($detail)"
+    return
+  fi
+  if [[ "$fix" -ne 1 ]]; then
+    doctor_report "daemon" err "Cannot verify service companion: $detail (run ubs doctor --fix)"
+    return
+  fi
+  # A repair may create a verified installed sidecar, but must not overwrite
+  # or shadow a tracked runner/companion in another checkout. The transaction
+  # also checks adjacent source/export markers before creating any files.
+  if is_checkout_asset "$runner" \
+      || is_checkout_asset "$runner.daemon.$UBS_DAEMON_SHA256.py" \
+      || is_checkout_asset "$(dirname "$runner")/ubs-daemon"; then
+    doctor_report "daemon" err "Service companion belongs to source; restore the matching source or regenerate its pins (doctor --fix never overwrites source assets): $detail"
+    return
+  fi
+  if detail="$(release_generation repair-daemon "$runner" "$UBS_VERSION" \
+      "$UBS_DAEMON_SHA256" "$REPO_RAW_BASE" 2>&1)"; then
+    doctor_report "daemon" ok "Service companion repaired and checksum verified ($detail)"
+  else
+    doctor_report "daemon" err "Failed to repair service companion: $detail"
+  fi
+}
+
 run_doctor(){
   local fix="${1:-$DOCTOR_FIX}" fmt="${2:-$DOCTOR_FORMAT}"
   DOCTOR_FORMAT="${fmt:-text}"
@@ -5822,6 +5855,8 @@ run_doctor(){
   else
     doctor_report "module-cache-writable" err "Module cache is not writable: $MODULE_DIR"
   fi
+
+  doctor_check_daemon "$fix"
 
   # Never import cached Python code just to diagnose its integrity. In
   # particular, doctor --fix used to execute ubs_core.cache before checking
@@ -5979,7 +6014,9 @@ PYDOCTORCACHE
     fi
     if should_verify_module_path "$module_path"; then
       cached_modules=1
-      if [[ -f "$module_path" ]]; then
+      if { [[ ! -f "$module_path" ]] || [[ ! -x "$module_path" ]]; } && is_checkout_asset "$module_path"; then
+        doctor_report "module:$lang" err "$lang checkout module is missing or not executable ($module_path); restore source and permissions before scanning (doctor --fix never overwrites checkout modules)"
+      elif [[ -f "$module_path" ]]; then
         if verify_module_checksum "$lang" "$module_path"; then
           doctor_report "module:$lang" ok "$lang module checksum verified ($module_path)"
         else
@@ -5987,7 +6024,7 @@ PYDOCTORCACHE
           if [[ $verify_status -eq 2 ]]; then
             doctor_report "module:$lang" err "$lang module: $VERIFY_MODULE_ERR"
           else
-            if [[ "$module_path" == "$(script_dir)/modules/"* ]]; then
+            if is_checkout_asset "$module_path"; then
               doctor_report "module:$lang" err "$lang module in this checkout does not match MODULE_CHECKSUMS ($VERIFY_MODULE_ERR); run ./scripts/update_checksums.sh (doctor --fix never overwrites checkout modules)"
             elif [[ "$fix" -eq 1 ]]; then
               say "    ${DIM}Refreshing $lang module...${RESET}"
@@ -6439,6 +6476,13 @@ select_langs(){
 
 download_module(){
   local lang="$1" path="$2"
+  # Every repair caller must honor source ownership, even when this installed
+  # runner is pointed at a different checkout or linked worktree.
+  if is_checkout_asset "$path"; then
+    VERIFY_MODULE_ERR="checkout module $lang is source, not a cache entry; refusing to overwrite it (restore source or run ./scripts/update_checksums.sh after editing modules)"
+    say_err "${RED}$X ${VERIFY_MODULE_ERR}${RESET}"
+    return 2
+  fi
   ensure_dir "$(dirname "$path")"
   local release_url latest_url url label tmp head err_msg
   release_url=$(printf '%s' "$MODULE_PATH_TEMPLATE" | sed "s/%s/$lang/")
@@ -6538,18 +6582,30 @@ download_module(){
   return 1
 }
 
-is_checkout_helper(){
+is_checkout_asset(){
   local path="$1"
   # Bundled source assets are not cache entries, including an exported tree
   # without .git. An explicit --module-dir can also point at tracked source
   # belonging to a different checkout than this runner.
   [[ "$path" == "$(script_dir)/modules/"* ]] && return 0
-  need_cmd git && git -C "$(dirname "$path")" ls-files --error-unmatch -- "$(basename "$path")" >/dev/null 2>&1
+  need_cmd git || return 1
+  if git -C "$(dirname "$path")" ls-files --error-unmatch -- "$(basename "$path")" >/dev/null 2>&1; then
+    return 0
+  fi
+  # A tracked contract identifies the selected module directory as source,
+  # including newly created assets and files in a locally removed subdirectory.
+  # An ordinary untracked cache inside some other Git repository stays a cache.
+  if [[ -n "${MODULE_CACHE_ROOT:-}" && "$path" == "$MODULE_CACHE_ROOT/"* \
+      && "$path" != "$MODULE_CACHE_ROOT/contract.json" ]]; then
+    git -C "$MODULE_CACHE_ROOT" ls-files --error-unmatch -- contract.json >/dev/null 2>&1
+    return $?
+  fi
+  return 1
 }
 
 download_helper_asset(){
   local rel="$1" path="$2"
-  if is_checkout_helper "$path"; then
+  if is_checkout_asset "$path"; then
     VERIFY_HELPER_ERR="checkout helper $rel is source, not a cache entry; refusing to overwrite it (run ./scripts/update_checksums.sh after editing helpers)"
     say_err "${RED}$X ${VERIFY_HELPER_ERR}${RESET}"
     return 2
@@ -6653,7 +6709,7 @@ ensure_helper_asset(){
   # Check ownership only on mutation paths. Healthy scans should not spawn a
   # Git process for every pinned helper in an ordinary installed cache.
   if [ "$UPDATE_MODULES" -eq 1 ] || [ ! -f "$path" ]; then
-    is_checkout_helper "$path" && checkout_helper=1
+    is_checkout_asset "$path" && checkout_helper=1
   fi
   if [[ "$checkout_helper" -eq 1 && ! -f "$path" ]]; then
     VERIFY_HELPER_ERR="checkout helper $rel is missing; restore source before scanning (never downloading over a checkout)"
@@ -6681,7 +6737,7 @@ ensure_helper_asset(){
       return 2
     fi
     if [[ $verify_code -ne 0 ]]; then
-      if is_checkout_helper "$path"; then
+      if is_checkout_asset "$path"; then
         say_err "${RED}$X helper $rel in this checkout failed verification (${VERIFY_HELPER_ERR:-mismatch}); run ./scripts/update_checksums.sh after editing helpers (never downloading over a checkout)${RESET}"
         return 2
       fi
@@ -6761,7 +6817,7 @@ ensure_detection_contract(){
     # from this release and verify the download against this runner's pin;
     # unknown bytes (or a failed refresh) still refuse to scan (issue #129).
     local mismatch_err="${VERIFY_HELPER_ERR}" cached_sha="" superseded=""
-    if [[ "$MODULE_GENERATION_ACTIVE" -eq 0 && "$path" == "$MODULE_CACHE_ROOT/$rel" ]] && ! is_checkout_helper "$path" \
+    if [[ "$MODULE_GENERATION_ACTIVE" -eq 0 && "$path" == "$MODULE_CACHE_ROOT/$rel" ]] && ! is_checkout_asset "$path" \
         && sha256_into cached_sha "$snapshot"; then
       superseded="${SUPERSEDED_CONTRACT_SHA256[$cached_sha]:-}"
     fi
@@ -6884,14 +6940,21 @@ ensure_cached_helpers(){
 
 ensure_module(){
   local lang="$1" path="$2"
-  # A module that lives next to this script (a repository checkout) is source
-  # under version control: never download over it. --update-modules and the
-  # "refresh on checksum mismatch" repair apply to the cache directory only;
+  # Bundled or Git-owned modules are source: never download over them.
+  # Forced refresh and checksum repair apply to the cache directory only;
   # a checkout module that does not match MODULE_CHECKSUMS needs
   # scripts/update_checksums.sh (or git), not a download.
   local checkout_module=0
   if [[ "$path" == "$(script_dir)/modules/"* ]]; then
     checkout_module=1
+  elif { [[ "$UPDATE_MODULES" -eq 1 ]] || [[ ! -x "$path" ]]; } && is_checkout_asset "$path"; then
+    # Avoid a Git subprocess for every healthy installed module. Ownership
+    # matters when a refresh or a failed verification could modify its path.
+    checkout_module=1
+  fi
+  if [[ "$checkout_module" -eq 1 && ! -x "$path" ]]; then
+    say_err "${RED}$X $lang checkout module is missing or not executable ($path); restore source and permissions before scanning (never downloading over a checkout)${RESET}"
+    return 1
   fi
   if [ "$UPDATE_MODULES" -eq 1 ] && [ "$checkout_module" -eq 1 ]; then
     say_err "${DIM}${INFO}${RESET} $lang module comes from this checkout ($path); --update-modules never overwrites checkout modules (use git)."
@@ -6906,7 +6969,7 @@ ensure_module(){
       return 1
     fi
     if [[ $verify_code -ne 0 ]]; then
-      if [ "$checkout_module" -eq 1 ]; then
+      if [[ "$checkout_module" -eq 1 ]] || is_checkout_asset "$path"; then
         say "${RED}$X $lang module in this checkout does not match MODULE_CHECKSUMS (${VERIFY_MODULE_ERR:-mismatch}); run ./scripts/update_checksums.sh after editing modules (never downloading over a checkout)${RESET}"
         return 1
       fi
@@ -6970,6 +7033,7 @@ except ImportError:
 
 MAX_ASSET_BYTES = 32 * 1024 * 1024
 MAX_RUNNER_BYTES = 4 * 1024 * 1024
+MAX_DAEMON_BYTES = 512 * 1024
 GENERATION_DIRECTORY = ".ubs-releases"
 READY_FILE = ".ubs-ready.json"
 USER_AGENT = "ultimate_bug_scanner-agent"
@@ -7244,7 +7308,7 @@ def check_parents(root: Path, relative: str) -> Path:
     return root / relative
 
 
-def read_cached_asset(root: Path, relative: str) -> bytes:
+def read_cached_asset(root: Path, relative: str, limit: int = MAX_ASSET_BYTES) -> bytes:
     """Read cache bytes without admitting a changed or symlinked source tree.
 
     Cache contents are only candidates: the caller must still authenticate
@@ -7264,7 +7328,7 @@ def read_cached_asset(root: Path, relative: str) -> bytes:
                 or (not OPEN_NOFOLLOW and not info.st_ino)):
             raise UpdateError(f"unsafe cached asset directory: {parent}")
         identities.append((parent, info))
-    data = read_regular(root / relative)
+    data = read_regular(root / relative, limit)
     for parent, before in identities:
         after = parent.lstat()
         if (not stat.S_ISDIR(after.st_mode) or is_reparse(after)
@@ -7429,7 +7493,8 @@ def write_verified(path: Path, data: bytes, expected: str, *, executable: bool) 
         os.fsync(stream.fileno())
 
 
-def download(url: str, destination: Path, *, allow_override: bool) -> bytes:
+def download(url: str, destination: Path, *, allow_override: bool,
+             max_bytes: int = MAX_ASSET_BYTES) -> bytes:
     proto = "=https,http,file" if allow_override else "=https"
     if not allow_override and not url.startswith("https://"):
         raise UpdateError("non-HTTPS asset source requires UBS_REPO_RAW_BASE")
@@ -7439,7 +7504,7 @@ def download(url: str, destination: Path, *, allow_override: bool) -> bytes:
                 ["curl", "-fsSL", "--proto", proto, "--proto-redir", proto,
                  "--user-agent", USER_AGENT,
                  "--connect-timeout", "10", "--max-time", "30", "--max-filesize",
-                 str(MAX_ASSET_BYTES), "--retry", "2", "--retry-delay", "1",
+                 str(max_bytes), "--retry", "2", "--retry-delay", "1",
                  "-o", str(destination), "--", url],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE, check=False, timeout=100)
@@ -7456,7 +7521,7 @@ def download(url: str, destination: Path, *, allow_override: bool) -> bytes:
         raise UpdateError(f"could not fetch {url}: {exc}") from exc
     if result.returncode:
         raise UpdateError(f"could not fetch {url} (exit {result.returncode})")
-    return read_regular(destination)
+    return read_regular(destination, max_bytes)
 
 
 @contextlib.contextmanager
@@ -7696,6 +7761,108 @@ def publish_file(destination: Path, data: bytes, *, mode: int) -> None:
             stage.unlink()
 
 
+def daemon_target(installed: Path, expected: str) -> Path:
+    if not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise UpdateError("invalid loaded daemon checksum")
+    return installed.with_name(installed.name + ".daemon." + expected + ".py")
+
+
+def check_daemon(installed: Path, expected: str) -> Path:
+    """Verify exactly the companion the service loader will select, without imports.
+
+    The checksum comes from the already-running shell, never a reopened runner.
+    A present but damaged digest-named sidecar cannot authorize falling back to
+    a healthy adjacent source file; normal service startup refuses that case.
+    """
+    installed = installed.absolute()
+    target = daemon_target(installed, expected)
+    try:
+        target.lstat()
+    except FileNotFoundError:
+        target = installed.with_name("ubs-daemon")
+    data = read_cached_asset(installed.parent, target.name, MAX_DAEMON_BYTES)
+    if not hmac.compare_digest(digest(data), expected):
+        raise UpdateError(f"daemon companion checksum mismatch: {target}")
+    return target
+
+
+def require_installed_daemon_repair(installed: Path) -> None:
+    """Do not overwrite or shadow a source/exported checkout's companion.
+
+    The shell additionally rejects Git-tracked runners and companions, even
+    when they live below a checkout root. These adjacent markers cover source
+    exports without Git as well, before creating any lock or staging files.
+    """
+    real_directory(installed.parent)
+    for name in (".git", "modules"):
+        marker = installed.parent / name
+        try:
+            marker.lstat()
+        except FileNotFoundError:
+            continue
+        raise UpdateError("source-owned daemon companion cannot be automatically repaired")
+
+
+def require_safe_daemon_target(target: Path) -> None:
+    try:
+        info = target.lstat()
+    except FileNotFoundError:
+        return
+    require_regular(info, target)
+
+
+def repair_daemon(installed: Path, version: str, expected: str, raw_base: str, *,
+                  allow_override: bool) -> Path:
+    """Repair only the loaded release's installed companion, under its update lock.
+
+    The installed runner is reread only as a compare-and-swap lease. It cannot
+    supply a new trusted pin or version. All bytes are authenticated before an
+    atomic replacement on the destination filesystem; adjacent source bytes,
+    old companions and the runner itself are never replaced by this repair.
+    """
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+        raise UpdateError("invalid loaded runner version")
+    installed = installed.absolute()
+    target = daemon_target(installed, expected)
+    require_installed_daemon_repair(installed)
+    with publication_lock(installed):
+        require_installed_daemon_repair(installed)
+        current = read_regular(installed, MAX_RUNNER_BYTES)
+        if (runner_version(current) != version
+                or not hmac.compare_digest(daemon_pin(current), expected)):
+            raise UpdateError("installed runner no longer matches the loaded release; retry doctor")
+        current_sha = digest(current)
+        try:
+            return check_daemon(installed, expected)
+        except (OSError, UpdateError):
+            pass
+        require_safe_daemon_target(target)
+        data = None
+        try:
+            adjacent = read_cached_asset(installed.parent, "ubs-daemon", MAX_DAEMON_BYTES)
+        except (OSError, UpdateError):
+            pass
+        else:
+            if hmac.compare_digest(digest(adjacent), expected):
+                data = adjacent
+        if data is None:
+            # This directory is private and owned solely by this invocation.
+            # No candidate code is imported or executed, even for diagnosis.
+            with tempfile.TemporaryDirectory(prefix="." + installed.name + ".daemon-repair-",
+                                             dir=installed.parent) as temporary:
+                url = f"{raw_base.rstrip('/')}/v{version}/ubs-daemon"
+                data = download(url, Path(temporary) / "companion", allow_override=allow_override,
+                                max_bytes=MAX_DAEMON_BYTES)
+                if not hmac.compare_digest(digest(data), expected):
+                    raise UpdateError("downloaded daemon companion checksum mismatch")
+        if not hmac.compare_digest(digest(read_regular(installed, MAX_RUNNER_BYTES)), current_sha):
+            raise UpdateError("installed runner changed during daemon repair; retry doctor")
+        require_installed_daemon_repair(installed)
+        require_safe_daemon_target(target)
+        publish_file(target, data, mode=0o644)
+        return check_daemon(installed, expected)
+
+
 def publish(candidate: Path, root: Path, raw_base: str, installed: Path,
             expected_current_sha: str, *, allow_override: bool,
             daemon_source: Optional[Path] = None, local_source: Optional[Path] = None) -> Path:
@@ -7749,7 +7916,7 @@ def publish(candidate: Path, root: Path, raw_base: str, installed: Path,
         if daemon_expected:
             daemon_target = installed.with_name(installed.name + ".daemon." + daemon_expected + ".py")
             daemon_path = daemon_source if daemon_source is not None else daemon_target
-            daemon_data = read_regular(daemon_path, 512 * 1024)
+            daemon_data = read_regular(daemon_path, MAX_DAEMON_BYTES)
             if not hmac.compare_digest(digest(daemon_data), daemon_expected):
                 raise UpdateError("release daemon checksum mismatch")
             if daemon_target.is_symlink() or (daemon_target.exists() and not daemon_target.is_file()):
@@ -7783,6 +7950,12 @@ def main() -> int:
         if command == "select-manifest" and len(args) >= 3:
             root, version, *entries = args
             result = select_manifest(manifest_from_arguments(version, entries), Path(root))
+        elif command == "check-daemon" and len(args) == 2:
+            installed, expected = args
+            result = check_daemon(Path(installed), expected)
+        elif command == "repair-daemon" and len(args) == 4:
+            installed, version, expected, base = args
+            result = repair_daemon(Path(installed), version, expected, base, allow_override=override)
         elif command == "snapshot-helpers" and len(args) >= 4:
             source, destination, version, *entries = args
             result = snapshot_helpers(manifest_from_arguments(version, entries),
@@ -7908,7 +8081,7 @@ check_and_update_self(){
     self_update_fail "installed binary is not writable: $self_path (re-run with sufficient permissions)"
     return $?
   fi
-  if is_checkout_helper "$MODULE_CACHE_ROOT/contract.json"; then
+  if is_checkout_asset "$MODULE_CACHE_ROOT/contract.json"; then
     self_update_fail "module directory is source, not an installed cache: $MODULE_CACHE_ROOT"
     return $?
   fi
@@ -8126,7 +8299,7 @@ fi
 
 if [[ "$MODE" == "doctor" ]]; then
   if [[ "$DOCTOR_FIX" -eq 1 && ! -e "$(script_dir)/.git" ]] \
-      && ! is_checkout_helper "$MODULE_CACHE_ROOT/contract.json"; then
+      && ! is_checkout_asset "$MODULE_CACHE_ROOT/contract.json"; then
     # Explicit repair can replace damaged bytes, but only after the entire
     # replacement has verified. Keep a legacy cache usable by older scans.
     prepare_current_release_generation repair-manifest || exit 2

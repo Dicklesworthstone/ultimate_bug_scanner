@@ -56,6 +56,8 @@ Authenticate SHA256SUMS, verify install.sh, ubs and git_safety_guard.py against
 that same manifest, and install the verified local payload. The caller's
 working directory is preserved for project hook setup. Missing signatures,
 missing or ambiguous checksums, and different release versions fail closed.
+Installation also requires a runner that supports verified cache publication;
+use --verify-only to authenticate historical releases without installing them.
 
 Options:
   --version VERSION       Select an exact release, including prerelease tags.
@@ -665,6 +667,17 @@ if [[ "$INSECURE" -eq 0 ]]; then
     "UBS_VERSION=\"${VERSION}\""|"UBS_VERSION='${VERSION}'"|"UBS_VERSION=${VERSION}") ;;
     *) die "Authenticated runner does not match requested version $VERSION" ;;
   esac
+  if [[ "$VERIFY_ONLY" -eq 0 ]]; then
+    # This entrypoint executes the selected release's own installer. An older
+    # signed installer can still replace a runner without preparing its cache;
+    # authentication alone does not make that publication safe. Inspect the
+    # target as data before executing any bundled code, including install.sh.
+    generation_declaration="$(awk '/^UBS_RELEASE_GENERATIONS=/ { count++; value=$0 }
+      END { if (count != 1) exit 1; print value }' "$VERIFY_DIR/ubs")" \
+      || die 'Target runner does not support verified cache publication; select a transaction-capable release or use --verify-only'
+    [[ "$generation_declaration" == 'UBS_RELEASE_GENERATIONS=1' ]] \
+      || die 'Target runner does not support verified cache publication; select a supported release generation protocol or use --verify-only'
+  fi
   # Bind the companion to the authenticated manifest AND the runner's literal
   # pin without executing the payload. A runner without a service pin has no
   # companion requirement.

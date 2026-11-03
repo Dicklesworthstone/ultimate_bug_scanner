@@ -1097,5 +1097,301 @@ class EntrypointTests(unittest.TestCase):
                         process.wait(timeout=5)
 
 
+@unittest.skipUnless(os.name == 'posix', 'the local service client requires POSIX')
+class CompanionDoctorTests(unittest.TestCase):
+    """Public doctor recovery for the installed, checksum-bound service client.
+
+    Only transport is doubled. The runner, complete module generation, daemon,
+    Python interpreter, and fallback scan all execute the actual release code.
+    Each temporary tree contains one module generation and is cleaned serially.
+    """
+
+    FETCH = r'''#!/usr/bin/env python3
+import os, pathlib, sys, time, urllib.parse
+args = sys.argv[1:]
+url = next((arg for arg in args if '://' in arg), '')
+with open(os.environ['COMPANION_FETCH_LOG'], 'a') as stream:
+    stream.write(url + '\n')
+if not url.startswith('file://'):
+    raise SystemExit(22)
+output = next((args[args.index(flag) + 1] for flag in ('-o', '-O') if flag in args), None)
+if output is None:
+    raise SystemExit(22)
+source = pathlib.Path(urllib.parse.unquote(urllib.parse.urlsplit(url).path))
+try:
+    data = source.read_bytes()
+except OSError:
+    raise SystemExit(22)
+if source.name == 'ubs-daemon':
+    failure = os.environ.get('COMPANION_FETCH_FAILURE', '')
+    if failure == 'missing':
+        raise SystemExit(22)
+    if failure == 'corrupt':
+        data += b'\n# unauthenticated transport modification\n'
+    if os.environ.get('COMPANION_FETCH_READY'):
+        pathlib.Path(output).write_bytes(data[:32])
+        pathlib.Path(os.environ['COMPANION_FETCH_READY']).write_text('partial download')
+        deadline = time.monotonic() + 60
+        while not pathlib.Path(os.environ['COMPANION_FETCH_RELEASE']).exists():
+            if time.monotonic() >= deadline:
+                raise SystemExit(23)
+            time.sleep(0.02)
+pathlib.Path(output).write_bytes(data)
+'''
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='ubs-companion-doctor-')
+        self.addCleanup(self.tmp.cleanup)
+        self.work = Path(self.tmp.name).resolve()
+        self.project = self.work / 'project'
+        self.bin = self.work / 'bin'
+        self.tools = self.work / 'transport'
+        self.home = self.work / 'home'
+        for path in (self.project, self.bin, self.tools, self.home, self.work / 'run'):
+            path.mkdir(mode=0o700)
+        self.runner = self.bin / 'ubs'
+        self.runner_bytes = (ROOT / 'ubs').read_bytes()
+        self.daemon_bytes = (ROOT / 'ubs-daemon').read_bytes()
+        source = self.runner_bytes.decode()
+        self.version = re.search(r'^UBS_VERSION="([^"]+)"$', source, re.M).group(1)
+        self.pin = re.search(r'^UBS_DAEMON_SHA256="([0-9a-f]{64})"$', source, re.M).group(1)
+        self.assertEqual(hashlib.sha256(self.daemon_bytes).hexdigest(), self.pin)
+        self.frontend = self.runner.with_name('ubs.daemon.' + self.pin + '.py')
+        self.mirror = self.work / 'mirror'
+        release = self.mirror / ('v' + self.version)
+        release.mkdir(parents=True)
+        (release / 'ubs-daemon').write_bytes(self.daemon_bytes)
+        self.expected_url = (release / 'ubs-daemon').as_uri()
+        self.fetch_log = self.work / 'fetch.log'
+        self.marker = self.work / 'unverified-companion-executed'
+        self.altered = (f'from pathlib import Path\nPath({str(self.marker)!r}).write_text("executed")\n').encode()
+        for name in ('curl', 'wget'):
+            executable = self.tools / name
+            executable.write_text(self.FETCH)
+            executable.chmod(0o755)
+        self.env = {key: value for key, value in os.environ.items()
+                    if not key.startswith(('UBS_', 'GIT_', 'XDG_', 'CLAUDE_', 'PYTHON', 'BASH_FUNC_'))
+                    and key not in {'BASH_ENV', 'ENV', 'TOON_TRU_BIN', 'ENABLE_UV_TOOLS', 'UV_TOOLS'}}
+        self.env.update(PATH=str(self.tools) + os.pathsep + os.environ['PATH'], HOME=str(self.home),
+                        XDG_DATA_HOME=str(self.work / 'data'), XDG_CACHE_HOME=str(self.work / 'cache'),
+                        XDG_CONFIG_HOME=str(self.work / 'config'), XDG_RUNTIME_DIR='../run',
+                        UBS_NO_AUTO_UPDATE='1', UBS_NO_CACHE='1', PYTHONDONTWRITEBYTECODE='1',
+                        ENABLE_UV_TOOLS='0', UV_TOOLS='0', UBS_SKIP_RUST_BUILD='1',
+                        UBS_REPO_RAW_BASE=self.mirror.as_uri(), UBS_TOON_BASE_URL=(self.mirror / 'optional-toon').as_uri(),
+                        COMPANION_FETCH_LOG=str(self.fetch_log), NO_COLOR='1')
+        # Doctor --fix must have its genuine required tool, so a missing
+        # optional encoder can warn without masking a companion result.
+        ast_grep = shutil.which('ast-grep', path=self.env['PATH'])
+        self.assertIsNotNone(ast_grep, 'Companion doctor integration requires real ast-grep on PATH')
+        self.env['UBS_AST_GREP_BIN'] = ast_grep
+        self.calls = []
+        cache = self.work / 'data/ubs/modules'
+        result = self.cli('--prepare-release-cache=' + str(cache), '--publish-release=' + str(self.runner),
+                          '--expected-runner-sha=absent', '--release-daemon=' + str(ROOT / 'ubs-daemon'),
+                          '--release-source=' + str((ROOT / 'modules').resolve()), runner=ROOT / 'ubs')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.generation = Path(result.stdout.strip())
+        self.assertTrue((self.generation / '.ubs-ready.json').is_file(), result.stdout + result.stderr)
+        self.assertEqual(self.frontend.read_bytes(), self.daemon_bytes)
+        self.assets = self.fingerprints()
+        (self.project / 'unsafe.py').write_text('eval(input())\n')
+
+    def run(self, result=None):
+        case = 'companion-doctor:' + self._testMethodName
+        print(f'[{case}] RUN', flush=True)
+        started = time.monotonic()
+        result = result or self.defaultTestResult()
+        before = len(result.failures) + len(result.errors)
+        skipped = len(result.skipped)
+        super().run(result)
+        failed = len(result.failures) + len(result.errors) > before
+        if failed:
+            for args, stdout, stderr in getattr(self, 'calls', []):
+                print(f'[{case}] command={args!r}\nstdout:\n{stdout}\nstderr:\n{stderr}', flush=True)
+        status = 'FAIL' if failed else 'SKIP' if len(result.skipped) > skipped else 'PASS'
+        print(f'[{case}] {status} ({time.monotonic() - started:.3f}s)', flush=True)
+        return result
+
+    def cli(self, *args, runner=None, env=None):
+        command = [str(runner or self.runner), *args]
+        result = subprocess.run(command, cwd=self.project, env=env or self.env,
+                                capture_output=True, text=True, timeout=150)
+        self.calls.append((command, result.stdout, result.stderr))
+        return result
+
+    def fingerprints(self):
+        return {str(path.relative_to(self.generation)): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in self.generation.rglob('*') if path.is_file()}
+
+    def assert_installation_intact(self):
+        self.assertEqual(self.runner.read_bytes(), self.runner_bytes)
+        self.assertEqual(self.fingerprints(), self.assets)
+        self.assertFalse(self.marker.exists(), 'unverified companion bytes were executed')
+
+    def fetched_companions(self):
+        if not self.fetch_log.exists():
+            return []
+        return [url for url in self.fetch_log.read_text().splitlines() if url.endswith('/ubs-daemon')]
+
+    def doctor(self, *, fix=False, runner=None, env=None):
+        return self.cli('doctor', '--format=json', *(['--fix'] if fix else []), runner=runner, env=env)
+
+    def assert_doctor(self, result, status):
+        self.assertEqual(result.returncode, 0 if status == 'ok' else 2, result.stdout + result.stderr)
+        try:
+            report = json.loads(result.stdout)
+        except ValueError as exc:
+            self.fail(f'Invalid doctor JSON: {exc}\n{result.stdout}\n{result.stderr}')
+        self.assertEqual(report['status'], 'ok' if status == 'ok' else 'error', report)
+        checks = [check for check in report['checks'] if check['id'] == 'daemon']
+        self.assertEqual(len(checks), 1, report)
+        self.assertEqual(checks[0]['status'], status, checks)
+        return checks[0]
+
+    def assert_client_rejected(self):
+        result = self.cli('--client', '--repo', str(self.project), '--', 'unsafe.py')
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('cannot load the verified local scan service', result.stderr)
+        self.assertNotIn('python.taint.eval', result.stdout)
+        self.assertFalse(self.marker.exists())
+
+    def assert_actual_fallback(self):
+        result = self.cli('--client', '--repo', str(self.project), '--', 'unsafe.py')
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report['status'], 'ok', report)
+        self.assertEqual(report['failed_modules'], [], report)
+        self.assertTrue(any(finding['rule_id'] == 'python.taint.eval' and finding['line'] == 1
+                            for finding in report['findings']), report)
+        self.assertFalse(list((self.work / 'run').rglob('*.sock')), 'this test must use the real absent-service fallback')
+        return report
+
+    def test_healthy_installed_client_fallback_runs_actual_scanner_without_fetching(self):
+        direct = self.cli('--ci', '--no-auto-update', '--format=json', '--only=python', str(self.project / 'unsafe.py'))
+        self.assertEqual(direct.returncode, 1, direct.stdout + direct.stderr)
+        fallback = self.assert_actual_fallback()
+        self.assertEqual(fallback['findings'], json.loads(direct.stdout)['findings'])
+        self.assertEqual(self.fetched_companions(), [])
+        self.assert_installation_intact()
+
+    def test_missing_companion_is_a_doctor_error_and_never_bypasses_the_client(self):
+        self.frontend.rename(self.work / 'saved-companion.py')
+        check = self.assert_doctor(self.doctor(), 'err')
+        self.assertIn('doctor --fix', check['detail'])
+        self.assert_client_rejected()
+        self.assertFalse(self.frontend.exists())
+        self.assertEqual(self.fetched_companions(), [])
+        self.assert_installation_intact()
+
+    def test_tampered_generation_is_not_hidden_by_adjacent_or_path_companions(self):
+        self.frontend.write_bytes(self.altered)
+        (self.bin / 'ubs-daemon').write_bytes(self.daemon_bytes)
+        replacement = self.tools / 'ubs-daemon'
+        replacement.write_bytes(b'#!/usr/bin/env python3\n' + self.altered)
+        replacement.chmod(0o755)
+        self.assert_doctor(self.doctor(), 'err')
+        self.assert_client_rejected()
+        self.assertEqual(self.frontend.read_bytes(), self.altered)
+        self.assertEqual(self.fetched_companions(), [])
+        self.assert_installation_intact()
+
+    def test_missing_companion_repair_restores_pinned_client_and_healthy_doctor_does_not_refetch(self):
+        self.frontend.rename(self.work / 'saved-companion.py')
+        self.assert_client_rejected()
+        self.assert_doctor(self.doctor(fix=True), 'ok')
+        self.assertTrue(self.frontend.is_file(), 'doctor --fix left the installed client missing')
+        self.assertEqual(self.frontend.read_bytes(), self.daemon_bytes)
+        self.assertEqual(self.fetched_companions(), [self.expected_url])
+        self.assert_actual_fallback()
+        self.assert_doctor(self.doctor(), 'ok')
+        self.assertEqual(self.fetched_companions(), [self.expected_url])
+        self.assert_installation_intact()
+
+    def test_failed_and_modified_downloads_preserve_damaged_bytes_and_verified_modules(self):
+        self.frontend.write_bytes(self.altered)
+        for failure in ('missing', 'corrupt'):
+            with self.subTest(failure=failure):
+                result = self.doctor(fix=True, env=dict(self.env, COMPANION_FETCH_FAILURE=failure))
+                self.assert_doctor(result, 'err')
+                self.assertEqual(self.frontend.read_bytes(), self.altered)
+                self.assert_client_rejected()
+                self.assert_installation_intact()
+        self.assertEqual(self.fetched_companions(), [self.expected_url, self.expected_url])
+
+    def test_repair_publishes_only_after_the_complete_download_is_verified(self):
+        self.frontend.write_bytes(self.altered)
+        identity = self.frontend.stat().st_ino
+        ready = self.work / 'partial-download-ready'
+        release = self.work / 'complete-download'
+        command = [str(self.runner), 'doctor', '--fix', '--format=json']
+        stdout_path = self.work / 'repair.stdout'
+        stderr_path = self.work / 'repair.stderr'
+        stdout_sink = stdout_path.open('w')
+        stderr_sink = stderr_path.open('w')
+        process = subprocess.Popen(command, cwd=self.project,
+            env=dict(self.env, COMPANION_FETCH_READY=str(ready), COMPANION_FETCH_RELEASE=str(release)),
+            stdout=stdout_sink, stderr=stderr_sink, text=True, start_new_session=True)
+        try:
+            deadline = time.monotonic() + 30
+            while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.02)
+            if not ready.exists():
+                if process.poll() is not None:
+                    stdout, stderr = stdout_path.read_text(), stderr_path.read_text()
+                    self.calls.append((command, stdout, stderr))
+                    self.fail('doctor did not request the missing/corrupted companion\n' + stdout + stderr)
+                self.fail('doctor did not reach the bounded companion download')
+            self.assertEqual(self.frontend.stat().st_ino, identity)
+            self.assertEqual(self.frontend.read_bytes(), self.altered)
+            self.assert_client_rejected()
+            release.write_text('finish verified download')
+            process.wait(timeout=150)
+            stdout, stderr = stdout_path.read_text(), stderr_path.read_text()
+            self.calls.append((command, stdout, stderr))
+            self.assert_doctor(subprocess.CompletedProcess(command, process.returncode, stdout, stderr), 'ok')
+            self.assertNotEqual(self.frontend.stat().st_ino, identity)
+            self.assertEqual(self.frontend.read_bytes(), self.daemon_bytes)
+            self.assert_actual_fallback()
+            self.assert_installation_intact()
+        finally:
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                process.wait(timeout=5)
+            stdout_sink.close()
+            stderr_sink.close()
+
+    def test_symlinked_generation_is_refused_without_touching_its_target(self):
+        self.frontend.rename(self.work / 'saved-companion.py')
+        outside = self.work / 'outside-companion.py'
+        outside.write_bytes(self.daemon_bytes)
+        self.frontend.symlink_to(outside)
+        self.assert_doctor(self.doctor(fix=True), 'err')
+        self.assertTrue(self.frontend.is_symlink())
+        self.assertEqual(outside.read_bytes(), self.daemon_bytes)
+        self.assertEqual(self.fetched_companions(), [])
+        self.assert_client_rejected()
+        self.assert_installation_intact()
+
+    def test_doctor_fix_preserves_a_source_checkouts_companion(self):
+        checkout = self.work / 'source-checkout'
+        checkout.mkdir()
+        subprocess.run(['git', 'init', '-q', str(checkout)], env=self.env,
+                       check=True, capture_output=True, timeout=20)
+        source_runner = checkout / 'ubs'
+        shutil.copy2(self.runner, source_runner)
+        (checkout / 'modules').symlink_to((ROOT / 'modules').resolve(), target_is_directory=True)
+        companion = checkout / 'ubs-daemon'
+        companion.write_bytes(self.altered)
+        check = self.assert_doctor(self.doctor(fix=True, runner=source_runner), 'err')
+        self.assertIn('source', check['detail'].lower())
+        self.assertEqual(companion.read_bytes(), self.altered)
+        self.assertEqual(source_runner.read_bytes(), self.runner_bytes)
+        self.assertEqual(self.fetched_companions(), [])
+        self.assert_installation_intact()
+
+
 if __name__ == '__main__':
     unittest.main()

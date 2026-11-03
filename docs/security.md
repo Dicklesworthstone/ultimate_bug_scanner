@@ -150,6 +150,18 @@ Python startup; adjacent startup files and previously compiled bytecode cannot
 authorize diagnostic code. Ordinary scans reject damaged generations; they never
 authorize an arbitrary checksum mismatch as an old release.
 
+Doctor also verifies the exact service companion used by `ubs --client` and
+installed POSIX hooks. A missing or damaged companion makes diagnosis fail,
+even when a healthy adjacent or PATH replacement exists behind a damaged
+preferred sidecar. Explicit repair accepts only bytes matching the running
+runner's daemon pin, reuses a matching adjacent copy or fetches that release's
+tag, and atomically publishes the verified digest-named companion. It never
+imports candidate code. The existing publication lock and runner-digest lease
+prevent repair from claiming success across a concurrent runner replacement.
+Failed companion downloads preserve the existing runner and companion bytes;
+unsafe destination types and source-owned companions are refused without
+overwriting or shadowing them.
+
 For installed runners, `ubs --update-modules` forces a fresh download of
 every pinned runtime asset into private staging. It verifies the entire graph
 before applying the same atomic, same-pin replacements used by repair. Module

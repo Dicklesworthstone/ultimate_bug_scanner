@@ -97,6 +97,16 @@ class InstalledContract(unittest.TestCase):
         self.runner = self.bin / "ubs"
         shutil.copy2(UBS_BIN, self.runner)
         self.runner.chmod(0o755)
+        # A healthy standalone installation includes its release companion.
+        # Keep the real adjacent layout here: updater tests must still publish
+        # the digest-named companion, and damaged/missing-companion controls
+        # live in the dedicated service suite.
+        companion = (REPO_ROOT / "ubs-daemon").read_bytes()
+        companion_pins = re.findall(rb'^UBS_DAEMON_SHA256="([0-9a-f]{64})"$',
+                                    self.runner.read_bytes(), re.M)
+        self.assertEqual(companion_pins, [hashlib.sha256(companion).hexdigest().encode()])
+        (self.bin / "ubs-daemon").write_bytes(companion)
+        (self.bin / "ubs-daemon").chmod(0o644)
         self.cache = self.root / "cache"
         self.cache.mkdir()
         self.target = self.root / "project"

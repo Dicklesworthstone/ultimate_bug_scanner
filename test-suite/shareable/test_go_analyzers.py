@@ -514,10 +514,37 @@ class RealGoTools(unittest.TestCase):
         self.assertTrue({"go.vet.printf", "go.gofmt.format"} <= {f["rule"] for f in self.rows()})
         self.assertEqual(result[1]["status"], "ok")
 
+    OFFLINE_GO = {"GOTOOLCHAIN": "local", "GOPROXY": "off", "GOSUMDB": "off", "GOWORK": "off", "GOFLAGS": ""}
+
+    def native_printf_column(self, statement: str) -> int:
+        """Ask this Go toolchain which column its printf check reports.
+
+        Go releases differ: older vet anchors the diagnostic at the call,
+        newer vet at the offending format directive. A one-diagnostic
+        package outside the scanned tree pins the expectation to the
+        toolchain under test instead of to one release.
+        """
+        artifacts = REPO / "test-suite/artifacts/go-analyzers"
+        probe = tempfile.TemporaryDirectory(prefix="ubs-go-vet-probe-", dir=artifacts)
+        self.addCleanup(probe.cleanup)
+        root = Path(probe.name)
+        (root / "go.mod").write_text("module example.invalid/probe\n\ngo 1.23\n")
+        (root / "probe.go").write_text('package main\n\nimport "fmt"\n\nfunc main() {\n' + statement + '}\n')
+        result = subprocess.run(["go", "vet", "-json", "./..."], cwd=root, capture_output=True,
+                                text=True, timeout=120, env=dict(os.environ, **self.OFFLINE_GO))
+        report = "\n".join(line for line in (result.stdout + result.stderr).splitlines()
+                           if not line.startswith("#"))
+        rows = json.loads(report)["example.invalid/probe"]["printf"]
+        self.assertEqual(len(rows), 1, report)
+        position = rows[0]["posn"].rsplit(":", 2)
+        self.assertEqual((Path(position[0]).name, position[1]), ("probe.go", "6"), report)
+        return int(position[2])
+
     def test_real_vet_keeps_every_diagnostic_beyond_sixteen_megabytes(self) -> None:
         # A real offline vet run, with 13,000 distinct source sites in one
         # package. Long but valid arguments grow the report past the former
         # aggregate cap without storing a giant fixture in the repository.
+        column = self.native_printf_column('\tfmt.Printf("%d", "x")\n')
         files, expected = [], set()
         for number in range(13):
             path = self.root / f"part{number:02}.go"
@@ -525,7 +552,7 @@ class RealGoTools(unittest.TestCase):
             path.write_text('package main\n\nimport "fmt"\n\n' +
                             f"func Check{number}() {{\n" + body * 1000 + '}\n')
             files.append(path)
-            expected.update((str(path), line, 2) for line in range(6, 1006))
+            expected.update((str(path), line, column) for line in range(6, 1006))
         hashes = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in files}
         captured = {}
         capture, which = tools.run_command_stream, shutil.which

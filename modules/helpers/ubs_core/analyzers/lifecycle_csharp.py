@@ -84,12 +84,12 @@ RESOURCE_PATTERNS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
 
 def iter_csharp_files(root: Path):
     if root.is_file():
-        if root.suffix.lower() in {".cs", ".csx"} and not any(part in SKIP_DIRS for part in root.parts):
+        if root.suffix.lower() in {".cs", ".csx"}:
             yield root
         return
     for ext in ("*.cs", "*.csx"):
         for path in root.rglob(ext):
-            if any(part in SKIP_DIRS for part in path.parts):
+            if any(part in SKIP_DIRS for part in path.relative_to(root).parts):
                 continue
             if path.is_file():
                 yield path

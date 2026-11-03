@@ -89,7 +89,7 @@ _SEVERITY = {
 
 def iter_swiftish_files(root: Path):
     if root.is_file():
-        if root.suffix.lower() in SWIFTISH_SUFFIXES and not any(part in SKIP_DIRS for part in root.parts):
+        if root.suffix.lower() in SWIFTISH_SUFFIXES:
             yield root
         return
     for path in root.rglob("*"):
@@ -97,7 +97,7 @@ def iter_swiftish_files(root: Path):
             continue
         if path.suffix.lower() not in SWIFTISH_SUFFIXES:
             continue
-        if any(part in SKIP_DIRS for part in path.parts):
+        if any(part in SKIP_DIRS for part in path.relative_to(root).parts):
             continue
         yield path
 

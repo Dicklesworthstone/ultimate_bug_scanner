@@ -280,6 +280,25 @@ class SQLSinkArguments(unittest.TestCase):
         # one method caused every unrelated test body to consume SQL flow.
         self.assertEqual(list(detector.find([Path(__file__).with_name('test_ubs_core.py')])), [])
 
+    def test_large_binding_index_omits_only_operator_and_context_tags(self):
+        # A non-SQL use of the admitted name still needs the full lexical
+        # index. Its marker leaves do not describe additional program state.
+        source = 'value = extra + right * (extra - right)\n' * 7000
+        tree = ast.parse(source)
+        self.assertGreater(sum(1 for _ in ast.walk(tree)), 100_000)
+        path = self.artifacts / 'large-ordinary-extra.py'
+        path.write_text(source, encoding='utf-8')
+        self.assertEqual(list(detector.find([path])), [])
+        with self.assertRaisesRegex(detector.SQLFlowLimit, 'binding budget.*incomplete'):
+            list(detector.find([path], max_steps=1))
+
+    def test_large_source_default_does_not_override_explicit_budget(self):
+        path = self.artifacts / 'large-index-budget.py'
+        path.write_text('value = extra + right * (extra - right)\n' * 12000, encoding='utf-8')
+        self.assertEqual(list(detector.find([path])), [])
+        with self.assertRaisesRegex(detector.SQLFlowLimit, 'binding budget.*incomplete'):
+            list(detector.find([path], max_steps=100_000))
+
     def test_literal_scope_admission_keeps_decorators_and_reflection(self):
         closure = ('events = []\n'
                    'def record(item):\n    events.append(item)\n    raise ValueError(item)\n'

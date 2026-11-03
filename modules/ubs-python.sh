@@ -18,7 +18,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="40fc108aeb5dafc1d3f0df6065563207902dc0c221865e2df12cfc4804d04357"
+UBS_LIB_CHECKSUM="b633e72ac7ead6a1eeb12dda6c82776aa40e4e7590c8aeeede96c22a7044c30e"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -449,13 +449,14 @@ run_uv_tool_text() {
   if [[ "${UBS_KEEP_TEMP:-0}" == "1" ]]; then
     BASH_COMPAT="${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"
   fi
-  PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 - "$tool" "$UV_TIMEOUT" "${command_args[@]}" <<'PYUVTOOL'
+  PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 - "$tool" "$UV_TIMEOUT" "$USE_COLOR" "${command_args[@]}" <<'PYUVTOOL'
 from pathlib import Path
+import os
 import shutil
 import sys
 from ubs_core.external_tools import run_command_stream
 
-tool, timeout_raw, *command = sys.argv[1:]
+tool, timeout_raw, use_color, *command = sys.argv[1:]
 try:
     timeout = float(timeout_raw)
 except ValueError:
@@ -463,7 +464,16 @@ except ValueError:
     sys.exit(2)
 errors = []
 status = 2
-with run_command_stream(tool, command, Path.cwd(), timeout, errors) as output:
+environment = os.environ.copy()
+if use_color == "0":
+    # A present FORCE_COLOR (even "0") can make a captured tool emit
+    # cursor/progress escapes despite NO_COLOR. Forward the caller's
+    # plain-output intent without filtering any analyzer evidence.
+    environment.pop("FORCE_COLOR", None)
+    environment.pop("CLICOLOR_FORCE", None)
+    environment["NO_COLOR"] = "1"
+    environment["PYTHON_COLORS"] = "0"
+with run_command_stream(tool, command, Path.cwd(), timeout, errors, env=environment) as output:
     if output is not None:
         shutil.copyfileobj(output.stdout, sys.stdout.buffer, length=64 * 1024)
         if output.stderr_stream is not None:

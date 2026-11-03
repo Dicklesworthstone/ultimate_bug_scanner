@@ -168,6 +168,8 @@ class SanitizerBindings:
         self._instrumentation_lists = {}
         self._instrumentation_forwarders = set()
         self._possible_sql_imports = {}
+        self._binding_resolutions = {}
+        self._sql_binding_cells = {}
         self._sql_facade_flow = None
         self.independent_functions = self._independent_functions()
         for scope in self.owner_scopes.values():
@@ -724,6 +726,12 @@ class SanitizerBindings:
 
     def sql_binding_cell(self, name, scope):
         """Locate the declared lexical cell, including global/nonlocal writes."""
+        key = name, scope['node'] if scope is not None else None
+        if key not in self._sql_binding_cells:
+            self._sql_binding_cells[key] = self._find_sql_binding_cell(name, scope)
+        return self._sql_binding_cells[key]
+
+    def _find_sql_binding_cell(self, name, scope):
         while scope is not None:
             self.budget[0] -= 1
             if self.budget[0] < 0:
@@ -1458,6 +1466,12 @@ class SanitizerBindings:
             self._walk(node.value, scope)
             return
         for child in ast.iter_child_nodes(node):
+            # Operator and context markers are field tags, with no lexical
+            # bindings, references or descendants. Their owning expressions
+            # retain the tags; indexing shared singleton leaves adds no facts.
+            if isinstance(child, (ast.expr_context, ast.operator, ast.unaryop,
+                                  ast.boolop, ast.cmpop)):
+                continue
             self._walk(child, scope)
 
     def lookup(self, name, scope, seen=None):
@@ -1478,6 +1492,17 @@ class SanitizerBindings:
         return ('unbound', name)
 
     def resolve(self, node, seen=None):
+        root = seen is None
+        if root and node in self._binding_resolutions:
+            return self._binding_resolutions[node]
+        result = self._resolve(node, seen)
+        # Nested alias-cycle queries have context-dependent visited sets.
+        # Only a complete root result belongs to the immutable lexical index.
+        if root:
+            self._binding_resolutions[node] = result
+        return result
+
+    def _resolve(self, node, seen=None):
         self.budget[0] -= 1
         if self.budget[0] < 0:
             raise SQLFlowLimit('SQL binding resolution budget exceeded; analysis is incomplete')
@@ -6659,7 +6684,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             self._sink_risks[id(node)] = (worst, node.lineno, source_line(self.lines, node.lineno))
 
 
-def find(files: Sequence[Path], *, max_steps=100_000) -> Iterable[tuple[str, Path, int, int, str]]:
+def find(files: Sequence[Path], *, max_steps=None) -> Iterable[tuple[str, Path, int, int, str]]:
     for path in files:
         if path.suffix.lower() not in {'.py', '.pyi'}:
             continue
@@ -6674,17 +6699,22 @@ def find(files: Sequence[Path], *, max_steps=100_000) -> Iterable[tuple[str, Pat
         # a matching name admits full analysis regardless of its arguments.
         # Decode and parse failures above must remain incomplete even when no
         # sink can be recognized. Applicable SQL flow keeps its ordinary budget.
+        nodes = tuple(ast.walk(tree))
         if not any(isinstance(node, ast.Call) and sql_sink_name(node)
                    or isinstance(node, ast.Attribute) and node.attr in EXECUTE_METHODS | {'extra'}
                    or isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in EXECUTE_METHODS | {'extra'}
                    or isinstance(node, ast.ImportFrom) and any(
                        alias.name in EXECUTE_METHODS | {'extra'} for alias in node.names)
-                   for node in ast.walk(tree)):
+                   for node in nodes):
             continue
         lines = text.splitlines()
         param_names, name_risk = build_provenance(tree)
         sanitizers = configured_sanitizers()
-        budget = [max_steps]
+        # The mandatory lexical index is linear in source size. Keep the
+        # ordinary small-file allowance, scale that floor for large modules,
+        # and retain a hard ceiling. Explicit caller budgets remain exact.
+        steps = max_steps if max_steps is not None else min(1_000_000, max(100_000, 2 * len(nodes)))
+        budget = [steps]
         bindings = SanitizerBindings(tree, configured_sanitizer_targets(), budget)
         if (not any(sql_sink_name(call, bindings) or bindings.unresolved_sql_aliases(call)
                     for call in bindings.calls) and not bindings.sql_facade_flow()[1]):
@@ -6697,7 +6727,7 @@ def find(files: Sequence[Path], *, max_steps=100_000) -> Iterable[tuple[str, Pat
             name_risk,
             sanitizers,
             summaries,
-            max_steps=max_steps,
+            max_steps=steps,
             budget=budget,
             bindings=bindings,
         )

@@ -10,6 +10,21 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+### Python analysis and bounded reporting
+
+- Reuse immutable SQL binding lookups and relevant callable-summary inputs
+  so large Python modules complete without increasing taint work limits.
+  SQL indexing scales its default allowance with input size under a fixed
+  ceiling; explicit caller budgets and incomplete-analysis errors remain exact.
+- Track temporary callable replacements through `globals()` item writes,
+  updates and ordinary helper calls. Restored clean calls stay clean; dynamic
+  keys and unsupported namespace escapes report incomplete analysis.
+- Honor plain-output requests in captured Python tools even when the parent
+  forces terminal colors, retaining their full diagnostics and exit status.
+- Build JavaScript finding-location indexes for the current reporting file
+  instead of retaining every selected file's newline offsets during analysis.
+  The original connected-component memory and finding checks remain unchanged.
+
 ### JavaScript precision (5.5.27)
 
 - Playwright response predicates compare public HTTP methods and route paths

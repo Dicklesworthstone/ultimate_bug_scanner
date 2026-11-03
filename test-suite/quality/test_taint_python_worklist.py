@@ -205,6 +205,42 @@ def f():
     except ValueError:
         os.system(shared[0])
 '''},
+    'transitive_global_callback_override': {'app.py': '''
+import os
+def safe(value):
+    return None
+def invoke(callback, value):
+    callback(value)
+def indirect(value):
+    target(value)
+target = safe
+def handler():
+    global target
+    target = os.system
+    invoke(indirect, input())
+    target = safe
+'''},
+    'transitive_global_class_override': {'app.py': '''
+import os
+class Safe:
+    @staticmethod
+    def send(value):
+        return None
+class Unsafe:
+    @staticmethod
+    def send(value):
+        os.system(value)
+Target = Safe
+def dispatch(value):
+    Target.send(value)
+def invoke(callback, value):
+    callback(value)
+def handler():
+    global Target
+    Target = Unsafe
+    invoke(dispatch, input())
+    Target = Safe
+'''},
 }
 
 EXPECTED = {
@@ -219,6 +255,8 @@ EXPECTED = {
     'call_global_refresh': {('app.py', 7), ('app.py', 12)},
     'exception_branch_heap': {('app.py', 11)},
     'exception_comprehension': {('app.py', 8)},
+    'transitive_global_callback_override': {('app.py', 7)},
+    'transitive_global_class_override': {('app.py', 9)},
 }
 
 
@@ -327,6 +365,175 @@ def fresh_exception_join(flow, state):
 
 
 class WorklistReuseTests(unittest.TestCase):
+    def test_reflective_global_replacement_retains_callables_and_restoration(self):
+        for kind in ('item', 'update', 'alias'):
+            for unsafe in (False, True):
+                with self.subTest(kind=kind, unsafe=unsafe):
+                    prefix = '''import os
+def target(value): return None
+saved = target
+def indirect(value): target(value)
+def invoke(callback, value): callback(value)
+def handler():
+'''
+                    if kind == 'update':
+                        replace = 'globals().update(target=os.system)'
+                        restore = 'globals().update(target=saved)'
+                        setup = ''
+                    else:
+                        receiver = 'namespace' if kind == 'alias' else 'globals()'
+                        setup = '    namespace = globals()\n' if kind == 'alias' else ''
+                        replace = f'{receiver}["target"] = os.system'
+                        restore = f'{receiver}["target"] = saved'
+                    statements = [replace, 'invoke(indirect, input())', restore] if unsafe else [replace, restore, 'invoke(indirect, input())']
+                    source = prefix + setup + ''.join(f'    {statement}\n' for statement in statements)
+                    effects = taint_py._Analysis(ast.parse(source)).analyze()
+                    self.assertEqual({key[:3] for key in effects}, {('command', 4, 22)} if unsafe else set())
+
+    def test_namespace_mutation_keeps_same_named_local_separate(self):
+        source = '''import os
+def target(value): return None
+def indirect(value): target(value)
+def handler():
+    target = print
+    globals()['target'] = os.system
+    target(input())
+    indirect(input())
+'''
+        effects = taint_py._Analysis(ast.parse(source)).analyze()
+        self.assertEqual({key[:3] for key in effects}, {('command', 3, 22)})
+
+    def test_namespace_reads_keep_the_replaced_callable(self):
+        for expression in ("globals()['target']", "globals().get('target')"):
+            source = f'''import os
+target = print
+globals()['target'] = os.system
+{expression}(input())
+'''
+            with self.subTest(expression=expression):
+                effects = taint_py._Analysis(ast.parse(source)).analyze()
+                self.assertEqual({key[:3] for key in effects}, {('command', 4, 1)})
+
+    def test_unknown_namespace_write_is_incomplete_and_shadowed_globals_is_ordinary(self):
+        source = '''import os
+def handler(): globals()[input()] = os.system
+'''
+        with self.assertRaisesRegex(AnalysisLimit, 'dynamic globals mapping key'):
+            taint_py._Analysis(ast.parse(source)).analyze()
+        source = '''import os
+def globals(): return {}
+def target(value): return None
+def handler():
+    globals()['target'] = os.system
+    target(input())
+'''
+        self.assertEqual(taint_py._Analysis(ast.parse(source)).analyze(), {})
+
+    def test_namespace_replacement_restored_by_lexical_assignment_is_clean(self):
+        source = '''import os
+def target(value): return None
+saved = target
+def handler():
+    global target
+    globals()['target'] = os.system
+    target = saved
+    target(input())
+'''
+        self.assertEqual(taint_py._Analysis(ast.parse(source)).analyze(), {})
+
+    def test_namespace_get_does_not_execute_an_unused_dangerous_default(self):
+        source = '''import os
+target = print
+globals().get('target', os.system)(input())
+'''
+        self.assertEqual(taint_py._Analysis(ast.parse(source)).analyze(), {})
+
+    def test_namespace_literal_key_alias_invalidates_prior_helper_identity(self):
+        source = '''import os
+def target(value): return None
+def indirect(value): target(value)
+def handler():
+    key = 'target'
+    globals()[key] = os.system
+    indirect(input())
+'''
+        effects = taint_py._Analysis(ast.parse(source)).analyze()
+        self.assertEqual({key[:3] for key in effects}, {('command', 3, 22)})
+
+    def test_namespace_escape_to_an_unmodeled_mutator_is_incomplete(self):
+        source = '''import os
+def target(value): return None
+def replace(namespace, value): namespace['target'] = value
+def handler():
+    replace(globals(), os.system)
+    target(input())
+'''
+        with self.assertRaisesRegex(AnalysisLimit, 'globals mapping passed to a callable'):
+            taint_py._Analysis(ast.parse(source)).analyze()
+
+    def test_joined_namespace_item_access_is_incomplete(self):
+        header = 'import os\ndef target(value): return None\ndef indirect(value): target(value)\n'
+        cases = (
+            "def handler():\n"
+            "    namespace = globals() if input() else {}\n"
+            "    namespace['target'] = os.system\n"
+            "    indirect(input())\n",
+            "def handler():\n"
+            "    globals()['target'] = os.system\n"
+            "    namespace = globals() if input() else {'target': print}\n"
+            "    namespace['target'](input())\n",
+        )
+        for source in cases:
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(AnalysisLimit, 'ambiguous globals mapping'):
+                    taint_py._Analysis(ast.parse(header + source)).analyze()
+        # An ordinary dictionary alternative confers no module write authority.
+        ordinary = "namespace = {} if input() else {'target': print}\nnamespace['target'] = print\n"
+        self.assertEqual(taint_py._Analysis(ast.parse(ordinary)).analyze(), {})
+
+    def test_recursive_opaque_ast_fields_complete_with_unsafe_and_clean_inputs(self):
+        visitor = '''import ast
+def visit(node):
+    if isinstance(node, ast.Constant): return node.value
+    if isinstance(node, ast.BinOp): return visit(node.left) + visit(node.right)
+    if isinstance(node, ast.UnaryOp): return visit(node.operand)
+    if isinstance(node, ast.List): return [visit(item) for item in node.elts]
+    if isinstance(node, ast.Tuple): return tuple(visit(item) for item in node.elts)
+    if isinstance(node, ast.Dict): return {visit(key): visit(value) for key,value in zip(node.keys,node.values)}
+    return node
+'''
+        for unsafe in (False, True):
+            with self.subTest(unsafe=unsafe):
+                value = 'input()' if unsafe else '"123"'
+                source = visitor + f'eval(visit(ast.parse({value}, mode="eval").body))\n'
+                effects = taint_py._Analysis(ast.parse(source)).analyze()
+                self.assertEqual({key[:3] for key in effects},
+                                 {('eval', len(source.splitlines()), 1)} if unsafe else set())
+
+    def test_unrelated_global_replacements_keep_helper_context_storage_linear(self):
+        for count in (8, 64):
+            for unsafe in (False, True):
+                with self.subTest(count=count, unsafe=unsafe):
+                    lines = ['import os', 'def safe(value): return None']
+                    lines += [f'alias{index} = safe' for index in range(count)]
+                    for index in range(count):
+                        target = f'f{index + 1}(value)' if index + 1 < count else 'value'
+                        lines += [f'def f{index}(value): return {target}']
+                    lines += ['def handler():',
+                              '    global ' + ', '.join(f'alias{index}' for index in range(count))]
+                    lines += [f'    alias{index} = os.system' for index in range(count)]
+                    actual = 'input()' if unsafe else '"fixed"'
+                    lines += [f'    eval(f0({actual}))']
+                    sink_line = len(lines)
+                    lines += [f'    alias{index} = safe' for index in range(count)]
+                    engine = taint_py._Analysis(ast.parse('\n'.join(lines) + '\n'))
+                    effects = engine.analyze()
+                    self.assertEqual({key[:3] for key in effects},
+                                     {('eval', sink_line, 5)} if unsafe else set())
+                    retained = sum(len(key[1]) for key in engine.summaries
+                                   if isinstance(key, tuple) and key[0].name.startswith('f'))
+                    self.assertLessEqual(retained, 32 * count)
+
     def scan(self, sources):
         with tempfile.TemporaryDirectory(prefix='ubs-python-worklist-') as tmp:
             root = Path(tmp).resolve()
@@ -3110,7 +3317,8 @@ class PythonInputAdmissionTests(unittest.TestCase):
                 raise AssertionError(f'Input-admission tests must not write files: {file}')
             path = Path(os.fsdecode(file)) if not isinstance(file, int) else None
             if path is None or not path.is_relative_to(self.root):
-                return original_open(file, mode, buffering, encoding, errors,
+                # The caller owns this returned stream and closes it, like io.open.
+                return original_open(file, mode, buffering, encoding, errors,  # ubs:ignore[python.lifecycle.file_handle]
                                      newline, closefd, opener)
             if path not in self.contents:
                 raise FileNotFoundError(2, 'virtual source does not exist', str(path))

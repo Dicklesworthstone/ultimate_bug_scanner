@@ -11,7 +11,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="54dba71e6c69d92aa2825eef549a9652d16d5718a7db01e6ea4e6595c053aa31"
+UBS_LIB_CHECKSUM="a72fde3e273e174302f5ef9f5a128d5ebb27b9fe124c7869572e965753d4daf9"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -332,7 +332,7 @@ run_contract_v2_bash(){
 
   if [[ -n "$text_out" ]]; then
     if [[ -n "$OUTPUT_FILE" ]]; then
-      cat "$text_out" 2>/dev/null | tee "$OUTPUT_FILE" || true
+      tee "$OUTPUT_FILE" < "$text_out" || true
     else
       cat "$text_out" 2>/dev/null || true
     fi
@@ -341,7 +341,7 @@ run_contract_v2_bash(){
 
   if [[ -n "$v2_json_out" && "$FORMAT" == "json" ]]; then
     if [[ -n "$OUTPUT_FILE" ]]; then
-      cat "$v2_json_out" 2>/dev/null | tee "$OUTPUT_FILE" || true
+      tee "$OUTPUT_FILE" < "$v2_json_out" || true
     else
       cat "$v2_json_out" 2>/dev/null || true
     fi
@@ -364,7 +364,9 @@ run_contract_v2_bash(){
     cp "$sink" "$REPORT_JSON" 2>/dev/null || true
   fi
   ubs_remove_temp -f "$list_file" "$sink" 2>/dev/null || true
-  [[ -n "$created_ast_dir" ]] && ubs_remove_temp -rf -- "$created_ast_dir" 2>/dev/null || true
+  if [[ -n "$created_ast_dir" ]]; then
+    ubs_remove_temp -rf -- "$created_ast_dir" 2>/dev/null || true
+  fi
   return "$exit_code"
 }
 

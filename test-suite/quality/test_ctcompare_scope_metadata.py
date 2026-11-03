@@ -107,6 +107,43 @@ def operators(language: str) -> tuple[str, ...]:
     return ("==", "!=", "===", "!==") if language == "js" else ("==", "!=")
 
 
+class GoCollectorRootTests(unittest.TestCase):
+    def test_requested_root_exempts_ancestors_but_not_ignored_children(self) -> None:
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        work = Path(tempfile.mkdtemp(prefix="ctcompare-go-root-", dir=artifacts))
+        code, line = comparison_source("go", "SessionToken", right="expected", member=False)
+        for ancestor in ("build", "vendor"):
+            with self.subTest(ancestor=ancestor):
+                project = work / ancestor / "project"
+                project.mkdir(parents=True)
+                source = project / "session.go"
+                source.write_text(code, encoding="utf-8")
+                generated = project / "build"
+                generated.mkdir()
+                excluded = generated / "generated.go"
+                excluded.write_text(code, encoding="utf-8")
+                other = project / "notes.txt"
+                other.write_text(code, encoding="utf-8")
+
+                self.assertEqual([source], list(ctcompare_go.iter_files(project)))
+                self.assertEqual(
+                    [("session.go", line)],
+                    [(name, row) for name, row, _ in ctcompare_go.collect_issues(project)],
+                )
+                # Explicit selection keeps its existing semantics even when
+                # the same directory would be pruned from its parent walk.
+                self.assertEqual([excluded], list(ctcompare_go.iter_files(generated)))
+                self.assertEqual([excluded], list(ctcompare_go.iter_files(excluded)))
+                for selected in (generated, excluded):
+                    with self.subTest(selected=selected):
+                        self.assertEqual(
+                            [("generated.go", line)],
+                            [(name, row) for name, row, _ in ctcompare_go.collect_issues(selected)],
+                        )
+                self.assertEqual([], list(ctcompare_go.iter_files(other)))
+
+
 class ScopeMetadataTests(unittest.TestCase):
     def test_jsx_attributes_do_not_taint_javascript_variables(self) -> None:
         source = '''function Screen({id, className, copyState}) {

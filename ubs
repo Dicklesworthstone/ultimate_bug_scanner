@@ -21,7 +21,9 @@ if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
   if [ -f "$0" ] && [ -z "${UBS_NO_BASH_REEXEC:-}" ]; then
     # shellcheck disable=SC2046  # word-split the PATH lookups on purpose
     for _ubs_bash in /opt/homebrew/bin/bash /usr/local/bin/bash /home/linuxbrew/.linuxbrew/bin/bash $(type -ap bash 2>/dev/null); do
-      [ -x "$_ubs_bash" ] && [ "$_ubs_bash" != "${BASH:-}" ] || continue
+      if [ ! -x "$_ubs_bash" ] || [ "$_ubs_bash" = "${BASH:-}" ]; then
+        continue
+      fi
       # shellcheck disable=SC2016  # expanded by the candidate bash
       if [ "$("$_ubs_bash" -c 'echo "${BASH_VERSINFO[0]}"' 2>/dev/null)" -ge 4 ] 2>/dev/null; then
         exec "$_ubs_bash" "$0" "$@"
@@ -168,20 +170,20 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='bd21d435b9c90bb222814381dd030f570798f987baa854e97b33a3c9fc118fa8'
-  [cpp]='3b274ec1107508d269900c1ac16b026792d1698cf3add9a4c38f0858ecb01998'
-  [csharp]='1bd8e7ae2820c2f39969fa5ddb2d4027083643123f9cffb3023752f1baa5ba87'
-  [elixir]='83a16a9ea9788b4718cb6d5e939a46867609e658c864d7ff500c045a5561f58f'
-  [golang]='7d054b848454212fc9597234608ad9c2a2bc642c5578fa5bed5057d754796def'
-  [java]='4799ab1d983781719e37a0144e93ec5427a5d468bc83dd389f5f23cd8e352af9'
-  [js]='de396feb94f63109869cfbc355d393e586e2b45364b2746da2f3165e8a87e07b'
-  [kotlin]='89dc22065018f0710d0f453a1844a60fde154bfa89812f5a808ac27a34b8c980'
-  [php]='81d933ebdc26ffbb14cc5b5c5b733d98133242a6bf2b9fe4e0810f2372cea9a7'
-  [python]='7df1849ff2e877132b8b8eb4b3e926796a705ed2fee5d9e9d26171e10d96bfb8'
-  [ruby]='bcd1d927ba60d22d4acd9f75557ac83b65322976f7f9f1cf04b2fee7adeef331'
-  [rust]='b6a667149d25272a4f0c50111b3841d9ec77159bc1b48d7aabab9306839ce2fc'
-  [sql]='019653f8463a99aaf66df394b50bd77e32b5858dc3d1f84c975734c2556e58d2'
-  [swift]='c6866c9958c26bbd605b342f3f2dacb313bb053675ce79cdf0510604fb55e4b7'
+  [bash]='b095092a604bd86d4ed59c7311b2ccf63a1c782ab823088f4e87ec0c4bd7504e'
+  [cpp]='d5beb62b300d6f6c330f125bd5325d57329ced7ddefe25f8a5d20aaee6b34c72'
+  [csharp]='e23ea4c3adf9ab0a5a213bd8ce60234df556a3b906ef9450e0fa61fe9104d174'
+  [elixir]='3807ad175fa086878da57ad2883f4cc9549a621f94c82f0c06ec93f611472b9a'
+  [golang]='7a35911b289a007487eb08670e803b753fa129cb2b660f9c71cd0e155e4a0e03'
+  [java]='ea2512fa0e63158a1cf8c8fbbd818b220d420470f7ff9b664e615cda72f1f44b'
+  [js]='00941f6d90e3bd9d9982e516d31c4273fb6f21e16b0952914d1076cbc8dc4189'
+  [kotlin]='50a12c159262d3e3e7f802e4d102ecffc95f728d8376f968e542d03cd58fec3c'
+  [php]='c696c9b4d77579aae7a158b265496867a604ecd72d1e36ad8efdd597849c16be'
+  [python]='ab3dd3fa522d64affeeb077f32b0b95254bab6f3716b041ac4b7c888ec8ca667'
+  [ruby]='43e241036dcec55a279dd273ad938d46d4530d330e8b87c1cb189ff104541ccf'
+  [rust]='bcb71b2d5037acf3682b8e1d17bfc480260ef3efb62f6b046a36c2f156b4b9c7'
+  [sql]='5ba9af33e5d4e4f8106c13a0a1beab833d02002e3de1d1b489c2526704ee1c50'
+  [swift]='9c6e813c8142dbb26eda88ff58be5d90d15f7af809e462ed9fd1c1fbaf883417'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -222,7 +224,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/analyzers/async_timer.py']='c05499eaa0473572c9a84974426cc8a7e58ea94cc26acf8e9ccced665fcf0144'
   ['helpers/ubs_core/analyzers/cfg_test_only_rust.py']='9ce5fbb35121074409b3951eec97f7fd2714a05acd4c78d6f86932872acd5205'
   ['helpers/ubs_core/analyzers/coroutines_kotlin.py']='a0c339eec751780472e975b2eb885ec166c0c4a90d3ecf7a07fe5982269ca32a'
-  ['helpers/ubs_core/analyzers/ctcompare_go.py']='a46dfb62750d28394179c86cc9f1571f7f921bceb6e7dccd37bb141f88b3a790'
+  ['helpers/ubs_core/analyzers/ctcompare_go.py']='8205b7ea0af334800470dba9654c222de34cba3eecd317aae44678b53f4ebb21'
   ['helpers/ubs_core/analyzers/ctcompare_js.py']='a1d420efd044e4c20a67b00058497004bad8c44b1b2122d0db029c5403e13059'
   ['helpers/ubs_core/analyzers/ctcompare_py.py']='f4662351955c8ac681753d02e4049c0cd143fbc88de568202df433fa59481b10'
   ['helpers/ubs_core/analyzers/ctcompare_rust.py']='5790f299b3e7446f605f3180e5f1940c8f373b32d743c55642cba1e4c593a084'
@@ -556,7 +558,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='77a16e60dce843652c053d069dcbffce17c8ffae543bf77693d2e8254a3967de'
   ['helpers/ubs_core/taint_flow.py']='83b941e15357a6a593db1d7f77a099b1707090301f695445356bfcede4baef26'
-  ['lib/ubs-common.sh']='54dba71e6c69d92aa2825eef549a9652d16d5718a7db01e6ea4e6595c053aa31'
+  ['lib/ubs-common.sh']='a72fde3e273e174302f5ef9f5a128d5ebb27b9fe124c7869572e965753d4daf9'
 )
 
 # contract.json as shipped by earlier releases (sha256 -> first tag), kept out
@@ -603,7 +605,7 @@ ensure_tmpdir_run(){
   fi
 }
 # Invoked by the EXIT trap below and the later cleanup callback.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 early_cleanup(){
   local p
   for p in "${EARLY_TMP_PATHS[@]}"; do
@@ -1434,7 +1436,7 @@ PY
 }
 
 # Invoked by the ERR trap below; ShellCheck does not count trap callbacks.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 on_err(){ local ec=$? ln="${BASH_LINENO[0]:-?}" cmd="${BASH_COMMAND:-?}"; say "${RED}${BOLD}Error${RESET}${DIM} (exit $ec)${RESET} ${WHITE}line $ln:${RESET} $cmd"; exit "$ec"; }
 trap on_err ERR
 
@@ -5366,17 +5368,23 @@ verify_ast_grep_bin(){
   # ast-grep metavariables must reach the pattern parser as literal dollar signs.
   # shellcheck disable=SC2016
   if "$bin" run -p '$X = $Y' "$tmpfile" --json=stream >/dev/null 2>&1; then
-    [[ -n "$tmpdir" && "$tmpdir" != "/" ]] && ubs_remove_temp -rf "$tmpdir" 2>/dev/null || true
+    if [[ -n "$tmpdir" && "$tmpdir" != "/" ]]; then
+      ubs_remove_temp -rf "$tmpdir" 2>/dev/null || true
+    fi
     return 0
   fi
   # The legacy form uses the same literal ast-grep metavariables.
   # shellcheck disable=SC2016
   if "$bin" --pattern '$X = $Y' "$tmpfile" --json=stream >/dev/null 2>&1; then
-    [[ -n "$tmpdir" && "$tmpdir" != "/" ]] && ubs_remove_temp -rf "$tmpdir" 2>/dev/null || true
+    if [[ -n "$tmpdir" && "$tmpdir" != "/" ]]; then
+      ubs_remove_temp -rf "$tmpdir" 2>/dev/null || true
+    fi
     return 0
   fi
 
-  [[ -n "$tmpdir" && "$tmpdir" != "/" ]] && ubs_remove_temp -rf "$tmpdir" 2>/dev/null || true
+  if [[ -n "$tmpdir" && "$tmpdir" != "/" ]]; then
+    ubs_remove_temp -rf "$tmpdir" 2>/dev/null || true
+  fi
   return 1
 }
 

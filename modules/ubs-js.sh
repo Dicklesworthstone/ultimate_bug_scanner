@@ -16,7 +16,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="54dba71e6c69d92aa2825eef549a9652d16d5718a7db01e6ea4e6595c053aa31"
+UBS_LIB_CHECKSUM="a72fde3e273e174302f5ef9f5a128d5ebb27b9fe124c7869572e965753d4daf9"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -73,13 +73,15 @@ TEMP_PATHS=()
 cleanup_add() { [[ -n "${1:-}" ]] && TEMP_PATHS+=("$1"); }
 
 # Called indirectly by Bash's EXIT trap.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 cleanup() {
   IFS=${ORIG_IFS}
   [[ "${KEEP_TEMP}" == "1" ]] && return 0
   local p
   for p in "${TEMP_PATHS[@]:-}"; do
-    [[ -n "$p" && "$p" != "/" && "$p" != "." ]] && ubs_remove_temp -rf -- "$p" 2>/dev/null || true
+    if [[ -n "$p" && "$p" != "/" && "$p" != "." ]]; then
+      ubs_remove_temp -rf -- "$p" 2>/dev/null || true
+    fi
   done
 }
 trap cleanup EXIT
@@ -88,7 +90,7 @@ trap cleanup EXIT
 # Error trapping
 # ────────────────────────────────────────────────────────────────────────────
 # Called indirectly by Bash's ERR trap.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 on_err() {
   local ec=$?; local cmd=${BASH_COMMAND}; local line=${BASH_LINENO[0]}; local src=${BASH_SOURCE[1]:-${BASH_SOURCE[0]}}
   local _RED=${RED:-}; local _BOLD=${BOLD:-}; local _RESET=${RESET:-}; local _DIM=${DIM:-}; local _WHITE=${WHITE:-}
@@ -611,7 +613,9 @@ PYRULES
     cp "$sink" "$REPORT_JSON" 2>/dev/null || true   # K2: the sink IS the findings record stream
   fi
   ubs_remove_temp -f "$list_file" "$sink" 2>/dev/null || true
-  [[ -n "$ast_rule_dir" ]] && ubs_remove_temp -rf "$ast_rule_dir" 2>/dev/null || true
+  if [[ -n "$ast_rule_dir" ]]; then
+    ubs_remove_temp -rf "$ast_rule_dir" 2>/dev/null || true
+  fi
   return "$exit_code"
 }
 

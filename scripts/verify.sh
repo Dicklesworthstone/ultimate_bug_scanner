@@ -205,7 +205,7 @@ mktemp_dir() {
 }
 VERIFY_DIR="$(mktemp_dir)" || die 'Could not create private release staging directory'
 # Invoked by the EXIT trap below; ShellCheck does not count trap callbacks.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 cleanup() {
   # Only this invocation's randomly created directory is ever removed.
   [[ -n "${VERIFY_DIR:-}" && "$VERIFY_DIR" != / ]] || return 0

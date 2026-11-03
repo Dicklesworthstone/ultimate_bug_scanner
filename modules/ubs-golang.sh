@@ -15,7 +15,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="54dba71e6c69d92aa2825eef549a9652d16d5718a7db01e6ea4e6595c053aa31"
+UBS_LIB_CHECKSUM="a72fde3e273e174302f5ef9f5a128d5ebb27b9fe124c7869572e965753d4daf9"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -64,7 +64,7 @@ VERSION="7.1.4"
 
 # Color-safe error trap (works before colors are initialized)
 # Called indirectly by Bash's ERR trap.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 on_err() {
   local ec=$? cmd=${BASH_COMMAND} line=${BASH_LINENO[0]} src=${BASH_SOURCE[1]:-${BASH_SOURCE[0]}}
   local _RED=${RED:-} _BOLD=${BOLD:-} _RESET=${RESET:-} _DIM=${DIM:-} _WHITE=${WHITE:-}
@@ -571,7 +571,9 @@ generate(Path('$DUMP_RULES_DIR'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' els
     cp "$sink" "$REPORT_JSON" 2>/dev/null || true   # K2: the sink IS the findings record stream
   fi
   rm -f "$list_file" "$sink" "$tally_file" "${life_raw:-}" 2>/dev/null || true
-  [[ -n "$ast_rule_dir" ]] && rm -rf -- "$ast_rule_dir" 2>/dev/null || true
+  if [[ -n "$ast_rule_dir" ]]; then
+    rm -rf -- "$ast_rule_dir" 2>/dev/null || true
+  fi
   return "$exit_code"
 }
 

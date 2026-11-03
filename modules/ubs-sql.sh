@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 
 # Bootstrap the same checksum-pinned shared library as the other modules.
-UBS_LIB_CHECKSUM="54dba71e6c69d92aa2825eef549a9652d16d5718a7db01e6ea4e6595c053aa31"
+UBS_LIB_CHECKSUM="a72fde3e273e174302f5ef9f5a128d5ebb27b9fe124c7869572e965753d4daf9"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -187,7 +187,8 @@ fi
 
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/ubs-sql.XXXXXX")" || fail_scan "cannot allocate SQL scan workspace"
 # Invocation-owned scratch follows the shared UBS_KEEP_TEMP retention policy.
-# shellcheck disable=SC2329
+# Called indirectly by Bash's EXIT trap below.
+# shellcheck disable=SC2317,SC2329
 cleanup(){
   [[ "${UBS_KEEP_TEMP:-0}" != "1" ]] || return 0
   ubs_remove_temp -f -- "$work_dir/files" "$work_dir/findings" "$work_dir/findings.cache" \

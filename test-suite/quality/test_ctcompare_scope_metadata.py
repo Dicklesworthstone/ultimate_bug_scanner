@@ -345,6 +345,122 @@ class CredentialDetectionTests(unittest.TestCase):
         self.assertEqual(scan_lines('js', source), [9, 13], source)
 
 
+class JavascriptParameterBindingTests(unittest.TestCase):
+    """A new parameter binding cannot inherit an unrelated local's value."""
+
+    def assert_sites(self, body):
+        source = 'const r = password;\n' + textwrap.dedent(body)
+        expected = [number for number, line in enumerate(source.splitlines(), 1)
+                    if '// expect-secret' in line]
+        self.assertEqual(scan_lines('js', source), expected, source)
+
+    def test_callback_parameter_shadows_unrelated_secret_alias(self):
+        self.assert_sites('''
+            const sent = rows(w).filter((r) => r.status === "sent").length;
+            const selected = rows.filter(r => r.value === supplied);
+            const block = rows.filter((r: Row) => {
+                return r.status === "sent";
+            });
+            const ordinary = rows.filter(function (r) { return r.value === supplied; });
+            const captured = rows.filter(r => (() => r.value === supplied)());
+            const secretMember = rows.filter(r => r.password === supplied); // expect-secret
+            const secretName = rows.filter(password => password === supplied); // expect-secret
+            const outside = r.value === supplied; // expect-secret
+        ''')
+
+    def test_secret_defaults_destructuring_and_reassignments_remain_findings(self):
+        self.assert_sites('''
+            const defaults = rows.filter((r = password) => r.value === supplied); // expect-secret
+            const destructured = rows.filter(({password: r}) => r === supplied); // expect-secret
+            const destructuredDefault = rows.filter(({value: r = password}) => r === supplied); // expect-secret
+            const reassigned = rows.filter(r => { r = password; return r.value === supplied; }); // expect-secret
+            const propertyWrite = rows.filter(r => { r.value = password; return r.value === supplied; }); // expect-secret
+            const assignmentPattern = rows.filter(r => { ({password: r} = credentials); return r === supplied; }); // expect-secret
+            const tightPattern = rows.filter(r => { ({password:r}=credentials); return r === supplied; }); // expect-secret
+            const escaped = rows.filter(r => { mutate(r); return r.value === supplied; }); // expect-secret
+            const mutated = rows.filter(r => { r.mutate(); return r.value === supplied; }); // expect-secret
+            const aliased = rows.filter(r => { const alias = r; alias.value = password; return r.value === supplied; }); // expect-secret
+            const captured = rows.filter(row => r.value === supplied); // expect-secret
+            const nested = rows.filter(r => ((r = password) => r.value === supplied)()); // expect-secret
+            const closedOverWrite = rows.filter(r => {
+                function write() { r = password; }
+                write();
+                return r.value === supplied; // expect-secret
+            });
+        ''')
+
+    def test_callback_secret_inputs_are_not_reclassified_by_shadowing(self):
+        self.assert_sites('''
+            const direct = [r].filter(r => r.value === supplied); // expect-secret
+            const named = credentials.filter(r => r.value === supplied); // expect-secret
+            const nested = getRows(password).filter(r => r.value === supplied); // expect-secret
+            const continued = credentials
+                .filter(r => r.value === supplied); // expect-secret
+            const nextLine = [r].filter(
+                r => r.value === supplied); // expect-secret
+        ''')
+
+    def test_new_parameter_does_not_inherit_old_call_result_metadata_evidence(self):
+        source = '''const r = await login(password);
+rows.filter((r = password) => r.status === supplied);
+rows.filter(r => { r = password; return r.status === supplied; });
+rows.filter(({password: r}) => r.status === supplied);
+'''
+        self.assertEqual(scan_lines('js', source), [2, 3, 4])
+
+    def test_boolean_operands_and_comments_keep_their_own_scope(self):
+        self.assert_sites('''
+            const both = rows.filter(r => r.status === "sent" && r.mode !== "hidden");
+            const comment = rows.filter(/* public row */ (r) => r.status === "sent");
+            /* before callback */ rows.filter(r => r.status === "sent");
+            rows.filter(r => r.status === "sent"); /* keep outside */ r.value === supplied; // expect-secret
+            const mixed = rows.filter(r => r.status === "sent" && password === supplied); // expect-secret
+        ''')
+
+    def test_callback_inputs_resolve_the_local_declaration_not_another_function(self):
+        self.assert_sites('''
+            async function earlier() {
+                const w = await world({SESSION_SECRET: password});
+                const r = await requestMagicLink(w, SECRET);
+                return r;
+            }
+            async function current() {
+                const w = await world();
+                return rows(w).filter((r) => r.status === "sent").length;
+            }
+            async function actualSecretInput() {
+                const w = password;
+                const alias = w;
+                return rows(alias).filter((r) => r.value === supplied); // expect-secret
+            }
+        ''')
+
+    def test_object_inputs_and_block_shadows_retain_captured_secrets(self):
+        self.assert_sites('''
+            const wrapped = getRows({value: password}).filter(r => r.value === supplied); // expect-secret
+            const indirect = getRows({value: r}).filter(r => r.value === supplied); // expect-secret
+            const data = password;
+            function captured() {
+                if (ready) { const data = []; use(data); }
+                return data.filter(r => r.value === supplied); // expect-secret
+            }
+            function loopLocal() {
+                for (let data of publicRows) use(data);
+                return data.filter(r => r.value === supplied); // expect-secret
+            }
+            const deeplyWrapped = getRows({value: (() => { observe(); return password; })()}).filter(r => r.value === supplied); // expect-secret
+        ''')
+
+    def test_named_function_metadata_policy_is_not_changed_by_callback_repair(self):
+        self.assert_sites('''
+            async function derive() { const keys = await loadKeys(secret); return keys; }
+            function publicId(keys) { return keys.id === supplied; }
+            function nestedId(keys) { return rows.some(row => row.key_id === keys.id); }
+            function actualMaterial(keys) { return keys.value === supplied; } // expect-secret
+            function namedMaterial(keys) { return keys.hmac === supplied; } // expect-secret
+        ''')
+
+
 class CallResultMetadataTests(unittest.TestCase):
     """GH #181, #185: a call result's public discriminant is not the secret.
 

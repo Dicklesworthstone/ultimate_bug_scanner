@@ -526,9 +526,136 @@ def response_metadata_read(operand, names, path_names):
     return False
 
 
+def callback_parameter_ranges(text, sensitive_vars):
+    """Independent callback bindings, limited to unreassigned direct reads.
+
+    A file-wide alias such as `r = await login(secret)` says nothing about
+    `rows.filter(r => r.status === "sent")`. Defaults, destructuring, writes
+    and secret-bearing callback inputs do not establish an independent value.
+    Method calls and computed/compound reads retain conservative taint below.
+    """
+    if not sensitive_vars:
+        return []
+    from ubs_core.analyzers.taint_js import _function_scopes
+
+    source, code = javascript_lexical_views(text)
+    root, _scopes = _function_scopes(source, code)
+    ranges = []
+    input_contexts = {}
+
+    def input_context(scope):
+        """Resolve callback input names in their enclosing lexical binding.
+
+        A local `w = world()` does not inherit another function's `w = secret`.
+        Retain captured aliases and propagate local secret assignments before
+        deciding whether the callback receives a potentially secret value.
+        """
+        if scope in input_contexts:
+            return input_contexts[scope]
+        active = set(input_context(scope.parent)) if scope.parent else set()
+        own_code = scope.code[scope.body_start:scope.body_end]
+        local_names = set()
+        for declaration in re.finditer(r'\b(const|let|var)\s+([A-Za-z_$][\w$]*)', own_code):
+            before = own_code[:declaration.start()]
+            # A block/loop-local let or const cannot shadow a captured binding
+            # throughout the function. Retain taint when that scope is unclear.
+            if (declaration.group(1) == 'var'
+                    or all(before.count(opening) == before.count(closing)
+                           for opening, closing in (('{', '}'), ('(', ')'), ('[', ']')))):
+                local_names.add(declaration.group(2))
+        active.difference_update(local_names)
+        for bindings, _rest, _default, _span in scope.params:
+            active.difference_update(bindings)
+            # Unknown incoming arguments keep the incumbent's conservative
+            # classification; this is only a local declaration shadow repair.
+            active.update(set(bindings) & sensitive_vars)
+        own_lines = own_code.splitlines()
+        local_sensitive, _call_results = collect_sensitive_bindings(own_lines, own_lines)
+        active.update(local_sensitive)
+        assignments = [(match.group('name'), own_code[match.end():].split(';', 1)[0])
+                       for match in assignment_head_re.finditer(own_code)]
+        changed = True
+        while changed:
+            changed = False
+            for name, expression in assignments:
+                if name not in active and operand_identifiers(expression) & active:
+                    active.add(name)
+                    changed = True
+        input_contexts[scope] = frozenset(active)
+        return input_contexts[scope]
+
+    def visit(scope, inherited, bound):
+        names = set(inherited)
+        bound = set(bound)
+        inline_callback = scope is not root and not (scope.name or scope.method)
+        for bindings, _rest, _default, _span in scope.params:
+            names.difference_update(bindings)
+            # This repair handles inline callback bindings. Named functions
+            # keep the existing call-result metadata policy; changing it here
+            # would introduce unrelated key-id false positives.
+            if inline_callback:
+                bound.update(bindings)
+        # Named functions/methods have separately resolved callers. Keep their
+        # existing conservative treatment; only inline callbacks qualify here.
+        if inline_callback:
+            prefix_start = scope.parent.body_start
+            nesting = {')': 0, ']': 0, '}': 0}
+            pairs = {'(': ')', '[': ']', '{': '}'}
+            for index in range(scope.start - 1, prefix_start - 1, -1):
+                char = code[index]
+                if char in nesting:
+                    nesting[char] += 1
+                elif char in pairs:
+                    closing = pairs[char]
+                    if nesting[closing]:
+                        nesting[closing] -= 1
+                    elif char == '{':
+                        prefix_start = index + 1
+                        break
+                elif char == ';' and not any(nesting.values()):
+                    prefix_start = index + 1
+                    break
+            # Balanced object literals belong to the receiver/arguments; a
+            # closing brace alone is not a statement boundary.
+            prefix = source[prefix_start:scope.start]
+            secret_input = (is_sensitive_text(prefix)
+                            or bool(operand_identifiers(prefix) & input_context(scope.parent)))
+            if not secret_input:
+                for bindings, rest, default, span in scope.params:
+                    pattern = code[span[0]:span[1]].strip()
+                    if (len(bindings) == 1 and not rest and default is None
+                            and re.fullmatch(r'[A-Za-z_$][\w$]*(?:\s*\??\s*:[\s\S]+)?', pattern)):
+                        names.add(bindings[0])
+        body = code[scope.body_start:scope.body_end]
+        for name in tuple(names):
+            target = rf'(?<![\w$.]){re.escape(name)}\b'
+            member = r'(?:\s*\.\s*[A-Za-z_$][\w$]*|\s*\[[^\]\n]*\])*'
+            if re.search(target + member + r'\s*(?:[+*/%&|^?-]*=(?!=|>)|\+\+|--)', body):
+                names.discard(name)
+            elif re.search(target + r'\s*[,}\]][^;\n]*=(?!=|>)', body):
+                names.discard(name)
+            elif re.search(r'(?:\+\+|--)\s*' + target, body):
+                names.discard(name)
+            # Calls/aliases can mutate an object without spelling a direct
+            # write. Do not declare its later fields independent in that case.
+            elif (re.search(target + member + r'\s*\(', body)
+                  or re.search(target + r'\s*[,)]', body)
+                  or re.search(r'(?<![=!<>])=\s*' + target, body)):
+                names.discard(name)
+        cursor = scope.body_start
+        for child in sorted(scope.children, key=lambda item: item.start):
+            ranges.append((cursor, child.start, frozenset(names), scope.body_start, frozenset(bound)))
+            visit(child, names, bound)
+            cursor = child.end
+        ranges.append((cursor, scope.body_end, frozenset(names), scope.body_start, frozenset(bound)))
+
+    visit(root, set(), set())
+    return ranges
+
+
 def unsafe_secret_compare(statement, sensitive_vars, *, call_results=frozenset(),
                           comparison_start=0, comparison_limit=None,
-                          response_ranges=(), source_offset=0):
+                          response_ranges=(), parameter_ranges=(), source_offset=0):
     if safe_compare_re.search(statement):
         return False
     # Match within each term, never across &&/||. An exempt comparison only
@@ -538,6 +665,16 @@ def unsafe_secret_compare(statement, sensitive_vars, *, call_results=frozenset()
             continue
         if comparison_limit is not None and offset >= comparison_limit:
             continue
+        independent = set()
+        comparison_call_results = call_results
+        for start, end, names, body, bound in parameter_ranges:
+            if start <= source_offset + offset < end:
+                independent.update(names)
+                # A new parameter cannot inherit the old variable's evidence
+                # that its value was exclusively a call result, either.
+                comparison_call_results = call_results - bound
+                if names and source_offset + offset - len(left) < body <= source_offset + offset:
+                    left = statement[body - source_offset:offset]
         public = [(name, paths, body) for start, end, name, paths, body in response_ranges
                   if start <= source_offset + offset < end]
         for name, paths, body in public:
@@ -549,20 +686,27 @@ def unsafe_secret_compare(statement, sensitive_vars, *, call_results=frozenset()
                 if response_metadata_read(callback_left, {name}, {name} if paths else set()):
                     left = callback_left
                     break
-        if unsafe_secret_operands(left, right, sensitive_vars, call_results,
+        if unsafe_secret_operands(left, right, sensitive_vars, comparison_call_results,
                                   frozenset(name for name, _, _ in public),
-                                  frozenset(name for name, paths, _ in public if paths)):
+                                  frozenset(name for name, paths, _ in public if paths),
+                                  frozenset(independent)):
             return True
     return False
 
 
-def operand_tainted(operand, sensitive_vars, call_results=frozenset()):
-    return (bool(operand_identifiers(operand) & sensitive_vars)
+def operand_tainted(operand, sensitive_vars, call_results=frozenset(), independent=frozenset()):
+    identifiers = operand_identifiers(operand)
+    read = member_read_re.fullmatch(operand)
+    scalar = re.fullmatch(r'(?:(?:return|yield)\s+)?\(*\s*([A-Za-z_$][\w$]*)\s*\)*', operand)
+    root = read.group('root') if read else scalar.group(1) if scalar else None
+    if root in independent:
+        identifiers.discard(root)
+    return (bool(identifiers & sensitive_vars)
             and not call_result_metadata_read(operand, call_results))
 
 
 def unsafe_secret_operands(left, right, sensitive_vars, call_results=frozenset(),
-                           response_names=frozenset(), path_names=frozenset()):
+                           response_names=frozenset(), path_names=frozenset(), independent=frozenset()):
     left_metadata = response_metadata_read(left, response_names, path_names)
     right_metadata = response_metadata_read(right, response_names, path_names)
     left = clean_operand_text(left)
@@ -572,9 +716,9 @@ def unsafe_secret_operands(left, right, sensitive_vars, call_results=frozenset()
 
     left_fams = sensitive_families(left)
     right_fams = sensitive_families(right)
-    left_taint = (operand_tainted(left, sensitive_vars, call_results)
+    left_taint = (operand_tainted(left, sensitive_vars, call_results, independent)
                   and not left_metadata)
-    right_taint = (operand_tainted(right, sensitive_vars, call_results)
+    right_taint = (operand_tainted(right, sensitive_vars, call_results, independent)
                    and not right_metadata)
     left_sensitive = bool(left_fams) or left_taint
     right_sensitive = bool(right_fams) or right_taint
@@ -611,9 +755,13 @@ def scan_file(path: Path, sample_root: Path) -> list[tuple[str, int, str]]:
     source_index = SourceSuppressions('javascript').index(path, text)
     # Statement lookahead revisits each physical line. Keep its exact lexical
     # view only for this file; the shared index owns suppression separately.
-    code_lines = [code_line(raw) for raw in lines]
+    # Scope coordinates are absolute. Blank comments without shortening the
+    # line so a later comparison cannot appear inside an earlier callback.
+    lexical_source, _lexical_code = javascript_lexical_views(text)
+    code_lines = lexical_source.splitlines()
     sensitive_vars, call_results = collect_sensitive_bindings(lines, code_lines)
     response_ranges = playwright_response_ranges(text)
+    parameter_ranges = callback_parameter_ranges(text, sensitive_vars)
     line_offsets = []
     offset = 0
     for line in text.splitlines(keepends=True):
@@ -639,7 +787,8 @@ def scan_file(path: Path, sample_root: Path) -> list[tuple[str, int, str]]:
             statement, sensitive_vars, call_results=call_results,
             comparison_start=len(prefix), comparison_limit=len(prefix) + len(stripped),
             response_ranges=response_ranges,
-            source_offset=line_offsets[idx] + len(lines[idx]) - len(lines[idx].lstrip()) - len(prefix)
+            parameter_ranges=parameter_ranges,
+            source_offset=line_offsets[idx] + len(code) - len(code.lstrip()) - len(prefix)
         ):
             continue
         if idx in seen_lines or source_index.is_suppressed(idx + 1, _RULE):

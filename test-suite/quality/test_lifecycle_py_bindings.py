@@ -16,7 +16,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "modules" / "helpers"))
 
-from ubs_core.analyzers.lifecycle_py import SELF_TESTS, _collect_unreleased
+from ubs_core.analyzers.lifecycle_py import SELF_TESTS, _collect_unreleased, collect_files
 from ubs_core.registry import RunContext, run_layer
 
 
@@ -390,6 +390,34 @@ class LifecycleBindingsTests(unittest.TestCase):
     def test_relative_imports_do_not_impersonate_standard_library_factories(self):
         self.assertLeaks("from .socket import socket as create\nhandle = create()", [])
         self.assertLeaks("from . import socket\nhandle = socket.socket()", [])
+
+    def test_directory_selection_ignores_only_descendants_of_requested_root(self):
+        artifacts = ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        work = Path(tempfile.mkdtemp(prefix="lifecycle-parent-", dir=artifacts))
+        project = work / "build" / "project"
+        project.mkdir(parents=True)
+        source = project / "fixture.py"
+        source.write_text("handle = open('unclosed')\n", encoding="utf-8")
+        nested = project / "build"
+        nested.mkdir()
+        excluded = nested / "generated.py"
+        excluded.write_text("handle = open('generated')\n", encoding="utf-8")
+
+        self.assertEqual([source], collect_files(project))
+        # An explicitly selected directory or file remains in scope, even
+        # when its name would be excluded while traversing its parent.
+        self.assertEqual([excluded], collect_files(nested))
+        self.assertEqual([excluded], collect_files(excluded))
+        proc = subprocess.run(
+            [sys.executable, "-B", str(ROOT / "modules/helpers/resource_lifecycle_py.py"), str(project)],
+            text=True, capture_output=True, timeout=15, cwd=project,
+        )
+        self.assertEqual(0, proc.returncode, msg=proc.stdout + proc.stderr)
+        self.assertEqual("", proc.stderr)
+        self.assertEqual(1, len(proc.stdout.splitlines()), msg=proc.stdout)
+        self.assertIn("fixture.py:1\tfile_handle\t", proc.stdout)
+        self.assertNotIn("generated.py", proc.stdout)
 
     def test_structured_and_legacy_entrypoints_agree(self):
         artifacts = ROOT / "test-suite" / "artifacts"

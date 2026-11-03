@@ -649,7 +649,9 @@ def collect_files(root: Path) -> list[Path]:
     if root.is_file() and root.suffix == ".py":
         return [root]
     for path in root.rglob("*.py"):
-        if any(part in IGNORED_PARTS for part in path.parts):
+        # The caller selects the root. Names above it must not exclude the
+        # entire project (for example, a checkout stored under /build).
+        if any(part in IGNORED_PARTS for part in path.relative_to(root).parts):
             continue
         files.append(path)
     return files

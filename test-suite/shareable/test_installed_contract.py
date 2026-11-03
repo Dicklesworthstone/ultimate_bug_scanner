@@ -1244,5 +1244,222 @@ raise SystemExit(result.returncode)
         self.scan_usable()
 
 
+class SourceModuleOwnership(unittest.TestCase):
+    """An installed runner may read another checkout, but cannot repair its source."""
+
+    run_ubs = InstalledUpgrade.run_ubs
+    parsed_report = InstalledContract.parsed_report
+    doctor = InstalledContract.doctor
+
+    def run(self, result=None):
+        case_id = "source-module-ownership:" + self._testMethodName
+        print(f"[{case_id}] RUN", flush=True)
+        started = time.monotonic()
+        self.commands = []
+        result = result or self.defaultTestResult()
+        failures = len(result.failures) + len(result.errors)
+        super().run(result)
+        failed = len(result.failures) + len(result.errors) > failures
+        artifact = REPO_ROOT / "test-suite/artifacts/source-module-ownership" / self._testMethodName
+        artifact.mkdir(parents=True, exist_ok=True)
+        for stream in ("stdout", "stderr"):
+            text = "\n".join(f"$ {command!r} [exit {item.returncode}]\n{getattr(item, stream)}"
+                             for command, item in self.commands)
+            (artifact / (stream + ".log")).write_text(text)
+            if failed:
+                print(f"[{case_id}] {stream}:\n{text}", flush=True)
+        print(f"[{case_id}] {'FAIL' if failed else 'PASS'} ({time.monotonic() - started:.3f}s)", flush=True)
+        return result
+
+    def setUp(self) -> None:
+        InstalledContract.setUp(self)
+        for name in tuple(self.env):
+            if name.startswith("GIT_"):
+                self.env.pop(name)
+        self.env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                        GIT_OPTIONAL_LOCKS="0", UBS_NO_CACHE="1", UBS_SKIP_SIZE_CHECK="1")
+        self.source = self.target / "a.py"
+        self.source.write_text("eval(input())\n", encoding="utf-8")
+        self.original_module = (REPO_ROOT / "modules/ubs-python.sh").read_bytes()
+
+    def git(self, *args: str) -> subprocess.CompletedProcess[str]:
+        command = ["git", *args]
+        result = subprocess.run(command, cwd=self.root, env=self.env, capture_output=True,
+                                text=True, check=False, timeout=30)
+        self.commands.append((command, result))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return result
+
+    def module_directory(self, *, tracked: bool = True, worktree: bool = False,
+                         track_module: bool = True) -> Path:
+        checkout = self.root / "separate source checkout"
+        if tracked:
+            checkout.mkdir()
+            self.cache = checkout / "modules"
+        shutil.copytree(REPO_ROOT / "modules", self.cache, dirs_exist_ok=True,
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        if tracked:
+            self.git("init", "-q", "-b", "main", str(checkout))
+            # Only the mutation targets need Git objects. The other real assets
+            # stay available for native scans without duplicating a whole repo.
+            tracked_names = ["contract.json", *(["ubs-python.sh"] if track_module else [])]
+            self.git("-C", str(checkout), "add", "--", *("modules/" + name for name in tracked_names))
+            if worktree:
+                self.git("-C", str(checkout), "-c", "user.name=UBS regression",
+                         "-c", "user.email=ubs-regression@example.invalid",
+                         "commit", "-q", "--no-gpg-sign", "-m", "Source ownership fixture")
+                linked = self.root / "linked source worktree"
+                self.git("-C", str(checkout), "worktree", "add", "-q", "--detach", str(linked), "HEAD")
+                self.assertTrue((linked / ".git").is_file())
+                for entry in self.cache.iterdir():
+                    destination = linked / "modules" / entry.name
+                    if not destination.exists():
+                        destination.symlink_to(entry, target_is_directory=entry.is_dir())
+                self.cache = linked / "modules"
+            self.git("-C", str(self.cache), "ls-files", "--error-unmatch", "--", *tracked_names)
+        self.assertFalse((self.bin / "modules").exists())
+        self.assertFalse((self.cache / ".ubs-releases").exists())
+        return self.cache / "ubs-python.sh"
+
+    def source_snapshot(self) -> dict:
+        snapshot = {}
+        for name in ("contract.json", "ubs-python.sh"):
+            path = self.cache / name
+            if not path.exists():
+                snapshot[name] = None
+                continue
+            info = path.stat()
+            snapshot[name] = (hashlib.sha256(path.read_bytes()).hexdigest(),
+                              info.st_ino, info.st_mtime_ns, info.st_mode & 0o777)
+        return snapshot
+
+    def fetch_requests(self) -> list[str]:
+        if not self.fetch_log.exists():
+            return []
+        return self.fetch_log.read_text().splitlines()
+
+    def module_requests(self) -> list[str]:
+        return [url for url in self.fetch_requests() if url.endswith("/ubs-python.sh")]
+
+    def scan(self, *, update: bool = False) -> subprocess.CompletedProcess[str]:
+        return self.run_ubs("--only=python", "--ci", *(["--update-modules"] if update else []),
+                            str(self.source))
+
+    def assert_native_finding(self, result: subprocess.CompletedProcess[str]) -> None:
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 1, output)
+        report = self.parsed_report(result)
+        self.assertEqual(report["status"], "ok", output)
+        self.assertEqual(report["totals"]["files"], 1, output)
+        self.assertTrue(any(finding["rule_id"] == "python.taint.eval" and finding["line"] == 1
+                            for finding in report["findings"]), output)
+
+    def assert_source_refused(self, before: dict, result: subprocess.CompletedProcess[str]) -> None:
+        output = result.stdout + result.stderr
+        self.assertEqual(self.source_snapshot(), before, "Tracked source changed during repair:\n" + output)
+        self.assertEqual(self.module_requests(), [], "Downloaded a replacement for tracked source")
+        self.assertFalse((self.cache / ".ubs-releases").exists(), "Created a cache generation in source")
+        self.assertEqual(result.returncode, 2, output)
+        self.assertRegex(output.lower(), r"checkout|source")
+        self.assertIn("python", output.lower())
+
+    def edited_module(self, *, worktree: bool = False) -> dict:
+        module = self.module_directory(worktree=worktree)
+        module.write_bytes(self.original_module + b"\n# Local source edit: preserve this comment.\n")
+        return self.source_snapshot()
+
+    def test_installed_scan_preserves_modified_tracked_module(self) -> None:
+        before = self.edited_module()
+        self.assert_source_refused(before, self.scan())
+
+    def test_installed_scan_preserves_untracked_module_in_source_directory(self) -> None:
+        module = self.module_directory(track_module=False)
+        untracked = self.git("-C", str(self.cache), "ls-files", "--others", "--exclude-standard", "--",
+                             "ubs-python.sh")
+        self.assertEqual(untracked.stdout.strip(), "ubs-python.sh")
+        module.write_bytes(self.original_module + b"\n# Untracked local source edit: preserve it.\n")
+        before = self.source_snapshot()
+        self.assert_source_refused(before, self.scan())
+
+    def test_forced_refresh_preserves_modified_tracked_module(self) -> None:
+        before = self.edited_module()
+        self.assert_source_refused(before, self.scan(update=True))
+
+    def test_doctor_fix_preserves_modified_tracked_module(self) -> None:
+        before = self.edited_module()
+        result, _ = self.doctor(fix=True)
+        self.assert_source_refused(before, result)
+
+    def test_healthy_tracked_module_directory_runs_real_scan(self) -> None:
+        self.module_directory()
+        before = self.source_snapshot()
+        self.assert_native_finding(self.scan())
+        self.assertEqual(self.source_snapshot(), before)
+        self.assertEqual(self.module_requests(), [])
+
+    def test_forced_refresh_preserves_healthy_tracked_module_identity(self) -> None:
+        self.module_directory()
+        before = self.source_snapshot()
+        self.assert_native_finding(self.scan(update=True))
+        self.assertEqual(self.source_snapshot(), before)
+        self.assertEqual(self.fetch_requests(), [], "Forced refresh fetched assets into a source checkout")
+
+    def test_missing_tracked_module_is_not_restored_by_scan(self) -> None:
+        module = self.module_directory()
+        module.rename(module.with_suffix(".sh.saved"))
+        before = self.source_snapshot()
+        self.assert_source_refused(before, self.scan())
+
+    def test_nonexecutable_tracked_module_is_not_repaired_by_scan(self) -> None:
+        module = self.module_directory()
+        module.chmod(0o644)
+        before = self.source_snapshot()
+        self.assert_source_refused(before, self.scan())
+
+    def test_doctor_fix_does_not_restore_missing_tracked_module(self) -> None:
+        module = self.module_directory()
+        module.rename(module.with_suffix(".sh.saved"))
+        before = self.source_snapshot()
+        result, _ = self.doctor(fix=True)
+        self.assert_source_refused(before, result)
+
+    def test_doctor_fix_rejects_nonexecutable_tracked_module(self) -> None:
+        module = self.module_directory()
+        module.chmod(0o644)
+        before = self.source_snapshot()
+        result, _ = self.doctor(fix=True)
+        self.assert_source_refused(before, result)
+
+    def test_installed_scan_preserves_modified_linked_worktree_module(self) -> None:
+        before = self.edited_module(worktree=True)
+        self.assert_source_refused(before, self.scan())
+
+    def test_untracked_installed_cache_still_repairs_a_modified_module(self) -> None:
+        module = self.module_directory(tracked=False)
+        # A CI cache may live inside an unrelated repository. Git ancestry
+        # alone does not make its untracked cache payload source-owned.
+        self.git("init", "-q", "-b", "main", str(self.root))
+        (self.root / "application.txt").write_text("Unrelated tracked application file.\n")
+        self.git("-C", str(self.root), "add", "--", "application.txt")
+        module.write_bytes(self.original_module + b"\n# Damaged cache copy.\n")
+        self.assert_native_finding(self.scan())
+        self.assertEqual(module.read_bytes(), self.original_module)
+        self.assertTrue(self.module_requests(), "Installed cache was not repaired from pinned bytes")
+
+    def test_installed_cache_doctor_still_publishes_a_verified_repair(self) -> None:
+        module = self.module_directory(tracked=False)
+        damaged = self.original_module + b"\n# Damaged cache copy.\n"
+        module.write_bytes(damaged)
+        result, check = self.doctor(fix=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(check["status"], "ok", check)
+        manifest = generation.parse_manifest(self.runner.read_bytes())
+        active = generation.generation_path(self.cache, manifest)
+        generation.check_ready(active, manifest, complete=True)
+        self.assertEqual((active / "ubs-python.sh").read_bytes(), self.original_module)
+        self.assertEqual(module.read_bytes(), damaged, "Repair must preserve the old flat cache")
+        self.assert_native_finding(self.scan())
+
+
 if __name__ == "__main__":
     unittest.main()

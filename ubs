@@ -4493,7 +4493,7 @@ select_release_generation(){
 
 should_refresh_release_generation(){
   [[ "$UPDATE_MODULES" -eq 1 ]] || return 1
-  is_checkout_helper "$MODULE_CACHE_ROOT/contract.json" && return 1
+  is_checkout_asset "$MODULE_CACHE_ROOT/contract.json" && return 1
   if [[ -e "$MODULE_CACHE_ROOT/.ubs-releases" || -L "$MODULE_CACHE_ROOT/.ubs-releases" ]]; then
     return 0
   fi
@@ -5979,7 +5979,9 @@ PYDOCTORCACHE
     fi
     if should_verify_module_path "$module_path"; then
       cached_modules=1
-      if [[ -f "$module_path" ]]; then
+      if { [[ ! -f "$module_path" ]] || [[ ! -x "$module_path" ]]; } && is_checkout_asset "$module_path"; then
+        doctor_report "module:$lang" err "$lang checkout module is missing or not executable ($module_path); restore source and permissions before scanning (doctor --fix never overwrites checkout modules)"
+      elif [[ -f "$module_path" ]]; then
         if verify_module_checksum "$lang" "$module_path"; then
           doctor_report "module:$lang" ok "$lang module checksum verified ($module_path)"
         else
@@ -5987,7 +5989,7 @@ PYDOCTORCACHE
           if [[ $verify_status -eq 2 ]]; then
             doctor_report "module:$lang" err "$lang module: $VERIFY_MODULE_ERR"
           else
-            if [[ "$module_path" == "$(script_dir)/modules/"* ]]; then
+            if is_checkout_asset "$module_path"; then
               doctor_report "module:$lang" err "$lang module in this checkout does not match MODULE_CHECKSUMS ($VERIFY_MODULE_ERR); run ./scripts/update_checksums.sh (doctor --fix never overwrites checkout modules)"
             elif [[ "$fix" -eq 1 ]]; then
               say "    ${DIM}Refreshing $lang module...${RESET}"
@@ -6439,6 +6441,13 @@ select_langs(){
 
 download_module(){
   local lang="$1" path="$2"
+  # Every repair caller must honor source ownership, even when this installed
+  # runner is pointed at a different checkout or linked worktree.
+  if is_checkout_asset "$path"; then
+    VERIFY_MODULE_ERR="checkout module $lang is source, not a cache entry; refusing to overwrite it (restore source or run ./scripts/update_checksums.sh after editing modules)"
+    say_err "${RED}$X ${VERIFY_MODULE_ERR}${RESET}"
+    return 2
+  fi
   ensure_dir "$(dirname "$path")"
   local release_url latest_url url label tmp head err_msg
   release_url=$(printf '%s' "$MODULE_PATH_TEMPLATE" | sed "s/%s/$lang/")
@@ -6538,18 +6547,30 @@ download_module(){
   return 1
 }
 
-is_checkout_helper(){
+is_checkout_asset(){
   local path="$1"
   # Bundled source assets are not cache entries, including an exported tree
   # without .git. An explicit --module-dir can also point at tracked source
   # belonging to a different checkout than this runner.
   [[ "$path" == "$(script_dir)/modules/"* ]] && return 0
-  need_cmd git && git -C "$(dirname "$path")" ls-files --error-unmatch -- "$(basename "$path")" >/dev/null 2>&1
+  need_cmd git || return 1
+  if git -C "$(dirname "$path")" ls-files --error-unmatch -- "$(basename "$path")" >/dev/null 2>&1; then
+    return 0
+  fi
+  # A tracked contract identifies the selected module directory as source,
+  # including newly created assets and files in a locally removed subdirectory.
+  # An ordinary untracked cache inside some other Git repository stays a cache.
+  if [[ -n "${MODULE_CACHE_ROOT:-}" && "$path" == "$MODULE_CACHE_ROOT/"* \
+      && "$path" != "$MODULE_CACHE_ROOT/contract.json" ]]; then
+    git -C "$MODULE_CACHE_ROOT" ls-files --error-unmatch -- contract.json >/dev/null 2>&1
+    return $?
+  fi
+  return 1
 }
 
 download_helper_asset(){
   local rel="$1" path="$2"
-  if is_checkout_helper "$path"; then
+  if is_checkout_asset "$path"; then
     VERIFY_HELPER_ERR="checkout helper $rel is source, not a cache entry; refusing to overwrite it (run ./scripts/update_checksums.sh after editing helpers)"
     say_err "${RED}$X ${VERIFY_HELPER_ERR}${RESET}"
     return 2
@@ -6653,7 +6674,7 @@ ensure_helper_asset(){
   # Check ownership only on mutation paths. Healthy scans should not spawn a
   # Git process for every pinned helper in an ordinary installed cache.
   if [ "$UPDATE_MODULES" -eq 1 ] || [ ! -f "$path" ]; then
-    is_checkout_helper "$path" && checkout_helper=1
+    is_checkout_asset "$path" && checkout_helper=1
   fi
   if [[ "$checkout_helper" -eq 1 && ! -f "$path" ]]; then
     VERIFY_HELPER_ERR="checkout helper $rel is missing; restore source before scanning (never downloading over a checkout)"
@@ -6681,7 +6702,7 @@ ensure_helper_asset(){
       return 2
     fi
     if [[ $verify_code -ne 0 ]]; then
-      if is_checkout_helper "$path"; then
+      if is_checkout_asset "$path"; then
         say_err "${RED}$X helper $rel in this checkout failed verification (${VERIFY_HELPER_ERR:-mismatch}); run ./scripts/update_checksums.sh after editing helpers (never downloading over a checkout)${RESET}"
         return 2
       fi
@@ -6761,7 +6782,7 @@ ensure_detection_contract(){
     # from this release and verify the download against this runner's pin;
     # unknown bytes (or a failed refresh) still refuse to scan (issue #129).
     local mismatch_err="${VERIFY_HELPER_ERR}" cached_sha="" superseded=""
-    if [[ "$MODULE_GENERATION_ACTIVE" -eq 0 && "$path" == "$MODULE_CACHE_ROOT/$rel" ]] && ! is_checkout_helper "$path" \
+    if [[ "$MODULE_GENERATION_ACTIVE" -eq 0 && "$path" == "$MODULE_CACHE_ROOT/$rel" ]] && ! is_checkout_asset "$path" \
         && sha256_into cached_sha "$snapshot"; then
       superseded="${SUPERSEDED_CONTRACT_SHA256[$cached_sha]:-}"
     fi
@@ -6884,14 +6905,21 @@ ensure_cached_helpers(){
 
 ensure_module(){
   local lang="$1" path="$2"
-  # A module that lives next to this script (a repository checkout) is source
-  # under version control: never download over it. --update-modules and the
-  # "refresh on checksum mismatch" repair apply to the cache directory only;
+  # Bundled or Git-owned modules are source: never download over them.
+  # Forced refresh and checksum repair apply to the cache directory only;
   # a checkout module that does not match MODULE_CHECKSUMS needs
   # scripts/update_checksums.sh (or git), not a download.
   local checkout_module=0
   if [[ "$path" == "$(script_dir)/modules/"* ]]; then
     checkout_module=1
+  elif { [[ "$UPDATE_MODULES" -eq 1 ]] || [[ ! -x "$path" ]]; } && is_checkout_asset "$path"; then
+    # Avoid a Git subprocess for every healthy installed module. Ownership
+    # matters when a refresh or a failed verification could modify its path.
+    checkout_module=1
+  fi
+  if [[ "$checkout_module" -eq 1 && ! -x "$path" ]]; then
+    say_err "${RED}$X $lang checkout module is missing or not executable ($path); restore source and permissions before scanning (never downloading over a checkout)${RESET}"
+    return 1
   fi
   if [ "$UPDATE_MODULES" -eq 1 ] && [ "$checkout_module" -eq 1 ]; then
     say_err "${DIM}${INFO}${RESET} $lang module comes from this checkout ($path); --update-modules never overwrites checkout modules (use git)."
@@ -6906,7 +6934,7 @@ ensure_module(){
       return 1
     fi
     if [[ $verify_code -ne 0 ]]; then
-      if [ "$checkout_module" -eq 1 ]; then
+      if [[ "$checkout_module" -eq 1 ]] || is_checkout_asset "$path"; then
         say "${RED}$X $lang module in this checkout does not match MODULE_CHECKSUMS (${VERIFY_MODULE_ERR:-mismatch}); run ./scripts/update_checksums.sh after editing modules (never downloading over a checkout)${RESET}"
         return 1
       fi
@@ -7908,7 +7936,7 @@ check_and_update_self(){
     self_update_fail "installed binary is not writable: $self_path (re-run with sufficient permissions)"
     return $?
   fi
-  if is_checkout_helper "$MODULE_CACHE_ROOT/contract.json"; then
+  if is_checkout_asset "$MODULE_CACHE_ROOT/contract.json"; then
     self_update_fail "module directory is source, not an installed cache: $MODULE_CACHE_ROOT"
     return $?
   fi
@@ -8126,7 +8154,7 @@ fi
 
 if [[ "$MODE" == "doctor" ]]; then
   if [[ "$DOCTOR_FIX" -eq 1 && ! -e "$(script_dir)/.git" ]] \
-      && ! is_checkout_helper "$MODULE_CACHE_ROOT/contract.json"; then
+      && ! is_checkout_asset "$MODULE_CACHE_ROOT/contract.json"; then
     # Explicit repair can replace damaged bytes, but only after the entire
     # replacement has verified. Keep a legacy cache usable by older scans.
     prepare_current_release_generation repair-manifest || exit 2

@@ -159,8 +159,13 @@ the existing generation; concurrent scans continue to use its pinned bytes.
 An explicit refresh can repair damaged assets or permissions, while ordinary
 scans continue to fail closed. Standalone runners with flat legacy caches
 prepare a new complete generation and leave the legacy files intact for older
-readers. Source checkouts and exported trees with bundled modules retain their
-existing source-owned refresh behavior.
+readers. Bundled source assets and Git-tracked files remain source-owned, even
+when an installed runner selects another checkout or linked worktree through
+`--module-dir`. A tracked module contract also protects new, untracked assets in
+that same source directory. Scans, forced refresh, and `doctor --fix` refuse to
+download over these files; mismatches or missing executable permissions require
+restoring the source or regenerating its pins. Untracked installed caches can
+still be repaired when they happen to reside inside an unrelated Git repository.
 
 Older runner-only updaters cannot acquire these transaction guarantees
 retroactively. The installed runner recognizes exact released contract digests

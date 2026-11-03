@@ -709,6 +709,94 @@ class InstalledUpgrade(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertEqual((target / "contract.json").read_bytes(), V553_CONTRACT.read_bytes())
 
+    def test_completed_generation_rejects_unpinned_python_startup_offline(self) -> None:
+        self.release()
+        result = self.update()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        target = self.active_generation()
+        manifest = generation.parse_manifest(self.runner.read_bytes())
+        marker = self.root / "unpinned-startup-executed"
+        (target / "helpers/sitecustomize.py").write_text(
+            f"from pathlib import Path\nPath({str(marker)!r}).write_text('executed')\n")
+        # This attack leaves every authenticated source file unchanged.
+        for relative, expected in manifest.assets.items():
+            self.assertEqual(hashlib.sha256((target / relative).read_bytes()).hexdigest(), expected)
+        result = self.run_ubs(str(self.target), "--ci", extra_env={
+            "UBS_REPO_RAW_BASE": (self.root / "offline").as_uri(),
+        })
+        self.assertFalse(marker.exists(), "scan executed an unpinned Python startup file")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+
+    def test_completed_generation_rejects_forged_valid_timestamp_bytecode(self) -> None:
+        import marshal
+        import struct
+
+        self.release()
+        result = self.update()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        target = self.active_generation()
+        source = target / "helpers/ubs_core/__init__.py"
+        original = source.read_bytes()
+        info = source.stat()
+        marker = self.root / "forged-bytecode-executed"
+        payload = source.read_text() + (
+            f"\nfrom pathlib import Path\nPath({str(marker)!r}).write_text('executed')\n")
+        bytecode = Path(importlib.util.cache_from_source(str(source)))
+        bytecode.parent.mkdir()
+        # Supply the unchanged source's real timestamp and length. Python's
+        # ordinary bytecode freshness check therefore accepts this payload,
+        # even when PYTHONDONTWRITEBYTECODE disables new cache writes.
+        bytecode.write_bytes(importlib.util.MAGIC_NUMBER
+                             + struct.pack("<III", 0, int(info.st_mtime), info.st_size)
+                             + marshal.dumps(compile(payload, str(source), "exec")))
+        result = self.run_ubs(str(self.target), "--ci", extra_env={
+            "UBS_REPO_RAW_BASE": (self.root / "offline").as_uri(),
+        })
+        self.assertEqual(source.read_bytes(), original)
+        self.assertFalse(marker.exists(), "scan loaded unauthenticated cached bytecode")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+
+    def test_repeated_scans_work_without_inherited_bytecode_suppression(self) -> None:
+        # Real cron and Git hook environments need not contain this setting.
+        # Remove it from the actual subprocess environment, not just its value.
+        self.env.pop("PYTHONDONTWRITEBYTECODE", None)
+        self.assertNotIn("PYTHONDONTWRITEBYTECODE", self.env)
+        self.release()
+        result = self.update()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        target = self.active_generation()
+        for _ in range(2):
+            self.scan_usable()
+            self.active_generation()
+        self.assertEqual(list(target.rglob("__pycache__")), [])
+        self.assertEqual(list(target.rglob("*.pyc")), [])
+
+    def test_doctor_repairs_unpinned_startup_without_executing_quarantine(self) -> None:
+        self.env.pop("PYTHONDONTWRITEBYTECODE", None)
+        self.release()
+        result = self.update()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        target = self.active_generation()
+        marker = self.root / "quarantined-startup-executed"
+        payload = (f"from pathlib import Path\n"
+                   f"Path({str(marker)!r}).write_text('executed')\n").encode()
+        injected = target / "helpers/sitecustomize.py"
+        injected.write_bytes(payload)
+
+        self.env["UBS_REPO_RAW_BASE"] = (self.root / "offline").as_uri()
+        result, check = InstalledContract.doctor(self, fix=True)
+        self.assertFalse(marker.exists(), "doctor --fix executed unauthenticated startup code")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(check["status"], "ok", check)
+        repaired = self.active_generation()
+        self.assertFalse((repaired / "helpers/sitecustomize.py").exists())
+        quarantined = [path for path in target.parent.rglob("sitecustomize.py")
+                       if repaired not in path.parents]
+        self.assertEqual(len(quarantined), 1, "repair must retain the unexpected bytes outside the generation")
+        self.assertEqual(quarantined[0].read_bytes(), payload)
+        self.scan_usable()
+        self.assertFalse(marker.exists(), "scan imported the quarantined startup file")
+
     def test_doctor_never_imports_tampered_helpers_and_explicit_repair_recovers(self) -> None:
         self.release()
         result = self.update()
@@ -725,6 +813,48 @@ class InstalledUpgrade(unittest.TestCase):
         self.assertEqual(check["status"], "ok", check)
         self.active_generation()
         self.assertFalse(marker.exists(), "doctor --fix executed the damaged helper")
+        self.scan_usable()
+
+    def test_doctor_rejects_tampered_adjacent_helpers_before_import(self) -> None:
+        # Legacy standalone installations may have modules/ beside the runner
+        # as well as an independent XDG cache. Diagnose the selected siblings,
+        # not merely the healthy helpers in MODULE_DIR.
+        self.populate_legacy_cache(contract=self.contract)
+        siblings = self.bin / "modules/helpers"
+        shutil.copytree(REPO_ROOT / "modules/helpers", siblings)
+        startup_marker = self.root / "unverified-adjacent-startup-executed"
+        startup = (f"from pathlib import Path\n"
+                   f"Path({str(startup_marker)!r}).write_text('executed')\n").encode()
+        self.assertFalse((siblings / "sitecustomize.py").exists())
+        (siblings / "sitecustomize.py").write_bytes(startup)
+        # All pinned helpers still match. Extra source files must neither run
+        # at Python startup nor disable diagnostics from the verified helpers.
+        healthy, _ = InstalledContract.doctor(self)
+        self.assertFalse(startup_marker.exists(), "doctor executed unpinned adjacent startup code")
+        self.assertEqual(healthy.returncode, 0, healthy.stdout + healthy.stderr)
+        healthy_checks = {item["id"]: item for item in self.parsed_report(healthy)["checks"]}
+        self.assertEqual(healthy_checks["scan-cache"]["status"], "ok", healthy_checks)
+        marker = self.root / "unverified-adjacent-doctor-code-executed"
+        damaged = (f"from pathlib import Path\n"
+                   f"Path({str(marker)!r}).write_text('executed')\n").encode()
+        (siblings / "ubs_core/__init__.py").write_bytes(damaged)
+        self.assertFalse((self.bin / ".git").exists())
+
+        result, _ = InstalledContract.doctor(self)
+        self.assertFalse(marker.exists(), "doctor imported the unverified adjacent package")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        checks = {item["id"]: item for item in self.parsed_report(result)["checks"]}
+        self.assertEqual(checks["scan-cache-helpers"]["status"], "err", checks)
+        self.assertIn("checksum mismatch", checks["scan-cache-helpers"]["detail"])
+
+        result, check = InstalledContract.doctor(self, fix=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(check["status"], "ok", check)
+        self.active_generation()
+        self.assertFalse(marker.exists(), "doctor --fix imported the unverified adjacent package")
+        self.assertFalse(startup_marker.exists(), "doctor --fix executed unpinned adjacent startup code")
+        self.assertEqual((siblings / "ubs_core/__init__.py").read_bytes(), damaged)
+        self.assertEqual((siblings / "sitecustomize.py").read_bytes(), startup)
         self.scan_usable()
 
     def blocked_update(self) -> tuple[subprocess.Popen[str], Path]:

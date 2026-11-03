@@ -103,7 +103,10 @@ library-to-helper pins. Cached or local source files are reused only when their
 bytes match the target digest; downloads use the target release tag and have
 no mutable-main fallback. Every module, helper, library, and contract must pass
 before publication. Ready markers describe a generation; they do not replace
-verification of its actual bytes.
+verification of its actual bytes. A generation must also contain exactly the
+pinned files, its ready marker, and their parent directories. Unexpected files,
+Python bytecode caches, and symlinks fail validation before helper startup.
+Managed scans disable bytecode writes so normal imports preserve this inventory.
 
 Preparation occurs in a private directory on the cache filesystem. Publication
 locks serialize writers, and an expected-runner digest prevents an updater or
@@ -119,7 +122,12 @@ that cannot provide it.
 `ubs doctor --fix` prepares a fully verified replacement before repairing an
 installed generation. Repairs replace only files with the same pinned target
 bytes, publish the ready marker last, and keep the generation directory stable
-for concurrent readers. Ordinary scans reject damaged generations; they never
+for concurrent readers. After the complete replacement has been verified,
+unexpected entries are moved to a private quarantine outside the active
+generation and retained for inspection. Doctor's cache diagnostics execute
+from a private snapshot containing only verified helper sources, using isolated
+Python startup; adjacent startup files and previously compiled bytecode cannot
+authorize diagnostic code. Ordinary scans reject damaged generations; they never
 authorize an arbitrary checksum mismatch as an old release.
 
 Older runner-only updaters cannot acquire these transaction guarantees

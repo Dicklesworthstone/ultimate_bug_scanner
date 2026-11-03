@@ -310,6 +310,69 @@ def check_parents(root: Path, relative: str) -> Path:
     return root / relative
 
 
+def unexpected_entries(path: Path, files: set[str]) -> list[tuple[str, os.stat_result]]:
+    """Find topmost unpinned entries without traversing unknown trees or links.
+
+    Authentic Python sources alone are insufficient: an extra sitecustomize,
+    bytecode cache or importable sibling can execute before those sources.
+    Managed generations therefore contain only pinned files, their parent
+    directories, and the ready marker. Directory placement grants no trust.
+    """
+    directories = {parent.as_posix() for name in files for parent in Path(name).parents
+                   if parent.as_posix() != "."}
+    pending = [""]
+    unexpected = []
+    while pending:
+        relative = pending.pop()
+        directory = check_parents(path, relative) if relative else path
+        real_directory(directory)
+        with os.scandir(directory) as entries:
+            for entry in sorted(entries, key=lambda item: item.name):
+                name = f"{relative}/{entry.name}" if relative else entry.name
+                info = entry.stat(follow_symlinks=False)
+                if is_reparse(info):
+                    unexpected.append((name, info))
+                elif name in directories and stat.S_ISDIR(info.st_mode):
+                    pending.append(name)
+                elif name in files and stat.S_ISREG(info.st_mode):
+                    continue
+                else:
+                    unexpected.append((name, info))
+    return unexpected
+
+
+def check_inventory(path: Path, files: set[str]) -> None:
+    unexpected = unexpected_entries(path, files)
+    if unexpected:
+        raise UpdateError(f"unexpected entry in verified generation: {unexpected[0][0]}")
+
+
+def quarantine_unexpected(path: Path, manifest: Manifest) -> None:
+    """Retain untrusted extras outside an active generation before repair.
+
+    Called only under the generation lock, after the complete replacement set
+    has verified. Moving topmost entries preserves unknown bytes and symlinks
+    without importing, following or deleting them. Interrupted moves leave
+    either a still-refused generation or one containing only pinned assets.
+    """
+    unexpected = unexpected_entries(path, set(manifest.assets) | {READY_FILE})
+    if not unexpected:
+        return
+    quarantine = Path(tempfile.mkdtemp(prefix=".quarantine-" + path.name[:12] + "-",
+                                       dir=path.parent))
+    for relative, observed in unexpected:
+        source = check_parents(path, relative)
+        if not os.path.samestat(observed, source.lstat()):
+            raise UpdateError(f"unexpected entry changed during quarantine: {relative}")
+        destination = quarantine / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        os.rename(source, destination)
+        sync_directory(source.parent)
+        sync_directory(destination.parent)
+    sync_directory(quarantine)
+    sync_directory(path.parent)
+
+
 def check_ready(path: Path, manifest: Manifest, *, complete: bool) -> None:
     real_directory(path.parent)
     real_directory(path)
@@ -327,6 +390,34 @@ def check_ready(path: Path, manifest: Manifest, *, complete: bool) -> None:
                 if not os.access(path / relative, access):
                     raise UpdateError(f"module is not readable/executable: {relative}")
         verify_dependency_pins(path, manifest)
+        check_inventory(path, set(manifest.assets) | {READY_FILE})
+
+
+def snapshot_helpers(manifest: Manifest, source: Path, destination: Path) -> Path:
+    """Copy only verified helper pins into an exclusively created private tree.
+
+    Doctor may inspect a legacy or sibling source tree with additional files.
+    Importing directly from it would authorize those files and race the digest
+    checks. The caller imports this snapshot with isolated Python only after
+    the command succeeds; partial snapshots are never returned for execution.
+    """
+    validate_asset_map(manifest.assets)
+    real_directory(source)
+    real_directory(destination.parent)
+    destination.mkdir(mode=0o700)
+    assets = {name.removeprefix("helpers/"): expected
+              for name, expected in manifest.assets.items() if name.startswith("helpers/")}
+    if not assets:
+        raise UpdateError("manifest has no pinned diagnostic helpers")
+    for relative, expected in sorted(assets.items()):
+        data = read_regular(check_parents(source, relative))
+        if not hmac.compare_digest(digest(data), expected):
+            raise UpdateError(f"diagnostic helper checksum mismatch: {relative}")
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        write_verified(target, data, expected, executable=False)
+    check_inventory(destination, set(assets))
+    return destination
 
 
 def verify_dependency_pins(path: Path, manifest: Manifest) -> None:
@@ -522,6 +613,7 @@ def prepare_manifest(manifest: Manifest, root: Path, raw_base: str, *, allow_ove
                 # healthy concurrent reader still sees the same pinned bytes;
                 # a damaged reader fails closed until its asset is repaired.
                 # The generation directory itself never disappears or moves.
+                quarantine_unexpected(target, manifest)
                 parents = {target}
                 for relative in sorted(manifest.assets):
                     parent = target
@@ -703,6 +795,10 @@ def main() -> int:
         if command == "select-manifest" and len(args) >= 3:
             root, version, *entries = args
             result = select_manifest(manifest_from_arguments(version, entries), Path(root))
+        elif command == "snapshot-helpers" and len(args) >= 4:
+            source, destination, version, *entries = args
+            result = snapshot_helpers(manifest_from_arguments(version, entries),
+                                      Path(source), Path(destination))
         elif command in ("prepare-manifest", "repair-manifest") and len(args) >= 4:
             root, version, base, *entries = args
             local_source = None

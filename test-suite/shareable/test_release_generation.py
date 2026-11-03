@@ -613,6 +613,143 @@ class ReleaseGeneration(unittest.TestCase):
                 asset.write_bytes(original)
         self.assertEqual(generation.select_manifest(self.manifest, self.cache), target)
 
+    def test_selection_rejects_every_unpinned_entry_with_all_pinned_bytes_intact(self) -> None:
+        target = self.prepare()
+        for name, kind in (("helpers/sitecustomize.py", "file"),
+                           ("helpers/__pycache__", "directory"),
+                           ("helpers/nested/extra", "directory"),
+                           ("helpers/extra.py", "symlink")):
+            with self.subTest(name=name, kind=kind):
+                extra = target / name
+                if kind == "directory":
+                    extra.mkdir()
+                elif kind == "symlink":
+                    extra.symlink_to(self.remote / "helpers/nested/helper.py")
+                else:
+                    extra.write_text("raise AssertionError('untrusted startup')\n")
+                with self.assertRaisesRegex(generation.UpdateError, "unexpected entry"):
+                    generation.select_manifest(self.manifest, self.cache)
+                extra.rename(self.root / (extra.name + ".retained"))
+        self.assert_complete(target)
+
+    def test_explicit_repair_quarantines_unknown_trees_and_links_without_following_them(self) -> None:
+        target = self.prepare()
+        injected = b"raise AssertionError('untrusted startup')\n"
+        (target / "helpers/sitecustomize.py").write_bytes(injected)
+        bytecode = target / "helpers/__pycache__"
+        bytecode.mkdir()
+        (bytecode / "cache.pyc").write_bytes(b"untrusted bytecode")
+        outside = self.root / "outside.py"
+        outside.write_bytes(b"outside content must survive")
+        (target / "helpers/unpinned.py").symlink_to(outside)
+        with mock.patch.object(generation, "download", side_effect=AssertionError("unexpected download")):
+            generation.prepare_manifest(self.manifest, self.cache, "https://offline.invalid",
+                                        allow_override=False, repair=True)
+        self.assert_complete(target)
+        quarantines = list(target.parent.glob(".quarantine-*"))
+        self.assertEqual(len(quarantines), 1)
+        quarantined = quarantines[0]
+        self.assertEqual((quarantined / "helpers/sitecustomize.py").read_bytes(), injected)
+        self.assertEqual((quarantined / "helpers/__pycache__/cache.pyc").read_bytes(), b"untrusted bytecode")
+        self.assertTrue((quarantined / "helpers/unpinned.py").is_symlink())
+        self.assertEqual((quarantined / "helpers/unpinned.py").readlink(), outside)
+        self.assertEqual(outside.read_bytes(), b"outside content must survive")
+        self.assertEqual(quarantined.stat().st_mode & 0o777, 0o700)
+
+    def test_failed_download_leaves_untrusted_extras_in_place_until_verified_repair(self) -> None:
+        target = self.prepare()
+        extra = target / "helpers/sitecustomize.py"
+        extra.write_bytes(b"untrusted startup")
+        (target / "helpers/nested/helper.py").write_bytes(b"damaged pinned helper")
+        (self.remote / "helpers/nested/helper.py").write_bytes(b"bad replacement")
+        with self.assertRaisesRegex(generation.UpdateError, "checksum mismatch"):
+            generation.prepare_manifest(self.manifest, self.cache, self.mirror.as_uri(),
+                                        allow_override=True, repair=True)
+        self.assertEqual(extra.read_bytes(), b"untrusted startup")
+        self.assertEqual(list(target.parent.glob(".quarantine-*")), [])
+
+    def test_interrupted_quarantine_fails_closed_and_retry_retains_all_unknown_bytes(self) -> None:
+        target = self.prepare()
+        first = target / "helpers/first-extra.py"
+        second = target / "helpers/second-extra.py"
+        first.write_bytes(b"first untrusted file")
+        second.write_bytes(b"second untrusted file")
+        rename = generation.os.rename
+
+        def interrupted_rename(source, destination):
+            if Path(source) == second:
+                raise OSError("quarantine interrupted")
+            return rename(source, destination)
+
+        with mock.patch.object(generation.os, "rename", side_effect=interrupted_rename):
+            with self.assertRaisesRegex(OSError, "quarantine interrupted"):
+                generation.prepare_manifest(self.manifest, self.cache, self.mirror.as_uri(),
+                                            allow_override=True, repair=True)
+        self.assertFalse(first.exists())
+        self.assertEqual(second.read_bytes(), b"second untrusted file")
+        with self.assertRaisesRegex(generation.UpdateError, "unexpected entry"):
+            generation.select_manifest(self.manifest, self.cache)
+        generation.prepare_manifest(self.manifest, self.cache, self.mirror.as_uri(),
+                                    allow_override=True, repair=True)
+        self.assert_complete(target)
+        retained = [p.read_bytes() for q in target.parent.glob(".quarantine-*")
+                    for p in q.rglob("*-extra.py")]
+        self.assertCountEqual(retained, [b"first untrusted file", b"second untrusted file"])
+
+    def test_repair_quarantines_symlink_at_a_pinned_parent(self) -> None:
+        target = self.prepare()
+        (target / "helpers/nested").rename(self.root / "saved nested")
+        outside = self.root / "outside helpers"
+        outside.mkdir()
+        helper = outside / "helper.py"
+        helper.write_bytes(b"outside content")
+        (target / "helpers/nested").symlink_to(outside, target_is_directory=True)
+        generation.prepare_manifest(self.manifest, self.cache, self.mirror.as_uri(),
+                                    allow_override=True, repair=True)
+        self.assert_complete(target)
+        self.assertEqual(helper.read_bytes(), b"outside content")
+        quarantined = next(target.parent.glob(".quarantine-*"))
+        self.assertTrue((quarantined / "helpers/nested").is_symlink())
+
+    def test_helper_snapshot_copies_only_verified_pins_and_detaches_from_source(self) -> None:
+        source = self.remote / "helpers"
+        (source / "sitecustomize.py").write_bytes(b"raise AssertionError('startup')\n")
+        (source / "nested/__pycache__").mkdir()
+        (source / "nested/__pycache__/helper.pyc").write_bytes(b"untrusted bytecode")
+        destination = self.root / "private helper snapshot"
+        self.assertEqual(generation.snapshot_helpers(self.manifest, source, destination), destination)
+        expected = {name[len("helpers/"):] for name in self.new_assets if name.startswith("helpers/")}
+        self.assertEqual({str(p.relative_to(destination)) for p in destination.rglob("*") if p.is_file()}, expected)
+        for name in expected:
+            self.assertEqual((destination / name).read_bytes(), self.new_assets["helpers/" + name])
+        (source / "nested/helper.py").write_bytes(b"later mutation")
+        self.assertEqual((destination / "nested/helper.py").read_bytes(), self.new_assets["helpers/nested/helper.py"])
+        with self.assertRaises(FileExistsError):
+            generation.snapshot_helpers(self.manifest, source, destination)
+
+    def test_helper_snapshot_cli_refuses_corrupt_source_without_authorizing_snapshot(self) -> None:
+        source = self.remote / "helpers"
+        helper = source / "nested/helper.py"
+        helper.write_bytes(b"untrusted replacement")
+        result = subprocess.run(
+            [sys.executable, "-I", "-S", str(SOURCE), "snapshot-helpers", str(source),
+             str(self.root / "private snapshot"), self.manifest.version,
+             *(f"{name}={pin}" for name, pin in self.manifest.assets.items())],
+            env=self.env, capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("diagnostic helper checksum mismatch", result.stderr)
+
+    def test_helper_snapshot_refuses_symlinked_pinned_sources(self) -> None:
+        source = self.remote / "helpers"
+        original = source / "nested/helper.py"
+        saved = self.root / "saved helper.py"
+        original.rename(saved)
+        original.symlink_to(saved)
+        with self.assertRaisesRegex(OSError, "symlink or reparse"):
+            generation.snapshot_helpers(self.manifest, source, self.root / "private snapshot")
+
     def test_final_asset_validation_precedes_runner_publication(self) -> None:
         prepare = generation.prepare_manifest
 

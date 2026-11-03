@@ -29,7 +29,8 @@ Options:
   --artifact-archive FILE Read a gzip-compressed release tar archive privately.
                           Reject unsafe paths, links, duplicates and oversized input.
   --verify-only           Verify the complete release WITHOUT running it.
-  --with-modules          Also verify every pinned module/helper (requires --verify-only).
+  --with-modules          Verify and stage every pinned module/helper before installation.
+                          Combine with --verify-only to inspect without installing.
   --bundle-output FILE    Export a complete verified portable runtime as .tar.gz.
                           Implies --verify-only --with-modules; never overwrites FILE.
   --install-args "ARGS"   Legacy whitespace-separated arguments (no shell eval).
@@ -54,11 +55,15 @@ install.sh, ubs, and git_safety_guard.py. Only regular, non-symlink files are
 accepted; private copies are authenticated, never executed from the input
 directory. Cosign may still refresh its trust metadata. Installing a local
 bundle can fetch third-party dependencies; --verify-only never runs installers.
-With --with-modules, local bundles must also contain modules/ with every asset
+Installation automatically verifies and stages an included modules/ directory.
+With --with-modules, local bundles must contain modules/ with every asset
 listed in the authenticated runner. Missing assets never fall back to a network
 download. Remote runtime assets come only from the selected release tag (or the
 explicit module mirror), never mutable main. Runtime metadata is parsed as data,
-not sourced as shell code. Host dependencies are not part of this verification.
+not sourced as shell code. All runtime verification finishes before the installer
+starts, and only verified assets enter its private source directory. A local
+bundle without modules/ retains the installer's normal runtime download path.
+Host dependencies are not part of this verification.
 Bundle export includes the original signature, manifest, runner, installer,
 hook and verified modules. It never executes them. Extract into an empty
 directory, re-verify with --artifact-dir DIR --verify-only --with-modules, then
@@ -142,8 +147,7 @@ if [[ -n "$BUNDLE_OUTPUT" ]]; then
   WITH_MODULES=1
 fi
 if [[ "$WITH_MODULES" -eq 1 ]]; then
-  [[ "$VERIFY_ONLY" -eq 1 ]] || usage_error '--with-modules requires --verify-only'
-  command -v python3 >/dev/null 2>&1 || die 'python3 is required to verify the runtime asset graph'
+  [[ "$INSECURE" -eq 0 ]] || usage_error '--with-modules requires authenticated verification'
 fi
 if [[ "$VERIFY_ONLY" -eq 1 ]]; then
   [[ "$INSECURE" -eq 0 ]] || usage_error '--verify-only cannot be combined with --insecure'
@@ -338,6 +342,18 @@ except (OSError, EOFError, ValueError, RecursionError, tarfile.TarError, zlib.er
     sys.exit(1)
 PY
   ARTIFACT_DIR="$VERIFY_DIR/archive-input"
+fi
+
+# A supplied runtime is part of the requested installation, even if it is
+# incomplete or its root is a dangling symlink. Never discard it and silently
+# let the installer fetch another copy. Verification-only keeps its explicit
+# --with-modules scope; thin local bundles retain their existing install path.
+if [[ "$INSECURE" -eq 0 && "$VERIFY_ONLY" -eq 0 && -n "$ARTIFACT_DIR" ]] \
+    && [[ -e "$ARTIFACT_DIR/modules" || -L "$ARTIFACT_DIR/modules" ]]; then
+  WITH_MODULES=1
+fi
+if [[ "$WITH_MODULES" -eq 1 ]]; then
+  command -v python3 >/dev/null 2>&1 || die 'python3 is required to verify the runtime asset graph'
 fi
 
 fetch_asset() {

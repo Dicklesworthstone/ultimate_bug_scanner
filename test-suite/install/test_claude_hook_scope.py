@@ -70,7 +70,7 @@ install_claude_safety_guard(){
 }
 setup_claude_code_hook
 """
-        result = subprocess.run(["bash", "-c", script], cwd=cwd,
+        result = subprocess.run(["bash", "-c", script], cwd=cwd,  # ubs:ignore[py.security.command-injection] - executes repository installer functions plus the fixed fixture above; test inputs are passed through isolated environment variables, never interpolated as shell code.
                                 env={**self.env, "DRY_RUN": str(int(dry_run))},
                                 capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -589,6 +589,10 @@ class InstallerCLI(unittest.TestCase):
             # install exercises maybe_setup_hook under the same HOME reproduction.
             shutil.copy2(ROOT / "ubs", home / "ubs")
             shutil.copy2(ROOT / "ubs-daemon", home / "ubs-daemon")
+            # A local install now verifies the complete release before
+            # publishing its runner, even when the optional doctor is skipped.
+            shutil.copytree(ROOT / "modules", home / "modules",
+                            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
             for index, args in enumerate((
                 ["--setup-claude-hook", "--non-interactive"],
                 ["--easy-mode", "--local", "--skip-ast-grep", "--skip-ripgrep", "--skip-jq", "--skip-bun",

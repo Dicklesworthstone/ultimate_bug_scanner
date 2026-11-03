@@ -27,6 +27,16 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Fixed
 
+- Self-updates and fresh installations prepare a complete authenticated runtime
+  before publishing the runner (GH #199). Version-bound module generations,
+  serialized publication, and a runner-digest lease preserve concurrent scans
+  and the previous installation on download or verification failure. Explicit
+  same-version updates and doctor repair verify the complete cache; recognized
+  historical v5.5.3 contracts migrate without accepting arbitrary mismatches.
+  Cron preserves the public verification key, cache location, and Bash path.
+  Release manifest signatures are mandatory by default, and partial installer
+  repair or scanner environment errors no longer report installation success.
+
 - Repeated initialization calls to simple Python factories no longer create
   contexts for unrelated globals added later in the module. A conservative
   syntax proof restricts pruning to direct lexical reads, retaining relevant

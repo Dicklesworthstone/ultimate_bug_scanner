@@ -245,6 +245,8 @@ run_step status-invariants "${PY[@]}" shareable/test_status_invariants.py
 # GH #170: exercise native executable publication races in the normal suite, not only the dedicated workflow.
 run_step tool-cache-concurrency "${PY[@]}" ./test_tool_cache_concurrency.py
 run_step supply-chain "${PY[@]}" shareable/test_supply_chain.py
+run_step release-generations "${PY[@]}" shareable/test_release_generation.py
+run_step installed-upgrades "${PY[@]}" shareable/test_installed_contract.py
 run_step skip-categories "${PY[@]}" shareable/test_skip_categories.py
 # SARIF parity (bead K5): asserted for the modules whose SARIF carries their
 # heuristic findings; the other languages are reported (json has no per-finding

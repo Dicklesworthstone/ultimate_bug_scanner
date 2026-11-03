@@ -84,6 +84,56 @@ class ContractChecksums(unittest.TestCase):
                 after = {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
                 self.assertEqual(before, after)
 
+    def test_generation_preserves_embedded_parser_markers_and_quoted_pins(self) -> None:
+        # The standalone updater parses literal Bash tables as data. Its
+        # Python marker strings are not additional Bash declarations: the old
+        # unanchored substitutions replaced them with table bodies, producing
+        # a syntactically broken installed updater while reporting success.
+        embedded = (
+            "def pins(marker):\n    return marker\n"
+            'modules = pins("declare -A MODULE_CHECKSUMS=(")\n'
+            'helpers = pins("declare -A HELPER_CHECKSUMS=(")\n'
+            'common = pins("declare -g -A UBS_COMMON_HELPER_CHECKSUMS=(")\n'
+            'inventory = pins("HELPER_ASSETS=(")\n'
+        )
+        wrapper = "python3 - <<'PYCHECKSUMMARKERS'\n" + embedded + "PYCHECKSUMMARKERS\n"
+        quoted_pin = "printf '%s\\n' 'UBS_LIB_CHECKSUM=\"marker-only\"'\n"
+        with tempfile.TemporaryDirectory(prefix="ubs-checksum-parser-markers-") as tmp:
+            root = Path(tmp)
+            self.make_tree(root)
+            for name in ("ubs", "modules/lib/ubs-common.sh"):
+                path = root / name
+                path.write_text(path.read_text() + wrapper, encoding="utf-8")
+            for name in ("modules/ubs-rust.sh", "scripts/new-module.sh"):
+                path = root / name
+                path.write_text(path.read_text() + quoted_pin, encoding="utf-8")
+            for _ in range(2):
+                result = self.generate(root)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assert_chain(root)
+                for name in ("ubs", "modules/lib/ubs-common.sh"):
+                    source = (root / name).read_text(encoding="utf-8")
+                    actual = source.split("<<'PYCHECKSUMMARKERS'\n", 1)[1].split("PYCHECKSUMMARKERS\n", 1)[0]
+                    self.assertEqual(actual, embedded, name)
+                    compile(actual, name + " embedded parser", "exec")
+                    syntax = subprocess.run(["bash", "-n", str(root / name)],
+                                            capture_output=True, text=True, check=False, timeout=15)
+                    self.assertEqual(syntax.returncode, 0, syntax.stderr)
+                for name in ("modules/ubs-rust.sh", "scripts/new-module.sh"):
+                    self.assertTrue((root / name).read_text().endswith(quoted_pin), name)
+
+    def test_duplicate_real_runner_declarations_are_refused(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ubs-checksum-ambiguous-") as tmp:
+            root = Path(tmp)
+            self.make_tree(root)
+            runner = root / "ubs"
+            runner.write_text(runner.read_text() + "declare -A MODULE_CHECKSUMS=(\n)\n")
+            before = runner.read_bytes()
+            result = self.generate(root)
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("exactly one top-level MODULE_CHECKSUMS", result.stderr)
+            self.assertEqual(runner.read_bytes(), before)
+
     def test_missing_contract_fails_before_modifying_pins(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ubs-contract-missing-") as tmp:
             root = Path(tmp)

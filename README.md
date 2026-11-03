@@ -126,7 +126,7 @@ const zipCode = parseInt(userInput);  // 💥 "08" becomes 0 in old browsers (oc
 ### 🧠 Language-Aware Meta-Runner
 - `ubs` auto-detects **JavaScript/TypeScript, Python, C/C++, Rust, Go, Java, Kotlin, Ruby, Swift, C#, Elixir, Bash, PHP, and PostgreSQL SQL** in the same repo and fans out to per-language scanners.
 - Each scanner lives under `modules/ubs-<lang>.sh`, ships independently, and supports `--format text|json|jsonl|sarif|toon` for consistent downstream tooling.
-- Modules download lazily (PATH → repo `modules/` → cached under `${XDG_DATA_HOME:-$HOME/.local/share}/ubs/modules`) and are validated before execution.
+- Installed releases use a complete verified module generation under `${XDG_DATA_HOME:-$HOME/.local/share}/ubs/modules`. Source checkouts and legacy installations retain lazy module resolution (PATH → repo `modules/` → cache).
 - Results from every language merge into one text/JSON/SARIF report via `jq`, so CI systems and AI agents only have to parse a single artifact.
 
 ### 🔐 Supply-Chain Safeguards
@@ -135,7 +135,7 @@ const zipCode = parseInt(userInput);  // 💥 "08" becomes 0 in old browsers (oc
 - Run `ubs doctor` at any time to audit your environment. It checks for curl/wget availability, writable cache directories, and per-language module integrity. Add `--fix` to redownload missing or corrupted modules proactively.
 - Scanner runs still respect `--update-modules`, but an invalid checksum now causes an immediate failure with remediation guidance rather than executing unverified code.
 - **Developer Pre-commit Hook**: The repository ships with a `.githooks/pre-commit` hook that auto-updates `SHA256SUMS` when modules change and blocks commits with stale checksums. This ensures every release has verified checksums without manual intervention.
-- **Minisign Support**: For additional assurance, set `UBS_MINISIGN_PUBKEY` to verify cryptographic signatures on `SHA256SUMS` via [minisign](https://jedisct1.github.io/minisign/).
+- **Authenticated Updates**: Install [minisign](https://jedisct1.github.io/minisign/) to authenticate release manifests with the embedded public key. `UBS_MINISIGN_PUBKEY` selects an explicitly trusted alternate key; signatures remain mandatory for `ubs --update`, including unattended cron jobs.
 
 ### 🎛 Category Packs & Shareable Reports
 - `--category=resource-lifecycle` focuses the scanners on Python/Go/Java resource hygiene (context managers, defer symmetry, try-with-resources). UBS automatically narrows the language set to those with lifecycle packs enabled and suppresses unrelated categories.
@@ -3478,13 +3478,15 @@ This enables debugging test failures and tracking scanner behavior changes acros
 
 ## 🔄 **Auto-Update System**
 
-UBS includes a background auto-update mechanism that keeps your installation current without manual intervention.
+UBS includes an opt-in update mechanism that publishes the runner and its verified
+dependencies together. Updates require Minisign; the published public key is
+embedded, so cron does not depend on an interactive shell exporting it.
 
 ### How It Works
 
 ```bash
 # Force immediate update check
-ubs --update .
+ubs --update
 
 # Enable automatic updates (checks on each run)
 export UBS_ENABLE_AUTO_UPDATE=1
@@ -3499,6 +3501,19 @@ ubs --no-auto-update .
 # Force module re-download before scanning
 ubs --update-modules .
 ```
+
+An update authenticates the release manifest, verifies the runner and optional
+daemon, and prepares every module, helper, shared library, and contract before
+switching runners. The same-version path verifies and repairs the cache too.
+Download or verification failure returns a nonzero status for `--update` and
+keeps the previous release usable. Concurrent scans retain their own version's
+dependencies, and an interrupted update can be retried safely.
+
+Installations left with a genuine old cache by a runner-only updater migrate
+from explicitly recognized historical contract digests, including v5.5.3.
+Unknown or tampered contracts still refuse scanning; `ubs doctor --fix` is the
+explicit repair command. See [runner and cache publication](docs/security.md#runner-and-cache-publication)
+for the integrity and recovery guarantees.
 
 ### CI Mode Behavior
 

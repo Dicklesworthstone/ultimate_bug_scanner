@@ -13,8 +13,8 @@ This document captures the threat model for the UBS installer, module downloads,
 ## Controls
 
 - **Authenticated release installation**: `scripts/verify.sh` authenticates one `SHA256SUMS` with minisign or Cosign, then verifies `install.sh`, `ubs`, and `git_safety_guard.py` against that same manifest before executing any release code. The verified runner and hook are staged beside the installer in a private directory, so the installer does not re-fetch an unsigned manifest or select a planted runner in the caller's directory.
-- **Release-pinned installs**: `install.sh` downloads `ubs` from the release artifacts (never raw `main`) and verifies it against the release `SHA256SUMS` before installing. When `UBS_MINISIGN_PUBKEY` is set, the checksum manifest's minisign signature is verified as well and any failure aborts. The only opt-out is the explicit `--insecure` / `--skip-verification` flag.
-- **Verified self-update**: `ubs --update` (and the opt-in background check) pulls the latest **release** artifacts, verifies the payload against the release `SHA256SUMS` (plus minisign when `UBS_MINISIGN_PUBKEY` is set), and replaces the binary atomically. `ubs --update` exits nonzero when the update cannot be fetched or verified.
+- **Release-pinned installs**: `install.sh` downloads `ubs` from release artifacts and authenticates `SHA256SUMS` with the embedded Minisign public key before installing. `UBS_MINISIGN_PUBKEY` selects an explicitly trusted alternate key; omitting it does not disable signatures. A missing verifier or invalid signature aborts. Only the explicit `--insecure` / `--skip-verification` installer option bypasses this gate. Trusted local source installations remain an explicit `--local` operation.
+- **Transactional self-update**: `ubs --update` (and the opt-in background check) authenticates the latest release manifest with Minisign, verifies the runner and companion, then prepares and verifies the entire module cache before atomically replacing the runner. It exits nonzero when a forced update cannot complete, including same-version cache repair. There is no unsigned updater fallback.
 - **Cosign keyless signing for OCI**: Images are signed by digest (not tag) and stored in the Rekor transparency log. SBOM + SLSA provenance attestations are attached to the same digest.
 - **Cosign keyless signatures for the release blobs**: `install.sh`, `ubs`, `SHA256SUMS` and `git_safety_guard.py` each get a Sigstore bundle (`<asset>.sigstore.json`) produced by `cosign sign-blob` in the release workflow, plus GitHub build-provenance attestations (`gh attestation verify <asset> --repo Dicklesworthstone/ultimate_bug_scanner`). `scripts/verify.sh` requires the exact certificate identity `https://github.com/Dicklesworthstone/ultimate_bug_scanner/.github/workflows/release.yml@refs/tags/vX.Y.Z` for the selected release and issuer `https://token.actions.githubusercontent.com`; a signature for another tag is not sufficient. `UBS_VERIFY_WITH=cosign|minisign` forces a path. Without an explicit choice, a configured minisign key selects minisign; otherwise Cosign is required. There is no signature-failure fallback to bare checksums.
 - **Immutable references in workflows**: release and OCI workflows sign by digest and avoid mutable tag signing.
@@ -66,11 +66,14 @@ are copied to private staging before authentication; the input bundle is never
 modified or executed in place. A changed input manifest cannot replace the
 already authenticated staged manifest. Unknown extra files are not consumed.
 
-`--artifact-dir` performs no artifact downloads and needs no downloader. Cosign
-may still refresh its trust metadata; a local bundle does not promise an offline
-Sigstore trust bootstrap. Omitting `--verify-only` installs the verified local
-release and may fetch third-party dependencies through the installer's existing
-dependency setup. The caller's working directory is preserved for project hooks.
+The verifier reads local release files without a downloader. When installing a
+bundle containing `modules/`, it also verifies and privately stages that complete
+runtime before invoking the installer. Missing or damaged runtime files abort
+before installation; they never trigger a network fallback. A thin bundle with
+no `modules/` retains the installer's normal tagged runtime-download path.
+Cosign may still refresh its trust metadata, and installation may fetch
+third-party dependencies through the existing dependency setup. The caller's
+working directory is preserved for project hooks.
 
 Missing, malformed, or duplicate required checksum entries fail closed, as do
 missing signatures or assets. Older releases without a signed hook entry cannot
@@ -81,10 +84,84 @@ changing which signing identity or release version is trusted. Broad
 `UBS_COSIGN_IDENTITY_RE` overrides are rejected.
 
 The verifier itself and the installed signature-verification tool must come from
-a trusted source. Direct `install.sh` invocation retains its existing separate
-policy: checksums are enforced, but manifest authentication requires a configured
-minisign key. Use `scripts/verify.sh` for the authenticated Cosign installation
-path. The verifier's explicit `--insecure` mode is not an authenticated install.
+a trusted source. Direct `install.sh` invocation requires Minisign and uses the
+published key by default. Use `scripts/verify.sh` for the authenticated Cosign
+installation path. The installer's optional raw-main self-refresh is disabled
+unless `--insecure` was explicitly requested. An explicit `--insecure` mode is
+not an authenticated install.
+
+## Runner and cache publication
+
+A managed installation stores complete module generations below
+`$XDG_DATA_HOME/ubs/modules/.ubs-releases/` (normally
+`~/.local/share/ubs/modules/.ubs-releases/`). Their identities derive from the
+runner version and its literal asset pins. Scans select with their already
+loaded pins, so replacing the installed runner pathname cannot switch an
+in-flight scan to another version's dependencies. A selected generation takes
+precedence over stale sibling modules or language commands on `PATH`.
+
+The updater parses the authenticated candidate as data. It requires a complete,
+unambiguous language/helper inventory and matching module-to-library and
+library-to-helper pins. Cached or local source files are reused only when their
+bytes match the target digest; downloads use the target release tag and have
+no mutable-main fallback. Every module, helper, library, and contract must pass
+before publication. Ready markers describe a generation; they do not replace
+verification of its actual bytes. A generation must also contain exactly the
+pinned files, its ready marker, and their parent directories. Unexpected files,
+Python bytecode caches, and symlinks fail validation before helper startup.
+Managed scans disable bytecode writes so normal imports preserve this inventory.
+
+Later updates can reuse assets from the generation named by the currently
+installed runner, while holding that runner's publication lock. Each reused
+file must match the new release's exact pin; previous ready markers and version
+labels grant no trust. Unchanged assets need no module download. Changed,
+missing, or damaged assets still require a verified replacement, and a failed
+fetch preserves the previous installation. Release signature authentication
+remains mandatory even when every module byte is already cached.
+
+Preparation occurs in a private directory on the cache filesystem. Publication
+locks serialize writers, and an expected-runner digest prevents an updater or
+installer from overwriting a peer's newer installation. The complete generation
+is renamed into place before the runner's final atomic replacement. Previous
+generations and the original legacy cache are retained for concurrent readers.
+Interrupted staging directories are never selected. A failed fetch, invalid
+signature, corrupt asset, or failed prepublication check cannot activate a
+partial replacement. Files are flushed before publication; directory flushing
+is used where supported, without claiming power-loss durability on filesystems
+that cannot provide it.
+
+`ubs doctor --fix` prepares a fully verified replacement before repairing an
+installed generation. Repairs replace only files with the same pinned target
+bytes, publish the ready marker last, and keep the generation directory stable
+for concurrent readers. After the complete replacement has been verified,
+unexpected entries are moved to a private quarantine outside the active
+generation and retained for inspection. Doctor's cache diagnostics execute
+from a private snapshot containing only verified helper sources, using isolated
+Python startup; adjacent startup files and previously compiled bytecode cannot
+authorize diagnostic code. Ordinary scans reject damaged generations; they never
+authorize an arbitrary checksum mismatch as an old release.
+
+Older runner-only updaters cannot acquire these transaction guarantees
+retroactively. The installed runner recognizes exact released contract digests
+from the supported v5.4.x releases, v5.5.3, and v5.5.26, then prepares its own
+complete verified generation on first use. The old bytes are not executed or
+overwritten during migration. A modified historical contract still fails closed.
+Offline migration fails explicitly while retaining the original cache; retry
+once the matching release assets are available, or use `ubs doctor --fix` for
+explicit repair.
+
+The installer's cron job invokes this same transaction and preserves its public
+verification key, cache location, and Bash executable. It does not need a second
+`doctor --fix` command after an apparently successful runner-only update.
+Keep Minisign available on the recorded `PATH`; an unattended verification
+failure leaves the existing release in service. Old generations are retained
+deliberately; automatic pruning of assets potentially used by running scans is
+not part of the update operation.
+
+Uninstall holds the runner publication locks until removal finishes and refuses
+to start while an updater owns them. This lock handoff currently requires
+POSIX; native Windows uninstall refuses before removing files. Native Windows
+and macOS publication behavior still requires validation on those platforms.
 
 ## Complete runtime verification and portable bundles
 
@@ -112,8 +189,25 @@ Remote runtime files are fetched from the selected `vX.Y.Z` tag, with no fallbac
 to mutable `main`. `UBS_MODULE_ARTIFACT_BASE` can point to an HTTPS mirror of the
 tag's `modules/` directory without weakening any checksum checks. A local bundle
 must contain all required files under `modules/`; missing local files are never
-downloaded. `--with-modules` requires a nonexecuting verification mode, and it
-does not silently install a module cache into an existing scanner installation.
+downloaded. Use `--verify-only --with-modules` to inspect without changing an
+installation. Without `--verify-only`, `--with-modules` stages the complete
+verified runtime before executing the verified installer:
+
+```bash
+scripts/verify.sh --version vX.Y.Z --with-modules -- --non-interactive
+scripts/verify.sh --version vX.Y.Z --artifact-dir ./release-bundle \
+  --with-modules -- --non-interactive
+```
+
+Installing a local directory or archive that contains a `modules/` entry enables
+this complete verification automatically. The explicit flag also requires a
+runtime when the bundle has no such entry. An incomplete directory, a symlink
+(including a dangling one), or a special file cannot silently select a thinner
+installation path. Unlisted extras, including Python startup files and bytecode,
+are not copied into the installer's source directory. The current installer
+publishes the runner only after its complete module generation is ready; failed
+bundle verification never executes it or changes an existing runner/cache.
+`--with-modules` rejects `--insecure` in both verification and installation modes.
 
 To retain and transfer the verified runtime instead of discarding private
 staging, export it as a portable archive:
@@ -158,6 +252,22 @@ verification. Host dependencies (Bash, Python, jq, ripgrep, Git, optional langua
 tools) must be provisioned separately; this is not a hermetic OS image. Cosign
 may still need trust-metadata access. Preparing, verifying, and exporting a
 bundle never runs the installer, scanner, or hook.
+
+Alternatively, install an archive through the separately trusted verifier:
+
+```bash
+scripts/verify.sh --version vX.Y.Z --artifact-archive ./ubs-runtime.tar.gz \
+  --with-modules -- --non-interactive
+```
+
+This authenticates the archive's release and every pinned runtime file before
+running its installer; a fresh user cache is sufficient. To keep the host fully
+offline, provision the desired host dependencies beforehand and use the
+installer's existing `--skip-*` flags for optional tools you choose to omit.
+For example, `--skip-bun --skip-type-narrowing --skip-typos --skip-toon` avoids
+installing those optional tools. Signature verification still needs a trusted
+host verifier; minisign with an explicitly trusted key needs no online trust
+metadata.
 
 ## Key handling
 

@@ -43,6 +43,8 @@ if ((BASH_VERSINFO[0] < 4)); then
     FOUND_VALID_BASH=0
 
     if [[ -x "$POTENTIAL_BASH" ]]; then
+      # Inspect the child interpreter's version, not the current Bash 3.2.
+      # shellcheck disable=SC2016
       POTENTIAL_VER="$("$POTENTIAL_BASH" -c 'echo "${BASH_VERSINFO[0]}"' 2>/dev/null)"
       if [[ "$POTENTIAL_VER" =~ ^[0-9]+$ ]] && (( POTENTIAL_VER >= 4 )); then
         FOUND_VALID_BASH=1
@@ -85,9 +87,11 @@ if ((BASH_VERSINFO[0] < 4)); then
         if [[ "${SHELL:-}" == *"zsh"* ]]; then
            RC_FILE="${HOME}/.zshrc"
            if [ -f "$RC_FILE" ] && ! grep -q "alias bash=" "$RC_FILE"; then
-             echo "" >> "$RC_FILE"
-             echo "# Added by Ultimate Bug Scanner Installer" >> "$RC_FILE"
-             echo "alias bash='$NEW_BASH'" >> "$RC_FILE"
+             {
+               echo ""
+               echo "# Added by Ultimate Bug Scanner Installer"
+               echo "alias bash='$NEW_BASH'"
+             } >> "$RC_FILE"
              echo "Added bash alias to $RC_FILE"
            fi
         fi
@@ -153,7 +157,9 @@ declare -A DEP_ASSET_SHA256=(
   [toon-windows-amd64.zip]='3cfdb169a4f1a28e2fb14bffa6c775d1824f45793b9e602ce6a30be550872de8'
   [typos-v1.50.1-x86_64-pc-windows-msvc.zip]='8740867a0d9e44a62f0803e37a669ec3c6cd17ab63cd49d00e14a96d3e03ccc3'
 )
-MINISIGN_PUBKEY="${UBS_MINISIGN_PUBKEY:-}"  # Set to minisign public key line (untrusted placeholder fails closed)
+# Published release key (docs/security.md, key id 97732BB3E99E8CBE). A manifest
+# fetched next to its payload is not an authentication boundary on its own.
+MINISIGN_PUBKEY="${UBS_MINISIGN_PUBKEY:-RWS+jJ7psytzl3v4znpraY9VWBQrICXBFmT3VwvxpTzbuV2Q/CBTDmVJ}"
 
 # Global copy of original args (needed in update re-exec; must not be local)
 ORIGINAL_ARGS=()
@@ -579,26 +585,20 @@ fetch_checksum_bundle() {
     exit 1
   fi
 
-  if [ -n "$MINISIGN_PUBKEY" ]; then
-    # A configured public key makes signature verification mandatory: any
-    # failure past this point aborts the install (fail closed).
-    if ! command -v minisign >/dev/null 2>&1; then
-      error "minisign is required for signature verification (install via your package manager)."
-      exit 1
-    fi
-    if ! secure_fetch "${ARTIFACT_BASE}/SHA256SUMS.minisig" "$sig" "$err"; then
-      log_network_failure "Failed to download SHA256SUMS.minisig from ${ARTIFACT_BASE}" "$err"
-      error "Checksum signature download failed. Use --insecure to bypass (not recommended)."
-      exit 1
-    fi
-    if minisign -Vm "$sums" -P "$MINISIGN_PUBKEY" -x "$sig" >/dev/null 2>&1; then
-      success "Checksum signature verified"
-    else
-      error "Signature verification failed for SHA256SUMS"
-      exit 1
-    fi
+  if ! command -v minisign >/dev/null 2>&1; then
+    error "minisign is required for signature verification (install via your package manager)."
+    exit 1
+  fi
+  if ! secure_fetch "${ARTIFACT_BASE}/SHA256SUMS.minisig" "$sig" "$err"; then
+    log_network_failure "Failed to download SHA256SUMS.minisig from ${ARTIFACT_BASE}" "$err"
+    error "Checksum signature download failed. Use --insecure to bypass (not recommended)."
+    exit 1
+  fi
+  if minisign -Vm "$sums" -P "$MINISIGN_PUBKEY" -x "$sig" >/dev/null 2>&1; then
+    success "Checksum signature verified"
   else
-    warn "UBS_MINISIGN_PUBKEY not set — skipping signature verification (release-pinned checksums still enforced)"
+    error "Signature verification failed for SHA256SUMS"
+    exit 1
   fi
 
   CHECKSUM_FILE="$sums"
@@ -1170,6 +1170,14 @@ check_for_updates() {
     return 0
   fi
 
+  # A newer VERSION on mutable main does not authenticate another installer.
+  # Keep the selected installer unless the caller explicitly opted out of
+  # integrity. Runner upgrades use the authenticated release protocol below.
+  if [[ "$INSECURE" -ne 1 ]]; then
+    log "Skipping unsigned installer self-update; continuing with the selected installer"
+    return 0
+  fi
+
   local current_version="$VERSION"
   local latest_url="$REPO_URL/VERSION"
   local err_log latest_file
@@ -1660,12 +1668,19 @@ if (value === NaN) {
 }
 SMOKE
 
-  if [ -n "$ubs_cmd" ]; then
-    if safe_timeout 10 "$ubs_cmd" --fail-on-warning --ci --only=js "$test_dir" >/dev/null 2>&1; then
-      warn "Smoke test FAILED - scanner did not flag known bugs (exit 0)"
-    else
-      success "Smoke test PASSED - scanner detects bugs (non-zero exit)"
-    fi
+  if [[ "$SKIP_AST_GREP" -eq 1 ]] && ! check_ast_grep; then
+    warn "JS smoke test skipped: ast-grep was explicitly skipped and is unavailable"
+  elif [ -n "$ubs_cmd" ]; then
+    local smoke_status=0
+    safe_timeout 10 "$ubs_cmd" --fail-on-warning --ci --only=js "$test_dir" >/dev/null 2>&1 || smoke_status=$?
+    case "$smoke_status" in
+      0) warn "Smoke test FAILED - scanner did not flag known bugs (exit 0)" ;;
+      1) success "Smoke test PASSED - scanner detects bugs (exit 1)" ;;
+      *)
+        error "Smoke test could not verify the installation (exit $smoke_status)"
+        errors=$((errors + 1))
+        ;;
+    esac
   else
     warn "Smoke test skipped - ubs command unavailable"
   fi
@@ -1821,7 +1836,7 @@ run_post_install_doctor() {
   if [ ! -x "$installed_bin" ]; then
     warn "'ubs doctor' skipped because $installed_bin is not executable"
     write_session_summary "FAILED" "" "$install_dir" "installer binary missing"
-    return 0
+    return 1
   fi
   log "Running 'ubs doctor --format=json --fix' (post-install health check + pre-cache modules)..."
   local doctor_log doctor_json
@@ -1879,6 +1894,22 @@ run_post_install_doctor() {
     } >>"$doctor_log"
   fi
   write_session_summary "$status" "$doctor_log" "$install_dir" "$note"
+  if [[ "$status" != "PASS" ]]; then
+    # Optional tooling may have been deliberately omitted. A failed asset
+    # check, malformed response, or missing runner must never lead to the
+    # INSTALLATION COMPLETE banner. The generation was verified before
+    # publication; this also protects explicitly selected older releases.
+    if [[ "$SKIP_AST_GREP" -eq 1 ]] && check_jq && jq -e '
+      type == "object" and (.checks | type == "array") and
+      (.checks | length > 0) and
+      all(.checks[]; .status != "err" or .id == "ast-grep")
+    ' "$doctor_json" >/dev/null 2>&1; then
+      warn "Post-install doctor still reports the explicitly skipped ast-grep dependency"
+    else
+      error "Post-install health verification failed; installation is incomplete"
+      return 1
+    fi
+  fi
 }
 
 # ==============================================================================
@@ -2262,7 +2293,123 @@ uninstall_scanner_daemon() {
   fi
 }
 
+with_uninstall_update_locks() {
+  # Keep publisher locks alive through the complete existing uninstall. The
+  # child validates inherited descriptors, so an environment variable alone
+  # cannot bypass locking. Retire paths only after the last cache mutation;
+  # queued publishers reject their now-stale inode after acquiring the lock.
+  local mode="$1" interpreter="${UBS_PYTHON:-python3}"
+  if ! command -v "$interpreter" >/dev/null 2>&1; then
+    error "Python 3 is required for a concurrency-safe uninstall"
+    return 1
+  fi
+  if [[ "$mode" == acquire ]]; then
+    # The locked child runs normal argument/config handling and owns the
+    # installer's existing process lock. A competing installer makes it fail
+    # before deletion; publishers remain excluded by the descriptors below.
+    release_lock
+  fi
+  "$interpreter" -I -S - "$mode" "$BASH" "${BASH_SOURCE[0]}" "$INSTALL_NAME" \
+    "$(determine_install_dir)" "$HOME/.local/bin" /usr/local/bin "${ORIGINAL_ARGS[@]}" <<'PYUNINSTALLLOCK'
+import json
+import os
+from pathlib import Path
+import signal
+import stat
+import subprocess
+import sys
+
+try:
+    if os.name != "posix":
+        raise ValueError("safe update-lock handoff for uninstall requires POSIX; no files were removed")
+    import fcntl
+
+    _, mode, shell, installer, name, first, second, third, *arguments = sys.argv
+    candidates = {Path(directory).absolute() / name for directory in (first, second, third)}
+    expected = set()
+    for runner in candidates:
+        lock = runner.with_name(runner.name + ".update.lock")
+        if lock.exists() or lock.is_symlink():
+            expected.add(lock)
+        elif runner.is_file():
+            with runner.open("rb") as stream:
+                header = stream.read(65536)
+            if b"UBS Meta-Runner" in header or b"Ultimate Bug Scanner" in header:
+                expected.add(lock)
+
+    def checked_lock(path, descriptor):
+        opened = os.fstat(descriptor)
+        current = path.lstat()
+        if (not stat.S_ISREG(opened.st_mode) or not stat.S_ISREG(current.st_mode)
+                or opened.st_size != 0
+                or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)):
+            raise ValueError(f"unsafe or replaced update lock: {path}")
+
+    if mode == "verify":
+        inherited = json.loads(os.environ.get("UBS_UNINSTALL_LOCKS", "null"))
+        if not isinstance(inherited, list) or len(inherited) != len(expected):
+            raise ValueError("missing uninstall update-lock descriptors")
+        seen = set()
+        for entry in inherited:
+            path = Path(entry[0])
+            descriptor = entry[1]
+            if path not in expected or path in seen or not isinstance(descriptor, int) or descriptor < 3:
+                raise ValueError("invalid uninstall update-lock descriptor")
+            checked_lock(path, descriptor)
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            seen.add(path)
+    elif mode == "acquire":
+        if not Path(installer).is_file():
+            raise ValueError("save the installer to a local file before uninstalling")
+        descriptors = []
+        inherited = []
+        process = None
+        try:
+            for path in sorted(expected):
+                descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+                descriptors.append(descriptor)
+                checked_lock(path, descriptor)
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                checked_lock(path, descriptor)
+                inherited.append([str(path), descriptor])
+            env = dict(os.environ, UBS_UNINSTALL_LOCKS=json.dumps(inherited))
+            # The parent owns its workdir; re-entry must allocate a fresh one.
+            env.pop("UBS_INSTALLER_WORKDIR", None)
+            process = subprocess.Popen([shell, installer, *arguments], env=env, pass_fds=descriptors)
+
+            def interrupted(signum, frame):
+                raise KeyboardInterrupt
+
+            signal.signal(signal.SIGTERM, interrupted)
+            try:
+                result = process.wait()
+            except BaseException:
+                process.terminate()
+                process.wait()
+                raise
+            if result == 0:
+                for path, descriptor in inherited:
+                    checked_lock(Path(path), descriptor)
+                for path, _ in inherited:
+                    Path(path).unlink()
+            raise SystemExit(result)
+        finally:
+            for descriptor in descriptors:
+                os.close(descriptor)
+    else:
+        raise ValueError("invalid uninstall lock mode")
+except (OSError, ValueError, TypeError, KeyError) as exc:
+    print(f"ubs: cannot safely uninstall while updates may be active: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+PYUNINSTALLLOCK
+}
+
 uninstall_ubs() {
+  if [[ -z "${UBS_UNINSTALL_LOCKS:-}" ]]; then
+    with_uninstall_update_locks acquire
+    return $?
+  fi
+  with_uninstall_update_locks verify || return 1
   log_section "Uninstall Ultimate Bug Scanner"
 
   warn "This will remove Ultimate Bug Scanner and all integrations"
@@ -2380,7 +2527,9 @@ uninstall_ubs() {
     current_crontab="$(crontab -l 2>/dev/null || true)"
     if printf '%s\n' "$current_crontab" | grep -q "Ultimate Bug Scanner Auto-Update"; then
       local remaining
-      remaining="$(printf '%s\n' "$current_crontab" | grep -v "Ultimate Bug Scanner Auto-Update" | sed '/^[[:space:]]*$/d')"
+      # An empty result is expected when UBS owned the only job. grep -v
+      # returns 1 in that case, which aborts uninstall under pipefail.
+      remaining="$(printf '%s\n' "$current_crontab" | sed '/Ultimate Bug Scanner Auto-Update/d; /^[[:space:]]*$/d')"
       if [ -n "$remaining" ]; then
         printf '%s\n' "$remaining" | crontab - 2>/dev/null || warn "Could not rewrite the crontab"
       else
@@ -3142,6 +3291,8 @@ install_scanner_daemon() {
   # The selected runner supplies the literal companion digest. Do not execute
   # either payload to inspect its release metadata.
   local runner="$1" local_source="$2" script_path="$3" use_sudo="$4" source_base="$5"
+  local prepare_only="${6:-0}"
+  SCANNER_DAEMON_STAGED=""
   local declaration expected actual source staged target temporary
   declaration="$(awk '/^UBS_DAEMON_SHA256=/ { count++; value=$0 }
     END { if (count > 1) exit 1; print value }' "$runner")" || {
@@ -3176,6 +3327,10 @@ install_scanner_daemon() {
   if [[ "$actual" != "$expected" || $(wc -c < "$staged") -gt 524288 ]]; then
     error "Daemon checksum or size mismatch; installed runner remains unchanged"; return 1
   fi
+  SCANNER_DAEMON_STAGED="$staged"
+  # Generation-capable runners publish this companion and the complete cache
+  # under the same installation lock, replacing the runner last.
+  [[ "$prepare_only" -eq 1 ]] && return 0
   target="${script_path}.daemon.${expected}.py"
   if [[ -L "$target" || ( -e "$target" && ! -f "$target" ) ]]; then
     error "Refusing an unsafe daemon installation path: $target"; return 1
@@ -3235,6 +3390,13 @@ install_scanner() {
     error "Refusing an unsafe runner installation path: $script_path"
     return 1
   fi
+  local expected_runner_sha="absent"
+  if [[ -f "$script_path" ]]; then
+    expected_runner_sha="$(compute_sha256 "$script_path")" || {
+      error "Cannot authenticate the current installation before replacing it"
+      return 1
+    }
+  fi
   local temp_path
   temp_path="$(mktemp_in_workdir "${INSTALL_NAME}.download.XXXXXX")"
 
@@ -3287,8 +3449,8 @@ install_scanner() {
     fi
   elif [ "$RUN_VERIFICATION" -eq 1 ] && [ "$INSECURE" -eq 0 ]; then
       # Secure path (issue #87): install the release-pinned artifact and
-      # verify it against the release SHA256SUMS (minisign-verified when
-      # UBS_MINISIGN_PUBKEY is configured). Any fetch or verification
+      # verify it against the minisign-authenticated release SHA256SUMS.
+      # Any fetch or verification
       # failure aborts — no silent fallback to unverified sources.
       log "Downloading release artifact from ${ARTIFACT_BASE}..."
 
@@ -3351,16 +3513,45 @@ install_scanner() {
     warn "Downloaded file does not contain expected marker; continuing (marker may have changed)"
   fi
 
-  # A daemon publication failure must leave the currently installed runner
-  # usable. Stage both files beside their targets for atomic publication.
-  install_scanner_daemon "$temp_path" "$local_source" "$script_path" "$use_sudo" "$daemon_source_base" || return 1
-  local runner_stage
-  runner_stage="$($use_sudo mktemp "${script_path}.install.XXXXXX")" || return 1
-  if ! $use_sudo install -m 0755 "$temp_path" "$runner_stage" \
-      || ! $use_sudo mv -f -- "$runner_stage" "$script_path"; then
-    $use_sudo rm -f -- "$runner_stage"
-    error "Could not publish runner; previous installation remains unchanged"
-    return 1
+  local generation_declaration
+  generation_declaration="$(awk '/^UBS_RELEASE_GENERATIONS=/ { count++; value=$0 }
+    END { if (count > 1) exit 1; print value }' "$temp_path")" || {
+    error "Ambiguous release generation declaration in selected runner"; return 1;
+  }
+  if [[ -n "$generation_declaration" ]]; then
+    if [[ "$generation_declaration" != "UBS_RELEASE_GENERATIONS=1" ]]; then
+      error "Unsupported release generation protocol in selected runner"; return 1
+    fi
+    # The authenticated candidate owns the asset manifest. Prepare every
+    # pinned dependency before changing an installed runner, even when the
+    # optional post-install doctor is disabled. The shared publisher also
+    # excludes self-updates and detects a concurrent change to this target.
+    install_scanner_daemon "$temp_path" "$local_source" "$script_path" "$use_sudo" "$daemon_source_base" 1 || return 1
+    local module_root="${XDG_DATA_HOME:-$HOME/.local/share}/ubs/modules"
+    local -a release_args=("--prepare-release-cache=$module_root"
+      "--publish-release=$script_path" "--expected-runner-sha=$expected_runner_sha")
+    if [[ -n "$SCANNER_DAEMON_STAGED" ]]; then
+      release_args+=("--release-daemon=$SCANNER_DAEMON_STAGED")
+    fi
+    if [[ -n "$local_source" && -d "$(dirname "$local_source")/modules" ]]; then
+      release_args+=("--release-source=$(dirname "$local_source")/modules")
+    fi
+    log "Preparing and verifying the complete module cache before publication..."
+    if ! $use_sudo env UBS_NO_AUTO_UPDATE=1 "$BASH" "$temp_path" "${release_args[@]}"; then
+      error "Release preparation failed; previous runner and module cache remain available"
+      return 1
+    fi
+  else
+    # An explicitly selected historical release predates generation support.
+    install_scanner_daemon "$temp_path" "$local_source" "$script_path" "$use_sudo" "$daemon_source_base" || return 1
+    local runner_stage
+    runner_stage="$($use_sudo mktemp "${script_path}.install.XXXXXX")" || return 1
+    if ! $use_sudo install -m 0755 "$temp_path" "$runner_stage" \
+        || ! $use_sudo mv -f -- "$runner_stage" "$script_path"; then
+      $use_sudo rm -f -- "$runner_stage"
+      error "Could not publish runner; previous installation remains unchanged"
+      return 1
+    fi
   fi
 
   if [ -n "$use_sudo" ]; then
@@ -4570,6 +4761,12 @@ check_cron() {
   command -v crontab >/dev/null 2>&1
 }
 
+quote_cron_word() {
+  # crontab normally uses /bin/sh, not Bash. Keep shell quoting and cron's
+  # separate percent escaping distinct; the latter is applied to the job.
+  printf "'%s'" "${1//\'/\'\\\'\'}"
+}
+
 setup_auto_update() {
   log "Setting up daily auto-updates..."
 
@@ -4587,9 +4784,28 @@ setup_auto_update() {
     return 1
   fi
 
-  # Command to run: ubs --update --quiet --non-interactive
-  # We use the absolute path to ensure it works in cron
-  local update_cmd="$script_path --update --quiet --non-interactive"
+  # --update prepares a complete authenticated generation before publishing
+  # its runner. Chaining doctor afterward would leave a broken installation
+  # if the repair failed. Preserve the trusted interpreter/key and selected
+  # cache location because cron does not inherit an interactive environment.
+  local data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+  if [[ "$data_home" != /* ]]; then data_home="$PWD/$data_home"; fi
+  if [[ -d "$data_home" ]]; then data_home="$(cd -- "$data_home" && pwd -P)"; fi
+  local update_cmd key value cron_path_word
+  cron_path_word="$(quote_cron_word "$script_path")"
+  update_cmd="PATH=$(quote_cron_word "$PATH") XDG_DATA_HOME=$(quote_cron_word "$data_home")"
+  update_cmd+=" UBS_MINISIGN_PUBKEY=$(quote_cron_word "$MINISIGN_PUBKEY")"
+  for key in XDG_CACHE_HOME UBS_TOOLS_DIR UBS_PYTHON UBS_RELEASE_BASE UBS_REPO_RAW_BASE; do
+    value="${!key:-}"
+    [[ -z "$value" ]] || update_cmd+=" $key=$(quote_cron_word "$value")"
+  done
+  update_cmd+=" $(quote_cron_word "$BASH") $cron_path_word --update --quiet --non-interactive"
+  if [[ "$update_cmd" == *$'\n'* || "$update_cmd" == *$'\r'* ]]; then
+    error "Cannot schedule an update with a newline in its command or environment"
+    return 1
+  fi
+  update_cmd="${update_cmd//%/\\%}"
+  cron_path_word="${cron_path_word//%/\\%}"
 
   # Run daily at midnight
   local cron_schedule="0 0 * * *"
@@ -4600,16 +4816,24 @@ setup_auto_update() {
     return 1
   fi
 
-  local current_crontab
+  local current_crontab retained="" line
   current_crontab="$(crontab -l 2>/dev/null || true)"
 
-  if echo "$current_crontab" | grep -qF "$script_path --update"; then
+  if printf '%s\n' "$current_crontab" | grep -qxF "$job"; then
     log "Auto-update cron job already exists."
     return 0
   fi
 
-  # Append new job
-  if echo -e "${current_crontab}\n${job}" | crontab -; then
+  # Upgrade only this installation's marked jobs, retaining other programs
+  # and other UBS installations. Re-running the installer is idempotent.
+  while IFS= read -r line; do
+    if [[ "$line" == *"# Ultimate Bug Scanner Auto-Update"* \
+       && ( "$line" == *"$script_path --update"* || "$line" == *"$cron_path_word --update"* ) ]]; then
+      continue
+    fi
+    [[ -z "$line" ]] || retained+="$line"$'\n'
+  done <<< "$current_crontab"
+  if printf '%s%s\n' "$retained" "$job" | crontab -; then
     success "Daily auto-update scheduled via cron."
     return 0
   else
@@ -4683,6 +4907,7 @@ if [[ " ${ORIGINAL_ARGS[*]} " =~ " --no-color " ]]; then COLOR_ENABLED=0; init_c
 if [[ " ${ORIGINAL_ARGS[*]} " =~ " --easy-mode " ]]; then EASY_MODE=1; NON_INTERACTIVE=1; fi
 if [[ " ${ORIGINAL_ARGS[*]} " =~ " --non-interactive " ]]; then NON_INTERACTIVE=1; fi
 if [[ " ${ORIGINAL_ARGS[*]} " =~ " --dry-run " ]]; then DRY_RUN=1; fi
+if [[ " ${ORIGINAL_ARGS[*]} " =~ " --insecure " ]]; then INSECURE=1; RUN_VERIFICATION=0; fi
 
 # Concurrent execution lock to prevent race conditions. A dry run reads and
 # reports only, so it takes no lock and cannot be blocked by (or leave) one.
@@ -5071,7 +5296,8 @@ if [ "$RERUN_AFTER_FIX" -eq 1 ]; then
   if NO_COLOR=1 "$install_dir/$INSTALL_NAME" doctor --format=json >/dev/null 2>&1; then
     success "Doctor verification passed after auto-fix"
   else
-    warn "Doctor still reports issues after auto-fix. Run 'ubs doctor' to investigate."
+    error "Doctor still reports issues after auto-fix; installation is incomplete."
+    return 1
   fi
 fi
 

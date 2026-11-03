@@ -45,11 +45,28 @@ def run_case_command(cmd: List[str], env: Dict[str, str], timeout: float | None)
         except BaseException:
             try:
                 if os.name == "posix":
-                    os.killpg(proc.pid, signal.SIGKILL)
+                    os.killpg(proc.pid, signal.SIGTERM)
                 else:
-                    proc.kill()
+                    proc.terminate()
             except ProcessLookupError:
                 pass
+            try:
+                # UBS's TERM handler drains modules in separate process
+                # groups. Allow that handler to run before forcing shutdown.
+                # This grace is cleanup only: the original timeout stays red.
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            finally:
+                try:
+                    if os.name == "posix":
+                        # Kill remaining group members even if the leader
+                        # exited promptly but left an uncooperative child.
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    else:
+                        proc.kill()
+                except ProcessLookupError:
+                    pass
             # TimeoutExpired already retains the bytes received before the
             # deadline. Do not drain pipes held by a detached descendant here.
             raise

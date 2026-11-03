@@ -300,13 +300,17 @@ run_v2_legacy_parity_bridges_go(){
   local files_n bridge_rc=0
   files_n="$(tr -dc '\0' <"$list_file" 2>/dev/null | wc -c)"
   python3 - "$sink" "$text_out" "$files_n" "${FAIL_ON_WARNING:-0}" "$skip_csv" \
-    "$go_exit" "$tally_file" "$life_raw_path" "$life_status_raw" "$run_life_raw" <<'PYV2BRIDGE' || bridge_rc=$?
+    "$go_exit" "$tally_file" "$life_raw_path" "$life_status_raw" "$run_life_raw" \
+    "$list_file" "$PROJECT_DIR" <<'PYV2BRIDGE' || bridge_rc=$?
 import json
 import os
+import re
 import sys
+from pathlib import Path
 
 (sink_path, text_out, files_raw, fow_raw, skip_csv, go_exit_raw,
- tally_file, life_raw_path, life_status_raw, run_life_raw) = sys.argv[1:11]
+ tally_file, life_raw_path, life_status_raw, run_life_raw,
+ list_path, project_dir) = sys.argv[1:13]
 files_n = int(files_raw or 0)
 fail_on_warning = fow_raw == "1"
 skip = {int(x) for x in skip_csv.split(",") if x.strip().isdigit()}
@@ -364,6 +368,39 @@ out = []
 def emit(line=""):
     out.append(line)
 
+def lifecycle_scan_paths(list_path, project_dir):
+    """Map the lifecycle helper's file names back to the scanned paths.
+
+    resource_lifecycle_go.go names a file by filepath.Rel(abs(root), file),
+    which is "." when the target is a single file. Every other Go finding
+    carries the selected list entry as go_scan spells it, and the runner maps
+    that spelling back to the caller's path (also for staged/diff mirrors).
+    Rebuild the helper's name for each selected .go entry so a lifecycle
+    finding points at the same file as its neighbours.
+    """
+    try:
+        with open(list_path, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return {}
+    root = os.path.abspath(project_dir)
+    nul = b"\0" in data
+    names = {}
+    for raw in (data.split(b"\0") if nul else data.splitlines()):
+        if not raw.strip():
+            continue
+        shown = raw.decode("utf-8", "surrogateescape")
+        entry = shown if nul else shown.strip()
+        if not entry.endswith(".go"):
+            continue
+        full = entry if os.path.isabs(entry) else os.path.join(root, entry)
+        names.setdefault(os.path.relpath(full, root), str(Path(shown)))
+    return names
+
+
+# The helper prints "<name>:<line>"; the name itself may contain colons.
+LIFE_LOCATION = re.compile(r"(.+):([0-9]+)", re.DOTALL)
+
 # Bridge 1: run_resource_lifecycle_checks (cat 17) → sink records + text.
 if run_life:
     raw = ""
@@ -377,8 +414,17 @@ if run_life:
             rows.append(parts)
     new_records = []
     if rows:
+        scan_paths = lifecycle_scan_paths(list_path, project_dir)
         for parts in rows:
             location = parts[0]
+            match = LIFE_LOCATION.fullmatch(location)
+            if match:
+                name, source_line = match.group(1), int(match.group(2))
+                source_path = scan_paths.get(name) or os.path.normpath(
+                    os.path.join(os.path.abspath(project_dir), name))
+            else:
+                # Not the helper's format: keep the token rather than guess.
+                source_path, source_line = location, 0
             kind = parts[1] if len(parts) > 1 else ""
             message = parts[2] if len(parts) > 2 else ""
             severity = LIFE_SEVERITY.get(kind, "warning")
@@ -388,8 +434,8 @@ if run_life:
             new_records.append({
                 "rule": f"go.lifecycle.{kind or 'imbalance'}",
                 "category_id": "golang.lifecycle-correlation",
-                "path": location,
-                "line": 0,
+                "path": source_path,
+                "line": source_line,
                 "col": 1,
                 "severity": severity,
                 "message": f"{summary} [{location}] — {desc}"[:300],
@@ -400,10 +446,10 @@ if run_life:
                 fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
         records.extend(new_records)
         if as_text:
-            for rec in new_records:
+            # The text report keeps the helper's short "<name>:<line>" form.
+            for rec, parts in zip(new_records, rows):
                 emit(f"[{rec['severity']}] {LIFE_SUMMARY.get(rec['rule'].rsplit('.', 1)[-1], rec['message'])} (1 found) — {rec['rule']}")
-                location = rec["path"]
-                emit(f"    {location}  {rec['message'][:180]}")
+                emit(f"    {parts[0]}  {rec['message'][:180]}")
     elif life_status == 0:
         if as_text:
             emit("good: All tracked resource acquisitions have matching cleanups")

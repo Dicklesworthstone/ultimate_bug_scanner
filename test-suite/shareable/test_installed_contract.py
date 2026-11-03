@@ -502,6 +502,188 @@ class InstalledUpgrade(unittest.TestCase):
         self.assertIn("rust", {s.get("language") for s in payload.get("scanners", [])}, output)
         return payload
 
+    def managed_refresh_fixture(self) -> tuple[Path, generation.Manifest]:
+        self.cache = Path(self.env["XDG_DATA_HOME"]) / "ubs/modules"
+        self.cache.mkdir(parents=True)
+        manifest = generation.parse_manifest(self.runner.read_bytes())
+        target = generation.prepare(self.runner, self.cache, self.mirror.as_uri(),
+                                    allow_override=True, local_source=REPO_ROOT / "modules")
+        (self.target / "src").mkdir()
+        (self.target / "src/main.rs").write_text("fn main() {}\n")
+        return target, manifest
+
+    def assert_flat_refresh_transaction(self, contract: bytes) -> None:
+        self.populate_legacy_cache(contract=contract)
+        self.before_cache = self.cache_snapshot()
+        identities = {name: (self.cache / name).stat() for name in self.before_cache}
+        before_runner = self.runner.read_bytes()
+        manifest = generation.parse_manifest(before_runner)
+        target = generation.generation_path(self.cache, manifest)
+        self.assertFalse((self.cache / generation.GENERATION_DIRECTORY).exists())
+        (self.target / "src").mkdir()
+        (self.target / "src/main.rs").write_text("fn main() {}\n")
+        refreshed = self.run_ubs("--update-modules", str(self.target), "--ci")
+        self.assertIn(refreshed.returncode, (0, 1), refreshed.stdout + refreshed.stderr)
+        self.assertEqual(self.parsed_report(refreshed).get("status"), "ok")
+        self.assertTrue((target / generation.READY_FILE).is_file(),
+                        "standalone installed refresh did not publish a complete generation")
+        generation.check_ready(target, manifest, complete=True)
+        self.assertEqual(self.runner.read_bytes(), before_runner)
+        self.assert_legacy_intact()
+        for name, before in identities.items():
+            after = (self.cache / name).stat()
+            self.assertTrue(os.path.samestat(before, after), name)
+            self.assertEqual((before.st_mode, before.st_mtime_ns, before.st_ctime_ns),
+                             (after.st_mode, after.st_mtime_ns, after.st_ctime_ns), name)
+        expected = {f"{self.mirror.as_uri()}/v{manifest.version}/modules/{name}" for name in manifest.assets}
+        requested = self.fetch_log.read_text().splitlines()
+        self.assertEqual(set(requested), expected)
+        self.assertEqual(len(requested), len(expected))
+        self.scan_usable()
+
+    def test_flat_installed_refresh_preserves_legacy_files_and_publishes_complete_generation(self) -> None:
+        self.assert_flat_refresh_transaction(self.contract)
+
+    def test_v553_flat_cache_refresh_uses_one_complete_transaction_before_detection(self) -> None:
+        self.assert_flat_refresh_transaction(V553_CONTRACT.read_bytes())
+
+    def test_failed_flat_refresh_preserves_working_legacy_cache_and_publishes_no_generation(self) -> None:
+        self.populate_legacy_cache(contract=self.contract)
+        self.before_cache = self.cache_snapshot()
+        identities = {name: (self.cache / name).stat() for name in self.before_cache}
+        manifest = generation.parse_manifest(self.runner.read_bytes())
+        target = generation.generation_path(self.cache, manifest)
+        (self.target / "src").mkdir()
+        (self.target / "src/main.rs").write_text("fn main() {}\n")
+        self.scan_usable()
+        for override in ("CONTRACT_MISSING_ASSET", "CONTRACT_BAD_ASSET"):
+            with self.subTest(transport=override):
+                refreshed = self.run_ubs("--update-modules", str(self.target), "--ci",
+                                         extra_env={override: "ubs-swift.sh"})
+                self.assertEqual(refreshed.returncode, 2, refreshed.stdout + refreshed.stderr)
+                self.assertIn("ubs-swift.sh", refreshed.stderr)
+                self.assertFalse(target.exists(), "failed refresh published an active generation")
+                self.assert_legacy_intact()
+                for name, before in identities.items():
+                    after = (self.cache / name).stat()
+                    self.assertTrue(os.path.samestat(before, after), name)
+                    self.assertEqual((before.st_mode, before.st_mtime_ns, before.st_ctime_ns),
+                                     (after.st_mode, after.st_mtime_ns, after.st_ctime_ns), name)
+                self.scan_usable()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX executable permissions and process groups")
+    def test_managed_refresh_never_publishes_a_nonexecutable_module(self) -> None:
+        target, manifest = self.managed_refresh_fixture()
+        self.scan_usable()
+        module = target / "ubs-rust.sh"
+        marker = self.root / "nonexecutable-publication"
+        real_mv = shutil.which("mv")
+        self.assertIsNotNone(real_mv)
+        shim = self.bin / "mv"
+        # Exercise the legacy publication boundary with the real mv. A process
+        # interruption after publishing a nonexecutable module must not strand
+        # a complete managed installation. Safe publication never triggers it.
+        shim.write_text(r'''#!/usr/bin/env python3
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+args = sys.argv[1:]
+result = subprocess.run([os.environ["REFRESH_REAL_MV"], *args], check=False)
+if result.returncode == 0 and args and args[-1] == os.environ["REFRESH_MODULE"]:
+    if not os.access(args[-1], os.X_OK):
+        Path(os.environ["REFRESH_UNSAFE_MARKER"]).write_text(oct(Path(args[-1]).stat().st_mode & 0o777))
+        os.killpg(os.getpgrp(), signal.SIGKILL)
+raise SystemExit(result.returncode)
+''')
+        shim.chmod(0o755)
+        self.env.update(REFRESH_REAL_MV=real_mv, REFRESH_MODULE=str(module),
+                        REFRESH_UNSAFE_MARKER=str(marker))
+        command = [str(self.runner), "--update-modules", "--only=rust", "--ci", "--format=json",
+                   f"--module-dir={self.cache}", str(self.target)]
+        refreshed = subprocess.run(
+            command, cwd=self.root, env=self.env,
+            capture_output=True, text=True, timeout=180, start_new_session=True,
+        )
+        self.commands.append((command, refreshed))
+        self.assertFalse(marker.exists(), "refresh published a nonexecutable module before interruption")
+        self.assertIn(refreshed.returncode, (0, 1), refreshed.stdout + refreshed.stderr)
+        self.assertEqual(self.parsed_report(refreshed).get("status"), "ok")
+        generation.check_ready(target, manifest, complete=True)
+        self.scan_usable()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX executable permissions")
+    def test_managed_refresh_downloads_every_asset_and_repairs_module_permissions(self) -> None:
+        target, manifest = self.managed_refresh_fixture()
+        identity = target.stat().st_ino
+        (target / "ubs-rust.sh").chmod(0o600)
+        refused = self.run_ubs(str(self.target), "--ci")
+        self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+        self.assertIn("not readable/executable", refused.stderr)
+        refreshed = self.run_ubs("--update-modules", str(self.target), "--ci")
+        self.assertIn(refreshed.returncode, (0, 1), refreshed.stdout + refreshed.stderr)
+        self.assertEqual(self.parsed_report(refreshed).get("status"), "ok")
+        self.assertEqual(target.stat().st_ino, identity)
+        expected = {f"{self.mirror.as_uri()}/v{manifest.version}/modules/{name}" for name in manifest.assets}
+        requested = self.fetch_log.read_text().splitlines()
+        self.assertEqual(set(requested), expected)
+        self.assertEqual(len(requested), len(expected))
+        generation.check_ready(target, manifest, complete=True)
+        self.scan_usable()
+
+    def test_managed_refresh_late_download_failure_or_tampering_preserves_active_files(self) -> None:
+        target, manifest = self.managed_refresh_fixture()
+        identities = {name: (target / name).stat() for name in (*manifest.assets, generation.READY_FILE)}
+        for override in ("CONTRACT_MISSING_ASSET", "CONTRACT_BAD_ASSET"):
+            with self.subTest(transport=override):
+                refreshed = self.run_ubs("--update-modules", str(self.target), "--ci",
+                                         extra_env={override: "ubs-swift.sh"})
+                self.assertEqual(refreshed.returncode, 2, refreshed.stdout + refreshed.stderr)
+                self.assertIn("ubs-swift.sh", refreshed.stderr)
+                for name, before in identities.items():
+                    after = (target / name).stat()
+                    self.assertTrue(os.path.samestat(before, after), name)
+                    self.assertEqual((before.st_mode, before.st_mtime_ns, before.st_ctime_ns),
+                                     (after.st_mode, after.st_mtime_ns, after.st_ctime_ns), name)
+                generation.check_ready(target, manifest, complete=True)
+                self.scan_usable()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process-group interruption")
+    def test_interrupted_managed_refresh_preserves_concurrent_scans_and_retry(self) -> None:
+        target, manifest = self.managed_refresh_fixture()
+        ready = self.root / "refresh-download-ready"
+        release = self.root / "refresh-download-release"
+        command = [str(self.runner), "--update-modules", "--ci", "--format=json",
+                   f"--module-dir={self.cache}", str(self.target)]
+        process = subprocess.Popen(
+            command, cwd=self.root, env={**self.env, "CONTRACT_BLOCK_ASSET": "cache.py",
+                                        "CONTRACT_BLOCK_READY": str(ready),
+                                        "CONTRACT_BLOCK_RELEASE": str(release)},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
+        )
+        try:
+            deadline = time.monotonic() + 30
+            while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(ready.exists(), "refresh did not reach the controlled download boundary")
+            generation.check_ready(target, manifest, complete=True)
+            self.scan_usable()
+            os.killpg(process.pid, signal.SIGKILL)
+            stdout, stderr = process.communicate(timeout=10)
+            self.commands.append((command, subprocess.CompletedProcess(command, process.returncode, stdout, stderr)))
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+            process.communicate(timeout=10)
+        generation.check_ready(target, manifest, complete=True)
+        self.scan_usable()
+        retried = self.run_ubs("--update-modules", str(self.target), "--ci")
+        self.assertIn(retried.returncode, (0, 1), retried.stdout + retried.stderr)
+        self.assertEqual(self.parsed_report(retried).get("status"), "ok")
+        generation.check_ready(target, manifest, complete=True)
+        self.scan_usable()
+
     def test_next_managed_release_reuses_unchanged_assets_with_module_origin_offline(self) -> None:
         candidate, changed = self.managed_release()
         self.assertEqual(changed, set())

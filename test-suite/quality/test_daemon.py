@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 from pathlib import Path
 import shutil
 import signal
@@ -876,6 +877,114 @@ class EntrypointTests(unittest.TestCase):
                 result = self.cli(*args, env=env)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn('usage:', result.stdout)
+
+    def service_python_path(self, name):
+        bin_ = self.work / 'python-path'
+        bin_.mkdir()
+        (bin_ / 'bash').symlink_to(shutil.which('bash'))
+        (bin_ / name).symlink_to(sys.executable)
+        return bin_, dict(self.env, PATH=str(bin_), UBS_ENABLE_AUTO_UPDATE='1', FORCE_SELF_UPDATE='1')
+
+    def test_service_help_discovers_python_without_other_dependencies(self):
+        _bin, env = self.service_python_path('python')
+        self.assertIsNone(shutil.which('python3', path=env['PATH']))
+        for command in ('serve', '--client', 'daemon'):
+            with self.subTest(command=command):
+                result = self.cli(command, '--help', env=env)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn('usage:', result.stdout)
+
+    def test_service_skips_unusable_python3_but_explicit_override_stays_strict(self):
+        bin_, env = self.service_python_path('python')
+        rejected = bin_ / 'python3'
+        # Interpreter-launch protocol double; the fallback is real Python.
+        rejected.write_text('#!/bin/sh\nexit 99\n')
+        rejected.chmod(0o755)
+        result = self.cli('daemon', '--help', env=env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('usage:', result.stdout)
+        result = self.cli('daemon', '--help', env=dict(env, UBS_PYTHON=str(rejected)))
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('requires Python >= 3.9', result.stderr)
+
+    def test_service_discovers_py_launcher_with_explicit_python3_selection(self):
+        bin_ = self.work / 'launcher-path'
+        bin_.mkdir()
+        (bin_ / 'bash').symlink_to(shutil.which('bash'))
+        launcher = bin_ / 'py'
+        # A launcher protocol double checks -3, then delegates every probe
+        # and the complete verified service to the actual host interpreter.
+        launcher.write_text('#!/bin/sh\n[ "$1" = -3 ] || exit 97\nshift\nexec '
+                            + shlex.quote(sys.executable) + ' "$@"\n')
+        launcher.chmod(0o755)
+        result = self.cli('daemon', '--help', env=dict(self.env, PATH=str(bin_)))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('usage:', result.stdout)
+
+    def test_service_freezes_relative_virtualenv_override_without_resolving_its_symlink(self):
+        installed = self.installation()
+        # This benign pinned companion makes the actual interpreter identity
+        # observable; the other entrypoint cases execute the real daemon.
+        companion = ('import json, os, sys\n'
+                     'print(json.dumps({"executable": sys.executable, '
+                     '"override": os.environ.get("UBS_PYTHON")}))\n')
+        (installed / 'ubs-daemon').write_text(companion)
+        runner = installed / 'ubs'
+        source = runner.read_text()
+        source, count = re.subn(r'^UBS_DAEMON_SHA256="[0-9a-f]{64}"$',
+                               'UBS_DAEMON_SHA256="' + hashlib.sha256(companion.encode()).hexdigest() + '"',
+                               source, flags=re.M)
+        self.assertEqual(count, 1)
+        runner.write_text(source)
+        venv = self.work / 'selected environment'
+        (venv / 'bin').mkdir(parents=True)
+        selected = venv / 'bin/python'
+        selected.symlink_to(sys.executable)
+        (venv / 'pyvenv.cfg').write_text('home = ' + str(Path(sys.executable).resolve().parent)
+                                       + '\ninclude-system-site-packages = false\n')
+        relative = os.path.relpath(selected, self.root)
+        result = self.cli('daemon', '--help', runner=runner,
+                          env=dict(self.env, UBS_PYTHON=relative))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        observed = self.report(result)
+        self.assertEqual(observed['executable'], str(selected))
+        self.assertEqual(observed['override'], str(selected))
+        self.assertTrue(selected.is_symlink())
+
+    @unittest.skipUnless(os.environ.get('UBS_DAEMON_E2E') == '1', 'set UBS_DAEMON_E2E=1 for actual scanner parity')
+    def test_service_python_only_client_fallback_runs_actual_scanner(self):
+        installed = self.installation()
+        bin_, env = self.service_python_path('python')
+        # Keep actual scan prerequisites, with Python available under only its
+        # portable name. No listener or transport double participates here.
+        for name in ('sh', 'env', 'mktemp', 'chmod', 'cp', 'mv', 'rm', 'mkdir',
+                     'dirname', 'basename', 'readlink', 'realpath', 'find', 'sed',
+                     'awk', 'grep', 'cut', 'sort', 'uniq', 'wc', 'head', 'tail',
+                     'tr', 'date', 'cat', 'timeout', 'jq', 'rg', 'git', 'ast-grep',
+                     'sha256sum', 'shasum', 'openssl', 'stat', 'du', 'sleep', 'tee',
+                     'touch', 'xargs', 'uname'):
+            executable = shutil.which(name)
+            if executable:
+                (bin_ / name).symlink_to(executable)
+        env.pop('UBS_ENABLE_AUTO_UPDATE')
+        env.pop('FORCE_SELF_UPDATE')
+        env['XDG_DATA_HOME'] = str(self.work / 'data')
+        self.assertIsNone(shutil.which('python3', path=env['PATH']))
+        prepared = self.cli('--prepare-release-cache=' + str(self.work / 'data/ubs/modules'),
+                            '--release-source=' + str(ROOT / 'modules'),
+                            runner=installed / 'ubs', env=env)
+        self.assertEqual(prepared.returncode, 0, prepared.stdout + prepared.stderr)
+        source = self.root / 'a.py'
+        source.write_text('eval(input())\n')
+        direct = self.cli('--ci', '--no-auto-update', '--no-color', '--format=json', '--', str(source),
+                          runner=installed / 'ubs', env=env)
+        fallback = self.cli('--client', '--repo', str(self.root), '--', 'a.py',
+                            runner=installed / 'ubs', env=env)
+        self.assertEqual(direct.returncode, 1, direct.stdout + direct.stderr)
+        self.assertEqual(fallback.returncode, 1, fallback.stdout + fallback.stderr)
+        expected = self.report(direct)['findings']
+        self.assertEqual(self.report(fallback)['findings'], expected)
+        self.assertTrue(any(f['rule_id'] == 'python.taint.eval' and f['line'] == 1 for f in expected))
 
     def test_altered_or_missing_daemon_never_runs_a_replacement(self):
         installed = self.installation()

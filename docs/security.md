@@ -75,6 +75,15 @@ Cosign may still refresh its trust metadata, and installation may fetch
 third-party dependencies through the existing dependency setup. The caller's
 working directory is preserved for project hooks.
 
+Archive import and runtime verification require Python >= 3.9. The verifier
+honors `UBS_PYTHON`, or discovers `python3`, `python`, then the `py -3` launcher;
+these modes reject an unusable explicit override before verification. Interpreter probes and
+the verifier's standard-library helpers use isolated startup (`-I -S`). Project
+modules, `PYTHONPATH`, `PYTHONHOME`, and site startup files cannot execute during
+these steps, including archive inspection before signature authentication.
+Interpreter paths are fixed before staging, preserving paths with spaces and
+the final symlink of a selected virtual environment.
+
 Missing, malformed, or duplicate required checksum entries fail closed, as do
 missing signatures or assets. Older releases without a signed hook entry cannot
 satisfy this complete-payload verification contract. Standalone copies of the
@@ -140,6 +149,18 @@ from a private snapshot containing only verified helper sources, using isolated
 Python startup; adjacent startup files and previously compiled bytecode cannot
 authorize diagnostic code. Ordinary scans reject damaged generations; they never
 authorize an arbitrary checksum mismatch as an old release.
+
+For installed runners, `ubs --update-modules` forces a fresh download of
+every pinned runtime asset into private staging. It verifies the entire graph
+before applying the same atomic, same-pin replacements used by repair. Module
+permissions are set before publication, so an interrupted refresh cannot leave
+a healthy active module non-executable. Failed or corrupt downloads preserve
+the existing generation; concurrent scans continue to use its pinned bytes.
+An explicit refresh can repair damaged assets or permissions, while ordinary
+scans continue to fail closed. Standalone runners with flat legacy caches
+prepare a new complete generation and leave the legacy files intact for older
+readers. Source checkouts and exported trees with bundled modules retain their
+existing source-owned refresh behavior.
 
 Older runner-only updaters cannot acquire these transaction guarantees
 retroactively. The installed runner recognizes exact released contract digests

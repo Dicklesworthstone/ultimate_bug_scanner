@@ -575,7 +575,8 @@ def verify_lock_identity(descriptor: int, path: Path) -> None:
 
 def prepare_manifest(manifest: Manifest, root: Path, raw_base: str, *, allow_override: bool,
                      local_source: Optional[Path] = None, repair: bool = False,
-                     previous_generation: Optional[Path] = None) -> Path:
+                     previous_generation: Optional[Path] = None,
+                     force_download: bool = False) -> Path:
     """Publish one complete generation, without changing any active file.
 
     The caller authenticates runner before calling this function and atomically
@@ -583,6 +584,10 @@ def prepare_manifest(manifest: Manifest, root: Path, raw_base: str, *, allow_ove
     rename leaves an unselectable .stage-* directory; after it, the generation
     is complete but inactive until that runner is published. Old generations
     and the legacy module directory are deliberately retained.
+
+    Explicit module refresh bypasses every reusable source, including a valid
+    existing generation, but retains the same complete-stage verification and
+    atomic same-pin repair protocol. Failed downloads never disturb readers.
     """
     validate_asset_map(manifest.assets)
     root.mkdir(parents=True, exist_ok=True)
@@ -596,7 +601,8 @@ def prepare_manifest(manifest: Manifest, root: Path, raw_base: str, *, allow_ove
             real_directory(target)
             try:
                 check_ready(target, manifest, complete=True)
-                return target
+                if not force_download:
+                    return target
             except (OSError, UpdateError):
                 if not repair:
                     raise
@@ -605,13 +611,15 @@ def prepare_manifest(manifest: Manifest, root: Path, raw_base: str, *, allow_ove
             scratch = stage / ".download"
             for relative, expected in sorted(manifest.assets.items()):
                 data = b""
-                sources = [root]
-                if previous_generation is not None and previous_generation != target:
-                    sources.insert(0, previous_generation)
-                if local_source is not None:
-                    sources.insert(0, local_source)
-                if existing:
-                    sources.insert(0, target)
+                sources = []
+                if not force_download:
+                    sources.append(root)
+                    if previous_generation is not None and previous_generation != target:
+                        sources.insert(0, previous_generation)
+                    if local_source is not None:
+                        sources.insert(0, local_source)
+                    if existing:
+                        sources.insert(0, target)
                 for source_root in sources:
                     try:
                         data = read_cached_asset(source_root, relative)
@@ -619,7 +627,7 @@ def prepare_manifest(manifest: Manifest, root: Path, raw_base: str, *, allow_ove
                         data = b""
                     if hmac.compare_digest(digest(data), expected):
                         break
-                if not hmac.compare_digest(digest(data), expected):
+                if force_download or not hmac.compare_digest(digest(data), expected):
                     url = f"{raw_base.rstrip('/')}/v{manifest.version}/modules/{relative}"
                     data = download(url, scratch, allow_override=allow_override)
                     # Never retry a bad digest against main, disable integrity,
@@ -845,14 +853,15 @@ def main() -> int:
             source, destination, version, *entries = args
             result = snapshot_helpers(manifest_from_arguments(version, entries),
                                       Path(source), Path(destination))
-        elif command in ("prepare-manifest", "repair-manifest") and len(args) >= 4:
+        elif command in ("prepare-manifest", "repair-manifest", "refresh-manifest") and len(args) >= 4:
             root, version, base, *entries = args
             local_source = None
             if entries and entries[0].startswith("--local-source="):
                 local_source = Path(entries.pop(0).partition("=")[2])
             result = prepare_manifest(manifest_from_arguments(version, entries), Path(root), base,
                                       allow_override=override, local_source=local_source,
-                                      repair=command == "repair-manifest")
+                                      repair=command != "prepare-manifest",
+                                      force_download=command == "refresh-manifest")
         elif command == "publish" and 5 <= len(args) <= 7:
             candidate, root, base, installed, expected, *optional = args
             daemon = Path(optional[0]) if optional and optional[0] != "-" else None

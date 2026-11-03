@@ -362,6 +362,67 @@ count_swift_files() {
   echo "$count"
 }
 
+INSTALLER_PYTHON=()
+INSTALLER_HOOK_PYTHON=""
+INSTALLER_HOOK_PYTHON_ARG=""
+
+installer_python_executable_path() {
+  local located directory
+  located="$(type -P -- "$1" 2>/dev/null)" || return 1
+  [[ -n "$located" && -x "$located" ]] || return 1
+  if [[ "$located" == /* ]]; then
+    printf '%s\n' "$located"
+  else
+    directory="$(CDPATH='' cd -P -- "$(dirname -- "$located")" && pwd -P)" || return 1
+    # Keep the final symlink: resolving a virtualenv's python to its base
+    # interpreter changes the environment selected by the user.
+    printf '%s/%s\n' "$directory" "${located##*/}"
+  fi
+}
+
+resolve_installer_python() {
+  local executable name
+  INSTALLER_PYTHON=()
+  INSTALLER_HOOK_PYTHON=""
+  INSTALLER_HOOK_PYTHON_ARG=""
+  if [[ -n "${UBS_PYTHON:-}" ]]; then
+    if executable="$(installer_python_executable_path "$UBS_PYTHON")" \
+      && "$executable" -I -S -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1; then
+      INSTALLER_PYTHON=("$executable")
+      INSTALLER_HOOK_PYTHON="$executable"
+      # The installer may persist this choice in cron or pass it to a child
+      # runner. Never leave it relative to this invocation's working directory.
+      export UBS_PYTHON="$executable"
+      return 0
+    fi
+    error "UBS_PYTHON=$UBS_PYTHON is not a usable Python >= 3.9 interpreter"
+    return 1
+  fi
+  for name in python3 python py; do
+    executable="$(installer_python_executable_path "$name")" || continue
+    INSTALLER_PYTHON=("$executable")
+    [[ "$name" != py ]] || INSTALLER_PYTHON+=("-3")
+    if "${INSTALLER_PYTHON[@]}" -I -S -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1; then
+      if [[ "$name" != python3 ]]; then
+        INSTALLER_HOOK_PYTHON="$executable"
+        [[ "$name" != py ]] || INSTALLER_HOOK_PYTHON_ARG="-3"
+      fi
+      return 0
+    fi
+  done
+  INSTALLER_PYTHON=()
+  return 1
+}
+
+installer_python_available() { [[ -n "${INSTALLER_PYTHON[0]:-}" ]]; }
+
+installer_python() {
+  installer_python_available || return 127
+  # These installer helpers use only the standard library. The invoking
+  # project, PYTHONPATH and user site hooks must not run during installation.
+  "${INSTALLER_PYTHON[@]}" -I -S "$@"
+}
+
 report_swift_guard_readiness() {
   echo -e "${BOLD}Swift guard readiness:${RESET}"
   if [ "$SKIP_TYPE_NARROWING" -eq 1 ]; then
@@ -370,9 +431,9 @@ report_swift_guard_readiness() {
     echo ""
     return 0
   fi
-  if ! command -v python3 >/dev/null 2>&1; then
-    warn "  python3 not found – Swift guard helper requires python3"
-    record_session_fact "swift guard helper" "python3 missing"
+  if ! installer_python_available; then
+    warn "  Python >= 3.9 not found – Swift guard helper requires Python"
+    record_session_fact "swift guard helper" "Python >= 3.9 missing"
     echo ""
     return 0
   fi
@@ -1359,15 +1420,15 @@ download_binary_release() {
         verify_dependency_asset "$zip_path" "$asset" || return 1
         if command -v unzip >/dev/null 2>&1; then
           unzip -q "$zip_path" -d "$extract_dir" 2>/dev/null || true
-        elif command -v python3 >/dev/null 2>&1; then
-          python3 - "$zip_path" "$extract_dir" <<'PY' 2>/dev/null || true
+        elif installer_python_available; then
+          installer_python - "$zip_path" "$extract_dir" <<'PY' 2>/dev/null || true
 import sys, zipfile
 zip_path, out_dir = sys.argv[1], sys.argv[2]
 with zipfile.ZipFile(zip_path) as z:
     z.extractall(out_dir)
 PY
         else
-          warn "Need unzip or python3 to extract ast-grep archive"
+          warn "Need unzip or Python >= 3.9 to extract ast-grep archive"
           return 1
         fi
 
@@ -3724,8 +3785,8 @@ create_alias() {
 }
 
 claude_dcg_hook_registered() {
-  command -v python3 >/dev/null 2>&1 || return 2
-  python3 - "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json" \
+  installer_python_available || return 2
+  installer_python - "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json" \
     "$1/.claude/settings.json" "$1/.claude/settings.local.json" <<'PY'
 import json, os, re, shlex, sys
 
@@ -3780,13 +3841,13 @@ PY
 repair_user_scope_claude_hooks() {
   local settings="$HOME/.claude/settings.json"
   [ -f "$settings" ] || return 0
-  command -v python3 >/dev/null 2>&1 || return 0
+  installer_python_available || return 0
   if dry_run_enabled; then
     log_dry_run "Would remove any \$CLAUDE_PROJECT_DIR UBS hook entries from $settings."
     return 0
   fi
   local result
-  result="$(python3 - "$settings" << 'PY'
+  result="$(installer_python - "$settings" << 'PY'
 import json, os, shutil, sys, time
 
 path = sys.argv[1]
@@ -4100,8 +4161,8 @@ install_claude_safety_guard() {
 # paths and custom matchers. Other settings are preserved; replacement is atomic.
 register_claude_settings_hooks() {
   local settings="$1" has_guard="$2"
-  if ! command -v python3 >/dev/null 2>&1; then
-    warn "python3 not available; add these hooks to $settings manually:"
+  if ! installer_python_available; then
+    warn "Python >= 3.9 not available; add these hooks to $settings manually:"
     cat << 'SNIPPET'
   "hooks": {
     "PostToolUse": [{"matcher": "Edit|Write|MultiEdit", "hooks": [{"type": "command", "command": "\"$CLAUDE_PROJECT_DIR/.claude/hooks/on-file-write.sh\""}]}]
@@ -4110,8 +4171,15 @@ SNIPPET
     return 0
   fi
   local result
-  if result="$(python3 - "$settings" "$has_guard" << 'PY'
+  if result="$(installer_python - "$settings" "$has_guard" \
+    "$INSTALLER_HOOK_PYTHON" "$INSTALLER_HOOK_PYTHON_ARG" << 'PY'
 import json, os, shlex, shutil, stat, sys, tempfile
+
+guard_python = [sys.argv[3]] if sys.argv[3] else []
+if guard_python:
+    if sys.argv[4]:
+        guard_python.append(sys.argv[4])
+    guard_python.extend(("-I", "-S"))
 
 def script_name(command):
     if not isinstance(command, str):
@@ -4122,7 +4190,9 @@ def script_name(command):
         return ""
     if not words:
         return ""
-    if os.path.basename(words[0]) in ("bash", "sh", "python", "python3"):
+    if guard_python and words[:len(guard_python)] == guard_python:
+        words = words[len(guard_python):]
+    elif os.path.basename(words[0]) in ("bash", "sh", "python", "python3", "py", "py.exe"):
         words.pop(0)
         while words and words[0].startswith("-"):
             if words[0] in ("-c", "-m"):
@@ -4150,7 +4220,10 @@ if not isinstance(hooks, dict):
     sys.exit(0)
 wanted = [("PostToolUse", "Edit|Write|MultiEdit", '"$CLAUDE_PROJECT_DIR/.claude/hooks/on-file-write.sh"')]
 if has_guard:
-    wanted.append(("PreToolUse", "Bash", '"$CLAUDE_PROJECT_DIR/.claude/hooks/git_safety_guard.py"'))
+    guard_command = '"$CLAUDE_PROJECT_DIR/.claude/hooks/git_safety_guard.py"'
+    if guard_python:
+        guard_command = " ".join(shlex.quote(word) for word in guard_python) + " " + guard_command
+    wanted.append(("PreToolUse", "Bash", guard_command))
 added = []
 for event, matcher, command in wanted:
     entries = hooks.setdefault(event, [])
@@ -4160,12 +4233,18 @@ for event, matcher, command in wanted:
     if any(not isinstance(entry, dict) or not isinstance(entry.get("hooks", []), list) for entry in entries):
         print(f"invalid:'hooks.{event}' contains an invalid entry")
         sys.exit(0)
-    # Upgrade only the exact command older UBS installers emitted. It breaks
-    # when CLAUDE_PROJECT_DIR contains spaces; corrected/custom commands stay
-    # untouched, including their interpreter, arguments, and matcher.
+    # Upgrade only exact commands older UBS installers emitted. The unquoted
+    # path breaks in projects with spaces; the direct Python-script form also
+    # needs the selected interpreter when python3 is not the user's runtime.
+    # Custom interpreters, arguments, and matchers stay untouched.
+    legacy = "$CLAUDE_PROJECT_DIR/.claude/hooks/" + script_name(command)
+    owned_commands = {legacy}
+    if event == "PreToolUse" and guard_python:
+        owned_commands.add('"' + legacy + '"')
     for entry in entries:
         for hook in entry.get("hooks", []):
-            if isinstance(hook, dict) and hook.get("type") == "command" and hook.get("command") == command[1:-1]:
+            if (isinstance(hook, dict) and hook.get("type") == "command"
+                    and isinstance(hook.get("command"), str) and hook["command"] in owned_commands):
                 hook["command"] = command
                 added.append(f"{event}:quoted-command")
     present = any(
@@ -4638,13 +4717,13 @@ append_quick_reference_block() {
 
   # For file-based storage: check if marker exists in the specific target file
   if [ -f "$destination" ] && grep -qF "$marker" "$destination" 2>/dev/null; then
-    if ! command -v python3 >/dev/null 2>&1; then
-      warn "python3 is required to refresh existing UBS guidance in $destination"
+    if ! installer_python_available; then
+      warn "Python >= 3.9 is required to refresh existing UBS guidance in $destination"
       return 1
     fi
     local reference result
     reference="$(quick_reference_block)"
-    if ! result="$(python3 - "$destination" "$reference" <<'PY'
+    if ! result="$(installer_python - "$destination" "$reference" <<'PY'
 import hashlib, os, re, shutil, stat, sys, tempfile
 
 path, replacement = sys.argv[1:]
@@ -5040,6 +5119,16 @@ exit 1
 ;;
 esac
 done
+
+case "${INSTALLER_ACTION:-}" in
+  ""|--setup-claude-hook|--diagnose)
+    # Other standalone actions do not require Python. In particular, leave
+    # uninstall's separate lock-handoff interpreter selection unchanged.
+    if ! resolve_installer_python && [[ -n "${UBS_PYTHON:-}" && "${INSTALLER_ACTION:-}" != --diagnose ]]; then
+      exit 1
+    fi
+    ;;
+esac
 
 case "${INSTALLER_ACTION:-}" in
   --setup-git-hook) setup_git_hook; exit 0 ;;

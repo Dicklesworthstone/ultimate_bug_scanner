@@ -653,6 +653,124 @@ sys.exit(0 if expected == actual and args[args.index('-P')+1] == 'fixture-key' e
         self.assertTrue(output.is_file())
         self.assertFalse(any(event[0] == 'fetch' for event in self.events()))
 
+    def python_tools_path(self, spelling='python'):
+        isolated = self.work / ('bootstrap tools ' + spelling)
+        isolated.mkdir()
+        for name in ('bash', 'dirname', 'cat', 'awk', 'mktemp', 'rm', 'cp', 'mkdir', 'sha256sum'):
+            actual = shutil.which(name)
+            self.assertIsNotNone(actual, name)
+            (isolated / name).symlink_to(actual)
+        (isolated / 'cosign').symlink_to(self.bin / 'cosign')
+        if spelling == 'py':
+            # Model only the launcher's -3 argument transport; execute real
+            # Python for the probe and all actual verification work.
+            self.tool('py', '''
+import os, sys
+if sys.argv[1:2] != ['-3']: sys.exit(98)
+os.execv(sys.executable, [sys.executable, *sys.argv[2:]])
+''')
+            (isolated / 'py').symlink_to(self.bin / 'py')
+        else:
+            (isolated / spelling).symlink_to(sys.executable)
+        self.env['PATH'] = str(isolated)
+        return isolated
+
+    def test_runtime_verification_uses_python_when_python3_is_absent(self):
+        self.python_tools_path()
+        result = self.run_verify()
+        self.assertIn('Runtime verified:', result.stdout)
+        self.assertEqual([event[0] for event in self.events()], ['signature'])
+
+    def test_archive_import_uses_the_real_interpreter_through_py_launcher(self):
+        output = self.work / 'launcher runtime.tar.gz'
+        self.export(output)
+        self.python_tools_path('py')
+        self.import_archive(output)
+
+    def test_explicit_relative_python_with_spaces_is_frozen_before_staging(self):
+        self.python_tools_path('chosen interpreter')
+        self.env['UBS_PYTHON'] = 'bootstrap tools chosen interpreter/chosen interpreter'
+        output = self.work / 'explicit runtime.tar.gz'
+        self.export(output)
+        self.import_archive(output)
+
+    def test_broken_python3_does_not_hide_a_working_python(self):
+        isolated = self.python_tools_path()
+        broken = isolated / 'python3'
+        broken.write_text('#!/bin/sh\nexit 99\n')
+        broken.chmod(0o755)
+        self.run_verify()
+
+    def test_invalid_explicit_python_refuses_before_authentication_or_payloads(self):
+        self.env['UBS_PYTHON'] = str(self.work / 'missing interpreter')
+        result = self.run_verify(expected=1)
+        self.assertIn('UBS_PYTHON', result.stderr)
+        self.assertEqual(self.events(), [])
+
+    def sign_bootstrap_fixture(self):
+        executable = shutil.which('minisign')
+        if executable is None:
+            self.skipTest('minisign is required for real cryptographic bootstrap tests')
+        secret, public = self.work / 'bootstrap.key', self.work / 'bootstrap.pub'
+        for command in ([executable, '-G', '-W', '-p', str(public), '-s', str(secret)],
+                        [executable, '-S', '-s', str(secret), '-m', str(self.origin / 'SHA256SUMS'),
+                         '-x', str(self.origin / 'SHA256SUMS.minisig')]):
+            result = subprocess.run(command, text=True, capture_output=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.env.update(UBS_VERIFY_WITH='minisign', UBS_MINISIGN_PUBKEY=public.read_text().splitlines()[-1])
+        return executable
+
+    def poison_python_startup(self, *, shadows=()):
+        marker = self.work / 'unverified-python-executed'
+        body = f'with open({str(marker)!r}, "a") as marker:\n    marker.write("executed\\n")\n'
+        (self.work / 'sitecustomize.py').write_text(body)
+        for name in shadows:
+            (self.work / name).write_text(body + 'raise RuntimeError("untrusted Python module loaded")\n')
+        return marker
+
+    def reject_bootstrap_signer(self, executable):
+        public, secret = self.work / 'other.pub', self.work / 'other.key'
+        result = subprocess.run([executable, '-G', '-W', '-p', str(public), '-s', str(secret)],
+                                text=True, capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.env['UBS_MINISIGN_PUBKEY'] = public.read_text().splitlines()[-1]
+
+    def test_real_signed_runtime_ignores_python_startup_and_project_imports(self):
+        self.sign_bootstrap_fixture()
+        marker = self.poison_python_startup(shadows=('hashlib.py', 'tarfile.py', 'json.py', 'pathlib.py'))
+        self.env.update(PYTHONPATH=str(self.work), UBS_PYTHON=sys.executable)
+        result = self.run_verify()
+        self.assertIn('Runtime verified:', result.stdout)
+        self.assertFalse(marker.exists(), 'Verification executed unverified Python code')
+
+    def test_archive_rejected_signature_cannot_execute_python_startup(self):
+        executable = self.sign_bootstrap_fixture()
+        archive = self.work / 'signed runtime.tar.gz'
+        self.export(archive)
+        self.reject_bootstrap_signer(executable)
+        marker = self.poison_python_startup()
+        self.env['PYTHONPATH'] = str(self.work)
+        result = self.import_archive(archive, expected=1)
+        self.assertFalse(marker.exists(), 'Unauthenticated archive executed Python startup code')
+        self.assertIn('Signature verification failed', result.stderr)
+
+    def test_archive_import_cannot_load_cwd_modules_before_authentication(self):
+        executable = self.sign_bootstrap_fixture()
+        archive = self.work / 'signed runtime.tar.gz'
+        self.export(archive)
+        self.reject_bootstrap_signer(executable)
+        marker = self.poison_python_startup(shadows=('tarfile.py',))
+        self.env.pop('PYTHONPATH', None)
+        self.env.pop('PYTHONHOME', None)
+        result = self.import_archive(archive, expected=1)
+        self.assertFalse(marker.exists(), 'Archive import executed a module from the working directory')
+        self.assertIn('Signature verification failed', result.stderr)
+
+    def test_runtime_bootstrap_ignores_a_broken_pythonhome(self):
+        self.sign_bootstrap_fixture()
+        self.env['PYTHONHOME'] = str(self.work / 'untrusted missing Python home')
+        self.run_verify()
+
     def prepare_real_install(self):
         self.version = (ROOT / 'VERSION').read_text().strip().removeprefix('v')
         self.env['EXPECT_VERSION'] = self.version

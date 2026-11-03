@@ -111,12 +111,43 @@ case "${1:-}" in
       serve) set -- serve "$@" ;;
       --client) set -- client "$@" ;;
     esac
-    _service_python="${UBS_PYTHON:-python3}"
-    if ! command -v "$_service_python" >/dev/null 2>&1; then
+    # Service startup precedes scan dependency probes. Resolve with Bash
+    # builtins only, and isolate even the interpreter version probe from
+    # project/PYTHONPATH/site startup code. An explicit override is strict.
+    _service_python=()
+    if [[ -n "${UBS_PYTHON:-}" ]]; then
+      _service_candidates=("$UBS_PYTHON")
+    else
+      _service_candidates=(python3 python py)
+    fi
+    for _service_candidate in "${_service_candidates[@]}"; do
+      _service_executable="$(type -P -- "$_service_candidate" 2>/dev/null)" || continue
+      [[ -n "$_service_executable" && -x "$_service_executable" ]] || continue
+      if [[ "$_service_executable" != /* ]]; then
+        _service_directory="${_service_executable%/*}"
+        [[ "$_service_directory" != "$_service_executable" ]] || _service_directory=.
+        _service_directory="$(CDPATH='' cd -P -- "$_service_directory" && pwd -P)" || continue
+        _service_executable="$_service_directory/${_service_executable##*/}"
+      fi
+      _service_python=("$_service_executable")
+      if [[ -z "${UBS_PYTHON:-}" && "$_service_candidate" == py ]]; then
+        _service_python+=(-3)
+      fi
+      if "${_service_python[@]}" -I -S -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1; then
+        break
+      fi
+      _service_python=()
+    done
+    if [[ ${#_service_python[@]} -eq 0 ]]; then
       echo 'ERROR: The local scan service requires Python >= 3.9; set UBS_PYTHON.' >&2
       exit 2
     fi
-    exec "$_service_python" -I -S - "${BASH_SOURCE[0]}" "$UBS_DAEMON_SHA256" "$@" <<'PYDAEMON'
+    # Preserve the final symlink (including virtualenv identity), and anchor
+    # a caller-relative override before the service changes scanner cwd.
+    if [[ -n "${UBS_PYTHON:-}" ]]; then
+      export UBS_PYTHON="${_service_python[0]}"
+    fi
+    exec "${_service_python[@]}" -I -S - "${BASH_SOURCE[0]}" "$UBS_DAEMON_SHA256" "$@" <<'PYDAEMON'
 import hashlib
 import os
 from pathlib import Path
@@ -4460,6 +4491,21 @@ select_release_generation(){
   return 0
 }
 
+should_refresh_release_generation(){
+  [[ "$UPDATE_MODULES" -eq 1 ]] || return 1
+  is_checkout_helper "$MODULE_CACHE_ROOT/contract.json" && return 1
+  if [[ -e "$MODULE_CACHE_ROOT/.ubs-releases" || -L "$MODULE_CACHE_ROOT/.ubs-releases" ]]; then
+    return 0
+  fi
+  # Standalone installed runners may still have a flat cache from an older
+  # updater. Refresh into a complete generation, preserving those legacy
+  # files for older readers. Bundled or tracked source remains source-owned.
+  local runner_dir
+  runner_dir="$(script_dir)" || return 1
+  [[ ! -e "$runner_dir/.git" && ! -L "$runner_dir/.git" \
+     && ! -e "$runner_dir/modules" && ! -L "$runner_dir/modules" ]]
+}
+
 prepare_current_release_generation(){
   local operation="${1:-prepare-manifest}" selected
   [[ "$UBS_RELEASE_GENERATIONS" -eq 1 ]] || return 2
@@ -7463,7 +7509,8 @@ def verify_lock_identity(descriptor: int, path: Path) -> None:
 
 def prepare_manifest(manifest: Manifest, root: Path, raw_base: str, *, allow_override: bool,
                      local_source: Optional[Path] = None, repair: bool = False,
-                     previous_generation: Optional[Path] = None) -> Path:
+                     previous_generation: Optional[Path] = None,
+                     force_download: bool = False) -> Path:
     """Publish one complete generation, without changing any active file.
 
     The caller authenticates runner before calling this function and atomically
@@ -7471,6 +7518,10 @@ def prepare_manifest(manifest: Manifest, root: Path, raw_base: str, *, allow_ove
     rename leaves an unselectable .stage-* directory; after it, the generation
     is complete but inactive until that runner is published. Old generations
     and the legacy module directory are deliberately retained.
+
+    Explicit module refresh bypasses every reusable source, including a valid
+    existing generation, but retains the same complete-stage verification and
+    atomic same-pin repair protocol. Failed downloads never disturb readers.
     """
     validate_asset_map(manifest.assets)
     root.mkdir(parents=True, exist_ok=True)
@@ -7484,7 +7535,8 @@ def prepare_manifest(manifest: Manifest, root: Path, raw_base: str, *, allow_ove
             real_directory(target)
             try:
                 check_ready(target, manifest, complete=True)
-                return target
+                if not force_download:
+                    return target
             except (OSError, UpdateError):
                 if not repair:
                     raise
@@ -7493,13 +7545,15 @@ def prepare_manifest(manifest: Manifest, root: Path, raw_base: str, *, allow_ove
             scratch = stage / ".download"
             for relative, expected in sorted(manifest.assets.items()):
                 data = b""
-                sources = [root]
-                if previous_generation is not None and previous_generation != target:
-                    sources.insert(0, previous_generation)
-                if local_source is not None:
-                    sources.insert(0, local_source)
-                if existing:
-                    sources.insert(0, target)
+                sources = []
+                if not force_download:
+                    sources.append(root)
+                    if previous_generation is not None and previous_generation != target:
+                        sources.insert(0, previous_generation)
+                    if local_source is not None:
+                        sources.insert(0, local_source)
+                    if existing:
+                        sources.insert(0, target)
                 for source_root in sources:
                     try:
                         data = read_cached_asset(source_root, relative)
@@ -7507,7 +7561,7 @@ def prepare_manifest(manifest: Manifest, root: Path, raw_base: str, *, allow_ove
                         data = b""
                     if hmac.compare_digest(digest(data), expected):
                         break
-                if not hmac.compare_digest(digest(data), expected):
+                if force_download or not hmac.compare_digest(digest(data), expected):
                     url = f"{raw_base.rstrip('/')}/v{manifest.version}/modules/{relative}"
                     data = download(url, scratch, allow_override=allow_override)
                     # Never retry a bad digest against main, disable integrity,
@@ -7733,14 +7787,15 @@ def main() -> int:
             source, destination, version, *entries = args
             result = snapshot_helpers(manifest_from_arguments(version, entries),
                                       Path(source), Path(destination))
-        elif command in ("prepare-manifest", "repair-manifest") and len(args) >= 4:
+        elif command in ("prepare-manifest", "repair-manifest", "refresh-manifest") and len(args) >= 4:
             root, version, base, *entries = args
             local_source = None
             if entries and entries[0].startswith("--local-source="):
                 local_source = Path(entries.pop(0).partition("=")[2])
             result = prepare_manifest(manifest_from_arguments(version, entries), Path(root), base,
                                       allow_override=override, local_source=local_source,
-                                      repair=command == "repair-manifest")
+                                      repair=command != "prepare-manifest",
+                                      force_download=command == "refresh-manifest")
         elif command == "publish" and 5 <= len(args) <= 7:
             candidate, root, base, installed, expected, *optional = args
             daemon = Path(optional[0]) if optional and optional[0] != "-" else None
@@ -8111,7 +8166,15 @@ fi
 # Execution / aggregation
 # ─────────────────────────────────────────────────────────────────────────────
 ensure_tmpdir_run
-select_release_generation || exit 2
+if should_refresh_release_generation; then
+  # A forced refresh must finish and verify its complete download set before
+  # touching the active generation. Its same-pin replacements already carry
+  # final permissions, so interrupted refreshes cannot disable other scans.
+  prepare_current_release_generation refresh-manifest || exit 2
+  UPDATE_MODULES=0
+else
+  select_release_generation || exit 2
+fi
 # Unlike the best-effort file listing, integrity failures must not be swallowed
 # by a conditional/|| true. Informational modes have already returned above.
 ensure_detection_contract || exit 2

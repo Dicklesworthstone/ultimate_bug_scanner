@@ -533,6 +533,103 @@ class ReleaseGeneration(unittest.TestCase):
         self.assert_complete(target)
         self.assert_old_intact()
 
+    def test_refresh_downloads_every_pin_even_with_a_complete_reusable_generation(self) -> None:
+        target = self.prepare()
+        directory_identity = target.stat().st_ino
+        with mock.patch.object(generation, "download", wraps=generation.download) as fetch:
+            refreshed = generation.prepare_manifest(
+                self.manifest, self.cache, self.mirror.as_uri(), allow_override=True,
+                local_source=self.remote, repair=True, force_download=True,
+            )
+        self.assertEqual(refreshed, target)
+        self.assertEqual(target.stat().st_ino, directory_identity)
+        expected_urls = {f"{self.mirror.as_uri()}/v{self.manifest.version}/modules/{name}"
+                         for name in self.new_assets}
+        self.assertEqual({call.args[0] for call in fetch.call_args_list}, expected_urls)
+        self.assertEqual(fetch.call_count, len(expected_urls))
+        self.assert_complete(target)
+        self.assert_old_intact()
+
+    def test_failed_or_tampered_late_refresh_download_preserves_the_complete_active_generation(self) -> None:
+        target = self.prepare()
+        names = set(self.new_assets) | {generation.READY_FILE}
+        identities = {name: (target / name).stat() for name in names}
+        remote = self.remote / "ubs-rust.sh"
+        absent = remote.with_name("saved-ubs-rust.sh")
+        remote.rename(absent)
+        with self.assertRaisesRegex(generation.UpdateError, "could not fetch"):
+            generation.prepare_manifest(self.manifest, self.cache, self.mirror.as_uri(),
+                                        allow_override=True, repair=True, force_download=True)
+        absent.rename(remote)
+        remote.write_bytes(b"untrusted replacement\n")
+        with self.assertRaisesRegex(generation.UpdateError, "checksum mismatch"):
+            generation.prepare_manifest(self.manifest, self.cache, self.mirror.as_uri(),
+                                        allow_override=True, repair=True, force_download=True)
+        for name, before in identities.items():
+            after = (target / name).stat()
+            self.assertTrue(os.path.samestat(before, after), name)
+            self.assertEqual((before.st_mode, before.st_mtime_ns, before.st_ctime_ns),
+                             (after.st_mode, after.st_mtime_ns, after.st_ctime_ns), name)
+        self.assert_complete(target)
+        self.assert_old_intact()
+
+    def test_interrupted_refresh_publication_keeps_every_reader_usable(self) -> None:
+        target = self.prepare()
+        identity = target.stat().st_ino
+        replace = generation.os.replace
+        observed = []
+
+        def interrupt_after_module(source, destination):
+            replace(source, destination)
+            if Path(destination).is_relative_to(target):
+                generation.check_ready(target, self.manifest, complete=True)
+                observed.append(Path(destination).relative_to(target).as_posix())
+                if Path(destination).name == "ubs-js.sh":
+                    raise OSError("refresh publication interrupted")
+
+        with mock.patch.object(generation.os, "replace", side_effect=interrupt_after_module):
+            with self.assertRaisesRegex(OSError, "refresh publication interrupted"):
+                generation.prepare_manifest(self.manifest, self.cache, self.mirror.as_uri(),
+                                            allow_override=True, repair=True, force_download=True)
+        self.assertIn("ubs-js.sh", observed)
+        self.assertEqual(target.stat().st_ino, identity)
+        self.assert_complete(target)
+        generation.prepare_manifest(self.manifest, self.cache, self.mirror.as_uri(),
+                                    allow_override=True, repair=True, force_download=True)
+        self.assert_complete(target)
+        self.assert_old_intact()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX executable permissions")
+    def test_explicit_refresh_repairs_nonexecutable_module_without_changing_generation(self) -> None:
+        target = self.prepare()
+        identity = target.stat().st_ino
+        (target / "ubs-rust.sh").chmod(0o600)
+        with self.assertRaisesRegex(generation.UpdateError, "not readable/executable"):
+            generation.select_manifest(self.manifest, self.cache)
+        result = generation.prepare_manifest(self.manifest, self.cache, self.mirror.as_uri(),
+                                             allow_override=True, repair=True, force_download=True)
+        self.assertEqual(result, target)
+        self.assertEqual(target.stat().st_ino, identity)
+        self.assert_complete(target)
+
+    def test_refresh_manifest_cli_downloads_again_using_only_loaded_pins(self) -> None:
+        target = self.prepare()
+        self.candidate.write_bytes(b"runner pathname has been replaced")
+        command = [sys.executable, "-I", "-S", str(SOURCE), "refresh-manifest", str(self.cache),
+                   self.manifest.version, self.mirror.as_uri(),
+                   *(f"{name}={pin}" for name, pin in self.manifest.assets.items())]
+        remote = self.remote / "ubs-rust.sh"
+        remote.write_bytes(b"unauthenticated download\n")
+        rejected = subprocess.run(command, env=self.env, capture_output=True, text=True, timeout=20)
+        self.assertEqual(rejected.returncode, 2, rejected.stdout + rejected.stderr)
+        self.assertIn("checksum mismatch", rejected.stderr)
+        self.assert_complete(target)
+        remote.write_bytes(self.new_assets["ubs-rust.sh"])
+        refreshed = subprocess.run(command, env=self.env, capture_output=True, text=True, timeout=20)
+        self.assertEqual(refreshed.returncode, 0, refreshed.stdout + refreshed.stderr)
+        self.assertEqual(refreshed.stdout.strip(), str(target))
+        self.assert_complete(target)
+
     def test_missing_target_below_symlinked_generation_container_is_rejected(self) -> None:
         other = self.root / "other releases"
         other.mkdir()

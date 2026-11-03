@@ -11,6 +11,13 @@ The service requires POSIX (Linux, macOS or another supported Unix). On Windows
 Git Bash, MSYS and Cygwin, installed save and Git hooks use ordinary `ubs`
 scans; use the ordinary scanner directly there. WSL uses the Linux service.
 
+Canonical service commands discover Python >= 3.9 through `python3`, `python`,
+or `py -3`, and honor an explicit `UBS_PYTHON` executable. An invalid explicit
+override is an error. Discovery uses isolated Python startup before loading
+the verified companion, requires no scanner tools or temporary launcher, and
+preserves a selected virtual environment. A relative override is anchored
+before the service changes the scanner's working directory.
+
 ```bash
 ./ubs serve --repo /path/to/project --jobs=2
 ./ubs --client --repo /path/to/project src/main.py

@@ -11,6 +11,40 @@ warn() { printf 'WARNING: %s\n' "$*" >&2; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 usage_error() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
 
+VERIFY_PYTHON=()
+verify_python_candidate() {
+  local executable directory
+  executable="$(type -P -- "$1" 2>/dev/null)" || return 1
+  shift
+  [[ -n "$executable" && -x "$executable" ]] || return 1
+  if [[ "$executable" != /* ]]; then
+    directory="${executable%/*}"
+    [[ "$directory" != "$executable" ]] || directory=.
+    directory="$(CDPATH='' cd -P -- "$directory" && pwd -P)" || return 1
+    executable="$directory/${executable##*/}"
+  fi
+  # Even interpreter discovery precedes authentication for archive input.
+  # Never import project modules, PYTHONPATH or site startup code here.
+  if "$executable" "$@" -I -S -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1; then
+    VERIFY_PYTHON=("$executable" "$@")
+    return 0
+  fi
+  return 1
+}
+
+require_verify_python() {
+  [[ ${#VERIFY_PYTHON[@]} -eq 0 ]] || return 0
+  if [[ -n "${UBS_PYTHON:-}" ]]; then
+    verify_python_candidate "$UBS_PYTHON" \
+      || die 'UBS_PYTHON must name a usable Python >= 3.9 interpreter'
+    return 0
+  fi
+  if verify_python_candidate python3 || verify_python_candidate python || verify_python_candidate py -3; then
+    return 0
+  fi
+  die 'Python >= 3.9 is required for runtime/archive verification; set UBS_PYTHON or install python3, python or py -3'
+}
+
 usage() {
   cat <<'USAGE'
 Usage: verify.sh [--version X.Y.Z|vX.Y.Z]
@@ -39,6 +73,8 @@ Options:
   -h, --help              Show help without downloading or installing anything.
 
 Environment:
+  UBS_PYTHON              Python >= 3.9 interpreter; otherwise try python3,
+                          python, then py -3. Explicit invalid overrides fail.
   UBS_VERSION             Version; otherwise use the checkout's VERSION file.
                           A standalone verifier requires an explicit version.
   UBS_ARTIFACT_BASE       HTTPS mirror containing the selected release assets.
@@ -138,7 +174,7 @@ if [[ -n "$ARTIFACT_ARCHIVE" ]]; then
   [[ "$INSECURE" -eq 0 ]] || usage_error '--artifact-archive requires authenticated verification'
   [[ -f "$ARTIFACT_ARCHIVE" && ! -L "$ARTIFACT_ARCHIVE" ]] \
     || usage_error '--artifact-archive must name a regular non-symlink file'
-  command -v python3 >/dev/null 2>&1 || die 'python3 is required to import a release archive'
+  require_verify_python
 fi
 if [[ -n "$BUNDLE_OUTPUT" ]]; then
   [[ ! -e "$BUNDLE_OUTPUT" && ! -L "$BUNDLE_OUTPUT" ]] || usage_error '--bundle-output must not already exist'
@@ -222,7 +258,7 @@ trap 'exit 143' TERM
 if [[ -n "$ARTIFACT_ARCHIVE" ]]; then
   # Unpack only into our private staging directory. Authenticate the copied
   # manifest and payloads afterwards through the same path as directory input.
-  python3 - "$ARTIFACT_ARCHIVE" "$VERIFY_DIR" <<'PY'
+  "${VERIFY_PYTHON[@]}" -I -S - "$ARTIFACT_ARCHIVE" "$VERIFY_DIR" <<'PY'
 import gzip
 import os
 from pathlib import Path
@@ -353,7 +389,7 @@ if [[ "$INSECURE" -eq 0 && "$VERIFY_ONLY" -eq 0 && -n "$ARTIFACT_DIR" ]] \
   WITH_MODULES=1
 fi
 if [[ "$WITH_MODULES" -eq 1 ]]; then
-  command -v python3 >/dev/null 2>&1 || die 'python3 is required to verify the runtime asset graph'
+  require_verify_python
 fi
 
 fetch_asset() {
@@ -405,7 +441,7 @@ verify_asset() {
 verify_runtime() {
   # Only invoke the host Python, never the downloaded runner or its helpers.
   # Its signed checksum tables are a restricted literal format, not a script.
-  python3 - "$VERIFY_DIR" "$ARTIFACT_DIR" "$MODULE_ARTIFACT_BASE" "$BUNDLE_OUTPUT" "$VERIFY_WITH" <<'PY'
+  "${VERIFY_PYTHON[@]}" -I -S - "$VERIFY_DIR" "$ARTIFACT_DIR" "$MODULE_ARTIFACT_BASE" "$BUNDLE_OUTPUT" "$VERIFY_WITH" <<'PY'
 import gzip
 import hashlib
 import json

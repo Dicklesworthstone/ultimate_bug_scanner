@@ -101,6 +101,19 @@ not an authenticated install.
 
 ## Runner and cache publication
 
+The current installer requires a target runner with the version-bound
+publication protocol (`UBS_RELEASE_GENERATIONS=1`). Historical runner-only
+targets are refused before publishing any runner, companion, or cache, including
+at a fresh destination, because that user may already have an incompatible
+cache. `--local`, `--insecure`, and `--skip-doctor` do not bypass this installer
+requirement. The authenticated `scripts/verify.sh` installation path checks the
+same protocol before executing the selected release's bundled installer.
+This restricts the target, not the starting installation: supported older
+installed runners and caches can still upgrade to a transaction-capable release.
+Historical artifacts remain inspectable with `scripts/verify.sh --verify-only`.
+Previously published installers do not gain these guarantees retroactively;
+normal release delivery requires a signed release containing the new protocol.
+
 A managed installation stores complete module generations below
 `$XDG_DATA_HOME/ubs/modules/.ubs-releases/` (normally
 `~/.local/share/ubs/modules/.ubs-releases/`). Their identities derive from the

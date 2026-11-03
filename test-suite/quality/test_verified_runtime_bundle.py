@@ -122,6 +122,14 @@ if os.environ.get('LATE_OUTPUT'): pathlib.Path(os.environ['LATE_OUTPUT']).write_
         self.write('ubs', transform((self.origin / 'ubs').read_text()).encode())
         self.seal()
 
+    def declare_install_protocol(self):
+        # These cases test verifier dispatch into an inert installer stub.
+        # The runner remains an inert payload (exit 93); actual publication
+        # tests below install the real current runner and assets.
+        self.change_runner(lambda text: text.replace(
+            '#!/usr/bin/env bash\n',
+            '#!/usr/bin/env bash\nUBS_RELEASE_GENERATIONS=1\n', 1))
+
     def run_verify(self, *args, local=True, expected=0):
         command = ['bash', str(VERIFY), '--version', self.version, '--verify-only', '--with-modules']
         if local:
@@ -244,6 +252,7 @@ if os.environ.get('LATE_OUTPUT'): pathlib.Path(os.environ['LATE_OUTPUT']).write_
         self.assertEqual(self.events(), [])
 
     def test_with_modules_installs_only_after_runtime_verification(self):
+        self.declare_install_protocol()
         result = subprocess.run(['bash', str(VERIFY), '--version', VERSION, '--with-modules'],
                                 cwd=self.work, env=self.env, text=True, capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 94, result.stdout + result.stderr)
@@ -326,6 +335,7 @@ if os.environ.get('LATE_OUTPUT'): pathlib.Path(os.environ['LATE_OUTPUT']).write_
         self.assertFalse(list(self.stage.iterdir()))
 
     def test_plain_installer_exit_status_and_cleanup_are_preserved(self):
+        self.declare_install_protocol()
         result = subprocess.run(['bash', str(VERIFY), '--version', VERSION, '--artifact-dir', str(self.origin)],
                                 cwd=self.work, env=self.env, text=True, capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 94, result.stdout + result.stderr)
@@ -432,6 +442,7 @@ sys.exit(0 if expected == actual and args[args.index('-P')+1] == 'fixture-key' e
         self.assertIn('checksum mismatch', result.stderr)
 
     def test_archive_import_installer_status_and_arguments_are_preserved(self):
+        self.declare_install_protocol()
         self.write('install.sh', b'''#!/usr/bin/env bash
 [[ "$UBS_INSTALLER_SELF_UPDATED" == 1 && "$UBS_NO_AUTO_UPDATE" == 1 ]] || exit 99
 [[ "$1" == '--label' && "$2" == 'space ; $literal' ]] || exit 98
@@ -902,6 +913,7 @@ sys.exit(97)
         self.assert_installed_runtime_scans_offline()
 
     def test_invalid_module_roots_cannot_silently_fall_back_to_plain_installation(self):
+        self.declare_install_protocol()
         modules = self.origin / 'modules'
         saved = self.origin / 'saved-modules'
         modules.rename(saved)

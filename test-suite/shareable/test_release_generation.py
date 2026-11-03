@@ -601,6 +601,129 @@ class ReleaseGeneration(unittest.TestCase):
         self.assert_complete(target)
         self.assertEqual(self.installed.read_bytes(), current)
 
+    def test_next_generation_reuses_unchanged_authenticated_assets_offline(self) -> None:
+        previous = self.publish()
+        current = self.installed.read_bytes()
+        self.candidate.write_bytes(fixture_runner("5.5.2", self.new_assets))
+        target_manifest = generation.parse_manifest(self.candidate.read_bytes())
+        with mock.patch.object(generation, "download", side_effect=AssertionError("unnecessary download")):
+            target = generation.publish(
+                self.candidate, self.cache, "https://offline.invalid", self.installed,
+                hashlib.sha256(current).hexdigest(), allow_override=False,
+            )
+        self.assertNotEqual(target, previous)
+        generation.check_ready(previous, self.manifest, complete=True)
+        generation.check_ready(target, target_manifest, complete=True)
+        self.assertEqual(self.installed.read_bytes(), self.candidate.read_bytes())
+        for name, data in self.old_assets.items():
+            self.assertEqual((self.cache / name).read_bytes(), data)
+
+    def test_next_generation_downloads_only_assets_with_changed_target_pins(self) -> None:
+        previous = self.publish()
+        current = self.installed.read_bytes()
+        assets = dict(self.new_assets)
+        assets["contract.json"] = b'{"contract_version":1,"modules":{"rust":{},"js":{}}}\n'
+        original_library = assets["lib/ubs-common.sh"]
+        assets["lib/ubs-common.sh"] = original_library.replace(
+            hashlib.sha256(self.new_assets["contract.json"]).hexdigest().encode(),
+            hashlib.sha256(assets["contract.json"]).hexdigest().encode(),
+        )
+        for name in ("ubs-js.sh", "ubs-rust.sh"):
+            assets[name] = assets[name].replace(
+                hashlib.sha256(original_library).hexdigest().encode(),
+                hashlib.sha256(assets["lib/ubs-common.sh"]).hexdigest().encode(),
+            )
+        changed = {name for name in assets if assets[name] != self.new_assets[name]}
+        requested = []
+
+        def changed_assets_only(url, destination, *, allow_override):
+            relative = url.split("/modules/", 1)[1]
+            self.assertIn(relative, changed, "unchanged authenticated asset was downloaded")
+            requested.append(relative)
+            destination.write_bytes(assets[relative])
+            return assets[relative]
+
+        self.candidate.write_bytes(fixture_runner("5.5.2", assets))
+        with mock.patch.object(generation, "download", side_effect=changed_assets_only):
+            target = generation.publish(
+                self.candidate, self.cache, "https://partial.invalid", self.installed,
+                hashlib.sha256(current).hexdigest(), allow_override=False,
+            )
+        self.assertCountEqual(requested, changed)
+        generation.check_ready(target, generation.parse_manifest(self.candidate.read_bytes()), complete=True)
+        generation.check_ready(previous, self.manifest, complete=True)
+
+    def test_damaged_previous_asset_needs_verified_download_and_failed_update_preserves_runner(self) -> None:
+        previous = self.publish()
+        current = self.installed.read_bytes()
+        damaged = previous / "helpers/nested/helper.py"
+        damaged.write_bytes(b"modified cached code is not a historical version")
+        self.candidate.write_bytes(fixture_runner("5.5.2", self.new_assets))
+        target_manifest = generation.parse_manifest(self.candidate.read_bytes())
+        with mock.patch.object(generation, "download", side_effect=generation.UpdateError("offline")):
+            with self.assertRaisesRegex(generation.UpdateError, "offline"):
+                generation.publish(self.candidate, self.cache, "https://offline.invalid", self.installed,
+                                   hashlib.sha256(current).hexdigest(), allow_override=False)
+        self.assertEqual(self.installed.read_bytes(), current)
+        self.assertFalse(generation.generation_path(self.cache, target_manifest).exists())
+        requested = []
+
+        def authentic_helper(url, destination, *, allow_override):
+            relative = url.split("/modules/", 1)[1]
+            self.assertEqual(relative, "helpers/nested/helper.py")
+            requested.append(relative)
+            destination.write_bytes(self.new_assets[relative])
+            return self.new_assets[relative]
+
+        with mock.patch.object(generation, "download", side_effect=authentic_helper):
+            target = generation.publish(
+                self.candidate, self.cache, "https://partial.invalid", self.installed,
+                hashlib.sha256(current).hexdigest(), allow_override=False,
+            )
+        self.assertEqual(requested, ["helpers/nested/helper.py"])
+        generation.check_ready(target, target_manifest, complete=True)
+        self.assertEqual(damaged.read_bytes(), b"modified cached code is not a historical version")
+
+    def test_symlinked_previous_generation_is_never_a_reuse_source(self) -> None:
+        previous = self.publish()
+        current = self.installed.read_bytes()
+        parked = self.root / "parked previous generation"
+        previous.rename(parked)
+        previous.symlink_to(parked, target_is_directory=True)
+        self.candidate.write_bytes(fixture_runner("5.5.2", self.new_assets))
+        with mock.patch.object(generation, "download", side_effect=generation.UpdateError("source offline")):
+            with self.assertRaisesRegex(generation.UpdateError, "source offline"):
+                generation.publish(self.candidate, self.cache, "https://offline.invalid", self.installed,
+                                   hashlib.sha256(current).hexdigest(), allow_override=False)
+        self.assertEqual(self.installed.read_bytes(), current)
+        self.assertTrue(previous.is_symlink())
+        generation.check_ready(parked, self.manifest, complete=True)
+
+    def test_previous_generation_ancestor_swap_during_read_cannot_authorize_reuse(self) -> None:
+        previous = self.publish()
+        current = self.installed.read_bytes()
+        parked = self.root / "raced previous generation"
+        original_read = generation.read_regular
+        replaced = False
+
+        def swap_before_read(path, limit=generation.MAX_ASSET_BYTES):
+            nonlocal replaced
+            if Path(path) == previous / "contract.json" and not replaced:
+                previous.rename(parked)
+                previous.symlink_to(parked, target_is_directory=True)
+                replaced = True
+            return original_read(path, limit)
+
+        self.candidate.write_bytes(fixture_runner("5.5.2", self.new_assets))
+        with mock.patch.object(generation, "read_regular", side_effect=swap_before_read), \
+                mock.patch.object(generation, "download", side_effect=generation.UpdateError("source offline")):
+            with self.assertRaisesRegex(generation.UpdateError, "source offline"):
+                generation.publish(self.candidate, self.cache, "https://offline.invalid", self.installed,
+                                   hashlib.sha256(current).hexdigest(), allow_override=False)
+        self.assertTrue(replaced, "previous generation was never examined")
+        self.assertEqual(self.installed.read_bytes(), current)
+        generation.check_ready(parked, self.manifest, complete=True)
+
     def test_selection_verifies_all_assets_despite_valid_ready_marker(self) -> None:
         target = self.prepare()
         for name in self.new_assets:

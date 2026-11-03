@@ -403,6 +403,72 @@ class InstalledUpgrade(unittest.TestCase):
         (self.release_dir / "SHA256SUMS").write_text(manifest)
         (self.release_dir / "SHA256SUMS.minisig").write_text(hashlib.sha256(manifest.encode()).hexdigest())
 
+    def managed_release(self, *, change_helper: bool = False) -> tuple[bytes, set[str]]:
+        """Stage a later release above a fresh, generation-only installation.
+
+        The raw origin deliberately contains only changed assets. Unchanged
+        authentic bytes exist exclusively in the currently leased generation,
+        never in the legacy root or a caller-provided local source directory.
+        """
+        self.cache = Path(self.env["XDG_DATA_HOME"]) / "ubs/modules"
+        self.cache.mkdir(parents=True)
+        self.before_runner = self.runner.read_bytes()
+        self.previous_manifest = generation.parse_manifest(self.before_runner)
+        self.previous_generation = generation.prepare(
+            self.runner, self.cache, "https://offline.invalid", allow_override=False,
+            local_source=REPO_ROOT / "modules",
+        )
+        self.before_cache = self.cache_snapshot()
+        self.assertEqual(self.before_cache, {})
+        version_parts = self.previous_manifest.version.split(".")
+        version_parts[-1] = str(int(version_parts[-1]) + 1)
+        next_version = ".".join(version_parts)
+        candidate = self.before_runner.replace(
+            f'UBS_VERSION="{self.previous_manifest.version}"'.encode(),
+            f'UBS_VERSION="{next_version}"'.encode(),
+        )
+        changed = {}
+        if change_helper:
+            relative = "helpers/ubs_core/cache.py"
+            changed[relative] = (REPO_ROOT / "modules" / relative).read_bytes() + b"\n# Next-release fixture.\n"
+            library = (REPO_ROOT / "modules/lib/ubs-common.sh").read_bytes()
+            changed["lib/ubs-common.sh"] = library.replace(
+                self.previous_manifest.assets[relative].encode(),
+                hashlib.sha256(changed[relative]).hexdigest().encode(),
+            )
+            old_library_pin = self.previous_manifest.assets["lib/ubs-common.sh"]
+            new_library_pin = hashlib.sha256(changed["lib/ubs-common.sh"]).hexdigest()
+            for name in self.previous_manifest.assets:
+                if re.fullmatch(r"ubs-[a-z]+\.sh", name):
+                    changed[name] = (REPO_ROOT / "modules" / name).read_bytes().replace(
+                        f'UBS_LIB_CHECKSUM="{old_library_pin}"'.encode(),
+                        f'UBS_LIB_CHECKSUM="{new_library_pin}"'.encode(),
+                    )
+            for name, data in changed.items():
+                key = name[4:-3] if re.fullmatch(r"ubs-[a-z]+\.sh", name) else f"'{name}'"
+                old_pin = f"[{key}]='{self.previous_manifest.assets[name]}'".encode()
+                new_pin = f"[{key}]='{hashlib.sha256(data).hexdigest()}'".encode()
+                self.assertEqual(candidate.count(old_pin), 1, name)
+                candidate = candidate.replace(old_pin, new_pin)
+        self.next_modules = self.mirror / f"v{next_version}/modules"
+        for name, data in changed.items():
+            destination = self.next_modules / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(data)
+        self.release_dir = self.root / "signed release"
+        self.release_dir.mkdir()
+        (self.release_dir / "ubs").write_bytes(candidate)
+        shutil.copy2(REPO_ROOT / "ubs-daemon", self.release_dir / "ubs-daemon")
+        self.sign_release()
+        verifier = self.bin / "minisign"
+        verifier.write_text(SIGNATURE_SHIM)
+        verifier.chmod(0o755)
+        self.env.update(UBS_RELEASE_BASE=self.release_dir.as_uri(),
+                        UBS_MINISIGN_PUBKEY="ubs-upgrade-test-trusted-key")
+        (self.target / "src").mkdir()
+        (self.target / "src/main.rs").write_text("fn main() {}\n")
+        return candidate, set(changed)
+
     def cache_snapshot(self) -> dict[str, str]:
         return {str(path.relative_to(self.cache)): hashlib.sha256(path.read_bytes()).hexdigest()
                 for path in self.cache.rglob("*")
@@ -435,6 +501,92 @@ class InstalledUpgrade(unittest.TestCase):
         self.assertEqual(payload.get("status"), "ok", output)
         self.assertIn("rust", {s.get("language") for s in payload.get("scanners", [])}, output)
         return payload
+
+    def test_next_managed_release_reuses_unchanged_assets_with_module_origin_offline(self) -> None:
+        candidate, changed = self.managed_release()
+        self.assertEqual(changed, set())
+        before = self.scan_usable()
+        result = self.update()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.runner.read_bytes(), candidate)
+        self.assertNotEqual(self.active_generation(), self.previous_generation)
+        generation.check_ready(self.previous_generation, self.previous_manifest, complete=True)
+        after = self.scan_usable()
+        self.assertEqual(before["totals"], after["totals"])
+        self.assertGreaterEqual(after["totals"]["files"], 1)
+        self.assertFalse(any("/modules/" in url for url in self.fetch_log.read_text().splitlines()))
+        self.assert_legacy_intact()
+
+    def test_next_managed_release_downloads_only_changed_authenticated_assets(self) -> None:
+        candidate, changed = self.managed_release(change_helper=True)
+        result = self.update()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.runner.read_bytes(), candidate)
+        requested = [url.split("/modules/", 1)[1] for url in self.fetch_log.read_text().splitlines()
+                     if "/modules/" in url]
+        self.assertCountEqual(requested, changed)
+        self.active_generation()
+        generation.check_ready(self.previous_generation, self.previous_manifest, complete=True)
+        self.scan_usable()
+        self.assert_legacy_intact()
+
+    def test_next_managed_release_never_reuses_modified_old_helper_and_recovers(self) -> None:
+        candidate, _ = self.managed_release()
+        relative = "helpers/ubs_core/cache.py"
+        sentinel = self.root / "modified-old-helper-executed"
+        malicious = f"from pathlib import Path\nPath({str(sentinel)!r}).write_text('executed')\n".encode()
+        (self.previous_generation / relative).write_bytes(malicious)
+        failed = self.update()
+        self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
+        self.assertEqual(self.runner.read_bytes(), self.before_runner)
+        target_manifest = generation.parse_manifest(candidate)
+        self.assertFalse(generation.generation_path(self.cache, target_manifest).exists())
+        self.assertFalse(sentinel.exists())
+        source = self.next_modules / relative
+        source.parent.mkdir(parents=True)
+        source.write_bytes((REPO_ROOT / "modules" / relative).read_bytes())
+        recovered = self.update()
+        self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+        self.assertEqual(self.runner.read_bytes(), candidate)
+        self.active_generation()
+        self.scan_usable()
+        self.assertFalse(sentinel.exists())
+        self.assertEqual((self.previous_generation / relative).read_bytes(), malicious)
+        self.assert_legacy_intact()
+
+    def test_next_managed_release_preserves_concurrent_old_generation_scan(self) -> None:
+        candidate, _ = self.managed_release(change_helper=True)
+        blocked = self.root / "next-generation-download-blocked"
+        release = self.root / "next-generation-download-release"
+        command = [str(self.runner), "--update", "--quiet", "--non-interactive"]
+        updater = subprocess.Popen(
+            command, cwd=self.root, env={**self.env, "CONTRACT_BLOCK_ASSET": "cache.py",
+                                        "CONTRACT_BLOCK_READY": str(blocked),
+                                        "CONTRACT_BLOCK_RELEASE": str(release)},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            deadline = time.monotonic() + 15
+            while not blocked.exists() and updater.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(blocked.exists(), "updater never reached the changed-asset download")
+            self.assertEqual(self.runner.read_bytes(), self.before_runner)
+            self.scan_usable()
+            generation.check_ready(self.previous_generation, self.previous_manifest, complete=True)
+            release.write_text("continue")
+            stdout, stderr = updater.communicate(timeout=90)
+            result = subprocess.CompletedProcess(command, updater.returncode, stdout, stderr)
+            self.commands.append((command, result))
+            self.assertEqual(updater.returncode, 0, stdout + stderr)
+            self.assertEqual(self.runner.read_bytes(), candidate)
+            self.active_generation()
+            self.scan_usable()
+            generation.check_ready(self.previous_generation, self.previous_manifest, complete=True)
+        finally:
+            release.write_text("continue")
+            if updater.poll() is None:
+                updater.kill()
+            updater.communicate(timeout=10)
 
     def test_v553_to_v5526_unattended_update_verifies_all_assets_before_success(self) -> None:
         self.assertEqual(hashlib.sha256(V553_CONTRACT.read_bytes()).hexdigest(),

@@ -261,6 +261,14 @@ def scan_config_reusable(contents: bytearray) -> bool:
     return 'UBS_RULES' in os.environ or not rules
 
 
+def default_module_cache(root: Path) -> Path:
+    data = Path(os.environ.get('XDG_DATA_HOME') or str(Path.home() / '.local' / 'share'))
+    # The scanner executes in the served root, including relative XDG paths.
+    if not data.is_absolute():
+        data = root / data
+    return data / 'ubs' / 'modules'
+
+
 def snapshot(root: Path, scanner: Path, *, cancel: threading.Event | None = None) -> str | None:
     """Conservative bounded content snapshot, not an mtime-only clean shortcut.
 
@@ -270,7 +278,7 @@ def snapshot(root: Path, scanner: Path, *, cancel: threading.Event | None = None
     Any uncertainty is a cache miss, never a clean result.
     """
     check_cancelled(cancel)
-    if os.environ.get('UBS_MODULE_DIR') or os.environ.get('UBS_VERIFIED_ASSET_DIR'):
+    if any(os.environ.get(name) for name in ('UBS_MODULE_DIR', 'UBS_VERIFIED_ASSET_DIR', 'UBS_HELPERS_DIR')):
         return None  # The override can select runtime assets outside this graph.
     if os.environ.get('UBS_RULES', '').strip(':'):
         return None  # Custom rules may depend on bytes outside the served root.
@@ -311,10 +319,18 @@ def snapshot(root: Path, scanner: Path, *, cancel: threading.Event | None = None
             if descriptor is not None:
                 os.close(descriptor)
 
-    roots = [root, scanner, scanner.parent / 'modules']
+    roots = [root, scanner]
+    runtimes = (scanner.parent / 'modules', default_module_cache(root))
+    if not any(path.exists() or path.is_symlink() for path in runtimes):
+        return None
     config = Path(os.environ.get('XDG_CONFIG_HOME', str(Path.home() / '.config')))
-    # Global Git excludes can change file selection without a project edit.
-    for extra in (Path.home() / '.gitconfig', Path.home() / '.gitignore', config / 'git'):
+    # Installed runners select the XDG cache, including version-bound
+    # generations, ahead of sibling modules. Observe both possible trees and
+    # their absence: publishing a generation must invalidate a legacy report.
+    # Retained generations share the existing byte/entry budget; if the whole
+    # runtime cannot be observed safely, run the ordinary scanner instead.
+    # Global Git excludes can also change selection without a project edit.
+    for extra in (*runtimes, Path.home() / '.gitconfig', Path.home() / '.gitignore', config / 'git'):
         if extra.is_symlink():
             return None
         digest.update(os.fsencode(str(extra)) + (b'1' if extra.exists() else b'0'))
@@ -600,6 +616,15 @@ class ScanService:
         # do not reuse whole reports or silently disable the caller's tools.
         source_only = request.get('selection', 'files') == 'files'
         reuse = self.cache_bytes and not live_audit and source_only
+        if reuse:
+            try:
+                # Ordinary scans create this directory even with checkout
+                # modules. Prepare it before hashing so that initialization
+                # alone does not discard the first otherwise stable report.
+                default_module_cache(self.root).mkdir(parents=True, exist_ok=True)
+            except OSError:
+                # Let the ordinary scanner report any filesystem error.
+                reuse = False
         before = snapshot(self.root, self.scanner, cancel=cancellation) if reuse else None
         check_cancelled(cancellation)
         key = (tuple(map(str, paths)), tuple(options), before)

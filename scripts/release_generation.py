@@ -310,6 +310,35 @@ def check_parents(root: Path, relative: str) -> Path:
     return root / relative
 
 
+def read_cached_asset(root: Path, relative: str) -> bytes:
+    """Read cache bytes without admitting a changed or symlinked source tree.
+
+    Cache contents are only candidates: the caller must still authenticate
+    these exact bytes against the target release's pin. Keep directory
+    identities around the no-follow file read so a source-directory swap is
+    not mistaken for an ordinary missing or valid historical asset.
+    """
+    parents = [root.parent, root]
+    current = root
+    for part in relative.split("/")[:-1]:
+        current = current / part
+        parents.append(current)
+    identities = []
+    for parent in parents:
+        info = parent.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or is_reparse(info)
+                or (not OPEN_NOFOLLOW and not info.st_ino)):
+            raise UpdateError(f"unsafe cached asset directory: {parent}")
+        identities.append((parent, info))
+    data = read_regular(root / relative)
+    for parent, before in identities:
+        after = parent.lstat()
+        if (not stat.S_ISDIR(after.st_mode) or is_reparse(after)
+                or not os.path.samestat(before, after)):
+            raise UpdateError(f"cached asset directory changed while reading: {parent}")
+    return data
+
+
 def unexpected_entries(path: Path, files: set[str]) -> list[tuple[str, os.stat_result]]:
     """Find topmost unpinned entries without traversing unknown trees or links.
 
@@ -545,7 +574,8 @@ def verify_lock_identity(descriptor: int, path: Path) -> None:
 
 
 def prepare_manifest(manifest: Manifest, root: Path, raw_base: str, *, allow_override: bool,
-                     local_source: Optional[Path] = None, repair: bool = False) -> Path:
+                     local_source: Optional[Path] = None, repair: bool = False,
+                     previous_generation: Optional[Path] = None) -> Path:
     """Publish one complete generation, without changing any active file.
 
     The caller authenticates runner before calling this function and atomically
@@ -576,14 +606,15 @@ def prepare_manifest(manifest: Manifest, root: Path, raw_base: str, *, allow_ove
             for relative, expected in sorted(manifest.assets.items()):
                 data = b""
                 sources = [root]
+                if previous_generation is not None and previous_generation != target:
+                    sources.insert(0, previous_generation)
                 if local_source is not None:
                     sources.insert(0, local_source)
                 if existing:
                     sources.insert(0, target)
                 for source_root in sources:
                     try:
-                        real_directory(source_root)
-                        data = read_regular(check_parents(source_root, relative))
+                        data = read_cached_asset(source_root, relative)
                     except (OSError, UpdateError):
                         data = b""
                     if hmac.compare_digest(digest(data), expected):
@@ -751,11 +782,25 @@ def publish(candidate: Path, root: Path, raw_base: str, installed: Path,
                 and (expected_current_sha == "absent" or not hmac.compare_digest(current_sha, manifest.runner_sha256))):
             raise UpdateError("installed runner changed during update; retry with the current release")
         mode = 0o755
+        previous_generation = None
         if current is not None:
             previous_version = runner_version(current)
             if tuple(map(int, manifest.version.split("."))) < tuple(map(int, previous_version.split("."))):
                 raise UpdateError("refusing to downgrade the installed runner")
             mode = stat.S_IMODE(installed.stat().st_mode)
+            if current.splitlines().count(b"UBS_RELEASE_GENERATIONS=1") == 1:
+                try:
+                    previous_manifest = parse_manifest(current)
+                except (UnicodeError, UpdateError):
+                    # An old/malformed manifest cannot identify a reusable
+                    # generation. The authenticated target can still repair
+                    # the install from its own verified downloads.
+                    pass
+                else:
+                    # Read only the generation named by the leased runner,
+                    # never arbitrary staging/quarantine/ready-marker data.
+                    # Every reused byte is checked against the TARGET pin.
+                    previous_generation = generation_path(root.resolve(), previous_manifest)
         daemon_expected = daemon_pin(source)
         daemon_data = None
         daemon_target = None
@@ -768,7 +813,8 @@ def publish(candidate: Path, root: Path, raw_base: str, installed: Path,
             if daemon_target.is_symlink() or (daemon_target.exists() and not daemon_target.is_file()):
                 raise UpdateError("unsafe daemon installation path")
         target = prepare_manifest(manifest, root, raw_base, allow_override=allow_override,
-                                  local_source=local_source, repair=True)
+                                  local_source=local_source, repair=True,
+                                  previous_generation=previous_generation)
         # Recheck after downloads: a non-cooperating older updater may not use
         # our lock. Never overwrite a runner that changed while we prepared.
         try:

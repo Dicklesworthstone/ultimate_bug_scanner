@@ -165,6 +165,17 @@ class SanitizerBindings:
                 self.dynamic_namespace = True
                 self.builtin_namespace = True
                 break
+        for name in ('setattr', 'delattr'):
+            for reference in self.name_loads.get(name, ()):
+                if (reference not in self.direct_callees
+                        and self.resolve(reference) in (None, ('unbound', name))):
+                    # Aliasing/exporting the builtin preserves its ability
+                    # to replace an execution method without a named call.
+                    self.reflective_member_writes = True
+        if any(isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load)
+               and node.attr in {'setattr', 'delattr', '__setattr__', '__delattr__'}
+               and node not in self.direct_callees for node in self.scope_of):
+            self.reflective_member_writes = True
         for call in self.calls:
             if call_name(call.func).rsplit('.', 1)[-1] in {'setattr', 'delattr', '__setattr__', '__delattr__'}:
                 self.reflective_member_writes = True
@@ -396,6 +407,27 @@ class SanitizerBindings:
     def class_escapes(self, owner):
         if owner in self._escaped_classes:
             return self._escaped_classes[owner]
+        for statement in owner.body:
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if any(not isinstance(decorator, ast.Name)
+                       or decorator.id not in {'classmethod', 'staticmethod'}
+                       or self.resolve(decorator) != ('unbound', decorator.id)
+                       for decorator in statement.decorator_list):
+                    self._escaped_classes[owner] = True
+                    return True
+            elif isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                value = statement.value
+                targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+                if (any(not isinstance(target, ast.Name) for target in targets)
+                        or value is not None and not isinstance(value, ast.Constant)):
+                    # An unknown class value can be a descriptor whose
+                    # __set_name__/__get__ receives the owner implicitly.
+                    self._escaped_classes[owner] = True
+                    return True
+            elif not (isinstance(statement, ast.Pass)
+                      or isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant)):
+                self._escaped_classes[owner] = True
+                return True
         names = {owner.name}
         for statement in owner.body:
             if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -408,14 +440,30 @@ class SanitizerBindings:
                     continue
                 parent = self.parents.get(reference)
                 if isinstance(parent, ast.Attribute) and parent.value is reference:
-                    # An exported bound method exposes its receiver too.
+                    # Only a known local method used directly keeps the
+                    # receiver closed. Opaque/decorated descriptors and
+                    # exported attributes can expose it without a self arg.
                     member = self.resolve(parent)
-                    if member and member[0] == 'function' and parent not in self.direct_callees:
-                        escaped = True
-                        break
-                    continue
+                    if (member and member[0] == 'function' and parent in self.direct_callees
+                            and (member[2] or [call_name(value) for value in member[1].decorator_list]
+                                 == ['staticmethod'])):
+                        continue
+                    escaped = True
+                    break
                 if target[0] == 'class' and isinstance(parent, ast.Call) and parent.func is reference:
-                    continue
+                    use = self.parents.get(parent)
+                    if isinstance(use, ast.Expr):
+                        continue
+                    if (isinstance(use, ast.Attribute) and use.value is parent
+                            and use in self.direct_callees):
+                        member = self.lookup(use.attr, self.owner_scopes[owner])
+                        if member and member[0] == 'function':
+                            continue
+                    # Stored/exported construction results expose an instance
+                    # even when the class name itself remains unmodified.
+                    # No instance-alias ownership summary proves these uses.
+                    escaped = True
+                    break
                 escaped = True
                 break
             if escaped:
@@ -426,9 +474,9 @@ class SanitizerBindings:
     def forwards_to_unknown(self, function, bound):
         """Refuse a non-SQL certificate when the SQL slot escapes to a callback.
 
-        Follow raw parameter/alias text through local helper parameters. Field
-        selection from an interpreter's statement record is not raw SQL text;
-        actual SQL-family operations in any callee are checked separately.
+        Follow parameter/alias text through local helper parameters, including
+        record fields. Field selection needs its own provenance proof before
+        forwarding to an opaque callback can be certified non-SQL.
         """
         cache_key = function, bound
         if cache_key in self._forwarding_cache:
@@ -453,7 +501,7 @@ class SanitizerBindings:
                 if isinstance(value, ast.Name):
                     return value.id in names
                 if isinstance(value, ast.Attribute):
-                    return False
+                    return carries_text(value.value)
                 if isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute):
                     if carries_text(value.func.value):
                         return True

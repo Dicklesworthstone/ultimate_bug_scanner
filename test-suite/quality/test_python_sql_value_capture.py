@@ -1177,6 +1177,169 @@ class SQLValueCaptureTests(unittest.TestCase):
                       + '        return self.execute(f"SELECT {user}")\n')
             self.inspect('escaped-execute-' + name, source, ((CRITICAL, 6),))
 
+    def test_escaped_setter_capabilities_invalidate_local_execute(self):
+        owner = ('class Runner:\n    def execute(self, query):\n        return len(query)\n'
+                 '    def run(self, user):\n'
+                 '        return self.execute(f"SELECT count(*) FROM users WHERE name = \'{user}\'")\n')
+        for name, effect in (
+                ('setattr-alias', 'install = setattr\nconfigure(install)\n'),
+                ('delattr-alias', 'remove = delattr\nconfigure(remove)\n'),
+                ('imported-setter', 'from builtins import setattr as install\nconfigure(install)\n'),
+                ('imported-deleter', 'from builtins import delattr as remove\nconfigure(remove)\n'),
+                ('object-setter', 'install = object.__setattr__\nconfigure(install)\n'),
+                ('object-deleter', 'remove = object.__delattr__\nconfigure(remove)\n')):
+            with self.subTest(capability=name):
+                self.inspect('escaped-capability-' + name, owner + effect, ((CRITICAL, 5),))
+        for name in ('setattr', 'delattr'):
+            source = f'def {name}(value):\n    return value\n' + owner
+            source += f'callback = {name}\nconfigure(callback)\n'
+            self.inspect('shadowed-capability-' + name, source, ())
+        witness = ('def configure(install):\n'
+                   '    install(Runner, "execute", lambda self, query: db.execute(query))\n' + owner
+                   + 'def run(cursor, params, user, rows):\n    global db\n    db = cursor\n'
+                   '    install = setattr\n    configure(install)\n'
+                   '    return Runner().run(user).fetchone()[0]\n')
+        self.assertEqual(sqlite_witness(self.artifacts, 'escaped-setter', witness)['rows'], 2)
+
+    def test_record_field_sql_forwarding_is_not_a_non_database_proof(self):
+        record = ('from dataclasses import dataclass\n@dataclass\nclass Request:\n    query: str\n')
+        for name, body in (
+                ('direct', '        return run_query(request.query)\n'),
+                ('alias', '        saved = request.query\n        return run_query(saved)\n'),
+                ('helper', '        return self.send(request.query)\n'
+                 '    def send(self, value):\n        return run_query(value)\n')):
+            owner = ('class Runner:\n    def execute(self, request):\n' + body
+                     + '    def run(self, user):\n'
+                     '        return self.execute(Request(f"SELECT count(*) FROM users WHERE name = \'{user}\'"))\n')
+            source = 'from backend import run_query\n' + record + owner
+            with self.subTest(forwarding=name):
+                self.inspect('record-field-' + name, source, ((CRITICAL, len(source.splitlines())),))
+            witness = ('def run_query(query):\n    return db.execute(query)\n' + record + owner
+                       + 'def run(cursor, params, user, rows):\n    global db\n    db = cursor\n'
+                       '    return Runner().run(user).fetchone()[0]\n')
+            self.assertEqual(sqlite_witness(self.artifacts, 'record-field-' + name, witness)['rows'], 2)
+
+    def test_constructed_and_implicit_receiver_exports_keep_sql_findings(self):
+        method = ('    def execute(self, query):\n        return len(query)\n')
+        sink = '        return self.execute(f"SELECT count(*) FROM users WHERE name = \'{user}\'")\n'
+        cases = (
+            ('stored-instance', 'class Runner:\n' + method + '    def run(self, user):\n' + sink,
+             'runner = Runner()\nconfigure(runner)\nreturn runner.run(user).fetchone()[0]\n'),
+            ('constructor-export', 'class Runner:\n' + method + '    def run(self, user):\n' + sink,
+             'runner = configure(Runner())\nreturn runner.run(user).fetchone()[0]\n'),
+            ('class-from-instance', 'class Runner:\n' + method + '    def run(self, user):\n'
+             '        configure(self.__class__)\n' + sink,
+             'return Runner().run(user).fetchone()[0]\n'),
+            ('bound-import', 'class Runner:\n    configure = configure\n' + method
+             + '    def run(self, user):\n        self.configure()\n' + sink,
+             'return Runner().run(user).fetchone()[0]\n'),
+            ('property', 'class Runner:\n' + method + '    @property\n    def refresh(self):\n'
+             '        configure(self)\n        return None\n'
+             '    def run(self, user):\n        self.refresh\n' + sink,
+             'return Runner().run(user).fetchone()[0]\n'),
+            ('descriptor-owner', 'class Runner:\n    hook = Descriptor()\n' + method
+             + '    def run(self, user):\n' + sink,
+             'return Runner().run(user).fetchone()[0]\n'),
+        )
+        driver = ('def configure(instance):\n    if isinstance(instance, type):\n'
+                  '        instance.execute = lambda self, query: db.execute(query)\n'
+                  '    else:\n        instance.execute = db.execute\n    return instance\n'
+                  'class Descriptor:\n    def __set_name__(self, owner, name):\n'
+                  '        owner.execute = lambda self, query: db.execute(query)\n')
+        for name, owner, body in cases:
+            source = ('from backend import configure, Descriptor\n' + owner
+                      + 'def run(user):\n' + ''.join('    ' + line + '\n' for line in body.splitlines()))
+            line = next(n for n, value in enumerate(source.splitlines(), 1) if 'return self.execute(' in value)
+            with self.subTest(receiver=name):
+                self.inspect('receiver-export-' + name, source, ((CRITICAL, line),))
+                witness = (driver + owner + 'def run(cursor, params, user, rows):\n'
+                           '    global db\n    db = cursor\n'
+                           + ''.join('    ' + line + '\n' for line in body.splitlines()))
+                self.assertEqual(sqlite_witness(self.artifacts, 'receiver-export-' + name, witness)['rows'], 2)
+        closed = ('class Runner:\n    label = "ordinary application"\n' + method
+                  + '    def run(self, user):\n' + sink
+                  + 'result = Runner().run(user)\n')
+        self.inspect('closed-immediate-receiver', closed, ())
+
+    def test_kotlin_interpreter_keeps_unproved_receiver_effects_explicit(self):
+        path = ROOT / 'modules/helpers/ubs_core/analyzers/narrowing_kotlin.py'
+        source = path.read_text(encoding='utf-8')
+        self.assertIn('def run_statement(', source)
+        self.assertEqual(list(detector.find([path])), [])
+        restored = source.replace('self.run_statement(', 'self.execute(').replace(
+            'def run_statement(', 'def execute(')
+        case = self.artifacts / 'kotlin-interpreter-restored-execute.py'
+        case.write_text(restored, encoding='utf-8')
+        # Remove this boundary and the naming workaround together only when
+        # receiver/record effects are modeled without clearing the unsafe
+        # field, descriptor and constructor witnesses above.
+        with self.assertRaisesRegex(detector.SQLFlowLimit, 'consumer call effects.*incomplete'):
+            list(detector.find([case]))
+
+    def test_class_qualified_instance_calls_need_receiver_ownership(self):
+        owner = ('class Runner:\n    def execute(self, query):\n        return len(query)\n'
+                 '    def run(self, user):\n'
+                 '        return self.execute(f"SELECT count(*) FROM users WHERE name = \'{user}\'")\n')
+        for name, extra, invocation in (
+                ('direct', '', 'Runner.run(cursor, user)'),
+                ('classmethod-forwarder', '    @classmethod\n    def invoke(cls, cursor, user):\n'
+                 '        return cls.run(cursor, user)\n', 'Runner.invoke(cursor, user)')):
+            source = owner + extra + 'def call(cursor, user):\n    return ' + invocation + '\n'
+            with self.subTest(receiver=name):
+                self.inspect('unbound-receiver-' + name, source, ((CRITICAL, 5),))
+                witness = (owner + extra + 'def run(cursor, params, user, rows):\n'
+                           '    return ' + invocation + '.fetchone()[0]\n')
+                self.assertEqual(sqlite_witness(self.artifacts, 'unbound-receiver-' + name, witness)['rows'], 2)
+        for decorator, receiver, parameter in (
+                ('staticmethod', 'Runner', ''), ('classmethod', 'cls', 'cls, ')):
+            source = (f'class Runner:\n    @{decorator}\n    def execute({parameter}query):\n'
+                      '        return len(query)\n'
+                      f'    @{decorator}\n    def run({parameter}user):\n'
+                      f'        return {receiver}.execute(f"SELECT {{user}}")\n'
+                      'result = Runner.run(user)\n')
+            self.inspect('verified-class-access-' + decorator, source, ())
+
+    def test_callback_indirection_and_implicit_calls_keep_dictionary_refusal(self):
+        helper = 'def merge(keys):\n    return dict.fromkeys(key for key in keys)\n'
+        callback = 'lambda keys: dict.fromkeys(key for key in keys)'
+        cases = (
+            ('caller-before-helper-sink', helper + 'def send(cursor):\n    cursor.execute(query)\n'
+             'def run(cursor):\n    merge([Key()])\n    send(cursor)\n'),
+            ('named-callback-sink', helper + 'def send(cursor):\n    cursor.execute(query)\n'
+             'def run(cursor):\n    merge([Key()])\n    opaque(send, cursor)\n'),
+            ('lambda-registry', f'registry = {{"merge": {callback}}}\n'
+             'def run(cursor):\n    registry["merge"]([Key()])\n    cursor.execute(query)\n'),
+            ('lambda-alias', f'def run(cursor):\n    fn = {callback}\n    alias = fn\n'
+             '    alias([Key()])\n    cursor.execute(query)\n'),
+            ('lambda-callback', f'def run(cursor):\n    opaque({callback}, [Key()])\n    cursor.execute(query)\n'),
+            ('lambda-return', f'def factory():\n    return {callback}\n'
+             'def run(cursor):\n    factory()([Key()])\n    cursor.execute(query)\n'),
+            ('lambda-sink', helper + 'send = lambda cursor: cursor.execute(query)\n'
+             'def run(cursor):\n    merge([Key()])\n    send(cursor)\n'),
+            ('locals', f'def run(cursor):\n    merge = {callback}\n'
+             '    fn = locals()["merge"]\n    fn([Key()])\n    cursor.execute(query)\n'),
+            ('eval', f'def run(cursor):\n    merge = {callback}\n'
+             '    fn = eval("merge")\n    fn([Key()])\n    cursor.execute(query)\n'),
+            ('namespace-alias', 'from builtins import locals as snapshot\n'
+             f'def run(cursor):\n    merge = {callback}\n'
+             '    fn = snapshot()["merge"]\n    fn([Key()])\n    cursor.execute(query)\n'),
+            ('eager-global-alias', f'merge = {callback}\nfn = globals()["merge"]\n'
+             'def run(cursor):\n    fn([Key()])\n    cursor.execute(query)\n'),
+            ('frame', 'from inspect import currentframe as frame\n'
+             f'def run(cursor):\n    merge = {callback}\n'
+             '    fn = frame().f_locals["merge"]\n    fn([Key()])\n    cursor.execute(query)\n'),
+            ('constructor', helper + 'class Prepare:\n    def __init__(self):\n        merge([Key()])\n'
+             'def run(cursor):\n    Prepare()\n    cursor.execute(query)\n'),
+            ('decorator', '@invoke\n' + helper + 'def run(cursor):\n    cursor.execute(query)\n'),
+        )
+        for initial in ('"SELECT 1"', '"not SQL"'):
+            for name, body in cases:
+                with self.subTest(initial=initial, callable=name):
+                    path = self.artifacts / ('callable-boundary-' + str(initial == '"SELECT 1"') + '-' + name + '.py')
+                    path.write_text('query = ' + initial + '\n' + body, encoding='utf-8')
+                    with self.assertRaisesRegex(detector.SQLFlowLimit, 'analysis is incomplete'):
+                        list(detector.find([path]))
+
     def test_exclusive_list_consumers_preserve_sql_and_reject_aliases(self):
         cases = (
             ('extend-sql', '    queries = []\n    queries.extend(f"SELECT {user}" for item in [1])\n    cursor.execute(queries[0])\n', ((CRITICAL, 4),)),

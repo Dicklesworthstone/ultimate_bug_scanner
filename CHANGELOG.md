@@ -50,10 +50,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
   SQL effects, resolves bounded ordinary attribute-name tables, and checks
   local `execute` wrappers before treating their names as database APIs.
   Rebinding, namespace reflection, generator-key callbacks and unresolved
-  SQL forwarding remain conservative. The Kotlin flow analyzer can use its
-  original `execute` name again. The PHP analyzer's four eager dictionary
-  comprehensions remain until record-state writes have a sufficient heap
-  proof; restoring them must not hide callback-mediated SQL execution.
+  SQL forwarding remain conservative. Escaped setter capabilities, stored
+  instances, imported bound methods and opaque descriptors invalidate local
+  method proofs; forwarding a record field preserves its SQL evidence.
+  The Kotlin flow analyzer retains `run_statement` until receiver ownership
+  is proven, and the PHP analyzer's four eager dictionary comprehensions
+  remain until record-state writes have a sufficient heap proof. Restoring
+  those workarounds must not hide callback-mediated SQL execution.
 - Reassessed the 24 v5.5.26 release suppressions from GH #195: removed six
   I/O-loop markers and one comparison marker after detector regressions
   passed. Retained fifteen genuine high-parameter-count findings tracked by

@@ -17,7 +17,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="67e18d8fe599dd85279ecb3115ae371b19bf005b355ad181ba8479a19e99594a"
+UBS_LIB_CHECKSUM="0efa0fd18839a5e7b32023651536d69b92ad8c7d2ac6bcdd355c6cfc37669f7e"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -492,6 +492,9 @@ category_enabled() {
 
 # Cargo helpers
 check_cargo() {
+  local helpers_dir="$1" context
+  CARGO_PROJECT_DIR="$PROJECT_DIR"
+  CARGO_CONTEXT_ERROR=""
   HAS_CARGO=0
   HAS_CLIPPY=0
   HAS_FMT=0
@@ -514,6 +517,24 @@ check_cargo() {
   fi
 
   HAS_CARGO=1
+  if [[ -n "${UBS_SHADOW_WORKSPACE_DIR:-}" || -n "${UBS_SHADOW_SOURCE_DIR:-}" ]]; then
+    if context=$(PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 - "$PROJECT_DIR" <<'PYCARGOCONTEXT'
+import sys
+from pathlib import Path
+from ubs_core.rust_scan import cargo_project_in_context
+
+try:
+    print(cargo_project_in_context(Path(sys.argv[1])))
+except (OSError, ValueError) as error:
+    print(f"Cargo source context unavailable: {error}")
+    sys.exit(1)
+PYCARGOCONTEXT
+    ); then
+      CARGO_PROJECT_DIR="$context"
+    else
+      CARGO_CONTEXT_ERROR="$context"
+    fi
+  fi
   if command -v cargo-fmt >/dev/null 2>&1 || command -v rustfmt >/dev/null 2>&1; then HAS_FMT=1; fi
   if command -v cargo-clippy >/dev/null 2>&1; then HAS_CLIPPY=1; fi
   if command -v cargo-audit >/dev/null 2>&1; then HAS_AUDIT=1; fi
@@ -529,10 +550,22 @@ run_cargo_subcmd() {
     : >"$logfile"; echo 0 >"$logfile.ec"; return 0
   fi
   CARGO_INVOKED+=("$name")
+  if [[ -n "$CARGO_CONTEXT_ERROR" ]]; then
+    printf '%s\n' "$CARGO_CONTEXT_ERROR" >"$logfile"
+    printf '1\n' >"$logfile.ec"
+    return 0
+  fi
   set +e
   trap - ERR
-  ( cd "$PROJECT_DIR" && CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-never}" "$@" ) >"$logfile" 2>&1
-  ec=$?
+  if [[ "$name" == "audit" ]]; then
+    TMP_FILES+=("$logfile.json" "$logfile.stderr")
+    ( cd "$CARGO_PROJECT_DIR" && CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-never}" "$@" ) >"$logfile.json" 2>"$logfile.stderr"
+    ec=$?
+    cat "$logfile.json" "$logfile.stderr" >"$logfile"
+  else
+    ( cd "$CARGO_PROJECT_DIR" && CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-never}" "$@" ) >"$logfile" 2>&1
+    ec=$?
+  fi
   trap on_err ERR
   set -e
   echo "$ec" >"$logfile.ec"
@@ -545,13 +578,21 @@ cargo_phase_ec() {
 
 count_warnings_errors() {
   local file="$1"
-  local w e
-  # Cargo/RCH may force terminal colors even with NO_COLOR set. Preserve the
-  # original log, but count the visible diagnostics rather than escape bytes.
-  # Coded rustc errors (error[E0512]) are compiler findings, not unavailable tools.
-  w=$(sed $'s/\033\\[[0-9;]*m//g' "$file" | grep -E -c "^warning(\[[^]]+\])?: |: warning:" || true)
-  e=$(sed $'s/\033\\[[0-9;]*m//g' "$file" | grep -E -c "^error(\[[^]]+\])?: |: error:" || true)
-  echo "${w:-0} ${e:-0}"
+  local helpers_dir=""
+  ubs_resolve_helpers_dir helpers_dir || helpers_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers"
+  python3 -I - "$file" "$helpers_dir" <<'PYCARGODIAGNOSTICS'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[2])
+from ubs_core.rust_scan import cargo_diagnostic_counts
+
+path = Path(sys.argv[1])
+receipt = Path(str(path) + ".ec")
+# Only an actual zero receipt admits successful ancillary diagnostics. A
+# missing or malformed receipt cannot turn an error into a warning.
+native_exit = 0 if receipt.is_file() and receipt.read_text().strip() == "0" else None
+print(*cargo_diagnostic_counts(path.read_text(errors="replace"), native_exit))
+PYCARGODIAGNOSTICS
 }
 
 CARGO_UNAVAILABLE=0
@@ -703,19 +744,50 @@ run_v2_cargo_phases(){
     if [[ "$RUN_CARGO" -eq 1 && "$HAS_CARGO" -eq 1 ]]; then
       if [[ "$HAS_AUDIT" -eq 1 ]]; then
         local AUDIT_LOG
-        AUDIT_LOG="$(mktemp 2>/dev/null || mktemp -t ubs-rust-audit.XXXXXX)"; TMP_FILES+=("$AUDIT_LOG"); run_cargo_subcmd "audit" "$AUDIT_LOG" cargo audit
-        local audit_vuln
-        audit_vuln=$(grep -c -E "Vulnerability|RUSTSEC" "$AUDIT_LOG" 2>/dev/null || true); audit_vuln=${audit_vuln:-0}
-        if [[ "$audit_vuln" -gt 0 ]]; then print_finding "critical" "$audit_vuln" "Advisories found by cargo-audit"; _v2_add_finding "critical" "$audit_vuln" "Advisories found by cargo-audit" "" "${CATEGORY_NAME[14]}"
-        elif [[ "$(cargo_phase_ec "$AUDIT_LOG")" -ne 0 ]]; then _v2_report_cargo_failure "warning" "$AUDIT_LOG" "${CATEGORY_NAME[14]}" "cargo audit could not run"
-        else print_finding "good" "No known advisories (cargo-audit)"; fi
+        AUDIT_LOG="$(mktemp 2>/dev/null || mktemp -t ubs-rust-audit.XXXXXX)"; TMP_FILES+=("$AUDIT_LOG"); run_cargo_subcmd "audit" "$AUDIT_LOG" cargo audit --json
+        local audit_report audit_vuln audit_warn audit_details audit_helpers_dir=""
+        ubs_resolve_helpers_dir audit_helpers_dir || audit_helpers_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers"
+        if audit_report=$(python3 -I - "$AUDIT_LOG.json" "$audit_helpers_dir" <<'PYCARGOAUDIT'
+import json
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[2])
+from ubs_core.rust_scan import cargo_audit_counts
+
+try:
+    print(json.dumps(cargo_audit_counts(json.loads(Path(sys.argv[1]).read_text()))))
+except (OSError, ValueError) as error:
+    print(f"cargo-audit report could not be classified: {error}", file=sys.stderr)
+    sys.exit(1)
+PYCARGOAUDIT
+        ); then
+          audit_vuln=$(printf '%s' "$audit_report" | jq -r '.critical')
+          audit_warn=$(printf '%s' "$audit_report" | jq -r '.warning')
+          audit_details=$(printf '%s' "$audit_report" | jq -r '.details')
+          if [[ "$audit_vuln" -gt 0 ]]; then
+            print_finding "critical" "$audit_vuln" "Vulnerabilities or unsoundness found by cargo-audit" "$audit_details"
+            _v2_add_finding "critical" "$audit_vuln" "Vulnerabilities or unsoundness found by cargo-audit" "$audit_details" "${CATEGORY_NAME[14]}"
+          fi
+          if [[ "$audit_warn" -gt 0 ]]; then
+            print_finding "warning" "$audit_warn" "Informational cargo-audit notices" "$audit_details"
+            _v2_add_finding "warning" "$audit_warn" "Informational cargo-audit notices" "$audit_details" "${CATEGORY_NAME[14]}"
+          fi
+          if [[ "$(cargo_phase_ec "$AUDIT_LOG")" -ne 0 && "$audit_vuln" -eq 0 ]]; then
+            print_finding "critical" 1 "cargo-audit rejected its report" "$audit_details"
+            _v2_add_finding "critical" 1 "cargo-audit rejected its report" "$audit_details" "${CATEGORY_NAME[14]}"
+          elif [[ "$audit_vuln" -eq 0 && "$audit_warn" -eq 0 ]]; then
+            print_finding "good" "No known advisories or informational notices (cargo-audit)"
+          fi
+        else
+          _v2_report_cargo_failure "warning" "$AUDIT_LOG" "${CATEGORY_NAME[14]}" "cargo audit report could not be classified"
+        fi
       else
         print_finding "info" 1 "cargo-audit not installed; skipping advisory scan"
         _v2_add_finding "info" 1 "cargo-audit not installed; skipping advisory scan" "" "${CATEGORY_NAME[14]}"
       fi
       if [[ "$HAS_DENY" -eq 1 ]]; then
         local -a DENY_CHECKS=(advisories bans sources)
-        if [[ -f "$PROJECT_DIR/deny.toml" || -f "$PROJECT_DIR/.cargo/deny.toml" || -f "$PROJECT_DIR/.deny.toml" ]]; then
+        if [[ -f "$CARGO_PROJECT_DIR/deny.toml" || -f "$CARGO_PROJECT_DIR/.cargo/deny.toml" || -f "$CARGO_PROJECT_DIR/.deny.toml" ]]; then
           DENY_CHECKS+=(licenses)
         else
           print_finding "info" 1 "cargo-deny licenses check skipped: no deny.toml (cargo-deny allows no license until one is listed there)"
@@ -933,7 +1005,7 @@ run_contract_v2_rust(){
   TMP_FILES+=("$list_file" "$sink" "$checks")
   V2_SINK="$sink"
 
-  check_cargo
+  check_cargo "$helpers_dir"
 
   # Cargo and its plugins manage their own build/audit scratch. UBS cannot
   # retain that storage, so refuse only when an enabled phase would launch.

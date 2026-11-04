@@ -171,7 +171,7 @@ class ServiceTests(unittest.TestCase):
         path.write_text('preserve me')
         self.assertEqual(self.cli('serve').returncode, 2)
         self.assertEqual(path.read_text(), 'preserve me')
-        path.parent.chmod(0o777)
+        path.parent.chmod(0o777)  # ubs:ignore[py.security.file-permissions] Deliberate unsafe-directory refusal fixture; the next assertion requires rejection.
         self.assertEqual(self.cli('status').returncode, 2)
 
     def test_stale_socket_is_recovered_under_lock(self):

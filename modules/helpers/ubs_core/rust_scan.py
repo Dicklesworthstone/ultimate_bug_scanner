@@ -301,6 +301,120 @@ def integration_test_root_in_context(path: Path, environ=None) -> bool:
     return source is not None and cargo_integration_test_root(source)
 
 
+def cargo_project_in_context(project: Path, environ=None) -> Path:
+    """Keep explicitly selected Cargo manifests in their complete source tree.
+
+    Static checks still inspect only the selected copies. Cargo requires the
+    original workspace's member manifests, configuration and modules. Refuse
+    a stale or unmapped manifest/lock instead of running against another input.
+    Callers retain their existing skip when no Cargo.toml was selected.
+    """
+    env = os.environ if environ is None else environ
+    if not env.get("UBS_SHADOW_WORKSPACE_DIR") and not env.get("UBS_SHADOW_SOURCE_DIR"):
+        return project
+    source = shadow_source_path(project / "Cargo.toml", env)
+    if source is None:
+        raise ValueError("selected Cargo.toml has no original source mapping")
+    for name in ("Cargo.toml", "Cargo.lock"):
+        selected = project / name
+        if name == "Cargo.lock" and not selected.exists() and not selected.is_symlink():
+            continue
+        original = shadow_source_path(selected, env)
+        if original is None or original.parent.resolve() != source.parent.resolve():
+            raise ValueError(f"selected {name} maps outside its Cargo project")
+        if selected.read_bytes() != original.read_bytes():
+            raise ValueError(f"selected {name} differs from its original source")
+    return source.parent
+
+
+def cargo_diagnostic_counts(text: str, native_exit: int | None) -> tuple[int, int]:
+    """Count native Cargo diagnostics without turning successful discovery into failure.
+
+    Cargo can print an uncoded manifest error while discovering packages in a
+    Git dependency and still successfully build the selected package. Keep
+    that output visible as a warning only when its exit status is known to be
+    zero. Coded compiler errors remain critical even with a contradictory
+    zero exit; nonzero or unknown exits retain the original error counts.
+    """
+    visible = re.sub(r"\x1b\[[0-9;]*m", "", text)
+    warnings = errors = 0
+    for line in visible.splitlines():
+        if re.search(r"^warning(\[[^]]+\])?: |: warning:", line):
+            warnings += 1
+        if re.search(r"^error(\[[^]]+\])?: |: error:", line):
+            if native_exit == 0 and not re.search(r"^error\[[^]]+\]: ", line):
+                warnings += 1
+            else:
+                errors += 1
+    return warnings, errors
+
+
+def cargo_audit_counts(report: object) -> dict:
+    """Classify the native audit report, preserving informational notices.
+
+    Advisory identifiers and URLs are presentation, not vulnerability counts.
+    Unsoundness remains critical even when Cargo calls it informational.
+    Unknown, contradictory or ignored results cannot establish a clean audit.
+    """
+    if not isinstance(report, dict):
+        raise ValueError("cargo-audit report is not an object")
+    settings = report.get("settings")
+    vulnerabilities = report.get("vulnerabilities")
+    warnings = report.get("warnings")
+    if not isinstance(settings, dict) or not isinstance(vulnerabilities, dict) or not isinstance(warnings, dict):
+        raise ValueError("cargo-audit report lacks settings, vulnerabilities or warnings")
+    ignored = settings.get("ignore")
+    if not isinstance(ignored, list) or ignored:
+        raise ValueError("cargo-audit report has unknown or ignored advisory coverage")
+    informational = settings.get("informational_warnings")
+    if (set(settings) != {"target_arch", "target_os", "severity", "ignore", "informational_warnings"}
+            or settings["target_arch"] != [] or settings["target_os"] != [] or settings["severity"] is not None
+            or not isinstance(informational, list) or any(not isinstance(kind, str) for kind in informational)
+            or len(informational) != 3 or set(informational) != {"unmaintained", "unsound", "notice"}):
+        raise ValueError("cargo-audit report has filtered or unknown advisory coverage")
+    found = vulnerabilities.get("found")
+    count = vulnerabilities.get("count")
+    entries = vulnerabilities.get("list")
+    if (type(found) is not bool or type(count) is not int or count < 0
+            or not isinstance(entries, list) or count != len(entries) or found != (count > 0)):
+        raise ValueError("cargo-audit vulnerability count is inconsistent")
+    critical, warning = count, 0
+    details = []
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("advisory"), dict):
+            raise ValueError("cargo-audit vulnerability entry is invalid")
+        identity = entry["advisory"].get("id")
+        if not isinstance(identity, str) or not identity:
+            raise ValueError("cargo-audit vulnerability identity is invalid")
+        details.append("vulnerability: " + identity)
+    for kind, notices in warnings.items():
+        if kind not in {"unmaintained", "notice", "yanked", "unsound"} or not isinstance(notices, list):
+            raise ValueError("cargo-audit warning category is unknown or invalid")
+        for notice in notices:
+            if not isinstance(notice, dict) or notice.get("kind") != kind:
+                raise ValueError("cargo-audit warning kind is inconsistent")
+            package = notice.get("package")
+            if (not isinstance(package, dict) or not isinstance(package.get("name"), str)
+                    or not package["name"] or not isinstance(package.get("version"), str) or not package["version"]):
+                raise ValueError("cargo-audit warning package is invalid")
+            advisory = notice.get("advisory")
+            if kind == "yanked":
+                if advisory is not None:
+                    raise ValueError("cargo-audit yanked notice has an unexpected advisory")
+                identity = ""
+            else:
+                if (not isinstance(advisory, dict) or advisory.get("informational") != kind
+                        or not isinstance(advisory.get("id"), str) or not advisory["id"]):
+                    raise ValueError("cargo-audit informational advisory is inconsistent")
+                identity = " (" + advisory["id"] + ")"
+            if kind == "unsound":
+                critical += 1
+            else:
+                warning += 1
+            details.append(kind + ": " + package["name"] + " " + package["version"] + identity)
+    return {"critical": critical, "warning": warning, "details": "; ".join(details)}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Conservative three-valued cfg evaluation (test=False)
 # ─────────────────────────────────────────────────────────────────────────────

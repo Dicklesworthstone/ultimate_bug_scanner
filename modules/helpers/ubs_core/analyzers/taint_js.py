@@ -4134,21 +4134,20 @@ def scan_project_findings(files):
         engine = _Engine('', '', graph, modules)
         try:
             starts = [module.start for module in modules]
-            # Findings need coordinates only in the modules they reference.
-            # Keep source-wide newline tables out of the analysis peak for
-            # large connected components with few findings.
-            line_starts = {}
+            # Findings arrive in source-offset order. Index only the file
+            # currently being reported, rather than retaining every selected
+            # file's newline offsets while the whole component is analyzed.
+            indexed_module, lines = None, []
             for start, rule, path_desc in engine.findings():
                 module = modules[bisect_right(starts, start) - 1]
                 if start >= module.end:
                     continue
                 offset = start - module.start
-                lines = line_starts.get(module.path)
-                if lines is None:
+                if module is not indexed_module:
                     lines = [0] + [match.end() for match in re.finditer('\n', module.text)]
-                    line_starts[module.path] = lines
+                    indexed_module = module
                 line = bisect_right(lines, offset)
-                # line_starts lists begin with offset 0 <= offset, so line >= 1 — ubs:ignore[py.collections.index-arithmetic]
+                # The index begins with offset 0 <= offset, so line >= 1 — ubs:ignore[py.collections.index-arithmetic]
                 yield module.path, rule, line, offset - lines[line - 1] + 1, path_desc
         except AnalysisLimit as exc:
             failed_components += 1

@@ -78,6 +78,15 @@ def check_rust_cargo_phases(tmpdir: Path) -> None:
     sentinel.write_text(
         "#!/usr/bin/env bash\n"
         "printf 'cargo %s cwd=%s\\n' \"$*\" \"$PWD\" >> \"${SENTINEL_LOG:?}\"\n"
+        'if [[ "$1" == audit ]]; then\n'
+        '  if [[ "${SENTINEL_EMPTY_AUDIT:-0}" != 1 ]]; then\n'
+        "    cat <<'AUDIT_JSON'\n"
+        '{"settings":{"target_arch":[],"target_os":[],"severity":null,"ignore":[],"informational_warnings":["unmaintained","unsound","notice"]},"vulnerabilities":{"found":false,"count":0,"list":[]},"warnings":{}}\n'
+        'AUDIT_JSON\n'
+        '  fi\n'
+        '  if [[ -n "${SENTINEL_DIAGNOSTICS:-}" ]]; then exit 0; fi\n'
+        '  exit "${SENTINEL_EXIT:-0}"\n'
+        'fi\n'
         'if [[ -n "${SENTINEL_DIAGNOSTICS:-}" ]]; then\n'
         '  case "$1" in\n'
         '    clippy|check|test) printf "%s\\n" "$SENTINEL_DIAGNOSTICS" >&2;;\n'
@@ -87,8 +96,8 @@ def check_rust_cargo_phases(tmpdir: Path) -> None:
         "exit \"${SENTINEL_EXIT:-0}\"\n"
     )
     sentinel.chmod(0o755)
-    # Make the module believe fmt/clippy are installed so those phases dispatch.
-    for helper in ("cargo-fmt", "cargo-clippy"):
+    # Keep all three protocol controls independent of host plugin availability.
+    for helper in ("cargo-fmt", "cargo-clippy", "cargo-audit"):
         stub = fake_bin / helper
         stub.write_text("#!/usr/bin/env bash\nexit 0\n")
         stub.chmod(0o755)
@@ -129,6 +138,18 @@ def check_rust_cargo_phases(tmpdir: Path) -> None:
     assert "Cargo.toml" not in calls  # sanity: cwd lines, not manifest errors
     assert "cargo check clean" in out, out
     assert "Not evaluated" not in out, out
+
+    # A successful audit command still needs its structured report. Keep the
+    # former empty sentinel response as an explicit refusal control, rather
+    # than teaching the scanner to accept missing advisory coverage.
+    result, calls = scan(["--format=json", str(proj)], {"SENTINEL_EMPTY_AUDIT": "1"})
+    out = result.stdout + result.stderr
+    assert result.returncode == 2, out
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "partial", payload
+    assert payload["failed_modules"][0]["module_error"] == "CARGO_UNAVAILABLE", payload
+    assert "cargo audit report could not be classified" in out, out
+    assert "cargo audit --json" in calls, calls
 
     # --no-cargo is forwarded by the meta-runner: nothing runs, every cargo
     # category says so, and the unqualified "EXCELLENT" banner is withheld.

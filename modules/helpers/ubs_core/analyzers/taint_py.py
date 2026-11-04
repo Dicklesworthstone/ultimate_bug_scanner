@@ -286,6 +286,15 @@ class _BoundCallable:
     name: str
     references: References
     receiver: Fact = CLEAN
+    # Import qualifiers identify an API; invented receiver paths do not.
+    namespace_proven: bool = False
+
+
+@dataclass(frozen=True)
+class _GlobalNamespace:
+    """A real globals() mapping, distinct from a same-spelled user object."""
+    module: ast.Module
+    member: str | None = None
 
 
 @dataclass(frozen=True)
@@ -474,7 +483,7 @@ class _ModuleBinding:
 # Preserve the existing conventional unimported names, but never restore one
 # after a local assignment/parameter has explicitly shadowed it.
 _IMPLICIT_IDENTITIES = frozenset({
-    'eval', 'exec', 'input', 'raw_input', 'print', 'str', 'builtins', 'staticmethod', 'classmethod',
+    'eval', 'exec', 'input', 'raw_input', 'print', 'str', 'globals', 'builtins', 'staticmethod', 'classmethod',
     'html', 'django', 'flask', 'markupsafe', 'bleach', 'shlex', 'subprocess', 'os', 'asyncio',
     'sys', 'request', 'cursor', 'session', 'conn', 'engine', 'db',
     'render_template', 'render_template_string', 'HttpResponse', 'Response',
@@ -537,16 +546,33 @@ def _without_object_contract(binding):
 
 
 _QUALIFIER_WIDTH = max(4, *(candidate.count('.') + 1 for candidate in SANITIZERS))
+_KNOWN_QUALIFIER_PREFIXES = frozenset(
+    '.'.join(qualified.split('.')[:size])
+    for qualified in (*SANITIZERS, *_HTTP_URL_POSITIONS, *_ALL_FRAMEWORK_NAMES, *_REQUEST_TYPES)
+    for size in range(1, len(qualified.split('.')) + 1))
 
 
-def _extend_qualifier(base: str, attribute: str) -> str:
+def _opaque_qualifier(name: str, *, receiver_unknown=False) -> str:
+    """Forget unproved intermediate receiver paths, retaining recognizers."""
+    parts = name.split('.')
+    opaque = next((index for index, part in enumerate(parts)
+                   if part in {'<object>', '<unknown>'}), None)
+    if name not in _KNOWN_QUALIFIER_PREFIXES and not any(pattern.search(name + '(') for pattern in SOURCE_PATTERNS):
+        if opaque is not None and opaque + 2 < len(parts):
+            return '.'.join([*parts[:opaque + 1], parts[-1]])
+        if receiver_unknown and opaque is None and len(parts) > 2:
+            return '.'.join((parts[0], '<unknown>', parts[-1]))
+    return name
+
+
+def _extend_qualifier(base: str, attribute: str, *, receiver_unknown=False) -> str:
     """Keep name identities finite without dropping value or receiver facts.
 
     Recognizers need an exact known API name, the root SQL handle, the final
     method, or up to three trailing source components. A non-identifier marker
     prevents long unknown paths from acquiring an exact sanitizer identity.
     """
-    name = f'{base}.{attribute}'
+    name = _opaque_qualifier(f'{base}.{attribute}', receiver_unknown=receiver_unknown)
     if name.count('.') < _QUALIFIER_WIDTH:
         return name
     components = name.split('.')
@@ -1647,6 +1673,13 @@ class _Flow:
             state[target.id] = _advance(fact, target.id)
             state.bindings[target.id] = self.expression_bindings.get(value)
             state.references[target.id] = self.expression_references.get(value, NO_REFERENCES)
+            slot = '@global:' + target.id
+            local = (self.engine.locals.get(self.scope, frozenset()) | self.engine.closures.get(self.scope, frozenset())
+                     if not isinstance(self.scope, ast.Module) else frozenset())
+            if target.id not in local and slot in state.bindings:
+                state[slot] = state[target.id]
+                state.bindings[slot] = state.bindings[target.id]
+                state.references[slot] = state.references[target.id]
         elif isinstance(target, (ast.Tuple, ast.List)):
             if isinstance(value, (ast.Tuple, ast.List)) and len(target.elts) == len(value.elts):
                 for item, expression in zip(target.elts, value.elts):
@@ -1657,12 +1690,35 @@ class _Flow:
         elif isinstance(target, ast.Starred):
             self.assign(target.value, fact, state)
         elif isinstance(target, (ast.Subscript, ast.Attribute)):
+            if any(isinstance(choice, _GlobalNamespace)
+                   for choice in _binding_choices(self.expression_bindings.get(value))):
+                raise AnalysisLimit('globals mapping stored in an object; analysis is incomplete')
+            # Heap value facts do not preserve a stored callable's identity.
+            # Retain its namespace-producing authority for the final summary
+            # check instead of silently forgetting a globals() factory.
+            for choice in _binding_choices(self.expression_bindings.get(value)):
+                if isinstance(choice, str):
+                    if choice in ('globals', 'builtins.globals'):
+                        self.engine.escaping_callables[choice] = None
+                elif isinstance(choice, (_FunctionValue, _DeferredCall, _BoundCallable,
+                                         _BoundClassMethod, ast.FunctionDef,
+                                         ast.AsyncFunctionDef, ast.Lambda)):
+                    self.engine.escaping_callables[choice] = None
             if target_references is None:
                 self.expr(target.value, state)
                 target_references = self.expression_references.get(target.value, NO_REFERENCES)
                 # The receiver precedes an index that can rebind its name.
                 if isinstance(target, ast.Subscript):
                     self.expr(target.slice, state)
+            namespace = self.expression_bindings.get(target.value)
+            if (not isinstance(namespace, _GlobalNamespace)
+                    and any(isinstance(choice, _GlobalNamespace) for choice in _binding_choices(namespace))):
+                raise AnalysisLimit('ambiguous globals mapping write; analysis is incomplete')
+            if isinstance(namespace, _GlobalNamespace):
+                if not isinstance(target, ast.Subscript) or namespace.member is not None:
+                    raise AnalysisLimit('unsupported globals mapping member write; analysis is incomplete')
+                self.write_global(namespace, target.slice, fact, value, state)
+                return
             if target_references:
                 self.mutate(target_references, fact, state)
                 return
@@ -1675,6 +1731,35 @@ class _Flow:
                     self.mutate(references, _advance(fact, base.id), state)
                 else:
                     state[base.id] = join_facts(state.get(base.id, CLEAN), _advance(fact, base.id))
+
+    def namespace_key(self, namespace, key):
+        if namespace.module is not self.engine.tree:
+            raise AnalysisLimit('foreign globals mapping access; analysis is incomplete')
+        binding = self.expression_bindings.get(key)
+        name = key.value if isinstance(key, ast.Constant) else binding.value if isinstance(binding, _LiteralString) else None
+        if not isinstance(name, str):
+            raise AnalysisLimit('dynamic globals mapping key; analysis is incomplete')
+        return name
+
+    def write_global(self, namespace, key, fact, value, state):
+        name = self.namespace_key(namespace, key)
+        if name not in self.engine.global_names:
+            raise AnalysisLimit('new globals mapping declaration; analysis is incomplete')
+        self.engine.budget.spend()
+        slot = '@global:' + name
+        state[slot] = _advance(fact, name)
+        state.bindings[slot] = self.expression_bindings.get(value)
+        state.references[slot] = self.expression_references.get(value, NO_REFERENCES)
+        self.engine.rebound_globals.add(name)
+
+    def read_global(self, namespace, key, state):
+        name = self.namespace_key(namespace, key)
+        slot = '@global:' + name
+        local = (self.engine.locals.get(self.scope, frozenset()) | self.engine.closures.get(self.scope, frozenset())
+                 if not isinstance(self.scope, ast.Module) else frozenset())
+        source = slot if slot in state.bindings else name
+        values = state if slot in state.bindings or name not in local and name in state.bindings else self.engine.globals
+        return values.value(source), values.bindings.get(source), values.references.get(source, NO_REFERENCES), source in values.bindings
 
     def condition(self, node, state):
         """Return truthy/falsy successors, preserving ordered guard effects."""
@@ -1904,6 +1989,9 @@ class _Flow:
         default_namespace = state if same_engine else owner.globals
         for name in owner.global_names:
             key = f'@global:{name}'
+            if same_engine and key in state.bindings:
+                yield key, state.value(key), state.references.get(key, NO_REFERENCES), state.bindings[key]
+                continue
             if shadowed_in_scope and name in shadowed_in_scope:
                 fact, refs, value = owner.global_symbols[name]
                 yield key, fact, refs, value
@@ -2081,14 +2169,13 @@ class _Flow:
             candidate_keys.update((f'@global:{name}', None) for module, name in required
                                   if module is owner.tree)
         direct_globals = (owner.used_names[function]
-                          if (function in owner.direct_global_functions
-                              and summary is not None and not summary.incomplete) else None)
+                          if summary is not None and not summary.incomplete else None)
         items = (((name, values.get(name)) for name in candidate_keys)
                  if candidate_keys is not None else values.items())
         pending = []
         for name, binding in items:
             if (direct_globals is not None and name.startswith('@global:')
-                    and name[8:] not in direct_globals and name[8:] not in self.context_globals
+                    and name[8:] not in direct_globals
                     and (owner.tree, name[8:]) not in required):
                 continue
             if not any(isinstance(value, (_FunctionValue, _BoundCallable, _BoundClassMethod))
@@ -2263,7 +2350,7 @@ class _Flow:
             elif isinstance(target, _BoundCallable):
                 actual = frozenset().union(*(self._lookup_refs(references, ref) if isinstance(ref, str)
                                              else frozenset({node}) for ref in target.references))
-                choices.append(_BoundCallable(target.name, actual, substitute(target.receiver)))
+                choices.append(_BoundCallable(target.name, actual, substitute(target.receiver), target.namespace_proven))
             elif isinstance(target, _BoundClassMethod):
                 actual = frozenset().union(*(
                     self._lookup_refs(references, ref) if isinstance(ref, str)
@@ -2439,6 +2526,50 @@ class _Flow:
         target, fallback_name = callee.binding, callee.fallback_name
         receiver, receiver_refs = callee.receiver, callee.references
         arguments, keywords, keyword_nodes = inputs.arguments, inputs.keywords, inputs.keyword_nodes
+        if isinstance(target, _GlobalNamespace):
+            if target.module is not self.engine.tree:
+                raise AnalysisLimit('foreign globals mapping call; analysis is incomplete')
+            if target.member == 'update':
+                for expression in node.args:
+                    if not isinstance(expression, ast.Dict):
+                        raise AnalysisLimit('opaque globals mapping update; analysis is incomplete')
+                    for key, value in zip(expression.keys, expression.values):
+                        if key is None:
+                            raise AnalysisLimit('expanded globals mapping update; analysis is incomplete')
+                        self.write_global(target, key, self.expression_facts.get(value, CLEAN), value, state)
+                for name, expression in keyword_nodes.items():
+                    if name is None:
+                        raise AnalysisLimit('expanded globals mapping update; analysis is incomplete')
+                    key = ast.Constant(value=name)
+                    self.write_global(target, key, keywords[name], expression, state)
+                self.expression_bindings[node] = None
+                self.expression_references[node] = NO_REFERENCES
+                return CLEAN
+            if target.member == 'get' and node.args:
+                fact, value, refs, present = self.read_global(target, node.args[0], state)
+                if not present and len(node.args) > 1:
+                    fact = join_facts(fact, arguments[1])
+                    value = _join_bindings(value, self.expression_bindings.get(node.args[1]))
+                    refs |= self.expression_references.get(node.args[1], NO_REFERENCES)
+                self.expression_bindings[node], self.expression_references[node] = value, refs
+                return fact
+            raise AnalysisLimit('unsupported globals mapping method; analysis is incomplete')
+        if target in ('globals', 'builtins.globals'):
+            if node.args or node.keywords:
+                self.possible_exception(state)
+                return CLEAN
+            self.expression_bindings[node] = _GlobalNamespace(self.engine.tree)
+            self.expression_references[node] = NO_REFERENCES
+            return CLEAN
+        # Summary heap mutations carry value facts, not replacements of a
+        # module's callable cells. Never lose that write authority by turning
+        # an escaping globals mapping into an ordinary symbolic parameter.
+        # Await resumes reuse arguments checked when the coroutine was
+        # created; the Await node has no new argument expressions.
+        for expression in (*(node.args if isinstance(node, ast.Call) else ()), *keyword_nodes.values()):
+            if any(isinstance(value, _GlobalNamespace)
+                   for value in _binding_choices(self.expression_bindings.get(expression))):
+                raise AnalysisLimit('globals mapping passed to a callable; analysis is incomplete')
         if isinstance(target, _BoundClassMethod):
             signature = target.function.args
             positional = [arg.arg for arg in (*signature.posonlyargs, *signature.args)]
@@ -2551,6 +2682,13 @@ class _Flow:
                             val = _without_object_contract(val)
                         values[gkey] = val
                         non_base_keys.append(gkey)
+                    for gkey in state.bindings:
+                        if gkey.startswith('@global:'):
+                            self.engine.budget.spend()
+                            bound[gkey] = state.value(gkey)
+                            references[gkey] = state.references.get(gkey, NO_REFERENCES)
+                            values[gkey] = state.bindings[gkey]
+                            non_base_keys.append(gkey)
                     bound.update(local_bound)
                     references.update(local_refs)
                     values.update(local_values)
@@ -2595,7 +2733,27 @@ class _Flow:
                     tuple(sorted(values.items())))
                 self.expression_references[node] = NO_REFERENCES
                 return CLEAN
-            overrides = self.context_globals if owner is self.engine else ()
+            overrides = set(self.context_globals) if owner is self.engine else set()
+            # A temporary callable replacement must survive intervening
+            # helpers even when they do not lexically name that global.
+            # Stable raw helper definitions need no transitive context entry.
+            for key in summary_keys if summary_keys is not None else values:
+                if not owner.namespace_ready:
+                    break
+                if not key.startswith('@global:'):
+                    continue
+                gname = key[8:]
+                if gname not in owner.rebound_globals:
+                    continue
+                binding = values.get(key)
+                nominal = owner.globals.bindings.get(gname)
+                if (isinstance(binding, _SymbolicValue)
+                        or _same_witness(binding, nominal)):
+                    continue
+                if any(isinstance(value, (str, ast.FunctionDef, ast.AsyncFunctionDef,
+                                          ast.Lambda, _BoundClassMethod))
+                       for value in (*_binding_choices(binding), *_binding_choices(nominal))):
+                    overrides.add(gname)
             summary = self.engine.call_summary(function, values, summary_keys, overrides)
             self.engine.budget.spend(len(summary.capture_globals))
             self.capture_globals.update(summary.capture_globals)
@@ -2878,15 +3036,34 @@ class _Flow:
             fact = state.value(node.id)
             self.expression_facts[node] = fact
             binding = state.bindings.get(node.id, _implicit_identity(node.id))
+            slot = '@global:' + node.id
+            local = (self.engine.locals.get(self.scope, frozenset()) | self.engine.closures.get(self.scope, frozenset())
+                     if not isinstance(self.scope, ast.Module) else frozenset())
+            if node.id not in local and slot in state.bindings:
+                fact = state.value(slot)
+                binding = state.bindings[slot]
+                self.expression_facts[node] = fact
             if (node.id in self.engine.global_names
                     and node.id not in self.engine.locals.get(self.scope, ())
                     and node.id not in self.engine.closures.get(self.scope, ())
                     and not any(node.id in self.engine.locals[scope]
-                                for scope, _outer in self.comprehension_environments)
-                    and any(isinstance(value, (_FunctionValue, _BoundCallable))
-                            for value in _binding_choices(binding))):
-                self.capture_globals.add((self.engine.tree, node.id))
-            refs = state.references.get(node.id, NO_REFERENCES)
+                                for scope, _outer in self.comprehension_environments)):
+                # Classes and captured callable values can be rebound through
+                # a helper. Unchanged raw helper definitions do not need an
+                # ever-growing transitive dependency set along call chains.
+                nominal = self.engine.globals.bindings.get(node.id)
+                nominal_helper = (isinstance(binding, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+                                  and binding is self.engine.globals.bindings.get(node.id)
+                                  and getattr(binding, 'name', None) == node.id
+                                  and node.id not in self.engine.rebound_globals
+                                  and node.id not in self.context_globals)
+                identity = (str, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
+                            ast.ClassDef, _FunctionValue, _BoundCallable,
+                            _BoundClassMethod, _ModuleBinding)
+                if (not nominal_helper and any(isinstance(value, identity)
+                        for value in (*_binding_choices(binding), *_binding_choices(nominal)))):
+                    self.capture_globals.add((self.engine.tree, node.id))
+            refs = state.references.get(slot if node.id not in local and slot in state.bindings else node.id, NO_REFERENCES)
             self.expression_references[node] = refs
             if state.mutated and (refs & state.mutated):
                 binding = _without_object_contract(binding)
@@ -2906,6 +3083,15 @@ class _Flow:
         fact = self.expression(node, state)
         if not state.reachable:
             return CLEAN
+        # Container summaries retain value provenance, not module write
+        # authority. Refuse that escape before replacing the mapping with an
+        # ordinary vector/heap value and falsely reporting a later call clean.
+        if isinstance(node, (ast.Tuple, ast.List, ast.Dict, ast.Set, ast.Starred,
+                             ast.ListComp, ast.DictComp, ast.SetComp, ast.GeneratorExp)):
+            for child in ast.iter_child_nodes(node):
+                if any(isinstance(choice, _GlobalNamespace)
+                       for choice in _binding_choices(self.expression_bindings.get(child))):
+                    raise AnalysisLimit('globals mapping stored in a container; analysis is incomplete')
         self.expression_facts[node] = fact
         binding = self.expression_bindings.get(node)
         if isinstance(node, ast.Attribute):
@@ -2913,6 +3099,9 @@ class _Flow:
             receiver_refs = self.expression_references.get(node.value, NO_REFERENCES)
             receiver_fact = self.expression_facts.get(node.value, CLEAN)
             for base in _binding_choices(self.expression_bindings.get(node.value)):
+                if isinstance(base, _GlobalNamespace) and base.member is None:
+                    candidates.append(_GlobalNamespace(base.module, node.attr))
+                    continue
                 if isinstance(base, ast.ClassDef):
                     members = self.engine.class_members.get(base, {})
                     if self.engine.reads is not None:
@@ -2923,24 +3112,30 @@ class _Flow:
                     candidates.append(member)
                     continue
                 if isinstance(base, _ModuleBinding):
+                    owner = base.project.modules.get(base.key)
+                    if owner is not None:
+                        self.capture_globals.add((owner.tree, node.attr))
                     incoming, member, refs = base.project.member(base.key, node.attr, state)
                     fact = join_facts(fact, incoming)
                     self.expression_references[node] = self.expression_references.get(node, NO_REFERENCES) | refs
                     candidates.append(member)
                     continue
                 if isinstance(base, _ProcessInput) and node.attr == 'communicate':
-                    candidates.append(_BoundCallable('@stdin.' + base.kind, receiver_refs, receiver_fact))
+                    candidates.append(_BoundCallable('@stdin.' + base.kind, receiver_refs, receiver_fact, True))
                     continue
                 name = (_extend_qualifier(base, node.attr) if isinstance(base, str)
-                        else _extend_qualifier(base.name, node.attr) if isinstance(base, _BoundCallable)
-                        else _qualified(node, state.bindings))
+                        else _extend_qualifier(base.name, node.attr, receiver_unknown=not base.namespace_proven)
+                        if isinstance(base, _BoundCallable)
+                        else _opaque_qualifier(_qualified(node, state.bindings), receiver_unknown=True))
                 if not name and receiver_refs:
                     # A returned object has identity even without a source
                     # spelling (identity(box).append(...)). Keep the method
                     # and receiver without inventing an import/sanitizer.
                     name = _extend_qualifier('<object>', node.attr)
                 framework = name.startswith('@fastapi.router.') or name in _ALL_FRAMEWORK_NAMES
-                candidates.append(_BoundCallable(name, receiver_refs, receiver_fact) if name and receiver_refs and not framework
+                proven = isinstance(base, str) or isinstance(base, _BoundCallable) and base.namespace_proven
+                proven = proven and not any(part in {'<object>', '<unknown>'} for part in name.split('.'))
+                candidates.append(_BoundCallable(name, receiver_refs, receiver_fact, proven) if name and receiver_refs and not framework
                                   else name or None)
             binding = _join_bindings(*candidates)
             # A joined module identity can still denote a real source
@@ -2972,6 +3167,13 @@ class _Flow:
                 binding = _FrameworkInput('dependency', imported_call,
                                           _dependency_target(node, state.bindings, self.expression_bindings))
         if isinstance(node, ast.Subscript):
+            namespace = self.expression_bindings.get(node.value)
+            if (not isinstance(namespace, _GlobalNamespace)
+                    and any(isinstance(choice, _GlobalNamespace) for choice in _binding_choices(namespace))):
+                raise AnalysisLimit('ambiguous globals mapping read; analysis is incomplete')
+            if isinstance(namespace, _GlobalNamespace) and namespace.member is None:
+                fact, binding, refs, _present = self.read_global(namespace, node.slice, state)
+                self.expression_references[node] = refs
             binding = _framework_input(node, state.bindings, evaluated=self.expression_bindings) or binding
         if isinstance(node, (ast.Tuple, ast.List)):
             markers = tuple(self.expression_bindings.get(item) for item in node.elts)
@@ -3631,6 +3833,7 @@ class _Analysis:
         self.failed_summaries = {}
         self.partial_scope_effects = {}
         self.observed_effects = {}
+        self.escaping_callables = {}
         self.scope_errors = []
         self.scope_remaining = {}
         self.scope_limits = {}
@@ -3735,6 +3938,23 @@ class _Analysis:
                                      for child in ast.walk(generator.target)
                                      if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)}
         self.global_names = self.locals[tree]
+        self.rebound_globals = {node.id for node in nodes
+                                if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del))
+                                and node.id in self.global_names}
+        # A literal mapping key can replace a declaration without a Name
+        # store. Index possible keys before solving helpers, so cached raw
+        # function identities never predate a later namespace replacement.
+        for node in nodes:
+            keys = ()
+            if isinstance(node, ast.Subscript) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                keys = (node.slice,)
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == 'update':
+                self.rebound_globals.update(keyword.arg for keyword in node.keywords
+                                            if keyword.arg in self.global_names)
+                keys = (key for arg in node.args if isinstance(arg, ast.Dict) for key in arg.keys)
+            self.rebound_globals.update(key.value for key in keys
+                                        if isinstance(key, ast.Constant) and isinstance(key.value, str)
+                                        and key.value in self.global_names)
         # Formal globals are lexical constants, not concrete heap facts.
         # Reusing their immutable traces preserves paths and lets state joins
         # recognize unchanged globals by identity across fixed-point passes.
@@ -4090,6 +4310,8 @@ class _Analysis:
         """Finite callable identity with captured values replaced by slots."""
         choices = []
         for value in _binding_choices(binding):
+            if isinstance(value, _GlobalNamespace):
+                raise AnalysisLimit('globals mapping captured by a callable; analysis is incomplete')
             if isinstance(value, _FunctionValue):
                 self.budget.spend(1 + len(value.arguments))
                 arguments, references, bindings = [], [], []
@@ -4105,9 +4327,12 @@ class _Analysis:
             elif isinstance(value, (_BoundCallable, _BoundClassMethod)):
                 slot = '@method:' + name
                 symbolic = frozenset({TaintTrace(slot, parameter=slot, path=(slot,))})
+                qualified = value.name if isinstance(value, _BoundCallable) else None
+                if qualified:
+                    qualified = _opaque_qualifier(qualified, receiver_unknown=not value.namespace_proven)
                 value = (_BoundClassMethod(value.function, value.owner, frozenset({slot}), symbolic, value.valid)
                          if isinstance(value, _BoundClassMethod)
-                         else _BoundCallable(value.name, frozenset({slot}), symbolic))
+                         else _BoundCallable(qualified, frozenset({slot}), symbolic, value.namespace_proven))
             elif not isinstance(value, (str, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
                 value = _SymbolicValue(name) if captured else None
             choices.append(value)
@@ -4148,8 +4373,7 @@ class _Analysis:
                 self.reads[('summaries', function)] = summary
             return summary
         context = []
-        direct_globals = (owner.used_names[function]
-                          if function in owner.direct_global_functions else None)
+        direct_globals = owner.used_names[function]
         owner_fn = None
         owner_bindings = None
         # Candidate names can come from both a lexical global and an inherited
@@ -4167,7 +4391,6 @@ class _Analysis:
             if name.startswith('@global:'):
                 gname = name[8:]
                 if (direct_globals is not None and gname not in direct_globals
-                        and gname not in global_overrides
                         and (owner.tree, gname) not in capture_globals):
                     continue
                 # A caller may replace a global callable or class method and
@@ -4354,6 +4577,42 @@ class _Analysis:
             owner.local_journal = None
             owner.budget = total_budget
 
+    def _escaping_namespace_factory(self):
+        """Check settled return/capture bindings once, without executing code."""
+        pending = list(self.escaping_callables)
+        seen_values, seen_functions = set(), set()
+        while pending:
+            self.budget.spend()
+            value = pending.pop()
+            if id(value) in seen_values:
+                continue
+            seen_values.add(id(value))
+            if isinstance(value, _GlobalNamespace):
+                return True
+            if isinstance(value, str) and value in ('globals', 'builtins.globals'):
+                return True
+            if (isinstance(value, _BoundCallable) and value.namespace_proven
+                    and value.name in ('globals', 'builtins.globals')):
+                return True
+            if isinstance(value, (_FunctionValue, _DeferredCall)):
+                for _name, binding in value.values:
+                    pending.extend(_binding_choices(binding))
+                function = value.function
+            elif isinstance(value, _BoundClassMethod):
+                function = value.function
+            elif isinstance(value, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                function = value
+            else:
+                continue
+            if function in seen_functions:
+                continue
+            seen_functions.add(function)
+            summary = self.owner(function).summaries.get(function)
+            if summary is not None:
+                pending.extend(_binding_choices(summary.returned_binding))
+                pending.extend(_binding_choices(summary.yielded_binding))
+        return False
+
     def analyze(self):
         try:
             return self._analyze()
@@ -4399,6 +4658,7 @@ class _Analysis:
         # the same summary and effects, so the previous ones are reused. Local
         # expression/heap states belong to the solve, not the summary cache.
         solved = {}  # summary key -> (reads, writes, latest base effects)
+        namespace_inputs = {}
         readers = defaultdict(dict)
         # A write-free job can read defaults produced by a writer context.
         # Moving all writers ahead of it changes that read even when writer
@@ -4415,9 +4675,30 @@ class _Analysis:
         # cycles keep the uncached path because peer namespaces can change.
         cache_module = not solving
         previous_module = None
+        initializing = cache_module
+        initializer_jobs = set()
 
         def parts(key):
             return key if isinstance(key, tuple) else (key, ())
+
+        def namespace_input(key):
+            function, _ = parts(key)
+            owner = self.owner(function)
+            required = self.summaries.get(key, FunctionSummary()).capture_globals
+            if any(module is not owner.tree for module, _name in required):
+                return None  # Foreign namespace changes retain the full solve.
+            names = ((owner.used_names[function] - owner.locals[function])
+                     | {name for _module, name in required})
+            return owner.namespace_ready, {
+                name: owner.globals.bindings.get(name, _MISSING) for name in names}
+
+        def namespace_current(key):
+            before = namespace_inputs.get(key)
+            after = namespace_input(key)
+            return (before is not None and after is not None and before[0] == after[0]
+                    and before[1].keys() == after[1].keys()
+                    and all(_same_witness(value, after[1][name])
+                            for name, value in before[1].items()))
 
         def replay(owner, writes):
             for table, node, value in writes:
@@ -4480,12 +4761,20 @@ class _Analysis:
             # this module. Publish this pass's namespace before solving those
             # contexts, and iterate again when initialization facts change.
             changed = not self.namespace_ready or globals_ != self.globals
-            if changed:
+            if changed and not cache_module:
                 solved.clear()  # Every job of this module starts from the namespace.
                 readers.clear()
+                namespace_inputs.clear()
             self.refresh_globals(globals_)
+            if initializing:
+                initializer_jobs.update(key for (table, key) in reads if table == 'summaries')
+                if not initializer_jobs:
+                    initializing = False
             jobs = [*self.functions, *(key for key in self.summaries
                                       if isinstance(key, tuple) and key not in inherited)]
+            if initializing:
+                jobs = [key for key in jobs if key in initializer_jobs]
+            previous_initializer_jobs = len(initializer_jobs)
             pending, queued, dirty = deque(), set(), set()
 
             def enqueue(key):
@@ -4503,7 +4792,8 @@ class _Analysis:
                     solved[summary_key] = ({}, [], effects)
                     return False
                 previous = solved.get(summary_key)
-                if previous is not None and owner.reads_current(previous[0]):
+                if (previous is not None and namespace_current(summary_key)
+                        and owner.reads_current(previous[0])):
                     # Replay its definition-time writes, in job order, so later
                     # jobs read exactly what a fresh solve would have left.
                     replay(owner, previous[1])
@@ -4537,8 +4827,11 @@ class _Analysis:
                 if not context and owner is self:
                     self.observed_effects[function] = latest_effects
                 solved[summary_key] = (reads, writes, latest_effects)
+                namespace_inputs[summary_key] = namespace_input(summary_key)
                 for table, key in reads:
                     if table == 'summaries':
+                        if initializing:
+                            initializer_jobs.add(key)
                         readers[key][summary_key] = None
                         if key not in solved and reorderable(key):
                             enqueue(key)
@@ -4599,7 +4892,13 @@ class _Analysis:
                     if solve(key):
                         changed = True
 
-            if not changed and len(self.summaries) == previous_contexts:
+            if (not changed and len(self.summaries) == previous_contexts
+                    and len(initializer_jobs) == previous_initializer_jobs):
+                if initializing:
+                    # Initialization only warms the ordinary fixed point;
+                    # every base function and callback still runs afterward.
+                    initializing = False
+                    continue
                 self.refresh_globals(globals_)
                 effects = {}
                 framework_bound = self.framework_bound(globals_)
@@ -4625,6 +4924,8 @@ class _Analysis:
                         if concrete:
                             effects[key] = join_facts(effects.get(key, CLEAN), concrete)
                 problems = list(dict.fromkeys([*self.scope_errors, *self.failed_scopes.values()]))
+                if self._escaping_namespace_factory():
+                    problems.append('globals mapping factory stored in an object; analysis is incomplete')
                 if problems:
                     more = (f'; and {len(problems) - 8} more failed scopes'
                             if len(problems) > 8 else '')

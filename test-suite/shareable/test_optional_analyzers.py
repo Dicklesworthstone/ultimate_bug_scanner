@@ -327,7 +327,7 @@ merge_json_scanners > "$TMPDIR_RUN/second.out"
 cmp "$TMPDIR_RUN/first.out" "$TMPDIR_RUN/second.out"
 cat "$TMPDIR_RUN/second.out"
 '''
-                proc = subprocess.run(["bash", "-c", script, "ubs-merge", tmp, *languages],
+                proc = subprocess.run(["bash", "-c", script, "ubs-merge", tmp, *languages],  # ubs:ignore[py.security.command-injection] Runs repository-owned code; fixture data stays in positional argv.
                                       capture_output=True, text=True, check=False, timeout=10)
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 doc = json.loads(proc.stdout)
@@ -381,12 +381,9 @@ if mode == "stall":
     time.sleep(120)
 sys.exit(int(os.environ.get("AUDIT_EXIT", "2")))
 '''
-        target = self.bin / ("uvx" if uv else tool)
+        target = self.bin / ("uv" if uv else tool)
         target.write_text(script)
         target.chmod(0o755)
-        if uv:
-            # Only presence is queried. uvx is the actual attempted command.
-            (self.bin / "uv").symlink_to(target)
 
     def command(self, tool):
         return [str(ROOT / "modules/ubs-python.sh"), str(self.project),
@@ -424,14 +421,15 @@ sys.exit(int(os.environ.get("AUDIT_EXIT", "2")))
         self.assertEqual(len(self.calls.read_text().splitlines()), 6)
         self.assertGreater(summary["extras"]["profile"]["cache_hits"], 0)
 
-    def test_uvx_failure_preserves_both_output_streams_and_native_findings(self):
+    def test_uv_without_companion_preserves_both_streams_and_native_findings(self):
         self.failure_tool("ruff", uv=True)
+        self.assertFalse((self.bin / "uvx").exists())
         proc, summary = self.scan("ruff", AUDIT_MODE="output")
         self.assert_partial(proc, summary, "ruff")
         self.assertIn("audit evidence before failure", proc.stdout)
         self.assertIn("audit stderr before failure", proc.stdout)
         argv = json.loads(self.calls.read_text().splitlines()[0])
-        self.assertEqual(argv[:3], ["--quiet", "ruff", "check"])
+        self.assertEqual(argv[:5], ["tool", "run", "--quiet", "ruff", "check"])
         self.assertIn("--no-fix", argv)
 
     @staticmethod

@@ -10,6 +10,42 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Keep uncoded Cargo package-discovery errors visible as warnings when the
+  native command succeeds; coded compiler errors and failed commands still
+  block. Read cargo-audit's structured vulnerability and informational-warning
+  fields instead of counting advisory URLs. Vulnerabilities, unsoundness,
+  denied warnings and unclassifiable reports continue to block a clean scan.
+  Configured advisory ignores or coverage filters report incomplete coverage
+  rather than establishing an unfiltered clean audit.
+- Run explicitly selected Rust Cargo manifests in their original complete
+  workspace, preserving all formatter, Clippy, test and dependency checks.
+  Filtered copies no longer turn omitted member manifests into false compiler
+  and policy errors; changed or unmapped manifest/lock context remains partial.
+
+### Python analysis and bounded reporting
+
+- Reuse immutable SQL binding lookups and relevant callable-summary inputs
+  so large Python modules complete without increasing taint work limits.
+  SQL indexing scales its default allowance with input size under a fixed
+  ceiling; explicit caller budgets and incomplete-analysis errors remain exact.
+- Track temporary callable replacements through `globals()` item writes,
+  updates and ordinary helper calls. Restored clean calls stay clean; dynamic
+  keys and unsupported namespace escapes report incomplete analysis.
+- Refuse namespace mappings stored in containers, objects or callable captures
+  until those write effects can be modeled, while retaining ordinary containers
+  and command findings through returned namespace mappings.
+- Retain namespace-producing authority when a builtin or user factory is
+  stored in an object field. Unsupported factory escapes report incomplete
+  analysis and preserve observed findings; ordinary factories remain clean.
+- Launch optional Python analyzers with the detected `uv` executable's
+  `tool run` command, so a missing `uvx` companion does not break text scans
+  or warm-cache summaries. Analyzer failures still report incomplete coverage.
+- Honor plain-output requests in captured Python tools even when the parent
+  forces terminal colors, retaining their full diagnostics and exit status.
+- Build JavaScript finding-location indexes for the current reporting file
+  instead of retaining every selected file's newline offsets during analysis.
+  The original connected-component memory and finding checks remain unchanged.
+
 ### JavaScript precision (5.5.27)
 
 - Playwright response predicates compare public HTTP methods and route paths

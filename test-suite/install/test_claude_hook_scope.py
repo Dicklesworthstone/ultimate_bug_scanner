@@ -650,7 +650,7 @@ class InstallerPython(unittest.TestCase):
         for name in ("curl", "wget"):
             self.executable(self.bin / name, 'printf "unexpected network request\\n" >&2\nexit 91\n')
         self.executable(self.bin / "crontab", 'case "$1" in\n-l) exit 0;;\n-) cat > "$TEST_CRON_FILE";;\n*) exit 1;;\nesac\n')
-        subprocess.run([str(self.bin / "git"), "init", "-q", str(self.project)],
+        subprocess.run([str(self.bin / "git"), "init", "-q", str(self.project)],  # ubs:ignore[python.taint.command] Private fixture symlink to the real host git; environment values are separate data, never the executable.
                        env=self.env, check=True, capture_output=True, timeout=20)
         self.calls = 0
 

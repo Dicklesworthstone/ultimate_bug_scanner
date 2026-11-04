@@ -464,7 +464,7 @@ def playwright_response_ranges(text):
     """Public metadata of real, unrebound Playwright response callback bindings.
 
     File-wide alias names are not proof that a callback's Response is a secret.
-    Keep that conservative taint for its contents; only method/route metadata
+    Keep that conservative taint for its contents; only method/URL metadata
     gets a scoped exception, with fixture provenance and no shadowed URL.
     """
     source, code = javascript_lexical_views(text)
@@ -489,11 +489,22 @@ def playwright_response_ranges(text):
         names, rest, default, _span = scope.params[0]
         if len(names) != 1 or rest or default is not None:
             continue
+        if code[_span[0]:_span[1]].lstrip().startswith(('{', '[')):
+            continue
         name = names[0]
-        call = re.search(r'\b([A-Za-z_$][\w$]*)\s*\.\s*waitForResponse\s*\(\s*$',
-                         code[max(0, scope.start - 256):scope.start])
+        prefix_start = max(0, scope.start - 256)
+        call = re.search(
+            r'\b([A-Za-z_$][\w$]*)\s*\.\s*(?:waitForResponse\s*\(\s*'
+            r'|(?:on|once)\s*\(([^,()]*)\,\s*)$',
+            code[prefix_start:scope.start],
+        )
         if not call:
             continue
+        if call.group(2) is not None:
+            event_start, event_end = call.span(2)
+            event = source[prefix_start + event_start:prefix_start + event_end].strip()
+            if event not in {'"response"', "'response'"}:
+                continue
         receiver = call.group(1)
         parent = scope.parent
         fixture = None
@@ -530,6 +541,8 @@ def response_metadata_read(operand, names, path_names):
     operand = re.sub(r'^(?:if|while)\s*\(', '(', operand)
     for name in names:
         root = re.escape(name)
+        if re.fullmatch(rf'\(*\s*{root}\s*\.\s*url\s*\(\s*\)\s*\)*', operand):
+            return True
         if re.fullmatch(rf'\(*\s*{root}\s*\.\s*request\s*\(\s*\)\s*\.\s*method\s*\(\s*\)\s*\)*', operand):
             return True
         if name in path_names and re.fullmatch(

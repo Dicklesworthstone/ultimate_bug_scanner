@@ -4575,6 +4575,46 @@ async function unrelatedLogin(credentials) {
         ]
         self.compare(cases, "secret")
 
+    def test_response_event_url_metadata_retains_secret_checks(self):
+        def event(expression, *, event_name="response", before="", after=""):
+            return (self.HEADER
+                    + 'test("reader", async ({ page }) => {\n'
+                    + '  const photoURL = "https://cdn.example.org/profile.jpg";\n'
+                    + before
+                    + '  page.on(' + json.dumps(event_name) + ',\n'
+                    + '    (response) =>\n      ' + expression + '\n  );\n'
+                    + after + '});\n')
+
+        url = 'response.url() === photoURL'
+        cases = [
+            ("event-url", event(url), 0, "public"),
+            ("event-reverse-url", event('photoURL === response.url()'), 0, "public"),
+            ("event-wrapped-url", event('(response.url()) === photoURL'), 0, "public"),
+            ("event-once-url", event(url).replace('page.on(', 'page.once('), 0, "public"),
+            ("event-method", event('response.request().method() === "POST"'), 0, "public"),
+            ("event-path", event('new URL(response.url()).pathname === targetRoute'), 0, "public"),
+            ("wait-full-url", self.response_program(url), 0, "public"),
+            ("event-secret-url-rhs", event('response.url() === expectedAuthToken'), 1, "unsafe"),
+            ("event-secret-header", event('response.request().headers().authorization === expectedAuthToken'), 1, "unsafe"),
+            ("event-secret-body", event('response.text().then((actualAuthToken) => actualAuthToken === expectedAuthToken)'), 1, "unsafe"),
+            ("event-secret-boolean", event(url + ' && actualAuthToken === expectedAuthToken'), 1, "mixed"),
+            ("event-outer-secret", event(url, before='  const response = actualAuthToken;\n',
+                                         after='  return response === expectedAuthToken;\n'), 1, "mixed"),
+            ("event-page-rebound", event(url, before='  page = customPage;\n'), 1, "conservative"),
+            ("event-response-rebound", event('{ response = actualAuthToken; return response.url() === photoURL; }'), 1, "conservative"),
+            ("event-unknown-provider", event(url).replace('"@playwright/test"', '"custom-tests"'), 1, "conservative"),
+            ("event-unknown-receiver", event(url).replace('page.on(', 'customPage.on('), 1, "conservative"),
+            ("event-unknown-name", event(url).replace('"response",', 'eventName,'), 1, "conservative"),
+            ("event-other-event", event(url, event_name="request"), 1, "conservative"),
+            ("event-object-parameter", event(url).replace('(response) =>', '({ response }) =>'), 1, "conservative"),
+            ("event-array-parameter", event(url).replace('(response) =>', '([response]) =>'), 1, "conservative"),
+            ("event-nested-shadow", event('''{
+      const check = (response) => response.url() === photoURL;
+      return check(customResponse);
+    }'''), 1, "conservative"),
+        ]
+        self.compare(cases, "secret")
+
     def test_computed_reads_retain_real_property_writes_and_merges(self):
         header = '''function inspect(request, expected) {
   const rows = request.body.rows;

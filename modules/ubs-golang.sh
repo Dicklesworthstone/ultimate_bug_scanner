@@ -15,7 +15,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="67e18d8fe599dd85279ecb3115ae371b19bf005b355ad181ba8479a19e99594a"
+UBS_LIB_CHECKSUM="08f67a9bd18a591eb05844bd3b661ffb991c5a1d2219db7a38f80f24726927f5"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -405,14 +405,23 @@ LIFE_LOCATION = re.compile(r"(.+):([0-9]+)", re.DOTALL)
 if run_life:
     raw = ""
     if life_raw_path and os.path.isfile(life_raw_path):
-        with open(life_raw_path, encoding="utf-8", errors="replace") as fh:
+        with open(life_raw_path, encoding="utf-8", errors="replace", newline="") as fh:
             raw = fh.read()
     rows = []
-    for line in raw.splitlines():
-        # Split from the right: a file name may contain a tab; kind and message cannot.
-        parts = line.rsplit("\t", 2)
-        if len(parts) >= 1 and parts[0].strip():
+    name_start = ""
+    for line in raw.split("\n"):
+        # A row is "<name>:<line>\t<kind>\t<message>". Kind and message hold only
+        # fixed text and Go identifiers, so split from the right: the name may
+        # contain a tab, and a line that is not a whole row starts a name with a
+        # newline in it.
+        parts = (name_start + line).rsplit("\t", 2)
+        if len(parts) == 3 and LIFE_LOCATION.fullmatch(parts[0]):
             rows.append(parts)
+            name_start = ""
+        else:
+            name_start += line + "\n"
+    if name_start.strip():
+        rows.append(name_start.rstrip("\n").rsplit("\t", 2))
     new_records = []
     if rows:
         scan_paths = lifecycle_scan_paths(list_path, project_dir)

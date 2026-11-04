@@ -16,7 +16,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="112e0656b4aeeb72652119a1d51f61b908cbe598f31fcc2e4a14b09152d08f3c"
+UBS_LIB_CHECKSUM="67e18d8fe599dd85279ecb3115ae371b19bf005b355ad181ba8479a19e99594a"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -113,7 +113,7 @@ fi
 # ────────────────────────────────────────────────────────────────────────────
 
 # Invoked by the ERR trap below; ShellCheck does not count trap callbacks.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 on_err() {
   local ec=$?; local cmd=${BASH_COMMAND}; local line=${BASH_LINENO[0]}; local src=${BASH_SOURCE[1]:-${BASH_SOURCE[0]}}
   if [[ "${FORMAT:-text}" == "json" || "${FORMAT:-text}" == "sarif" ]]; then
@@ -297,9 +297,9 @@ print_finding() {
       local raw_count=$2; local title=$3; local description="${4:-}"
       local count; count=$(printf '%s\n' "$raw_count" | awk 'END{print $0+0}')
       case $severity in
-        critical) say "  ${RED}${BOLD}${FIRE} CRITICAL${RESET} ${WHITE}($count found)${RESET}"; say "    ${RED}${BOLD}$title${RESET}"; [ -n "$description" ] && say "    ${DIM}$description${RESET}" || true ;;
-        warning)  say "  ${YELLOW}${WARN} Warning${RESET} ${WHITE}($count found)${RESET}"; say "    ${YELLOW}$title${RESET}"; [ -n "$description" ] && say "    ${DIM}$description${RESET}" || true ;;
-        info)     say "  ${BLUE}${INFO} Info${RESET} ${WHITE}($count found)${RESET}"; say "    ${BLUE}$title${RESET}"; [ -n "$description" ] && say "    ${DIM}$description${RESET}" || true ;;
+        critical) say "  ${RED}${BOLD}${FIRE} CRITICAL${RESET} ${WHITE}($count found)${RESET}"; say "    ${RED}${BOLD}$title${RESET}"; if [ -n "$description" ]; then say "    ${DIM}$description${RESET}" || true; fi ;;
+        warning)  say "  ${YELLOW}${WARN} Warning${RESET} ${WHITE}($count found)${RESET}"; say "    ${YELLOW}$title${RESET}"; if [ -n "$description" ]; then say "    ${DIM}$description${RESET}" || true; fi ;;
+        info)     say "  ${BLUE}${INFO} Info${RESET} ${WHITE}($count found)${RESET}"; say "    ${BLUE}$title${RESET}"; if [ -n "$description" ]; then say "    ${DIM}$description${RESET}" || true; fi ;;
       esac
       ;;
   esac
@@ -707,7 +707,9 @@ PY
   [[ -n "$ast_rule_dir" ]] && scan_args+=(--ast-rule-dir "$ast_rule_dir")
   PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core.elixir_scan \
     "${scan_args[@]}" --version "1.0.2" || exit_code=$?
-  [[ -n "$ast_rule_dir" ]] && rm -rf "$ast_rule_dir" 2>/dev/null || true
+  if [[ -n "$ast_rule_dir" ]]; then
+    rm -rf "$ast_rule_dir" 2>/dev/null || true
+  fi
   if [[ "$FORMAT" != "sarif" ]]; then
     # Category 16 parity bridge: raw mix-tool passthrough
     if [[ ",$v2_skip," != *",16,"* ]]; then

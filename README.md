@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.5.27-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.5.28-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -126,7 +126,7 @@ const zipCode = parseInt(userInput);  // 💥 "08" becomes 0 in old browsers (oc
 ### 🧠 Language-Aware Meta-Runner
 - `ubs` auto-detects **JavaScript/TypeScript, Python, C/C++, Rust, Go, Java, Kotlin, Ruby, Swift, C#, Elixir, Bash, PHP, and PostgreSQL SQL** in the same repo and fans out to per-language scanners.
 - Each scanner lives under `modules/ubs-<lang>.sh`, ships independently, and supports `--format text|json|jsonl|sarif|toon` for consistent downstream tooling.
-- Modules download lazily (PATH → repo `modules/` → cached under `${XDG_DATA_HOME:-$HOME/.local/share}/ubs/modules`) and are validated before execution.
+- Installed releases use a complete verified module generation under `${XDG_DATA_HOME:-$HOME/.local/share}/ubs/modules`. Source checkouts and legacy installations retain lazy module resolution (PATH → repo `modules/` → cache).
 - Results from every language merge into one text/JSON/SARIF report via `jq`, so CI systems and AI agents only have to parse a single artifact.
 
 ### 🔐 Supply-Chain Safeguards
@@ -135,7 +135,7 @@ const zipCode = parseInt(userInput);  // 💥 "08" becomes 0 in old browsers (oc
 - Run `ubs doctor` at any time to audit your environment. It checks for curl/wget availability, writable cache directories, and per-language module integrity. Add `--fix` to redownload missing or corrupted modules proactively.
 - Scanner runs still respect `--update-modules`, but an invalid checksum now causes an immediate failure with remediation guidance rather than executing unverified code.
 - **Developer Pre-commit Hook**: The repository ships with a `.githooks/pre-commit` hook that auto-updates `SHA256SUMS` when modules change and blocks commits with stale checksums. This ensures every release has verified checksums without manual intervention.
-- **Minisign Support**: For additional assurance, set `UBS_MINISIGN_PUBKEY` to verify cryptographic signatures on `SHA256SUMS` via [minisign](https://jedisct1.github.io/minisign/).
+- **Authenticated Updates**: Install [minisign](https://jedisct1.github.io/minisign/) to authenticate release manifests with the embedded public key. `UBS_MINISIGN_PUBKEY` selects an explicitly trusted alternate key; signatures remain mandatory for `ubs --update`, including unattended cron jobs.
 
 ### 🎛 Category Packs & Shareable Reports
 - `--category=resource-lifecycle` focuses the scanners on Python/Go/Java resource hygiene (context managers, defer symmetry, try-with-resources). UBS automatically narrows the language set to those with lifecycle packs enabled and suppresses unrelated categories.
@@ -1231,6 +1231,8 @@ Environment Variables:
   UBS_MAX_DIR_SIZE_MB      Max directory size in MB before refusing to scan (default: 1000)
   UBS_MAX_FILE_MB          Leave files above N MB out of whole-project scans (default: 8; 0 disables)
   UBS_PYTHON               Python >= 3.9 interpreter to use as python3 (Git Bash/Windows: `python` or `py -3` are tried automatically)
+  UBS_PYTHON_FLOW_MAX_STEPS   Override each Python taint/header analyzer's per-file work limit (positive integer)
+  UBS_PYTHON_FLOW_SCOPE_STEPS Override cumulative work per Python function, including callback contexts (positive integer)
   UBS_ALLOW_PARTIAL=1      Accept partial runs (timed-out/crashed module): exit on findings, not 2
   UBS_PROFILE=1            Add phase timings (list, fan-out, per module, merge, total ms) to json/toon output and the text summary
                            Numeric 0/1 leaves project severity unchanged; strict|loose overrides it
@@ -2099,10 +2101,44 @@ path also covers imported helpers and can offer less scheduling speedup.
 Sink-specific sanitizers, mutation effects, work budgets, and incomplete-result
 handling remain active on both paths.
 
+Source-order passes reuse the module's initialization transfer when its
+namespace and observed summary/definition inputs are unchanged. Replaying
+declaration writes preserves their original position in the pass. Changed
+inputs invalidate the reuse, including changed evidence witnesses; active
+import cycles keep the uncached path. A nested definition therefore no longer
+forces every settling call-chain link to execute unrelated module statements.
+
+Simple declaration/return factories also exclude unrelated globals from their
+summary contexts and captured-value projection. A cached syntax proof permits
+only direct lexical reads and checks nested definitions' executable headers;
+calls, decorators, class bodies, imports, control flow, and protocol-dispatch
+expressions keep the broader analysis. Relevant lexical and deferred-child
+reads, explicit global overrides, and observed module-qualified capture
+dependencies remain active. A growing module namespace therefore does not
+create a new factory context for every unrelated assignment. Regressions with
+10, 50, and 200 factory calls check exact unsafe, clean, and mixed-instance
+findings under the unchanged budgets.
+
+A paired 200-factory/200-caller fixture previously exhausted the factory's
+20,000-unit allowance after 422,409 total units. The restricted dependency
+selection completes with the same 200 exact findings in 6,646 total units and
+two factory solves. The comparison uses identical source and work limits;
+clean controls retain no taint findings.
+
 Completed imported base summaries are reused across callers; new callback
 contexts and active import cycles still receive their required analysis. The
 worklist retains dependency metadata and the latest effects while releasing
 completed functions' temporary expression, heap, and completion states.
+
+Functions and lambdas returned or yielded by a factory retain the facts,
+object references, and callable identities of their evaluated defaults.
+Creating another callback cannot replace an earlier callback's captured
+defaults. Explicit call arguments override those defaults, while later writes
+through a captured mutable object remain visible. Shared body summaries use
+symbolic default inputs, so different concrete values do not create a new
+summary context for every factory invocation. This also applies to awaited
+factories and generator completion values. Incomplete factories retain
+observed captured sources while revoking unfinished sanitizer guarantees.
 
 Summary substitution joins expanded facts once, avoiding repeated copies of
 a growing result. A 1,024-entry cache reuses immutable witness transformations;
@@ -2137,14 +2173,119 @@ calls are included in this check; matching calls retain full analysis even
 when their arguments are unknown. Read, decode, parse, and applicable analysis
 failures continue to report incomplete coverage.
 
-Each selected source has a work budget of `max(500000, 128 * AST node count)`.
-Transfers, summary scheduling, and fact substitution consume that budget.
-If it is exhausted, UBS reports an explicit incomplete analysis naming the
-affected component: the normal result is `status: partial` and exit 2.
-Completed findings from independent components remain in the report, failed
-summary writes are rolled back, and the partial scan is not cached as complete.
-This limit reports missing coverage; it does not turn an unfinished scan into
-a clean result.
+Taint and response-header analysis use the same bounded work policy. They run
+separately and each has its own counters; the header detector has no additional
+fixed 250,000-expression cutoff. Transfers, summary scheduling, and fact
+substitution consume work units rather than elapsed seconds.
+
+| Environment variable | Work boundary | Default when unset |
+| --- | --- | --- |
+| `UBS_PYTHON_FLOW_MAX_STEPS` | Total work for one selected source, in each analyzer | `min(10000000, max(500000, 128 * AST node count))` |
+| `UBS_PYTHON_FLOW_SCOPE_STEPS` | Cumulative work for one function across passes and callback contexts | `min(250000, max(20000, 64 * scope AST node count, 8 * module AST node count))` |
+
+Overrides must be positive integers. Zero, negative, and malformed values fail
+analysis explicitly; there is no value that disables accounting. A function's
+allowance does not reset for each call, fixed-point pass, or newly discovered
+callback context. The default also accounts for module size because a small
+wrapper can project large summaries from a long downstream call chain.
+Increasing `UBS_MODULE_TIMEOUT` only changes the separate wall-clock timeout
+and cannot increase these work limits.
+
+Captured defaults and deferred async calls can share nested value graphs.
+Their immutable hashes are cached, and semantic/evidence comparisons reuse
+results for already compared object pairs within that comparison. A separate
+64-level captured-value shape limit protects recursive value operations;
+exceeding it reports incomplete analysis and retains established findings.
+This shape limit counts both captured functions and deferred calls. Ordinary
+function-call chains continue to use summary convergence without a call-depth
+cutoff.
+
+For example, a gate can pin both limits explicitly:
+
+```bash
+UBS_PYTHON_FLOW_MAX_STEPS=1000000 \
+UBS_PYTHON_FLOW_SCOPE_STEPS=100000 \
+  ubs large.py --only=python --format=json --ci
+```
+
+If a function exhausts its allowance, independent functions can still finish
+and contribute their findings. An exhausted total-file budget stops remaining
+work for that source. Both outcomes report incomplete coverage: the normal
+result is `status: partial` and exit 2, even when security findings are present.
+Diagnostics identify the exhausted function and its local source-line range
+when the failure occurs within a function. Established findings remain in the
+report after a function cutoff, including observed writes, return sources, and
+exception payloads projected through callers, aliases, awaited calls, and
+generator completions. Previously completed callback contexts contribute their
+observations before their contracts are revoked. Recovery consumes the
+remaining file allowance; it cannot certify
+sanitizer or return guarantees from unfinished code. A total-file cutoff
+retains already resolved concrete findings without completing unexplored code
+or new symbolic projections. Provisional summary writes are rolled back, and
+the partial scan is not cached as complete. A report with no findings and
+incomplete coverage is not a clean result.
+
+Public regressions for [issue #198](https://github.com/Dicklesworthstone/ultimate_bug_scanner/issues/198)
+exercise large generated modules, finite loops, interprocedural flows, planted
+security sinks, and deliberately exhausted limits. Generated 6,568- and
+9,696-line modules each check the exact locations of 13 planted semantic
+findings (11 taint findings and two response-header findings), alongside seven
+safe controls and clean variants. A separate header regression keeps all 13
+planted header findings in a 6,551-line synthetic module, alongside an
+encoded-safe control. These fixtures reproduce the budget failure mechanism;
+the reporter's original private modules and planted payload are unavailable,
+so they do not establish a rerun of the reporter's original 13 findings.
+
+One paired benchmark on November 2, 2026 compared the same generated sources
+against main commit `3d95f029` and this bounded implementation using Python
+3.14.8. Both implementations ran sequentially in the same benchmark invocation
+with default analysis budgets. Times include parsing and direct helper
+analysis, not whole-CLI startup or other detectors. The fixtures come from
+`large_budget_source` in `test-suite/quality/test_taint_python_worklist.py`.
+
+| Source | Analyzer | `3d95f029` result / seconds | Bounded result / seconds |
+| --- | --- | --- | --- |
+| 6,568 lines, unsafe | Taint | Complete, 11/11 sites / 13.958 | Complete, 11/11 sites / 1.764 |
+| 6,568 lines, unsafe | Header | Partial, 0/2 sites / 6.445 | Complete, 2/2 sites / 2.021 |
+| 9,696 lines, unsafe | Taint | External benchmark deadline / 30.370 | Complete, 11/11 sites / 4.274 |
+| 9,696 lines, unsafe | Header | Partial, 0/2 sites / 8.330 | Complete, 2/2 sites / 5.040 |
+| 9,696 lines, clean | Taint | External benchmark deadline / 32.056 | Complete, no findings / 4.014 |
+| 9,696 lines, clean | Header | Partial / 8.121 | Complete, no findings / 3.260 |
+
+The baseline header failures reached its actual 250,000-expression limit.
+The baseline taint deadlines were imposed by the benchmark's 30-second timer,
+not by the scanner; the clean baseline also experienced scheduling contention
+and does not establish a speed ratio. On the 6,568-line taint case, module
+passes fell from 545 to 2 and charged work from 1,225,234 to 31,177 units.
+All 12 bounded runs completed with exact expected sites, including the 80-,
+417-, and 1,185-line cases. Those ordinary cases took about 0.006, 0.022–0.025,
+and 0.077–0.085 seconds per analyzer. Peak observed process RSS among bounded
+runs was 60,936 KiB (59.5 MiB); this is a measurement, not a memory guarantee.
+The large-file regressions retain their 45-second per-case deadlines.
+
+A further paired audit against `1d03868a` found a separate setup cost: each
+function retained all closure names in the module. Setup now retains lexical
+dependencies per function and supplies escaped-callable dependencies when they
+are read. Incomplete recovery keeps one shared closure-name set. With Python
+3.14.8 and the same 256 MiB address-space cap for both implementations:
+
+| Synthetic source | `1d03868a` | Scoped dependency setup |
+| --- | --- | --- |
+| 1,200 independent closure pairs, 4,801 lines | 2,881,200 retained names; 193,644 KiB RSS | 3,600 names; 48,660 KiB RSS |
+| 1,800 pairs, 7,201 lines | MemoryError during setup, before charged work | Complete; exact tail sink; 57,108 KiB RSS; 0.395 s |
+| 8,000 independent functions, 16,001 lines | Complete; 8.475 s | Complete; 3.136 s |
+
+All nine candidate runs completed with exact unsafe/clean expectations.
+Completed pairs charged identical work. The memory failure was imposed by
+the audit cap, not a native UBS diagnostic. Whole-module state snapshots
+still have superlinear cost; this change removes quadratic retained closure
+metadata and repeated namespace scans during function initialization.
+
+Parallel detector workers also send each completed finding before requesting
+the next result. A crash, timeout, missing final record, or malformed response
+retains the valid prefix and reports incomplete coverage. Such runs cannot
+populate a successful scan cache. The private worker protocol uses UTF-8
+independently of the caller's terminal encoding.
 
 The regressions for [issue #192](https://github.com/Dicklesworthstone/ultimate_bug_scanner/issues/192)
 cover 50/100/200-function subprocess chains, shuffled definitions, recursion,
@@ -3337,13 +3478,15 @@ This enables debugging test failures and tracking scanner behavior changes acros
 
 ## 🔄 **Auto-Update System**
 
-UBS includes a background auto-update mechanism that keeps your installation current without manual intervention.
+UBS includes an opt-in update mechanism that publishes the runner and its verified
+dependencies together. Updates require Minisign; the published public key is
+embedded, so cron does not depend on an interactive shell exporting it.
 
 ### How It Works
 
 ```bash
 # Force immediate update check
-ubs --update .
+ubs --update
 
 # Enable automatic updates (checks on each run)
 export UBS_ENABLE_AUTO_UPDATE=1
@@ -3358,6 +3501,19 @@ ubs --no-auto-update .
 # Force module re-download before scanning
 ubs --update-modules .
 ```
+
+An update authenticates the release manifest, verifies the runner and optional
+daemon, and prepares every module, helper, shared library, and contract before
+switching runners. The same-version path verifies and repairs the cache too.
+Download or verification failure returns a nonzero status for `--update` and
+keeps the previous release usable. Concurrent scans retain their own version's
+dependencies, and an interrupted update can be retried safely.
+
+Installations left with a genuine old cache by a runner-only updater migrate
+from explicitly recognized historical contract digests, including v5.5.3.
+Unknown or tampered contracts still refuse scanning; `ubs doctor --fix` is the
+explicit repair command. See [runner and cache publication](docs/security.md#runner-and-cache-publication)
+for the integrity and recovery guarantees.
 
 ### CI Mode Behavior
 

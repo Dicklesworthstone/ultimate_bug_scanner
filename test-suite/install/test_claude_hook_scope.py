@@ -12,12 +12,19 @@ from pathlib import Path
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
+import venv
 
 ROOT = Path(__file__).resolve().parents[2]
 INSTALLER = ROOT / "install.sh"
+
+
+def installer_python_functions() -> str:
+    text = INSTALLER.read_text(encoding="utf-8")
+    return text[text.index("\nINSTALLER_PYTHON=()\n"):text.index("\nreport_swift_guard_readiness() {")]
 
 
 def command_hook(command: str, matcher: str = "Bash") -> dict:
@@ -59,7 +66,7 @@ warn(){ log "$*"; }
 success(){ log "$*"; }
 log_dry_run(){ log "$*"; }
 dry_run_enabled(){ [[ "$DRY_RUN" == 1 ]]; }
-""" + functions + """
+""" + installer_python_functions() + "\nresolve_installer_python\n" + functions + """
 install_claude_safety_guard(){
   local destination="${1:-.}/.claude/hooks"
   printf '%s\\n' "$destination" >> "$GUARD_CALLS"
@@ -70,7 +77,7 @@ install_claude_safety_guard(){
 }
 setup_claude_code_hook
 """
-        result = subprocess.run(["bash", "-c", script], cwd=cwd,
+        result = subprocess.run(["bash", "-c", script], cwd=cwd,  # ubs:ignore[py.security.command-injection] - executes repository installer functions plus the fixed fixture above; test inputs are passed through isolated environment variables, never interpolated as shell code.
                                 env={**self.env, "DRY_RUN": str(int(dry_run))},
                                 capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -457,7 +464,8 @@ exit "$SCAN_EXIT"
         functions = text[text.index("\nquick_reference_block() {\n"):text.index("\nadd_to_agents_md() {\n")]
         generator = self.root / "reference-generator.sh"
         generator.write_text("set -euo pipefail\nlog(){ :; }\nwarn(){ printf '%s\\n' \"$*\" >&2; }\n"
-                             "success(){ :; }\ndry_run_enabled(){ return 1; }\n" + functions +
+                             "success(){ :; }\ndry_run_enabled(){ return 1; }\n" +
+                             installer_python_functions() + "\nresolve_installer_python\n" + functions +
                              '\nappend_quick_reference_block "$1" "test guardrails"\n')
         result = subprocess.run(["bash", str(generator), str(destination)],
                                 cwd=self.project, env=self.env, capture_output=True,
@@ -589,6 +597,10 @@ class InstallerCLI(unittest.TestCase):
             # install exercises maybe_setup_hook under the same HOME reproduction.
             shutil.copy2(ROOT / "ubs", home / "ubs")
             shutil.copy2(ROOT / "ubs-daemon", home / "ubs-daemon")
+            # A local install now verifies the complete release before
+            # publishing its runner, even when the optional doctor is skipped.
+            shutil.copytree(ROOT / "modules", home / "modules",
+                            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
             for index, args in enumerate((
                 ["--setup-claude-hook", "--non-interactive"],
                 ["--easy-mode", "--local", "--skip-ast-grep", "--skip-ripgrep", "--skip-jq", "--skip-bun",
@@ -603,6 +615,200 @@ class InstallerCLI(unittest.TestCase):
                 self.assertEqual(settings.read_bytes(), before)
                 self.assertFalse((settings.parent / "hooks").exists())
                 self.assertFalse(list(settings.parent.glob("settings.json.bak-ubs-*")))
+
+
+class InstallerPython(unittest.TestCase):
+    """Real installer actions with Python available through supported names."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="ubs-installer-python-")
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.home = self.root / "home"
+        self.project = self.root / "project with spaces"
+        self.bin = self.root / "tools"
+        for path in (self.home, self.project, self.bin):
+            path.mkdir()
+        # Use a private PATH instead of renaming or removing a host interpreter.
+        # jq/ripgrep are real host prerequisites, not successful scanner doubles.
+        for name in ("awk", "basename", "bash", "cat", "chmod", "cmp", "cp", "cut", "date", "dirname",
+                     "du", "env", "find", "git", "grep", "head", "id", "jq", "ln", "ls", "mkdir", "mktemp", "mv",
+                     "pwd", "readlink", "realpath", "rg", "rm", "rmdir", "sed", "sha256sum",
+                     "sh", "sleep", "sort", "stat", "tail", "tee", "timeout", "touch", "tr", "uname", "uniq", "wc", "xargs"):
+            target = shutil.which(name)
+            if target:
+                (self.bin / name).symlink_to(target)
+        self.assertTrue((self.bin / "jq").exists(), "installer integration requires jq")
+        self.assertTrue((self.bin / "rg").exists(), "installer integration requires ripgrep")
+        self.env = {k: v for k, v in os.environ.items()
+                    if not k.startswith(("GIT_", "UBS_", "XDG_", "CLAUDE_", "PYTHON", "BASH_FUNC_"))
+                    and k not in ("BASH_ENV", "ENV", "CDPATH")}
+        self.env.update(HOME=str(self.home), NO_COLOR="1", SHELL=str(self.bin / "bash"),
+                        PATH=str(self.bin), XDG_DATA_HOME=str(self.root / "data"),
+                        XDG_CACHE_HOME=str(self.root / "cache"),
+                        TEST_REAL_PYTHON=sys.executable, TEST_CRON_FILE=str(self.root / "cron"))
+        for name in ("curl", "wget"):
+            self.executable(self.bin / name, 'printf "unexpected network request\\n" >&2\nexit 91\n')
+        self.executable(self.bin / "crontab", 'case "$1" in\n-l) exit 0;;\n-) cat > "$TEST_CRON_FILE";;\n*) exit 1;;\nesac\n')
+        subprocess.run([str(self.bin / "git"), "init", "-q", str(self.project)],
+                       env=self.env, check=True, capture_output=True, timeout=20)
+        self.calls = 0
+
+    def executable(self, path: Path, body: str) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("#!/bin/sh\n" + body)
+        path.chmod(0o755)
+        return path
+
+    def interpreter(self, path: Path) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.symlink_to(sys.executable)
+        return path
+
+    def invoke(self, *args: str) -> subprocess.CompletedProcess[str]:
+        self.calls += 1
+        work = self.root / f"installer-work-{self.calls}"
+        result = subprocess.run([str(self.bin / "bash"), str(INSTALLER), "--skip-version-check", *args],
+                                cwd=self.project, env={**self.env, "UBS_INSTALLER_WORKDIR": str(work)},
+                                capture_output=True, text=True, timeout=120)
+        self.assertFalse(work.exists(), "installer temporary files must not be required by saved hooks")
+        return result
+
+    def setup_hooks(self) -> dict:
+        result = self.invoke("--setup-claude-hook", "--non-interactive")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        settings = self.project / ".claude/settings.json"
+        self.assertTrue(settings.is_file(), result.stdout + result.stderr)
+        data = json.loads(settings.read_text())
+        self.assertIn("PostToolUse", data["hooks"])
+        self.assertIn("PreToolUse", data["hooks"])
+        return data
+
+    def run_registered_guard(self, settings: dict) -> str:
+        command = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        # Exercise the actual saved shell command after installer cleanup and
+        # from another directory. The destructive text is only guard input.
+        result = subprocess.run([str(self.bin / "sh"), "-c", command],  # ubs:ignore[py.security.command-injection] - trusted installer-generated hook command, executed to verify its shell quoting and retained interpreter arguments.
+            cwd=self.root, env={**self.env, "CLAUDE_PROJECT_DIR": str(self.project)},
+            input=json.dumps({"tool_name": "Bash", "tool_input": {"command": "git reset --hard"}}),
+            capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
+        return command
+
+    def test_python_fallback_registers_hooks_that_survive_installer_cleanup(self) -> None:
+        selected = self.interpreter(self.bin / "python")
+        settings = self.setup_hooks()
+        command = self.run_registered_guard(settings)
+        self.assertEqual(shlex.split(command)[:3], [str(selected), "-I", "-S"])
+        path = self.project / ".claude/settings.json"
+        before = path.read_bytes()
+        self.setup_hooks()
+        self.assertEqual(path.read_bytes(), before)
+        self.assertFalse(list(path.parent.glob("settings.json.bak-ubs-*")))
+
+    def test_py_launcher_keeps_python3_argument_in_saved_guard(self) -> None:
+        selected = self.executable(self.bin / "py", '[ "$1" = "-3" ] || exit 88\nshift\nexec "$TEST_REAL_PYTHON" "$@"\n')
+        command = self.run_registered_guard(self.setup_hooks())
+        self.assertEqual(shlex.split(command)[:4], [str(selected), "-3", "-I", "-S"])
+
+    def test_relative_override_with_spaces_upgrades_owned_guard_without_losing_custom_settings(self) -> None:
+        selected = self.interpreter(self.project / "tool chain/python selected")
+        self.env["UBS_PYTHON"] = "./tool chain/python selected"
+        path = self.project / ".claude/settings.json"
+        path.parent.mkdir()
+        before = {"permissions": {"allow": ["Bash(ls:*)"]}, "hooks": {"PreToolUse": [
+            command_hook('"$CLAUDE_PROJECT_DIR/.claude/hooks/git_safety_guard.py"', "Bash|Custom")],
+            "PostToolUse": [command_hook("custom-on-save", "Custom")]}}
+        path.write_text(json.dumps(before) + "\n")
+        settings = self.setup_hooks()
+        command = self.run_registered_guard(settings)
+        self.assertEqual(shlex.split(command)[:3], [str(selected), "-I", "-S"])
+        self.assertEqual(settings["permissions"], before["permissions"])
+        self.assertEqual(settings["hooks"]["PreToolUse"][0]["matcher"], "Bash|Custom")
+        self.assertEqual(settings["hooks"]["PostToolUse"][0], before["hooks"]["PostToolUse"][0])
+        self.assertEqual(len(list(path.parent.glob("settings.json.bak-ubs-*"))), 1)
+
+    def test_virtualenv_final_symlink_is_kept_in_registered_interpreter(self) -> None:
+        environment = self.project / "virtual environment"
+        venv.EnvBuilder(with_pip=False, symlinks=True).create(environment)
+        selected = environment / "bin/python"
+        self.assertTrue(selected.is_symlink())
+        self.env["UBS_PYTHON"] = str(selected)
+        command = self.run_registered_guard(self.setup_hooks())
+        self.assertEqual(shlex.split(command)[0], str(selected))
+        self.assertNotEqual(shlex.split(command)[0], str(selected.resolve()))
+
+    def test_failed_default_python3_falls_back_to_working_python(self) -> None:
+        self.executable(self.bin / "python3", "exit 89\n")
+        selected = self.interpreter(self.bin / "python")
+        command = self.run_registered_guard(self.setup_hooks())
+        self.assertEqual(shlex.split(command)[0], str(selected))
+
+    def test_bad_explicit_override_fails_before_hook_changes_but_help_still_works(self) -> None:
+        self.interpreter(self.bin / "python3")
+        self.env["UBS_PYTHON"] = str(self.root / "missing-python")
+        result = self.invoke("--setup-claude-hook", "--non-interactive")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("not a usable Python >= 3.9", result.stdout + result.stderr)
+        self.assertFalse((self.project / ".claude").exists())
+        result = self.invoke("--help")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        result = self.invoke("--setup-git-hook", "--non-interactive")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((self.project / ".git/hooks/pre-commit").is_file())
+
+    def test_probes_and_settings_helpers_ignore_python_startup_and_project_imports(self) -> None:
+        self.interpreter(self.bin / "python3")
+        marker = self.root / "unauthenticated-python-executed"
+        payload = f"from pathlib import Path\nPath({str(marker)!r}).write_text('executed')\n"
+        startup = self.root / "startup"
+        startup.mkdir()
+        (startup / "sitecustomize.py").write_text(payload)
+        (self.project / "json.py").write_text(payload + "raise RuntimeError('project json shadow')\n")
+        self.env["PYTHONPATH"] = str(startup)
+        result = self.invoke("--setup-claude-hook", "--non-interactive")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(marker.exists(), "installer must isolate both version probes and stdlib helpers")
+        self.assertTrue((self.project / ".claude/settings.json").is_file(), result.stdout + result.stderr)
+
+    def test_diagnostic_readiness_uses_the_selected_interpreter(self) -> None:
+        self.interpreter(self.bin / "python")
+        (self.project / "sample.swift").write_text("let value = 1\n")
+        source = INSTALLER.read_text()
+        functions = source[source.index("count_swift_files() {"):source.index("register_temp_path() {")]
+        harness = self.root / "swift-readiness.sh"
+        harness.write_text('set -euo pipefail\nSKIP_TYPE_NARROWING=0\nBOLD=\"\"\nRESET=\"\"\n'
+                           'log(){ printf "%s\\n" "$*"; }\nwarn(){ log "$@"; }\n'
+                           'success(){ log "$@"; }\nrecord_session_fact(){ log "$@"; }\n' + functions +
+                           '\nresolve_installer_python\nreport_swift_guard_readiness\n')
+        result = subprocess.run([str(self.bin / "bash"), str(harness)], cwd=self.project, env=self.env,
+                                capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("1 Swift files detected (helper ready)", result.stdout)
+        self.assertNotIn("missing", result.stdout)
+
+    def test_local_install_with_python_alias_keeps_scan_and_cron_operational(self) -> None:
+        self.interpreter(self.bin / "python")
+        (self.project / ".claude").mkdir()
+        install_dir = self.home / ".local/bin"
+        result = self.invoke("--easy-mode", "--local", "--skip-ast-grep", "--skip-ripgrep", "--skip-jq",
+            "--skip-bun", "--skip-type-narrowing", "--skip-typos", "--skip-toon", "--skip-doctor",
+            "--no-path-modify", "--install-dir", str(install_dir))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        settings = json.loads((self.project / ".claude/settings.json").read_text())
+        self.run_registered_guard(settings)
+        job = (self.root / "cron").read_text()
+        self.assertIn("--update --quiet --non-interactive", job)
+        self.assertNotIn("installer-work-", job)
+        target = self.project / "unsafe.py"
+        target.write_text("eval(input())\n")
+        result = subprocess.run([str(install_dir / "ubs"), "--no-auto-update", "--only=python", "--format=json",
+                                 str(target)], cwd=self.project, env=self.env,
+                                capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("python.taint.eval", result.stdout)
+        self.assertEqual(json.loads(result.stdout)["status"], "ok")
 
 
 if __name__ == "__main__":

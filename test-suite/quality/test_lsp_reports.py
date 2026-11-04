@@ -78,6 +78,27 @@ class ReportTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(lsp.ProtocolError):
                 self.render(dict(self.report, findings=value))
 
+    def test_complete_reports_require_all_nonnegative_severity_counters(self):
+        for severity in ('critical', 'warning', 'info'):
+            report = copy.deepcopy(self.report)
+            del report['totals'][severity]
+            with self.subTest(severity=severity), self.assertRaises(lsp.ProtocolError):
+                self.render(dict(report, findings=[]))
+        for value in (None, False, '0', 0.0, -1):
+            report = copy.deepcopy(self.report)
+            report['totals']['warning'] = value
+            with self.subTest(value=value), self.assertRaises(lsp.ProtocolError):
+                self.render(dict(report, findings=[]))
+
+    def test_explicit_empty_ledger_cannot_hide_positive_scanner_counters(self):
+        for severity in ('critical', 'warning', 'info'):
+            report = copy.deepcopy(self.report)
+            report['scanners'] = [{'language': 'python', 'files': 1,
+                                   'critical': 0, 'warning': 0, 'info': 0}]
+            report['scanners'][0][severity] = 1
+            with self.subTest(severity=severity), self.assertRaises(lsp.ProtocolError):
+                self.render(dict(report, findings=[]))
+
     def test_partial_failed_and_no_target_reports_still_fail_closed(self):
         for report in (dict(self.report, status='partial'), dict(self.report, status='error'),
                        dict(self.report, failed_modules=['python']),
@@ -120,8 +141,16 @@ class RoutingTests(unittest.TestCase):
                      'severity': 'warning', 'message': rule}, **fields)
 
     def report(self, records, **fields):
+        # Count only the unsuppressed ledger, not advisory AST records. Project
+        # records contribute their occurrence count; located records count once.
+        totals = {'files': 2, **{
+            severity: sum(record.get('count', 1) if record.get('scope') in ('project', 'project_aggregate') else 1
+                          for record in records
+                          if record.get('severity') == severity and record.get('suppressed') is not True)
+            for severity in ('critical', 'warning', 'info')
+        }}
         return dict({'status': 'ok', 'project': str(self.root),
-                     'totals': {'files': 2}, 'findings': records}, **fields)
+                     'totals': totals, 'findings': records}, **fields)
 
     def render(self, report, path, paths=None, **options):
         return lsp.report_diagnostics(report, path, self.root, '\ufeffvalue😀\nnext\n', 1,

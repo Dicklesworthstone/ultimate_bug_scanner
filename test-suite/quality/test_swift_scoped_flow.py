@@ -1727,5 +1727,95 @@ class SwiftScopedFlowTests(unittest.TestCase):
             ''', policy='path')
 
 
+class SwiftNarrowingOperators(unittest.TestCase):
+    """Comparison tokens and other bindings cannot stand in for an unwrap."""
+
+    def findings(self, tail):
+        from ubs_core.analyzers.narrowing_swift import scan_text
+        source = 'if value == nil { recordMissing() }\n' + tail
+        return scan_text(Path('Operators.swift'), source)
+
+    def test_comparison_is_not_a_forced_unwrap(self):
+        for tail in ('if value != nil { use(value) }',
+                     'if value != nil, ready, !reviewing { show() }',
+                     'use(othervalue!)'):
+            with self.subTest(tail=tail):
+                self.assertEqual(self.findings(tail), [])
+
+    def test_actual_unwrap_reports_its_site_after_comparisons(self):
+        for preceding in ('if value != nil { observe() }',
+                          'if value == nil { observe() }',
+                          'observe(value == nil)',
+                          'othervalue = replacement'):
+            with self.subTest(preceding=preceding):
+                found = self.findings(preceding + '\nuse(value!)')
+                negative = [item for item in found if item[0] == 'negative_nil_guard']
+                self.assertTrue(negative, found)
+                self.assertTrue(all(item[2:4] == (3, 5) for item in found), found)
+
+    def test_actual_assignment_keeps_the_existing_narrowing_boundary(self):
+        self.assertEqual(self.findings('value = replacement\nuse(value!)'), [])
+
+    def test_actual_unwrap_and_missing_guard_exit_remain_detected(self):
+        self.assertEqual([(item[0], item[2], item[3]) for item in self.findings('use(value!)')],
+                         [('negative_nil_guard', 2, 5)])
+        from ubs_core.analyzers.narrowing_swift import scan_text
+        findings = scan_text(Path('Operators.swift'),
+                             'guard let value = raw else { recordMissing() }\nuse(value)')
+        self.assertEqual([(item[0], item[2], item[3]) for item in findings],
+                         [('guard_let_no_exit', 1, 1)])
+
+    def test_public_json_and_sarif_distinguish_comparisons_from_unwraps(self):
+        import hashlib
+        import os
+        import subprocess
+        import time
+        artifact = ROOT / 'test-suite/artifacts' / ('swift-narrowing-' + uuid.uuid4().hex)
+        artifact.mkdir(parents=True)
+        cases = (
+            ('comparison', 'if value != nil { observe() }', []),
+            ('other-binding', 'use(othervalue!)', []),
+            ('equality-before-unwrap', 'observe(value == nil)\nuse(value!)', [3]),
+            ('other-assignment-before-unwrap', 'othervalue = replacement\nuse(value!)', [3]),
+        )
+        for name, tail, lines in cases:
+            target = artifact / (name + '.swift')
+            target.write_text('if value == nil { recordMissing() }\n' + tail + '\n', encoding='utf-8')
+            for fmt in ('json', 'sarif'):
+                with self.subTest(case=name, format=fmt):
+                    command = [str(ROOT / 'ubs'), '--only=swift', '--ci', '--no-cache',
+                               '--fail-on-warning', '--format=' + fmt, str(target)]
+                    started = time.monotonic()
+                    result = subprocess.run(command, cwd=artifact, text=True, capture_output=True,
+                        timeout=180, env={**os.environ, 'UBS_NO_AUTO_UPDATE': '1',
+                            'UBS_ENABLE_AUTO_UPDATE': '0',
+                            'PYTHONDONTWRITEBYTECODE': '1', 'UBS_CACHE_DIR': str(artifact / 'cache')})
+                    prefix = artifact / (name + '-' + fmt)
+                    prefix.with_suffix('.stdout').write_text(result.stdout, encoding='utf-8')
+                    prefix.with_suffix('.stderr').write_text(result.stderr, encoding='utf-8')
+                    prefix.with_suffix('.identity.json').write_text(json.dumps({
+                        'command': command, 'exit': result.returncode, 'seconds': time.monotonic() - started,
+                        'source_sha256': hashlib.sha256(target.read_bytes()).hexdigest(),
+                    }, indent=2), encoding='utf-8')
+                    self.assertEqual(result.returncode, int(bool(lines)), (result.stdout, result.stderr))
+                    payload = json.loads(result.stdout)
+                    if fmt == 'json':
+                        self.assertEqual(payload['status'], 'ok', payload)
+                        self.assertEqual(payload['failed_modules'], [], payload)
+                        self.assertEqual(payload['totals']['files'], 1, payload)
+                        self.assertEqual(payload['totals']['critical'], 0, payload)
+                        self.assertEqual(payload['totals']['warning'], len(lines), payload)
+                        rows = [row for row in payload['findings']
+                                if row['rule_id'].startswith('swift.narrowing.')]
+                        actual = [(row['rule_id'], row['line'], row['severity']) for row in rows]
+                    else:
+                        rows = [row for run in payload['runs'] for row in run.get('results', [])
+                                if row['ruleId'].startswith('swift.narrowing.')]
+                        actual = [(row['ruleId'], row['locations'][0]['physicalLocation']['region']['startLine'],
+                                   row['level']) for row in rows]
+                    self.assertEqual(actual, [('swift.narrowing.negative_nil_guard', line, 'warning')
+                                              for line in lines], payload)
+
+
 if __name__ == '__main__':
     unittest.main()

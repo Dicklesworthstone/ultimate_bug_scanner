@@ -299,17 +299,20 @@ class DiagnosticsTests(Fixture):
 
     def test_suppression_project_records_and_advisory_ast_channel(self):
         base = {'rule_id': 'py.example', 'file': str(self.source), 'line': 1, 'severity': 'warning', 'message': 'finding'}
-        report = {'status': 'ok', 'totals': {'files': 1}, 'findings': [{**base, 'suppressed': True}],
+        report = {'status': 'ok', 'totals': {'files': 1, 'critical': 0, 'warning': 0, 'info': 0},
+                  'findings': [{**base, 'suppressed': True}],
                   'ast_findings': [{**base, 'rule_id': 'py.ast'}]}
         diagnostics = lsp.report_diagnostics(report, self.source, self.root, 'clean\n', 0)
         self.assertEqual([d['code'] for d in diagnostics], ['py.ast'])
         report['findings'].append({**base, 'scope': 'project_aggregate', 'file': '', 'line': 0, 'count': 4})
+        report['totals']['warning'] = 4
         self.assertIn('Project-level', lsp.report_diagnostics(report, self.source, self.root, 'clean\n', 1)[0]['message'])
 
     def test_malformed_or_foreign_findings_never_create_false_source_diagnostics(self):
         finding = {'rule_id': 'py.bug', 'message': 'BUG', 'file': str(self.source), 'line': 1, 'severity': 'critical'}
         for update in ({'line': True}, {'line': 40}, {'severity': 'unknown'}, {'suppressed': 'yes'}):
-            report = {'status': 'ok', 'totals': {'files': 1}, 'findings': [{**finding, **update}]}
+            report = {'status': 'ok', 'totals': {'files': 1, 'critical': 1, 'warning': 0, 'info': 0},
+                      'findings': [{**finding, **update}]}
             with self.subTest(update=update), self.assertRaises(lsp.ProtocolError):
                 lsp.report_diagnostics(report, self.source, self.root, 'clean', 1)
         report['findings'] = [{**finding, 'file': '/outside/private.py'}]

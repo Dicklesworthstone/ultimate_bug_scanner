@@ -2346,6 +2346,156 @@ class HeaderInjectionFlowTests(unittest.TestCase):
         self.assertIn('emit()', findings[0][3])
         self.assertIn('response header', findings[0][3])
 
+    def test_large_module_keeps_thirteen_late_security_findings(self):
+        # 6,520 lines of independent, finite loops exceeded the old file-wide
+        # expression cap. Each loop needs 81 passes to propagate the argument
+        # across 80 slots; no individual function is an unbounded workload.
+        slots = 80
+        body = ''.join(f'    v{index} = ""\n' for index in range(slots))
+        body += '    while enabled:\n'
+        body += ''.join(f'        v{index} = v{index + 1}\n' for index in range(slots - 1))
+        body += f'        v{slots - 1} = value\n    return v0\n'
+        prefix = ''.join(f'def process_{index}(value):\n' + body for index in range(40))
+        helpers = ('from urllib.parse import quote, unquote\n'
+                   'def relay(value): return value\n'
+                   'def encode(value): return quote(value, safe="")\n')
+        payloads = ('request.args["name"]', 'relay(request.args["name"])',
+                    'process_39(request.args["name"])',
+                    'unquote(encode(request.args["name"]))')
+        planted = ''.join(
+            f'def unsafe_{index}(request, response):\n'
+            f'    response.headers["X-{index}"] = {payloads[index % len(payloads)]}  # header-finding\n'
+            for index in range(13))
+        clean = ('def safe(request, response):\n'
+                 '    response.headers["X"] = encode(request.args["name"])\n')
+        self.check_cases({'large-late-header-findings': prefix + helpers + planted + clean})
+
+    def test_exhausted_function_keeps_other_functions_and_diagnostic(self):
+        from unittest import mock
+
+        source = ('def before(request, response):\n'
+                  '    response.headers["Before"] = request.args["before"]\n'
+                  'def expensive(value):\n' + '    value = str(value)\n' * 100 +
+                  '    return value\n'
+                  'def relay(value): return value\n'
+                  'def after(request, response):\n'
+                  '    response.headers["After"] = relay(request.args["after"])\n')
+        path = self.work / 'limited-header-functions.py'
+        path.write_text(source, encoding='utf-8')
+        findings = []
+        with mock.patch.dict(os.environ, {'UBS_PYTHON_FLOW_SCOPE_STEPS': '200'}), \
+                self.assertRaisesRegex(RuntimeError, 'incomplete header analysis') as raised:
+            findings.extend(header_injection.find([path]))
+        self.assertEqual([line for _, line, _, _ in findings], [2, len(source.splitlines())])
+        self.assertIn('expensive', str(raised.exception))
+        self.assertIn('lines 3-104', str(raised.exception))
+        self.assertIn('limited-header-functions.py', str(raised.exception))
+        self.assertIn('200', str(raised.exception))
+
+    def test_exhausted_helper_keeps_observed_parameterized_sink(self):
+        from unittest import mock
+
+        helper = ('from urllib.parse import quote\n'
+                  'def expensive(value, response):\n'
+                  '    response.headers["X"] = value\n' +
+                  '    value = str(value)\n' * 100 + '    return value\n')
+        for label, argument, expected in (
+                ('unsafe', 'request.args["x"]', [3]),
+                ('encoded', 'quote(request.args["x"], safe="")', [])):
+            with self.subTest(case=label):
+                path = self.work / f'limited-helper-{label}.py'
+                path.write_text(helper + 'def view(request, response):\n'
+                                f'    expensive({argument}, response)\n', encoding='utf-8')
+                findings = []
+                with mock.patch.dict(os.environ, {'UBS_PYTHON_FLOW_SCOPE_STEPS': '200'}), \
+                        self.assertRaisesRegex(RuntimeError, 'incomplete header analysis.*expensive'):
+                    findings.extend(header_injection.find([path]))
+                self.assertEqual([line for _, line, _, _ in findings], expected)
+                if findings:
+                    self.assertIn('request.args', findings[0][3])
+                    self.assertIn('response header', findings[0][3])
+
+    def test_coroutine_summaries_preserve_sinks_and_encoder_proofs(self):
+        self.check_cases({
+            'awaited-header-return': '''
+                async def relay(value): return value
+                async def view(request, response):
+                    response.headers['X'] = await relay(request.args['x'])  # header-finding
+            ''',
+            'awaited-header-sink': '''
+                async def emit(value, response):
+                    response.headers['X'] = value  # header-finding
+                async def view(request, response):
+                    await emit(request.args['x'], response)
+            ''',
+            'unawaited-header-sink': '''
+                async def emit(value, response):
+                    response.headers['X'] = value
+                def view(request, response):
+                    emit(request.args['x'], response)
+            ''',
+            'awaited-header-encoder': '''
+                from urllib.parse import quote
+                async def encode(value): return quote(value, safe='')
+                async def view(request, response):
+                    response.headers['X'] = await encode(request.args['x'])
+            ''',
+            'asyncio-run-header-return': '''
+                import asyncio
+                async def relay(value): return value
+                def view(request, response):
+                    response.headers['X'] = asyncio.run(relay(request.args['x']))  # header-finding
+            ''',
+        })
+
+    def test_exhausted_coroutines_preserve_actual_arguments_and_revoke_proofs(self):
+        from unittest import mock
+
+        helper = ('from urllib.parse import quote, unquote\n'
+                  'import asyncio\n'
+                  'async def expensive(value):\n'
+                  '    value = unquote(value)\n' +
+                  '    value = str(value)\n' * 100 + '    return value\n')
+        for label, handler, result in (
+                ('await', 'async def view(request, response):',
+                 'await expensive(request.args["x"])'),
+                ('encoded-await', 'async def view(request, response):',
+                 'await expensive(quote(request.args["x"], safe=""))'),
+                ('run', 'def view(request, response):',
+                 'asyncio.run(expensive(request.args["x"]))')):
+            with self.subTest(case=label):
+                source = helper + handler + f'\n    response.headers["X"] = {result}\n'
+                path = self.work / f'limited-coroutine-{label}.py'
+                path.write_text(source, encoding='utf-8')
+                findings = []
+                with mock.patch.dict(os.environ, {'UBS_PYTHON_FLOW_SCOPE_STEPS': '200'}), \
+                        self.assertRaisesRegex(RuntimeError, 'incomplete header analysis.*expensive'):
+                    findings.extend(header_injection.find([path]))
+                self.assertEqual([line for _, line, _, _ in findings], [len(source.splitlines())])
+                self.assertIn('request.args', findings[0][3])
+
+    def test_exhausted_coroutines_retain_shared_taint_provenance(self):
+        from unittest import mock
+
+        helper = ('import os, asyncio\n'
+                  'async def expensive(value):\n' + '    value = str(value)\n' * 100 +
+                  '    return value\n')
+        for label, handler, result in (
+                ('await', 'async def view():', 'await expensive(input())'),
+                ('run', 'def view():', 'asyncio.run(expensive(input()))')):
+            with self.subTest(case=label):
+                source = helper + handler + f'\n    os.system({result})\n'
+                path = self.work / f'limited-taint-coroutine-{label}.py'
+                path.write_text(source, encoding='utf-8')
+                findings = []
+                with mock.patch.dict(os.environ, {'UBS_PYTHON_FLOW_SCOPE_STEPS': '200'}), \
+                        self.assertRaisesRegex(header_injection.flow.AnalysisLimit,
+                                               'incomplete.*expensive'):
+                    findings.extend(header_injection.flow.scan_file_findings(path))
+                self.assertEqual([(rule, line) for rule, line, _, _ in findings],
+                                 [('py.taint.command', len(source.splitlines()))])
+                self.assertIn('input(', findings[0][3])
+
     def test_sink_scoped_suppression_and_structural_prefilter(self):
         from unittest import mock
         self.check_cases({'header-suppressions': '''
@@ -2373,8 +2523,8 @@ class HeaderInjectionFlowTests(unittest.TestCase):
             self.assertEqual(next(findings)[:3], (good, 1, 1))
             with self.assertRaisesRegex(RuntimeError, 'incomplete header analysis.*SyntaxError'):
                 next(findings)
-        with mock.patch.object(header_injection, 'MAX_FLOW_STEPS', 1):
-            with self.assertRaisesRegex(RuntimeError, 'incomplete header analysis.*evaluation steps'):
+        with mock.patch.dict(os.environ, {'UBS_PYTHON_FLOW_MAX_STEPS': '1'}):
+            with self.assertRaisesRegex(RuntimeError, 'incomplete header analysis.*work limit'):
                 list(header_injection.find([good]))
 
     def test_shared_work_limit_keeps_earlier_and_later_header_findings(self):
@@ -2412,6 +2562,8 @@ class HeaderInjectionPublicTests(unittest.TestCase):
                  'def prepare(value): return encoded(value, safe="")\n'
                  'def view(request, response):\n'
                  '    response.headers["X"] = prepare(request.args["x"])\n')
+        limited = ('def expensive(value):\n' + '    value = str(value)\n' * 100 +
+                   '    return value\n' + unsafe)
         env = {**os.environ, 'UBS_NO_AUTO_UPDATE': '1', 'UBS_ENABLE_AUTO_UPDATE': '0',
                'UBS_NO_CACHE': '1', 'CI': '1', 'NO_COLOR': '1',
                'XDG_DATA_HOME': str(work / 'data'), 'XDG_CONFIG_HOME': str(work / 'config'),
@@ -2419,20 +2571,22 @@ class HeaderInjectionPublicTests(unittest.TestCase):
         skip = '--skip=' + ','.join(str(i) for i in range(1, 24) if i != 7)
         for label, source, expected, partial in (
                 ('unsafe', unsafe, [4], False), ('clean', clean, [], False),
-                ('partial', unsafe, [4], True)):
+                ('partial', unsafe, [4], True),
+                ('limited', limited, [len(limited.splitlines())], True)):
             selected = work / label
             selected.mkdir()
             path = selected / 'view.py'
             path.write_text(source, encoding='utf-8')
-            if partial:
+            if label == 'partial':
                 (selected / 'malformed.py').write_text('response.headers[ = input()\n', encoding='utf-8')
+            run_env = {**env, 'UBS_PYTHON_FLOW_SCOPE_STEPS': '200'} if label == 'limited' else env
             for module in (True, False):
                 for fmt in ('json', 'sarif'):
                     with self.subTest(case=label, module=module, format=fmt):
                         prefix = (('bash', str(REPO_ROOT / 'modules/ubs-python.sh'), '--no-uv')
                                   if module else ('bash', str(REPO_ROOT / 'ubs'), '--only=python'))
                         command = (*prefix, '--ci', '--format=' + fmt, skip, str(selected))
-                        result = subprocess.run(command, cwd=work, env=env, capture_output=True,
+                        result = subprocess.run(command, cwd=work, env=run_env, capture_output=True,
                                                 text=True, timeout=180)
                         output = work / f'{label}-{module}-{fmt}'
                         output.with_suffix('.stdout').write_text(result.stdout, encoding='utf-8')

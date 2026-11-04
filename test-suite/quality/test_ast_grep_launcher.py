@@ -17,6 +17,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -172,13 +174,15 @@ class AstGrepLauncher(unittest.TestCase):
     def test_shipped_runner_refuses_scan_when_launcher_cannot_be_shadowed(self) -> None:
         # Fail one real filesystem operation in the shipped CLI. It must stop
         # before any module can invoke the unsafe launcher, even on a Python scan.
+        real_mkdir = shutil.which('mkdir')
+        self.assertIsNotNone(real_mkdir, 'mkdir is required to exercise the launcher failure')
         tools = self.root / 'tools'
         tools.mkdir()
         mkdir = tools / 'mkdir'
         mkdir.write_text(
             '#!/bin/sh\n'
             'case "$*" in *ast-grep-path*) exit 71;; esac\n'
-            'exec /usr/bin/mkdir "$@"\n', encoding='utf-8',
+            f'exec {shlex.quote(real_mkdir)} "$@"\n', encoding='utf-8',
         )
         mkdir.chmod(0o755)
         target = self.root / 'clean.py'

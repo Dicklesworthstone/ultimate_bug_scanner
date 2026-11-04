@@ -11,6 +11,13 @@ The service requires POSIX (Linux, macOS or another supported Unix). On Windows
 Git Bash, MSYS and Cygwin, installed save and Git hooks use ordinary `ubs`
 scans; use the ordinary scanner directly there. WSL uses the Linux service.
 
+Canonical service commands discover Python >= 3.9 through `python3`, `python`,
+or `py -3`, and honor an explicit `UBS_PYTHON` executable. An invalid explicit
+override is an error. Discovery uses isolated Python startup before loading
+the verified companion, requires no scanner tools or temporary launcher, and
+preserves a selected virtual environment. A relative override is anchored
+before the service changes the scanner's working directory.
+
 ```bash
 ./ubs serve --repo /path/to/project --jobs=2
 ./ubs --client --repo /path/to/project src/main.py
@@ -47,12 +54,21 @@ to a checkout or portable bundle. Renamed runners retain their actual scanner
 path. Neither the project nor PATH supplies replacement daemon code.
 
 The release payload and checksum manifest include `ubs-daemon`.
+Restart a running service after updating its daemon executable so requests use
+the newly installed implementation; an existing process retains its loaded code.
 `scripts/verify.sh` binds its digest to both the authenticated manifest and
 the runner pin, then includes it in exported portable bundles. Local installs
 require the matching local companion without downloading a replacement.
 Host tools remain separate dependencies and no service starts automatically.
-An upgrade from a runner predating the service may require running the new
-installer once to provision its companion.
+`ubs doctor` verifies the same companion selected by the canonical service
+loader. A missing or damaged payload is an error, including when no daemon is
+running: the client needs that verified payload before one-shot fallback.
+Use `ubs doctor --fix` to restore an installed companion from its pinned release
+tag, or reuse an adjacent copy only when its exact bytes match the loaded pin.
+Repair verifies the complete download before atomically publishing it and
+refuses a runner that changed while repair was in progress. A failed companion
+download leaves the runner and existing companion unchanged. Source checkouts
+and portable source bundles require restoring their matching source instead.
 
 A missing daemon or a different invocation environment/scanner falls back to an
 ordinary scan. `--require-daemon` disables that fallback. Authentication, protocol
@@ -68,8 +84,9 @@ exits after 900 idle seconds by default (`--idle-timeout`).
 
 Eligible explicit-file reports are retained in a bounded in-memory LRU (32 MiB by default,
 `--cache-mib=0` disables it). Reuse requires matching source selection, policy,
-format, environment, and a fresh byte snapshot of the repository and adjacent
-runtime modules. Global Git configuration and ordinary tool executable updates
+format, environment, and a fresh byte snapshot of the repository, adjacent
+runtime modules, and the installed module cache under `$XDG_DATA_HOME/ubs/modules`
+(normally `~/.local/share/ubs/modules`). Global Git configuration and ordinary tool executable updates
 also invalidate reuse. Inputs are checked before and after each scan; failures
 and scans spanning edits are not cached. Cached reports retain their original
 scan timestamp. Symlinks, special files, unreadable input, more than 20,000 input
@@ -85,7 +102,7 @@ with `ENABLE_UV_TOOLS=0`. The frontend never silently disables those tools.
 
 Cache snapshots verify the entire input inventory again after hashing, not only
 each file immediately after its read. Concurrent changes to earlier sources,
-directory inventories, optional global policy files or tool executables
+directory inventories, runtime generations, optional global policy files or tool executables
 (including Git) invalidate reuse. Reads use nonblocking, component-wise
 no-follow descriptors, so file/parent symlink substitutions and FIFO swaps do
 not redirect or block snapshot reads. A failed snapshot causes an ordinary scan;
@@ -93,10 +110,14 @@ it is never a clean result. These are input observations, not filesystem freezes
 
 The toolchain and other external configuration that its programs load remain
 trusted session inputs; restart the daemon after changing tool libraries or
-external tool configuration. For installed scanners without an adjacent `modules`
-directory, report reuse is disabled. Installed requests still run the ordinary
-scanner with its verified module downloads and incremental cache. Portable
-runtimes include the adjacent module graph for report reuse.
+external tool configuration. Installed scanners can reuse reports with only
+their verified XDG module generation; an adjacent `modules` directory is not
+required. Both runtime locations participate when present, including ready
+markers and unexpected files, so a cached report cannot hide a later integrity
+failure. Creation of a previously absent runtime directory also invalidates
+reuse. Retained generations count toward the snapshot limits; installations
+over those limits continue through the ordinary scanner and its incremental
+cache. The snapshot performs no pruning or repair.
 
 Misses still run the standard CLI, preserving its verified modules and existing
 Merkle cache. This does not claim sub-100 ms edited-file scans: keeping parsers

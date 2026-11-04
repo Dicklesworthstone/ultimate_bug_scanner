@@ -35,6 +35,34 @@ from ubs_core.py_detectors import sql_injection as detector
 CRITICAL = "py.security.sql-injection"
 WARNING = "py.security.sql-injection-unproven"
 
+NESTED_LOOP_BUILDER = (
+    'def inner(value):\n'
+    '    query = "SELECT 1"\n'
+    '    for item in (value,):\n'
+    '        query = f"SELECT {item}"\n'
+    '    return query\n'
+    'def outer(value):\n'
+    '    return inner(value)\n'
+)
+
+RAW_PROCESS_WRAPPER = textwrap.dedent('''\
+    import subprocess
+    def wrap(run):
+        return run
+    def check(repo):
+        calls = []
+        def raw(*args):
+            calls.append(args)
+            return subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True, timeout=10, check=True)
+        reads = [("rev-parse", "HEAD"), ("log", "-1")]
+        cached = wrap(raw)
+        before = [cached(*args).stdout for args in reads]
+        calls.clear()
+        assert not any(args in reads for args in calls)
+        expected = [raw(*args) for args in reads]
+        assert before == [result.stdout for result in expected]
+''')
+
 # Each case has a unique source file. The sink starts at line 2 unless a case
 # explicitly supplies a multi-line program and its expected location.
 CASES = (
@@ -59,6 +87,22 @@ CASES = (
     ("fragment-warning", 'from settings import TABLE_VALUE\nqs.extra(where=[f"name = {TABLE_VALUE}"])\n', ((WARNING, 2),)),
     ("fragment-critical-wins", 'def run(qs, user):\n    qs.extra(select={"flag": f"id = {UNKNOWN}"}, where=[f"name = {user}"])\n', ((CRITICAL, 2),)),
     ("ordinary-positional", 'def run(cursor, user):\n    cursor.execute(f"SELECT {user}")\n', ((CRITICAL, 2),)),
+    ("fromkeys-mixed-primitives", 'def run(cursor, user):\n    keys = dict.fromkeys(key for key in ("entry", 1, None))\n    cursor.execute("SELECT ?", (user,))\n', ()),
+    ("fromkeys-tuple-default", 'def run(cursor, user):\n    queries = dict.fromkeys(((name, index) for name, index in [("users", 1)]), f"SELECT {user}")\n    cursor.execute(queries[("users", 1)])\n', ((CRITICAL, 3),)),
+    ("fromkeys-tuple-bound", 'def run(cursor, user):\n    queries = dict.fromkeys(((name, index) for name, index in [("users", 1)]), "SELECT ?")\n    cursor.execute(queries[("users", 1)], (user,))\n', ()),
+    ("fromkeys-nested-tuple", 'def run(cursor, user):\n    keys = dict.fromkeys(key for key in ((("users", 1), None),))\n    cursor.execute(f"SELECT {user}")\n', ((CRITICAL, 3),)),
+    ("application-method-fields", 'class Runner:\n    def __init__(self):\n        self.count = 0\n    def execute(self, query):\n        self.count += 1\n        return len(query) + self.count\n    def run(self, user):\n        return self.execute(f"SELECT {user}")\n', ()),
+    ("application-method-field-sql", 'from backend import run_query\nclass Runner:\n    def execute(self, query):\n        self.saved = query\n        return run_query(self.saved)\n    def run(self, user):\n        return self.execute(f"SELECT {user}")\n', ((CRITICAL, 7),)),
+    ("local-raw-process-wrapper", RAW_PROCESS_WRAPPER, ()),
+    ("local-raw-opaque-sql", 'from backend import dispatch\ndef raw(*args):\n    return dispatch(*args)\ndef run(user):\n    raw(f"SELECT {user}")\n', ((CRITICAL, 5),)),
+    ("imported-sql-alias-positional", 'from pandas import read_sql as load_rows\ndef run(conn, user):\n    return load_rows(f"SELECT {user}", conn)\n', ((CRITICAL, 3),)),
+    ("imported-sql-alias-keyword", 'from pandas import read_sql as load_rows\ndef run(conn, user):\n    return load_rows(con=conn, sql=f"SELECT {user}")\n', ((CRITICAL, 3),)),
+    ("imported-sql-alias-bound-data", 'from pandas import read_sql as load_rows\ndef run(conn, user):\n    return load_rows("SELECT ?", conn, params=(f"SELECT {user}",))\n', ()),
+    ("imported-sql-alias-unproven", 'from pandas import read_sql as load_rows\nfrom settings import TABLE_NAME\nload_rows(f"SELECT * FROM {TABLE_NAME}", conn)\n', ((WARNING, 3),)),
+    ("imported-sql-alias-local-copy", 'from pandas import read_sql as load_rows\ndef run(conn, user):\n    fetch = load_rows\n    return fetch(sql=f"SELECT {user}", con=conn)\n', ((CRITICAL, 4),)),
+    ("imported-sql-alias-parameter-shadow", 'from pandas import read_sql as load_rows\ndef format_note(load_rows, user):\n    return load_rows(f"SELECT {user}")\n', ()),
+    ("application-sql-builder-length", 'def make(value):\n    return f"SELECT {value}"\ndef execute(value):\n    return len(make(value))\ndef run(user):\n    return execute(user)\n', ()),
+    ("nested-sql-builder-length", NESTED_LOOP_BUILDER + 'def raw(value):\n    return len(outer(value))\ndef run(user):\n    return raw(user)\n', ()),
     ("keyword-alias", 'def run(cursor, user):\n    query = f"SELECT {user}"\n    cursor.execute(query=query)\n', ((CRITICAL, 3),)),
     ("multiline", 'def run(cursor, user):\n    cursor.execute(\n        query=f"SELECT {user}"\n    )\n', ((CRITICAL, 2),)),
     ("bound-query", 'def run(cursor, user):\n    cursor.execute(query="SELECT * FROM users WHERE name = %s", params=(user,))\n', ()),
@@ -210,6 +254,82 @@ class SQLSinkArguments(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'budget.*incomplete'):
             analyzer.visit(tree)
 
+    def test_literal_statements_do_not_depend_on_unrelated_closure_ownership(self):
+        # A closure may need heap analysis, but cannot change a string literal
+        # in a separate SQL call. Keep the closure present, not suppressed.
+        unrelated = ('class Worker:\n'
+                     '    def collect(self, value):\n'
+                     '        events = []\n'
+                     '        def record(item):\n'
+                     '            events.append(item)\n'
+                     '            raise ValueError(item)\n'
+                     '        record(value)\n')
+        for name, statement in (
+                ('positional', 'cursor.execute("SELECT ?", (user,))'),
+                ('keyword', 'cursor.execute(query="SELECT ?", params=(user,))'),
+                ('import-alias', 'fetch("SELECT ?", conn, params=(user,))')):
+            with self.subTest(case=name):
+                path = self.artifacts / ('literal-closure-' + name + '.py')
+                path.write_text('from pandas import read_sql as fetch\n' + unrelated
+                                + 'def run(cursor, conn, user):\n    ' + statement + '\n',
+                                encoding='utf-8')
+                self.assertEqual(list(detector.find([path])), [])
+
+    def test_core_tests_literal_sql_fits_the_original_budget(self):
+        # This real source triggered the failure: fixed SQLite statements in
+        # one method caused every unrelated test body to consume SQL flow.
+        self.assertEqual(list(detector.find([Path(__file__).with_name('test_ubs_core.py')])), [])
+
+    def test_literal_scope_admission_keeps_decorators_and_reflection(self):
+        closure = ('events = []\n'
+                   'def record(item):\n    events.append(item)\n    raise ValueError(item)\n'
+                   'record(value)\n')
+        worker = 'class Worker:\n    def collect(self):\n' + textwrap.indent(closure, '        ')
+        cases = (
+            ('decorated-function', 'def invoke(fn):\n    fn()\n    return fn\n'
+             '@invoke\ndef hidden():\n' + textwrap.indent(closure, '    ')),
+            ('decorated-method', 'def invoke(fn):\n    fn()\n    return fn\n'
+             'class Worker:\n    @invoke\n    def collect():\n' + textwrap.indent(closure, '        ')),
+            ('aliased-attrgetter', 'from operator import attrgetter as grab\n' + worker
+             + 'callback = grab("col" + "lect")(Worker())\ncallback()\n'),
+            ('aliased-methodcaller', 'from operator import methodcaller as call\n' + worker
+             + 'call("col" + "lect")(Worker())\n'),
+            ('attribute-protocol', worker + 'Worker().__getattribute__("col" + "lect")()\n'),
+            ('literal-getattr', worker + 'getattr(Worker(), "collect")()\n'),
+            ('aliased-getattr', worker + 'grab = getattr\ngrab(Worker(), "col" + "lect")()\n'),
+            ('literal-namespace', worker + 'getattr(Worker, "__dict__")["col" + "lect"](Worker())\n'),
+            ('literal-reflective-method', worker
+             + 'getattr(Worker(), "__getattribute__")("col" + "lect")()\n'),
+            ('expanded-selector', worker
+             + 'getattr(*(Worker, "__dict__"), "unused")["col" + "lect"](Worker())\n'),
+        )
+        for name, source in cases:
+            with self.subTest(case=name):
+                path = self.artifacts / ('literal-sql-reachable-' + name + '.py')
+                path.write_text('cursor.execute("SELECT 1")\n' + source, encoding='utf-8')
+                with self.assertRaisesRegex(detector.SQLFlowLimit, 'closure list ownership'):
+                    list(detector.find([path]))
+
+    def test_literal_statements_do_not_hide_ambiguous_or_opaque_sql(self):
+        for name, source, reason in (
+                ('ambiguous', 'from backend import execute as fetch\n'
+                 'if configured:\n    fetch = replacement\n'
+                 'def run(user):\n    fetch("SELECT ?", (f"SELECT {user}",))\n',
+                 'aliased execution binding'),
+                ('facade', 'from backend import dispatch\n'
+                 'def raw(value):\n    dispatch(f"SELECT {value}")\n'
+                 'def run(user):\n    raw(user)\n', 'facade forwarding call'),
+                ('same-scope-closure', 'def run(cursor, user):\n'
+                 '    events = []\n'
+                 '    def record(item):\n        events.append(item)\n        raise ValueError(item)\n'
+                 '    record(user)\n    cursor.execute("SELECT ?", (user,))\n',
+                 'closure list ownership')):
+            with self.subTest(case=name):
+                path = self.artifacts / ('literal-sql-negative-' + name + '.py')
+                path.write_text('cursor.execute("SELECT 1")\n' + source, encoding='utf-8')
+                with self.assertRaisesRegex(detector.SQLFlowLimit, reason):
+                    list(detector.find([path]))
+
     @unittest.skipIf(sys.version_info < (3, 11), 'except* syntax requires Python 3.11')
     def test_exception_groups_are_explicitly_incomplete(self):
         path = self.artifacts / 'exception_group.py'
@@ -221,12 +341,116 @@ class SQLSinkArguments(unittest.TestCase):
 @unittest.skipUnless((ROOT / 'ubs').is_file() and (ROOT / 'modules/ubs-python.sh').is_file(),
                      'real CLI requires a full source checkout')
 class SQLSinkArgumentsCLI(unittest.TestCase):
+    def test_real_cli_unresolved_sql_execution_is_partial(self):
+        artifacts = ROOT / 'test-suite/artifacts'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        run = Path(tempfile.mkdtemp(prefix='python-sql-alias-partial-', dir=artifacts))
+        cases = (
+            ('ambiguous-query', 'from pandas import read_sql as fetch\n'
+             'if configured:\n    fetch = replacement\n'
+             'def run(conn, user):\n    return fetch(f"SELECT {user}", conn)\n', [], 'aliased execution binding'),
+            ('ambiguous-second-argument', 'from backend import execute as fetch\n'
+             'if configured:\n    fetch = replacement\n'
+             'def run(user):\n    return fetch("SELECT ?", (f"SELECT {user}",))\n', [], 'aliased execution binding'),
+            ('retained-before-ambiguity', 'from backend import execute as fetch\n'
+             'def run(cursor, user):\n    cursor.execute(f"SELECT {user}")\n'
+             '    fetch(f"SELECT {user}")\n'
+             'if configured:\n    fetch = replacement\n', [3], 'aliased execution binding'),
+            ('opaque-internal-query', 'from backend import dispatch\n'
+             'def raw(value):\n    return dispatch(f"SELECT {value}")\n'
+             'def run(user):\n    return raw(user)\n', [], 'facade forwarding call'),
+            ('opaque-builder-return', 'from backend import dispatch\n'
+             'def make(value):\n    return f"SELECT {value}"\n'
+             'def raw(value):\n    return dispatch(make(value))\n'
+             'def run(user):\n    return raw(user)\n', [], 'facade forwarding call'),
+            ('opaque-nested-loop-return', 'from backend import dispatch\n' + NESTED_LOOP_BUILDER
+             + 'def raw(value):\n    return dispatch(outer(value))\n'
+             'def run(user):\n    return raw(user)\n', [], 'facade forwarding call'),
+            ('opaque-captured-template', 'from backend import dispatch\nTEMPLATE = "SELECT {}"\n'
+             'def raw(value):\n    return dispatch(TEMPLATE.format(value))\n'
+             'def run(user):\n    return raw(user)\n', [], 'facade forwarding call'),
+            ('opaque-heap-store', 'from backend import dispatch, record\n'
+             'def execute(value):\n    record.query = f"SELECT {value}"\n'
+             '    return dispatch(record.query)\n'
+             'def run(user):\n    return execute(user)\n', [], 'facade heap or closure store'),
+            ('retained-before-opaque-forward', 'from backend import dispatch\n'
+             'def raw(cursor, value):\n    cursor.execute(f"SELECT {value}")\n'
+             '    return dispatch(f"SELECT {value}")\n'
+             'def run(cursor, user):\n    return raw(cursor, user)\n', [3], 'facade forwarding call'),
+        )
+        detector_hash = hashlib.sha256(Path(detector.__file__).read_bytes()).hexdigest()
+        for name, source, expected_lines, expected_error in cases:
+            for entry in ('module', 'runner'):
+                for fmt in ('json', 'sarif'):
+                    with self.subTest(case=name, entry=entry, format=fmt):
+                        folder = run / f'{name}-{entry}-{fmt}'
+                        folder.mkdir()
+                        path = folder / 'case.py'
+                        path.write_text(source, encoding='utf-8')
+                        for child in ('tmp', 'cache', 'data'):
+                            (folder / child).mkdir()
+                        env = {key: value for key, value in os.environ.items()
+                               if not key.startswith('UBS_')}
+                        env.update(TMPDIR=str(folder / 'tmp'), XDG_CACHE_HOME=str(folder / 'cache'),
+                                   XDG_DATA_HOME=str(folder / 'data'), NO_COLOR='1',
+                                   PYTHONDONTWRITEBYTECODE='1', UBS_NO_AUTO_UPDATE='1',
+                                   UBS_KEEP_TEMP='1', ENABLE_UV_TOOLS='0')
+                        executable = ROOT / ('ubs' if entry == 'runner' else 'modules/ubs-python.sh')
+                        command = ['bash', str(executable), '--ci', '--no-color', '--format=' + fmt,
+                                   '--skip=' + ','.join(str(n) for n in range(1, 24) if n != 7),
+                                   '--only=python' if entry == 'runner' else '--no-uv', str(path)]
+                        started = time.perf_counter()
+                        try:
+                            result = subprocess.run(command, cwd=folder, env=env, capture_output=True,
+                                                    text=True, timeout=120, check=False)
+                        except subprocess.TimeoutExpired as exc:
+                            (folder / 'stdout.log').write_bytes(exc.stdout or b'')
+                            (folder / 'stderr.log').write_bytes(exc.stderr or b'')
+                            self.fail(f'CLI timeout; complete evidence: {folder}')
+                        (folder / 'stdout.log').write_text(result.stdout, encoding='utf-8')
+                        (folder / 'stderr.log').write_text(result.stderr, encoding='utf-8')
+                        (folder / 'run.json').write_text(json.dumps({
+                            'command': command, 'returncode': result.returncode,
+                            'detector_sha256': detector_hash,
+                            'source_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                            'elapsed_seconds': time.perf_counter() - started,
+                        }, indent=2) + '\n', encoding='utf-8')
+                        self.assertEqual(result.returncode, 2, f'{folder}\n{result.stdout}\n{result.stderr}')
+                        document = json.loads(result.stdout)
+                        self.assertIn('SQLFlowLimit', result.stdout, folder)
+                        self.assertIn(expected_error, result.stdout, folder)
+                        if fmt == 'json':
+                            self.assertEqual(document['status'], 'partial', folder)
+                            scanners = document['scanners'] if entry == 'runner' else [document]
+                            self.assertEqual(len(scanners), 1, folder)
+                            self.assertEqual(scanners[0]['status'], 'partial', folder)
+                            actual = [sample['line'] for group in scanners[0]['findings']
+                                      if group.get('rule_id', group.get('rule')) == CRITICAL
+                                      for sample in group['samples']]
+                        else:
+                            self.assertTrue(any(invocation.get('executionSuccessful') is False
+                                                for scan in document['runs']
+                                                for invocation in scan.get('invocations', [])), folder)
+                            actual = [finding['locations'][0]['physicalLocation']['region']['startLine']
+                                      for scan in document['runs'] for finding in scan.get('results', [])
+                                      if finding['ruleId'] == CRITICAL]
+                        self.assertEqual(actual, expected_lines, folder)
+
     def test_real_cli_json_and_sarif(self):
         artifacts = ROOT / 'test-suite/artifacts'
         artifacts.mkdir(parents=True, exist_ok=True)
         run = Path(tempfile.mkdtemp(prefix='python-sql-flow-cli-', dir=artifacts))
         selected = {'loop-carried-query', 'loop-bound-values-stay-data',
-                    'exception-before-literal-overwrite', 'finally-cleans-break-exit'}
+                    'exception-before-literal-overwrite', 'finally-cleans-break-exit',
+                    'fromkeys-mixed-primitives', 'fromkeys-tuple-default',
+                    'fromkeys-tuple-bound', 'fromkeys-nested-tuple',
+                    'application-method-fields', 'application-method-field-sql',
+                    'application-sql-builder-length',
+                    'nested-sql-builder-length',
+                    'local-raw-process-wrapper', 'local-raw-opaque-sql',
+                    'imported-sql-alias-positional', 'imported-sql-alias-keyword',
+                    'imported-sql-alias-bound-data', 'imported-sql-alias-unproven',
+                    'imported-sql-alias-local-copy', 'imported-sql-alias-parameter-shadow'}
         tools = {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
                  for name in ('ubs', 'modules/ubs-python.sh',
                               'modules/helpers/ubs_core/py_detectors/sql_injection.py')}
@@ -243,13 +467,14 @@ class SQLSinkArgumentsCLI(unittest.TestCase):
                         for child in ('tmp', 'home', 'cache'):
                             (folder / child).mkdir()
                         env = {key: value for key, value in os.environ.items() if not key.startswith('UBS_')}
+                        skip_categories = ','.join(str(n) for n in range(1, 24) if n != 7)
                         env.update(HOME=str(folder / 'home'), XDG_CACHE_HOME=str(folder / 'cache'),
                                    TMPDIR=str(folder / 'tmp'), NO_COLOR='1', PYTHONDONTWRITEBYTECODE='1',
                                    UBS_NO_AUTO_UPDATE='1', UBS_KEEP_TEMP='1', ENABLE_UV_TOOLS='0',
-                                   UBS_SKIP_CATEGORIES=','.join(str(n) for n in range(1, 24) if n != 7))
+                                   UBS_SKIP_CATEGORIES=skip_categories)
                         executable = ROOT / ('ubs' if entry == 'runner' else 'modules/ubs-python.sh')
-                        command = ['bash', str(executable), '--ci', '--no-color', f'--format={format_name}',
-                                   '--skip=' + env['UBS_SKIP_CATEGORIES']]
+                        command = ['bash', str(executable), '--ci', '--fail-on-warning', '--no-color', f'--format={format_name}',
+                                   '--skip=' + skip_categories]
                         command += ['--only=python'] if entry == 'runner' else ['--no-uv']
                         command.append(str(path))
                         started = time.perf_counter()

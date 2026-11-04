@@ -29,7 +29,8 @@ if any('SOURCE' in value for value in texts.values()):
                              'message': 'cross-file example', 'severity': 'critical'})
 count = len(files) - (1 if any('IGNORED' in value for value in texts.values()) else 0)
 print(json.dumps({'status': 'ok', 'project': str(pathlib.Path.cwd()),
-                  'totals': {'files': count, 'critical': len(findings)}, 'findings': findings}))
+                  'totals': {'files': count, 'critical': len(findings), 'warning': 0, 'info': 0},
+                  'findings': findings}))
 sys.exit(1 if findings else 0)
 '''
 
@@ -219,7 +220,9 @@ class WorkspaceTests(Fixture):
     def test_large_unicode_findings_stay_framable_and_omissions_are_visible(self):
         finding = {'rule_id': 'python.large', 'file': str(self.source), 'line': 1,
                    'message': '🦀' * 8000, 'severity': 'critical'}
-        report = {'status': 'ok', 'totals': {'files': 1}, 'findings': [finding] * 100}
+        findings = [finding] * 100
+        report = {'status': 'ok', 'totals': {'files': 1, 'critical': len(findings), 'warning': 0, 'info': 0},
+                  'findings': findings}
         diagnostics = lsp.report_diagnostics(report, self.source, self.root, 'SOURCE\n', 1)
         self.assertLess(len(diagnostics), 100)
         self.assertEqual(diagnostics[-1]['code'], 'ubs.incomplete-display')
@@ -237,7 +240,7 @@ class WorkspaceTests(Fixture):
         self.assertEqual(len(self.calls()), 1)
 
     def test_summary_without_ledger_cannot_become_a_clean_editor_result(self):
-        report = {'status': 'ok', 'totals': {'files': 1, 'critical': 1}, 'findings': []}
+        report = {'status': 'ok', 'totals': {'files': 1, 'critical': 1, 'warning': 0, 'info': 0}, 'findings': []}
         with self.assertRaisesRegex(lsp.ProtocolError, 'ledger'):
             lsp.report_diagnostics(report, self.source, self.root, 'SOURCE\n', 0)
         report['ast_findings'] = [{'rule_id': 'python.test', 'file': str(self.source),

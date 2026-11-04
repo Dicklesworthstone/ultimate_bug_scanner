@@ -84,6 +84,56 @@ class ContractChecksums(unittest.TestCase):
                 after = {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
                 self.assertEqual(before, after)
 
+    def test_generation_preserves_embedded_parser_markers_and_quoted_pins(self) -> None:
+        # The standalone updater parses literal Bash tables as data. Its
+        # Python marker strings are not additional Bash declarations: the old
+        # unanchored substitutions replaced them with table bodies, producing
+        # a syntactically broken installed updater while reporting success.
+        embedded = (
+            "def pins(marker):\n    return marker\n"
+            'modules = pins("declare -A MODULE_CHECKSUMS=(")\n'
+            'helpers = pins("declare -A HELPER_CHECKSUMS=(")\n'
+            'common = pins("declare -g -A UBS_COMMON_HELPER_CHECKSUMS=(")\n'
+            'inventory = pins("HELPER_ASSETS=(")\n'
+        )
+        wrapper = "python3 - <<'PYCHECKSUMMARKERS'\n" + embedded + "PYCHECKSUMMARKERS\n"
+        quoted_pin = "printf '%s\\n' 'UBS_LIB_CHECKSUM=\"marker-only\"'\n"
+        with tempfile.TemporaryDirectory(prefix="ubs-checksum-parser-markers-") as tmp:
+            root = Path(tmp)
+            self.make_tree(root)
+            for name in ("ubs", "modules/lib/ubs-common.sh"):
+                path = root / name
+                path.write_text(path.read_text() + wrapper, encoding="utf-8")
+            for name in ("modules/ubs-rust.sh", "scripts/new-module.sh"):
+                path = root / name
+                path.write_text(path.read_text() + quoted_pin, encoding="utf-8")
+            for _ in range(2):
+                result = self.generate(root)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assert_chain(root)
+                for name in ("ubs", "modules/lib/ubs-common.sh"):
+                    source = (root / name).read_text(encoding="utf-8")
+                    actual = source.split("<<'PYCHECKSUMMARKERS'\n", 1)[1].split("PYCHECKSUMMARKERS\n", 1)[0]
+                    self.assertEqual(actual, embedded, name)
+                    compile(actual, name + " embedded parser", "exec")
+                    syntax = subprocess.run(["bash", "-n", str(root / name)],
+                                            capture_output=True, text=True, check=False, timeout=15)
+                    self.assertEqual(syntax.returncode, 0, syntax.stderr)
+                for name in ("modules/ubs-rust.sh", "scripts/new-module.sh"):
+                    self.assertTrue((root / name).read_text().endswith(quoted_pin), name)
+
+    def test_duplicate_real_runner_declarations_are_refused(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ubs-checksum-ambiguous-") as tmp:
+            root = Path(tmp)
+            self.make_tree(root)
+            runner = root / "ubs"
+            runner.write_text(runner.read_text() + "declare -A MODULE_CHECKSUMS=(\n)\n")
+            before = runner.read_bytes()
+            result = self.generate(root)
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("exactly one top-level MODULE_CHECKSUMS", result.stderr)
+            self.assertEqual(runner.read_bytes(), before)
+
     def test_missing_contract_fails_before_modifying_pins(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ubs-contract-missing-") as tmp:
             root = Path(tmp)
@@ -279,6 +329,68 @@ class ContractChecksums(unittest.TestCase):
             result = verify()
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("CHECKSUM FILE MISSING: modules/contract.json", result.stdout)
+
+
+SUPERSEDED_BLOCK = re.compile(r"^declare -A SUPERSEDED_CONTRACT_SHA256=\(\n(.*?)^\)$", re.M | re.S)
+SUPERSEDED_ENTRY = re.compile(r"\s*\['([0-9a-f]{64})'\]='(v[0-9][^']*)'\s*")
+RELEASE_TAG = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+")
+
+
+class SupersededContracts(unittest.TestCase):
+    """Issues #174 and #199: a contract any release shipped stays recognizable.
+
+    An older updater replaces the runner but leaves the cached
+    modules/contract.json behind. The new runner refreshes that cache only when
+    the cached digest is listed in SUPERSEDED_CONTRACT_SHA256; any other
+    mismatch refuses to scan. So every contract a release tag shipped must be
+    the current one or listed, or users upgrading from that release get stuck.
+    """
+
+    maxDiff = None
+
+    def git(self, *args: str, stdin: bytes | None = None) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", str(REPO_ROOT), *args], input=stdin,
+                              capture_output=True, check=False, timeout=120)
+
+    def released_contracts(self) -> dict[str, str]:
+        if shutil.which("git") is None:
+            self.skipTest("git is not installed")
+        top = self.git("rev-parse", "--show-toplevel")
+        if top.returncode != 0 or Path(top.stdout.decode().strip()).resolve() != REPO_ROOT:
+            self.skipTest("not a git checkout of this repository")
+        listing = self.git("tag", "--list", "v*", "--merged", "HEAD")
+        self.assertEqual(listing.returncode, 0, listing.stderr.decode(errors="replace"))
+        tags = [tag for tag in listing.stdout.decode().split() if RELEASE_TAG.fullmatch(tag)]
+        if not tags:
+            self.skipTest("no release tags in this clone")
+        query = "".join(f"refs/tags/{tag}:modules/contract.json\n" for tag in tags).encode()
+        batch = self.git("cat-file", "--batch", stdin=query)
+        self.assertEqual(batch.returncode, 0, batch.stderr.decode(errors="replace"))
+        out, pos, contracts = batch.stdout, 0, {}
+        for tag in tags:
+            end = out.index(b"\n", pos)
+            header = out[pos:end].split()
+            pos = end + 1
+            if header[-1] == b"missing":
+                continue  # released before the contract existed
+            self.assertEqual(header[1], b"blob", (tag, header))
+            size = int(header[2])
+            contracts[tag] = hashlib.sha256(out[pos:pos + size]).hexdigest()
+            pos += size + 1
+        if not contracts:
+            self.skipTest("no release tag ships modules/contract.json")
+        return contracts
+
+    def test_every_released_contract_is_current_or_superseded(self) -> None:
+        blocks = SUPERSEDED_BLOCK.findall((REPO_ROOT / "ubs").read_text(encoding="utf-8"))
+        self.assertEqual(len(blocks), 1, "expected one SUPERSEDED_CONTRACT_SHA256 declaration in ubs")
+        lines = [line for line in blocks[0].splitlines() if line.strip()]
+        unparsed = [line for line in lines if not SUPERSEDED_ENTRY.fullmatch(line)]
+        self.assertEqual(unparsed, [], "entries must stay ['<sha256>']='<tag>'")
+        known = {SUPERSEDED_ENTRY.fullmatch(line).group(1) for line in lines}
+        known.add(digest(REPO_ROOT / "modules/contract.json"))
+        missing = {tag: sha for tag, sha in self.released_contracts().items() if sha not in known}
+        self.assertEqual(missing, {}, "add each released contract digest to SUPERSEDED_CONTRACT_SHA256 in ubs")
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -17,6 +18,80 @@ import run_manifest  # noqa: E402
 
 
 class ShardTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
+    def test_timeout_forces_shutdown_when_scanner_ignores_term(self) -> None:
+        artifact_root = TEST_ROOT / "artifacts"
+        artifact_root.mkdir(exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix="manifest-timeout-resistant-", dir=artifact_root))
+        ready = scratch / "scanner.pid"
+        receiver = scratch / "receiver.py"
+        receiver.write_text(
+            "import os, signal, time\nfrom pathlib import Path\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            f"Path({str(ready)!r}).write_text(str(os.getpid()))\n"
+            "print('scanner-started', flush=True)\n"
+            "time.sleep(30)\n"
+        )
+        started = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired) as raised:
+            run_manifest.run_case_command([sys.executable, str(receiver)], dict(os.environ), 2)
+        self.assertLess(time.monotonic() - started, 10, "Shutdown grace must remain bounded")
+        self.assertEqual(raised.exception.timeout, 2)
+        self.assertIn("scanner-started", run_manifest.timeout_output(raised.exception.stdout))
+        self.assertTrue(ready.exists(), "The TERM-resistant scanner must actually start")
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int(ready.read_text()), 0)
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
+    def test_timeout_allows_handler_to_drain_separate_child_group(self) -> None:
+        artifact_root = TEST_ROOT / "artifacts"
+        artifact_root.mkdir(exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix="manifest-timeout-handler-", dir=artifact_root))
+        child = scratch / "child.py"
+        ready, drained = scratch / "child-started.json", scratch / "child-drained"
+        child.write_text(
+            "import json, os, time\nfrom pathlib import Path\n"
+            f"Path({str(ready)!r}).write_text(json.dumps({{'pid': os.getpid(), 'pgid': os.getpgrp()}}))\n"
+            "time.sleep(30)\n"
+        )
+        receiver = scratch / "receiver.py"
+        receiver.write_text(
+            "import os, signal, subprocess, sys, time\nfrom pathlib import Path\n"
+            f"child = subprocess.Popen([sys.executable, {str(child)!r}], start_new_session=True, "
+            "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+            "def terminate(signum, frame):\n"
+            "    os.killpg(child.pid, signal.SIGTERM)\n"
+            "    child.wait(timeout=2)\n"
+            f"    Path({str(drained)!r}).write_text(str(child.returncode))\n"
+            "    sys.exit(0)\n"
+            "signal.signal(signal.SIGTERM, terminate)\n"
+            "until = time.monotonic() + 2\n"
+            f"while not Path({str(ready)!r}).exists() and time.monotonic() < until:\n"
+            "    time.sleep(0.01)\n"
+            "print('scanner-started', flush=True)\n"
+            "time.sleep(30)\n"
+        )
+        try:
+            with self.assertRaises(subprocess.TimeoutExpired) as raised:
+                run_manifest.run_case_command([sys.executable, str(receiver)], dict(os.environ), 3)
+            self.assertEqual(raised.exception.timeout, 3)
+            self.assertIn("scanner-started", run_manifest.timeout_output(raised.exception.stdout))
+            self.assertTrue(ready.exists(), "The separate-group child must actually start")
+            child_state = json.loads(ready.read_text())
+            self.assertEqual(child_state["pid"], child_state["pgid"])
+            self.assertTrue(drained.exists(), "The scanner TERM handler must run and reap its child")
+            self.assertEqual(drained.read_text(), str(-signal.SIGTERM))
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child_state["pid"], 0)
+        finally:
+            # The baseline intentionally fails before its handler runs; stop
+            # only this fixture's recorded child rather than leaking it.
+            if ready.exists():
+                try:
+                    os.killpg(json.loads(ready.read_text())["pgid"], signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
     @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX child processes")
     def test_timeout_stops_descendants_and_preserves_failure_output(self) -> None:
         """A failed case must not leave its scanner children running behind the next case."""

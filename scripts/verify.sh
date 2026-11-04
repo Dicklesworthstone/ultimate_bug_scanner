@@ -11,6 +11,40 @@ warn() { printf 'WARNING: %s\n' "$*" >&2; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 usage_error() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
 
+VERIFY_PYTHON=()
+verify_python_candidate() {
+  local executable directory
+  executable="$(type -P -- "$1" 2>/dev/null)" || return 1
+  shift
+  [[ -n "$executable" && -x "$executable" ]] || return 1
+  if [[ "$executable" != /* ]]; then
+    directory="${executable%/*}"
+    [[ "$directory" != "$executable" ]] || directory=.
+    directory="$(CDPATH='' cd -P -- "$directory" && pwd -P)" || return 1
+    executable="$directory/${executable##*/}"
+  fi
+  # Even interpreter discovery precedes authentication for archive input.
+  # Never import project modules, PYTHONPATH or site startup code here.
+  if "$executable" "$@" -I -S -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1; then
+    VERIFY_PYTHON=("$executable" "$@")
+    return 0
+  fi
+  return 1
+}
+
+require_verify_python() {
+  [[ ${#VERIFY_PYTHON[@]} -eq 0 ]] || return 0
+  if [[ -n "${UBS_PYTHON:-}" ]]; then
+    verify_python_candidate "$UBS_PYTHON" \
+      || die 'UBS_PYTHON must name a usable Python >= 3.9 interpreter'
+    return 0
+  fi
+  if verify_python_candidate python3 || verify_python_candidate python || verify_python_candidate py -3; then
+    return 0
+  fi
+  die 'Python >= 3.9 is required for runtime/archive verification; set UBS_PYTHON or install python3, python or py -3'
+}
+
 usage() {
   cat <<'USAGE'
 Usage: verify.sh [--version X.Y.Z|vX.Y.Z]
@@ -22,6 +56,8 @@ Authenticate SHA256SUMS, verify install.sh, ubs and git_safety_guard.py against
 that same manifest, and install the verified local payload. The caller's
 working directory is preserved for project hook setup. Missing signatures,
 missing or ambiguous checksums, and different release versions fail closed.
+Installation also requires a runner that supports verified cache publication;
+use --verify-only to authenticate historical releases without installing them.
 
 Options:
   --version VERSION       Select an exact release, including prerelease tags.
@@ -29,7 +65,8 @@ Options:
   --artifact-archive FILE Read a gzip-compressed release tar archive privately.
                           Reject unsafe paths, links, duplicates and oversized input.
   --verify-only           Verify the complete release WITHOUT running it.
-  --with-modules          Also verify every pinned module/helper (requires --verify-only).
+  --with-modules          Verify and stage every pinned module/helper before installation.
+                          Combine with --verify-only to inspect without installing.
   --bundle-output FILE    Export a complete verified portable runtime as .tar.gz.
                           Implies --verify-only --with-modules; never overwrites FILE.
   --install-args "ARGS"   Legacy whitespace-separated arguments (no shell eval).
@@ -38,6 +75,8 @@ Options:
   -h, --help              Show help without downloading or installing anything.
 
 Environment:
+  UBS_PYTHON              Python >= 3.9 interpreter; otherwise try python3,
+                          python, then py -3. Explicit invalid overrides fail.
   UBS_VERSION             Version; otherwise use the checkout's VERSION file.
                           A standalone verifier requires an explicit version.
   UBS_ARTIFACT_BASE       HTTPS mirror containing the selected release assets.
@@ -54,11 +93,15 @@ install.sh, ubs, and git_safety_guard.py. Only regular, non-symlink files are
 accepted; private copies are authenticated, never executed from the input
 directory. Cosign may still refresh its trust metadata. Installing a local
 bundle can fetch third-party dependencies; --verify-only never runs installers.
-With --with-modules, local bundles must also contain modules/ with every asset
+Installation automatically verifies and stages an included modules/ directory.
+With --with-modules, local bundles must contain modules/ with every asset
 listed in the authenticated runner. Missing assets never fall back to a network
 download. Remote runtime assets come only from the selected release tag (or the
 explicit module mirror), never mutable main. Runtime metadata is parsed as data,
-not sourced as shell code. Host dependencies are not part of this verification.
+not sourced as shell code. All runtime verification finishes before the installer
+starts, and only verified assets enter its private source directory. A local
+bundle without modules/ retains the installer's normal runtime download path.
+Host dependencies are not part of this verification.
 Bundle export includes the original signature, manifest, runner, installer,
 hook and verified modules. It never executes them. Extract into an empty
 directory, re-verify with --artifact-dir DIR --verify-only --with-modules, then
@@ -133,7 +176,7 @@ if [[ -n "$ARTIFACT_ARCHIVE" ]]; then
   [[ "$INSECURE" -eq 0 ]] || usage_error '--artifact-archive requires authenticated verification'
   [[ -f "$ARTIFACT_ARCHIVE" && ! -L "$ARTIFACT_ARCHIVE" ]] \
     || usage_error '--artifact-archive must name a regular non-symlink file'
-  command -v python3 >/dev/null 2>&1 || die 'python3 is required to import a release archive'
+  require_verify_python
 fi
 if [[ -n "$BUNDLE_OUTPUT" ]]; then
   [[ ! -e "$BUNDLE_OUTPUT" && ! -L "$BUNDLE_OUTPUT" ]] || usage_error '--bundle-output must not already exist'
@@ -142,8 +185,7 @@ if [[ -n "$BUNDLE_OUTPUT" ]]; then
   WITH_MODULES=1
 fi
 if [[ "$WITH_MODULES" -eq 1 ]]; then
-  [[ "$VERIFY_ONLY" -eq 1 ]] || usage_error '--with-modules requires --verify-only'
-  command -v python3 >/dev/null 2>&1 || die 'python3 is required to verify the runtime asset graph'
+  [[ "$INSECURE" -eq 0 ]] || usage_error '--with-modules requires authenticated verification'
 fi
 if [[ "$VERIFY_ONLY" -eq 1 ]]; then
   [[ "$INSECURE" -eq 0 ]] || usage_error '--verify-only cannot be combined with --insecure'
@@ -205,7 +247,7 @@ mktemp_dir() {
 }
 VERIFY_DIR="$(mktemp_dir)" || die 'Could not create private release staging directory'
 # Invoked by the EXIT trap below; ShellCheck does not count trap callbacks.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 cleanup() {
   # Only this invocation's randomly created directory is ever removed.
   [[ -n "${VERIFY_DIR:-}" && "$VERIFY_DIR" != / ]] || return 0
@@ -218,7 +260,7 @@ trap 'exit 143' TERM
 if [[ -n "$ARTIFACT_ARCHIVE" ]]; then
   # Unpack only into our private staging directory. Authenticate the copied
   # manifest and payloads afterwards through the same path as directory input.
-  python3 - "$ARTIFACT_ARCHIVE" "$VERIFY_DIR" <<'PY'
+  "${VERIFY_PYTHON[@]}" -I -S - "$ARTIFACT_ARCHIVE" "$VERIFY_DIR" <<'PY'
 import gzip
 import os
 from pathlib import Path
@@ -340,6 +382,18 @@ PY
   ARTIFACT_DIR="$VERIFY_DIR/archive-input"
 fi
 
+# A supplied runtime is part of the requested installation, even if it is
+# incomplete or its root is a dangling symlink. Never discard it and silently
+# let the installer fetch another copy. Verification-only keeps its explicit
+# --with-modules scope; thin local bundles retain their existing install path.
+if [[ "$INSECURE" -eq 0 && "$VERIFY_ONLY" -eq 0 && -n "$ARTIFACT_DIR" ]] \
+    && [[ -e "$ARTIFACT_DIR/modules" || -L "$ARTIFACT_DIR/modules" ]]; then
+  WITH_MODULES=1
+fi
+if [[ "$WITH_MODULES" -eq 1 ]]; then
+  require_verify_python
+fi
+
 fetch_asset() {
   local name="$1"
   if [[ -n "$ARTIFACT_DIR" ]]; then
@@ -389,7 +443,7 @@ verify_asset() {
 verify_runtime() {
   # Only invoke the host Python, never the downloaded runner or its helpers.
   # Its signed checksum tables are a restricted literal format, not a script.
-  python3 - "$VERIFY_DIR" "$ARTIFACT_DIR" "$MODULE_ARTIFACT_BASE" "$BUNDLE_OUTPUT" "$VERIFY_WITH" <<'PY'
+  "${VERIFY_PYTHON[@]}" -I -S - "$VERIFY_DIR" "$ARTIFACT_DIR" "$MODULE_ARTIFACT_BASE" "$BUNDLE_OUTPUT" "$VERIFY_WITH" <<'PY'
 import gzip
 import hashlib
 import json
@@ -613,6 +667,17 @@ if [[ "$INSECURE" -eq 0 ]]; then
     "UBS_VERSION=\"${VERSION}\""|"UBS_VERSION='${VERSION}'"|"UBS_VERSION=${VERSION}") ;;
     *) die "Authenticated runner does not match requested version $VERSION" ;;
   esac
+  if [[ "$VERIFY_ONLY" -eq 0 ]]; then
+    # This entrypoint executes the selected release's own installer. An older
+    # signed installer can still replace a runner without preparing its cache;
+    # authentication alone does not make that publication safe. Inspect the
+    # target as data before executing any bundled code, including install.sh.
+    generation_declaration="$(awk '/^UBS_RELEASE_GENERATIONS=/ { count++; value=$0 }
+      END { if (count != 1) exit 1; print value }' "$VERIFY_DIR/ubs")" \
+      || die 'Target runner does not support verified cache publication; select a transaction-capable release or use --verify-only'
+    [[ "$generation_declaration" == 'UBS_RELEASE_GENERATIONS=1' ]] \
+      || die 'Target runner does not support verified cache publication; select a supported release generation protocol or use --verify-only'
+  fi
   # Bind the companion to the authenticated manifest AND the runner's literal
   # pin without executing the payload. A runner without a service pin has no
   # companion requirement.

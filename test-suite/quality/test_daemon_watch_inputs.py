@@ -612,8 +612,12 @@ class DirectoryWatchTests(WatchFixture, unittest.TestCase):
         invalid = self.event('invalid')
         self.assertEqual(invalid['exit_code'], 2)
         self.assertEqual(len(self.calls()), 1)
-        self.tree.mkdir()
-        (self.tree / 'new.py').write_text('BUG')
+        # Publish the populated replacement atomically. Otherwise a scheduler
+        # pause before write_text can correctly produce an empty-directory result.
+        replacement = self.work / 'replacement-src'
+        replacement.mkdir()
+        (replacement / 'new.py').write_text('BUG')
+        replacement.rename(self.tree)
         self.assertEqual(self.event('result')['exit_code'], 1)
 
     def test_obsolete_directory_scan_is_cancelled_for_new_inventory(self):

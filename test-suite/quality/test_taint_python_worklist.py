@@ -222,6 +222,104 @@ EXPECTED = {
 }
 
 
+def large_budget_source(line_count, *, unsafe=True):
+    """Public #198 fixture: many globals/defaults, a chain and a closure.
+
+    The unrelated nested definition used to disable dependency ordering for
+    the entire module. The last handler has thirteen distinct security sinks
+    and seven clean controls; the generated module is only ever analyzed.
+    """
+    prefix = [
+        'import os', 'import subprocess', 'import requests',
+        'from django.http import HttpResponse', 'from urllib.parse import quote',
+        'from html import escape', 'from shlex import quote as shell_quote',
+        'def unused_factory():', '    def inner(value="fixed"):',
+        '        return value', '    return inner',
+    ]
+    actual = 'input()' if unsafe else '"fixed"'
+    tail = [
+        'def planted():',
+        f'    value = stage0({actual})',
+        '    os.system(value)',
+        '    subprocess.run(value, shell=True)',
+        '    subprocess.run([value])',
+        '    eval(value)',
+        '    exec(value)',
+        '    cursor.execute(value)',
+        '    cursor.executemany(value, [])',
+        '    requests.get(value)',
+        '    requests.post(value)',
+        '    HttpResponse(value)',
+        '    HttpResponse(content=value)',
+        '    response.headers["X-User"] = value',
+        '    response.headers["X-Other"] = value',
+        '    os.system("printf %s " + shell_quote(value))',
+        '    subprocess.run(["echo", value])',
+        '    eval("1", {"value": value})',
+        '    cursor.execute("SELECT ?", (value,))',
+        '    requests.get("https://fixed.invalid/", params={"q": value})',
+        '    HttpResponse(escape(value))',
+        '    response.headers["X-Encoded"] = quote(value)',
+    ]
+    count = (line_count - len(prefix) - len(tail)) // 12
+    if count < 1:
+        raise ValueError('The fixture must contain at least one helper')
+    lines = list(prefix)
+    for index in range(count):
+        successor = f'stage{index + 1}(value)' if index + 1 < count else 'value'
+        lines.extend([
+            f'TOKEN{index} = "fixed"',
+            f'def stage{index}(value, marker=TOKEN{index}):',
+            '    label = marker', '    status = 0', '    low = 1',
+            '    high = 9', '    kind = "text"', '    enabled = True',
+            '    offset = 0', '    scale = 1', '    token = label',
+            f'    return {successor}',
+        ])
+    lines.extend(f'padding{index} = "fixed"'
+                 for index in range(line_count - len(lines) - len(tail)))
+    lines.extend(tail)
+    expected = {
+        ('command', line_count - len(tail) + 3, 5),
+        ('command', line_count - len(tail) + 4, 5),
+        ('command', line_count - len(tail) + 5, 5),
+        ('eval', line_count - len(tail) + 6, 5),
+        ('eval', line_count - len(tail) + 7, 5),
+        ('sql', line_count - len(tail) + 8, 5),
+        ('sql', line_count - len(tail) + 9, 5),
+        ('ssrf', line_count - len(tail) + 10, 5),
+        ('ssrf', line_count - len(tail) + 11, 5),
+        ('xss', line_count - len(tail) + 12, 5),
+        ('xss', line_count - len(tail) + 13, 5),
+        ('header', line_count - len(tail) + 14, 5),
+        ('header', line_count - len(tail) + 15, 5),
+    } if unsafe else set()
+    return '\n'.join(lines) + '\n', expected
+
+
+def large_budget_worker():
+    """Real flow evaluation in a fresh process with an external deadline."""
+    source = sys.stdin.read()
+    reports = {}
+    for name, engine_class in (('taint', taint_py._Analysis),
+                               ('header', header_injection._HeaderAnalysis)):
+        engine = engine_class(ast.parse(source))
+        initialize = taint_py._Flow.__init__
+        counts = {'module_passes': 0, 'function_passes': 0}
+
+        def observe(flow, owner, scope):
+            counts['module_passes' if scope is owner.tree else 'function_passes'] += 1
+            initialize(flow, owner, scope)
+
+        with patch.object(taint_py._Flow, '__init__', observe):
+            effects = engine.analyze()
+        sites = [(kind, line, column) for (kind, line, column, _), facts in effects.items()
+                 if kind != 'header' or any(not header_injection._safe(trace) for trace in facts)]
+        reports[name] = {**counts, 'sites': sorted(sites),
+                         'work': engine.work_limit - engine.budget.remaining,
+                         'functions': len(engine.functions)}
+    print(json.dumps(reports))
+
+
 def fresh_exception_join(flow, state):
     """Reference collector: join the entire state at every possible raise."""
     if state.reachable and flow.exception_states:
@@ -286,8 +384,10 @@ main()
                         self.assertEqual(findings, [])
                         continue
                     line = sources['app.py'].splitlines().index('    os.system(value)') + 1
+                    # Per-creation defaults cross invoke's callback summary;
+                    # retain that real call in the exact diagnostic witness.
                     self.assertEqual(findings, [('app.py', 'py.taint.command', line, 5,
-                                               'input( -> target() -> value -> subprocess execution')])
+                                               'input( -> invoke() -> target() -> value -> subprocess execution')])
 
     def test_prepared_syntax_preserves_child_scopes_and_deferred_imports(self):
         tree = ast.parse('''
@@ -325,6 +425,170 @@ class Factory:
         self.assertEqual(engine.functions, [node for node in ast.walk(tree)
                          if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))])
 
+    def test_independent_closures_retain_only_linear_scope_dependencies(self):
+        for count in (64, 256):
+            prefix = ''.join(
+                f'def outer{index}(captured{index}):\n'
+                f'    def inner{index}():\n'
+                f'        return captured{index}\n'
+                f'    return inner{index}\n'
+                for index in range(count))
+            for unsafe in (True, False):
+                with self.subTest(function_pairs=count, unsafe=unsafe):
+                    source = prefix + ('eval(input())\n' if unsafe else 'eval("fixed")\n')
+                    engine = taint_py._Analysis(ast.parse(source))
+                    # Retaining every unrelated captured name in every scope
+                    # consumes quadratic memory before any budget is charged.
+                    retained = sum(len(names) for names in engine.used_names.values())
+                    self.assertLessEqual(retained, 4 * count)
+                    effects = engine.analyze()
+                    expected = {('eval', 4 * count + 1, 1)} if unsafe else set()
+                    self.assertEqual({key[:3] for key in effects}, expected)
+
+    def test_scope_dependencies_keep_transitive_closures_and_class_bodies(self):
+        bodies = (
+            '    alias = payload\n'
+            '    def leaf():\n        return alias\n'
+            '    def relay():\n        callback = leaf\n        return callback()\n'
+            '    def invoke():\n        def further():\n            return relay()\n'
+            '        return further()\n    return invoke()\n',
+            '    def leaf():\n        return payload\n'
+            '    def dispatch(callback):\n        return callback()\n'
+            '    return dispatch(leaf)\n',
+            '    def choose(value=payload):\n        return value\n'
+            '    return choose()\n',
+            '    class Local:\n        @staticmethod\n'
+            '        def value():\n            return payload\n'
+            '    return Local.value()\n',
+        )
+        for index, body in enumerate(bodies):
+            for unsafe in (True, False):
+                with self.subTest(shape=index, unsafe=unsafe):
+                    actual = 'input()' if unsafe else '"fixed"'
+                    source = ('payload = "unrelated global"\n'
+                              'def unrelated(noise):\n    def inner():\n        return noise\n'
+                              '    return inner\n'
+                              'def outer(payload):\n' + body + f'eval(outer({actual}))\n')
+                    effects = taint_py._Analysis(ast.parse(source)).analyze()
+                    expected = {('eval', len(source.splitlines()), 1)} if unsafe else set()
+                    self.assertEqual({key[:3] for key in effects}, expected, effects)
+
+    def test_lazy_scope_dependencies_keep_escaped_callable_flows(self):
+        shapes = (
+            'callback = maker(token)\ndef caller():\n    eval(callback())\n',
+            'callback = maker(token)\ndef first():\n    return second()\n'
+            'def second():\n    return callback\ndef caller():\n    eval(first()())\n',
+            'callback = maker(token)\ndef invoke(target):\n    return target()\n'
+            'def caller():\n    eval(invoke(callback))\n',
+            'def provide():\n    return maker(token)\ndef caller():\n    eval(provide()())\n',
+            'def provide():\n    yield maker(token)\ndef caller():\n'
+            '    for callback in provide():\n        eval(callback())\n',
+            'async def provide():\n    return maker(token)\nasync def caller():\n'
+            '    callback = await provide()\n    eval(callback())\n',
+            'callback = maker(token)\ndef invoke(target=callback):\n    return target()\n'
+            'def caller():\n    eval(invoke())\n',
+            'callback = maker(token)\ndef caller():\n'
+            '    values = [callback() for token in ("fixed",)]\n    eval(values[0])\n',
+        )
+        definition = ('def maker(token):\n    def read():\n        return token\n'
+                      '    return read\n')
+        for index, shape in enumerate(shapes):
+            for unsafe in (True, False):
+                with self.subTest(shape=index, unsafe=unsafe):
+                    actual = 'input()' if unsafe else '"fixed"'
+                    source = f'token = {actual}\n' + definition + shape
+                    effects = taint_py._Analysis(ast.parse(source)).analyze()
+                    expected = {('eval', len(source.splitlines()), 9 if index == 4 else 5)} if unsafe else set()
+                    self.assertEqual({key[:3] for key in effects}, expected, effects)
+
+        for unsafe in (True, False):
+            with self.subTest(live_heap=True, unsafe=unsafe):
+                actual = 'input()' if unsafe else '"fixed"'
+                source = ('token = []\n' + definition + 'callback = maker(token)\n'
+                          f'def populate():\n    token.append({actual})\n'
+                          'def caller():\n    populate()\n    eval(callback()[0])\n')
+                effects = taint_py._Analysis(ast.parse(source)).analyze()
+                expected = {('eval', len(source.splitlines()), 5)} if unsafe else set()
+                self.assertEqual({key[:3] for key in effects}, expected, effects)
+
+    def test_function_initialization_does_not_scan_unrelated_globals(self):
+        source = (''.join(f'unrelated{index} = {index}\n' for index in range(400))
+                  + 'important = input()\ndef selected():\n    return important\neval(selected())\n')
+        engine = taint_py._Analysis(ast.parse(source))
+        self.assertEqual({key[:3] for key in engine.analyze()}, {('eval', 404, 1)})
+        function = next(function for function in engine.functions if function.name == 'selected')
+        visits = []
+
+        class ObservedNames(set):
+            def __iter__(self):
+                visits.append(len(self))
+                return super().__iter__()
+
+        class ObservedBindings(dict):
+            def items(self):
+                visits.append(len(self))
+                return super().items()
+
+        engine.global_names = ObservedNames(engine.global_names)
+        engine.globals.bindings = ObservedBindings(engine.globals.bindings)
+        _reads, _writes, summary = engine.solve_function(function, ())
+        self.assertEqual(summary, engine.summaries[function])
+        self.assertLessEqual(sum(visits), 3 * len(engine.used_names[function]),
+                             'A tiny function cannot visit the whole module namespace per solve')
+
+    def test_compact_dependencies_keep_incomplete_escaped_aliases(self):
+        prefix = ('box = []\ndef maker(box):\n    def read():\n        return box\n'
+                  '    return read\ncallback = maker(box)\ndef expensive():\n'
+                  + ''.join(f'    padding{index} = {index}\n' for index in range(100))
+                  + '    return callback()\ndef caller():\n    alias = expensive()\n')
+        for unsafe in (True, False):
+            actual = 'input()' if unsafe else '"fixed"'
+            source = prefix + f'    alias.append({actual})\n    eval(box[0])\n'
+            for allowance in (5000, 20):
+                with self.subTest(unsafe=unsafe, allowance=allowance):
+                    engine = taint_py._Analysis(ast.parse(source))
+                    expensive = next(function for function in engine.functions if function.name == 'expensive')
+                    engine.scope_limits[expensive] = engine.scope_remaining[expensive] = allowance
+                    if allowance == 20:
+                        with self.assertRaises(AnalysisLimit) as raised:
+                            engine.analyze()
+                        self.assertIn('expensive', str(raised.exception))
+                        effects = raised.exception.effects
+                    else:
+                        effects = engine.analyze()
+                    expected = {('eval', len(source.splitlines()), 5)} if unsafe else set()
+                    self.assertEqual({key[:3] for key in effects}, expected, effects)
+
+    def test_function_initialization_keeps_dynamic_namespace_bindings(self):
+        # Resolver-provided bindings need not appear in the module's static
+        # assignment-name index, for example after a wildcard import.
+        for binding, expected in (('eval', {('eval', 2, 5)}), ('print', set())):
+            with self.subTest(binding=binding):
+                tree = ast.parse('def handler():\n    callback(input())\n')
+                engine = taint_py._Analysis(tree)
+                self.assertNotIn('callback', engine.global_symbols)
+                engine.refresh_globals(taint_py._State(bindings={'callback': binding}))
+                _reads, _writes, summary = engine.solve_function(tree.body[0], ())
+                self.assertEqual({effect[:3] for effect in summary.effects}, expected)
+
+    def test_lazy_closure_globals_do_not_cross_module_ownership(self):
+        root = Path('/__ubs_virtual_closure_names__')
+        sources = {
+            root / 'helpers.py': 'token = "fixed"\ndef maker(token):\n'
+                                 '    def read():\n        return token\n'
+                                 '    return read\ncallback = maker(token)\n',
+            root / 'app.py': 'from helpers import callback\ntoken = input()\n'
+                             'def caller():\n    eval(callback())\n',
+        }
+        with patch.object(taint_py, '_parse_source',
+                          side_effect=lambda path: (sources[path], ast.parse(sources[path]))):
+            project = taint_py._Project(sources, root)
+            engines = {path.name: engine for path, _text, engine, _offset in project.sources}
+            self.assertIn('token', engines['helpers.py'].closure_names)
+            self.assertNotIn('token', engines['app.py'].closure_names)
+            self.assertIs(engines['helpers.py'].closures, engines['app.py'].closures)
+            self.assertEqual(list(project.findings()), [])
+
     def test_namespace_changes_recompute_handlers_without_new_value_facts(self):
         source = SHAPES['late_global_callable']['app.py']
         for callback, expected in [('os.system', {('app.py', 13)}), ('harmless', set())]:
@@ -348,6 +612,84 @@ class Factory:
             mutate(changed)
             self.assertFalse(original == changed)
             self.assertTrue(original != changed)
+
+    def test_namespace_cache_accepts_fresh_literals_but_keeps_nested_witnesses(self):
+        # Lattice equality omits evidence intentionally, but a cached transfer
+        # must not freeze the earlier witness of a receiver, argument or heap
+        # value. Fresh equal literal wrappers, conversely, are unchanged input.
+        first = taint_py._State(bindings={'label': taint_py._LiteralString('fixed')})
+        equal = taint_py._State(bindings={'label': taint_py._LiteralString('fixed')})
+        self.assertIsNot(first.bindings['label'], equal.bindings['label'])
+        self.assertTrue(taint_py._same_namespace(first, equal))
+
+        tree = ast.parse('class Owner:\n    async def later(self, value):\n        return value\n'
+                         'pending = Owner.later(input())\n')
+        owner, function, call = tree.body[0], tree.body[0].body[0], tree.body[1].value
+        references = frozenset({'object'})
+        old = frozenset({taint_py.TaintTrace('input', path=('input', 'long', 'route'))})
+        new = frozenset({taint_py.TaintTrace('input', path=('input', 'short'))})
+        bindings = (
+            lambda fact: taint_py._BoundCallable('append', references, fact),
+            lambda fact: taint_py._BoundClassMethod(function, owner, references, fact),
+            lambda fact: taint_py._DeferredCall(function, call, (('value', fact),), ()),
+            lambda fact: taint_py._DeferredCall(function, call, (), (),
+                                                (('callback', taint_py._BoundCallable('append', references, fact)),)),
+            lambda fact: taint_py._ArgumentVector(((call, fact, taint_py._LiteralString('sh')),)),
+            lambda fact: frozenset({taint_py._BoundCallable('append', references, fact), None}),
+        )
+        for index, binding in enumerate(bindings):
+            with self.subTest(binding=index):
+                before = taint_py._State(bindings={'value': binding(old)})
+                after = taint_py._State(bindings={'value': binding(new)})
+                self.assertEqual(before, after, 'The witnesses deliberately describe equal lattice facts')
+                self.assertFalse(taint_py._same_namespace(before, after))
+                self.assertTrue(taint_py._same_namespace(before, before.copy()))
+        for table in ('value', 'heap'):
+            with self.subTest(table=table):
+                before, after = taint_py._State(), taint_py._State()
+                if table == 'value':
+                    before['value'], after['value'] = old, new
+                else:
+                    before.heap['object'], after.heap['object'] = old, new
+                self.assertEqual(before, after)
+                self.assertFalse(taint_py._same_namespace(before, after))
+
+    def test_module_cache_matches_fresh_composed_value_witnesses(self):
+        prefix = '''import os
+import subprocess
+import asyncio
+label = 'fixed'
+def unrelated():
+    def child(value=label):
+        return value
+    return child
+def source():
+    return indirect()
+def indirect():
+    return input()
+'''
+        tails = (
+            ('deferred', 'async def later(value):\n    os.system(value)\n'
+                         'pending = later(source())\nasyncio.run(pending)\n',
+             14, 5, 'input( -> later() -> value -> subprocess execution'),
+            ('vector', 'command = ["sh", "-c", source()]\nsubprocess.run(command)\n',
+             14, 1, 'input( -> subprocess execution'),
+            ('receiver', 'value = source()\nstored = value.format\nos.system(stored())\n',
+             15, 1, 'input( -> value -> subprocess execution'),
+        )
+        for name, tail, line, column, witness in tails:
+            for unsafe in (True, False):
+                with self.subTest(shape=name, unsafe=unsafe):
+                    source = prefix + tail
+                    if not unsafe:
+                        source = source.replace('return input()', 'return "fixed"')
+                    cached = self.scan({'app.py': source})
+                    with patch.object(taint_py._Analysis, 'reads_current', lambda self, reads: False), \
+                            patch.object(taint_py._Flow, 'possible_exception', fresh_exception_join):
+                        fresh = self.scan({'app.py': source})
+                    expected = [('app.py', 'py.taint.command', line, column, witness)] if unsafe else []
+                    self.assertEqual(cached, expected)
+                    self.assertEqual(cached, fresh)
 
     def test_temporary_global_callable_binding_survives_nested_helpers(self):
         for initial, active, expected in (
@@ -919,7 +1261,7 @@ main()
                 # A later factory invocation cannot change a value already
                 # returned by the earlier closure. Keep its captured input.
                 expected = [('zapp.py', 'py.taint.command', 19, 5,
-                             'input( -> target() -> value -> subprocess execution')] if unsafe else []
+                             'input( -> invoke() -> target() -> value -> subprocess execution')] if unsafe else []
                 self.assertEqual(findings, expected)
 
     def test_failed_namespace_context_rolls_back_without_poisoning_other_groups(self):
@@ -1421,6 +1763,585 @@ class SummarySubstitutionTests(unittest.TestCase):
                         self.assertEqual(witnesses(effects), first_unsafe)
 
 
+class LargeModuleBudgetTests(unittest.TestCase):
+    """An unrelated definition writer cannot starve late security findings."""
+
+    def test_nested_writer_does_not_replay_module_once_per_dependency(self):
+        for count in (32, 96):
+            for unsafe in (True, False):
+                source, expected = large_budget_source(12 * count + 33, unsafe=unsafe)
+                with self.subTest(functions=count, unsafe=unsafe):
+                    engine = taint_py._Analysis(ast.parse(source))
+                    initialize = taint_py._Flow.__init__
+                    passes = [0]
+
+                    def observe(flow, owner, scope):
+                        if scope is owner.tree:
+                            passes[0] += 1
+                        initialize(flow, owner, scope)
+
+                    with patch.object(taint_py._Flow, '__init__', observe):
+                        effects = engine.analyze()
+                    self.assertEqual({key[:3] for key in effects},
+                                     {site for site in expected if site[0] != 'header'})
+                    self.assertLessEqual(passes[0], 8,
+                                         'An unrelated closure must not force one module pass per helper')
+
+    def test_large_files_preserve_all_thirteen_sinks_and_clean_controls(self):
+        environment = {name: value for name, value in os.environ.items()
+                       if not name.startswith('UBS_')}
+        environment['PYTHONDONTWRITEBYTECODE'] = '1'
+        for line_count in (6568, 9696):
+            for unsafe in (True, False):
+                source, expected = large_budget_source(line_count, unsafe=unsafe)
+                with self.subTest(lines=line_count, unsafe=unsafe):
+                    self.assertEqual(len(source.splitlines()), line_count)
+                    try:
+                        result = subprocess.run(
+                            [sys.executable, '-B', str(Path(__file__).resolve()), '--large-budget-worker'],
+                            input=source, text=True, capture_output=True, env=environment, timeout=45,
+                        )
+                    except subprocess.TimeoutExpired as exc:
+                        self.fail(f'Large-module analysis failed to make bounded progress: {exc}')
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    try:
+                        report = json.loads(result.stdout)
+                    except json.JSONDecodeError as exc:
+                        self.fail(f'Invalid large-module analysis report: {exc}\n{result.stdout}\n{result.stderr}')
+                    sites = {tuple(site) for domain in report.values() for site in domain['sites']}
+                    self.assertEqual(sites, expected, report)
+                    for domain in report.values():
+                        self.assertLessEqual(domain['module_passes'], 8, report)
+                        self.assertLessEqual(domain['function_passes'], 10 * domain['functions'], report)
+
+
+class CapturedDefaultValueTests(unittest.TestCase):
+    """A function AST is shared; each evaluated default belongs to its creation."""
+
+    def test_repeated_factory_initialization_uses_bounded_summaries(self):
+        prefix = ('def factory(value):\n    def callback(arg=value):\n        return arg\n'
+                  '    return callback\ndef identity(value):\n    return value\n')
+        for count in (10, 50, 200):
+            for dirty in (False, True):
+                with self.subTest(count=count, dirty=dirty):
+                    lines = prefix.splitlines()
+                    lines += [f'saved{index} = factory("fixed")' for index in range(count)]
+                    expected = set()
+                    for index in range(count):
+                        actual = 'input()' if dirty else '"fixed"'
+                        lines += [f'def caller{index}():', f'    eval(identity({actual}))']
+                        if dirty:
+                            expected.add(('eval', len(lines), 5))
+                    engine = self.assert_sites('\n'.join(lines) + '\n', expected)
+                    self.assertLessEqual(engine.work_limit - engine.budget.remaining,
+                                         40 * count + 100)
+                    contexts = sum(isinstance(key, tuple) and key[0].name == 'factory'
+                                   for key in engine.summaries)
+                    self.assertLessEqual(contexts, 2)
+
+    def test_repeated_factory_defaults_keep_each_creation_value(self):
+        for count in (10, 50, 200):
+            for mode in ('clean', 'unsafe', 'mixed'):
+                with self.subTest(count=count, mode=mode):
+                    lines = ['def factory(value):', '    def target(captured=value):',
+                             '        return captured', '    return target']
+                    dirty = [mode == 'unsafe' or (mode == 'mixed' and index % 2 == 1)
+                             for index in range(count)]
+                    for index, unsafe in enumerate(dirty):
+                        actual = 'input()' if unsafe else '"fixed"'
+                        lines.append(f'saved{index} = factory({actual})')
+                    expected = set()
+                    for index, unsafe in enumerate(dirty):
+                        lines.append(f'eval(saved{index}())')
+                        if unsafe:
+                            expected.add(('eval', len(lines), 1))
+                    engine = self.assert_sites('\n'.join(lines) + '\n', expected)
+                    self.assertLessEqual(engine.work_limit - engine.budget.remaining,
+                                         40 * count + 100)
+
+    def test_unrelated_captured_globals_do_not_expand_forward_summaries(self):
+        prefixes = (
+            'def factory(value):\n    def callback(arg=value):\n        return arg\n'
+            '    return callback\nsaved = factory("fixed")\n',
+            'box = []\nsaved = box.append\n',
+        )
+        for prefix in prefixes:
+            for count in (80, 200):
+                helpers = ''.join(
+                    f'def f{index}(value):\n    return '
+                    + (f'f{index + 1}(value)' if index + 1 < count else 'value') + '\n'
+                    for index in range(count)
+                )
+                for dirty in (False, True):
+                    with self.subTest(prefix=prefix, count=count, dirty=dirty):
+                        actual = 'input()' if dirty else '"fixed"'
+                        source = prefix + helpers + f'eval(f0({actual}))\n'
+                        sites = {('eval', len(source.splitlines()), 1)} if dirty else set()
+                        engine = self.assert_sites(source, sites)
+                        work = engine.work_limit - engine.budget.remaining
+                        self.assertLess(work, 150 * count, (count, dirty, work))
+                        contexts = sum(isinstance(key, tuple) for key in engine.summaries)
+                        self.assertLessEqual(contexts, count + 10)
+
+    def test_global_captures_follow_transitive_dependencies(self):
+        factory = ('def factory(value):\n    def callback(arg=value):\n        return arg\n'
+                   '    return callback\n')
+        helpers = ('def leaf():\n    return saved()\n'
+                   'def relay():\n    return leaf()\n')
+        shapes = (
+            factory + 'saved = factory(SOURCE)\n' + helpers + 'eval(relay())\n',
+            factory + 'box = []\nsaved = factory(box)\n' + helpers
+            + 'box.append(SOURCE)\neval(relay()[0])\n',
+            factory + 'saved = factory("fixed")\n' + helpers
+            + 'saved = factory(SOURCE)\nvalue = relay()\n'
+            + 'saved = factory("fixed")\neval(value)\n',
+        )
+        for index, shape in enumerate(shapes):
+            for dirty in (False, True):
+                with self.subTest(shape=index, dirty=dirty):
+                    source = shape.replace('SOURCE', 'input()' if dirty else '"fixed"')
+                    sites = {('eval', len(source.splitlines()), 1)} if dirty else set()
+                    self.assert_sites(source, sites)
+
+    def test_unrelated_captured_globals_are_not_selected_per_call(self):
+        for count in (50, 200):
+            for dirty in (False, True):
+                with self.subTest(count=count, dirty=dirty):
+                    lines = ['def identity(value):', '    return value']
+                    lines += [f'saved{index} = lambda captured="fixed": captured'
+                              for index in range(count)]
+                    expected = set()
+                    for index in range(count):
+                        lines += [f'def caller{index}():',
+                                  '    eval(identity(' + ('input()' if dirty else '"fixed"') + '))']
+                        if dirty:
+                            expected.add(('eval', len(lines), 5))
+                    selected = []
+                    original = taint_py._Analysis._call_summary
+
+                    def counted(engine, function, values, candidate_keys=None,
+                                global_overrides=(), capture_globals=frozenset()):
+                        if function.name == 'identity':
+                            keys = values if candidate_keys is None else candidate_keys
+                            selected.append(sum(key.startswith('@global:saved') for key in keys))
+                        return original(engine, function, values, candidate_keys,
+                                        global_overrides, capture_globals)
+
+                    with patch.object(taint_py._Analysis, '_call_summary', counted):
+                        engine = self.assert_sites('\n'.join(lines) + '\n', expected)
+                    self.assertTrue(selected)
+                    self.assertEqual(sum(selected), 0,
+                                     'Unused captured globals were scanned for each helper call')
+                    self.assertLessEqual(engine.work_limit - engine.budget.remaining,
+                                         40 * count + 200)
+
+    def test_global_capture_dependencies_preserve_module_ownership(self):
+        root = Path('/__ubs_default_capture_owners__')
+        helpers = ('def factory(value):\n    def target(arg=value):\n        return arg\n'
+                   '    return target\ndef leaf():\n    return saved()\n'
+                   'def relay():\n    return leaf()\n')
+        app = ('import left\nimport right\nsaved = "unrelated"\ndef run():\n'
+               '    eval(left.relay())\n    eval(right.relay())\n')
+        for left_dirty in (False, True):
+            with self.subTest(left_dirty=left_dirty):
+                sources = {root / 'app.py': app}
+                for name, dirty in (('left', left_dirty), ('right', not left_dirty)):
+                    value = 'input()' if dirty else '"fixed"'
+                    sources[root / (name + '.py')] = helpers + f'saved = factory({value})\n'
+                with patch.object(taint_py, '_parse_source',
+                                  side_effect=lambda path: (sources[path], ast.parse(sources[path]))):
+                    findings = list(taint_py._Project(list(sources), root).findings())
+                self.assertEqual({(path.name, rule, line, column)
+                                  for path, rule, line, column, _ in findings},
+                                 {('app.py', 'py.taint.eval', 5 if left_dirty else 6, 5)})
+
+    def test_interrupted_relay_retains_global_capture_dependencies(self):
+        for dirty in (False, True):
+            lines = ['saved = lambda arg=' + ('input()' if dirty else '"fixed"') + ': arg',
+                     'def leaf():', '    return saved()', 'def relay():',
+                     '    value = leaf()', '    if choice:', '        return value']
+            lines += ['    padding = "fixed"'] * 100
+            lines += ['    return "fixed"', 'eval(relay())']
+            source = '\n'.join(lines) + '\n'
+            expected = {('eval', len(lines), 1)} if dirty else set()
+            self.assert_sites(source, expected)
+            with self.subTest(dirty=dirty):
+                engine = taint_py._Analysis(ast.parse(source))
+                function = next(fn for fn in engine.functions if getattr(fn, 'name', None) == 'relay')
+                engine.scope_limits[function] = 60
+                engine.scope_remaining[function] = 60
+                with self.assertRaisesRegex(AnalysisLimit, 'relay.*function work limit') as caught:
+                    engine.analyze()
+                self.assertEqual({effect[:3] for effect in caught.exception.effects}, expected)
+                self.assertTrue(engine.failed_summaries[function].capture_globals)
+                self.assertGreater(engine.budget.remaining, 0)
+
+    def test_direct_global_filter_keeps_relevant_creation_and_deferred_reads(self):
+        shapes = (
+            ('def factory():\n    def target(captured=selected):\n        return captured\n'
+             '    return target\nselected=SOURCE\ncallback=factory()\n'
+             'selected="fixed"\neval(callback())\n', {('eval', 8, 1)}),
+            ('def fixed():\n    return "fixed"\ndef factory(value):\n'
+             '    def target(captured=value):\n        return selected(captured)\n'
+             '    return target\nselected=eval\ncallback=factory(SOURCE)\n'
+             'callback()\nselected=print\n', {('eval', 5, 16)}),
+            ('def factory():\n    def target(captured=selected):\n        captured(SOURCE)\n'
+             '    return target\nbox=[]\nselected=box.append\ncallback=factory()\n'
+             'selected=print\ncallback()\neval(box[0])\n', {('eval', 10, 1)}),
+        )
+        for index, (shape, expected) in enumerate(shapes):
+            for dirty in (False, True):
+                with self.subTest(shape=index, dirty=dirty):
+                    source = shape.replace('SOURCE', 'input()' if dirty else '"fixed"')
+                    engine = self.assert_sites(source, expected if dirty else set())
+                    factory = next(fn for fn in engine.functions if getattr(fn, 'name', None) == 'factory')
+                    self.assertIn(factory, engine.direct_global_functions)
+        source = ('import os, shlex\ndef passthrough(value): return value\n'
+                  'def factory(value):\n    return selected(value)\nselected=passthrough\n'
+                  'os.system(factory(input()))\nselected=shlex.quote\nos.system(factory(input()))\n')
+        self.assert_sites(source, {('command', 6, 1)})
+
+    def test_definition_header_calls_keep_indirect_global_contexts(self):
+        headers = (
+            'def factory():\n    def target(captured=read()):\n'
+            '        return captured\n    return target\n',
+            'def factory():\n    return lambda captured=read(): captured\n',
+        )
+        prefix = ('def fixed():\n    return "fixed"\ndef read():\n    return selected()\n')
+        for index, header in enumerate(headers):
+            for dirty in (False, True):
+                with self.subTest(header=index, dirty=dirty):
+                    source = (prefix + header + 'selected=' + ('input' if dirty else 'fixed')
+                              + '\ncallback=factory()\nselected=fixed\neval(callback())\n')
+                    expected = {('eval', len(source.splitlines()), 1)} if dirty else set()
+                    engine = self.assert_sites(source, expected)
+                    factory = next(fn for fn in engine.functions if getattr(fn, 'name', None) == 'factory')
+                    self.assertNotIn(factory, engine.direct_global_functions)
+
+    def test_factory_filter_preserves_imported_scalar_and_callback_defaults(self):
+        root = Path('/__ubs_factory_import_controls__')
+        helpers = (
+            'from values import selected\ndef factory():\n'
+            '    def target(captured=selected):\n        return captured\n    return target\n',
+            'def factory():\n    from values import selected\n'
+            '    def target(captured=selected):\n        return captured\n    return target\n',
+            'def factory():\n    from values import source\n'
+            '    def target(captured=source):\n        return captured()\n    return target\n',
+        )
+        app = 'from helpers import factory\ncallback=factory()\neval(callback())\n'
+        for index, helper in enumerate(helpers):
+            for dirty in (False, True):
+                with self.subTest(helper=index, dirty=dirty):
+                    values = ('selected=' + ('input()' if dirty else '"fixed"')
+                              + '\nsource=' + ('input' if dirty else '(lambda: "fixed")') + '\n')
+                    sources = {root / 'values.py': values, root / 'helpers.py': helper, root / 'app.py': app}
+                    with patch.object(taint_py, '_parse_source',
+                                      side_effect=lambda path: (sources[path], ast.parse(sources[path]))):
+                        findings = list(taint_py._Project(list(sources), root).findings())
+                    self.assertEqual({(path.name, rule, line, column)
+                                      for path, rule, line, column, _ in findings},
+                                     {('app.py', 'py.taint.eval', 3, 1)} if dirty else set())
+
+    def assert_sites(self, source, expected, *, scope=None):
+        settings = {'UBS_PYTHON_FLOW_SCOPE_STEPS': str(scope)} if scope is not None else {}
+        with patch.dict(os.environ, settings):
+            engine = taint_py._Analysis(ast.parse(source))
+            if scope == 60:
+                with self.assertRaisesRegex(AnalysisLimit, 'factory.*function work limit') as caught:
+                    engine.analyze()
+                effects = caught.exception.effects
+                for fact in effects.values():
+                    self.assertTrue(all(taint_py._INCOMPLETE_PROOF in trace.sanitizers for trace in fact))
+            else:
+                effects = engine.analyze()
+        actual = {(kind, line, column) for kind, line, column, _label in effects}
+        self.assertEqual(actual, expected, source)
+        return engine
+
+    def test_safe_and_unsafe_creations_keep_their_own_defaults(self):
+        factories = (
+            ('value', 'def factory(value):\n    def target(captured=value):\n        return captured\n    return target\n',
+             'input()', '"fixed"'),
+            ('lambda', 'def factory(value):\n    return lambda *, captured=value: captured\n',
+             'input()', '"fixed"'),
+            ('callback-result', 'def factory(callback):\n    def target(captured=callback()):\n        return captured\n    return target\n',
+             'input', 'fixed'),
+            ('callback-value', 'def factory(callback):\n    def target(captured=callback):\n        return captured()\n    return target\n',
+             'input', 'fixed'),
+            ('nested', 'def factory(value):\n    def inner(captured=value):\n        return captured\n'
+                       '    def target(callback=inner):\n        return callback()\n    return target\n',
+             'input()', '"fixed"'),
+        )
+        helpers = ('def fixed():\n    return "fixed"\ndef invoke(callback):\n    return callback()\n'
+                   'def relay(callback):\n    return invoke(callback)\n')
+        for name, factory, dirty, clean in factories:
+            for first_dirty in (False, True):
+                for invocation in ('{}()', 'invoke({})', 'relay({})'):
+                    with self.subTest(factory=name, first_dirty=first_dirty, invocation=invocation):
+                        first, second = (dirty, clean) if first_dirty else (clean, dirty)
+                        lines = (helpers + factory).splitlines()
+                        lines += [f'first = factory({first})', f'second = factory({second})',
+                                  f'eval({invocation.format("first")})', f'eval({invocation.format("second")})']
+                        expected_line = len(lines) - int(first_dirty)
+                        self.assert_sites('\n'.join(lines) + '\n', {('eval', expected_line, 1)})
+
+    def test_nested_framework_dependencies_keep_callable_identity(self):
+        for returned, expected in (('q', {('eval', 6, 9)}), ('"fixed"', set())):
+            with self.subTest(returned=returned):
+                source = ('from fastapi import Depends, Query\ndef build():\n'
+                          '    def obtain(q=Query()):\n'
+                          f'        return {returned}\n'
+                          '    def endpoint(code=Depends(obtain)):\n        eval(code)\n'
+                          '    return endpoint\n')
+                self.assert_sites(source, expected)
+
+    def test_explicit_arguments_override_captured_defaults(self):
+        factory = ('def factory(value):\n    def target(captured=value, *, named=value):\n'
+                   '        return captured + named\n    return target\n')
+        for invocation, dirty in (("callback('fixed', named='fixed')", False),
+                                  ("callback(captured='fixed', named='fixed')", False),
+                                  ("callback('fixed')", True),
+                                  ("callback(named='fixed')", True)):
+            with self.subTest(invocation=invocation):
+                lines = factory.splitlines() + ['callback = factory(input())', f'eval({invocation})']
+                self.assert_sites('\n'.join(lines) + '\n', {('eval', len(lines), 1)} if dirty else set())
+
+    def test_default_aliases_keep_late_heap_writes_and_bound_receivers(self):
+        shapes = (
+            'def factory(value):\n    def target(captured=value):\n        return captured\n    return target\n'
+            'box = []\ncallback = factory(box)\nother = factory([])\nbox.append(SOURCE)\neval(callback()[0])\n',
+            'def factory():\n    box = []\n    def target(captured=box):\n        return captured[0]\n'
+            '    box.append(SOURCE)\n    return target\neval(factory()())\n',
+            'def factory():\n    box = []\n    def target(captured=box):\n        return captured[0]\n'
+            '    try:\n        return target\n    finally:\n        box.append(SOURCE)\neval(factory()())\n',
+            'def factory(value):\n    def target(captured=value):\n        captured.append(SOURCE)\n    return target\n'
+            'def invoke(callback):\n    callback()\nbox = []\ncallback = factory(box)\n'
+            'other = factory([])\ninvoke(callback)\neval(box[0])\n',
+            'def factory(value):\n    def target(captured=value):\n        captured(SOURCE)\n    return target\n'
+            'def invoke(callback):\n    callback()\nbox = []\ncallback = factory(box.append)\n'
+            'other = factory(print)\ninvoke(callback)\neval(box[0])\n',
+        )
+        for index, shape in enumerate(shapes):
+            for dirty in (False, True):
+                with self.subTest(shape=index, dirty=dirty):
+                    source = shape.replace('SOURCE', 'input()' if dirty else '"fixed"')
+                    self.assert_sites(source, {('eval', len(source.splitlines()), 1)} if dirty else set())
+
+    def test_async_and_generator_paths_preserve_captured_defaults(self):
+        shapes = (
+            'import asyncio\ndef factory(value):\n    async def target(captured=value):\n        return captured\n'
+            '    return target\ncallback = factory(SOURCE)\nother = factory("fixed")\neval(asyncio.run(callback()))\n',
+            'import asyncio\nasync def factory(value):\n    def target(captured=value):\n        return captured\n'
+            '    return target\ncallback = asyncio.run(factory(SOURCE))\n'
+            'other = asyncio.run(factory("fixed"))\neval(callback())\n',
+            'def factory(value):\n    def target(captured=value):\n        return captured\n    yield target\n'
+            'for callback in factory(SOURCE):\n    other = factory("fixed")\n    eval(callback())\n',
+            'def factory(value):\n    def target(captured=value):\n        yield captured\n    return target\n'
+            'callback = factory(SOURCE)\nother = factory("fixed")\nfor value in callback():\n    eval(value)\n',
+            'def factory(value):\n    def target(captured=value):\n        yield "fixed"\n        return captured\n'
+            '    return target\ndef caller(callback):\n    value = yield from callback()\n    eval(value)\n'
+            'callback = factory(SOURCE)\nother = factory("fixed")\nfor ignored in caller(callback):\n    pass\n',
+        )
+        for index, shape in enumerate(shapes):
+            for dirty in (False, True):
+                with self.subTest(shape=index, dirty=dirty):
+                    source = shape.replace('SOURCE', 'input()' if dirty else '"fixed"')
+                    sink_line = next(line for line, text in enumerate(source.splitlines(), 1) if 'eval(' in text)
+                    column = 5 if index >= 2 else 1
+                    self.assert_sites(source, {('eval', sink_line, column)} if dirty else set())
+
+    def test_interrupted_factory_keeps_observed_default_sources(self):
+        factories = (
+            'def factory():\n    def target(captured=SOURCE):\n        return captured\n',
+            'def factory():\n    box = []\n    def target(captured=box):\n        return captured[0]\n'
+            '    box.append(SOURCE)\n',
+        )
+        for index, factory in enumerate(factories):
+            for dirty in (False, True):
+                lines = factory.replace('SOURCE', 'input()' if dirty else '"fixed"').splitlines()
+                lines += ['    if choice:', '        return target']
+                lines += ['    padding = "fixed"'] * 100
+                lines += ['    return target', 'eval(factory()())']
+                source = '\n'.join(lines) + '\n'
+                expected = {('eval', len(lines), 1)} if dirty else set()
+                for scope in (250000, 60):
+                    with self.subTest(factory=index, dirty=dirty, scope=scope):
+                        self.assert_sites(source, expected, scope=scope)
+
+    def test_concrete_default_facts_do_not_create_contexts(self):
+        prefix = ('def factory(value):\n    def target(captured=value):\n        return captured\n    return target\n'
+                  'def invoke(callback):\n    return callback()\n')
+        counts = []
+        for count in (8, 64):
+            lines = prefix.splitlines()
+            expected = set()
+            for index in range(count):
+                lines += [f'eval(invoke(factory({"input()" if index % 2 else repr("fixed")})))']
+                if index % 2:
+                    expected.add(('eval', len(lines), 1))
+            engine = self.assert_sites('\n'.join(lines) + '\n', expected)
+            counts.append((len(engine.summaries), engine.work_limit - engine.budget.remaining))
+        self.assertEqual(counts[0][0], counts[1][0], counts)
+        self.assertLessEqual(counts[1][1], 10 * counts[0][1], counts)
+
+    def test_recursive_default_contexts_report_limits_and_retain_findings(self):
+        source = ('def factory(callback):\n    def target(previous=callback):\n        return previous()\n'
+                  '    return target\ncallback = input\nwhile condition:\n'
+                  '    callback = factory(callback)\neval(callback())\n')
+        # Use an explicit scope allowance so this exercises scope recovery
+        # before the module's expanding callback environment uses its total.
+        with patch.dict(os.environ, {'UBS_PYTHON_FLOW_SCOPE_STEPS': '2000'}):
+            engine = taint_py._Analysis(ast.parse(source))
+        with self.assertRaisesRegex(AnalysisLimit, 'function work limit') as caught:
+            engine.analyze()
+        self.assertEqual({(kind, line, column) for kind, line, column, _ in caught.exception.effects},
+                         {('eval', 8, 1)})
+        self.assertGreater(engine.budget.remaining, 0)
+
+    def test_captured_value_construction_is_bounded_before_hashing(self):
+        lines = ['eval(input())', 'def factory():', '    previous = input']
+        for index in range(80):
+            lines += [f'    def step_{index}(captured=previous):', '        return captured()',
+                      f'    previous = step_{index}']
+        lines += ['    return previous', 'factory()']
+        engine = taint_py._Analysis(ast.parse('\n'.join(lines) + '\n'))
+        with self.assertRaisesRegex(AnalysisLimit, 'captured-default nesting exceeds 64 levels') as caught:
+            engine.analyze()
+        self.assertEqual({(kind, line, column) for kind, line, column, _ in caught.exception.effects},
+                         {('eval', 1, 1)})
+
+    def test_header_default_instances_keep_encoder_and_body_proofs(self):
+        sources = (
+            ('from urllib.parse import quote\ndef factory(value):\n'
+             '    def target(captured=value): return captured\n    return target\n'
+             'def view(request, response):\n    raw = factory(request.args["x"])\n'
+             '    safe = factory(quote(request.args["x"], safe=""))\n    fixed = factory("fixed")\n'
+             '    response.headers["raw"] = raw()\n    response.headers["safe"] = safe()\n'
+             '    response.headers["fixed"] = fixed()\n', {('header', 9, 5)}),
+            ('def factory(value):\n    def target(captured=value):\n'
+             '        return captured.replace("\\r", "").replace("\\n", "")\n    return target\n'
+             'def view(request, response):\n    safe = factory(request.args["x"])\n'
+             '    response.headers["safe"] = safe()\n', set()),
+        )
+        for source, expected in sources:
+            with self.subTest(expected=expected):
+                effects = header_injection._HeaderAnalysis(ast.parse(source)).analyze()
+                sites = {key[:3] for key, fact in effects.items()
+                         if any(not header_injection._safe(trace) for trace in fact)}
+                self.assertEqual(sites, expected)
+
+    def test_incomplete_header_factory_retains_captured_provenance(self):
+        for captured in ('input()', '"fixed"', 'quote(input(), safe="")'):
+            lines = ['from urllib.parse import quote', 'def factory():',
+                     f'    def target(captured={captured}): return captured',
+                     '    if choice: return target']
+            lines += ['    padding = "fixed"'] * 100
+            lines += ['    return target', 'def view(response):',
+                      '    response.headers["x"] = factory()()']
+            for scope in (250000, 60):
+                with self.subTest(captured=captured, scope=scope):
+                    with patch.dict(os.environ, {'UBS_PYTHON_FLOW_SCOPE_STEPS': str(scope)}):
+                        engine = header_injection._HeaderAnalysis(ast.parse('\n'.join(lines) + '\n'))
+                    if scope == 60:
+                        with self.assertRaisesRegex(AnalysisLimit, 'factory.*function work limit') as caught:
+                            engine.analyze()
+                        effects = caught.exception.effects
+                    else:
+                        effects = engine.analyze()
+                    sites = {key[:3] for key, fact in effects.items()
+                             if any(not header_injection._safe(trace) for trace in fact)}
+                    expected = ({('header', len(lines), 5)}
+                                if captured == 'input()' or (scope == 60 and captured != '"fixed"') else set())
+                    self.assertEqual(sites, expected)
+
+    def test_shared_capture_graph_comparison_and_hashing_are_bounded(self):
+        original_equal = taint_py._FunctionValue.__eq__
+        original_hash = taint_py._FunctionValue.__hash__
+        for depth in (8, 32):
+            with self.subTest(depth=depth):
+                visits = {'equal': 0, 'hash': 0}
+
+                def bounded_equal(left, right):
+                    visits['equal'] += 1
+                    self.assertLessEqual(visits['equal'], 64 * depth,
+                                         'Shared captured defaults expanded during equality')
+                    return original_equal(left, right)
+
+                def bounded_hash(value):
+                    visits['hash'] += 1
+                    self.assertLessEqual(visits['hash'], 64 * depth,
+                                         'A captured child was recursively rehashed')
+                    return original_hash(value)
+
+                source = ('eval(input())\nprevious = input\n'
+                          + 'previous = lambda left=previous, right=previous: left()\n' * depth)
+                with patch.object(taint_py._FunctionValue, '__eq__', bounded_equal), \
+                        patch.object(taint_py._FunctionValue, '__hash__', bounded_hash):
+                    self.assert_sites(source, {('eval', 1, 1)})
+
+    def test_mixed_coroutine_capture_depth_is_bounded(self):
+        source = ('eval(input())\nasync def defer(value): return value\nprevious = input\n'
+                  + ('waiting = defer(previous)\n'
+                     'previous = lambda captured=waiting: captured\n') * 33)
+        engine = taint_py._Analysis(ast.parse(source))
+        with self.assertRaisesRegex(AnalysisLimit, 'captured-default nesting exceeds 64 levels') as caught:
+            engine.analyze()
+        self.assertEqual({effect[:3] for effect in caught.exception.effects}, {('eval', 1, 1)})
+        self.assertGreater(engine.budget.remaining, 0)
+
+    def test_shared_capture_witness_comparison_preserves_evidence(self):
+        # Use independently evaluated values from the same real syntax, so
+        # identity alone cannot compare the captured graphs or their paths.
+        source = ('previous = input()\n'
+                  + 'previous = lambda left=previous, right=previous: left()\n' * 16)
+        tree = ast.parse(source)
+        first = taint_py._Analysis(tree)
+        second = taint_py._Analysis(tree)
+        first.analyze()
+        second.analyze()
+        left, right = first.globals.bindings['previous'], second.globals.bindings['previous']
+        visits = 0
+        original_equal = taint_py.TaintTrace.__eq__
+
+        def bounded_equal(a, b):
+            nonlocal visits
+            visits += 1
+            self.assertLessEqual(visits, 1024, 'Witness comparison revisited shared capture paths')
+            return original_equal(a, b)
+
+        with patch.object(taint_py.TaintTrace, '__eq__', bounded_equal):
+            self.assertTrue(taint_py._same_witness(left, right))
+        original_source = taint_py._Flow.source
+
+        def changed_source(flow, node, state, candidate=None):
+            facts = original_source(flow, node, state, candidate)
+            return frozenset(taint_py.TaintTrace(trace.source, trace.parameter, trace.sanitizers,
+                                                ('changed witness', *trace.path)) for trace in facts)
+
+        third = taint_py._Analysis(tree)
+        with patch.object(taint_py._Flow, 'source', changed_source):
+            third.analyze()
+        changed = third.globals.bindings['previous']
+        self.assertEqual(left, changed)
+        self.assertEqual(hash(left), hash(changed))
+        self.assertFalse(taint_py._same_witness(left, changed))
+        self.assertFalse(taint_py._same_namespace(first.globals, third.globals))
+
+    def test_imported_factories_preserve_default_creation_instances(self):
+        root = Path('/__ubs_default_capture_test__')
+        helpers = ('def factory(value):\n    def target(captured=value):\n        return captured\n'
+                   '    return target\ndef invoke(callback):\n    return callback()\n')
+        app = ('from helpers import factory, invoke\nfirst = factory(input())\nsecond = factory("fixed")\n'
+               'eval(invoke(first))\neval(invoke(second))\n')
+        sources = {root / 'helpers.py': helpers, root / 'app.py': app}
+        # Only parsing is virtualized; the real project resolver, summaries,
+        # module ownership, line mapping and report generation are exercised.
+        with patch.object(taint_py, '_parse_source', side_effect=lambda path: (sources[path], ast.parse(sources[path]))):
+            findings = list(taint_py._Project(list(sources), root).findings())
+        self.assertEqual({(path.name, rule, line, column) for path, rule, line, column, _ in findings},
+                         {('app.py', 'py.taint.eval', 4, 1)})
+
+
 class WorkLimitCompletionTests(unittest.TestCase):
     """A work limit bounds analysis without manufacturing a clean result."""
 
@@ -1443,6 +2364,384 @@ class WorkLimitCompletionTests(unittest.TestCase):
         path = self.root / name
         path.write_text(text, encoding='utf-8')
         return path
+
+    @staticmethod
+    def environment(**settings):
+        result = {name: value for name, value in os.environ.items()
+                  if not name.startswith(('UBS_', 'XDG_'))}
+        result.update(PYTHONDONTWRITEBYTECODE='1', UBS_KEEP_TEMP='1')
+        result.update(settings)
+        return result
+
+    def driver(self, files, environment):
+        from ubs_core import py_scan
+
+        selected = self.root / 'selected-files'
+        selected.write_bytes(b''.join(os.fsencode(path) + b'\0' for path in files))
+        sink, report = self.root / 'budget-findings.jsonl', self.root / 'budget-report.json'
+        arguments = ['--files-from', str(selected), '--sink', str(sink), '--json-out', str(report),
+                     '--project-dir', str(self.root), '--jobs', '1',
+                     '--skip', ','.join(str(number) for number in range(1, 24) if number != 7)]
+        stderr = io.StringIO()
+        with patch.dict(os.environ, environment, clear=True), contextlib.redirect_stderr(stderr):
+            code = py_scan.main(arguments)
+        try:
+            document = json.loads(report.read_text(encoding='utf-8'))
+            records = [json.loads(line) for line in sink.read_text(encoding='utf-8').splitlines()]
+        except json.JSONDecodeError as exc:
+            self.fail(f'Invalid budget report: {exc}\n{stderr.getvalue()}')
+        return code, document, records, stderr.getvalue()
+
+    def test_scope_limit_preserves_independent_sinks_in_the_same_file(self):
+        lines = ['def before():', '    eval(input())', 'def expensive():']
+        lines.extend(f'    value{index} = {index}' for index in range(300))
+        lines.extend(['def after():', '    eval(input())'])
+        path = self.source('same-file.py', '\n'.join(lines) + '\n')
+        expected = {('py.taint.eval', 2, 5), ('py.taint.eval', len(lines), 5)}
+        environment = self.environment(UBS_PYTHON_FLOW_SCOPE_STEPS='200',
+                                       UBS_PYTHON_FLOW_MAX_STEPS='100000')
+        findings = []
+        with patch.dict(os.environ, environment, clear=True), self.assertRaises(AnalysisLimit) as raised:
+            findings.extend(taint_py.scan_file_findings(path))
+        self.assertEqual({row[:3] for row in findings}, expected, findings)
+        for detail in ('expensive', '200', 'incomplete'):
+            self.assertIn(detail, str(raised.exception))
+        self.assertRegex(str(raised.exception), r'(?:lines?\s+|:)3(?:\D|$)')
+        self.assertEqual({key[:3] for key in raised.exception.effects},
+                         {('eval', 2, 5), ('eval', len(lines), 5)})
+
+        # A larger explicit, still finite allowance completes the same source
+        # without changing the independent sink identities or their evidence.
+        environment['UBS_PYTHON_FLOW_SCOPE_STEPS'] = '5000'
+        with patch.dict(os.environ, environment, clear=True):
+            complete = list(taint_py.scan_file_findings(path))
+        self.assertEqual(complete, findings)
+
+    def test_scope_allowance_is_shared_by_recursive_callback_contexts(self):
+        names = [f'cb{index}' for index in range(8)]
+        swapped, rotated = [names[1], names[0], *names[2:]], [*names[1:], names[0]]
+        lines = ['def before():', '    eval(input())',
+                 f'def rotate({", ".join(names)}, value):',
+                 '    if condition_a:', f'        return rotate({", ".join(swapped)}, value)',
+                 '    if condition_b:', f'        return rotate({", ".join(rotated)}, value)',
+                 '    return cb0(value)']
+        for index in range(8):
+            lines.extend([f'def ident{index}(value):', '    return value'])
+        arguments = ', '.join(f'ident{index}' for index in range(8))
+        lines.extend(['def expensive():', f'    return rotate({arguments}, input())',
+                      'def after():', '    eval(input())'])
+        path = self.source('callback-contexts.py', '\n'.join(lines) + '\n')
+        initialize = taint_py._Flow.__init__
+        solves = [0]
+
+        def observe(flow, engine, scope):
+            if getattr(scope, 'name', '') == 'rotate':
+                solves[0] += 1
+            initialize(flow, engine, scope)
+
+        environment = self.environment(UBS_PYTHON_FLOW_SCOPE_STEPS='2500',
+                                       UBS_PYTHON_FLOW_MAX_STEPS='1000000')
+        findings = []
+        with patch.dict(os.environ, environment, clear=True), \
+                patch.object(taint_py._Flow, '__init__', observe), self.assertRaises(AnalysisLimit) as raised:
+            findings.extend(taint_py.scan_file_findings(path))
+        self.assertEqual({row[:3] for row in findings},
+                         {('py.taint.eval', 2, 5), ('py.taint.eval', len(lines), 5)}, findings)
+        self.assertIn('rotate', str(raised.exception))
+        self.assertIn('2500', str(raised.exception))
+        self.assertGreater(solves[0], 1, 'The source must request specialized callback contexts')
+        self.assertLessEqual(solves[0], 100,
+                             'New callable permutations cannot reset the function work allowance')
+
+    def test_failed_context_preserves_previously_completed_base_effects(self):
+        source = '''def expensive(callback):
+    callback()
+    eval(input())
+def stop():
+    raise RuntimeError()
+def caller():
+    expensive(stop)
+def tail():
+    eval(input())
+'''
+        expected = {('eval', 3, 5), ('eval', 9, 5)}
+        self.assertEqual({key[:3] for key in taint_py._Analysis(ast.parse(source)).analyze()}, expected)
+        engine = taint_py._Analysis(ast.parse(source))
+        expensive = next(function for function in engine.functions if function.name == 'expensive')
+        # The generic solve completes in nine units; its nonreturning callback
+        # context then exhausts the cumulative scope allowance. An incomplete
+        # replacement summary must retain the base entry's established sink.
+        engine.scope_limits[expensive] = engine.scope_remaining[expensive] = 10
+        with self.assertRaises(AnalysisLimit) as raised:
+            engine.analyze()
+        self.assertEqual({key[:3] for key in raised.exception.effects}, expected)
+        self.assertIn('expensive', str(raised.exception))
+
+    def test_limited_import_cycle_keeps_completed_member_effects(self):
+        files = [
+            self.source('a.py', 'import b\ndef first():\n    eval(input())\n'),
+            self.source('b.py', 'import a\ndef hard():\n    x = input()\n'
+                                '    y = str(x)\n    return y\n'),
+            self.source('z.py', 'def last():\n    eval(input())\n'),
+        ]
+        project = taint_py._Project(files, self.root)
+        engines = {path.name: engine for path, _, engine, _ in project.sources}
+        owner = engines['b.py']
+        hard = next(function for function in owner.functions if function.name == 'hard')
+        owner.scope_limits[hard] = owner.scope_remaining[hard] = 2
+        findings = []
+        with self.assertRaises(AnalysisLimit) as raised:
+            findings.extend(project.findings())
+        self.assertEqual({(path.name, rule, line, column) for path, rule, line, column, _ in findings},
+                         {('a.py', 'py.taint.eval', 3, 5), ('z.py', 'py.taint.eval', 2, 5)}, findings)
+        self.assertIn('hard', str(raised.exception))
+        self.assertFalse(project.ready & {engines['a.py'], engines['b.py']},
+                         'Retained findings do not make a partial import cycle reusable')
+
+    def test_incomplete_helper_cannot_preserve_unproved_sanitizer_contract(self):
+        for actual, unsafe in (('input()', True), ('"fixed"', False)):
+            lines = ['import os', 'import shlex', 'def expensive(value):']
+            lines.extend(f'    local{index} = {index}' for index in range(300))
+            lines.extend(['    return decode_unknown(value)', 'def caller():',
+                          f'    os.system(expensive(shlex.quote({actual})))'])
+            path = self.source(f'incomplete-contract-{unsafe}.py', '\n'.join(lines) + '\n')
+            environment = self.environment(UBS_PYTHON_FLOW_SCOPE_STEPS='200',
+                                           UBS_PYTHON_FLOW_MAX_STEPS='100000')
+            findings = []
+            with self.subTest(unsafe=unsafe), patch.dict(os.environ, environment, clear=True), \
+                    self.assertRaises(AnalysisLimit) as raised:
+                findings.extend(taint_py.scan_file_findings(path))
+            expected = {('py.taint.command', len(lines), 5)} if unsafe else set()
+            self.assertEqual({row[:3] for row in findings}, expected, findings)
+            self.assertIn('expensive', str(raised.exception))
+            if unsafe:
+                self.assertIn('input', findings[0][-1])
+
+    def assert_budgeted_mutation_sites(self, lines, kind, unsafe, *, column=5):
+        source = '\n'.join(lines) + '\n'
+        expected = {(kind, len(lines), column)} if unsafe else set()
+        engine_type = header_injection._HeaderAnalysis if kind == 'header' else taint_py._Analysis
+        for allowance in (5000, 100):
+            with self.subTest(scope_allowance=allowance):
+                environment = self.environment(UBS_PYTHON_FLOW_SCOPE_STEPS=str(allowance),
+                                               UBS_PYTHON_FLOW_MAX_STEPS='100000')
+                with patch.dict(os.environ, environment, clear=True):
+                    engine = engine_type(ast.parse(source))
+                    if allowance == 100:
+                        with self.assertRaises(AnalysisLimit) as raised:
+                            engine.analyze()
+                        self.assertIn('populate', str(raised.exception))
+                        self.assertIn('100', str(raised.exception))
+                        effects = raised.exception.effects
+                    else:
+                        effects = engine.analyze()
+                sites = {key[:3] for key, facts in effects.items()
+                         if key[0] != 'header' or any(not header_injection._safe(trace) for trace in facts)}
+                self.assertEqual(sites, expected, effects)
+                if unsafe:
+                    self.assertTrue(any('input' in trace.source for facts in effects.values() for trace in facts),
+                                    'The retained finding must have real external-input provenance')
+
+    def test_incomplete_mutations_reach_callers_through_aliases_and_await(self):
+        # The write precedes the cutoff. Ignoring the helper's return cannot
+        # erase it, and coroutine construction must defer it until the await.
+        modes = ('sync', 'await', 'run', 'return_alias', 'aliased_argument', 'symbolic_write')
+        for mode in modes:
+            for unsafe in (True, False):
+                with self.subTest(mode=mode, unsafe=unsafe):
+                    actual = 'input()' if unsafe else '"fixed"'
+                    is_async = mode in ('await', 'run')
+                    arguments = 'box, value' if mode == 'symbolic_write' else 'box'
+                    write = 'value' if mode == 'symbolic_write' else actual
+                    lines = ['import asyncio',
+                             f'{"async " if is_async else ""}def populate({arguments}):',
+                             f'    box.append({write})']
+                    lines.extend(f'    padding{index} = {index}' for index in range(100))
+                    lines.extend(['    return box',
+                                  f'{"async " if mode == "await" else ""}def caller():'])
+                    if mode == 'return_alias':
+                        lines.extend(['    result = populate([])', '    eval(result[0])'])
+                    else:
+                        lines.append('    box = []')
+                        if mode == 'await':
+                            lines.append('    await populate(box)')
+                        elif mode == 'run':
+                            lines.append('    asyncio.run(populate(box))')
+                        elif mode == 'aliased_argument':
+                            lines.extend(['    alias = box', '    populate(alias)'])
+                        elif mode == 'symbolic_write':
+                            lines.append(f'    populate(box, {actual})')
+                        else:
+                            lines.append('    populate(box)')
+                        lines.append('    eval(box[0])')
+                    self.assert_budgeted_mutation_sites(lines, 'eval', unsafe)
+
+    def test_incomplete_mutation_revokes_argument_encoding_proofs(self):
+        domains = (
+            ('command', 'shlex.quote', 'os.system(box[0])'),
+            ('header', 'urllib.parse.quote', 'response.headers["X-Result"] = box[0]'),
+        )
+        for kind, sanitizer, sink in domains:
+            for unsafe in (True, False):
+                with self.subTest(domain=kind, unsafe=unsafe):
+                    initial = f'{sanitizer}(input())' if unsafe else '"fixed"'
+                    write = 'input()' if unsafe else '"fixed"'
+                    lines = ['import os', 'import shlex', 'import urllib.parse', 'def populate(box):']
+                    lines.extend(f'    padding{index} = {index}' for index in range(100))
+                    # The unseen suffix can replace an encoded value. A partial
+                    # warning needs only the already-known argument provenance;
+                    # the fixed-input control has no external source to invent.
+                    lines.extend([f'    box[0] = {write}', 'def caller():', f'    box = [{initial}]',
+                                  '    populate(box)', f'    {sink}'])
+                    self.assert_budgeted_mutation_sites(lines, kind, unsafe)
+
+    def test_incomplete_return_keeps_possible_argument_aliases(self):
+        for unsafe in (True, False):
+            with self.subTest(unsafe=unsafe):
+                actual = 'input()' if unsafe else '"fixed"'
+                lines = ['def populate(box):', '    box.append("fixed")']
+                lines.extend(f'    padding{index} = {index}' for index in range(100))
+                lines.extend(['    return box', 'def caller():', '    box = []',
+                              '    result = populate(box)', f'    result.append({actual})',
+                              '    eval(box[0])'])
+                self.assert_budgeted_mutation_sites(lines, 'eval', unsafe)
+
+    def test_incomplete_return_keeps_observed_branch_sources(self):
+        for container in (False, True):
+            for unsafe in (True, False):
+                with self.subTest(container=container, unsafe=unsafe):
+                    actual = 'input()' if unsafe else '"fixed"'
+                    returned = f'[{actual}]' if container else actual
+                    lines = ['def populate():', '    if flag:', f'        return {returned}']
+                    lines.extend(f'    padding{index} = {index}' for index in range(100))
+                    lines.extend(['    return "fixed"', 'def caller():',
+                                  '    eval(populate()[0])' if container else '    eval(populate())'])
+                    # capture() must retain the completed branch's value when
+                    # a different reachable path exhausts the scope allowance.
+                    self.assert_budgeted_mutation_sites(lines, 'eval', unsafe)
+
+    def test_incomplete_generator_keeps_yield_from_completion_values_and_aliases(self):
+        for alias in (False, True):
+            for unsafe in (True, False):
+                with self.subTest(alias=alias, unsafe=unsafe):
+                    actual = 'input()' if unsafe else '"fixed"'
+                    lines = [f'def populate({"box" if alias else ""}):',
+                             '    if flag:', f'        return {"box" if alias else actual}',
+                             '    yield "fixed"']
+                    lines.extend(f'    padding{index} = {index}' for index in range(100))
+                    lines.extend([f'    return {"box" if alias else "None"}', 'def caller():'])
+                    if alias:
+                        lines.extend(['    box = []', '    result = yield from populate(box)',
+                                      f'    result.append({actual})', '    eval(box[0])'])
+                    else:
+                        lines.extend(['    result = yield from populate()', '    eval(result)'])
+                    # A generator has separate yielded-value and completion
+                    # channels. The retained return observation must reach
+                    # the value of yield-from, including its object identity.
+                    self.assert_budgeted_mutation_sites(lines, 'eval', unsafe)
+
+    def test_incomplete_exception_keeps_observed_payloads_in_callers(self):
+        for mode in ('explicit', 'assert', 'delegated'):
+            for unsafe in (True, False):
+                with self.subTest(mode=mode, unsafe=unsafe):
+                    actual = 'input()' if unsafe else '"fixed"'
+                    lines = ['def raises():', f'    raise ValueError({actual})'] if mode == 'delegated' else []
+                    lines.extend(['def populate():', '    if flag:'])
+                    if mode == 'assert':
+                        lines.append(f'        assert False, {actual}')
+                    elif mode == 'delegated':
+                        lines.append('        raises()')
+                    else:
+                        lines.append(f'        raise ValueError({actual})')
+                    lines.extend(f'    padding{index} = {index}' for index in range(100))
+                    exception = 'AssertionError' if mode == 'assert' else 'ValueError'
+                    lines.extend(['    return "fixed"', 'def caller():', '    try:', '        populate()',
+                                  f'    except {exception} as error:', '        eval(str(error))'])
+                    # The exceptional branch finishes before a different
+                    # reachable path exhausts its allowance. Its payload must
+                    # survive the incomplete summary and reach the handler.
+                    self.assert_budgeted_mutation_sites(lines, 'eval', unsafe, column=9)
+
+    def test_failed_context_keeps_mutations_of_an_earlier_completed_context(self):
+        source = '''def populate(callback, box):
+    callback(box)
+def dirty(box):
+    box.append(input())
+def stop(box):
+    raise RuntimeError()
+def first():
+    box = []
+    populate(dirty, box)
+    eval(box[0])
+def second():
+    populate(stop, [])
+'''
+        for unsafe in (True, False):
+            with self.subTest(unsafe=unsafe):
+                selected = source if unsafe else source.replace('input()', '"fixed"')
+                expected = {('eval', 10, 5)} if unsafe else set()
+                complete = taint_py._Analysis(ast.parse(selected)).analyze()
+                self.assertEqual({key[:3] for key in complete}, expected)
+                engine = taint_py._Analysis(ast.parse(selected))
+                populate = next(function for function in engine.functions if function.name == 'populate')
+                # Base plus dirty context use twelve units (ten for the clean
+                # control). The subsequent stop context needs five more. Its
+                # cutoff cannot erase the earlier context's established write.
+                engine.scope_limits[populate] = engine.scope_remaining[populate] = 14
+                with self.assertRaises(AnalysisLimit) as raised:
+                    engine.analyze()
+                self.assertEqual({key[:3] for key in raised.exception.effects}, expected)
+                self.assertIn('populate', str(raised.exception))
+
+    def test_invalid_flow_limits_are_partial_native_reports(self):
+        path = self.source('invalid-budget.py', 'response.headers["X-User"] = input()\n')
+        for variable in ('UBS_PYTHON_FLOW_SCOPE_STEPS', 'UBS_PYTHON_FLOW_MAX_STEPS'):
+            for value in ('0', '-1', 'unbounded', '1.5'):
+                with self.subTest(variable=variable, value=value):
+                    environment = self.environment(UBS_NO_CACHE='1', **{variable: value})
+                    code, report, _records, diagnostic = self.driver([path], environment)
+                    self.assertEqual(code, 2, diagnostic)
+                    self.assertEqual(report['status'], 'partial', report)
+                    self.assertEqual(report['module_error'], 'ANALYZER_ERROR', report)
+                    self.assertIn(variable, diagnostic)
+
+    def test_budget_changes_invalidate_completed_header_cache_and_never_cache_partial(self):
+        lines = ['def expensive():']
+        lines.extend(f'    value{index} = {index}' for index in range(300))
+        lines.extend(['    response.headers["X-Expensive"] = input()',
+                      'def after():', '    response.headers["X-After"] = input()'])
+        path = self.source('cached-header.py', '\n'.join(lines) + '\n')
+        cache = self.root / 'budget-cache'
+        environment = self.environment(UBS_CACHE_DIR=str(cache), UBS_NO_CACHE='0', UBS_PROFILE='1',
+                                       UBS_PYTHON_FLOW_SCOPE_STEPS='5000', UBS_PYTHON_FLOW_MAX_STEPS='100000')
+
+        def sites(records):
+            return sorted(row['line'] for row in records if row['rule'] == header_injection.RULE_ID)
+
+        for hits in (0, 1):
+            result = self.driver([path], environment)
+            code, report, records, diagnostic = result
+            self.assertEqual((code, report['status']), (1, 'ok'), result)
+            self.assertEqual(report['profile']['cache_hits'], hits, result)
+            self.assertEqual(sites(records), [len(lines) - 2, len(lines)], diagnostic)
+        completed_entries = set(cache.glob('*/files/**/*.json'))
+        self.assertTrue(completed_entries, 'The high-budget control must create a reusable completed entry')
+
+        environment['UBS_PYTHON_FLOW_SCOPE_STEPS'] = '200'
+        for _attempt in range(2):
+            result = self.driver([path], environment)
+            code, report, records, diagnostic = result
+            self.assertEqual((code, report['status']), (2, 'partial'), result)
+            self.assertEqual(report['profile']['cache_hits'], 0, result)
+            self.assertEqual(sites(records), [len(lines)], diagnostic)
+            self.assertIn('expensive', diagnostic)
+            self.assertEqual(set(cache.glob('*/files/**/*.json')), completed_entries,
+                             'Changing the allowance must not admit a partial header report')
+
+        environment['UBS_PYTHON_FLOW_SCOPE_STEPS'] = '5000'
+        code, report, records, diagnostic = self.driver([path], environment)
+        self.assertEqual((code, report['status'], report['profile']['cache_hits']), (1, 'ok', 1), diagnostic)
+        self.assertEqual(sites(records), [len(lines) - 2, len(lines)], diagnostic)
 
     def test_tabular_entrypoint_keeps_findings_and_returns_incomplete(self):
         from ubs_core.taint_flow import Budget
@@ -1637,6 +2936,47 @@ eval(relay(input()))
                               ('m_recursive.py', 'python.taint.eval', 5),
                               ('z_last.py', 'python.taint.eval', 1)], result)
 
+    def test_file_limit_during_foreign_scope_recovery_keeps_prefix_findings(self):
+        library_source = 'def apply(callback):\n    eval(callback())\n' + ''.join(
+            f'    padding{index} = "fixed"\n' for index in range(100))
+        files = [self.source('aa_lib.py', library_source),
+                 self.source('bb_app.py', 'from aa_lib import apply\ndef callback():\n'
+                                         '    return input()\ndef run():\n    apply(callback)\n')]
+        project = taint_py._Project(files, self.root)
+        engines = {path.name: engine for path, _, engine, _ in project.sources}
+        library = engines['aa_lib.py']
+        apply = library.functions[0]
+        solve = taint_py._Analysis.solve_function
+        interrupted = False
+
+        def limit_context(engine, function, context):
+            nonlocal interrupted
+            if engine.owner(function) is library and context and not interrupted:
+                self.assertIn(library, project.ready)
+                interrupted = True
+                # The concrete callback's prefix establishes the sink before
+                # its scope allowance expires. Recovery then exhausts the
+                # small remaining file allowance while retaining summaries.
+                library.scope_limits[function] = library.scope_remaining[function] = 30
+                library.budget.remaining = 32
+            return solve(engine, function, context)
+
+        findings = []
+        with patch.object(taint_py._Analysis, 'solve_function', limit_context), \
+                self.assertRaises(AnalysisLimit) as raised:
+            findings.extend(project.findings())
+        self.assertTrue(interrupted)
+        self.assertEqual({(path.name, rule, line, column) for path, rule, line, column, _ in findings},
+                         {('aa_lib.py', 'py.taint.eval', 2, 5)}, findings)
+        self.assertIn('input', findings[0][-1])
+        for detail in ('aa_lib.py', 'apply', 'work limit'):
+            self.assertIn(detail, str(raised.exception))
+        self.assertLess(library.budget.remaining, 0)
+        self.assertNotIn(apply, library.failed_scopes,
+                         'Failed recovery cannot advertise a sentinel that was never constructed')
+        self.assertNotIn(engines['bb_app.py'], project.ready)
+        self.assertIsNone(library.local_journal)
+
     def test_failed_foreign_context_is_not_reused_as_a_completed_summary(self):
         files = [
             self.source('aa_lib.py', 'def apply(callback, value):\n    return callback(value)\n'),
@@ -1741,10 +3081,14 @@ apply(eval, sys.argv[1])
         self.assertIn('work limit exceeded', result.stdout + result.stderr)
         self.assertIn('m_callbacks.py', result.stdout + result.stderr)
         self.assertEqual(report['profile']['cache_hits'], 0, report)
+        # The bounded helper has an opaque return, so input still reaches its
+        # caller's eval at line 32. Retain that finding as well as both other
+        # files; partial status and the cache barrier must remain unchanged.
         # Top-level findings have no guaranteed order, so compare the taint rows sorted.
         self.assertEqual(sorted((Path(row['file']).name, row['rule_id'], row['line'])
                                 for row in report['findings'] if row['rule_id'].startswith('python.taint.')),
                          sorted([('a_first.py', 'python.taint.eval', 1),
+                                 ('m_callbacks.py', 'python.taint.eval', 32),
                                  ('z_last.py', 'python.taint.eval', 1)]), report)
         self.assertFalse(list((self.root / 'cache').glob('*/files/**/*.json')),
                          'A naturally exhausted scan must not admit partial cache entries')
@@ -1978,4 +3322,7 @@ class PythonInputAdmissionTests(unittest.TestCase):
 
 
 if __name__ == '__main__':
-    unittest.main()
+    if sys.argv[1:] == ['--large-budget-worker']:
+        large_budget_worker()
+    else:
+        unittest.main()

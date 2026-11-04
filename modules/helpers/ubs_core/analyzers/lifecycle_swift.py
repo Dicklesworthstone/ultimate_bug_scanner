@@ -24,7 +24,10 @@ from ubs_core.analyzers.taint_swift_traversal import (
 SKIP_DIRS = {".git", ".hg", ".svn", "build", "DerivedData", ".swiftpm", ".idea", "node_modules"}
 
 IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
-ACQUISITION_NAMES = {'scheduledTimer', 'publish', 'dataTask', 'uploadTask', 'downloadTask',
+# A publisher alone acquires no subscription. The sink token below activates
+# analysis when a subscription is actually acquired; unrelated publish methods
+# must not introduce a Foundation resource obligation.
+ACQUISITION_NAMES = {'scheduledTimer', 'dataTask', 'uploadTask', 'downloadTask',
                      'addObserver', 'sink', 'makeTimerSource', 'makeFileSystemObjectSource',
                      'makeReadSource', 'makeWriteSource', 'CADisplayLink'}
 
@@ -89,7 +92,7 @@ _SEVERITY = {
 
 def iter_swiftish_files(root: Path):
     if root.is_file():
-        if root.suffix.lower() in SWIFTISH_SUFFIXES and not any(part in SKIP_DIRS for part in root.parts):
+        if root.suffix.lower() in SWIFTISH_SUFFIXES:
             yield root
         return
     for path in root.rglob("*"):
@@ -97,7 +100,7 @@ def iter_swiftish_files(root: Path):
             continue
         if path.suffix.lower() not in SWIFTISH_SUFFIXES:
             continue
-        if any(part in SKIP_DIRS for part in path.parts):
+        if any(part in SKIP_DIRS for part in path.relative_to(root).parts):
             continue
         yield path
 
@@ -193,6 +196,56 @@ class LifecycleParser(SwiftParser):
         self.fields = {}
         super().__init__(text)
 
+    def switch(self, part, owner, scope, depth):
+        opening = next((i for i, token in enumerate(part) if token.value == '{'), -1)
+        if opening < 0 or swift_close(part, opening) != len(part) - 1:
+            raise ValueError('Swift lifecycle malformed switch; analysis is incomplete')
+        cursor, limit, arms, exhaustive = opening + 1, len(part) - 1, [], False
+        while cursor < limit:
+            while cursor < limit and part[cursor].value == '\n':
+                cursor += 1
+            if cursor == limit:
+                break
+            if tuple(t.value for t in part[cursor:cursor + 2]) == ('@', 'unknown'):
+                cursor += 2
+                if cursor == limit or part[cursor].value != 'default':
+                    raise ValueError('Swift lifecycle switch attribute needs analysis; analysis is incomplete')
+            kind = part[cursor].value
+            if kind not in {'case', 'default'}:
+                raise ValueError('Swift lifecycle malformed switch arm; analysis is incomplete')
+            end = cursor + 1
+            while end < limit and part[end].value != ':':
+                if part[end].kind == 'code' and part[end].value in {'let', 'var', 'where', '(', '[', '{', '=', 'is', 'as'}:
+                    raise ValueError('Swift lifecycle switch pattern needs binding analysis; analysis is incomplete')
+                end += 1
+            if end == limit or (kind == 'default' and end != cursor + 1):
+                raise ValueError('Swift lifecycle malformed switch label; analysis is incomplete')
+            exhaustive |= kind == 'default'
+            start = end + 1
+            end = start
+            while end < limit:
+                token = part[end]
+                if token.kind == 'code' and token.value in {'case', 'default', '@'}:
+                    break
+                if token.kind == 'code' and token.value in {'(', '[', '{'}:
+                    end = swift_close(part, end)
+                end += 1
+            body_tokens = part[start:end]
+            if any(t.kind == 'code' and t.value == 'fallthrough' for t in body_tokens):
+                raise ValueError('Swift lifecycle fallthrough needs successor analysis; analysis is incomplete')
+            for index, token in enumerate(body_tokens[:-1]):
+                if token.kind == 'code' and token.value == 'break' and body_tokens[index + 1].value not in {'\n', ';', '}'}:
+                    raise ValueError('Swift lifecycle labeled break needs target analysis; analysis is incomplete')
+            body = self.block(body_tokens, owner, scope, depth=depth + 1)
+            arms.append(SwiftStatement('case', (), body))
+            cursor = end
+        if not arms:
+            raise ValueError('Swift lifecycle empty switch; analysis is incomplete')
+        if not exhaustive:
+            # Without a type checker, enum exhaustiveness is not established.
+            arms.append(SwiftStatement('case', (), ()))
+        return SwiftStatement('switch', part[1:opening], extra=tuple(arms))
+
     def block(self, tokens, owner, scope, declarations=False, depth=0):
         statements = super().block(tokens, owner, scope, declarations=False, depth=depth)
         result = []
@@ -210,7 +263,9 @@ class LifecycleParser(SwiftParser):
                     part = part[1:]
                 statement = replace(statement, tokens=part)
             first = part[0].value
-            if statement.kind == 'unsupported' and first in {'defer', 'do'}:
+            if statement.kind == 'unsupported' and first == 'switch':
+                statement = self.switch(part, owner, scope, depth)
+            elif statement.kind == 'unsupported' and first in {'defer', 'do'}:
                 opening = next((i for i, token in enumerate(part) if token.value == '{'), -1)
                 if opening < 0:
                     raise ValueError('Swift lifecycle catch or malformed cleanup scope; analysis is incomplete')
@@ -565,6 +620,14 @@ class LifecycleEngine:
                 if kind == 'defer':
                     next_paths.append((state, names, (*deferred, (statement.body, dict(names))), ''))
                     continue
+                if kind == 'switch':
+                    exceptions = []
+                    self.release_calls(statement.tokens, state, names, exceptions)
+                    next_paths.extend((exceptional, dict(names), deferred, 'throw') for exceptional in exceptions)
+                    for arm in statement.extra:
+                        for child, outcome in self.block(arm.body, state, names, depth + 1):
+                            next_paths.append((child, dict(names), deferred, '' if outcome == 'break' else outcome))
+                    continue
                 if kind in {'if', 'guard'}:
                     exceptions = []
                     self.release_calls(statement.tokens, state, names, exceptions)
@@ -662,9 +725,14 @@ class LifecycleEngine:
                     self.simple(statement, state, names, exceptions)
                     next_paths.extend((exceptional, dict(names), deferred, 'throw') for exceptional in exceptions)
                 next_paths.append((state, names, deferred, ''))
-            if len(next_paths) > 256:
+            unique_paths = {}
+            for state, names, deferred, control in next_paths:
+                key = (state.key(), tuple(sorted(names.items())),
+                       tuple((body, tuple(sorted(captured.items()))) for body, captured in deferred), control)
+                unique_paths.setdefault(key, (state, names, deferred, control))
+            if len(unique_paths) > 256:
                 raise AnalysisLimit('Swift lifecycle path-state limit exceeded; analysis is incomplete')
-            paths = next_paths
+            paths = list(unique_paths.values())
         outcomes = []
         for state, names, deferred, control in paths:
             cleanup = [(state, control)]
@@ -726,11 +794,33 @@ def scan_text(path: Path, text: str, base: Path) -> list[tuple[str, str, str, in
             found.append((kind, message, rel, line, col))
 
     tokens = SwiftLexer(text).scan()
+    analysis_text = text
+    directives = [(index, token) for index, token in enumerate(tokens)
+                  if token.kind == 'code' and token.value == '#'
+                  and index + 1 < len(tokens) and tokens[index + 1].value in {'if', 'elseif', 'else', 'endif'}]
+    significant = [token for token in tokens if token.value != '\n']
+    if (len(directives) == 2 and significant
+            and directives[0][1] == significant[0]
+            and tokens[directives[0][0] + 1].value == 'if'
+            and tokens[directives[1][0] + 1] == significant[-1]
+            and significant[-1].value == 'endif'):
+        # A whole-file conditional has exactly two possible programs: this
+        # body, or an empty file. Analyze the body regardless of host SDK so
+        # platform-specific leaks stay visible. Blank only the directives to
+        # preserve original finding coordinates; other conditional shapes
+        # remain unsupported rather than merging mutually exclusive cleanup.
+        chars = list(text)
+        for _, token in directives:
+            end = text.find('\n', token.start)
+            if end < 0:
+                end = len(text)
+            chars[token.start:end] = ' ' * (end - token.start)
+        analysis_text = ''.join(chars)
     # Owning FileHandle URL/path initializers close their descriptor in deinit.
     # A borrowed raw descriptor needs origin/ownership analysis, not a blanket
     # missing-explicit-close warning on the wrapper object.
     if any(token.kind == 'code' and token.value in ACQUISITION_NAMES for token in tokens):
-        for position, kind, message, name in LifecycleEngine(text).analyze():
+        for position, kind, message, name in LifecycleEngine(analysis_text).analyze():
             emit(position, kind, f"{message} ({name})")
 
     kvo_kind, kvo_message, kvo_acquire, kvo_release = KVO_RULE

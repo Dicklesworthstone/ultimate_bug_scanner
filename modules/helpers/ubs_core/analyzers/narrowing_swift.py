@@ -17,8 +17,10 @@ GUARD_PATTERN = re.compile(r"guard\s+let\s+([A-Za-z_][\w]*)\s*=\s*[^\n]+\s+else\
 NEGATIVE_NIL_GUARD = re.compile(r"if\s*\(?\s*([A-Za-z_][\w]*)\s*==\s*nil[^)\{]*\)?", re.MULTILINE)
 POSITIVE_NIL_GUARD = re.compile(r"if\s*\(?\s*([A-Za-z_][\w]*)\s*!=\s*nil[^)\{]*\)?", re.MULTILINE)
 OPTIONAL_CHAIN_GUARD = re.compile(r"if\s*\(?\s*([A-Za-z_][\w]*)\s*\?\.[^)\{]*\)?", re.MULTILINE)
-FORCE_TEMPLATE = r"{name}\s*!"
-ASSIGN_TEMPLATE = r"{name}\s*="
+# Match the binding and operator, not another identifier's suffix or a
+# comparison. Equality must not erase an outstanding unsafe unwrap either.
+FORCE_TEMPLATE = r"\b{name}\s*!(?!=)"
+ASSIGN_TEMPLATE = r"\b{name}\s*=(?!=)"
 COMMENT_PATTERN = re.compile(r"//.*?$|/\*.*?\*/", re.MULTILINE | re.DOTALL)
 EXIT_PATTERN = re.compile(
     r"\b(?:return|throw|break|continue)\b|\b(?:fatalError|preconditionFailure)\b",

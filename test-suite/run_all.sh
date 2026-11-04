@@ -24,6 +24,10 @@ if [[ -z "${TMPDIR:-}" || ! -d "$TMPDIR" || ! -w "$TMPDIR" ]]; then
   fi
 fi
 if [[ -n "${TMPDIR:-}" ]]; then
+  # macOS /var aliases /private/var. Fixture file URIs must use the same
+  # physical root as the scanner's repository boundary, without weakening it.
+  TMPDIR="$(CDPATH='' cd -- "$TMPDIR" && pwd -P)" || exit 1
+  export TMPDIR
   export TMP="${TMP:-$TMPDIR}"
   export TEMP="${TEMP:-$TMPDIR}"
 fi
@@ -241,6 +245,13 @@ run_step status-invariants "${PY[@]}" shareable/test_status_invariants.py
 # GH #170: exercise native executable publication races in the normal suite, not only the dedicated workflow.
 run_step tool-cache-concurrency "${PY[@]}" ./test_tool_cache_concurrency.py
 run_step supply-chain "${PY[@]}" shareable/test_supply_chain.py
+run_step release-generations "${PY[@]}" shareable/test_release_generation.py
+run_step installed-upgrades "${PY[@]}" shareable/test_installed_contract.py
+# Issue #199: the released-contract guard needs the release tags. Every workflow
+# that runs this file directly has a shallow checkout, where the guard skips.
+run_step contract-checksums "${PY[@]}" shareable/test_contract_checksums.py
+# Issues #128, #196, #197: real-toolchain Go adapter and lifecycle location checks.
+run_step go-analyzers "${PY[@]}" shareable/test_go_analyzers.py
 run_step skip-categories "${PY[@]}" shareable/test_skip_categories.py
 # SARIF parity (bead K5): asserted for the modules whose SARIF carries their
 # heuristic findings; the other languages are reported (json has no per-finding

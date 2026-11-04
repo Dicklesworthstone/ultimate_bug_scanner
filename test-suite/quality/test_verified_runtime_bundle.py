@@ -122,10 +122,19 @@ if os.environ.get('LATE_OUTPUT'): pathlib.Path(os.environ['LATE_OUTPUT']).write_
         self.write('ubs', transform((self.origin / 'ubs').read_text()).encode())
         self.seal()
 
+    def declare_install_protocol(self):
+        # These cases test verifier dispatch into an inert installer stub.
+        # The runner remains an inert payload (exit 93); actual publication
+        # tests below install the real current runner and assets.
+        self.change_runner(lambda text: text.replace(
+            '#!/usr/bin/env bash\n',
+            '#!/usr/bin/env bash\nUBS_RELEASE_GENERATIONS=1\n', 1))
+
     def run_verify(self, *args, local=True, expected=0):
         command = ['bash', str(VERIFY), '--version', self.version, '--verify-only', '--with-modules']
         if local:
             command += ['--artifact-dir', str(self.origin)]
+        # ubs:ignore[py.security.command-injection] Fixed Bash/verifier; extra argv are test fixture literals.
         result = subprocess.run(command + list(args), cwd=self.work, env=self.env,
                                 text=True, capture_output=True, timeout=30)
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
@@ -242,11 +251,20 @@ if os.environ.get('LATE_OUTPUT'): pathlib.Path(os.environ['LATE_OUTPUT']).write_
         self.run_verify('--insecure', expected=2)
         self.assertEqual(self.events(), [])
 
-    def test_with_modules_requires_a_nonexecuting_mode(self):
+    def test_with_modules_installs_only_after_runtime_verification(self):
+        self.declare_install_protocol()
         result = subprocess.run(['bash', str(VERIFY), '--version', VERSION, '--with-modules'],
                                 cwd=self.work, env=self.env, text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 94, result.stdout + result.stderr)
+        self.assertLess(result.stdout.index('Runtime verified:'), result.stdout.index('Executing installer'))
+        self.assertTrue(any(event[0] == 'fetch' and '/modules/' in event[1]
+                            for event in self.events()))
+
+    def test_with_modules_install_rejects_insecure_mode_before_downloads(self):
+        result = subprocess.run(['bash', str(VERIFY), '--version', VERSION,
+                                 '--with-modules', '--insecure'], cwd=self.work, env=self.env,
+                                text=True, capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn('--verify-only', result.stderr)
         self.assertEqual(self.events(), [])
 
     def test_conflicting_nested_library_pin_is_rejected(self):
@@ -317,6 +335,7 @@ if os.environ.get('LATE_OUTPUT'): pathlib.Path(os.environ['LATE_OUTPUT']).write_
         self.assertFalse(list(self.stage.iterdir()))
 
     def test_plain_installer_exit_status_and_cleanup_are_preserved(self):
+        self.declare_install_protocol()
         result = subprocess.run(['bash', str(VERIFY), '--version', VERSION, '--artifact-dir', str(self.origin)],
                                 cwd=self.work, env=self.env, text=True, capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 94, result.stdout + result.stderr)
@@ -423,6 +442,7 @@ sys.exit(0 if expected == actual and args[args.index('-P')+1] == 'fixture-key' e
         self.assertIn('checksum mismatch', result.stderr)
 
     def test_archive_import_installer_status_and_arguments_are_preserved(self):
+        self.declare_install_protocol()
         self.write('install.sh', b'''#!/usr/bin/env bash
 [[ "$UBS_INSTALLER_SELF_UPDATED" == 1 && "$UBS_NO_AUTO_UPDATE" == 1 ]] || exit 99
 [[ "$1" == '--label' && "$2" == 'space ; $literal' ]] || exit 98
@@ -643,6 +663,295 @@ sys.exit(0 if expected == actual and args[args.index('-P')+1] == 'fixture-key' e
         self.export(output)
         self.assertTrue(output.is_file())
         self.assertFalse(any(event[0] == 'fetch' for event in self.events()))
+
+    def python_tools_path(self, spelling='python'):
+        isolated = self.work / ('bootstrap tools ' + spelling)
+        isolated.mkdir()
+        for name in ('bash', 'dirname', 'cat', 'awk', 'mktemp', 'rm', 'cp', 'mkdir', 'sha256sum'):
+            actual = shutil.which(name)
+            self.assertIsNotNone(actual, name)
+            (isolated / name).symlink_to(actual)
+        (isolated / 'cosign').symlink_to(self.bin / 'cosign')
+        if spelling == 'py':
+            # Model only the launcher's -3 argument transport; execute real
+            # Python for the probe and all actual verification work.
+            self.tool('py', '''
+import os, sys
+if sys.argv[1:2] != ['-3']: sys.exit(98)
+os.execv(sys.executable, [sys.executable, *sys.argv[2:]])
+''')
+            (isolated / 'py').symlink_to(self.bin / 'py')
+        else:
+            (isolated / spelling).symlink_to(sys.executable)
+        self.env['PATH'] = str(isolated)
+        return isolated
+
+    def test_runtime_verification_uses_python_when_python3_is_absent(self):
+        self.python_tools_path()
+        result = self.run_verify()
+        self.assertIn('Runtime verified:', result.stdout)
+        self.assertEqual([event[0] for event in self.events()], ['signature'])
+
+    def test_archive_import_uses_the_real_interpreter_through_py_launcher(self):
+        output = self.work / 'launcher runtime.tar.gz'
+        self.export(output)
+        self.python_tools_path('py')
+        self.import_archive(output)
+
+    def test_explicit_relative_python_with_spaces_is_frozen_before_staging(self):
+        self.python_tools_path('chosen interpreter')
+        self.env['UBS_PYTHON'] = 'bootstrap tools chosen interpreter/chosen interpreter'
+        output = self.work / 'explicit runtime.tar.gz'
+        self.export(output)
+        self.import_archive(output)
+
+    def test_broken_python3_does_not_hide_a_working_python(self):
+        isolated = self.python_tools_path()
+        broken = isolated / 'python3'
+        broken.write_text('#!/bin/sh\nexit 99\n')
+        broken.chmod(0o755)
+        self.run_verify()
+
+    def test_invalid_explicit_python_refuses_before_authentication_or_payloads(self):
+        self.env['UBS_PYTHON'] = str(self.work / 'missing interpreter')
+        result = self.run_verify(expected=1)
+        self.assertIn('UBS_PYTHON', result.stderr)
+        self.assertEqual(self.events(), [])
+
+    def sign_bootstrap_fixture(self):
+        executable = shutil.which('minisign')
+        if executable is None:
+            self.skipTest('minisign is required for real cryptographic bootstrap tests')
+        secret, public = self.work / 'bootstrap.key', self.work / 'bootstrap.pub'
+        for command in ([executable, '-G', '-W', '-p', str(public), '-s', str(secret)],
+                        [executable, '-S', '-s', str(secret), '-m', str(self.origin / 'SHA256SUMS'),
+                         '-x', str(self.origin / 'SHA256SUMS.minisig')]):
+            result = subprocess.run(command, text=True, capture_output=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.env.update(UBS_VERIFY_WITH='minisign', UBS_MINISIGN_PUBKEY=public.read_text().splitlines()[-1])
+        return executable
+
+    def poison_python_startup(self, *, shadows=()):
+        marker = self.work / 'unverified-python-executed'
+        body = f'with open({str(marker)!r}, "a") as marker:\n    marker.write("executed\\n")\n'
+        (self.work / 'sitecustomize.py').write_text(body)
+        for name in shadows:
+            (self.work / name).write_text(body + 'raise RuntimeError("untrusted Python module loaded")\n')
+        return marker
+
+    def reject_bootstrap_signer(self, executable):
+        public, secret = self.work / 'other.pub', self.work / 'other.key'
+        result = subprocess.run([executable, '-G', '-W', '-p', str(public), '-s', str(secret)],
+                                text=True, capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.env['UBS_MINISIGN_PUBKEY'] = public.read_text().splitlines()[-1]
+
+    def test_real_signed_runtime_ignores_python_startup_and_project_imports(self):
+        self.sign_bootstrap_fixture()
+        marker = self.poison_python_startup(shadows=('hashlib.py', 'tarfile.py', 'json.py', 'pathlib.py'))
+        self.env.update(PYTHONPATH=str(self.work), UBS_PYTHON=sys.executable)
+        result = self.run_verify()
+        self.assertIn('Runtime verified:', result.stdout)
+        self.assertFalse(marker.exists(), 'Verification executed unverified Python code')
+
+    def test_archive_rejected_signature_cannot_execute_python_startup(self):
+        executable = self.sign_bootstrap_fixture()
+        archive = self.work / 'signed runtime.tar.gz'
+        self.export(archive)
+        self.reject_bootstrap_signer(executable)
+        marker = self.poison_python_startup()
+        self.env['PYTHONPATH'] = str(self.work)
+        result = self.import_archive(archive, expected=1)
+        self.assertFalse(marker.exists(), 'Unauthenticated archive executed Python startup code')
+        self.assertIn('Signature verification failed', result.stderr)
+
+    def test_archive_import_cannot_load_cwd_modules_before_authentication(self):
+        executable = self.sign_bootstrap_fixture()
+        archive = self.work / 'signed runtime.tar.gz'
+        self.export(archive)
+        self.reject_bootstrap_signer(executable)
+        marker = self.poison_python_startup(shadows=('tarfile.py',))
+        self.env.pop('PYTHONPATH', None)
+        self.env.pop('PYTHONHOME', None)
+        result = self.import_archive(archive, expected=1)
+        self.assertFalse(marker.exists(), 'Archive import executed a module from the working directory')
+        self.assertIn('Signature verification failed', result.stderr)
+
+    def test_runtime_bootstrap_ignores_a_broken_pythonhome(self):
+        self.sign_bootstrap_fixture()
+        self.env['PYTHONHOME'] = str(self.work / 'untrusted missing Python home')
+        self.run_verify()
+
+    def prepare_real_install(self):
+        self.version = (ROOT / 'VERSION').read_text().strip().removeprefix('v')
+        self.env['EXPECT_VERSION'] = self.version
+        for name in ('ubs', 'install.sh', 'ubs-daemon'):
+            self.write(name, (ROOT / name).read_bytes())
+        self.write('git_safety_guard.py', (ROOT / '.claude/hooks/git_safety_guard.py').read_bytes())
+        shutil.copytree(ROOT / 'modules', self.origin / 'modules', dirs_exist_ok=True,
+                        ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+        self.seal()
+        self.env.pop('PYTHONDONTWRITEBYTECODE', None)
+        self.env.update(UBS_NO_AUTO_UPDATE='1', XDG_DATA_HOME=str(self.home / 'data'),
+                        XDG_CACHE_HOME=str(self.home / 'cache'), XDG_CONFIG_HOME=str(self.home / 'config'))
+        self.destination = self.home / 'installed'
+        self.project = self.work / 'isolated project'
+        self.project.mkdir()
+        # Tests live beneath the checkout's artifacts directory. Give the
+        # installer an independent Git root so hooks cannot target the checkout.
+        subprocess.run(['git', 'init', '-q', str(self.project)], env=self.env, check=True, timeout=15)
+        self.install_flags = ['--non-interactive', '--skip-ast-grep', '--skip-ripgrep', '--skip-jq',
+                              '--skip-bun', '--skip-type-narrowing', '--skip-typos', '--skip-toon',
+                              '--skip-doctor', '--skip-hooks', '--skip-version-check', '--no-path-modify',
+                              '--install-dir', str(self.destination)]
+
+    def block_runtime_network(self):
+        for name in ('curl', 'wget'):
+            self.tool(name, '''
+import json, os, sys
+with open(os.environ['EVENT_LOG'], 'a') as f: f.write(json.dumps(['blocked-network', sys.argv]) + '\\n')
+sys.exit(97)
+''')
+
+    def install_runtime_bundle(self, *, archive=None, extra=(), expected=0):
+        source = ['--artifact-archive', str(archive)] if archive else ['--artifact-dir', str(self.origin)]
+        command = ['bash', str(VERIFY), '--version', self.version, *source, *extra,
+                   '--', *self.install_flags]
+        result = subprocess.run(command, cwd=self.project, env=self.env,
+                                text=True, capture_output=True, timeout=90)
+        self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+        self.assertFalse(list(self.stage.iterdir()), 'Private verification staging leaked')
+        return result
+
+    def installed_snapshot(self):
+        roots = {'bin': self.destination, 'modules': self.home / 'data/ubs/modules'}
+        return {label + '/' + str(path.relative_to(root)): digest(path.read_bytes())
+                for label, root in roots.items() for path in root.rglob('*') if path.is_file()}
+
+    def assert_installed_runtime_scans_offline(self):
+        cache = self.home / 'data/ubs/modules'
+        ready = list(cache.glob('.ubs-releases/*/.ubs-ready.json'))
+        self.assertEqual(len(ready), 1)
+        active = ready[0].parent
+        self.assertEqual((active / 'contract.json').read_bytes(), (ROOT / 'modules/contract.json').read_bytes())
+        self.assertFalse((cache / 'contract.json').exists(), 'installation must use a complete generation')
+        source = self.project / 'view.py'
+        source.write_text('eval(input())\n', encoding='utf-8')
+        result = subprocess.run([str(self.destination / 'ubs'), str(source), '--only=python', '--ci',
+                                 '--format=json'], cwd=self.project, env=self.env,
+                                text=True, capture_output=True, timeout=120)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        try:
+            report = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            self.fail(f'Invalid scanner JSON: {error}\n{result.stdout}\n{result.stderr}')
+        self.assertEqual(report.get('status'), 'ok', report)
+        self.assertEqual(report['totals']['files'], 1, report)
+        self.assertTrue(any(item['rule_id'] == 'python.taint.eval' and item['line'] == 1
+                            for item in report['findings']), report)
+        self.assertFalse(list(active.rglob('__pycache__')))
+        self.assertFalse(any(event[0] in {'fetch', 'blocked-network'} for event in self.events()), self.events())
+
+    def test_complete_local_runtime_installs_offline_without_executing_extra_files(self):
+        self.prepare_real_install()
+        sentinel = self.work / 'unverified-extra-executed'
+        self.write('modules/helpers/sitecustomize.py',
+                   f'from pathlib import Path\nPath({str(sentinel)!r}).touch()\n'.encode())
+        self.block_runtime_network()
+        result = self.install_runtime_bundle()
+        self.assertLess(result.stdout.index('Runtime verified:'), result.stdout.index('Executing installer'))
+        self.assert_installed_runtime_scans_offline()
+        self.assertFalse(sentinel.exists())
+        self.assertFalse(list((self.home / 'data/ubs/modules').rglob('sitecustomize.py')))
+
+    def test_complete_archive_runtime_installs_offline(self):
+        self.prepare_real_install()
+        archive = self.work / 'complete runtime.tar.gz'
+        self.export(archive)
+        self.block_runtime_network()
+        self.install_runtime_bundle(archive=archive)
+        self.assert_installed_runtime_scans_offline()
+
+    def test_missing_or_tampered_local_runtime_preserves_existing_installation(self):
+        self.prepare_real_install()
+        self.block_runtime_network()
+        self.install_runtime_bundle()
+        self.assert_installed_runtime_scans_offline()
+        before = self.installed_snapshot()
+        for relative, missing in (('contract.json', True), ('helpers/ubs_core/__init__.py', False)):
+            with self.subTest(asset=relative, missing=missing):
+                asset = self.origin / 'modules' / relative
+                original = asset.read_bytes()
+                saved = asset.with_name(asset.name + '.saved')
+                if missing:
+                    asset.rename(saved)
+                else:
+                    asset.write_bytes(original + b'\n# tampered runtime\n')
+                result = self.install_runtime_bundle(expected=1)
+                self.assertNotIn('Executing installer', result.stdout)
+                self.assertEqual(self.installed_snapshot(), before)
+                self.assert_installed_runtime_scans_offline()
+                if missing:
+                    saved.rename(asset)
+                else:
+                    asset.write_bytes(original)
+
+    def test_tampered_archive_runtime_preserves_existing_installation(self):
+        self.prepare_real_install()
+        self.block_runtime_network()
+        self.install_runtime_bundle()
+        before = self.installed_snapshot()
+        self.write('modules/contract.json', b'{"tampered":true}\n')
+        archive = self.work / 'tampered runtime.tar.gz'
+        with tarfile.open(archive, 'w:gz') as output:
+            for path in sorted(self.origin.rglob('*')):
+                if path.is_file():
+                    output.add(path, arcname=str(path.relative_to(self.origin)), recursive=False)
+        result = self.install_runtime_bundle(archive=archive, expected=1)
+        self.assertNotIn('Executing installer', result.stdout)
+        self.assertEqual(self.installed_snapshot(), before)
+        self.assert_installed_runtime_scans_offline()
+
+    def test_invalid_module_roots_cannot_silently_fall_back_to_plain_installation(self):
+        self.declare_install_protocol()
+        modules = self.origin / 'modules'
+        saved = self.origin / 'saved-modules'
+        modules.rename(saved)
+        kinds = ['regular-file', 'symlink', 'dangling-symlink']
+        if hasattr(os, 'mkfifo'):
+            kinds.append('fifo')
+        for kind in kinds:
+            with self.subTest(kind=kind):
+                if kind == 'regular-file':
+                    modules.write_bytes(b'not a directory\n')
+                elif kind == 'fifo':
+                    os.mkfifo(modules)
+                else:
+                    modules.symlink_to(saved if kind == 'symlink' else self.work / 'missing-directory',
+                                       target_is_directory=True)
+                result = subprocess.run(['bash', str(VERIFY), '--version', self.version,
+                                         '--artifact-dir', str(self.origin)], cwd=self.work, env=self.env,
+                                        text=True, capture_output=True, timeout=10)
+                modules.rename(self.work / ('rejected-' + kind))
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertNotIn('Executing installer', result.stdout)
+        self.assertFalse(any(event[0] == 'fetch' for event in self.events()))
+
+    def test_real_minisign_runtime_installation_and_offline_scan(self):
+        executable = shutil.which('minisign')
+        if executable is None:
+            self.skipTest('minisign is required for real cryptographic signature tests')
+        self.prepare_real_install()
+        secret, public = self.work / 'trusted.key', self.work / 'trusted.pub'
+        for command in ([executable, '-G', '-W', '-p', str(public), '-s', str(secret)],
+                        [executable, '-S', '-s', str(secret), '-m', str(self.origin / 'SHA256SUMS'),
+                         '-x', str(self.origin / 'SHA256SUMS.minisig')]):
+            result = subprocess.run(command, text=True, capture_output=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.env.update(UBS_VERIFY_WITH='minisign', UBS_MINISIGN_PUBKEY=public.read_text().splitlines()[-1])
+        self.block_runtime_network()
+        self.install_runtime_bundle(extra=('--with-modules',))
+        self.assert_installed_runtime_scans_offline()
 
     def test_bundle_actual_scanner_runs_with_empty_cache_and_downloads_blocked(self):
         self.version = (ROOT / 'VERSION').read_text().strip().removeprefix('v')

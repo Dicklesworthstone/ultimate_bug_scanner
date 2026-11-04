@@ -27,9 +27,130 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Fixed
 
+- Self-updates and fresh installations prepare a complete authenticated runtime
+  before publishing the runner (GH #199). Version-bound module generations,
+  serialized publication, and a runner-digest lease preserve concurrent scans
+  and the previous installation on download or verification failure. Explicit
+  same-version updates and doctor repair verify the complete cache; recognized
+  historical v5.5.3 contracts migrate without accepting arbitrary mismatches.
+  Cron preserves the public verification key, cache location, and Bash path.
+  Release manifest signatures are mandatory by default, and partial installer
+  repair or scanner environment errors no longer report installation success.
+
+- Repeated initialization calls to simple Python factories no longer create
+  contexts for unrelated globals added later in the module. A conservative
+  syntax proof restricts pruning to direct lexical reads, retaining relevant
+  defaults, deferred child reads, explicit overrides, imported ownership,
+  and broad incomplete-analysis recovery. The unchanged-budget regressions
+  cover 10, 50, and 200 calls with unsafe, clean, and mixed captured values.
+- Python factory-created functions and lambdas retain their own evaluated
+  default values, references, and callable identities. A later safe factory
+  call no longer overwrites an earlier tainted callback. Symbolic default
+  inputs preserve summary reuse across concrete values; explicit overrides,
+  mutable aliases, async/generator paths, header proofs, and incomplete
+  factory recovery have exact-site regressions.
+- Captured function and deferred-call values cache immutable hashes and
+  compare shared subgraphs once per object pair, including evidence paths.
+  Mixed capture nesting has an explicit finite shape limit with partial
+  reporting and retained findings; ordinary call chains retain summary-based
+  convergence.
+- Python function setup no longer copies every closure name into every
+  function. Lexical dependencies stay local; escaped-callable reads recover
+  their required symbolic globals lazily, and incomplete-call alias recovery
+  retains its conservative coverage. Function initialization probes required
+  names instead of scanning the entire module namespace for every solve.
+- Parallel Python detectors retain completed findings when a worker times out,
+  exits abruptly, or emits a malformed/truncated response. An explicit final
+  record is required for completion; incomplete runs still exit 2 and cannot
+  populate successful cache entries. The private protocol uses UTF-8 even
+  under ASCII or Latin-1 caller environments.
+
+- Python taint and HTTP response-header analysis address the large-module
+  budget regression in GH #198. Source-order fixed-point passes reuse module
+  initialization only while their namespace, observed inputs, and evidence
+  remain unchanged; declaration replay preserves defaults and class bindings,
+  and active import cycles retain their conservative path. The header detector
+  no longer has a separate fixed 250,000-expression cutoff.
+- Python flow work is bounded both per source and cumulatively per function,
+  including repeated passes and callback contexts. Positive-integer
+  `UBS_PYTHON_FLOW_MAX_STEPS` and `UBS_PYTHON_FLOW_SCOPE_STEPS` overrides let
+  callers pin those limits independently of `UBS_MODULE_TIMEOUT`. Exhausted
+  functions no longer erase findings from independent functions; genuine
+  limits still produce partial results, exit 2, and scope/location diagnostics.
+  Interrupted summaries preserve observed container writes, return sources,
+  and exception payloads through ordinary calls, aliases, awaited calls,
+  generator completions, and previously completed callback contexts without
+  trusting unfinished sanitizer guarantees. Recovery uses the remaining file
+  allowance. Public synthetic 6,568- and 9,696-line
+  modules check all 13 planted semantic findings and clean controls; a separate
+  6,551-line module retains 13 planted header findings. Forced-limit regressions
+  check partial reports with retained findings. The reporter's private inputs
+  remain unavailable, so their exact findings have not been independently rerun.
+
+- Python SQL builder wrappers retain unresolved return dependencies through
+  assignments, branches and containers. Visiting a helper no longer certifies
+  an unsupported inner query result. A separate closed string-shape proof
+  keeps ordinary length operations clean while preserving callback checks
+  and explicit incomplete analysis for unresolved SQL forwarding.
+
+- Python SQL flow retains queries built inside invoked local execution facades,
+  including helper returns and captured templates. Unresolved forwarding and
+  SQL-bearing heap or closure writes remain explicitly incomplete, while
+  proven primitive operations and real APIs' bound data remain distinct.
+  A bounded lexical reachability solver reuses completed dependency proofs
+  without increasing analysis budgets or caching live value state.
+
+- Suppression parsing reuses immutable results for identical source text and
+  language across detector instances. Each caller receives independent mutable
+  markers and formatter metadata, so one rule cannot change another rule's
+  suppression decisions. Reuse is bounded by entry, source-byte and retained
+  object budgets; oversized inputs and parser failures keep their original
+  behavior. A live 375-file comparison preserves every parsed interval and
+  marker while reducing repeated parsing passes from about six seconds to
+  one tenth of a second, with a small first-pass admission cost.
+
+- Python SQL execution retains its API identity through stable import and
+  module-member aliases, including keyword query arguments. Lexical shadows
+  and verified plain replacements stay distinct. Conditional rebinding,
+  captured aliases and mutated imported members remain explicitly incomplete
+  when dynamic SQL reaches an unresolved callable; such calls cannot borrow
+  the original API's parameter-binding contract.
+
 - Python's SQL detector takes syntax evidence from literal strings and tracked
   values. Identifiers such as `call`, `select` and `update` no longer create
   SQL templates; interpolated SQL still produces the existing findings.
+
+- Python SQL flow accepts generator-based `dict.fromkeys` with proven
+  immutable primitive and tuple keys, including mixed and nested keys.
+  Generator effects and the separately evaluated default retain their SQL
+  provenance. Escaped lists lose stale element proofs; an immediate
+  one-argument consumer can borrow a still-private list until exhaustion.
+  Unknown hash/equality callbacks and unproved record keys remain incomplete.
+
+- Python SQL analysis distinguishes ordinary data fields on a closed local
+  application object from exports of the receiver. Local `execute` methods
+  that maintain counters no longer become SQL sinks merely because they
+  touch fields. Method replacement, descriptors, foreign receivers and SQL
+  forwarded through fields remain conservative. Receiver captures in
+  generators require a verified eager consumer; decorated or retaining
+  consumers cannot inherit that proof.
+
+- Local variadic process wrappers such as the `raw(*args)` example in GH
+  #195 no longer force partial SQL analysis merely because of their name.
+  The proof checks closed callable/import bindings, actual primitive
+  arguments, and private instrumentation storage. Opaque SQL forwarding,
+  exported closures, mutated imports, and file/path protocol callbacks keep
+  their findings or explicit incomplete-analysis result.
+
+- Python SQL flow preserves hash/equality callback boundaries when building
+  dictionaries and sets. Custom keys that can change captured SQL state now
+  produce explicit incomplete analysis instead of a clean result; findings
+  from eagerly evaluated keys and values remain visible. Proven immutable
+  primitive keys, including mixed tuple keys, retain complete analysis.
+- Closed process-log helpers remain independent when a separate function
+  contains unsafe SQL. Private log proofs check primitive stored values and
+  every direct, aliased and identity-wrapped call; opaque objects, finalizers,
+  exported callables and altered defaults cannot erase SQL effects.
 
 - Python's I/O-in-loop rule checks that a candidate call actually repeats.
   Comments, loop-like identifier text, one write around a generator argument,

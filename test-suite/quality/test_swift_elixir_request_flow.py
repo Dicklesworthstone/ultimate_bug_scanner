@@ -684,6 +684,77 @@ class SwiftLifecycleBindings(LoggedCase):
     of a local variable or on an unrelated cleanup call elsewhere in a file.
     """
 
+    def test_publish_without_subscription_has_no_resource_obligation(self):
+        from ubs_core.analyzers.lifecycle_swift import scan_text
+        source = ('func update() { switch value {\n'
+                  'case let .publicKey(id): control.publish(panes: id)\n'
+                  'default: break\n} }')
+        self.assertEqual(scan_text(self.artifact / 'publish.swift', source, self.artifact), [])
+        for cleanup, count in (('', 1), ('subscription.cancel()', 0)):
+            subscribed = ('func start() {\n'
+                          'let subscription = Timer.publish(every: 1, on: .main, in: .common)'
+                          '.autoconnect().sink(receiveValue: consume)\n'
+                          + cleanup + '\n}')
+            with self.subTest(cleanup=cleanup):
+                findings = scan_text(self.artifact / 'subscribed.swift', subscribed, self.artifact)
+                self.assertEqual(len(findings), count, findings)
+                self.assertTrue(all(item[0] == 'combine_sink' for item in findings), findings)
+
+    def test_switch_cleanup_paths_keep_resource_identity(self):
+        from ubs_core.analyzers.lifecycle_swift import scan_text
+        cases = (
+            ('all_arms', 'case .cold: timer.invalidate()\n@unknown default: timer.invalidate()', 0),
+            ('missing_cleanup', 'case .cold: timer.invalidate()\ndefault: break', 1),
+            ('not_proven_exhaustive', 'case .cold: timer.invalidate()', 1),
+            ('local_defer', 'case .cold: defer { timer.invalidate() }; break\ndefault: timer.invalidate()', 0),
+            ('early_return', 'case .cold: return\ndefault: timer.invalidate()', 1),
+            ('nested', 'case .cold: switch other { case .one: timer.invalidate()\ndefault: timer.invalidate() }\ndefault: timer.invalidate()', 0),
+        )
+        for name, arms, expected in cases:
+            source = ('func run() {\n'
+                      'let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }\n'
+                      'switch state {\n' + arms + '\n}\n}')
+            with self.subTest(case=name):
+                path = self.artifact / (name + '.swift')
+                path.write_text(source)
+                findings = scan_text(path, source, self.artifact)
+                self.assertEqual(len(findings), expected, findings)
+                self.assertTrue(all(item[0] == 'timer' for item in findings), findings)
+
+    def test_switch_unmodeled_bindings_and_fallthrough_stay_incomplete(self):
+        from ubs_core.analyzers.lifecycle_swift import scan_text
+        for arm in ('case let .some(timer): timer.invalidate()',
+                    'case .cold where test(): timer.invalidate()',
+                    'case .cold: break outer\ndefault: timer.invalidate()',
+                    'case .cold: fallthrough\ndefault: timer.invalidate()'):
+            source = ('func run() {\n'
+                      'let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }\n'
+                      'switch state {\n' + arm + '\n}\n}')
+            with self.subTest(arm=arm), self.assertRaisesRegex(ValueError, 'analysis is incomplete'):
+                scan_text(self.artifact / 'unsupported-switch.swift', source, self.artifact)
+
+    def test_equivalent_switch_paths_compact_without_losing_leaks(self):
+        from ubs_core.analyzers.lifecycle_swift import scan_text
+        switches = '\n'.join('switch state { case .cold: break\ndefault: break }' for _ in range(12))
+        for cleanup, count in (('timer.invalidate()', 0), ('', 1)):
+            source = ('func run() {\n'
+                      'let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }\n'
+                      + switches + '\n' + cleanup + '\n}')
+            with self.subTest(cleanup=cleanup):
+                self.assertEqual(len(scan_text(self.artifact / 'many-switches.swift', source, self.artifact)), count)
+
+    def test_whole_file_platform_guard_analyzes_enabled_body_at_original_lines(self):
+        from ubs_core.analyzers.lifecycle_swift import scan_text
+        for cleanup, count in (('timer.invalidate()', 0), ('', 1)):
+            source = ('#if canImport(UIKit) && canImport(MetalKit)\nfunc run() {\n'
+                      'let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }\n'
+                      + cleanup + '\n}\n#endif\n')
+            with self.subTest(cleanup=cleanup):
+                findings = scan_text(self.artifact / 'platform.swift', source, self.artifact)
+                self.assertEqual(len(findings), count)
+                if findings:
+                    self.assertEqual(findings[0][3], 3)
+
     @staticmethod
     def cases():
         cases = (

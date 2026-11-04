@@ -18,7 +18,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="112e0656b4aeeb72652119a1d51f61b908cbe598f31fcc2e4a14b09152d08f3c"
+UBS_LIB_CHECKSUM="67e18d8fe599dd85279ecb3115ae371b19bf005b355ad181ba8479a19e99594a"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -73,13 +73,15 @@ KEEP_TEMP=${UBS_KEEP_TEMP:-0}
 TEMP_PATHS=()
 
 # Called indirectly by Bash's EXIT trap.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 cleanup() {
   IFS=${ORIG_IFS}
   [[ "${KEEP_TEMP}" == "1" ]] && return 0
   local p
   for p in "${TEMP_PATHS[@]:-}"; do
-    [[ -n "$p" && "$p" != "/" && "$p" != "." ]] && ubs_remove_temp -rf -- "$p" 2>/dev/null || true
+    if [[ -n "$p" && "$p" != "/" && "$p" != "." ]]; then
+      ubs_remove_temp -rf -- "$p" 2>/dev/null || true
+    fi
   done
 }
 trap cleanup EXIT
@@ -88,7 +90,7 @@ trap cleanup EXIT
 # Error trapping
 # ────────────────────────────────────────────────────────────────────────────
 # Called indirectly by Bash's ERR trap.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 on_err() {
   local ec=$?; local cmd=${BASH_COMMAND}; local line=${BASH_LINENO[0]}; local src=${BASH_SOURCE[1]:-${BASH_SOURCE[0]}}
   local _RED=${RED:-}; local _BOLD=${BOLD:-}; local _RESET=${RESET:-}; local _DIM=${DIM:-}; local _WHITE=${WHITE:-}
@@ -135,7 +137,7 @@ print_finding() {
       local count=$2 title=$3 desc="${4:-}"
       say "  ${BLUE}${INFO} Info${RESET} ${WHITE}($count found)${RESET}"
       say "    ${WHITE}$title${RESET}"
-      [ -n "$desc" ] && say "    ${DIM}$desc${RESET}" || true
+      if [ -n "$desc" ]; then say "    ${DIM}$desc${RESET}" || true; fi
       ;;
     warn|warning)
       # An analyzer that did not complete is reported here: silence would make
@@ -143,7 +145,7 @@ print_finding() {
       local count=$2 title=$3 desc="${4:-}"
       say "  ${YELLOW}${WARN} Warning${RESET} ${WHITE}($count found)${RESET}"
       say "    ${WHITE}$title${RESET}"
-      [ -n "$desc" ] && say "    ${DIM}$desc${RESET}" || true
+      if [ -n "$desc" ]; then say "    ${DIM}$desc${RESET}" || true; fi
       ;;
     *)
       ;;
@@ -979,7 +981,9 @@ PYPATTERNRESULT
     exit_code=2
   fi
   ubs_remove_temp -f "$list_file" "$sink" 2>/dev/null || true
-  [[ -n "$ast_rule_dir" ]] && ubs_remove_temp -rf -- "$ast_rule_dir" 2>/dev/null || true
+  if [[ -n "$ast_rule_dir" ]]; then
+    ubs_remove_temp -rf -- "$ast_rule_dir" 2>/dev/null || true
+  fi
   return "$exit_code"
 }
 

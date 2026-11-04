@@ -403,6 +403,65 @@ class BufferGitEnvironmentTests(PullFixture):
                                        threading.Event(), time.monotonic() + 5)
         workspace.validate_configuration()
 
+    @contextmanager
+    def isolate_failed_pull_case(self):
+        # Preserve the original single-session sequence while cases pass.
+        # Only an already-failed case needs a new server and response store.
+        if self.server.workspace_cache.closed:
+            self.messages = []
+            self.server = lsp.Server(self.root, self.scanner, self.messages.append, timeout=5,
+                                     buffer_mode=True, incremental_workspace=True)
+            self.addCleanup(self.server.close)
+            self.start()
+            self.open(text='BUG unsaved\n')
+        try:
+            yield
+        except BaseException:
+            self.server.close()
+            raise
+
+    def pull_in_environment(self, request, environment, *, previous=None):
+        with patch.dict(os.environ, {'GIT_EDITOR': 'true', **environment}):
+            try:
+                self.pull(request, previous=previous)
+                return self.result(request)
+            except BaseException:
+                # Join before patch.dict restores variables a worker may
+                # still be reading. The original assertion stays a failure.
+                self.server.close()
+                raise
+
+    def test_pending_pull_failure_does_not_contaminate_later_environment_cases(self):
+        class PendingFailureCase(BufferGitEnvironmentTests):
+            result_calls = 0
+
+            def result(self, request_id=10):
+                self.result_calls += 1
+                if self.result_calls == 2:
+                    # The first warm pull is outstanding, just as it is when
+                    # the fixture's deadline expires before the server's.
+                    self.assertIn(request_id, self.server.pulls)
+                    self.fail('controlled pending pull failure')
+                return super().result(request_id)
+
+        class CaseResults(unittest.TestResult):
+            def __init__(self):
+                super().__init__()
+                self.successful_subtests = 0
+
+            def addSubTest(self, test, subtest, err):
+                super().addSubTest(test, subtest, err)
+                if err is None:
+                    self.successful_subtests += 1
+
+        case = PendingFailureCase('test_redirects_helpers_and_unknown_overrides_refuse_cold_and_warm_pulls')
+        result = CaseResults()
+        case.run(result)
+        self.assertEqual(result.errors, [])
+        self.assertEqual(len(result.failures), 1, result.failures)
+        self.assertIn('controlled pending pull failure', result.failures[0][1])
+        self.assertEqual(result.successful_subtests, 71)
+
     def test_trace_values_and_disabled_terminal_prompt_have_exact_boundaries(self):
         original = dict(os.environ)
         for name in TRACE_SINKS:
@@ -454,20 +513,16 @@ class BufferGitEnvironmentTests(PullFixture):
         request = 10
         for environment in environments:
             for warm in (False, True):
-                with self.subTest(names=sorted(environment), warm=warm):
+                with self.subTest(names=sorted(environment), warm=warm), self.isolate_failed_pull_case():
                     previous = None
                     if warm:
-                        with patch.dict(os.environ, {'GIT_EDITOR': 'true'}):
-                            self.pull(request)
-                            report = self.result(request)
+                        report = self.pull_in_environment(request, {})
                         self.assertEqual(report['items'][0]['code'], 'python.test.marker')
                         self.assertIsNotNone(self.server.workspace_cache.retained)
                         previous = report['resultId']
                         request += 1
                     calls = len(self.calls())
-                    with patch.dict(os.environ, {'GIT_EDITOR': 'true', **environment}):
-                        self.pull(request, previous=previous)
-                        report = self.result(request)
+                    report = self.pull_in_environment(request, environment, previous=previous)
                     request += 1
                     self.assertEqual(report['kind'], 'full')
                     self.assertEqual([item['code'] for item in report['items']], ['ubs.unverified'])

@@ -28,7 +28,7 @@ def iter_java_files(root: Path) -> Iterable[Path]:
         yield root
         return
     for path in root.rglob("*.java"):
-        if any(part in SKIP_DIRS for part in path.parts):
+        if any(part in SKIP_DIRS for part in path.relative_to(root).parts):
             continue
         yield path
 

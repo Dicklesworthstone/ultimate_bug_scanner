@@ -10,7 +10,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="112e0656b4aeeb72652119a1d51f61b908cbe598f31fcc2e4a14b09152d08f3c"
+UBS_LIB_CHECKSUM="67e18d8fe599dd85279ecb3115ae371b19bf005b355ad181ba8479a19e99594a"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -245,7 +245,7 @@ SINK_FILE="$(mktemp 2>/dev/null || mktemp -t ubs-kt-sink.XXXXXX)" || { echo "ERR
 JSON_TMP="$(mktemp 2>/dev/null || mktemp -t ubs-kt-json.XXXXXX)" || { echo "ERROR: cannot allocate temporary JSON report; analysis is incomplete" >&2; exit 2; }
 TEXT_TMP="$(mktemp 2>/dev/null || mktemp -t ubs-kt-text.XXXXXX)" || { echo "ERROR: cannot allocate temporary text report; analysis is incomplete" >&2; exit 2; }
 # Called indirectly by Bash's EXIT trap.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 cleanup() {
   rm -f "$LIST_FILE" "$SINK_FILE" "$JSON_TMP" "$TEXT_TMP"
 }

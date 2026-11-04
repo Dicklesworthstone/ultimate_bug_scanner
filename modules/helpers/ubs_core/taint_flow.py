@@ -14,6 +14,13 @@ from typing import Callable, Mapping
 class AnalysisLimit(ValueError):
     """The bounded analysis could not finish; callers must report failure."""
 
+    def __init__(self, message: str, *, effects=None):
+        super().__init__(message)
+        # Frontends may retain independently established findings while
+        # still reporting an incomplete scan. Never treat these as a complete
+        # reusable summary or silently turn the exception into success.
+        self.effects = effects if effects is not None else {}
+
 
 @dataclass
 class Budget:

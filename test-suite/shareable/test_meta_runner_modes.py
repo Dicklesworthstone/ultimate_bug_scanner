@@ -868,6 +868,9 @@ def main() -> None:
             "UBS_MAX_DIR_SIZE_MB": "1",
             "UBS_SKIP_SIZE_CHECK": "0",
             "UBS_ENABLE_AUTO_UPDATE": "0",
+            # This checks the non-scan size guard, not the operator's shared
+            # cache. Populated cache diagnostics have their own integration tests.
+            "UBS_CACHE_DIR": str(tmpdir / "scan-cache"),
         }
 
         doctor = run_ubs(["doctor", f"--module-dir={tmpdir / 'modules'}"], tight_limit_env)

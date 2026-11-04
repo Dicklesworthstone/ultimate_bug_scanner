@@ -16,6 +16,13 @@ def compute_sha256(path: Path) -> str:
         return ""
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
+
+def replace_array(pattern: re.Pattern, replacement, content: str, name: str) -> str:
+    """Replace one actual Bash declaration, never marker strings in helpers."""
+    if len(pattern.findall(content)) != 1:
+        raise SystemExit(f"Error: expected exactly one top-level {name} declaration")
+    return pattern.sub(replacement, content, count=1)
+
 def git_ignored_untracked(root: Path, subdir: Path) -> set[Path]:
     """Untracked files git ignores under `subdir` (editor backups, caches).
 
@@ -158,7 +165,7 @@ def main():
     if lib_common.exists():
         lib_content = lib_common.read_text(encoding="utf-8")
         lib_helper_pattern = re.compile(
-            r"(declare\s+(?:-g\s+)?-A\s+UBS_COMMON_HELPER_CHECKSUMS=\s*\()([\s\S]*?)(\))",
+            r"^(declare[ \t]+(?:-g[ \t]+)?-A[ \t]+UBS_COMMON_HELPER_CHECKSUMS=[ \t]*[(])[ \t]*\n([\s\S]*?)(^[)][ \t]*$)",
             re.MULTILINE,
         )
         def replace_common_helpers(match):
@@ -171,7 +178,8 @@ def main():
                 lines.append(f"  ['{rel}']='{new_helper_checksums[rel]}'")
             return f"{prefix}\n" + "\n".join(lines) + f"\n{suffix}"
 
-        new_lib_content = lib_helper_pattern.sub(replace_common_helpers, lib_content)
+        new_lib_content = replace_array(lib_helper_pattern, replace_common_helpers,
+                                        lib_content, "UBS_COMMON_HELPER_CHECKSUMS")
         if new_lib_content != lib_content:
             lib_common.write_text(new_lib_content, encoding="utf-8")
             print("✓ modules/lib/ubs-common.sh updated with helper checksums.")
@@ -191,9 +199,10 @@ def main():
         for mod_path in sorted(modules_dir.glob("ubs-*.sh")):
             mod_text = mod_path.read_text(encoding="utf-8")
             updated_mod_text = re.sub(
-                r'UBS_LIB_CHECKSUM="[^"]*"',
+                r'^UBS_LIB_CHECKSUM="[^"\n]*"$',
                 f'UBS_LIB_CHECKSUM="{lib_checksum}"',
                 mod_text,
+                flags=re.MULTILINE,
             )
             if updated_mod_text != mod_text:
                 mod_path.write_text(updated_mod_text, encoding="utf-8")
@@ -203,9 +212,10 @@ def main():
         if new_mod_path.exists():
             nm_text = new_mod_path.read_text(encoding="utf-8")
             updated_nm_text = re.sub(
-                r'UBS_LIB_CHECKSUM="[^"]*"',
+                r'^UBS_LIB_CHECKSUM="[^"\n]*"$',
                 f'UBS_LIB_CHECKSUM="{lib_checksum}"',
                 nm_text,
+                flags=re.MULTILINE,
             )
             if updated_nm_text != nm_text:
                 new_mod_path.write_text(updated_nm_text, encoding="utf-8")
@@ -234,7 +244,7 @@ def main():
         f'UBS_DAEMON_SHA256="{compute_sha256(daemon_script)}"', content)
     
     # Regex to find the MODULE_CHECKSUMS array block
-    pattern = re.compile(r"(declare -A MODULE_CHECKSUMS=\s*\()([\s\S]*?)(\))", re.MULTILINE)
+    pattern = re.compile(r"^(declare -A MODULE_CHECKSUMS=[ \t]*[(])[ \t]*\n([\s\S]*?)(^[)][ \t]*$)", re.MULTILINE)
     
     def replace_checksums(match):
         prefix = match.group(1)
@@ -245,9 +255,9 @@ def main():
                 lines.append(f"  [{lang}]='{new_checksums[lang]}'")
         return f"{prefix}\n" + "\n".join(lines) + f"\n{suffix}"
 
-    new_content = pattern.sub(replace_checksums, content_with_daemon)
+    new_content = replace_array(pattern, replace_checksums, content_with_daemon, "MODULE_CHECKSUMS")
 
-    helper_pattern = re.compile(r"(declare -A HELPER_CHECKSUMS=\s*\()([\s\S]*?)(\))", re.MULTILINE)
+    helper_pattern = re.compile(r"^(declare -A HELPER_CHECKSUMS=[ \t]*[(])[ \t]*\n([\s\S]*?)(^[)][ \t]*$)", re.MULTILINE)
 
     def replace_helper_checksums(match):
         prefix = match.group(1)
@@ -260,17 +270,17 @@ def main():
             lines.append(f"  ['{rel}']='{checksum}'")
         return f"{prefix}\n" + "\n".join(lines) + f"\n{suffix}"
 
-    new_content = helper_pattern.sub(replace_helper_checksums, new_content)
+    new_content = replace_array(helper_pattern, replace_helper_checksums, new_content, "HELPER_CHECKSUMS")
 
-    assets_pattern = re.compile(r"(HELPER_ASSETS=\s*\()([\s\S]*?)(\n\))")
+    assets_pattern = re.compile(r"^(HELPER_ASSETS=[ \t]*[(])[ \t]*\n([\s\S]*?)(^[)][ \t]*$)", re.MULTILINE)
 
     def replace_assets(match):
         prefix = match.group(1)
         suffix = match.group(3)
         lines = [f'  "{rel}"' for rel in sorted(new_helper_checksums.keys())]
-        return prefix + "\n" + "\n".join(lines) + suffix
+        return prefix + "\n" + "\n".join(lines) + "\n" + suffix
 
-    new_content = assets_pattern.sub(replace_assets, new_content)
+    new_content = replace_array(assets_pattern, replace_assets, new_content, "HELPER_ASSETS")
     
     if new_content != content:
         ubs_script.write_text(new_content, encoding="utf-8")

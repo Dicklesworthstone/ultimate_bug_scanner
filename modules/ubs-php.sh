@@ -5,7 +5,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="112e0656b4aeeb72652119a1d51f61b908cbe598f31fcc2e4a14b09152d08f3c"
+UBS_LIB_CHECKSUM="67e18d8fe599dd85279ecb3115ae371b19bf005b355ad181ba8479a19e99594a"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -169,7 +169,7 @@ fi
 # A crash or failed write cannot be mistaken for a completed clean analysis.
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/ubs-php.XXXXXX")" || { echo "ERROR: cannot allocate PHP scan workspace" >&2; exit 2; }
 # Called by Bash when this scanner exits; these are invocation-owned artifacts.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 cleanup(){ rm -f -- "$work_dir/files" "$work_dir/findings" "$work_dir/findings.cache" "$work_dir/summary" "$work_dir/sarif" "$work_dir/text" "$work_dir/complete"; rmdir -- "$work_dir" 2>/dev/null || true; }
 trap cleanup EXIT
 source_dir="$PROJECT_DIR"

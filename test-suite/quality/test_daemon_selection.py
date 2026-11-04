@@ -123,19 +123,45 @@ class SelectionFixture:
                 process.kill()
                 process.communicate(timeout=5)
         self.addCleanup(finish)
+        last_readiness = 'No readiness response received'
+
+        def startup_failure(reason):
+            # Capture only currently available bytes. A live child (or one
+            # of its descendants) may still hold these pipes open.
+            output = []
+            for label, stream in (('stdout', process.stdout), ('stderr', process.stderr)):
+                try:
+                    descriptor = stream.fileno()
+                    blocking = os.get_blocking(descriptor)
+                    try:
+                        os.set_blocking(descriptor, False)
+                        try:
+                            data = os.read(descriptor, 65536)
+                        except BlockingIOError:
+                            data = b''
+                    finally:
+                        os.set_blocking(descriptor, blocking)
+                    text = data.decode(stream.encoding or 'utf-8', errors='backslashreplace')
+                except (OSError, ValueError) as exc:
+                    text = f'<output unavailable: {exc}>'
+                output.append(f'{label} (up to 65536 available bytes):\n{text}')
+            self.fail(f'{reason}; child status={process.poll()!r}; '
+                      f'last readiness={last_readiness}\n' + '\n'.join(output))
+
         until = time.monotonic() + 5
         while time.monotonic() < until:
             if process.poll() is not None:
-                self.fail('Daemon startup failed: ' + process.communicate()[1])
+                startup_failure('Daemon startup failed')
             try:
                 response = daemon.request_service(self.root, {'protocol': daemon.PROTOCOL,
                                                   'root': str(self.root), 'op': 'status'}, 0.5)
                 if response.get('status') == 'ready':
                     return process
-            except (OSError, daemon.ServiceError):
-                pass
+                last_readiness = f'Unexpected response: {repr(response)[:2048]}'
+            except (OSError, daemon.ServiceError) as exc:
+                last_readiness = f'{type(exc).__name__}: {exc}'
             time.sleep(0.02)
-        self.fail('Daemon startup timed out')
+        startup_failure('Daemon startup timed out')
 
 
 @unittest.skipUnless(os.name == 'posix', 'Unix service requires POSIX')

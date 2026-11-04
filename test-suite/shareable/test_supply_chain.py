@@ -31,6 +31,8 @@ import textwrap
 import time
 from pathlib import Path
 
+from test_installed_contract import SIGNATURE_SHIM
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 UBS = REPO_ROOT / "ubs"
 MODULES = REPO_ROOT / "modules"
@@ -341,7 +343,8 @@ def check_cached_helper_batch_verification() -> None:
         'if [[ "$#" -gt 2 ]]; then\n'
         '  case "$UBS_TEST_BATCH_HASH_MODE" in\n'
         '    malformed) printf "invalid-digest\\n"; exit 0 ;;\n'
-        '    truncated) exec ' + shlex.quote(real_hash) + ' -- "$2" ;;\n'
+        '    truncated) exec ' + shlex.quote(real_hash) + ' --zero -- "$3" ;;\n'
+        '    extra) ' + shlex.quote(real_hash) + ' "$@"; printf "unframed-tail"; exit 0 ;;\n'
         '    failed) exit 1 ;;\n'
         '  esac\n'
         'fi\n'
@@ -357,7 +360,7 @@ def check_cached_helper_batch_verification() -> None:
         "XDG_CACHE_HOME": str(tmp / "user-cache"),
         "XDG_CONFIG_HOME": str(tmp / "user-config"),
     }
-    for mode in ("healthy", "malformed", "truncated", "failed"):
+    for mode in ("healthy", "malformed", "truncated", "failed", "extra"):
         hash_log.write_text("", encoding="utf-8")
         started = time.monotonic()
         proc = sb.run(*environment.items(), ("UBS_TEST_BATCH_HASH_MODE", mode))
@@ -810,6 +813,10 @@ def test_self_update_bad_signature_refused() -> None:
         (release_dir / "ubs").write_text("#!/usr/bin/env bash\necho evil\n", encoding="utf-8")
 
         env = os.environ.copy()
+        home = p / "home"
+        home.mkdir()
+        env.update(HOME=str(home), XDG_CACHE_HOME=str(home / ".cache"),
+                   XDG_CONFIG_HOME=str(home / ".config"), XDG_DATA_HOME=str(home / ".local/share"))
         env["UBS_RELEASE_BASE"] = f"file://{release_dir}"
         env["UBS_MINISIGN_PUBKEY"] = "RWS+jJ7psytzl3v4znpraY9VWBQrICXBFmT3VwvxpTzbuV2Q/CBTDmVJ"
         env["FORCE_SELF_UPDATE"] = "1"
@@ -833,12 +840,13 @@ def test_self_update_bad_signature_refused() -> None:
 
 
 def _self_update_release(p: Path, marker: Path) -> tuple[Path, Path, dict[str, str]]:
-    """Install a ubs copy plus a verified fake release under a scratch HOME.
+    """Install a ubs copy and an authenticated fixture release in scratch HOME.
 
-    The release payload is a stub "newer" ubs that records its argv in
-    `marker` and exits 7, so a test can tell whether (and how) the updated
-    binary was re-executed. HOME/XDG_CACHE_HOME point into `p` so nothing
-    touches the real user's cache or installed binaries.
+    The release contains the real runner's full pinned asset inventory and
+    daemon. Its execution entry records argv and exits 7, making re-execution
+    observable without substituting the updater or cache transaction. Only
+    the external signature executable is a clearly configured protocol double.
+    HOME and every XDG directory point into `p`.
     """
     home = p / "home"
     home.mkdir()
@@ -850,24 +858,39 @@ def _self_update_release(p: Path, marker: Path) -> tuple[Path, Path, dict[str, s
 
     release_dir = p / "release"
     release_dir.mkdir()
-    payload = (
-        "#!/usr/bin/env bash\n"
+    payload = UBS.read_text(encoding="utf-8").replace(
+        f'UBS_VERSION="{ubs_version()}"\n',
         'UBS_VERSION="99.0.0"\n'
         f"printf '%s\\n' \"argc=$#\" \"$@\" > {shlex.quote(str(marker))}\n"
-        "exit 7\n"
+        "exit 7\n",
+        1,
     )
     (release_dir / "ubs").write_text(payload, encoding="utf-8")
-    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-    (release_dir / "SHA256SUMS").write_text(f"{digest}  ubs\n", encoding="utf-8")
+    shutil.copy2(REPO_ROOT / "ubs-daemon", release_dir / "ubs-daemon")
+    sums = "".join(f"{hashlib.sha256((release_dir / name).read_bytes()).hexdigest()}  {name}\n"
+                   for name in ("ubs", "ubs-daemon"))
+    (release_dir / "SHA256SUMS").write_text(sums, encoding="utf-8")
+    (release_dir / "SHA256SUMS.minisig").write_text(hashlib.sha256(sums.encode()).hexdigest())
+    signer = bin_dir / "minisign"
+    signer.write_text(SIGNATURE_SHIM)
+    signer.chmod(0o755)
+    cache = home / ".local/share/ubs/modules"
+    cache.parent.mkdir(parents=True)
+    shutil.copytree(MODULES, cache)
 
     env = os.environ.copy()
-    for key in ("UBS_MINISIGN_PUBKEY", "UBS_NO_AUTO_UPDATE", "CI", "FORCE_SELF_UPDATE", "UBS_ENABLE_AUTO_UPDATE"):
-        env.pop(key, None)
+    for key in tuple(env):
+        if key.startswith("UBS_") or key in ("CI", "FORCE_SELF_UPDATE", "BASH_ENV", "ENV"):
+            env.pop(key)
     env.update({
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
         "HOME": str(home),
         "XDG_CACHE_HOME": str(home / ".cache"),
         "XDG_CONFIG_HOME": str(home / ".config"),
+        "XDG_DATA_HOME": str(home / ".local/share"),
         "UBS_RELEASE_BASE": f"file://{release_dir}",
+        "UBS_REPO_RAW_BASE": (p / "offline").as_uri(),
+        "UBS_MINISIGN_PUBKEY": "ubs-upgrade-test-trusted-key",
         "NO_COLOR": "1",
     })
     return installed_ubs, release_dir / "ubs", env
@@ -919,6 +942,30 @@ def test_auto_update_reexecs_with_original_args() -> None:
             f"exit={proc.returncode} replaced={replaced} argv={recorded!r}",
             proc,
         )
+
+
+def test_forced_same_runner_update_continues_the_scan_without_reexec_loop() -> None:
+    """A forced verified no-change update returns to the scan instead of recursively execing."""
+    with tempfile.TemporaryDirectory(prefix="ubs-sc-update-same-") as tmp:
+        p = Path(tmp)
+        installed_ubs, payload, env = _self_update_release(p, p / "not-executed")
+        payload.write_bytes(UBS.read_bytes())
+        release_dir = payload.parent
+        sums = "".join(f"{hashlib.sha256((release_dir / name).read_bytes()).hexdigest()}  {name}\n"
+                       for name in ("ubs", "ubs-daemon"))
+        (release_dir / "SHA256SUMS").write_text(sums)
+        (release_dir / "SHA256SUMS.minisig").write_text(hashlib.sha256(sums.encode()).hexdigest())
+        target = p / "project"
+        target.mkdir()
+        (target / "Cargo.toml").write_text('[package]\nname="same_runner"\nversion="0.0.0"\nedition="2021"\n')
+        env.update(FORCE_SELF_UPDATE="1", UBS_SKIP_RUST_BUILD="1")
+        command = [str(installed_ubs), "--ci", "--format=json", str(target)]
+        proc = subprocess.run(command, cwd=p, env=env, capture_output=True, text=True, timeout=20)  # ubs:ignore[python.taint.command] - executes the repository runner copied to this test's private HOME against a test-owned authenticated release and project.
+        document = json.loads(proc.stdout)
+        report("test_forced_same_runner_update_continues_the_scan_without_reexec_loop",
+               proc.returncode in (0, 1) and document.get("status") == "ok"
+               and any(scanner.get("language") == "rust" for scanner in document.get("scanners", [])),
+               f"exit={proc.returncode}", proc)
 
 
 def test_sha256sums_coverage() -> None:
@@ -997,6 +1044,7 @@ def main() -> int:
         test_self_update_bad_signature_refused,
         test_self_update_only_exits_zero_without_rerun,
         test_auto_update_reexecs_with_original_args,
+        test_forced_same_runner_update_continues_the_scan_without_reexec_loop,
         test_sha256sums_coverage,
     ):
         try:

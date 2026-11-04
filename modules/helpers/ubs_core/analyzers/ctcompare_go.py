@@ -84,7 +84,9 @@ def iter_files(root: Path):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
         for name in filenames:
             path = Path(dirpath) / name
-            if path.suffix.lower() == '.go' and not should_skip(path):
+            # Only descendants of the selected root are exclusions; the
+            # checkout itself may live under a directory such as /build.
+            if path.suffix.lower() == '.go' and not should_skip(path.relative_to(root)):
                 yield path
 
 

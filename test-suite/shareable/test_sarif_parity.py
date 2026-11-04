@@ -49,7 +49,8 @@ def audit(lang: str) -> dict:
     try:
         doc = json.loads(jp.stdout)
         if jp.returncode not in (0, 1) or doc.get("status") != "ok" or doc.get("failed_modules"):
-            row["error"] = f"json scan incomplete: exit={jp.returncode}, status={doc.get('status')!r}"
+            row["error"] = (f"json scan incomplete: exit={jp.returncode}, status={doc.get('status')!r}, "
+                            f"failed_modules={json.dumps(doc.get('failed_modules', []), ensure_ascii=True)}")
         scanner = next((s for s in doc.get("scanners", []) if s.get("language") == lang), {})
         findings = scanner.get("findings", []) or []
         row["json_occurrences"] = sum(int(f.get("count", 0) or 0) for f in findings)
@@ -66,6 +67,11 @@ def audit(lang: str) -> dict:
         row["sarif_rules"] = len({r.get("ruleId") for r in results})
     except Exception as exc:  # noqa: BLE001
         row["error"] = (row.get("error", "") + f" sarif: {exc}").strip()
+    if "error" in row:
+        # The real compiler/launcher failure can be in stderr even when the
+        # renderer returned parseable partial output. Keep both invocations.
+        row["json_stderr"] = jp.stderr
+        row["sarif_stderr"] = sp.stderr
     return row
 
 
@@ -93,6 +99,9 @@ def main(argv: list[str]) -> int:
             continue
         if "error" in row:
             print(f"[sarif-parity:{lang}] FAIL — {row['error']}")
+            for output_format in ("json", "sarif"):
+                if diagnostic := row.get(f"{output_format}_stderr"):
+                    print(f"[sarif-parity:{lang}:{output_format}] stderr:\n{diagnostic}", file=sys.stderr)
             failures += 1
             continue
         occ, smp, res, titles = row["json_occurrences"], row["json_samples"], row["sarif_results"], row["json_titles"]

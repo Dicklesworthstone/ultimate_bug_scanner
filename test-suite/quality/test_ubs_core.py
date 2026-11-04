@@ -2462,6 +2462,70 @@ class AstIngestionTests(unittest.TestCase):
                     self.assertIn("not valid UTF-8", errors[0])
 
     @unittest.skipUnless(os.name == "posix", "POSIX process groups")
+    def test_unreaped_group_permission_denial_stays_live_until_reaped(self) -> None:
+        # Darwin can return EPERM for a group containing only an unreaped
+        # zombie. Do not poll/wait the child before exercising that real state.
+        child = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+        try:
+            deadline = time.monotonic() + 5
+            while True:
+                state = subprocess.run(["ps", "-p", str(child.pid), "-o", "stat="],
+                                       capture_output=True, text=True, timeout=2)
+                self.assertEqual(state.returncode, 0, state.stderr)
+                if state.stdout.strip().startswith("Z"):
+                    break
+                self.assertLess(time.monotonic(), deadline, "child did not exit")
+                time.sleep(0.01)
+            # Neither a zombie nor an actual permission denial may crash the
+            # liveness probe; uncertain state remains live, never clean proof.
+            self.assertIsInstance(self.tools._process_group_running(child.pid), bool)
+            with patch.object(self.tools.os, "killpg", side_effect=PermissionError(1, "denied")):
+                self.assertTrue(self.tools._process_group_running(child.pid))
+            self.assertEqual(child.wait(timeout=2), 0)
+            self.assertFalse(self.tools._process_group_running(child.pid))
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=2)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process groups")
+    def test_denied_group_signal_does_not_publish_live_output(self) -> None:
+        import signal
+        self.executable(self.payload(self.diagnostic()), suffix="time.sleep(30)\n")
+        killpg = os.killpg
+        popen = subprocess.Popen
+        children = []
+        groups = set()
+
+        def remember_child(*args, **kwargs):
+            child = popen(*args, **kwargs)
+            children.append(child)
+            return child
+
+        def deny_kill(group, signum):
+            if signum == signal.SIGKILL:
+                groups.add(group)
+                raise PermissionError(1, "test signal denial")
+            return killpg(group, signum)
+
+        errors = []
+        try:
+            with patch.object(self.tools.os, "killpg", side_effect=deny_kill), \
+                    patch.object(self.tools.subprocess, "Popen", side_effect=remember_child):
+                with self.tools.run_command_stream("fixture", [str(self.binary)], self.root, 0.2, errors) as output:
+                    self.assertIsNone(output, "live writers cannot produce a frozen scan")
+            self.assertTrue(groups)
+            self.assertTrue(errors)
+        finally:
+            for group in groups:
+                try:
+                    killpg(group, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            for child in children:
+                child.wait(timeout=5)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process groups")
     def test_exited_leader_with_live_child_is_partial_and_child_stops(self) -> None:
         import signal
         import time

@@ -107,6 +107,43 @@ def operators(language: str) -> tuple[str, ...]:
     return ("==", "!=", "===", "!==") if language == "js" else ("==", "!=")
 
 
+class GoCollectorRootTests(unittest.TestCase):
+    def test_requested_root_exempts_ancestors_but_not_ignored_children(self) -> None:
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        work = Path(tempfile.mkdtemp(prefix="ctcompare-go-root-", dir=artifacts))
+        code, line = comparison_source("go", "SessionToken", right="expected", member=False)
+        for ancestor in ("build", "vendor"):
+            with self.subTest(ancestor=ancestor):
+                project = work / ancestor / "project"
+                project.mkdir(parents=True)
+                source = project / "session.go"
+                source.write_text(code, encoding="utf-8")
+                generated = project / "build"
+                generated.mkdir()
+                excluded = generated / "generated.go"
+                excluded.write_text(code, encoding="utf-8")
+                other = project / "notes.txt"
+                other.write_text(code, encoding="utf-8")
+
+                self.assertEqual([source], list(ctcompare_go.iter_files(project)))
+                self.assertEqual(
+                    [("session.go", line)],
+                    [(name, row) for name, row, _ in ctcompare_go.collect_issues(project)],
+                )
+                # Explicit selection keeps its existing semantics even when
+                # the same directory would be pruned from its parent walk.
+                self.assertEqual([excluded], list(ctcompare_go.iter_files(generated)))
+                self.assertEqual([excluded], list(ctcompare_go.iter_files(excluded)))
+                for selected in (generated, excluded):
+                    with self.subTest(selected=selected):
+                        self.assertEqual(
+                            [("generated.go", line)],
+                            [(name, row) for name, row, _ in ctcompare_go.collect_issues(selected)],
+                        )
+                self.assertEqual([], list(ctcompare_go.iter_files(other)))
+
+
 class ScopeMetadataTests(unittest.TestCase):
     def test_jsx_attributes_do_not_taint_javascript_variables(self) -> None:
         source = '''function Screen({id, className, copyState}) {
@@ -306,6 +343,189 @@ class CredentialDetectionTests(unittest.TestCase):
             '}',
         ]) + '\n'
         self.assertEqual(scan_lines('js', source), [9, 13], source)
+
+
+class JavascriptAssignmentOperandTests(unittest.TestCase):
+    def test_type_guard_assignment_does_not_compare_its_destination(self):
+        for destination in ("const token", "let authToken", "var secret", "credential", "state.authToken"):
+            for operator in operators("js"):
+                with self.subTest(destination=destination, operator=operator):
+                    source = f'{destination} = typeof link {operator} "string" ? new URL(link).searchParams.get("t") : null;\n'
+                    self.assertEqual(scan_lines("js", source), [])
+
+    def test_chained_and_compound_assignments_bound_the_right_hand_comparison(self):
+        for assignment in ("=", "+=", "-=", "*=", "/=", "%=", "**=", "&&=", "||=", "??=", "&=", "|=", "^=", "<<=", ">>=", ">>>="):
+            with self.subTest(assignment=assignment):
+                source = f'authToken {assignment} secret = typeof link === "string";\n'
+                self.assertEqual(scan_lines("js", source), [])
+                unsafe = f'authToken {assignment} result = password === supplied;\n'
+                self.assertEqual(scan_lines("js", unsafe), [1])
+
+    def test_assigned_secret_comparisons_remain_findings(self):
+        for operator in operators("js"):
+            for left in ("password", "authToken", "credentials.secret"):
+                with self.subTest(operator=operator, left=left):
+                    self.assertEqual(scan_lines("js", f'const result = {left} {operator} supplied;\n'), [1])
+        self.assertEqual(scan_lines("js", 'const alias = password;\nconst result = alias === supplied;\n'), [2])
+
+    def test_nested_assignment_is_an_operand_not_an_outer_boundary(self):
+        for expression in (
+            '(authToken = supplied) === expected',
+            '(authToken ||= supplied) === expected',
+            '(authToken = other = supplied) === expected',
+            'authToken === (other = supplied)',
+            '(authToken += suffix) === supplied',
+            'state[password === supplied] = typeof link === "string"',
+        ):
+            with self.subTest(expression=expression):
+                self.assertEqual(scan_lines("js", f'const result = {expression};\n'), [1])
+
+    def test_type_guard_does_not_hide_adjacent_or_conditional_secret_comparisons(self):
+        source = '''const token = typeof link === "string" ? link : null;
+if (typeof link !== "string" || authToken === supplied) return false;
+const result = typeof link === "string" ? password === supplied : false;
+const other = typeof link === "string" ? true : password === supplied;
+'''
+        self.assertEqual(scan_lines("js", source), [2, 3, 4])
+
+    def test_typeof_compound_operands_keep_the_secret(self):
+        for expression in ('typeof link + password', 'typeof link + ":" + authToken'):
+            with self.subTest(expression=expression):
+                self.assertEqual(scan_lines("js", f'const result = {expression} === supplied;\n'), [1])
+
+    def test_arrow_and_quoted_assignment_text_do_not_hide_secrets(self):
+        for expression in (
+            'authToken === "typeof value"',
+            'authToken === "a=b"',
+            'authToken === "left => right"',
+            'authToken === `value=${supplied}`',
+            'row => row.authToken === supplied',
+            '(authToken) => authToken === supplied',
+        ):
+            with self.subTest(expression=expression):
+                self.assertEqual(scan_lines("js", f'const result = {expression};\n'), [1])
+
+    def test_assignment_text_inside_regular_expressions_is_not_a_boundary(self):
+        for literal in ('/x=y/', '/[=]/', r'/a\/=b/'):
+            with self.subTest(literal=literal):
+                source = f'const result = authToken + {literal}.source === supplied;\n'
+                self.assertEqual(scan_lines("js", source), [1])
+
+
+class JavascriptParameterBindingTests(unittest.TestCase):
+    """A new parameter binding cannot inherit an unrelated local's value."""
+
+    def assert_sites(self, body):
+        source = 'const r = password;\n' + textwrap.dedent(body)
+        expected = [number for number, line in enumerate(source.splitlines(), 1)
+                    if '// expect-secret' in line]
+        self.assertEqual(scan_lines('js', source), expected, source)
+
+    def test_callback_parameter_shadows_unrelated_secret_alias(self):
+        self.assert_sites('''
+            const sent = rows(w).filter((r) => r.status === "sent").length;
+            const selected = rows.filter(r => r.value === supplied);
+            const block = rows.filter((r: Row) => {
+                return r.status === "sent";
+            });
+            const ordinary = rows.filter(function (r) { return r.value === supplied; });
+            const captured = rows.filter(r => (() => r.value === supplied)());
+            const secretMember = rows.filter(r => r.password === supplied); // expect-secret
+            const secretName = rows.filter(password => password === supplied); // expect-secret
+            const outside = r.value === supplied; // expect-secret
+        ''')
+
+    def test_secret_defaults_destructuring_and_reassignments_remain_findings(self):
+        self.assert_sites('''
+            const defaults = rows.filter((r = password) => r.value === supplied); // expect-secret
+            const destructured = rows.filter(({password: r}) => r === supplied); // expect-secret
+            const destructuredDefault = rows.filter(({value: r = password}) => r === supplied); // expect-secret
+            const reassigned = rows.filter(r => { r = password; return r.value === supplied; }); // expect-secret
+            const propertyWrite = rows.filter(r => { r.value = password; return r.value === supplied; }); // expect-secret
+            const assignmentPattern = rows.filter(r => { ({password: r} = credentials); return r === supplied; }); // expect-secret
+            const tightPattern = rows.filter(r => { ({password:r}=credentials); return r === supplied; }); // expect-secret
+            const escaped = rows.filter(r => { mutate(r); return r.value === supplied; }); // expect-secret
+            const mutated = rows.filter(r => { r.mutate(); return r.value === supplied; }); // expect-secret
+            const aliased = rows.filter(r => { const alias = r; alias.value = password; return r.value === supplied; }); // expect-secret
+            const captured = rows.filter(row => r.value === supplied); // expect-secret
+            const nested = rows.filter(r => ((r = password) => r.value === supplied)()); // expect-secret
+            const closedOverWrite = rows.filter(r => {
+                function write() { r = password; }
+                write();
+                return r.value === supplied; // expect-secret
+            });
+        ''')
+
+    def test_callback_secret_inputs_are_not_reclassified_by_shadowing(self):
+        self.assert_sites('''
+            const direct = [r].filter(r => r.value === supplied); // expect-secret
+            const named = credentials.filter(r => r.value === supplied); // expect-secret
+            const nested = getRows(password).filter(r => r.value === supplied); // expect-secret
+            const continued = credentials
+                .filter(r => r.value === supplied); // expect-secret
+            const nextLine = [r].filter(
+                r => r.value === supplied); // expect-secret
+        ''')
+
+    def test_new_parameter_does_not_inherit_old_call_result_metadata_evidence(self):
+        source = '''const r = await login(password);
+rows.filter((r = password) => r.status === supplied);
+rows.filter(r => { r = password; return r.status === supplied; });
+rows.filter(({password: r}) => r.status === supplied);
+'''
+        self.assertEqual(scan_lines('js', source), [2, 3, 4])
+
+    def test_boolean_operands_and_comments_keep_their_own_scope(self):
+        self.assert_sites('''
+            const both = rows.filter(r => r.status === "sent" && r.mode !== "hidden");
+            const comment = rows.filter(/* public row */ (r) => r.status === "sent");
+            /* before callback */ rows.filter(r => r.status === "sent");
+            rows.filter(r => r.status === "sent"); /* keep outside */ r.value === supplied; // expect-secret
+            const mixed = rows.filter(r => r.status === "sent" && password === supplied); // expect-secret
+        ''')
+
+    def test_callback_inputs_resolve_the_local_declaration_not_another_function(self):
+        self.assert_sites('''
+            async function earlier() {
+                const w = await world({SESSION_SECRET: password});
+                const r = await requestMagicLink(w, SECRET);
+                return r;
+            }
+            async function current() {
+                const w = await world();
+                return rows(w).filter((r) => r.status === "sent").length;
+            }
+            async function actualSecretInput() {
+                const w = password;
+                const alias = w;
+                return rows(alias).filter((r) => r.value === supplied); // expect-secret
+            }
+        ''')
+
+    def test_object_inputs_and_block_shadows_retain_captured_secrets(self):
+        self.assert_sites('''
+            const wrapped = getRows({value: password}).filter(r => r.value === supplied); // expect-secret
+            const indirect = getRows({value: r}).filter(r => r.value === supplied); // expect-secret
+            const data = password;
+            function captured() {
+                if (ready) { const data = []; use(data); }
+                return data.filter(r => r.value === supplied); // expect-secret
+            }
+            function loopLocal() {
+                for (let data of publicRows) use(data);
+                return data.filter(r => r.value === supplied); // expect-secret
+            }
+            const deeplyWrapped = getRows({value: (() => { observe(); return password; })()}).filter(r => r.value === supplied); // expect-secret
+        ''')
+
+    def test_named_function_metadata_policy_is_not_changed_by_callback_repair(self):
+        self.assert_sites('''
+            async function derive() { const keys = await loadKeys(secret); return keys; }
+            function publicId(keys) { return keys.id === supplied; }
+            function nestedId(keys) { return rows.some(row => row.key_id === keys.id); }
+            function actualMaterial(keys) { return keys.value === supplied; } // expect-secret
+            function namedMaterial(keys) { return keys.hmac === supplied; } // expect-secret
+        ''')
 
 
 class CallResultMetadataTests(unittest.TestCase):

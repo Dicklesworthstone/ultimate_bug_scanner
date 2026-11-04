@@ -100,11 +100,9 @@ def scanned_count(result) -> int:
     return summary(result)["totals"]["files"]
 
 
-def run_helper(command, **kwargs):
+def run_helper(command, *, env=None, timeout=HELPER_TIMEOUT, capture_output=True, **kwargs):
     """A bounded local child: a hung helper must fail the test, not the run."""
-    kwargs.setdefault("timeout", HELPER_TIMEOUT)
-    kwargs.setdefault("capture_output", True)
-    return subprocess.run(command, **kwargs)  # ubs:ignore[py.security.command-injection] Fixed repo sources and test-owned paths.
+    return subprocess.run(command, env=env, timeout=timeout, capture_output=capture_output, **kwargs)  # ubs:ignore[py.security.command-injection] Fixed repo sources and test-owned paths.
 
 
 def bash_function(name: str) -> str:
@@ -959,6 +957,32 @@ class PostprocessStreamingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CachedHelperAllocationTest(unittest.TestCase):
+    def test_failed_batch_allocation_keeps_per_file_verification(self):
+        script = "\n".join([
+            "set -Euo pipefail",
+            "TMPDIR_RUN=; EARLY_TMP_PATHS=(); UPDATE_MODULES=0",
+            "HELPER_ASSETS=(contract.json)",
+            "declare -A HELPER_CHECKSUMS=([contract.json]=test-digest)",
+            "mktemp(){ return 1; }",
+            "need_cmd(){ return 0; }",
+            "ensure_helper_asset(){ printf 'verified:%s\\n' \"$1\"; }",
+            # Stop before any redirection if a regression attempts a batch
+            # after allocation failed, even when the test runs as root.
+            "set -T",
+            "trap 'case $BASH_COMMAND in \"sha256sum --zero\"*) exit 97;; esac' DEBUG",
+            bash_function("ensure_tmpdir_run"),
+            bash_function("ensure_cached_helpers"),
+            "ensure_cached_helpers scan || exit $?",
+            "[[ $HELPERS_READY == 1 && -z $TMPDIR_RUN ]]",
+        ])
+        env = dict(os.environ, MODULE_DIR=str(REPO_ROOT / "modules"))
+        result = run_helper(["bash", "-c", script], env=env, check=False, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "verified:contract.json")
+        self.assertEqual(result.stderr, "")
 
 
 class SizeGuardExcludeTest(unittest.TestCase):

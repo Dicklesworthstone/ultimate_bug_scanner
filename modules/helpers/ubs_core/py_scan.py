@@ -845,36 +845,99 @@ def _detector_worker() -> None:
         name, paths, skip = json.load(sys.stdin)
     except (ValueError, TypeError) as exc:
         raise ValueError('Invalid detector worker request') from exc
-    result = _detector_job(name, [Path(path) for path in paths],
-                           set(skip) if skip is not None else None)
-    sys.stdout.write(json.dumps(result))
+    class Stream:
+        def write(self, record):
+            # _run_detector writes one complete JSON finding at a time. Send
+            # it before asking the producer for its next result: a timeout or
+            # native crash must not erase findings already established.
+            sys.stdout.write('["finding", ' + record.rstrip('\n') + ']\n')
+            sys.stdout.flush()
+
+    errors: list[str] = []
+    _run_detector(name, [Path(path) for path in paths], Stream(),
+                  set(skip) if skip is not None else None, errors)
+    sys.stdout.write(json.dumps(['complete', errors], ensure_ascii=False) + '\n')
+    sys.stdout.flush()
+
+
+def _detector_response(output: bytes):
+    """Decode a completed prefix; EOF alone never certifies completion."""
+    records, problems = [], []
+    complete = False
+    invalid = None
+    # Split bytes on LF only. Unicode line separators are legal finding text,
+    # and an interrupted UTF-8 or JSON tail cannot invalidate earlier frames.
+    frames = output.split(b'\n')
+    for raw in frames[:-1]:
+        if complete:
+            invalid = 'output after completion record'
+            break
+        try:
+            frame = json.loads(raw)
+        except (ValueError, UnicodeError):
+            invalid = 'invalid JSON frame'
+            break
+        if not isinstance(frame, list) or len(frame) != 2:
+            invalid = 'expected a tagged record'
+            break
+        kind, payload = frame
+        if (kind == 'finding' and isinstance(payload, dict)
+                and all(isinstance(payload.get(key), str)
+                        for key in ('rule', 'path', 'severity', 'message'))
+                and payload['rule'] and payload['path']
+                and all(isinstance(payload.get(key), int) and not isinstance(payload[key], bool)
+                        for key in ('line', 'col'))):
+            records.append(json.dumps(payload, ensure_ascii=False) + '\n')
+        elif (kind == 'complete' and isinstance(payload, list)
+              and all(isinstance(problem, str) for problem in payload)):
+            complete = True
+            problems = payload
+        else:
+            invalid = 'invalid record type or payload'
+            break
+    if invalid is None:
+        if frames[-1]:
+            invalid = 'truncated output frame'
+        elif not complete:
+            invalid = 'missing completion record'
+    return ''.join(records), problems, invalid
 
 
 def _detector_process(module_name: str, files: Sequence[Path], skip: set[int] | None):
     import subprocess
 
     env = dict(os.environ)
+    # This private wire protocol is UTF-8 even when the caller's terminal is
+    # ASCII or another locale; finding text routinely includes an em dash.
+    env['PYTHONIOENCODING'] = 'utf-8'
     helpers = str(Path(__file__).resolve().parent.parent)
     env['PYTHONPATH'] = os.pathsep.join(part for part in (helpers, env.get('PYTHONPATH', '')) if part)
     limit = env.get('UBS_MODULE_TIMEOUT', '300')
     timeout = int(limit) if limit.isdecimal() else 300
-    result = subprocess.run(
-        [sys.executable, '-c', 'from ubs_core.py_scan import _detector_worker; _detector_worker()'],
-        input=json.dumps([module_name, [str(path) for path in files],
-                          sorted(skip) if skip is not None else None]).encode('utf-8'),
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
-        timeout=timeout or None,  # An explicit zero retains the unlimited policy.
-    )
-    if result.returncode:
-        raise RuntimeError(f'worker exited {result.returncode}: '
-                           f'{result.stderr.decode("utf-8", "replace")[-2000:]}')
     try:
-        records, problems = json.loads(result.stdout)
-        if (not isinstance(records, str) or not isinstance(problems, list)
-                or any(not isinstance(problem, str) for problem in problems)):
-            raise ValueError('Expected records and a list of diagnostic strings')
-    except (ValueError, TypeError) as exc:
-        raise ValueError(f'Invalid detector worker response from {module_name}') from exc
+        result = subprocess.run(
+            [sys.executable, '-c', 'from ubs_core.py_scan import _detector_worker; _detector_worker()'],
+            input=json.dumps([module_name, [str(path) for path in files],
+                              sorted(skip) if skip is not None else None]).encode('utf-8'),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+            timeout=timeout or None,  # An explicit zero retains the unlimited policy.
+        )
+    except subprocess.TimeoutExpired as exc:
+        records, problems, _invalid = _detector_response(exc.output or b'')
+        exc.detector_records = records
+        exc.detector_errors = problems
+        raise
+    records, problems, invalid = _detector_response(result.stdout)
+    failure = None
+    if result.returncode:
+        failure = RuntimeError(f'worker exited {result.returncode}: '
+                               f'{result.stderr.decode("utf-8", "replace")[-2000:]}')
+    elif invalid is not None:
+        failure = ValueError(f'Invalid detector worker response from {module_name}: {invalid}')
+    if failure is not None:
+        failure.detector_records = records
+        failure.detector_errors = problems
+        raise failure
     if result.stderr:
         sys.stderr.write(result.stderr.decode('utf-8', 'replace'))
     return records, problems
@@ -932,7 +995,8 @@ def run_detectors(files: Sequence[Path], sink, skip: set[int] | None = None,
                 records, problems = future.result()
             except (Exception, SystemExit) as exc:
                 _analysis_error(errors, f"detector {name}", exc)
-                continue
+                records = getattr(exc, 'detector_records', '')
+                problems = getattr(exc, 'detector_errors', [])
             # CapturingSink consumes one JSON record per write, not a batch.
             # NDJSON is delimited by LF, not Unicode line separators that
             # may occur literally inside a JSON string.
@@ -1121,7 +1185,10 @@ def main(argv: list[str] | None = None) -> int:
         project_dir=args.project_dir or args.project or ".",
         skip=args.skip,
         custom_rules=args.ast_rule_dir,
-        extra=f"new_analyzers={args.enable_new_analyzers}",
+        extra=json.dumps({"new_analyzers": args.enable_new_analyzers,
+                          "flow_max_steps": os.environ.get("UBS_PYTHON_FLOW_MAX_STEPS"),
+                          "flow_scope_steps": os.environ.get("UBS_PYTHON_FLOW_SCOPE_STEPS")},
+                         sort_keys=True),
     )
     cached_findings, files_to_scan = cache.partition_files(files)
 

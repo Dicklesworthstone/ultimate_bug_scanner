@@ -345,6 +345,73 @@ class CredentialDetectionTests(unittest.TestCase):
         self.assertEqual(scan_lines('js', source), [9, 13], source)
 
 
+class JavascriptAssignmentOperandTests(unittest.TestCase):
+    def test_type_guard_assignment_does_not_compare_its_destination(self):
+        for destination in ("const token", "let authToken", "var secret", "credential", "state.authToken"):
+            for operator in operators("js"):
+                with self.subTest(destination=destination, operator=operator):
+                    source = f'{destination} = typeof link {operator} "string" ? new URL(link).searchParams.get("t") : null;\n'
+                    self.assertEqual(scan_lines("js", source), [])
+
+    def test_chained_and_compound_assignments_bound_the_right_hand_comparison(self):
+        for assignment in ("=", "+=", "-=", "*=", "/=", "%=", "**=", "&&=", "||=", "??=", "&=", "|=", "^=", "<<=", ">>=", ">>>="):
+            with self.subTest(assignment=assignment):
+                source = f'authToken {assignment} secret = typeof link === "string";\n'
+                self.assertEqual(scan_lines("js", source), [])
+                unsafe = f'authToken {assignment} result = password === supplied;\n'
+                self.assertEqual(scan_lines("js", unsafe), [1])
+
+    def test_assigned_secret_comparisons_remain_findings(self):
+        for operator in operators("js"):
+            for left in ("password", "authToken", "credentials.secret"):
+                with self.subTest(operator=operator, left=left):
+                    self.assertEqual(scan_lines("js", f'const result = {left} {operator} supplied;\n'), [1])
+        self.assertEqual(scan_lines("js", 'const alias = password;\nconst result = alias === supplied;\n'), [2])
+
+    def test_nested_assignment_is_an_operand_not_an_outer_boundary(self):
+        for expression in (
+            '(authToken = supplied) === expected',
+            '(authToken ||= supplied) === expected',
+            '(authToken = other = supplied) === expected',
+            'authToken === (other = supplied)',
+            '(authToken += suffix) === supplied',
+            'state[password === supplied] = typeof link === "string"',
+        ):
+            with self.subTest(expression=expression):
+                self.assertEqual(scan_lines("js", f'const result = {expression};\n'), [1])
+
+    def test_type_guard_does_not_hide_adjacent_or_conditional_secret_comparisons(self):
+        source = '''const token = typeof link === "string" ? link : null;
+if (typeof link !== "string" || authToken === supplied) return false;
+const result = typeof link === "string" ? password === supplied : false;
+const other = typeof link === "string" ? true : password === supplied;
+'''
+        self.assertEqual(scan_lines("js", source), [2, 3, 4])
+
+    def test_typeof_compound_operands_keep_the_secret(self):
+        for expression in ('typeof link + password', 'typeof link + ":" + authToken'):
+            with self.subTest(expression=expression):
+                self.assertEqual(scan_lines("js", f'const result = {expression} === supplied;\n'), [1])
+
+    def test_arrow_and_quoted_assignment_text_do_not_hide_secrets(self):
+        for expression in (
+            'authToken === "typeof value"',
+            'authToken === "a=b"',
+            'authToken === "left => right"',
+            'authToken === `value=${supplied}`',
+            'row => row.authToken === supplied',
+            '(authToken) => authToken === supplied',
+        ):
+            with self.subTest(expression=expression):
+                self.assertEqual(scan_lines("js", f'const result = {expression};\n'), [1])
+
+    def test_assignment_text_inside_regular_expressions_is_not_a_boundary(self):
+        for literal in ('/x=y/', '/[=]/', r'/a\/=b/'):
+            with self.subTest(literal=literal):
+                source = f'const result = authToken + {literal}.source === supplied;\n'
+                self.assertEqual(scan_lines("js", source), [1])
+
+
 class JavascriptParameterBindingTests(unittest.TestCase):
     """A new parameter binding cannot inherit an unrelated local's value."""
 

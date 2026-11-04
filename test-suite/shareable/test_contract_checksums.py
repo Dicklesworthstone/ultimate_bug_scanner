@@ -331,5 +331,67 @@ class ContractChecksums(unittest.TestCase):
             self.assertIn("CHECKSUM FILE MISSING: modules/contract.json", result.stdout)
 
 
+SUPERSEDED_BLOCK = re.compile(r"^declare -A SUPERSEDED_CONTRACT_SHA256=\(\n(.*?)^\)$", re.M | re.S)
+SUPERSEDED_ENTRY = re.compile(r"\s*\['([0-9a-f]{64})'\]='(v[0-9][^']*)'\s*")
+RELEASE_TAG = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+")
+
+
+class SupersededContracts(unittest.TestCase):
+    """Issues #174 and #199: a contract any release shipped stays recognizable.
+
+    An older updater replaces the runner but leaves the cached
+    modules/contract.json behind. The new runner refreshes that cache only when
+    the cached digest is listed in SUPERSEDED_CONTRACT_SHA256; any other
+    mismatch refuses to scan. So every contract a release tag shipped must be
+    the current one or listed, or users upgrading from that release get stuck.
+    """
+
+    maxDiff = None
+
+    def git(self, *args: str, stdin: bytes | None = None) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", str(REPO_ROOT), *args], input=stdin,
+                              capture_output=True, check=False, timeout=120)
+
+    def released_contracts(self) -> dict[str, str]:
+        if shutil.which("git") is None:
+            self.skipTest("git is not installed")
+        top = self.git("rev-parse", "--show-toplevel")
+        if top.returncode != 0 or Path(top.stdout.decode().strip()).resolve() != REPO_ROOT:
+            self.skipTest("not a git checkout of this repository")
+        listing = self.git("tag", "--list", "v*", "--merged", "HEAD")
+        self.assertEqual(listing.returncode, 0, listing.stderr.decode(errors="replace"))
+        tags = [tag for tag in listing.stdout.decode().split() if RELEASE_TAG.fullmatch(tag)]
+        if not tags:
+            self.skipTest("no release tags in this clone")
+        query = "".join(f"refs/tags/{tag}:modules/contract.json\n" for tag in tags).encode()
+        batch = self.git("cat-file", "--batch", stdin=query)
+        self.assertEqual(batch.returncode, 0, batch.stderr.decode(errors="replace"))
+        out, pos, contracts = batch.stdout, 0, {}
+        for tag in tags:
+            end = out.index(b"\n", pos)
+            header = out[pos:end].split()
+            pos = end + 1
+            if header[-1] == b"missing":
+                continue  # released before the contract existed
+            self.assertEqual(header[1], b"blob", (tag, header))
+            size = int(header[2])
+            contracts[tag] = hashlib.sha256(out[pos:pos + size]).hexdigest()
+            pos += size + 1
+        if not contracts:
+            self.skipTest("no release tag ships modules/contract.json")
+        return contracts
+
+    def test_every_released_contract_is_current_or_superseded(self) -> None:
+        blocks = SUPERSEDED_BLOCK.findall((REPO_ROOT / "ubs").read_text(encoding="utf-8"))
+        self.assertEqual(len(blocks), 1, "expected one SUPERSEDED_CONTRACT_SHA256 declaration in ubs")
+        lines = [line for line in blocks[0].splitlines() if line.strip()]
+        unparsed = [line for line in lines if not SUPERSEDED_ENTRY.fullmatch(line)]
+        self.assertEqual(unparsed, [], "entries must stay ['<sha256>']='<tag>'")
+        known = {SUPERSEDED_ENTRY.fullmatch(line).group(1) for line in lines}
+        known.add(digest(REPO_ROOT / "modules/contract.json"))
+        missing = {tag: sha for tag, sha in self.released_contracts().items() if sha not in known}
+        self.assertEqual(missing, {}, "add each released contract digest to SUPERSEDED_CONTRACT_SHA256 in ubs")
+
+
 if __name__ == "__main__":
     unittest.main()

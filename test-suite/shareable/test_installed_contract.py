@@ -928,7 +928,12 @@ raise SystemExit(result.returncode)
         if executable is None:
             self.skipTest("minisign is required for real cryptographic signature tests")
         # Replace only this test's protocol double, never a system executable.
-        shutil.copy2(executable, self.bin / "minisign")
+        # Package managers can install minisign read-only (Homebrew uses 0555)
+        # and copy2 keeps that mode, so a test that creates a second signer
+        # could not reopen its own copy. Stage beside it and rename over it.
+        staged = self.bin / ".minisign.staged"
+        shutil.copy2(executable, staged)
+        os.replace(staged, self.bin / "minisign")
         secret = self.root / f"{name}.key"
         public = self.root / f"{name}.pub"
         result = subprocess.run([executable, "-G", "-W", "-p", str(public), "-s", str(secret)],

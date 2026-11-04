@@ -514,10 +514,37 @@ class RealGoTools(unittest.TestCase):
         self.assertTrue({"go.vet.printf", "go.gofmt.format"} <= {f["rule"] for f in self.rows()})
         self.assertEqual(result[1]["status"], "ok")
 
+    OFFLINE_GO = {"GOTOOLCHAIN": "local", "GOPROXY": "off", "GOSUMDB": "off", "GOWORK": "off", "GOFLAGS": ""}
+
+    def native_printf_column(self, statement: str) -> int:
+        """Ask this Go toolchain which column its printf check reports.
+
+        Go releases differ: older vet anchors the diagnostic at the call,
+        newer vet at the offending format directive. A one-diagnostic
+        package outside the scanned tree pins the expectation to the
+        toolchain under test instead of to one release.
+        """
+        artifacts = REPO / "test-suite/artifacts/go-analyzers"
+        probe = tempfile.TemporaryDirectory(prefix="ubs-go-vet-probe-", dir=artifacts)
+        self.addCleanup(probe.cleanup)
+        root = Path(probe.name)
+        (root / "go.mod").write_text("module example.invalid/probe\n\ngo 1.23\n")
+        (root / "probe.go").write_text('package main\n\nimport "fmt"\n\nfunc main() {\n' + statement + '}\n')
+        result = subprocess.run(["go", "vet", "-json", "./..."], cwd=root, capture_output=True,
+                                text=True, timeout=120, env=dict(os.environ, **self.OFFLINE_GO))
+        report = "\n".join(line for line in (result.stdout + result.stderr).splitlines()
+                           if not line.startswith("#"))
+        rows = json.loads(report)["example.invalid/probe"]["printf"]
+        self.assertEqual(len(rows), 1, report)
+        position = rows[0]["posn"].rsplit(":", 2)
+        self.assertEqual((Path(position[0]).name, position[1]), ("probe.go", "6"), report)
+        return int(position[2])
+
     def test_real_vet_keeps_every_diagnostic_beyond_sixteen_megabytes(self) -> None:
         # A real offline vet run, with 13,000 distinct source sites in one
         # package. Long but valid arguments grow the report past the former
         # aggregate cap without storing a giant fixture in the repository.
+        column = self.native_printf_column('\tfmt.Printf("%d", "x")\n')
         files, expected = [], set()
         for number in range(13):
             path = self.root / f"part{number:02}.go"
@@ -525,7 +552,7 @@ class RealGoTools(unittest.TestCase):
             path.write_text('package main\n\nimport "fmt"\n\n' +
                             f"func Check{number}() {{\n" + body * 1000 + '}\n')
             files.append(path)
-            expected.update((str(path), line, 2) for line in range(6, 1006))
+            expected.update((str(path), line, column) for line in range(6, 1006))
         hashes = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in files}
         captured = {}
         capture, which = tools.run_command_stream, shutil.which
@@ -554,6 +581,92 @@ class RealGoTools(unittest.TestCase):
         self.assertTrue(all(row["severity"] == "warning" and "fmt.Printf format %d" in row["message"]
                             for row in rows))
         self.assertEqual({path: hashlib.sha256(path.read_bytes()).hexdigest() for path in files}, hashes)
+
+
+@unittest.skipUnless(shutil.which("go"), "Go toolchain not available")
+class LifecycleLocations(unittest.TestCase):
+    """Category 17 findings name the leaking file and line, like their neighbours.
+
+    The resource-lifecycle helper reports `<root-relative name>:<line>`. That
+    token used to become the finding's file with line 0 (and `.:<line>` for a
+    single-file target), so JSON, SARIF and editors pointed at no real file.
+    Each leak below also discards an error, so `go.error-handling.blank-discards`
+    marks the same line through the ordinary path handling.
+    """
+    LEAK = 'package main\n\nimport "os"\n\nfunc leak{n}() {{\n\n\tfh, _ := os.Open("in")\n\t_ = fh\n}}\n'
+    NAMES = ("plain.go", "dir with space/spaced.go") + (("odd:name.go", "odd\tname.go") if os.name != "nt" else ())
+
+    def setUp(self) -> None:
+        artifacts = REPO / "test-suite/artifacts/go-analyzers"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        self.tmp = tempfile.TemporaryDirectory(prefix="ubs-go-lifecycle-", dir=artifacts)
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name) / "project"
+        for number, name in enumerate(self.NAMES):
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(self.LEAK.format(n=number), encoding="utf-8")
+        self.env = dict(os.environ, NO_COLOR="1", CI="1", UBS_NO_AUTO_UPDATE="1",
+                        UBS_ENABLE_AUTO_UPDATE="0", PYTHONDONTWRITEBYTECODE="1",
+                        UBS_CACHE_DIR=str(Path(self.tmp.name) / "cache"),
+                        XDG_DATA_HOME=str(Path(self.tmp.name) / "data"),
+                        GOTOOLCHAIN="local", GOPROXY="off", GOSUMDB="off", GOWORK="off", GOFLAGS="")
+        for name in ("UBS_VERIFIED_ASSET_DIR", "UBS_ALLOW_UNVERIFIED_HELPERS"):
+            self.env.pop(name, None)
+
+    def scan(self, target: Path, fmt: str) -> dict:
+        result = subprocess.run(
+            [str(REPO / "ubs"), "--ci", "--no-config", "--only=golang", f"--format={fmt}", str(target)],
+            cwd=self.tmp.name, env=self.env, capture_output=True, text=True, timeout=180)
+        self.assertIn(result.returncode, (0, 1), result.stderr + result.stdout)
+        return json.loads(result.stdout)
+
+    def json_sites(self, report: dict, rule: str) -> set:
+        self.assertEqual(report["status"], "ok", report.get("failed_modules"))
+        return {(f["file"], f["line"]) for f in report["findings"] if f["rule_id"] == rule}
+
+    def test_directory_scan_reports_each_leak_at_its_file_and_line(self) -> None:
+        report = self.scan(self.root, "json")
+        leaks = self.json_sites(report, "go.lifecycle.file_handle")
+        self.assertEqual(leaks, self.json_sites(report, "go.error-handling.blank-discards"))
+        self.assertEqual(leaks, {(str(self.root / name), 7) for name in self.NAMES})
+
+    def test_single_file_scan_names_the_file_not_the_root(self) -> None:
+        target = self.root / self.NAMES[0]
+        report = self.scan(target, "json")
+        leaks = self.json_sites(report, "go.lifecycle.file_handle")
+        self.assertEqual(len(leaks), 1)
+        self.assertEqual(leaks, self.json_sites(report, "go.error-handling.blank-discards"))
+        self.assertEqual({line for _, line in leaks}, {7})
+
+    def test_single_file_message_and_text_name_the_file_not_the_root(self) -> None:
+        # The helper names a single-file target "." (relative to itself). That
+        # token must not reach the finding's message or the text report.
+        target = self.root / self.NAMES[0]
+        report = self.scan(target, "json")
+        messages = [f["message"] for f in report["findings"] if f["rule_id"] == "go.lifecycle.file_handle"]
+        self.assertEqual(len(messages), 1)
+        self.assertIn(f"[{self.NAMES[0]}:7]", messages[0])
+        text = subprocess.run(
+            [str(REPO / "ubs"), "--ci", "--no-config", "--only=golang", "--format=text", str(target)],
+            cwd=self.tmp.name, env=self.env, capture_output=True, text=True, timeout=180)
+        self.assertIn(text.returncode, (0, 1), text.stderr + text.stdout)
+        self.assertIn(f"{self.NAMES[0]}:7", text.stdout)
+        self.assertNotIn(".:7", text.stdout)
+
+    def test_sarif_locations_match_the_ordinary_go_findings(self) -> None:
+        report = self.scan(self.root, "sarif")
+        sites = {}
+        for run in report["runs"]:
+            for result in run.get("results", []):
+                for location in result["locations"]:
+                    physical = location["physicalLocation"]
+                    sites.setdefault(result["ruleId"], set()).add(
+                        (physical["artifactLocation"]["uri"], physical["region"]["startLine"]))
+        leaks = sites.get("go.lifecycle.file_handle", set())
+        self.assertEqual(len(leaks), len(self.NAMES))
+        self.assertEqual(leaks, sites.get("go.error-handling.blank-discards"))
+        self.assertEqual({line for _, line in leaks}, {7})
 
 
 if __name__ == "__main__":

@@ -24,6 +24,10 @@ skip_dirs = {'.git', 'node_modules', 'dist', 'build', 'coverage', '.next', '.cac
 
 compare_re = re.compile(r'(?<![=!<>])(?:===|!==|==|!=)(?!=)')
 assignment_head_re = re.compile(r'(?<![\w$])(?P<name>[A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?!=)')
+assignment_prefix_re = re.compile(
+    r'^\s*(?:(?:const|let|var)\s+)?[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*\s*'
+    r'(?:\*\*|>>>|<<|>>|&&|\|\||\?\?|[+\-*/%&|^])?=(?!=|>)\s*'
+)
 open_jsx_tag_re = re.compile(r'<[A-Za-z_$][\w.$:-]*(?=[\s/>]|$)[^<>]*$')
 identifier_re = re.compile(r'[A-Za-z_$][A-Za-z0-9_$]*')
 safe_compare_re = re.compile(
@@ -91,7 +95,7 @@ string_literal_re = re.compile(r'''(["'`])(?:\\.|(?!\1).)*?\1''')
 comparison_token_re = re.compile(
     string_literal_re.pattern
     + rf'|(?P<compare>{compare_re.pattern})'
-    + r'|(?P<boolean>&&|\|\|)'
+    + r'|(?P<boolean>&&(?![=])|\|\|(?![=]))'
     + r'|(?P<conditional>(?<!\?)\?(?![.?])|:)'
     + r'|(?P<open>[\[(])|(?P<close>[\])])|(?P<separator>[;{}])'
 )
@@ -444,6 +448,14 @@ def comparison_operands(statement: str) -> Iterable[tuple[int, str, str]]:
                 break
         left = statement[start:comparison.start()]
         right = statement[comparison.end():end]
+        # Equality binds more tightly than assignment. A leading simple
+        # destination is not a compared value: `token = typeof value ===
+        # "string"` compares only the type. Peel only proven identifier/member
+        # assignment prefixes, including chains. Never search inside an
+        # operand: nested assignments and regex text such as /x=y/ must remain
+        # intact. Complex destinations stay conservative rather than guessed.
+        while assignment := assignment_prefix_re.match(left):
+            left = left[assignment.end():]
         if left.strip() and right.strip():
             yield comparison.start(), left, right
 

@@ -405,14 +405,23 @@ LIFE_LOCATION = re.compile(r"(.+):([0-9]+)", re.DOTALL)
 if run_life:
     raw = ""
     if life_raw_path and os.path.isfile(life_raw_path):
-        with open(life_raw_path, encoding="utf-8", errors="replace") as fh:
+        with open(life_raw_path, encoding="utf-8", errors="replace", newline="") as fh:
             raw = fh.read()
     rows = []
-    for line in raw.splitlines():
-        # Split from the right: a file name may contain a tab; kind and message cannot.
-        parts = line.rsplit("\t", 2)
-        if len(parts) >= 1 and parts[0].strip():
+    name_start = ""
+    for line in raw.split("\n"):
+        # A row is "<name>:<line>\t<kind>\t<message>". Kind and message hold only
+        # fixed text and Go identifiers, so split from the right: the name may
+        # contain a tab, and a line that is not a whole row starts a name with a
+        # newline in it.
+        parts = (name_start + line).rsplit("\t", 2)
+        if len(parts) == 3 and LIFE_LOCATION.fullmatch(parts[0]):
             rows.append(parts)
+            name_start = ""
+        else:
+            name_start += line + "\n"
+    if name_start.strip():
+        rows.append(name_start.rstrip("\n").rsplit("\t", 2))
     new_records = []
     if rows:
         scan_paths = lifecycle_scan_paths(list_path, project_dir)

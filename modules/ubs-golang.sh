@@ -409,7 +409,8 @@ if run_life:
             raw = fh.read()
     rows = []
     for line in raw.splitlines():
-        parts = line.split("\t")
+        # Split from the right: a file name may contain a tab; kind and message cannot.
+        parts = line.rsplit("\t", 2)
         if len(parts) >= 1 and parts[0].strip():
             rows.append(parts)
     new_records = []

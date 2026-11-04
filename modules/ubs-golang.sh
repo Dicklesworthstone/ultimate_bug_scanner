@@ -422,6 +422,10 @@ if run_life:
                 name, source_line = match.group(1), int(match.group(2))
                 source_path = scan_paths.get(name) or os.path.normpath(
                     os.path.join(os.path.abspath(project_dir), name))
+                if name == ".":
+                    # A single-file target is "." relative to itself, which
+                    # tells a reader nothing: show the file's name instead.
+                    location = parts[0] = f"{os.path.basename(source_path)}:{source_line}"
             else:
                 # Not the helper's format: keep the token rather than guess.
                 source_path, source_line = location, 0

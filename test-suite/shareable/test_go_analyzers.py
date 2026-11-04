@@ -639,6 +639,21 @@ class LifecycleLocations(unittest.TestCase):
         self.assertEqual(leaks, self.json_sites(report, "go.error-handling.blank-discards"))
         self.assertEqual({line for _, line in leaks}, {7})
 
+    def test_single_file_message_and_text_name_the_file_not_the_root(self) -> None:
+        # The helper names a single-file target "." (relative to itself). That
+        # token must not reach the finding's message or the text report.
+        target = self.root / self.NAMES[0]
+        report = self.scan(target, "json")
+        messages = [f["message"] for f in report["findings"] if f["rule_id"] == "go.lifecycle.file_handle"]
+        self.assertEqual(len(messages), 1)
+        self.assertIn(f"[{self.NAMES[0]}:7]", messages[0])
+        text = subprocess.run(
+            [str(REPO / "ubs"), "--ci", "--no-config", "--only=golang", "--format=text", str(target)],
+            cwd=self.tmp.name, env=self.env, capture_output=True, text=True, timeout=180)
+        self.assertIn(text.returncode, (0, 1), text.stderr + text.stdout)
+        self.assertIn(f"{self.NAMES[0]}:7", text.stdout)
+        self.assertNotIn(".:7", text.stdout)
+
     def test_sarif_locations_match_the_ordinary_go_findings(self) -> None:
         report = self.scan(self.root, "sarif")
         sites = {}

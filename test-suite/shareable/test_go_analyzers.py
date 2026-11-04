@@ -594,7 +594,9 @@ class LifecycleLocations(unittest.TestCase):
     marks the same line through the ordinary path handling.
     """
     LEAK = 'package main\n\nimport "os"\n\nfunc leak{n}() {{\n\n\tfh, _ := os.Open("in")\n\t_ = fh\n}}\n'
-    NAMES = ("plain.go", "dir with space/spaced.go") + (("odd:name.go", "odd\tname.go") if os.name != "nt" else ())
+    NAMES = ("plain.go", "dir with space/spaced.go") + (
+        ("odd:name.go", "odd\tname.go", "odd\nname.go", "odd\rname.go", "odd name.go")
+        if os.name != "nt" else ())
 
     def setUp(self) -> None:
         artifacts = REPO / "test-suite/artifacts/go-analyzers"

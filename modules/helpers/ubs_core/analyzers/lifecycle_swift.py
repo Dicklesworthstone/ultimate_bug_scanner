@@ -24,7 +24,10 @@ from ubs_core.analyzers.taint_swift_traversal import (
 SKIP_DIRS = {".git", ".hg", ".svn", "build", "DerivedData", ".swiftpm", ".idea", "node_modules"}
 
 IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
-ACQUISITION_NAMES = {'scheduledTimer', 'publish', 'dataTask', 'uploadTask', 'downloadTask',
+# A publisher alone acquires no subscription. The sink token below activates
+# analysis when a subscription is actually acquired; unrelated publish methods
+# must not introduce a Foundation resource obligation.
+ACQUISITION_NAMES = {'scheduledTimer', 'dataTask', 'uploadTask', 'downloadTask',
                      'addObserver', 'sink', 'makeTimerSource', 'makeFileSystemObjectSource',
                      'makeReadSource', 'makeWriteSource', 'CADisplayLink'}
 

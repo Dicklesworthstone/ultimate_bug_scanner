@@ -684,6 +684,22 @@ class SwiftLifecycleBindings(LoggedCase):
     of a local variable or on an unrelated cleanup call elsewhere in a file.
     """
 
+    def test_publish_without_subscription_has_no_resource_obligation(self):
+        from ubs_core.analyzers.lifecycle_swift import scan_text
+        source = ('func update() { switch value {\n'
+                  'case let .publicKey(id): control.publish(panes: id)\n'
+                  'default: break\n} }')
+        self.assertEqual(scan_text(self.artifact / 'publish.swift', source, self.artifact), [])
+        for cleanup, count in (('', 1), ('subscription.cancel()', 0)):
+            subscribed = ('func start() {\n'
+                          'let subscription = Timer.publish(every: 1, on: .main, in: .common)'
+                          '.autoconnect().sink(receiveValue: consume)\n'
+                          + cleanup + '\n}')
+            with self.subTest(cleanup=cleanup):
+                findings = scan_text(self.artifact / 'subscribed.swift', subscribed, self.artifact)
+                self.assertEqual(len(findings), count, findings)
+                self.assertTrue(all(item[0] == 'combine_sink' for item in findings), findings)
+
     def test_switch_cleanup_paths_keep_resource_identity(self):
         from ubs_core.analyzers.lifecycle_swift import scan_text
         cases = (

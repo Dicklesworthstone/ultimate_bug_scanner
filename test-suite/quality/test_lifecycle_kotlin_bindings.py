@@ -5,6 +5,10 @@ https://kotlinlang.org/api/core/kotlin-stdlib/kotlin.io/use.html
 https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/io/Closeable.html
 https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/io/FileInputStream.html
 https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/nio/file/Files.html
+https://kotlinlang.org/api/core/kotlin-stdlib/kotlin.io/buffered.html
+https://kotlinlang.org/api/core/kotlin-stdlib/kotlin.io/reader.html
+https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/io/BufferedReader.html
+https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/io/InputStreamReader.html
 
 Kotlin use closes its receiver on normal and exceptional exits, and returns the
 block's result. Returning that receiver therefore exports a closed resource.
@@ -582,7 +586,246 @@ CASES = (
         }
         '''),
 )
-BY_NAME = {case.name: case for case in CASES}
+# Wrapping a stream preserves the backing resource's obligation. Closing the
+# wrapper closes that resource; returning a wrapper transfers it. Construction
+# can fail before use starts: invalid buffer sizes and unsupported charset names
+# must leave the original handle open unless an outer use/finally closes it.
+WRAPPER_CASES = (
+    Case("buffered_input_use", '''
+        import java.io.FileInputStream
+        fun f(): Int = FileInputStream("input.bin").buffered().use { it.read() }
+        '''),
+    Case("buffered_output_use", '''
+        import java.io.FileOutputStream
+        fun f() { FileOutputStream("output.bin").buffered().use { it.write(1) } }
+        '''),
+    Case("buffered_reader_use", '''
+        import java.io.FileReader
+        fun f(): String? = FileReader("input.txt").buffered().use { it.readLine() }
+        '''),
+    Case("buffered_writer_use", '''
+        import java.io.FileWriter
+        fun f() { FileWriter("output.txt").buffered().use { it.write("value") } }
+        '''),
+    Case("reader_buffer_chain", '''
+        import java.io.FileInputStream
+        fun f(): String? = FileInputStream("input.txt").reader().buffered().use { it.readLine() }
+        '''),
+    Case("buffered_reader_extension", '''
+        import java.io.FileInputStream
+        fun f(): String? = FileInputStream("input.txt").bufferedReader().use { it.readLine() }
+        '''),
+    Case("writer_buffer_chain", '''
+        import java.io.FileOutputStream
+        fun f() { FileOutputStream("output.txt").writer().buffered().use { it.write("value") } }
+        '''),
+    Case("buffered_writer_extension", '''
+        import java.io.FileOutputStream
+        fun f() { FileOutputStream("output.txt").bufferedWriter().use { it.write("value") } }
+        '''),
+    Case("wrapper_constructor_import_alias", '''
+        import java.io.FileInputStream
+        import java.io.BufferedInputStream as Buffer
+        fun f(): Int = Buffer(FileInputStream("input.bin")).use { it.read() }
+        '''),
+    Case("reader_constructor_chain", '''
+        import java.io.FileInputStream
+        import java.io.InputStreamReader
+        import java.io.BufferedReader
+        fun f(): String? = BufferedReader(InputStreamReader(FileInputStream("input.txt"))).use { it.readLine() }
+        '''),
+    Case("writer_constructor_chain", '''
+        import java.io.FileOutputStream
+        import java.io.OutputStreamWriter
+        import java.io.BufferedWriter
+        fun f() {
+            BufferedWriter(OutputStreamWriter(FileOutputStream("output.txt"))).use { it.write("value") }
+        }
+        '''),
+    Case("buffered_resource_leaks_at_acquisition", '''
+        import java.io.FileInputStream
+        fun f() {
+            val raw = FileInputStream("input.bin") // expect:unclosed
+            val buffered = raw.buffered()
+        }
+        '''),
+    Case("wrapper_close_invalidates_raw_alias", '''
+        import java.io.FileInputStream
+        fun f(): Int {
+            val raw = FileInputStream("input.bin")
+            val buffered = raw.buffered()
+            buffered.close()
+            return raw.read() // expect:closed
+        }
+        '''),
+    Case("raw_close_invalidates_wrapper", '''
+        import java.io.FileInputStream
+        fun f(): Int {
+            val raw = FileInputStream("input.bin")
+            val buffered = raw.buffered()
+            raw.close()
+            return buffered.read() // expect:closed
+        }
+        '''),
+    Case("noncallable_local_does_not_shadow_extension", '''
+        import java.io.FileInputStream
+        fun f(): Int {
+            val raw = FileInputStream("input.bin")
+            val buffered = raw.buffered()
+            val another = raw.buffered()
+            another.close()
+            return buffered.read() // expect:closed
+        }
+        '''),
+    Case("wrapper_escape_from_use", '''
+        import java.io.FileInputStream
+        import java.io.BufferedInputStream
+        fun f(): BufferedInputStream = FileInputStream("input.bin").use {
+            it.buffered() // expect:escape
+        }
+        '''),
+    Case("returned_wrapper_transfers_backing_resource", '''
+        import java.io.FileInputStream
+        import java.io.BufferedInputStream
+        fun f(): BufferedInputStream {
+            val raw = FileInputStream("input.bin")
+            return BufferedInputStream(raw)
+        }
+        '''),
+    Case("helper_returns_wrapper_identity", '''
+        import java.io.FileInputStream
+        import java.io.InputStream
+        import java.io.BufferedInputStream
+        fun buffer(raw: InputStream): BufferedInputStream = BufferedInputStream(raw)
+        fun f(): Int = buffer(FileInputStream("input.bin")).use { it.read() }
+        '''),
+    Case("selected_buffered_extension_body_wins", '''
+        import java.io.FileInputStream
+        fun FileInputStream.buffered(): FileInputStream {
+            this.close()
+            return this
+        }
+        fun f(): Int {
+            val raw = FileInputStream("input.bin")
+            val copy = raw.buffered()
+            return copy.read() // expect:closed
+        }
+        '''),
+    Case("dynamic_buffer_size_failure_leaks", '''
+        import java.io.FileInputStream
+        fun f(size: Int) {
+            val raw = FileInputStream("input.bin") // expect:unclosed
+            raw.buffered(size).close()
+        }
+        '''),
+    Case("dynamic_buffer_size_outer_use", '''
+        import java.io.FileInputStream
+        fun f(size: Int) {
+            FileInputStream("input.bin").use { raw -> raw.buffered(size).use { it.read() } }
+        }
+        '''),
+    Case("invalid_buffer_size_never_enters_use", '''
+        import java.io.FileInputStream
+        fun f() {
+            val raw = FileInputStream("input.bin") // expect:unclosed
+            raw.buffered(0).use { raw.close() }
+        }
+        '''),
+    Case("invalid_buffer_size_catch_closes", '''
+        import java.io.FileInputStream
+        fun f() {
+            val raw = FileInputStream("input.bin")
+            try { raw.buffered(0) }
+            catch (problem: IllegalArgumentException) { raw.close() }
+        }
+        '''),
+    Case("negative_buffer_size_catch_closes", '''
+        import java.io.FileInputStream
+        import java.io.BufferedInputStream
+        fun f() {
+            val raw = FileInputStream("input.bin")
+            try { BufferedInputStream(raw, -1) }
+            catch (problem: IllegalArgumentException) { raw.close() }
+        }
+        '''),
+    Case("positive_buffer_size_use", '''
+        import java.io.FileInputStream
+        fun f(): Int = FileInputStream("input.bin").buffered(bufferSize = 4096).use { it.read() }
+        '''),
+    Case("already_buffered_does_not_reallocate", '''
+        import java.io.FileInputStream
+        fun f(): Int = FileInputStream("input.bin").buffered().buffered(0).use { it.read() }
+        '''),
+    Case("unsupported_charset_constructor_leaks", '''
+        import java.io.FileInputStream
+        import java.io.InputStreamReader
+        fun f(charsetName: String) {
+            val raw = FileInputStream("input.txt") // expect:unclosed
+            InputStreamReader(raw, charsetName).use { it.read() }
+        }
+        '''),
+    Case("charset_constructor_outer_use", '''
+        import java.io.FileInputStream
+        import java.io.InputStreamReader
+        fun f(charsetName: String) {
+            FileInputStream("input.txt").use { raw -> InputStreamReader(raw, charsetName).use { it.read() } }
+        }
+        '''),
+    Case("charset_constructor_failure_catch", '''
+        import java.io.FileInputStream
+        import java.io.InputStreamReader
+        import java.io.UnsupportedEncodingException
+        fun f(charsetName: String) {
+            val raw = FileInputStream("input.txt")
+            try { InputStreamReader(raw, charsetName).close() }
+            catch (problem: UnsupportedEncodingException) { raw.close() }
+        }
+        '''),
+    Case("standard_charset_reader_use", '''
+        import java.io.FileInputStream
+        fun f(): Int = FileInputStream("input.txt").reader(Charsets.UTF_8).use { it.read() }
+        '''),
+    Case("standard_charset_literal_constructor", '''
+        import java.io.FileInputStream
+        import java.io.InputStreamReader
+        fun f(): Int = InputStreamReader(FileInputStream("input.txt"), "UTF-8").use { it.read() }
+        '''),
+    Case("standard_charset_import_alias", '''
+        import java.io.FileOutputStream
+        import java.io.OutputStreamWriter
+        import java.nio.charset.StandardCharsets as Encoding
+        fun f() { OutputStreamWriter(FileOutputStream("output.txt"), Encoding.UTF_8).use { it.write("value") } }
+        '''),
+    Case("buffered_extension_import_alias", '''
+        import java.io.FileInputStream
+        import kotlin.io.buffered as wrap
+        fun f(): Int = FileInputStream("input.bin").wrap().use { it.read() }
+        '''),
+    Case("wrapper_wildcard_constructor_import", '''
+        import java.io.*
+        fun f(): Int = BufferedInputStream(FileInputStream("input.bin")).use { it.read() }
+        '''),
+    Case("in_memory_wrapper_has_no_file_obligation", '''
+        import java.io.BufferedReader
+        import java.io.StringReader
+        class Example { val text = BufferedReader(StringReader("value")) }
+        fun f(): String? = BufferedReader(StringReader("value")).readLine()
+        '''),
+    Case("unrelated_wrapper_does_not_close_selected_resource", '''
+        import java.io.FileInputStream
+        fun f() {
+            val raw = FileInputStream("first.bin") // expect:unclosed
+            FileInputStream("second.bin").use { other -> other.buffered().close() }
+        }
+        '''),
+    Case("wrapper_lexical_decoys", '''
+        fun f(): String {
+            // FileInputStream("unused").buffered().read()
+            return "BufferedReader(FileReader(input)).close()"
+        }
+        '''),
+)
+BY_NAME = {case.name: case for case in (*CASES, *WRAPPER_CASES)}
 
 UNSUPPORTED_CASES = (
     Case("unknown_resource_argument", '''
@@ -605,6 +848,33 @@ UNSUPPORTED_CASES = (
             val stream = FileInputStream("input.bin")
             handles["selected"] = stream
         }
+        '''),
+    Case("external_buffered_extension_is_not_stdlib", '''
+        import java.io.FileInputStream
+        import application.buffered
+        fun f() {
+            val raw = FileInputStream("input.bin")
+            raw.buffered().use { it.read() }
+        }
+        '''),
+    Case("callable_buffered_binding_is_not_stdlib", '''
+        import java.io.FileInputStream
+        fun f() {
+            val buffered: FileInputStream.() -> FileInputStream = { this }
+            val raw = FileInputStream("input.bin")
+            raw.buffered().use { it.read() }
+        }
+        '''),
+    Case("socket_stream_ownership_remains_incomplete", '''
+        import java.net.Socket
+        fun f() {
+            Socket("localhost", 8080).use { socket -> socket.getInputStream().use { it.read() } }
+        }
+        '''),
+    Case("compression_wrapper_remains_incomplete", '''
+        import java.io.FileInputStream
+        import java.util.zip.GZIPInputStream
+        fun f() { GZIPInputStream(FileInputStream("input.gz")).use { it.read() } }
         '''),
 )
 MALFORMED = Case("malformed_resource_body", '''
@@ -642,8 +912,8 @@ class LoggedResourceCase(native.LoggedKotlinCase):
 
 
 class KotlinResourceAnalyzerTests(LoggedResourceCase):
-    def test_selected_resource_bindings_and_exit_paths(self):
-        for case in CASES:
+    def check_cases(self, cases):
+        for case in cases:
             with self.subTest(case=case.name):
                 directory, source = self.fixture(case)
                 sink, stdout, stderr = io.StringIO(), io.StringIO(), io.StringIO()
@@ -668,6 +938,12 @@ class KotlinResourceAnalyzerTests(LoggedResourceCase):
                         "elapsed": time.monotonic() - started, "error": error, "findings": records,
                     }, indent=2) + "\n", encoding="utf-8")
                     print(f"[{case.name}] {status} ({time.monotonic() - started:.3f}s)", flush=True)
+
+    def test_selected_resource_bindings_and_exit_paths(self):
+        self.check_cases(CASES)
+
+    def test_stream_wrapper_identity_and_construction_failures(self):
+        self.check_cases(WRAPPER_CASES)
 
     def test_selected_unknown_shapes_and_budgets_are_incomplete(self):
         cases = [(case, {}) for case in (*UNSUPPORTED_CASES, MALFORMED)]
@@ -724,6 +1000,47 @@ PUBLIC_SAFE = Case("public_managed", '''
     fun managed(): Int = FileInputStream("input.bin").use { it.read() }
     fun transferred(): FileInputStream = FileInputStream("input.bin")
     ''')
+PUBLIC_WRAPPERS_UNSAFE = Case("public_wrapper_obligations", '''
+    import java.io.FileInputStream
+    import java.io.BufferedInputStream
+    import java.io.InputStreamReader
+    fun leaked() {
+        val raw = FileInputStream("input.bin") // expect:unclosed
+        val wrapped = raw.buffered()
+    }
+    fun closed(): Int {
+        val raw = FileInputStream("input.bin")
+        raw.buffered().close()
+        return raw.read() // expect:closed
+    }
+    fun escaped(): BufferedInputStream = FileInputStream("input.bin").use {
+        it.buffered() // expect:escape
+    }
+    fun invalidSize(size: Int) {
+        val raw = FileInputStream("input.bin") // expect:unclosed
+        raw.buffered(size).close()
+    }
+    fun charsetFailure(charsetName: String) {
+        val raw = FileInputStream("input.txt") // expect:unclosed
+        InputStreamReader(raw, charsetName).use { it.read() }
+    }
+    ''')
+PUBLIC_WRAPPERS_SAFE = Case("public_wrapper_managed", '''
+    import java.io.FileInputStream
+    import java.io.FileOutputStream
+    import java.io.BufferedInputStream
+    import java.io.InputStreamReader
+    import java.nio.charset.StandardCharsets
+    fun read(): Int = FileInputStream("input.txt").bufferedReader().use { it.read() }
+    fun write() { FileOutputStream("output.txt").writer(StandardCharsets.UTF_8).buffered().use { it.write("value") } }
+    fun transferred(): BufferedInputStream = FileInputStream("input.bin").buffered()
+    fun cleanup(size: Int) {
+        FileInputStream("input.bin").use { raw -> raw.buffered(size).use { it.read() } }
+    }
+    fun charsetCleanup(charsetName: String) {
+        FileInputStream("input.txt").use { raw -> InputStreamReader(raw, charsetName).use { it.read() } }
+    }
+    ''')
 
 
 @unittest.skipUnless(os.environ.get("UBS_KOTLIN_RESOURCE_E2E") == "1", "set UBS_KOTLIN_RESOURCE_E2E=1 for actual resource CLI scans")
@@ -743,7 +1060,7 @@ class KotlinResourceCliTests(LoggedResourceCase):
         self.assertEqual(sorted(actual), case.expected, payload)
 
     def test_public_json_sarif_and_exact_totals(self):
-        for case in (PUBLIC_UNSAFE, PUBLIC_SAFE):
+        for case in (PUBLIC_UNSAFE, PUBLIC_SAFE, PUBLIC_WRAPPERS_UNSAFE, PUBLIC_WRAPPERS_SAFE):
             for meta in (False, True):
                 for fmt in ("json", "sarif"):
                     with self.subTest(case=case.name, meta=meta, format=fmt):

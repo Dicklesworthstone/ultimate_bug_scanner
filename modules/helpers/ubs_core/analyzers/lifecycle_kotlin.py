@@ -4,6 +4,8 @@ Known file/socket constructors and Files factories create obligations. Kotlin
 use closes its selected receiver on every exit; aliases, reassignment, local
 helpers, returns and finally retain the original obligation. IO operations may
 throw before a later close. Java Closeable's repeated close is valid.
+Selected buffering and character-conversion wrappers retain their backing
+resource identity, including aliases, ownership transfer and construction failure.
 
 The shared Kotlin lexical frontend and JVM statement parser bound the work.
 Unknown selected callbacks/heap effects and unsupported control flow are explicit
@@ -43,11 +45,38 @@ FILE_EXTENSIONS = {
     "writer": "java.io.Writer", "bufferedWriter": "java.io.BufferedWriter",
     "printWriter": "java.io.PrintWriter",
 }
+STREAM_TYPES = {
+    "input": frozenset("java.io." + name for name in
+                       ("InputStream", "FileInputStream", "BufferedInputStream")),
+    "output": frozenset("java.io." + name for name in
+                        ("OutputStream", "FileOutputStream", "BufferedOutputStream")),
+    "reader": frozenset("java.io." + name for name in
+                        ("Reader", "FileReader", "InputStreamReader", "BufferedReader")),
+    "writer": frozenset("java.io." + name for name in
+                        ("Writer", "FileWriter", "OutputStreamWriter", "BufferedWriter", "PrintWriter")),
+}
+WRAPPERS = {
+    "java.io.BufferedInputStream": ("input", "size"),
+    "java.io.BufferedOutputStream": ("output", "size"),
+    "java.io.BufferedReader": ("reader", "size"),
+    "java.io.BufferedWriter": ("writer", "size"),
+    "java.io.InputStreamReader": ("input", "charset"),
+    "java.io.OutputStreamWriter": ("output", "charset"),
+}
+STREAM_EXTENSIONS = {
+    "buffered": {"input": "java.io.BufferedInputStream", "output": "java.io.BufferedOutputStream",
+                 "reader": "java.io.BufferedReader", "writer": "java.io.BufferedWriter"},
+    "reader": {"input": "java.io.InputStreamReader"},
+    "bufferedReader": {"input": "java.io.BufferedReader"},
+    "writer": {"output": "java.io.OutputStreamWriter"},
+    "bufferedWriter": {"output": "java.io.BufferedWriter"},
+}
+STANDARD_CHARSETS = frozenset({"US-ASCII", "ISO-8859-1", "UTF-8", "UTF-16", "UTF-16BE", "UTF-16LE"})
 IO_OPERATIONS = frozenset({
     "read", "readBytes", "readText", "readLine", "readLines", "readAllBytes", "readNBytes",
     "readFully", "readByte", "readInt", "readLong", "readUTF", "skip", "skipBytes", "available",
     "write", "writeBytes", "writeText", "writeByte", "writeInt", "writeLong", "writeUTF",
-    "append", "flush", "seek", "setLength", "length", "getFD", "getChannel", "reset", "mark",
+    "append", "flush", "newLine", "ready", "seek", "setLength", "length", "getFD", "getChannel", "reset", "mark",
     "connect", "bind", "accept", "getInputStream", "getOutputStream", "sendUrgentData",
     "shutdownInput", "shutdownOutput", "count", "forEach", "toArray", "collect", "reduce",
     "findFirst", "findAny", "anyMatch", "allMatch", "noneMatch", "min", "max", "iterator",
@@ -81,6 +110,7 @@ class Value:
     escapes: tuple[tuple[ResourceId, int], ...] = ()
     captured: tuple[tuple[int, Value], ...] = ()
     implicit: tuple[tuple[int, int, Value], ...] = ()
+    literal: str | None = None
 
 
 UNKNOWN, UNIT = Value(), Value(constant="Unit")
@@ -134,6 +164,7 @@ class Ownership:
         self.parser.definitions = {self.offset(function.declaration): function for function in functions}
         self.functions = {fn.name: fn for fn in self.model.functions}
         self.active_calls: list[int] = []
+        self.initializers: list[int] = []
         self.resources: dict[ResourceId, tuple[str, int]] = {}
         self.findings: dict[tuple[str, int], str] = {}
 
@@ -143,36 +174,60 @@ class Ownership:
     def offset(self, token: int) -> int:
         return self.positions[token] if token < len(self.positions) else len(self.code)
 
-    def key(self, name: str, token: int) -> int | None:
+    def binding(self, name: str, token: int):
         binding = self.model.binding(name, token)
+        if binding is not None and binding.declaration in self.initializers:
+            # A local declaration is not a callable/binding in its own
+            # initializer: val buffered = raw.buffered() still calls stdlib.
+            candidates = [item for item in self.model.bindings.get(name, ())
+                          if item.low <= token < item.high and item.declaration not in self.initializers]
+            binding = max(candidates, key=lambda item: (item.low, item.declaration), default=None)
+        return binding
+
+    def key(self, name: str, token: int) -> int | None:
+        binding = self.binding(name, token)
         return binding.declaration if binding is not None else None
 
     def canonical(self, name: str, token: int) -> str:
         parts = name.split(".")
-        if self.model.binding(parts[0], token) is not None:
+        if self.binding(parts[0], token) is not None:
             return ""
         if parts[0] in self.model.imports:
             return ".".join([self.model.imports[parts[0]], *parts[1:]])
         if parts[0] in {"java", "kotlin"} and len(parts) > 1:
             return name
-        known = CONSTRUCTORS | {"java.io.File", "java.nio.file.Files", "java.nio.file.Path",
-                                "java.nio.file.Paths", "java.io.IOException", "java.io.Closeable"}
+        known = CONSTRUCTORS | WRAPPERS.keys() | set().union(*STREAM_TYPES.values()) | {
+            "java.io.File", "java.nio.file.Files", "java.nio.file.Path", "java.nio.file.Paths",
+            "java.io.IOException", "java.io.UnsupportedEncodingException", "java.io.Closeable",
+            "java.nio.charset.Charset", "java.nio.charset.CharsetDecoder", "java.nio.charset.CharsetEncoder",
+            "java.nio.charset.StandardCharsets", "kotlin.text.Charsets", "java.lang.String",
+        }
         matches = [package + "." + name for package in self.model.wildcards
                    if package + "." + parts[0] in known]
         if len(matches) == 1:
             return matches[0]
-        if name in {"Exception", "Throwable", "RuntimeException", "IllegalStateException",
+        if name in {"Exception", "Throwable", "RuntimeException", "IllegalStateException", "String",
                     "IllegalArgumentException", "UnsupportedOperationException", "NullPointerException"}:
             return "java.lang." + name
         return ""
 
-    def builtin(self, name: str, token: int, wanted: str) -> bool:
+    def builtin(self, name: str, token: int, wanted: str, *, state: State | None = None) -> bool:
         packages = {"use": {"kotlin.io.use", "kotlin.jdk7.use", "kotlin.use"}}
-        qualified = packages.get(wanted, {("kotlin.io." if wanted in {"print", "println"} else "kotlin.") + wanted})
+        io_name = wanted in FILE_EXTENSIONS or wanted in STREAM_EXTENSIONS or wanted in {"print", "println"}
+        qualified = packages.get(wanted, {("kotlin.io." if io_name else "kotlin.") + wanted})
         if self.canonical(name, token) in qualified:
             return True
+        binding = self.binding(name, token)
+        if binding is not None and state is not None and binding.declaration not in self.functions:
+            value = state.values.get(binding.declaration, UNKNOWN)
+            if value.callback < 0 and (value.resources or value.constant or value.literal is not None):
+                # A known noncallable local named buffered/reader is not an
+                # extension function. Unknown and callable bindings still win.
+                if self.model.imports.get(name) in qualified:
+                    return True
+                binding = None
         return (name == wanted and name not in self.model.imports
-                and self.model.binding(name, token) is None
+                and binding is None
                 and all(package.startswith(("java.", "kotlin.")) for package in self.model.wildcards))
 
     def value(self, state: State, name: str, token: int) -> Value:
@@ -186,7 +241,11 @@ class Ownership:
         if key in state.values:
             return state.values[key]
         if name.isdigit() and not self.text[self.offset(token):self.offset(token) + 1].isdigit():
-            return Value(kind="java.lang.String")
+            # The lexer replaces literals with numeric placeholders. Retain
+            # only a literal without escapes/interpolation; arbitrary source
+            # text or a variable named like a charset cannot prove its value.
+            literal = re.match(r'"([^"\\$\r\n]*)"', self.text[self.offset(token):])
+            return Value(kind="java.lang.String", literal=literal.group(1) if literal else None)
         if name in {"true", "false", "null", "Unit"} or name.isdigit():
             return Value(constant=name)
         return Value(symbol=name)
@@ -239,6 +298,58 @@ class Ownership:
         self.resources[resource] = (factory, position)
         state.life[resource] = "open"
         return self.result(state, Value(frozenset({resource}), kind=kind), position) + [failed]
+
+    def standard_charset(self, value: Value, token: int) -> bool:
+        owner, _, field = value.symbol.rpartition(".")
+        if field not in {charset.replace("-", "_") for charset in STANDARD_CHARSETS}:
+            return False
+        qualified = self.canonical(owner, token)
+        if qualified in {"java.nio.charset.StandardCharsets", "kotlin.text.Charsets"}:
+            return True
+        return (owner == "Charsets" and owner not in self.model.imports
+                and self.binding(owner, token) is None
+                and all(package.startswith(("java.", "kotlin.")) for package in self.model.wildcards))
+
+    def wrap_stream(self, state: State, backing: Value, kind: str, options: tuple[Value, ...],
+                    token: int, *, option_kind: str, reuse: bool = False,
+                    charset_extension: bool = False) -> list[State]:
+        if len(options) > 1 or any(self.references(value, state) or value.callback >= 0 for value in options):
+            raise ValueError("Unsupported Kotlin stream wrapper arguments; analysis is incomplete")
+        position = self.offset(token)
+        # The Kotlin buffered extensions return an already buffered receiver.
+        # A size argument is evaluated but cannot fail a skipped constructor.
+        if reuse and backing.kind == kind:
+            return self.result(state, backing, position)
+        wrapped = replace(backing, kind=kind, symbol="", constant="", literal=None)
+        if not options:
+            return self.result(state, wrapped, position)
+        option = options[0]
+        if option_kind == "size":
+            number = int(option.constant) if re.fullmatch(r"[+-]?\d+", option.constant) else None
+            if number is not None and 0 < number <= 2_147_483_647:
+                return self.result(state, wrapped, position)
+            failed = self.thrown(state, "java.lang.IllegalArgumentException")
+            if number is not None and number <= 0:
+                return [failed]
+        else:
+            if self.standard_charset(option, token):
+                return self.result(state, wrapped, position)
+            if not charset_extension and option.kind in {"java.lang.String", "kotlin.String"}:
+                if option.literal is not None and option.literal.upper() in STANDARD_CHARSETS:
+                    return self.result(state, wrapped, position)
+                failed = self.thrown(state, "java.io.UnsupportedEncodingException")
+            elif option.constant == "null":
+                return [self.thrown(state, "java.lang.NullPointerException")]
+            elif option.kind in {"java.nio.charset.Charset", "java.nio.charset.CharsetDecoder",
+                                 "java.nio.charset.CharsetEncoder"}:
+                # A nullable/custom charset or codec can fail before the
+                # wrapper exists; its precise exception is not locally known.
+                failed = self.thrown(state, "")
+            else:
+                raise ValueError("Unresolved Kotlin stream charset overload; analysis is incomplete")
+        # Failure precedes ownership transfer. Keep the backing obligation in
+        # this branch so outer use/finally or a matching catch must discharge it.
+        return self.result(state, wrapped, position) + [failed]
 
     def operator(self, low: int, high: int, wanted: set[str]) -> int | None:
         index = low
@@ -351,6 +462,8 @@ class Ownership:
             if self.code[finish:self.offset(high)].strip():
                 raise ValueError("Unsupported Kotlin resource expression; analysis is incomplete")
             return self.execute(statement, state)
+        if high - low == 2 and word in {"+", "-"} and self.model.value(low + 1).isdigit():
+            return self.result(state, Value(constant=word + self.model.value(low + 1)), start)
         if high - low == 3:
             prefix = self.model.value(low) == self.model.value(low + 1) and word in {"+", "-"}
             postfix = self.model.value(low + 1) == self.model.value(low + 2) and self.model.value(low + 1) in {"+", "-"}
@@ -506,6 +619,17 @@ class Ownership:
             qualified = self.canonical(name, token)
         if qualified in CONSTRUCTORS:
             return self.acquire(state, qualified, qualified, position)
+        if qualified in WRAPPERS:
+            family, option_kind = WRAPPERS[qualified]
+            if not arguments or arguments[0].kind not in STREAM_TYPES[family]:
+                if (arguments and not any(self.references(value, state) for value in arguments)
+                        and not any(value.callback >= 0 for value in arguments)
+                        and not any(status == "open" for status in state.life.values())):
+                    # Buffering an unowned/in-memory value does not acquire an
+                    # OS resource. Do not manufacture a local obligation.
+                    return self.result(state, Value(kind=qualified), position)
+                raise ValueError("Unresolved Kotlin stream wrapper receiver; analysis is incomplete")
+            return self.wrap_stream(state, arguments[0], qualified, arguments[1:], token, option_kind=option_kind)
         if qualified.startswith("java.nio.file.Files.") and qualified.rsplit(".", 1)[-1] in FILES_FACTORIES:
             return self.acquire(state, qualified, FILES_FACTORIES[qualified.rsplit(".", 1)[-1]], position)
         if qualified == "java.io.File":
@@ -519,6 +643,13 @@ class Ownership:
             return self.function(function, arguments, receiver, state)
         if receiver.kind == "java.io.File" and name in FILE_EXTENSIONS and self.builtin(name, token, name):
             return self.acquire(state, "kotlin.io." + name, FILE_EXTENSIONS[name], position)
+        for extension, families in STREAM_EXTENSIONS.items():
+            if self.builtin(name, token, extension, state=state):
+                kind = next((wrapper for family, wrapper in families.items() if receiver.kind in STREAM_TYPES[family]), None)
+                if kind is not None:
+                    return self.wrap_stream(state, receiver, kind, arguments, token,
+                                            option_kind="size" if extension == "buffered" else "charset",
+                                            reuse=extension == "buffered", charset_extension=True)
         if receiver.resources and self.builtin(name, token, "use"):
             if len(arguments) != 1 or arguments[0].callback < 0:
                 raise ValueError("Unsupported Kotlin use callback; analysis is incomplete")
@@ -688,7 +819,14 @@ class Ownership:
         assignment = re.match(r"\s*(?:(?:val|var)\s+)?([A-Za-z_]\w*)(?:\s*:\s*[^=]+)?\s*=(?!=)", expression)
         if assignment:
             key = self.key(assignment.group(1), self.token(statement.start + assignment.start(1)))
-            output = self.evaluate(statement.start + assignment.end(), statement.end, state)
+            initializing = key is not None and re.match(r"\s*(?:val|var)\b", expression)
+            if initializing:
+                self.initializers.append(key)
+            try:
+                output = self.evaluate(statement.start + assignment.end(), statement.end, state)
+            finally:
+                if initializing:
+                    self.initializers.pop()
             for branch in output:
                 if not branch.exit:
                     if key is None:
@@ -787,6 +925,7 @@ class Ownership:
             "java.lang.UnsupportedOperationException": "java.lang.RuntimeException",
             "java.io.UncheckedIOException": "java.lang.RuntimeException",
             "java.io.FileNotFoundException": "java.io.IOException",
+            "java.io.UnsupportedEncodingException": "java.io.IOException",
             "java.net.SocketException": "java.io.IOException",
             "java.io.IOException": "java.lang.Exception",
             "java.lang.RuntimeException": "java.lang.Exception",

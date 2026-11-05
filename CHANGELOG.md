@@ -10,6 +10,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Track Kotlin stream ownership through standard buffering and character
+  conversion wrappers. Closing a wrapper closes its backing resource;
+  returning a live wrapper transfers ownership, while escaping from `use`
+  retains the closed-resource finding. Model buffer-size and charset
+  construction failures so cleanup must also cover the underlying stream.
+
 - Analyze Swift response-header values with the scoped request-flow engine.
   Follow assignments, branches, helper bodies, aliases and interpolation;
   require both CR and LF protection on the actual value. Recognize bounded

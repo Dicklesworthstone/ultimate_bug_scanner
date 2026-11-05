@@ -143,6 +143,7 @@ class _BaselineJSON:
     CHUNK_SIZE = 64 * 1024
     MAX_VALUE = 16 * 1024 * 1024  # Decoded characters, not total report bytes.
     MAX_DEPTH = 128
+    COMPLETION_FIELDS = frozenset({"status", "failed_modules", "module_error", "exit_code"})
     _SPACE = re.compile(r"[ \t\r\n]*")
 
     def __init__(self, source):
@@ -244,16 +245,55 @@ class _BaselineJSON:
             selected = "counted" if channel == "*" and isinstance(item, dict) else channel
             yield selected, item if isinstance(item, dict) else {"fingerprint": fp}
 
+    def completion(self, key, *, scanner):
+        """Refuse explicit failure evidence without buffering scanner reports.
+
+        Older reports and fingerprint arrays omit completion metadata. When
+        present, however, it must prove a complete observation: an ``ok`` at
+        the root cannot override a failed scanner or a nonempty failure list.
+        """
+        scope = "scanner" if scanner else "report"
+        invalid = f"invalid baseline {scope} completion: {key}"
+        incomplete = f"baseline {scope} is incomplete: {key}"
+        if key == "failed_modules":
+            if self.peek() != "[":
+                raise ValueError(f"{invalid} must be an array")
+            self.expect("[")
+            if self.peek() != "]":
+                raise ValueError(f"{incomplete} must be empty")
+            self.expect("]")
+            return
+        value = self.value()
+        if key == "status":
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{invalid} must be a nonempty string")
+            complete = value == "ok"
+        elif key == "module_error":
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"{invalid} must be a string or null")
+            complete = not value
+        else:
+            if type(value) is not int:
+                raise ValueError(f"{invalid} must be an integer")
+            # Exit 1 is a completed scan with findings; 2, 3 and signal
+            # failures cannot supply baseline suppression credit.
+            complete = value in (0, 1)
+        if not complete:
+            raise ValueError(f"{incomplete} records a failed or incomplete scan")
+
     def report(self, *, scanner=False, extras=False):
         seen = set()
         for key in self.members():
+            completion = not extras and key in self.COMPLETION_FIELDS
             relevant = (key == "ast_findings" if extras else
-                        key == "extras" or (not scanner and key in {"findings", "scanners"}))
+                        completion or key == "extras" or (not scanner and key in {"findings", "scanners"}))
             if relevant:
                 if key in seen:
                     raise ValueError(f"duplicate baseline report field: {key}")
                 seen.add(key)
-            if extras and key == "ast_findings":
+            if completion:
+                self.completion(key, scanner=scanner)
+            elif extras and key == "ast_findings":
                 yield from self.records("report")
             elif not extras and not scanner and key == "findings":
                 yield from self.records("counted")

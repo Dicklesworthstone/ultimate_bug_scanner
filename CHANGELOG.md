@@ -10,6 +10,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Refuse incomplete, failed, or contradictory baseline reports in `--new-only`
+  scans before they can suppress current findings. Completion metadata is
+  checked at report and scanner boundaries without buffering the report;
+  legacy fingerprint arrays remain supported. Reject `--new-only` without a
+  baseline before touching output files.
+
 - Keep uncoded Cargo package-discovery errors visible as warnings when the
   native command succeeds; coded compiler errors and failed commands still
   block. Read cargo-audit's structured vulnerability and informational-warning

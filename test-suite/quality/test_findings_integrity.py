@@ -6,6 +6,8 @@ import hashlib
 import json
 import io
 import os
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -245,6 +247,67 @@ class FindingsIntegrityTests(unittest.TestCase):
                 self.baseline.write_text(json.dumps(document), encoding="utf-8")
                 self.assertEqual(load_baseline_fingerprints(self.baseline), {"a", "b"})
 
+    def test_incomplete_baseline_cannot_remove_existing_critical_findings(self) -> None:
+        known = self.capture_baseline([self.finding()], critical=1)
+        failures = [
+            {"status": "partial"}, {"status": "error"}, {"status": "timeout"},
+            {"status": "ok", "failed_modules": [{"language": "python", "status": "timeout"}]},
+            {"status": "ok", "module_error": "ANALYZER_ERROR"},
+            {"status": "ok", "exit_code": 2}, {"exit_code": 3}, {"exit_code": -9},
+        ]
+        for metadata in failures:
+            for nested in (False, True):
+                for metadata_first in (False, True):
+                    with self.subTest(metadata=metadata, scanner=nested, metadata_first=metadata_first):
+                        fields = {"scanners": [{"language": "python", **metadata}]} if nested else metadata
+                        document = ({**fields, "findings": known} if metadata_first
+                                    else {"findings": known, **fields})
+                        self.baseline.write_text(json.dumps(document), encoding="utf-8")
+                        original = self.baseline.read_bytes()
+                        self.summary(critical=1)
+                        self.assert_refused("baseline .* incomplete")
+                        self.assertEqual(self.baseline.read_bytes(), original)
+
+    def test_malformed_baseline_completion_metadata_is_not_a_success(self) -> None:
+        known = self.capture_baseline([self.finding()], critical=1)
+        malformed = {
+            "status": [None, False, 0, "", [], {}],
+            "failed_modules": [None, False, 0, "", {}],
+            "module_error": [False, 0, [], {}],
+            "exit_code": [None, False, True, "0", 0.0, [], {}],
+        }
+        for field, values in malformed.items():
+            for value in values:
+                for nested in (False, True):
+                    with self.subTest(field=field, value=value, scanner=nested):
+                        fields = {"scanners": [{field: value}]} if nested else {field: value}
+                        self.baseline.write_text(json.dumps({"findings": known, **fields}), encoding="utf-8")
+                        self.summary(critical=1)
+                        self.assert_refused("invalid baseline .* completion")
+
+    def test_complete_and_legacy_baselines_keep_their_existing_matching_semantics(self) -> None:
+        known = self.capture_baseline([self.finding()], critical=1)
+        for exit_code in (0, 1):
+            for no_error in (None, ""):
+                for nested in (False, True):
+                    with self.subTest(exit_code=exit_code, module_error=no_error, scanner=nested):
+                        complete = {"status": "ok", "failed_modules": [],
+                                    "module_error": no_error, "exit_code": exit_code}
+                        fields = {"scanners": [complete]} if nested else complete
+                        # Only report/scanner completion fields are evidence;
+                        # finding payloads and arbitrary metadata are not.
+                        document = {"findings": known, **fields,
+                                    "metadata": {"status": "partial", "failed_modules": ["decoy"]},
+                                    "extras": {"status": "error", "module_error": "decoy"}}
+                        self.baseline.write_text(json.dumps(document), encoding="utf-8")
+                        self.summary(critical=1)
+                        self.assertEqual(self.filtered()["findings"], [])
+        for document in ([known[0]["fingerprint"]], known, {"findings": known}):
+            with self.subTest(legacy=document):
+                self.baseline.write_text(json.dumps(document), encoding="utf-8")
+                self.summary(critical=1)
+                self.assertEqual(self.filtered()["totals"]["critical"], 0)
+
     def test_new_only_requires_baseline(self) -> None:
         self.summary()
         before = self.combined.read_bytes()
@@ -253,13 +316,13 @@ class FindingsIntegrityTests(unittest.TestCase):
         self.assertEqual(self.combined.read_bytes(), before)
 
     def test_baseline_filter_does_not_clear_existing_execution_failure(self) -> None:
+        # A valid earlier observation may filter known findings, but it cannot
+        # repair the execution state of the current, incomplete observation.
+        self.capture_baseline([self.finding()], critical=1)
         doc = self.summary(critical=1)
         doc.update(status="partial", exit_code=2,
                    failed_modules=[{"language": "js", "status": "timeout"}])
         self.combined.write_text(json.dumps(doc), encoding="utf-8")
-        self.sink([self.finding()])
-        merge(self.root, self.combined)
-        self.baseline.write_bytes(self.combined.read_bytes())
         filtered = self.filtered()
         self.assertEqual(filtered["totals"]["critical"], 0)
         self.assertEqual(filtered["status"], "partial")
@@ -601,6 +664,48 @@ class StreamingBaselineTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "duplicate baseline report field"):
                     load_baseline_fingerprints(self.baseline)
 
+    def test_duplicate_completion_fields_are_rejected_in_report_and_scanner(self):
+        for field, value in (("status", "ok"), ("failed_modules", []),
+                             ("module_error", None), ("exit_code", 0)):
+            for nested in (False, True):
+                for chunk_size in (1, 65536):
+                    with self.subTest(field=field, scanner=nested, chunk_size=chunk_size):
+                        member = json.dumps(field) + ":" + json.dumps(value)
+                        repeated = "{" + member + "," + member + "}"
+                        source = ('{"findings":[{"fingerprint":"known"}],"scanners":[' + repeated + "]}"
+                                  if nested else repeated)
+                        self.baseline.write_text(source, encoding="utf-8")
+                        with mock.patch.object(findings_merge._BaselineJSON, "CHUNK_SIZE", chunk_size):
+                            with self.assertRaisesRegex(ValueError, "duplicate baseline report field"):
+                                load_baseline_fingerprints(self.baseline)
+
+    def test_late_incomplete_metadata_closes_spill_and_preserves_current_report(self):
+        real_connect = findings_merge.sqlite3.connect
+        connections = []
+
+        def connect(*args, **kwargs):
+            connection = real_connect(*args, **kwargs)
+            connections.append(connection)
+            return connection
+
+        combined = self.root / "combined.json"
+        original = '{"status":"ok","scanners":[],"totals":{}}'
+        combined.write_text(original, encoding="utf-8")
+        self.baseline.write_text(
+            '{"findings":[{"fingerprint":"one"},{"fingerprint":"two"}],'
+            '"scanners":[{"status":"ok","failed_modules":[]}],"status":"partial"}',
+            encoding="utf-8",
+        )
+        with mock.patch.object(findings_merge._BaselineFilter, "MEMORY_LIMIT", 0), \
+                mock.patch.object(findings_merge._BaselineJSON, "CHUNK_SIZE", 1), \
+                mock.patch.object(findings_merge.sqlite3, "connect", side_effect=connect):
+            with self.assertRaisesRegex(ValueError, "baseline .* incomplete"):
+                merge(self.root, combined, baseline_path=self.baseline, new_only=True)
+        self.assertEqual(len(connections), 1)
+        with self.assertRaises(findings_merge.sqlite3.ProgrammingError):
+            connections[0].execute("SELECT 1")
+        self.assertEqual(combined.read_text(encoding="utf-8"), original)
+
     def test_malformed_numbers_are_not_accepted_at_a_chunk_boundary(self):
         for number in ("01", "1e", "1e+", "--2", "1.", "-", "1x"):
             with self.subTest(number=number):
@@ -780,6 +885,149 @@ class StreamingBaselineTests(unittest.TestCase):
         self.assertEqual(result["findings"][0]["message"], "diagnostic 2")
         self.assertNotEqual(result["findings"][0]["fingerprint"], captured["fingerprint"])
         print(f"[baseline-stream-memory] PASS {measured['rss']} KiB ({time.monotonic() - started:.2f}s)", flush=True)
+
+
+@unittest.skipUnless(all(shutil.which(tool) for tool in ("bash", "git", "jq", "rg")),
+                     "real baseline scans require bash, git, jq and ripgrep")
+class BaselineCompletionCLITests(unittest.TestCase):
+    """Retain real scanner inputs, commands and streams for both baseline outcomes."""
+
+    def setUp(self):
+        ARTIFACTS.mkdir(parents=True, exist_ok=True)
+        self.root = Path(tempfile.mkdtemp(prefix="baseline-completion-cli-", dir=ARTIFACTS))
+        self.source = self.root / "app.sh"
+        self.source.write_text('#!/bin/bash\nuser_command="$1"\neval "$user_command"\n', encoding="utf-8")
+        self.baseline = self.root / "baseline.json"
+        self.calls = 0
+        self.env = {key: value for key, value in os.environ.items()
+                    if not key.startswith(("UBS_", "GIT_", "XDG_", "TOON_"))
+                    and key not in {"PYTHONPATH", "JOBS", "ENABLE_UV_TOOLS"}}
+        self.env.update(
+            UBS_NO_AUTO_UPDATE="1", UBS_ENABLE_AUTO_UPDATE="0", UBS_NO_CACHE="1", UBS_KEEP_TEMP="1",
+            ENABLE_UV_TOOLS="0", PYTHONDONTWRITEBYTECODE="1", NO_COLOR="1", TMPDIR=str(self.root),
+            XDG_CONFIG_HOME=str(self.root / "settings"), XDG_CACHE_HOME=str(self.root / "cache"),
+            XDG_DATA_HOME=str(self.root / "data"),
+        )
+
+    def run_ubs(self, label, output_format="json", *args):
+        command = [str(REPO_ROOT / "ubs"), str(self.source), "--only=bash", "--ci", "--no-color",
+                   "--no-config", "--no-cache", "--ignore-file=/dev/null",
+                   f"--module-dir={REPO_ROOT / 'modules'}", f"--format={output_format}", *args]
+        self.calls += 1
+        prefix = self.root / f"{self.calls:02d}-{label}"
+        start = time.monotonic()
+        result = subprocess.run(command, cwd=self.root, env=self.env, capture_output=True, text=True, timeout=120)
+        elapsed = time.monotonic() - start
+        prefix.with_suffix(".stdout").write_text(result.stdout, encoding="utf-8")
+        prefix.with_suffix(".stderr").write_text(result.stderr, encoding="utf-8")
+        identities = {str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+                      for path in (self.source, REPO_ROOT / "ubs", REPO_ROOT / "modules/ubs-bash.sh",
+                                   REPO_ROOT / "modules/helpers/ubs_core/findings_merge.py")}
+        prefix.with_suffix(".json").write_text(json.dumps({
+            "case": self.id(), "command": command, "cwd": str(self.root),
+            "exit_code": result.returncode, "seconds": round(elapsed, 4),
+            "sha256": identities, "python": sys.version,
+            "tools": {tool: shutil.which(tool) for tool in ("bash", "git", "jq", "rg", "python3")},
+        }, indent=2) + "\n", encoding="utf-8")
+        print(f"[{self.id()}] {label}: exit={result.returncode} {elapsed:.3f}s artifacts={prefix}", flush=True)
+        return result
+
+    def assert_one_finding(self, result, line):
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        document = json.loads(result.stdout)
+        self.assertEqual(document["status"], "ok")
+        self.assertEqual(document["totals"], {"files": 1, "critical": 1, "warning": 0, "info": 0})
+        self.assertEqual([(item["rule_id"], item["file"], item["line"], item["col"], item["severity"])
+                          for item in document["findings"]],
+                         [("bash.security.eval_variable", str(self.source), line, 1, "critical")])
+        return document
+
+    def test_partial_baseline_refuses_all_public_formats_and_preserves_saved_baseline(self):
+        initial = self.run_ubs("capture", "json", f"--save-baseline={self.baseline}")
+        document = self.assert_one_finding(initial, 3)
+        document.update(status="partial", failed_modules=[{"language": "bash", "status": "timeout"}])
+        self.baseline.write_text(json.dumps(document), encoding="utf-8")
+        original = self.baseline.read_bytes()
+        for output_format in ("json", "jsonl", "sarif", "text"):
+            with self.subTest(output_format=output_format):
+                side_report = self.root / f"{output_format}-report.json"
+                result = self.run_ubs(
+                    "partial-" + output_format, output_format, f"--baseline={self.baseline}", "--new-only",
+                    f"--also=json:{side_report}", f"--save-baseline={self.baseline}",
+                )
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("baseline report is incomplete", result.stderr)
+                self.assertEqual(self.baseline.read_bytes(), original)
+                report = json.loads(side_report.read_text(encoding="utf-8"))
+                self.assertEqual(report["status"], "partial")
+                self.assertEqual(report["totals"], {"files": 1, "critical": 1, "warning": 0, "info": 0})
+                self.assertEqual(report["failed_modules"][0]["module_error"], "FINDINGS_MERGE_ERROR")
+                if output_format == "text":
+                    # Text modules retain their diagnostics in the human
+                    # stream; their parsed summary contains scalar counts.
+                    self.assertEqual(result.stdout.count("[critical] bash.security.eval_variable:"), 1)
+                    self.assertRegex(result.stdout, r"(?m)^\s+" + re.escape(str(self.source)) + r":3(?:\s|$)")
+                else:
+                    observed = report["scanners"][0]["findings"]
+                    self.assertEqual([(item["rule"], item["path"], item["line"], item["severity"])
+                                      for item in observed],
+                                     [("bash.security.eval_variable", str(self.source), 3, "critical")])
+                if output_format == "json":
+                    self.assertEqual(json.loads(result.stdout), report)
+                elif output_format == "jsonl":
+                    rows = [json.loads(line) for line in result.stdout.splitlines()]
+                    totals = [row for row in rows if row["type"] == "totals"]
+                    self.assertEqual(len(totals), 1)
+                    self.assertEqual((totals[0]["status"], totals[0]["critical"]), ("partial", 1))
+                elif output_format == "sarif":
+                    runs = json.loads(result.stdout)["runs"]
+                    self.assertTrue(runs)
+                    for run in runs:
+                        self.assertFalse(run["invocations"][0]["executionSuccessful"])
+                        self.assertEqual(run["invocations"][0]["exitCode"], 2)
+                else:
+                    self.assertIn("Status: partial", result.stdout + result.stderr)
+
+    def test_complete_and_legacy_baselines_keep_new_findings_visible(self):
+        initial = self.run_ubs("capture", "json", f"--save-baseline={self.baseline}")
+        document = self.assert_one_finding(initial, 3)
+        original = self.baseline.read_bytes()
+        for label, baseline in (("complete", self.baseline), ("legacy", self.root / "fingerprints.json")):
+            with self.subTest(label=label):
+                if label == "legacy":
+                    baseline.write_text(json.dumps([item["fingerprint"] for item in document["findings"]]),
+                                        encoding="utf-8")
+                result = self.run_ubs(label, "json", f"--baseline={baseline}", "--new-only")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                filtered = json.loads(result.stdout)
+                self.assertEqual(filtered["status"], "ok")
+                self.assertEqual(filtered["totals"], {"files": 1, "critical": 0, "warning": 0, "info": 0})
+                self.assertEqual(filtered["findings"], [])
+        with self.source.open("a", encoding="utf-8") as output:
+            output.write('eval "$user_command"\n')
+        result = self.run_ubs("new-finding", "json", f"--baseline={self.baseline}", "--new-only")
+        self.assert_one_finding(result, 4)
+        self.assertEqual(self.baseline.read_bytes(), original)
+
+    def test_new_only_requires_a_baseline_before_touching_report_destinations(self):
+        for label, selection in (("missing", []), ("empty-baseline", ["--baseline="]),
+                                 ("empty-comparison", ["--comparison="])):
+            with self.subTest(label=label):
+                destinations = [self.root / f"{label}-{name}.json"
+                                for name in ("output", "report", "baseline", "also")]
+                for destination in destinations:
+                    destination.write_text("previous report\n", encoding="utf-8")
+                result = self.run_ubs(
+                    label, "json", "--new-only", *selection,
+                    f"--output={destinations[0]}", f"--report-json={destinations[1]}",
+                    f"--save-baseline={destinations[2]}", f"--also=json:{destinations[3]}",
+                )
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("--new-only requires", result.stderr)
+                self.assertIn("--baseline", result.stderr)
+                self.assertIn("--comparison", result.stderr)
+                for destination in destinations:
+                    self.assertEqual(destination.read_text(encoding="utf-8"), "previous report\n")
 
 
 class OccurrenceExportIntegrityTests(unittest.TestCase):

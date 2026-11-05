@@ -4,6 +4,7 @@ All payloads are static-analysis fixtures; the unit tests never execute them.
 """
 from __future__ import annotations
 
+import ast
 import json
 import os
 from pathlib import Path
@@ -720,6 +721,328 @@ class WrapperArgumentVectorTests(SourceTest):
         ''')
 
 
+class IndexedArgumentVectorTests(SourceTest):
+    def assert_vector_rules(self, vector, expression, *rules):
+        fixtures = {
+            'saved': f'argv = {vector}\nsubprocess.run({expression})',
+            'list-wrapper': f'def run(argv):\n subprocess.run({expression})\nrun({vector})',
+            'variadic-wrapper': f'def run(*argv):\n subprocess.run({expression})\nrun(*{vector})',
+        }
+        for form, source in fixtures.items():
+            with self.subTest(form=form, vector=vector, expression=expression):
+                self.assert_rules(source, *rules)
+
+    def test_expanded_literal_indices_follow_runtime_positions(self):
+        for program in ('python3', 'sh'):
+            for vector in (f'[*["unused", {program!r}], "echo"]',
+                           f'(*("unused", {program!r}), "echo")'):
+                for index in (1, -2):
+                    with self.subTest(program=program, vector=vector, index=index):
+                        self.assert_rules(f'subprocess.run([{vector}[{index}], "-c", input()])', 'command')
+                for index in (2, -1):
+                    with self.subTest(program=program, vector=vector, index=index):
+                        self.assert_rules(f'subprocess.run([{vector}[{index}], "-c", input()])')
+
+    def test_starred_wrapper_indices_do_not_certify_syntactic_slots(self):
+        for program in ('python3', 'sh'):
+            for index in (1, -2):
+                with self.subTest(program=program, index=index):
+                    self.assert_rules(f'''
+                        def run(argv, code):
+                            subprocess.run([[*argv, 'echo'][{index}], '-c', code])
+                        run(['unused', {program!r}], input())
+                    ''', 'command')
+        for index in (1, -2):
+            with self.subTest(unknown_prefix=True, index=index):
+                self.assert_rules(f'subprocess.run([[*prefix, "echo"][{index}], "-c", input()])', 'command')
+
+    def test_exact_indices_preserve_executable_and_argument_facts(self):
+        for vector in ('["echo", input()]', '("echo", input())'):
+            self.assert_vector_rules(vector, '[argv[0], argv[1]]')
+            self.assert_vector_rules(vector, '[argv[0], *argv[1:]]')
+        self.assert_vector_rules('[input(), "data"]', '[argv[0], argv[1]]', 'command')
+        self.assert_rules('subprocess.run([["echo", input()][0], "data"])')
+        self.assert_rules('subprocess.run([[input(), "echo"][0], "data"])', 'command')
+
+    def test_negative_indices_select_the_matching_operand(self):
+        self.assert_vector_rules('[input(), "echo"]', '[argv[-1], "data"]')
+        self.assert_vector_rules('["echo", input()]', '[argv[-2], argv[-1]]')
+        self.assert_vector_rules('["echo", input()]', '[argv[-1], "data"]', 'command')
+
+    def test_exact_slices_preserve_positions_and_exclude_removed_taint(self):
+        for expression in ('argv[:]', 'argv[0:]', 'argv[::1]', 'argv[-2:]'):
+            self.assert_vector_rules('["echo", input()]', expression)
+            self.assert_vector_rules('[input(), "data"]', expression, 'command')
+        for vector, expression in (
+            ('[input(), "echo", "data"]', 'argv[1:]'),
+            ('["echo", "data", input()]', 'argv[:-1]'),
+            ('["echo", input(), "data"]', 'argv[::2]'),
+            ('[input(), "echo"]', 'argv[::-1]'),
+            ('["echo", input()]', 'argv[1:1]'),
+        ):
+            self.assert_vector_rules(vector, expression)
+        self.assert_vector_rules('["echo", input()]', 'argv[::-1]', 'command')
+
+    def test_selected_interpreters_keep_code_and_data_distinct(self):
+        for program, expected in (('python3', ('command',)), ('sh', ('command',)), ('echo', ())):
+            with self.subTest(program=program):
+                self.assert_vector_rules(f'[{program!r}, "-c", input()]',
+                                         '[argv[0], argv[1], argv[2]]', *expected)
+                self.assert_vector_rules(f'["ignored", {program!r}, "-c", input()]', 'argv[1:]', *expected)
+        self.assert_vector_rules('["python3", "-c", "print(1)", input()]', 'argv[:]')
+        self.assert_vector_rules('["sh", "-c", "echo safe", input()]', 'argv[:]')
+
+    def test_unknown_index_or_slice_keeps_possible_unsafe_positions(self):
+        self.assert_rules('argv = ["echo", input()]\nsubprocess.run([argv[index]])', 'command')
+        self.assert_rules('argv = ["echo", input()]\nsubprocess.run(argv[start:])', 'command')
+        self.assert_rules('argv = ["echo", input()]\nsubprocess.run(argv[::step])', 'command')
+        self.assert_rules('argv = ["echo", "python3"]\nsubprocess.run([argv[index], "-c", input()])', 'command')
+
+    def test_index_taint_does_not_create_text_outside_a_literal_whitelist(self):
+        self.assert_rules('program = ["echo", "printf"][int(input())]\nsubprocess.run([program, "data"])')
+        self.assert_rules('''
+            def run(argv, index):
+                subprocess.run([argv[index], 'data'])
+            run(['echo', 'printf'], int(input()))
+        ''')
+        self.assert_rules('''
+            def run(argv, index, code):
+                subprocess.run([argv[index], '-c', code])
+            run(['echo', 'python3'], int(input()), input())
+        ''', 'command')
+
+    def test_index_side_effects_are_visible_when_lookup_occurs(self):
+        self.assert_rules('''
+            argv = ['echo']
+            def choose():
+                argv[0] = input()
+                return 0
+            subprocess.run([argv[choose()]])
+        ''', 'command')
+        self.assert_rules('''
+            def choose(argv):
+                argv[0] = input()
+                return 0
+            def run(argv):
+                subprocess.run([argv[choose(argv)]])
+            run(['echo'])
+        ''', 'command')
+
+    def test_new_vector_snapshots_precede_index_side_effects(self):
+        self.assert_rules('''
+            argv = ['echo']
+            def choose():
+                argv[0] = input()
+                return 0
+            subprocess.run([[*argv][choose()], '-c', input()])
+        ''')
+        self.assert_rules('''
+            def choose(argv):
+                argv[0] = input()
+                return 0
+            def run(argv):
+                subprocess.run([[*argv][choose(argv)], '-c', input()])
+            run(['echo'])
+        ''', 'command')
+        # Each function body is also analyzed as a possible entry point. Its
+        # own input() can reach an interpreter selected by an unknown caller,
+        # even when the visible invocation selects echo or there is no call.
+        self.assert_rules('''
+            def choose(argv):
+                argv[0] = input()
+                return 0
+            def run(argv):
+                subprocess.run([[*argv][choose(argv)], '-c', input()])
+        ''', 'command')
+        for program, expected in (('echo', ()), ('python3', ('command',))):
+            with self.subTest(program=program):
+                self.assert_rules(f'''
+                    def choose(argv):
+                        argv[0] = input()
+                        return 0
+                    def run(argv, code):
+                        subprocess.run([[*argv][choose(argv)], '-c', code])
+                    run([{program!r}], input())
+                ''', *expected)
+
+    def test_alias_mutation_before_index_or_slice_is_not_lost(self):
+        for expression in ('[argv[0]]', 'argv[:]'):
+            with self.subTest(expression=expression):
+                self.assert_rules(f'''
+                    def run(argv):
+                        alias = argv
+                        alias[0] = input()
+                        subprocess.run({expression})
+                    run(['echo'])
+                ''', 'command')
+
+    def test_saved_string_and_slice_do_not_alias_later_outer_writes(self):
+        for saved, expression in (('argv[0]', '[saved]'), ('argv[:]', 'saved')):
+            with self.subTest(saved=saved):
+                self.assert_rules(f'''
+                    argv = ['echo', 'data']
+                    saved = {saved}
+                    alias = argv
+                    alias[0] = input()
+                    subprocess.run({expression})
+                ''')
+        self.assert_rules('''
+            argv = ['echo']
+            def change():
+                argv[0] = input()
+                return None
+            subprocess.run(argv[:], cwd=change())
+        ''')
+
+    def test_slice_copy_still_shares_mutable_elements(self):
+        for saved, expression in (('outer[0]', 'saved'), ('outer[:]', 'saved[0]')):
+            with self.subTest(saved=saved):
+                self.assert_rules(f'''
+                    outer = [['echo']]
+                    saved = {saved}
+                    outer[0][0] = input()
+                    subprocess.run({expression})
+                ''', 'command')
+
+    def test_wrapped_lookup_observes_an_independent_inner_alias(self):
+        for unrelated in ('input()', '"data"'):
+            with self.subTest(unrelated=unrelated):
+                self.assert_rules(f'''
+                    inner = ['echo']
+                    outer = [inner, {unrelated}]
+                    inner[0] = input()
+                    def run(argv):
+                        subprocess.run(argv[0])
+                    run(outer)
+                ''', 'command')
+
+    def test_returned_element_keeps_its_independent_mutable_alias(self):
+        for unrelated in ('input()', '"data"'):
+            with self.subTest(unrelated=unrelated):
+                self.assert_rules(f'''
+                    def select(argv):
+                        return argv[0]
+                    inner = ['echo']
+                    outer = [inner, {unrelated}]
+                    selected = select(outer)
+                    inner[0] = input()
+                    subprocess.run(selected)
+                ''', 'command')
+        self.assert_rules('''
+            def select(argv):
+                return argv[0]
+            outer = ['echo']
+            selected = select(outer)
+            outer[0] = input()
+            subprocess.run([selected])
+        ''')
+
+    def test_returned_slice_keeps_independent_mutable_element_aliases(self):
+        for expression in ('argv[:1]', 'argv[:]'):
+            for unrelated in ('input()', '"data"'):
+                with self.subTest(expression=expression, unrelated=unrelated):
+                    self.assert_rules(f'''
+                        def copy(argv):
+                            return {expression}
+                        inner = ['echo']
+                        outer = [inner, {unrelated}]
+                        copied = copy(outer)
+                        inner[0] = input()
+                        subprocess.run(copied[0])
+                    ''', 'command')
+            with self.subTest(expression=expression, immutable_element=True):
+                self.assert_rules(f'''
+                    def copy(argv):
+                        return {expression}
+                    outer = ['echo', 'data']
+                    copied = copy(outer)
+                    outer[0] = input()
+                    subprocess.run(copied)
+                ''')
+
+    def test_indexed_wrapper_findings_exclude_data_only_callers(self):
+        findings = self.assert_rules('''
+            def run(argv):
+                subprocess.run([argv[0], *argv[1:]])
+            run(['echo', request.args['data']])
+            run([input(), 'data'])
+        ''', 'command')
+        self.assertIn('input(', findings[0]['message'])
+        self.assertNotIn('request.args', findings[0]['message'])
+        self.assertEqual(findings[0]['line'], 2)
+
+    def test_sliced_variants_keep_program_and_payload_correlated(self):
+        self.assert_rules('''
+            def run(argv):
+                subprocess.run(argv[:])
+            argv = ['echo', '-c', input()] if flag else ['python3', '-c', 'print(1)']
+            run(argv)
+        ''')
+        self.assert_rules('''
+            def run(argv):
+                subprocess.run(argv[:])
+            argv = ['echo', '-c', 'data'] if flag else ['python3', '-c', input()]
+            run(argv)
+        ''', 'command')
+
+    def test_nested_vector_choices_do_not_capture_actual_aliases_in_contexts(self):
+        # Each literal() call has a different object reference, but all sites
+        # have the same executable alternatives. Packing their joined inner
+        # vectors must not retain those concrete aliases in a scalar shape.
+        for count in (1, 4, 16):
+            with self.subTest(call_sites=count):
+                source = ('def literal(): return "echo"\n'
+                          'def pack(value): return [value]\n'
+                          'def run(groups): subprocess.run(groups[0])\n')
+                source += ''.join(
+                    f'choice{index} = [literal()] if flag else ["printf"]\n'
+                    f'run(pack(choice{index}))\n' for index in range(count))
+                engine = taint_py._Analysis(ast.parse(source))
+                self.assertEqual(engine.analyze(), {})
+                function = next(function for function in engine.functions if function.name == 'run')
+                contexts = [key for key in engine.summaries if isinstance(key, tuple) and key[0] is function]
+                self.assertEqual(len(contexts), 1, 'Equivalent element aliases created distinct summary contexts')
+        for alternative, expected in (('printf', ()), ('python3', ('command',))):
+            with self.subTest(scalar_alternative=alternative):
+                self.assert_rules(f'''
+                    def pack(program, code): return [program, '-c', code]
+                    def run(argv): subprocess.run(argv[:])
+                    program = 'echo' if flag else {alternative!r}
+                    run(pack(program, input()))
+                ''', *expected)
+        self.assert_rules('''
+            def pack(value): return [value]
+            def run(groups): subprocess.run(groups[0])
+            inner = ['echo']
+            choice = inner if flag else ['printf']
+            groups = pack(choice)
+            inner[0] = input()
+            run(groups)
+        ''', 'command')
+
+    def test_index_projection_preserves_shell_and_raw_source_domains(self):
+        self.assert_rules('''
+            def run(argv):
+                subprocess.run(argv[0], shell=True)
+            run([shlex.quote(input()), input()])
+        ''')
+        self.assert_rules('''
+            def run(argv):
+                subprocess.run([argv[0]])
+            run([shlex.quote(input()), 'data'])
+        ''', 'command')
+        self.assert_rules('''
+            def run(argv):
+                subprocess.run(['python3', '-c', argv[0]])
+            run([shlex.quote(input()), 'data'])
+        ''', 'command')
+        self.assert_rules('''
+            def run(argv):
+                subprocess.run(argv[:], shell=True)
+            run(['echo safe', input()])
+        ''')
+
+
 class InterpreterStdinTests(SourceTest):
     def test_input_keyword_is_source_only_when_interpreter_reads_code(self):
         for args in ('["python3"]', '["python3", "-"]', '["python3", "-I", "-"]',
@@ -779,6 +1102,253 @@ class InterpreterStdinTests(SourceTest):
                 p = subprocess.Popen(['python3', '-'], stdin=subprocess.PIPE)
                 p.communicate(await req.body())
         ''', 'command')
+
+
+class ProcessStdinContractTests(SourceTest):
+    def test_constructed_programs_keep_pipe_source_contract(self):
+        for argv in ('["py" + "thon3"]', '["ba" + "sh", "-s"]'):
+            with self.subTest(argv=argv):
+                self.assert_rules(f'''
+                    import subprocess
+                    subprocess.Popen({argv}, stdin=subprocess.PIPE).communicate(input())
+                ''', 'command')
+
+    def test_constructed_process_contract_follows_handle_and_method_aliases(self):
+        for consume in ('p.communicate(input())', 'q = p\nq.communicate(input())',
+                        'send = p.communicate\nsend(input())'):
+            with self.subTest(consume=consume):
+                self.assert_rules('import subprocess\n'
+                                  'p = subprocess.Popen(["py" + "thon3"], stdin=subprocess.PIPE)\n'
+                                  + consume, 'command')
+
+    def test_program_and_override_alternatives_preserve_possible_stdin_code(self):
+        for program in ('"py" + "thon3"', '"echo" if flag else "python3"',
+                        '"echo" if flag else "py" + "thon3"'):
+            for command in ('[program]', '["ignored"], executable=program'):
+                with self.subTest(program=program, command=command):
+                    self.assert_rules(f'''
+                        import subprocess
+                        program = {program}
+                        subprocess.Popen({command}, stdin=subprocess.PIPE).communicate(input())
+                    ''', 'command')
+
+    def test_real_import_factories_preserve_process_and_pipe_identity(self):
+        factories = (
+            'import subprocess\ndef start():\n return subprocess.Popen(["python3"], stdin=subprocess.PIPE)\n',
+            'import subprocess as proc\ndef start():\n return proc.Popen(["python3"], stdin=proc.PIPE)\n',
+            'from subprocess import Popen, PIPE\ndef start():\n return Popen(["python3"], stdin=PIPE)\n',
+            'def start():\n import subprocess\n return subprocess.Popen(["python3"], stdin=subprocess.PIPE)\n',
+            'import subprocess\ndef start():\n return subprocess.Popen(["py" + "thon3"], stdin=subprocess.PIPE)\n',
+        )
+        for factory in factories:
+            with self.subTest(factory=factory):
+                self.assert_rules(factory + 'p = start()\np.communicate(input())', 'command')
+        self.assert_rules('''
+            import subprocess
+            def start(argv):
+                return subprocess.Popen(argv, stdin=subprocess.PIPE)
+            p = start(["python3"])
+            p.communicate(input())
+        ''', 'command')
+
+    def test_pipe_binding_alternatives_keep_the_known_pipe_branch(self):
+        self.assert_rules('''
+            import subprocess
+            pipe = subprocess.PIPE if flag else None
+            def start():
+                return subprocess.Popen(["python3"], stdin=pipe)
+            start().communicate(input())
+        ''', 'command')
+        self.assert_rules('''
+            import subprocess
+            pipe = subprocess.PIPE
+            def start():
+                return subprocess.Popen(["python3"], stdin=pipe)
+            start().communicate(input())
+        ''', 'command')
+
+    def test_process_contracts_cross_nested_helper_parameters(self):
+        for argv, expected in (('["python3"]', ('command',)),
+                               ('["py" + "thon3"]', ('command',)),
+                               ('["echo"]', ()),
+                               ('["python3", "-c", "print(1)"]', ())):
+            with self.subTest(argv=argv):
+                self.assert_rules(f'''
+                    import subprocess
+                    def send(proc, code):
+                        proc.communicate(code)
+                    def forward(proc, code):
+                        send(proc, code)
+                    forward(subprocess.Popen({argv}, stdin=subprocess.PIPE), input())
+                ''', *expected)
+
+    def test_process_contexts_keep_python_and_unknown_domains_strict(self):
+        for argv, expected in (('["bash", "-s"]', ()),
+                               ('["python3"]', ('command',)),
+                               ('["ba" + "sh"]', ('command',)),
+                               ('["py" + "thon3"]', ('command',))):
+            with self.subTest(argv=argv):
+                self.assert_rules(f'''
+                    import shlex
+                    import subprocess
+                    def send(proc, code):
+                        proc.communicate(code)
+                    p = subprocess.Popen({argv}, stdin=subprocess.PIPE)
+                    send(p, "echo " + shlex.quote(input()))
+                ''', *expected)
+        self.assert_rules('''
+            import shlex
+            import subprocess
+            def send(proc, code):
+                proc.communicate(code)
+            p = subprocess.Popen(["bash"] if flag else ["python3"], stdin=subprocess.PIPE)
+            send(p, "echo " + shlex.quote(input()))
+        ''', 'command')
+
+    def test_multiple_process_call_sites_do_not_share_stdin_modes(self):
+        self.assert_rules('''
+            import shlex
+            import subprocess
+            def send(proc, code):
+                proc.communicate(code)
+            send(subprocess.Popen(["echo"], stdin=subprocess.PIPE), input())
+            send(subprocess.Popen(["bash"], stdin=subprocess.PIPE), "echo " + shlex.quote(input()))
+            send(subprocess.Popen(["python3"], stdin=subprocess.PIPE), shlex.quote(input()))
+            send(subprocess.Popen(["python3", "script.py"], stdin=subprocess.PIPE), input())
+        ''', 'command')
+
+    def test_process_contracts_survive_closures_and_evaluated_defaults(self):
+        self.assert_rules('''
+            import subprocess
+            def forward(proc, code):
+                def send():
+                    proc.communicate(code)
+                send()
+            forward(subprocess.Popen(["python3"], stdin=subprocess.PIPE), input())
+        ''', 'command')
+        self.assert_rules('''
+            import subprocess
+            def send(proc=subprocess.Popen(["python3"], stdin=subprocess.PIPE)):
+                proc.communicate(input())
+            send()
+        ''', 'command')
+
+    def test_temporary_global_process_contracts_cross_helpers(self):
+        self.assert_rules('''
+            import subprocess
+            p = Other()
+            def send():
+                p.communicate(input())
+            def forward():
+                send()
+            p = subprocess.Popen(["python3"], stdin=subprocess.PIPE)
+            forward()
+            p = Other()
+            forward()
+        ''', 'command')
+        self.assert_rules('''
+            import subprocess
+            p = Other()
+            def start():
+                global p
+                p = subprocess.Popen(["python3"], stdin=subprocess.PIPE)
+                send()
+            def send():
+                p.communicate(input())
+            start()
+        ''', 'command')
+
+    def test_process_rebinding_keeps_original_aliases(self):
+        self.assert_rules('''
+            import subprocess
+            def send(proc):
+                proc.communicate(input())
+            p = subprocess.Popen(["python3"], stdin=subprocess.PIPE)
+            original = p
+            p = Other()
+            send(original)
+        ''', 'command')
+        self.assert_rules('''
+            import subprocess
+            def disable(proc):
+                proc.communicate = print
+            p = subprocess.Popen(["python3"], stdin=subprocess.PIPE)
+            send = p.communicate
+            disable(p)
+            send(input())
+        ''', 'command')
+
+    def test_process_member_writes_revoke_future_method_lookups(self):
+        for change in ('proc.communicate = print', 'del proc.communicate'):
+            with self.subTest(change=change):
+                self.assert_rules(f'''
+                    import subprocess
+                    def disable(proc):
+                        {change}
+                    p = subprocess.Popen(["python3"], stdin=subprocess.PIPE)
+                    alias = p
+                    disable(alias)
+                    p.communicate(input())
+                ''')
+        self.assert_rules('''
+            import subprocess
+            p = subprocess.Popen(["python3"], stdin=subprocess.PIPE)
+            def send():
+                p.communicate(input())
+            def forward():
+                send()
+            p = Other()
+            forward()
+        ''')
+
+    def test_unknown_calls_do_not_prove_process_stdin_safe(self):
+        self.assert_rules('''
+            import subprocess
+            def inspect(proc):
+                external(proc)
+            p = subprocess.Popen(["python3"], stdin=subprocess.PIPE)
+            inspect(p)
+            p.communicate(input())
+        ''', 'command')
+
+    def test_async_process_contracts_use_real_imports_and_known_modes(self):
+        for program, args, expected in (('"python3"', '', ('command',)),
+                                        ('"py" + "thon3"', '', ('command',)),
+                                        ('"echo"', '', ()),
+                                        ('"python3"', ', "-c", "print(1)"', ())):
+            with self.subTest(program=program, args=args):
+                self.assert_rules(f'''
+                    import asyncio
+                    import subprocess
+                    async def run():
+                        p = await asyncio.create_subprocess_exec({program}{args}, stdin=subprocess.PIPE)
+                        await p.communicate(input())
+                ''', *expected)
+
+    def test_known_data_modes_and_nonprocess_objects_remain_clean(self):
+        for argv in ('["echo"]', '["python3", "script.py"]', '["python3", "-m", "module"]',
+                     '["python3", "-c", "print(1)"]', '["bash", "-c", "cat"]'):
+            with self.subTest(argv=argv):
+                self.assert_rules(f'''
+                    import subprocess
+                    def start():
+                        return subprocess.Popen({argv}, stdin=subprocess.PIPE)
+                    start().communicate(input())
+                ''')
+        for options in ('', ', stdin=subprocess.DEVNULL', ', shell=True, stdin=subprocess.PIPE'):
+            with self.subTest(options=options):
+                self.assert_rules('import subprocess\n'
+                                  f'p = subprocess.Popen(["py" + "thon3"]{options})\n'
+                                  'p.communicate(input())')
+        self.assert_rules('def send(proc):\n proc.communicate(input())\nsend(Other())')
+        self.assert_rules('''
+            import subprocess
+            from subprocess import PIPE
+            PIPE = None
+            def start():
+                return subprocess.Popen(["python3"], stdin=PIPE)
+            start().communicate(input())
+        ''')
 
 
 @unittest.skipUnless(os.environ.get('UBS_TAINT_E2E') == '1', 'Set UBS_TAINT_E2E=1 for real CLI scans')

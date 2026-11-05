@@ -1627,10 +1627,23 @@ retain a finite positional prefix and conservatively combine the remaining
 suffix; mutation or an opaque operation revokes the known shape. This keeps
 uncertain data tainted rather than silently declaring it safe.
 
+Indexing and exact slicing use the evaluated vector, including positions after
+`*` expansion. A lookup observes mutations performed while evaluating its index.
+Copies retain references to mutable elements across wrapper calls. Copies of
+known immutable arguments do not acquire later writes to the original outer list.
+
 If the executable's identity cannot be resolved, UBS conservatively treats it
 as a possible interpreter. A value with no recognized taint source can still
 name an interpreter, so that alone does not prove its arguments are ordinary
 data. Resolved literal executables retain the positional distinction above.
+
+For a known process created with `stdin=PIPE`, the analyzer carries its stdin
+execution mode through helper parameters, returned process handles, and saved
+`communicate` methods. Python source remains distinct from shell text: shell
+quoting cannot sanitize Python or an unresolved interpreter's input. Known
+data-only modes, such as `python script.py` or a fixed `python -c` program, do
+not treat subsequent stdin data as source. An unrelated object's `communicate`
+method does not establish a subprocess sink.
 
 Diagnostics remain at the subprocess call in the wrapper, with at most one
 `python.taint.command` finding per process call. Executable, shell, and

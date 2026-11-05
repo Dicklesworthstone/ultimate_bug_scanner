@@ -335,6 +335,14 @@ class _ArgumentVector:
     # lengths. Writes/escapes invalidate the shape instead of assigning a heap
     # fact to a guessed operand.
     operands: tuple
+    # The outer container and its elements have different identities. Keep
+    # evaluated element aliases beside their facts so wrapper projections and
+    # returned slices still observe writes through an independent inner alias.
+    # Empty metadata is retained for older/internal shape-only constructions.
+    references: tuple = ()
+
+    def references_at(self, index):
+        return self.references[index] if self.references else NO_REFERENCES
 
 
 @dataclass(frozen=True)
@@ -342,8 +350,21 @@ class _ArgumentExpansion:
     """An unknown-length argv segment, never a single positional operand."""
 
 
+def _literal_choices(binding):
+    """Scalar argv alternatives carry literals or unknown, never object graphs.
+
+    Nested vectors/callables have independent facts and aliases. Retaining
+    them inside a scalar choice would leak concrete captures into context
+    keys and could certify an object's stale shape after a heap write.
+    """
+    if isinstance(binding, frozenset):
+        return frozenset(value if isinstance(value, _LiteralString) else None for value in binding)
+    return binding
+
+
 def _vector_shape(vector):
-    return tuple(operand if isinstance(operand, (_LiteralString, _ArgumentExpansion, frozenset)) else None
+    return tuple(_literal_choices(operand)
+                 if isinstance(operand, (_LiteralString, _ArgumentExpansion, frozenset)) else None
                  for operand, _fact in vector.operands)
 
 
@@ -352,9 +373,13 @@ def _context_vector(vector):
         return vector
     # Retain the executable and a bounded option prefix. The rest remains an
     # unknown-length segment with ALL of its taint, including recursive growth.
+    references = ((*vector.references[:_MAX_VECTOR_CONTEXT],
+                   frozenset().union(*vector.references[_MAX_VECTOR_CONTEXT:]))
+                  if vector.references else ())
     return _ArgumentVector((*vector.operands[:_MAX_VECTOR_CONTEXT],
                             (_ArgumentExpansion(), join_facts(*(
-                                fact for _operand, fact in vector.operands[_MAX_VECTOR_CONTEXT:])))))
+                                fact for _operand, fact in vector.operands[_MAX_VECTOR_CONTEXT:])))),
+                           references)
 
 
 def _vector_variants(binding):
@@ -380,6 +405,7 @@ def _vector_slot(name, variant, index):
 
 @dataclass(frozen=True)
 class _ProcessInput:
+    """Finite stdin-source contract, independent of process identity or taint."""
     kind: str
 
 
@@ -506,7 +532,8 @@ def _same_analysis_value(left, right, *, witness=False):
                       and a.references == b.references and a.valid == b.valid
                       and same(a.receiver, b.receiver, evidence))
         elif isinstance(a, _ArgumentVector):
-            result = type(a) is type(b) and same(a.operands, b.operands, evidence)
+            result = (type(a) is type(b) and a.references == b.references
+                      and same(a.operands, b.operands, evidence))
         else:
             result = a == b
         compared[key] = result
@@ -2009,12 +2036,21 @@ class _Flow:
                               tuple(self.engine.default_bindings.get(function, {}).items()))
 
     def refresh_function_defaults(self, binding, heap, mutated):
-        """An escaping default retains mutations to its captured local object."""
-        if not isinstance(binding, (_FunctionValue, frozenset)):
+        """Escaping defaults/vectors retain writes to their captured objects."""
+        if not isinstance(binding, (_FunctionValue, _ArgumentVector, frozenset)):
             return binding
         choices = []
         for value in _binding_choices(binding):
-            if isinstance(value, _FunctionValue):
+            if isinstance(value, _ArgumentVector):
+                self.engine.budget.spend(1 + len(value.operands)
+                                         + sum(len(refs) for refs in value.references))
+                operands = []
+                for index, (operand, fact) in enumerate(value.operands):
+                    refs = value.references_at(index)
+                    self.engine.budget.spend(len(fact) + sum(len(heap.get(ref, CLEAN)) for ref in refs))
+                    operands.append((operand, join_facts(fact, *(heap.get(ref, CLEAN) for ref in refs))))
+                value = _ArgumentVector(tuple(operands), value.references)
+            elif isinstance(value, _FunctionValue):
                 self.engine.budget.spend(1 + len(value.arguments))
                 references = dict(value.references)
                 arguments = []
@@ -2092,7 +2128,7 @@ class _Flow:
                 value = _without_object_contract(value)
             yield key, fact, refs, value
 
-    def call_positions(self, node, arguments=None):
+    def call_positions(self, node, arguments=None, state=None):
         """Expand evaluated, exact *vectors without re-evaluating their AST.
 
         Keep unknown expansions in place so all binders agree on when an
@@ -2109,18 +2145,25 @@ class _Flow:
             if (isinstance(expression, ast.Starred) and isinstance(binding, _ArgumentVector)
                     and not any(isinstance(operand, _ArgumentExpansion) for operand, _ in binding.operands)):
                 self.engine.budget.spend(len(binding.operands))
-                for operand, value in binding.operands:
+                for index, (operand, value) in enumerate(binding.operands):
                     identity = (operand if isinstance(operand, (_LiteralString, _SymbolicValue, frozenset))
                                 else self.expression_bindings.get(operand))
                     element_refs = (NO_REFERENCES if isinstance(operand, _LiteralString)
+                                    else binding.references_at(index) if binding.references
                                     else self.expression_references.get(operand, refs))
+                    if state is not None:
+                        self.engine.budget.spend(len(element_refs)
+                                                 + sum(len(state.heap.get(ref, CLEAN)) for ref in element_refs))
+                        value = join_facts(value, *(state.heap.get(ref, CLEAN) for ref in element_refs))
+                        if element_refs & state.mutated:
+                            identity = _without_object_contract(identity)
                     positions.append((operand, value, identity, element_refs))
             else:
                 positions.append((expression, fact, binding, refs))
         return positions
 
     def bind(self, function, node, arguments, keywords, state, globals_snapshot=None, captured_defaults=None):
-        positions = self.call_positions(node, arguments)
+        positions = self.call_positions(node, arguments, state)
         arguments = [fact for _expression, fact, _binding, _refs in positions]
         positional = [arg.arg for arg in (*function.args.posonlyargs, *function.args.args)]
         bound = {name: fact for name, fact in zip(positional, arguments)}
@@ -2167,7 +2210,7 @@ class _Flow:
         """
         positional = [arg.arg for arg in (*function.args.posonlyargs, *function.args.args)]
         accepted = set(positional) | {arg.arg for arg in function.args.kwonlyargs}
-        positions = self.call_positions(node)
+        positions = self.call_positions(node, state=state)
         bound = {name: item[3] for name, item in zip(positional, positions)}
         for name, expression in keyword_nodes.items():
             if name in accepted:
@@ -2199,7 +2242,7 @@ class _Flow:
 
     def bind_values(self, function, node, arguments, keyword_nodes, state, globals_snapshot=None, captured_defaults=None):
         positional = [arg.arg for arg in (*function.args.posonlyargs, *function.args.args)]
-        positions = self.call_positions(node, arguments)
+        positions = self.call_positions(node, arguments, state)
         bound = {name: item[2] for name, item in zip(positional, positions)}
         expanded = any(isinstance(item[0], ast.Starred) for item in positions)
         if expanded:
@@ -2207,13 +2250,17 @@ class _Flow:
             bound.update((name, None) for name in positional)
         if function.args.vararg:
             operands = []
-            for expression, fact, binding, _refs in positions[len(positional):]:
+            element_references = []
+            for expression, fact, binding, refs in positions[len(positional):]:
                 if isinstance(expression, ast.Starred) and isinstance(binding, _ArgumentVector):
                     operands.extend(binding.operands)
+                    element_references.extend(binding.references if binding.references else
+                                              (refs for _ in binding.operands))
                 else:
                     operands.append(self.command_operand(expression, fact))
+                    element_references.append(refs)
             bound[function.args.vararg.arg] = (
-                None if expanded and positional else _ArgumentVector(tuple(operands)))
+                None if expanded and positional else _ArgumentVector(tuple(operands), tuple(element_references)))
         bound.update((name, self.expression_bindings.get(value)) for name, value in keyword_nodes.items()
                      if name is not None)
         defaults = (captured_defaults.values if captured_defaults is not None
@@ -2228,7 +2275,7 @@ class _Flow:
             bound[key] = value
         return bound
 
-    def bind_vector_elements(self, bound, values, candidate_keys=None):
+    def bind_vector_elements(self, bound, references, values, state, candidate_keys=None):
         """Bind summary projections to this invocation's positional facts.
 
         Separate slots for each shape retain branch correlation (echo data
@@ -2239,14 +2286,27 @@ class _Flow:
         items = (((name, values.get(name)) for name in candidate_keys)
                  if candidate_keys is not None else values.items())
         for name, binding in items:
+            for vector in _binding_choices(binding):
+                if isinstance(vector, _ArgumentVector):
+                    self.engine.budget.spend(sum(len(refs) for refs in vector.references))
             for variant, shape, vectors in _vector_variants(binding):
                 self.engine.budget.spend(len(shape) * len(vectors))
+                aggregate = []
                 for index in range(len(shape)):
                     slot = _vector_slot(name, variant, index)
-                    bound[slot] = join_facts(*(vector.operands[index][1] for vector in vectors))
+                    refs = frozenset().union(*(vector.references_at(index) for vector in vectors))
+                    self.engine.budget.spend(len(refs) + sum(len(state.heap.get(ref, CLEAN)) for ref in refs))
+                    references[slot] = refs
+                    bound[slot] = join_facts(*(vector.operands[index][1] for vector in vectors),
+                                            *(state.heap.get(ref, CLEAN) for ref in refs))
+                    aggregate.append(bound[slot])
                     projected[slot] = _join_bindings(*(
                         operand if isinstance(operand, (_LiteralString, _SymbolicValue, frozenset)) else None
                         for operand, _fact in (vector.operands[index] for vector in vectors)))
+                # Unknown indices/slices and widened suffixes still use the
+                # aggregate parameter. Its provenance must include these same
+                # live element writes even when no exact projection is possible.
+                bound[name] = join_facts(bound.get(name, CLEAN), *aggregate)
         values.update(projected)
 
     @staticmethod
@@ -2471,13 +2531,21 @@ class _Flow:
                 choices.append(values.get(target.parameter))
             elif isinstance(target, _ArgumentVector):
                 operands = []
-                for operand, fact in target.operands:
+                element_references = []
+                self.engine.budget.spend(len(target.operands)
+                                         + sum(len(refs) for refs in target.references))
+                for index, (operand, fact) in enumerate(target.operands):
                     if isinstance(operand, _SymbolicValue):
                         replacement = values.get(operand.parameter)
                         if isinstance(replacement, (_LiteralString, _SymbolicValue, frozenset)):
-                            operand = replacement
+                            operand = _literal_choices(replacement)
                     operands.append((operand, substitute(fact)))
-                choices.append(_ArgumentVector(tuple(operands)))
+                    refs = frozenset().union(*(
+                        self._lookup_refs(references, ref) if isinstance(ref, str) else frozenset({node})
+                        for ref in target.references_at(index)))
+                    self.engine.budget.spend(len(refs))
+                    element_references.append(refs)
+                choices.append(_ArgumentVector(tuple(operands), tuple(element_references)))
             elif isinstance(target, _BoundCallable):
                 actual = frozenset().union(*(self._lookup_refs(references, ref) if isinstance(ref, str)
                                              else frozenset({node}) for ref in target.references))
@@ -2512,26 +2580,34 @@ class _Flow:
         literal = self.expression_bindings.get(node)
         if literal == 'sys.executable':
             literal = _LiteralString('python')
-        if isinstance(literal, frozenset):
-            literal = frozenset(value if isinstance(value, _LiteralString) else None for value in literal)
+        literal = _literal_choices(literal)
         return (literal if isinstance(literal, (_LiteralString, _SymbolicValue, frozenset)) else node), fact
 
-    def command_operands(self, node):
+    def command_vector(self, node):
         """Expand literal argv without evaluating any argument a second time."""
         binding = self.expression_bindings.get(node)
         self.require_value(binding)
         if isinstance(binding, _ArgumentVector):
-            return list(binding.operands)
+            return binding
         if not isinstance(node, (ast.List, ast.Tuple)):
             return None
-        result = []
+        result, references = [], []
         for item in node.elts:
-            expanded = self.command_operands(item.value) if isinstance(item, ast.Starred) else None
+            expanded = self.command_vector(item.value) if isinstance(item, ast.Starred) else None
             if expanded is not None:
-                result.extend(expanded)
+                result.extend(expanded.operands)
+                references.extend(expanded.references if expanded.references else
+                                  (self.expression_references.get(item.value, NO_REFERENCES)
+                                   for _ in expanded.operands))
             else:
                 result.append(self.command_operand(item, self.expression_facts.get(item, CLEAN)))
-        return result
+                references.append(self.expression_references.get(item, NO_REFERENCES))
+        self.engine.budget.spend(len(result) + sum(len(refs) for refs in references))
+        return _ArgumentVector(tuple(result), tuple(references))
+
+    def command_operands(self, node):
+        vector = self.command_vector(node)
+        return list(vector.operands) if vector is not None else None
 
     def command_vectors(self, node):
         binding = self.expression_bindings.get(node)
@@ -2555,6 +2631,88 @@ class _Flow:
                     break
         return result
 
+    def vector_subscript(self, node, state):
+        """Project evaluated operands, never the syntax slots before a star.
+
+        A lookup observes index-expression mutations. A slice copies the outer
+        container, while selected mutable elements retain conservative aliases.
+        """
+        binding = self.expression_bindings.get(node.value)
+        self.require_value(binding)
+        receiver_refs = self.expression_references.get(node.value, NO_REFERENCES)
+        vectors = _binding_choices(binding)
+        if (receiver_refs & state.mutated or not vectors
+                or any(not isinstance(vector, _ArgumentVector) for vector in vectors)):
+            return None
+
+        def integer(expression):
+            if isinstance(expression, ast.Constant) and isinstance(expression.value, int):
+                return expression.value
+            if (isinstance(expression, ast.UnaryOp) and isinstance(expression.op, (ast.UAdd, ast.USub))
+                    and isinstance(expression.operand, ast.Constant)
+                    and isinstance(expression.operand.value, int)):
+                return (-expression.operand.value if isinstance(expression.op, ast.USub)
+                        else expression.operand.value)
+            return _MISSING
+
+        sliced = isinstance(node.slice, ast.Slice)
+        if sliced:
+            bounds = [None if part is None else integer(part)
+                      for part in (node.slice.lower, node.slice.upper, node.slice.step)]
+            if _MISSING in bounds or bounds[2] == 0:
+                return None
+            selector = slice(*bounds)
+        else:
+            selector = integer(node.slice)
+
+        facts, values, references = [], [], set()
+        for vector in vectors:
+            operands = vector.operands
+            if sliced:
+                if any(isinstance(operand, _ArgumentExpansion) for operand, _fact in operands):
+                    return None
+                selected = range(len(operands))[selector]
+            elif selector is _MISSING:
+                # The index chooses from these values; its taint cannot create
+                # new executable text outside an exact literal whitelist.
+                if any(isinstance(operand, _ArgumentExpansion) for operand, _fact in operands):
+                    return None
+                selected = range(len(operands))
+            else:
+                if not -len(operands) <= selector < len(operands):
+                    return None
+                prefix = operands[:selector + 1] if selector >= 0 else operands[selector:]
+                if any(isinstance(operand, _ArgumentExpansion) for operand, _fact in prefix):
+                    return None
+                selected = (selector,)
+            self.engine.budget.spend(len(selected))
+            projected, projected_references = [], []
+            for index in selected:
+                operand, fact = operands[index]
+                value = (operand if isinstance(operand, (_LiteralString, _SymbolicValue, frozenset))
+                         else self.expression_bindings.get(operand))
+                immutable = (isinstance(operand, ast.Constant)
+                             or all(isinstance(choice, _LiteralString) for choice in _binding_choices(value)))
+                refs = (NO_REFERENCES if immutable else receiver_refs | (
+                    vector.references_at(index) if vector.references else
+                    self.expression_references.get(operand, NO_REFERENCES)))
+                self.engine.budget.spend(len(refs) + sum(len(state.heap.get(ref, CLEAN)) for ref in refs))
+                fact = join_facts(fact, *(state.heap.get(ref, CLEAN) for ref in refs))
+                if refs & state.mutated:
+                    value = _without_object_contract(value)
+                facts.append(fact)
+                references.update(refs)
+                if sliced:
+                    projected.append((operand, fact))
+                    projected_references.append(refs)
+                else:
+                    values.append(value)
+            if sliced:
+                values.append(_ArgumentVector(tuple(projected), tuple(projected_references)))
+                references.add(node)
+        return (join_facts(self.source(node, state), *facts),
+                _join_bindings(*values), frozenset(references))
+
     def require_value(self, binding):
         for value in _binding_choices(binding):
             if isinstance(value, _SymbolicValue):
@@ -2577,12 +2735,22 @@ class _Flow:
         A communicate() spelling alone is not a process sink. The identity
         follows the process or its bound method, including local returns.
         """
-        kind = _interpreter_kind(self.interpreter_name(program))
+        program = self.interpreter_name(program)
+        kind = _interpreter_kind(program)
         pipe = keyword_nodes.get('stdin')
-        piped = self.expression_bindings.get(pipe) == 'subprocess.PIPE' or (
+        piped = any(value == 'subprocess.PIPE' or (
+            isinstance(value, _BoundCallable) and value.namespace_proven
+            and value.name == 'subprocess.PIPE')
+            for value in _binding_choices(self.expression_bindings.get(pipe))) or (
             isinstance(pipe, ast.UnaryOp) and isinstance(pipe.op, ast.USub)
             and isinstance(pipe.operand, ast.Constant) and pipe.operand.value == 1)
-        if not shell and piped and kind is not None and _interpreter_reads_stdin(kind, operands, self.literal_value):
+        if shell or not piped:
+            return None
+        if program is None:
+            # Match immediate input= analysis: a clean but unresolved program
+            # can consume source, and shell quoting cannot certify its domain.
+            return _ProcessInput('unknown')
+        if kind is not None and _interpreter_reads_stdin(kind, operands, self.literal_value):
             return _ProcessInput(kind)
         return None
 
@@ -2913,7 +3081,8 @@ class _Flow:
                 if (isinstance(binding, _SymbolicValue)
                         or _same_witness(binding, nominal)):
                     continue
-                if any(isinstance(value, (str, _LiteralString, _ArgumentVector, ast.FunctionDef, ast.AsyncFunctionDef,
+                if any(isinstance(value, (str, _LiteralString, _ArgumentVector, _ProcessInput,
+                                          ast.FunctionDef, ast.AsyncFunctionDef,
                                           ast.Lambda, _BoundClassMethod))
                        for value in (*_binding_choices(binding), *_binding_choices(nominal))):
                     overrides.add(gname)
@@ -2925,7 +3094,7 @@ class _Flow:
             vector_keys = (None if summary_keys is None else
                            set(summary_keys) | captured_keys | {
                                f'@global:{name}' for module, name in summary.capture_globals if module is owner.tree})
-            self.bind_vector_elements(bound, values, vector_keys)
+            self.bind_vector_elements(bound, references, values, state, vector_keys)
             for name in summary.value_parameters:
                 for value in _binding_choices(values.get(name)):
                     if isinstance(value, _SymbolicValue):
@@ -3114,20 +3283,24 @@ class _Flow:
                     process = None
                     if not shell_true or shell_unknown:
                         program_node = override if fixed_executable else operands[0][0] if operands else command_node
+                        tail = operands[1:] if operands else []
                         if operands is not None or self.interpreter_name(command_node) is not None:
-                            tail = operands[1:] if operands else []
                             nested_shell, nested_raw = self.interpreter_effects(program_node, tail, stdin)
                             shell_code = join_facts(shell_code, nested_shell)
                             interpreter_code = join_facts(interpreter_code, nested_raw)
-                            process = self.process_input(node, program_node, tail, keyword_nodes)
-                        elif _interpreter_kind(self.interpreter_name(program_node)) is not None:
-                            # A mutated/escaped vector no longer proves positional
-                            # safety, even when executable= fixes argv[0].
-                            interpreter_code = join_facts(interpreter_code, command_fact, stdin)
+                        else:
+                            # Opaque argv cannot establish a data-only stdin
+                            # mode, even with a fixed interpreter override.
+                            tail = [(_ArgumentExpansion(), command_fact)]
+                            if _interpreter_kind(self.interpreter_name(program_node)) is not None:
+                                interpreter_code = join_facts(interpreter_code, command_fact, stdin)
+                        process = self.process_input(node, program_node, tail, keyword_nodes)
                     if has_override and not fixed_executable:
                         # An unresolved override may itself select an interpreter;
                         # its clean provenance is not proof that argv is data.
                         interpreter_code = join_facts(interpreter_code, command_fact, stdin)
+                        if not shell_true or shell_unknown:
+                            process = self.process_input(node, None, [], keyword_nodes)
                     process_inputs.append(process)
             if leaf == 'Popen':
                 self.expression_bindings[node] = _join_bindings(*process_inputs)
@@ -3173,10 +3346,10 @@ class _Flow:
             self.command_effect(node, keywords.get('executable', CLEAN), command, raw)
         elif name in {'eval', 'exec', 'builtins.eval', 'builtins.exec'}:
             self.effect('eval', node, leaf, source_argument('source', 'object'))
-        elif name in {'@stdin.shell', '@stdin.python'}:
+        elif name in {'@stdin.shell', '@stdin.python', '@stdin.unknown'}:
             code = source_argument('input')
             self.command_effect(node, CLEAN, code if name == '@stdin.shell' else CLEAN,
-                                code if name == '@stdin.python' else CLEAN)
+                                code if name != '@stdin.shell' else CLEAN)
         else:
             # Passing a known vector to an unmodeled routine may mutate it.
             # Retain aggregate provenance but stop certifying its old shape.
@@ -3236,7 +3409,7 @@ class _Flow:
                                   and node.id not in self.context_globals)
                 identity = (str, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
                             ast.ClassDef, _FunctionValue, _BoundCallable,
-                            _BoundClassMethod, _ModuleBinding, _ArgumentVector, _LiteralString)
+                            _BoundClassMethod, _ModuleBinding, _ArgumentVector, _LiteralString, _ProcessInput)
                 if (not nominal_helper and any(isinstance(value, identity)
                         for value in (*_binding_choices(binding), *_binding_choices(nominal)))):
                     self.capture_globals.add((self.engine.tree, node.id))
@@ -3275,6 +3448,13 @@ class _Flow:
             candidates = []
             receiver_refs = self.expression_references.get(node.value, NO_REFERENCES)
             receiver_fact = self.expression_facts.get(node.value, CLEAN)
+            if node.attr == 'communicate':
+                # A later global binding may be opaque even though this call
+                # received a process earlier. Keep the leaf's identity demand
+                # so intervening helpers specialize only the globals they use.
+                self.capture_globals.update((self.engine.tree, ref[8:])
+                                            for ref in receiver_refs
+                                            if isinstance(ref, str) and ref.startswith('@global:'))
             for base in _binding_choices(self.expression_bindings.get(node.value)):
                 if isinstance(base, _GlobalNamespace) and base.member is None:
                     candidates.append(_GlobalNamespace(base.module, node.attr))
@@ -3331,10 +3511,18 @@ class _Flow:
             binding = _join_bindings(self.expression_bindings.get(node.body), self.expression_bindings.get(node.orelse))
         elif isinstance(node, ast.BoolOp):
             binding = _join_bindings(*(self.expression_bindings.get(value) for value in node.values))
-        elif (isinstance(node, ast.Subscript) and isinstance(node.value, (ast.Tuple, ast.List))
-              and isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, int)
-              and -len(node.value.elts) <= node.slice.value < len(node.value.elts)):
-            binding = self.expression_bindings.get(node.value.elts[node.slice.value])
+        elif isinstance(node, ast.Subscript):
+            projected = self.vector_subscript(node, state)
+            if projected is not None:
+                fact, binding, refs = projected
+                self.expression_references[node] = refs
+            elif (isinstance(node.value, (ast.Tuple, ast.List))
+                  and not any(isinstance(item, ast.Starred) for item in node.value.elts)
+                  and isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, int)
+                  and -len(node.value.elts) <= node.slice.value < len(node.value.elts)):
+                # Framework annotation tuples use a separate marker binding.
+                # Only unexpanded syntax has the same positions as its values.
+                binding = self.expression_bindings.get(node.value.elts[node.slice.value])
         if is_call:
             if exception_type:
                 binding = '@exception:' + exception_type
@@ -3359,7 +3547,7 @@ class _Flow:
             if any(isinstance(marker, _FrameworkInput) for marker in markers):
                 binding = markers
             else:
-                binding = _ArgumentVector(tuple(self.command_operands(node)))
+                binding = self.command_vector(node)
         self.expression_bindings[node] = binding
         if isinstance(node, (ast.Attribute, ast.Subscript, ast.Starred)):
             self.expression_references.setdefault(node, self.expression_references.get(node.value, NO_REFERENCES))
@@ -3382,7 +3570,14 @@ class _Flow:
         if isinstance(node, ast.Attribute):
             return join_facts(self.source(node, state), self.expr(node.value, state))
         if isinstance(node, ast.Subscript):
-            return join_facts(self.source(node, state), self.expr(node.value, state), self.expr(node.slice, state))
+            source = self.source(node, state)
+            receiver = self.expr(node.value, state)
+            references = self.expression_references.get(node.value, NO_REFERENCES)
+            index = self.expr(node.slice, state)
+            # Python evaluates the receiver before the index, but performs the
+            # lookup afterward. Index evaluation can mutate that same object.
+            return join_facts(source, receiver, index,
+                              *(state.heap.get(ref, CLEAN) for ref in references))
         if isinstance(node, ast.BinOp):
             return join_facts(self.expr(node.left, state), self.expr(node.right, state))
         if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
@@ -4487,8 +4682,12 @@ class _Analysis:
                 return bound
 
     def callable_context(self, name, binding, *, captured=False, value_parameters=()):
-        """Finite callable/argv identity with captured facts replaced by slots."""
+        """Finite callable/argv/process identity; captured facts use slots."""
         choices = []
+        if name in value_parameters:
+            for value in _binding_choices(binding):
+                if isinstance(value, _ArgumentVector):
+                    self.budget.spend(sum(len(refs) for refs in value.references))
         variants = ({shape: index for index, shape, _vectors in _vector_variants(binding)}
                     if name in value_parameters else {})
         for value in _binding_choices(binding):
@@ -4520,16 +4719,17 @@ class _Analysis:
                 shape = _vector_shape(value)
                 variant = variants[shape]
                 self.budget.spend(len(shape))
-                operands = []
+                operands, references = [], []
                 for index, operand in enumerate(shape):
                     slot = _vector_slot(name, variant, index)
                     symbolic = frozenset({TaintTrace(slot, parameter=slot,
                                                      path=(slot, f'{name}[{index}]'))})
                     operands.append((operand if operand is not None else _SymbolicValue(slot), symbolic))
-                value = _ArgumentVector(tuple(operands))
+                    references.append(NO_REFERENCES if isinstance(operand, _LiteralString) else frozenset({slot}))
+                value = _ArgumentVector(tuple(operands), tuple(references))
             elif isinstance(value, _LiteralString) and name in value_parameters:
                 pass
-            elif not isinstance(value, (str, ast.FunctionDef, ast.AsyncFunctionDef,
+            elif not isinstance(value, (str, _ProcessInput, ast.FunctionDef, ast.AsyncFunctionDef,
                                         ast.Lambda, ast.ClassDef)):
                 value = _SymbolicValue(name) if captured else None
             choices.append(value)
@@ -4616,7 +4816,7 @@ class _Analysis:
                     continue
                 if (binding is nominal
                         and not isinstance(binding, (frozenset, _BoundCallable, _BoundClassMethod, _FunctionValue,
-                                                     _ArgumentVector, _LiteralString))
+                                                     _ArgumentVector, _LiteralString, _ProcessInput))
                         and not explicit_override
                         and gname in owner_bindings
                         and gname not in owner_fn.locals[function]
@@ -4628,7 +4828,7 @@ class _Analysis:
                 if not explicit_override and not any(
                         isinstance(value, (str, ast.FunctionDef, ast.AsyncFunctionDef,
                                            ast.Lambda, ast.ClassDef, _BoundCallable, _BoundClassMethod, _FunctionValue,
-                                           _ArgumentVector, _LiteralString))
+                                           _ArgumentVector, _LiteralString, _ProcessInput))
                         for value in (*_binding_choices(binding), *_binding_choices(nominal))):
                     continue
             elif binding is None or isinstance(binding, _SymbolicValue):

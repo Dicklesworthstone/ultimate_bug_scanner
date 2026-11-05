@@ -10,6 +10,11 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Resolve native GZIP I/O and inherited metadata members before same-named
+  Kotlin extensions, preserving genuine extension overloads. Carry closure
+  through `use` and explicit `close`; later effects on unresolved borrowed
+  backing aliases report incomplete analysis instead of a clean result.
+
 - Track Kotlin GZIP stream ownership, including independent inflater/deflater
   cleanup, backing-stream aliases, nested wrappers and ownership returns.
   Preserve obligations on header I/O and invalid buffer-size failures;

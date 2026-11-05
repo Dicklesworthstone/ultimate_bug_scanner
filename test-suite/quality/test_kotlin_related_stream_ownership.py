@@ -112,6 +112,33 @@ SOCKET_CASES = (
 )
 
 COMPRESSION_CASES = (
+    Case("gzip_native_write_wins_over_closing_extension", '''
+        import java.io.OutputStream
+        import java.util.zip.GZIPOutputStream
+        fun GZIPOutputStream.write(value: Int) { this.close() }
+        fun f(raw: OutputStream) {
+            val gzip = GZIPOutputStream(raw) // expect:unclosed
+            gzip.write(1)
+        }
+        '''),
+    Case("gzip_native_read_wins_over_closing_extension", '''
+        import java.io.InputStream
+        import java.util.zip.GZIPInputStream
+        fun GZIPInputStream.read(): Int { this.close(); return -1 }
+        fun f(raw: InputStream) {
+            val gzip = GZIPInputStream(raw) // expect:unclosed
+            gzip.read()
+        }
+        '''),
+    Case("gzip_native_flush_wins_over_closing_extension", '''
+        import java.io.OutputStream
+        import java.util.zip.GZIPOutputStream
+        fun GZIPOutputStream.flush() { this.close() }
+        fun f(raw: OutputStream) {
+            val gzip = GZIPOutputStream(raw) // expect:unclosed
+            gzip.flush()
+        }
+        '''),
     Case("gzip_input_inner_use_misses_header_failure", '''
         import java.io.FileInputStream
         import java.util.zip.GZIPInputStream
@@ -221,6 +248,42 @@ COMPRESSION_CASES = (
             }
         }
         '''),
+    Case("gzip_native_to_string_wins_over_closing_extension", '''
+        import java.io.OutputStream
+        import java.util.zip.GZIPOutputStream
+        fun GZIPOutputStream.toString(): String { this.close(); return "closed" }
+        fun f(raw: OutputStream) {
+            val gzip = GZIPOutputStream(raw) // expect:unclosed
+            gzip.toString()
+        }
+        '''),
+    Case("gzip_native_hash_code_wins_over_closing_extension", '''
+        import java.io.OutputStream
+        import java.util.zip.GZIPOutputStream
+        fun GZIPOutputStream.hashCode(): Int { this.close(); return 0 }
+        fun f(raw: OutputStream) {
+            val gzip = GZIPOutputStream(raw) // expect:unclosed
+            gzip.hashCode()
+        }
+        '''),
+    Case("gzip_native_equals_wins_over_closing_extension", '''
+        import java.io.OutputStream
+        import java.util.zip.GZIPOutputStream
+        fun GZIPOutputStream.equals(other: Any?): Boolean { this.close(); return true }
+        fun f(raw: OutputStream) {
+            val gzip = GZIPOutputStream(raw) // expect:unclosed
+            gzip.equals(null)
+        }
+        '''),
+    Case("gzip_different_arity_metadata_extension_can_close", '''
+        import java.io.OutputStream
+        import java.util.zip.GZIPOutputStream
+        fun GZIPOutputStream.toString(close: Boolean): String { this.close(); return "closed" }
+        fun f(raw: OutputStream) {
+            val gzip = GZIPOutputStream(raw)
+            gzip.toString(true)
+        }
+        '''),
 )
 
 
@@ -242,7 +305,18 @@ class KotlinRelatedStreamCliTests(resources.LoggedResourceCase):
     assert_sarif = resources.KotlinResourceCliTests.assert_sarif
 
     def test_public_socket_and_compression_json_sarif(self):
-        for case in (SOCKET_CASES[0], SOCKET_CASES[3], COMPRESSION_CASES[0], COMPRESSION_CASES[3]):
+        selected = {
+            "gzip_native_write_wins_over_closing_extension",
+            "gzip_input_inner_use_misses_header_failure",
+            "gzip_native_to_string_wins_over_closing_extension",
+            "gzip_native_hash_code_wins_over_closing_extension",
+            "gzip_native_equals_wins_over_closing_extension",
+            "gzip_different_arity_metadata_extension_can_close",
+        }
+        cases = (SOCKET_CASES[0], SOCKET_CASES[3],
+                 *(case for case in COMPRESSION_CASES if case.name in selected))
+        self.assertEqual(len(cases), 8)
+        for case in cases:
             for meta in (False, True):
                 for fmt in ("json", "sarif"):
                     with self.subTest(case=case.name, meta=meta, format=fmt):
@@ -259,6 +333,28 @@ class KotlinRelatedStreamCliTests(resources.LoggedResourceCase):
                             self.assertEqual(totals["warning"], len(case.expected), payload)
                             if not meta:
                                 self.assertEqual(payload["status"], "ok", payload)
+
+    def test_borrowed_backing_aliases_are_publicly_incomplete(self):
+        names = {"borrowed_file_read_after_gzip_close", "borrowed_file_rewrapped_after_gzip_use"}
+        cases = [case for case in resources.UNSUPPORTED_CASES if case.name in names]
+        self.assertEqual(len(cases), 2)
+        for case in cases:
+            for meta in (False, True):
+                for fmt in ("json", "sarif"):
+                    with self.subTest(case=case.name, meta=meta, format=fmt):
+                        result, payload = self.scan(case, meta=meta, fmt=fmt)
+                        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+                        if fmt == "sarif":
+                            invocations = [invocation for run in payload["runs"]
+                                           for invocation in run.get("invocations", [])]
+                            self.assertTrue(any(invocation.get("executionSuccessful") is False
+                                                for invocation in invocations), payload)
+                            self.assertIn("incomplete", str(invocations).lower())
+                        else:
+                            scanners = payload["scanners"] if meta else [payload]
+                            self.assertTrue(any(scanner.get("status") == "partial"
+                                                and scanner.get("module_error") == "ANALYZER_ERROR"
+                                                for scanner in scanners), payload)
 
 
 if __name__ == "__main__":

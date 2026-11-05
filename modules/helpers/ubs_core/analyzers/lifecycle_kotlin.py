@@ -69,6 +69,19 @@ WRAPPERS = {
     "java.io.OutputStreamWriter": ("output", "charset"),
 }
 COMPRESSION_WRAPPERS = {"java.util.zip.GZIPInputStream": "input", "java.util.zip.GZIPOutputStream": "output"}
+RESOURCE_TYPES = CONSTRUCTORS | set().union(*STREAM_TYPES.values()) | set(FILES_FACTORIES.values())
+COMPRESSION_IO = {
+    "java.util.zip.GZIPInputStream": {
+        "read": ((), ("bytes",), ("bytes", "int", "int")),
+        "readAllBytes": ((),), "readNBytes": (("int",), ("bytes", "int", "int")),
+        "available": ((),), "skip": (("long",),), "skipNBytes": (("long",),),
+        "mark": (("int",),), "reset": ((),),
+    },
+    "java.util.zip.GZIPOutputStream": {
+        "write": (("int",), ("bytes",), ("bytes", "int", "int")),
+        "flush": ((),), "finish": ((),),
+    },
+}
 STREAM_EXTENSIONS = {
     "buffered": {"input": "java.io.BufferedInputStream", "output": "java.io.BufferedOutputStream",
                  "reader": "java.io.BufferedReader", "writer": "java.io.BufferedWriter"},
@@ -245,13 +258,14 @@ class Ownership:
             "java.io.IOException", "java.io.UnsupportedEncodingException", "java.io.Closeable",
             "java.nio.charset.Charset", "java.nio.charset.CharsetDecoder", "java.nio.charset.CharsetEncoder",
             "java.nio.charset.StandardCharsets", "kotlin.text.Charsets", "java.lang.String",
-            "kotlin.Boolean", "kotlin.Int", "java.lang.Boolean", "java.lang.Integer",
+            "kotlin.Boolean", "kotlin.Int", "kotlin.Long", "kotlin.ByteArray",
+            "java.lang.Boolean", "java.lang.Integer", "java.lang.Long",
         }
         matches = [package + "." + name for package in self.model.wildcards
                    if package + "." + parts[0] in known]
         if len(matches) == 1:
             return matches[0]
-        if name in {"Boolean", "Int"}:
+        if name in {"Boolean", "Int", "Long", "ByteArray"}:
             return "kotlin." + name
         if name in {"Exception", "Throwable", "Error", "RuntimeException", "IllegalStateException", "String",
                     "IllegalArgumentException", "UnsupportedOperationException", "NullPointerException"}:
@@ -440,18 +454,63 @@ class Ownership:
                 output.append(after)
         return self.unique(output)
 
-    def close_resource(self, receiver: Value, position: int, state: State) -> list[State]:
+    def mark_closed(self, receiver: Value, state: State) -> None:
         if not receiver.resources:
             # Borrowed parameters do not have local acquisition identities.
             # Do not assume their close is unrelated to a live GZIP wrapper.
             if any(not backing and state.life.get(resource) == "open"
                    for resource, backing in state.backing.items()):
                 raise ValueError("Borrowed Kotlin compression close needs alias identity; analysis is incomplete")
+        if not receiver.resources or any(resource in state.backing and not state.backing[resource]
+                                         for resource in receiver.resources):
+            # An owned compressor can close an unowned backing stream. Keep
+            # that effect for later borrowed operations and selected helpers.
             state.borrowed_closed = True
         for resource in receiver.resources:
             state.life[resource] = "closed"
+
+    def close_resource(self, receiver: Value, position: int, state: State) -> list[State]:
+        self.mark_closed(receiver, state)
         self.result(state, UNIT, position)
         return [state, self.thrown(state)]
+
+    @staticmethod
+    def borrowed_effect(value: Value, state: State) -> bool:
+        if not state.borrowed_closed:
+            return False
+        if not value.resources:
+            return value.kind in RESOURCE_TYPES
+        return any(resource in state.backing and not state.backing[resource]
+                   and state.life.get(resource) == "open" for resource in value.resources)
+
+    @staticmethod
+    def native_argument(value: Value, wanted: str) -> bool | None:
+        kinds = {"int": {"kotlin.Int", "java.lang.Integer"},
+                 "long": {"kotlin.Long", "java.lang.Long"}, "bytes": {"kotlin.ByteArray"}}
+        if value.kind in kinds[wanted]:
+            return True
+        if value.constant == "null":
+            return None
+        if re.fullmatch(r"[+-]?\d+", value.constant):
+            if wanted == "long":
+                return None  # Constant propagation does not preserve literal-vs-Int overload context.
+            return wanted == "int" and -2_147_483_648 <= int(value.constant) <= 2_147_483_647
+        if value.kind or value.constant in {"true", "false", "Unit"} or value.literal is not None:
+            return False
+        return None
+
+    def native_compression_io(self, receiver: Value, name: str, arguments: tuple[Value, ...]) -> bool:
+        ambiguous = False
+        for signature in COMPRESSION_IO.get(receiver.kind, {}).get(name, ()):
+            if len(signature) != len(arguments):
+                continue
+            matches = [self.native_argument(value, wanted) for value, wanted in zip(arguments, signature)]
+            if all(match is True for match in matches):
+                return True
+            ambiguous |= all(match is not False for match in matches)
+        if ambiguous:
+            raise ValueError("Unresolved Kotlin native compression overload; analysis is incomplete")
+        return False
 
     def io_operation(self, receiver: Value, name: str, position: int, state: State) -> list[State]:
         for resource in receiver.resources:
@@ -549,7 +608,7 @@ class Ownership:
         return Value(callback=opening, captured=captured, implicit=implicit)
 
     def selected(self, low: int, high: int, state: State) -> bool:
-        if any(status == "open" for status in state.life.values()):
+        if state.borrowed_closed or any(status == "open" for status in state.life.values()):
             return True
         for call in self.model.calls:
             if low <= call.start < high:
@@ -792,6 +851,8 @@ class Ownership:
             return self.acquire(state, qualified, FILES_FACTORIES[qualified.rsplit(".", 1)[-1]], position)
         if qualified == "java.io.File":
             return self.result(state, Value(kind=qualified), position)
+        if name not in {"close", "toString", "hashCode", "equals", "isClosed"} and self.borrowed_effect(receiver, state):
+            raise ValueError("Closed borrowed Kotlin stream effect needs alias identity; analysis is incomplete")
         if not arguments and ((receiver.kind == "java.net.Socket" and name in SOCKET_STREAMS)
                               or (receiver.kind == "java.net.ServerSocket" and name == "accept")):
             # Kotlin resolves real members ahead of same-named extensions.
@@ -799,10 +860,16 @@ class Ownership:
             return self.socket_resource(receiver, name, position, state)
         if name == "getChannel" and receiver.kind in {"java.net.Socket", "java.net.ServerSocket"}:
             raise ValueError("Kotlin socket/channel ownership needs analysis; analysis is incomplete")
-        if not arguments and receiver.kind == "java.util.zip.GZIPOutputStream" and name == "finish":
+        if self.native_compression_io(receiver, name, arguments):
             return self.io_operation(receiver, name, position, state)
         if not arguments and receiver.kind in COMPRESSION_WRAPPERS and name == "close":
             return self.close_resource(receiver, position, state)
+        if receiver.kind in COMPRESSION_WRAPPERS and (
+                (name in {"toString", "hashCode"} and not arguments)
+                or (name == "equals" and len(arguments) == 1)):
+            # These inherited members also take precedence over extensions;
+            # an extension body must not close the native receiver for them.
+            return self.result(state, UNKNOWN, position)
         function = self.functions.get(self.key(name, token))
         if function is not None and (not receiver.kind or function.receiver):
             if (not self.selected(function.start, function.end, state)
@@ -810,6 +877,8 @@ class Ownership:
                     and not any(value.callback >= 0 for value in arguments)):
                 return self.result(state, UNKNOWN, position)
             return self.function(function, arguments, receiver, state)
+        if receiver.kind in COMPRESSION_WRAPPERS and (name in COMPRESSION_IO[receiver.kind] or name == "close"):
+            raise ValueError("Unknown Kotlin compression extension overload; analysis is incomplete")
         if receiver.kind == "java.io.File" and name in FILE_EXTENSIONS and self.builtin(name, token, name):
             return self.acquire(state, "kotlin.io." + name, FILE_EXTENSIONS[name], position)
         for extension, families in STREAM_EXTENSIONS.items():
@@ -832,8 +901,7 @@ class Ownership:
                 if escaping:
                     branch.result = replace(branch.result, escapes=tuple(sorted(set(branch.result.escapes) |
                         {(resource, branch.position) for resource in escaping})))
-                for resource in receiver.resources:
-                    branch.life[resource] = "closed"
+                self.mark_closed(receiver, branch)
                 branch.managed = previous
                 branch.use_scopes = previous_scopes
                 final.append(branch)
@@ -855,7 +923,7 @@ class Ownership:
             return self.result(state, UNIT, position)
         if name in {"requireNotNull", "checkNotNull"} and self.builtin(name, token, name) and arguments:
             return self.result(state, arguments[0], position)
-        if any(value.resources for value in (receiver, *arguments)):
+        if any(value.resources or self.borrowed_effect(value, state) for value in (receiver, *arguments)):
             raise ValueError("Unknown Kotlin resource receiver/argument effect; analysis is incomplete")
         if any(value.callback >= 0 and (self.captures(value.callback, state)
                or self.selected(value.callback, self.model.pairs[value.callback], State())) for value in arguments):

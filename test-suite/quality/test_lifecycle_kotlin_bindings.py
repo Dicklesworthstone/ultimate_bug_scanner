@@ -1134,6 +1134,49 @@ GZIP_CASES = (
         fun GZIPOutputStream.close() { }
         fun f(raw: OutputStream) { GZIPOutputStream(raw).close() }
         '''),
+    Case("gzip_string_write_extension_has_no_native_overload", '''
+        import java.io.OutputStream
+        import java.util.zip.GZIPOutputStream
+        fun GZIPOutputStream.write(value: String) { this.close() }
+        fun f(raw: OutputStream) { GZIPOutputStream(raw).write("done") }
+        '''),
+    Case("gzip_zero_argument_write_keeps_extension_dispatch", '''
+        import java.io.OutputStream
+        import java.util.zip.GZIPOutputStream
+        fun GZIPOutputStream.write() { this.close() }
+        fun f(raw: OutputStream) { GZIPOutputStream(raw).write() }
+        '''),
+    Case("gzip_read_text_keeps_kotlin_extension_dispatch", '''
+        import java.io.InputStream
+        import java.util.zip.GZIPInputStream
+        fun GZIPInputStream.readText(): String { this.close(); return "done" }
+        fun f(raw: InputStream) { GZIPInputStream(raw).readText() }
+        '''),
+    Case("gzip_read_bytes_keeps_kotlin_extension_dispatch", '''
+        import java.io.InputStream
+        import java.util.zip.GZIPInputStream
+        fun GZIPInputStream.readBytes(): ByteArray { this.close(); return byteArrayOf() }
+        fun f(raw: InputStream) { GZIPInputStream(raw).readBytes() }
+        '''),
+    Case("gzip_byte_array_write_member_wins_over_extension", '''
+        import java.io.OutputStream
+        import java.util.zip.GZIPOutputStream
+        fun GZIPOutputStream.write(value: ByteArray) { this.close() }
+        fun f(raw: OutputStream, bytes: ByteArray) {
+            val gzip = GZIPOutputStream(raw) // expect:unclosed
+            gzip.write(bytes)
+        }
+        '''),
+    Case("owned_file_is_independent_of_borrowed_gzip_close", '''
+        import java.io.FileInputStream
+        import java.util.zip.GZIPInputStream
+        fun f(raw: FileInputStream) {
+            GZIPInputStream(raw).close()
+            FileInputStream("other.gz").use { owned ->
+                GZIPInputStream(owned).use { it.read() }
+            }
+        }
+        '''),
     Case("gzip_sibling_close_invalidates_shared_output", '''
         import java.io.FileOutputStream
         import java.util.zip.GZIPOutputStream
@@ -1358,6 +1401,58 @@ UNSUPPORTED_CASES = (
                 raw.close()
                 gzip.read()
             }
+        }
+        '''),
+    Case("borrowed_file_read_after_gzip_close", '''
+        import java.io.FileInputStream
+        import java.util.zip.GZIPInputStream
+        fun f(raw: FileInputStream) {
+            GZIPInputStream(raw).close()
+            raw.read()
+        }
+        '''),
+    Case("borrowed_file_rewrapped_after_gzip_use", '''
+        import java.io.FileInputStream
+        import java.util.zip.GZIPInputStream
+        fun f(raw: FileInputStream) {
+            GZIPInputStream(raw).use { it.read() }
+            GZIPInputStream(raw).use { it.read() }
+        }
+        '''),
+    Case("borrowed_file_helper_alias_after_gzip_use", '''
+        import java.io.FileInputStream
+        import java.util.zip.GZIPInputStream
+        fun identity(raw: FileInputStream): FileInputStream = raw
+        fun f(raw: FileInputStream) {
+            GZIPInputStream(raw).use { it.read() }
+            identity(raw).read()
+        }
+        '''),
+    Case("borrowed_file_read_after_gzip_finally_close", '''
+        import java.io.FileInputStream
+        import java.util.zip.GZIPInputStream
+        fun f(raw: FileInputStream) {
+            val gzip = GZIPInputStream(raw)
+            try { gzip.read() } finally { gzip.close() }
+            raw.read()
+        }
+        '''),
+    Case("borrowed_socket_sibling_getter_after_gzip_close", '''
+        import java.net.Socket
+        import java.util.zip.GZIPInputStream
+        fun f(socket: Socket) {
+            GZIPInputStream(socket.getInputStream()).close()
+            socket.getOutputStream().write(1)
+        }
+        '''),
+    Case("gzip_unresolved_native_write_overload_is_incomplete", '''
+        import java.io.OutputStream
+        import java.util.zip.GZIPOutputStream
+        fun bytes(): ByteArray = externalBytes()
+        fun GZIPOutputStream.write(value: Any) { this.close() }
+        fun f(raw: OutputStream) {
+            val gzip = GZIPOutputStream(raw)
+            gzip.write(bytes())
         }
         '''),
 )

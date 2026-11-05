@@ -9,6 +9,8 @@ https://kotlinlang.org/api/core/kotlin-stdlib/kotlin.io/buffered.html
 https://kotlinlang.org/api/core/kotlin-stdlib/kotlin.io/reader.html
 https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/io/BufferedReader.html
 https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/io/InputStreamReader.html
+https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/net/Socket.html
+https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/net/ServerSocket.html
 
 Kotlin use closes its receiver on normal and exceptional exits, and returns the
 block's result. Returning that receiver therefore exports a closed resource.
@@ -16,6 +18,9 @@ Closing Java Closeable twice is permitted; no double-close finding is expected.
 Files.lines/walk streams own resources even after a terminal stream operation.
 IO operations can throw before a later unprotected close. Cases are compiled
 separately from analysis and never execute their file/network operations.
+Socket stream getters can fail before an inner use acquires their shared lifetime.
+An accepted client is independent of its listener; a failing listener use-close
+can prevent transferring an otherwise returned client to the caller.
 
 Set UBS_KOTLIN_RESOURCE_E2E=1 for actual module/meta-runner integration probes.
 """
@@ -825,7 +830,248 @@ WRAPPER_CASES = (
         }
         '''),
 )
-BY_NAME = {case.name: case for case in (*CASES, *WRAPPER_CASES)}
+NETWORK_CASES = (
+    Case("accepted_socket_from_borrowed_listener_is_owned", '''
+        import java.net.ServerSocket
+        fun f(listener: ServerSocket) {
+            val client = listener.accept() // expect:unclosed
+        }
+        '''),
+    Case("closing_listener_does_not_close_accepted_socket", '''
+        import java.net.ServerSocket
+        fun f() {
+            ServerSocket(8080).use { listener ->
+                val client = listener.accept() // expect:unclosed
+            }
+        }
+        '''),
+    Case("closing_client_does_not_close_listener", '''
+        import java.net.ServerSocket
+        fun f() {
+            val listener = ServerSocket(8080) // expect:unclosed
+            listener.accept().use { client -> client.getOutputStream().write(1) }
+        }
+        '''),
+    Case("accepted_socket_nested_use_closes_both", '''
+        import java.net.ServerSocket
+        fun f() {
+            ServerSocket(8080).use { listener ->
+                listener.accept().use { client -> client.getInputStream().read() }
+            }
+        }
+        '''),
+    Case("accepted_return_misses_listener_close_failure", '''
+        import java.net.ServerSocket
+        import java.net.Socket
+        fun f(): Socket = ServerSocket(8080).use { listener -> listener.accept() } // expect:unclosed
+        '''),
+    Case("accepted_socket_transfers_from_borrowed_listener", '''
+        import java.net.ServerSocket
+        import java.net.Socket
+        fun f(listener: ServerSocket): Socket = listener.accept()
+        '''),
+    Case("accept_failure_before_client_use_leaves_listener", '''
+        import java.net.ServerSocket
+        fun f() {
+            val listener = ServerSocket(8080) // expect:unclosed
+            listener.accept().use { client -> client.getInputStream().read() }
+            listener.close()
+        }
+        '''),
+    Case("accepted_socket_finally_closes_listener_and_client", '''
+        import java.net.ServerSocket
+        fun f() {
+            val listener = ServerSocket(8080)
+            try {
+                listener.accept().use { client -> client.getOutputStream().write(1) }
+            } finally {
+                listener.close()
+            }
+        }
+        '''),
+    Case("accept_on_closed_listener_cannot_create_client", '''
+        import java.net.ServerSocket
+        fun f() {
+            val listener = ServerSocket(8080)
+            listener.close()
+            listener.accept() // expect:closed
+        }
+        '''),
+    Case("accepted_stream_close_preserves_listener", '''
+        import java.net.ServerSocket
+        fun f() {
+            ServerSocket(8080).use { listener ->
+                listener.accept().use { first -> first.getInputStream().close() }
+                listener.accept().use { second -> second.getOutputStream().write(1) }
+            }
+        }
+        '''),
+    Case("accepted_helper_transfers_client_to_caller", '''
+        import java.net.ServerSocket
+        import java.net.Socket
+        fun acceptOne(listener: ServerSocket): Socket = listener.accept() // expect:unclosed
+        fun f(listener: ServerSocket) { val client = acceptOne(listener) }
+        '''),
+    Case("accepted_helper_caller_use_closes_client", '''
+        import java.net.ServerSocket
+        import java.net.Socket
+        fun acceptOne(listener: ServerSocket): Socket = listener.accept()
+        fun f(listener: ServerSocket) {
+            acceptOne(listener).use { it.getInputStream().bufferedReader().readLine() }
+        }
+        '''),
+    Case("socket_stream_getter_failure_io_catch_closes_socket", '''
+        import java.io.IOException
+        import java.net.Socket
+        fun f() {
+            val socket = Socket("localhost", 8080)
+            try {
+                socket.getInputStream().use { it.read() }
+            } catch (failure: IOException) {
+                socket.close()
+            }
+        }
+        '''),
+    Case("socket_shutdown_is_not_close", '''
+        import java.net.Socket
+        fun f() {
+            val socket = Socket("localhost", 8080) // expect:unclosed
+            socket.shutdownOutput()
+        }
+        '''),
+    Case("borrowed_socket_stream_does_not_invent_local_ownership", '''
+        import java.net.Socket
+        fun f(socket: Socket) { val input = socket.getInputStream() }
+        '''),
+    Case("native_accept_member_wins_over_same_named_extension", '''
+        import java.net.ServerSocket
+        import java.net.Socket
+        fun ServerSocket.accept(): Socket = Socket("localhost", 8080)
+        fun f(listener: ServerSocket) {
+            val client = listener.accept() // expect:unclosed
+        }
+        '''),
+    Case("socket_stream_use_closes_socket", '''
+        import java.net.Socket
+        fun f() {
+            Socket("localhost", 8080).use { socket -> socket.getInputStream().use { it.read() } }
+        }
+        '''),
+    Case("socket_timeout_catch_can_acquire_unclosed_socket", '''
+        import java.net.ServerSocket
+        import java.net.Socket
+        import java.net.SocketTimeoutException
+        fun f(listener: ServerSocket) {
+            try { listener.accept().close() }
+            catch (timeout: SocketTimeoutException) {
+                Socket("localhost", 8080) // expect:unclosed
+            }
+        }
+        '''),
+    Case("socket_timeout_catch_can_manage_socket", '''
+        import java.net.ServerSocket
+        import java.net.Socket
+        import java.net.SocketTimeoutException
+        fun f(listener: ServerSocket) {
+            try { listener.accept().close() }
+            catch (timeout: SocketTimeoutException) {
+                Socket("localhost", 8080).use { it.getInputStream().read() }
+            }
+        }
+        '''),
+    Case("interrupted_io_catch_can_acquire_unclosed_socket", '''
+        import java.io.InterruptedIOException
+        import java.net.ServerSocket
+        import java.net.Socket
+        fun f(listener: ServerSocket) {
+            try { listener.accept().close() }
+            catch (interrupted: InterruptedIOException) {
+                Socket("localhost", 8080) // expect:unclosed
+            }
+        }
+        '''),
+    Case("socket_exception_catch_can_acquire_unclosed_socket", '''
+        import java.net.ServerSocket
+        import java.net.Socket
+        import java.net.SocketException
+        fun f(listener: ServerSocket) {
+            try { listener.accept().close() }
+            catch (failure: SocketException) {
+                Socket("localhost", 8080) // expect:unclosed
+            }
+        }
+        '''),
+    Case("runtime_catch_does_not_handle_io_family", '''
+        import java.net.ServerSocket
+        import java.net.Socket
+        fun f(listener: ServerSocket) {
+            try { listener.accept().close() }
+            catch (failure: RuntimeException) { Socket("localhost", 8080) }
+        }
+        '''),
+    Case("rethrow_preserves_previously_caught_subtypes", '''
+        import java.io.IOException
+        import java.net.ServerSocket
+        import java.net.Socket
+        import java.net.SocketTimeoutException
+        fun f(listener: ServerSocket) {
+            try {
+                try { listener.accept().close() }
+                catch (timeout: SocketTimeoutException) { }
+                catch (failure: IOException) { val alias = failure; throw alias }
+            } catch (alreadyHandled: SocketTimeoutException) {
+                Socket("localhost", 8080)
+            }
+        }
+        '''),
+    Case("rethrow_preserves_narrowed_timeout_parent", '''
+        import java.io.InterruptedIOException
+        import java.net.ServerSocket
+        import java.net.Socket
+        import java.net.SocketTimeoutException
+        fun f(listener: ServerSocket) {
+            try {
+                try { listener.accept().close() }
+                catch (timeout: SocketTimeoutException) { val alias = timeout; throw alias }
+            } catch (interrupted: InterruptedIOException) {
+                Socket("localhost", 8080) // expect:unclosed
+            }
+        }
+        '''),
+    Case("explicit_io_exception_is_not_an_unknown_subtype", '''
+        import java.io.IOException
+        import java.net.Socket
+        import java.net.SocketTimeoutException
+        fun f() {
+            try { throw IOException("exact") }
+            catch (timeout: SocketTimeoutException) { Socket("localhost", 8080) }
+        }
+        '''),
+    Case("exact_throwable_does_not_enter_exception_subtypes", '''
+        import java.net.Socket
+        fun runtime() {
+            try { throw Throwable("exact") }
+            catch (failure: RuntimeException) { Socket("localhost", 8080) }
+        }
+        fun ordinary() {
+            try { throw Throwable("exact") }
+            catch (failure: Exception) { Socket("localhost", 8080) }
+        }
+        '''),
+    Case("timeout_and_io_catches_discharge_listener", '''
+        import java.io.IOException
+        import java.net.ServerSocket
+        import java.net.SocketTimeoutException
+        fun f() {
+            val listener = ServerSocket(8080)
+            try { listener.accept().close() }
+            catch (timeout: SocketTimeoutException) { listener.close() }
+            catch (failure: IOException) { listener.close() }
+            listener.close()
+        }
+        '''),
+)
+BY_NAME = {case.name: case for case in (*CASES, *WRAPPER_CASES, *NETWORK_CASES)}
 
 UNSUPPORTED_CASES = (
     Case("unknown_resource_argument", '''
@@ -865,10 +1111,25 @@ UNSUPPORTED_CASES = (
             raw.buffered().use { it.read() }
         }
         '''),
-    Case("socket_stream_ownership_remains_incomplete", '''
+    Case("socket_channel_ownership_remains_incomplete", '''
         import java.net.Socket
         fun f() {
-            Socket("localhost", 8080).use { socket -> socket.getInputStream().use { it.read() } }
+            Socket("localhost", 8080).use { socket -> socket.getChannel() }
+        }
+        '''),
+    Case("borrowed_listener_channel_ownership_remains_incomplete", '''
+        import java.net.ServerSocket
+        fun f(listener: ServerSocket) {
+            listener.getChannel().accept()
+        }
+        '''),
+    Case("unknown_io_catch_hierarchy_remains_incomplete", '''
+        import application.CustomIOException
+        import java.net.ServerSocket
+        import java.net.Socket
+        fun f(listener: ServerSocket) {
+            try { listener.accept().close() }
+            catch (failure: CustomIOException) { Socket("localhost", 8080) }
         }
         '''),
     Case("compression_wrapper_remains_incomplete", '''
@@ -944,6 +1205,9 @@ class KotlinResourceAnalyzerTests(LoggedResourceCase):
 
     def test_stream_wrapper_identity_and_construction_failures(self):
         self.check_cases(WRAPPER_CASES)
+
+    def test_accepted_socket_identity_and_transfer(self):
+        self.check_cases(NETWORK_CASES)
 
     def test_selected_unknown_shapes_and_budgets_are_incomplete(self):
         cases = [(case, {}) for case in (*UNSUPPORTED_CASES, MALFORMED)]
@@ -1041,6 +1305,50 @@ PUBLIC_WRAPPERS_SAFE = Case("public_wrapper_managed", '''
         FileInputStream("input.txt").use { raw -> InputStreamReader(raw, charsetName).use { it.read() } }
     }
     ''')
+PUBLIC_NETWORK_UNSAFE = Case("public_network_obligations", '''
+    import java.io.InputStream
+    import java.net.ServerSocket
+    import java.net.Socket
+    import java.net.SocketTimeoutException
+    fun leaked(listener: ServerSocket) {
+        val client = listener.accept() // expect:unclosed
+    }
+    fun closed() {
+        Socket("localhost", 8080).use { socket ->
+            val output = socket.getOutputStream()
+            socket.getInputStream().close()
+            output.write(1) // expect:closed
+        }
+    }
+    fun escaped(): InputStream = Socket("localhost", 8080).use {
+        it.getInputStream() // expect:escape
+    }
+    fun timeout(listener: ServerSocket) {
+        try { listener.accept().close() }
+        catch (timeout: SocketTimeoutException) {
+            Socket("localhost", 8080) // expect:unclosed
+        }
+    }
+    ''')
+PUBLIC_NETWORK_SAFE = Case("public_network_managed", '''
+    import java.net.ServerSocket
+    import java.net.Socket
+    import java.net.SocketTimeoutException
+    fun managed() {
+        ServerSocket(8080).use { listener ->
+            listener.accept().use { client ->
+                client.getInputStream().bufferedReader().use { it.readLine() }
+            }
+        }
+    }
+    fun transferred(listener: ServerSocket): Socket = listener.accept()
+    fun timeout(listener: ServerSocket) {
+        try { listener.accept().close() }
+        catch (timeout: SocketTimeoutException) {
+            Socket("localhost", 8080).use { it.getInputStream().read() }
+        }
+    }
+    ''')
 
 
 @unittest.skipUnless(os.environ.get("UBS_KOTLIN_RESOURCE_E2E") == "1", "set UBS_KOTLIN_RESOURCE_E2E=1 for actual resource CLI scans")
@@ -1060,7 +1368,8 @@ class KotlinResourceCliTests(LoggedResourceCase):
         self.assertEqual(sorted(actual), case.expected, payload)
 
     def test_public_json_sarif_and_exact_totals(self):
-        for case in (PUBLIC_UNSAFE, PUBLIC_SAFE, PUBLIC_WRAPPERS_UNSAFE, PUBLIC_WRAPPERS_SAFE):
+        for case in (PUBLIC_UNSAFE, PUBLIC_SAFE, PUBLIC_WRAPPERS_UNSAFE, PUBLIC_WRAPPERS_SAFE,
+                     PUBLIC_NETWORK_UNSAFE, PUBLIC_NETWORK_SAFE):
             for meta in (False, True):
                 for fmt in ("json", "sarif"):
                     with self.subTest(case=case.name, meta=meta, format=fmt):

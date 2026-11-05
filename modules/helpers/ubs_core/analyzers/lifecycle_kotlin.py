@@ -6,6 +6,8 @@ helpers, returns and finally retain the original obligation. IO operations may
 throw before a later close. Java Closeable's repeated close is valid.
 Selected buffering and character-conversion wrappers retain their backing
 resource identity, including aliases, ownership transfer and construction failure.
+Socket streams share their socket's lifetime; ServerSocket.accept creates an
+independent client obligation even when the listening socket is borrowed.
 
 The shared Kotlin lexical frontend and JVM statement parser bound the work.
 Unknown selected callbacks/heap effects and unsupported control flow are explicit
@@ -72,6 +74,7 @@ STREAM_EXTENSIONS = {
     "bufferedWriter": {"output": "java.io.BufferedWriter"},
 }
 STANDARD_CHARSETS = frozenset({"US-ASCII", "ISO-8859-1", "UTF-8", "UTF-16", "UTF-16BE", "UTF-16LE"})
+SOCKET_STREAMS = {"getInputStream": "java.io.InputStream", "getOutputStream": "java.io.OutputStream"}
 IO_OPERATIONS = frozenset({
     "read", "readBytes", "readText", "readLine", "readLines", "readAllBytes", "readNBytes",
     "readFully", "readByte", "readInt", "readLong", "readUTF", "skip", "skipBytes", "available",
@@ -83,6 +86,31 @@ IO_OPERATIONS = frozenset({
     "spliterator",
 })
 ResourceId = tuple[int, int]
+EXCEPTION_PARENTS = {
+    "java.lang.IllegalStateException": "java.lang.RuntimeException",
+    "java.lang.IllegalArgumentException": "java.lang.RuntimeException",
+    "java.lang.NullPointerException": "java.lang.RuntimeException",
+    "java.lang.UnsupportedOperationException": "java.lang.RuntimeException",
+    "java.io.UncheckedIOException": "java.lang.RuntimeException",
+    "java.io.FileNotFoundException": "java.io.IOException",
+    "java.io.UnsupportedEncodingException": "java.io.IOException",
+    "java.io.EOFException": "java.io.IOException",
+    "java.io.InterruptedIOException": "java.io.IOException",
+    "java.net.SocketTimeoutException": "java.io.InterruptedIOException",
+    "java.net.SocketException": "java.io.IOException",
+    "java.net.BindException": "java.net.SocketException",
+    "java.net.ConnectException": "java.net.SocketException",
+    "java.net.NoRouteToHostException": "java.net.SocketException",
+    "java.net.PortUnreachableException": "java.net.SocketException",
+    "java.net.ProtocolException": "java.io.IOException",
+    "java.net.UnknownHostException": "java.io.IOException",
+    "java.net.UnknownServiceException": "java.io.IOException",
+    "java.util.zip.ZipException": "java.io.IOException",
+    "java.io.IOException": "java.lang.Exception",
+    "java.lang.RuntimeException": "java.lang.Exception",
+    "java.lang.Exception": "java.lang.Throwable",
+    "java.lang.Error": "java.lang.Throwable",
+}
 
 
 class ResourceParser(NullParser):
@@ -101,6 +129,13 @@ class ResourceParser(NullParser):
 
 
 @dataclass(frozen=True)
+class ExceptionPath:
+    kind: str
+    exact: bool = False
+    excluded: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
 class Value:
     resources: frozenset[ResourceId] = frozenset()
     kind: str = ""
@@ -111,6 +146,7 @@ class Value:
     captured: tuple[tuple[int, Value], ...] = ()
     implicit: tuple[tuple[int, int, Value], ...] = ()
     literal: str | None = None
+    exception: ExceptionPath | None = None
 
 
 UNKNOWN, UNIT = Value(), Value(constant="Unit")
@@ -123,7 +159,7 @@ class State:
     result: Value = UNIT
     position: int = 0
     exit: str = ""
-    exception: str = ""
+    exception: ExceptionPath | None = None
     receiver: Value = UNKNOWN
     implicit: tuple[tuple[int, int, Value], ...] = ()
     managed: tuple[frozenset[ResourceId], ...] = ()
@@ -196,7 +232,7 @@ class Ownership:
             return ".".join([self.model.imports[parts[0]], *parts[1:]])
         if parts[0] in {"java", "kotlin"} and len(parts) > 1:
             return name
-        known = CONSTRUCTORS | WRAPPERS.keys() | set().union(*STREAM_TYPES.values()) | {
+        known = CONSTRUCTORS | WRAPPERS.keys() | EXCEPTION_PARENTS.keys() | set().union(*STREAM_TYPES.values()) | {
             "java.io.File", "java.nio.file.Files", "java.nio.file.Path", "java.nio.file.Paths",
             "java.io.IOException", "java.io.UnsupportedEncodingException", "java.io.Closeable",
             "java.nio.charset.Charset", "java.nio.charset.CharsetDecoder", "java.nio.charset.CharsetEncoder",
@@ -206,7 +242,7 @@ class Ownership:
                    if package + "." + parts[0] in known]
         if len(matches) == 1:
             return matches[0]
-        if name in {"Exception", "Throwable", "RuntimeException", "IllegalStateException", "String",
+        if name in {"Exception", "Throwable", "Error", "RuntimeException", "IllegalStateException", "String",
                     "IllegalArgumentException", "UnsupportedOperationException", "NullPointerException"}:
             return "java.lang." + name
         return ""
@@ -284,9 +320,13 @@ class Ownership:
                     self.report("unclosed", resource)
                 del state.life[resource]
 
-    def thrown(self, state: State, exception: str = "java.io.IOException") -> State:
+    def thrown(self, state: State, exception: str | None = None) -> State:
         failed = state.copy()
-        failed.exit, failed.exception, failed.result = "throw", exception, UNIT
+        # Native I/O can throw any IOException subtype; an explicit exception
+        # from a known failing check has an exact type. Unknown ordinary calls
+        # retain the existing bounded Exception-family effect.
+        kind = "java.io.IOException" if exception is None else exception or "java.lang.Exception"
+        failed.exit, failed.exception, failed.result = "throw", ExceptionPath(kind, exact=bool(exception)), UNIT
         return failed
 
     def acquire(self, state: State, factory: str, kind: str, position: int) -> list[State]:
@@ -298,6 +338,26 @@ class Ownership:
         self.resources[resource] = (factory, position)
         state.life[resource] = "open"
         return self.result(state, Value(frozenset({resource}), kind=kind), position) + [failed]
+
+    def socket_resource(self, receiver: Value, name: str, position: int, state: State) -> list[State]:
+        closed = {resource for resource in receiver.resources if state.life.get(resource) == "closed"}
+        for resource in closed:
+            self.report("use-after-close", resource, position)
+        self.escaped(receiver)
+        if closed:
+            # A closed listener cannot produce another client, and a closed
+            # socket cannot return a usable stream. Avoid phantom successors.
+            return [self.thrown(state, "java.net.SocketException")]
+        if name == "accept":
+            # Closing the listener has no effect on this accepted connection.
+            # The failure branch keeps the listener but creates no client.
+            return self.acquire(state, "java.net.ServerSocket.accept", "java.net.Socket", position)
+        failed = self.thrown(state)
+        stream = replace(receiver, kind=SOCKET_STREAMS[name], symbol="", constant="", literal=None)
+        # Closing either direction closes the socket and every stream alias.
+        # A getter can fail before an inner use owns its stream, so retain the
+        # socket obligation unless an enclosing use/finally/catch closes it.
+        return self.result(state, stream, position) + [failed]
 
     def standard_charset(self, value: Value, token: int) -> bool:
         owner, _, field = value.symbol.rpartition(".")
@@ -404,7 +464,9 @@ class Ownership:
                 if qualified in CONSTRUCTORS or (qualified.startswith("java.nio.file.Files.")
                         and qualified.rsplit(".", 1)[-1] in FILES_FACTORIES):
                     return True
-                if self.model.value(call.name) in FILE_EXTENSIONS:
+                if self.model.value(call.name) in FILE_EXTENSIONS or self.model.value(call.name) == "accept":
+                    # A helper can acquire a client from a borrowed listener;
+                    # the receiver's exact kind is checked during evaluation.
                     return True
         return False
 
@@ -455,7 +517,7 @@ class Ownership:
                 if not branch.exit:
                     branch.exit = label
                     if word == "throw":
-                        branch.exception = branch.result.kind or "java.lang.Exception"
+                        branch.exception = branch.result.exception or ExceptionPath(branch.result.kind or "java.lang.Exception")
             return output
         if word in {"if", "try", "when"}:
             statement, finish = self.parser.statement(self.offset(low), self.offset(high))
@@ -634,6 +696,13 @@ class Ownership:
             return self.acquire(state, qualified, FILES_FACTORIES[qualified.rsplit(".", 1)[-1]], position)
         if qualified == "java.io.File":
             return self.result(state, Value(kind=qualified), position)
+        if not arguments and ((receiver.kind == "java.net.Socket" and name in SOCKET_STREAMS)
+                              or (receiver.kind == "java.net.ServerSocket" and name == "accept")):
+            # Kotlin resolves real members ahead of same-named extensions.
+            # Keep this before selected helper dispatch for the native arity.
+            return self.socket_resource(receiver, name, position, state)
+        if name == "getChannel" and receiver.kind in {"java.net.Socket", "java.net.ServerSocket"}:
+            raise ValueError("Kotlin socket/channel ownership needs analysis; analysis is incomplete")
         function = self.functions.get(self.key(name, token))
         if function is not None and (not receiver.kind or function.receiver):
             if (not self.selected(function.start, function.end, state)
@@ -702,7 +771,7 @@ class Ownership:
                or self.selected(value.callback, self.model.pairs[value.callback], State())) for value in arguments):
             raise ValueError("Unknown Kotlin callback affects selected resources; analysis is incomplete")
         kind = qualified if qualified.startswith("java.") and qualified.endswith(("Exception", "Throwable", "Error")) else ""
-        self.result(state, Value(kind=kind), position)
+        self.result(state, Value(kind=kind, exception=ExceptionPath(kind, exact=True) if kind else None), position)
         if kind:
             return [state]
         if any(status == "open" for status in state.life.values()):
@@ -881,7 +950,7 @@ class Ownership:
         branches = self.flow(body.body if body.kind == "block" else (body,), [state])
         output = [branch for branch in branches if branch.exit != "throw"]
         for failed in (branch for branch in branches if branch.exit == "throw"):
-            unmatched = True
+            remaining = failed
             for handler in statement.body[1:]:
                 text = self.code[slice(*handler.header)]
                 parameter = re.match(r"\s*([A-Za-z_]\w*)\s*:\s*([\w.]+)", text)
@@ -889,25 +958,25 @@ class Ownership:
                     raise ValueError("Unsupported Kotlin resource catch binding; analysis is incomplete")
                 token = self.token(handler.header[0] + parameter.start(1))
                 kind = self.canonical(parameter.group(2), token)
-                broad = kind in {"java.lang.Exception", "java.lang.Throwable"}
-                matched = self.catches(kind, failed.exception)
-                if broad or not failed.exception or matched:
-                    branch = failed.copy()
-                    branch.exit, branch.exception = "", ""
-                    branch.values[token] = Value(kind=kind)
+                caught, rest = self.catch_partition(remaining.exception, kind)
+                if caught is not None:
+                    branch = remaining.copy()
+                    branch.exit, branch.exception = "", None
+                    branch.values[token] = Value(kind=kind, exception=caught)
                     output.extend(self.flow(handler.body, [branch]))
-                    if broad or matched:
-                        unmatched = False
-                        break
-            if unmatched:
-                output.append(failed)
+                if rest is None:
+                    remaining = None
+                    break
+                remaining.exception = rest
+            if remaining is not None:
+                output.append(remaining)
         if statement.otherwise:
             final = []
             for branch in self.unique(output):
                 previous = (branch.exit, branch.exception, branch.result, branch.position)
                 previous_unwinding = branch.unwinding
                 branch.unwinding += (branch.result,)
-                branch.exit, branch.exception = "", ""
+                branch.exit, branch.exception = "", None
                 for after in self.flow(statement.otherwise, [branch]):
                     if not after.exit:
                         after.exit, after.exception, after.result, after.position = previous
@@ -918,24 +987,30 @@ class Ownership:
 
     @staticmethod
     def catches(handler: str, thrown: str) -> bool:
-        parents = {
-            "java.lang.IllegalStateException": "java.lang.RuntimeException",
-            "java.lang.IllegalArgumentException": "java.lang.RuntimeException",
-            "java.lang.NullPointerException": "java.lang.RuntimeException",
-            "java.lang.UnsupportedOperationException": "java.lang.RuntimeException",
-            "java.io.UncheckedIOException": "java.lang.RuntimeException",
-            "java.io.FileNotFoundException": "java.io.IOException",
-            "java.io.UnsupportedEncodingException": "java.io.IOException",
-            "java.net.SocketException": "java.io.IOException",
-            "java.io.IOException": "java.lang.Exception",
-            "java.lang.RuntimeException": "java.lang.Exception",
-            "java.lang.Exception": "java.lang.Throwable",
-        }
         while thrown:
             if handler == thrown:
                 return True
-            thrown = parents.get(thrown, "")
+            thrown = EXCEPTION_PARENTS.get(thrown, "")
         return False
+
+    def catch_partition(self, failure: ExceptionPath | None, handler: str) -> tuple[ExceptionPath | None, ExceptionPath | None]:
+        if failure is None:
+            raise ValueError("Unknown Kotlin thrown resource effect; analysis is incomplete")
+        if any(self.catches(excluded, handler) for excluded in failure.excluded):
+            return None, failure
+        if handler == "java.lang.Throwable" or self.catches(handler, failure.kind):
+            return failure, None
+        if failure.exact and (failure.kind in EXCEPTION_PARENTS or failure.kind == "java.lang.Throwable"):
+            return None, failure
+        if handler not in EXCEPTION_PARENTS or failure.kind not in (*EXCEPTION_PARENTS, "java.lang.Throwable"):
+            raise ValueError("Unknown Kotlin resource catch hierarchy; analysis is incomplete")
+        if not self.catches(failure.kind, handler):
+            return None, failure
+        # A subtype catch handles only its part of a declared exception family.
+        # Keep the rest for later handlers/outer scopes; rethrowing a catch alias
+        # must retain both its narrower type and previously handled exclusions.
+        caught = ExceptionPath(handler, excluded=failure.excluded)
+        return caught, replace(failure, excluded=failure.excluded | {handler})
 
     def initialize(self, function) -> State:
         state = State()

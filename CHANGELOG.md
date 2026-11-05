@@ -10,6 +10,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Track Kotlin socket streams as aliases of their socket and accepted clients
+  as independent resources. Closing a socket or either stream invalidates the
+  related aliases; getter and accept failures retain outstanding cleanup.
+  Native socket members take precedence over same-named Kotlin extensions.
+  Keep I/O exception subtypes reachable in catch handlers, preserving exact
+  explicit throws and narrowed exception identities through rethrows.
+
 - Track Kotlin stream ownership through standard buffering and character
   conversion wrappers. Closing a wrapper closes its backing resource;
   returning a live wrapper transfers ownership, while escaping from `use`

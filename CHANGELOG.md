@@ -10,6 +10,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Track Kotlin GZIP stream ownership, including independent inflater/deflater
+  cleanup, backing-stream aliases, nested wrappers and ownership returns.
+  Preserve obligations on header I/O and invalid buffer-size failures;
+  `finish()` leaves the stream open. Compression-only code no longer selects
+  archive-entry analysis, while unresolved borrowed aliases remain incomplete.
+
 - Publish primary reports atomically after rendering and writer completion.
   Protect selected source and comparison baselines from every report path,
   including symlink and hardlink aliases; preserve prior reports on early

@@ -8,6 +8,9 @@ Selected buffering and character-conversion wrappers retain their backing
 resource identity, including aliases, ownership transfer and construction failure.
 Socket streams share their socket's lifetime; ServerSocket.accept creates an
 independent client obligation even when the listening socket is borrowed.
+GZIP streams additionally own their compressor/decompressor: closing a wrapper
+closes its backing stream, while closing only the backing stream leaves the
+compression resource live. Construction can fail before that transfer occurs.
 
 The shared Kotlin lexical frontend and JVM statement parser bound the work.
 Unknown selected callbacks/heap effects and unsupported control flow are explicit
@@ -49,9 +52,9 @@ FILE_EXTENSIONS = {
 }
 STREAM_TYPES = {
     "input": frozenset("java.io." + name for name in
-                       ("InputStream", "FileInputStream", "BufferedInputStream")),
+                       ("InputStream", "FileInputStream", "BufferedInputStream")) | {"java.util.zip.GZIPInputStream"},
     "output": frozenset("java.io." + name for name in
-                        ("OutputStream", "FileOutputStream", "BufferedOutputStream")),
+                        ("OutputStream", "FileOutputStream", "BufferedOutputStream")) | {"java.util.zip.GZIPOutputStream"},
     "reader": frozenset("java.io." + name for name in
                         ("Reader", "FileReader", "InputStreamReader", "BufferedReader")),
     "writer": frozenset("java.io." + name for name in
@@ -65,6 +68,7 @@ WRAPPERS = {
     "java.io.InputStreamReader": ("input", "charset"),
     "java.io.OutputStreamWriter": ("output", "charset"),
 }
+COMPRESSION_WRAPPERS = {"java.util.zip.GZIPInputStream": "input", "java.util.zip.GZIPOutputStream": "output"}
 STREAM_EXTENSIONS = {
     "buffered": {"input": "java.io.BufferedInputStream", "output": "java.io.BufferedOutputStream",
                  "reader": "java.io.BufferedReader", "writer": "java.io.BufferedWriter"},
@@ -156,6 +160,8 @@ UNKNOWN, UNIT = Value(), Value(constant="Unit")
 class State:
     values: dict[int, Value] = field(default_factory=dict)
     life: dict[ResourceId, str] = field(default_factory=dict)
+    backing: dict[ResourceId, frozenset[ResourceId]] = field(default_factory=dict)
+    borrowed_closed: bool = False
     result: Value = UNIT
     position: int = 0
     exit: str = ""
@@ -167,10 +173,12 @@ class State:
     unwinding: tuple[Value, ...] = ()
 
     def copy(self):
-        return replace(self, values=dict(self.values), life=dict(self.life))
+        return replace(self, values=dict(self.values), life=dict(self.life), backing=dict(self.backing))
 
     def signature(self):
         return (tuple(sorted(self.values.items())), tuple(sorted(self.life.items())),
+                tuple(sorted(self.backing.items())),
+                self.borrowed_closed,
                 self.result, self.position, self.exit, self.exception, self.receiver,
                 self.implicit, self.managed, self.use_scopes, self.unwinding)
 
@@ -237,11 +245,14 @@ class Ownership:
             "java.io.IOException", "java.io.UnsupportedEncodingException", "java.io.Closeable",
             "java.nio.charset.Charset", "java.nio.charset.CharsetDecoder", "java.nio.charset.CharsetEncoder",
             "java.nio.charset.StandardCharsets", "kotlin.text.Charsets", "java.lang.String",
+            "kotlin.Boolean", "kotlin.Int", "java.lang.Boolean", "java.lang.Integer",
         }
         matches = [package + "." + name for package in self.model.wildcards
                    if package + "." + parts[0] in known]
         if len(matches) == 1:
             return matches[0]
+        if name in {"Boolean", "Int"}:
+            return "kotlin." + name
         if name in {"Exception", "Throwable", "Error", "RuntimeException", "IllegalStateException", "String",
                     "IllegalArgumentException", "UnsupportedOperationException", "NullPointerException"}:
             return "java.lang." + name
@@ -310,15 +321,24 @@ class Ownership:
         for resource, position in value.escapes:
             self.report("escape-from-use", resource, position)
 
+    def report_unclosed(self, state: State, resources: Iterable[ResourceId]) -> None:
+        pending = {resource for resource in resources if state.life.get(resource) == "open"}
+        for resource in sorted(pending):
+            # One unclosed stream chain gets its original acquisition finding.
+            # A wrapper still needs its own finding when its backing obligation
+            # was closed, transferred, or remains reachable elsewhere.
+            if not state.backing.get(resource, frozenset()) & pending:
+                self.report("unclosed", resource)
+
     def discard_unreachable(self, state: State) -> None:
         values = [*state.values.values(), state.result, state.receiver, *state.unwinding]
         values.extend(value for _, _, value in state.implicit)
         references = set().union(*(self.references(value, state) for value in values), *state.managed)
-        for resource in list(state.life):
-            if resource not in references:
-                if state.life[resource] == "open":
-                    self.report("unclosed", resource)
-                del state.life[resource]
+        unreachable = set(state.life) - references
+        self.report_unclosed(state, unreachable)
+        for resource in unreachable:
+            del state.life[resource]
+            state.backing.pop(resource, None)
 
     def thrown(self, state: State, exception: str | None = None) -> State:
         failed = state.copy()
@@ -369,6 +389,80 @@ class Ownership:
         return (owner == "Charsets" and owner not in self.model.imports
                 and self.binding(owner, token) is None
                 and all(package.startswith(("java.", "kotlin.")) for package in self.model.wildcards))
+
+    def compression_size(self, kind: str, options: tuple[Value, ...]) -> tuple[Value, ...]:
+        is_output = kind == "java.util.zip.GZIPOutputStream"
+        if len(options) > (2 if is_output else 1):
+            raise ValueError("Unsupported Kotlin compression constructor; analysis is incomplete")
+        size = options
+        if is_output and options:
+            last = options[-1]
+            boolean = last.constant in {"true", "false"} or last.kind in {"kotlin.Boolean", "java.lang.Boolean"}
+            if boolean:
+                size = options[:-1]
+            elif len(options) == 2:
+                raise ValueError("Unresolved Kotlin compression flush mode; analysis is incomplete")
+        if size and (len(size) != 1 or not (re.fullmatch(r"[+-]?\d+", size[0].constant)
+                                           or size[0].kind in {"kotlin.Int", "java.lang.Integer"})):
+            raise ValueError("Unresolved Kotlin compression size overload; analysis is incomplete")
+        return size
+
+    def compress_stream(self, state: State, kind: str, arguments: tuple[Value, ...], token: int) -> list[State]:
+        if not arguments or arguments[0].kind not in STREAM_TYPES[COMPRESSION_WRAPPERS[kind]]:
+            raise ValueError("Unresolved Kotlin compression backing stream; analysis is incomplete")
+        backing, options = arguments[0], arguments[1:]
+        if any(self.references(value, state) or value.callback >= 0 for value in options):
+            raise ValueError("Unsupported Kotlin compression constructor arguments; analysis is incomplete")
+        size, position = self.compression_size(kind, options), self.offset(token)
+        output = []
+        for branch in self.wrap_stream(state, backing, kind, size, token, option_kind="size"):
+            if branch.exit:
+                output.append(branch)
+                continue
+            if not backing.resources and branch.borrowed_closed:
+                raise ValueError("Closed borrowed Kotlin compression backing needs alias identity; analysis is incomplete")
+            closed = {resource for resource in backing.resources if branch.life.get(resource) == "closed"}
+            for resource in closed:
+                self.report("use-after-close", resource, position)
+            self.escaped(backing)
+            if closed:
+                output.append(self.thrown(branch))
+                continue
+            wrapped = branch.result
+            # Header I/O can fail before the caller obtains a wrapper. Only a
+            # successful construction owns a new native inflater/deflater.
+            for after in self.acquire(branch, kind, kind, position):
+                if not after.exit:
+                    owned = after.result.resources
+                    for resource in owned:
+                        after.backing[resource] = backing.resources
+                    after.result = replace(wrapped, resources=backing.resources | owned)
+                output.append(after)
+        return self.unique(output)
+
+    def close_resource(self, receiver: Value, position: int, state: State) -> list[State]:
+        if not receiver.resources:
+            # Borrowed parameters do not have local acquisition identities.
+            # Do not assume their close is unrelated to a live GZIP wrapper.
+            if any(not backing and state.life.get(resource) == "open"
+                   for resource, backing in state.backing.items()):
+                raise ValueError("Borrowed Kotlin compression close needs alias identity; analysis is incomplete")
+            state.borrowed_closed = True
+        for resource in receiver.resources:
+            state.life[resource] = "closed"
+        self.result(state, UNIT, position)
+        return [state, self.thrown(state)]
+
+    def io_operation(self, receiver: Value, name: str, position: int, state: State) -> list[State]:
+        for resource in receiver.resources:
+            if state.life.get(resource) == "closed":
+                self.report("use-after-close", resource, position)
+        self.escaped(receiver)
+        # Writer.append returns the writer; GZIP.finish writes a trailer but
+        # releases neither its deflater nor its backing stream.
+        result = receiver if name == "append" and "Writer" in receiver.kind else UNKNOWN
+        self.result(state, result, position)
+        return [state, self.thrown(state)]
 
     def wrap_stream(self, state: State, backing: Value, kind: str, options: tuple[Value, ...],
                     token: int, *, option_kind: str, reuse: bool = False,
@@ -461,7 +555,7 @@ class Ownership:
             if low <= call.start < high:
                 name = self.model.path(call.start, call.name + 1)
                 qualified = self.canonical(name, call.start)
-                if qualified in CONSTRUCTORS or (qualified.startswith("java.nio.file.Files.")
+                if qualified in CONSTRUCTORS or qualified in COMPRESSION_WRAPPERS or (qualified.startswith("java.nio.file.Files.")
                         and qualified.rsplit(".", 1)[-1] in FILES_FACTORIES):
                     return True
                 if self.model.value(call.name) in FILE_EXTENSIONS or self.model.value(call.name) == "accept":
@@ -681,6 +775,8 @@ class Ownership:
             qualified = self.canonical(name, token)
         if qualified in CONSTRUCTORS:
             return self.acquire(state, qualified, qualified, position)
+        if qualified in COMPRESSION_WRAPPERS:
+            return self.compress_stream(state, qualified, arguments, token)
         if qualified in WRAPPERS:
             family, option_kind = WRAPPERS[qualified]
             if not arguments or arguments[0].kind not in STREAM_TYPES[family]:
@@ -703,6 +799,10 @@ class Ownership:
             return self.socket_resource(receiver, name, position, state)
         if name == "getChannel" and receiver.kind in {"java.net.Socket", "java.net.ServerSocket"}:
             raise ValueError("Kotlin socket/channel ownership needs analysis; analysis is incomplete")
+        if not arguments and receiver.kind == "java.util.zip.GZIPOutputStream" and name == "finish":
+            return self.io_operation(receiver, name, position, state)
+        if not arguments and receiver.kind in COMPRESSION_WRAPPERS and name == "close":
+            return self.close_resource(receiver, position, state)
         function = self.functions.get(self.key(name, token))
         if function is not None and (not receiver.kind or function.receiver):
             if (not self.selected(function.start, function.end, state)
@@ -740,23 +840,13 @@ class Ownership:
                 if not branch.exit:
                     final.append(self.thrown(branch))
             return self.unique(final)
-        if name == "close" and (receiver.resources or receiver.kind.startswith(("java.io.", "java.net.", "java.util.stream."))):
-            for resource in receiver.resources:
-                state.life[resource] = "closed"
-            self.result(state, UNIT, position)
-            return [state, self.thrown(state)]
+        if name == "close" and (receiver.resources or receiver.kind in COMPRESSION_WRAPPERS
+                                or receiver.kind.startswith(("java.io.", "java.net.", "java.util.stream."))):
+            return self.close_resource(receiver, position, state)
         if receiver.resources and name in {"getInputStream", "getOutputStream", "accept", "getChannel"}:
             raise ValueError("Related Kotlin/JVM resource return needs ownership analysis; analysis is incomplete")
         if receiver.resources and name in IO_OPERATIONS:
-            for resource in receiver.resources:
-                if state.life.get(resource) == "closed":
-                    self.report("use-after-close", resource, position)
-            self.escaped(receiver)
-            # Writer.append returns this writer; losing that identity can hide
-            # use-after-close through the returned alias.
-            result = receiver if name == "append" and "Writer" in receiver.kind else UNKNOWN
-            self.result(state, result, position)
-            return [state, self.thrown(state)]
+            return self.io_operation(receiver, name, position, state)
         if receiver.resources and name in {"toString", "hashCode", "equals", "isClosed"}:
             return self.result(state, UNKNOWN, position)
         if self.builtin(name, token, "run") and len(arguments) == 1 and arguments[0].callback >= 0:
@@ -1028,9 +1118,7 @@ class Ownership:
             self.escaped(returned)
             if returned.callback >= 0 and self.references(returned, state) - {resource for resource, _ in returned.escapes}:
                 raise ValueError("Returned Kotlin callback captures selected resources; analysis is incomplete")
-            for resource, status in state.life.items():
-                if status == "open" and resource not in returned.resources:
-                    self.report("unclosed", resource)
+            self.report_unclosed(state, set(state.life) - returned.resources)
 
     def scan(self) -> list[tuple[str, int, int, str]]:
         for function in self.model.functions:

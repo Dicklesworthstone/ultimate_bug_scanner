@@ -25,10 +25,12 @@ DESCRIPTION = (
     "before writing files"
 )
 
+# Package membership alone is insufficient: GZIP and compression utilities have
+# no archive entry names. Keep actual entry/container identities as the selector.
 ARCHIVE_HINT_RE = re.compile(
     r'\b(?:ZipInputStream|ZipFile|ZipEntry|JarInputStream|JarFile|JarEntry|'
-    r'ZipArchiveInputStream|ZipArchiveEntry|TarArchiveInputStream|TarArchiveEntry|ArchiveEntry)\b'
-    r'|java\.util\.(?:zip|jar)\.|org\.apache\.commons\.compress\.archivers',
+    r'ZipArchiveInputStream|ZipArchiveEntry|TarArchiveInputStream|TarArchiveEntry|ArchiveInputStream|ArchiveEntry)\b'
+    r'|org\.apache\.commons\.compress\.archivers',
 )
 SINK_RE = re.compile(
     r'\b(?:FileOutputStream|FileWriter|RandomAccessFile)\s*\('

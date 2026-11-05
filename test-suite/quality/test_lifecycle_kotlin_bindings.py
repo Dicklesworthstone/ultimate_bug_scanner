@@ -11,6 +11,9 @@ https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/io/BufferedRea
 https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/io/InputStreamReader.html
 https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/net/Socket.html
 https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/net/ServerSocket.html
+https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/zip/GZIPInputStream.html
+https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/zip/GZIPOutputStream.html
+https://docs.oracle.com/en/java/javase/26/docs/api/java.base/java/util/zip/DeflaterOutputStream.html
 
 Kotlin use closes its receiver on normal and exceptional exits, and returns the
 block's result. Returning that receiver therefore exports a closed resource.
@@ -21,6 +24,8 @@ separately from analysis and never execute their file/network operations.
 Socket stream getters can fail before an inner use acquires their shared lifetime.
 An accepted client is independent of its listener; a failing listener use-close
 can prevent transferring an otherwise returned client to the caller.
+GZIP also owns its inflater/deflater. Closing the underlying file alone does not
+release that compression resource; finish writes a trailer without closing.
 
 Set UBS_KOTLIN_RESOURCE_E2E=1 for actual module/meta-runner integration probes.
 """
@@ -1071,7 +1076,197 @@ NETWORK_CASES = (
         }
         '''),
 )
-BY_NAME = {case.name: case for case in (*CASES, *WRAPPER_CASES, *NETWORK_CASES)}
+GZIP_CASES = (
+    Case("gzip_borrowed_input_still_owns_inflater", '''
+        import java.io.InputStream
+        import java.util.zip.GZIPInputStream
+        fun f(raw: InputStream) { GZIPInputStream(raw) } // expect:unclosed
+        '''),
+    Case("gzip_borrowed_output_still_owns_deflater", '''
+        import java.io.OutputStream
+        import java.util.zip.GZIPOutputStream
+        fun f(raw: OutputStream) { GZIPOutputStream(raw) } // expect:unclosed
+        '''),
+    Case("closing_backing_file_does_not_release_inflater", '''
+        import java.io.FileInputStream
+        import java.util.zip.GZIPInputStream
+        fun f() {
+            FileInputStream("input.gz").use { raw ->
+                val gzip = GZIPInputStream(raw) // expect:unclosed
+                raw.close()
+            }
+        }
+        '''),
+    Case("gzip_helper_transfers_owned_wrapper", '''
+        import java.io.InputStream
+        import java.util.zip.GZIPInputStream
+        fun wrap(raw: InputStream): GZIPInputStream = GZIPInputStream(raw)
+        fun f(raw: InputStream) { wrap(raw).use { it.read() } }
+        '''),
+    Case("gzip_helper_return_does_not_discharge_caller", '''
+        import java.io.InputStream
+        import java.util.zip.GZIPInputStream
+        fun wrap(raw: InputStream): GZIPInputStream = GZIPInputStream(raw) // expect:unclosed
+        fun f(raw: InputStream) { val gzip = wrap(raw) }
+        '''),
+    Case("gzip_finish_keeps_deflater_obligation", '''
+        import java.io.OutputStream
+        import java.util.zip.GZIPOutputStream
+        fun f(raw: OutputStream) {
+            val gzip = GZIPOutputStream(raw) // expect:unclosed
+            gzip.finish()
+        }
+        '''),
+    Case("gzip_alias_close_is_idempotent", '''
+        import java.io.OutputStream
+        import java.util.zip.GZIPOutputStream
+        fun f(raw: OutputStream) {
+            GZIPOutputStream(raw).use { gzip ->
+                val alias = gzip
+                alias.close()
+                gzip.close()
+            }
+        }
+        '''),
+    Case("gzip_close_member_wins_over_empty_extension", '''
+        import java.io.OutputStream
+        import java.util.zip.GZIPOutputStream
+        fun GZIPOutputStream.close() { }
+        fun f(raw: OutputStream) { GZIPOutputStream(raw).close() }
+        '''),
+    Case("gzip_sibling_close_invalidates_shared_output", '''
+        import java.io.FileOutputStream
+        import java.util.zip.GZIPOutputStream
+        fun f() {
+            FileOutputStream("output.gz").use { raw ->
+                GZIPOutputStream(raw).use { first ->
+                    GZIPOutputStream(raw).use { second ->
+                        first.close()
+                        second.write(1) // expect:closed
+                    }
+                }
+            }
+        }
+        '''),
+    Case("gzip_sibling_close_does_not_release_other_deflater", '''
+        import java.io.FileOutputStream
+        import java.util.zip.GZIPOutputStream
+        fun f() {
+            FileOutputStream("output.gz").use { raw ->
+                GZIPOutputStream(raw).use { first ->
+                    val second = GZIPOutputStream(raw) // expect:unclosed
+                    first.close()
+                }
+            }
+        }
+        '''),
+    Case("separate_gzip_streams_have_independent_lifetimes", '''
+        import java.io.FileOutputStream
+        import java.util.zip.GZIPOutputStream
+        fun f() {
+            FileOutputStream("one.gz").use { one ->
+                FileOutputStream("two.gz").use { two ->
+                    GZIPOutputStream(one).use { first ->
+                        GZIPOutputStream(two).use { second ->
+                            first.close()
+                            second.write(1)
+                        }
+                    }
+                }
+            }
+        }
+        '''),
+    Case("gzip_buffered_reader_closes_compression_and_backing", '''
+        import java.io.FileInputStream
+        import java.util.zip.GZIPInputStream as Compressed
+        fun f() {
+            FileInputStream("input.gz").use { raw ->
+                Compressed(raw).bufferedReader().use { it.readLine() }
+            }
+        }
+        '''),
+    Case("gzip_output_size_and_flush_overload", '''
+        import java.io.FileOutputStream
+        import java.util.zip.GZIPOutputStream
+        fun f(size: Int, syncFlush: Boolean) {
+            FileOutputStream("output.gz").use { raw ->
+                GZIPOutputStream(raw, size, syncFlush).use { it.write(1) }
+            }
+        }
+        '''),
+    Case("gzip_flush_boolean_is_not_a_buffer_size", '''
+        import java.io.FileOutputStream
+        import java.io.IOException
+        import java.util.zip.GZIPOutputStream
+        fun f(syncFlush: Boolean) {
+            val raw = FileOutputStream("output.gz")
+            try { GZIPOutputStream(raw, syncFlush).use { it.write(1) } }
+            catch (failure: IOException) { raw.close() }
+        }
+        '''),
+    Case("gzip_invalid_size_does_not_run_use_callback", '''
+        import java.io.FileInputStream
+        import java.io.FileOutputStream
+        import java.io.IOException
+        import java.util.zip.GZIPOutputStream
+        fun f() {
+            val raw = FileOutputStream("output.gz") // expect:unclosed
+            try {
+                GZIPOutputStream(raw, 0, true).use { FileInputStream("unreachable") }
+            } catch (failure: IOException) { raw.close() }
+        }
+        '''),
+    Case("gzip_known_invalid_size_only_throws_argument_error", '''
+        import java.io.FileInputStream
+        import java.util.zip.GZIPInputStream
+        fun f() {
+            val raw = FileInputStream("input.gz")
+            try { GZIPInputStream(raw, 0).use { it.read() } }
+            catch (failure: IllegalArgumentException) { raw.close() }
+        }
+        '''),
+    Case("gzip_unknown_size_needs_more_than_io_cleanup", '''
+        import java.io.FileOutputStream
+        import java.io.IOException
+        import java.util.zip.GZIPOutputStream
+        fun f(size: Int) {
+            val raw = FileOutputStream("output.gz") // expect:unclosed
+            try { GZIPOutputStream(raw, size).use { it.write(1) } }
+            catch (failure: IOException) { raw.close() }
+        }
+        '''),
+    Case("gzip_finish_member_wins_over_closing_extension", '''
+        import java.io.OutputStream
+        import java.util.zip.GZIPOutputStream
+        fun GZIPOutputStream.finish() { close() }
+        fun f(raw: OutputStream) {
+            val gzip = GZIPOutputStream(raw) // expect:unclosed
+            gzip.finish()
+        }
+        '''),
+    Case("nested_gzip_failure_keeps_inner_inflater_obligation", '''
+        import java.io.FileInputStream
+        import java.util.zip.GZIPInputStream
+        fun f() {
+            FileInputStream("input.gz.gz").use { raw ->
+                val inner = GZIPInputStream(raw) // expect:unclosed
+                GZIPInputStream(inner).use { it.read() }
+            }
+        }
+        '''),
+    Case("nested_gzip_use_closes_both_inflaters", '''
+        import java.io.FileInputStream
+        import java.util.zip.GZIPInputStream
+        fun f() {
+            FileInputStream("input.gz.gz").use { raw ->
+                GZIPInputStream(raw).use { inner ->
+                    GZIPInputStream(inner).use { it.read() }
+                }
+            }
+        }
+        '''),
+)
+BY_NAME = {case.name: case for case in (*CASES, *WRAPPER_CASES, *NETWORK_CASES, *GZIP_CASES)}
 
 UNSUPPORTED_CASES = (
     Case("unknown_resource_argument", '''
@@ -1132,10 +1327,38 @@ UNSUPPORTED_CASES = (
             catch (failure: CustomIOException) { Socket("localhost", 8080) }
         }
         '''),
-    Case("compression_wrapper_remains_incomplete", '''
+    Case("unmodeled_compression_wrapper_remains_incomplete", '''
         import java.io.FileInputStream
+        import java.util.zip.InflaterInputStream
+        fun f() { InflaterInputStream(FileInputStream("input.deflate")).use { it.read() } }
+        '''),
+    Case("unresolved_gzip_backing_remains_incomplete", '''
+        import java.io.InputStream
         import java.util.zip.GZIPInputStream
+        fun f(factory: () -> InputStream) { GZIPInputStream(factory()).use { it.read() } }
+        '''),
+    Case("custom_gzip_constructor_with_owned_stream_remains_incomplete", '''
+        import java.io.FileInputStream
+        import application.GZIPInputStream
         fun f() { GZIPInputStream(FileInputStream("input.gz")).use { it.read() } }
+        '''),
+    Case("borrowed_backing_close_before_gzip_needs_alias_identity", '''
+        import java.io.InputStream
+        import java.util.zip.GZIPInputStream
+        fun f(raw: InputStream) {
+            raw.close()
+            GZIPInputStream(raw).use { it.read() }
+        }
+        '''),
+    Case("borrowed_backing_close_inside_gzip_needs_alias_identity", '''
+        import java.io.InputStream
+        import java.util.zip.GZIPInputStream
+        fun f(raw: InputStream) {
+            GZIPInputStream(raw).use { gzip ->
+                raw.close()
+                gzip.read()
+            }
+        }
         '''),
 )
 MALFORMED = Case("malformed_resource_body", '''
@@ -1208,6 +1431,25 @@ class KotlinResourceAnalyzerTests(LoggedResourceCase):
 
     def test_accepted_socket_identity_and_transfer(self):
         self.check_cases(NETWORK_CASES)
+
+    def test_gzip_constructor_failures_and_dependent_ownership(self):
+        self.check_cases(GZIP_CASES)
+
+    def test_gzip_has_no_archive_entry_names(self):
+        from ubs_core.java_detectors import archive_extraction
+        case = Case("gzip_output_has_no_archive_entries", '''
+            import java.io.FileOutputStream
+            import java.util.zip.GZIPOutputStream
+            fun f() {
+                FileOutputStream("output.gz").use { raw ->
+                    GZIPOutputStream(raw).use { it.write(1) }
+                }
+            }
+            ''')
+        _, source = self.fixture(case)
+        findings = list(archive_extraction.find([source], language="kotlin",
+                                                rule_id="kotlin.security.archive-extraction"))
+        self.assertEqual(findings, [])
 
     def test_selected_unknown_shapes_and_budgets_are_incomplete(self):
         cases = [(case, {}) for case in (*UNSUPPORTED_CASES, MALFORMED)]
@@ -1369,7 +1611,9 @@ class KotlinResourceCliTests(LoggedResourceCase):
 
     def test_public_json_sarif_and_exact_totals(self):
         for case in (PUBLIC_UNSAFE, PUBLIC_SAFE, PUBLIC_WRAPPERS_UNSAFE, PUBLIC_WRAPPERS_SAFE,
-                     PUBLIC_NETWORK_UNSAFE, PUBLIC_NETWORK_SAFE):
+                     PUBLIC_NETWORK_UNSAFE, PUBLIC_NETWORK_SAFE,
+                     BY_NAME["gzip_borrowed_input_still_owns_inflater"],
+                     BY_NAME["gzip_alias_close_is_idempotent"]):
             for meta in (False, True):
                 for fmt in ("json", "sarif"):
                     with self.subTest(case=case.name, meta=meta, format=fmt):

@@ -1817,5 +1817,222 @@ class SwiftNarrowingOperators(unittest.TestCase):
                                               for line in lines], payload)
 
 
+class SwiftHeaderFlowTests(unittest.TestCase):
+    """Independent response-value oracle, authored against the legacy pass.
+
+    Labels specify whether attacker-supplied CR or LF can reach the exact
+    value slot. A helper's spelling, a different value's check, or a check on
+    only one branch cannot discharge that obligation. Location values retain
+    their existing distinct redirect rule.
+    """
+
+    RULE = 'swift.taint.header-injection'
+
+    @classmethod
+    def setUpClass(cls):
+        cls.artifacts = ROOT / 'test-suite/artifacts' / ('swift-header-flow-' + uuid.uuid4().hex)
+        cls.artifacts.mkdir(parents=True)
+
+    @staticmethod
+    def cases():
+        source = 'let value = req.query["name"] ?? ""\n'
+        sink = 'response.headers["X-Value"] = value // expect-header\n'
+        guard = r'guard !value.contains("\r"), !value.contains("\n") else { return }' + '\n'
+        clean_sink = 'response.headers["X-Value"] = value\n'
+        return (
+            ('direct', source + sink, ''),
+            ('safe_name_identity', 'let value = safeHeaderValue(req.query["name"] ?? "")\n' + sink,
+             'func safeHeaderValue(_ raw: String) -> String { return raw }'),
+            ('renamed_identity', 'let value = forwardValue(req.query["name"] ?? "")\n' + sink,
+             'func forwardValue(_ raw: String) -> String { return raw }'),
+            ('constant_helper', 'let value = fixed(req.query["name"] ?? "")\n' + clean_sink,
+             'func fixed(_ raw: String) -> String { return "fixed" }'),
+            ('literal_overwrite', 'var value = req.query["name"] ?? ""\nvalue = "fixed"\n' + clean_sink, ''),
+            ('strip_both', r'let value = (req.query["name"] ?? "").replacingOccurrences(of: "\r", with: "").replacingOccurrences(of: "\n", with: "")' + '\n' + clean_sink, ''),
+            ('strip_only_cr', r'let value = (req.query["name"] ?? "").replacingOccurrences(of: "\r", with: "")' + '\n' + sink, ''),
+            ('strip_only_lf', r'let value = (req.query["name"] ?? "").replacingOccurrences(of: "\n", with: "")' + '\n' + sink, ''),
+            ('replacement_reintroduces_cr', r'let value = (req.query["name"] ?? "").replacingOccurrences(of: "\r", with: "").replacingOccurrences(of: "\n", with: "\r")' + '\n' + sink, ''),
+            ('request_replacement', r'let value = (req.query["name"] ?? "").replacingOccurrences(of: "\r", with: "").replacingOccurrences(of: "\n", with: req.query["replacement"] ?? "")' + '\n' + sink, ''),
+            ('range_limited_strip', r'let raw = req.query["name"] ?? ""' + '\n' +
+             r'let value = raw.replacingOccurrences(of: "\r", with: "", range: raw.startIndex..<raw.startIndex).replacingOccurrences(of: "\n", with: "")' + '\n' + sink, ''),
+            ('anchored_strip', r'let value = (req.query["name"] ?? "").replacingOccurrences(of: "\r", with: "", options: .anchored).replacingOccurrences(of: "\n", with: "")' + '\n' + sink, ''),
+            ('percent_encoding_known_set', r'let value = (req.query["name"] ?? "").addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? "fixed"' + '\n' + clean_sink, ''),
+            ('percent_encoding_custom_set', r'let value = (req.query["name"] ?? "").addingPercentEncoding(withAllowedCharacters: CharacterSet(charactersIn: "\r\nx")) ?? "fixed"' + '\n' + sink, ''),
+            ('percent_encoding_shadowed_set', r'let value = (req.query["name"] ?? "").addingPercentEncoding(withAllowedCharacters: CharacterSet.urlPathAllowed) ?? "fixed"' + '\n' + sink,
+             r'struct CharacterSet { static let urlPathAllowed = Foundation.CharacterSet(charactersIn: "\r\n") }'),
+            ('full_guard', source + guard + clean_sink, ''),
+            ('only_cr_guard', source + r'guard !value.contains("\r") else { return }' + '\n' + sink, ''),
+            ('only_lf_guard', source + r'guard !value.contains("\n") else { return }' + '\n' + sink, ''),
+            ('unrelated_guard', source + 'let other = req.query["other"] ?? ""\n' + guard.replace('value', 'other') + sink, ''),
+            ('conditional_guard', source + 'if enabled {\n' + guard + '}\n' + sink, ''),
+            ('continuing_check', source + r'if value.contains("\r") || value.contains("\n") { recordInvalid() }' + '\n' + sink, ''),
+            ('reassigned_after_guard', source.replace('let ', 'var ', 1) + guard + 'value = req.query["other"] ?? ""\n' + sink, ''),
+            ('guarded_helper', 'let value = strip(req.query["name"] ?? "")\n' + clean_sink,
+             r'func strip(_ raw: String) -> String { guard !raw.contains("\r"), !raw.contains("\n") else { return "invalid" }; return raw }'),
+            ('strip_helper', 'let value = strip(req.query["name"] ?? "")\n' + clean_sink,
+             r'func strip(_ raw: String) -> String { return raw.replacingOccurrences(of: "\r", with: "").replacingOccurrences(of: "\n", with: "") }'),
+            ('literal_not_binding', source + 'response.headers["X-Value"] = "value"\n', ''),
+            ('comments_are_not_sinks', source + '// response.headers["X-Value"] = value\n', ''),
+            ('literal_is_not_sink', source + 'let sample = #"response.headers["X-Value"] = value"#\n', ''),
+            ('interpolation', source + r'response.headers["Content-Disposition"] = "attachment; filename=\(value)" // expect-header' + '\n', ''),
+            ('add_value', source + 'headers.add(name: "X-Value", value: value) // expect-header\n', ''),
+            ('replace_value', source + 'headers.replaceOrAdd(name: "X-Value", value: value) // expect-header\n', ''),
+            ('set_value', source + 'headers.set(name: "X-Value", value: value) // expect-header\n', ''),
+            ('response_constructor', source + '_ = Response(status: .ok, headers: ["X-Value": value]) // expect-header\n', ''),
+            ('tuple_constructor', source + '_ = HTTPHeaders([("X-Value", value)]) // expect-header\n', ''),
+            ('location_value_is_distinct_policy', source + 'response.headers["Location"] = value\n', ''),
+            ('location_only_tainted', source + '_ = Response(status: .ok, headers: ["Location": value, "X-Value": "fixed"])\n', ''),
+            ('mixed_header_values', source + '_ = Response(status: .ok, headers: ["Location": "/fixed", "X-Value": value]) // expect-header\n', ''),
+        )
+
+    @staticmethod
+    def program(body, helper=''):
+        return ('import Foundation\n' + helper + '\nfunc handle(req: Request) {\n' + body + '}\n')
+
+    def probe(self, name, source):
+        import hashlib
+        import time
+        from ubs_core.swift_detectors.header_injection import scan
+        target = self.artifacts / (name + '.swift')
+        target.write_text(source, encoding='utf-8')
+        started = time.monotonic()
+        rows = list(scan(SimpleNamespace(project_dir=self.artifacts, files=[target])))
+        target.with_suffix('.json').write_text(json.dumps({
+            'source_sha256': hashlib.sha256(target.read_bytes()).hexdigest(),
+            'seconds': time.monotonic() - started, 'findings': rows,
+        }, indent=2), encoding='utf-8')
+        return rows
+
+    def test_independent_header_value_cases(self):
+        for name, body, helper in self.cases():
+            with self.subTest(case=name):
+                source = self.program(body, helper)
+                expected = [index for index, line in enumerate(source.splitlines(), 1) if '// expect-header' in line]
+                rows = self.probe(name, source)
+                self.assertEqual([(row['rule'], row['line'], row['severity']) for row in rows],
+                                 [(self.RULE, index, 'critical') for index in expected], rows)
+
+    def test_same_name_in_other_function_is_not_a_source(self):
+        source = '''import Foundation
+func incoming(req: Request) {
+    let value = req.query["name"] ?? ""
+}
+func unrelated() {
+    let value = "fixed"
+    response.headers["X-Value"] = value
+}
+'''
+        self.assertEqual(self.probe('other-function', source), [])
+
+    def test_suppression_removes_only_selected_header_rule(self):
+        source = self.program('let value = req.query["name"] ?? ""\n'
+                              'response.headers["X-Value"] = value // ubs:ignore[swift.taint.header-injection]\n')
+        self.assertEqual(self.probe('suppressed', source), [])
+
+    def test_same_file_string_overload_is_not_native_sanitizer_proof(self):
+        from ubs_core.swift_detectors.header_injection import scan
+        # This two-label overload can shadow Foundation's four-label method
+        # (whose options/range have defaults). Its body preserves the input.
+        source = self.program(
+            r'let value = (req.query["name"] ?? "").replacingOccurrences(of: "\r", with: "").replacingOccurrences(of: "\n", with: "")' + '\n' +
+            'response.headers["X-Value"] = value\n',
+            'extension String { func replacingOccurrences(of target: String, with replacement: String) -> String { return self } }')
+        target = self.artifacts / 'shadowed-string-method.swift'
+        target.write_text(source, encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, r'dispatch.*incomplete'):
+            list(scan(SimpleNamespace(project_dir=self.artifacts, files=[target])))
+
+    def test_non_exiting_guard_is_explicitly_incomplete(self):
+        # Swift requires guard's else arm to leave its enclosing scope. An
+        # invalid guard is an analysis error, never a sanitizer or clean scan.
+        source = self.program('let value = req.query["name"] ?? ""\n' +
+                              r'guard !value.contains("\r"), !value.contains("\n") else { recordInvalid() }' + '\n' +
+                              'response.headers["X-Value"] = value\n')
+        with self.assertRaisesRegex(ValueError, r'guard else.*incomplete'):
+            self.probe('non-exiting-guard', source)
+
+    def test_original_fixture_header_sites(self):
+        from ubs_core.swift_detectors.header_injection import scan
+        cases = (
+            ('header_injection_buggy/Headers.swift', [52, 58, 67, 74, 80, 85, 94]),
+            ('header_injection_clean/HeadersSafe.swift', []),
+        )
+        for relative, expected in cases:
+            target = ROOT / 'test-suite/swift' / relative
+            with self.subTest(fixture=relative):
+                rows = list(scan(SimpleNamespace(project_dir=target.parent, files=[target])))
+                self.assertEqual([(row['rule'], row['line']) for row in rows],
+                                 [(self.RULE, line) for line in expected], rows)
+
+    def test_header_name_branches_preserve_each_possible_sink_policy(self):
+        # A conditional name can designate either Location or a regular
+        # header. Neither policy may erase the other branch's obligation.
+        for label, name in (
+            ('two-literals', 'enabled ? "Location" : "X-Value"'),
+            ('literal-or-request', 'enabled ? "Location" : (req.query["header"] ?? "Location")'),
+        ):
+            source = self.program('let value = req.query["next"] ?? ""\n' +
+                                  'let name = ' + name + '\n' +
+                                  'headers.add(name: name, value: value)\n')
+            target = self.artifacts / ('header-name-' + label + '.swift')
+            target.write_text(source, encoding='utf-8')
+            for policy, rule in (('header', self.RULE), ('redirect', 'swift.taint.request_open_redirect')):
+                with self.subTest(case=label, policy=policy):
+                    rows = flow_findings(target, source, policy)
+                    (self.artifacts / ('header-name-' + label + '-' + policy + '.json')).write_text(
+                        json.dumps(rows, indent=2), encoding='utf-8')
+                    self.assertEqual([(row['rule'], row['line']) for row in rows], [(rule, 6)], rows)
+
+    def test_module_and_runner_json_sarif(self):
+        import hashlib
+        import os
+        import subprocess
+        import time
+        cases = [(name, self.program(body, helper)) for name, body, helper in self.cases()
+                 if name in {'safe_name_identity', 'literal_overwrite', 'strip_both'}]
+        cases.append(('original_safe_fixture',
+                      (ROOT / 'test-suite/swift/header_injection_clean/HeadersSafe.swift').read_text(encoding='utf-8')))
+        for name, source in cases:
+            target = self.artifacts / (name + '-cli.swift')
+            target.write_text(source, encoding='utf-8')
+            expected = [index for index, line in enumerate(source.splitlines(), 1) if '// expect-header' in line]
+            for surface in ('module', 'runner'):
+                for fmt in ('json', 'sarif'):
+                    with self.subTest(case=name, surface=surface, format=fmt):
+                        entry = ROOT / 'modules/ubs-swift.sh' if surface == 'module' else ROOT / 'ubs'
+                        command = [str(entry), '--ci', '--format=' + fmt, str(target)]
+                        command.insert(1, '--only=6' if surface == 'module' else '--only=swift')
+                        started = time.monotonic()
+                        proc = subprocess.run(command, cwd=self.artifacts, capture_output=True, text=True,
+                            timeout=180, env={**os.environ, 'UBS_NO_AUTO_UPDATE': '1', 'UBS_NO_CACHE': '1',
+                                             'ENABLE_UV_TOOLS': '0', 'PYTHONDONTWRITEBYTECODE': '1'})
+                        prefix = self.artifacts / (name + '-' + surface + '-' + fmt)
+                        prefix.with_suffix('.stdout').write_text(proc.stdout, encoding='utf-8')
+                        prefix.with_suffix('.stderr').write_text(proc.stderr, encoding='utf-8')
+                        prefix.with_suffix('.identity.json').write_text(json.dumps({
+                            'command': command, 'exit': proc.returncode, 'seconds': time.monotonic() - started,
+                            'source_sha256': hashlib.sha256(target.read_bytes()).hexdigest(),
+                        }, indent=2), encoding='utf-8')
+                        context = f'exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}'
+                        self.assertEqual(proc.returncode, int(bool(expected)), context)
+                        report = json.loads(proc.stdout)
+                        if fmt == 'json':
+                            records = report['findings']
+                            key = 'rule_id' if surface == 'runner' else 'rule'
+                            actual = [(row[key], row['line'], row['severity']) for row in records
+                                      if row[key] == self.RULE]
+                            totals = report['totals'] if surface == 'runner' else report
+                            self.assertEqual((totals['critical'], totals['warning']), (len(expected), 0), context)
+                            self.assertEqual(actual, [(self.RULE, line, 'critical') for line in expected], context)
+                            if surface == 'runner':
+                                self.assertEqual(report['status'], 'ok', context)
+                                self.assertEqual(report['failed_modules'], [], context)
+                        else:
+                            records = [row for run in report['runs'] for row in run.get('results', [])]
+                            actual = [(row['ruleId'], row['locations'][0]['physicalLocation']['region']['startLine'],
+                                       row['level']) for row in records if row['ruleId'] == self.RULE]
+                            self.assertEqual(actual, [(self.RULE, line, 'error') for line in expected], context)
+
+
 if __name__ == '__main__':
     unittest.main()

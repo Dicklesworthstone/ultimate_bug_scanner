@@ -1,4 +1,4 @@
-"""Scoped Swift request dataflow for file and redirect sinks (mj1j.8).
+"""Scoped Swift request dataflow for file, redirect and header sinks (mj1j.8).
 
 The lexer keeps executable interpolation separate from inert literal text.
 Lexical bindings, structured branches/loops and selected same-file calls use
@@ -513,6 +513,7 @@ SWIFT_VALUE_TAGS = frozenset({'local-slash', 'not-network-path', 'no-backslash',
     'serialized-url', 'file-url', 'path-string', 'canonical-path', 'contained-path', 'file-leaf'})
 SWIFT_LOCAL_TAGS = frozenset({'local-slash', 'not-network-path', 'no-backslash',
                             'no-tab', 'no-newline', 'no-carriage-return'})
+SWIFT_HEADER_TAGS = frozenset({'no-newline', 'no-carriage-return'})
 
 
 def swift_tainted(fact):
@@ -849,6 +850,7 @@ class SwiftSummary:
 class SwiftEngine:
     def __init__(self, path, text, policy='path', parser=None):
         self.path, self.text, self.policy = Path(path).resolve(), text, policy
+        self.sink_label = {'path': 'file sink', 'redirect': 'redirect', 'header': 'response header'}[policy]
         self.parser = SwiftParser(text) if parser is None else parser
         self.lines = [0, *(index + 1 for index, char in enumerate(text) if char == '\n')]
         self.budget, self.graphs = Budget(), {}
@@ -915,12 +917,61 @@ class SwiftEngine:
             unsafe = frozenset(trace for trace in swift_tainted(value)
                 if not SWIFT_LOCAL_TAGS <= trace.tags and not (
                     {'url-scheme', 'url-host', 'serialized-url'} <= trace.tags))
+        elif self.policy == 'header':
+            unsafe = frozenset(trace for trace in swift_tainted(value)
+                if not SWIFT_HEADER_TAGS <= trace.tags)
         else:
             unsafe = frozenset(trace for trace in swift_tainted(value)
                 if 'contained-path' not in trace.tags and not (file_leaf and 'file-leaf' in trace.tags))
         if unsafe:
             self.effects[offset] = join(self.effects.get(offset, CLEAN),
-                advance(unsafe, self.step(offset, 'sink', 'redirect' if self.policy == 'redirect' else 'file sink')))
+                advance(unsafe, self.step(offset, 'sink', self.sink_label)))
+
+    def header_text(self, values):
+        """String composition preserves only each component's CR/LF proof.
+
+        It cannot manufacture a redirect or filesystem validation. Literal
+        CR/LF in the composition invalidates the corresponding header proof.
+        Unknown transformations still use forget(), including percent decoding.
+        """
+        value = join(*values)
+        removed = set()
+        for trace in value:
+            if trace.kind == 'constant' and trace.key[0] == 'literal':
+                if '\r' in trace.key[1]:
+                    removed.add('no-carriage-return')
+                if '\n' in trace.key[1]:
+                    removed.add('no-newline')
+        return retag(self.forget(value, SWIFT_HEADER_TAGS - removed), add=frozenset({'swift-string'}))
+
+    def native_string_method(self, leaf, receiver):
+        # A selected String extension can override/overload a sanitizer. Its
+        # spelling alone is never proof of Foundation/stdlib behavior.
+        return (bool(receiver) and all('swift-string' in trace.tags for trace in receiver)
+                and self.builtin('String')
+                and not any(function.owner and function.owner[-1] in {'String', 'NSString'}
+                            and function.name == leaf for function in self.parser.functions.values()))
+
+    def header_sanitizer(self, leaf, receiver, arguments, state, bindings):
+        if not self.native_string_method(leaf, receiver):
+            return None
+        parts = {label: swift_ungroup(tokens) for label, _, tokens in arguments}
+        if leaf == 'replacingOccurrences' and len(arguments) == 2 and set(parts) == {'of', 'with'}:
+            target, replacement = parts['of'], parts['with']
+            if (len(target) == len(replacement) == 1
+                    and target[0].kind == replacement[0].kind == 'literal'
+                    and target[0].value in {'\r', '\n'}
+                    and not any(char in replacement[0].value for char in '\r\n')):
+                tag = 'no-carriage-return' if target[0].value == '\r' else 'no-newline'
+                return retag(self.forget(receiver, SWIFT_HEADER_TAGS),
+                             add=frozenset({tag, 'swift-string'}))
+        if leaf == 'addingPercentEncoding' and len(arguments) == 1 and set(parts) == {'withAllowedCharacters'}:
+            allowed = swift_text(parts['withAllowedCharacters'])
+            if (re.fullmatch(r'(?:(?:Foundation\.)?CharacterSet)?\.(?:urlPathAllowed|urlQueryAllowed|alphanumerics)', allowed)
+                    and self.builtin('CharacterSet', state, bindings)
+                    and not any(owner.split('.')[-1] == 'CharacterSet' for owner in self.parser.extensions)):
+                return retag(self.forget(receiver), add=SWIFT_HEADER_TAGS | frozenset({'swift-string'}))
+        return None
 
     def candidates(self, name, receiver, state, bindings):
         leaf, owner = name.rsplit('.', 1)[-1], self.function.owner
@@ -1004,13 +1055,28 @@ class SwiftEngine:
             header_value = labeled.get('headers', join(*values) if leaf == 'HTTPHeaders' else CLEAN)
             if self.policy == 'redirect':
                 self.record(token.start, frozenset(trace for trace in header_value if 'header-key:location' in trace.tags))
+            elif self.policy == 'header':
+                self.record(token.start, frozenset(trace for trace in header_value
+                    if {tag for tag in trace.tags if tag.startswith('header-key:')} != {'header-key:location'}))
             return swift_shape('instance:' + leaf, token.start)
-        if leaf in {'add', 'replaceOrAdd'} and ('headers' in name.lower() or swift_has_shape(receiver, 'instance:Headers')):
-            names = {trace.key[1].lower() for trace in labeled.get('name', CLEAN) if trace.kind == 'constant'}
+        if leaf in {'add', 'replaceOrAdd', 'set'} and ('headers' in name.lower()
+                or swift_has_shape(receiver, 'instance:Headers')
+                or swift_has_shape(receiver, 'instance:HTTPHeaders')):
+            name_value = labeled.get('name', CLEAN)
+            names = {trace.key[1].lower() for trace in name_value
+                     if trace.kind == 'constant' and trace.key[0] == 'literal'}
             name_tokens = next((part for label, _, part in arguments if label == 'name'), ())
-            if names & {'location'} or swift_text(name_tokens).lower() == '.location':
-                if self.policy == 'redirect':
-                    self.record(token.start, labeled.get('value', CLEAN))
+            member = swift_text(name_tokens).lower()
+            literal_names = bool(name_value) and all(trace.kind == 'constant' and trace.key[0] == 'literal'
+                                                     for trace in name_value)
+            static_member = bool(re.fullmatch(r'\.[a-z][a-z0-9]*', member))
+            only_location = member == '.location' or literal_names and names == {'location'}
+            possible_location = (member == '.location' or 'location' in names
+                                 or not literal_names and not static_member)
+            if self.policy == 'redirect' and possible_location:
+                self.record(token.start, labeled.get('value', CLEAN))
+            elif self.policy == 'header' and not only_location:
+                self.record(token.start, labeled.get('value', CLEAN))
             return CLEAN
         native_file = (not candidates or name.startswith(('req.fileio.', 'request.fileio.')))
         if leaf in {'String', 'Data', 'FileHandle'}:
@@ -1091,6 +1157,10 @@ class SwiftEngine:
             return returned
         if candidates and any(swift_tainted(fact) for fact in values):
             raise ValueError('Swift selected helper arguments could not bind; analysis is incomplete')
+        if self.policy == 'header':
+            sanitized = self.header_sanitizer(leaf, receiver, arguments, state, bindings)
+            if sanitized is not None:
+                return sanitized
         if leaf in {'URL', 'URLComponents'} and self.builtin(name, state, bindings):
             if 'fileURLWithPath' in labeled:
                 return join(retag(self.forget(labeled['fileURLWithPath']), add=frozenset({'file-url'})),
@@ -1128,7 +1198,7 @@ class SwiftEngine:
 
     def member(self, name, receiver, token, owner_binding=None):
         if swift_has_shape(receiver, 'request'):
-            if name in {'query', 'parameters', 'params', 'headers'}:
+            if name in {'query', 'parameters', 'params', 'headers', 'cookies'}:
                 return swift_shape('request-collection', token.start)
             if name == 'content':
                 return swift_shape('request-content', token.start)
@@ -1305,7 +1375,11 @@ class SwiftEngine:
                     # helper mutations cannot strongly kill the skipped arm.
                     state.update(join_states(before, state))
             value = join(*values)
-            return value if set(operators) <= {'??'} else self.forget(value)
+            if set(operators) <= {'??'}:
+                return value
+            if self.policy == 'header' and set(operators) <= {'+'}:
+                return self.header_text(values)
+            return self.forget(value)
         if tokens[0].value == '#':
             imports_testing = any(left.value == 'import' and right.value == 'Testing'
                                   for left, right in zip(self.parser.tokens, self.parser.tokens[1:]))
@@ -1316,8 +1390,11 @@ class SwiftEngine:
         elif tokens[0].kind in {'literal', 'number', 'regex', 'template'}:
             token = tokens[0]
             if token.kind == 'template':
-                value = retag(self.forget(join(*(self.expression(part, state, bindings, depth + 1) for part in token.parts))),
-                              add=frozenset({'swift-string'}))
+                parts = [self.expression(part, state, bindings, depth + 1) for part in token.parts]
+                if self.policy == 'header':
+                    value = self.header_text([swift_constant(token.value), *parts])
+                else:
+                    value = retag(self.forget(join(*parts)), add=frozenset({'swift-string'}))
             else:
                 value = swift_constant(token.value, token.kind)
             cursor, name, owner_binding = 1, '', None
@@ -1548,6 +1625,8 @@ class SwiftEngine:
         value = state.get(binding, self.globals.get(name, CLEAN))
         if tag in SWIFT_LOCAL_TAGS:
             if not self.builtin('String') or any('file-url' in trace.tags or 'url-object' in trace.tags for trace in value):
+                return state
+            if self.policy == 'header' and not self.native_string_method('contains', value):
                 return state
             state[binding] = retag(value, add=frozenset({tag}))
             return state
@@ -1850,6 +1929,8 @@ class SwiftEngine:
                 if header_assignment:
                     if self.policy == 'redirect' and header_assignment.group(2).lower() == 'location':
                         self.record(lhs[0].start, value)
+                    elif self.policy == 'header' and header_assignment.group(2).lower() != 'location':
+                        self.record(lhs[0].start, value)
                     return state
                 member = re.fullmatch(r'([A-Za-z_]\w*)\.[A-Za-z_]\w*', header)
                 if member:
@@ -1930,7 +2011,7 @@ class SwiftEngine:
         effects = {}
         for summary in self.summaries.values():
             for offset, value in summary.effects.items():
-                sink = self.step(offset, 'sink', 'redirect' if self.policy == 'redirect' else 'file sink')
+                sink = self.step(offset, 'sink', self.sink_label)
                 effects[offset] = join(effects.get(offset, CLEAN), advance(swift_tainted(value), sink))
         return effects
 
@@ -1957,13 +2038,17 @@ def flow_findings(path, text, policy='path'):
     tokens = swift_validated_tokens(text)
     # Lexing and delimiter validation still run on every selected source.
     # With no selected request source, there is no source-to-sink obligation
-    # for these two policies; unrelated Swift closure/actor syntax belongs to
+    # for these policies; unrelated Swift closure/actor syntax belongs to
     # its own analyzer rather than being misreported as a failed taint pass.
     if not swift_request_source_tokens(tokens) or not swift_flow_obligation(tokens):
         return []
     parser = SwiftParser(text, tokens)
     engine = SwiftEngine(path, text, policy, parser)
-    rule = 'swift.taint.request_open_redirect' if policy == 'redirect' else 'swift.taint.request_path_traversal'
+    rule, message = {
+        'path': ('swift.taint.request_path_traversal', 'Request-derived path reaches file read/write/serve sink'),
+        'redirect': ('swift.taint.request_open_redirect', 'Unvalidated redirect from request data'),
+        'header': ('swift.taint.header-injection', 'Request-controlled value reaches HTTP response header'),
+    }[policy]
     suppression = SourceSuppressions('swift')
     suppression.index(path, text)
     findings, seen = [], set()
@@ -1971,13 +2056,13 @@ def flow_findings(path, text, policy='path'):
         traces = sorted(value, key=lambda trace: (len(trace.evidence), trace.evidence, trace.key))
         if not traces:
             continue
-        sink = engine.step(offset, 'sink', 'redirect' if policy == 'redirect' else 'file sink')
+        sink = engine.step(offset, 'sink', engine.sink_label)
         if sink.line in seen or suppression.is_suppressed(path, sink.line, rule):
             continue
         seen.add(sink.line)
         findings.append(dict(rule=rule, path=str(path.resolve()), line=sink.line, col=sink.column,
             lang='swift', layer='taint', severity='critical',
-            message='Unvalidated redirect from request data' if policy == 'redirect' else 'Request-derived path reaches file read/write/serve sink',
+            message=message,
             extras={'taint_path': [step.record() for step in traces[0].evidence],
                     'source_count': len({trace.key for trace in traces})}))
     return findings

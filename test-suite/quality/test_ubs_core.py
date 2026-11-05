@@ -6257,6 +6257,7 @@ class SwiftCppSuppressionTests(unittest.TestCase):
     # programs still reach the sink there (expected sink lines below). The
     # shipped clean fixtures (original-safe) carry the safe side for them.
     UNBOUND_SAFE = {
+        "swift_detectors.header_injection": [4],
         "analyzers.taint_swift_redirect": [6],
         "analyzers.taint_cpp_traversal": [4],
         "analyzers.taint_cpp_redirect": [4],

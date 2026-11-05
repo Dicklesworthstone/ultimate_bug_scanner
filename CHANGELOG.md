@@ -10,6 +10,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Analyze Swift response-header values with the scoped request-flow engine.
+  Follow assignments, branches, helper bodies, aliases and interpolation;
+  require both CR and LF protection on the actual value. Recognize bounded
+  full-string stripping and safe percent encoding, reject name-only sanitizer
+  trust, and retain distinct redirect/header obligations for mixed names.
+
 - Refuse incomplete, failed, or contradictory baseline reports in `--new-only`
   scans before they can suppress current findings. Completion metadata is
   checked at report and scanner boundaries without buffering the report;

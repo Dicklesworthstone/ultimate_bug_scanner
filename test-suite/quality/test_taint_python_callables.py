@@ -11,7 +11,7 @@ import tempfile
 import textwrap
 import unittest
 
-from test_taint_python_dataflow import ROOT, SourceTest
+from test_taint_python_dataflow import ROOT, SourceTest, taint_py
 
 
 class CallableFlowTests(SourceTest):
@@ -231,6 +231,587 @@ class ClassCallableFlowTests(SourceTest):
             with self.subTest(decorator=decorator):
                 self.assert_rules(f'class Service:\n    @{decorator}\n    def clean(value):\n'
                                   '        return "safe"\neval(Service.clean(input()))', 'eval')
+
+    def test_captured_method_does_not_bypass_unsupported_descriptor_guard(self):
+        for decorator in ('unknown', 'property'):
+            for body in ('prefix', 'pass'):
+                with self.subTest(decorator=decorator, captured=body == 'prefix'):
+                    self.assert_rules(f'''
+                        def invoke(prefix, code):
+                            class Service:
+                                @{decorator}
+                                def clean(value):
+                                    {body}
+                                    return 'fixed'
+                            eval(Service.clean(code))
+                        invoke('fixed', input())
+                    ''', 'eval')
+
+
+class EscapingClosureCellTests(SourceTest):
+    """Escaped lexical cells stay live and separate from evaluated defaults."""
+
+    CELL_FACTORY = (
+        'def factory(value):\n'
+        '    def read():\n'
+        '        return value\n'
+        '    def write(new):\n'
+        '        nonlocal value\n'
+        '        value = new\n'
+        '        return read\n'
+        '    return write\n'
+    )
+
+    def test_returned_def_and_lambda_keep_captured_sink_values(self):
+        for definition in (
+            'def factory(code):\n    def run():\n        eval(code)\n    return run\n',
+            'def factory(code):\n    return lambda: eval(code)\n',
+        ):
+            for actual, expected in (('input()', ('eval',)), ('"fixed"', ())):
+                with self.subTest(definition=definition, actual=actual):
+                    self.assert_rules(definition + f'factory({actual})()\n', *expected)
+            with self.subTest(definition=definition, invoked=False):
+                self.assert_rules(definition + 'saved = factory(input())\n')
+
+    def test_returned_def_and_lambda_keep_captured_return_values(self):
+        for definition in (
+            'def factory(code):\n    def read():\n        return code\n    return read\n',
+            'def factory(code):\n    return lambda: code\n',
+        ):
+            for actual, expected in (('input()', ('eval',)), ('"fixed"', ())):
+                with self.subTest(definition=definition, actual=actual):
+                    self.assert_rules(definition + f'eval(factory({actual})())\n', *expected)
+
+    def test_returned_closure_keeps_captured_callable_identities(self):
+        definition = ('def factory(callback):\n    def run(code):\n'
+                      '        return callback(code)\n    return run\n')
+        self.assert_rules(definition + 'factory(eval)(input())\n', 'eval')
+        self.assert_rules(definition + 'factory(print)(input())\n')
+        self.assert_rules('''
+            def factory(obtain):
+                return lambda: obtain()
+            eval(factory(input)())
+        ''', 'eval')
+
+    def test_captured_sanitizers_remain_domain_specific(self):
+        definition = 'def factory(escape):\n    return lambda value: escape(value)\n'
+        for expression, expected in (
+            ('HttpResponse(factory(html.escape)(input()))', ()),
+            ('eval(factory(html.escape)(input()))', ('eval',)),
+            ('os.system(factory(shlex.quote)(input()))', ()),
+            ('eval(factory(shlex.quote)(input()))', ('eval',)),
+        ):
+            with self.subTest(expression=expression):
+                self.assert_rules(definition + expression, *expected)
+
+    def test_caller_locals_do_not_replace_captured_cells(self):
+        for captured, local, expected in (
+            ('input()', '"fixed"', ('eval',)),
+            ('"fixed"', 'input()', ()),
+        ):
+            with self.subTest(captured=captured, local=local):
+                self.assert_rules(f'''
+                    def factory(code):
+                        return lambda: code
+                    saved = factory({captured})
+                    def caller(callback):
+                        code = {local}
+                        eval(callback())
+                    caller(saved)
+                ''', *expected)
+
+    def test_caller_globals_do_not_replace_captured_cells(self):
+        for captured, global_value, expected in (
+            ('input()', '"fixed"', ('eval',)),
+            ('"fixed"', 'input()', ()),
+        ):
+            with self.subTest(captured=captured, global_value=global_value):
+                self.assert_rules(f'''
+                    def factory(code):
+                        def read():
+                            return code
+                        return read
+                    saved = factory({captured})
+                    code = {global_value}
+                    eval(saved())
+                ''', *expected)
+
+    def test_factory_invocations_keep_independent_cells(self):
+        for create in ('factory', 'forward'):
+            with self.subTest(create=create):
+                source = (
+                    'def factory(value):\n    return lambda: value\n'
+                    'def forward(value):\n    return factory(value)\n'
+                    f'dirty = {create}(input())\n'
+                    f'clean = {create}("fixed")\n'
+                    'eval(clean())\neval(dirty())\n'
+                )
+                findings = self.assert_rules(source, 'eval')
+                self.assertEqual(findings[0]['line'], len(source.splitlines()))
+
+    def test_recursive_invocation_does_not_replace_the_callers_cell(self):
+        for actual, expected in (('input()', ('eval',)), ('"fixed"', ())):
+            with self.subTest(actual=actual):
+                self.assert_rules(f'''
+                    def make(value, stop):
+                        def read():
+                            return value
+                        if stop:
+                            return read
+                        make('fixed', True)
+                        eval(read())
+                    make({actual}, False)
+                ''', *expected)
+
+    def test_nested_closures_resolve_the_nearest_lexical_owner(self):
+        self.assert_rules('''
+            def outer(value):
+                def middle():
+                    def read():
+                        return value
+                    return read
+                return middle
+            eval(outer(input())()())
+        ''', 'eval')
+        self.assert_rules('''
+            def outer(value):
+                def middle():
+                    value = 'fixed'
+                    return lambda: value
+                return middle
+            eval(outer(input())()())
+        ''')
+        for global_value, actual, expected in (
+            ('input()', '"fixed"', ('eval',)),
+            ('"fixed"', 'input()', ()),
+        ):
+            with self.subTest(explicit_global=global_value):
+                self.assert_rules(f'''
+                    value = {global_value}
+                    def factory(value):
+                        def read():
+                            global value
+                            return value
+                        return read
+                    eval(factory({actual})())
+                ''', *expected)
+
+    def test_intermediate_global_declaration_blocks_outer_cell_capture(self):
+        for global_value, actual, expected in (
+            ('input()', '"fixed"', ('eval',)),
+            ('"fixed"', 'input()', ()),
+        ):
+            with self.subTest(global_value=global_value, actual=actual):
+                self.assert_rules(f'''
+                    value = {global_value}
+                    def outer(value):
+                        def middle():
+                            global value
+                            def read():
+                                return value
+                            return read
+                        return middle
+                    eval(outer({actual})()())
+                ''', *expected)
+
+    def test_rebinding_before_return_updates_the_live_closure(self):
+        for closure in ('def read():\n        return value', 'read = lambda: value'):
+            for initial, final, expected in (
+                ('"fixed"', 'input()', ('eval',)),
+                ('input()', '"fixed"', ()),
+            ):
+                with self.subTest(closure=closure, initial=initial, final=final):
+                    source = ('def factory(initial, final):\n    value = initial\n'
+                              f'    {closure}\n    value = final\n    return read\n'
+                              f'eval(factory({initial}, {final})())\n')
+                    self.assert_rules(source, *expected)
+
+    def test_branch_join_keeps_values_before_lazy_cell_allocation(self):
+        # Only one branch creates a closure before the join. The other
+        # branch's value must still reach the cell used by the final closure.
+        for first, second in (
+            ('unused = lambda: value', 'value = replacement'),
+            ('value = replacement', 'unused = lambda: value'),
+        ):
+            for initial, replacement, expected in (
+                ('"fixed"', 'input()', ('eval',)),
+                ('input()', '"fixed"', ('eval',)),
+                ('"fixed"', '"other fixed"', ()),
+            ):
+                with self.subTest(first=first, initial=initial, replacement=replacement):
+                    self.assert_rules(f'''
+                        def factory(initial, replacement):
+                            value = initial
+                            if flag:
+                                {first}
+                            else:
+                                {second}
+                            return lambda: value
+                        eval(factory({initial}, {replacement})())
+                    ''', *expected)
+
+    def test_evaluated_defaults_are_snapshots_not_live_cells(self):
+        for initial, final, expected in (
+            ('input()', '"fixed"', ('eval',)),
+            ('"fixed"', 'input()', ()),
+        ):
+            with self.subTest(initial=initial, final=final):
+                self.assert_rules(f'''
+                    def factory(initial, final):
+                        value = initial
+                        def read(captured=value):
+                            return captured
+                        value = final
+                        return read
+                    eval(factory({initial}, {final})())
+                ''', *expected)
+
+    def test_escaped_nonlocal_setter_updates_a_sibling_reader(self):
+        self.assert_rules(self.CELL_FACTORY + '''
+setter = factory('fixed')
+reader = setter('fixed')
+setter(input())
+eval(reader())
+''', 'eval')
+        self.assert_rules(self.CELL_FACTORY + '''
+first = factory('fixed')
+second = factory('fixed')
+dirty = first(input())
+clean = second('fixed')
+eval(clean())
+eval(dirty())
+''', 'eval')
+
+    def test_clean_nonlocal_overwrite_kills_previous_taint(self):
+        self.assert_rules(self.CELL_FACTORY + '''
+setter = factory('fixed')
+reader = setter(input())
+setter('fixed')
+eval(reader())
+''')
+        self.assert_rules(self.CELL_FACTORY + '''
+setter = factory(input())
+reader = setter('fixed')
+eval(reader())
+''')
+
+    def test_shared_sibling_cells_survive_callback_arguments(self):
+        for initial, new, expected in (
+            ('"fixed"', 'input()', ('eval',)),
+            ('input()', '"fixed"', ()),
+        ):
+            with self.subTest(initial=initial, new=new):
+                self.assert_rules(f'''
+                    def factory(value):
+                        def read():
+                            return value
+                        def write(new):
+                            nonlocal value
+                            value = new
+                        def apply(callback, new):
+                            return callback(read, write, new)
+                        return apply
+                    def change_and_read(read, write, new):
+                        write(new)
+                        return read()
+                    eval(factory({initial})(change_and_read, {new}))
+                ''', *expected)
+
+    def test_callback_identity_rebinding_uses_the_shared_cell(self):
+        for before, after, expected in (('print', 'eval', ('eval',)), ('eval', 'print', ())):
+            with self.subTest(before=before, after=after):
+                self.assert_rules(f'''
+                    def factory(callback):
+                        def run(value):
+                            callback(value)
+                        def write(new):
+                            nonlocal callback
+                            callback = new
+                            return run
+                        return write
+                    setter = factory({before})
+                    run = setter({before})
+                    setter({after})
+                    run(input())
+                ''', *expected)
+
+    def test_nonlocal_delete_does_not_fall_back_to_a_caller_name(self):
+        self.assert_rules('''
+            def factory(value):
+                def read():
+                    return value
+                def erase():
+                    nonlocal value
+                    del value
+                    return read
+                return erase
+            value = input()
+            reader = factory(input())()
+            eval(reader())
+        ''')
+
+    def test_deleted_nonlocal_can_be_reinitialized(self):
+        for actual, expected in (('input()', ('eval',)), ('"fixed"', ())):
+            with self.subTest(actual=actual):
+                self.assert_rules(f'''
+                    def factory(value):
+                        def read():
+                            return value
+                        def replace(new):
+                            nonlocal value
+                            del value
+                            value = new
+                            return read
+                        return replace
+                    reader = factory(input())({actual})
+                    eval(reader())
+                ''', *expected)
+
+    def test_finally_writes_update_the_returned_closure(self):
+        for initial, final, expected in (
+            ('"fixed"', 'input()', ('eval',)),
+            ('input()', '"fixed"', ()),
+        ):
+            with self.subTest(initial=initial, final=final):
+                self.assert_rules(f'''
+                    def factory(initial, final):
+                        value = initial
+                        def read():
+                            return value
+                        try:
+                            return read
+                        finally:
+                            value = final
+                    eval(factory({initial}, {final})())
+                ''', *expected)
+
+    def test_exceptional_nonlocal_writes_reach_a_sibling_reader(self):
+        for initial, new, expected in (
+            ('"fixed"', 'input()', ('eval',)),
+            ('input()', '"fixed"', ()),
+        ):
+            with self.subTest(initial=initial, new=new):
+                self.assert_rules(f'''
+                    def factory(value):
+                        def read():
+                            return value
+                        def write(new):
+                            nonlocal value
+                            value = new
+                            raise ValueError()
+                        def apply(callback, new):
+                            return callback(read, write, new)
+                        return apply
+                    def change_and_read(read, write, new):
+                        try:
+                            write(new)
+                        except ValueError:
+                            return read()
+                    eval(factory({initial})(change_and_read, {new}))
+                ''', *expected)
+
+    def test_escaped_async_closure_reads_its_captured_value(self):
+        for actual, expected in (('input()', ('eval',)), ('"fixed"', ())):
+            with self.subTest(actual=actual):
+                self.assert_rules(f'''
+                    import asyncio
+                    def factory(code):
+                        async def read():
+                            return code
+                        return read
+                    async def route(value):
+                        read = factory(value)
+                        return await read()
+                    eval(asyncio.run(route({actual})))
+                ''', *expected)
+
+    def test_async_cell_reads_happen_when_the_coroutine_resumes(self):
+        for initial, final, expected in (
+            ('"fixed"', 'input()', ('eval',)),
+            ('input()', '"fixed"', ()),
+        ):
+            with self.subTest(initial=initial, final=final):
+                self.assert_rules(f'''
+                    import asyncio
+                    def factory(value):
+                        async def read():
+                            return value
+                        def write(new):
+                            nonlocal value
+                            value = new
+                            return read
+                        return write
+                    async def route(initial, final):
+                        setter = factory(initial)
+                        read = setter(initial)
+                        waiting = read()
+                        setter(final)
+                        return await waiting
+                    eval(asyncio.run(route({initial}, {final})))
+                ''', *expected)
+
+    def test_unawaited_escaped_async_closure_has_no_sink_effect(self):
+        self.assert_rules('''
+            def factory(code):
+                async def run():
+                    eval(code)
+                return run
+            pending = factory(input())()
+        ''')
+
+    def test_live_cell_generator_requires_resume_analysis_without_hiding_effects(self):
+        definition = (
+            'def factory(value):\n'
+            '    def values():\n        yield value\n'
+            '    def change(new):\n'
+            '        nonlocal value\n        value = new\n        return values\n'
+            '    return change\n'
+        )
+        for consume in ('eval(next(iterator))\n', 'for code in iterator:\n    eval(code)\n'):
+            with self.subTest(consume=consume):
+                source = ('eval(input())\n' + definition
+                          + "change = factory('fixed')\nvalues = change('fixed')\n"
+                          + 'iterator = values()\nchange(input())\n' + consume)
+                with self.assertRaisesRegex(
+                    taint_py.AnalysisLimit,
+                    'generator with live lexical cells requires resume-state analysis.*incomplete',
+                ) as raised:
+                    taint_py._Analysis(ast.parse(source)).analyze()
+                self.assertIn(('eval', 1, 1), {key[:3] for key in raised.exception.effects})
+
+        # Creating a generator closure does not execute it or require its
+        # resume state. Plain arguments and evaluated defaults stay supported.
+        self.assert_rules(definition + 'change = factory(input())\nvalues = change(input())\n')
+        for actual, expected in (('input()', ('eval',)), ('"fixed"', ())):
+            for provider in (
+                f'def values(code):\n    yield code\nfor code in values({actual}):\n    eval(code)\n',
+                'def factory(code):\n    def values(saved=code):\n        yield saved\n'
+                f'    return values\nfor code in factory({actual})():\n    eval(code)\n',
+            ):
+                with self.subTest(actual=actual, provider=provider):
+                    self.assert_rules(provider, *expected)
+
+    def test_generator_admits_only_stable_write_only_list_captures(self):
+        self.assert_rules('''
+            import json
+            def observe():
+                consumed = []
+                def lines():
+                    for index in range(3):
+                        consumed.append(index)
+                        yield json.dumps({'index': index})
+                for record in lines():
+                    print(record)
+            observe()
+        ''')
+        for mutation in ('append(input())', 'extend([input()])', 'insert(0, input())'):
+            with self.subTest(mutation=mutation):
+                self.assert_rules(f'''
+                    def observe():
+                        consumed = []
+                        def lines():
+                            consumed.{mutation}
+                            yield 'fixed'
+                        for record in lines():
+                            pass
+                        eval(consumed[0])
+                    observe()
+                ''', 'eval')
+
+        for source in (
+            '''
+            def observe():
+                consumed = []
+                def lines():
+                    consumed.append('fixed')
+                    yield consumed[0]
+                iterator = lines()
+            observe()
+            ''',
+            '''
+            def observe():
+                consumed = Custom()
+                def lines():
+                    consumed.append('fixed')
+                    yield 'fixed'
+                iterator = lines()
+            observe()
+            ''',
+            '''
+            def observe():
+                consumed = []
+                def lines():
+                    consumed.append('fixed')
+                    yield 'fixed'
+                def replace():
+                    nonlocal consumed
+                    consumed = []
+                iterator = lines()
+                replace()
+                for record in iterator:
+                    pass
+            observe()
+            ''',
+        ):
+            with self.subTest(incomplete=source), self.assertRaisesRegex(
+                taint_py.AnalysisLimit,
+                'generator with live lexical cells requires resume-state analysis.*incomplete',
+            ):
+                taint_py._Analysis(ast.parse(textwrap.dedent(source))).analyze()
+
+    def test_captured_mutable_object_retains_its_original_alias(self):
+        self.assert_rules('''
+            def factory(box):
+                return lambda: box[0]
+            box = ['fixed']
+            read = factory(box)
+            alias = box
+            box = ['fixed']
+            alias[0] = input()
+            eval(read())
+        ''', 'eval')
+        self.assert_rules('''
+            def factory(box):
+                return lambda: box[0]
+            box = ['fixed']
+            read = factory(box)
+            box = [input()]
+            eval(read())
+        ''')
+
+    def test_escaped_process_receiver_keeps_its_stdin_contract(self):
+        for argv, expected in (
+            ('["python3"]', ('command',)),
+            ('["echo"]', ()),
+            ('["python3", "-c", "print(1)"]', ()),
+        ):
+            with self.subTest(argv=argv):
+                self.assert_rules(f'''
+                    import subprocess
+                    def factory(proc):
+                        def send(code):
+                            proc.communicate(code)
+                        return send
+                    send = factory(subprocess.Popen({argv}, stdin=subprocess.PIPE))
+                    send(input())
+                ''', *expected)
+
+    def test_escaped_vectors_keep_program_and_data_positions(self):
+        for argv, expected in (
+            ('[input(), "data"]', ('command',)),
+            ('["echo", input()]', ()),
+            ('["python3", "-c", input()]', ('command',)),
+            ('["python3", "-c", "print(1)", input()]', ()),
+        ):
+            with self.subTest(argv=argv):
+                self.assert_rules(f'''
+                    import subprocess
+                    def factory(argv):
+                        def run():
+                            subprocess.run(argv)
+                        return run
+                    factory({argv})()
+                ''', *expected)
 
 
 class FiniteCallableTests(SourceTest):

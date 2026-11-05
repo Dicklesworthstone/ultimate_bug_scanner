@@ -192,6 +192,8 @@ def _dependency_target(node, bindings, evaluated=None):
         target = evaluated.get(argument)
     else:
         target = bindings.get(argument.id) if isinstance(argument, ast.Name) else None
+    if isinstance(target, _ClosureValue):
+        target = target.value
     if isinstance(target, _FunctionValue):
         target = target.function
     return target if isinstance(target, (ast.FunctionDef, ast.AsyncFunctionDef)) else None
@@ -409,6 +411,86 @@ class _ProcessInput:
     kind: str
 
 
+@dataclass(frozen=True)
+class _CellRef:
+    """A lexical allocation site with at most two enclosing call sites."""
+    owner: ast.AST
+    name: str
+    sites: tuple = ()
+
+
+@dataclass(frozen=True)
+class _CellContents:
+    fact: Fact = CLEAN
+    references: References = NO_REFERENCES
+    binding: object = None
+    # None means a join of bound and deleted/uninitialized alternatives.
+    bound: bool | None = True
+
+
+def _join_cells(left, right):
+    if left is right:
+        return left
+    return _CellContents(join_facts(left.fact, right.fact), left.references | right.references,
+                         _join_bindings(left.binding, right.binding),
+                         left.bound if left.bound == right.bound else None)
+
+
+@dataclass(frozen=True, eq=False)
+class _ClosureValue:
+    """A callable owns cell identities; their live contents belong to state."""
+    value: object
+    cells: tuple
+    depth: int = field(init=False, compare=False)
+    _hash: int = field(init=False, compare=False, repr=False)
+
+    @property
+    def function(self):
+        return self.value.function if isinstance(self.value, _FunctionValue) else self.value
+
+    def __post_init__(self):
+        depth = 1 + getattr(self.value, 'depth', 0)
+        if depth > _MAX_CAPTURE_DEPTH:
+            raise AnalysisLimit(f'Python captured-default nesting exceeds {_MAX_CAPTURE_DEPTH} levels')
+        object.__setattr__(self, 'depth', depth)
+        object.__setattr__(self, '_hash', hash((self.value, self.cells)))
+
+    def __hash__(self):
+        return self._hash
+
+    def __eq__(self, other):
+        return type(other) is type(self) and _same_analysis_value(self, other)
+
+
+@dataclass(frozen=True)
+class _CellGraph:
+    """Canonical call-context cells; contents here contain identities only."""
+    roots: tuple = ()
+    entries: tuple = ()
+
+
+class _CellState:
+    """Allocated lazily so scopes without closures keep their old state cost."""
+    def __init__(self):
+        self.names = {}
+        self.contents = {}
+        self.written = set()
+        self.multiple = set()
+
+    def copy(self):
+        other = _CellState()
+        other.names = self.names.copy()
+        other.contents = self.contents.copy()
+        other.written = self.written.copy()
+        other.multiple = self.multiple.copy()
+        return other
+
+    def __eq__(self, other):
+        return (isinstance(other, _CellState) and self.names == other.names
+                and self.contents == other.contents and self.written == other.written
+                and self.multiple == other.multiple)
+
+
 @dataclass(frozen=True, eq=False)
 class _FunctionValue:
     """One function creation owns its evaluated defaults.
@@ -445,6 +527,7 @@ class _DeferredCall:
     arguments: tuple = field(repr=False)
     references: tuple = field(repr=False)
     values: tuple = field(default=(), repr=False)
+    cells: tuple = field(default=(), repr=False)
     depth: int = field(init=False, compare=False)
     _hash: int = field(init=False, compare=False, repr=False)
 
@@ -469,13 +552,13 @@ def _capture_metadata(value):
     """
     depth = 1 + max((child.depth for _, binding in value.values
                      for child in (binding if isinstance(binding, frozenset) else (binding,))
-                     if isinstance(child, (_FunctionValue, _DeferredCall))), default=0)
+                     if isinstance(child, (_FunctionValue, _DeferredCall, _ClosureValue))), default=0)
     if depth > _MAX_CAPTURE_DEPTH:
         raise AnalysisLimit(f'Python captured-default nesting exceeds {_MAX_CAPTURE_DEPTH} levels')
     object.__setattr__(value, 'depth', depth)
     parts = (value.function, value.arguments, value.references, value.values)
     if isinstance(value, _DeferredCall):
-        parts = (value.call, *parts)
+        parts = (value.call, value.cells, *parts)
     object.__setattr__(value, '_hash', hash(parts))
 
 
@@ -490,56 +573,95 @@ def _same_analysis_value(left, right, *, witness=False):
     if left is right:
         return True
     compared = {}
-
-    def same(a, b, evidence):
+    pending = []
+    request = (left, right, witness)
+    while True:
+        a, b, evidence = request
         if a is b:
-            return True
-        key = (id(a), id(b), evidence)
-        previous = compared.get(key, _MISSING)
-        if previous is not _MISSING:
-            return previous
-        if isinstance(a, (_FunctionValue, _DeferredCall)):
-            result = (type(a) is type(b) and a._hash == b._hash
-                      and a.function is b.function
-                      and (not isinstance(a, _DeferredCall) or a.call is b.call)
-                      and same(a.arguments, b.arguments, evidence)
-                      and same(a.references, b.references, evidence)
-                      and same(a.values, b.values, evidence))
-        elif isinstance(b, (_FunctionValue, _DeferredCall)):
-            result = False
-        elif isinstance(a, TaintTrace):
-            result = a == b and (not evidence or a.path == b.path)
-        elif isinstance(a, tuple):
-            result = (isinstance(b, tuple) and len(a) == len(b)
-                      and all(same(x, y, evidence) for x, y in zip(a, b)))
-        elif isinstance(a, frozenset):
-            result = isinstance(b, frozenset) and len(a) == len(b)
-            if result:
-                buckets = {}
-                for candidate in b:
-                    buckets.setdefault(hash(candidate), []).append(candidate)
-                for item in a:
-                    matched = next((candidate for candidate in buckets.get(hash(item), ())
-                                    if same(item, candidate, False)), _MISSING)
-                    if matched is _MISSING or evidence and not same(item, matched, True):
-                        result = False
-                        break
-        elif isinstance(a, _BoundCallable):
-            result = (type(a) is type(b) and a.name == b.name and a.references == b.references
-                      and same(a.receiver, b.receiver, evidence))
-        elif isinstance(a, _BoundClassMethod):
-            result = (type(a) is type(b) and a.function is b.function and a.owner is b.owner
-                      and a.references == b.references and a.valid == b.valid
-                      and same(a.receiver, b.receiver, evidence))
-        elif isinstance(a, _ArgumentVector):
-            result = (type(a) is type(b) and a.references == b.references
-                      and same(a.operands, b.operands, evidence))
+            result = True
         else:
-            result = a == b
-        compared[key] = result
-        return result
+            key = (id(a), id(b), evidence)
+            result = compared.get(key, _MISSING)
+            if result is _MISSING:
+                frame = _analysis_comparison_steps(a, b, evidence)
+                try:
+                    request = next(frame)
+                except StopIteration as done:
+                    result = done.value
+                    compared[key] = result
+                else:
+                    pending.append((key, frame))
+                    continue
+        while pending:
+            key, frame = pending[-1]
+            try:
+                request = frame.send(result)
+            except StopIteration as done:
+                result = done.value
+                compared[key] = result
+                pending.pop()
+            else:
+                break
+        else:
+            return result
 
-    return same(left, right, witness)
+
+def _analysis_comparison_steps(a, b, evidence):
+    """Yield child comparisons in order; the driver owns the stack and memo."""
+    if isinstance(a, _ClosureValue):
+        return (type(a) is type(b) and a._hash == b._hash and a.cells == b.cells
+                and (yield (a.value, b.value, evidence)))
+    if isinstance(a, _CellContents):
+        return (type(a) is type(b) and a.bound == b.bound and a.references == b.references
+                and (yield (a.fact, b.fact, evidence))
+                and (yield (a.binding, b.binding, evidence)))
+    if isinstance(a, (_FunctionValue, _DeferredCall)):
+        return (type(a) is type(b) and a._hash == b._hash
+                and a.function is b.function
+                and (not isinstance(a, _DeferredCall) or a.call is b.call)
+                and (not isinstance(a, _DeferredCall) or a.cells == b.cells)
+                and (yield (a.arguments, b.arguments, evidence))
+                and (yield (a.references, b.references, evidence))
+                and (yield (a.values, b.values, evidence)))
+    if isinstance(b, (_FunctionValue, _DeferredCall)):
+        return False
+    if isinstance(a, TaintTrace):
+        return a == b and (not evidence or a.path == b.path)
+    if isinstance(a, tuple):
+        if not isinstance(b, tuple) or len(a) != len(b):
+            return False
+        for x, y in zip(a, b):
+            if not (yield (x, y, evidence)):
+                return False
+        return True
+    if isinstance(a, frozenset):
+        if not isinstance(b, frozenset) or len(a) != len(b):
+            return False
+        buckets = {}
+        for candidate in b:
+            buckets.setdefault(hash(candidate), []).append(candidate)
+        for item in a:
+            for candidate in buckets.get(hash(item), ()):
+                if (yield (item, candidate, False)):
+                    # Preserve first semantic match, then its evidence check;
+                    # the missing sentinel itself never proves a match.
+                    if candidate is _MISSING or evidence and not (yield (item, candidate, True)):
+                        return False
+                    break
+            else:
+                return False
+        return True
+    if isinstance(a, _BoundCallable):
+        return (type(a) is type(b) and a.name == b.name and a.references == b.references
+                and (yield (a.receiver, b.receiver, evidence)))
+    if isinstance(a, _BoundClassMethod):
+        return (type(a) is type(b) and (yield (a.function, b.function, evidence))
+                and a.owner is b.owner and a.references == b.references and a.valid == b.valid
+                and (yield (a.receiver, b.receiver, evidence)))
+    if isinstance(a, _ArgumentVector):
+        return (type(a) is type(b) and a.references == b.references
+                and (yield (a.operands, b.operands, evidence)))
+    return a == b
 
 
 @dataclass(frozen=True)
@@ -892,7 +1014,27 @@ class _State(dict):
         self.references = dict(getattr(values, 'references', {}))
         self.heap = dict(getattr(values, 'heap', {}))
         self.mutated = set(getattr(values, 'mutated', ()))
+        cells = getattr(values, 'cells', None)
+        self.cells = cells.copy() if cells is not None else None
         self.reachable = getattr(values, 'reachable', True)
+
+    def cell_state(self):
+        if self.cells is None:
+            self.cells = _CellState()
+        return self.cells
+
+    def put_cell(self, ref, contents, *, written=False, weak=False):
+        cells = self.cell_state()
+        if weak and ref in cells.contents:
+            contents = _join_cells(cells.contents[ref], contents)
+        cells.contents[ref] = contents
+        if written:
+            cells.written.add(ref)
+        for name, target in cells.names.items():
+            if target == ref:
+                self[name] = contents.fact
+                self.bindings[name] = contents.binding
+                self.references[name] = contents.references
 
     def value(self, name):
         base = self.get(name, CLEAN)
@@ -915,6 +1057,7 @@ class _State(dict):
         clone.references = self.references.copy()
         clone.heap = self.heap.copy()
         clone.mutated = self.mutated.copy()
+        clone.cells = self.cells.copy() if self.cells is not None else None
         clone.reachable = self.reachable
         return clone
 
@@ -928,12 +1071,14 @@ class _State(dict):
         self.references = other.references.copy()
         self.heap = other.heap.copy()
         self.mutated = other.mutated.copy()
+        self.cells = other.cells.copy() if other.cells is not None else None
         self.reachable = other.reachable
 
     def __eq__(self, other):
         return (isinstance(other, _State) and dict.__eq__(self, other)
                 and self.bindings == other.bindings and self.references == other.references
                 and self.heap == other.heap and self.mutated == other.mutated
+                and self.cells == other.cells
                 and self.reachable == other.reachable)
 
     def __ne__(self, other):
@@ -985,6 +1130,21 @@ def _join_states(*states):
                 references[key] = previous | refs
         if other.mutated:
             values.mutated.update(other.mutated)
+        if other.cells is not None:
+            if values.cells is None:
+                values.cells = other.cells.copy()
+            else:
+                cells = values.cells
+                for name, ref in other.cells.names.items():
+                    previous = cells.names.get(name, ref)
+                    if previous != ref:
+                        raise AnalysisLimit('ambiguous lexical cell ownership; analysis is incomplete')
+                    cells.names[name] = ref
+                for ref, contents in other.cells.contents.items():
+                    previous = cells.contents.get(ref)
+                    cells.contents[ref] = contents if previous is None else _join_cells(previous, contents)
+                cells.written.update(other.cells.written)
+                cells.multiple.update(other.cells.multiple)
     # A missing binding is not neutral: it stands for the name's implicit
     # identity, so bindings are joined over the full key union as before.
     if len(others) == 1:
@@ -1032,13 +1192,18 @@ def _identity_snapshot(state):
             tuple(state.bindings), tuple(state.bindings.values()),
             tuple(state.references), tuple(state.references.values()),
             tuple(state.heap), tuple(state.heap.values()),
-            frozenset(state.mutated))
+            frozenset(state.mutated),
+            (tuple(state.cells.names.items()), tuple(state.cells.contents), tuple(state.cells.contents.values()),
+             frozenset(state.cells.written), frozenset(state.cells.multiple)) if state.cells is not None else None)
 
 
 def _same_snapshot(left, right):
     # Keys compare by equality; values must be the very same objects, since
     # equal facts may still carry different (shorter) evidence paths.
-    return (left[0] == right[0] and left[2] == right[2] and left[4] == right[4]
+    cells_equal = (left[9] is right[9] or left[9] is not None and right[9] is not None
+                   and left[9][:2] == right[9][:2] and left[9][3:] == right[9][3:]
+                   and all(map(operator.is_, left[9][2], right[9][2])))
+    return (cells_equal and left[0] == right[0] and left[2] == right[2] and left[4] == right[4]
             and left[6] == right[6] and left[8] == right[8]
             and all(map(operator.is_, left[1], right[1]))
             and all(map(operator.is_, left[3], right[3]))
@@ -1064,10 +1229,12 @@ def _same_namespace(left, right):
         return False
     # State equality already covers reference sets, reachability and mutated
     # identities. Only values, heap cells and bindings can carry evidence.
-    return all(_same_witness(value, other[name])
+    return ((left.cells is None or all(_same_witness(value, right.cells.contents[ref])
+                                      for ref, value in left.cells.contents.items()))
+            and all(_same_witness(value, other[name])
                for values, other in ((left, right), (left.heap, right.heap),
                                      (left.bindings, right.bindings))
-               for name, value in values.items())
+               for name, value in values.items()))
 
 
 def _qualified(node: ast.AST, aliases: dict[str, object]) -> str:
@@ -1273,6 +1440,8 @@ class ExceptionSummary:
     exception_type: str | None
     value: Fact = CLEAN
     mutations: tuple = ()
+    cells: tuple = ()
+    multiple_cells: frozenset = frozenset()
 
 
 @dataclass(frozen=True)
@@ -1303,6 +1472,10 @@ class FunctionSummary:
     # Request value identities only when a program/option/argv operation needs
     # them. Ordinary data and unrelated defaults share the same summary.
     value_parameters: frozenset[str] = frozenset()
+    # Final contents of written incoming cells and newly escaping cells.
+    # Unlike object mutations, these may replace a value or delete its name.
+    cells: tuple = ()
+    multiple_cells: frozenset = frozenset()
 
 
 class _CallSubstitution:
@@ -1409,6 +1582,7 @@ class _Flow:
         self.yielded_references = set()
         self.returned_bindings = []
         self.yielded_bindings = []
+        self.yielded_state = None
         self.generator_return_bindings = {}
         self.normal_state = None
         self.last_state = None
@@ -1417,6 +1591,7 @@ class _Flow:
         # element/effect; this is a precision budget, not a scan cutoff.
         self.comprehension_budget = 64
         self.comprehension_environments = []
+        self.class_environments = []
         self.context_globals = ()
         self.capture_globals = set()
         self.value_parameters = set()
@@ -1508,7 +1683,8 @@ class _Flow:
         # assignment or heap mutation still introduces its unsanitized facts.
         if checked == {'scheme', 'hostname'} and not any(
                 state.heap.get(ref, CLEAN) for ref in state.references.get(name, NO_REFERENCES)):
-            state[name] = _sanitize(state.value(name), 'ssrf')
+            self.write_name(state, name, _sanitize(state.value(name), 'ssrf'), state.bindings.get(name),
+                            state.references.get(name, NO_REFERENCES))
 
     def possible_exception(self, state):
         if not (state.reachable and self.exception_states):
@@ -1656,10 +1832,9 @@ class _Flow:
                 branch = item.state.copy()
                 self.expr(handler.type, branch)
                 if handler.name:
-                    branch[handler.name] = _advance(item.value, handler.name)
-                    branch.references[handler.name] = item.references
-                    branch.bindings[handler.name] = (
-                        '@exception:' + item.exception_type if item.exception_type else None)
+                    self.write_name(branch, handler.name, _advance(item.value, handler.name),
+                                    '@exception:' + item.exception_type if item.exception_type else None,
+                                    item.references)
                 self.handled.append(item)
                 try:
                     end, exits = self.capture(handler.body, branch, exceptions=True)
@@ -1670,9 +1845,7 @@ class _Flow:
                 if handler.name:
                     for target in [end, *(exit_.state for exit_ in exits)]:
                         if target is not None:
-                            target[handler.name] = CLEAN
-                            target.bindings[handler.name] = None
-                            target.references[handler.name] = NO_REFERENCES
+                            self.write_name(target, handler.name, CLEAN, None, bound=False)
                 normals.append(end)
                 outgoing.extend(exits)
         outgoing.extend(remaining)
@@ -1762,11 +1935,335 @@ class _Flow:
         if unsafe:
             self.effects[key] = join_facts(self.effects.get(key, CLEAN), unsafe)
 
+    def write_name(self, state, name, fact, binding, references=NO_REFERENCES, *, bound=True):
+        """A scalar rebinding replaces a cell; object writes still use mutate."""
+        state[name] = fact
+        state.bindings[name] = binding
+        state.references[name] = references
+        if state.cells is not None and name in state.cells.names:
+            ref = state.cells.names[name]
+            self.engine.budget.spend(1 + len(state.cells.names))
+            state.put_cell(ref, _CellContents(fact, references, binding, bound), written=True,
+                           weak=ref in state.cells.multiple)
+
+    def lexical_cell(self, function, name, state):
+        owner = self.engine.cell_owners.get(function, {}).get(name)
+        active = owner is self.scope or any(owner is scope for scope, _outer in self.comprehension_environments)
+        inherited = self.engine.cell_owners.get(self.scope, {}).get(name) is owner
+        if state.cells is not None and name in state.cells.names and (active or inherited):
+            return state.cells.names[name]
+        if active or inherited:
+            for _class, enclosing in reversed(self.class_environments):
+                if enclosing.cells is not None and name in enclosing.cells.names:
+                    return enclosing.cells.names[name]
+        if not active:
+            raise AnalysisLimit(f'lexical cell {name!r} has no defining invocation; analysis is incomplete')
+        ref = _CellRef(owner, name)
+        cells = state.cell_state()
+        if ref in cells.contents:
+            # A class body has its own namespace, but its methods close over
+            # the enclosing function's already allocated cells.
+            return ref
+        cells.names[name] = ref
+        cells.contents[ref] = _CellContents(state.get(name, CLEAN),
+                                          state.references.get(name, NO_REFERENCES),
+                                          state.bindings.get(name), name in state)
+        self.engine.budget.spend()
+        return ref
+
+    def cell_contents(self, ref, state):
+        contents = state.cells.contents.get(ref) if state.cells is not None else None
+        if contents is not None:
+            return contents
+        # Imported/module callbacks retain their defining module's cells.
+        owner = self.engine.owner(ref.owner) if isinstance(ref, _CellRef) else self.engine
+        if owner.globals.cells is not None and ref in owner.globals.cells.contents:
+            cells = state.cell_state()
+            contents = owner.globals.cells.contents[ref]
+            if not isinstance(self.scope, ast.Module):
+                # A module capture stores concrete object identities, while
+                # this function's heap uses symbolic globals. Preserve both
+                # representations of every proven alias. The current frame's
+                # module index cannot confuse a foreign or same-name local
+                # object with the one that was actually captured.
+                def project(objects):
+                    aliases = set(objects)
+                    self.engine.budget.spend(len(objects))
+                    for obj in objects:
+                        if not isinstance(obj, ast.AST):
+                            continue
+                        symbolic = self.engine.global_object_aliases.get(obj)
+                        if self.engine.reads is not None:
+                            self.engine.reads[('global_object_aliases', obj)] = symbolic
+                        if symbolic:
+                            aliases.update(symbolic)
+                    return frozenset(aliases)
+
+                contents = _CellContents(contents.fact, project(contents.references),
+                                         self.map_cell_bindings(contents.binding, lambda cell: cell,
+                                                                map_objects=project), contents.bound)
+            cells.contents[ref] = contents
+            if ref in owner.globals.cells.multiple:
+                cells.multiple.add(ref)
+            self.engine.budget.spend()
+            return contents
+        raise AnalysisLimit('unavailable captured lexical cell; analysis is incomplete')
+
+    def closure_environment(self, function, state, closure=None):
+        if not self.engine.closures.get(function):
+            return state
+        refs = dict(closure.cells) if closure is not None else {
+            name: self.lexical_cell(function, name, state) for name in self.engine.closures[function]}
+        captured = _State()
+        for name, ref in refs.items():
+            contents = self.cell_contents(ref, state)
+            fact = join_facts(contents.fact, *(state.heap.get(obj, CLEAN) for obj in contents.references))
+            captured[name] = fact
+            captured.references[name] = contents.references
+            captured.bindings[name] = (_without_object_contract(contents.binding)
+                                       if contents.references & state.mutated else contents.binding)
+        return captured
+
+    def generator_receiver_proof(self, function):
+        """Prove that captured cells only receive monotone builtin-list writes.
+
+        These effects do not read captured data or depend on a resumable cell
+        replacement. Every other lexical dependency keeps the explicit
+        generator boundary until suspension states are represented.
+        """
+        captures = self.engine.cell_owners.get(function, {})
+        if not captures:
+            return False
+        seen = set()
+        for node in ast.walk(function):
+            self.engine.budget.spend()
+            if node is not function and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                                          ast.Lambda, ast.ClassDef, ast.GeneratorExp)):
+                return False
+            if not isinstance(node, ast.Name) or node.id not in captures:
+                continue
+            attribute = self.engine.parents.get(node)
+            call = self.engine.parents.get(attribute)
+            statement = self.engine.parents.get(call)
+            if not (isinstance(node.ctx, ast.Load) and isinstance(attribute, ast.Attribute)
+                    and attribute.value is node and attribute.attr in {'append', 'extend', 'insert'}
+                    and isinstance(call, ast.Call) and call.func is attribute
+                    and isinstance(statement, ast.Expr) and statement.value is call
+                    and not call.keywords and not any(isinstance(arg, ast.Starred) for arg in call.args)
+                    and len(call.args) == (2 if attribute.attr == 'insert' else 1)):
+                return False
+            seen.add(node.id)
+        if seen != set(captures):
+            return False
+        for name, defining in captures.items():
+            if not isinstance(defining, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return False
+            declaration = function
+            while self.engine.parents.get(declaration) is not defining:
+                declaration = self.engine.parents.get(declaration)
+                if declaration is None:
+                    return False
+            target = None
+            for statement in defining.body:
+                if statement is declaration:
+                    break
+                candidate = (statement.targets[0] if isinstance(statement, ast.Assign)
+                             and len(statement.targets) == 1 else
+                             statement.target if isinstance(statement, ast.AnnAssign) else None)
+                if (isinstance(candidate, ast.Name) and candidate.id == name
+                        and isinstance(statement.value, ast.List)):
+                    target = candidate
+            if target is None:
+                return False
+            # Reject even shadowing writes in descendant scopes: this is a
+            # positive proof, not a partial nonlocal/reflective execution model.
+            for node in ast.walk(defining):
+                self.engine.budget.spend()
+                if (isinstance(node, ast.Name) and node.id == name
+                        and isinstance(node.ctx, (ast.Store, ast.Del)) and node is not target
+                        or isinstance(node, ast.arg) and node.arg == name
+                        or isinstance(node, ast.Nonlocal) and name in node.names
+                        or isinstance(node, ast.ExceptHandler) and node.name == name
+                        or _pattern_capture(node) == name
+                        or node is not defining and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                                                      ast.ClassDef)) and node.name == name
+                        or isinstance(node, (ast.Import, ast.ImportFrom))
+                        and any((alias.asname or alias.name.split('.')[0]) == name for alias in node.names)):
+                    return False
+        return True
+
+    def stable_generator_receivers(self, function, closure, state):
+        owner = self.engine.owner(function)
+        proven = owner.generator_receiver_proofs.get(function)
+        if proven is None:
+            proven = self.generator_receiver_proof(function)
+            owner.generator_receiver_proofs[function] = proven
+        if not proven:
+            return False
+        for _name, ref in closure.cells:
+            contents = self.cell_contents(ref, state)
+            if contents.bound is not True or state.cells is not None and ref in state.cells.multiple:
+                return False
+        return True
+
+    def map_cell_bindings(self, binding, map_ref, memo=None, *, map_objects=None):
+        """Rewrite cell edges without traversing their possibly cyclic store."""
+        # Evaluated defaults form a shared DAG. Visiting each immutable value
+        # once keeps adding cell edges from expanding that DAG exponentially.
+        memo = {} if memo is None else memo
+        cached = memo.get(id(binding), _MISSING)
+        if cached is not _MISSING:
+            return cached
+        choices = []
+        for value in _binding_choices(binding):
+            if isinstance(value, _ClosureValue):
+                self.engine.budget.spend(1 + len(value.cells))
+                value = _ClosureValue(self.map_cell_bindings(value.value, map_ref, memo, map_objects=map_objects),
+                                      tuple((name, map_ref(ref)) for name, ref in value.cells))
+            elif isinstance(value, _BoundClassMethod):
+                value = _BoundClassMethod(self.map_cell_bindings(value.function, map_ref, memo,
+                                                                map_objects=map_objects), value.owner,
+                                          map_objects(value.references) if map_objects else value.references,
+                                          value.receiver, value.valid)
+            elif isinstance(value, _BoundCallable) and map_objects is not None:
+                value = _BoundCallable(value.name, map_objects(value.references), value.receiver, value.namespace_proven)
+            elif isinstance(value, _ArgumentVector) and map_objects is not None:
+                value = _ArgumentVector(value.operands, tuple(map_objects(refs) for refs in value.references))
+            elif isinstance(value, (_FunctionValue, _DeferredCall)):
+                self.engine.budget.spend(1 + len(value.values))
+                values = tuple((name, self.map_cell_bindings(child, map_ref, memo, map_objects=map_objects))
+                               for name, child in value.values)
+                references = (tuple((name, map_objects(refs)) for name, refs in value.references)
+                              if map_objects is not None else value.references)
+                value = (_DeferredCall(value.function, value.call, value.arguments, references, values,
+                                       tuple((name, map_ref(ref)) for name, ref in value.cells))
+                         if isinstance(value, _DeferredCall) else
+                         _FunctionValue(value.function, value.arguments, references, values))
+            choices.append(value)
+        result = _join_bindings(*choices)
+        memo[id(binding)] = result
+        return result
+
+    def prepare_cell_context(self, function, closure, values, state, candidate_keys, required):
+        """Canonicalize the reachable lexical graph; bind its data separately."""
+        owner = self.engine.owner(function)
+        needed = owner.used_names[function] | {name for module, name in required if module is owner.tree}
+        keys = set(candidate_keys) if candidate_keys is not None else set(values)
+        keys.update(f'@global:{name}' for module, name in required if module is owner.tree)
+        keys = sorted(key for key in keys if not key.startswith('@global:') or key[8:] in needed)
+        actual, pending = {}, []
+
+        def register(ref):
+            slot = actual.get(ref)
+            if slot is None:
+                self.engine.budget.spend()
+                slot = f'@cell:{len(actual)}'
+                actual[ref] = slot
+                pending.append(ref)
+            return slot
+
+        roots = tuple((name, register(ref)) for name, ref in closure.cells) if closure is not None else ()
+        contextual = values.copy()
+        for name in keys:
+            contextual[name] = self.map_cell_bindings(values.get(name), register)
+        entries, bound, references, bindings = [], {}, {}, {}
+        index = 0
+        while index < len(pending):
+            ref = pending[index]
+            index += 1
+            slot = actual[ref]
+            contents = self.cell_contents(ref, state)
+            self.engine.budget.spend(1 + len(contents.fact) + len(contents.references)
+                                     + sum(len(state.heap.get(obj, CLEAN)) for obj in contents.references))
+            binding = (_without_object_contract(contents.binding)
+                       if contents.references & state.mutated else contents.binding)
+            entries.append((slot, self.map_cell_bindings(binding, register), contents.bound,
+                            state.cells is not None and ref in state.cells.multiple))
+            bound[slot] = join_facts(contents.fact, *(state.heap.get(obj, CLEAN) for obj in contents.references))
+            references[slot] = contents.references
+            bindings[slot] = binding
+        if entries:
+            contextual['@cells'] = _CellGraph(roots, tuple(entries))
+            keys.append('@cells')
+        return contextual, keys, {slot: ref for ref, slot in actual.items()}, bound, references, bindings
+
+    def export_cells(self, state, bindings=()):
+        if state is None or state.cells is None:
+            return ()
+        pending = list(state.cells.written)
+        seen = set()
+
+        def retain(ref):
+            pending.append(ref)
+            return ref
+
+        for binding in bindings:
+            self.map_cell_bindings(binding, retain)
+        result = []
+        while pending:
+            ref = pending.pop()
+            if ref in seen:
+                continue
+            seen.add(ref)
+            contents = self.cell_contents(ref, state)
+            self.engine.budget.spend(1 + len(contents.fact) + len(contents.references)
+                                     + sum(len(state.heap.get(obj, CLEAN)) for obj in contents.references))
+            binding = self.refresh_function_defaults(contents.binding, state.heap, state.mutated)
+            if contents.references & state.mutated:
+                binding = _without_object_contract(binding)
+            self.map_cell_bindings(binding, retain)
+            result.append((ref, _CellContents(
+                join_facts(contents.fact, *(state.heap.get(obj, CLEAN) for obj in contents.references)),
+                contents.references, binding, contents.bound)))
+        return tuple(result)
+
+    def apply_cells(self, items, multiple, cell_map, state, node, bound, references, values, substitute):
+        """Instantiate local cells once and project incoming-cell replacements."""
+        if not items:
+            return
+        cells = state.cell_state()
+
+        def mapped(ref):
+            if ref in cell_map:
+                return cell_map[ref]
+            if isinstance(ref, str):
+                raise AnalysisLimit('unbound symbolic lexical cell; analysis is incomplete')
+            # Concrete refs are allocations owned by the summarized frame.
+            # Recursion can give the caller an equal local allocation site;
+            # it still denotes a different invocation. Incoming live cells
+            # have canonical slots and were mapped above before this branch.
+            sites = (node, *ref.sites)
+            target = _CellRef(ref.owner, ref.name, sites[-2:])
+            cell_map[ref] = target
+            repeated = len(sites) > 2 or ref in multiple
+            parent = node
+            while parent is not None and parent is not self.scope:
+                if isinstance(parent, (ast.For, ast.AsyncFor, ast.While, ast.GeneratorExp,
+                                       ast.ListComp, ast.SetComp, ast.DictComp)):
+                    repeated = True
+                    break
+                parent = self.engine.parents.get(parent)
+            if repeated:
+                cells.multiple.add(target)
+            return target
+
+        for ref, _contents in items:
+            mapped(ref)
+        for ref, contents in items:
+            target = mapped(ref)
+            actual_refs = frozenset().union(*(
+                self._lookup_refs(references, obj) if isinstance(obj, str) else frozenset({node})
+                for obj in contents.references))
+            binding = self.substitute_binding(contents.binding, bound, references, node, '<closure>()',
+                                              values, substitute=substitute, cells=cell_map)
+            projected = _CellContents(substitute(contents.fact), actual_refs, binding, contents.bound)
+            self.engine.budget.spend(1 + len(cells.names) + len(actual_refs))
+            state.put_cell(target, projected, written=True, weak=target in cells.multiple)
+
     def assign(self, target, fact, state, value=None, *, target_references=None):
         if isinstance(target, ast.Name):
-            state[target.id] = _advance(fact, target.id)
-            state.bindings[target.id] = self.expression_bindings.get(value)
-            state.references[target.id] = self.expression_references.get(value, NO_REFERENCES)
+            self.write_name(state, target.id, _advance(fact, target.id), self.expression_bindings.get(value),
+                            self.expression_references.get(value, NO_REFERENCES))
             slot = '@global:' + target.id
             local = (self.engine.locals.get(self.scope, frozenset()) | self.engine.closures.get(self.scope, frozenset())
                      if not isinstance(self.scope, ast.Module) else frozenset())
@@ -1794,7 +2291,7 @@ class _Flow:
                 if isinstance(choice, str):
                     if choice in ('globals', 'builtins.globals'):
                         self.engine.escaping_callables[choice] = None
-                elif isinstance(choice, (_FunctionValue, _DeferredCall, _BoundCallable,
+                elif isinstance(choice, (_FunctionValue, _ClosureValue, _DeferredCall, _BoundCallable,
                                          _BoundClassMethod, ast.FunctionDef,
                                          ast.AsyncFunctionDef, ast.Lambda)):
                     self.engine.escaping_callables[choice] = None
@@ -1824,7 +2321,8 @@ class _Flow:
                 if references:
                     self.mutate(references, _advance(fact, base.id), state)
                 else:
-                    state[base.id] = join_facts(state.get(base.id, CLEAN), _advance(fact, base.id))
+                    self.write_name(state, base.id, join_facts(state.get(base.id, CLEAN), _advance(fact, base.id)),
+                                    state.bindings.get(base.id))
 
     def namespace_key(self, namespace, key):
         if namespace.module is not self.engine.tree:
@@ -1924,9 +2422,7 @@ class _Flow:
                 self.bind_pattern(child, fact, state, references=references)
         name = _pattern_capture(pattern)
         if name is not None:
-            state[name] = _advance(fact, name)
-            state.bindings[name] = binding
-            state.references[name] = references
+            self.write_name(state, name, _advance(fact, name), binding, references)
 
     def source(self, node, state, candidate=None):
         # A supplied candidate was resolved before a call's argument effects.
@@ -2026,22 +2522,29 @@ class _Flow:
             self.engine.reads[(table, function)] = value
         return value if value is not None else {}
 
-    def function_value(self, function):
+    def function_value(self, function, state):
         defaults = self.engine.defaults.get(function, {})
-        if not defaults or isinstance(self.engine.parents.get(function), (ast.Module, ast.ClassDef)):
-            return function
-        self.engine.budget.spend(len(defaults))
-        return _FunctionValue(function, tuple(defaults.items()),
-                              tuple(self.engine.default_references.get(function, {}).items()),
-                              tuple(self.engine.default_bindings.get(function, {}).items()))
+        value = function
+        if defaults and not isinstance(self.engine.parents.get(function), (ast.Module, ast.ClassDef)):
+            self.engine.budget.spend(len(defaults))
+            value = _FunctionValue(function, tuple(defaults.items()),
+                                   tuple(self.engine.default_references.get(function, {}).items()),
+                                   tuple(self.engine.default_bindings.get(function, {}).items()))
+        names = self.engine.closures.get(function, ())
+        if names:
+            value = _ClosureValue(value, tuple((name, self.lexical_cell(function, name, state))
+                                               for name in sorted(names)))
+        return value
 
     def refresh_function_defaults(self, binding, heap, mutated):
         """Escaping defaults/vectors retain writes to their captured objects."""
-        if not isinstance(binding, (_FunctionValue, _ArgumentVector, frozenset)):
+        if not isinstance(binding, (_FunctionValue, _ClosureValue, _ArgumentVector, frozenset)):
             return binding
         choices = []
         for value in _binding_choices(binding):
-            if isinstance(value, _ArgumentVector):
+            if isinstance(value, _ClosureValue):
+                value = _ClosureValue(self.refresh_function_defaults(value.value, heap, mutated), value.cells)
+            elif isinstance(value, _ArgumentVector):
                 self.engine.budget.spend(1 + len(value.operands)
                                          + sum(len(refs) for refs in value.references))
                 operands = []
@@ -2162,7 +2665,8 @@ class _Flow:
                 positions.append((expression, fact, binding, refs))
         return positions
 
-    def bind(self, function, node, arguments, keywords, state, globals_snapshot=None, captured_defaults=None):
+    def bind(self, function, node, arguments, keywords, state, globals_snapshot=None, captured_defaults=None,
+             closure=None):
         positions = self.call_positions(node, arguments, state)
         arguments = [fact for _expression, fact, _binding, _refs in positions]
         positional = [arg.arg for arg in (*function.args.posonlyargs, *function.args.args)]
@@ -2193,7 +2697,7 @@ class _Flow:
         if function.args.kwarg:
             accepted = set(positional) | {arg.arg for arg in function.args.kwonlyargs}
             bound[function.args.kwarg.arg] = join_facts(*(fact for name, fact in keywords.items() if name not in accepted))
-        captured = self.closure_namespace(function, state)
+        captured = self.closure_environment(function, state, closure)
         for name in self.engine.closures.get(function, ()):
             bound[f'@free:{name}'] = captured.value(name)
         global_items = globals_snapshot if globals_snapshot is not None else self.global_arguments(function, state)
@@ -2201,7 +2705,8 @@ class _Flow:
             bound[key] = fact
         return bound
 
-    def bind_references(self, function, node, keyword_nodes, state, globals_snapshot=None, captured_defaults=None):
+    def bind_references(self, function, node, keyword_nodes, state, globals_snapshot=None, captured_defaults=None,
+                        closure=None):
         """Bind references from evaluated argument snapshots, never re-read names.
 
         Variadic packs are new Python containers, not aliases to their values.
@@ -2224,7 +2729,7 @@ class _Flow:
         if expanded:
             for name in positional:
                 bound[name] = bound.get(name, NO_REFERENCES) | expanded
-        captured = self.closure_namespace(function, state)
+        captured = self.closure_environment(function, state, closure)
         for name in self.engine.closures.get(function, ()):
             bound[f'@free:{name}'] = captured.references.get(name, NO_REFERENCES)
         global_items = globals_snapshot if globals_snapshot is not None else self.global_arguments(function, state)
@@ -2240,7 +2745,8 @@ class _Flow:
             return self.engine.project.module_ref_map.get(key, NO_REFERENCES)
         return NO_REFERENCES
 
-    def bind_values(self, function, node, arguments, keyword_nodes, state, globals_snapshot=None, captured_defaults=None):
+    def bind_values(self, function, node, arguments, keyword_nodes, state, globals_snapshot=None, captured_defaults=None,
+                    closure=None):
         positional = [arg.arg for arg in (*function.args.posonlyargs, *function.args.args)]
         positions = self.call_positions(node, arguments, state)
         bound = {name: item[2] for name, item in zip(positional, positions)}
@@ -2267,7 +2773,7 @@ class _Flow:
                     else self.definition_table('default_bindings', function).items())
         for name, value in defaults:
             bound.setdefault(name, value)
-        captured = self.closure_namespace(function, state)
+        captured = self.closure_environment(function, state, closure)
         for name in self.engine.closures.get(function, ()):
             bound[f'@free:{name}'] = captured.bindings.get(name)
         global_items = globals_snapshot if globals_snapshot is not None else self.global_arguments(function, state)
@@ -2367,7 +2873,7 @@ class _Flow:
                     and name[8:] not in direct_globals
                     and (owner.tree, name[8:]) not in required):
                 continue
-            if not any(isinstance(value, (_FunctionValue, _BoundCallable, _BoundClassMethod))
+            if not any(isinstance(value, (_FunctionValue, _ClosureValue, _BoundCallable, _BoundClassMethod))
                        for value in _binding_choices(binding)):
                 continue
             if (name.startswith('@global:') and summary is not None and not summary.incomplete
@@ -2380,6 +2886,8 @@ class _Flow:
         while pending:
             name, binding = pending.pop()
             for value in _binding_choices(binding):
+                if isinstance(value, _ClosureValue):
+                    value = value.value
                 if isinstance(value, (_BoundCallable, _BoundClassMethod)):
                     slot = '@method:' + name
                     refs = value.references
@@ -2415,7 +2923,7 @@ class _Flow:
                     pending.append((slot, captured))
         return captured_keys
 
-    def resume_environment(self, function, bound, references, values, state):
+    def resume_environment(self, function, bound, references, values, state, closure=None):
         """Arguments are captured at creation; globals and cells are read later.
 
         Refresh only the callee's real module namespace and cells owned by
@@ -2424,6 +2932,14 @@ class _Flow:
         """
         for key, fact, refs, value in self.global_arguments(function, state):
             bound[key], references[key], values[key] = fact, refs, value
+        if closure is not None:
+            captured = self.closure_environment(function, state, closure)
+            for name, _ref in closure.cells:
+                key = f'@free:{name}'
+                bound[key] = captured.value(name)
+                references[key] = captured.references.get(name, NO_REFERENCES)
+                values[key] = captured.bindings.get(name)
+            return
         captured = self.closure_namespace(function, state)
         for name in self.engine.closures.get(function, ()):
             owner = self.engine.enclosing(function)
@@ -2453,9 +2969,27 @@ class _Flow:
         return frozenset(TaintTrace(trace.source, trace.parameter,
                                     frozenset({_INCOMPLETE_PROOF}), trace.path) for trace in fact)
 
-    def incomplete_call(self, node, function, summary, bound, references, receiver, state, substitute):
+    def incomplete_call(self, node, function, summary, bound, references, receiver, state, substitute,
+                        values=None, cell_map=None):
         """Project observed writes without trusting the unfinished suffix."""
         budget = self.engine.budget
+        if summary.cells:
+            # An interrupted body can replace or delete an incoming cell.
+            # Preserve observations weakly and discard callable/shape proofs.
+            mapping = cell_map or {}
+            retained = tuple((ref, _CellContents(contents.fact, contents.references, None, None))
+                             for ref, contents in summary.cells
+                             if not isinstance(ref, str) or ref in mapping)
+            self.apply_cells(retained, frozenset(ref for ref, _contents in retained), mapping, state,
+                             node, bound, references, values or {},
+                             lambda fact: self.incomplete_result(substitute(fact)))
+            if state.cells is not None:
+                for ref in mapping.values():
+                    contents = state.cells.contents.get(ref)
+                    if contents is not None:
+                        state.put_cell(ref, _CellContents(self.incomplete_result(contents.fact),
+                                                         contents.references, None, None),
+                                       written=True, weak=True)
         for parameter, written in summary.mutations:
             refs = self._lookup_refs(references, parameter)
             fact = self.incomplete_result(substitute(written))
@@ -2520,14 +3054,21 @@ class _Flow:
                             for trace in fact))
 
     # maps one summary binding into the caller: binding, bound arguments, references, node, call name and values; a parameter record is bead ultimate_bug_scanner-8tqg — ubs:ignore[py.functions.high-param-count]
-    def substitute_binding(self, binding, bound, references, node, call_name, values, *, substitute=None):
+    def substitute_binding(self, binding, bound, references, node, call_name, values, *, substitute=None,
+                           cells=None):
         if binding is None:
             return None
         if substitute is None:
             substitute = _CallSubstitution(self.substitute_trace, bound, call_name, self.engine.budget)
         choices = []
         for target in _binding_choices(binding):
-            if isinstance(target, _SymbolicValue):
+            if isinstance(target, _ClosureValue):
+                cell_map = cells or {}
+                choices.append(_ClosureValue(
+                    self.substitute_binding(target.value, bound, references, node, call_name, values,
+                                            substitute=substitute, cells=cells),
+                    tuple((name, cell_map.get(ref, ref)) for name, ref in target.cells)))
+            elif isinstance(target, _SymbolicValue):
                 choices.append(values.get(target.parameter))
             elif isinstance(target, _ArgumentVector):
                 operands = []
@@ -2555,7 +3096,9 @@ class _Flow:
                     self._lookup_refs(references, ref) if isinstance(ref, str)
                     else frozenset({ref if isinstance(ref, ast.ClassDef) else node})
                     for ref in target.references))
-                choices.append(_BoundClassMethod(target.function, target.owner, actual,
+                function = self.substitute_binding(target.function, bound, references, node, call_name,
+                                                   values, substitute=substitute, cells=cells)
+                choices.append(_BoundClassMethod(function, target.owner, actual,
                                                  substitute(target.receiver), target.valid))
             elif isinstance(target, (_DeferredCall, _FunctionValue)):
                 arguments = tuple((name, substitute(fact))
@@ -2565,9 +3108,10 @@ class _Flow:
                     for ref in refs))) for name, refs in target.references)
                 captured_values = tuple((name, self.substitute_binding(value, bound, references,
                                                                        node, call_name, values,
-                                                                       substitute=substitute))
+                                                                       substitute=substitute, cells=cells))
                                         for name, value in target.values)
-                choices.append(_DeferredCall(target.function, target.call, arguments, actual, captured_values)
+                choices.append(_DeferredCall(target.function, target.call, arguments, actual, captured_values,
+                                              tuple((name, (cells or {}).get(ref, ref)) for name, ref in target.cells))
                                if isinstance(target, _DeferredCall)
                                else _FunctionValue(target.function, arguments, actual, captured_values))
             else:
@@ -2902,7 +3446,8 @@ class _Flow:
                    for value in _binding_choices(self.expression_bindings.get(expression))):
                 raise AnalysisLimit('globals mapping passed to a callable; analysis is incomplete')
         if isinstance(target, _BoundClassMethod):
-            signature = target.function.args
+            function = target.function.function if isinstance(target.function, (_ClosureValue, _FunctionValue)) else target.function
+            signature = function.args
             positional = [arg.arg for arg in (*signature.posonlyargs, *signature.args)]
             count = len(node.args) + 1
             expanded = any(isinstance(arg, ast.Starred) for arg in node.args)
@@ -2956,6 +3501,11 @@ class _Flow:
             name = target.name
             receiver_refs = target.references
             receiver = join_facts(target.receiver, *(state.heap.get(ref, CLEAN) for ref in receiver_refs))
+        closure = target if isinstance(target, _ClosureValue) else None
+        if closure is not None:
+            target = closure.value
+        elif resumed is not None and resumed.cells:
+            closure = _ClosureValue(resumed.function, resumed.cells)
         captured_defaults = target if isinstance(target, _FunctionValue) else None
         if captured_defaults is not None:
             target = captured_defaults.function
@@ -2969,9 +3519,9 @@ class _Flow:
                         and not isinstance(self.scope, ast.Module)
                         and not self.comprehension_environments
                         and (module_ref is None or (module_ref not in state.heap and module_ref not in state.mutated))):
-                    local_bound = self.bind(function, node, arguments, keywords, state, (), captured_defaults)
-                    local_refs = self.bind_references(function, node, keyword_nodes, state, (), captured_defaults)
-                    local_values = self.bind_values(function, node, arguments, keyword_nodes, state, (), captured_defaults)
+                    local_bound = self.bind(function, node, arguments, keywords, state, (), captured_defaults, closure)
+                    local_refs = self.bind_references(function, node, keyword_nodes, state, (), captured_defaults, closure)
+                    local_values = self.bind_values(function, node, arguments, keyword_nodes, state, (), captured_defaults, closure)
                     bound = owner.base_global_bound.copy()
                     references = owner.base_global_refs.copy()
                     values = owner.base_global_values.copy()
@@ -3034,9 +3584,9 @@ class _Flow:
                     )
                 else:
                     globals_snapshot = tuple(self.global_arguments(function, state))
-                    bound = self.bind(function, node, arguments, keywords, state, globals_snapshot, captured_defaults)
-                    references = self.bind_references(function, node, keyword_nodes, state, globals_snapshot, captured_defaults)
-                    values = self.bind_values(function, node, arguments, keyword_nodes, state, globals_snapshot, captured_defaults)
+                    bound = self.bind(function, node, arguments, keywords, state, globals_snapshot, captured_defaults, closure)
+                    references = self.bind_references(function, node, keyword_nodes, state, globals_snapshot, captured_defaults, closure)
+                    values = self.bind_values(function, node, arguments, keyword_nodes, state, globals_snapshot, captured_defaults, closure)
                     if state.mutated:
                         for name, refs in references.items():
                             if refs and (refs & state.mutated):
@@ -3049,7 +3599,7 @@ class _Flow:
                 bound = {name: join_facts(fact, *(state.heap.get(ref, CLEAN)
                                               for ref in self._lookup_refs(references, name)))
                          for name, fact in resumed.arguments}
-                self.resume_environment(function, bound, references, values, state)
+                self.resume_environment(function, bound, references, values, state, closure)
                 if state.mutated:
                     for name, refs in references.items():
                         if refs and (refs & state.mutated):
@@ -3061,7 +3611,7 @@ class _Flow:
                     and function not in self.engine.generators and resumed is None):
                 self.expression_bindings[node] = _DeferredCall(
                     function, node, tuple(sorted(bound.items())), tuple(sorted(references.items())),
-                    tuple(sorted(values.items())))
+                    tuple(sorted(values.items())), closure.cells if closure is not None else ())
                 self.expression_references[node] = NO_REFERENCES
                 return CLEAN
             overrides = set(self.context_globals) if owner is self.engine else set()
@@ -3082,17 +3632,36 @@ class _Flow:
                         or _same_witness(binding, nominal)):
                     continue
                 if any(isinstance(value, (str, _LiteralString, _ArgumentVector, _ProcessInput,
+                                          _FunctionValue, _ClosureValue,
                                           ast.FunctionDef, ast.AsyncFunctionDef,
                                           ast.Lambda, _BoundClassMethod))
                        for value in (*_binding_choices(binding), *_binding_choices(nominal))):
                     overrides.add(gname)
-            summary = self.engine.call_summary(function, values, summary_keys, overrides)
+            prepared = []
+
+            def cell_context(required):
+                result = self.prepare_cell_context(function, closure, values, state, summary_keys, required)
+                prepared[:] = [result]
+                return result[:2]
+
+            has_cells = closure is not None or state.cells is not None or owner.globals.cells is not None
+            summary = self.engine.call_summary(function, values, summary_keys, overrides,
+                                               cell_context=cell_context if has_cells else None)
+            cell_map, cell_keys = {}, set()
+            if prepared:
+                _contextual, _keys, cell_map, cell_bound, cell_refs, cell_values = prepared[0]
+                bound.update(cell_bound)
+                references.update(cell_refs)
+                values.update(cell_values)
+                cell_keys = set(cell_values)
+                if receiver_keys is not None:
+                    receiver_keys = set(receiver_keys) | cell_keys
             self.engine.budget.spend(len(summary.capture_globals))
             self.capture_globals.update(summary.capture_globals)
             captured_keys = self.bind_function_defaults(bound, references, values, state, receiver_keys,
                                                         function=function, summary=summary)
             vector_keys = (None if summary_keys is None else
-                           set(summary_keys) | captured_keys | {
+                           set(summary_keys) | captured_keys | cell_keys | {
                                f'@global:{name}' for module, name in summary.capture_globals if module is owner.tree})
             self.bind_vector_elements(bound, references, values, state, vector_keys)
             for name in summary.value_parameters:
@@ -3106,17 +3675,29 @@ class _Flow:
                 key = (kind, line, column, label)
                 if propagated:
                     self.effects[key] = join_facts(self.effects.get(key, CLEAN), propagated)
+            if (closure is not None and function in self.engine.generators
+                    and summary != FunctionSummary()
+                    and not self.stable_generator_receivers(function, closure, state)):
+                # Generator summaries currently join the whole body rather
+                # than representing suspension/resume program counters. Live
+                # cells can change between construction and any later yield;
+                # do not certify a snapshot as the value read on resumption.
+                # Wait for a non-bottom summary and retain its known effects.
+                raise AnalysisLimit('generator with live lexical cells requires resume-state analysis; '
+                                    'analysis is incomplete')
             if summary.incomplete:
                 # Resumed coroutines use an Await node, not a Call, and their
                 # values were captured at construction. Use the already bound
                 # environment without evaluating either syntax a second time.
                 return self.incomplete_call(node, function, summary, bound, references,
-                                            receiver, state, substitute)
+                                            receiver, state, substitute, values, cell_map)
             for exception in summary.exceptions:
                 exceptional = state.copy()
                 for parameter, written in exception.mutations:
                     self.mutate(self._lookup_refs(references, parameter),
                                 substitute(written), exceptional)
+                self.apply_cells(exception.cells, exception.multiple_cells, cell_map.copy(), exceptional,
+                                 node, bound, references, values, substitute)
                 raised = substitute(exception.value)
                 self.observed_raises.append((raised, frozenset({node})))
                 self.pending.append(_Completion(
@@ -3131,18 +3712,22 @@ class _Flow:
             for parameter, written in summary.mutations:
                 fact = substitute(written)
                 self.mutate(self._lookup_refs(references, parameter), fact, state)
+            self.apply_cells(summary.cells, summary.multiple_cells, cell_map, state,
+                             node, bound, references, values, substitute)
             returned_refs = frozenset().union(*(self._lookup_refs(references, parameter)
                                                for parameter in summary.returned_references))
             self.expression_references[node] = returned_refs or frozenset({node})
             self.expression_bindings[node] = self.substitute_binding(
-                summary.returned_binding, bound, references, node, call_name, values, substitute=substitute)
+                summary.returned_binding, bound, references, node, call_name, values,
+                substitute=substitute, cells=cell_map)
             returned = substitute(summary.returned)
             if function in self.engine.generators:
                 self.generator_returns[node] = returned
                 self.generator_return_references[node] = returned_refs
                 self.generator_return_bindings[node] = self.expression_bindings[node]
                 self.expression_bindings[node] = self.substitute_binding(
-                    summary.yielded_binding, bound, references, node, call_name, values, substitute=substitute)
+                    summary.yielded_binding, bound, references, node, call_name, values,
+                    substitute=substitute, cells=cell_map)
                 self.expression_references[node] = frozenset().union(*(
                     self._lookup_refs(references, parameter) for parameter in summary.yielded_references))
                 return substitute(summary.yielded)
@@ -3193,6 +3778,9 @@ class _Flow:
                 for end in ends:
                     for ref in end.heap.keys() | end.mutated:
                         self.mutate(frozenset({ref}), end.heap.get(ref, CLEAN), state)
+                    if end.cells is not None:
+                        for ref in end.cells.written:
+                            state.put_cell(ref, end.cells.contents[ref], written=True, weak=True)
             # Awaiting the returned task/gather group resolves these same
             # finite alternatives and observes any later argument mutations.
             self.expression_bindings[node] = _join_bindings(*deferred)
@@ -3383,6 +3971,13 @@ class _Flow:
             self.expression_facts[node] = CLEAN
             return CLEAN
         if isinstance(node, ast.Name):
+            if state.cells is not None and node.id in state.cells.names:
+                contents = state.cells.contents[state.cells.names[node.id]]
+                if contents.bound is not True:
+                    self.pending.append(_Completion('raise', state.copy(), exception_type='NameError'))
+                    if contents.bound is False:
+                        state.reachable = False
+                        return CLEAN
             fact = state.value(node.id)
             self.expression_facts[node] = fact
             binding = state.bindings.get(node.id, _implicit_identity(node.id))
@@ -3408,7 +4003,7 @@ class _Flow:
                                   and node.id not in self.engine.rebound_globals
                                   and node.id not in self.context_globals)
                 identity = (str, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
-                            ast.ClassDef, _FunctionValue, _BoundCallable,
+                            ast.ClassDef, _FunctionValue, _ClosureValue, _BoundCallable,
                             _BoundClassMethod, _ModuleBinding, _ArgumentVector, _LiteralString, _ProcessInput)
                 if (not nominal_helper and any(isinstance(value, identity)
                         for value in (*_binding_choices(binding), *_binding_choices(nominal)))):
@@ -3502,7 +4097,7 @@ class _Flow:
                 if isinstance(name, str):
                     fact = join_facts(fact, self.source(node, state, name))
         elif isinstance(node, ast.Lambda):
-            binding = self.function_value(node)
+            binding = self.function_value(node, state)
         elif isinstance(node, ast.NamedExpr):
             binding = self.expression_bindings.get(node.value)
         elif isinstance(node, ast.Starred):
@@ -3675,6 +4270,8 @@ class _Flow:
             self.yielded = join_facts(self.yielded, self.expr(node.value, state))
             self.yielded_references.update(self.expression_references.get(node.value, NO_REFERENCES))
             self.yielded_bindings.append(self.expression_bindings.get(node.value))
+            if state.cells is not None:
+                self.yielded_state = _join_states(self.yielded_state, state)
             if isinstance(node, ast.YieldFrom):
                 self.expression_references[node] = self.generator_return_references.get(node.value, NO_REFERENCES)
                 self.expression_bindings[node] = self.generator_return_bindings.get(node.value)
@@ -3720,8 +4317,8 @@ class _Flow:
             for child in ast.walk(node):
                 if isinstance(child, ast.NamedExpr) and isinstance(child.target, ast.Name):
                     name = child.target.id
-                    state[name] = join_facts(state.get(name, CLEAN), nested.get(name, CLEAN))
-                    state.bindings[name] = None
+                    self.write_name(state, name, join_facts(state.get(name, CLEAN), nested.get(name, CLEAN)),
+                                    None, state.references.get(name, NO_REFERENCES))
             return fact
         return join_facts(self.source(node, state), *(self.expr(child, state) for child in ast.iter_child_nodes(node)
                                               if isinstance(child, ast.expr)))
@@ -3741,6 +4338,8 @@ class _Flow:
         local_names = self.engine.locals[node]
         nested = state.copy()
         for name in local_names:
+            if nested.cells is not None:
+                nested.cells.names.pop(name, None)
             nested[name] = CLEAN
             nested.bindings[name] = None
             nested.references[name] = NO_REFERENCES
@@ -3758,6 +4357,13 @@ class _Flow:
                         target[name] = source[name]
                     else:
                         target.pop(name, None)
+            if projected.cells is not None:
+                for name in local_names:
+                    ref = original.cells.names.get(name) if original.cells is not None else None
+                    if ref is None:
+                        projected.cells.names.pop(name, None)
+                    else:
+                        projected.cells.names[name] = ref
             return projected
 
         def clause(index, entering):
@@ -3808,6 +4414,9 @@ class _Flow:
                 for name in local_names:
                     if current.references.get(name, NO_REFERENCES) & current.mutated:
                         current.bindings[name] = _without_object_contract(current.bindings.get(name))
+                    if current.cells is not None and name in current.cells.names:
+                        self.write_name(current, name, current.get(name, CLEAN), current.bindings.get(name),
+                                        current.references.get(name, NO_REFERENCES))
                 skipped = []
                 for condition in generator.ifs:
                     current, rejected = self.condition(condition, current)
@@ -3918,46 +4527,56 @@ class _Flow:
             descriptor = ('class' if descriptors in (['classmethod'], ['builtins.classmethod'])
                           else not descriptors or descriptors in (['staticmethod'], ['builtins.staticmethod']))
             self.engine.define('class_callables', node, descriptor)
-            state[node.name] = CLEAN
-            state.bindings[node.name] = self.function_value(node)
-            state.references[node.name] = NO_REFERENCES
+            self.write_name(state, node.name, CLEAN, self.function_value(node, state))
         elif isinstance(node, ast.ClassDef):
             for expression in (*node.bases, *node.decorator_list):
                 self.expr(expression, state)
             for keyword in node.keywords:
                 self.expr(keyword.value, state)
-            completed = self.block(node.body, state.copy())
+            namespace = state.copy()
+            if namespace.cells is not None:
+                for name in _local_names(node):
+                    namespace.cells.names.pop(name, None)
+            self.class_environments.append((node, state))
+            try:
+                completed = self.block(node.body, namespace)
+            finally:
+                self.class_environments.pop()
             if completed is None:
                 return None
             for ref, fact in completed.heap.items():
                 state.heap[ref] = join_facts(state.heap.get(ref, CLEAN), fact)
+            if completed.cells is not None:
+                cells = state.cell_state()
+                cells.multiple.update(completed.cells.multiple)
+                for ref, contents in completed.cells.contents.items():
+                    state.put_cell(ref, contents, written=ref in completed.cells.written)
             members = {}
             if self.engine.plain_class(node, state):
                 for name in _local_names(node):
                     value = completed.bindings.get(name)
-                    if isinstance(value, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        descriptor = self.engine.class_callables.get(value)
+                    function = value.function if isinstance(value, (_ClosureValue, _FunctionValue)) else value
+                    if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        descriptor = self.engine.class_callables.get(function)
                         if self.engine.reads is not None:
-                            self.engine.reads[('class_callables', value)] = descriptor
+                            self.engine.reads[('class_callables', function)] = descriptor
                         value = (_ClassMethodDescriptor(value) if descriptor == 'class'
                                  else value if descriptor else None)
                     members[name] = value
             self.engine.define('class_members', node, members)
-            state[node.name] = CLEAN
-            state.bindings[node.name] = node
-            state.references[node.name] = frozenset({node})
+            self.write_name(state, node.name, CLEAN, node, frozenset({node}))
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
             for alias in node.names:
                 local = alias.asname or alias.name.split('.')[0]
                 imported = (self.engine.project.imported(self.engine, node, alias, state)
                             if self.engine.project is not None else None)
                 if imported is not None:
-                    state[local], state.bindings[local], state.references[local] = imported
+                    fact, binding, refs = imported
+                    self.write_name(state, local, fact, binding, refs)
                     continue
-                state.bindings[local] = (f'{node.module}.{alias.name}' if isinstance(node, ast.ImportFrom)
-                                         else alias.name if alias.asname else local)
-                state[local] = CLEAN
-                state.references[local] = NO_REFERENCES
+                self.write_name(state, local, CLEAN,
+                                f'{node.module}.{alias.name}' if isinstance(node, ast.ImportFrom)
+                                else alias.name if alias.asname else local)
         elif isinstance(node, (ast.Assign, ast.AnnAssign)):
             if node.value is None:
                 return state  # An annotation alone does not assign a value.
@@ -3976,7 +4595,8 @@ class _Flow:
             # tuple/string += instead rebinds. Do not conflate these cases.
             if isinstance(node.target, ast.Name) and references and all(isinstance(ref, ast.List) for ref in references):
                 self.mutate(references, fact, state)
-                state.references[node.target.id] = references
+                self.write_name(state, node.target.id, state.get(node.target.id, CLEAN),
+                                state.bindings.get(node.target.id), references)
         elif isinstance(node, ast.Assert):
             self.expr(node.test, state)
             if not state.reachable:
@@ -4042,9 +4662,7 @@ class _Flow:
         elif isinstance(node, ast.Delete):
             for target in node.targets:
                 if isinstance(target, ast.Name):
-                    state[target.id] = CLEAN
-                    state.bindings[target.id] = None
-                    state.references[target.id] = NO_REFERENCES
+                    self.write_name(state, target.id, CLEAN, None, bound=False)
                 elif isinstance(target, (ast.Subscript, ast.Attribute)):
                     self.assign(target, CLEAN, state)
         elif hasattr(ast, 'Match') and isinstance(node, ast.Match):
@@ -4111,8 +4729,7 @@ class _Flow:
                 # A local generator summary identifies its yielded callable;
                 # an ordinary iterable object is not itself that callable.
                 if isinstance(node.target, ast.Name) and node.iter in self.generator_returns:
-                    body.bindings[node.target.id] = binding
-                    body.references[node.target.id] = references
+                    self.write_name(body, node.target.id, body.get(node.target.id, CLEAN), binding, references)
             back, pending = self.capture(node.body, None if always is False else body)
             exits = [_join_states(*exits, *(item.state for item in pending if item.kind == 'break'))]
             outgoing = _merge_completions([*outgoing, *(item for item in pending
@@ -4152,7 +4769,8 @@ class _Flow:
         exceptions = tuple(
             ExceptionSummary(item.exception_type,
                              join_facts(item.value, *(item.state.heap.get(ref, CLEAN) for ref in item.references)),
-                             mutations_on(item.state))
+                             mutations_on(item.state), self.export_cells(item.state),
+                             frozenset(item.state.cells.multiple) if item.state.cells is not None else frozenset())
             for item in _merge_completions(item for item in self.pending if item.kind == 'raise')
         )
         if self.normal_state is not None and not isinstance(self.scope, ast.Lambda):
@@ -4169,6 +4787,8 @@ class _Flow:
             returned_binding = _without_object_contract(returned_binding)
         if self.yielded_references & self.mutations.keys():
             yielded_binding = _without_object_contract(yielded_binding)
+        cell_state = _join_states(normal, self.yielded_state) if self.yielded_state is not None else normal
+        cells = self.export_cells(cell_state, (returned_binding, yielded_binding))
         return FunctionSummary(
             returned=returned, effects=tuple((*key, fact) for key, fact in sorted(self.effects.items())),
             yielded=yielded, mutations=mutations,
@@ -4180,6 +4800,9 @@ class _Flow:
             exceptions=exceptions,
             capture_globals=frozenset(self.capture_globals),
             value_parameters=frozenset(self.value_parameters),
+            cells=cells,
+            multiple_cells=frozenset(cell_state.cells.multiple)
+            if cell_state is not None and cell_state.cells is not None else frozenset(),
         )
 
 
@@ -4287,13 +4910,17 @@ class _Analysis:
         self.method_calls = {}
         self.functions = [node for node in nodes if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))]
         self.generators = set()
+        self.generator_receiver_proofs = {}
         self.definition_writers = set()
         self.direct_global_functions = set()
         self.locals = {}
         raw_used = {}
+        self.declared_globals = {}
         for scope in [tree, *self.functions]:
             body = tuple(_scope_nodes(scope))
             self.locals[scope] = _local_names(scope, body)
+            self.declared_globals[scope] = {name for node in body if isinstance(node, ast.Global)
+                                             for name in node.names}
             if scope is not tree:
                 limit = (scope_override if scope_override is not None else
                          min(250_000, max(20_000, 64 * len(body), 8 * len(nodes))))
@@ -4338,22 +4965,34 @@ class _Analysis:
                    frozenset({f'@global:{name}'}), _SymbolicValue(f'@global:{name}'))
             for name in self.global_names
         }
-        parent_captured = {}
+        self.cell_owners = {function: {} for function in self.functions}
+        self.cell_locals = {}
+        for function in self.functions:
+            for name in raw_used[function] - self.locals[function] - self.declared_globals[function]:
+                parent = self.enclosing(function)
+                intermediates = []
+                while parent is not None and not isinstance(parent, ast.Module):
+                    if isinstance(parent, ast.ClassDef):
+                        parent = self.enclosing(parent)
+                        continue  # A method does not close over the class namespace.
+                    if name in self.declared_globals.get(parent, ()):
+                        break  # An intervening global declaration is a lexical barrier.
+                    if name in self.locals.get(parent, ()):
+                        self.cell_owners[function][name] = parent
+                        self.cell_locals.setdefault(parent, set()).add(name)
+                        for intermediate in intermediates:
+                            self.cell_owners[intermediate][name] = parent
+                        break
+                    if parent in self.cell_owners:
+                        intermediates.append(parent)
+                    parent = self.enclosing(parent)
         for function in reversed(self.functions):
             parent = self.enclosing(function)
             while parent is not None and not isinstance(parent, ast.Module):
                 if parent in raw_used:
                     raw_used[parent].update(raw_used[function])
-                parent_captured.setdefault(parent, set()).update(raw_used[function])
                 parent = self.enclosing(parent)
-        self.closures = {}
-        for function in self.functions:
-            available = set()
-            parent = self.enclosing(function)
-            while parent is not None and not isinstance(parent, ast.Module):
-                available.update(self.locals.get(parent, set()) & parent_captured.get(parent, set()))
-                parent = self.enclosing(parent)
-            self.closures[function] = available - self.locals[function]
+        self.closures = {function: set(owners) for function, owners in self.cell_owners.items()}
         # A cutoff can precede the invocation of an escaped closure. Keep the
         # old conservative may-alias candidates once for incomplete recovery,
         # rather than duplicating them in every completed function's state.
@@ -4397,6 +5036,15 @@ class _Analysis:
     def refresh_globals(self, globals_, *, ready=True):
         self.globals = globals_
         self.namespace_ready = ready
+        aliases = {}
+        for name, references in globals_.references.items():
+            if name not in self.global_symbols:
+                continue
+            self.budget.spend(len(references))
+            for ref in references:
+                if isinstance(ref, ast.AST):
+                    aliases.setdefault(ref, set()).add('@global:' + name)
+        self.global_object_aliases = {ref: frozenset(names) for ref, names in aliases.items()}
         bindings = globals_.bindings
         self.base_global_values = {
             f'@global:{name}': bindings.get(name)
@@ -4555,6 +5203,7 @@ class _Analysis:
         previous = [summary for key, summary in self.summaries.items()
                     if (key[0] if isinstance(key, tuple) else key) is function]
         effects, mutations = {}, {}
+        cells = {}
         returned, yielded, raised, returned_refs, yielded_refs = [], [], [], set(), set()
         capture_globals = set()
 
@@ -4569,6 +5218,13 @@ class _Analysis:
                 if isinstance(ref, str):
                     budget.spend(1 + len(fact) + len(mutations.get(ref, CLEAN)))
                     mutations[ref] = join_facts(mutations.get(ref, CLEAN), fact)
+
+        def retain_cells(items):
+            for ref, contents in items:
+                budget.spend(1 + len(contents.fact) + len(contents.references))
+                retained = _CellContents(contents.fact, contents.references, None, None)
+                previous = cells.get(ref)
+                cells[ref] = retained if previous is None else _join_cells(previous, retained)
 
         def retain_observations(items, facts, references=None):
             budget.spend(len(items))
@@ -4585,6 +5241,15 @@ class _Analysis:
             while pending:
                 binding = pending.pop()
                 for value in _binding_choices(binding):
+                    if isinstance(value, _ClosureValue):
+                        pending.append(value.value)
+                        budget.spend(1 + len(value.cells))
+                        for _name, ref in value.cells:
+                            contents = cells.get(ref)
+                            if contents is not None:
+                                facts.append(contents.fact)
+                                references.update(obj for obj in contents.references if isinstance(obj, str))
+                        continue
                     if not isinstance(value, _FunctionValue):
                         continue
                     budget.spend(1 + len(value.arguments) + len(value.references) + len(value.values))
@@ -4604,6 +5269,7 @@ class _Analysis:
             capture_globals.update(summary.capture_globals)
             retain_effects(summary.effects)
             retain_mutations(summary.mutations)
+            retain_cells(summary.cells)
             budget.spend(len(summary.returned) + len(summary.yielded)
                          + len(summary.returned_references) + len(summary.yielded_references))
             returned.append(summary.returned)
@@ -4614,10 +5280,18 @@ class _Analysis:
             retain_defaults(summary.yielded_binding, yielded, yielded_refs)
             for exception in summary.exceptions:
                 retain_mutations(exception.mutations)
+                retain_cells(exception.cells)
                 budget.spend(1 + len(exception.value))
                 raised.append(exception.value)
         retain_effects(self.partial_scope_effects.get(function, ()))
         if flow is not None:
+            observed_states = (flow.last_state, flow.normal_state, flow.yielded_state,
+                               *(item.state for item in flow.pending))
+            for state in observed_states:
+                if state is not None and state.cells is not None:
+                    retain_cells((ref, _CellContents(
+                        join_facts(contents.fact, *(state.heap.get(obj, CLEAN) for obj in contents.references)),
+                        contents.references, None, None)) for ref, contents in state.cells.contents.items())
             budget.spend(len(flow.capture_globals))
             capture_globals.update(flow.capture_globals)
             retain_mutations(flow.mutations.items())
@@ -4638,6 +5312,7 @@ class _Analysis:
             exceptions=(ExceptionSummary(None, join_facts(*raised)),) if raised else (),
             returned_binding=None, yielded_binding=None, can_return=True, incomplete=True,
             capture_globals=frozenset(capture_globals),
+            cells=tuple(cells.items()), multiple_cells=frozenset(cells),
         )
 
     def framework_bound(self, globals_):
@@ -4693,7 +5368,18 @@ class _Analysis:
         for value in _binding_choices(binding):
             if isinstance(value, _GlobalNamespace):
                 raise AnalysisLimit('globals mapping captured by a callable; analysis is incomplete')
-            if isinstance(value, _FunctionValue):
+            if isinstance(value, _CellGraph):
+                self.budget.spend(len(value.entries))
+                value = _CellGraph(value.roots, tuple(
+                    (slot, self.callable_context(slot, child, captured=True, value_parameters=value_parameters),
+                     bound, multiple) for slot, child, bound, multiple in value.entries))
+            elif isinstance(value, _ClosureValue):
+                if any(not isinstance(ref, str) for _name, ref in value.cells):
+                    raise AnalysisLimit('unnormalized lexical callback context; analysis is incomplete')
+                self.budget.spend(len(value.cells))
+                value = _ClosureValue(self.callable_context(name, value.value, captured=captured,
+                                                           value_parameters=value_parameters), value.cells)
+            elif isinstance(value, _FunctionValue):
                 self.budget.spend(1 + len(value.arguments))
                 arguments, references, bindings = [], [], []
                 default_values = dict(value.values)
@@ -4711,7 +5397,10 @@ class _Analysis:
                 qualified = value.name if isinstance(value, _BoundCallable) else None
                 if qualified:
                     qualified = _opaque_qualifier(qualified, receiver_unknown=not value.namespace_proven)
-                value = (_BoundClassMethod(value.function, value.owner, frozenset({slot}), symbolic, value.valid)
+                function = (self.callable_context(name, value.function, captured=captured,
+                                                  value_parameters=value_parameters)
+                            if isinstance(value, _BoundClassMethod) else None)
+                value = (_BoundClassMethod(function, value.owner, frozenset({slot}), symbolic, value.valid)
                          if isinstance(value, _BoundClassMethod)
                          else _BoundCallable(qualified, frozenset({slot}), symbolic, value.namespace_proven))
             elif isinstance(value, _ArgumentVector) and name in value_parameters:
@@ -4735,7 +5424,7 @@ class _Analysis:
             choices.append(value)
         return _join_bindings(*choices)
 
-    def call_summary(self, function, values, candidate_keys=None, global_overrides=()):
+    def call_summary(self, function, values, candidate_keys=None, global_overrides=(), *, cell_context=None):
         # A provisional summary may discover a captured global only through
         # another helper. Follow those ordinary summary dependencies until
         # this call's context includes the captures it actually reads. Each
@@ -4744,7 +5433,8 @@ class _Analysis:
         required = frozenset()
         required_values = frozenset()
         while True:
-            summary = self._call_summary(function, values, candidate_keys,
+            contextual, keys = cell_context(required) if cell_context is not None else (values, candidate_keys)
+            summary = self._call_summary(function, contextual, keys,
                                          global_overrides, required, required_values)
             self.budget.spend(len(required) + len(summary.capture_globals)
                               + len(required_values) + len(summary.value_parameters))
@@ -4810,12 +5500,12 @@ class _Analysis:
                 nominal = owner_bindings.get(gname)
                 explicit_override = gname in global_overrides
                 if (not explicit_override and (owner_fn.tree, gname) not in capture_globals
-                        and any(isinstance(value, (_FunctionValue, _BoundCallable))
+                        and any(isinstance(value, (_FunctionValue, _ClosureValue, _BoundCallable))
                                 for value in _binding_choices(binding))
                         and _same_witness(binding, nominal)):
                     continue
                 if (binding is nominal
-                        and not isinstance(binding, (frozenset, _BoundCallable, _BoundClassMethod, _FunctionValue,
+                        and not isinstance(binding, (frozenset, _BoundCallable, _BoundClassMethod, _FunctionValue, _ClosureValue,
                                                      _ArgumentVector, _LiteralString, _ProcessInput))
                         and not explicit_override
                         and gname in owner_bindings
@@ -4827,7 +5517,7 @@ class _Analysis:
                     continue
                 if not explicit_override and not any(
                         isinstance(value, (str, ast.FunctionDef, ast.AsyncFunctionDef,
-                                           ast.Lambda, ast.ClassDef, _BoundCallable, _BoundClassMethod, _FunctionValue,
+                                           ast.Lambda, ast.ClassDef, _BoundCallable, _BoundClassMethod, _FunctionValue, _ClosureValue,
                                            _ArgumentVector, _LiteralString, _ProcessInput))
                         for value in (*_binding_choices(binding), *_binding_choices(nominal))):
                     continue
@@ -4921,9 +5611,17 @@ class _Analysis:
                 state[name] = frozenset({TaintTrace(name, parameter=f'@free:{name}', path=(name,))})
                 state.bindings[name] = _SymbolicValue(f'@free:{name}')
                 state.references[name] = frozenset({f'@free:{name}'})
+                cells = state.cell_state()
+                cells.names[name] = f'@free:{name}'
+                cells.contents[f'@free:{name}'] = _CellContents(
+                    state[name], state.references[name], state.bindings[name])
             if context:
                 ctx_globals = []
+                cell_graph = None
                 for name, binding in context:
+                    if name == '@cells':
+                        cell_graph = binding
+                        continue
                     raw = name.removeprefix('@free:').removeprefix('@global:')
                     if name.startswith('@global:') and (raw in local or raw in owner.closures[function]):
                         # A module value cannot replace a same-spelled argument
@@ -4941,6 +5639,27 @@ class _Analysis:
                     state.bindings[raw] = binding
                 if ctx_globals:
                     flow.context_globals = tuple(ctx_globals)
+                if isinstance(cell_graph, _CellGraph):
+                    cells = state.cell_state()
+                    for slot, binding, present, multiple in cell_graph.entries:
+                        symbolic = frozenset({TaintTrace(slot, parameter=slot, path=(slot,))})
+                        cells.contents[slot] = _CellContents(symbolic, frozenset({slot}), binding, present)
+                        if multiple:
+                            cells.multiple.add(slot)
+                    for name, slot in cell_graph.roots:
+                        cells.names[name] = slot
+                        state.put_cell(slot, cells.contents[slot])
+            # A cell exists for the whole defining invocation, including
+            # branches that have not yet created a closure. Allocating these
+            # exact cell variables here also models uninitialized/deleted
+            # locals without borrowing a same-spelled caller value.
+            for name in owner.cell_locals.get(function, ()):
+                cells = state.cell_state()
+                ref = _CellRef(function, name)
+                cells.names[name] = ref
+                cells.contents[ref] = _CellContents(state.get(name, CLEAN),
+                                                    state.references.get(name, NO_REFERENCES),
+                                                    state.bindings.get(name), name in state)
             if isinstance(function, ast.Lambda):
                 flow.exception_states.append(None)
                 flow.returned = flow.expr(function.body, state)
@@ -5009,6 +5728,9 @@ class _Analysis:
             if (isinstance(value, _BoundCallable) and value.namespace_proven
                     and value.name in ('globals', 'builtins.globals')):
                 return True
+            if isinstance(value, _ClosureValue):
+                pending.append(value.value)
+                continue
             if isinstance(value, (_FunctionValue, _DeferredCall)):
                 for _name, binding in value.values:
                     pending.extend(_binding_choices(binding))
@@ -5446,6 +6168,7 @@ class _Project:
             for engine in group:
                 engine.function_owners = owners
             for name in ('summaries', 'defaults', 'default_references', 'default_bindings', 'parents', 'locals', 'closures',
+                         'cell_owners', 'cell_locals', 'declared_globals',
                          'used_names', 'shadowed_globals', 'shadowed_global_values', 'active_globals',
                          'class_members', 'class_callables'):
                 shared = {}

@@ -2328,6 +2328,118 @@ class HeaderInjectionFlowTests(unittest.TestCase):
             ''',
         })
 
+    def test_escaped_header_cells_keep_sources_and_caller_isolation(self):
+        self.check_cases({
+            'closure-direct-control': '''
+                response.headers['X'] = request.args['x']  # header-finding
+            ''',
+            'escaped-header-source': '''
+                def make(value):
+                    def emit():
+                        response.headers['X'] = value  # header-finding
+                    return emit
+                make(request.args['x'])()
+            ''',
+            'escaped-header-caller-collision': '''
+                def make(value):
+                    def emit(): response.headers['X'] = value
+                    return emit
+                emit = make('fixed')
+                value = request.args['x']
+                emit()
+            ''',
+            'unused-header-closure': '''
+                def make(value):
+                    def emit(): response.headers['X'] = value
+                    return emit
+                unused = make(request.args['x'])
+            ''',
+        })
+
+    def test_escaped_header_encoders_keep_identity_and_proofs(self):
+        self.check_cases({
+            'captured-local-encoder-import': '''
+                def make():
+                    from urllib.parse import quote
+                    def encode(value): return quote(value, safe='')
+                    return encode
+                response.headers['X'] = make()(request.args['x'])
+            ''',
+            'captured-encoded-value': '''
+                from urllib.parse import quote
+                def make(value):
+                    def read(): return value
+                    return read
+                response.headers['X'] = make(quote(request.args['x']))()
+            ''',
+            'captured-shadowed-encoder': '''
+                from urllib.parse import quote
+                def identity(value): return value
+                def make(quote):
+                    def encode(value): return quote(value)
+                    return encode
+                response.headers['X'] = make(identity)(request.args['x'])  # header-finding
+            ''',
+            'escaped-decoder-revokes-proof': '''
+                from urllib.parse import quote, unquote
+                def make(value):
+                    def read(): return unquote(value)
+                    return read
+                response.headers['X'] = make(quote(request.args['x']))()  # header-finding
+            ''',
+        })
+
+    def test_escaped_header_guards_refine_lexical_cells(self):
+        self.check_cases({
+            'guard-inside-escaped-closure': r'''
+                def make(value):
+                    def emit():
+                        if '\r' in value or '\n' in value: raise ValueError('header')
+                        response.headers['X'] = value
+                    return emit
+                make(request.args['x'])()
+            ''',
+            'guard-before-closure-creation': r'''
+                def make(value):
+                    if '\r' in value or '\n' in value: raise ValueError('header')
+                    def emit(): response.headers['X'] = value
+                    return emit
+                make(request.args['x'])()
+            ''',
+            'escaped-guard-rejects-only-cr': r'''
+                def make(value):
+                    def emit():
+                        if '\r' in value: raise ValueError('header')
+                        response.headers['X'] = value  # header-finding
+                    return emit
+                make(request.args['x'])()
+            ''',
+        })
+
+    def test_sibling_header_closures_share_nonlocal_replacements(self):
+        factory = '''
+            def make(value):
+                def read(): return value
+                def replace(new_value):
+                    nonlocal value
+                    value = new_value
+                    return read
+                return replace
+        '''
+        self.check_cases({
+            'sibling-header-write-retains-source': factory + '''
+            replace = make('fixed')
+            read = replace(request.args['x'])
+            response.headers['X'] = read()  # header-finding
+            ''',
+            'sibling-header-write-replaces-old-proof': factory + '''
+            from urllib.parse import quote
+            replace = make(request.args['old'])
+            read = replace(quote(request.args['new']))
+            response.headers['X'] = read()
+            ''',
+        })
+
     def test_existing_security_fixtures_keep_exact_locations(self):
         security = REPO_ROOT / 'test-suite/python/security'
         buggy = security / 'header_injection_buggy.py'

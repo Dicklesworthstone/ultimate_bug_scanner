@@ -1645,6 +1645,28 @@ data-only modes, such as `python script.py` or a fixed `python -c` program, do
 not treat subsequent stdin data as source. An unrelated object's `communicate`
 method does not establish a subprocess sink.
 
+Returned local functions and lambdas retain their defining lexical cells.
+Calling a closure reads the current captured values; an unrelated variable
+with the same name in its caller does not supply those values. Sibling closures
+share `nonlocal` assignments and deletion, including writes on exceptional
+exits and in `finally`. Captured vectors and process handles keep their argument
+positions and stdin contracts through these calls. Awaited local coroutines
+also read live captured cells when resumed; ordinary arguments and evaluated
+defaults keep their existing snapshot semantics.
+
+Closure summaries separate cell identity from concrete taint provenance.
+Allocation contexts are bounded, so repeated or deeper factory instances may
+be conservatively joined. This bound does not discard their taint or turn an
+unresolved executable into a known data-only program.
+
+Generators with live lexical cells still require a suspension/resumption model.
+A narrow supported case is a proven stable local list used only as an
+ignored-result `append`, `extend`, or `insert` receiver: its weak heap writes
+remain conservative. Other live-cell generators report incomplete analysis and
+retain already established findings.
+The existing heap model also does not infer arbitrary alias relationships
+between separate helper parameters.
+
 Diagnostics remain at the subprocess call in the wrapper, with at most one
 `python.taint.command` finding per process call. Executable, shell, and
 interpreter-source facts are checked separately after substituting each

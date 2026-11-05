@@ -2103,6 +2103,34 @@ class LargeModuleBudgetTests(unittest.TestCase):
                         self.assertLessEqual(domain['function_passes'], 10 * domain['functions'], report)
 
 
+class CapturedCellContextTests(unittest.TestCase):
+    """Distinct factory cells retain provenance without multiplying contexts."""
+
+    def test_factory_instances_keep_provenance_outside_summary_keys(self):
+        for count in (8, 32, 96):
+            with self.subTest(factory_calls=count):
+                lines = [
+                    'def factory(value):',
+                    '    def read(): return value',
+                    '    return read',
+                    'def invoke(callback): return callback()',
+                ]
+                expected = set()
+                for index in range(count):
+                    value = 'input()' if index % 2 else '"safe"'
+                    lines.append(f'callback{index} = factory({value})')
+                    lines.append(f'eval(invoke(callback{index}))')
+                    if index % 2:
+                        expected.add(('eval', len(lines), 1))
+                engine = taint_py._Analysis(ast.parse('\n'.join(lines) + '\n'))
+                effects = engine.analyze()
+                self.assertEqual({key[:3] for key in effects}, expected)
+                invoke = next(function for function in engine.functions if function.name == 'invoke')
+                contexts = [key for key in engine.summaries if isinstance(key, tuple) and key[0] is invoke]
+                self.assertLessEqual(len(contexts), 2,
+                                     'Factory allocations or concrete provenance entered callback summary keys')
+
+
 class CapturedDefaultValueTests(unittest.TestCase):
     """A function AST is shared; each evaluated default belongs to its creation."""
 

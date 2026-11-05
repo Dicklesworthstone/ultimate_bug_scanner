@@ -181,12 +181,13 @@ class _HeaderFlow(flow._Flow):
                 continue
             choices = [None if _import_name(choice) in _MODULES else choice
                        for choice in flow._binding_choices(binding)]
-            state.bindings[name] = flow._join_bindings(*choices)
             if name not in local and name in self.engine.global_symbols:
                 value, global_refs, _binding = self.engine.global_symbols[name]
                 state.setdefault(name, value)
                 state.references[name] = refs | global_refs
                 changed_globals.add(name)
+            self.write_name(state, name, state.get(name, flow.CLEAN), flow._join_bindings(*choices),
+                            state.references.get(name, flow.NO_REFERENCES))
         self.context_globals = tuple(sorted(changed_globals))
 
     def statement(self, node, state):
@@ -195,8 +196,10 @@ class _HeaderFlow(flow._Flow):
             # previously captured encoder. Only a later explicit import can
             # establish a new identity.
             for name, binding in tuple(state.bindings.items()):
-                state.bindings[name] = flow._join_bindings(*(
+                replacement = flow._join_bindings(*(
                     None if _import_name(choice) else choice for choice in flow._binding_choices(binding)))
+                self.write_name(state, name, state.get(name, flow.CLEAN), replacement,
+                                state.references.get(name, flow.NO_REFERENCES))
             return state
         result = super().statement(node, state)
         if result is not None and isinstance(node, (ast.Import, ast.ImportFrom)):
@@ -208,8 +211,8 @@ class _HeaderFlow(flow._Flow):
                     refs = frozenset({_MODULE_REF + name}) if name in _MODULES else flow.NO_REFERENCES
                     owner = name.rsplit('.', 1)[0]
                     invalid = (_MODULE_REF + name in state.mutated or _MODULE_REF + owner in state.mutated)
-                    result.bindings[local] = None if invalid else _IMPORT + name
-                    result.references[local] = refs
+                    self.write_name(result, local, result.get(local, flow.CLEAN),
+                                    None if invalid else _IMPORT + name, refs)
         return result
 
     def source(self, node, state, candidate=None):
@@ -372,10 +375,11 @@ class _HeaderFlow(flow._Flow):
             text = self._literal(test.left)
             if absent and text in {'\r', '\n'}:
                 name = test.comparators[0].id
-                state[name] = _prove(state.value(name), frozenset({_CR if text == '\r' else _LF}))
                 # String values are snapshots. Re-reading the symbolic heap
-                # must not add the unrefined copy back to the proved value.
-                state.references[name] = flow.NO_REFERENCES
+                # must not add the unrefined copy back to the proved value,
+                # including when this branch refines a captured lexical cell.
+                fact = _prove(state.value(name), frozenset({_CR if text == '\r' else _LF}))
+                self.write_name(state, name, fact, state.bindings.get(name), flow.NO_REFERENCES)
 
     def invoke(self, node, state, callee, inputs, *, resumed=None):
         if resumed is not None:
@@ -401,7 +405,7 @@ class _HeaderFlow(flow._Flow):
             sink = flow.join_facts(sink, *(keywords.get(key, flow.CLEAN) for key in FILENAME_KEYWORDS))
         self.effect('header', node, 'response header call', sink)
         local = isinstance(target, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
-                                    flow._BoundClassMethod, flow._FunctionValue))
+                                    flow._BoundClassMethod, flow._FunctionValue, flow._ClosureValue))
         if not local:
             for expression in (*node.args, *keyword_nodes.values()):
                 if _module_refs(self.expression_bindings.get(expression)):

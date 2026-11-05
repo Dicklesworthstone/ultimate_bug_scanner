@@ -92,7 +92,7 @@ if [[ "$UBS_KEEP_TEMP" == "1" ]]; then
   unset _ubs_arg
 fi
 
-UBS_VERSION="5.5.34"
+UBS_VERSION="5.5.35"
 # Installed releases prepare a complete, version-bound cache before publication.
 # This literal marker is parsed as data by the updater, never evaluated remotely.
 UBS_RELEASE_GENERATIONS=1
@@ -643,6 +643,25 @@ ensure_tmpdir_run(){
     EARLY_TMP_PATHS+=("$TMPDIR_RUN")
   fi
 }
+# The primary report is captured without opening its requested destination.
+# Only an explicitly completed report may replace that destination; refusals,
+# interrupts and failed writers leave the previous report intact.
+finish_primary_output(){
+  [[ -n "${TEE_PID:-}" ]] || return 0
+  local failed=0
+  exec 1>&2
+  wait "$TEE_PID" || failed=1
+  TEE_PID=""
+  if [[ "$failed" -ne 0 ]]; then
+    say_err "ERROR: Could not capture the requested --output report; the previous destination is unchanged"
+    return 1
+  fi
+  if [[ "${PRIMARY_OUTPUT_READY:-0}" -eq 1 ]]; then
+    validate_report_destinations selected || return 1
+    deliver_file "$PRIMARY_OUTPUT_STAGE" "$OUTPUT_FILE" "--output report" || return 1
+  fi
+  return 0
+}
 # Invoked by the EXIT trap below and the later cleanup callback.
 # shellcheck disable=SC2317,SC2329
 early_cleanup(){
@@ -655,7 +674,7 @@ early_cleanup(){
   fi
   return 0
 }
-trap early_cleanup EXIT
+trap 'ubs_exit_status=$?; finish_primary_output || ubs_exit_status=2; early_cleanup; exit "$ubs_exit_status"' EXIT
 
 # python3 resolution (bead G7). Modules and helpers call `python3` by name.
 # Validate every candidate, including an existing python3, and freeze its
@@ -1551,7 +1570,9 @@ INCLUDE_EXT=""             # csv forwarded to modules as --include-ext=
 USER_RULES_DIR=""          # forwarded to modules as --rules= (custom ast-grep rules)
 USER_RULES_SOURCES=()      # every --rules DIR (repeatable), else the UBS_RULES entries
 USER_RULES_REQUESTED=0     # distinguish an absent option from --rules=
-OUTPUT_FILE=""             # tee the rendered report to this file (--output / PROJECT_DIR OUTPUT_FILE)
+OUTPUT_FILE=""             # atomically publish the rendered report (--output / PROJECT_DIR OUTPUT_FILE)
+PRIMARY_OUTPUT_STAGE=""
+PRIMARY_OUTPUT_READY=0
 ALSO_REPORTS=()            # repeatable FORMAT:FILE exports from the same scan
 ALSO_FORMATS=()
 ALSO_PATHS=()
@@ -1668,6 +1689,166 @@ lang_for_source_file(){
       fi
       return 1;;
   esac
+}
+
+report_outputs_requested(){
+  [[ -n "$OUTPUT_FILE" || -n "$SAVE_BASELINE_FILE" || -n "$REPORT_JSON_PATH" \
+     || -n "$HTML_REPORT_PATH" || -n "$BEADS_JSONL_PATH" || -n "$PYTHON_PATTERN_COUNTS_PATH" \
+     || ${#ALSO_PATHS[@]} -gt 0 ]]
+}
+
+# Check identities, not spellings: relative paths, symlinks and hardlinks can
+# name the same input or destination. The second pass uses the real selection
+# inventory and maps shadow-workspace files back to the original source tree.
+validate_report_destinations(){
+  report_outputs_requested || return 0
+  local -a destinations=(
+    --output "$OUTPUT_FILE" --save-baseline "$SAVE_BASELINE_FILE"
+    --report-json "$REPORT_JSON_PATH" --html-report "$HTML_REPORT_PATH"
+    --beads-jsonl "$BEADS_JSONL_PATH" --python-pattern-counts "$PYTHON_PATTERN_COUNTS_PATH"
+  )
+  local index
+  for index in "${!ALSO_PATHS[@]}"; do
+    destinations+=("--also=${ALSO_FORMATS[$index]}" "${ALSO_PATHS[$index]}")
+  done
+  python3 - "${1:-arguments}" "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}" "$PROJECT_DIR" \
+    "$SINGLE_FILE_TARGET" "$FILTERED_PROJECT_DIR" "$WORKSPACE_MIRROR_MAP" "$TMPDIR_RUN" \
+    "$COMPARISON_FILE" "${#SCAN_FILES[@]}" "${SCAN_FILES[@]}" "${destinations[@]}" <<'PYREPORTPATHS'
+import os
+from pathlib import Path
+import sys
+
+phase, source_root, scan_root, single, filtered, mirror_map, scratch, baseline = sys.argv[1:9]
+count = int(sys.argv[9])
+explicit = sys.argv[10:10 + count]
+raw_outputs = sys.argv[10 + count:]
+
+
+def identity(raw):
+    path = Path(raw).resolve()
+    try:
+        st = path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return path, None
+    return path, (st.st_dev, st.st_ino)
+
+
+try:
+    outputs = []
+    paths = {}
+    inodes = {}
+    for label, raw in zip(raw_outputs[::2], raw_outputs[1::2]):
+        if not raw:
+            continue
+        target = Path(raw)
+        if label in {"--output", "--python-pattern-counts"}:
+            if (target.exists() or target.is_symlink()) and not target.is_file():
+                raise ValueError(f"{label} report destination must be a regular file: {raw}")
+        path, inode = identity(raw)
+        if path in paths or (inode is not None and inode in inodes):
+            previous = paths.get(path) or inodes[inode]
+            raise ValueError(f"report destinations refer to the same file: {previous} and {label} ({raw})")
+        paths[path] = label
+        if inode is not None:
+            inodes[inode] = label
+        outputs.append((label, raw, path, inode))
+
+    if baseline:
+        base_path, base_inode = identity(baseline)
+        for label, raw, path, inode in outputs:
+            # Explicitly refreshing a previously read baseline is supported.
+            # Other reports have different schemas or may contain only NEW findings.
+            if label != "--save-baseline" and (path == base_path or (
+                    inode is not None and inode == base_inode)):
+                raise ValueError(f"{label} report destination refers to comparison baseline input: {raw}")
+
+    def protect(raw):
+        path, inode = identity(raw)
+        label = paths.get(path) or (inodes.get(inode) if inode is not None else None)
+        if label:
+            raise ValueError(f"{label} report destination refers to source input: {raw}")
+
+    original_root = Path(source_root)
+    if original_root.is_file():
+        original_root = original_root.parent
+    for raw in explicit:
+        path = Path(raw)
+        if not path.is_absolute() and (original_root / path).exists():
+            path = original_root / path
+        if path.is_file():
+            protect(path)
+    if single:
+        protect(single)
+    elif phase == "selected" and scratch:
+        mirrors = []
+        if mirror_map:
+            entries = Path(mirror_map).read_bytes().split(b"\0")
+            if entries and entries[-1] == b"":
+                entries.pop()
+            if len(entries) % 2:
+                raise ValueError("cannot validate source inputs: invalid workspace mirror map")
+            mirrors = [(Path(os.fsdecode(entries[i])), Path(os.fsdecode(entries[i + 1])))
+                       for i in range(0, len(entries), 2)]
+            mirrors.sort(key=lambda pair: len(pair[0].parts), reverse=True)
+        seen = set()
+        for listing in Path(scratch).glob("*.files"):
+            for raw in listing.read_bytes().split(b"\0"):
+                if not raw or raw in seen:
+                    continue
+                seen.add(raw)
+                rel = Path(os.fsdecode(raw))
+                if rel.is_absolute() or ".." in rel.parts:
+                    raise ValueError("cannot validate source inputs: invalid selection path")
+                original = Path(scan_root) / rel
+                if filtered:
+                    for copied, real in mirrors:
+                        try:
+                            original = real / original.relative_to(copied)
+                            break
+                        except ValueError:
+                            continue
+                    else:
+                        original = original_root / rel
+                protect(original)
+except (OSError, RuntimeError, ValueError) as exc:
+    print(f"ubs: invalid report output: {exc}", file=sys.stderr)
+    raise SystemExit(2)
+PYREPORTPATHS
+}
+
+# Stage beside the destination so publication is one rename, even when the
+# run scratch and output directory are on different filesystems. Never move
+# a report over a directory, FIFO or device.
+deliver_file(){
+  local src="$1" dest="$2" label="$3" dir tmp
+  if [[ ( -e "$dest" || -L "$dest" ) && ! -f "$dest" ]]; then
+    say_err "${RED}${X}${RESET} Cannot replace the requested ${label}: $dest is not a regular file"
+    return 1
+  fi
+  dir="$(dirname -- "$dest")"
+  if [[ ! -d "$dir" ]] && ! mkdir -p "$dir" 2>/dev/null; then
+    say_err "${RED}${X}${RESET} Cannot create the directory for the requested ${label}: $dir"
+    return 1
+  fi
+  if [[ ! -d "$dir" ]]; then
+    say_err "${RED}${X}${RESET} Cannot write the requested ${label}: $dir is not a directory"
+    return 1
+  fi
+  tmp="$(mktemp "$dir/.${dest##*/}.ubs-XXXXXX" 2>/dev/null)" || {
+    say_err "${RED}${X}${RESET} Cannot stage the requested ${label} in $dir (not writable?)"
+    return 1
+  }
+  if ! cat -- "$src" >"$tmp" 2>/dev/null; then
+    ubs_remove_temp -f "$tmp" 2>/dev/null || true
+    say_err "${RED}${X}${RESET} Cannot write the requested ${label}: $dest"
+    return 1
+  fi
+  if [[ ( -e "$dest" || -L "$dest" ) && ! -f "$dest" ]] || ! mv -f -- "$tmp" "$dest" 2>/dev/null; then
+    ubs_remove_temp -f "$tmp" 2>/dev/null || true
+    say_err "${RED}${X}${RESET} Cannot replace the requested ${label}: $dest"
+    return 1
+  fi
+  return 0
 }
 
 # Shared by command-line parsing, configuration and language selection.
@@ -3218,47 +3399,18 @@ else
     say_err "ERROR: --python-pattern-counts requires a scan, not a listing, version or update request"
     exit 2
   fi
-  if [[ ${#ALSO_PATHS[@]} -gt 0 || -n "$PYTHON_PATTERN_COUNTS_PATH" ]]; then
-    # Reject aliases before --output can truncate a file or any scan starts.
-    # A destination cannot represent two different reports at once.
-    if ! python3 - "$PYTHON_PATTERN_COUNTS_PATH" "$OUTPUT_FILE" "$SAVE_BASELINE_FILE" "$REPORT_JSON_PATH" \
-        "$HTML_REPORT_PATH" "$BEADS_JSONL_PATH" "${ALSO_PATHS[@]}" <<'PYALSO'
-import os
-from pathlib import Path
-import sys
-
-seen = []
-try:
-    if sys.argv[1]:
-        target = Path(sys.argv[1])
-        if target.exists() and not target.is_file():
-            raise ValueError("pattern counts destination must be a regular file")
-    for raw in sys.argv[1:]:
-        if not raw:
-            continue
-        path = Path(raw).resolve()
-        for previous in seen:
-            if path == previous or (path.exists() and previous.exists() and os.path.samefile(path, previous)):
-                raise ValueError(f"report destinations refer to the same file: {raw}")
-        seen.append(path)
-except (OSError, RuntimeError, ValueError) as exc:
-    option = "--python-pattern-counts" if sys.argv[1] else "--also"
-    print(f"ubs: invalid {option} output: {exc}", file=sys.stderr)
-    raise SystemExit(2)
-PYALSO
-    then
-      exit 2
-    fi
-  fi
+  validate_report_destinations arguments || exit 2
   if [[ -n "$OUTPUT_FILE" && "$LIST_CATEGORIES" -eq 0 ]]; then
-    if ! : >"$OUTPUT_FILE" 2>/dev/null; then
-      say_err "${RED}$X cannot write output file${RESET}: $OUTPUT_FILE"
+    ensure_tmpdir_run
+    PRIMARY_OUTPUT_STAGE="$TMPDIR_RUN/primary-output"
+    if ! : >"$PRIMARY_OUTPUT_STAGE" 2>/dev/null; then
+      say_err "${RED}$X cannot stage the requested --output report${RESET}: $OUTPUT_FILE"
       exit 2
     fi
-    # Tee everything that goes to stdout (the report in text mode, the payload
-    # in machine modes; diagnostics already live on stderr) into OUTPUT_FILE.
-    # cleanup() waits for tee so the file is complete before we exit.
-    exec > >(tee "$OUTPUT_FILE")
+    # Stdout stays live, but the requested file is replaced only after a
+    # complete report and a successful writer. The child must not run our
+    # EXIT/ERR traps and remove scratch that the parent still needs.
+    exec > >(trap - EXIT ERR; exec tee -- "$PRIMARY_OUTPUT_STAGE")
     TEE_PID=$!
     init_colors  # stdout is no longer a tty: write the file without ANSI codes
   fi
@@ -3314,6 +3466,7 @@ if [[ "$SHOW_VERSION" -eq 1 ]]; then
     fi
   fi
   say "UBS Meta-Runner v${UBS_VERSION}${short_sha:+ (git $short_sha)}"
+  PRIMARY_OUTPUT_READY=1
   exit 0
 fi
 
@@ -4769,13 +4922,13 @@ PY
     refuse_scan "git-index-failed" "Failed to prepare staged index workspace" ""
   fi
   if [[ "$count" -eq 0 ]]; then
-    say "${GREEN}${CHECK} No changed files to scan.${RESET}"
-    if [[ "$ALL_OCCURRENCES" -eq 1 ]]; then
+    if [[ "$ALL_OCCURRENCES" -eq 1 || "$FORMAT" != "text" ]] || report_outputs_requested; then
       EMPTY_GIT_SELECTION=1
       FILTERED_PROJECT_DIR="$dest"
       PROJECT_DIR="$dest"
       return 0
     fi
+    say "${GREEN}${CHECK} No changed files to scan.${RESET}"
     exit 0
   fi
   FILTERED_PROJECT_DIR="$dest"
@@ -4862,14 +5015,14 @@ for raw in sys.stdin.buffer.read().split(b'\0'):
   fi
 
   if [[ ${#files[@]} -eq 0 ]]; then
-    say "${GREEN}${CHECK} No changed files to scan.${RESET}"
-    if [[ "$ALL_OCCURRENCES" -eq 1 ]]; then
+    if [[ "$ALL_OCCURRENCES" -eq 1 || "$FORMAT" != "text" ]] || report_outputs_requested; then
       EMPTY_GIT_SELECTION=1
       FILTERED_PROJECT_DIR="$TMPDIR_RUN/git_scan"
       ensure_dir "$FILTERED_PROJECT_DIR"
       PROJECT_DIR="$FILTERED_PROJECT_DIR"
       return 0
     fi
+    say "${GREEN}${CHECK} No changed files to scan.${RESET}"
     exit 0
   fi
   
@@ -8336,6 +8489,7 @@ if [[ "$UPDATE_ONLY" -eq 1 ]]; then
       say_err "${RED}${X}${RESET} Update failed (exit ${SELF_UPDATE_STATUS})."
     fi
   fi
+  [[ "$SELF_UPDATE_STATUS" -ne 0 ]] || PRIMARY_OUTPUT_READY=1
   exit "$SELF_UPDATE_STATUS"
 fi
 
@@ -8420,13 +8574,6 @@ kill_module_pgroups(){
 
 # shellcheck disable=SC2317,SC2329  # invoked via the EXIT trap and from on_interrupt
 cleanup(){
-  # Flush the OUTPUT_FILE tee (if any) before tearing anything down: close our
-  # copy of the pipe so tee sees EOF, then wait for it to finish writing.
-  if [[ -n "${TEE_PID:-}" ]]; then
-    exec 1>&2
-    wait "$TEE_PID" 2>/dev/null || true
-    TEE_PID=""
-  fi
   early_cleanup
   local dir="${TMPDIR_RUN:-}"
   [[ -n "$dir" && "$dir" != "/" ]] || return 0
@@ -8439,11 +8586,13 @@ cleanup(){
 on_interrupt(){
   local sig="$1"
   kill_module_pgroups
+  PRIMARY_OUTPUT_READY=0
+  finish_primary_output || true
   cleanup
   trap - INT TERM EXIT
   kill -"$sig" "$$" 2>/dev/null || exit 130
 }
-trap cleanup EXIT
+trap 'ubs_exit_status=$?; finish_primary_output || ubs_exit_status=2; cleanup; exit "$ubs_exit_status"' EXIT
 trap 'on_interrupt INT' INT
 trap 'on_interrupt TERM' TERM
 COMBINED_JSON_FILE="$TMPDIR_RUN/combined.json"
@@ -8472,6 +8621,17 @@ if [[ -n "$FILTERED_PROJECT_DIR" ]]; then
        SCAN_DATA_EXTENSIONS="" build_scan_file_list "$PROJECT_DIR"; then
     refuse_scan "file-list-failed" "Could not list the targeted scan workspace" ""
   fi
+fi
+
+if report_outputs_requested; then
+  # A failed best-effort size listing cannot authorize overwriting an input.
+  # Targeted workspaces already have the same verified selection inventory.
+  if [[ -z "$SINGLE_FILE_TARGET" && -z "$SCAN_FILE_LIST" && -d "$PROJECT_DIR" ]]; then
+    if ! build_scan_file_list "$PROJECT_DIR"; then
+      refuse_scan "report-input-validation-failed" "Could not validate report destinations against selected inputs" ""
+    fi
+  fi
+  validate_report_destinations selected || exit 2
 fi
 
 
@@ -10266,36 +10426,6 @@ write_jsonl_summary(){
   fi
 }
 
-# Deliver a requested artifact atomically; a failed write preserves the old
-# report. Defined before language detection so empty scans can export too.
-deliver_file(){
-  local src="$1" dest="$2" label="$3" dir tmp
-  dir="$(dirname "$dest")"
-  if [[ ! -d "$dir" ]] && ! mkdir -p "$dir" 2>/dev/null; then
-    say_err "${RED}${X}${RESET} Cannot create the directory for the requested ${label}: $dir"
-    return 1
-  fi
-  if [[ ! -d "$dir" ]]; then
-    say_err "${RED}${X}${RESET} Cannot write the requested ${label}: $dir is not a directory"
-    return 1
-  fi
-  tmp="$(mktemp "$dest.ubs-XXXXXX" 2>/dev/null)" || {
-    say_err "${RED}${X}${RESET} Cannot stage the requested ${label} in $dir (not writable?)"
-    return 1
-  }
-  if ! cat "$src" >"$tmp" 2>/dev/null; then
-    ubs_remove_temp -f "$tmp" 2>/dev/null || true
-    say_err "${RED}${X}${RESET} Cannot write the requested ${label}: $dest"
-    return 1
-  fi
-  if [[ -d "$dest" ]] || ! mv -f "$tmp" "$dest" 2>/dev/null; then
-    ubs_remove_temp -f "$tmp" 2>/dev/null || true
-    say_err "${RED}${X}${RESET} Cannot replace the requested ${label}: $dest"
-    return 1
-  fi
-  return 0
-}
-
 write_python_pattern_counts(){
   [[ -n "$PYTHON_PATTERN_COUNTS_PATH" ]] || return 0
   local staged="$TMPDIR_RUN/python.pattern-counts"
@@ -10415,6 +10545,10 @@ emit_no_langs_document(){
       printf '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"ubs","informationUri":"https://github.com/Dicklesworthstone/ultimate_bug_scanner","rules":[]}},"results":[],"invocations":[{"executionSuccessful":true,"exitCode":%d,"properties":{"result":"no-supported-languages","project":"%s","supportedLanguages":"%s"}}]}]}\n' "$rc" "$proj_e" "$(json_escape "$supported")"
       ;;
     text|*)
+      if [[ "${EMPTY_GIT_SELECTION:-0}" -eq 1 ]]; then
+        say "${GREEN}${CHECK} No changed files to scan.${RESET}"
+        return 0
+      fi
       say "${YELLOW}${WARN}${RESET} no supported languages detected in ${proj}"
       say "${DIM}UBS did not run any scanner: nothing was checked (this is NOT a pass).${RESET}"
       say "${DIM}Supported languages: ${supported}${RESET}"
@@ -10432,7 +10566,11 @@ emit_no_langs_result(){
   NO_SCAN_TIMESTAMP="$(date_iso)"
   if [[ "${UBS_ALLOW_NO_SCAN:-0}" == "1" ]]; then rc=0; fi
   [[ "${EMPTY_GIT_SELECTION:-0}" -eq 1 ]] && rc=0
-  emit_no_langs_document "$FORMAT" || rc=2
+  if emit_no_langs_document "$FORMAT"; then
+    PRIMARY_OUTPUT_READY=1
+  else
+    rc=2
+  fi
   write_additional_reports 1 || rc=2
   if [[ "${ALL_OCCURRENCES:-0}" -eq 1 && -n "$BEADS_JSONL_PATH" ]]; then
     if emit_no_langs_document jsonl >"$TMPDIR_RUN/no-scan.jsonl"; then
@@ -10444,9 +10582,9 @@ emit_no_langs_result(){
   exit "$rc"
 }
 
-# Git's empty-selection fast path precedes report function definitions. In
-# occurrence mode defer its exit so every requested JSONL destination receives
-# an explicit no-coverage result instead of an apparently successful silence.
+# Git's empty-selection fast path precedes report function definitions. Machine
+# formats and report requests reach this renderer before output is published;
+# an empty selection still needs a complete document in each requested format.
 if [[ "$EMPTY_GIT_SELECTION" -eq 1 ]]; then emit_no_langs_result; fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -10868,7 +11006,11 @@ case "$FORMAT" in
   json)
     [[ "$HAS_ENV_ERROR" -eq 1 ]] && emit_env_error_report
     if generate_combined_json; then
-      emit_combined_json
+      if ! emit_combined_json; then
+        say_err "ERROR: Could not render the requested JSON report"
+        status=2
+        REPORT_FAILED=1
+      fi
     else
       # No combined document at all (no scanner JSON, or jq missing): the
       # minimal envelope is the only honest thing left to print.
@@ -10879,7 +11021,8 @@ case "$FORMAT" in
         REPORT_FAILED=1
       elif ! merge_json_scanners; then
         say "${RED}$X could not produce combined JSON${RESET}"
-        [[ "$status" -lt 1 ]] && status=1
+        status=2
+        REPORT_FAILED=1
       fi
     fi
     ;;
@@ -10895,7 +11038,8 @@ case "$FORMAT" in
         REPORT_FAILED=1
       else
         say "${RED}$X could not produce JSONL output${RESET}"
-        [[ "$status" -lt 1 ]] && status=1
+        status=2
+        REPORT_FAILED=1
       fi
     fi
     ;;
@@ -10910,7 +11054,7 @@ case "$FORMAT" in
         status=2
         REPORT_FAILED=1
       else
-        merge_sarif_runs
+        merge_sarif_runs || { status=2; REPORT_FAILED=1; }
       fi
     fi
     ;;
@@ -10925,7 +11069,11 @@ case "$FORMAT" in
       status=2
       REPORT_FAILED=1
     elif generate_combined_json; then
-      emit_combined_json | "$TOON_BIN" --encode
+      if ! emit_combined_json | "$TOON_BIN" --encode; then
+        say_err "ERROR: Could not render the requested TOON report"
+        status=2
+        REPORT_FAILED=1
+      fi
     else
       if [[ "$RUN_STATUS" != "ok" ]]; then
         emit_error_envelope "environment" "error" "$(incomplete_run_reason)" "$(incomplete_run_message)" \
@@ -10934,7 +11082,8 @@ case "$FORMAT" in
         REPORT_FAILED=1
       elif ! merge_json_scanners | "$TOON_BIN" --encode; then
         say "${RED}$X could not produce TOON output${RESET}"
-        [[ "$status" -lt 1 ]] && status=1
+        status=2
+        REPORT_FAILED=1
       fi
     fi
     ;;
@@ -11076,6 +11225,17 @@ case "$FORMAT" in
 	    status=2
 	  fi
 	fi
+
+if [[ "$REPORT_FAILED" -eq 0 ]]; then
+  PRIMARY_OUTPUT_READY=1
+else
+  # A --new-only findings verdict cannot turn a renderer failure into success.
+  status=2
+fi
+if ! validate_report_destinations selected; then
+  PRIMARY_OUTPUT_READY=0
+  exit 2
+fi
 
 write_python_pattern_counts || status=2
 write_additional_reports || status=2
@@ -11230,12 +11390,16 @@ def deliver(path, payload, label):
     target = pathlib.Path(path)
     staged = None
     try:
+        if (target.exists() or target.is_symlink()) and not target.is_file():
+            raise ValueError("report destination is not a regular file")
         with tempfile.NamedTemporaryFile(prefix=f".{target.name}.", dir=target.parent,
                                          delete=False) as stream:
             staged = pathlib.Path(stream.name)
             stream.write(payload.encode("utf-8"))
             stream.flush()
             os.fsync(stream.fileno())
+        if (target.exists() or target.is_symlink()) and not target.is_file():
+            raise ValueError("report destination is not a regular file")
         os.replace(staged, target)
         staged = None
     except (OSError, ValueError) as exc:

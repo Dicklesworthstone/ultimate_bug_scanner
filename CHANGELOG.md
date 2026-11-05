@@ -10,6 +10,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Publish primary reports atomically after rendering and writer completion.
+  Protect selected source and comparison baselines from every report path,
+  including symlink and hardlink aliases; preserve prior reports on early
+  failures, interrupts and failed writers. Empty Git selections emit complete
+  machine reports, and rendering or delivery failures remain exit 2.
+
 - Track Kotlin socket streams as aliases of their socket and accepted clients
   as independent resources. Closing a socket or either stream invalidates the
   related aliases; getter and accept failures retain outstanding cleanup.

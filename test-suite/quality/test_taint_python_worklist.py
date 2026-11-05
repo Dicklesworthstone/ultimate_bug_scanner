@@ -2208,12 +2208,13 @@ class CapturedDefaultValueTests(unittest.TestCase):
                     original = taint_py._Analysis._call_summary
 
                     def counted(engine, function, values, candidate_keys=None,
-                                global_overrides=(), capture_globals=frozenset()):
+                                global_overrides=(), capture_globals=frozenset(),
+                                value_parameters=frozenset()):
                         if function.name == 'identity':
                             keys = values if candidate_keys is None else candidate_keys
                             selected.append(sum(key.startswith('@global:saved') for key in keys))
                         return original(engine, function, values, candidate_keys,
-                                        global_overrides, capture_globals)
+                                        global_overrides, capture_globals, value_parameters)
 
                     with patch.object(taint_py._Analysis, '_call_summary', counted):
                         engine = self.assert_sites('\n'.join(lines) + '\n', expected)

@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 import unittest
 
-from test_taint_python_dataflow import ROOT, SourceTest
+from test_taint_python_dataflow import ROOT, RunContext, SourceTest, taint_py
 
 
 class InterpreterProcessTests(SourceTest):
@@ -290,6 +290,434 @@ class SavedArgumentVectorTests(SourceTest):
                                 input='def build(code):\n return build(code) if flag else ["python3", "-c", code]\nsubprocess.run(build(input()))',
                                 text=True, capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class WrapperArgumentVectorTests(SourceTest):
+    """Issue #200: summaries must distinguish argv[0] from ordinary arguments."""
+
+    def test_issue_200_exact_direct_control(self):
+        self.assert_rules('''
+            import os
+            import subprocess
+
+            user = os.environ.get("SUDO_USER", "root")
+            subprocess.run(["sshd", "-T", "-C", "user=" + user], check=False)
+        ''')
+
+    def test_issue_200_exact_variadic_reproduction(self):
+        self.assert_rules('''
+            import os
+            import subprocess
+
+
+            def run(*argv):
+                return subprocess.run(argv, check=False)
+
+
+            user = os.environ.get("SUDO_USER", "root")
+            run("sshd", "-T", "-C", "user=" + user)
+        ''')
+
+    def test_issue_200_list_parameter_reproduction(self):
+        self.assert_rules('''
+            import os
+            import subprocess
+
+
+            def run(argv):
+                return subprocess.run(argv, check=False)
+
+
+            user = os.environ.get("SUDO_USER", "root")
+            run(["sshd", "-T", "-C", "user=" + user])
+        ''')
+
+    def test_issue_200_exact_tainted_executable_control(self):
+        self.assert_rules('''
+            import os
+            import subprocess
+
+            subprocess.run([os.environ.get("TOOL", "true")])
+        ''', 'command')
+
+    def test_tainted_executable_survives_both_wrapper_forms(self):
+        for parameter, invocation in (('*argv', 'run(os.environ["TOOL"], "-T")'),
+                                      ('argv', 'run([os.environ["TOOL"], "-T"])')):
+            with self.subTest(parameter=parameter):
+                self.assert_rules(f'def run({parameter}):\n return subprocess.run(argv)\n{invocation}', 'command')
+
+    def test_nested_variadic_and_list_wrappers(self):
+        source = '''
+            def run(argv):
+                return subprocess.run(argv, check=False)
+            def forward(*argv):
+                return run(argv)
+            def outer(argv):
+                return forward(*argv)
+        '''
+        self.assert_rules(source + '\n            outer(["echo", input()])\n')
+        self.assert_rules(source + '\n            outer([input(), "safe"])\n', 'command')
+        self.assert_rules(source + '\n            outer(["python3", "-c", input()])\n', 'command')
+
+    def test_multiple_call_sites_exclude_argument_only_provenance(self):
+        for parameter, template in (('*argv', 'run({})'), ('argv', 'run([{}])')):
+            safe_call = template.format('"sshd", "-T", harmless_argument')
+            unsafe_call = template.format('unsafe_executable, "-T"')
+            for calls in ((safe_call, unsafe_call), (unsafe_call, safe_call)):
+                with self.subTest(parameter=parameter, calls=calls):
+                    findings = self.assert_rules(
+                        f'def run({parameter}):\n return subprocess.run(argv)\n'
+                        'harmless_argument = os.environ["SUDO_USER"]\n'
+                        'unsafe_executable = os.environ["TOOL"]\n' + '\n'.join(calls), 'command')
+                    self.assertEqual(findings[0]['line'], 2)
+                    self.assertIn('unsafe_executable', findings[0]['message'])
+                    self.assertNotIn('harmless_argument', findings[0]['message'])
+                    self.assertIn('subprocess executable', findings[0]['message'])
+
+    def test_multiple_argument_only_sites_do_not_taint_executable(self):
+        self.assert_rules('''
+            def run(*argv):
+                return subprocess.run(argv)
+            run("sshd", "-T", input())
+            run("echo", input())
+            run("python3", "-c", "print(1)", input())
+        ''')
+
+    def test_literal_program_selection_stays_paired_with_its_arguments(self):
+        self.assert_rules('''
+            def run(argv):
+                return subprocess.run(argv)
+            argv = ["echo", "-c", input()] if flag else ["python3", "-c", "print(1)"]
+            run(argv)
+        ''')
+        self.assert_rules('''
+            def run(argv):
+                return subprocess.run(argv)
+            argv = ["echo", "-c", input()] if flag else ["python3", "-c", input()]
+            run(argv)
+        ''', 'command')
+
+    def test_dynamic_executable_selection_is_not_proven_safe(self):
+        self.assert_rules('''
+            def run(argv):
+                return subprocess.run(argv)
+            program = "echo" if flag else os.environ["TOOL"]
+            run([program, "safe"])
+        ''', 'command')
+        self.assert_rules('''
+            def run(*argv):
+                return subprocess.run(argv)
+            program = "echo" if flag else "python3"
+            run(program, "-c", input())
+        ''', 'command')
+
+    def test_unresolved_program_identity_keeps_possible_interpreter_flows(self):
+        for expression in ('"py" + "thon3"', 'str("python3")',
+                           'os.path.join("/usr/bin", "python3")'):
+            for wrapper, invocation in (
+                ('', 'subprocess.run([program, "-c", input()])'),
+                ('def run(*argv):\n return subprocess.run(argv)\n', 'run(program, "-c", input())'),
+                ('def run(argv):\n return subprocess.run(argv)\n', 'run([program, "-c", input()])'),
+            ):
+                with self.subTest(expression=expression, invocation=invocation):
+                    self.assert_rules(wrapper + f'program = {expression}\n' + invocation, 'command')
+        self.assert_rules('subprocess.run(["echo", "-c", input()])')
+
+    def test_starred_call_keeps_alternative_interpreter_identity(self):
+        self.assert_rules('''
+            def run(program, *args):
+                subprocess.run([program, *args])
+            program = "echo" if flag else "python3"
+            args = [program, "-c", input()]
+            run(*args)
+        ''', 'command')
+
+    def test_executable_override_keeps_alternative_interpreter_identity(self):
+        self.assert_rules('''
+            def run(argv, program):
+                subprocess.run(argv, executable=program)
+            program = "echo" if flag else "python3"
+            run(["ignored", "-c", input()], program)
+        ''', 'command')
+
+    def test_keyword_and_starred_forwarding_preserve_positions(self):
+        for invocation in ('run(argv=["echo", input()])', 'run(*[["echo", input()]])',
+                           'run(**{"argv": ["echo", input()]})'):
+            with self.subTest(invocation=invocation):
+                self.assert_rules('def run(argv):\n return subprocess.run(args=argv)\n' + invocation)
+        self.assert_rules('def run(*argv):\n return subprocess.run(argv)\nrun(*["echo", input()])')
+        self.assert_rules('def run(*argv):\n return subprocess.run(argv)\nrun(*[input(), "safe"])', 'command')
+
+    def test_wrapper_vector_copies_and_prefixes(self):
+        for command in ('[*argv]', '["echo", *argv]'):
+            with self.subTest(command=command):
+                self.assert_rules(f'def run(argv):\n return subprocess.run({command})\nrun(["echo", input()])')
+        self.assert_rules('def run(argv):\n return subprocess.run([*argv])\nrun([input(), "safe"])', 'command')
+
+    def test_all_subprocess_entrypoints_through_wrappers(self):
+        for function in ('run', 'Popen', 'call', 'check_call', 'check_output'):
+            for parameter, invocation in (('*argv', 'execute("echo", input())'),
+                                          ('argv', 'execute(["echo", input()])')):
+                with self.subTest(function=function, parameter=parameter):
+                    source = f'def execute({parameter}):\n return subprocess.{function}(argv)\n'
+                    self.assert_rules(source + invocation)
+                    dangerous = 'execute(input())' if parameter.startswith('*') else 'execute([input()])'
+                    self.assert_rules(source + dangerous, 'command')
+
+    def test_shell_true_uses_command_position_not_later_arguments(self):
+        self.assert_rules('def run(argv):\n return subprocess.run(argv, shell=True)\nrun(input())', 'command')
+        self.assert_rules('def run(argv):\n return subprocess.run(argv, shell=True)\nrun([input(), "safe"])', 'command')
+        self.assert_rules('def run(*argv):\n return subprocess.run(argv, shell=True)\nrun(input(), "safe")', 'command')
+        self.assert_rules('def run(argv):\n return subprocess.run(argv, shell=True)\nrun(["echo safe", input()])')
+        self.assert_rules('def run(*argv):\n return subprocess.run(argv, shell=True)\nrun("echo safe", input())')
+
+    def test_interpreter_code_and_data_survive_wrapper_boundaries(self):
+        for program in ('python3', 'sh'):
+            for parameter, template in (('*argv', 'run({})'), ('argv', 'run([{}])')):
+                with self.subTest(program=program, parameter=parameter):
+                    source = f'def run({parameter}):\n return subprocess.run(argv)\n'
+                    self.assert_rules(source + template.format(f'{program!r}, "-c", input()'), 'command')
+                    self.assert_rules(source + template.format(f'{program!r}, "-c", "fixed", input()'))
+
+    def test_wrapper_domains_keep_shell_quoting_specific_to_shell_code(self):
+        source = 'def run(argv):\n return subprocess.run(argv)\n'
+        self.assert_rules(source + 'run(["sh", "-c", "echo " + shlex.quote(input())])')
+        self.assert_rules(source + 'run(["python3", "-c", shlex.quote(input())])', 'command')
+        self.assert_rules(source + 'run([shlex.quote(input())])', 'command')
+        self.assert_rules('def run(argv):\n return subprocess.run(argv, shell=True)\nrun("echo " + shlex.quote(input()))')
+
+    def test_wrapper_executable_override_selects_the_actual_program(self):
+        source = ('def run(argv, executable):\n'
+                  ' return subprocess.run(argv, executable=executable)\n')
+        self.assert_rules(source + 'run(["python3", "-c", input()], "echo")')
+        self.assert_rules(source + 'run(["echo", "-c", input()], "python3")', 'command')
+        self.assert_rules(source + 'run(["echo", "safe"], input())', 'command')
+
+    def test_wrapper_stdin_depends_on_selected_interpreter_mode(self):
+        source = 'def run(argv, payload):\n return subprocess.run(argv, input=payload)\n'
+        self.assert_rules(source + 'run(["python3"], input())', 'command')
+        self.assert_rules(source + 'run(["sh", "-s"], input())', 'command')
+        self.assert_rules(source + 'run(["python3", "-c", "print(1)"], input())')
+        self.assert_rules(source + 'run(["echo"], input())')
+
+    def test_wrapper_returned_process_keeps_stdin_contract(self):
+        source = 'def start(argv):\n return subprocess.Popen(argv, stdin=subprocess.PIPE)\n'
+        self.assert_rules(source + 'p = start(["python3"])\np.communicate(input())', 'command')
+        self.assert_rules(source + 'p = start(["echo"])\np.communicate(input())')
+
+    def test_wrapper_mutation_revokes_argument_position_certainty(self):
+        self.assert_rules('''
+            def run(argv):
+                argv.reverse()
+                return subprocess.run(argv)
+            run(["echo", input()])
+        ''', 'command')
+        self.assert_rules('''
+            def run(argv):
+                argv[0] = "python3"
+                return subprocess.run(argv)
+            run(["echo", "-c", input()])
+        ''', 'command')
+
+    def test_mutation_before_call_or_in_later_argument_revokes_shape(self):
+        self.assert_rules('''
+            def run(argv):
+                return subprocess.run(argv)
+            argv = ["echo", "-c", input()]
+            argv[0] = "python3"
+            run(argv)
+        ''', 'command')
+        self.assert_rules('''
+            def run(argv, unused):
+                return subprocess.run(argv)
+            argv = ["echo", input()]
+            run(argv, argv.reverse())
+        ''', 'command')
+
+    def test_unknown_length_prefix_can_expose_later_executable(self):
+        for prefix in ('unknown', '([] if flag else ["echo"])'):
+            for parameter, invocation in (('*argv', f'run(*{prefix}, input())'),
+                                          ('argv', f'run([*{prefix}, input()])')):
+                for options in ('', ', shell=True'):
+                    with self.subTest(prefix=prefix, parameter=parameter, options=options):
+                        self.assert_rules(
+                            f'def run({parameter}):\n return subprocess.run(argv{options})\n' + invocation,
+                            'command')
+
+    def test_unknown_length_suffix_preserves_fixed_executable(self):
+        for parameter, template in (('*argv', 'run({})'), ('argv', 'run([{}])')):
+            source = f'def run({parameter}):\n return subprocess.run(argv)\n'
+            with self.subTest(parameter=parameter):
+                self.assert_rules(source + template.format('"echo", *unknown, input()'))
+                self.assert_rules(source + template.format('"python3", *unknown, input()'), 'command')
+                self.assert_rules(source + template.format('"sh", *unknown, input()'), 'command')
+
+    def test_widened_vectors_keep_late_code_taint_and_selected_program(self):
+        # Long argument vectors must not silently drop taint when summary
+        # contexts widen their suffix to keep recursive analysis bounded.
+        for program, option in (('python3', '-I'), ('sh', '-l')):
+            options = ', '.join([repr(option)] * 40)
+            padding = ', '.join(['"padding"'] * 40)
+            for parameter, template in (('*argv', 'run({})'), ('argv', 'run([{}])')):
+                source = f'def run({parameter}):\n return subprocess.run(argv)\n'
+                with self.subTest(program=program, parameter=parameter):
+                    self.assert_rules(source + template.format(
+                        f'{program!r}, {options}, "-c", input()'), 'command')
+                    self.assert_rules(source + template.format(
+                        f'{program!r}, "-c", "fixed", {padding}, input()'))
+
+    def test_interpreter_option_value_does_not_consume_unknown_suffix(self):
+        for program, flag, option, value in (('python3', '-I', '-W', 'ignore'),
+                                             ('python3', '-I', '-X', 'dev'),
+                                             ('sh', '-l', '-o', 'errexit')):
+            for parameter, template in (('*argv', 'run({})'), ('argv', 'run([{}])')):
+                source = f'def run({parameter}):\n return subprocess.run(argv)\n'
+                with self.subTest(program=program, option=option, parameter=parameter):
+                    # The expansion may contain an option value followed by
+                    # -c and source; it cannot be consumed as exactly one item.
+                    self.assert_rules(source + template.format(
+                        f'{program!r}, {option!r}, *input().split()'), 'command')
+                    padding = ', '.join([repr(flag)] * 14)
+                    self.assert_rules(source + template.format(
+                        f'{program!r}, {padding}, {option!r}, {value!r}, "-c", input()'), 'command')
+        for option in ('-c', '-m', '-Ic'):
+            for parameter, template in (('*argv', 'run({})'), ('argv', 'run([{}])')):
+                source = f'def run({parameter}):\n return subprocess.run(argv)\n'
+                with self.subTest(option=option, parameter=parameter):
+                    # An empty expansion exposes the later operand as source.
+                    self.assert_rules(source + template.format(
+                        f'"python3", {option!r}, *unknown, input()'), 'command')
+                    self.assert_rules(source + template.format(
+                        f'"python3", {option!r}, "fixed", *unknown, input()'))
+        self.assert_rules('''
+            def run(argv, payload):
+                subprocess.run(argv, input=payload)
+            run(["python3", "--", *unknown], input())
+        ''', 'command')
+
+    def test_repeated_shape_contexts_keep_branch_and_sanitizer_provenance(self):
+        source = '''
+            def run(argv):
+                subprocess.run(argv)
+            quoted_code = "echo " + shlex.quote(input())
+            harmless_argument = input()
+            argv = ["echo", "-c", harmless_argument] if flag else ["sh", "-c", quoted_code]
+            run(argv)
+        '''
+        self.assert_rules(source)
+        findings = self.assert_rules(source + '''
+            unsafe_code = input()
+            argv = ["echo", "-c", harmless_argument] if flag else ["sh", "-c", unsafe_code]
+            run(argv)
+        ''', 'command')
+        self.assertIn('unsafe_code', findings[0]['message'])
+        self.assertIn('subprocess execution', findings[0]['message'])
+        self.assertNotIn('quoted_code', findings[0]['message'])
+        self.assertNotIn('harmless_argument', findings[0]['message'])
+
+    def test_callback_forwarding_preserves_vector_positions(self):
+        source = '''
+            def run(argv):
+                return subprocess.run(argv)
+            def invoke(callback, argv):
+                return callback(argv)
+        '''
+        self.assert_rules(source + '\n            invoke(run, ["echo", input()])\n')
+        self.assert_rules(source + '\n            invoke(run, [input(), "safe"])\n', 'command')
+
+    def test_captured_defaults_preserve_each_factory_invocations_vector(self):
+        source = '''
+            def make(argv):
+                def run(args=argv):
+                    return subprocess.run(args)
+                return run
+        '''
+        self.assert_rules(source + '\n            make(["echo", input()])()\n')
+        self.assert_rules(source + '''
+            make(["echo", input()])()
+            make([input(), "safe"])()
+        ''', 'command')
+
+    def test_selected_modules_preserve_wrapper_positions_in_either_order(self):
+        for parameter, template in (('*argv', 'run({})'), ('argv', 'run([{}])')):
+            for operands, expected in (("'echo', input()", []),
+                                       ("input(), 'safe'", ['python.taint.command'])):
+                for reverse in (False, True):
+                    with self.subTest(parameter=parameter, operands=operands, reverse=reverse):
+                        with tempfile.TemporaryDirectory(prefix='ubs-wrapper-modules-') as tmp:
+                            helper = Path(tmp) / 'helper.py'
+                            helper.write_text('import subprocess\n'
+                                              f'def run({parameter}):\n return subprocess.run(argv)\n', encoding='utf-8')
+                            app = Path(tmp) / 'app.py'
+                            app.write_text('from helper import run\n' + template.format(operands) + '\n', encoding='utf-8')
+                            paths = [app, helper] if reverse else [helper, app]
+                            findings = list(taint_py.run(RunContext(
+                                lang='python', files=paths, profile={'project_dir': tmp})))
+                        self.assertEqual([finding['rule'] for finding in findings], expected, findings)
+                        if findings:
+                            self.assertEqual((Path(findings[0]['path']).name, findings[0]['line']), ('helper.py', 3))
+
+    def test_wrapper_observes_temporary_global_vector_at_call_time(self):
+        self.assert_rules('''
+            import subprocess
+            argv = ["echo", input()]
+            def run(argv):
+                subprocess.run(argv)
+            def invoke():
+                run(argv)
+            argv = [input()]
+            invoke()
+            argv = ["echo", input()]
+        ''', 'command')
+
+    def test_wrapper_observes_global_vector_rebound_inside_helper(self):
+        self.assert_rules('''
+            import subprocess
+            argv = ["echo"]
+            def run(argv):
+                subprocess.run(argv)
+            def invoke():
+                run(argv)
+            def update():
+                global argv
+                argv = [input()]
+                invoke()
+            update()
+        ''', 'command')
+
+    def test_recursive_wrapper_vector_growth_is_bounded(self):
+        probe = ('import sys;sys.path.insert(0,sys.argv[1]);'
+                 'from test_taint_python_dataflow import SourceTest;'
+                 'SourceTest().assert_rules(sys.stdin.read(), "command")')
+        import sys
+        result = subprocess.run(
+            [sys.executable, '-B', '-c', probe, str(Path(__file__).parent)],
+            input='def run(argv):\n if flag: return run([*argv, "extra"])\n subprocess.run(argv)\nrun([input(), "safe"])',
+            text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_issue_200_environment_output_dependency(self):
+        # An unknown child's output can depend on its environment. This is a
+        # different dependency from treating an ordinary argv item as argv[0].
+        self.assert_rules('''
+            import os
+            import subprocess
+
+            env = {"PATH": "/usr/bin", "SSH_CONNECTION": os.environ.get("SSH_CONNECTION", "")}
+            wan = subprocess.run(["ip", "-j", "route"], capture_output=True, text=True, env=env).stdout.strip()
+            subprocess.run([wan], check=False)
+        ''', 'command')
+        self.assert_rules('''
+            import subprocess
+
+            env = {"PATH": "/usr/bin", "SSH_CONNECTION": ""}
+            wan = subprocess.run(["ip", "-j", "route"], capture_output=True, text=True, env=env).stdout.strip()
+            subprocess.run([wan], check=False)
+        ''')
+        self.assert_rules('''
+            env = {"SSH_CONNECTION": os.environ.get("SSH_CONNECTION", "")}
+            subprocess.run(["ip", "-j", "route"], env=env)
+        ''')
 
 
 class InterpreterStdinTests(SourceTest):

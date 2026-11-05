@@ -51,6 +51,8 @@ EXTS = {'.py', '.pyi'}
 PATH_LIMIT = 5
 _INCOMPLETE_PROOF = 'taint:incomplete'
 _MAX_CAPTURE_DEPTH = 64
+# Keep a precise prefix plus an aggregate unknown-length suffix in summaries.
+_MAX_VECTOR_CONTEXT = 16
 
 
 def _work_setting(name, default):
@@ -329,9 +331,51 @@ class _SymbolicValue:
 
 @dataclass(frozen=True)
 class _ArgumentVector:
-    # Only fixed syntactic constructions have a shape. Unknown writes/escapes
-    # invalidate it instead of guessing which position a heap fact describes.
+    # Fixed constructions retain positions; opaque expansions retain unknown
+    # lengths. Writes/escapes invalidate the shape instead of assigning a heap
+    # fact to a guessed operand.
     operands: tuple
+
+
+@dataclass(frozen=True)
+class _ArgumentExpansion:
+    """An unknown-length argv segment, never a single positional operand."""
+
+
+def _vector_shape(vector):
+    return tuple(operand if isinstance(operand, (_LiteralString, _ArgumentExpansion, frozenset)) else None
+                 for operand, _fact in vector.operands)
+
+
+def _context_vector(vector):
+    if len(vector.operands) <= _MAX_VECTOR_CONTEXT:
+        return vector
+    # Retain the executable and a bounded option prefix. The rest remains an
+    # unknown-length segment with ALL of its taint, including recursive growth.
+    return _ArgumentVector((*vector.operands[:_MAX_VECTOR_CONTEXT],
+                            (_ArgumentExpansion(), join_facts(*(
+                                fact for _operand, fact in vector.operands[_MAX_VECTOR_CONTEXT:])))))
+
+
+def _vector_variants(binding):
+    """Group equal program/option shapes without cross-pairing their facts.
+
+    Contexts contain only bounded shapes and source-level literal identities.
+    Recursive argv growth widens the suffix; taint is never discarded.
+    """
+    if not isinstance(binding, (_ArgumentVector, frozenset)):
+        return []
+    shapes = {}
+    for value in _binding_choices(binding):
+        if isinstance(value, _ArgumentVector):
+            value = _context_vector(value)
+            shapes.setdefault(_vector_shape(value), []).append(value)
+    return [(index, shape, shapes[shape])
+            for index, shape in enumerate(sorted(shapes, key=repr))]
+
+
+def _vector_slot(name, variant, index):
+    return f'@argv:{name}:{variant}:{index}'
 
 
 @dataclass(frozen=True)
@@ -705,7 +749,7 @@ def _interpreter_kind(program):
     return None
 
 
-def _interpreter_inputs(kind, arguments):
+def _interpreter_inputs(kind, arguments, literal_text=_literal_text):
     """Return possible code operands, not data following a selected program.
 
     Arguments are already evaluated (AST expression, fact) snapshots. Unknown
@@ -717,12 +761,14 @@ def _interpreter_inputs(kind, arguments):
     shell_command = False
     while index < len(arguments):
         node, fact = arguments[index]
-        option = _literal_text(node)
+        option = literal_text(node)
         if option is None:
-            if shell_command and not isinstance(node, ast.Starred):
+            if shell_command and not isinstance(node, (ast.Starred, _ArgumentExpansion)):
                 return fact, CLEAN
             return CLEAN, join_facts(*(value for _node, value in arguments[index:]))
         if option == '--':
+            if index + 1 < len(arguments) and isinstance(arguments[index + 1][0], (ast.Starred, _ArgumentExpansion)):
+                return CLEAN, join_facts(*(value for _node, value in arguments[index + 1:]))
             value = arguments[index + 1][1] if index + 1 < len(arguments) else CLEAN
             return (value, CLEAN) if shell_command else (CLEAN, value)
         if option == '-' or not option.startswith(('-', '+')):
@@ -732,6 +778,10 @@ def _interpreter_inputs(kind, arguments):
         takes_value = ({'-o', '+o', '-O', '+O', '--rcfile', '--init-file'} if kind == 'shell'
                        else {'-W', '-X', '--check-hash-based-pycs'})
         if option in takes_value:
+            if index + 1 < len(arguments) and isinstance(arguments[index + 1][0], (ast.Starred, _ArgumentExpansion)):
+                # Only one element is the option value. An opaque/widened
+                # segment can also contain a later -c and its source text.
+                return CLEAN, join_facts(*(value for _node, value in arguments[index + 1:]))
             index += 2
             continue
         if option.startswith('-') and not option.startswith('--'):
@@ -740,11 +790,17 @@ def _interpreter_inputs(kind, arguments):
                     if flag in {'c', 'm'}:
                         # The rest of this option is code/module text, not
                         # additional flags. -W/-X values must never supply c.
+                        if (not option[position:] and index + 1 < len(arguments)
+                                and isinstance(arguments[index + 1][0], (ast.Starred, _ArgumentExpansion))):
+                            return CLEAN, join_facts(*(value for _node, value in arguments[index + 1:]))
                         value = fact if option[position:] else (
                             arguments[index + 1][1] if index + 1 < len(arguments) else CLEAN)
                         return CLEAN, value
                     if flag in {'W', 'X'}:
                         if not option[position:]:
+                            if (index + 1 < len(arguments)
+                                    and isinstance(arguments[index + 1][0], (ast.Starred, _ArgumentExpansion))):
+                                return CLEAN, join_facts(*(value for _node, value in arguments[index + 1:]))
                             index += 1
                         break
             elif 'c' in option[1:]:
@@ -753,16 +809,18 @@ def _interpreter_inputs(kind, arguments):
     return CLEAN, CLEAN
 
 
-def _interpreter_reads_stdin(kind, arguments):
+def _interpreter_reads_stdin(kind, arguments, literal_text=_literal_text):
     """Whether stdin may be executable source, rather than application data."""
     index = 0
     shell_stdin = False
     while index < len(arguments):
-        option = _literal_text(arguments[index][0])
+        option = literal_text(arguments[index][0])
         if option is None:
             return True
         if option == '--':
-            return shell_stdin or index + 1 == len(arguments) or _literal_text(arguments[index + 1][0]) == '-'
+            return (shell_stdin or index + 1 == len(arguments)
+                    or isinstance(arguments[index + 1][0], (ast.Starred, _ArgumentExpansion))
+                    or literal_text(arguments[index + 1][0]) == '-')
         if option == '-':
             return True
         if not option.startswith(('-', '+')):
@@ -770,6 +828,8 @@ def _interpreter_reads_stdin(kind, arguments):
         consumes = ({'-o', '+o', '-O', '+O', '--rcfile', '--init-file'} if kind == 'shell'
                     else {'-W', '-X', '--check-hash-based-pycs'})
         if option in consumes:
+            if index + 1 < len(arguments) and isinstance(arguments[index + 1][0], (ast.Starred, _ArgumentExpansion)):
+                return True
             index += 2
             continue
         if option.startswith('-') and not option.startswith('--'):
@@ -783,6 +843,9 @@ def _interpreter_reads_stdin(kind, arguments):
                         return False
                     if flag in {'W', 'X'}:
                         if not option[position:]:
+                            if (index + 1 < len(arguments)
+                                    and isinstance(arguments[index + 1][0], (ast.Starred, _ArgumentExpansion))):
+                                return True
                             index += 1
                         break
         index += 1
@@ -1210,6 +1273,9 @@ class FunctionSummary:
     incomplete: bool = False
     # Module identity matters: same-spelled globals in two files are distinct.
     capture_globals: frozenset[tuple[ast.Module, str]] = frozenset()
+    # Request value identities only when a program/option/argv operation needs
+    # them. Ordinary data and unrelated defaults share the same summary.
+    value_parameters: frozenset[str] = frozenset()
 
 
 class _CallSubstitution:
@@ -1326,6 +1392,7 @@ class _Flow:
         self.comprehension_environments = []
         self.context_globals = ()
         self.capture_globals = set()
+        self.value_parameters = set()
 
     def refine_url_guard(self, test, state, truth):
         """Recognize an exact, terminating local URL allow-list predicate.
@@ -2025,7 +2092,36 @@ class _Flow:
                 value = _without_object_contract(value)
             yield key, fact, refs, value
 
+    def call_positions(self, node, arguments=None):
+        """Expand evaluated, exact *vectors without re-evaluating their AST.
+
+        Keep unknown expansions in place so all binders agree on when an
+        argument can shift. References remain conservative for saved elements.
+        """
+        if arguments is None:
+            arguments = [self.expression_facts.get(arg, CLEAN) for arg in node.args]
+        positions = []
+        for expression, fact in zip(node.args, arguments):
+            binding = self.expression_bindings.get(expression)
+            refs = self.expression_references.get(expression, NO_REFERENCES)
+            if isinstance(expression, ast.Starred):
+                self.require_value(binding)
+            if (isinstance(expression, ast.Starred) and isinstance(binding, _ArgumentVector)
+                    and not any(isinstance(operand, _ArgumentExpansion) for operand, _ in binding.operands)):
+                self.engine.budget.spend(len(binding.operands))
+                for operand, value in binding.operands:
+                    identity = (operand if isinstance(operand, (_LiteralString, _SymbolicValue, frozenset))
+                                else self.expression_bindings.get(operand))
+                    element_refs = (NO_REFERENCES if isinstance(operand, _LiteralString)
+                                    else self.expression_references.get(operand, refs))
+                    positions.append((operand, value, identity, element_refs))
+            else:
+                positions.append((expression, fact, binding, refs))
+        return positions
+
     def bind(self, function, node, arguments, keywords, state, globals_snapshot=None, captured_defaults=None):
+        positions = self.call_positions(node, arguments)
+        arguments = [fact for _expression, fact, _binding, _refs in positions]
         positional = [arg.arg for arg in (*function.args.posonlyargs, *function.args.args)]
         bound = {name: fact for name, fact in zip(positional, arguments)}
         for name, fact in keywords.items():
@@ -2044,7 +2140,7 @@ class _Flow:
                 references = default_references.get(name, NO_REFERENCES)
                 bound[name] = join_facts(default_facts.get(name, CLEAN),
                                          *(state.heap.get(ref, CLEAN) for ref in references))
-        expanded = join_facts(*(fact for arg, fact in zip(node.args, arguments) if isinstance(arg, ast.Starred)),
+        expanded = join_facts(*(fact for arg, fact, _binding, _refs in positions if isinstance(arg, ast.Starred)),
                               keywords.get(None, CLEAN))
         if expanded:
             for arg in (*function.args.posonlyargs, *function.args.args, *function.args.kwonlyargs):
@@ -2071,8 +2167,8 @@ class _Flow:
         """
         positional = [arg.arg for arg in (*function.args.posonlyargs, *function.args.args)]
         accepted = set(positional) | {arg.arg for arg in function.args.kwonlyargs}
-        bound = {name: self.expression_references.get(arg, NO_REFERENCES)
-                 for name, arg in zip(positional, node.args)}
+        positions = self.call_positions(node)
+        bound = {name: item[3] for name, item in zip(positional, positions)}
         for name, expression in keyword_nodes.items():
             if name in accepted:
                 bound[name] = self.expression_references.get(expression, NO_REFERENCES)
@@ -2080,8 +2176,8 @@ class _Flow:
                     else self.definition_table('default_references', function).items())
         for name, references in defaults:
             bound.setdefault(name, references)
-        expanded = frozenset().union(*(self.expression_references.get(arg, NO_REFERENCES)
-                                      for arg in node.args if isinstance(arg, ast.Starred)))
+        expanded = frozenset().union(*(refs for arg, _fact, _binding, refs in positions
+                                      if isinstance(arg, ast.Starred)))
         if expanded:
             for name in positional:
                 bound[name] = bound.get(name, NO_REFERENCES) | expanded
@@ -2101,12 +2197,23 @@ class _Flow:
             return self.engine.project.module_ref_map.get(key, NO_REFERENCES)
         return NO_REFERENCES
 
-    def bind_values(self, function, node, keyword_nodes, state, globals_snapshot=None, captured_defaults=None):
+    def bind_values(self, function, node, arguments, keyword_nodes, state, globals_snapshot=None, captured_defaults=None):
         positional = [arg.arg for arg in (*function.args.posonlyargs, *function.args.args)]
-        bound = {name: self.expression_bindings.get(arg) for name, arg in zip(positional, node.args)}
-        if any(isinstance(arg, ast.Starred) for arg in node.args):
+        positions = self.call_positions(node, arguments)
+        bound = {name: item[2] for name, item in zip(positional, positions)}
+        expanded = any(isinstance(item[0], ast.Starred) for item in positions)
+        if expanded:
             # Unknown expansion must not certify a particular program/option.
             bound.update((name, None) for name in positional)
+        if function.args.vararg:
+            operands = []
+            for expression, fact, binding, _refs in positions[len(positional):]:
+                if isinstance(expression, ast.Starred) and isinstance(binding, _ArgumentVector):
+                    operands.extend(binding.operands)
+                else:
+                    operands.append(self.command_operand(expression, fact))
+            bound[function.args.vararg.arg] = (
+                None if expanded and positional else _ArgumentVector(tuple(operands)))
         bound.update((name, self.expression_bindings.get(value)) for name, value in keyword_nodes.items()
                      if name is not None)
         defaults = (captured_defaults.values if captured_defaults is not None
@@ -2120,6 +2227,27 @@ class _Flow:
         for key, _fact, _refs, value in global_items:
             bound[key] = value
         return bound
+
+    def bind_vector_elements(self, bound, values, candidate_keys=None):
+        """Bind summary projections to this invocation's positional facts.
+
+        Separate slots for each shape retain branch correlation (echo data
+        must not become a different branch's Python source). Facts and their
+        provenance live here, never in summary context keys.
+        """
+        projected = {}
+        items = (((name, values.get(name)) for name in candidate_keys)
+                 if candidate_keys is not None else values.items())
+        for name, binding in items:
+            for variant, shape, vectors in _vector_variants(binding):
+                self.engine.budget.spend(len(shape) * len(vectors))
+                for index in range(len(shape)):
+                    slot = _vector_slot(name, variant, index)
+                    bound[slot] = join_facts(*(vector.operands[index][1] for vector in vectors))
+                    projected[slot] = _join_bindings(*(
+                        operand if isinstance(operand, (_LiteralString, _SymbolicValue, frozenset)) else None
+                        for operand, _fact in (vector.operands[index] for vector in vectors)))
+        values.update(projected)
 
     @staticmethod
     def bind_method_receivers(bound, references, values, state, candidate_keys=None):
@@ -2173,6 +2301,7 @@ class _Flow:
         items = (((name, values.get(name)) for name in candidate_keys)
                  if candidate_keys is not None else values.items())
         pending = []
+        captured_keys = set()
         for name, binding in items:
             if (direct_globals is not None and name.startswith('@global:')
                     and name[8:] not in direct_globals
@@ -2222,7 +2351,9 @@ class _Flow:
                                              + (len(_binding_choices(values[slot])) if slot in values else 0))
                     values[slot] = (_join_bindings(values[slot], captured)
                                     if slot in values else captured)
+                    captured_keys.add(slot)
                     pending.append((slot, captured))
+        return captured_keys
 
     def resume_environment(self, function, bound, references, values, state):
         """Arguments are captured at creation; globals and cells are read later.
@@ -2343,7 +2474,7 @@ class _Flow:
                 for operand, fact in target.operands:
                     if isinstance(operand, _SymbolicValue):
                         replacement = values.get(operand.parameter)
-                        if isinstance(replacement, (_LiteralString, _SymbolicValue)):
+                        if isinstance(replacement, (_LiteralString, _SymbolicValue, frozenset)):
                             operand = replacement
                     operands.append((operand, substitute(fact)))
                 choices.append(_ArgumentVector(tuple(operands)))
@@ -2376,14 +2507,19 @@ class _Flow:
         return _join_bindings(*choices)
 
     def command_operand(self, node, fact):
+        if isinstance(node, (ast.Starred, _ArgumentExpansion)):
+            return _ArgumentExpansion(), fact
         literal = self.expression_bindings.get(node)
         if literal == 'sys.executable':
             literal = _LiteralString('python')
-        return (literal if isinstance(literal, (_LiteralString, _SymbolicValue)) else node), fact
+        if isinstance(literal, frozenset):
+            literal = frozenset(value if isinstance(value, _LiteralString) else None for value in literal)
+        return (literal if isinstance(literal, (_LiteralString, _SymbolicValue, frozenset)) else node), fact
 
     def command_operands(self, node):
         """Expand literal argv without evaluating any argument a second time."""
         binding = self.expression_bindings.get(node)
+        self.require_value(binding)
         if isinstance(binding, _ArgumentVector):
             return list(binding.operands)
         if not isinstance(node, (ast.List, ast.Tuple)):
@@ -2399,16 +2535,41 @@ class _Flow:
 
     def command_vectors(self, node):
         binding = self.expression_bindings.get(node)
+        self.require_value(binding)
         if isinstance(binding, (frozenset, _ArgumentVector)):
-            return [list(value.operands) if isinstance(value, _ArgumentVector) else None
-                    for value in _binding_choices(binding)]
-        return [self.command_operands(node)]
+            vectors = [list(value.operands) if isinstance(value, _ArgumentVector) else None
+                       for value in _binding_choices(binding)]
+        else:
+            vectors = [self.command_operands(node)]
+        result = []
+        for operands in vectors:
+            if not operands:
+                result.append(operands)
+                continue
+            for index, (operand, fact) in enumerate(operands):
+                result.extend([(program, fact), *operands[index + 1:]]
+                              for program in _binding_choices(operand))
+                # An unknown expansion can be empty. Each following operand
+                # up to the first definite one may therefore be argv[0].
+                if not isinstance(operand, _ArgumentExpansion):
+                    break
+        return result
+
+    def require_value(self, binding):
+        for value in _binding_choices(binding):
+            if isinstance(value, _SymbolicValue):
+                self.value_parameters.add(value.parameter)
+
+    def literal_value(self, node):
+        binding = self.expression_bindings.get(node, node)
+        self.require_value(binding)
+        return _literal_text(binding) or _literal_text(node)
 
     def interpreter_name(self, node):
         binding = self.expression_bindings.get(node)
         if binding == 'sys.executable':
             return 'python'
-        return _literal_text(binding) or _literal_text(node)
+        return self.literal_value(node)
 
     def process_input(self, node, program, operands, keyword_nodes, *, shell=False):
         """Remember only processes whose explicit stdin pipe accepts source.
@@ -2421,17 +2582,22 @@ class _Flow:
         piped = self.expression_bindings.get(pipe) == 'subprocess.PIPE' or (
             isinstance(pipe, ast.UnaryOp) and isinstance(pipe.op, ast.USub)
             and isinstance(pipe.operand, ast.Constant) and pipe.operand.value == 1)
-        if not shell and piped and kind is not None and _interpreter_reads_stdin(kind, operands):
+        if not shell and piped and kind is not None and _interpreter_reads_stdin(kind, operands, self.literal_value):
             return _ProcessInput(kind)
         return None
 
     def interpreter_effects(self, program_node, operands, stdin=CLEAN):
         program = self.interpreter_name(program_node)
         kind = _interpreter_kind(program)
+        if program is None:
+            # Clean provenance alone does not identify the selected program.
+            # An unresolved executable can be an interpreter, including one
+            # built by string operations, so its argv/stdin are not proven data.
+            return CLEAN, join_facts(*(fact for _operand, fact in operands), stdin)
         if kind is None:
             return CLEAN, CLEAN
-        shell, raw = _interpreter_inputs(kind, operands)
-        if stdin and _interpreter_reads_stdin(kind, operands):
+        shell, raw = _interpreter_inputs(kind, operands, self.literal_value)
+        if stdin and _interpreter_reads_stdin(kind, operands, self.literal_value):
             if kind == 'shell':
                 shell = join_facts(shell, stdin)
             else:
@@ -2439,15 +2605,12 @@ class _Flow:
         return shell, raw
 
     def command_effect(self, node, executable, shell_code=CLEAN, interpreter_code=CLEAN):
-        # One diagnostic at a process call even when more than one operand is
-        # unsafe. Preserve the strict domain in symbolic helper summaries.
-        if interpreter_code or executable:
-            unsafe_shell = frozenset(trace for trace in shell_code
-                                     if not _safe_for(trace, 'command', 'subprocess execution'))
-            self.effect('command', node, 'interpreter source' if interpreter_code else 'subprocess executable',
-                        join_facts(executable, interpreter_code, unsafe_shell))
-        else:
-            self.effect('command', node, 'subprocess execution', shell_code)
+        # Keep domains separate until concrete call-site substitution. A
+        # symbolic executable may bind clean while shell code binds quoted;
+        # combining them here would incorrectly revoke shell sanitization.
+        self.effect('command', node, 'subprocess executable', executable)
+        self.effect('command', node, 'interpreter source', interpreter_code)
+        self.effect('command', node, 'subprocess execution', shell_code)
 
     def call(self, node, state):
         original = node
@@ -2640,7 +2803,7 @@ class _Flow:
                         and (module_ref is None or (module_ref not in state.heap and module_ref not in state.mutated))):
                     local_bound = self.bind(function, node, arguments, keywords, state, (), captured_defaults)
                     local_refs = self.bind_references(function, node, keyword_nodes, state, (), captured_defaults)
-                    local_values = self.bind_values(function, node, keyword_nodes, state, (), captured_defaults)
+                    local_values = self.bind_values(function, node, arguments, keyword_nodes, state, (), captured_defaults)
                     bound = owner.base_global_bound.copy()
                     references = owner.base_global_refs.copy()
                     values = owner.base_global_values.copy()
@@ -2705,7 +2868,7 @@ class _Flow:
                     globals_snapshot = tuple(self.global_arguments(function, state))
                     bound = self.bind(function, node, arguments, keywords, state, globals_snapshot, captured_defaults)
                     references = self.bind_references(function, node, keyword_nodes, state, globals_snapshot, captured_defaults)
-                    values = self.bind_values(function, node, keyword_nodes, state, globals_snapshot, captured_defaults)
+                    values = self.bind_values(function, node, arguments, keyword_nodes, state, globals_snapshot, captured_defaults)
                     if state.mutated:
                         for name, refs in references.items():
                             if refs and (refs & state.mutated):
@@ -2750,15 +2913,23 @@ class _Flow:
                 if (isinstance(binding, _SymbolicValue)
                         or _same_witness(binding, nominal)):
                     continue
-                if any(isinstance(value, (str, ast.FunctionDef, ast.AsyncFunctionDef,
+                if any(isinstance(value, (str, _LiteralString, _ArgumentVector, ast.FunctionDef, ast.AsyncFunctionDef,
                                           ast.Lambda, _BoundClassMethod))
                        for value in (*_binding_choices(binding), *_binding_choices(nominal))):
                     overrides.add(gname)
             summary = self.engine.call_summary(function, values, summary_keys, overrides)
             self.engine.budget.spend(len(summary.capture_globals))
             self.capture_globals.update(summary.capture_globals)
-            self.bind_function_defaults(bound, references, values, state, receiver_keys,
-                                        function=function, summary=summary)
+            captured_keys = self.bind_function_defaults(bound, references, values, state, receiver_keys,
+                                                        function=function, summary=summary)
+            vector_keys = (None if summary_keys is None else
+                           set(summary_keys) | captured_keys | {
+                               f'@global:{name}' for module, name in summary.capture_globals if module is owner.tree})
+            self.bind_vector_elements(bound, values, vector_keys)
+            for name in summary.value_parameters:
+                for value in _binding_choices(values.get(name)):
+                    if isinstance(value, _SymbolicValue):
+                        self.value_parameters.add(value.parameter)
             substitute = _CallSubstitution(self.substitute_trace, bound, call_name, self.engine.budget)
             for kind, line, column, label, fact in summary.effects:
                 propagated = substitute(fact)
@@ -2920,9 +3091,7 @@ class _Flow:
             shell_unknown = (shell is not None and not isinstance(shell, ast.Constant)) or None in keywords
             explicit_executable = join_facts(keywords.get('executable', CLEAN), keywords.get(None, CLEAN))
             executable_node = keyword_nodes.get('executable')
-            executable_literal = self.expression_bindings.get(executable_node)
-            fixed_executable = (isinstance(executable_literal, _LiteralString)
-                                or isinstance(executable_node, ast.Constant) and executable_node.value is not None)
+            executable_value, _fact = self.command_operand(executable_node, explicit_executable)
             has_override = executable_node is not None and not (
                 isinstance(executable_node, ast.Constant) and executable_node.value is None)
             executable, shell_code, interpreter_code = explicit_executable, CLEAN, CLEAN
@@ -2932,26 +3101,34 @@ class _Flow:
             # item of one branch with tainted data from another invents flows.
             for operands in self.command_vectors(command_node):
                 command = (operands[0][1] if operands else CLEAN) if operands is not None else command_fact
-                if (not shell_true or shell_unknown) and not fixed_executable:
-                    executable = join_facts(executable, command)
-                if shell_true or shell_unknown:
-                    shell_code = join_facts(shell_code, command)
-                    if has_override and _interpreter_kind(self.interpreter_name(executable_node)) != 'shell':
-                        interpreter_code = join_facts(interpreter_code, command)
-                process = None
-                if not shell_true or shell_unknown:
-                    program_node = executable_node if fixed_executable else operands[0][0] if operands else command_node
-                    if operands is not None or self.interpreter_name(command_node) is not None:
-                        tail = operands[1:] if operands else []
-                        nested_shell, nested_raw = self.interpreter_effects(program_node, tail, stdin)
-                        shell_code = join_facts(shell_code, nested_shell)
-                        interpreter_code = join_facts(interpreter_code, nested_raw)
-                        process = self.process_input(node, program_node, tail, keyword_nodes)
-                    elif _interpreter_kind(self.interpreter_name(program_node)) is not None:
-                        # A mutated/escaped vector no longer proves positional
-                        # safety, even when executable= fixes argv[0].
+                for override in _binding_choices(executable_value):
+                    override_name = self.interpreter_name(override)
+                    fixed_executable = (isinstance(override, _LiteralString)
+                                        or isinstance(override, ast.Constant) and override.value is not None)
+                    if (not shell_true or shell_unknown) and not fixed_executable:
+                        executable = join_facts(executable, command)
+                    if shell_true or shell_unknown:
+                        shell_code = join_facts(shell_code, command)
+                        if has_override and _interpreter_kind(override_name) != 'shell':
+                            interpreter_code = join_facts(interpreter_code, command)
+                    process = None
+                    if not shell_true or shell_unknown:
+                        program_node = override if fixed_executable else operands[0][0] if operands else command_node
+                        if operands is not None or self.interpreter_name(command_node) is not None:
+                            tail = operands[1:] if operands else []
+                            nested_shell, nested_raw = self.interpreter_effects(program_node, tail, stdin)
+                            shell_code = join_facts(shell_code, nested_shell)
+                            interpreter_code = join_facts(interpreter_code, nested_raw)
+                            process = self.process_input(node, program_node, tail, keyword_nodes)
+                        elif _interpreter_kind(self.interpreter_name(program_node)) is not None:
+                            # A mutated/escaped vector no longer proves positional
+                            # safety, even when executable= fixes argv[0].
+                            interpreter_code = join_facts(interpreter_code, command_fact, stdin)
+                    if has_override and not fixed_executable:
+                        # An unresolved override may itself select an interpreter;
+                        # its clean provenance is not proof that argv is data.
                         interpreter_code = join_facts(interpreter_code, command_fact, stdin)
-                process_inputs.append(process)
+                    process_inputs.append(process)
             if leaf == 'Popen':
                 self.expression_bindings[node] = _join_bindings(*process_inputs)
             self.command_effect(node, executable, shell_code, interpreter_code)
@@ -3059,7 +3236,7 @@ class _Flow:
                                   and node.id not in self.context_globals)
                 identity = (str, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
                             ast.ClassDef, _FunctionValue, _BoundCallable,
-                            _BoundClassMethod, _ModuleBinding)
+                            _BoundClassMethod, _ModuleBinding, _ArgumentVector, _LiteralString)
                 if (not nominal_helper and any(isinstance(value, identity)
                         for value in (*_binding_choices(binding), *_binding_choices(nominal)))):
                     self.capture_globals.add((self.engine.tree, node.id))
@@ -3147,6 +3324,8 @@ class _Flow:
         elif isinstance(node, ast.Lambda):
             binding = self.function_value(node)
         elif isinstance(node, ast.NamedExpr):
+            binding = self.expression_bindings.get(node.value)
+        elif isinstance(node, ast.Starred):
             binding = self.expression_bindings.get(node.value)
         elif isinstance(node, ast.IfExp):
             binding = _join_bindings(self.expression_bindings.get(node.body), self.expression_bindings.get(node.orelse))
@@ -3805,6 +3984,7 @@ class _Flow:
             can_return=normal is not None,
             exceptions=exceptions,
             capture_globals=frozenset(self.capture_globals),
+            value_parameters=frozenset(self.value_parameters),
         )
 
 
@@ -4306,9 +4486,11 @@ class _Analysis:
             if not changed:
                 return bound
 
-    def callable_context(self, name, binding, *, captured=False):
-        """Finite callable identity with captured values replaced by slots."""
+    def callable_context(self, name, binding, *, captured=False, value_parameters=()):
+        """Finite callable/argv identity with captured facts replaced by slots."""
         choices = []
+        variants = ({shape: index for index, shape, _vectors in _vector_variants(binding)}
+                    if name in value_parameters else {})
         for value in _binding_choices(binding):
             if isinstance(value, _GlobalNamespace):
                 raise AnalysisLimit('globals mapping captured by a callable; analysis is incomplete')
@@ -4322,7 +4504,7 @@ class _Analysis:
                     arguments.append((parameter, symbolic))
                     references.append((parameter, frozenset({slot})))
                     bindings.append((parameter, self.callable_context(
-                        slot, default_values.get(parameter), captured=True)))
+                        slot, default_values.get(parameter), captured=True, value_parameters=value_parameters)))
                 value = _FunctionValue(value.function, tuple(arguments), tuple(references), tuple(bindings))
             elif isinstance(value, (_BoundCallable, _BoundClassMethod)):
                 slot = '@method:' + name
@@ -4333,7 +4515,22 @@ class _Analysis:
                 value = (_BoundClassMethod(value.function, value.owner, frozenset({slot}), symbolic, value.valid)
                          if isinstance(value, _BoundClassMethod)
                          else _BoundCallable(qualified, frozenset({slot}), symbolic, value.namespace_proven))
-            elif not isinstance(value, (str, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            elif isinstance(value, _ArgumentVector) and name in value_parameters:
+                value = _context_vector(value)
+                shape = _vector_shape(value)
+                variant = variants[shape]
+                self.budget.spend(len(shape))
+                operands = []
+                for index, operand in enumerate(shape):
+                    slot = _vector_slot(name, variant, index)
+                    symbolic = frozenset({TaintTrace(slot, parameter=slot,
+                                                     path=(slot, f'{name}[{index}]'))})
+                    operands.append((operand if operand is not None else _SymbolicValue(slot), symbolic))
+                value = _ArgumentVector(tuple(operands))
+            elif isinstance(value, _LiteralString) and name in value_parameters:
+                pass
+            elif not isinstance(value, (str, ast.FunctionDef, ast.AsyncFunctionDef,
+                                        ast.Lambda, ast.ClassDef)):
                 value = _SymbolicValue(name) if captured else None
             choices.append(value)
         return _join_bindings(*choices)
@@ -4345,22 +4542,26 @@ class _Analysis:
         # read participates in the existing fixed point and every expansion
         # adds a finite, module-qualified dependency.
         required = frozenset()
+        required_values = frozenset()
         while True:
             summary = self._call_summary(function, values, candidate_keys,
-                                         global_overrides, required)
-            self.budget.spend(len(required) + len(summary.capture_globals))
+                                         global_overrides, required, required_values)
+            self.budget.spend(len(required) + len(summary.capture_globals)
+                              + len(required_values) + len(summary.value_parameters))
             missing = summary.capture_globals - required
-            if not missing:
+            missing_values = summary.value_parameters - required_values
+            if not missing and not missing_values:
                 return summary
             required = required | missing
+            required_values = required_values | missing_values
 
     def _call_summary(self, function, values, candidate_keys=None, global_overrides=(),
-                      capture_globals=frozenset()):
-        """Request a symbolic summary for known callback identities.
+                      capture_globals=frozenset(), value_parameters=frozenset()):
+        """Request a symbolic summary for known callable and argv identities.
 
         Facts, heaps and evidence paths are NOT context keys. Only finite
-        source-level callable identities distinguish invocations; unresolved
-        alternatives stay opaque rather than certifying a sanitizer. A new
+        source-level identities and bounded argv shapes distinguish invocations.
+        Unresolved alternatives stay opaque rather than certifying a sanitizer. A new
         context starts at bottom and is solved by the normal fixed-point
         loop, never by recursively interpreting callees on the Python stack.
         """
@@ -4414,7 +4615,8 @@ class _Analysis:
                         and _same_witness(binding, nominal)):
                     continue
                 if (binding is nominal
-                        and not isinstance(binding, (frozenset, _BoundCallable, _BoundClassMethod, _FunctionValue))
+                        and not isinstance(binding, (frozenset, _BoundCallable, _BoundClassMethod, _FunctionValue,
+                                                     _ArgumentVector, _LiteralString))
                         and not explicit_override
                         and gname in owner_bindings
                         and gname not in owner_fn.locals[function]
@@ -4425,12 +4627,16 @@ class _Analysis:
                     continue
                 if not explicit_override and not any(
                         isinstance(value, (str, ast.FunctionDef, ast.AsyncFunctionDef,
-                                           ast.Lambda, ast.ClassDef, _BoundCallable, _BoundClassMethod, _FunctionValue))
+                                           ast.Lambda, ast.ClassDef, _BoundCallable, _BoundClassMethod, _FunctionValue,
+                                           _ArgumentVector, _LiteralString))
                         for value in (*_binding_choices(binding), *_binding_choices(nominal))):
                     continue
             elif binding is None or isinstance(binding, _SymbolicValue):
                 continue
-            choices = _binding_choices(self.callable_context(name, binding))
+            required_values = value_parameters
+            if name.startswith('@global:') and (explicit_override or (owner.tree, gname) in capture_globals):
+                required_values = required_values | {name}
+            choices = _binding_choices(self.callable_context(name, binding, value_parameters=required_values))
             if name.startswith('@global:'):
                 joined_choice = _join_bindings(*choices)
                 if (joined_choice is nominal
@@ -4519,6 +4725,15 @@ class _Analysis:
                 ctx_globals = []
                 for name, binding in context:
                     raw = name.removeprefix('@free:').removeprefix('@global:')
+                    if name.startswith('@global:') and (raw in local or raw in owner.closures[function]):
+                        # A module value cannot replace a same-spelled argument
+                        # or closure cell. Reflective global reads still use
+                        # their separate, module-qualified slot.
+                        if raw in owner.global_symbols:
+                            state[name] = owner.global_symbols[raw][0]
+                            state.references[name] = owner.global_symbols[raw][1]
+                        state.bindings[name] = binding
+                        continue
                     if name.startswith('@global:') and raw in owner.global_symbols and raw not in local:
                         state.setdefault(raw, owner.global_symbols[raw][0])
                         state.references.setdefault(raw, owner.global_symbols[raw][1])
@@ -4946,6 +5161,22 @@ def _parse_source(path):
         ) from exc
 
 
+def _sink_traces(effects):
+    """Choose one concrete witness per process call, after domain filtering."""
+    findings = {}
+    for key, fact in effects.items():
+        if not fact:
+            continue
+        trace = min(fact, key=lambda item: (len(item.path), item.path, item.source))
+        site = key[:3] if key[0] == 'command' else key
+        previous = findings.get(site)
+        rank = (len(trace.path), trace.path, trace.source, key[3])
+        if previous is None or rank < previous[0]:
+            findings[site] = (rank, key, trace)
+    return [(key, trace) for _rank, key, trace in sorted(
+        findings.values(), key=lambda item: (item[1][1], item[1][2], item[1][0]))]
+
+
 class _Project:
     """Resolve only selected Python source files; never search sys.path/import code.
 
@@ -5361,13 +5592,12 @@ class _Project:
                 self.journal.clear()
         starts = [offset for _, _, _, offset in self.sources]
         indexes = {path: build_index(text, lang='python') for path, text, _, _ in self.sources}
-        for (kind, line, column, label), fact in sorted(effects.items(), key=lambda item: (item[0][1], item[0][2], item[0][0])):
+        for (kind, line, column, label), trace in _sink_traces(effects):
             path, _, _, offset = self.sources[bisect_right(starts, line - 1) - 1]
             line -= offset
             rule = f'py.taint.{kind}'
             if indexes[path].is_suppressed(line, rule) or indexes[path].is_suppressed(line, f'python.taint.{kind}'):
                 continue
-            trace = min(fact, key=lambda item: (len(item.path), item.path, item.source))
             yield path, rule, line, column, ' -> '.join((*trace.path, label))
         problems = []
         if self.failed_inputs:
@@ -5466,11 +5696,10 @@ def scan_file_findings(path: Path):
         effects = engine.analyze()
     except AnalysisLimit as exc:
         effects, incomplete = exc.effects, exc
-    for (kind, line, column, label), fact in sorted(effects.items(), key=lambda item: (item[0][1], item[0][2], item[0][0])):
+    for (kind, line, column, label), trace in _sink_traces(effects):
         rule = f'py.taint.{kind}'
         if suppressions.is_suppressed(line, rule) or suppressions.is_suppressed(line, f'python.taint.{kind}'):
             continue
-        trace = min(fact, key=lambda item: (len(item.path), item.path, item.source))
         path_desc = ' -> '.join((*trace.path, label))
         yield rule, line, column, path_desc
     if incomplete is not None:

@@ -1612,6 +1612,68 @@ promise of additivity for cross-file detectors, taint/data-flow analyses, other
 languages, or arbitrary source concatenation: concatenation can change syntax,
 string/comment boundaries, statement suppression and file-role exclusions.
 
+### Python subprocess taint
+
+`python.taint.command` distinguishes executable selection, shell command text,
+and source interpreted by programs such as `sh` and `python`. With
+`shell=False`, an ordinary argument to a fixed executable is not executable
+taint. Interpreter operands such as `python -c SOURCE` still execute source,
+even without `shell=True`.
+
+Known list/tuple vectors and `*argv` packs retain separate operand facts through
+local wrapper summaries, including nested calls. Program/option alternatives
+stay paired with their own arguments. To bound recursive analysis, summaries
+retain a finite positional prefix and conservatively combine the remaining
+suffix; mutation or an opaque operation revokes the known shape. This keeps
+uncertain data tainted rather than silently declaring it safe.
+
+If the executable's identity cannot be resolved, UBS conservatively treats it
+as a possible interpreter. A value with no recognized taint source can still
+name an interpreter, so that alone does not prove its arguments are ordinary
+data. Resolved literal executables retain the positional distinction above.
+
+Diagnostics remain at the subprocess call in the wrapper, with at most one
+`python.taint.command` finding per process call. Executable, shell, and
+interpreter-source facts are checked separately after substituting each
+caller's inputs, so argument-only callers do not contribute executable
+evidence for a resolved vector.
+
+**Environment values and captured output.** Process results conservatively
+retain taint from supplied arguments, `input=`, and `env=`. This includes
+`subprocess.run(...).stdout`, `subprocess.check_output(...)`, and output read
+through `Popen(...).communicate()`. Python passes an explicit `env` mapping to
+the child process, which can read those values and incorporate them into its
+output ([Python subprocess documentation](https://docs.python.org/3/library/subprocess.html#subprocess.run)).
+Passing a tainted environment value alone does not produce a command-injection
+finding; a finding requires a subsequent flow into an unsafe sink.
+
+For example, the environment-only case in
+[issue #200](https://github.com/Dicklesworthstone/ultimate_bug_scanner/issues/200)
+retains this dependency:
+
+```python
+import os
+import subprocess
+
+env = {"PATH": "/usr/bin", "SSH_CONNECTION": os.environ.get("SSH_CONNECTION", "")}
+wan = subprocess.run(["ip", "-j", "route"], capture_output=True, text=True, env=env).stdout.strip()
+subprocess.run([wan], check=False)  # Output is used as an executable name.
+```
+
+UBS reports the final call because its executable depends on a process result
+with tainted inputs. The analysis does not model the internals of `ip` or prove
+that it reads `SSH_CONNECTION`; this is a conservative dependency and can need
+review for a particular program. It is separate from treating a wrapper's
+ordinary arguments as executable names. Using `wan` as an ordinary argument to
+a fixed, non-interpreting executable does not trigger this taint rule.
+
+The process result is currently represented by one aggregate taint fact, not
+separate facts for every `CompletedProcess` field. A clean result from a call
+with no recognized taint source is therefore not proof that arbitrary child
+output is trustworthy. Keep executable names fixed and validate child output
+according to its intended use; shell quoting does not authorize it as an
+executable or sanitize interpreter source.
+
 ### **Custom AST-Grep Rules**
 
 You can add your own bug detection patterns:

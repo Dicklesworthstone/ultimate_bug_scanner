@@ -197,6 +197,298 @@ def program(body):
     return 'def run(cursor, qs, user, rows):\n' + body
 
 
+def boolean_generator_cases():
+    """GH #201: SQL effects run only on reachable generator prefixes."""
+    for consumer, stop, continuing in (('any', 'True', 'False'), ('all', 'False', 'True')):
+        other = 'all' if consumer == 'any' else 'any'
+        cases = (
+            ('constant-query', f'    return {consumer}(cursor.execute("SELECT 1 FROM records LIMIT 1").fetchone() is None for _ in (1, 2))\n', ()),
+            ('constant-columns', f'    return {consumer}(cursor.execute("SELECT 1 FROM records WHERE " + column + " IS NOT NULL").fetchone() is None for column in ("at", "closed_at"))\n', ()),
+            ('bound-parameters', f'    return {consumer}(cursor.execute("SELECT ?", (user,)).fetchone() is None for _ in (1, 2))\n', ()),
+            ('tainted-query', f'    return {consumer}(cursor.execute(f"SELECT {{user}}").fetchone() is None for _ in (1, 2))\n', ((CRITICAL, 2),)),
+            ('unknown-query', f'    return {consumer}(cursor.execute(f"SELECT {{UNKNOWN}}").fetchone() is None for _ in (1, 2))\n', ((WARNING, 2),)),
+            ('empty', f'    return {consumer}(cursor.execute(f"SELECT {{user}}").fetchone() is None for _ in ())\n', ()),
+            ('false-filter', f'    return {consumer}(cursor.execute(f"SELECT {{user}}").fetchone() is None for _ in (1, 2) if False)\n', ()),
+            ('local-shadow', f'    return {consumer}(cursor.execute(f"SELECT {{user}}").fetchone() is None for user in (1, 2))\n', ()),
+            ('generator-alias', '    query = "SELECT 1"\n'
+             '    pending = (cursor.execute(query).fetchone() is None for _ in (1, 2))\n'
+             '    alias = pending\n    query = f"SELECT {user}"\n'
+             f'    {consumer}(alias)\n', ((CRITICAL, 3),)),
+            ('late-clean', '    query = f"SELECT {user}"\n'
+             '    pending = (cursor.execute(query).fetchone() is None for _ in (1, 2))\n'
+             '    query = "SELECT 1"\n' + f'    {consumer}(pending)\n', ()),
+            ('closed-alias', '    pending = (cursor.execute(f"SELECT {user}").fetchone() is None for _ in (1, 2))\n'
+             '    alias = pending\n    pending.close()\n' + f'    {consumer}(alias)\n', ()),
+            ('empty-alias', '    pending = (cursor.execute(f"SELECT {user}").fetchone() is None for _ in ())\n'
+             '    alias = pending\n' + f'    {consumer}(alias)\n    list(pending)\n', ()),
+            ('builtin-alias', f'    consume = {consumer}\n'
+             '    pending = (cursor.execute(f"SELECT {user}").fetchone() is None for _ in (1, 2))\n'
+             '    consume(pending)\n', ((CRITICAL, 3),)),
+            ('namespace-readonly-import', '    import builtins\n'
+             + f'    {consumer}(value for value in (False, True))\n'
+             '    cursor.execute("SELECT 1")\n', ()),
+            ('namespace-readonly-globals', '    globals()\n'
+             + f'    {consumer}(value for value in (False, True))\n'
+             '    cursor.execute("SELECT 1")\n', ()),
+            ('namespace-identity', '    import builtins\n    query = f"SELECT {user}"\n'
+             + f'    {consumer}(query is user for _ in (1, 2))\n'
+             '    cursor.execute("SELECT 1")\n', ()),
+            ('namespace-boolean-identity', '    globals()\n    query = f"SELECT {user}"\n'
+             + f'    {consumer}(query is user or query is not None for _ in (1, 2))\n'
+             '    cursor.execute("SELECT 1")\n', ()),
+            ('identity-operand-effects', '    query = "SELECT 1"\n'
+             '    result = (cursor.execute(f"SELECT {user}"), (query := f"SELECT {user}")) is None\n'
+             + f'    {consumer}(result for _ in (1,))\n'
+             '    cursor.execute(query)\n', ((CRITICAL, 3), (CRITICAL, 5))),
+            # Literal yields make stop/continue independent of database results.
+            # The nonempty tuple filter evaluates both effects before yielding;
+            # draining eagerly would invent the second SQL execution.
+            ('stop-before-backedge', '    query = "SELECT 1"\n'
+             + f'    {consumer}({stop} for _ in (1, 2)\n'
+             '               if (cursor.execute(query), (query := f"SELECT {user}")))\n', ()),
+            ('continue-backedge', '    query = "SELECT 1"\n'
+             + f'    {consumer}({continuing} for _ in (1, 2)\n'
+             '               if (cursor.execute(query), (query := f"SELECT {user}")))\n', ((CRITICAL, 4),)),
+            ('body-backedge', '    query = "SELECT 1"\n'
+             + f'    {consumer}((cursor.execute(query).fetchone() is None, (query := f"SELECT {{user}}"))[0] for _ in (1, 2))\n', ((CRITICAL, 3),)),
+            ('unknown-iteration-backedge', '    query = "SELECT 1"\n'
+             + f'    {consumer}((cursor.execute(query).fetchone() is None, (query := f"SELECT {{user}}"))[0] for _ in rows)\n', ((CRITICAL, 3),)),
+            ('one-trip-write', '    query = f"SELECT {user}"\n'
+             + f'    {consumer}((cursor.execute("SELECT 1"), (query := "SELECT 1")) is None for _ in (1,))\n'
+             '    cursor.execute(query)\n', ()),
+            ('optional-write', '    query = f"SELECT {user}"\n'
+             + f'    {consumer}((cursor.execute("SELECT 1"), (query := "SELECT 1")) is None for _ in rows)\n'
+             '    cursor.execute(query)\n', ((CRITICAL, 4),)),
+            ('short-circuit-write', '    query = f"SELECT {user}"\n'
+             + f'    {consumer}(cursor.execute("SELECT 1").fetchone() is None or (query := "SELECT 1") for _ in (1,))\n'
+             '    cursor.execute(query)\n', ((CRITICAL, 4),)),
+            ('exception-before-write', '    query = f"SELECT {user}"\n    try:\n'
+             + f'        {consumer}((cursor.execute("SELECT 1"), (query := "SELECT 1")) is None for _ in (1,))\n'
+             '    except Exception:\n        cursor.execute(query)\n', ((CRITICAL, 6),)),
+            ('body-exception-closes-alias', '    query = "SELECT 1"\n'
+             '    pending = (cursor.execute(query).fetchone() is None for _ in (1, 2))\n'
+             '    alias = pending\n    try:\n' + f'        {consumer}(pending)\n'
+             '    except Exception:\n        query = f"SELECT {user}"\n'
+             + f'        {consumer}(alias)\n', ()),
+            ('nested-consumer', f'    return {consumer}({other}(cursor.execute(f"SELECT {{user}}").fetchone() is None for _ in (1, 2)) for group in (1, 2))\n', ((CRITICAL, 2),)),
+            ('nested-safe', f'    return {consumer}({other}(cursor.execute("SELECT 1").fetchone() is None for _ in (1, 2)) for group in (1, 2))\n', ()),
+            ('nested-clauses', f'    return {consumer}(cursor.execute(f"SELECT {{item}}").fetchone() is None for group in (user,) for item in (group,))\n', ((CRITICAL, 2),)),
+            ('result-is-boolean', f'    answer = {consumer}(cursor.execute(f"SELECT {{user}}").fetchone() is None for _ in (1, 2))\n'
+             '    cursor.execute(f"SELECT {answer}")\n', ((CRITICAL, 2),)),
+        )
+        for name, body, expected in cases:
+            yield consumer + '-' + name, program(body), expected
+        for name, body, retained in boolean_finalizer_lifetime_cases(consumer, '"SELECT 1"', 'f"SELECT {user}"'):
+            if retained:
+                source = program('    cursor.execute(f"SELECT {user}")\n' + body
+                                 + '    cursor.execute(query)\n')
+                yield consumer + '-' + name, source, ((CRITICAL, 2),)
+
+
+def boolean_external_cell_cases(consumer, safe, unsafe):
+    """Calls and implicit protocols may write a generator's lexical captures."""
+    cases = (
+        ('helper-callback',
+         '    def change():\n        nonlocal query\n'
+         + f'        query = {unsafe}\n        return 1\n',
+         '(cursor.execute(query), change())[0] is None', '(1, 2)'),
+        ('operator-callback',
+         '    class Change:\n        def __add__(self, unused):\n            nonlocal query\n'
+         + f'            query = {unsafe}\n            return 1\n',
+         '(cursor.execute(query), Change() + 1)[0] is None', '(1, 2)'),
+        ('property-callback',
+         '    class Change:\n        @property\n        def value(self):\n            nonlocal query\n'
+         + f'            query = {unsafe}\n            return 1\n    value = Change()\n',
+         '(cursor.execute(query), value.value)[0] is None', '(1, 2)'),
+        ('iterator-callback',
+         '    class Change:\n        def __iter__(self):\n            nonlocal query\n'
+         + f'            query = {unsafe}\n            return iter([1])\n',
+         'cursor.execute(query) is None', 'Change()'),
+    )
+    for name, declaration, expression, iterable in cases:
+        yield name, (f'    query = {safe}\n' + declaration
+                     + f'    {consumer}({expression} for _ in {iterable})\n')
+
+
+def boolean_heap_cases(consumer, safe, unsafe):
+    """Mutable captures and pre-created protocol objects need a heap model."""
+    mapping = '    queries = {"query": ' + safe + '}\n'
+    finalizer = ('        def __del__(self):\n'
+                 + f'            queries["query"] = {unsafe}\n')
+    # Exhaust both consumers so iterator/element teardown runs before the
+    # following sink. Exact containers can own objects with finalizers too.
+    finalizer_predicate = ('cursor.execute(queries["query"]).fetchone() '
+                           + ('is None' if consumer == 'any' else 'is not None'))
+    cases = (
+        ('captured-dict', mapping + '    alias = queries\n    def change():\n'
+         + f'        alias["query"] = {unsafe}\n        return 1\n',
+         '(cursor.execute(queries["query"]), change())[0] is None', '(1, 2)', 'queries["query"]'),
+        ('attribute-write', '    class Box:\n        pass\n    box = Box()\n'
+         + f'    box.query = {safe}\n    def change():\n'
+         + f'        box.query = {unsafe}\n        return 1\n',
+         '(cursor.execute(box.query), change())[0] is None', '(1, 2)', 'box.query'),
+        ('opaque-mutable-argument', mapping,
+         '(cursor.execute(queries["query"]), qs(queries, user))[0] is None', '(1, 2)', 'queries["query"]'),
+        ('opaque-generator-argument', mapping + '    def change(values):\n'
+         + f'        queries["query"] = {unsafe}\n        return 1\n',
+         '(cursor.execute(queries["query"]), change(x for x in [1]))[0] is None', '(1, 2)', 'queries["query"]'),
+        ('precreated-operator', mapping + '    class Change:\n        def __add__(self, unused):\n'
+         + f'            queries["query"] = {unsafe}\n            return 1\n    value = Change()\n',
+         '(cursor.execute(queries["query"]), value + 1)[0] is None', '(1, 2)', 'queries["query"]'),
+        ('precreated-property', mapping + '    class Change:\n        @property\n        def value(self):\n'
+         + f'            queries["query"] = {unsafe}\n            return 1\n    value = Change()\n',
+         '(cursor.execute(queries["query"]), value.value)[0] is None', '(1, 2)', 'queries["query"]'),
+        ('precreated-iterator', mapping + '    class Change:\n        def __iter__(self):\n'
+         + f'            queries["query"] = {unsafe}\n            return iter([1])\n    values = Change()\n',
+         'cursor.execute(queries["query"]) is None', 'values', 'queries["query"]'),
+        ('format-callback', mapping + '    class Change:\n        def __format__(self, spec):\n'
+         + f'            queries["query"] = {unsafe}\n            return "done"\n    value = Change()\n',
+         '(cursor.execute(queries["query"]), f"{value}")[0] is None', '(1, 2)', 'queries["query"]'),
+        ('index-callback', mapping + '    class Index:\n        def __index__(self):\n'
+         + f'            queries["query"] = {unsafe}\n            return 0\n    index = Index()\n',
+         '(cursor.execute(queries["query"]), [1][index])[0] is None', '(1, 2)', 'queries["query"]'),
+        ('slice-callback', mapping + '    class Index:\n        def __index__(self):\n'
+         + f'            queries["query"] = {unsafe}\n            return 0\n    index = Index()\n',
+         '(cursor.execute(queries["query"]), [1][index:])[0] is None', '(1, 2)', 'queries["query"]'),
+        ('hash-callback', mapping + '    items = {1: "x"}\n    class Key:\n'
+         '        def __hash__(self):\n'
+         + f'            queries["query"] = {unsafe}\n            return 1\n'
+         '        def __eq__(self, other):\n            return True\n    index = Key()\n',
+         '(cursor.execute(queries["query"]), items[index])[0] is None', '(1, 2)', 'queries["query"]'),
+        ('iterator-finalizer', mapping + '    class Rows(list):\n' + finalizer,
+         finalizer_predicate, 'Rows([1, 2])', 'queries["query"]'),
+        ('list-element-finalizer', mapping + '    class Element:\n' + finalizer,
+         finalizer_predicate, '[Element(), Element()]', 'queries["query"]'),
+        ('tuple-element-finalizer', mapping + '    class Element:\n' + finalizer,
+         finalizer_predicate, '(Element(), Element())', 'queries["query"]'),
+        ('readonly-finalizer', mapping + '    class Rows(list):\n' + finalizer,
+         'False' if consumer == 'any' else 'True', 'Rows([1, 2])', 'queries["query"]'),
+    )
+    for name, setup, expression, iterable, query in cases:
+        yield name, (setup + f'    {consumer}({expression} for _ in {iterable})\n'
+                     + f'    query = {query}\n')
+
+
+def boolean_namespace_cases(consumer, safe, unsafe):
+    """Namespace observation cannot hide callbacks or builtin replacement."""
+    mapping = '    import builtins\n    queries = {"query": ' + safe + '}\n'
+    yield 'namespace-truth-callback', (mapping + '    class Predicate:\n'
+          '        def __bool__(self):\n'
+          + f'            queries["query"] = {unsafe}\n            return True\n'
+          '    value = Predicate()\n'
+          + f'    {consumer}(value for _ in (1, 2))\n'
+          '    query = queries["query"]\n')
+    for name, body in boolean_heap_cases(consumer, safe, unsafe):
+        if name == 'readonly-finalizer':
+            yield 'namespace-finalizer', '    import builtins\n' + body
+    # The replacement mutates a captured dictionary without executing the
+    # generator. Restore the real builtin even if the witness raises.
+    yield 'namespace-member-write', (mapping + f'    saved = builtins.{consumer}\n'
+          '    def replacement(values):\n'
+          + f'        queries["query"] = {unsafe}\n        return False\n'
+          '    try:\n'
+          + f'        builtins.{consumer} = replacement\n'
+          + f'        {consumer}(False for _ in (1, 2))\n'
+          '    finally:\n'
+          + f'        builtins.{consumer} = saved\n'
+          '    query = queries["query"]\n')
+
+
+def boolean_finalizer_lifetime_cases(consumer, safe, unsafe):
+    """An immediate predicate borrows elements only while their owner is held."""
+    setup = ('    queries = {"query": ' + safe + '}\n    class Element:\n'
+             '        def __del__(self):\n'
+             + f'            queries["query"] = {unsafe}\n')
+    continuing = 'False' if consumer == 'any' else 'True'
+    for kind, container, empty, predicate in (
+            ('list', '[Element(), Element()]', '[]',
+             'False or (item is None and not (item is not None))'),
+            ('tuple', '(Element(), Element())', '()',
+             'not (item in []) and item not in ()')):
+        owner = setup + f'    owner = {container}\n'
+        yield 'retained-' + kind, (owner
+              + f'    {consumer}({predicate} for item in owner)\n'
+              '    query = queries["query"]\n'), True
+        # The generator keeps the old container alive after rebinding, but
+        # exhausting it releases that last owner and invokes __del__.
+        yield 'delayed-owner-' + kind, (owner
+              + f'    pending = ({continuing} for item in owner)\n'
+              '    alias = pending\n' + f'    owner = {empty}\n'
+              + f'    {consumer}(alias)\n'
+              '    query = queries["query"]\n'), False
+    yield 'retained-name-truth', (setup + '    owner = [Element()]\n'
+          + f'    {consumer}(item for item in owner)\n'
+          '    query = queries["query"]\n'), False
+
+
+def boolean_generator_refusals():
+    """Unsupported lifetimes/callbacks must not become a clean SQL report."""
+    for consumer in ('any', 'all'):
+        bodies = (
+            ('shadowed-builtin', f'    {consumer} = unknown\n'
+             + f'    {consumer}(cursor.execute("SELECT 1").fetchone() is None for _ in (1, 2))\n'),
+            ('local-consumer', '    query = f"SELECT {user}"\n'
+             + f'    def {consumer}(values):\n        return False\n'
+             + f'    {consumer}((query := "SELECT 1") is None for _ in (1, 2))\n'
+             '    cursor.execute(query)\n'),
+            ('rebound-alias', f'    consume = {consumer}\n    consume = unknown\n'
+             '    consume(cursor.execute("SELECT 1").fetchone() is None for _ in (1, 2))\n'),
+            ('rebound-local-alias', f'    consume = {consumer}\n'
+             '    query = f"SELECT {user}"\n    def ignore(values):\n        return False\n'
+             '    consume = ignore\n    consume((query := "SELECT 1") is None for _ in (1, 2))\n'
+             '    cursor.execute(query)\n'),
+            ('builtin-namespace', '    import builtins\n'
+             + f'    builtins.{consumer}(cursor.execute("SELECT 1").fetchone() is None for _ in (1, 2))\n'),
+            ('builtin-import-alias', f'    from builtins import {consumer} as consume\n'
+             '    consume(cursor.execute("SELECT 1").fetchone() is None for _ in (1, 2))\n'),
+            ('namespace-sql-projection', '    import builtins\n'
+             + f'    {consumer}(f"SELECT {{user}}" for _ in (1, 2))\n'
+             '    cursor.execute("SELECT 1")\n'),
+            ('partial-alias', '    pending = (cursor.execute("SELECT 1").fetchone() is None for _ in (1, 2))\n'
+             '    alias = pending\n' + f'    {consumer}(pending)\n    list(alias)\n'),
+            ('captured-cursor', '    pending = ("SELECT 1" for _ in (1, 2))\n'
+             + f'    {consumer}(list(pending) for _ in (1, 2))\n'),
+            ('generator-iterable', '    pending = (1 for _ in (1, 2))\n'
+             + f'    {consumer}(cursor.execute("SELECT 1").fetchone() is None for _ in pending)\n'),
+            ('sql-result-truth', f'    {consumer}(cursor.execute("SELECT 1") for _ in (1, 2))\n'),
+            ('truth-callback', '    query = "SELECT 1"\n    class Predicate:\n'
+             '        def __bool__(self):\n            nonlocal query\n'
+             '            query = f"SELECT {user}"\n            return True\n'
+             + f'    {consumer}(Predicate() for _ in (1, 2))\n    cursor.execute(query)\n'),
+            ('implicit-not', '    query = "SELECT 1"\n    class Predicate:\n'
+             '        def __bool__(self):\n            nonlocal query\n'
+             '            query = f"SELECT {user}"\n            return True\n'
+             + f'    {consumer}((cursor.execute("SELECT 1"), not Predicate())[1] for _ in (1, 2))\n'
+             '    cursor.execute(query)\n'),
+            ('filter-truth', '    query = "SELECT 1"\n    class Predicate:\n'
+             '        def __bool__(self):\n            nonlocal query\n'
+             '            query = f"SELECT {user}"\n            return True\n'
+             + f'    {consumer}(cursor.execute("SELECT 1").fetchone() is None for _ in (1, 2) if Predicate())\n'
+             '    cursor.execute(query)\n'),
+            ('comparison-callback', '    query = "SELECT 1"\n    class Predicate:\n'
+             '        def __eq__(self, other):\n            nonlocal query\n'
+             '            query = f"SELECT {user}"\n            return True\n'
+             + f'    {consumer}((cursor.execute("SELECT 1"), Predicate() == None)[1] for _ in (1, 2))\n'
+             '    cursor.execute(query)\n'),
+            ('membership-callback', '    query = "SELECT 1"\n    class Predicate:\n'
+             '        def __contains__(self, other):\n            nonlocal query\n'
+             '            query = f"SELECT {user}"\n            return True\n'
+             + f'    {consumer}((cursor.execute("SELECT 1"), "key" in Predicate())[1] for _ in (1, 2))\n'
+             '    cursor.execute(query)\n'),
+        )
+        bodies += tuple((name, body + '    cursor.execute(query)\n') for name, body in
+                        boolean_external_cell_cases(consumer, '"SELECT 1"', 'f"SELECT {user}"'))
+        bodies += tuple((name, body + '    cursor.execute(query)\n') for name, body in
+                        boolean_heap_cases(consumer, '"SELECT 1"', 'f"SELECT {user}"'))
+        bodies += tuple((name, body + '    cursor.execute(query)\n') for name, body in
+                        boolean_namespace_cases(consumer, '"SELECT 1"', 'f"SELECT {user}"'))
+        bodies += tuple((name, body + '    cursor.execute(query)\n') for name, body, retained in
+                        boolean_finalizer_lifetime_cases(consumer, '"SELECT 1"', 'f"SELECT {user}"')
+                        if not retained)
+        for name, body in bodies:
+            yield consumer + '-' + name, program('    cursor.execute(f"SELECT {user}")\n' + body)
+
+
 def incomplete_program():
     unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
     return program(f'    first = cursor.execute({unsafe}).fetchone()[0]\n'
@@ -330,6 +622,221 @@ class SQLValueCaptureTests(unittest.TestCase):
         for name, body, expected in GENERATOR_CASES:
             with self.subTest(case=name):
                 self.inspect(name, program(body), expected)
+
+    def test_boolean_generator_programs(self):
+        for name, source, expected in boolean_generator_cases():
+            with self.subTest(case=name):
+                compile(source, '<boolean-' + name + '>', 'exec')
+                self.inspect('boolean-' + name, source, expected)
+
+    def test_boolean_generator_boundaries_remain_incomplete(self):
+        for name, source in boolean_generator_refusals():
+            with self.subTest(case=name):
+                compile(source, '<boolean-refusal-' + name + '>', 'exec')
+                path = self.artifacts / ('boolean-refusal-' + name + '.py')
+                path.write_text(source, encoding='utf-8')
+                found = []
+                with self.assertRaisesRegex(detector.SQLFlowLimit, 'incomplete'):
+                    for finding in detector.find([path]):
+                        found.append((finding[0], finding[2]))
+                self.assertEqual(found, [(CRITICAL, 2)], source)
+
+    def test_real_sqlite_boolean_generator_prefixes(self):
+        unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
+        safe = '"SELECT count(*) FROM users WHERE name = \'alice\'"'
+        for consumer, stop, continuing in (('any', 'True', 'False'), ('all', 'False', 'True')):
+            cases = (
+                ('stop', f'    query = {safe}\n'
+                 + f'    {consumer}({stop} for _ in (1, 2)\n'
+                 + f'               if (cursor.execute(query), (query := {unsafe})))\n'
+                 '    return cursor.execute(query).fetchone()[0]\n', 2, ((CRITICAL, 5),)),
+                ('continue', f'    query = {safe}\n'
+                 + f'    {consumer}({continuing} for _ in (1, 2)\n'
+                 + f'               if (cursor.execute(query), (query := {unsafe})))\n'
+                 '    return cursor.execute(query).fetchone()[0]\n', 2, ((CRITICAL, 4), (CRITICAL, 5))),
+                ('one-trip-clean', f'    query = {unsafe}\n'
+                 + f'    {consumer}((cursor.execute("SELECT 1"), (query := {safe})) is None for _ in (1,))\n'
+                 '    return cursor.execute(query).fetchone()[0]\n', 1, ()),
+                ('skipped-clean', f'    query = {unsafe}\n'
+                 + f'    {consumer}(cursor.execute("SELECT 1").fetchone() is not None or (query := {safe}) for _ in (1, 2))\n'
+                 '    return cursor.execute(query).fetchone()[0]\n', 2, ((CRITICAL, 4),)),
+                ('exception-before-clean', f'    query = {unsafe}\n    try:\n'
+                 + f'        {consumer}((cursor.execute("SELECT missing FROM absent"), (query := {safe})) is None for _ in (1,))\n'
+                 '    except Exception:\n        pass\n'
+                 '    return cursor.execute(query).fetchone()[0]\n', 2, ((CRITICAL, 7),)),
+            )
+            for name, body, rows, expected in cases:
+                name = 'boolean-witness-' + consumer + '-' + name
+                source = program(body)
+                with self.subTest(case=name):
+                    self.assertEqual(sqlite_witness(self.artifacts, name, source)['rows'], rows)
+                    self.inspect(name, source, expected)
+
+    def test_real_sqlite_boolean_callbacks_and_shadowing(self):
+        unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
+        safe = '"SELECT count(*) FROM users WHERE name = \'alice\'"'
+        for consumer in ('any', 'all'):
+            cases = [
+                ('local-consumer', f'    query = {unsafe}\n'
+                 + f'    def {consumer}(values):\n        return False\n'
+                 + f'    {consumer}((query := {safe}) is None for _ in (1, 2))\n'),
+                ('rebound-alias', f'    query = {unsafe}\n    consume = {consumer}\n'
+                 '    def ignore(values):\n        return False\n    consume = ignore\n'
+                 + f'    consume((query := {safe}) is None for _ in (1, 2))\n'),
+            ]
+            cases.extend(boolean_external_cell_cases(consumer, safe, unsafe))
+            # The ordinary witness caller passes None for qs. The opaque
+            # mutable-argument case instead has public-CLI refusal coverage;
+            # substituting a known function here would change that boundary.
+            cases.extend((name, body) for name, body in boolean_heap_cases(consumer, safe, unsafe)
+                         if name != 'opaque-mutable-argument')
+            cases.extend(boolean_namespace_cases(consumer, safe, unsafe))
+            for name, method, signature, expression in (
+                    ('truth', '__bool__', 'self', 'Predicate()'),
+                    ('implicit-not', '__bool__', 'self', '(cursor.execute("SELECT 1"), not Predicate())[1]'),
+                    ('comparison', '__eq__', 'self, other', '(cursor.execute("SELECT 1"), Predicate() == None)[1]'),
+                    ('membership', '__contains__', 'self, other', '(cursor.execute("SELECT 1"), "key" in Predicate())[1]'),
+                    ('filter', '__bool__', 'self', 'cursor.execute("SELECT 1").fetchone() is None')):
+                condition = ' if Predicate()' if name == 'filter' else ''
+                body = (f'    query = {safe}\n    class Predicate:\n'
+                        + f'        def {method}({signature}):\n            nonlocal query\n'
+                        + f'            query = {unsafe}\n            return True\n'
+                        + f'    {consumer}({expression} for _ in (1, 2){condition})\n')
+                cases.append((name, body))
+            for name, body in cases:
+                name = 'boolean-callback-witness-' + consumer + '-' + name
+                source = program(body + '    return cursor.execute(query).fetchone()[0]\n')
+                with self.subTest(case=name):
+                    self.assertEqual(sqlite_witness(self.artifacts, name, source)['rows'], 2)
+                    path = self.artifacts / (name + '.py')
+                    path.write_text(source, encoding='utf-8')
+                    with self.assertRaisesRegex(detector.SQLFlowLimit, 'incomplete'):
+                        list(detector.find([path]))
+            for name, body, retained in boolean_finalizer_lifetime_cases(consumer, safe, unsafe):
+                if name == 'retained-name-truth':
+                    continue
+                name = 'boolean-lifetime-witness-' + consumer + '-' + name
+                source = program(body + '    return cursor.execute(query).fetchone()[0]\n')
+                with self.subTest(case=name):
+                    self.assertEqual(sqlite_witness(self.artifacts, name, source)['rows'], 1 if retained else 2)
+                    if retained:
+                        self.inspect(name, source, ())
+                    else:
+                        path = self.artifacts / (name + '.py')
+                        path.write_text(source, encoding='utf-8')
+                        with self.assertRaisesRegex(detector.SQLFlowLimit, 'incomplete'):
+                            list(detector.find([path]))
+
+    def test_real_cli_boolean_generators(self):
+        # Full native scans (no category suppression), including the reporter's
+        # exact source and matched safe/security-sensitive controls for both
+        # consumers. Unit fixtures above additionally cover all alias states.
+        selected = {
+            'constant-columns', 'bound-parameters', 'tainted-query',
+            'generator-alias', 'builtin-alias', 'stop-before-backedge',
+            'continue-backedge', 'optional-write', 'exception-before-write',
+            'body-exception-closes-alias', 'nested-consumer', 'result-is-boolean',
+            'namespace-readonly-import', 'namespace-readonly-globals',
+            'namespace-identity', 'namespace-boolean-identity',
+            'retained-list', 'retained-tuple',
+        }
+        cases = [(name, source, expected) for name, source, expected in boolean_generator_cases()
+                 if name.split('-', 1)[1] in selected]
+        for consumer in ('any', 'all'):
+            cases.append(('reporter-' + consumer,
+                          'import sqlite3\n\n\ndef empty(db):\n'
+                          + f"    return {consumer}(db.execute('SELECT 1 FROM records LIMIT 1').fetchone() is None for _ in (1, 2))\n",
+                          ()))
+        for name, source, expected in cases:
+            self._assert_boolean_generator_cli(name, source, expected)
+
+    def _assert_boolean_generator_cli(self, name, source, expected):
+        for entry in ('ubs', 'modules/ubs-python.sh'):
+            for fmt in ('json', 'sarif'):
+                with self.subTest(case=name, entry=entry, format=fmt):
+                    case = 'boolean-cli-' + name + '-' + entry.replace('/', '-') + '-' + fmt
+                    folder = self.artifacts / case
+                    folder.mkdir()
+                    path = folder / 'case.py'
+                    path.write_text(source, encoding='utf-8')
+                    for child in ('home', 'cache', 'tmp'):
+                        (folder / child).mkdir()
+                    env = {key: value for key, value in os.environ.items() if not key.startswith('UBS_')}
+                    env.update(HOME=str(folder / 'home'), XDG_CACHE_HOME=str(folder / 'cache'),
+                               TMPDIR=str(folder / 'tmp'), UBS_KEEP_TEMP='1', UBS_NO_CACHE='1',
+                               UBS_NO_AUTO_UPDATE='1', ENABLE_UV_TOOLS='0',
+                               PYTHONDONTWRITEBYTECODE='1', NO_COLOR='1')
+                    command = ['bash', str(ROOT / entry), '--ci', '--no-color', '--format=' + fmt,
+                               '--only=python' if entry == 'ubs' else '--no-uv', str(path)]
+                    print(f'[{case}] RUN', flush=True)
+                    started = time.perf_counter()
+                    try:
+                        result = subprocess.run(command, cwd=folder, env=env, capture_output=True,
+                                                text=True, timeout=120, check=False)
+                    except subprocess.TimeoutExpired as exc:
+                        (folder / 'stdout.log').write_bytes(exc.stdout or b'')
+                        (folder / 'stderr.log').write_bytes(exc.stderr or b'')
+                        self.fail(f'CLI timeout: {command}; evidence: {folder}')
+                    elapsed = time.perf_counter() - started
+                    (folder / 'stdout.log').write_text(result.stdout, encoding='utf-8')
+                    (folder / 'stderr.log').write_text(result.stderr, encoding='utf-8')
+                    (folder / 'run.json').write_text(json.dumps({
+                        'command': command, 'status': result.returncode,
+                        'source_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                        'detector_sha256': self.identity,
+                        'entry_sha256': hashlib.sha256((ROOT / entry).read_bytes()).hexdigest(),
+                        'elapsed_seconds': elapsed, 'expected_sql_findings': expected,
+                    }, indent=2) + '\n', encoding='utf-8')
+                    evidence = result.stdout + '\n' + result.stderr
+                    self.assertEqual(result.returncode, int(any(rule == CRITICAL for rule, _ in expected)), evidence)
+                    try:
+                        report = json.loads(result.stdout)
+                    except json.JSONDecodeError as exc:
+                        self.fail(f'CLI emitted invalid JSON: {command}; evidence: {folder}: {exc}\n{evidence}')
+                    self.assertNotIn('SQLFlowLimit', evidence)
+                    actual = []
+                    if fmt == 'json':
+                        self.assertEqual(report['status'], 'ok', evidence)
+                        scans = report['scanners'] if entry == 'ubs' else [report]
+                        self.assertEqual(len(scans), 1)
+                        scan = scans[0]
+                        self.assertEqual((scan['status'], scan['files']), ('ok', 1), evidence)
+                        self.assertEqual(scan['critical'], sum(rule == CRITICAL for rule, _ in expected), evidence)
+                        for finding in scan['findings']:
+                            rule = finding.get('rule_id', finding.get('rule'))
+                            if rule in {CRITICAL, WARNING}:
+                                self.assertEqual(finding['count'], len(finding['samples']))
+                                for sample in finding['samples']:
+                                    self.assertEqual(Path(sample['file']).name, path.name)
+                                    actual.append((rule, sample['line']))
+                    else:
+                        self.assertTrue(report['runs'], evidence)
+                        for run in report['runs']:
+                            for invocation in run.get('invocations', []):
+                                self.assertIs(invocation.get('executionSuccessful'), True, evidence)
+                            for finding in run.get('results', []):
+                                if finding['ruleId'] in {CRITICAL, WARNING}:
+                                    location = finding['locations'][0]['physicalLocation']
+                                    self.assertEqual(Path(unquote(location['artifactLocation']['uri'])).name, path.name)
+                                    self.assertEqual(location['region']['startColumn'], 1)
+                                    actual.append((finding['ruleId'], location['region']['startLine']))
+                    self.assertEqual(sorted(actual), sorted(expected), evidence)
+                    print(f'[{case}] PASS ({elapsed:.3f}s)', flush=True)
+
+    def test_real_cli_boolean_generator_refusals(self):
+        for name, source in boolean_generator_refusals():
+            if name.split('-', 1)[1] in {
+                    'shadowed-builtin', 'local-consumer', 'rebound-local-alias', 'partial-alias',
+                    'truth-callback', 'sql-result-truth', 'implicit-not', 'filter-truth',
+                    'comparison-callback', 'membership-callback', 'helper-callback',
+                    'operator-callback', 'property-callback', 'iterator-callback',
+                    'captured-dict', 'attribute-write', 'opaque-mutable-argument',
+                    'opaque-generator-argument', 'precreated-operator', 'precreated-property',
+                    'precreated-iterator', 'format-callback', 'index-callback', 'hash-callback',
+                    'iterator-finalizer', 'list-element-finalizer', 'readonly-finalizer',
+                    'namespace-truth-callback', 'namespace-finalizer', 'namespace-member-write',
+                    'delayed-owner-list', 'delayed-owner-tuple'}:
+                self._assert_partial_cli('boolean-refusal-' + name, source, 2)
 
     def test_resolved_generator_consumers_keep_returns_and_sinks(self):
         unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'

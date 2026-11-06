@@ -77,6 +77,19 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Python analysis and bounded reporting
 
+- Model SQL execution in supported `any()` / `all()` generator predicates
+  without treating the generator as an eager list (GH #201). Short-circuit
+  exits retain their own SQL state, body failures close the cursor, and
+  later iterations preserve taint provenance. Stable builtin aliases,
+  generator aliases and nested predicates retain their binding semantics.
+  Opaque callbacks, unresolved finalizer and heap/cell effects, shadowed
+  builtins and effectful partial-cursor resumption still report incomplete
+  analysis. Pure predicates over retained exact lists and tuples preserve
+  the existing read-only behavior without releasing finalizable elements.
+  Native JSON/SARIF regressions and independent SQLite witnesses cover the
+  reporter's constant queries and security-sensitive counterexamples.
+- Keep SQL binding and builtin-scope discovery compatible with Python 3.9,
+  whose AST module does not expose structural pattern-matching node types.
 - Reuse immutable SQL binding lookups and relevant callable-summary inputs
   so large Python modules complete without increasing taint work limits.
   SQL indexing scales its default allowance with input size under a fixed

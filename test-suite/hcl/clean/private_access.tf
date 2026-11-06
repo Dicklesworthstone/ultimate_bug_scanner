@@ -13,3 +13,20 @@ resource "aws_s3_bucket" "reports" {
   bucket = "example-ubs-private-reports"
   acl    = "private"
 }
+
+provider "aws" {
+  region   = "us-east-1"
+  insecure = false
+}
+
+resource "aws_iam_policy" "report_reader" {
+  name = "example-report-reader-policy"
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["s3:GetObject"]
+      Resource = "arn:aws:s3:::example-ubs-private-reports/*"
+    }]
+  })
+}

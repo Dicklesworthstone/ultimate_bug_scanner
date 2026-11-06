@@ -10,6 +10,14 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Extend Terraform AWS scanning with unrestricted IAM identity-policy grants
+  and explicitly disabled provider TLS verification. Decode literal JSON and
+  bounded `jsonencode` values through shared locals; reject duplicate keys and
+  keep conditional/deny policy interactions incomplete. Respect actual provider
+  identity, aliases, primitive boolean conversion and secure optional defaults.
+  Add IAM/TLS categories, scoped suppression, report/cache checks and bounded
+  local/JSON expansion without executing Terraform or claiming deployed access.
+
 - Resolve selected Java and Kotlin Servlet request sources by API identity
   across redirect, path traversal, response-header and outbound-URL checks.
   Follow arbitrarily named parameters, aliases and selected helper returns;

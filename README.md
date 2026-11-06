@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.5.41-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.5.42-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -308,7 +308,7 @@ and [REVOKE semantics](https://www.postgresql.org/docs/current/sql-revoke.html).
 
 #### Terraform AWS configuration
 
-Native `.tf` files now have two bounded AWS checks, without running Terraform,
+Native `.tf` files have four bounded AWS checks, without running Terraform,
 loading provider plugins, or contacting AWS:
 
 ```bash
@@ -331,13 +331,30 @@ Conflicting ACL blocking, `BucketOwnerEnforced`, competing controls or unknown
 protection produce incomplete analysis, rather than a claim about deployed
 access. Missing account-wide controls and provider defaults are not inferred.
 
+`hcl.aws.iam-wildcard-privilege` warns for unconditional identity-policy `Allow`
+statements that select `"*"` in both `Action` and `Resource`. It supports
+`aws_iam_policy`, `aws_iam_role_policy`, `aws_iam_user_policy` and
+`aws_iam_group_policy` with literal JSON strings, heredocs, or bounded
+`jsonencode` expressions over selected literals and locals. Conditions or deny
+statements constraining a candidate grant produce incomplete analysis. Malformed
+JSON, duplicate keys, unsupported complement operators and unresolved policy
+documents also remain incomplete. The warning describes policy intent; it does
+not establish attachment, effective IAM permissions or permission-boundary state.
+
+`hcl.aws.insecure-provider-tls` warns when an actual HashiCorp AWS provider
+configuration sets `insecure = true`, including provider aliases and renamed
+local provider bindings. Literal string booleans follow Terraform's primitive
+conversion; omitted or null values use the documented secure default. Unknown
+settings and duplicate provider identities remain incomplete. Unrelated provider
+plugins do not acquire AWS semantics from a similarly named option.
+
 Selected files in the same directory share literal/local values and protective
 resource identities; nested directories remain distinct Terraform modules.
 Changes to any selected context file invalidate cached results. Actual `#`,
 `//` and block comments support scoped `ubs:ignore[rule-id]`; quoted strings,
 templates and heredocs cannot act as suppression comments. Categories are
-`hcl.network` (1) and `hcl.storage` (2), including `--skip-hcl=1` and `.ubs.json`
-policy. Both rules emit warnings; `--fail-on-warning` or the strict profile
+`hcl.network` (1), `hcl.storage` (2), `hcl.iam` (3) and `hcl.tls` (4), including
+`--skip-hcl=3` and `.ubs.json` policy. All four rules emit warnings; `--fail-on-warning` or the strict profile
 makes them fail the scan.
 
 This first slice does not evaluate Terraform plans, state, remote modules,
@@ -346,13 +363,18 @@ Relevant unresolved expressions, malformed syntax and exhausted budgets
 produce partial reports and exit 2 while retaining proven findings. Ordinary
 directory scans exclude downloaded `.terraform` dependencies. Source bounds
 are 4 MiB per file, 32 MiB per selected context, 200,000 tokens and 64 nesting
-levels. Custom `--rules` and extra non-`.tf` extensions are explicitly refused.
-Coverage of other providers, IAM, TLS settings and deployed reachability remains
-outside this slice, and confidence is uncalibrated.
+levels. Local evaluation is memoized and bounded; JSON policy input and encoded
+output are capped at 256 KiB, including expansion of shared local expressions.
+Custom `--rules` and extra non-`.tf` extensions are explicitly refused. Other
+providers, generated `aws_iam_policy_document` data sources, arbitrary policy
+evaluation and deployed reachability remain outside this slice. Confidence is
+uncalibrated.
 
 The checks follow the AWS provider's
 [ingress rule contract](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/vpc_security_group_ingress_rule),
 [S3 public-access controls](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/s3_bucket_public_access_block),
+[IAM policy grammar](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_grammar.html),
+[AWS provider TLS setting](https://registry.terraform.io/providers/hashicorp/aws/latest/docs),
 and Terraform's [module file boundaries](https://developer.hashicorp.com/terraform/language/files).
 
 #### Shareable output quickstart

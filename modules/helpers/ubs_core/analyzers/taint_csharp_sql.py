@@ -60,7 +60,16 @@ PARSE_TYPES = frozenset({
     "System.Double", "System.Decimal", "System.Char", "System.Guid", "System.DateTime",
     "System.DateTimeOffset", "System.TimeSpan", "System.DateOnly", "System.TimeOnly",
 })
-KNOWN_TYPES = CONNECTIONS | CONTROLLERS | PARSE_TYPES | frozenset({
+# Style and format-provider arguments accepted by the culture-aware TryParse
+# overloads (GH #171): an enum member or a static BCL culture/format property
+# runs no user code. CurrentCulture matches what the two-argument form reads.
+STYLE_TYPES = frozenset({"System.Globalization.NumberStyles", "System.Globalization.DateTimeStyles"})
+PROVIDER_MEMBERS = {
+    "System.Globalization.CultureInfo": frozenset({"InvariantCulture", "CurrentCulture"}),
+    "System.Globalization.NumberFormatInfo": frozenset({"InvariantInfo", "CurrentInfo"}),
+    "System.Globalization.DateTimeFormatInfo": frozenset({"InvariantInfo", "CurrentInfo"}),
+}
+KNOWN_TYPES = CONNECTIONS | CONTROLLERS | PARSE_TYPES | STYLE_TYPES | frozenset(PROVIDER_MEMBERS) | frozenset({
     REQUEST, CONTEXT, MAPPER, COMMAND, MAIL_ADDRESS, "System.Type", "System.String",
     "System.Object", "System.Data.CommandType",
 })
@@ -414,7 +423,14 @@ class DapperFlow(CSharpFlow):
         """
         if raw.startswith("global::"):
             return True
-        root = call.name.split(".")[0]
+        return self.unshadowed_type_root(call.name.split(".")[0], call)
+
+    def unshadowed_type_root(self, root, call):
+        """Whether `root`, the first segment of a type spelling, names a type here.
+
+        A local, a field, a static import or a generic type parameter spelled
+        like `root` would make the spelling a member access on storage.
+        """
         if root in call.bindings:
             return False
         # The CFG tracks local storage, not fields. A field named after
@@ -466,17 +482,26 @@ class DapperFlow(CSharpFlow):
         """Prove a BCL value-type TryParse has no SQL effect (GH #171).
 
         `int.TryParse(text, out var n)`, `Guid.TryParse(...)` and the other
-        PARSE_TYPES overloads with two positional arguments read a string and
-        write only a value of their own type, so the call cannot create,
-        replace or execute a connection or command; its Boolean result is not
-        request data. The output is not sanitized: the shared evaluator still
-        joins the input's provenance into the out storage. Other overloads
-        (format providers, styles, spans, generic forms), named arguments,
-        unproven inputs and shadowed receivers stay incomplete.
+        PARSE_TYPES overloads read a string and write only a value of their
+        own type, so the call cannot create, replace or execute a connection
+        or command; its Boolean result is not request data. The output is not
+        sanitized: the shared evaluator still joins the input's provenance into
+        the out storage.
+
+        Besides the two-argument form, the culture-aware overloads
+        `T.TryParse(text, style, provider, out r)`,
+        `T.TryParse(text, provider, style, out r)` and
+        `T.TryParse(text, provider, out r)` are accepted when every middle
+        argument is a parse_option: a NumberStyles/DateTimeStyles member
+        (or a `|` of them), `null`, or a static invariant/current culture or
+        format-info property. A caller-supplied provider could run its own
+        GetFormat, and a style held in storage could arrive through a user
+        conversion, so both stay incomplete, as do spans, generic forms,
+        named arguments, unproven inputs and shadowed receivers.
         """
         raw = self.raw_name(call.position, call.name)
         qualifier, dot, method = raw.rpartition(".")
-        if not dot or method != "TryParse" or len(call.args) != 2:
+        if not dot or method != "TryParse" or not 2 <= len(call.args) <= 4:
             return False
         if self.code[call.name_end:call.opening].strip():
             return False
@@ -487,14 +512,52 @@ class DapperFlow(CSharpFlow):
         keyword = qualifier in PRIMITIVES and self.code[call.position:call.position + 1] != "@"
         if not keyword and not self.static_type_receiver(call, raw):
             return False
-        (input_name, input_low, input_high), (output_name, output_low, output_high) = call.args
+        (input_name, input_low, input_high), *options, (output_name, output_low, output_high) = call.args
         if input_name is not None or output_name is not None:
             return False
         if re.match(r"\s*(?:ref|out|in)\b", self.code[input_low:input_high]):
             return False
         if not re.match(r"\s*out\b", self.code[output_low:output_high]):
             return False
+        kinds = [self.parse_option(call, low, high) if name is None else None
+                 for name, low, high in options]
+        # At most one style and one provider; a lone middle argument is a
+        # provider, as no TryParse(text, style, out r) overload exists.
+        if None in kinds or len(set(kinds)) != len(kinds) or kinds == ["style"]:
+            return False
         return self.proven_text_argument(call, 0) or self.request_text_argument(call, 0)
+
+    def parse_option(self, call, low, high):
+        """Classify a TryParse style or provider argument proven to run no user code.
+
+        Returns "style" for a member of NumberStyles/DateTimeStyles, or a `|`
+        of such members; "provider" for `null` or a selected static culture or
+        format-info property; otherwise None. Each type spelling must resolve to
+        the BCL type and its root must not be shadowed by storage. A member
+        access on an enum type without a call is one of its constants.
+        """
+        spelling = re.sub(r"\s", "", self.code[low:high])
+        if spelling == "null":
+            return "provider"
+        kinds = set()
+        members = spelling.split("|")
+        for member in members:
+            if not re.fullmatch(r"(?:global::)?@?\w+(?:\.@?\w+)+", member):
+                return None
+            qualifier, _, name = member.rpartition(".")
+            identity = self.types.resolve(qualifier, low)
+            if identity in STYLE_TYPES:
+                kinds.add("style")
+            elif name.lstrip("@") in PROVIDER_MEMBERS.get(identity, ()):
+                kinds.add("provider")
+            else:
+                return None
+            if (not qualifier.startswith("global::")
+                    and not self.unshadowed_type_root(qualifier.split(".")[0].lstrip("@"), call)):
+                return None
+        if len(kinds) != 1 or (len(members) > 1 and kinds != {"style"}):
+            return None
+        return kinds.pop()
 
     def selected_call(self, call):
         """Return the SQL slot only after resolving receiver, overload and mode."""

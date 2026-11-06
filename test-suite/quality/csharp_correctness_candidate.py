@@ -229,8 +229,7 @@ class C { void M(IDbConnection db, HttpRequest http) { MailAddress.TryCreate(db,
     def test_unproven_parses_and_trygetvalue_stay_incomplete(self):
         from ubs_core.taint_flow import AnalysisLimit
         methods = (
-            # Other overloads, named arguments and generic forms are not modeled.
-            'public static bool P(string raw) => int.TryParse(raw, System.Globalization.NumberStyles.Any, null, out var n);',
+            # Named arguments and generic forms are not modeled.
             'public static bool P(string raw) => int.TryParse(s: raw, result: out var n);',
             'public static bool P(string raw) => int.TryParse<int>(raw, out var n);',
             # Unknown receiver, shadowed receivers, an escaped keyword identifier.
@@ -249,6 +248,79 @@ class C { void M(IDbConnection db, HttpRequest http) { MailAddress.TryCreate(db,
                 rows, error = self.scan(self.parse_source(method))
                 self.assertEqual(rows, [])
                 self.assertIsInstance(error, AnalysisLimit)
+
+    CULTURE_PARSE_CALLS = {
+        'styles_provider': 'public static int P(string raw) => int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var n) ? n : 0;',
+        'combined_styles_null': 'public static bool P(string raw) => long.TryParse(raw, NumberStyles.AllowLeadingSign | NumberStyles.AllowThousands, null, out var n);',
+        'qualified_styles': 'public static bool P(string raw) => int.TryParse(raw, System.Globalization.NumberStyles.Any, null, out var n);',
+        'global_options': 'public static bool P(string raw) => int.TryParse(raw, global::System.Globalization.NumberStyles.None, global::System.Globalization.CultureInfo.InvariantCulture, out var n);',
+        'format_info': 'public static bool P(string raw) => double.TryParse(raw, NumberStyles.Float, NumberFormatInfo.InvariantInfo, out var d);',
+        'provider_only': 'public static bool P(string raw) => decimal.TryParse(raw, CultureInfo.CurrentCulture, out var d);',
+        'date_provider_styles': 'public static bool P(string raw) => DateTime.TryParse(raw, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var d);',
+        'date_format_info': 'public static bool P(string raw) => DateTimeOffset.TryParse(raw, DateTimeFormatInfo.InvariantInfo, DateTimeStyles.None, out var d);',
+        'timespan_provider': 'public static bool P(string raw) => TimeSpan.TryParse(raw, CultureInfo.InvariantCulture, out var t);',
+        'request_read': 'public static bool P(HttpRequest http) => int.TryParse(http.Query["page"], NumberStyles.Integer, CultureInfo.InvariantCulture, out var p);',
+    }
+
+    def culture_source(self, method):
+        return 'using System.Globalization;\n' + self.parse_source(method)
+
+    def test_culture_aware_tryparse_is_sql_inert(self):
+        # GH #171: the style/provider overloads write only their own value type
+        # too. Enum members and static BCL culture properties run no user code.
+        for label, method in self.CULTURE_PARSE_CALLS.items():
+            with self.subTest(label=label):
+                self.assertEqual(self.scan(self.culture_source(method)), ([], None))
+
+    def test_unproven_culture_options_stay_incomplete(self):
+        from ubs_core.taint_flow import AnalysisLimit
+        methods = (
+            # A caller-supplied provider runs its own GetFormat.
+            'public static bool P(string raw, IFormatProvider provider) => int.TryParse(raw, NumberStyles.Any, provider, out var n);',
+            'public static bool P(string raw) => int.TryParse(raw, NumberStyles.Any, new CultureInfo("en-US"), out var n);',
+            'public static bool P(string raw) => int.TryParse(raw, NumberStyles.Any, CultureInfo.GetCultureInfo("de-DE"), out var n);',
+            'public static bool P(string raw) => int.TryParse(raw, NumberStyles.Any, CultureInfo.DefaultThreadCurrentCulture, out var n);',
+            # A style held in storage could arrive through a user conversion.
+            'public static bool P(string raw, NumberStyles styles) => int.TryParse(raw, styles, CultureInfo.InvariantCulture, out var n);',
+            'public static bool P(string raw) => int.TryParse(raw, (NumberStyles)7, null, out var n);',
+            # Shadowed or file-local option types.
+            'public static bool P(string raw, dynamic CultureInfo) => int.TryParse(raw, NumberStyles.Any, CultureInfo.InvariantCulture, out var n);',
+            'class CultureInfo { public static IFormatProvider InvariantCulture => null; }\n'
+            '    public static bool P(string raw) => int.TryParse(raw, NumberStyles.Any, CultureInfo.InvariantCulture, out var n);',
+            # Overload shapes outside the selected ones, and named options.
+            'public static bool P(string raw) => int.TryParse(raw, NumberStyles.Any, out var n);',
+            'public static bool P(string raw) => int.TryParse(raw, CultureInfo.InvariantCulture, CultureInfo.CurrentCulture, out var n);',
+            'public static bool P(string raw) => int.TryParse(raw, NumberStyles.Any, CultureInfo.InvariantCulture | null, out var n);',
+            'public static bool P(string raw) => int.TryParse(raw, NumberStyles.Any, provider: null, out var n);',
+            'public static bool P(object raw) => int.TryParse(raw, NumberStyles.Any, CultureInfo.InvariantCulture, out var n);',
+        )
+        for method in methods:
+            with self.subTest(method=method):
+                rows, error = self.scan(self.culture_source(method))
+                self.assertEqual(rows, [])
+                self.assertIsInstance(error, AnalysisLimit)
+        # Without `using System.Globalization` the option types are unresolved.
+        rows, error = self.scan(self.parse_source(
+            'public static bool P(string raw) => int.TryParse(raw, NumberStyles.Any, CultureInfo.InvariantCulture, out var n);'))
+        self.assertEqual(rows, [])
+        self.assertIsInstance(error, AnalysisLimit)
+
+    def test_culture_parsed_request_value_keeps_its_provenance(self):
+        source = '''using System.Data;
+using System.Globalization;
+using Dapper;
+using Microsoft.AspNetCore.Http;
+class C {
+    static void Run(IDbConnection db, HttpRequest http) {
+        int.TryParse(http.Query["id"], NumberStyles.Integer, CultureInfo.InvariantCulture, out var n);
+        db.Execute("SELECT * FROM t WHERE id = " + n);
+    }
+}
+'''
+        rows, error = self.scan(source)
+        self.assertIsNone(error)
+        self.assertEqual([(rule(row), row['line'], row['severity']) for row in rows],
+                         [('cs.security.sql-injection', 8, 'critical')])
 
     def test_parsed_request_value_keeps_its_provenance(self):
         # The parse is SQL-inert, not a sanitizer: request data parsed into a

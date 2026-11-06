@@ -10,6 +10,16 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- C# SQL analysis models the culture-aware `TryParse` overloads as SQL-inert
+  too (#171): `int.TryParse(raw, NumberStyles.Integer,
+  CultureInfo.InvariantCulture, out var n)`, `DateTime.TryParse(raw, provider,
+  DateTimeStyles..., out var d)` and `T.TryParse(raw, provider, out var r)`.
+  Styles must be NumberStyles/DateTimeStyles members, optionally combined with
+  `|`, and the provider must be `null` or the invariant or current
+  `CultureInfo`, `NumberFormatInfo` or `DateTimeFormatInfo`. A provider or
+  style passed in from elsewhere, `Dictionary.TryGetValue` and cross-file
+  helpers still report incomplete analysis.
+
 - Follow Python `functools.partial` through captured arguments, keyword
   overrides, helper returns, bound receivers and live closure cells. Preserve
   subprocess executable and interpreter-source roles; unsupported mutable

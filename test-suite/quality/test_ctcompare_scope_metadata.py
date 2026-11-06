@@ -90,17 +90,18 @@ def scan_lines(language: str, source: str) -> list[int]:
         return sorted(line for line, _code in ctcompare_rust.scan_file(source))
     artifacts = REPO_ROOT / "test-suite" / "artifacts"
     artifacts.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="ctcompare-scope-", dir=artifacts) as tmp:
-        root = Path(tmp)
-        path = root / ("handoff" + EXTENSIONS[language])
-        path.write_text(source, encoding="utf-8")
-        if language == "python":
-            issues: list = []
-            ctcompare_py.analyze(path, issues)
-        else:
-            analyzer = ctcompare_go if language == "go" else ctcompare_js
-            issues = analyzer.scan_file(path, root)
-        return sorted(line for _path, line, _code in issues)
+    # Keep the actual scanner inputs for inspection, including failed cases.
+    # Repository policy forbids deleting fixtures after an assertion runs.
+    root = Path(tempfile.mkdtemp(prefix="ctcompare-scope-", dir=artifacts))
+    path = root / ("handoff" + EXTENSIONS[language])
+    path.write_text(source, encoding="utf-8")
+    if language == "python":
+        issues: list = []
+        ctcompare_py.analyze(path, issues)
+    else:
+        analyzer = ctcompare_go if language == "go" else ctcompare_js
+        issues = analyzer.scan_file(path, root)
+    return sorted(line for _path, line, _code in issues)
 
 
 def operators(language: str) -> tuple[str, ...]:
@@ -528,6 +529,122 @@ rows.filter(({password: r}) => r.status === supplied);
         ''')
 
 
+class JavascriptLocalBindingTests(unittest.TestCase):
+    """Real aliases and mutations must retain conservative detection."""
+
+    def test_secret_aliases_captures_and_object_writes_remain_findings(self):
+        source = '''function earlier(authorization) {
+  const result = authorization;
+  return () => result.value === supplied;
+}
+function actual(authorization) {
+  const result = authorization;
+  return result.value === supplied;
+}
+function indirect(authorization) {
+  const source = authorization;
+  const result = source;
+  return result.value === supplied;
+}
+function mutated(response, authorization) {
+  const result = response.json();
+  result.value = authorization;
+  return result.value === supplied;
+}
+function nestedMutation(response, authorization) {
+  const result = response.json();
+  function fill() { result.value = authorization; }
+  fill();
+  return result.value === supplied;
+}
+'''
+        self.assertEqual(scan_lines('js', source), [3, 7, 12, 17, 23], source)
+
+    def test_block_locals_do_not_clear_an_outer_secret(self):
+        source = '''const result = authorization;
+function current(response) {
+  if (ready) { const result = response.json(); use(result); }
+  return result.value === supplied;
+}
+'''
+        self.assertEqual(scan_lines('js', source), [4], source)
+
+    def test_aliases_destructuring_computed_writes_and_escapes_keep_taint(self):
+        source = '''function earlier(authorization) { const result = authorization; }
+function alias(response, authorization) {
+  const source = response.json();
+  const result = source;
+  source.value = authorization;
+  return result.value === supplied; // expect-secret
+}
+function pattern(response, authorization) {
+  const result = response.json();
+  ({value: result.value} = authorization);
+  return result.value === supplied; // expect-secret
+}
+function computed(response, authorization) {
+  const result = response.json();
+  result[
+    field
+  ] = authorization;
+  return result.value === supplied; // expect-secret
+}
+function method(response, authorization) {
+  const result = response.json();
+  result.fill(authorization);
+  return result.value === supplied; // expect-secret
+}
+function escaped(response, authorization) {
+  const result = response.json();
+  fill({record: result}, authorization);
+  return result.value === supplied; // expect-secret
+}
+'''
+        expected = [line for line, code in enumerate(source.splitlines(), 1)
+                    if '// expect-secret' in code]
+        self.assertEqual(scan_lines('js', source), expected, source)
+
+    def test_asserted_escapes_optional_calls_and_shadowed_classes_keep_taint(self):
+        for mutation in (
+            'result!.value = authorization;',
+            '(result as Box).value = authorization;',
+            'fill(result!, authorization);',
+            'fill(result as Box, authorization);',
+            'result.fill?.(authorization);',
+            'fill(result.nested, authorization);',
+        ):
+            field = 'nested.value' if 'result.nested' in mutation else 'value'
+            source = ('function earlier(authorization) { const result = authorization; }\n'
+                      'function current(authorization) {\n'
+                      '  const result = readBox();\n'
+                      f'  {mutation}\n'
+                      f'  return result.{field} === supplied;\n'
+                      '}\n')
+            with self.subTest(mutation=mutation):
+                self.assertEqual(scan_lines('js', source), [5], source)
+        source = '''function earlier(authorization) { const result = authorization; }
+function classShadow(response) {
+  const result = response.json();
+  function inner(authorization) {
+    class result { static value = authorization; }
+    return result.value === supplied;
+  }
+}
+'''
+        self.assertEqual(scan_lines('js', source), [6], source)
+
+    def test_secret_receiver_returned_alias_keeps_taint(self):
+        source = '''function earlier(authorization) { const output = authorization; }
+function wrap(value) { return {value}; }
+function unsafe(authorization, supplied) {
+  const record = wrap(authorization);
+  const output = record.valueOf();
+  return output.value === supplied;
+}
+'''
+        self.assertEqual(scan_lines('js', source), [6], source)
+
+
 class CallResultMetadataTests(unittest.TestCase):
     """GH #181, #185: a call result's public discriminant is not the secret.
 
@@ -535,6 +652,72 @@ class CallResultMetadataTests(unittest.TestCase):
     through its callee name and argument; `result.type` is the returned
     status, while aliases and value members of a secret stay reported.
     """
+
+    def test_multiline_call_results_keep_metadata_and_secret_members_distinct(self):
+        for field in ('createdAt', 'updatedAt', 'expiresAt', 'collaborativeFlowId'):
+            for padding in (0, 6, 20):
+                source = ('async function current(authorization, supplied) {\n'
+                          '  const result = await exchange({\n'
+                          '    authorization,\n'
+                          + '    value: 1,\n' * padding
+                          + '  });\n'
+                          + f'  const metadata = result.{field} === supplied;\n'
+                          + '  return result.accessToken === supplied;\n'
+                          + '}\n')
+                with self.subTest(field=field, padding=padding):
+                    self.assertEqual(scan_lines('js', source), [6 + padding], source)
+
+    def test_timestamp_named_secret_and_plain_alias_stay_reported(self):
+        for value in ('authorization', 'await exchange(authorization).value'):
+            source = ('async function current(authorization, supplied) {\n'
+                      f'  const result = {value};\n'
+                      '  return result.updatedAt === supplied;\n'
+                      '}\n')
+            with self.subTest(value=value):
+                self.assertEqual(scan_lines('js', source), [3], source)
+        source = ('async function current(authorization, supplied) {\n'
+                  '  const result = await exchange(authorization);\n'
+                  '  return result.authTokenUpdatedAt === supplied;\n'
+                  '}\n')
+        self.assertEqual(scan_lines('js', source), [3], source)
+
+    def test_arrow_body_assignments_are_not_lost_when_reading_complete_rhs(self):
+        source = '''let value;
+const capture =
+  run(() => value = authorization);
+if (value === supplied) deny();
+'''
+        self.assertEqual(scan_lines('js', source), [4], source)
+        source = '''const value =
+  authorization;
+if (value === supplied) deny();
+'''
+        self.assertEqual(scan_lines('js', source), [3], source)
+
+    def test_next_line_member_reads_and_operators_do_not_become_call_results(self):
+        for continuation in ('.value', '?.value', '[field]', '+ authorization'):
+            source = ('async function current(authorization, supplied) {\n'
+                      '  const result = exchange(authorization)\n'
+                      f'    {continuation};\n'
+                      '  return result.updatedAt === supplied;\n'
+                      '}\n')
+            with self.subTest(continuation=continuation):
+                self.assertEqual(scan_lines('js', source), [4], source)
+
+    def test_call_result_property_writes_cannot_hide_secret_timestamps(self):
+        for write in ('result.updatedAt = authorization;',
+                      'result["updatedAt"] = authorization;',
+                      '(result).updatedAt = authorization;',
+                      '(result as Record).updatedAt = authorization;',
+                      'const alias = result; alias.updatedAt = authorization;'):
+            for name in ('result', 'result$'):
+                source = ('async function current(authorization, supplied) {\n'
+                          f'  const {name} = exchange(authorization);\n'
+                          f'  {write.replace("result", name)}\n'
+                          f'  return {name}.updatedAt === supplied;\n'
+                          '}\n')
+                with self.subTest(write=write, name=name):
+                    self.assertEqual(scan_lines('js', source), [4], source)
 
     def test_reported_auth_session_discriminants_are_clean(self) -> None:
         for source in (

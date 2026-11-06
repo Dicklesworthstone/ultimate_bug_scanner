@@ -337,7 +337,8 @@ def call_result_metadata_read(operand, call_results):
     if not read or read.group('root') not in call_results:
         return False
     terms = identifier_terms(identifier_re.findall(read.group('chain'))[-1])
-    return bool(terms) and terms[-1] in METADATA_TERMS
+    timestamp = terms in (['created', 'at'], ['updated', 'at'], ['expires', 'at'])
+    return bool(terms) and (terms[-1] in METADATA_TERMS or timestamp)
 
 
 def collect_sensitive_bindings(lines, code_lines):
@@ -347,7 +348,15 @@ def collect_sensitive_bindings(lines, code_lines):
     every assignment that made it sensitive was exactly a call expression and
     the name itself carries no secret vocabulary.
     """
+    from ubs_core.analyzers.taint_js import expression_end
+
     sensitive_vars, call_vars, alias_vars = set(), set(), set()
+    source, lexical_code = javascript_lexical_views('\n'.join(code_lines))
+    lexical_lines = lexical_code.splitlines()
+    offsets, position = [], 0
+    for line in code_lines:
+        offsets.append(position)
+        position += len(line) + 1
     # Carry unfinished tags over physical lines. Attribute names are DOM
     # properties, not assignments to JavaScript locals. Keep assignments inside
     # their {...} expressions eligible, including nested assignment expressions.
@@ -357,19 +366,34 @@ def collect_sensitive_bindings(lines, code_lines):
         tag = open_jsx_tag(tag + ' ' + strip_string_literals(code))
     for idx, code in enumerate(code_lines):
         stripped = code.strip()
-        if not stripped or '=>' in stripped:
+        if not stripped:
             continue
-        statement = statement_from(code_lines, idx, max_lines=5)
-        if not statement or safe_compare_re.search(statement):
+        if safe_compare_re.search(code):
             continue
-        statement = strip_string_literals(statement)
-        for match in assignment_head_re.finditer(statement):
-            prefix = tag_prefixes[idx] + ' ' + statement[:match.start()]
+        for match in assignment_head_re.finditer(lexical_lines[idx]):
+            prefix = tag_prefixes[idx] + ' ' + code[:match.start()]
             tag = open_jsx_tag(prefix)
             if tag and tag.count('{') == tag.count('}'):
                 continue
             name = match.group('name')
-            expr = statement[match.end():].split(';', 1)[0]
+            start = offsets[idx] + match.end()
+            start += len(lexical_code[start:]) - len(lexical_code[start:].lstrip())
+            # A physical-line cap can turn a complete call into a secret alias
+            # merely because its arguments span several lines. Balance the
+            # actual expression; quoted semicolons and braces are not syntax.
+            end = expression_end(lexical_code, start)
+            # A call's closing parenthesis is not an ASI boundary when the
+            # next line continues with member access, indexing or an operator.
+            # In particular `exchange(secret)\n.value` is an alias, not a call.
+            while end < len(lexical_code) and lexical_code[end] == '\n':
+                following = end + len(lexical_code[end:]) - len(lexical_code[end:].lstrip())
+                suffix = lexical_code[following:]
+                if not re.match(r'(?:\?\.|[.([+*/%&|^?:!<>=-]|\b(?:as|satisfies)\b)', suffix):
+                    break
+                if suffix.startswith(('++', '--')):
+                    break
+                end = expression_end(lexical_code, following)
+            expr = strip_string_literals(source[start:end])
             # String contents and JSX attribute names cannot taint locals;
             # real assignment expressions still propagate secret material.
             named = bool(sensitive_families(name))
@@ -379,6 +403,17 @@ def collect_sensitive_bindings(lines, code_lines):
                     call_vars.add(name)
                 else:
                     alias_vars.add(name)
+    for name in call_vars - alias_vars:
+        target = rf'(?<![\w$.]){re.escape(name)}(?![\w$])'
+        member = r'(?:\s*\))*(?:\s*(?:\?\.|!?\.)\s*[A-Za-z_$][\w$]*|\s*\[[^\]]*\])+'
+        write = r'\s*(?:[+*/%&|^?-]*=(?!=|>)|\+\+|--)'
+        cast = r'\s+(?:as|satisfies)\s+[\w$.<>\[\]|&, ]+\s*\)'
+        # Metadata provenance does not survive a property write or a bare
+        # alias. Read-only non-null assertions retain the ordinary policy.
+        if (re.search(target + member + write, lexical_code)
+                or re.search(target + cast + member + write, lexical_code)
+                or re.search(r'(?<![=!<>])=\s*' + target + r'(?![\w$.])', lexical_code)):
+            alias_vars.add(name)
     return sensitive_vars, frozenset(call_vars - alias_vars)
 
 

@@ -35,7 +35,11 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "modules/helpers"))
-RULES = {"network": "hcl.aws.public-admin-ingress", "storage": "hcl.aws.public-s3-acl"}
+RULES = {
+    "network": "hcl.aws.public-admin-ingress", "storage": "hcl.aws.public-s3-acl",
+    "iam": "hcl.aws.iam-wildcard-privilege", "tls": "hcl.aws.insecure-provider-tls",
+}
+CATEGORY_IDS = {RULES[name]: number for number, name in enumerate(("network", "storage", "iam", "tls"), 1)}
 
 
 @dataclass(frozen=True)
@@ -43,6 +47,7 @@ class Case:
     name: str
     code: str
     incomplete: bool = False
+    locations: tuple[tuple[str, int, int], ...] = ()
 
     @property
     def source(self):
@@ -54,7 +59,7 @@ class Case:
 
     @property
     def expected(self):
-        result = []
+        result = [(RULES[name], line, col) for name, line, col in self.locations]
         for line, source in enumerate(self.source.splitlines(), 1):
             if "# expect:" in source:
                 for name in source.split("# expect:", 1)[1].strip().split(","):
@@ -546,6 +551,325 @@ REVIEW_CASES = (
 )
 
 
+# Second independently specified slice: exact wildcard identity-policy intent
+# and an explicitly insecure HashiCorp AWS provider. Effective deployed access,
+# policy attachment, permissions boundaries, SCPs and trust policies are outside
+# this rule. AWS explicit Deny and conditions must not be mistaken for an
+# unconditional grant; unsupported policy interactions stay incomplete.
+# https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_grammar.html
+# https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_evaluation-logic.html
+# https://developer.hashicorp.com/terraform/language/functions/jsonencode
+# https://github.com/hashicorp/terraform-provider-aws/blob/main/website/docs/index.html.markdown
+IAM_CASES = (
+    Case("iam_literal_json_heredoc", '''
+        resource "aws_iam_policy" "admin" {
+          policy = <<POLICY
+        {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}
+        POLICY
+        }
+    ''', locations=(("iam", 2, 3),)),
+    Case("iam_jsonencode_wildcard_arrays", '''
+        resource "aws_iam_policy" "array_admin" {
+          policy = jsonencode({ # expect:iam
+            Version = "2012-10-17"
+            Statement = [{
+              Effect = "Allow"
+              Action = ["s3:GetObject", "*"]
+              Resource = ["arn:aws:s3:::example/*", "*"]
+            }]
+          })
+        }
+    '''),
+    Case("iam_local_object_policy", '''
+        locals {
+          permission = {
+            Effect = "Allow"
+            Action = "*"
+            Resource = "*"
+          }
+          document = {
+            Version = "2012-10-17"
+            Statement = [local.permission]
+          }
+        }
+        resource "aws_iam_role_policy" "inline_admin" {
+          role = var.role_name
+          policy = jsonencode(local.document) # expect:iam
+        }
+    '''),
+    Case("iam_quoted_json_user_policy", r'''
+        resource "aws_iam_user_policy" "user_admin" {
+          user = "example-user"
+          policy = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"*\",\"Resource\":\"*\"}}" # expect:iam
+        }
+    '''),
+    Case("iam_group_policy_single_statement", '''
+        resource "aws_iam_group_policy" "group_admin" {
+          group = "example-group"
+          policy = jsonencode({ # expect:iam
+            Statement = { Effect = "Allow", Action = "*", Resource = "*" }
+          })
+        }
+    '''),
+    Case("iam_restricted_actions_are_not_administrator", '''
+        resource "aws_iam_policy" "readonly" {
+          policy = jsonencode({
+            Statement = [{ Effect = "Allow", Action = ["ec2:Describe*", "s3:GetObject"], Resource = "*" }]
+          })
+        }
+    '''),
+    Case("iam_restricted_resources", '''
+        resource "aws_iam_policy" "bucket_only" {
+          policy = jsonencode({
+            Statement = [{ Effect = "Allow", Action = "*", Resource = "arn:aws:s3:::example/*" }]
+          })
+        }
+    '''),
+    Case("iam_deny_does_not_grant", '''
+        resource "aws_iam_policy" "deny_only" {
+          policy = jsonencode({
+            Statement = [{ Effect = "Deny", Action = "*", Resource = "*" }]
+          })
+        }
+    '''),
+    Case("iam_allow_with_deny_is_incomplete", '''
+        resource "aws_iam_policy" "with_deny" {
+          policy = jsonencode({
+            Statement = [
+              { Effect = "Allow", Action = "*", Resource = "*" },
+              { Effect = "Deny", Action = "*", Resource = "*" },
+            ]
+          })
+        }
+    ''', True),
+    Case("iam_conditional_allow_is_incomplete", '''
+        resource "aws_iam_policy" "conditional_admin" {
+          policy = jsonencode({
+            Statement = [{
+              Effect = "Allow"
+              Action = "*"
+              Resource = "*"
+              Condition = { IpAddress = { "aws:SourceIp" = "10.0.0.0/8" } }
+            }]
+          })
+        }
+    ''', True),
+    Case("iam_not_action_is_outside_selected_model", '''
+        resource "aws_iam_policy" "not_action" {
+          policy = jsonencode({
+            Statement = [{ Effect = "Allow", NotAction = "iam:*", Resource = "*" }]
+          })
+        }
+    ''', True),
+    Case("iam_duplicate_json_keys_are_invalid", '''
+        resource "aws_iam_policy" "duplicate_effect" {
+          policy = <<POLICY
+        {"Statement":[{"Effect":"Deny","Effect":"Allow","Action":"*","Resource":"*"}]}
+        POLICY
+        }
+    ''', True),
+    Case("iam_principal_invalid_in_identity_policy", '''
+        resource "aws_iam_policy" "invalid_principal" {
+          policy = jsonencode({
+            Statement = [{ Effect = "Allow", Action = "*", Resource = "*", Principal = "*" }]
+          })
+        }
+    ''', True),
+    Case("iam_invalid_action_type", '''
+        resource "aws_iam_policy" "invalid_action" {
+          policy = jsonencode({
+            Statement = [{ Effect = "Allow", Action = ["*", true], Resource = "*" }]
+          })
+        }
+    ''', True),
+    Case("iam_policy_attribute_requires_json_string", '''
+        resource "aws_iam_policy" "object_without_jsonencode" {
+          policy = { Statement = [{ Effect = "Allow", Action = "*", Resource = "*" }] }
+        }
+    ''', True),
+    Case("iam_malformed_json_is_partial", '''
+        resource "aws_iam_policy" "malformed" {
+          policy = <<POLICY
+        {"Statement":[{"Effect":"Allow","Action":"*","Resource":"*",}]}
+        POLICY
+        }
+    ''', True),
+    Case("iam_unknown_variable_policy", '''
+        resource "aws_iam_policy" "variable_document" {
+          policy = var.policy_json
+        }
+    ''', True),
+    Case("iam_policy_document_reference_is_not_guessed", '''
+        data "aws_iam_policy_document" "example" {
+          statement {
+            effect = "Allow"
+            actions = ["*"]
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "from_data" {
+          policy = data.aws_iam_policy_document.example.json
+        }
+    ''', True),
+    Case("iam_unknown_jsonencode_member", '''
+        resource "aws_iam_policy" "unknown_action" {
+          policy = jsonencode({
+            Statement = [{ Effect = "Allow", Action = var.actions, Resource = "*" }]
+          })
+        }
+    ''', True),
+    Case("iam_inactive_unknown_policy_is_not_evaluated", '''
+        resource "aws_iam_policy" "disabled" {
+          count = 0
+          policy = var.policy_json
+        }
+    '''),
+    Case("iam_provider_rebinding_is_unknown", '''
+        terraform {
+          required_providers {
+            aws = { source = "example/not-aws" }
+          }
+        }
+        resource "aws_iam_policy" "unverified_provider" {
+          policy = jsonencode({
+            Statement = [{ Effect = "Allow", Action = "*", Resource = "*" }]
+          })
+        }
+    ''', True),
+    Case("iam_selected_comment_suppression", '''
+        resource "aws_iam_policy" "suppressed_admin" {
+          policy = jsonencode({ # ubs:ignore[hcl.aws.iam-wildcard-privilege]
+            Statement = [{ Effect = "Allow", Action = "*", Resource = "*" }]
+          })
+        }
+    '''),
+    Case("iam_unrelated_resource_policy_is_not_identity_policy", '''
+        resource "aws_s3_bucket_policy" "out_of_scope" {
+          bucket = "example-bucket"
+          policy = jsonencode({
+            Statement = [{ Effect = "Allow", Action = "*", Resource = "*", Principal = "*" }]
+          })
+        }
+        locals {
+          documentation = "Effect Allow Action * Resource *"
+        }
+        # resource "aws_iam_policy" "decoy" { policy = "*" }
+    '''),
+    Case("iam_empty_optional_sid_does_not_restrict_permissions", '''
+        resource "aws_iam_policy" "empty_sid_admin" {
+          policy = jsonencode({ # expect:iam
+            Statement = [{ Sid = "", Effect = "Allow", Action = "*", Resource = "*" }]
+          })
+        }
+    '''),
+)
+
+
+TLS_CASES = (
+    Case("aws_provider_insecure_tls", '''
+        provider "aws" {
+          insecure = true # expect:tls
+        }
+    '''),
+    Case("aws_provider_renamed_local_binding", '''
+        terraform {
+          required_providers {
+            cloud = { source = "hashicorp/aws" }
+          }
+        }
+        provider "cloud" {
+          alias = "secondary"
+          insecure = true # expect:tls
+        }
+    '''),
+    Case("aws_provider_local_insecure_value", '''
+        locals {
+          skip_verification = true
+        }
+        provider "aws" {
+          insecure = local.skip_verification # expect:tls
+        }
+    '''),
+    Case("aws_provider_string_true_coerces_to_boolean", '''
+        provider "aws" {
+          insecure = "true" # expect:tls
+        }
+    '''),
+    Case("aws_provider_string_false_coerces_to_boolean", '''
+        provider "aws" {
+          insecure = "false"
+        }
+    '''),
+    Case("aws_provider_false_and_default_tls", '''
+        provider "aws" {
+          insecure = false
+        }
+        provider "aws" {
+          alias = "default_tls"
+          region = "us-east-1"
+        }
+    '''),
+    Case("foreign_provider_insecure_is_not_aws", '''
+        terraform {
+          required_providers {
+            aws = { source = "example/not-aws" }
+          }
+        }
+        provider "aws" {
+          insecure = true
+        }
+    '''),
+    Case("aws_provider_insecure_unknown", '''
+        provider "aws" {
+          insecure = var.skip_verification
+        }
+    ''', True),
+    Case("aws_provider_unresolved_source", '''
+        terraform {
+          required_providers {
+            aws = { source = var.provider_source }
+          }
+        }
+        provider "aws" {
+          insecure = true
+        }
+    ''', True),
+    Case("aws_provider_invalid_boolean", '''
+        provider "aws" {
+          insecure = "sometimes"
+        }
+    ''', True),
+    Case("aws_provider_duplicate_alias_unknown", '''
+        provider "aws" {
+          alias = "same"
+          insecure = true
+        }
+        provider "aws" {
+          alias = "same"
+          insecure = false
+        }
+    ''', True),
+    Case("aws_provider_selected_comment_suppression", '''
+        provider "aws" {
+          alias = "suppressed_tls"
+          insecure = true # ubs:ignore[hcl.aws.insecure-provider-tls]
+        }
+    '''),
+    Case("aws_provider_null_uses_default_tls_verification", '''
+        locals {
+          default_tls = null
+        }
+        provider "aws" {
+          insecure = null
+        }
+        provider "aws" {
+          alias = "local_default"
+          insecure = local.default_tls
+        }
+    '''),
+)
+
+
 class EvidenceTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -588,7 +912,7 @@ class HCLNativeTests(EvidenceTest):
         for record in records:
             self.assertEqual(record["severity"], "warning", record)
             self.assertEqual(record["path"], str(source), record)
-            self.assertEqual(record["category_id"], 1 if record["rule"] == RULES["network"] else 2, record)
+            self.assertEqual(record["category_id"], CATEGORY_IDS[record["rule"]], record)
             self.assertTrue(record["message"], record)
 
     def test_selected_module_files_supply_protection_and_locals(self):
@@ -617,6 +941,47 @@ class HCLNativeTests(EvidenceTest):
         self.assertEqual(records, [])
         self.assertTrue(errors)
 
+    def test_iam_local_expansion_budget_is_incomplete(self):
+        # A small source DAG can encode hundreds of MiB. Bound the real helper
+        # process as well as requiring an explicit incomplete result, so a
+        # missing work/encoding budget cannot hang the acceptance suite.
+        declarations = ['  level0 = ["' + "a" * 64 + '"]']
+        declarations.extend(f"  level{level} = [local.level{level - 1}, local.level{level - 1}]"
+                            for level in range(1, 23))
+        code = ("locals {\n" + "\n".join(declarations) + "\n}\n"
+                'resource "aws_iam_policy" "expanded" {\n'
+                '  policy = jsonencode({\n'
+                '    Statement = [{ Effect = "Allow", Action = "*", Resource = "*", Sid = jsonencode(local.level22) }]\n'
+                '  })\n}\n')
+        case = Case("iam_expansion_budget", code, True)
+        directory = self.materialize((case,), case.name)
+        source = directory / case.filename
+        program = ("import json,sys; from pathlib import Path; "
+                   "from ubs_core.hcl_scan import analyze_source; p=Path(sys.argv[1]); "
+                   "print(json.dumps(analyze_source(p.read_text(),str(p))))")
+        command = [sys.executable, "-c", program, str(source)]
+        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", PYTHONPATH=str(ROOT / "modules/helpers"))
+        start = time.monotonic()
+        try:
+            result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=10, check=False)
+        except subprocess.TimeoutExpired as exc:
+            (directory / "receipt.json").write_text(json.dumps({
+                **self.identity, "command": command, "status": "timeout", "elapsed_s": time.monotonic() - start,
+                "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            }, indent=2) + "\n", encoding="utf-8")
+            self.fail(f"IAM literal expansion exceeded 10-second bound: {exc}")
+        (directory / "stdout.log").write_text(result.stdout, encoding="utf-8")
+        (directory / "stderr.log").write_text(result.stderr, encoding="utf-8")
+        (directory / "receipt.json").write_text(json.dumps({
+            **self.identity, "command": command, "exit": result.returncode, "elapsed_s": time.monotonic() - start,
+            "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            "analyzer_sha256": hashlib.sha256((ROOT / "modules/helpers/ubs_core/hcl_scan.py").read_bytes()).hexdigest(),
+        }, indent=2) + "\n", encoding="utf-8")
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        records, errors = json.loads(result.stdout)
+        self.assertEqual(records, [], (records, errors))
+        self.assertTrue(errors, "expanded policy must not produce a complete result")
+
 
 def native_test(case):
     def run(self):
@@ -624,7 +989,7 @@ def native_test(case):
     return run
 
 
-for _case in CASES + REVIEW_CASES:
+for _case in CASES + REVIEW_CASES + IAM_CASES + TLS_CASES:
     setattr(HCLNativeTests, "test_" + _case.name, native_test(_case))
 
 
@@ -738,6 +1103,57 @@ class HCLPublicTests(EvidenceTest):
         changed = Case(protector.name, protector.code.replace("true", "false"))
         (directory / changed.filename).write_text(changed.source, encoding="utf-8")
         exposed = Case(bucket.name, CASES[11].code)
+        self.assert_report(*self.execute(directory, cached=True), "json", (exposed, changed))
+
+    def test_iam_tls_public_formats_suppression_and_categories(self):
+        policies = {case.name: case for case in IAM_CASES}
+        providers = {case.name: case for case in TLS_CASES}
+        cases = (policies["iam_literal_json_heredoc"], policies["iam_restricted_actions_are_not_administrator"],
+                 policies["iam_selected_comment_suppression"], providers["aws_provider_insecure_tls"],
+                 providers["aws_provider_selected_comment_suppression"])
+        directory = self.materialize(cases, "iam-tls-formats")
+        for mode in ("module-json", "module-sarif", "json", "sarif"):
+            with self.subTest(mode=mode):
+                self.assert_report(*self.execute(directory, mode), mode, cases)
+        for category, kept_rule in ((3, RULES["tls"]), (4, RULES["iam"])):
+            expected = [(case.filename, rule, line, col) for case in cases for rule, line, col in case.expected
+                        if rule == kept_rule]
+            self.assert_report(*self.execute(directory, extra=(f"--skip-hcl={category}",)),
+                               "json", cases, expected_override=expected)
+
+    def test_iam_unknown_policy_keeps_other_selected_findings(self):
+        policies = {case.name: case for case in IAM_CASES}
+        providers = {case.name: case for case in TLS_CASES}
+        cases = (policies["iam_literal_json_heredoc"], policies["iam_unknown_variable_policy"],
+                 providers["aws_provider_insecure_tls"])
+        directory = self.materialize(cases, "iam-tls-partial")
+        for mode in ("json", "sarif"):
+            with self.subTest(mode=mode):
+                self.assert_report(*self.execute(directory, mode), mode, cases, partial=True)
+
+    def test_iam_context_cache_invalidates_changed_local_permissions(self):
+        policy = Case("main", '''
+            resource "aws_iam_policy" "context_policy" {
+              policy = jsonencode({
+                Statement = [{ Effect = "Allow", Action = local.actions, Resource = "*" }]
+              })
+            }
+        ''')
+        permissions = Case("permissions", '''
+            locals {
+              actions = ["s3:GetObject"]
+            }
+        ''')
+        directory = self.materialize((policy, permissions), "iam-context-cache")
+        for _ in range(2):
+            self.assert_report(*self.execute(directory, cached=True), "json", (policy, permissions))
+        changed = Case(permissions.name, '''
+            locals {
+              actions = ["*"]
+            }
+        ''')
+        (directory / changed.filename).write_text(changed.source, encoding="utf-8")
+        exposed = Case(policy.name, policy.code, locations=(("iam", 2, 3),))
         self.assert_report(*self.execute(directory, cached=True), "json", (exposed, changed))
 
 

@@ -1,6 +1,7 @@
 """Bounded Terraform AWS configuration checks; no plan, state or provider execution.
 
-Only explicit administrative ingress and public S3 ACL intent are checked.
+Selected administrative ingress, public S3 ACLs, unrestricted IAM policy intent,
+and disabled AWS provider TLS verification are checked.
 Selected .tf files in one directory share locals and resource identities. Input
 variables, remote modules, templates and dynamic relevant configuration remain
 unknown. A complete result describes these selected checks, never deployed
@@ -25,15 +26,21 @@ from ubs_core.suppression import has_suppression_marker
 RULES = {
     "hcl.aws.public-admin-ingress": ("network", 1, "AWS security group permits public administrative ingress"),
     "hcl.aws.public-s3-acl": ("storage", 2, "AWS S3 configuration requests a public ACL"),
+    "hcl.aws.iam-wildcard-privilege": ("iam", 3, "AWS IAM identity policy allows every action on every resource"),
+    "hcl.aws.insecure-provider-tls": ("tls", 4, "AWS provider explicitly disables TLS verification"),
+}
+REMEDIATION = {
+    1: "Restrict SSH/RDP ingress to trusted networks or a private management path.",
+    2: "Use a private ACL and explicit bucket ownership/public-access protections.",
+    3: "Grant only the actions and resource ARNs needed by the intended identity.",
+    4: "Keep provider TLS verification enabled and configure a trusted CA bundle when needed.",
 }
 RULE_METADATA = {
     rule: {
         "language": "hcl", "name": title, "family": "infrastructure_security",
         "category_id": "hcl." + slug, "severity": "warning", "confidence": "unknown",
         "message": title,
-        "remediation": ("Restrict SSH/RDP ingress to trusted networks or a private management path."
-                        if category == 1 else
-                        "Use a private ACL and explicit bucket ownership/public-access protections."),
+        "remediation": REMEDIATION[category],
         "manifest_cases": ["hcl-aws-buggy", "hcl-aws-clean"],
     } for rule, (slug, category, title) in RULES.items()
 }
@@ -41,8 +48,15 @@ MAX_SOURCE_BYTES = 4 * 1024 * 1024
 MAX_CONTEXT_BYTES = 32 * 1024 * 1024
 MAX_TOKENS = 200_000
 MAX_NESTING = 64
+MAX_EVALUATIONS = 200_000
+MAX_POLICY_BYTES = 256 * 1024
 NETWORK = "hcl.aws.public-admin-ingress"
 STORAGE = "hcl.aws.public-s3-acl"
+IAM = "hcl.aws.iam-wildcard-privilege"
+TLS = "hcl.aws.insecure-provider-tls"
+IAM_RESOURCES = frozenset({"aws_iam_policy", "aws_iam_role_policy", "aws_iam_user_policy", "aws_iam_group_policy"})
+AWS_SOURCES = frozenset({"hashicorp/aws", "registry.terraform.io/hashicorp/aws"})
+CATEGORIES = frozenset(category for _, category, _ in RULES.values())
 
 
 class Incomplete(ValueError):
@@ -262,6 +276,8 @@ class Values:
     def __init__(self, blocks: list[Block]):
         self.locals = {}
         self.duplicate_locals = set()
+        self.memo = {}
+        self.evaluations = 0
         for block in blocks:
             if block.kind == "locals" and not block.labels:
                 for name, attribute in block.attributes.items():
@@ -270,6 +286,9 @@ class Values:
                     self.locals[name] = attribute
 
     def evaluate(self, tokens: tuple[Token, ...], visiting: tuple[str, ...] = ()):
+        self.evaluations += 1
+        if self.evaluations > MAX_EVALUATIONS:
+            return Unknown("HCL expression evaluation budget exhausted")
         low, high = 0, len(tokens)
         while low < high and tokens[low].kind == "newline":
             low += 1
@@ -300,10 +319,35 @@ class Values:
                 return Unknown(f"cyclic or duplicate local {name}")
             if name not in self.locals:
                 return Unknown(f"unresolved local {name}")
-            value = self.evaluate(self.locals[name].tokens, (*visiting, name))
+            if name not in self.memo:
+                self.memo[name] = self.evaluate(self.locals[name].tokens, (*visiting, name))
+            value = self.memo[name]
             for member in members:
                 value = value.get(member, Unknown(f"unresolved local member {member}")) if isinstance(value, dict) else Unknown("unresolved local object")
             return value
+        if (len(tokens) >= 3 and tokens[0].kind == "word" and tokens[0].value == "jsonencode"
+                and tokens[1].value == "(" and tokens[-1].value == ")"):
+            # Only the built-in single-argument function is evaluated. No file
+            # reads, provider functions, templates or external code are run.
+            opening = next(index for index, token in enumerate(original) if token.value == "(")
+            arguments = split_items(original[opening + 1:-1])
+            if len(arguments) != 1:
+                return Unknown("jsonencode requires one supported argument")
+            value = self.evaluate(arguments[0], visiting)
+            if unknown(value):
+                return Unknown("jsonencode contains unresolved configuration")
+            # Local DAGs can describe exponentially larger JSON than their
+            # source. Stream into a bounded buffer instead of expanding first.
+            chunks, size = [], 0
+            try:
+                for chunk in json.JSONEncoder(ensure_ascii=True, allow_nan=False, separators=(",", ":")).iterencode(value):
+                    size += len(chunk)
+                    if size > MAX_POLICY_BYTES:
+                        return Unknown("encoded JSON policy byte budget exhausted")
+                    chunks.append(chunk)
+                return "".join(chunks)
+            except (ValueError, TypeError, RecursionError):
+                return Unknown("JSON encoding exceeded the supported value or nesting limits")
         if tokens[0].value == "[" and tokens[-1].value == "]":
             return [self.evaluate(part, visiting) for part in split_items(original[1:-1])]
         if tokens[0].value == "{" and tokens[-1].value == "}":
@@ -328,13 +372,87 @@ class Values:
 
 
 def unknown(value) -> bool:
-    if isinstance(value, Unknown):
-        return True
-    if isinstance(value, list):
-        return any(unknown(item) for item in value)
-    if isinstance(value, dict):
-        return any(unknown(item) for item in value.values())
+    pending, seen = [value], set()
+    while pending:
+        item = pending.pop()
+        if isinstance(item, Unknown):
+            return True
+        if isinstance(item, (dict, list)) and id(item) not in seen:
+            seen.add(id(item))
+            pending.extend(item.values() if isinstance(item, dict) else item)
     return False
+
+
+def policy_object(pairs):
+    """JSON policy keys are unique; a last-key-wins parse can invent a grant."""
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise Incomplete("duplicate IAM JSON key " + key)
+        result[key] = value
+    return result
+
+
+def policy_constant(value):
+    raise Incomplete("invalid IAM JSON constant " + value)
+
+
+def policy_strings(value, field):
+    values = [value] if isinstance(value, str) else value
+    if not isinstance(values, list) or not values or any(not isinstance(item, str) or not item for item in values):
+        raise Incomplete("IAM " + field + " must contain nonempty strings")
+    return values
+
+
+def wildcard_policy(value) -> bool:
+    """Prove only an unconditional all-action/all-resource identity grant.
+
+    Other policy types, complement operators and effective policy evaluation
+    are deliberately excluded. A deny can restrict a candidate grant, so it
+    requires an incomplete result instead of a guessed permission outcome.
+    """
+    if not isinstance(value, str):
+        raise Incomplete("IAM policy must resolve to a JSON string")
+    try:
+        if len(value.encode("utf-8")) > MAX_POLICY_BYTES:
+            raise Incomplete("IAM JSON policy byte budget exhausted")
+        document = json.loads(value, object_pairs_hook=policy_object, parse_constant=policy_constant)
+    except (ValueError, RecursionError) as exc:
+        raise Incomplete("invalid or unsupported IAM JSON policy: " + str(exc)) from exc
+    if not isinstance(document, dict) or set(document) - {"Version", "Statement"}:
+        raise Incomplete("unsupported IAM identity-policy document fields")
+    version = document.get("Version", "2008-10-17")
+    if not isinstance(version, str) or version not in {"2008-10-17", "2012-10-17"}:
+        raise Incomplete("unsupported IAM policy language version")
+    statements = document.get("Statement")
+    statements = [statements] if isinstance(statements, dict) else statements
+    if not isinstance(statements, list) or not statements:
+        raise Incomplete("IAM policy requires a nonempty Statement object or array")
+    candidate, conditional, denied, identifiers = False, False, False, set()
+    for statement in statements:
+        if not isinstance(statement, dict) or set(statement) - {"Sid", "Effect", "Action", "Resource", "Condition"}:
+            raise Incomplete("unsupported IAM statement fields, principal or complement operators")
+        if "Sid" in statement:
+            sid = statement["Sid"]
+            if not isinstance(sid, str) or not re.fullmatch(r"[A-Za-z0-9]*", sid) or sid in identifiers:
+                raise Incomplete("invalid or duplicate IAM statement identifier")
+            identifiers.add(sid)
+        effect = statement.get("Effect")
+        if not isinstance(effect, str) or effect not in {"Allow", "Deny"}:
+            raise Incomplete("IAM statement Effect must be Allow or Deny")
+        actions = policy_strings(statement.get("Action"), "Action")
+        resources = policy_strings(statement.get("Resource"), "Resource")
+        if "Condition" in statement:
+            condition = statement["Condition"]
+            if not isinstance(condition, dict) or not condition or any(not isinstance(v, dict) or not v for v in condition.values()):
+                raise Incomplete("unsupported IAM Condition structure")
+        denied |= effect == "Deny"
+        if effect == "Allow" and "*" in actions and "*" in resources:
+            conditional |= "Condition" in statement
+            candidate |= "Condition" not in statement
+    if conditional or candidate and denied:
+        raise Incomplete("IAM wildcard grant has conditional or deny constraints outside the selected model")
+    return candidate
 
 
 class Module:
@@ -402,7 +520,7 @@ class Module:
         if isinstance(spec, dict) and "source" in spec and not isinstance(source, str):
             self.error(block, "AWS provider source is unresolved")
             return None
-        if source is not None and source not in {"hashicorp/aws", "registry.terraform.io/hashicorp/aws"}:
+        if source is not None and source not in AWS_SOURCES:
             self.error(block, "resource does not resolve to the HashiCorp AWS provider")
             return None
         if (root != "aws" and source is None) or isinstance(spec, Unknown):
@@ -573,6 +691,70 @@ class Module:
         elif not ignored:
             self.emit(block, "acl", STORAGE, f"{acl} is configured without a selected effective ACL ignore control")
 
+    def iam(self, block: Block):
+        attribute = block.attributes.get("policy")
+        if attribute is None:
+            self.error(block, "IAM identity policy document is missing")
+            return
+        try:
+            candidate = wildcard_policy(self.values.attribute(block, "policy"))
+        except Incomplete as exc:
+            self.error(block, str(exc), attribute)
+            return
+        if candidate:
+            self.emit(block, "policy", IAM, "an unconditional Allow selects '*' for both Action and Resource; policy attachment and effective permissions are not evaluated")
+
+    def provider_tls(self):
+        """Inspect actual AWS provider configurations, including local aliases."""
+        configurations = {}
+        for block in self.blocks:
+            if block.kind != "provider":
+                continue
+            if len(block.labels) != 1:
+                if "insecure" in block.attributes:
+                    self.error(block, "provider configuration requires one local provider name")
+                continue
+            root = block.labels[0]
+            spec = self.required.get(root)
+            if root in self.required:
+                if not isinstance(spec, dict):
+                    if "insecure" in block.attributes:
+                        self.error(block, "provider source is unresolved for TLS verification")
+                    continue
+                source = spec.get("source", "hashicorp/" + root)
+                if not isinstance(source, str):
+                    if "insecure" in block.attributes:
+                        self.error(block, "provider source is unresolved for TLS verification")
+                    continue
+            else:
+                source = "hashicorp/" + root
+            if source not in AWS_SOURCES:
+                continue
+            alias = self.values.attribute(block, "alias", "")
+            if (not isinstance(alias, str) or ("alias" in block.attributes and not re.fullmatch(r"[A-Za-z_][\w-]*", alias))
+                    or "count" in block.attributes or "for_each" in block.attributes):
+                self.error(block, "AWS provider configuration identity is invalid or unresolved")
+                continue
+            configurations.setdefault((root, alias), []).append(block)
+        for blocks in configurations.values():
+            if len(blocks) != 1:
+                for block in blocks:
+                    self.error(block, "duplicate AWS provider configuration identity")
+                continue
+            block = blocks[0]
+            attribute = block.attributes.get("insecure")
+            if attribute is None:
+                continue  # The documented provider default verifies TLS.
+            value = self.values.attribute(block, "insecure")
+            if value is None:
+                value = False  # Null omits an optional argument and uses its default.
+            if isinstance(value, str) and value in {"true", "false"}:
+                value = value == "true"  # Terraform's primitive bool conversion.
+            if type(value) is not bool:
+                self.error(block, "AWS provider TLS verification setting is unresolved", attribute)
+            elif value:
+                self.emit(block, "insecure", TLS, "insecure=true permits provider HTTPS requests without certificate verification")
+
     def run(self):
         protections = [b for b in self.resources if b.labels[0] in
                        {"aws_s3_bucket_public_access_block", "aws_s3_bucket_ownership_controls"}]
@@ -580,7 +762,8 @@ class Module:
         for block in self.resources:
             kind = block.labels[0]
             relevant = (NETWORK in self.enabled and kind in {"aws_security_group", "aws_security_group_rule", "aws_vpc_security_group_ingress_rule"}
-                        or STORAGE in self.enabled and kind in {"aws_s3_bucket", "aws_s3_bucket_acl"})
+                        or STORAGE in self.enabled and kind in {"aws_s3_bucket", "aws_s3_bucket_acl"}
+                        or IAM in self.enabled and kind in IAM_RESOURCES)
             if not relevant:
                 continue
             if block.labels in seen:
@@ -610,8 +793,12 @@ class Module:
                     self.error(block, "security group rule direction is unresolved")
             elif kind == "aws_vpc_security_group_ingress_rule":
                 self.ingress(block, modern=True)
+            elif kind in IAM_RESOURCES:
+                self.iam(block)
             else:
                 self.acl(block, provider, protections)
+        if TLS in self.enabled:
+            self.provider_tls()
         return self.findings, list(dict.fromkeys(self.errors))
 
 
@@ -655,7 +842,7 @@ def main(argv=None) -> int:
     parser.add_argument("--project-dir", default=".")
     parser.add_argument("--project", default="")
     parser.add_argument("--skip", type=categories, default=set())
-    parser.add_argument("--only", type=categories, default={1, 2})
+    parser.add_argument("--only", type=categories, default=set(CATEGORIES))
     parser.add_argument("--json-out", required=True)
     parser.add_argument("--sarif-out", default="")
     parser.add_argument("--text-out", default="")
@@ -666,8 +853,8 @@ def main(argv=None) -> int:
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--fail-on-warning", action="store_true")
     args = parser.parse_args(argv)
-    if not args.only or not args.only <= {1, 2}:
-        parser.error("HCL categories are 1 (network) and 2 (storage)")
+    if not args.only or not args.only <= CATEGORIES:
+        parser.error("HCL categories are 1 (network), 2 (storage), 3 (iam), and 4 (tls)")
     from ubs_core.cache import CapturingSink, ScanCache
     raw = Path(args.files_from).read_bytes()
     files = list(dict.fromkeys(Path(os.fsdecode(entry)).resolve() for entry in raw.split(b"\0") if entry))
@@ -690,8 +877,8 @@ def main(argv=None) -> int:
     # Salt every file entry with the complete selected context, including paths.
     context = hashlib.sha256(json.dumps(sources, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
     cache = ScanCache(lang="hcl", project_dir=args.project_dir,
-                      skip=",".join(map(str, sorted(({1, 2} - args.only) | args.skip))),
-                      extra="aws-config-v1:" + context)
+                      skip=",".join(map(str, sorted((CATEGORIES - args.only) | args.skip))),
+                      extra="aws-config-v2:" + context)
     cached, pending = cache.partition_files(files)
     sink = CapturingSink()
     if pending:

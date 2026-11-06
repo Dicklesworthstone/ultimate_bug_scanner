@@ -10,6 +10,31 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Bind selected Kotlin Ktor call/request member properties to their actual API
+  types across redirect, filesystem traversal, response-header and outbound-URL
+  analysis. Follow request objects and extracted collections through aliases and
+  supported local helpers; keep ordinary maps, local lookalikes, same-named
+  methods and extension-only APIs distinct. Preserve input taint through unknown
+  calls, report unmodeled request field initialization as incomplete, and retain
+  existing rule identities and the separate JDBC analysis. Add independent
+  source/policy regressions and native JSON/SARIF, selection, suppression and
+  cache acceptance checks.
+
+- Extend Terraform AWS scanning with unrestricted IAM identity-policy grants
+  and explicitly disabled provider TLS verification. Decode literal JSON and
+  bounded `jsonencode` values through shared locals; reject duplicate keys and
+  keep conditional/deny policy interactions incomplete. Respect actual provider
+  identity, aliases, primitive boolean conversion and secure optional defaults.
+  Add IAM/TLS categories, scoped suppression, report/cache checks and bounded
+  local/JSON expansion without executing Terraform or claiming deployed access.
+
+- Resolve selected Java and Kotlin Servlet request sources by API identity
+  across redirect, path traversal, response-header and outbound-URL checks.
+  Follow arbitrarily named parameters, aliases and selected helper returns;
+  recognize both Jakarta and Javax APIs and reject declared local lookalikes.
+  Preserve tainted argument flow through unsupported getter overloads and keep
+  existing public rule IDs and the separate JDBC receiver analysis.
+
 - Add native Terraform HCL scanning for explicit AWS public SSH/RDP ingress
   and public S3 canned ACLs. Resolve selected literal/local configuration and
   same-directory bucket protections, distinguish conflicting or unknown inputs

@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.5.41-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.5.43-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -152,6 +152,44 @@ const zipCode = parseInt(userInput);  // 💥 "08" becomes 0 in old browsers (oc
 - **Go** – Category 5/17 now run a Go AST walker (`modules/helpers/resource_lifecycle_go.go`) that detects `context.With*` calls missing cancel, `time.NewTicker/NewTimer` without `Stop`, `os.Open/sql.Open` without `Close`, and mutex `Lock`/`Unlock` symmetry. Category 9 also tracks request query/header/form/framework values into response headers unless they strip or reject CR/LF, tracks redirect targets into `http.Redirect`, framework `Redirect` calls, and `Location` headers unless they pass through same-origin or explicit allow-list validation, flags request-derived reverse proxy targets flowing into `httputil.NewSingleHostReverseProxy`, `ProxyRequest.SetURL`, or `Director` URL mutation without HTTPS plus host allow-list validation, flags request-derived SQL text flowing into `ExecContext`/`QueryContext`, sqlx-style helpers, or query-builder predicates unless request data is passed as bound parameters, flags credentialed wildcard or reflected-origin CORS responses, and catches auth/session cookies missing `HttpOnly`, `Secure`, or `SameSite` protections. Findings come straight from the AST/resource helper or taint pass positions, so “ticker missing Stop()” and header/open-redirect/reverse-proxy/CORS/cookie/SQL lines map to exact `file:line` references instead of coarse regex summaries.
 - **Java / Kotlin** – Category 5 surfaces `FileInputStream`, readers/writers, JDBC handles, etc. that were created outside try-with-resources, while Category 19 keeps tracking executor services and file streams that never close. Category 4 also tracks servlet/Spring/Ktor request parameters, headers, and annotated parameters into response headers unless they strip/reject CR/LF or encode header fragments, and into redirect sinks such as `sendRedirect`, `respondRedirect`, Spring `redirect:` views, `RedirectView`, `ModelAndView`, and `Location` headers unless a same-origin or explicit allow-list helper is applied first. The summary text matches the manifest fixtures, so CI will fail if regression swallows these warnings.
 
+#### Java and Kotlin request identity
+
+The redirect, path traversal, response-header and outbound-URL analyzers recognize
+selected `jakarta.servlet` and `javax.servlet` request APIs by their declared types.
+A `ServletRequest` or `HttpServletRequest` can have an arbitrary variable name;
+selected aliases and same-file helper returns carry its request identity. The
+supported sources include `getParameter` and the HTTP request getters `getHeader`,
+`getQueryString`, `getRequestURI`, `getPathInfo` and `getServletPath`.
+
+An unrelated local type named `HttpServletRequest`, or a non-Servlet object named
+`request`, does not establish Servlet provenance. Unsupported overloads retain
+ordinary argument-flow analysis, and unknown external transformations do not
+inherit a request type merely from their input. These checks extend the shared
+bounded request-flow engine without resolving arbitrary external Servlet
+implementations. Existing public rule IDs and sink locations are unchanged.
+
+The same four analyzers recognize selected Kotlin Ktor member properties by
+their actual API receiver type:
+
+| Proven receiver | Supported request members |
+| --- | --- |
+| `ApplicationCall`, `PipelineCall`, `RoutingCall` | `.request` carries request-object identity; `.parameters` supplies request input |
+| `ApplicationRequest`, `PipelineRequest`, `RoutingRequest` | `.queryParameters`, `.rawQueryParameters`, `.headers` supply request input |
+| `RoutingCall` specifically | `.pathParameters`, `.queryParameters` also supply request input |
+
+Import aliases, selected type aliases, local aliases and supported same-file
+helper arguments/returns preserve this identity. Extracted collections carry
+request input through indexing and `.get()`. A bare `Parameters` or `Headers`
+value, an ordinary map, or a proven local lookalike does not become request input
+from its type or member names alone. Calls named `request()`, `headers()` or
+`queryParameters()` remain distinct from the API's member properties.
+
+This bounded Ktor adapter does not infer implicit route-DSL receivers or resolve
+extension-only request APIs such as `uri`, `path()`, `header()` and `receive*`.
+Request-derived field initialization that requires unmodeled object state reports
+incomplete analysis. Unknown calls preserve existing input taint while dropping
+unsupported request-object identity; the separate JDBC analysis is unchanged.
+
 #### Elixir raw SQL request flow
 
 Elixir category 4 tracks request-derived query text through local helpers, aliases,
@@ -291,7 +329,7 @@ and [REVOKE semantics](https://www.postgresql.org/docs/current/sql-revoke.html).
 
 #### Terraform AWS configuration
 
-Native `.tf` files now have two bounded AWS checks, without running Terraform,
+Native `.tf` files have four bounded AWS checks, without running Terraform,
 loading provider plugins, or contacting AWS:
 
 ```bash
@@ -314,13 +352,30 @@ Conflicting ACL blocking, `BucketOwnerEnforced`, competing controls or unknown
 protection produce incomplete analysis, rather than a claim about deployed
 access. Missing account-wide controls and provider defaults are not inferred.
 
+`hcl.aws.iam-wildcard-privilege` warns for unconditional identity-policy `Allow`
+statements that select `"*"` in both `Action` and `Resource`. It supports
+`aws_iam_policy`, `aws_iam_role_policy`, `aws_iam_user_policy` and
+`aws_iam_group_policy` with literal JSON strings, heredocs, or bounded
+`jsonencode` expressions over selected literals and locals. Conditions or deny
+statements constraining a candidate grant produce incomplete analysis. Malformed
+JSON, duplicate keys, unsupported complement operators and unresolved policy
+documents also remain incomplete. The warning describes policy intent; it does
+not establish attachment, effective IAM permissions or permission-boundary state.
+
+`hcl.aws.insecure-provider-tls` warns when an actual HashiCorp AWS provider
+configuration sets `insecure = true`, including provider aliases and renamed
+local provider bindings. Literal string booleans follow Terraform's primitive
+conversion; omitted or null values use the documented secure default. Unknown
+settings and duplicate provider identities remain incomplete. Unrelated provider
+plugins do not acquire AWS semantics from a similarly named option.
+
 Selected files in the same directory share literal/local values and protective
 resource identities; nested directories remain distinct Terraform modules.
 Changes to any selected context file invalidate cached results. Actual `#`,
 `//` and block comments support scoped `ubs:ignore[rule-id]`; quoted strings,
 templates and heredocs cannot act as suppression comments. Categories are
-`hcl.network` (1) and `hcl.storage` (2), including `--skip-hcl=1` and `.ubs.json`
-policy. Both rules emit warnings; `--fail-on-warning` or the strict profile
+`hcl.network` (1), `hcl.storage` (2), `hcl.iam` (3) and `hcl.tls` (4), including
+`--skip-hcl=3` and `.ubs.json` policy. All four rules emit warnings; `--fail-on-warning` or the strict profile
 makes them fail the scan.
 
 This first slice does not evaluate Terraform plans, state, remote modules,
@@ -329,13 +384,18 @@ Relevant unresolved expressions, malformed syntax and exhausted budgets
 produce partial reports and exit 2 while retaining proven findings. Ordinary
 directory scans exclude downloaded `.terraform` dependencies. Source bounds
 are 4 MiB per file, 32 MiB per selected context, 200,000 tokens and 64 nesting
-levels. Custom `--rules` and extra non-`.tf` extensions are explicitly refused.
-Coverage of other providers, IAM, TLS settings and deployed reachability remains
-outside this slice, and confidence is uncalibrated.
+levels. Local evaluation is memoized and bounded; JSON policy input and encoded
+output are capped at 256 KiB, including expansion of shared local expressions.
+Custom `--rules` and extra non-`.tf` extensions are explicitly refused. Other
+providers, generated `aws_iam_policy_document` data sources, arbitrary policy
+evaluation and deployed reachability remain outside this slice. Confidence is
+uncalibrated.
 
 The checks follow the AWS provider's
 [ingress rule contract](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/vpc_security_group_ingress_rule),
 [S3 public-access controls](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/s3_bucket_public_access_block),
+[IAM policy grammar](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_grammar.html),
+[AWS provider TLS setting](https://registry.terraform.io/providers/hashicorp/aws/latest/docs),
 and Terraform's [module file boundaries](https://developer.hashicorp.com/terraform/language/files).
 
 #### Shareable output quickstart

@@ -65,11 +65,11 @@
   "families": {
     "infrastructure_security": {
       "display": "Infrastructure Security Configuration",
-      "description": "Selected Terraform AWS resources with explicit public administrative ingress or public S3 ACLs. Unresolved expressions, external modules and deployed provider/account state are not assumed safe or insecure.",
+      "description": "Selected Terraform AWS public administrative ingress, public S3 ACLs, unrestricted identity-policy grants and disabled provider TLS verification. Unresolved expressions, conditional/deny policy interactions, external modules and deployed provider/account state are not assumed safe or insecure.",
       "detectors": {
         "hcl": {
           "status": "implemented",
-          "rule_ids": ["hcl.aws.public-admin-ingress", "hcl.aws.public-s3-acl"],
+          "rule_ids": ["hcl.aws.public-admin-ingress", "hcl.aws.public-s3-acl", "hcl.aws.iam-wildcard-privilege", "hcl.aws.insecure-provider-tls"],
           "fixture_pair_ids": ["hcl-aws"],
           "manifest_cases": ["hcl-aws-buggy", "hcl-aws-clean"]
         }

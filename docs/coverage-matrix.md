@@ -171,10 +171,10 @@ Committed API keys, JWT secrets, or insecure hardcoded fallback credentials
 **Planned:** Java, Kotlin, C / C++, Ruby, Swift, C#, Bash, PHP
 
 ### Infrastructure Security Configuration (`infrastructure_security`)
-Selected Terraform AWS resources with explicit public administrative ingress or public S3 ACLs. Unresolved expressions, external modules and deployed provider/account state are not assumed safe or insecure.
+Selected Terraform AWS public administrative ingress, public S3 ACLs, unrestricted identity-policy grants and disabled provider TLS verification. Unresolved expressions, conditional/deny policy interactions, external modules and deployed provider/account state are not assumed safe or insecure.
 
 **Implemented:**
-- **Terraform HCL**: `hcl.aws.public-admin-ingress`, `hcl.aws.public-s3-acl` (cases: `hcl-aws-buggy`, `hcl-aws-clean`)
+- **Terraform HCL**: `hcl.aws.public-admin-ingress`, `hcl.aws.public-s3-acl`, `hcl.aws.iam-wildcard-privilege`, `hcl.aws.insecure-provider-tls` (cases: `hcl-aws-buggy`, `hcl-aws-clean`)
 
 ### Insecure Cookie Flags (`cookies`)
 Missing HttpOnly, Secure, or SameSite protection flags on session cookies

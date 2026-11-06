@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 from ubs_core.suppression import SourceSuppressions
-from ubs_core.analyzers.taint_java_traversal import Engine
+from ubs_core.analyzers.taint_java_traversal import Engine, REQUEST_SOURCE_RE
 from ubs_core.taint_flow import CLEAN, advance, join, retag
 from ubs_core.java_detectors._common import (
     iter_java_files,
@@ -254,7 +254,7 @@ class HeaderEngine(Engine):
 
 def analyze(path: Path, issues, *, suppressions: SourceSuppressions, rule_id: str):
     text = path.read_text(encoding='utf-8', errors='ignore')
-    if not ((SOURCE_RE.search(text) or ANNOTATED_PARAM_RE.search(text)) and HeaderEngine.sink_re.search(text)):
+    if not ((SOURCE_RE.search(text) or REQUEST_SOURCE_RE.search(text) or ANNOTATED_PARAM_RE.search(text)) and HeaderEngine.sink_re.search(text)):
         return
     suppression = suppressions.index(path, text)
     lines = text.splitlines()

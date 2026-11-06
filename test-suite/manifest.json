@@ -11,20 +11,20 @@
   "cases": [
     {
       "id": "hcl-aws-buggy",
-      "description": "Terraform AWS resources explicitly allow public SSH ingress and configure a public-read S3 ACL.",
+      "description": "Terraform AWS configuration requests public SSH ingress, a public S3 ACL, unrestricted IAM permissions and disabled provider TLS verification.",
       "path": "test-suite/hcl/buggy",
       "language": "hcl",
       "tags": ["hcl", "aws", "security", "infrastructure", "buggy"],
       "args": ["--only=hcl", "--format=json", "--fail-on-warning"],
       "expect": {
         "exit_code": 1,
-        "totals": {"files": {"min": 1, "max": 1}, "critical": {"max": 0}, "warning": {"min": 2, "max": 2}, "info": {"max": 0}},
-        "rule_ids": {"min": {"hcl.aws.public-admin-ingress": 1, "hcl.aws.public-s3-acl": 1}}
+        "totals": {"files": {"min": 1, "max": 1}, "critical": {"max": 0}, "warning": {"min": 4, "max": 4}, "info": {"max": 0}},
+        "rule_ids": {"min": {"hcl.aws.public-admin-ingress": 1, "hcl.aws.public-s3-acl": 1, "hcl.aws.iam-wildcard-privilege": 1, "hcl.aws.insecure-provider-tls": 1}}
       }
     },
     {
       "id": "hcl-aws-clean",
-      "description": "Terraform AWS administrative ingress is restricted to a private CIDR and the S3 ACL is private.",
+      "description": "Terraform AWS administrative ingress and S3 ACL are private, IAM permissions are scoped and provider TLS verification is enabled.",
       "path": "test-suite/hcl/clean",
       "language": "hcl",
       "tags": ["hcl", "aws", "security", "infrastructure", "clean"],
@@ -32,7 +32,7 @@
       "expect": {
         "exit_code": 0,
         "totals": {"files": {"min": 1, "max": 1}, "critical": {"max": 0}, "warning": {"max": 0}, "info": {"max": 0}},
-        "rule_ids": {"forbid": ["hcl.aws.public-admin-ingress", "hcl.aws.public-s3-acl"]}
+        "rule_ids": {"forbid": ["hcl.aws.public-admin-ingress", "hcl.aws.public-s3-acl", "hcl.aws.iam-wildcard-privilege", "hcl.aws.insecure-provider-tls"]}
       }
     },
     {

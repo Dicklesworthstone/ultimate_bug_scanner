@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# UBS module: Terraform HCL. Bounded AWS network and storage configuration checks.
+# UBS module: Terraform HCL. Bounded AWS network, storage, IAM and TLS checks.
 # contract: v2. Native HCL analysis requires Python; no provider is contacted.
 set -Eeuo pipefail
 
 # Bootstrap the same checksum-pinned shared library as the other modules.
-UBS_LIB_CHECKSUM="fc35e86a23ddd22bdec2c674be6dea4a70db2679e68df366bd035d7bc07df32a"
+UBS_LIB_CHECKSUM="4ff25759a18a2514203c0807c297fbee935fca714531db7a450b1dbf45f83e60"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -43,7 +43,7 @@ fi
 source "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh"
 ubs_export_locale
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 PROJECT_DIR="."
 SOURCE_PROJECT_DIR=""
 PROJECT_SET=0
@@ -85,7 +85,7 @@ Options:
 --jobs=N            parallel hint (bounded native analysis is sequential)
 --exclude=GLOBS     additional path globs to skip (.terraform is excluded by default)
 --include-ext=CSV   accepted only for tf; other input formats are unsupported
---skip=CSV          skip category numbers (1 network, 2 storage)
+--skip=CSV          skip category numbers (1 network, 2 storage, 3 iam, 4 tls)
 --only=CSV          run only these category numbers
 --report-json=FILE  write NDJSON findings to FILE
 --files-from=FILE   scan this exact NUL-separated file list
@@ -177,7 +177,7 @@ for extension in "${hcl_extensions[@]}"; do
   [[ "$extension" == "tf" || "$extension" == ".tf" ]] || fail_scan "--include-ext only supports tf for Terraform HCL; unsupported extension: $extension"
 done
 if [[ "$LIST_CATEGORIES" -eq 1 ]]; then
-  printf '1  network  Public AWS administrative ingress\n2  storage  Explicit public AWS S3 ACLs\n'
+  printf '1  network  Public AWS administrative ingress\n2  storage  Explicit public AWS S3 ACLs\n3  iam  Unrestricted AWS IAM identity policies\n4  tls  Disabled AWS provider TLS verification\n'
   exit 0
 fi
 command -v python3 >/dev/null 2>&1 || fail_scan "Terraform HCL analysis requires python3"

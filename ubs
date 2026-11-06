@@ -262,7 +262,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/analyzers/cfg_test_only_rust.py']='9ce5fbb35121074409b3951eec97f7fd2714a05acd4c78d6f86932872acd5205'
   ['helpers/ubs_core/analyzers/coroutines_kotlin.py']='a0c339eec751780472e975b2eb885ec166c0c4a90d3ecf7a07fe5982269ca32a'
   ['helpers/ubs_core/analyzers/ctcompare_go.py']='8205b7ea0af334800470dba9654c222de34cba3eecd317aae44678b53f4ebb21'
-  ['helpers/ubs_core/analyzers/ctcompare_js.py']='3621ee7539c35460ee412ff59d895cdbea915cf8688a588b44233e34d9ae3159'
+  ['helpers/ubs_core/analyzers/ctcompare_js.py']='88e963b4f32e16b867db151374a3594b39ae8608df187d2dea64c46106aabd23'
   ['helpers/ubs_core/analyzers/ctcompare_py.py']='f4662351955c8ac681753d02e4049c0cd143fbc88de568202df433fa59481b10'
   ['helpers/ubs_core/analyzers/ctcompare_rust.py']='5790f299b3e7446f605f3180e5f1940c8f373b32d743c55642cba1e4c593a084'
   ['helpers/ubs_core/analyzers/guards_generic.py']='61ef81e6255aa3c09ed175648f8cbd99ee2bff9a98ed3c968781533beb91b4a5'
@@ -596,7 +596,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='77a16e60dce843652c053d069dcbffce17c8ffae543bf77693d2e8254a3967de'
   ['helpers/ubs_core/taint_flow.py']='83b941e15357a6a593db1d7f77a099b1707090301f695445356bfcede4baef26'
-  ['lib/ubs-common.sh']='51dd9b2b1fbf0308617f3f9a1227ed5648f70f53ad01c7dd91a113bc0ffb94a6'
+  ['lib/ubs-common.sh']='4ff25759a18a2514203c0807c297fbee935fca714531db7a450b1dbf45f83e60'
 )
 
 # contract.json as shipped by earlier releases (sha256 -> first tag), kept out
@@ -648,6 +648,8 @@ ensure_tmpdir_run(){
 # The primary report is captured without opening its requested destination.
 # Only an explicitly completed report may replace that destination; refusals,
 # interrupts and failed writers leave the previous report intact.
+# ShellCheck SC2329 does not resolve EXIT/INT/TERM callback calls (see its wiki).
+# shellcheck disable=SC2329
 finish_primary_output(){
   [[ -n "${TEE_PID:-}" ]] || return 0
   local failed=0
@@ -676,7 +678,15 @@ early_cleanup(){
   fi
   return 0
 }
-trap 'ubs_exit_status=$?; finish_primary_output || ubs_exit_status=2; early_cleanup; exit "$ubs_exit_status"' EXIT
+# Invoked by the early EXIT trap, before the full cleanup handler is installed.
+# shellcheck disable=SC2329
+finish_early_exit(){
+  local ubs_exit_status=$?
+  finish_primary_output || ubs_exit_status=2
+  early_cleanup
+  exit "$ubs_exit_status"
+}
+trap 'finish_early_exit' EXIT
 
 # python3 resolution (bead G7). Modules and helpers call `python3` by name.
 # Validate every candidate, including an existing python3, and freeze its

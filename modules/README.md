@@ -18,13 +18,13 @@ Options:
 --skip=CSV         skip category numbers (numbers differ per module)
 --report-json=FILE write NDJSON findings sink to FILE
 --python-pattern-counts=FILE write unthresholded per-file/per-rule counts as JSON (python)
---json-out=FILE    write JSON report to FILE (bash, elixir, java, kotlin, php, ruby, sql)
---sarif-out=FILE   write SARIF report to FILE (bash, elixir, java, kotlin, php, ruby, sql)
+--json-out=FILE    write JSON report to FILE (bash, elixir, hcl, java, kotlin, php, ruby, sql)
+--sarif-out=FILE   write SARIF report to FILE (bash, elixir, hcl, java, kotlin, php, ruby, sql)
 --files-from=FILE  NUL-separated file list to scan (meta-runner contract v2 hand-off)
---rules=DIR        run custom ast-grep rules alongside native checks in the supported modules (SQL rejects this option)
---list-rules       print generated ast-grep rule ids (native security ids for PHP and SQL) and exit
+--rules=DIR        run custom ast-grep rules alongside native checks in the supported modules (SQL and HCL reject this option)
+--list-rules       print generated ast-grep rule ids (native security ids for PHP, SQL and HCL) and exit
 --dump-rules=DIR   write generated ast-grep rules to DIR (bash, cpp, csharp, elixir, golang, java, js, kotlin, python, ruby, rust, swift)
---list-categories  print the category table and exit (python, rust, cpp, swift, csharp, bash, kotlin, php, sql)
+--list-categories  print the category table and exit (python, rust, cpp, swift, csharp, bash, kotlin, php, sql, hcl)
 -h, --help         this help
 <!-- /contract:options -->
 ```

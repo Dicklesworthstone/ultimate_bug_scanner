@@ -10,6 +10,32 @@
   },
   "cases": [
     {
+      "id": "hcl-aws-buggy",
+      "description": "Terraform AWS resources explicitly allow public SSH ingress and configure a public-read S3 ACL.",
+      "path": "test-suite/hcl/buggy",
+      "language": "hcl",
+      "tags": ["hcl", "aws", "security", "infrastructure", "buggy"],
+      "args": ["--only=hcl", "--format=json", "--fail-on-warning"],
+      "expect": {
+        "exit_code": 1,
+        "totals": {"files": {"min": 1, "max": 1}, "critical": {"max": 0}, "warning": {"min": 2, "max": 2}, "info": {"max": 0}},
+        "rule_ids": {"min": {"hcl.aws.public-admin-ingress": 1, "hcl.aws.public-s3-acl": 1}}
+      }
+    },
+    {
+      "id": "hcl-aws-clean",
+      "description": "Terraform AWS administrative ingress is restricted to a private CIDR and the S3 ACL is private.",
+      "path": "test-suite/hcl/clean",
+      "language": "hcl",
+      "tags": ["hcl", "aws", "security", "infrastructure", "clean"],
+      "args": ["--only=hcl", "--format=json", "--fail-on-warning"],
+      "expect": {
+        "exit_code": 0,
+        "totals": {"files": {"min": 1, "max": 1}, "critical": {"max": 0}, "warning": {"max": 0}, "info": {"max": 0}},
+        "rule_ids": {"forbid": ["hcl.aws.public-admin-ingress", "hcl.aws.public-s3-acl"]}
+      }
+    },
+    {
       "id": "sql-definer-buggy",
       "description": "PostgreSQL SECURITY DEFINER migration retains caller search_path and PUBLIC execution.",
       "path": "test-suite/sql/buggy",

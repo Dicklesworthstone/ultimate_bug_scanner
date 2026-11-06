@@ -127,16 +127,16 @@
     {
       "flag": "--json-out",
       "value": "FILE",
-      "modules": ["bash", "elixir", "java", "kotlin", "php", "ruby", "sql"],
+      "modules": ["bash", "elixir", "hcl", "java", "kotlin", "php", "ruby", "sql"],
       "documented": true,
-      "doc": "write JSON report to FILE (bash, elixir, java, kotlin, php, ruby, sql)"
+      "doc": "write JSON report to FILE (bash, elixir, hcl, java, kotlin, php, ruby, sql)"
     },
     {
       "flag": "--sarif-out",
       "value": "FILE",
-      "modules": ["bash", "elixir", "java", "kotlin", "php", "ruby", "sql"],
+      "modules": ["bash", "elixir", "hcl", "java", "kotlin", "php", "ruby", "sql"],
       "documented": true,
-      "doc": "write SARIF report to FILE (bash, elixir, java, kotlin, php, ruby, sql)"
+      "doc": "write SARIF report to FILE (bash, elixir, hcl, java, kotlin, php, ruby, sql)"
     },
     {
       "flag": "--files-from",
@@ -148,7 +148,7 @@
     {
       "flag": "--only",
       "value": "CSV",
-      "modules": ["bash", "cpp", "csharp", "elixir", "java", "kotlin", "php", "ruby", "rust", "sql", "swift"],
+      "modules": ["bash", "cpp", "csharp", "elixir", "hcl", "java", "kotlin", "php", "ruby", "rust", "sql", "swift"],
       "documented": false,
       "doc": "run only these category numbers"
     },
@@ -171,7 +171,7 @@
         "swift"
       ],
       "documented": true,
-      "doc": "run custom ast-grep rules alongside native checks in the supported modules (SQL rejects this option)"
+      "doc": "run custom ast-grep rules alongside native checks in the supported modules (SQL and HCL reject this option)"
     },
     {
       "flag": "--list-rules",
@@ -181,6 +181,7 @@
         "csharp",
         "elixir",
         "golang",
+        "hcl",
         "java",
         "js",
         "kotlin",
@@ -192,7 +193,7 @@
         "swift"
       ],
       "documented": true,
-      "doc": "print generated ast-grep rule ids (native security ids for PHP and SQL) and exit"
+      "doc": "print generated ast-grep rule ids (native security ids for PHP, SQL and HCL) and exit"
     },
     {
       "flag": "--dump-rules",
@@ -216,14 +217,14 @@
     },
     {
       "flag": "--list-categories",
-      "modules": ["bash", "cpp", "csharp", "kotlin", "php", "python", "rust", "sql", "swift"],
+      "modules": ["bash", "cpp", "csharp", "hcl", "kotlin", "php", "python", "rust", "sql", "swift"],
       "documented": true,
-      "doc": "print the category table and exit (python, rust, cpp, swift, csharp, bash, kotlin, php, sql)"
+      "doc": "print the category table and exit (python, rust, cpp, swift, csharp, bash, kotlin, php, sql, hcl)"
     },
     {
       "flag": "--summary-json",
       "value": "FILE",
-      "modules": ["bash", "csharp", "elixir", "kotlin", "php", "python", "ruby", "rust", "sql", "swift"],
+      "modules": ["bash", "csharp", "elixir", "hcl", "kotlin", "php", "python", "ruby", "rust", "sql", "swift"],
       "documented": false,
       "doc": "write summary JSON to FILE"
     },
@@ -594,6 +595,23 @@
       "file": "ubs-sql.sh",
       "display": "PostgreSQL SQL",
       "extensions": ["sql", "psql", "pgsql"],
+      "manifest_files": [],
+      "contract": 2,
+      "extra_flags": [
+        "--json-out",
+        "--list-categories",
+        "--list-rules",
+        "--only",
+        "--project",
+        "--sarif-out",
+        "--summary-json",
+        "--version"
+      ]
+    },
+    "hcl": {
+      "file": "ubs-hcl.sh",
+      "display": "Terraform HCL",
+      "extensions": ["tf"],
       "manifest_files": [],
       "contract": 2,
       "extra_flags": [

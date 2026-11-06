@@ -60,6 +60,7 @@ DEFAULT_SNIPPETS: dict[str, str] = {
     "kts": "println(42)\n",
     "php": "<?php\nfunction clean(): int { return 42; }\n",
     "sql": "SELECT 1;\n",
+    "tf": 'resource "aws_s3_bucket" "private" {\n  acl = "private"\n}\n',
     "zig": "pub fn main() void {}\n",
 }
 

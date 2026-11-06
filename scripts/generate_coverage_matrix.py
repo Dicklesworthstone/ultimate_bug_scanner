@@ -33,6 +33,7 @@ LANG_SHORT_DISPLAYS = {
     "elixir": "Elixir",
     "bash": "Bash",
     "php": "PHP",
+    "hcl": "Terraform HCL",
 }
 
 

@@ -10,6 +10,14 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Add native Terraform HCL scanning for explicit AWS public SSH/RDP ingress
+  and public S3 canned ACLs. Resolve selected literal/local configuration and
+  same-directory bucket protections, distinguish conflicting or unknown inputs
+  from clean scans, and preserve exact source locations and scoped suppressions.
+  Integrate `.tf` discovery, project policy, JSON/SARIF/text reports, context-aware
+  caching, explain metadata and verified runtime assets. This bounded AWS slice
+  does not execute Terraform or claim deployed infrastructure coverage.
+
 - C# SQL analysis models the culture-aware `TryParse` overloads as SQL-inert
   too (#171): `int.TryParse(raw, NumberStyles.Integer,
   CultureInfo.InvariantCulture, out var n)`, `DateTime.TryParse(raw, provider,

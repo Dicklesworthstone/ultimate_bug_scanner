@@ -118,12 +118,13 @@ LANG_NAMES: dict[str, str] = {
     "sh": "Bash / Shell",
     "php": "PHP",
     "sql": "PostgreSQL SQL",
+    "hcl": "Terraform HCL",
 }
 
 SRC_EXTS = {
     ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
     ".go", ".rs", ".java", ".kt", ".kts", ".cpp", ".cc", ".cxx",
-    ".c", ".h", ".hh", ".hpp", ".hxx", ".rb", ".swift", ".cs", ".ex", ".exs", ".sh", ".bash", ".php", ".phtml", ".sql", ".psql", ".pgsql",
+    ".c", ".h", ".hh", ".hpp", ".hxx", ".rb", ".swift", ".cs", ".ex", ".exs", ".sh", ".bash", ".php", ".phtml", ".sql", ".psql", ".pgsql", ".tf",
 }
 
 # The ubs_core package this module belongs to. Rule modules are read from here,
@@ -218,6 +219,8 @@ def _find_primary_source_file(target_path: Path, lang: str | None = None) -> Pat
             if lang_lower == "php" and ext in (".php", ".phtml"):
                 return c
             if lang_lower == "sql" and ext in (".sql", ".psql", ".pgsql"):
+                return c
+            if lang_lower == "hcl" and ext == ".tf":
                 return c
 
     return candidates[0]
@@ -429,12 +432,14 @@ def build_catalog(repo_root: Path) -> dict[str, dict[str, Any]]:
         except Exception:
             pass
 
-    # The native SQL DDL scanner is intentionally separate from application
-    # taint analyzers. Its shipped metadata also works in installed runtimes
-    # without a checkout registry and must not inherit default "critical/high".
+    # Native SQL and HCL scanners are separate from application taint analyzers.
+    # Shipped metadata also works in installed runtimes without a checkout
+    # registry and must not inherit default "critical/high".
     from ubs_core.sql_scan import RULE_METADATA as sql_metadata
-    for rule_id, details in sql_metadata.items():
-        catalog.setdefault(rule_id, {}).update({**details, "rule_id": rule_id})
+    from ubs_core.hcl_scan import RULE_METADATA as hcl_metadata
+    for metadata in (sql_metadata, hcl_metadata):
+        for rule_id, details in metadata.items():
+            catalog.setdefault(rule_id, {}).update({**details, "rule_id": rule_id})
     return catalog
 
 

@@ -1216,6 +1216,7 @@ _EVERY_MODULE_RULES = {
 # Modules outside the contract's --rules list: one file each, in a language the module scans.
 _RULES_REFUSAL_PROJECTS = {
     "sql": ("a.sql", "SELECT 1;\n"),
+    "hcl": ("a.tf", 'locals {\n  name = "example"\n}\n'),
 }
 
 

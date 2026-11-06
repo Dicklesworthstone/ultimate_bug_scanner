@@ -5,11 +5,11 @@
 
 ## Summary
 
-- **Detector Families**: 21
-- **Languages Supported**: 14
-- **Implemented Cells**: 142 (48.3%)
-- **Planned Cells**: 141 (48.0%)
-- **N/A Cells**: 11 (3.7%)
+- **Detector Families**: 22
+- **Languages Supported**: 15
+- **Implemented Cells**: 143 (43.3%)
+- **Planned Cells**: 176 (53.3%)
+- **N/A Cells**: 11 (3.3%)
 
 ## Matrix
 
@@ -18,29 +18,30 @@ Legend:
 - **○** Planned / In Progress
 - **—** Not Applicable for language runtime/ecosystem
 
-| Family | JS / TS | Python | Go | Rust | Java | Kotlin | C / C++ | Ruby | Swift | C# | Elixir | Bash | PHP | sql |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Archive Extraction (Zip Slip) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ |
-| Async & Concurrency Hazards | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ○ | ✓ | ○ | ○ | ○ | ○ |
-| Command Injection | ○ | ✓ | ○ | ✓ | ✓ | ✓ | ○ | ○ | ✓ | ○ | ✓ | ✓ | ✓ | ○ |
-| Constant-Time Secret Comparison | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ |
-| Credentialed Wildcard CORS | ✓ | ✓ | ✓ | ✓ | ○ | ○ | — | ○ | ○ | ○ | ○ | — | ○ | ○ |
-| Deep Guard Correlation | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | — | ○ | ○ |
-| Disabled TLS Verification | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ |
-| HTTP Response Header Injection | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | ○ | ○ |
-| Hardcoded Secrets & Default Fallbacks | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ✓ | ○ | ○ | ○ |
-| Insecure Cookie Flags | ✓ | ✓ | ✓ | ○ | ○ | ○ | — | ○ | ○ | ○ | ○ | — | ○ | ○ |
-| Insecure Security Randomness | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ |
-| JWT Verification Bypass | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | — | ○ | ○ |
-| Open Redirect | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | ○ | ○ |
-| Path Traversal | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ○ |
-| PostgreSQL Function Privileges | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ✓ |
-| Resource Lifecycle & Cleanup | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ○ | ✓ | ○ | ○ | ○ | ○ |
-| SQL Injection | ✓ | ✓ | ○ | ✓ | ○ | ○ | ○ | ○ | ○ | ✓ | ✓ | — | ✓ | ○ |
-| Server-Side Request Forgery (SSRF) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ |
-| Taint & Dataflow Engine | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ○ |
-| Type Narrowing & Safe Casting | ✓ | ○ | ○ | ✓ | ✓ | ✓ | ○ | ○ | ✓ | ✓ | ○ | — | ○ | ○ |
-| Unsafe Deserialization | ○ | ✓ | ○ | ○ | ○ | ○ | ○ | ✓ | ○ | ○ | ○ | — | ✓ | ○ |
+| Family | JS / TS | Python | Go | Rust | Java | Kotlin | C / C++ | Ruby | Swift | C# | Elixir | Bash | PHP | sql | Terraform HCL |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Archive Extraction (Zip Slip) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ |
+| Async & Concurrency Hazards | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ○ | ✓ | ○ | ○ | ○ | ○ | ○ |
+| Command Injection | ○ | ✓ | ○ | ✓ | ✓ | ✓ | ○ | ○ | ✓ | ○ | ✓ | ✓ | ✓ | ○ | ○ |
+| Constant-Time Secret Comparison | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ |
+| Credentialed Wildcard CORS | ✓ | ✓ | ✓ | ✓ | ○ | ○ | — | ○ | ○ | ○ | ○ | — | ○ | ○ | ○ |
+| Deep Guard Correlation | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | — | ○ | ○ | ○ |
+| Disabled TLS Verification | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ |
+| HTTP Response Header Injection | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | ○ | ○ | ○ |
+| Hardcoded Secrets & Default Fallbacks | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ✓ | ○ | ○ | ○ | ○ |
+| Infrastructure Security Configuration | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ✓ |
+| Insecure Cookie Flags | ✓ | ✓ | ✓ | ○ | ○ | ○ | — | ○ | ○ | ○ | ○ | — | ○ | ○ | ○ |
+| Insecure Security Randomness | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ |
+| JWT Verification Bypass | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | — | ○ | ○ | ○ |
+| Open Redirect | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | ○ | ○ | ○ |
+| Path Traversal | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ○ | ○ |
+| PostgreSQL Function Privileges | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ✓ | ○ |
+| Resource Lifecycle & Cleanup | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ○ | ✓ | ○ | ○ | ○ | ○ | ○ |
+| SQL Injection | ✓ | ✓ | ○ | ✓ | ○ | ○ | ○ | ○ | ○ | ✓ | ✓ | — | ✓ | ○ | ○ |
+| Server-Side Request Forgery (SSRF) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ |
+| Taint & Dataflow Engine | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ○ | ○ |
+| Type Narrowing & Safe Casting | ✓ | ○ | ○ | ✓ | ✓ | ✓ | ○ | ○ | ✓ | ✓ | ○ | — | ○ | ○ | ○ |
+| Unsafe Deserialization | ○ | ✓ | ○ | ○ | ○ | ○ | ○ | ✓ | ○ | ○ | ○ | — | ✓ | ○ | ○ |
 
 ## Family Details
 
@@ -168,6 +169,12 @@ Committed API keys, JWT secrets, or insecure hardcoded fallback credentials
 - **Elixir**: `elixir.security.hardcoded_secrets` (cases: `elixir-hardcoded-secrets-buggy`, `elixir-hardcoded-secrets-clean`)
 
 **Planned:** Java, Kotlin, C / C++, Ruby, Swift, C#, Bash, PHP
+
+### Infrastructure Security Configuration (`infrastructure_security`)
+Selected Terraform AWS resources with explicit public administrative ingress or public S3 ACLs. Unresolved expressions, external modules and deployed provider/account state are not assumed safe or insecure.
+
+**Implemented:**
+- **Terraform HCL**: `hcl.aws.public-admin-ingress`, `hcl.aws.public-s3-acl` (cases: `hcl-aws-buggy`, `hcl-aws-clean`)
 
 ### Insecure Cookie Flags (`cookies`)
 Missing HttpOnly, Secure, or SameSite protection flags on session cookies

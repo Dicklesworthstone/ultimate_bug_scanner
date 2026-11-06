@@ -102,6 +102,7 @@ def main():
         "bash": "ubs-bash.sh",
         "php": "ubs-php.sh",
         "sql": "ubs-sql.sh",
+        "hcl": "ubs-hcl.sh",
     }
 
     new_checksums = {}

@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.5.39-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.5.40-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -124,7 +124,7 @@ const zipCode = parseInt(userInput);  // 💥 "08" becomes 0 in old browsers (oc
 ## 🎯 **The Solution: Your 24/7 Bug Hunting Partner**
 
 ### 🧠 Language-Aware Meta-Runner
-- `ubs` auto-detects **JavaScript/TypeScript, Python, C/C++, Rust, Go, Java, Kotlin, Ruby, Swift, C#, Elixir, Bash, PHP, and PostgreSQL SQL** in the same repo and fans out to per-language scanners.
+- `ubs` auto-detects **JavaScript/TypeScript, Python, C/C++, Rust, Go, Java, Kotlin, Ruby, Swift, C#, Elixir, Bash, PHP, PostgreSQL SQL, and Terraform HCL** in the same repo and fans out to per-language scanners.
 - Each scanner lives under `modules/ubs-<lang>.sh`, ships independently, and supports `--format text|json|jsonl|sarif|toon` for consistent downstream tooling.
 - Installed releases use a complete verified module generation under `${XDG_DATA_HOME:-$HOME/.local/share}/ubs/modules`. Source checkouts and legacy installations retain lazy module resolution (PATH → repo `modules/` → cache).
 - Results from every language merge into one text/JSON/SARIF report via `jq`, so CI systems and AI agents only have to parse a single artifact.
@@ -288,6 +288,55 @@ The underlying privilege and search-path semantics follow PostgreSQL's
 [CREATE FUNCTION security guidance](https://www.postgresql.org/docs/current/sql-createfunction.html#SQL-CREATEFUNCTION-SECURITY),
 [search_path documentation](https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-SEARCH-PATH),
 and [REVOKE semantics](https://www.postgresql.org/docs/current/sql-revoke.html).
+
+#### Terraform AWS configuration
+
+Native `.tf` files now have two bounded AWS checks, without running Terraform,
+loading provider plugins, or contacting AWS:
+
+```bash
+ubs --only=hcl --fail-on-warning --format=json infrastructure/
+ubs --staged --format=sarif --fail-on-warning
+ubs explain hcl.aws.public-admin-ingress
+```
+
+`hcl.aws.public-admin-ingress` warns when an explicit world IPv4 or IPv6 CIDR
+allows TCP SSH/RDP ports (22/3389), including a containing port range, or all IP
+protocols. It supports inline `aws_security_group` ingress, legacy
+`aws_security_group_rule`, and `aws_vpc_security_group_ingress_rule`. Public
+HTTP/HTTPS, UDP-only rules, restricted source networks and egress are separate
+from this administrative-ingress policy.
+
+`hcl.aws.public-s3-acl` warns for explicit public canned ACLs on
+`aws_s3_bucket` and `aws_s3_bucket_acl`. A selected `ignore_public_acls = true`
+control must refer to the same bucket and provider to neutralize the warning.
+Conflicting ACL blocking, `BucketOwnerEnforced`, competing controls or unknown
+protection produce incomplete analysis, rather than a claim about deployed
+access. Missing account-wide controls and provider defaults are not inferred.
+
+Selected files in the same directory share literal/local values and protective
+resource identities; nested directories remain distinct Terraform modules.
+Changes to any selected context file invalidate cached results. Actual `#`,
+`//` and block comments support scoped `ubs:ignore[rule-id]`; quoted strings,
+templates and heredocs cannot act as suppression comments. Categories are
+`hcl.network` (1) and `hcl.storage` (2), including `--skip-hcl=1` and `.ubs.json`
+policy. Both rules emit warnings; `--fail-on-warning` or the strict profile
+makes them fail the scan.
+
+This first slice does not evaluate Terraform plans, state, remote modules,
+input variables, `.tfvars`, `.tf.json`, arbitrary functions or dynamic ingress.
+Relevant unresolved expressions, malformed syntax and exhausted budgets
+produce partial reports and exit 2 while retaining proven findings. Ordinary
+directory scans exclude downloaded `.terraform` dependencies. Source bounds
+are 4 MiB per file, 32 MiB per selected context, 200,000 tokens and 64 nesting
+levels. Custom `--rules` and extra non-`.tf` extensions are explicitly refused.
+Coverage of other providers, IAM, TLS settings and deployed reachability remains
+outside this slice, and confidence is uncalibrated.
+
+The checks follow the AWS provider's
+[ingress rule contract](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/vpc_security_group_ingress_rule),
+[S3 public-access controls](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/s3_bucket_public_access_block),
+and Terraform's [module file boundaries](https://developer.hashicorp.com/terraform/language/files).
 
 #### Shareable output quickstart
 ```bash
@@ -1238,7 +1287,7 @@ Environment Variables:
                            Numeric 0/1 leaves project severity unchanged; strict|loose overrides it
   UBS_SKIP_SIZE_CHECK      Skip directory size guard entirely (set to 1)
   UBS_ALLOW_NO_SCAN        Exit 0 instead of 3 when nothing was scanned (set to 1)
-  UBS_KEEP_TEMP=1          Retain scanner scratch for Rust/Python/JS/Bash; see below
+  UBS_KEEP_TEMP=1          Retain scanner scratch for Rust/Python/JS/Bash/HCL; see below
 
 Arguments:
   PROJECT_DIR              Directory to scan (default: current directory)
@@ -1262,7 +1311,7 @@ Exit Codes:
 
 Set `UBS_KEEP_TEMP=1` to retain scanner-owned workspaces, rule files, captured
 tool output, merge staging, and spill databases after successful, failed, or
-interrupted Rust, Python, JavaScript/TypeScript, and Bash scans. Set `TMPDIR`
+interrupted Rust, Python, JavaScript/TypeScript, Bash, and Terraform HCL scans. Set `TMPDIR`
 to an existing writable directory to choose where scratch accumulates; retained
 files can contain source code and findings, so use private storage. The caller
 manages its later removal. Retention does not change detectors, severity, module
@@ -2773,7 +2822,7 @@ Layer 4: Metrics collection  → Time-series quality tracking
 **This combination of speed + semantic understanding + correlation is unique.**
 
 **Unified multi-language runner:**
-- Auto-detects 14 languages in one scan
+- Auto-detects 15 languages in one scan
 - Parallel execution (Go + Python + Rust simultaneously)
 - Unified JSON/SARIF output for tooling
 - Module system with lazy download/caching
@@ -2904,7 +2953,7 @@ You wouldn't use a truck for a Formula 1 race. You wouldn't use a sports car to 
 These are fundamentally incompatible goals. ESLint would never accept "10-20% false positives are fine" or "skip auto-fix entirely."
 
 **2. Multi-language meta-runner**
-- The unified runner that auto-detects 14 languages is the core innovation
+- The unified runner that auto-detects 15 languages is the core innovation
 - This doesn't fit into any single linter's architecture
 - Each linter project has different maintainers, philosophies, release cycles
 
@@ -3067,7 +3116,7 @@ Use both.
 
 **A:** Probably! The module system makes it easy to add languages.
 
-**Current:** JavaScript/TypeScript, Python, Go, Rust, Java, Kotlin, C++, Ruby, Swift, C#, Elixir, Bash, PHP, PostgreSQL SQL (14 languages)
+**Current:** JavaScript/TypeScript, Python, Go, Rust, Java, Kotlin, C++, Ruby, Swift, C#, Elixir, Bash, PHP, PostgreSQL SQL, Terraform HCL (15 languages)
 
 **Roadmap considerations:**
 - **Scala** - JVM ecosystem
@@ -3106,7 +3155,7 @@ But the core tool will always be free and open source.
 
 **This isn't trying to replace ESLint.** It's solving a different problem:
 
-> **"How do I give LLM coding agents the ability to self-audit across 14 languages with zero configuration overhead and sub-5-second feedback?"**
+> **"How do I give LLM coding agents the ability to self-audit across 15 languages with zero configuration overhead and sub-5-second feedback?"**
 
 No existing tool does this because:
 - Traditional linters are human-first (need auto-fix, low FP tolerance)
@@ -3216,29 +3265,30 @@ coverage/
 
 <!-- coverage:matrix -->
 
-| Detector Family | JS / TS | Python | Go | Rust | Java | Kotlin | C / C++ | Ruby | Swift | C# | Elixir | Bash | PHP | sql |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Archive Extraction (Zip Slip) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ |
-| Async & Concurrency Hazards | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ○ | ✓ | ○ | ○ | ○ | ○ |
-| Command Injection | ○ | ✓ | ○ | ✓ | ✓ | ✓ | ○ | ○ | ✓ | ○ | ✓ | ✓ | ✓ | ○ |
-| Constant-Time Secret Comparison | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ |
-| Credentialed Wildcard CORS | ✓ | ✓ | ✓ | ✓ | ○ | ○ | — | ○ | ○ | ○ | ○ | — | ○ | ○ |
-| Deep Guard Correlation | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | — | ○ | ○ |
-| Disabled TLS Verification | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ |
-| HTTP Response Header Injection | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | ○ | ○ |
-| Hardcoded Secrets & Default Fallbacks | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ✓ | ○ | ○ | ○ |
-| Insecure Cookie Flags | ✓ | ✓ | ✓ | ○ | ○ | ○ | — | ○ | ○ | ○ | ○ | — | ○ | ○ |
-| Insecure Security Randomness | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ |
-| JWT Verification Bypass | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | — | ○ | ○ |
-| Open Redirect | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | ○ | ○ |
-| Path Traversal | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ○ |
-| PostgreSQL Function Privileges | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ✓ |
-| Resource Lifecycle & Cleanup | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ○ | ✓ | ○ | ○ | ○ | ○ |
-| SQL Injection | ✓ | ✓ | ○ | ✓ | ○ | ○ | ○ | ○ | ○ | ✓ | ✓ | — | ✓ | ○ |
-| Server-Side Request Forgery (SSRF) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ |
-| Taint & Dataflow Engine | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ○ |
-| Type Narrowing & Safe Casting | ✓ | ○ | ○ | ✓ | ✓ | ✓ | ○ | ○ | ✓ | ✓ | ○ | — | ○ | ○ |
-| Unsafe Deserialization | ○ | ✓ | ○ | ○ | ○ | ○ | ○ | ✓ | ○ | ○ | ○ | — | ✓ | ○ |
+| Detector Family | JS / TS | Python | Go | Rust | Java | Kotlin | C / C++ | Ruby | Swift | C# | Elixir | Bash | PHP | sql | Terraform HCL |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Archive Extraction (Zip Slip) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ |
+| Async & Concurrency Hazards | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ○ | ✓ | ○ | ○ | ○ | ○ | ○ |
+| Command Injection | ○ | ✓ | ○ | ✓ | ✓ | ✓ | ○ | ○ | ✓ | ○ | ✓ | ✓ | ✓ | ○ | ○ |
+| Constant-Time Secret Comparison | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ |
+| Credentialed Wildcard CORS | ✓ | ✓ | ✓ | ✓ | ○ | ○ | — | ○ | ○ | ○ | ○ | — | ○ | ○ | ○ |
+| Deep Guard Correlation | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | — | ○ | ○ | ○ |
+| Disabled TLS Verification | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ |
+| HTTP Response Header Injection | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | ○ | ○ | ○ |
+| Hardcoded Secrets & Default Fallbacks | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ✓ | ○ | ○ | ○ | ○ |
+| Infrastructure Security Configuration | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ✓ |
+| Insecure Cookie Flags | ✓ | ✓ | ✓ | ○ | ○ | ○ | — | ○ | ○ | ○ | ○ | — | ○ | ○ | ○ |
+| Insecure Security Randomness | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ |
+| JWT Verification Bypass | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | — | ○ | ○ | ○ |
+| Open Redirect | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | ○ | ○ | ○ |
+| Path Traversal | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ○ | ○ |
+| PostgreSQL Function Privileges | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ✓ | ○ |
+| Resource Lifecycle & Cleanup | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ○ | ✓ | ○ | ○ | ○ | ○ | ○ |
+| SQL Injection | ✓ | ✓ | ○ | ✓ | ○ | ○ | ○ | ○ | ○ | ✓ | ✓ | — | ✓ | ○ | ○ |
+| Server-Side Request Forgery (SSRF) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ |
+| Taint & Dataflow Engine | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ○ | ○ |
+| Type Narrowing & Safe Casting | ✓ | ○ | ○ | ✓ | ✓ | ✓ | ○ | ○ | ✓ | ✓ | ○ | — | ○ | ○ | ○ |
+| Unsafe Deserialization | ○ | ✓ | ○ | ○ | ○ | ○ | ○ | ✓ | ○ | ○ | ○ | — | ✓ | ○ | ○ |
 
 *(Legend: **✓** Implemented with dual-sided regression test pairs; **○** Planned; **—** N/A. Full details in [`docs/coverage-matrix.md`](docs/coverage-matrix.md).)*
 

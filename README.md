@@ -1347,7 +1347,7 @@ Environment Variables:
                            Numeric 0/1 leaves project severity unchanged; strict|loose overrides it
   UBS_SKIP_SIZE_CHECK      Skip directory size guard entirely (set to 1)
   UBS_ALLOW_NO_SCAN        Exit 0 instead of 3 when nothing was scanned (set to 1)
-  UBS_KEEP_TEMP=1          Retain scanner scratch for Rust/Python/JS/Bash/HCL; see below
+  UBS_KEEP_TEMP=1          Retain scanner scratch for Rust/Python/JS/Bash/HCL/C#/Kotlin; see below
 
 Arguments:
   PROJECT_DIR              Directory to scan (default: current directory)
@@ -1371,7 +1371,7 @@ Exit Codes:
 
 Set `UBS_KEEP_TEMP=1` to retain scanner-owned workspaces, rule files, captured
 tool output, merge staging, and spill databases after successful, failed, or
-interrupted Rust, Python, JavaScript/TypeScript, Bash, and Terraform HCL scans. Set `TMPDIR`
+interrupted Rust, Python, JavaScript/TypeScript, Bash, Terraform HCL, C#, and Kotlin scans. Set `TMPDIR`
 to an existing writable directory to choose where scratch accumulates; retained
 files can contain source code and findings, so use private storage. The caller
 manages its later removal. Retention does not change detectors, severity, module

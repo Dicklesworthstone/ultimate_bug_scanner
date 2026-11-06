@@ -197,11 +197,16 @@ if [[ "$LIST_RULES" -eq 1 ]]; then
   ubs_resolve_helpers_dir helpers_dir || helpers_dir="${UBS_MODULE_LIB_DIR}/helpers"
   if ! PYTHONPATH="${helpers_dir}${PYTHONPATH:+:${PYTHONPATH}}" python3 - "$DUMP_RULES_DIR" "$USER_RULE_DIR" <<'PYRULES'
 from pathlib import Path
+from contextlib import nullcontext
+import os
 import shutil
 import sys
 import tempfile
 from ubs_core.kotlin_rules import generate
-with tempfile.TemporaryDirectory() as td:
+temp_root = os.environ.get("TMPDIR") or os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp"
+with (nullcontext(tempfile.mkdtemp(prefix="ubs-kotlin-rules-", dir=temp_root))
+      if os.environ.get("UBS_KEEP_TEMP") == "1"
+      else tempfile.TemporaryDirectory()) as td:
     rule_dir = Path(td)
     generate(rule_dir, Path(sys.argv[2]) if sys.argv[2] else None)
     rule_files = [*rule_dir.glob('*.yml'), *(rule_dir / 'rules').glob('*.yml')]
@@ -247,7 +252,7 @@ TEXT_TMP="$(mktemp 2>/dev/null || mktemp -t ubs-kt-text.XXXXXX)" || { echo "ERRO
 # Called indirectly by Bash's EXIT trap.
 # shellcheck disable=SC2317,SC2329
 cleanup() {
-  rm -f "$LIST_FILE" "$SINK_FILE" "$JSON_TMP" "$TEXT_TMP"
+  ubs_remove_temp -f "$LIST_FILE" "$SINK_FILE" "$JSON_TMP" "$TEXT_TMP"
 }
 trap cleanup EXIT
 

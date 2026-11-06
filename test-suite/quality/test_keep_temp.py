@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Real CLI checks for the four languages supporting UBS_KEEP_TEMP=1.
+"""Real CLI checks for the languages supporting UBS_KEEP_TEMP=1.
 
 Run with PYTHONDONTWRITEBYTECODE=1. Every fixture, report and syscall trace is
 retained below test-suite/artifacts/keep-temp-*. No cleanup-mode scan is run.
 The repeat-run comparison checks determinism in retention mode; it does not
-claim equivalence to an unexecuted cleanup-mode baseline or all 13 languages.
+claim equivalence to an unexecuted cleanup-mode baseline or every language.
 """
 from __future__ import annotations
 
@@ -43,6 +43,14 @@ CASES = {
     "bash": ("sh", "bash.security.eval_variable", "critical",
              '#!/usr/bin/env bash\npayload="${1:-}"\neval "$payload"\n',
              "#!/usr/bin/env bash\nprintf '%s\\n' 'ready'\n"),
+    "csharp": ("cs", "cs-process-start", "warning",
+               "using System.Diagnostics;\n"
+               "class Demo { public void Run(string text) { Process.Start(text); } }\n",
+               "class Calculator {\n"
+               "  public int Double(int value) { return value + value; }\n}\n"),
+    "kotlin": ("kt", "kotlin.security.processbuilder-shell", "critical",
+               "fun run(text: String) {\n  ProcessBuilder(\"sh\", \"-c\", text).start()\n}\n",
+               "fun total(values: List<Int>): Int {\n  return values.sum()\n}\n"),
 }
 DELETION_GUARD = {"backend": "libseccomp.so.2", "default": "ALLOW",
                   "denied_syscalls": ["unlink", "unlinkat", "rmdir"],
@@ -394,7 +402,8 @@ class KeepTempCliTests(unittest.TestCase):
                  environment: dict[str, str] | None = None,
                  command_mode: str | None = None,
                  report_destination: Path | None = None,
-                 interrupt: bool = False) -> tuple[subprocess.CompletedProcess, dict, Path]:
+                 interrupt: bool = False,
+                 direct_module: bool = False) -> tuple[subprocess.CompletedProcess, dict, Path]:
         self.sequence += 1
         run = self.root / f"run-{self.sequence:02d}-{language}"
         run.mkdir()
@@ -412,13 +421,14 @@ class KeepTempCliTests(unittest.TestCase):
         if environment:
             env.update(environment)
         report_destination = report_destination or run / "requested-report.json"
-        arguments = ([command_mode] if command_mode else [
+        arguments = ([command_mode, *extra] if command_mode else [
             f"--module-dir={ROOT / 'modules'}", f"--only={language}",
             "--format=json", "--ci", "--no-cache", "--no-auto-update",
             "--fail-on-warning", f"--report-json={report_destination}", *extra, str(target),
         ])
+        entrypoint = ROOT / "modules" / f"ubs-{language}.sh" if direct_module else ROOT / "ubs"
         command = ["strace", "-ff", "-qq", "-s", "4096", "-yy", "-e", "trace=%file",
-                   "-o", str(run / "trace"), "bash", str(ROOT / "ubs"),
+                   "-o", str(run / "trace"), "bash", str(entrypoint),
                    *arguments]
         before_assets, before_source = scanner_assets(), source_digest(target)
         started = time.monotonic()
@@ -536,6 +546,14 @@ class KeepTempCliTests(unittest.TestCase):
                             for finding in document["findings"] if finding["severity"] == "info")
             self.assertEqual(actual, expected, context)
             self.assertEqual(document["totals"]["info"], 4, context)
+        elif language == "csharp":
+            expected = [("cs.inventory.project", "info", "", 0, 1,
+                         "Solutions: 0, Projects: 0, TargetFramework tags: 0, C# files scanned: 1", False)]
+            actual = sorted((finding["rule_id"], finding["severity"], finding["file"],
+                             finding["line"], finding["col"], finding["message"], finding["suppressed"])
+                            for finding in document["findings"] if finding["severity"] == "info")
+            self.assertEqual(actual, expected, context)
+            self.assertEqual(document["totals"]["info"], 1, context)
         if buggy:
             _, rule, severity, _, _ = CASES[language]
             rules = (rule, "rust.parsing.parse-unwrap") if language == "rust" else (rule,)
@@ -549,14 +567,16 @@ class KeepTempCliTests(unittest.TestCase):
             self.assertGreater(scanner[severity], 0, context)
         else:
             self.assertEqual({key: document["totals"][key] for key in SEVERITIES},
-                             {"critical": 0, "warning": 0, "info": 4 if language == "rust" else 0}, context)
-            if language != "rust":
+                             {"critical": 0, "warning": 0,
+                              "info": 4 if language == "rust" else 1 if language == "csharp" else 0}, context)
+            if language not in ("rust", "csharp"):
                 self.assertEqual(document.get("findings", []), [], context)
                 self.assertEqual(scanner.get("findings", []), [], context)
         return normalized_result(document), result.returncode
 
     def test_four_languages_retain_temps_without_losing_findings(self) -> None:
-        for language, (suffix, _, _, buggy, clean) in CASES.items():
+        for language in ("rust", "python", "js", "bash"):
+            suffix, _, _, buggy, clean = CASES[language]
             with self.subTest(language=language):
                 bad = self.source("buggy-" + language + "." + suffix, buggy)
                 good = self.source("clean-" + language + "." + suffix, clean)
@@ -564,6 +584,39 @@ class KeepTempCliTests(unittest.TestCase):
                 self.checked_report(language, good, buggy=False)
                 repeated = self.checked_report(language, bad, buggy=True)
                 self.assertEqual(repeated, first, "retention-mode findings, severities or exit changed across identical scans")
+
+    def test_csharp_and_kotlin_retain_temps_without_losing_findings(self) -> None:
+        for language in ("csharp", "kotlin"):
+            suffix, _, _, buggy, clean = CASES[language]
+            with self.subTest(language=language):
+                bad = self.source("buggy-" + language + "." + suffix, buggy)
+                good = self.source("clean-" + language + "." + suffix, clean)
+                first = self.checked_report(language, bad, buggy=True)
+                self.checked_report(language, good, buggy=False)
+                repeated = self.checked_report(language, bad, buggy=True)
+                self.assertEqual(repeated, first, "retention-mode findings, severities or exit changed across identical scans")
+
+    def test_csharp_and_kotlin_rule_listing_retains_generated_rules(self) -> None:
+        for language in ("csharp", "kotlin"):
+            suffix, rule, _, _, clean = CASES[language]
+            source = self.source("rule-control-" + language + "." + suffix, clean)
+            destination = self.root / (language + "-dumped-rules")
+            with self.subTest(language=language):
+                result, _, run = self.run_scan(
+                    language, source, "--dump-rules=" + str(destination),
+                    command_mode="--list-rules", direct_module=True,
+                )
+                context = f"{run}\n{result.stdout}\n{result.stderr}"
+                self.assertEqual(result.returncode, 0, context)
+                listed = result.stdout.splitlines()
+                self.assertIn(rule, listed, context)
+                dumped = {
+                    line.split(":", 1)[1].strip()
+                    for path in destination.rglob("*.yml")
+                    for line in path.read_text(encoding="utf-8").splitlines()
+                    if line.startswith("id:")
+                }
+                self.assertEqual(set(listed), dumped, context)
 
     def test_unsupported_php_refuses_before_module_execution(self) -> None:
         source = self.source("unsupported.php", '<?php eval($_GET["code"]);\n')

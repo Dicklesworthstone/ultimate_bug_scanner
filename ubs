@@ -208,13 +208,13 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 declare -A MODULE_CHECKSUMS=(
   [bash]='982660e72b91f5581dc039b50285a805bc805e3b48f396af31910d1655fb08cf'
   [cpp]='a7eb72ab0107dc9428d11d6306fe2109dfa8e478a219bdc8f68c7f603cf3ba16'
-  [csharp]='f8b3507ea7440d302b417ec0efc1f341861b0d4df98d0f4cff6c8ef465c8f5c2'
+  [csharp]='8097b9ae345364af7e5d38cde88090bc405d3aeca96830c214d9e09863e8e88b'
   [elixir]='227b59b110cb669cf68089c6f88a46ac333c81fd58f0e7101dcf2453e700feb1'
   [golang]='76d92f3c83cc8a90179c4f1d20aa54ad3ece7b320d011d0da24e290ea3aa0f7e'
   [hcl]='bd4b02c90711bbd2168a290931e3c441dd2ec8efa9e04f07b465d1e4bc815d1d'
   [java]='3fee2c7fd696e809687c28fba01cdeae1e0f144324598531f8917b74d051220f'
   [js]='951ca3d7148a56a354ab6f3f1fc6c01afab856ddaed91d6317fa864876a62f72'
-  [kotlin]='1d5da3f3ed95c4caf422825f50b7a12dac6ad610b0a9603698f91375555c4abf'
+  [kotlin]='7a0b20ad67b0632cbcc925b17c82a70eb46a25b6e3e48131535a69add6bd7167'
   [php]='a03f1c251cd85941317d6109e0277e697c4d22634dd0d379c51eb838907e50f7'
   [python]='9c7ada8230736b4a208d8b39282bde0f6080c5042ebe80efc9183f3096567c4d'
   [ruby]='4bb610058ba4ba00ffcb2402c970f4b0d84683a487a3e956c6adb0c73e651c38'
@@ -2242,7 +2242,7 @@ Environment Variables:
   CI=true                     Disable the opt-in auto-update check (like --ci)
   UBS_ENABLE_AUTO_UPDATE=1    Opt in to the 24h auto-update check
   UBS_NO_AUTO_UPDATE=1        Force-disable auto-update (like --no-auto-update)
-  UBS_KEEP_TEMP=1             Retain scanner scratch for Rust/Python/JS/Bash/HCL scans;
+  UBS_KEEP_TEMP=1             Retain scanner scratch for Rust/Python/JS/Bash/HCL/C#/Kotlin scans;
                               unsupported languages and update/service modes exit 2.
                               Use TMPDIR to choose storage. Caller removes retained files.
   FORCE_SELF_UPDATE=1         Force an immediate verified self-update check
@@ -2411,7 +2411,7 @@ cat <<'JSON'
     {"name": "UBS_SKIP_TYPE_NARROWING", "value": "1", "description": "Skip the type-narrowing helpers."},
     {"name": "UBS_ENABLE_AUTO_UPDATE", "value": "1", "description": "Opt in to the 24h auto-update check."},
     {"name": "UBS_NO_AUTO_UPDATE", "value": "1", "description": "Force-disable auto-update."},
-    {"name": "UBS_KEEP_TEMP", "value": "1", "description": "Retain scanner scratch for Rust/Python/JS/Bash/HCL; unsupported languages and update/service modes refuse with exit 2. Use TMPDIR to choose storage."},
+    {"name": "UBS_KEEP_TEMP", "value": "1", "description": "Retain scanner scratch for Rust/Python/JS/Bash/HCL/C#/Kotlin; unsupported languages and update/service modes refuse with exit 2. Use TMPDIR to choose storage."},
     {"name": "UBS_RULES", "value": "DIR[:DIR...]", "description": "Custom rule directories (':'-separated, like PATH) used when no --rules is given; empty entries are ignored."},
     {"name": "UBS_NO_CACHE", "value": "1", "description": "Disable scan caching (like --no-cache)."},
     {"name": "UBS_CACHE_DIR", "value": "PATH", "description": "Override root directory for scan cache (like --cache-dir)."},
@@ -10681,11 +10681,11 @@ if [[ ${#langs[@]} -eq 0 ]]; then emit_no_langs_result; fi
 if [[ "$UBS_KEEP_TEMP" == "1" ]]; then
   for L in "${langs[@]}"; do
     case "$L" in
-      rust|python|js|bash|hcl) ;;
+      rust|python|js|bash|hcl|csharp|kotlin) ;;
       *)
-        say_err "ERROR: UBS_KEEP_TEMP=1 does not support $L; supported languages: rust, python, js, bash, hcl."
+        say_err "ERROR: UBS_KEEP_TEMP=1 does not support $L; supported languages: rust, python, js, bash, hcl, csharp, kotlin."
         emit_error_envelope "environment" "error" "retention-unsupported-language" \
-          "UBS_KEEP_TEMP=1 does not support $L; supported languages: rust, python, js, bash, hcl" \
+          "UBS_KEEP_TEMP=1 does not support $L; supported languages: rust, python, js, bash, hcl, csharp, kotlin" \
           '"failed_modules":[]'
         exit 2 ;;
     esac

@@ -126,7 +126,7 @@ TMP_DIR=""
 # Invoked by the EXIT trap below; ShellCheck does not count trap callbacks.
 # shellcheck disable=SC2329
 cleanup() {
-  [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR" || true
+  [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]] && ubs_remove_temp -rf "$TMP_DIR" || true
 }
 # Invoked by the ERR trap below; ShellCheck does not count trap callbacks.
 # shellcheck disable=SC2329
@@ -741,7 +741,7 @@ generate(Path(os.environ["UBS_CONTRACT_V2_CSHARP_AST_DIR"]), Path(user) if user 
     "$v2_skip" "$v2_ast_ran" "$status_file" || exit_code=$?
   if [[ -n "$text_out" ]]; then
     cat "$text_out" 2>/dev/null || true
-    rm -f "$text_out" 2>/dev/null || true
+    ubs_remove_temp -f "$text_out" 2>/dev/null || true
   fi
   if [[ -n "$REPORT_JSON" ]]; then
     cp "$sink" "$REPORT_JSON" 2>/dev/null || true   # K2: the sink IS the findings record stream
@@ -749,8 +749,8 @@ generate(Path(os.environ["UBS_CONTRACT_V2_CSHARP_AST_DIR"]), Path(user) if user 
   if [[ -n "$EMIT_FINDINGS_JSON" ]]; then
     cp "$sink" "$EMIT_FINDINGS_JSON" 2>/dev/null || true   # K2: NDJSON records (shape-keyed downstream)
   fi
-  rm -f "$list_file" "$sink" 2>/dev/null || true
-  [[ -n "$ast_rule_dir" ]] && rm -rf -- "$ast_rule_dir" 2>/dev/null || true
+  ubs_remove_temp -f "$list_file" "$sink" 2>/dev/null || true
+  [[ -n "$ast_rule_dir" ]] && ubs_remove_temp -rf -- "$ast_rule_dir" 2>/dev/null || true
   return "$exit_code"
 }
 

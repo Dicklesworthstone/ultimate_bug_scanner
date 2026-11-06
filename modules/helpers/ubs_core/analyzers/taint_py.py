@@ -51,6 +51,9 @@ EXTS = {'.py', '.pyi'}
 PATH_LIMIT = 5
 _INCOMPLETE_PROOF = 'taint:incomplete'
 _MAX_CAPTURE_DEPTH = 64
+_PARTIAL_MODULE_REF = '@stdlib:functools'
+_PARTIAL_CHANGED_MODULE = '@partial:changed-module'
+_PARTIAL_CHANGED_CONSTRUCTOR = '@partial:changed-constructor'
 # Keep a precise prefix plus an aggregate unknown-length suffix in summaries.
 _MAX_VECTOR_CONTEXT = 16
 
@@ -194,6 +197,9 @@ def _dependency_target(node, bindings, evaluated=None):
         target = bindings.get(argument.id) if isinstance(argument, ast.Name) else None
     if isinstance(target, _ClosureValue):
         target = target.value
+    if any(isinstance(choice, _PartialValue) for choice in _binding_choices(target)):
+        raise AnalysisLimit('functools.partial framework dependency needs callback binding analysis; '
+                            'analysis is incomplete')
     if isinstance(target, _FunctionValue):
         target = target.function
     return target if isinstance(target, (ast.FunctionDef, ast.AsyncFunctionDef)) else None
@@ -436,6 +442,19 @@ def _join_cells(left, right):
                          left.bound if left.bound == right.bound else None)
 
 
+@dataclass(frozen=True)
+class _GlobalWrite:
+    """A module replacement and the value on a branch that did not write.
+
+    Unlike heap mutations these are strong assignments. Retaining the entry
+    value lets a lazily allocated record join an unwritten branch without
+    discarding that branch's original fact, callable identity or object alias.
+    """
+    initial: _CellContents
+    current: _CellContents
+    raw_global: bool = False
+
+
 @dataclass(frozen=True, eq=False)
 class _ClosureValue:
     """A callable owns cell identities; their live contents belong to state."""
@@ -516,6 +535,18 @@ class _FunctionValue:
         if type(other) is not type(self):
             return NotImplemented
         return _same_analysis_value(self, other)
+
+
+@dataclass(frozen=True, eq=False)
+class _PartialValue(_FunctionValue):
+    """A partial's creation site identifies captured callable/operand slots.
+
+    Reuse evaluated-default transport for facts, object aliases and lexical
+    cells. The creation site is not an executable function: only invoking this
+    value combines its captured operands with the new call's arguments.
+    """
+
+    function: ast.Call
 
 
 @dataclass(frozen=True, eq=False)
@@ -615,6 +646,10 @@ def _analysis_comparison_steps(a, b, evidence):
         return (type(a) is type(b) and a.bound == b.bound and a.references == b.references
                 and (yield (a.fact, b.fact, evidence))
                 and (yield (a.binding, b.binding, evidence)))
+    if isinstance(a, _GlobalWrite):
+        return (type(a) is type(b) and a.raw_global == b.raw_global
+                and (yield (a.initial, b.initial, evidence))
+                and (yield (a.current, b.current, evidence)))
     if isinstance(a, (_FunctionValue, _DeferredCall)):
         return (type(a) is type(b) and a._hash == b._hash
                 and a.function is b.function
@@ -734,7 +769,10 @@ def _join_bindings(*bindings):
 
 
 def _without_object_contract(binding):
-    return _join_bindings(*(None if isinstance(value, (_ArgumentVector, _ProcessInput, ast.ClassDef)) else value
+    if any(isinstance(value, _PartialValue) for value in _binding_choices(binding)):
+        raise AnalysisLimit('mutated functools.partial object; analysis is incomplete')
+    return _join_bindings(*(None if isinstance(value, (_ArgumentVector, _ProcessInput, ast.ClassDef))
+                            else _PARTIAL_CHANGED_MODULE if value == 'functools' else value
                             for value in _binding_choices(binding)))
 
 
@@ -1016,6 +1054,9 @@ class _State(dict):
         self.mutated = set(getattr(values, 'mutated', ()))
         cells = getattr(values, 'cells', None)
         self.cells = cells.copy() if cells is not None else None
+        global_writes = getattr(values, 'global_writes', None)
+        self.global_writes = global_writes.copy() if global_writes is not None else None
+        self.deleted_globals = getattr(values, 'deleted_globals', frozenset())
         self.reachable = getattr(values, 'reachable', True)
 
     def cell_state(self):
@@ -1058,6 +1099,8 @@ class _State(dict):
         clone.heap = self.heap.copy()
         clone.mutated = self.mutated.copy()
         clone.cells = self.cells.copy() if self.cells is not None else None
+        clone.global_writes = self.global_writes.copy() if self.global_writes is not None else None
+        clone.deleted_globals = self.deleted_globals
         clone.reachable = self.reachable
         return clone
 
@@ -1072,6 +1115,8 @@ class _State(dict):
         self.heap = other.heap.copy()
         self.mutated = other.mutated.copy()
         self.cells = other.cells.copy() if other.cells is not None else None
+        self.global_writes = other.global_writes.copy() if other.global_writes is not None else None
+        self.deleted_globals = other.deleted_globals
         self.reachable = other.reachable
 
     def __eq__(self, other):
@@ -1079,6 +1124,8 @@ class _State(dict):
                 and self.bindings == other.bindings and self.references == other.references
                 and self.heap == other.heap and self.mutated == other.mutated
                 and self.cells == other.cells
+                and self.global_writes == other.global_writes
+                and self.deleted_globals == other.deleted_globals
                 and self.reachable == other.reachable)
 
     def __ne__(self, other):
@@ -1130,6 +1177,7 @@ def _join_states(*states):
                 references[key] = previous | refs
         if other.mutated:
             values.mutated.update(other.mutated)
+        values.deleted_globals = values.deleted_globals | other.deleted_globals
         if other.cells is not None:
             if values.cells is None:
                 values.cells = other.cells.copy()
@@ -1174,6 +1222,40 @@ def _join_states(*states):
                 state.bindings[name] if name in state.bindings else _implicit_identity(name)
                 for state in reachable))
         values.bindings = bindings
+    if any(state.global_writes for state in reachable):
+        changes = {}
+        for state in reachable:
+            for name, write in (state.global_writes or {}).items():
+                previous = changes.get(name)
+                changes[name] = write if previous is None else _GlobalWrite(
+                    _join_cells(previous.initial, write.initial), previous.current,
+                    previous.raw_global and write.raw_global)
+        for name, write in changes.items():
+            contents = None
+            slot = '@global:' + name
+            for state in reachable:
+                branch = (state.global_writes or {}).get(name)
+                if branch is not None:
+                    incoming = branch.current
+                elif name in state.deleted_globals:
+                    incoming = _CellContents(bound=False)
+                elif slot in state.bindings or write.raw_global and name in state.bindings:
+                    # A module branch can assign directly without ever calling
+                    # a setter. Its current value, not the sibling's old entry
+                    # snapshot, is the unwritten side of this call effect.
+                    key = slot if slot in state.bindings else name
+                    incoming = _CellContents(state.get(key, CLEAN),
+                                             state.references.get(key, NO_REFERENCES), state.bindings[key])
+                else:
+                    incoming = write.initial
+                contents = incoming if contents is None else _join_cells(contents, incoming)
+            if contents.bound is not True:
+                raise AnalysisLimit('conditional global creation or deletion; analysis is incomplete')
+            changes[name] = _GlobalWrite(write.initial, contents, write.raw_global)
+            values[slot] = contents.fact
+            values.bindings[slot] = contents.binding
+            values.references[slot] = contents.references
+        values.global_writes = changes
     return values
 
 
@@ -1194,7 +1276,9 @@ def _identity_snapshot(state):
             tuple(state.heap), tuple(state.heap.values()),
             frozenset(state.mutated),
             (tuple(state.cells.names.items()), tuple(state.cells.contents), tuple(state.cells.contents.values()),
-             frozenset(state.cells.written), frozenset(state.cells.multiple)) if state.cells is not None else None)
+             frozenset(state.cells.written), frozenset(state.cells.multiple)) if state.cells is not None else None,
+            (tuple(state.global_writes), tuple(state.global_writes.values()))
+            if state.global_writes is not None else None, state.deleted_globals)
 
 
 def _same_snapshot(left, right):
@@ -1203,7 +1287,11 @@ def _same_snapshot(left, right):
     cells_equal = (left[9] is right[9] or left[9] is not None and right[9] is not None
                    and left[9][:2] == right[9][:2] and left[9][3:] == right[9][3:]
                    and all(map(operator.is_, left[9][2], right[9][2])))
-    return (cells_equal and left[0] == right[0] and left[2] == right[2] and left[4] == right[4]
+    globals_equal = (left[10] is right[10] or left[10] is not None and right[10] is not None
+                     and left[10][0] == right[10][0]
+                     and all(map(operator.is_, left[10][1], right[10][1])))
+    return (cells_equal and globals_equal and left[11] == right[11]
+            and left[0] == right[0] and left[2] == right[2] and left[4] == right[4]
             and left[6] == right[6] and left[8] == right[8]
             and all(map(operator.is_, left[1], right[1]))
             and all(map(operator.is_, left[3], right[3]))
@@ -1231,6 +1319,8 @@ def _same_namespace(left, right):
     # identities. Only values, heap cells and bindings can carry evidence.
     return ((left.cells is None or all(_same_witness(value, right.cells.contents[ref])
                                       for ref, value in left.cells.contents.items()))
+            and (left.global_writes is None or all(_same_witness(value, right.global_writes[name])
+                                                   for name, value in left.global_writes.items()))
             and all(_same_witness(value, other[name])
                for values, other in ((left, right), (left.heap, right.heap),
                                      (left.bindings, right.bindings))
@@ -1442,6 +1532,7 @@ class ExceptionSummary:
     mutations: tuple = ()
     cells: tuple = ()
     multiple_cells: frozenset = frozenset()
+    global_writes: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -1476,6 +1567,8 @@ class FunctionSummary:
     # Unlike object mutations, these may replace a value or delete its name.
     cells: tuple = ()
     multiple_cells: frozenset = frozenset()
+    # (defining module, name, final contents), separate from object mutation.
+    global_writes: tuple = ()
 
 
 class _CallSubstitution:
@@ -1595,6 +1688,8 @@ class _Flow:
         self.context_globals = ()
         self.capture_globals = set()
         self.value_parameters = set()
+        self.observed_global_writes = None
+        self.deferred_generator_depth = 0
 
     def refine_url_guard(self, test, state, truth):
         """Recognize an exact, terminating local URL allow-list predicate.
@@ -1684,7 +1779,7 @@ class _Flow:
         if checked == {'scheme', 'hostname'} and not any(
                 state.heap.get(ref, CLEAN) for ref in state.references.get(name, NO_REFERENCES)):
             self.write_name(state, name, _sanitize(state.value(name), 'ssrf'), state.bindings.get(name),
-                            state.references.get(name, NO_REFERENCES))
+                            state.references.get(name, NO_REFERENCES), global_write=False)
 
     def possible_exception(self, state):
         if not (state.reachable and self.exception_states):
@@ -1935,8 +2030,97 @@ class _Flow:
         if unsafe:
             self.effects[key] = join_facts(self.effects.get(key, CLEAN), unsafe)
 
-    def write_name(self, state, name, fact, binding, references=NO_REFERENCES, *, bound=True):
+    def global_shadowed(self, name):
+        if name in (self.engine.locals.get(self.scope, ()) if not isinstance(self.scope, ast.Module) else ()):
+            return True
+        if name in self.engine.closures.get(self.scope, ()):
+            return True
+        if any(name in self.engine.locals[scope] for scope, _outer in self.comprehension_environments):
+            return True
+        return any(name in _local_names(scope) for scope, _outer in self.class_environments)
+
+    def global_contents(self, name, state):
+        if name in state.deleted_globals:
+            return _CellContents(bound=False)
+        slot = '@global:' + name
+        if slot in state.bindings:
+            return _CellContents(state.get(slot, CLEAN), state.references.get(slot, NO_REFERENCES),
+                                 state.bindings[slot])
+        lexical = (self.engine.locals.get(self.scope, ()) if not isinstance(self.scope, ast.Module) else ())
+        if name not in lexical and name not in self.engine.closures.get(self.scope, ()):
+            namespace = state
+            for scope, outer in self.comprehension_environments:
+                if name in self.engine.locals[scope]:
+                    namespace = outer
+                    break
+            key = slot if slot in namespace.bindings else name
+            if key in namespace.bindings:
+                return _CellContents(namespace.get(key, CLEAN), namespace.references.get(key, NO_REFERENCES),
+                                     namespace.bindings[key])
+        if isinstance(self.scope, ast.Module):
+            return _CellContents(bound=False)
+        fact, refs, _binding = self.engine.global_symbols[name]
+        return _CellContents(fact, refs, self.engine.globals.bindings.get(name))
+
+    def put_global(self, name, contents, state):
+        """Replace one same-module global without touching a caller's local."""
+        if self.deferred_generator_depth:
+            raise AnalysisLimit('generator expression global writes require resume-state analysis; '
+                                'analysis is incomplete')
+        if name not in self.engine.global_names:
+            raise AnalysisLimit('new global declaration in a helper; analysis is incomplete')
+        if contents.bound is not True:
+            raise AnalysisLimit('global deletion requires namespace lifetime analysis; analysis is incomplete')
+        if any(name in _local_names(scope) for scope, _outer in self.class_environments):
+            # Class bodies resolve a name through their partially constructed
+            # namespace before globals. Tracking only lexical assignment sites
+            # cannot distinguish a later class binding from an existing one.
+            raise AnalysisLimit('global write shadowed by an active class namespace; analysis is incomplete')
+        self.engine.budget.spend(1 + len(contents.fact) + len(contents.references))
+        initial = self.global_contents(name, state)
+        if state.global_writes is None:
+            state.global_writes = {}
+        previous = state.global_writes.get(name)
+        state.global_writes[name] = _GlobalWrite(previous.initial if previous else initial, contents,
+                                                not self.global_shadowed(name))
+        state.deleted_globals = state.deleted_globals - {name}
+        if self.observed_global_writes is None:
+            self.observed_global_writes = {}
+        observed = self.observed_global_writes.get(name)
+        self.observed_global_writes[name] = contents if observed is None else _join_cells(observed, contents)
+        slot = '@global:' + name
+        state[slot], state.references[slot], state.bindings[slot] = (
+            contents.fact, contents.references, contents.binding)
+        if not self.global_shadowed(name):
+            state[name], state.references[name], state.bindings[name] = (
+                contents.fact, contents.references, contents.binding)
+        if not isinstance(self.scope, ast.Module):
+            # A conditional write may retain the incoming identity. Request
+            # that finite context through intermediaries, just like a read.
+            self.capture_globals.add((self.engine.tree, name))
+
+    def write_name(self, state, name, fact, binding, references=NO_REFERENCES, *, bound=True,
+                   global_write=True):
         """A scalar rebinding replaces a cell; object writes still use mutate."""
+        declared = name in self.engine.declared_globals.get(self.scope, ())
+        module_replacement = (isinstance(self.scope, ast.Module)
+                              and '@global:' + name in state.bindings)
+        if (global_write and self.deferred_generator_depth and not self.class_environments
+                and (declared or isinstance(self.scope, ast.Module))
+                and not self.global_shadowed(name)):
+            raise AnalysisLimit('generator expression global writes require resume-state analysis; '
+                                'analysis is incomplete')
+        if (global_write and (declared or module_replacement)
+                and not self.class_environments
+                and not any(name in self.engine.locals[scope] for scope, _outer in self.comprehension_environments)):
+            self.put_global(name, _CellContents(fact, references, binding, bound), state)
+        if (global_write and isinstance(self.scope, ast.Module) and not self.class_environments
+                and not any(name in self.engine.locals[scope] for scope, _outer in self.comprehension_environments)):
+            # Ordinary module cleanup remains supported. Only a later join
+            # with a helper's replacement needs to distinguish an actual
+            # deletion from a global omitted by a function's compact state.
+            state.deleted_globals = (state.deleted_globals - {name} if bound
+                                     else state.deleted_globals | {name})
         state[name] = fact
         state.bindings[name] = binding
         state.references[name] = references
@@ -2138,7 +2322,7 @@ class _Flow:
                 value = (_DeferredCall(value.function, value.call, value.arguments, references, values,
                                        tuple((name, map_ref(ref)) for name, ref in value.cells))
                          if isinstance(value, _DeferredCall) else
-                         _FunctionValue(value.function, value.arguments, references, values))
+                         type(value)(value.function, value.arguments, references, values))
             choices.append(value)
         result = _join_bindings(*choices)
         memo[id(binding)] = result
@@ -2260,17 +2444,44 @@ class _Flow:
             self.engine.budget.spend(1 + len(cells.names) + len(actual_refs))
             state.put_cell(target, projected, written=True, weak=target in cells.multiple)
 
-    def assign(self, target, fact, state, value=None, *, target_references=None):
+    def export_globals(self, state):
+        if state is None or not state.global_writes:
+            return ()
+        result = []
+        for name, write in sorted(state.global_writes.items()):
+            contents = write.current
+            self.engine.budget.spend(1 + len(contents.fact) + len(contents.references)
+                                     + sum(len(state.heap.get(ref, CLEAN)) for ref in contents.references))
+            binding = self.refresh_function_defaults(contents.binding, state.heap, state.mutated)
+            if contents.references & state.mutated:
+                binding = _without_object_contract(binding)
+            result.append((self.engine.tree, name, _CellContents(
+                join_facts(contents.fact, *(state.heap.get(ref, CLEAN) for ref in contents.references)),
+                contents.references, binding, contents.bound)))
+        return tuple(result)
+
+    def apply_globals(self, items, cell_map, state, node, bound, references, values, substitute, *, weak=False):
+        for module, name, contents in items:
+            if module is not self.engine.tree:
+                raise AnalysisLimit('foreign module global write; analysis is incomplete')
+            if name in state.deleted_globals and '@global:' + name in contents.references:
+                # A conditional setter can carry its unchanged input through
+                # the summary. That is not a definite recreation after del.
+                raise AnalysisLimit('conditional global creation or deletion; analysis is incomplete')
+            actual_refs = frozenset().union(*(
+                self._lookup_refs(references, ref) if isinstance(ref, str) else frozenset({node})
+                for ref in contents.references))
+            binding = self.substitute_binding(contents.binding, bound, references, node, '<global>()',
+                                              values, substitute=substitute, cells=cell_map)
+            projected = _CellContents(substitute(contents.fact), actual_refs, binding, contents.bound)
+            if weak:
+                projected = _join_cells(self.global_contents(name, state), projected)
+            self.put_global(name, projected, state)
+
+    def assign(self, target, fact, state, value=None, *, target_references=None, deleting=False):
         if isinstance(target, ast.Name):
             self.write_name(state, target.id, _advance(fact, target.id), self.expression_bindings.get(value),
                             self.expression_references.get(value, NO_REFERENCES))
-            slot = '@global:' + target.id
-            local = (self.engine.locals.get(self.scope, frozenset()) | self.engine.closures.get(self.scope, frozenset())
-                     if not isinstance(self.scope, ast.Module) else frozenset())
-            if target.id not in local and slot in state.bindings:
-                state[slot] = state[target.id]
-                state.bindings[slot] = state.bindings[target.id]
-                state.references[slot] = state.references[target.id]
         elif isinstance(target, (ast.Tuple, ast.List)):
             if isinstance(value, (ast.Tuple, ast.List)) and len(target.elts) == len(value.elts):
                 for item, expression in zip(target.elts, value.elts):
@@ -2281,6 +2492,9 @@ class _Flow:
         elif isinstance(target, ast.Starred):
             self.assign(target.value, fact, state)
         elif isinstance(target, (ast.Subscript, ast.Attribute)):
+            if any(isinstance(choice, _PartialValue)
+                   for choice in _binding_choices(self.expression_bindings.get(value))):
+                raise AnalysisLimit('functools.partial stored in an object; analysis is incomplete')
             if any(isinstance(choice, _GlobalNamespace)
                    for choice in _binding_choices(self.expression_bindings.get(value))):
                 raise AnalysisLimit('globals mapping stored in an object; analysis is incomplete')
@@ -2308,6 +2522,8 @@ class _Flow:
             if isinstance(namespace, _GlobalNamespace):
                 if not isinstance(target, ast.Subscript) or namespace.member is not None:
                     raise AnalysisLimit('unsupported globals mapping member write; analysis is incomplete')
+                if deleting:
+                    raise AnalysisLimit('global deletion requires namespace lifetime analysis; analysis is incomplete')
                 self.write_global(namespace, target.slice, fact, value, state)
                 return
             if target_references:
@@ -2337,11 +2553,9 @@ class _Flow:
         name = self.namespace_key(namespace, key)
         if name not in self.engine.global_names:
             raise AnalysisLimit('new globals mapping declaration; analysis is incomplete')
-        self.engine.budget.spend()
-        slot = '@global:' + name
-        state[slot] = _advance(fact, name)
-        state.bindings[slot] = self.expression_bindings.get(value)
-        state.references[slot] = self.expression_references.get(value, NO_REFERENCES)
+        self.put_global(name, _CellContents(_advance(fact, name),
+                                           self.expression_references.get(value, NO_REFERENCES),
+                                           self.expression_bindings.get(value)), state)
         self.engine.rebound_globals.add(name)
 
     def read_global(self, namespace, key, state):
@@ -2567,7 +2781,7 @@ class _Flow:
                     if references.get(name, NO_REFERENCES) & mutated:
                         captured = _without_object_contract(captured)
                     values.append((name, self.refresh_function_defaults(captured, heap, mutated)))
-                value = _FunctionValue(value.function, tuple(arguments), value.references, tuple(values))
+                value = type(value)(value.function, tuple(arguments), value.references, tuple(values))
             choices.append(value)
         return _join_bindings(*choices)
 
@@ -2738,6 +2952,8 @@ class _Flow:
         return bound
 
     def _lookup_refs(self, references, key):
+        if key == _PARTIAL_MODULE_REF:
+            return frozenset({key})
         res = references.get(key)
         if res is not None:
             return res
@@ -2995,6 +3211,10 @@ class _Flow:
             fact = self.incomplete_result(substitute(written))
             budget.spend(len(refs) * (1 + len(fact)))
             self.mutate(refs, fact, state)
+        if summary.global_writes:
+            self.apply_globals(summary.global_writes, cell_map or {}, state, node,
+                               bound, references, values or {},
+                               lambda fact: self.incomplete_result(substitute(fact)), weak=True)
 
         # The optimized binding contains every module global. Possible return
         # aliases need only actual arguments/cells, globals used by this body,
@@ -3113,7 +3333,7 @@ class _Flow:
                 choices.append(_DeferredCall(target.function, target.call, arguments, actual, captured_values,
                                               tuple((name, (cells or {}).get(ref, ref)) for name, ref in target.cells))
                                if isinstance(target, _DeferredCall)
-                               else _FunctionValue(target.function, arguments, actual, captured_values))
+                               else type(target)(target.function, arguments, actual, captured_values))
             else:
                 choices.append(target)
         return _join_bindings(*choices)
@@ -3324,6 +3544,104 @@ class _Flow:
         self.effect('command', node, 'interpreter source', interpreter_code)
         self.effect('command', node, 'subprocess execution', shell_code)
 
+    def partial_value(self, node, state, inputs):
+        """Capture a resolved stdlib partial without executing its target."""
+        positions = self.call_positions(node, inputs.arguments, state)
+        if (not positions or any(isinstance(item[0], (ast.Starred, _ArgumentExpansion))
+                                 for item in positions) or None in inputs.keywords):
+            raise AnalysisLimit('functools.partial argument expansion needs binding analysis; '
+                                'analysis is incomplete')
+        captured = [('target', *positions[0])]
+        captured.extend((f'pos:{index}', *item) for index, item in enumerate(positions[1:]))
+        captured.extend((f'kw:{name}', expression, inputs.keywords[name],
+                         self.expression_bindings.get(expression),
+                         self.expression_references.get(expression, NO_REFERENCES))
+                        for name, expression in sorted(inputs.keyword_nodes.items()))
+        arguments, references, values = [], [], []
+        for slot, expression, fact, binding, refs in captured:
+            self.engine.budget.spend(1 + len(fact) + len(refs))
+            if any(value == 'functools.Placeholder' for value in _binding_choices(binding)):
+                raise AnalysisLimit('functools.partial Placeholder needs positional binding analysis; '
+                                    'analysis is incomplete')
+            # Unlike a variable name, a literal scalar option is an evaluated
+            # snapshot. Retain bool/None as well as the existing string proof.
+            if isinstance(expression, ast.Constant) and binding is None:
+                binding = expression
+            arguments.append((slot, fact))
+            references.append((slot, refs))
+            values.append((slot, binding))
+        self.expression_bindings[node] = _PartialValue(node, tuple(arguments), tuple(references), tuple(values))
+        self.expression_references[node] = frozenset({node})
+        self.possible_exception(state)
+        return CLEAN
+
+    def invoke_partial(self, node, state, partial, inputs):
+        """Invoke captured operands followed by new positional/keyword values.
+
+        Call views have stable identities but never re-evaluate the original
+        expressions. Scalar facts stay captured; object aliases and the target
+        function's closure cells observe writes performed before invocation.
+        """
+        if (any(isinstance(argument, ast.Starred) for argument in node.args)
+                or None in inputs.keywords):
+            raise AnalysisLimit('functools.partial call expansion needs binding analysis; '
+                                'analysis is incomplete')
+        partial = self.refresh_function_defaults(partial, state.heap, state.mutated)
+        facts, refs, values = dict(partial.arguments), dict(partial.references), dict(partial.values)
+        slots = [slot for slot, _fact in partial.arguments if slot.startswith('pos:')]
+        keywords = {slot[3:]: slot for slot, _fact in partial.arguments if slot.startswith('kw:')}
+        for binding in values.values():
+            self.require_value(binding)
+        # Literal options can change dispatch (e.g. shell=False). Include only
+        # their finite identities in the call-view key, never taint evidence.
+        shape = tuple((slot, value if isinstance(value, (ast.Constant, _LiteralString)) else None)
+                      for slot, value in partial.values if slot != 'target')
+        key = (node, partial.function, shape)
+        view = self.engine.partial_calls.get(key)
+        if view is None:
+            expressions = {}
+            for slot, value in shape:
+                expression = (ast.Constant(value=value.value)
+                              if isinstance(value, (ast.Constant, _LiteralString)) else
+                              ast.Name(id='@partial:' + slot, ctx=ast.Load()))
+                expressions[slot] = ast.copy_location(expression, node)
+            call = ast.copy_location(ast.Call(
+                func=node.func, args=[*(expressions[slot] for slot in slots), *node.args],
+                keywords=[*(ast.keyword(arg=name, value=expressions[slot])
+                            for name, slot in keywords.items() if name not in inputs.keywords),
+                          *node.keywords]), node)
+            view = (call, expressions)
+            self.engine.partial_calls[key] = view
+        call, expressions = view
+        for slot, expression in expressions.items():
+            self.expression_facts[expression] = facts[slot]
+            self.expression_references[expression] = refs.get(slot, NO_REFERENCES)
+            self.expression_bindings[expression] = values.get(slot)
+        combined = _CallInputs(
+            [*(facts[slot] for slot in slots), *inputs.arguments],
+            {**{name: facts[slot] for name, slot in keywords.items()}, **inputs.keywords},
+            {**{name: expressions[slot] for name, slot in keywords.items()}, **inputs.keyword_nodes})
+        branches, results, returned_refs, bindings = [], [], [], []
+        for target in _binding_choices(values.get('target')):
+            branch = state.copy()
+            self.expression_bindings.pop(call, None)
+            self.expression_references.pop(call, None)
+            result = self.invoke(call, branch, _CallTarget(
+                target, receiver=facts.get('target', CLEAN),
+                references=refs.get('target', NO_REFERENCES)), combined)
+            if branch.reachable:
+                branches.append(branch)
+                results.append(result)
+                returned_refs.append(self.expression_references.get(call, frozenset({node})))
+                bindings.append(self.expression_bindings.get(call))
+        state.replace(_join_states(*branches))
+        self.expression_bindings[node] = _join_bindings(*bindings)
+        self.expression_references[node] = frozenset().union(*returned_refs)
+        for table in (self.generator_returns, self.generator_return_references, self.generator_return_bindings):
+            if call in table:
+                table[node] = table[call]
+        return join_facts(*results)
+
     def call(self, node, state):
         original = node
         node = self.engine.call_sites.get(node, node)
@@ -3401,6 +3719,10 @@ class _Flow:
         target, fallback_name = callee.binding, callee.fallback_name
         receiver, receiver_refs = callee.receiver, callee.references
         arguments, keywords, keyword_nodes = inputs.arguments, inputs.keywords, inputs.keyword_nodes
+        if isinstance(target, _PartialValue):
+            return self.invoke_partial(node, state, target, inputs)
+        if target == _PARTIAL_CHANGED_CONSTRUCTOR:
+            raise AnalysisLimit('functools.partial constructor replacement; analysis is incomplete')
         if isinstance(target, _GlobalNamespace):
             if target.module is not self.engine.tree:
                 raise AnalysisLimit('foreign globals mapping call; analysis is incomplete')
@@ -3501,6 +3823,8 @@ class _Flow:
             name = target.name
             receiver_refs = target.references
             receiver = join_facts(target.receiver, *(state.heap.get(ref, CLEAN) for ref in receiver_refs))
+        if name == 'functools.partial':
+            return self.partial_value(node, state, inputs)
         closure = target if isinstance(target, _ClosureValue) else None
         if closure is not None:
             target = closure.value
@@ -3634,7 +3958,7 @@ class _Flow:
                 if any(isinstance(value, (str, _LiteralString, _ArgumentVector, _ProcessInput,
                                           _FunctionValue, _ClosureValue,
                                           ast.FunctionDef, ast.AsyncFunctionDef,
-                                          ast.Lambda, _BoundClassMethod))
+                                          ast.Lambda, ast.Constant, _BoundClassMethod))
                        for value in (*_binding_choices(binding), *_binding_choices(nominal))):
                     overrides.add(gname)
             prepared = []
@@ -3685,6 +4009,9 @@ class _Flow:
                 # Wait for a non-bottom summary and retain its known effects.
                 raise AnalysisLimit('generator with live lexical cells requires resume-state analysis; '
                                     'analysis is incomplete')
+            if (function in owner.generators and (summary.global_writes
+                    or any(exception.global_writes for exception in summary.exceptions))):
+                raise AnalysisLimit('generator global writes require resume-state analysis; analysis is incomplete')
             if summary.incomplete:
                 # Resumed coroutines use an Await node, not a Call, and their
                 # values were captured at construction. Use the already bound
@@ -3693,11 +4020,14 @@ class _Flow:
                                             receiver, state, substitute, values, cell_map)
             for exception in summary.exceptions:
                 exceptional = state.copy()
+                exceptional_cells = cell_map.copy()
                 for parameter, written in exception.mutations:
                     self.mutate(self._lookup_refs(references, parameter),
                                 substitute(written), exceptional)
-                self.apply_cells(exception.cells, exception.multiple_cells, cell_map.copy(), exceptional,
+                self.apply_cells(exception.cells, exception.multiple_cells, exceptional_cells, exceptional,
                                  node, bound, references, values, substitute)
+                self.apply_globals(exception.global_writes, exceptional_cells, exceptional,
+                                   node, bound, references, values, substitute)
                 raised = substitute(exception.value)
                 self.observed_raises.append((raised, frozenset({node})))
                 self.pending.append(_Completion(
@@ -3714,6 +4044,8 @@ class _Flow:
                 self.mutate(self._lookup_refs(references, parameter), fact, state)
             self.apply_cells(summary.cells, summary.multiple_cells, cell_map, state,
                              node, bound, references, values, substitute)
+            self.apply_globals(summary.global_writes, cell_map, state,
+                               node, bound, references, values, substitute)
             returned_refs = frozenset().union(*(self._lookup_refs(references, parameter)
                                                for parameter in summary.returned_references))
             self.expression_references[node] = returned_refs or frozenset({node})
@@ -3776,6 +4108,9 @@ class _Flow:
                 finally:
                     self.pending = outer
                 for end in ends:
+                    if end.global_writes != state.global_writes:
+                        raise AnalysisLimit('scheduled task global writes require scheduling analysis; '
+                                            'analysis is incomplete')
                     for ref in end.heap.keys() | end.mutated:
                         self.mutate(frozenset({ref}), end.heap.get(ref, CLEAN), state)
                     if end.cells is not None:
@@ -3944,6 +4279,9 @@ class _Flow:
             # This effect is summarized even for a symbolic helper parameter.
             for expression in (*node.args, *keyword_nodes.values()):
                 value = self.expression_bindings.get(expression)
+                if {'functools', _PARTIAL_CHANGED_MODULE} & _binding_choices(value) and name not in {
+                        'print', 'str', 'repr', 'bool', 'builtins.print', 'builtins.str', 'builtins.repr'}:
+                    self.mutate(frozenset({_PARTIAL_MODULE_REF}), CLEAN, state)
                 if any(isinstance(choice, (_ArgumentVector, _SymbolicValue, ast.ClassDef, _BoundClassMethod))
                        for choice in _binding_choices(value)) and name not in SANITIZERS and name not in {
                            'print', 'str', 'len', 'repr', 'tuple', 'list', 'bool', 'int', 'float',
@@ -3952,6 +4290,14 @@ class _Flow:
                     for choice in _binding_choices(value):
                         if isinstance(choice, _BoundClassMethod):
                             self.mutate(choice.references, CLEAN, state)
+        # A native sink contract describes its data operands, not arbitrary
+        # callbacks such as subprocess preexec_fn or HTTP authentication.
+        # Keep any observed sink effect, then refuse unmodeled partial escapes.
+        if name not in {'print', 'str', 'repr', 'bool', 'builtins.print', 'builtins.str', 'builtins.repr'}:
+            for expression in (*node.args, *keyword_nodes.values()):
+                if any(isinstance(value, _PartialValue)
+                       for value in _binding_choices(self.expression_bindings.get(expression))):
+                    raise AnalysisLimit('functools.partial passed to an unresolved consumer; analysis is incomplete')
         configurable_html = name == 'bleach.clean' and (
             len(node.args) > 1 or any(keyword.arg not in {'text', 'strip', 'strip_comments'} for keyword in node.keywords)
         )
@@ -3967,7 +4313,8 @@ class _Flow:
         self.engine.budget.spend()
         if isinstance(node, ast.Constant):
             self.expression_references.pop(node, None)
-            self.expression_bindings[node] = _LiteralString(node.value) if isinstance(node.value, str) else None
+            self.expression_bindings[node] = (_LiteralString(node.value) if isinstance(node.value, str)
+                                             else node if isinstance(node.value, bool) else None)
             self.expression_facts[node] = CLEAN
             return CLEAN
         if isinstance(node, ast.Name):
@@ -3982,9 +4329,8 @@ class _Flow:
             self.expression_facts[node] = fact
             binding = state.bindings.get(node.id, _implicit_identity(node.id))
             slot = '@global:' + node.id
-            local = (self.engine.locals.get(self.scope, frozenset()) | self.engine.closures.get(self.scope, frozenset())
-                     if not isinstance(self.scope, ast.Module) else frozenset())
-            if node.id not in local and slot in state.bindings:
+            shadowed = self.global_shadowed(node.id)
+            if not shadowed and slot in state.bindings:
                 fact = state.value(slot)
                 binding = state.bindings[slot]
                 self.expression_facts[node] = fact
@@ -4004,11 +4350,12 @@ class _Flow:
                                   and node.id not in self.context_globals)
                 identity = (str, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
                             ast.ClassDef, _FunctionValue, _ClosureValue, _BoundCallable,
-                            _BoundClassMethod, _ModuleBinding, _ArgumentVector, _LiteralString, _ProcessInput)
+                            _BoundClassMethod, _ModuleBinding, _ArgumentVector, _LiteralString,
+                            _ProcessInput, ast.Constant)
                 if (not nominal_helper and any(isinstance(value, identity)
                         for value in (*_binding_choices(binding), *_binding_choices(nominal)))):
                     self.capture_globals.add((self.engine.tree, node.id))
-            refs = state.references.get(slot if node.id not in local and slot in state.bindings else node.id, NO_REFERENCES)
+            refs = state.references.get(slot if not shadowed and slot in state.bindings else node.id, NO_REFERENCES)
             self.expression_references[node] = refs
             if state.mutated and (refs & state.mutated):
                 binding = _without_object_contract(binding)
@@ -4034,6 +4381,11 @@ class _Flow:
         if isinstance(node, (ast.Tuple, ast.List, ast.Dict, ast.Set, ast.Starred,
                              ast.ListComp, ast.DictComp, ast.SetComp, ast.GeneratorExp)):
             for child in ast.iter_child_nodes(node):
+                if 'functools' in _binding_choices(self.expression_bindings.get(child)):
+                    self.mutate(frozenset({_PARTIAL_MODULE_REF}), CLEAN, state)
+                if any(isinstance(choice, _PartialValue)
+                       for choice in _binding_choices(self.expression_bindings.get(child))):
+                    raise AnalysisLimit('functools.partial stored in a container; analysis is incomplete')
                 if any(isinstance(choice, _GlobalNamespace)
                        for choice in _binding_choices(self.expression_bindings.get(child))):
                     raise AnalysisLimit('globals mapping stored in a container; analysis is incomplete')
@@ -4051,6 +4403,16 @@ class _Flow:
                                             for ref in receiver_refs
                                             if isinstance(ref, str) and ref.startswith('@global:'))
             for base in _binding_choices(self.expression_bindings.get(node.value)):
+                if base == _PARTIAL_CHANGED_MODULE:
+                    if node.attr == 'partial':
+                        candidates.append(_PARTIAL_CHANGED_CONSTRUCTOR)
+                        continue
+                    base = 'functools'
+                if base == 'functools' and node.attr == '__dict__':
+                    raise AnalysisLimit('functools module namespace access; analysis is incomplete')
+                if isinstance(base, _PartialValue):
+                    raise AnalysisLimit('functools.partial attribute access needs binding analysis; '
+                                        'analysis is incomplete')
                 if isinstance(base, _GlobalNamespace) and base.member is None:
                     candidates.append(_GlobalNamespace(base.module, node.attr))
                     continue
@@ -4305,13 +4667,21 @@ class _Flow:
             if not state.reachable:
                 return CLEAN
             nested = state.copy()
-            for index, generator in enumerate(node.generators):
-                value = iterable if index == 0 else self.expr(generator.iter, nested)
-                self.assign(generator.target, value, nested)
-                for condition in generator.ifs:
-                    self.expr(condition, nested)
-            values = (node.key, node.value) if isinstance(node, ast.DictComp) else (node.elt,)
-            fact = join_facts(*(self.expr(value, nested) for value in values))
+            if nested.cells is not None:
+                for name in self.engine.locals[node]:
+                    nested.cells.names.pop(name, None)
+            self.comprehension_environments.append((node, state))
+            self.deferred_generator_depth += 1
+            try:
+                for index, generator in enumerate(node.generators):
+                    value = iterable if index == 0 else self.expr(generator.iter, nested)
+                    self.assign(generator.target, value, nested)
+                    for condition in generator.ifs:
+                        self.expr(condition, nested)
+                fact = self.expr(node.elt, nested)
+            finally:
+                self.deferred_generator_depth -= 1
+                self.comprehension_environments.pop()
             # Assignment expressions bind in the enclosing scope, while
             # ordinary comprehension targets remain local to the expression.
             for child in ast.walk(node):
@@ -4364,6 +4734,13 @@ class _Flow:
                         projected.cells.names.pop(name, None)
                     else:
                         projected.cells.names[name] = ref
+            for name, write in (projected.global_writes or {}).items():
+                visible = not self.global_shadowed(name)
+                projected.global_writes[name] = _GlobalWrite(write.initial, write.current, visible)
+                if visible:
+                    projected[name] = write.current.fact
+                    projected.bindings[name] = write.current.binding
+                    projected.references[name] = write.current.references
             return projected
 
         def clause(index, entering):
@@ -4551,6 +4928,8 @@ class _Flow:
                 cells.multiple.update(completed.cells.multiple)
                 for ref, contents in completed.cells.contents.items():
                     state.put_cell(ref, contents, written=ref in completed.cells.written)
+            for name, write in (completed.global_writes or {}).items():
+                self.put_global(name, write.current, state)
             members = {}
             if self.engine.plain_class(node, state):
                 for name in _local_names(node):
@@ -4574,9 +4953,12 @@ class _Flow:
                     fact, binding, refs = imported
                     self.write_name(state, local, fact, binding, refs)
                     continue
-                self.write_name(state, local, CLEAN,
-                                f'{node.module}.{alias.name}' if isinstance(node, ast.ImportFrom)
-                                else alias.name if alias.asname else local)
+                binding = (f'{node.module}.{alias.name}' if isinstance(node, ast.ImportFrom)
+                           else alias.name if alias.asname else local)
+                refs = frozenset({_PARTIAL_MODULE_REF}) if binding == 'functools' else NO_REFERENCES
+                if binding == 'functools.partial' and _PARTIAL_MODULE_REF in state.mutated:
+                    binding = _PARTIAL_CHANGED_CONSTRUCTOR
+                self.write_name(state, local, CLEAN, binding, refs)
         elif isinstance(node, (ast.Assign, ast.AnnAssign)):
             if node.value is None:
                 return state  # An annotation alone does not assign a value.
@@ -4664,7 +5046,9 @@ class _Flow:
                 if isinstance(target, ast.Name):
                     self.write_name(state, target.id, CLEAN, None, bound=False)
                 elif isinstance(target, (ast.Subscript, ast.Attribute)):
-                    self.assign(target, CLEAN, state)
+                    self.assign(target, CLEAN, state, deleting=True)
+        elif isinstance(node, ast.Global) and self.class_environments:
+            raise AnalysisLimit('class-body global declaration; analysis is incomplete')
         elif hasattr(ast, 'Match') and isinstance(node, ast.Match):
             subject = self.expr(node.subject, state)
             if not state.reachable:
@@ -4766,13 +5150,16 @@ class _Flow:
                                 if isinstance(ref, str)))
 
         mutations = mutations_on(normal) if normal is not None else ()
-        exceptions = tuple(
-            ExceptionSummary(item.exception_type,
-                             join_facts(item.value, *(item.state.heap.get(ref, CLEAN) for ref in item.references)),
-                             mutations_on(item.state), self.export_cells(item.state),
-                             frozenset(item.state.cells.multiple) if item.state.cells is not None else frozenset())
-            for item in _merge_completions(item for item in self.pending if item.kind == 'raise')
-        )
+        exceptions = []
+        for item in _merge_completions(item for item in self.pending if item.kind == 'raise'):
+            global_writes = self.export_globals(item.state)
+            exceptions.append(ExceptionSummary(
+                item.exception_type,
+                join_facts(item.value, *(item.state.heap.get(ref, CLEAN) for ref in item.references)),
+                mutations_on(item.state),
+                self.export_cells(item.state, tuple(contents.binding for _module, _name, contents in global_writes)),
+                frozenset(item.state.cells.multiple) if item.state.cells is not None else frozenset(),
+                global_writes))
         if self.normal_state is not None and not isinstance(self.scope, ast.Lambda):
             returned_bindings.append(None)  # Implicit `return None`.
         returned_binding = _join_bindings(*returned_bindings)
@@ -4788,7 +5175,9 @@ class _Flow:
         if self.yielded_references & self.mutations.keys():
             yielded_binding = _without_object_contract(yielded_binding)
         cell_state = _join_states(normal, self.yielded_state) if self.yielded_state is not None else normal
-        cells = self.export_cells(cell_state, (returned_binding, yielded_binding))
+        global_writes = self.export_globals(cell_state)
+        cells = self.export_cells(cell_state, (returned_binding, yielded_binding,
+                                  *(contents.binding for _module, _name, contents in global_writes)))
         return FunctionSummary(
             returned=returned, effects=tuple((*key, fact) for key, fact in sorted(self.effects.items())),
             yielded=yielded, mutations=mutations,
@@ -4797,12 +5186,13 @@ class _Flow:
             returned_binding=returned_binding,
             yielded_binding=yielded_binding,
             can_return=normal is not None,
-            exceptions=exceptions,
+            exceptions=tuple(exceptions),
             capture_globals=frozenset(self.capture_globals),
             value_parameters=frozenset(self.value_parameters),
             cells=cells,
             multiple_cells=frozenset(cell_state.cells.multiple)
             if cell_state is not None and cell_state.cells is not None else frozenset(),
+            global_writes=global_writes,
         )
 
 
@@ -4908,6 +5298,7 @@ class _Analysis:
         self.call_sites = {node: _expanded_call(node) for node in nodes if isinstance(node, ast.Call)}
         self.imports = tuple(node for node in nodes if isinstance(node, (ast.Import, ast.ImportFrom)))
         self.method_calls = {}
+        self.partial_calls = {}
         self.functions = [node for node in nodes if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))]
         self.generators = set()
         self.generator_receiver_proofs = {}
@@ -5203,7 +5594,7 @@ class _Analysis:
         previous = [summary for key, summary in self.summaries.items()
                     if (key[0] if isinstance(key, tuple) else key) is function]
         effects, mutations = {}, {}
-        cells = {}
+        cells, global_writes = {}, {}
         returned, yielded, raised, returned_refs, yielded_refs = [], [], [], set(), set()
         capture_globals = set()
 
@@ -5225,6 +5616,14 @@ class _Analysis:
                 retained = _CellContents(contents.fact, contents.references, None, None)
                 previous = cells.get(ref)
                 cells[ref] = retained if previous is None else _join_cells(previous, retained)
+
+        def retain_globals(items):
+            for module, name, contents in items:
+                budget.spend(1 + len(contents.fact) + len(contents.references))
+                retained = _CellContents(contents.fact, contents.references, None)
+                key = (module, name)
+                previous = global_writes.get(key)
+                global_writes[key] = retained if previous is None else _join_cells(previous, retained)
 
         def retain_observations(items, facts, references=None):
             budget.spend(len(items))
@@ -5270,6 +5669,7 @@ class _Analysis:
             retain_effects(summary.effects)
             retain_mutations(summary.mutations)
             retain_cells(summary.cells)
+            retain_globals(summary.global_writes)
             budget.spend(len(summary.returned) + len(summary.yielded)
                          + len(summary.returned_references) + len(summary.yielded_references))
             returned.append(summary.returned)
@@ -5281,10 +5681,15 @@ class _Analysis:
             for exception in summary.exceptions:
                 retain_mutations(exception.mutations)
                 retain_cells(exception.cells)
+                retain_globals(exception.global_writes)
                 budget.spend(1 + len(exception.value))
                 raised.append(exception.value)
         retain_effects(self.partial_scope_effects.get(function, ()))
         if flow is not None:
+            retain_globals((self.tree, name, _CellContents(
+                join_facts(contents.fact, *(flow.mutations.get(ref, CLEAN) for ref in contents.references)),
+                contents.references, None))
+                for name, contents in (flow.observed_global_writes or {}).items())
             observed_states = (flow.last_state, flow.normal_state, flow.yielded_state,
                                *(item.state for item in flow.pending))
             for state in observed_states:
@@ -5313,6 +5718,8 @@ class _Analysis:
             returned_binding=None, yielded_binding=None, can_return=True, incomplete=True,
             capture_globals=frozenset(capture_globals),
             cells=tuple(cells.items()), multiple_cells=frozenset(cells),
+            global_writes=tuple((module, name, contents)
+                                for (module, name), contents in global_writes.items()),
         )
 
     def framework_bound(self, globals_):
@@ -5390,7 +5797,7 @@ class _Analysis:
                     references.append((parameter, frozenset({slot})))
                     bindings.append((parameter, self.callable_context(
                         slot, default_values.get(parameter), captured=True, value_parameters=value_parameters)))
-                value = _FunctionValue(value.function, tuple(arguments), tuple(references), tuple(bindings))
+                value = type(value)(value.function, tuple(arguments), tuple(references), tuple(bindings))
             elif isinstance(value, (_BoundCallable, _BoundClassMethod)):
                 slot = '@method:' + name
                 symbolic = frozenset({TaintTrace(slot, parameter=slot, path=(slot,))})
@@ -5417,6 +5824,10 @@ class _Analysis:
                     references.append(NO_REFERENCES if isinstance(operand, _LiteralString) else frozenset({slot}))
                 value = _ArgumentVector(tuple(operands), tuple(references))
             elif isinstance(value, _LiteralString) and name in value_parameters:
+                pass
+            elif isinstance(value, ast.Constant) and name in value_parameters:
+                # Partial captures may retain exact scalar options such as
+                # shell=False. Their source AST identities are finite.
                 pass
             elif not isinstance(value, (str, _ProcessInput, ast.FunctionDef, ast.AsyncFunctionDef,
                                         ast.Lambda, ast.ClassDef)):
@@ -5518,7 +5929,7 @@ class _Analysis:
                 if not explicit_override and not any(
                         isinstance(value, (str, ast.FunctionDef, ast.AsyncFunctionDef,
                                            ast.Lambda, ast.ClassDef, _BoundCallable, _BoundClassMethod, _FunctionValue, _ClosureValue,
-                                           _ArgumentVector, _LiteralString, _ProcessInput))
+                                           _ArgumentVector, _LiteralString, _ProcessInput, ast.Constant))
                         for value in (*_binding_choices(binding), *_binding_choices(nominal))):
                     continue
             elif binding is None or isinstance(binding, _SymbolicValue):

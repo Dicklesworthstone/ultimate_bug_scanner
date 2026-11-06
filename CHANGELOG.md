@@ -10,6 +10,17 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Follow Python `functools.partial` through captured arguments, keyword
+  overrides, helper returns, bound receivers and live closure cells. Preserve
+  subprocess executable and interpreter-source roles; unsupported mutable
+  partial objects, argument expansions and callback consumers remain incomplete.
+
+- Propagate Python module-global assignments through normal and exceptional
+  helper returns, including callable identities, object aliases and strong
+  clean resets. Keep conditional writes and same-name local, class and
+  comprehension bindings separate. Report incomplete analysis for unsupported
+  foreign writes, global deletions and deferred global-write timing.
+
 - Resolve native GZIP I/O and inherited metadata members before same-named
   Kotlin extensions, preserving genuine extension overloads. Carry closure
   through `use` and explicit `close`; later effects on unresolved borrowed

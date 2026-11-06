@@ -14,9 +14,11 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
   too (#171): `int.TryParse(raw, NumberStyles.Integer,
   CultureInfo.InvariantCulture, out var n)`, `DateTime.TryParse(raw, provider,
   DateTimeStyles..., out var d)` and `T.TryParse(raw, provider, out var r)`.
-  Styles must be NumberStyles/DateTimeStyles members, optionally combined with
-  `|`, and the provider must be `null` or the invariant or current
-  `CultureInfo`, `NumberFormatInfo` or `DateTimeFormatInfo`. A provider or
+  Styles must be declared NumberStyles/DateTimeStyles constants, optionally
+  combined with `|`, and the provider must be `null` or the invariant or current
+  `CultureInfo`, `NumberFormatInfo` or `DateTimeFormatInfo`. The arguments
+  must match a BCL overload of the receiver type, in its order, so a call that
+  could bind to a C# 14 extension member is not taken as BCL. A provider or
   style passed in from elsewhere, `Dictionary.TryGetValue` and cross-file
   helpers still report incomplete analysis.
 

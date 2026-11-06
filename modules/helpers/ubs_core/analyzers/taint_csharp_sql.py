@@ -61,15 +61,45 @@ PARSE_TYPES = frozenset({
     "System.DateTimeOffset", "System.TimeSpan", "System.DateOnly", "System.TimeOnly",
 })
 # Style and format-provider arguments accepted by the culture-aware TryParse
-# overloads (GH #171): an enum member or a static BCL culture/format property
-# runs no user code. CurrentCulture matches what the two-argument form reads.
-STYLE_TYPES = frozenset({"System.Globalization.NumberStyles", "System.Globalization.DateTimeStyles"})
+# overloads (GH #171): a declared enum constant or a static BCL culture/format
+# property runs no user code. Member names are listed because C# 14 extension
+# blocks can add static properties to these types, and such a property's
+# getter is user code. CurrentCulture matches what the two-argument form reads.
+NUMBER_STYLES = "System.Globalization.NumberStyles"
+DATE_STYLES = "System.Globalization.DateTimeStyles"
+STYLE_MEMBERS = {
+    NUMBER_STYLES: frozenset({
+        "None", "AllowLeadingWhite", "AllowTrailingWhite", "AllowLeadingSign", "AllowTrailingSign",
+        "AllowParentheses", "AllowDecimalPoint", "AllowThousands", "AllowExponent",
+        "AllowCurrencySymbol", "AllowHexSpecifier", "AllowBinarySpecifier", "Integer", "HexNumber",
+        "BinaryNumber", "Number", "Float", "Currency", "Any",
+    }),
+    DATE_STYLES: frozenset({
+        "None", "AllowLeadingWhite", "AllowTrailingWhite", "AllowInnerWhite", "AllowWhiteSpaces",
+        "NoCurrentDateDefault", "AdjustToUniversal", "AssumeLocal", "AssumeUniversal", "RoundtripKind",
+    }),
+}
 PROVIDER_MEMBERS = {
     "System.Globalization.CultureInfo": frozenset({"InvariantCulture", "CurrentCulture"}),
     "System.Globalization.NumberFormatInfo": frozenset({"InvariantInfo", "CurrentInfo"}),
     "System.Globalization.DateTimeFormatInfo": frozenset({"InvariantInfo", "CurrentInfo"}),
 }
-KNOWN_TYPES = CONNECTIONS | CONTROLLERS | PARSE_TYPES | STYLE_TYPES | frozenset(PROVIDER_MEMBERS) | frozenset({
+# The middle-argument shapes of the public BCL TryParse(string, ..., out T)
+# overloads per receiver type. Any other shape binds to no BCL overload, so
+# under C# 14 it could bind to an application extension member instead.
+# Boolean and Char option overloads are not modelled.
+_NUMBER_OPTIONS = frozenset({("provider",), (NUMBER_STYLES, "provider")})
+_DATE_OPTIONS = frozenset({("provider",), ("provider", DATE_STYLES)})
+PARSE_OPTION_SHAPES = {
+    **{identity: _NUMBER_OPTIONS for identity in (
+        "System.Byte", "System.SByte", "System.Int16", "System.UInt16", "System.Int32", "System.UInt32",
+        "System.Int64", "System.UInt64", "System.Single", "System.Double", "System.Decimal")},
+    **{identity: _DATE_OPTIONS for identity in (
+        "System.DateTime", "System.DateTimeOffset", "System.DateOnly", "System.TimeOnly")},
+    "System.Guid": frozenset({("provider",)}),
+    "System.TimeSpan": frozenset({("provider",)}),
+}
+KNOWN_TYPES = CONNECTIONS | CONTROLLERS | PARSE_TYPES | frozenset(STYLE_MEMBERS) | frozenset(PROVIDER_MEMBERS) | frozenset({
     REQUEST, CONTEXT, MAPPER, COMMAND, MAIL_ADDRESS, "System.Type", "System.String",
     "System.Object", "System.Data.CommandType",
 })
@@ -489,15 +519,17 @@ class DapperFlow(CSharpFlow):
         the out storage.
 
         Besides the two-argument form, the culture-aware overloads
-        `T.TryParse(text, style, provider, out r)`,
-        `T.TryParse(text, provider, style, out r)` and
-        `T.TryParse(text, provider, out r)` are accepted when every middle
-        argument is a parse_option: a NumberStyles/DateTimeStyles member
-        (or a `|` of them), `null`, or a static invariant/current culture or
-        format-info property. A caller-supplied provider could run its own
-        GetFormat, and a style held in storage could arrive through a user
-        conversion, so both stay incomplete, as do spans, generic forms,
-        named arguments, unproven inputs and shadowed receivers.
+        `T.TryParse(text, numberStyles, provider, out r)` for numbers,
+        `T.TryParse(text, provider, dateTimeStyles, out r)` for dates and
+        `T.TryParse(text, provider, out r)` (PARSE_OPTION_SHAPES) are accepted
+        when every middle argument is a parse_option: a declared
+        NumberStyles/DateTimeStyles constant (or a `|` of them), `null`, or a
+        static invariant/current culture or format-info property. A shape with
+        no BCL overload could bind to an application extension member. A
+        caller-supplied provider could run its own GetFormat, and a style held
+        in storage could arrive through a user conversion, so all of these stay
+        incomplete, as do spans, generic forms, named arguments, unproven
+        inputs and shadowed receivers.
         """
         raw = self.raw_name(call.position, call.name)
         qualifier, dot, method = raw.rpartition(".")
@@ -505,7 +537,8 @@ class DapperFlow(CSharpFlow):
             return False
         if self.code[call.name_end:call.opening].strip():
             return False
-        if self.types.resolve(qualifier, call.position) not in PARSE_TYPES:
+        receiver_type = self.types.resolve(qualifier, call.position)
+        if receiver_type not in PARSE_TYPES:
             return False
         # A C# keyword (`int`, `double`) always names its BCL type; `@int` is
         # an ordinary identifier and needs the storage/shadowing proof.
@@ -519,22 +552,22 @@ class DapperFlow(CSharpFlow):
             return False
         if not re.match(r"\s*out\b", self.code[output_low:output_high]):
             return False
-        kinds = [self.parse_option(call, low, high) if name is None else None
-                 for name, low, high in options]
-        # At most one style and one provider; a lone middle argument is a
-        # provider, as no TryParse(text, style, out r) overload exists.
-        if None in kinds or len(set(kinds)) != len(kinds) or kinds == ["style"]:
+        kinds = tuple(self.parse_option(call, low, high) if name is None else None
+                      for name, low, high in options)
+        # The options must match a BCL overload of this receiver type, in
+        # order: numbers take (styles, provider), dates (provider, styles).
+        if kinds and kinds not in PARSE_OPTION_SHAPES.get(receiver_type, ()):
             return False
         return self.proven_text_argument(call, 0) or self.request_text_argument(call, 0)
 
     def parse_option(self, call, low, high):
         """Classify a TryParse style or provider argument proven to run no user code.
 
-        Returns "style" for a member of NumberStyles/DateTimeStyles, or a `|`
-        of such members; "provider" for `null` or a selected static culture or
-        format-info property; otherwise None. Each type spelling must resolve to
-        the BCL type and its root must not be shadowed by storage. A member
-        access on an enum type without a call is one of its constants.
+        Returns the style type for a declared NumberStyles/DateTimeStyles
+        constant, or a `|` of constants of one of them; "provider" for `null`
+        or a selected static culture or format-info property; otherwise None.
+        Each type spelling must resolve to the BCL type and its root must not
+        be shadowed by storage.
         """
         spelling = re.sub(r"\s", "", self.code[low:high])
         if spelling == "null":
@@ -546,8 +579,8 @@ class DapperFlow(CSharpFlow):
                 return None
             qualifier, _, name = member.rpartition(".")
             identity = self.types.resolve(qualifier, low)
-            if identity in STYLE_TYPES:
-                kinds.add("style")
+            if name.lstrip("@") in STYLE_MEMBERS.get(identity, ()):
+                kinds.add(identity)
             elif name.lstrip("@") in PROVIDER_MEMBERS.get(identity, ()):
                 kinds.add("provider")
             else:
@@ -555,7 +588,7 @@ class DapperFlow(CSharpFlow):
             if (not qualifier.startswith("global::")
                     and not self.unshadowed_type_root(qualifier.split(".")[0].lstrip("@"), call)):
                 return None
-        if len(kinds) != 1 or (len(members) > 1 and kinds != {"style"}):
+        if len(kinds) != 1 or (len(members) > 1 and "provider" in kinds):
             return None
         return kinds.pop()
 

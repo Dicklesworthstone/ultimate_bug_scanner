@@ -206,20 +206,20 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='836d22737b643d1763c0b6f9480da1579b2b7e05d8c8e207026f0cd81d3ee36e'
-  [cpp]='dcaddd71b03b0ba5e70c17f7e1c9cd6bfcc799fe928601b670860bf4e1e13961'
-  [csharp]='78a9f08e42fd40dfb4c1aeb90d41390f1f7332ebbabd226c9be9f14a99673340'
-  [elixir]='2d4b1bbdcb89fb4c827dbf4ee47095a6d25941a98b887985129e76db836e3767'
-  [golang]='e5b410509c5367390f9241cabef77c781d323327c18bc126de07ececcad81c4a'
-  [java]='d2630e8b44c05005f1c880051ddd216d7a590ff660f3842e1cd92ef5762916ee'
-  [js]='ade5e03580eb0b838a85274505d02c9e8644e3befc86d67823942bf2d5df5a61'
-  [kotlin]='e2d1c9271e4a7f3d670c2515459aef58ea765a218767be129c194909fedc5c13'
-  [php]='08815fdd18facca14739b73decdcb57c3aaf905490eb22ad8934cf3d20b94391'
-  [python]='cded24c45d0420cd4574ca1a670f55be96a3d62e1d302186ea454c697cddf017'
-  [ruby]='e94fb06f8d342d9616dbb6fcc276350def7355fd164c433971871d2e16c54847'
-  [rust]='4c58f5228d979b9568aa2535011a4df7b3a640dd2459e75bb0756e319d892211'
-  [sql]='910ab1c14caa382adac4094145a74b6753bf789f7118c0f5e28c11f53c6f892c'
-  [swift]='fae04097536296dd4383f3c60ee3117ca47272a338db635b5b6afaf9bf72f828'
+  [bash]='c328fe543f836811b71c199d31da2ec171502417a5043a1da5f296d486a66165'
+  [cpp]='8a6d55fea0afb3f30235d70ac5bae59fcbde2e3ae2f05e20191d5145125ad585'
+  [csharp]='0487ed93e7740b8ab6ac8de7ad296db50822af78ccca3fe2889e1a32adeadd12'
+  [elixir]='dcab716160780f311cf16f79de711d8c9e3e84f3c592dd0f93a4a5a8ef83147c'
+  [golang]='f28d59d5d229d225257efbee7955f3ed037648ec61620dbd2b20ff69ef718855'
+  [java]='1f8b989a1f2aecf71da01ac1d6c199dd16f554888d874a35fad0d68eb4cfb791'
+  [js]='38118fbc2731cb8dcb9d241a9685d4a3c84e6b4df0b709a6b8edbd203602688c'
+  [kotlin]='ebf9e9ef55551b9b67e3d37a9972f72a55053ff59e89c731d43f5aefb501a27d'
+  [php]='05f1b373c3b275a44743bc7d681efc3ea0b0c5dde83775879a9942c0cd9d9f62'
+  [python]='7d56509f4c3fb8ff4c80379a7538a93c7ade8cbd4bf3e35978a9ebc1d5fbc8cc'
+  [ruby]='0daa154034e130a92db81d2557fdcf5a2f3c345afb05766544ee0c083f7927aa'
+  [rust]='dd3f03b770ba0d7274479a9c52363780e402921ce09dbb6199b5e24e56389de2'
+  [sql]='e14faee9989d8a9522b41cea2467dd52263f3abc2cfa701a806824608c1b6ce4'
+  [swift]='7f10cee1bdcc5f49aa500f13318966bf691b045410e9690f8d8b17f5e6b66c0d'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -317,7 +317,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/analyzers/taint_cpp_traversal.py']='cc6b1cd0ac6eef27698549259367e5a9634b51f57778b58d755b486351460dfb'
   ['helpers/ubs_core/analyzers/taint_csharp_redirect.py']='4591294ab7eb34f4311d85632089309b8209669d6b24ad78440e2498322946bf'
   ['helpers/ubs_core/analyzers/taint_csharp_request.py']='335991ef7305778f026f87cbc9760e8f117f7cd0994edd4265728d2c129d8fbb'
-  ['helpers/ubs_core/analyzers/taint_csharp_sql.py']='6c1143380999723d418e872defb56103f4a07620b13d6c6fb2711fb7057c15d8'
+  ['helpers/ubs_core/analyzers/taint_csharp_sql.py']='a3a2bbbbc5fb3f8d0c373221971ee07ef8a58afb7f0634d4e321e9dd2ef8f67a'
   ['helpers/ubs_core/analyzers/taint_elixir_redirect.py']='e79bcfc31754ce3485c2e3c398133eca890c3023ec135d410f72b3adfefe7da8'
   ['helpers/ubs_core/analyzers/taint_elixir_traversal.py']='e1c225beb83902d020e03fa80de18ca6978c1c90ec2637320eac00cbc9f52f99'
   ['helpers/ubs_core/analyzers/taint_go.py']='a0491b85cb21fc0d221b4b70b9ee9e311e722998f3e77ec01f9e51e1c38ff40a'
@@ -594,7 +594,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='77a16e60dce843652c053d069dcbffce17c8ffae543bf77693d2e8254a3967de'
   ['helpers/ubs_core/taint_flow.py']='83b941e15357a6a593db1d7f77a099b1707090301f695445356bfcede4baef26'
-  ['lib/ubs-common.sh']='e896a8f632895a793445ee34896d9327539bdd76befe98afcb92c012da4d1c6d'
+  ['lib/ubs-common.sh']='5143c9851638ca0e26f471bb7a9c10997ece6871558befd7768d1e01943b8aa3'
 )
 
 # contract.json as shipped by earlier releases (sha256 -> first tag), kept out

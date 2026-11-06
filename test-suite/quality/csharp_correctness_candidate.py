@@ -259,6 +259,8 @@ class C { void M(IDbConnection db, HttpRequest http) { MailAddress.TryCreate(db,
         'date_provider_styles': 'public static bool P(string raw) => DateTime.TryParse(raw, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var d);',
         'date_format_info': 'public static bool P(string raw) => DateTimeOffset.TryParse(raw, DateTimeFormatInfo.InvariantInfo, DateTimeStyles.None, out var d);',
         'timespan_provider': 'public static bool P(string raw) => TimeSpan.TryParse(raw, CultureInfo.InvariantCulture, out var t);',
+        'guid_provider': 'public static bool P(string raw) => Guid.TryParse(raw, null, out var g);',
+        'date_only_styles': 'public static bool P(string raw) => DateOnly.TryParse(raw, CultureInfo.CurrentCulture, DateTimeStyles.AllowWhiteSpaces, out var d);',
         'request_read': 'public static bool P(HttpRequest http) => int.TryParse(http.Query["page"], NumberStyles.Integer, CultureInfo.InvariantCulture, out var p);',
     }
 
@@ -267,7 +269,8 @@ class C { void M(IDbConnection db, HttpRequest http) { MailAddress.TryCreate(db,
 
     def test_culture_aware_tryparse_is_sql_inert(self):
         # GH #171: the style/provider overloads write only their own value type
-        # too. Enum members and static BCL culture properties run no user code.
+        # too. Declared enum constants and static BCL culture properties run no
+        # user code, and each shape matches a BCL overload of its receiver.
         for label, method in self.CULTURE_PARSE_CALLS.items():
             with self.subTest(label=label):
                 self.assertEqual(self.scan(self.culture_source(method)), ([], None))
@@ -293,6 +296,23 @@ class C { void M(IDbConnection db, HttpRequest http) { MailAddress.TryCreate(db,
             'public static bool P(string raw) => int.TryParse(raw, NumberStyles.Any, CultureInfo.InvariantCulture | null, out var n);',
             'public static bool P(string raw) => int.TryParse(raw, NumberStyles.Any, provider: null, out var n);',
             'public static bool P(object raw) => int.TryParse(raw, NumberStyles.Any, CultureInfo.InvariantCulture, out var n);',
+            # Not a declared constant: a C# 14 extension block can add a static
+            # property to an enum type, and its getter is user code.
+            'public static bool P(string raw) => int.TryParse(raw, NumberStyles.Custom, null, out var n);',
+            'public static bool P(string raw) => DateTime.TryParse(raw, null, DateTimeStyles.Lenient, out var d);',
+            'public static bool P(string raw) => int.TryParse(raw, NumberStyles.Any | NumberStyles.Custom, null, out var n);',
+            # Shapes with no BCL overload for the receiver type could bind to an
+            # application extension member: wrong order, wrong style type, or
+            # options the receiver's TryParse does not take. Boolean and Char
+            # option overloads are not modelled.
+            'public static bool P(string raw) => int.TryParse(raw, CultureInfo.InvariantCulture, NumberStyles.Any, out var n);',
+            'public static bool P(string raw) => DateTime.TryParse(raw, DateTimeStyles.None, CultureInfo.InvariantCulture, out var d);',
+            'public static bool P(string raw) => int.TryParse(raw, DateTimeStyles.None, null, out var n);',
+            'public static bool P(string raw) => DateTime.TryParse(raw, null, NumberStyles.Any, out var d);',
+            'public static bool P(string raw) => int.TryParse(raw, NumberStyles.Any | DateTimeStyles.None, null, out var n);',
+            'public static bool P(string raw) => Guid.TryParse(raw, NumberStyles.Any, CultureInfo.InvariantCulture, out var g);',
+            'public static bool P(string raw) => TimeSpan.TryParse(raw, CultureInfo.InvariantCulture, DateTimeStyles.None, out var t);',
+            'public static bool P(string raw) => bool.TryParse(raw, CultureInfo.InvariantCulture, out var b);',
         )
         for method in methods:
             with self.subTest(method=method):

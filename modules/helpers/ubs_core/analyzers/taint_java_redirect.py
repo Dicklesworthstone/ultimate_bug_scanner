@@ -13,7 +13,7 @@ import re
 import sys
 from pathlib import Path
 import json
-from ubs_core.analyzers.taint_java_traversal import Engine, REQUEST_GETTER_RE
+from ubs_core.analyzers.taint_java_traversal import Engine, REQUEST_SOURCE_RE
 from ubs_core.taint_flow import CLEAN, advance, join, retag
 from ubs_core.suppression import SourceSuppressions
 
@@ -333,7 +333,7 @@ class RedirectEngine(Engine):
 
 def analyze(path, issues):
     text = path.read_text(encoding='utf-8')
-    if not ((SOURCE_RE.search(text) or REQUEST_GETTER_RE.search(text) or ANNOTATED_PARAM_RE.search(text)) and SINK_RE.search(text)):
+    if not ((SOURCE_RE.search(text) or REQUEST_SOURCE_RE.search(text) or ANNOTATED_PARAM_RE.search(text)) and SINK_RE.search(text)):
         return
     engine = RedirectEngine(path, text)
     lines = text.splitlines()

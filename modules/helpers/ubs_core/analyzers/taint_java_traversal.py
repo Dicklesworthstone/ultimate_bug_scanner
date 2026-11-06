@@ -66,6 +66,16 @@ REQUEST_TYPES = SERVLET_TYPES | HTTP_SERVLET_TYPES
 REQUEST_GETTERS = {'getParameter': 1, 'getHeader': 1, 'getQueryString': 0,
                    'getRequestURI': 0, 'getPathInfo': 0, 'getServletPath': 0}
 REQUEST_GETTER_RE = re.compile(r'\.\s*(?:' + '|'.join(REQUEST_GETTERS) + r')\s*\(')
+KTOR_CALL_TYPES = frozenset({'io.ktor.server.application.ApplicationCall',
+                            'io.ktor.server.application.PipelineCall', 'io.ktor.server.routing.RoutingCall'})
+KTOR_REQUEST_TYPES = frozenset({'io.ktor.server.request.ApplicationRequest',
+                               'io.ktor.server.request.PipelineRequest', 'io.ktor.server.routing.RoutingRequest'})
+KTOR_TYPES = KTOR_CALL_TYPES | KTOR_REQUEST_TYPES
+KTOR_COLLECTION_TYPES = frozenset({'io.ktor.http.Parameters', 'io.ktor.http.Headers'})
+KTOR_SOURCE_MEMBERS = frozenset({'parameters', 'pathParameters', 'queryParameters', 'rawQueryParameters', 'headers'})
+KTOR_MEMBER_RE = re.compile(r'\.\s*(?:request|' + '|'.join(sorted(KTOR_SOURCE_MEMBERS)) + r')\b')
+REQUEST_SOURCE_RE = re.compile(REQUEST_GETTER_RE.pattern + '|' + KTOR_MEMBER_RE.pattern)
+KTOR_MAP_TAG = 'ktor-request-map'
 FILE_LEAF_METHODS = frozenset({'readAllBytes', 'readString', 'readAllLines', 'write', 'writeString',
                                'newInputStream', 'newOutputStream', 'createFile'})
 FILE_CONSTRUCTORS = frozenset({'FileInputStream', 'FileOutputStream', 'FileReader', 'FileWriter', 'RandomAccessFile'})
@@ -535,6 +545,7 @@ class Engine:
         self.summaries = {key: Summary() for key in self.parser.functions}
         self.graphs = {}
         self._request_index = None
+        self._local_request_constructors = {}
         self.shadowed_fields = set()
         for match in re.finditer(r'\b([A-Za-z_]\w*)\s*(?::[^=;\n]+)?=(?!=)', self.code):
             if any(function.key != -1 and function.declaration <= match.start() < function.end
@@ -577,17 +588,72 @@ class Engine:
             self.check_request_initializers()
 
     def check_request_initializers(self):
-        """Reject unmodeled Servlet field flow only after proving its API."""
+        """Reject unmodeled request field flow only after proving its API."""
+        def in_initializer(offset):
+            owner = max((low for low, high, _ in self.parser.owners if low < offset < high), default=-1)
+            if owner < 0:
+                return False
+            # A local class can capture its enclosing handler's request. Its
+            # field initialization is not part of that handler's method body;
+            # only a method declared inside this class excludes the access.
+            return not any(function.key >= 0 and owner < function.declaration <= offset < function.end
+                           for function in self.parser.functions.values())
+
         for getter in REQUEST_GETTER_RE.finditer(self.code):
             offset = getter.start()
-            if not any(low < offset < high for low, high, _ in self.parser.owners):
-                continue
-            if any(function.key >= 0 and function.declaration <= offset < function.end
-                   for function in self.parser.functions.values()):
+            if not in_initializer(offset):
                 continue
             index = self.request_index()
             if index.receiver_type(index.receiver_start(offset), offset) in REQUEST_TYPES:
                 raise ValueError('Executable Java/Kotlin Servlet initialization needs field-state analysis; analysis is incomplete')
+        if not self.parser.kotlin:
+            return
+        index = self.request_index()
+
+        def captured_request(span, owner, seen=()):
+            if len(seen) > 32:
+                raise AnalysisLimit('Kotlin initializer alias depth exceeded; analysis is incomplete')
+            low, high = span
+            for access in re.finditer(r'[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)*', self.code[low:high]):
+                self.budget.spend()
+                name = re.sub(r'\s+', '', access.group())
+                field = name.startswith('this.')
+                root = name.removeprefix('this.').split('.')[0]
+                binding = index.binding(root, low + access.start(), field=field)
+                if binding is None:
+                    continue
+                if index.resolve_type(binding.type_name, binding.declaration) in REQUEST_TYPES | KTOR_TYPES:
+                    return True
+                # Mutable captures can change after their declaration. A
+                # fixed initializer does not prove their later captured value.
+                if binding.declaration < owner and re.search(r'\bvar\s+$', self.code[:binding.declaration]):
+                    return True
+                if binding.initializer is not None:
+                    if binding.declaration in seen:
+                        raise AnalysisLimit('Cyclic Kotlin initializer aliases need field-state analysis; analysis is incomplete')
+                    if captured_request(binding.initializer, owner, (*seen, binding.declaration)):
+                        return True
+            return False
+
+        for bindings in index.bindings.values():
+            for binding in bindings:
+                if not binding.field or binding.initializer is None or not in_initializer(binding.initializer[0]):
+                    continue
+                owner = max(low for low, high, _ in self.parser.owners if low < binding.declaration < high)
+                if captured_request(binding.initializer, owner, (binding.declaration,)):
+                    raise ValueError('Executable Kotlin Ktor initialization needs captured-field analysis; analysis is incomplete')
+        if not KTOR_MEMBER_RE.search(self.code):
+            return
+        for access in re.finditer(r'\b[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)+', self.code):
+            self.budget.spend()
+            offset = access.start()
+            if not in_initializer(offset):
+                continue
+            following = self.parser.skip(access.end(), len(self.code))
+            arguments = [] if self.code[following:following + 1] == '(' else None
+            value = self.ktor_access(re.sub(r'\s+', '', access.group()), arguments, offset, {}, {})
+            if value and (any(trace.kind == 'source' for trace in value) or self.request_fact_types(value) & KTOR_TYPES):
+                raise ValueError('Executable Kotlin Ktor initialization needs field-state analysis; analysis is incomplete')
 
     def call_is_shadowed(self, name, bindings):
         return name in bindings or any(
@@ -628,7 +694,7 @@ class Engine:
         if self._request_index is None:
             if self.parser.kotlin:
                 from ubs_core.analyzers.taint_kotlin_sql import KotlinJdbcSource
-                self._request_index = KotlinJdbcSource(self.text)
+                self._request_index = KotlinJdbcSource(self.text, extra_apis=KTOR_TYPES | KTOR_COLLECTION_TYPES)
             else:
                 from ubs_core.analyzers.taint_java_sql import JdbcSource, LIMIT_DEFAULTS
                 self._request_index = JdbcSource(self.text, tuple(LIMIT_DEFAULTS.values()))
@@ -639,8 +705,44 @@ class Engine:
         return frozenset(tag[len(REQUEST_TYPE_PREFIX):] for trace in value for tag in trace.tags
                          if tag.startswith(REQUEST_TYPE_PREFIX))
 
+    def local_request_constructor(self, declaration):
+        """Prove a simple inferred local class cannot be a request API.
+
+        A same-named factory or callable binding, imported classifier, or any
+        superclass/delegation clause makes this bounded negative inconclusive.
+        """
+        key = declaration.declaration
+        if key in self._local_request_constructors:
+            return self._local_request_constructors[key]
+        self._local_request_constructors[key] = False
+        if not self.parser.kotlin or declaration.initializer is None:
+            return False
+        index = self.request_index()
+        low, high = index.trim(*declaration.initializer)
+        constructor = re.match(r'([A-Za-z_]\w*)\s*\(', self.code[low:high])
+        if not constructor or self.parser.pairs.get(low + constructor.end() - 1) != high - 1:
+            return False
+        name = constructor.group(1)
+        binding = index.binding(name, low)
+        if binding is None or (binding.low < 0 and name in index.imports):
+            return False
+        if any(function.name == name for function in self.parser.functions.values()):
+            return False
+        for start, end, owner in self.parser.owners:
+            header = re.match(r'class\s+', self.code[start:end])
+            if owner != name or not header or start + header.end() != binding.declaration:
+                continue
+            cursor = binding.declaration + len(name)
+            while cursor < end and self.code[cursor] != '{':
+                if self.code[cursor] == ':':
+                    return False
+                cursor = self.parser.pairs[cursor] + 1 if self.code[cursor] in '([' else cursor + 1
+            self._local_request_constructors[key] = True
+            return True
+        return False
+
     def request_receiver(self, name, offset, bindings, state, receiver=CLEAN):
-        """Return selected Servlet types and whether a declaration is known.
+        """Return selected request types and whether a declaration is known.
 
         Explicit API declarations override a value's carried type. Unresolved
         legacy snippets retain their existing heuristic; a resolved local or
@@ -658,7 +760,7 @@ class Engine:
             if dot >= 0 and self.code[dot] == '.':
                 low = index.receiver_start(dot)
                 actual = index.receiver_type(low, dot)
-                if actual in REQUEST_TYPES:
+                if actual in REQUEST_TYPES | KTOR_TYPES:
                     return frozenset({actual}), True
         if re.fullmatch(r'[A-Za-z_]\w*', root):
             receiver = state.get(bindings.get(root, root), receiver)
@@ -666,10 +768,12 @@ class Engine:
             if declaration:
                 spelling = declaration.type_name.rstrip('?')
                 actual = index.resolve_type(spelling, declaration.declaration)
-                if actual in REQUEST_TYPES:
+                if actual in REQUEST_TYPES | KTOR_TYPES:
                     return frozenset({actual}), True
                 if actual in {'com.sun.net.httpserver.HttpExchange', 'com.sun.net.httpserver.HttpsExchange'}:
                     return frozenset(), False  # Preserve the separate JDK HTTP source contract.
+                if spelling == 'var' and self.local_request_constructor(declaration):
+                    return frozenset(), True
                 if spelling != 'var':
                     head = spelling.split('.', 1)[0]
                     local_type = any(local == head and low < declaration.declaration < high
@@ -682,15 +786,75 @@ class Engine:
                     if known:
                         return frozenset(), True
         types = self.request_fact_types(receiver)
-        return types & REQUEST_TYPES, bool(types)
+        return types & (REQUEST_TYPES | KTOR_TYPES), bool(types)
+
+    def ktor_access(self, name, arguments, offset, bindings, state, receiver=CLEAN):
+        """Follow actual Ktor members without treating extension calls as properties.
+
+        Parameters/Headers objects are not input merely because of their type.
+        Their provenance starts at a verified request member and survives the
+        same aliases and summaries as other facts in the shared JVM engine.
+        """
+        if not self.request_receiver_sources or not self.parser.kotlin or '.' not in name:
+            return None
+        parts = name.split('.')
+        if parts[0] == 'this' and len(parts) > 2:
+            root, members = '.'.join(parts[:2]), parts[2:]
+        else:
+            root, members = parts[0], parts[1:]
+        value = state.get(bindings.get(root, root), receiver)
+        map_value = any(KTOR_MAP_TAG in trace.tags for trace in value)
+        if not map_value and not any(member in KTOR_SOURCE_MEMBERS | {'request'} for member in members):
+            return None
+        types, _ = self.request_receiver(root, offset, bindings, state, value)
+        types &= KTOR_TYPES
+        if not types and not map_value:
+            return None
+        if types and not value:
+            value = frozenset({Trace('request-object', (str(self.path), offset),
+                tags=frozenset(REQUEST_TYPE_PREFIX + actual for actual in types))})
+        selected = False
+        for position, member in enumerate(members):
+            self.budget.spend()
+            if arguments is not None and position == len(members) - 1:
+                if member == 'get' and len(arguments) == 1 and any(KTOR_MAP_TAG in trace.tags for trace in value):
+                    return retag(self.without_request_identity(join(value, *arguments)), add=frozenset({'jvm-string'}))
+                # Unknown extensions keep existing receiver/argument taint but
+                # cannot return a proven request object by their name alone.
+                return self.without_request_identity(join(value, *arguments)) if selected else None
+            if member == 'request' and types & KTOR_CALL_TYPES:
+                result_types = frozenset({
+                    'io.ktor.server.application.ApplicationCall': 'io.ktor.server.request.ApplicationRequest',
+                    'io.ktor.server.application.PipelineCall': 'io.ktor.server.request.PipelineRequest',
+                    'io.ktor.server.routing.RoutingCall': 'io.ktor.server.routing.RoutingRequest',
+                }[actual] for actual in types & KTOR_CALL_TYPES)
+                value = retag(self.without_request_identity(value),
+                              add=frozenset(REQUEST_TYPE_PREFIX + actual for actual in result_types))
+                types, selected = result_types, True
+            elif ((member == 'parameters' and types & KTOR_CALL_TYPES)
+                  or (member in {'queryParameters', 'rawQueryParameters', 'headers'} and types & KTOR_REQUEST_TYPES)
+                  or (member in {'pathParameters', 'queryParameters'} and 'io.ktor.server.routing.RoutingCall' in types)):
+                label = '.'.join([root, *members[:position + 1]])
+                value = retag(self.source(offset, label), add=frozenset({KTOR_MAP_TAG, 'jvm-string'}))
+                types, selected = frozenset(), True
+            else:
+                value = self.without_request_identity(value)
+                types = frozenset()
+        return value if selected else None
 
     def request_call(self, name, arguments, offset, bindings, state, receiver=CLEAN):
-        if not self.request_receiver_sources or arguments is None:
+        if not self.request_receiver_sources:
+            return None
+        ktor = self.ktor_access(name, arguments, offset, bindings, state, receiver)
+        if ktor is not None:
+            return ktor
+        if arguments is None:
             return None
         root, _, method = name.rpartition('.')
         if method not in REQUEST_GETTERS:
             return None
         types, _ = self.request_receiver(root, offset, bindings, state, receiver)
+        types &= REQUEST_TYPES
         if not types:
             return None
         if len(arguments) != REQUEST_GETTERS[method] or (method != 'getParameter' and not types & HTTP_SERVLET_TYPES):
@@ -702,6 +866,20 @@ class Engine:
     def named_request_source(self, name, offset, bindings, state):
         if not self.request_receiver_sources:
             return True
+        if self.parser.kotlin:
+            parts = name.split('.')
+            if len(parts) == 1 and name in KTOR_SOURCE_MEMBERS | {'params'}:
+                # A declared collection is ordinary data until a source
+                # assignment supplies provenance; its spelling is no proof.
+                return name not in bindings and self.request_index().binding(name, offset) is None
+            member = parts[-2] if len(parts) > 2 and parts[-1] in {'get', 'getAll'} else parts[-1]
+            if len(parts) > 1 and member in KTOR_SOURCE_MEMBERS:
+                root = '.'.join(parts[:2]) if parts[0] == 'this' else parts[0]
+                _, known = self.request_receiver(root, offset, bindings, state)
+                if known:
+                    # The member adapter supplies real sources. A known
+                    # lookalike or a same-named extension supplies none.
+                    return False
         root, _, method = name.rpartition('.')
         if not root:
             return True
@@ -711,6 +889,8 @@ class Engine:
             return True
         types, known = self.request_receiver(root, offset, bindings, state)
         if types:
+            if not types & REQUEST_TYPES:
+                return False
             opening = self.code.find('(', offset)
             if opening in self.parser.pairs:
                 arity = sum(1 for _ in self.parser.parts(opening + 1, self.parser.pairs[opening]))
@@ -722,7 +902,7 @@ class Engine:
         if not self.request_receiver_sources:
             return value
         return retag(value, remove=frozenset(tag for trace in value for tag in trace.tags
-                                            if tag.startswith(REQUEST_TYPE_PREFIX)))
+                                            if tag.startswith(REQUEST_TYPE_PREFIX) or tag == KTOR_MAP_TAG))
 
     def parameter_tags(self, declaration):
         declaration = declaration.split('=', 1)[0].strip()
@@ -738,7 +918,7 @@ class Engine:
         if self.request_receiver_sources:
             function = getattr(self, 'function', None)
             resolved = self.request_index().resolve_type(actual, function.key if function else 0)
-            if resolved in REQUEST_TYPES:
+            if resolved in REQUEST_TYPES | KTOR_TYPES:
                 request_tags = frozenset({REQUEST_TYPE_PREFIX + resolved})
         types = {'String': 'jvm-string', 'java.lang.String': 'jvm-string', 'kotlin.String': 'jvm-string',
                  'Path': 'jvm-path', 'java.nio.file.Path': 'jvm-path', 'File': 'jvm-path', 'java.io.File': 'jvm-path'}
@@ -1070,7 +1250,10 @@ class Engine:
                 cursor = close + 1
             else:
                 direct = self.source_re.search(self.code[offset:cursor + 1])
-                if direct and self.named_request_source(name, offset, bindings, state):
+                request_result = self.request_call(name, None, offset, bindings, state)
+                if request_result is not None:
+                    atom = request_result
+                elif direct and self.named_request_source(name, offset, bindings, state):
                     atom = join(atom, self.source(offset + direct.start(), direct.group().strip()))
             if '.' in name and not selected and request_result is None:
                 atom = self.member_value(name.rsplit('.', 1)[-1], atom, offset, arguments, direct_call=arguments is not None)
@@ -1080,6 +1263,8 @@ class Engine:
                 if self.code[tail:tail + 1] == '[':
                     close = self.parser.pairs[tail]
                     atom = join(atom, self.expression(tail + 1, close, state, bindings, depth + 1))
+                    if any(KTOR_MAP_TAG in trace.tags for trace in atom):
+                        atom = retag(self.without_request_identity(atom), add=frozenset({'jvm-string'}))
                     cursor = close + 1
                 elif member:
                     method = member.group(1)
@@ -1382,7 +1567,7 @@ class Engine:
 
 def analyze(path, issues):
     text = path.read_text(encoding='utf-8')
-    if not ((SOURCE_RE.search(text) or REQUEST_GETTER_RE.search(text) or ANNOTATED_PARAM_RE.search(text)) and SINK_RE.search(text)):
+    if not ((SOURCE_RE.search(text) or REQUEST_SOURCE_RE.search(text) or ANNOTATED_PARAM_RE.search(text)) and SINK_RE.search(text)):
         return
     engine = Engine(path, text)
     lines = text.splitlines()

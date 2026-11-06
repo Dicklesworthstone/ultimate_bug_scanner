@@ -13,7 +13,7 @@ from typing import Iterable, Sequence
 from ubs_core.suppression import SourceSuppressions
 from ubs_core.java_detectors._common import iter_java_files, source_line
 from ubs_core.analyzers.taint_java_redirect import RedirectEngine
-from ubs_core.analyzers.taint_java_traversal import Engine, REQUEST_GETTER_RE
+from ubs_core.analyzers.taint_java_traversal import Engine, REQUEST_SOURCE_RE
 from ubs_core.taint_flow import CLEAN, Trace, advance, join, retag
 
 RULE_ID = "java.security.ssrf-outbound-url"
@@ -361,7 +361,7 @@ class SSRFEngine(RedirectEngine):
 
 def analyze(path: Path, issues, *, suppressions: SourceSuppressions, rule_id: str):
     text = path.read_text(encoding='utf-8')
-    if not ((SOURCE_RE.search(text) or REQUEST_GETTER_RE.search(text) or ANNOTATED_PARAM_RE.search(text)) and SINK_RE.search(text)):
+    if not ((SOURCE_RE.search(text) or REQUEST_SOURCE_RE.search(text) or ANNOTATED_PARAM_RE.search(text)) and SINK_RE.search(text)):
         return
     suppression = suppressions.index(path, text)
     lines = text.splitlines()

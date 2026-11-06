@@ -1406,6 +1406,423 @@ class Example {
                 self.assertEqual((restored["hits"], restored["misses"]), (1, 0), restored)
 
 
+class KtorRequestReceiverIdentityTests(unittest.TestCase):
+    """Actual Ktor request members carry input; similarly named maps do not.
+
+    API contracts: https://ktor.io/docs/server-requests.html and the
+    ApplicationCall/ApplicationRequest/RoutingCall members at api.ktor.io.
+    No implicit routing-lambda receiver or extension-only request API is assumed.
+    """
+
+    expected_sites = staticmethod(JVMRequestReceiverIdentityTests.expected_sites)
+    scan = JVMRequestReceiverIdentityTests.scan
+
+    @classmethod
+    def setUpClass(cls):
+        artifacts = REPO_ROOT / "test-suite/artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        cls.root = Path(tempfile.mkdtemp(prefix="ktor-request-identity-", dir=artifacts))
+
+    @staticmethod
+    def program(kind, expression, *, receiver="incoming", prefix="", after="", members="", top="", unsafe=True):
+        imports = """import io.ktor.server.application.ApplicationCall
+import io.ktor.server.application.PipelineCall
+import io.ktor.server.request.ApplicationRequest
+import io.ktor.server.request.PipelineRequest
+import io.ktor.server.routing.RoutingCall
+import io.ktor.server.routing.RoutingRequest
+import io.ktor.http.Parameters
+import io.ktor.http.Headers
+import jakarta.servlet.http.HttpServletResponse
+import java.nio.file.Files
+import java.nio.file.Path
+import java.net.URI
+import java.net.http.HttpRequest
+import java.net.http.HttpClient
+import java.net.http.HttpResponse
+"""
+        sinks = (
+            ('response.sendRedirect(value);', "redirect"),
+            ('response.setHeader("X-Value", value);', "header"),
+            ('client.send(HttpRequest.newBuilder(URI.create(value)).build(), HttpResponse.BodyHandlers.discarding());', "ssrf"),
+            ('Files.readString(Path.of(value));', "path"),
+        )
+        body = prefix + "var value = " + expression + ";\n" + after
+        body += "\n".join(statement + (" // expect-" + policy if unsafe else "") for statement, policy in sinks)
+        return (imports + top + "\nclass KtorProbe {\n" + members + "\n"
+                f"fun handle({receiver}: {kind}, response: HttpServletResponse, client: HttpClient, enabled: Boolean) {{\n"
+                + body + "\n}\n}\n")
+
+    @classmethod
+    def cases(cls):
+        p = cls.program
+        query = 'incoming.request.queryParameters["next"] ?: "/fixed"'
+        parameters = 'incoming.parameters["next"] ?: "/fixed"'
+        yield "application_parameters", p("ApplicationCall", parameters)
+        yield "conventional_call", p("ApplicationCall", parameters.replace("incoming", "call"), receiver="call")
+        yield "request_query", p("ApplicationCall", query)
+        yield "request_raw_query", p("ApplicationCall", query.replace("queryParameters", "rawQueryParameters"))
+        yield "request_headers", p("ApplicationCall", query.replace('queryParameters["next"]', 'headers["X-Next"]'))
+        yield "pipeline_call", p("PipelineCall", parameters)
+        yield "routing_path", p("RoutingCall", parameters.replace("parameters", "pathParameters"))
+        yield "routing_query", p("RoutingCall", parameters.replace("parameters", "queryParameters"))
+        yield "application_request", p("ApplicationRequest", 'incoming.queryParameters["next"] ?: "/fixed"')
+        yield "pipeline_request", p("PipelineRequest", 'incoming.rawQueryParameters["next"] ?: "/fixed"')
+        yield "routing_request", p("RoutingRequest", 'incoming.headers["X-Next"] ?: "/fixed"')
+        yield "fully_qualified", p("io.ktor.server.application.ApplicationCall", parameters)
+        yield "import_alias", p("Inbound", parameters,
+                                top="import io.ktor.server.application.ApplicationCall as Inbound\n")
+        yield "type_alias", p("Inbound", parameters, top="typealias Inbound = ApplicationCall\n")
+        yield "typed_alias", p("ApplicationCall", query.replace("incoming", "selected"),
+                               prefix="val selected: ApplicationCall = incoming;\n")
+        yield "inferred_alias", p("ApplicationCall", parameters.replace("incoming", "selected"),
+                                  prefix="val selected = incoming;\n")
+        yield "request_alias", p("ApplicationCall", 'selected.queryParameters["next"] ?: "/fixed"',
+                                 prefix="val selected = incoming.request;\n")
+        yield "parameter_map_alias", p("ApplicationCall", 'selected["next"] ?: "/fixed"',
+                                       prefix="val selected = incoming.parameters;\n")
+        yield "header_map_alias", p("ApplicationCall", 'selected["X-Next"] ?: "/fixed"',
+                                    prefix="val selected = incoming.request.headers;\n")
+        yield "helper_getter", p("ApplicationCall", "read(incoming)",
+            members='fun read(selected: ApplicationCall): String { return selected.parameters["next"] ?: "/fixed" }\n')
+        yield "helper_receiver", p("ApplicationCall", 'same(incoming).parameters["next"] ?: "/fixed"',
+            members="fun same(selected: ApplicationCall): ApplicationCall { return selected }\n")
+        yield "helper_map", p("ApplicationCall", "read(incoming.parameters)",
+            members='fun read(selected: Parameters): String { return selected["next"] ?: "/fixed" }\n')
+        yield "branch_source", p("ApplicationCall", '"/fixed"',
+                                 after='if (enabled) { value = incoming.parameters["next"] ?: "/fixed"; }\n')
+        yield "literal_kill", p("ApplicationCall", parameters, after='value = "/fixed";\n', unsafe=False)
+        yield "fixed_literal", p("ApplicationCall", '"/fixed"', unsafe=False)
+        local_call = 'class LocalCall { val parameters = mapOf("next" to "/fixed") }\n'
+        yield "local_named_call", p("LocalCall", 'call.parameters["next"] ?: "/fixed"',
+                                    receiver="call", members=local_call, unsafe=False)
+        yield "local_renamed_call", p("LocalCall", parameters, members=local_call, unsafe=False)
+        yield "inferred_local_constructor", p("ApplicationCall", 'call.parameters["next"] ?: "/fixed"',
+                                               prefix="val call = LocalCall();\n", members=local_call, unsafe=False)
+        yield "delegating_request_constructor", p("ApplicationCall", 'call.parameters["next"] ?: "/fixed"',
+            prefix="val call = DelegatingCall(incoming);\n",
+            members="class DelegatingCall(private val selected: ApplicationCall) : ApplicationCall by selected {}\n")
+        yield "same_named_request_factory", p("ApplicationCall", 'call.parameters["next"] ?: "/fixed"',
+            prefix="val call = LocalCall(incoming);\n", members=local_call +
+            "fun LocalCall(selected: ApplicationCall): ApplicationCall { return selected }\n")
+        yield "shadowed_call_type", p("ApplicationCall", 'call.parameters["next"] ?: "/fixed"', receiver="call",
+                                      members=local_call.replace("LocalCall", "ApplicationCall"), unsafe=False)
+        local_request = 'class LocalRequest { val queryParameters = mapOf("next" to "/fixed") }\n'
+        yield "local_named_request", p("LocalRequest", 'request.queryParameters["next"] ?: "/fixed"',
+                                       receiver="request", members=local_request, unsafe=False)
+        yield "shadowed_request_type", p("ApplicationRequest", 'request.queryParameters["next"] ?: "/fixed"',
+                                         receiver="request", members=local_request.replace("LocalRequest", "ApplicationRequest"),
+                                         unsafe=False)
+        yield "bare_parameters", p("Parameters", 'parameters["next"] ?: "/fixed"', receiver="parameters", unsafe=False)
+        yield "bare_headers", p("Headers", 'headers["X-Next"] ?: "/fixed"', receiver="headers", unsafe=False)
+        yield "ordinary_map", p("Map<String, String>", 'parameters["next"] ?: "/fixed"',
+                                receiver="parameters", unsafe=False)
+        yield "string_named_call", p("String", "call", receiver="call", unsafe=False)
+        yield "request_extension_call", p("ApplicationCall", "incoming.request()", unsafe=False,
+            top='fun ApplicationCall.request(): String { return "/fixed" }\n')
+        yield "query_extension_call", p("ApplicationRequest", "incoming.queryParameters()", unsafe=False,
+            top='fun ApplicationRequest.queryParameters(): String { return "/fixed" }\n')
+        extension = 'fun ApplicationRequest.headers(fallback: String): String { return fallback }\n'
+        yield "header_extension_fixed", p("ApplicationRequest", 'incoming.headers("/fixed")',
+                                          top=extension, unsafe=False)
+        yield "header_extension_tainted", p("ApplicationRequest",
+            'incoming.headers(incoming.queryParameters["next"] ?: "/fixed")', top=extension)
+        yield "routing_extension_call", p("RoutingCall", "incoming.pathParameters()", unsafe=False,
+            top='fun RoutingCall.pathParameters(): String { return "/fixed" }\n')
+
+    def test_member_sources_and_binding_controls(self):
+        from ubs_core.analyzers.taint_java_redirect import RedirectEngine
+        from ubs_core.analyzers.taint_java_traversal import Engine
+        from ubs_core.java_detectors.header_injection import HeaderEngine
+        from ubs_core.java_detectors.ssrf_outbound_url import SSRFEngine
+
+        policies = (("redirect", RedirectEngine), ("header", HeaderEngine), ("ssrf", SSRFEngine), ("path", Engine))
+        observations = []
+        for name, text in self.cases():
+            path = self.root / (name + ".kt")
+            path.write_text(text, encoding="utf-8")
+            for policy, engine in policies:
+                with self.subTest(case=name, policy=policy):
+                    expected = [line for line, content in enumerate(text.splitlines(), 1) if "// expect-" + policy in content]
+                    started = time.monotonic()
+                    observation = {"case": name, "policy": policy, "expected_lines": expected,
+                                   "source_sha256": hashlib.sha256(text.encode()).hexdigest()}
+                    try:
+                        actual = sorted(engine(path, text).analyze())
+                    except Exception as exc:
+                        observation.update(error=repr(exc), elapsed_s=time.monotonic() - started)
+                        observations.append(observation)
+                        raise
+                    observation.update(actual_lines=actual, elapsed_s=time.monotonic() - started)
+                    observations.append(observation)
+                    self.assertEqual(actual, expected)
+        (self.root / "observations.json").write_text(json.dumps(observations, indent=2), encoding="utf-8")
+
+    def test_typed_initializers_are_incomplete_but_local_properties_stay_clean(self):
+        from ubs_core.analyzers.taint_java_traversal import Engine
+
+        real = '''import io.ktor.server.application.ApplicationCall
+import java.nio.file.Files
+import java.nio.file.Path
+class Example {
+  lateinit var incoming: ApplicationCall
+  val selected = incoming.request.rawQueryParameters["file"] ?: "/fixed"
+  fun read() { Files.readString(Path.of(selected)); }
+}
+'''
+        clean = '''import java.nio.file.Files
+import java.nio.file.Path
+class Example {
+  class LocalRequest { val rawQueryParameters = mapOf("file" to "/fixed") }
+  class LocalCall { val request = LocalRequest() }
+  val config = LocalCall()
+  val selected = config.request.rawQueryParameters["file"] ?: "/fixed"
+  fun read() { Files.readString(Path.of(selected)); }
+}
+'''
+        for name, text in (("KtorInitializer", real), ("LocalInitializer", clean)):
+            path = self.root / (name + ".kt")
+            path.write_text(text, encoding="utf-8")
+            with self.subTest(case=name):
+                if name == "KtorInitializer":
+                    with self.assertRaisesRegex(ValueError, "incomplete"):
+                        Engine(path, text).analyze()
+                else:
+                    self.assertEqual(Engine(path, text).analyze(), {})
+
+    def test_request_object_field_alias_requires_incomplete_analysis(self):
+        from ubs_core.analyzers.taint_java_traversal import Engine
+
+        real = '''import io.ktor.server.application.ApplicationCall
+import java.nio.file.Files
+import java.nio.file.Path
+class Example(private val incoming: ApplicationCall) {
+  private val selectedRequest = incoming.request
+  private val selectedPath = selectedRequest.rawQueryParameters["file"] ?: "/fixed"
+  fun read() { Files.readString(Path.of(selectedPath)); }
+}
+'''
+        clean = '''import java.nio.file.Files
+import java.nio.file.Path
+class LocalRequest { val rawQueryParameters = mapOf("file" to "/fixed") }
+class LocalCall { val request = LocalRequest() }
+class Example(private val incoming: LocalCall) {
+  private val selectedRequest = incoming.request
+  private val selectedPath = selectedRequest.rawQueryParameters["file"] ?: "/fixed"
+  fun read() { Files.readString(Path.of(selectedPath)); }
+}
+'''
+        for name, text in (("KtorFieldAlias", real), ("LocalFieldAlias", clean)):
+            path = self.root / (name + ".kt")
+            path.write_text(text, encoding="utf-8")
+            with self.subTest(case=name):
+                if name == "KtorFieldAlias":
+                    with self.assertRaisesRegex(ValueError, "incomplete"):
+                        Engine(path, text).analyze()
+                else:
+                    self.assertEqual(Engine(path, text).analyze(), {})
+
+    def test_local_class_request_capture_requires_incomplete_analysis(self):
+        from ubs_core.analyzers.taint_java_redirect import RedirectEngine
+        from ubs_core.analyzers.taint_java_traversal import Engine
+        from ubs_core.java_detectors.header_injection import HeaderEngine
+        from ubs_core.java_detectors.ssrf_outbound_url import SSRFEngine
+
+        cases = (
+            ("direct", "class LocalCall { val parameters = incoming.parameters }\n", True),
+            ("request_alias", "class LocalCall {\n  val selected = incoming.request\n"
+                              "  val parameters = selected.queryParameters\n}\n", True),
+            ("outer_map_alias", "val selected = incoming.parameters;\n"
+                                "class LocalCall { val parameters = selected }\n", True),
+            ("outer_alias_chain", "val selected = incoming.parameters;\nval chosen = selected;\n"
+                                  "class LocalCall { val parameters = chosen }\n", True),
+            ("fixed", 'class LocalCall { val parameters = mapOf("next" to "/fixed") }\n', False),
+            ("outer_fixed_map", 'val selected = mapOf("next" to "/fixed");\n'
+                                'class LocalCall { val parameters = selected }\n', False),
+        )
+        observations = []
+        policies = (("redirect", RedirectEngine), ("header", HeaderEngine), ("ssrf", SSRFEngine), ("path", Engine))
+        for name, declaration, incomplete in cases:
+            text = self.program("ApplicationCall", 'call.parameters["next"] ?: "/fixed"',
+                                prefix=declaration + "val call = LocalCall();\n", unsafe=False)
+            path = self.root / ("LocalCapture_" + name + ".kt")
+            path.write_text(text, encoding="utf-8")
+            for policy, engine in policies:
+                with self.subTest(case=name, policy=policy):
+                    observation = {"case": name, "policy": policy, "incomplete_expected": incomplete,
+                                   "source_sha256": hashlib.sha256(text.encode()).hexdigest()}
+                    try:
+                        actual = sorted(engine(path, text).analyze())
+                    except ValueError as exc:
+                        observation["error"] = str(exc)
+                        observations.append(observation)
+                        self.assertTrue(incomplete, repr(observation))
+                        self.assertRegex(str(exc), "Ktor initialization.*incomplete")
+                    else:
+                        observation["actual_lines"] = actual
+                        observations.append(observation)
+                        self.assertFalse(incomplete, repr(observation))
+                        self.assertEqual(actual, [])
+        (self.root / "local-capture-observations.json").write_text(json.dumps(observations, indent=2), encoding="utf-8")
+
+    def public_project(self, label):
+        directory = self.root / label
+        directory.mkdir()
+        cases = dict(self.cases())
+        expected = []
+        names = ("request_raw_query", "request_alias", "helper_map", "local_named_call", "bare_parameters",
+                 "request_extension_call", "header_extension_tainted")
+        for name in names:
+            source = "package ktor_probe_" + name + "\n" + cases[name].replace("class KtorProbe", "class Probe_" + name)
+            path = directory / ("Probe_" + name + ".kt")
+            path.write_text(source, encoding="utf-8")
+            expected.extend(self.expected_sites("kotlin", source, path.name))
+        return directory, sorted(expected), len(names)
+
+    def native_scan(self, target, format_, expected, label, *, listing=None, cache=False, files=1, enabled=True):
+        """Exercise the real Python scanner/report adapters with retained files.
+
+        This is separate from the shell/runner qualification below: those
+        entrypoints have independent lifetime and integrity responsibilities.
+        """
+        directory = target if target.is_dir() else target.parent
+        evidence = directory / label
+        evidence.mkdir()
+        if listing is None:
+            paths = sorted(target.glob("*.kt")) if target.is_dir() else [target]
+            listing = evidence / "files.nul"
+            listing.write_bytes(b"".join(os.fsencode(path) + b"\0" for path in paths))
+        sink, summary_path = evidence / "findings.jsonl", evidence / "summary.json"
+        stats = evidence / "cache.json"
+        skipped = ",".join(str(category) for category in range(1, 23) if not enabled or category != 4)
+        command = [sys.executable, "-m", "ubs_core.kotlin_scan", "--files-from", str(listing),
+                   "--sink", str(sink), "--json-out", str(summary_path), "--project-dir", str(directory),
+                   "--project", str(directory), "--skip", skipped]
+        env = dict(os.environ, PYTHONPATH=str(HELPERS_DIR), PYTHONDONTWRITEBYTECODE="1", UBS_KEEP_TEMP="1",
+                   UBS_NO_CACHE="0" if cache else "1", UBS_CACHE_DIR=str(directory / "native-cache"),
+                   UBS_CACHE_FILE=str(stats), UBS_NO_AUTO_UPDATE="1")
+        started = time.monotonic()
+        print(f"[ktor-native:{label}] RUN", flush=True)
+        proc = subprocess.run(command, cwd=directory, capture_output=True, text=True, timeout=180, env=env)
+        (evidence / "stdout.log").write_text(proc.stdout, encoding="utf-8")
+        (evidence / "stderr.log").write_text(proc.stderr, encoding="utf-8")
+        (evidence / "command.json").write_text(json.dumps({
+            "command": command, "exit": proc.returncode, "seconds": time.monotonic() - started,
+            "format_adapter": format_, "python": sys.executable, "python_version": sys.version,
+            "sources": {str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+                        for path in directory.glob("*.kt")},
+            "engine_sha256": hashlib.sha256((HELPERS_DIR / "ubs_core/analyzers/taint_java_traversal.py").read_bytes()).hexdigest(),
+            "scanner_sha256": hashlib.sha256((HELPERS_DIR / "ubs_core/kotlin_scan.py").read_bytes()).hexdigest(),
+            "environment": {key: env[key] for key in ("UBS_KEEP_TEMP", "UBS_NO_CACHE", "UBS_CACHE_DIR", "UBS_CACHE_FILE")},
+        }, indent=2), encoding="utf-8")
+        context = f"command={command!r}\nexit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+        self.assertEqual(proc.returncode, int(bool(expected)), context)
+        self.assertEqual(proc.stdout, "", context)
+        payload = json.loads(summary_path.read_text(encoding="utf-8"))
+        context += "\nsummary:\n" + json.dumps(payload, indent=2)
+        self.assertEqual(payload["status"], "ok", context)
+        self.assertEqual((payload["critical"], payload["warning"], payload["files"]), (len(expected), 0, files), context)
+        if format_ == "sarif":
+            from ubs_core.kotlin_scan import _render_sarif
+            counters = {severity: payload[severity] for severity in ("critical", "warning", "info")}
+            selected_files = [Path(os.fsdecode(raw)) for raw in listing.read_bytes().split(b"\0") if raw]
+            report = _render_sarif(payload["findings"], counters, str(directory), selected_files, summary=payload)
+            (evidence / "report.sarif").write_text(json.dumps(report, indent=2), encoding="utf-8")
+            rows = [row for run in report["runs"] for row in run.get("results", [])
+                    if row.get("level", "warning") in {"error", "warning"}]
+            self.assertTrue(all(row["level"] == "error" for row in rows), context)
+            actual = sorted((sarif_location_path(row["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]).name,
+                             row["ruleId"], row["locations"][0]["physicalLocation"]["region"]["startLine"],
+                             row["locations"][0]["physicalLocation"]["region"]["startColumn"]) for row in rows)
+            for run in report["runs"]:
+                self.assertTrue(all(invocation.get("executionSuccessful", True)
+                                    for invocation in run.get("invocations", [])), context)
+        else:
+            actual = sorted((Path(row["path"]).name, row["rule"], row["line"], row["col"])
+                            for row in payload["findings"] if row["severity"] in {"critical", "warning"})
+        self.assertEqual(actual, expected, context)
+        print(f"[ktor-native:{label}] PASS ({time.monotonic() - started:.3f}s)", flush=True)
+        return json.loads(stats.read_text(encoding="utf-8")) if cache else None
+
+    def test_native_scanner_json_sarif(self):
+        directory, expected, files = self.public_project("native-formats")
+        for format_ in ("json", "sarif"):
+            with self.subTest(format=format_):
+                self.native_scan(directory, format_, expected, "native-" + format_, files=files)
+
+    def test_native_selection_suppression_and_cache(self):
+        directory = self.root / "native-selection"
+        directory.mkdir()
+        cases = dict(self.cases())
+        source = cases["request_raw_query"]
+        path = directory / "Selected.kt"
+        path.write_text(source, encoding="utf-8")
+        (directory / "Unselected.kt").write_text("class Broken {", encoding="utf-8")
+        listing = directory / "files.nul"
+        listing.write_bytes(os.fsencode(path) + b"\0")
+        expected = self.expected_sites("kotlin", source, path.name)
+        cold = self.native_scan(directory, "json", expected, "cold", listing=listing, cache=True)
+        warm = self.native_scan(directory, "sarif", expected, "warm", listing=listing, cache=True)
+        self.assertEqual((cold["hits"], cold["misses"]), (0, 1), cold)
+        self.assertEqual((warm["hits"], warm["misses"]), (1, 0), warm)
+        suppressed = source.replace("// expect-redirect", "// ubs:ignore[kotlin.taint.open_redirect]")
+        path.write_text(suppressed, encoding="utf-8")
+        changed = self.native_scan(directory, "json", self.expected_sites("kotlin", suppressed, path.name),
+                                   "suppressed", listing=listing, cache=True)
+        self.assertEqual((changed["hits"], changed["misses"]), (0, 1), changed)
+        disabled = self.native_scan(directory, "json", [], "disabled-security", listing=listing, cache=True, enabled=False)
+        self.assertEqual(disabled["hits"], 0, disabled)
+        path.write_text(cases["local_named_call"], encoding="utf-8")
+        repaired = self.native_scan(directory, "json", [], "changed-api-identity", listing=listing, cache=True)
+        self.assertEqual((repaired["hits"], repaired["misses"]), (0, 1), repaired)
+        path.write_text(source, encoding="utf-8")
+        restored = self.native_scan(directory, "json", expected, "restored-api-identity", listing=listing, cache=True)
+        self.assertEqual((restored["hits"], restored["misses"]), (1, 0), restored)
+
+    def test_public_module_json_sarif(self):
+        directory, expected, files = self.public_project("public-module")
+        for format_ in ("json", "sarif"):
+            with self.subTest(format=format_):
+                self.scan("kotlin", directory, "module", format_, expected, "module-" + format_, files=files)
+
+    def test_public_runner_json_sarif(self):
+        directory, expected, files = self.public_project("public-runner")
+        for format_ in ("json", "sarif"):
+            with self.subTest(format=format_):
+                self.scan("kotlin", directory, "runner", format_, expected, "runner-" + format_, files=files)
+
+    def test_public_selection_suppression_and_cache(self):
+        directory = self.root / "selection"
+        directory.mkdir()
+        cases = dict(self.cases())
+        source = cases["request_raw_query"]
+        path = directory / "Selected.kt"
+        path.write_text(source, encoding="utf-8")
+        (directory / "Unselected.kt").write_text("class Broken {", encoding="utf-8")
+        listing = directory / "files.nul"
+        listing.write_bytes(os.fsencode(path) + b"\0")
+        options = ("--files-from=" + str(listing),)
+        expected = self.expected_sites("kotlin", source, path.name)
+        cold = self.scan("kotlin", directory, "module", "json", expected, "cold", options=options, cache=True)
+        warm = self.scan("kotlin", directory, "module", "sarif", expected, "warm", options=options, cache=True)
+        self.assertEqual((cold["hits"], cold["misses"]), (0, 1), cold)
+        self.assertEqual((warm["hits"], warm["misses"]), (1, 0), warm)
+        suppressed = source.replace("// expect-redirect", "// ubs:ignore[kotlin.taint.open_redirect]")
+        path.write_text(suppressed, encoding="utf-8")
+        changed = self.scan("kotlin", directory, "module", "json",
+                            self.expected_sites("kotlin", suppressed, path.name), "suppressed", options=options, cache=True)
+        self.assertEqual((changed["hits"], changed["misses"]), (0, 1), changed)
+        disabled = self.scan("kotlin", directory, "module", "json", [], "disabled-security",
+                             options=(*options, "--only=1"), cache=True)
+        self.assertEqual(disabled["hits"], 0, disabled)
+        path.write_text(cases["local_named_call"], encoding="utf-8")
+        repaired = self.scan("kotlin", directory, "module", "json", [], "changed-api-identity", options=options, cache=True)
+        self.assertEqual((repaired["hits"], repaired["misses"]), (0, 1), repaired)
+        path.write_text(source, encoding="utf-8")
+        restored = self.scan("kotlin", directory, "module", "json", expected, "restored-api-identity", options=options, cache=True)
+        self.assertEqual((restored["hits"], restored["misses"]), (1, 0), restored)
+
+
 class JavaRulePrecisionTests(unittest.TestCase):
     """Exercise generated Java rules and the public module on real sources."""
 

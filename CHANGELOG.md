@@ -10,6 +10,16 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Bind selected Kotlin Ktor call/request member properties to their actual API
+  types across redirect, filesystem traversal, response-header and outbound-URL
+  analysis. Follow request objects and extracted collections through aliases and
+  supported local helpers; keep ordinary maps, local lookalikes, same-named
+  methods and extension-only APIs distinct. Preserve input taint through unknown
+  calls, report unmodeled request field initialization as incomplete, and retain
+  existing rule identities and the separate JDBC analysis. Add independent
+  source/policy regressions and native JSON/SARIF, selection, suppression and
+  cache acceptance checks.
+
 - Extend Terraform AWS scanning with unrestricted IAM identity-policy grants
   and explicitly disabled provider TLS verification. Decode literal JSON and
   bounded `jsonencode` values through shared locals; reject duplicate keys and

@@ -67,8 +67,9 @@ class KotlinJdbcSource(jdbc.JdbcSource):
 
     kotlin = True
 
-    def __init__(self, text: str):
+    def __init__(self, text: str, *, extra_apis: frozenset[str] = frozenset()):
         self.model = KotlinCoroutines(text)
+        self.api_types = jdbc._APIS | extra_apis
         self.text, self.code = text, self.model.code
         self.positions = [token.start for token in self.model.tokens]
         self.pairs = {self.offset(low): self.offset(high) for low, high in self.model.pairs.items()}
@@ -107,11 +108,13 @@ class KotlinJdbcSource(jdbc.JdbcSource):
                     type_name = "var"
                 if self.model.value(cursor) == ":":
                     cursor += 1
+                    type_start = cursor
                     while cursor < len(self.model.tokens) and self.model.value(cursor) not in {"=", ",", ")", ";", "}"}:
                         if cursor > binding.declaration + 2 and "\n" in self.code[
                                 self.model.tokens[cursor - 1].end:self.offset(cursor)]:
                             break
                         cursor += 1
+                    type_name = self.model.path(type_start, cursor)
                 if self.model.value(cursor) == "=":
                     end = self.model.simple_end(cursor + 1, len(self.model.tokens))
                     initializer = (self.offset(cursor + 1), min(self.offset(end), high))
@@ -150,19 +153,19 @@ class KotlinJdbcSource(jdbc.JdbcSource):
         # local and member classifier scopes above precede those imports.
         if root in self.imports:
             spelling = self.imports[root] + ("." + tail if tail else "")
-            return spelling if spelling in jdbc._APIS else None
+            return spelling if spelling in self.api_types else None
         if aliases:
             _, _, target, declaration = max(aliases)
             return self.resolve_type(target, declaration, depth + 1)
         if any(name == root and low < position < high for name, low, high in self.classes):
             return None
-        if spelling in jdbc._APIS:
+        if spelling in self.api_types:
             return spelling
         defaults = {"String": "java.lang.String", "kotlin.String": "java.lang.String",
                     "Any": "java.lang.Object", "kotlin.Any": "java.lang.Object",
                     "StringBuilder": "java.lang.StringBuilder"}
         candidates = {package + "." + spelling for package in self.wildcards
-                      if package + "." + spelling in jdbc._APIS}
+                      if package + "." + spelling in self.api_types}
         if len(candidates) == 1:
             return next(iter(candidates))
         return defaults.get(spelling) if not candidates else None

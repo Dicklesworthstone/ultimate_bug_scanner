@@ -402,6 +402,7 @@ def _data(value):
 
 
 class SqlEngine(Engine):
+    request_receiver_sources = False
     source_re = _SOURCE_RE
     sink_re = _SQL_OPERATION_RE
     sink_label = "JDBC SQL execution"

@@ -1130,6 +1130,282 @@ class JVMHeaderDataflowTests(unittest.TestCase):
                                 self.assertEqual(actual, [(rule, line, "error") for line in expected], context)
 
 
+class JVMRequestReceiverIdentityTests(unittest.TestCase):
+    """Request provenance survives receiver renaming without blessing lookalikes."""
+
+    @classmethod
+    def setUpClass(cls):
+        artifacts = REPO_ROOT / "test-suite/artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        cls.root = Path(tempfile.mkdtemp(prefix="jvm-request-identity-", dir=artifacts))
+
+    @staticmethod
+    def cases(language, namespace):
+        declaration = "String" if language == "java" else "var"
+        typed_alias = "HttpServletRequest alias" if language == "java" else "val alias: HttpServletRequest"
+        inferred_alias = "var alias" if language == "java" else "val alias"
+        read = ("String read(HttpServletRequest selected) { return selected.getParameter(\"next\"); }"
+                if language == "java" else
+                "fun read(selected: HttpServletRequest): String { return selected.getParameter(\"next\") }")
+        same = ("HttpServletRequest same(HttpServletRequest selected) { return selected; }"
+                if language == "java" else
+                "fun same(selected: HttpServletRequest): HttpServletRequest { return selected }")
+        fake = ("static class Local { String getParameter(String key) { return \"/fixed\"; } }"
+                if language == "java" else
+                "class Local { fun getParameter(key: String): String { return \"/fixed\" } }")
+        cases = [
+            ("renamed_receiver", "HttpServletRequest", "incoming", "", 'incoming.getParameter("next")', "", True),
+            ("conventional_receiver", "HttpServletRequest", "request", "", 'request.getParameter("next")', "", True),
+            ("typed_alias", "HttpServletRequest", "incoming", typed_alias + " = incoming;\n",
+             'alias.getParameter("next")', "", True),
+            ("inferred_alias", "HttpServletRequest", "incoming", inferred_alias + " = incoming;\n",
+             'alias.getParameter("next")', "", True),
+            ("servlet_base", "ServletRequest", "incoming", "", 'incoming.getParameter("next")', "", True),
+            ("helper_getter", "HttpServletRequest", "incoming", "", "read(incoming)", read, True),
+            ("helper_receiver", "HttpServletRequest", "incoming", "", 'same(incoming).getParameter("next")', same, True),
+            ("fully_qualified", namespace + ".servlet.http.HttpServletRequest", "incoming", "",
+             'incoming.getParameter("next")', "", True),
+            ("http_header", "HttpServletRequest", "incoming", "", 'incoming.getHeader("X-Next")', "", True),
+            ("http_query", "HttpServletRequest", "incoming", "", "incoming.getQueryString()", "", True),
+            ("fake_named_request", "Local", "request", "", 'request.getParameter("next")', fake, False),
+            ("fake_renamed_request", "Local", "incoming", "", 'incoming.getParameter("next")', fake, False),
+            ("shadowed_api", "HttpServletRequest", "request", "", 'request.getParameter("next")',
+             fake.replace("Local", "HttpServletRequest"), False),
+            ("fixed_literal", "HttpServletRequest", "incoming", "", '"/fixed"', "", False),
+        ]
+        for name, kind, receiver, prefix, expression, members, unsafe in cases:
+            imports = (f"import {namespace}.servlet.http.HttpServletRequest;\n"
+                       f"import {namespace}.servlet.ServletRequest;\n"
+                       f"import {namespace}.servlet.http.HttpServletResponse;\n"
+                       "import java.nio.file.Files;\nimport java.nio.file.Path;\n"
+                       "import java.net.URI;\nimport java.net.http.HttpRequest;\n"
+                       "import java.net.http.HttpClient;\nimport java.net.http.HttpResponse;\n")
+            signature = (f"void handle({kind} {receiver}, HttpServletResponse response, HttpClient client) throws Exception"
+                         if language == "java" else
+                         f"fun handle({receiver}: {kind}, response: HttpServletResponse, client: HttpClient)")
+            body = prefix + f"{declaration} value = {expression};\n"
+            sinks = (
+                ('response.sendRedirect(value);', "redirect"),
+                ('response.setHeader("X-Value", value);', "header"),
+                ('client.send(HttpRequest.newBuilder(URI.create(value)).build(), HttpResponse.BodyHandlers.discarding());', "ssrf"),
+                ('Files.readString(Path.of(value));', "path"),
+            )
+            body += "\n".join(statement + (" // expect-" + policy if unsafe else "")
+                              for statement, policy in sinks)
+            yield name, imports + "class RequestProbe {\n" + members + "\n" + signature + " {\n" + body + "\n}\n}\n"
+
+    def test_servlet_sources_bind_to_api_receivers(self):
+        from ubs_core.analyzers.taint_java_redirect import RedirectEngine
+        from ubs_core.analyzers.taint_java_traversal import Engine
+        from ubs_core.java_detectors.header_injection import HeaderEngine
+        from ubs_core.java_detectors.ssrf_outbound_url import SSRFEngine
+
+        policies = (("redirect", RedirectEngine), ("header", HeaderEngine),
+                    ("ssrf", SSRFEngine), ("path", Engine))
+        observations = []
+        for language in ("java", "kotlin"):
+            for namespace in ("jakarta", "javax"):
+                for name, text in self.cases(language, namespace):
+                    path = self.root / f"{language}-{namespace}-{name}{'.java' if language == 'java' else '.kt'}"
+                    path.write_text(text, encoding="utf-8")
+                    for policy, engine in policies:
+                        with self.subTest(language=language, namespace=namespace, case=name, policy=policy):
+                            expected = [line for line, content in enumerate(text.splitlines(), 1)
+                                        if "// expect-" + policy in content]
+                            started = time.monotonic()
+                            actual = sorted(engine(path, text).analyze())
+                            observations.append({"language": language, "namespace": namespace,
+                                                 "case": name, "policy": policy,
+                                                 "source_sha256": hashlib.sha256(text.encode()).hexdigest(),
+                                                 "expected_lines": expected, "actual_lines": actual,
+                                                 "elapsed_s": time.monotonic() - started})
+                            self.assertEqual(actual, expected)
+        (self.root / "observations.json").write_text(json.dumps(observations, indent=2), encoding="utf-8")
+
+    @staticmethod
+    def expected_sites(language, source, filename):
+        rules = {"redirect": ".taint.open_redirect", "header": ".security.header-injection",
+                 "ssrf": ".security.ssrf-outbound-url", "path": ".taint.path_traversal"}
+        return sorted((filename, language + suffix, line, 1) for policy, suffix in rules.items()
+                      for line, content in enumerate(source.splitlines(), 1) if "// expect-" + policy in content)
+
+    @classmethod
+    def kotlin_overloads(cls):
+        original = dict(cls.cases("kotlin", "jakarta"))["renamed_receiver"]
+        extension = ('\nfun HttpServletRequest.getParameter(key: String, fallback: String): String {\n'
+                     '    return fallback\n}\n')
+        for receiver in ("incoming", "request"):
+            source = original.replace("incoming", receiver)
+            getter = receiver + '.getParameter("next")'
+            unsafe = source.replace('var value = ' + getter + ';',
+                                    'val raw = ' + getter + ';\nvar value = ' + receiver + '.getParameter("next", raw);')
+            yield "overload_tainted_" + receiver, unsafe + extension
+            clean = source.replace(getter, receiver + '.getParameter("next", "/fixed")')
+            for policy in ("redirect", "header", "ssrf", "path"):
+                clean = clean.replace("// expect-" + policy, "// fixed fallback")
+            yield "overload_fixed_" + receiver, clean + extension
+
+    def test_getter_overloads_preserve_arguments_without_promoting_sources(self):
+        from ubs_core.analyzers.taint_java_redirect import RedirectEngine
+        from ubs_core.analyzers.taint_java_traversal import Engine
+        from ubs_core.java_detectors.header_injection import HeaderEngine
+        from ubs_core.java_detectors.ssrf_outbound_url import SSRFEngine
+
+        for name, source in self.kotlin_overloads():
+            path = self.root / (name + ".kt")
+            path.write_text(source, encoding="utf-8")
+            for policy, engine in (("redirect", RedirectEngine), ("header", HeaderEngine),
+                                   ("ssrf", SSRFEngine), ("path", Engine)):
+                with self.subTest(case=name, policy=policy):
+                    expected = [line for line, content in enumerate(source.splitlines(), 1)
+                                if "// expect-" + policy in content]
+                    self.assertEqual(sorted(engine(path, source).analyze()), expected)
+
+    def test_class_initializer_getter_requires_real_api_identity(self):
+        from ubs_core.analyzers.taint_java_traversal import Engine
+
+        clean = '''import java.nio.file.Files;
+import java.nio.file.Path;
+class Example {
+  static class Local {
+    String getParameter(String key) { return "/fixed"; }
+  }
+  static final Local config = new Local();
+  static final String selected = config.getParameter("file");
+  void read() throws Exception {
+    Files.readString(Path.of(selected));
+  }
+}
+'''
+        real = '''import jakarta.servlet.http.HttpServletRequest;
+import java.nio.file.Files;
+import java.nio.file.Path;
+class Example {
+  HttpServletRequest incoming;
+  String selected = incoming.getParameter("file");
+  void read() throws Exception {
+    Files.readString(Path.of(selected));
+  }
+}
+'''
+        clean_path, real_path = self.root / "LocalInitializer.java", self.root / "ServletInitializer.java"
+        clean_path.write_text(clean, encoding="utf-8")
+        real_path.write_text(real, encoding="utf-8")
+        self.assertEqual(Engine(clean_path, clean).analyze(), {})
+        with self.assertRaisesRegex(ValueError, "Servlet initialization.*incomplete"):
+            Engine(real_path, real).analyze()
+
+    def scan(self, language, target, surface, format_, expected, label, *, options=(), cache=False, files=1):
+        entry = REPO_ROOT / ("modules/ubs-" + language + ".sh" if surface == "module" else "ubs")
+        directory = target if target.is_dir() else target.parent
+        command = [str(entry), "--only=4" if surface == "module" else "--only=" + language,
+                   "--format=" + format_, "--ci", *options, str(target)]
+        stats = directory / (label + ".cache.json")
+        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", UBS_NO_AUTO_UPDATE="1", ENABLE_UV_TOOLS="0",
+                   UBS_NO_CACHE="0" if cache else "1", UBS_CACHE_DIR=str(directory / "cache"),
+                   UBS_CACHE_FILE=str(stats), UBS_CATEGORY_FILTER="4")
+        started = time.monotonic()
+        proc = subprocess.run(command, cwd=directory, capture_output=True, text=True, timeout=180, env=env)
+        (directory / (label + ".stdout")).write_text(proc.stdout, encoding="utf-8")
+        (directory / (label + ".stderr")).write_text(proc.stderr, encoding="utf-8")
+        sources = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                   for path in directory.iterdir() if path.suffix in {".java", ".kt"}}
+        (directory / (label + ".command.json")).write_text(json.dumps({
+            "command": command, "exit": proc.returncode, "seconds": time.monotonic() - started,
+            "source_sha256": sources,
+            "engine_sha256": hashlib.sha256((HELPERS_DIR / "ubs_core/analyzers/taint_java_traversal.py").read_bytes()).hexdigest(),
+            "python": sys.executable, "python_version": sys.version,
+            "environment": {name: env.get(name) for name in ("UBS_KEEP_TEMP", "UBS_NO_CACHE", "UBS_CATEGORY_FILTER",
+                                                             "UBS_TEST_FORCE_NO_AST_GREP", "UBS_NO_AUTO_UPDATE")},
+        }, indent=2), encoding="utf-8")
+        context = f"command={command!r}\nexit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+        self.assertEqual(proc.returncode, int(bool(expected)), context)
+        payload = json.loads(proc.stdout)
+        if format_ == "json":
+            self.assertEqual(payload["status"], "ok", context)
+            key = "rule_id" if surface == "runner" else "rule"
+            path_key = "file" if surface == "runner" else "path"
+            rows = payload["findings"]
+            actual = sorted((Path(row[path_key]).name, row[key], row["line"], row["col"]) for row in rows
+                            if row["severity"] in {"critical", "warning"})
+            totals = payload["totals"] if surface == "runner" else payload
+            self.assertEqual((totals["critical"], totals["warning"]), (len(expected), 0), context)
+            self.assertEqual(totals["files"], files, context)
+        else:
+            rows = [row for run in payload["runs"] for row in run.get("results", [])
+                    if row.get("level", "warning") in {"error", "warning"}]
+            self.assertTrue(all(row["level"] == "error" for row in rows), context)
+            actual = sorted((sarif_location_path(row["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]).name,
+                             row["ruleId"], row["locations"][0]["physicalLocation"]["region"]["startLine"],
+                             row["locations"][0]["physicalLocation"]["region"]["startColumn"]) for row in rows)
+            for run in payload["runs"]:
+                self.assertTrue(all(invocation.get("executionSuccessful", True)
+                                    for invocation in run.get("invocations", [])), context)
+        self.assertEqual(actual, expected, context)
+        return json.loads(stats.read_text()) if cache else None
+
+    def test_public_json_sarif_api_identity(self):
+        for language in ("java", "kotlin"):
+            cases = dict(self.cases(language, "jakarta"))
+            directory = self.root / ("public-" + language)
+            directory.mkdir()
+            expected = []
+            selected = [(name, cases[name]) for name in ("renamed_receiver", "helper_receiver", "fake_named_request")]
+            if language == "kotlin":
+                selected.extend(self.kotlin_overloads())
+            for name, source in selected:
+                source = source.replace("class RequestProbe", "class Probe_" + name)
+                if language == "kotlin":
+                    source = "package jvm_probe_" + name + "\n" + source
+                path = directory / ("Probe_" + name + (".java" if language == "java" else ".kt"))
+                path.write_text(source, encoding="utf-8")
+                expected.extend(self.expected_sites(language, source, path.name))
+            for surface in ("module", "runner"):
+                for format_ in ("json", "sarif"):
+                    with self.subTest(language=language, surface=surface, format=format_):
+                        self.scan(language, directory, surface, format_, sorted(expected), surface + "-" + format_, files=len(selected))
+
+    def test_public_selection_suppression_and_cache_identity(self):
+        for language in ("java", "kotlin"):
+            with self.subTest(language=language):
+                directory = self.root / ("selection-" + language)
+                directory.mkdir()
+                cases = dict(self.cases(language, "javax"))
+                source = cases["renamed_receiver"]
+                suffix = ".java" if language == "java" else ".kt"
+                selected = directory / ("Selected" + suffix)
+                selected.write_text(source, encoding="utf-8")
+                (directory / ("Unselected" + suffix)).write_text("class Broken {", encoding="utf-8")
+                listing = directory / "files.nul"
+                listing.write_bytes(os.fsencode(selected) + b"\0")
+                options = ("--files-from=" + str(listing),)
+                expected = self.expected_sites(language, source, selected.name)
+                cold = self.scan(language, directory, "module", "json", expected, "cold", options=options, cache=True)
+                warm = self.scan(language, directory, "module", "sarif", expected, "warm", options=options, cache=True)
+                self.assertEqual((cold["hits"], cold["misses"]), (0, 1), cold)
+                self.assertEqual((warm["hits"], warm["misses"]), (1, 0), warm)
+                self.scan(language, selected, "runner", "json", expected, "selected-runner")
+
+                suppressed = source.replace("// expect-redirect", "// ubs:ignore[" + language + ".taint.open_redirect]")
+                selected.write_text(suppressed, encoding="utf-8")
+                expected_suppressed = self.expected_sites(language, suppressed, selected.name)
+                changed = self.scan(language, directory, "module", "json", expected_suppressed, "suppressed",
+                                    options=options, cache=True)
+                self.assertEqual((changed["hits"], changed["misses"]), (0, 1), changed)
+                disabled = self.scan(language, directory, "module", "json", [], "disabled-security",
+                                     options=(*options, "--only=1"), cache=True)
+                self.assertEqual(disabled["hits"], 0, disabled)
+
+                selected.write_text(cases["fake_named_request"], encoding="utf-8")
+                repaired = self.scan(language, directory, "module", "json", [], "changed-receiver",
+                                     options=options, cache=True)
+                self.assertEqual((repaired["hits"], repaired["misses"]), (0, 1), repaired)
+                selected.write_text(source, encoding="utf-8")
+                restored = self.scan(language, directory, "module", "json", expected, "restored-receiver",
+                                     options=options, cache=True)
+                self.assertEqual((restored["hits"], restored["misses"]), (1, 0), restored)
+
+
 class JavaRulePrecisionTests(unittest.TestCase):
     """Exercise generated Java rules and the public module on real sources."""
 

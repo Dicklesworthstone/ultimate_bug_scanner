@@ -10,6 +10,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Resolve selected Java and Kotlin Servlet request sources by API identity
+  across redirect, path traversal, response-header and outbound-URL checks.
+  Follow arbitrarily named parameters, aliases and selected helper returns;
+  recognize both Jakarta and Javax APIs and reject declared local lookalikes.
+  Preserve tainted argument flow through unsupported getter overloads and keep
+  existing public rule IDs and the separate JDBC receiver analysis.
+
 - Add native Terraform HCL scanning for explicit AWS public SSH/RDP ingress
   and public S3 canned ACLs. Resolve selected literal/local configuration and
   same-directory bucket protections, distinguish conflicting or unknown inputs

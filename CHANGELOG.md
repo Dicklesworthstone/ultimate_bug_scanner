@@ -10,6 +10,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Stream Rust guard-analysis records in bounded batches of the selected files.
+  Retain guard evidence beyond the former 16 MiB output limit and preserve
+  selected-file fallback findings after malformed records or failed producers.
+  Validate guard captures and byte ranges, keep excluded files out of fallback
+  scans, and honor an explicitly configured ast-grep executable.
+
 - Bind selected Kotlin Ktor call/request member properties to their actual API
   types across redirect, filesystem traversal, response-header and outbound-URL
   analysis. Follow request objects and extracted collections through aliases and

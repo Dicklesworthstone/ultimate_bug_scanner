@@ -1431,20 +1431,17 @@ def replay_findings(scan: Scan, r: Renderer, cached_records: Sequence[dict]) -> 
 # Analyzers (legacy invocations, in process)
 # ─────────────────────────────────────────────────────────────────────────────
 def run_narrowing(scan: Scan, skip_type_narrowing: bool) -> list[Hit]:
-    """Legacy run_rust_type_narrowing_checks (451-501): guard-JSON pipeline
-    from two `ast-grep run --pattern --json` spawns fed to
-    narrowing_rust.analyze_with_ast_json, falling back to the regex walk
-    when it yields nothing."""
+    """Analyze guard matches and fallback source from the selected file set."""
     if skip_type_narrowing:
         return []
     from ubs_core.analyzers import narrowing_rust
 
-    guard_json, guard_incomplete = _emit_guard_matches(scan.project_dir)
+    guard_json, guard_incomplete = _emit_guard_matches(scan.files)
     try:
         if guard_json is not None and not guard_incomplete:
             issues = narrowing_rust.analyze_with_ast_json(scan.project_dir, guard_json)
             if not issues:
-                issues = narrowing_rust.analyze_with_regex(scan.project_dir)
+                issues = _narrowing_regex_over_list(scan)
         else:
             # A guard scan that could not finish is treated exactly like an
             # absent ast-grep: the regex walk covers the whole file list on its
@@ -1455,9 +1452,9 @@ def run_narrowing(scan: Scan, skip_type_narrowing: bool) -> list[Hit]:
         if guard_json is not None and not keep_temp_enabled():
             guard_json.unlink(missing_ok=True)
     hits: list[Hit] = []
-    # The guard pass walks the whole project, but only the files being
-    # analyzed now may report: a cache hit's findings come back through
-    # replay_findings, and emitting them here too duplicated them (GH #150).
+    # Only files being analyzed now may report: a cache hit's findings come
+    # back through replay_findings, and emitting them here too duplicates them
+    # (GH #150). Keep this boundary even for external analyzer diagnostics.
     current: set[str] = set()
     for path in scan.files:
         current.add(str(path))
@@ -1468,8 +1465,6 @@ def run_narrowing(scan: Scan, skip_type_narrowing: bool) -> list[Hit]:
     for path, line, col, message in issues:
         path_str = str(path)
         if path_str not in current:
-            # legacy guard entries came from the raw project walk; the
-            # authoritative-file-set filter applied to their matches too
             continue
         if not scan.stream_line_allowed(path_str, line, scan._source_line(path_str, line)):
             continue
@@ -1489,9 +1484,8 @@ def _narrowing_regex_over_list(scan: Scan):
     return issues
 
 
-def _emit_guard_matches(project_dir: Path) -> tuple[Path | None, bool]:
-    """Legacy emit_rust_guard_matches (433-449): two pattern-mode JSONL
-    spawns concatenated into one file.
+def _emit_guard_matches(paths: Sequence[Path]) -> tuple[Path | None, bool]:
+    """Spool validated guard matches with bounded memory over selected paths.
 
     Returns (path, incomplete). The path is None when ast-grep is unavailable;
     ``incomplete`` is True when a spawn was attempted and did not succeed. The
@@ -1500,11 +1494,11 @@ def _emit_guard_matches(project_dir: Path) -> tuple[Path | None, bool]:
     issues, so the caller's "empty means fall back" test would not fire and
     narrowing would silently cover less than the whole tree (#111).
     """
-    import subprocess
     import tempfile
+    from ubs_core.external_tools import parse_ast_diagnostics, report_ast_stderr, run_command_stream
 
     ast_grep = _ast_grep_bin()
-    if ast_grep is None:
+    if ast_grep is None or not paths:
         return None, False
     if keep_temp_enabled():
         with temporary_file(prefix="ubs-v2-rust-guards-", suffix=".jsonl") as scratch:
@@ -1517,30 +1511,47 @@ def _emit_guard_matches(project_dir: Path) -> tuple[Path | None, bool]:
         "if let Some($BIND) = $SOURCE { $BODY }",
         "if let Ok($BIND) = $SOURCE { $BODY }",
     )
-    incomplete = False
+    failures: list[str] = []
     with tmp.open("w", encoding="utf-8") as fh:
         for pattern in patterns:
-            try:
-                proc = subprocess.run(
-                    [ast_grep, "run", "--pattern", pattern, "-l", "rust", "--json", str(project_dir)],
-                    capture_output=True, text=True, timeout=300,
-                )
-            except (OSError, subprocess.TimeoutExpired):
-                incomplete = True
-                continue
-            # 0 = no matches, 1 = matches; anything else is a failed spawn.
-            if proc.returncode not in (0, 1):
-                incomplete = True
-            for line in proc.stdout.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    json.loads(line)
-                except ValueError:
-                    continue
-                fh.write(line + "\n")
-    return tmp, incomplete
+            for start in range(0, len(paths), 400):
+                context = f"ast-grep (Rust guard {pattern})"
+                with run_command_stream(
+                    "ast-grep", [ast_grep, "run", "--pattern", pattern, "-l", "rust",
+                                 "--json=stream", "--", *(str(p) for p in paths[start:start + 400])],
+                    Path.cwd(), 300, failures,
+                ) as output:
+                    if output is None:
+                        continue
+                    report_ast_stderr(output, failures, context=context)
+                    if output.returncode not in (0, 1):
+                        failures.append(f"{context}: exited {output.returncode}")
+                    valid = False
+                    malformed_guards = 0
+                    for diagnostic in parse_ast_diagnostics(
+                        output.stdout, failures, context=context, run_rule_id="rust.narrowing.guard",
+                    ):
+                        valid = True
+                        # The shared boundary validates locations; the narrowing
+                        # adapter also requires the source capture and byte span.
+                        # Dropping either silently can hide a later unsafe unwrap
+                        # when another valid guard already produced a finding.
+                        single = diagnostic.get("metaVariables", {}).get("single", {})
+                        source = single.get("SOURCE") or single.get("S")
+                        offsets = diagnostic["range"].get("byteOffset")
+                        if (not isinstance(source, dict) or not isinstance(source.get("text"), str)
+                                or not isinstance(offsets, dict)
+                                or type(offsets.get("start")) is not int or offsets["start"] < 0
+                                or type(offsets.get("end")) is not int or offsets["end"] < offsets["start"]):
+                            malformed_guards += 1
+                            continue
+                        fh.write(json.dumps(diagnostic, ensure_ascii=True) + "\n")
+                    if malformed_guards:
+                        failures.append(f"{context}: {malformed_guards} malformed guard record(s)")
+                    # Pattern mode: 0 means matches, 1 means no matches.
+                    if output.returncode in (0, 1) and valid != (output.returncode == 0):
+                        failures.append(f"{context}: exit {output.returncode} is inconsistent with match output")
+    return tmp, bool(failures)
 
 
 _AST_GREP_CACHE: str | None = None
@@ -1566,6 +1577,11 @@ def _probe(binary: str, flag: str) -> str:
 def _ast_grep_bin() -> str | None:
     """Legacy check_ast_grep (7040-7062): ast-grep, or an ast-grep `sg`."""
     global _AST_GREP_CACHE
+    # The launcher supplies the verified executable; do not replace a broken
+    # explicit choice with an unrelated ambient binary or a cached probe.
+    configured = os.environ.get("UBS_AST_GREP_BIN")
+    if configured:
+        return configured
     if _AST_GREP_CACHE is not None:
         return _AST_GREP_CACHE or None
     import shutil

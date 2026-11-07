@@ -13,7 +13,7 @@ from typing import Iterable, Sequence
 from ubs_core.suppression import SourceSuppressions
 from ubs_core.java_detectors._common import iter_java_files, source_line
 from ubs_core.analyzers.taint_java_redirect import RedirectEngine
-from ubs_core.analyzers.taint_java_traversal import Engine, REQUEST_SOURCE_RE
+from ubs_core.analyzers.taint_java_traversal import Engine, REQUEST_SOURCE_RE, lexical_source
 from ubs_core.taint_flow import CLEAN, Trace, advance, join, retag
 
 RULE_ID = "java.security.ssrf-outbound-url"
@@ -60,8 +60,75 @@ DEFERRED_INIT_RE = re.compile(r'->|\bnew\s+[\w.<>?, ]+\([^;{}]*\)\s*\{|\bobject\
 
 
 class InitSinkGuard:
+    """Keep deferred request construction outside unsupported field analysis."""
+
+    def __init__(self, *, kotlin=False, source=''):
+        self.kotlin = kotlin
+        self.factories = None
+        self.deferred = None
+        if not kotlin:
+            return
+        code = lexical_source(source, True)
+        members = {
+            'org.springframework.http.RequestEntity': '(?:get|head|post|put|patch|delete|options|method)',
+            'okhttp3.Request': 'Builder',
+            'java.net.http.HttpRequest': 'newBuilder',
+        }
+        factories = [re.escape(name) + r'\s*\.\s*' + member
+                     for name, member in members.items()]
+        lazy_names = ['lazy', r'kotlin\s*\.\s*lazy']
+        for match in re.finditer(r'(?m)^\s*import\s+([\w.]+)(?:\s+as\s+([A-Za-z_]\w*))?', code):
+            imported, alias = match.groups()
+            name = alias or imported.rsplit('.', 1)[-1]
+            if imported in members:
+                factories.append(re.escape(name) + r'\s*\.\s*' + members[imported])
+            elif imported == 'okhttp3.Request.Builder':
+                factories.append(re.escape(name))
+            elif imported == 'kotlin.lazy' and alias:
+                lazy_names.append(re.escape(alias))
+        self.factories = re.compile(r'(?<![\w.])(?:' + '|'.join(factories) + r')\s*\(')
+        self.deferred = re.compile(r'(?:\b(?:' + '|'.join(lazy_names)
+                                   + r')\s*(?:\([^{}]*\))?|=)\s*\{')
+
+    def request_build(self, text, start, end):
+        """Follow the selected factory's member chain, not a nearby build."""
+        pairs, stack = {}, []
+        for position in range(start, end):
+            if text[position] == '(':
+                stack.append(position)
+            elif text[position] == ')' and stack:
+                pairs[stack.pop()] = position
+        member_call = re.compile(r'\s*(?:!!\s*)?(?:\?\.|\.)\s*([A-Za-z_]\w*)\s*\(')
+        for factory in self.factories.finditer(text, start, end):
+            closing = pairs.get(factory.end() - 1)
+            while closing is not None:
+                member = member_call.match(text, closing + 1, end)
+                if member is None:
+                    break
+                if member.group(1) == 'build':
+                    return factory
+                closing = pairs.get(member.end() - 1)
+        return None
+
     def search(self, text):
-        return (SINK_RE if DEFERRED_INIT_RE.search(text) else INIT_SINK_RE).search(text)
+        matched = (SINK_RE if DEFERRED_INIT_RE.search(text) else INIT_SINK_RE).search(text)
+        if matched is not None or not self.kotlin:
+            return matched
+        openings = {match.end() - 1 for match in self.deferred.finditer(text)}
+        stack, active = [], None
+        for position, char in enumerate(text):
+            if char == '{':
+                stack.append(position)
+                if position in openings and active is None:
+                    active = position
+            elif char == '}' and stack:
+                opening = stack.pop()
+                if opening == active:
+                    matched = self.request_build(text, opening + 1, position)
+                    if matched is not None:
+                        return matched
+                    active = None
+        return None
 
 KINDS = frozenset({'ssrf-uri', 'ssrf-url', 'ssrf-builder', 'ssrf-request', 'ssrf-text'})
 PROOFS = frozenset({'ssrf-scheme', 'ssrf-host'})
@@ -77,6 +144,7 @@ class SSRFEngine(RedirectEngine):
     sink_label = 'outbound HTTP destination'
 
     def __init__(self, path, text):
+        self.parser_sink_re = InitSinkGuard(kotlin=path.suffix.lower() in {'.kt', '.kts'}, source=text)
         super().__init__(path, text)
         if self.parser.kotlin:
             # Bind Kotlin annotations to the parsed function's parameters.

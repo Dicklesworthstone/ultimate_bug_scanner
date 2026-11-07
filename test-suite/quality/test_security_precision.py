@@ -869,6 +869,78 @@ class JVMOutboundDataflowTests(unittest.TestCase):
         with self.assertRaises(AnalysisLimit):
             engine.analyze()
 
+    def test_deferred_kotlin_request_initializers_are_incomplete(self):
+        """tz17: deferred blocks can read fields after a request handler writes."""
+        from ubs_core.java_detectors.ssrf_outbound_url import SSRFEngine
+
+        imports = ('import org.springframework.http.RequestEntity\n'
+                   'import okhttp3.Request\n')
+        requests = (
+            'RequestEntity.get(destination!!).build()',
+            'org.springframework.http.RequestEntity.post(destination!!).header("X", "fixed").build()',
+            'Request.Builder().url(destination!!.toString()).build()',
+            'HttpRequest.newBuilder(destination!!).build()',
+        )
+        wrappers = ('lazy { %s }', 'lazy(LazyThreadSafetyMode.NONE) { %s }',
+                    'kotlin.lazy { %s }', '{ %s }',
+                    'lazy { if (enabled) { %s } else { null } }')
+        for request in requests:
+            for wrapper in wrappers:
+                for assignment in ('=', 'by') if not wrapper.startswith('{') else ('=',):
+                    fields = ('var destination: URI? = null\nval enabled: Boolean = true\nval later '
+                              + assignment + ' '
+                              + wrapper % request + '\n')
+                    text = imports + self.program('kotlin',
+                        'destination = URI.create(request.getParameter("url"))\n', fields=fields)
+                    with self.subTest(request=request, wrapper=wrapper, assignment=assignment):
+                        with self.assertRaisesRegex(ValueError, 'class initialization.*incomplete'):
+                            SSRFEngine(self.root / 'deferred.kt', text).analyze()
+
+        aliases = (
+            ('import org.springframework.http.RequestEntity as Entity\n',
+             'lazy { Entity.get(destination!!).build() }'),
+            ('import org.springframework.http.RequestEntity\nimport kotlin.lazy as defer\n',
+             'defer { RequestEntity.get(destination!!).build() }'),
+        )
+        for imports, expression in aliases:
+            text = imports + self.program('kotlin',
+                'destination = URI.create(request.getParameter("url"))\n',
+                fields='var destination: URI? = null\nval later by ' + expression + '\n')
+            with self.subTest(imports=imports):
+                with self.assertRaisesRegex(ValueError, 'class initialization.*incomplete'):
+                    SSRFEngine(self.root / 'import-alias.kt', text).analyze()
+
+    def test_client_builders_do_not_become_request_initializers(self):
+        from ubs_core.java_detectors.ssrf_outbound_url import SSRFEngine
+
+        kotlin_fields = (
+            'val client by lazy { OkHttpClient.Builder().build() }',
+            'val client = lazy { OkHttpClient.Builder().build() }',
+            'val client = { OkHttpClient.Builder().build() }',
+            'val client by lazy { WebClient.builder().build() }',
+            'val client by lazy { HttpClient.newBuilder().build() }',
+            'val settings = Settings.builder().build()',
+            'val client by lazy { OkHttpClient.Builder().build() }\n'
+            'val fixed = RequestEntity.get(fixedUrl).build()',
+            'val client by lazy {\nval unused = RequestEntity.get(fixedUrl)\n'
+            'OkHttpClient.Builder().build()\n}',
+            'val client by lazy {\n// RequestEntity.get(destination!!).build()\n'
+            'OkHttpClient.Builder().build()\n}',
+            'val example = "lazy { RequestEntity.get(destination!!).build() }"',
+        )
+        for index, fields in enumerate(kotlin_fields):
+            fields = 'val fixedUrl = URI.create("https://api.example.com")\n' + fields
+            text = 'import org.springframework.http.RequestEntity\n' + self.program(
+                'kotlin', 'request.getHeader("X-Request-ID")\n', fields=fields)
+            with self.subTest(fields=fields):
+                self.assertEqual(SSRFEngine(self.root / f'client-{index}.kt', text).analyze(), {})
+
+        for fields in ('private static final Settings settings = Settings.builder().build();',
+                       'private static final Object[] clients = { Settings.builder().build() };'):
+            text = self.program('java', 'request.getHeader("X-Request-ID");', fields=fields)
+            with self.subTest(java=fields):
+                self.assertEqual(SSRFEngine(self.root / 'client.java', text).analyze(), {})
+
     def test_module_and_runner_json_sarif(self):
         for language in ("java", "kotlin"):
             for name, body, helper in self.cases(language):

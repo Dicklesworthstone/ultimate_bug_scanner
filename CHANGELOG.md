@@ -10,6 +10,14 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Prevent false-clean Python SQL analysis when generator reducers can invoke
+  state-changing user callbacks. Check yielded value and lambda-key shapes,
+  live captured cells, and reducer arguments; report unresolved comparison,
+  arithmetic, property, indexing and truth-testing effects as incomplete.
+  Preserve primitive and empty-generator behavior, follow selected builtin
+  aliases/imports, and support SQL effects with positional or keyword sum
+  starts. Add real SQLite callback witnesses and clean/unsafe controls.
+
 - Stream Rust guard-analysis records in bounded batches of the selected files.
   Retain guard evidence beyond the former 16 MiB output limit and preserve
   selected-file fallback findings after malformed records or failed producers.

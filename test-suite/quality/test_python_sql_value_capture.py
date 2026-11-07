@@ -489,6 +489,69 @@ def boolean_generator_refusals():
             yield consumer + '-' + name, program('    cursor.execute(f"SELECT {user}")\n' + body)
 
 
+def reducer_callback_programs():
+    """Real implicit dispatch can replace a query outside the generator."""
+    unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
+    safe = '"SELECT count(*) FROM users WHERE name = \'alice\'"'
+    cases = (
+        ('min-comparison', '__lt__', 'self, other', 'True',
+         'min(Choice() for _ in (1, 2))'),
+        ('max-comparison', '__gt__', 'self, other', 'True',
+         'max(Choice() for _ in (1, 2))'),
+        ('sorted-comparison', '__lt__', 'self, other', 'True',
+         'sorted(Choice() for _ in (1, 2))'),
+        ('sum-addition', '__radd__', 'self, other', '0',
+         'sum(Choice() for _ in (1, 2))'),
+        ('min-length-key', '__len__', 'self', '1',
+         'min((Choice() for _ in (1, 2)), key=len)'),
+        ('sorted-index-key', '__getitem__', 'self, index', '1',
+         'sorted((Choice() for _ in (1, 2)), key=lambda item: item[0])'),
+        ('max-negation-key', '__neg__', 'self', '1',
+         'max((Choice() for _ in (1, 2)), key=lambda item: -item)'),
+        ('sorted-reverse', '__bool__', 'self', 'True',
+         'sorted((item for item in (1, 2)), reverse=Choice())'),
+        ('sorted-empty-reverse', '__bool__', 'self', 'True',
+         'sorted((item for item in ()), reverse=Choice())'),
+        ('sum-start', '__add__', 'self, other', '0',
+         'sum((item for item in (1, 2)), Choice())'),
+        ('sum-keyword-start', '__add__', 'self, other', '0',
+         'sum((item for item in (1, 2)), start=Choice())'),
+        ('captured-key-comparison', '__lt__', 'self, other', 'True',
+         'min((item for item in (1, 2)), key=lambda item: choice)'),
+        ('captured-key-subscript', '__getitem__', 'self, index', '1',
+         'min((item for item in (1, 2)), key=lambda item: choice[0])'),
+        ('aliased-min', '__lt__', 'self, other', 'True',
+         'consume(Choice() for _ in (1, 2))'),
+        ('imported-sorted', '__lt__', 'self, other', 'True',
+         'builtins.sorted(Choice() for _ in (1, 2))'),
+    )
+    for name, protocol, signature, result, expression in cases:
+        body = (f'    query = {safe}\n    class Choice:\n'
+                + f'        def {protocol}({signature}):\n            nonlocal query\n'
+                + f'            query = {unsafe}\n            return {result}\n')
+        if name.startswith('captured-key-'):
+            body += '    choice = Choice()\n'
+        if name == 'aliased-min':
+            body += '    consume = min\n'
+        if name == 'imported-sorted':
+            body += '    import builtins\n'
+        yield name, program(body + f'    {expression}\n'
+                            '    return cursor.execute(query).fetchone()[0]\n')
+    yield 'property-key', program(
+        f'    query = {safe}\n    class Choice:\n        @property\n'
+        '        def value(self):\n            nonlocal query\n'
+        + f'            query = {unsafe}\n            return 1\n'
+        '    min((Choice() for _ in (1, 2)), key=lambda item: item.value)\n'
+        '    return cursor.execute(query).fetchone()[0]\n')
+    yield 'comparison-exception', program(
+        f'    query = {safe}\n    class Choice:\n'
+        '        def __lt__(self, other):\n            nonlocal query\n'
+        + f'            query = {unsafe}\n            raise ValueError("comparison")\n'
+        '    try:\n        min(Choice() for _ in (1, 2))\n'
+        '    except ValueError:\n        pass\n'
+        '    return cursor.execute(query).fetchone()[0]\n')
+
+
 def incomplete_program():
     unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
     return program(f'    first = cursor.execute({unsafe}).fetchone()[0]\n'
@@ -1448,6 +1511,69 @@ class SQLValueCaptureTests(unittest.TestCase):
                     path.write_text(source, encoding='utf-8')
                     with self.assertRaisesRegex(detector.SQLFlowLimit, 'collection key callbacks.*incomplete'):
                         list(detector.find([path]))
+
+    def test_generator_reducer_callbacks_remain_incomplete(self):
+        for name, source in reducer_callback_programs():
+            with self.subTest(case=name):
+                self.assertEqual(sqlite_witness(self.artifacts, 'reducer-' + name, source)['rows'], 2)
+                path = self.artifacts / ('reducer-' + name + '.py')
+                path.write_text(source, encoding='utf-8')
+                with self.assertRaisesRegex(detector.SQLFlowLimit, 'generator reducer.*incomplete'):
+                    list(detector.find([path]))
+
+    def test_generator_reducer_primitive_controls(self):
+        unused_callbacks = ('    class Unused:\n'
+                            '        def __lt__(self, other): return False\n'
+                            '        def __radd__(self, other): return self\n'
+                            '        def __len__(self): return 1\n')
+        expressions = (
+            'min(item for item in (1, 2))',
+            'max(item for item in ("a", "b"))',
+            'sorted(item for item in (((1, "a"),), ((2, "b"),)))',
+            'sum(item for item in (1, 2))',
+            'sum((item for item in (1, 2)), 3)',
+            'sum((item for item in (1, 2)), start=3)',
+            'sorted((item for item in ("a", "bb")), key=len, reverse=True)',
+            'min((item for item in ((1, 2), (3, 4))), key=lambda item: item[0])',
+            'max((item for item in (1, 2)), key=lambda item: -item)',
+            'sorted((item for item in (1, 2)), key=lambda item: (item + 1, item))',
+            'min((item for item in (1, 2)), key=lambda item: offset)',
+            'min((Unused() for _ in ()), default=0)',
+            'sorted(Unused() for _ in (1, 2) if False)',
+        )
+        for index, expression in enumerate(expressions):
+            for label, query, rows, expected in (
+                    ('clean', '"SELECT count(*) FROM users WHERE name = \'alice\'"', 1, ()),
+                    ('unsafe', 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"', 2, (CRITICAL,))):
+                name = f'reducer-control-{index}-{label}'
+                source = program(unused_callbacks + f'    query = {query}\n    offset = 1\n'
+                                 + f'    {expression}\n'
+                                 '    return cursor.execute(query).fetchone()[0]\n')
+                with self.subTest(case=name):
+                    self.assertEqual(sqlite_witness(self.artifacts, name, source)['rows'], rows)
+                    line = len(source.splitlines())
+                    self.inspect(name, source, tuple((rule, line) for rule in expected))
+
+    def test_generator_reducer_preserves_sql_effects_and_aliases(self):
+        cases = (
+            ('sum-start', '    sum((0 for _ in (1,) if (query := f"SELECT {user}")), start=1)\n'),
+            ('sum-start-cleans', '    query = f"SELECT {user}"\n'
+             '    sum((0 for _ in (1,) if (query := "SELECT 1")), 1)\n'),
+            ('min-alias', '    consume = min\n'
+             '    consume((query := f"SELECT {user}") for _ in (1,))\n'),
+            ('max-import', '    from builtins import max as consume\n'
+             '    consume((query := f"SELECT {user}") for _ in (1,))\n'),
+            ('sorted-import', '    import builtins\n'
+             '    builtins.sorted((query := f"SELECT {user}") for _ in (1,))\n'),
+            ('tuple-key', '    min(((query := f"SELECT {user}"), 1) for _ in (1,))\n'),
+            ('lambda-string-key', '    min(((query := f"SELECT {user}") for _ in (1,)), '
+             'key=lambda item: item[0])\n'),
+        )
+        for name, body in cases:
+            source = program('    query = "SELECT 1"\n' + body + '    cursor.execute(query)\n')
+            expected = () if name == 'sum-start-cleans' else ((CRITICAL, len(source.splitlines())),)
+            with self.subTest(case=name):
+                self.inspect('reducer-effects-' + name, source, expected)
 
     def test_collection_primitive_keys_keep_sql_provenance(self):
         key_type = ('    class Key:\n        def __hash__(self): return 0\n'

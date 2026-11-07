@@ -3273,7 +3273,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         return restored
 
     def visit_ListComp(self, node, *, captured=None, consumer_can_raise=False, hash_keys=False,
-                       short_circuit=None):
+                       short_circuit=None, reducer=None):
         """Evaluate eager comprehensions in loop/filter order and local scope.
 
         Literal lists/tuples have exact iteration counts. Dynamic iterables
@@ -3322,6 +3322,8 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                     self.check_collection_keys([facts])
                 if isinstance(node, ast.SetComp) and not isinstance(node.elt, ast.Constant):
                     self.note_possible_raise()
+            if reducer is not None:
+                self.check_generator_reducer(facts, *reducer)
             if consumer_can_raise:
                 if (self._short_circuiting
                         and not self.hash_safe_shape(self.element_shape(self.fact_kinds(facts)))):
@@ -3486,7 +3488,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         return not any(node in self.generator_refs(facts) for captured in captures for facts in captured.values())
 
     def materialize_generators(self, references, *, consumer_can_raise=False, hash_keys=False,
-                               short_circuit=None):
+                               short_circuit=None, reducer=None):
         """Consume selected same-scope generators using the comprehension engine.
 
         Generator identity and completion are stateful, whereas projected
@@ -3518,7 +3520,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                     self._generator_running.add(identity)
                     try:
                         self.visit_ListComp(identity, captured=captured, consumer_can_raise=consumer_can_raise,
-                                            hash_keys=hash_keys, short_circuit=short_circuit)
+                                            hash_keys=hash_keys, short_circuit=short_circuit, reducer=reducer)
                         value = self.value_facts(identity)
                         if self.generator_refs(value):
                             raise SQLFlowLimit('SQL generator-valued projection is unsupported; analysis is incomplete')
@@ -3643,22 +3645,45 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             self._evaluated_values[node] = self.with_kinds(
                 (combined[0], combined[1], default[1], combined[3], combined[4]), 'dict')
             return True
+        reducer_name = (target[1] if target and target[0] == 'unbound' else
+                        target[1].removeprefix('builtins.') if target and target[0] == 'import'
+                        and target[1] in {'builtins.min', 'builtins.max', 'builtins.sorted', 'builtins.sum'} else '')
+        if reducer_name in {'min', 'max', 'sorted', 'sum'}:
+            bindings = self.ownership_bindings()
+            if not self.closed_generator_reducer_binding(reducer_name):
+                raise SQLFlowLimit('SQL generator reducer binding is unresolved; analysis is incomplete')
+            keywords = {keyword.arg: keyword.value for keyword in node.keywords}
+            allowed = ({'start'} if reducer_name == 'sum' else
+                       {'key', 'reverse'} if reducer_name == 'sorted' else {'key', 'default'})
+            if (receiver or len(arguments) != 1 or not node.args or arguments[0][0] is not node.args[0]
+                    or any(isinstance(argument, ast.Starred) for argument in node.args)
+                    or not keywords.keys() <= allowed or len(keywords) != len(node.keywords)
+                    or len(node.args) not in ({1, 2} if reducer_name == 'sum' else {1})
+                    or reducer_name == 'sum' and len(node.args) == 2 and 'start' in keywords):
+                raise SQLFlowLimit('SQL generator reducer call shape is unresolved; analysis is incomplete')
+            start = node.args[1] if len(node.args) == 2 else keywords.get('start')
+            # These eagerly captured arguments can invoke protocols before
+            # (reverse) or during (start) iteration, even when the generator
+            # body itself has no SQL effects. Never infer purity from syntax.
+            for argument in (start, keywords.get('reverse')):
+                if (argument is not None
+                        and not self.hash_safe_shape(self.element_shape(self.value_kind(argument)))):
+                    raise SQLFlowLimit('SQL generator reducer argument callbacks are unresolved; analysis is incomplete')
+            key = keywords.get('key')
+            length_key = (isinstance(key, ast.Name) and key.id == 'len'
+                          and self.builtin_is_unshadowed('len'))
+            facts = self.materialize_generators(
+                arguments[0][1], consumer_can_raise=True, reducer=(key, length_key))
+            if start is not None:
+                facts = self.join_value_facts(facts, self.value_facts(start))
+            if 'default' in keywords:
+                facts = self.join_value_facts(facts, self.value_facts(keywords['default']))
+            if reducer_name == 'sorted':
+                facts = self.with_kinds(facts, 'list', self.element_shape(self.fact_kinds(facts)))
+            self._evaluated_values[node] = facts
+            return True
         if isinstance(node.func, ast.Name) and self.builtin_is_unshadowed(node.func.id):
             name = node.func.id
-            if (name in {'min', 'max', 'sorted'} and len(node.args) == 1
-                    and len(arguments) == 1 and arguments[0][0] is node.args[0]
-                    and all(keyword.arg in ({'key', 'reverse'} if name == 'sorted' else {'key', 'default'})
-                            for keyword in node.keywords)
-                    and all(self.read_only_reducer_key(keyword.value)
-                            for keyword in node.keywords if keyword.arg == 'key')):
-                facts = self.materialize_generators(arguments[0][1], consumer_can_raise=True)
-                default = next((keyword.value for keyword in node.keywords if keyword.arg == 'default'), None)
-                if default is not None:
-                    facts = self.join_value_facts(facts, self.value_facts(default))
-                if name == 'sorted':
-                    facts = self.with_kinds(facts, 'list', self.fact_kinds(facts)[0])
-                self._evaluated_values[node] = facts
-                return True
             if (name == 'next' and len(node.args) in {1, 2} and not node.keywords
                     and len(arguments) == 1 and arguments[0][0] is node.args[0]):
                 refs = arguments[0][1]
@@ -3683,13 +3708,11 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                     return True
             if len(node.args) == 1 and not node.keywords and arguments:
                 refs = arguments[0][1]
-                if name in {'list', 'tuple', 'set', 'frozenset', 'sorted', 'min', 'max', 'sum'}:
+                if name in {'list', 'tuple', 'set', 'frozenset'}:
                     facts = self.materialize_generators(
                         refs, consumer_can_raise=name not in {'list', 'tuple'},
                         hash_keys=name in {'set', 'frozenset'})
-                    if name in {'list', 'tuple', 'set', 'frozenset', 'sorted'}:
-                        facts = self.with_kinds(facts, 'list' if name == 'sorted' else name,
-                                                self.fact_kinds(facts)[0])
+                    facts = self.with_kinds(facts, name, self.fact_kinds(facts)[0])
                     self._evaluated_values[node] = facts
                     return True
                 if name == 'iter':
@@ -4005,14 +4028,96 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         self._evaluated_values[call] = self.join_value_facts(*returned)
         return True
 
-    def read_only_reducer_key(self, value):
-        if isinstance(value, ast.Constant) and value.value is None:
+    def closed_generator_reducer_binding(self, name):
+        bindings = self.ownership_bindings()
+        if (bindings.dynamic_namespace or bindings.reflective_member_writes
+                or name in bindings.member_writes):
+            return False
+        if not bindings.builtin_namespace:
             return True
-        if isinstance(value, ast.Name):
-            return value.id == 'len' and self.builtin_is_unshadowed('len')
-        return (isinstance(value, ast.Lambda) and not any(
-            isinstance(child, (ast.Call, ast.NamedExpr, ast.Await, ast.Yield, ast.YieldFrom))
-            for child in ast.walk(value.body)))
+        cache = self._ownership_syntax
+        if 'reducer_builtin_imports' not in cache:
+            closed = True
+            allowed = {'builtins.min', 'builtins.max', 'builtins.sorted', 'builtins.sum', 'builtins.len'}
+            for node in bindings.scope_of:
+                self.step()
+                if (isinstance(node, ast.Name) and node.id in {'__builtins__', '__import__', 'vars'}
+                        or isinstance(node, ast.Attribute)
+                        and node.attr in {'__builtins__', '__dict__', 'modules', 'import_module'}):
+                    closed = False
+                    break
+                if isinstance(node, (ast.Name, ast.Attribute)) and isinstance(node.ctx, ast.Load):
+                    target = bindings.resolve(node)
+                    if target == ('import', 'builtins'):
+                        member = bindings.parents.get(node)
+                        if (not isinstance(member, ast.Attribute) or member not in bindings.direct_callees
+                                or bindings.resolve(member) not in {('import', item) for item in allowed}):
+                            closed = False
+                            break
+                    elif target and target[0] == 'import' and target[1].startswith('builtins.'):
+                        if target[1] not in allowed or node not in bindings.direct_callees:
+                            closed = False
+                            break
+            cache['reducer_builtin_imports'] = closed
+        return cache['reducer_builtin_imports']
+
+    def check_generator_reducer(self, facts, key, length_key):
+        """Prove implicit reducer dispatch from each actual yielded value.
+
+        A read-only generator can still hand a reducer an object whose
+        comparison, arithmetic or key protocols replace an enclosing query.
+        Exact immutable builtin values cannot do that. Checking at emission
+        also keeps empty, filtered and exhausted cursors free of callbacks.
+        """
+        shape = self.element_shape(self.fact_kinds(facts))
+        if not self.hash_safe_shape(shape):
+            raise SQLFlowLimit('SQL generator reducer callbacks are unresolved; analysis is incomplete')
+        if key is None or isinstance(key, ast.Constant) and key.value is None or length_key:
+            return
+        if not isinstance(key, ast.Lambda):
+            raise SQLFlowLimit('SQL generator reducer key callbacks are unresolved; analysis is incomplete')
+        parameters = (*key.args.posonlyargs, *key.args.args)
+        if (len(parameters) != 1 or key.args.defaults or key.args.kwonlyargs
+                or key.args.vararg is not None or key.args.kwarg is not None):
+            raise SQLFlowLimit('SQL generator reducer key signature is unresolved; analysis is incomplete')
+
+        def key_shape(value):
+            self.step()
+            if isinstance(value, ast.Name):
+                # A lambda's free cells are read when the key runs, after
+                # this yield's effects, not when the lambda was created.
+                return shape if value.id == parameters[0].arg else self.element_shape(
+                    self.value_kind(ast.Name(id=value.id, ctx=ast.Load())))
+            if isinstance(value, ast.Constant):
+                return self.element_shape(self.value_kind(value))
+            if isinstance(value, ast.Tuple):
+                return 'tuple', self.join_element_shapes(*(key_shape(item) for item in value.elts))
+            if isinstance(value, ast.UnaryOp):
+                operand = key_shape(value.operand)
+                if isinstance(value.op, ast.Not) and self.hash_safe_shape(operand):
+                    return 'number'
+                if operand == 'number' and isinstance(value.op, (ast.UAdd, ast.USub, ast.Invert)):
+                    return 'number'
+            if isinstance(value, ast.BinOp):
+                left, right = key_shape(value.left), key_shape(value.right)
+                if left == right == 'number':
+                    return 'number'
+                if isinstance(value.op, ast.Add) and left == right == 'str':
+                    return 'str'
+                if (isinstance(value.op, ast.Add) and isinstance(left, tuple) and isinstance(right, tuple)
+                        and left[0] == right[0] == 'tuple'):
+                    return 'tuple', self.join_element_shapes(left[1], right[1])
+            if isinstance(value, ast.Subscript):
+                container, index = key_shape(value.value), key_shape(value.slice)
+                if index == 'number':
+                    if container == 'str':
+                        return 'str'
+                    if isinstance(container, tuple) and container[0] == 'tuple':
+                        return container[1]
+            return ''
+
+        if not self.hash_safe_shape(key_shape(key.body)):
+            raise SQLFlowLimit('SQL generator reducer key callbacks are unresolved; analysis is incomplete')
 
     def local_list_effect_plan(self, call, epochs, enclosing_reads):
         """Borrow a private list through a stable local helper parameter."""

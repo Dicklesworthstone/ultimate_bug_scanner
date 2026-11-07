@@ -1,4 +1,4 @@
-"""Scoped Swift request dataflow for file, redirect and header sinks (mj1j.8).
+"""Scoped Swift request dataflow for file, redirect, header and HTTP sinks.
 
 The lexer keeps executable interpolation separate from inert literal text.
 Lexical bindings, structured branches/loops and selected same-file calls use
@@ -510,10 +510,14 @@ class SwiftParser:
 
 SWIFT_VALUE_TAGS = frozenset({'local-slash', 'not-network-path', 'no-backslash', 'no-tab',
     'no-newline', 'no-carriage-return', 'url-scheme', 'url-host', 'url-object',
-    'serialized-url', 'file-url', 'path-string', 'canonical-path', 'contained-path', 'file-leaf'})
+    'serialized-url', 'file-url', 'path-string', 'canonical-path', 'contained-path', 'file-leaf',
+    'url-components', 'http-request'})
 SWIFT_LOCAL_TAGS = frozenset({'local-slash', 'not-network-path', 'no-backslash',
                             'no-tab', 'no-newline', 'no-carriage-return'})
 SWIFT_HEADER_TAGS = frozenset({'no-newline', 'no-carriage-return'})
+SWIFT_HTTP_METHODS = frozenset({'dataTask', 'downloadTask', 'uploadTask', 'streamTask',
+    'webSocketTask', 'data', 'bytes', 'download', 'upload'})
+SWIFT_CLIENT_METHODS = frozenset({'get', 'post', 'put', 'patch', 'delete', 'head', 'fetch', 'request', 'send'})
 
 
 def swift_tainted(fact):
@@ -830,6 +834,37 @@ def swift_statement_tokens(statements):
         yield from swift_statement_tokens(statement.alternate)
 
 
+def swift_outbound_obligation(tokens):
+    """Lexical activation only; native receiver identity is checked by flow."""
+    significant = tuple(token for token in tokens if token.kind != 'code' or token.value != '\n')
+    for index, token in enumerate(significant):
+        if token.kind == 'code':
+            if token.value == 'URLRequest':
+                # A native request may reach a client through a variable or
+                # selected helper. Construction activates flow; it is not a
+                # network operation or a reason to report a local method.
+                return True
+            if index > 0 and significant[index - 1].value == '.' and token.value in SWIFT_HTTP_METHODS | {'client'}:
+                return True
+            if (token.value == 'contentsOf' and index >= 2 and significant[index - 1].value == '('
+                    and significant[index - 2].value in {'String', 'Data'}):
+                return True
+            if (token.value in {'AF', 'Alamofire'} and index + 1 < len(significant)
+                    and significant[index + 1].value == '.'):
+                return True
+        if (token.kind == 'code' and token.value in SWIFT_CLIENT_METHODS
+                and index > 0 and significant[index - 1].value == '.'
+                and index + 1 < len(significant) and significant[index + 1].value == '('):
+            end = swift_close(significant, index + 1)
+            for part in swift_parts(significant[index + 2:end], {','}):
+                if (part and part[0].value == 'URLRequest' or len(part) >= 2
+                        and part[0].value in {'url', 'with'} and part[1].value == ':'):
+                    return True
+        if any(swift_outbound_obligation(part) for part in token.parts):
+            return True
+    return False
+
+
 @dataclass
 class SwiftSummary:
     returned: Fact = CLEAN
@@ -850,7 +885,8 @@ class SwiftSummary:
 class SwiftEngine:
     def __init__(self, path, text, policy='path', parser=None):
         self.path, self.text, self.policy = Path(path).resolve(), text, policy
-        self.sink_label = {'path': 'file sink', 'redirect': 'redirect', 'header': 'response header'}[policy]
+        self.sink_label = {'path': 'file sink', 'redirect': 'redirect', 'header': 'response header',
+                           'outbound': 'outbound HTTP destination'}[policy]
         self.parser = SwiftParser(text) if parser is None else parser
         self.lines = [0, *(index + 1 for index, char in enumerate(text) if char == '\n')]
         self.budget, self.graphs = Budget(), {}
@@ -920,6 +956,10 @@ class SwiftEngine:
         elif self.policy == 'header':
             unsafe = frozenset(trace for trace in swift_tainted(value)
                 if not SWIFT_HEADER_TAGS <= trace.tags)
+        elif self.policy == 'outbound':
+            unsafe = frozenset(trace for trace in swift_tainted(value)
+                if not ({'url-scheme', 'url-host'} <= trace.tags
+                        and trace.tags & {'url-object', 'serialized-url'}))
         else:
             unsafe = frozenset(trace for trace in swift_tainted(value)
                 if 'contained-path' not in trace.tags and not (file_leaf and 'file-leaf' in trace.tags))
@@ -1038,9 +1078,80 @@ class SwiftEngine:
             if any(link in trace.tags for trace in value):
                 state[key] = retag(value, remove=frozenset({link, 'url-host', 'url-scheme'}))
 
+    @staticmethod
+    def http_receiver(value, family):
+        return bool(value) and all(trace.kind == 'shape' and trace.key[0] == 'http-client:' + family
+                                   for trace in value)
+
+    @staticmethod
+    def http_request(value):
+        return bool(value) and all('http-request' in trace.tags for trace in value)
+
+    @staticmethod
+    def request_destination(value, offset):
+        """URLRequest copies its destination independently of headers and body."""
+        return retag(join(value, swift_shape('http-request', offset)), add=frozenset({'http-request'}))
+
+    def outbound_call(self, name, receiver, arguments, token, state, bindings):
+        """Selected native clients; unresolved HTTP dispatch stays incomplete.
+
+        Same-file helpers are resolved before this method. Neither a helper's
+        name nor a method on an unrelated custom type grants native behavior.
+        """
+        leaf = name.rsplit('.', 1)[-1]
+        values = [value for _, value, _ in arguments]
+        labeled = {label: value for label, value, _ in arguments}
+        if leaf == 'URLSession' and self.builtin(name, state, bindings):
+            return swift_shape('http-client:foundation', token.start)
+        if leaf == 'URLRequest' and self.builtin(name, state, bindings) and 'url' in labeled:
+            return self.request_destination(labeled['url'], token.start)
+        if self.http_request(receiver) and leaf in {'setValue', 'addValue'} and 'forHTTPHeaderField' in labeled:
+            if any(function.owner and function.owner[-1].split('.')[-1] == 'URLRequest' and function.name == leaf
+                   for function in self.parser.functions.values()):
+                raise ValueError('Swift URLRequest extension needs destination-mutation analysis; analysis is incomplete')
+            return CLEAN
+        method_refs = {trace.key[0] for trace in receiver if trace.kind == 'shape'
+                       and trace.key[0].startswith('http-method:')}
+        selected_method = (next(iter(method_refs)).split(':', 2) if len(method_refs) == 1
+                           and all(trace.kind == 'shape' and trace.key[0] in method_refs
+                                   for trace in receiver) else None)
+        if selected_method:
+            leaf = selected_method[2]
+        foundation = self.http_receiver(receiver, 'foundation') or bool(selected_method and selected_method[1] == 'foundation')
+        vapor = self.http_receiver(receiver, 'vapor') or bool(selected_method and selected_method[1] == 'vapor')
+        overridden = any(function.owner and function.owner[-1].split('.')[-1] in {'URLSession', 'Client'}
+                         and function.name == leaf for function in self.parser.functions.values())
+        if foundation and leaf in SWIFT_HTTP_METHODS and not overridden:
+            target = next((value for label, value, _ in arguments if label in {'with', 'from', 'for'}), None)
+            if leaf == 'streamTask':
+                target = labeled.get('withHostName', target)
+            if target is not None:
+                self.record(token.start, target)
+                return CLEAN
+        if vapor and leaf in SWIFT_CLIENT_METHODS and not overridden:
+            target = next((value for label, value, _ in arguments if label in {'', 'url', 'to'}), None)
+            if target is not None:
+                self.record(token.start, target)
+                return CLEAN
+        request_argument = any('http-request' in trace.tags for value in values for trace in value)
+        http_shape = (request_argument or bool(method_refs) or leaf in SWIFT_HTTP_METHODS
+                      or leaf in SWIFT_CLIENT_METHODS and (
+                          vapor or foundation or any(label in {'url', 'with'} for label in labeled)
+                          or name.startswith(('AF.', 'Alamofire.', 'req.client.', 'request.client.'))))
+        if http_shape and any(swift_request_dependency(value) for value in [receiver, *values]):
+            raise ValueError('Swift outbound HTTP receiver or overload needs binding analysis; analysis is incomplete')
+        return None
+
     def call(self, name, receiver, arguments, site, state, bindings):
         token, callee_token = site.expression, site.callee
         leaf = name.rsplit('.', 1)[-1]
+        if self.policy == 'outbound' and arguments and all(
+                label and (not part or re.fullmatch(r'(?:[A-Za-z_]\w*:)+', swift_text(part)))
+                for label, _, part in arguments):
+            # Swift method references such as data(from:) are not calls with
+            # empty (clean) destinations. Their later invocation needs a
+            # callable binding that this bounded frontend does not provide.
+            raise ValueError('Swift labeled callable reference needs argument binding; analysis is incomplete')
         values = [value for _, value, _ in arguments]
         labeled = {label: value for label, value, _ in arguments if label}
         value = join(receiver, *values)
@@ -1115,6 +1226,9 @@ class SwiftEngine:
                         # checked HTTPS URL is not a request-controlled file path.
                         sink_value = frozenset(trace for trace in sink_value if not {'url-object', 'url-scheme'} <= trace.tags)
                     self.record(token.start, sink_value, leaf_safe)
+                elif self.policy == 'outbound' and leaf in {'String', 'Data'} and 'contentsOf' in labeled:
+                    self.record(token.start, frozenset(trace for trace in labeled['contentsOf']
+                        if not ('file-url' in trace.tags and 'path-string' not in trace.tags)))
                 return CLEAN
         returned, matched = CLEAN, False
         for function in candidates:
@@ -1157,6 +1271,10 @@ class SwiftEngine:
             return returned
         if candidates and any(swift_tainted(fact) for fact in values):
             raise ValueError('Swift selected helper arguments could not bind; analysis is incomplete')
+        if self.policy == 'outbound':
+            result = self.outbound_call(name, receiver, arguments, token, state, bindings)
+            if result is not None:
+                return result
         if self.policy == 'header':
             sanitized = self.header_sanitizer(leaf, receiver, arguments, state, bindings)
             if sanitized is not None:
@@ -1167,7 +1285,12 @@ class SwiftEngine:
                             retag(swift_shape('file-url', token.start), add=frozenset({'file-url'})))
             if 'string' in labeled:
                 tags = frozenset({'url-object', 'url-id:' + str(token.start)})
-                return join(retag(self.forget(labeled['string']), add=tags), retag(swift_shape('url', token.start), add=tags))
+                source = labeled['string']
+                if self.policy == 'outbound':
+                    source = join(source, labeled.get('relativeTo', CLEAN))
+                    if leaf == 'URLComponents':
+                        tags |= frozenset({'url-components'})
+                return join(retag(self.forget(source), add=tags), retag(swift_shape('url', token.start), add=tags))
         if leaf == 'Set' and len(values) == 1 and swift_has_shape(values[0], 'literal-list'):
             return values[0]
         if name in self.parser.types:
@@ -1194,9 +1317,28 @@ class SwiftEngine:
             raise ValueError('Swift callback with unknown request-derived call effects needs heap/capture analysis; analysis is incomplete')
         if '.' in name and swift_tainted(receiver) and leaf not in {'hasPrefix', 'contains', 'hasSuffix', 'lowercased', 'uppercased', 'replacingOccurrences', 'addingPercentEncoding', 'dropFirst', 'dropLast'}:
             self.mutate(name.split('.', 1)[0], CLEAN, state, bindings)
-        return self.forget(value)
+        result = self.forget(value)
+        return join(result, swift_shape('unknown', token.start)) if self.policy == 'outbound' else result
 
     def member(self, name, receiver, token, owner_binding=None):
+        if self.policy == 'outbound':
+            if receiver and all(trace.kind == 'shape' and trace.key[0] == 'namespace:Foundation' for trace in receiver) and name == 'URLSession':
+                return swift_shape('native-type:URLSession', token.start)
+            if receiver and all(trace.kind == 'shape' and trace.key[0] == 'native-type:URLSession' for trace in receiver) and name == 'shared':
+                return swift_shape('http-client:foundation', token.start)
+            if swift_has_shape(receiver, 'request') and name == 'application':
+                return swift_shape('vapor-application', token.start)
+            if name == 'client' and any(swift_has_shape(receiver, shape) for shape in {'request', 'vapor-application'}):
+                return swift_shape('http-client:vapor', token.start)
+            if name in SWIFT_HTTP_METHODS and self.http_receiver(receiver, 'foundation'):
+                return swift_shape('http-method:foundation:' + name, token.start)
+            if name in SWIFT_CLIENT_METHODS and self.http_receiver(receiver, 'vapor'):
+                return swift_shape('http-method:vapor:' + name, token.start)
+            if name == 'url' and self.http_request(receiver):
+                return retag(frozenset(trace for trace in receiver if trace.key[0] != 'http-request'),
+                             remove=frozenset({'http-request'}))
+            if name == 'url' and receiver and all('url-components' in trace.tags for trace in receiver):
+                return retag(receiver, remove=frozenset({'url-components'}))
         if swift_has_shape(receiver, 'request'):
             if name in {'query', 'parameters', 'params', 'headers', 'cookies'}:
                 return swift_shape('request-collection', token.start)
@@ -1219,7 +1361,8 @@ class SwiftEngine:
             return retag(receiver, add=links | frozenset({'swift-string'}), remove=frozenset({'url-object', 'serialized-url'}))
         if name in {'query', 'parameters', 'params', 'headers', 'content'} and swift_tainted(receiver):
             return receiver
-        return self.forget(receiver)
+        value = self.forget(receiver)
+        return join(value, swift_shape('unknown', token.start)) if self.policy == 'outbound' else value
 
     def inline_closure(self, tokens, argument, state, bindings, depth, *, catches_errors=False):
         """Evaluate a collection callback with lexical captures and a loop join.
@@ -1437,6 +1580,14 @@ class SwiftEngine:
             if not value:
                 functions = self.candidates(name, CLEAN, state, bindings)
                 value = frozenset(Trace('function', (function.key,)) for function in functions)
+            if self.policy == 'outbound' and not value and name not in bindings and name not in state:
+                if self.builtin(name, state, bindings) and name in {'URLSession', 'Foundation'}:
+                    shape = 'native-type:URLSession' if name == 'URLSession' else 'namespace:Foundation'
+                    value = swift_shape(shape, tokens[0].start)
+                elif name not in self.globals:
+                    # An unresolved alternative must not disappear when joined
+                    # with a known session and thereby prove a native receiver.
+                    value = swift_shape('unknown', tokens[0].start)
             cursor = 1
         while cursor < len(tokens):
             self.budget.spend()
@@ -1934,6 +2085,17 @@ class SwiftEngine:
                     return state
                 member = re.fullmatch(r'([A-Za-z_]\w*)\.[A-Za-z_]\w*', header)
                 if member:
+                    binding = bindings.get(member.group(1), member.group(1))
+                    previous = state.get(binding, CLEAN)
+                    if self.policy == 'outbound' and self.http_request(previous):
+                        property_name = header.rsplit('.', 1)[-1]
+                        if property_name == 'url' and operator == '=':
+                            state[binding] = self.request_destination(value, lhs[0].start)
+                            self.invalidate_properties(binding, state)
+                            return state
+                        if property_name in {'httpBody', 'httpBodyStream', 'httpMethod', 'allHTTPHeaderFields',
+                                             'cachePolicy', 'timeoutInterval'}:
+                            return state
                     self.mutate(member.group(1), value, state, bindings)
                     return state
                 if swift_tainted(value):
@@ -1995,6 +2157,9 @@ class SwiftEngine:
                         value = join(value, swift_shape('request', function.key))
                     elif re.fullmatch(r'(?:inout)?(?:Swift\.)?String\??', declaration):
                         value = retag(value, add=frozenset({'swift-string'}))
+                    elif (self.policy == 'outbound' and re.fullmatch(r'(?:Foundation\.)?URLSession\??', declaration)
+                          and self.builtin(declaration.rstrip('?'))):
+                        value = join(value, swift_shape('http-client:foundation', function.key))
                     elif declaration in self.parser.types:
                         kind = 'instance:' if declaration in self.parser.final_types else 'dynamic-instance:'
                         value = join(value, swift_shape(kind + declaration, function.key))
@@ -2040,7 +2205,8 @@ def flow_findings(path, text, policy='path'):
     # With no selected request source, there is no source-to-sink obligation
     # for these policies; unrelated Swift closure/actor syntax belongs to
     # its own analyzer rather than being misreported as a failed taint pass.
-    if not swift_request_source_tokens(tokens) or not swift_flow_obligation(tokens):
+    obligation = swift_outbound_obligation(tokens) if policy == 'outbound' else swift_flow_obligation(tokens)
+    if not swift_request_source_tokens(tokens) or not obligation:
         return []
     parser = SwiftParser(text, tokens)
     engine = SwiftEngine(path, text, policy, parser)
@@ -2048,6 +2214,7 @@ def flow_findings(path, text, policy='path'):
         'path': ('swift.taint.request_path_traversal', 'Request-derived path reaches file read/write/serve sink'),
         'redirect': ('swift.taint.request_open_redirect', 'Unvalidated redirect from request data'),
         'header': ('swift.taint.header-injection', 'Request-controlled value reaches HTTP response header'),
+        'outbound': ('swift.taint.outbound-url', 'Request-derived URL reaches outbound HTTP client'),
     }[policy]
     suppression = SourceSuppressions('swift')
     suppression.index(path, text)

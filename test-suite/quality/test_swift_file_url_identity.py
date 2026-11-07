@@ -1,4 +1,4 @@
-"""File-URL exemptions must follow the exact outbound reader argument.
+"""Swift outbound findings must follow the exact scoped destination value.
 
 These tests run the real outbound detector with selected Swift sources. They
 protect its HTTP coverage while canonical filesystem reads are classified by
@@ -38,7 +38,390 @@ class SwiftFileURLIdentityTests(unittest.TestCase):
             self.assertEqual(finding['severity'], 'critical')
             self.assertEqual(finding['count'], 1)
             self.assertEqual(finding['path'], str(path.resolve()))
+            witness = finding['extras']['taint_path']
+            self.assertEqual(witness[0]['kind'], 'source')
+            self.assertEqual(witness[-1]['kind'], 'sink')
+            self.assertEqual(witness[-1]['line'], finding['line'])
         return path, source
+
+    def test_safe_named_helpers_and_function_aliases_do_not_hide_request_urls(self):
+        for name in ('safeURL', 'sanitizeURL', 'identity'):
+            for alias in (False, True):
+                with self.subTest(helper=name, alias=alias):
+                    self.check('''
+                        func %s(_ value: String) -> String { return value }
+                        func handle(req: Request) async throws {
+                            let chosen = %s
+                            let remote = URL(string: %s(req.query["url"]!))!
+                            _ = try await URLSession.shared.data(from: remote)
+                        }
+                    ''' % (name, name, 'chosen' if alias else name), (5,), name + str(alias))
+
+    def test_literal_overwrites_and_unrelated_function_bindings_are_clean(self):
+        self.check('''
+            func overwrite(req: Request) async throws {
+                var target = req.query["url"]!
+                target = "https://api.example.com"
+                _ = try await URLSession.shared.data(from: URL(string: target)!)
+            }
+            func unrelated(req: Request) async throws {
+                let target = "https://api.example.com"
+                _ = try await URLSession.shared.data(from: URL(string: target)!)
+            }
+            func unsafe(req: Request) async throws {
+                let target = req.query["url"]!
+                _ = try await URLSession.shared.data(from: URL(string: target)!)
+            }
+        ''', (12,))
+
+    def test_conditional_overwrite_keeps_the_unsafe_branch(self):
+        for both in (False, True):
+            with self.subTest(both=both):
+                self.check('''
+                    func handle(req: Request, enabled: Bool) async throws {
+                        var target = req.query["url"]!
+                        if enabled { target = "https://api.example.com" } %s
+                        _ = try await URLSession.shared.data(from: URL(string: target)!)
+                    }
+                ''' % ('else { target = "https://hooks.example.com" }' if both else ''),
+                    () if both else (4,), str(both))
+
+    def test_selected_url_guards_and_validating_helper_are_clean(self):
+        self.check('''
+            let hosts = Set(["api.example.com", "hooks.example.com"])
+            func selected(_ raw: String) throws -> URL {
+                guard let target = URL(string: raw), target.scheme == "https",
+                    let host = target.host, hosts.contains(host) else { throw Blocked() }
+                return target
+            }
+            func handle(req: Request) async throws {
+                let remote = try selected(req.query["arbitrary"]!)
+                let session = Foundation.URLSession.shared
+                _ = try await session.data(from: remote)
+            }
+        ''')
+
+    def test_both_scheme_and_exact_host_must_guard_the_selected_url(self):
+        guards = (
+            'target.scheme == "https"',
+            'target.host == "api.example.com"',
+            'target.scheme == "https", target.host!.hasSuffix("example.com")',
+            'other.scheme == "https", other.host == "api.example.com"',
+        )
+        for index, guard in enumerate(guards):
+            with self.subTest(guard=guard):
+                self.check('''
+                    func handle(req: Request) async throws {
+                        let target = URL(string: req.query["value"]!)!
+                        let other = URL(string: "https://api.example.com")!
+                        guard %s else { return }
+                        _ = try await URLSession.shared.data(from: target)
+                    }
+                ''' % guard, (5,), str(index))
+
+    def test_checked_url_does_not_validate_raw_or_changed_values(self):
+        variants = (
+            'URL(string: raw)!',
+            'URL(string: target.absoluteString + req.query["suffix"]!)!',
+            'unknownTransform(target)',
+        )
+        for index, outgoing in enumerate(variants):
+            with self.subTest(outgoing=outgoing):
+                self.check('''
+                    func handle(req: Request) async throws {
+                        let raw = req.query["url"]!
+                        guard let target = URL(string: raw), target.scheme == "https",
+                            target.host == "api.example.com" else { return }
+                        _ = try await URLSession.shared.data(from: %s)
+                    }
+                ''' % outgoing, (5,), str(index))
+
+    def test_url_components_mutation_and_rebinding_invalidate_guard(self):
+        for mutation in ('target.host = req.query["host"]!',
+                         'target = URLComponents(string: req.query["next"]!)!'):
+            with self.subTest(mutation=mutation):
+                self.check('''
+                    func handle(req: Request) async throws {
+                        guard var target = URLComponents(string: req.query["url"]!),
+                            target.scheme == "https", target.host == "api.example.com" else { return }
+                        %s
+                        _ = try await URLSession.shared.data(from: target.url!)
+                    }
+                ''' % mutation, (5,), 'host' if '.host' in mutation else 'rebind')
+
+    def test_checked_url_components_can_supply_the_selected_url(self):
+        self.check('''
+            func handle(req: Request) async throws {
+                guard let target = URLComponents(string: req.query["url"]!),
+                    target.scheme == "https", target.host == "api.example.com" else { return }
+                _ = try await URLSession.shared.data(from: target.url!)
+            }
+        ''')
+
+    def test_rebinding_does_not_reuse_an_old_host_property_guard(self):
+        self.check('''
+            func handle(req: Request) async throws {
+                guard var target = URL(string: req.query["first"]!), let oldHost = target.host else { return }
+                target = URL(string: req.query["next"]!)!
+                guard target.scheme == "https", oldHost == "api.example.com" else { return }
+                _ = try await URLSession.shared.data(from: target)
+            }
+        ''', (5,))
+
+    def test_request_destination_is_separate_from_headers_and_body(self):
+        self.check('''
+            func handle(req: Request, session: URLSession) async throws {
+                var outgoing = URLRequest(url: URL(string: "https://api.example.com")!)
+                outgoing.setValue(req.query["header"]!, forHTTPHeaderField: "X-Audit")
+                outgoing.addValue(req.query["more"]!, forHTTPHeaderField: "X-Audit")
+                outgoing.httpBody = Data(req.query["body"]!.utf8)
+                outgoing.httpMethod = req.query["method"]!
+                _ = try await session.data(for: outgoing)
+            }
+        ''')
+
+    def test_request_url_mutation_and_value_copies(self):
+        self.check('''
+            func handle(req: Request, session: Foundation.URLSession) async throws {
+                var outgoing = Foundation.URLRequest(url: URL(string: "https://api.example.com")!)
+                let copy = outgoing
+                outgoing.url = URL(string: req.query["url"]!)!
+                _ = try await session.data(for: outgoing)
+                _ = try await session.data(for: copy)
+                outgoing.url = URL(string: "https://api.example.com")!
+                _ = try await session.data(for: outgoing)
+            }
+        ''', (5,))
+
+    def test_validated_request_url_is_not_sanitized_by_headers(self):
+        self.check('''
+            func handle(req: Request) async throws {
+                guard let target = URL(string: req.query["url"]!), target.scheme == "https",
+                    target.host == "api.example.com" else { return }
+                let good = URLRequest(url: target)
+                _ = try await URLSession.shared.data(for: good)
+                var bad = URLRequest(url: URL(string: req.query["next"]!)!)
+                bad.setValue("fixed", forHTTPHeaderField: "Host")
+                _ = try await URLSession.shared.data(for: bad)
+            }
+        ''', (8,))
+
+    def test_native_session_and_bound_method_aliases_keep_the_sink(self):
+        for setup, callee in (
+            ('let session = URLSession.shared', 'session.data'),
+            ('let session = URLSession(configuration: .ephemeral)', 'session.data'),
+            ('let download = URLSession.shared.data', 'download'),
+        ):
+            with self.subTest(setup=setup):
+                self.check('''
+                    func handle(req: Request) async throws {
+                        %s
+                        _ = try await %s(from: URL(string: req.query["value"]!)!)
+                    }
+                ''' % (setup, callee), (3,), str(len(setup)))
+
+    def test_custom_same_file_client_method_is_not_a_native_http_sink(self):
+        self.check('''
+            struct LocalBuffer {
+                func data(from value: URL) -> String { return "recorded" }
+            }
+            func handle(req: Request) {
+                let client = LocalBuffer()
+                _ = client.data(from: URL(string: req.query["url"]!)!)
+            }
+        ''')
+
+    def test_unknown_client_and_mixed_session_alternative_remain_incomplete(self):
+        for source in ('''
+            func handle(req: Request, client: ExternalClient) {
+                _ = client.get(url: req.query["url"]!)
+            }
+        ''', '''
+            func handle(req: Request, enabled: Bool) async throws {
+                let session = enabled ? URLSession.shared : externalSession()
+                _ = try await session.data(from: URL(string: req.query["url"]!)!)
+            }
+        ''', '''
+            func handle(req: Request) {
+                _ = AF.request(req.query["url"]!)
+            }
+        '''):
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(ValueError, 'outbound HTTP.*incomplete'):
+                    self.check(source)
+
+    def test_unresolved_consumers_of_native_requests_remain_incomplete(self):
+        for index, call in enumerate((
+            'client.get(URLRequest(url: URL(string: req.query["url"]!)!))',
+            'client.get(outgoing)',
+            'client.request(outgoing)',
+            'client.get(outgoing, "audit")',
+            'consume(outgoing)',
+        )):
+            with self.subTest(call=call):
+                with self.assertRaisesRegex(ValueError, 'outbound HTTP.*incomplete'):
+                    self.check('''
+                        func handle(req: Request, client: ExternalClient) {
+                            let outgoing = URLRequest(url: URL(string: req.query["url"]!)!)
+                            _ = %s
+                        }
+                    ''' % call, suffix=str(index))
+
+    def test_helper_and_branch_request_values_keep_unresolved_dispatch_explicit(self):
+        with self.assertRaisesRegex(ValueError, 'outbound HTTP.*incomplete'):
+            self.check('''
+                func makeRequest(_ raw: String) -> URLRequest {
+                    return URLRequest(url: URL(string: raw)!)
+                }
+                func handle(req: Request, client: ExternalClient, enabled: Bool) {
+                    let outgoing = enabled ? makeRequest(req.query["url"]!) : unknownRequest()
+                    _ = client.get(outgoing)
+                }
+            ''')
+
+    def test_selected_local_request_consumer_does_not_become_an_http_sink(self):
+        self.check('''
+            struct LocalStore {
+                func get(_ value: URLRequest, _ label: String) -> String { return "stored" }
+            }
+            func handle(req: Request) {
+                let client = LocalStore()
+                let outgoing = URLRequest(url: URL(string: req.query["url"]!)!)
+                _ = client.get(outgoing, "audit")
+                _ = client.get(URLRequest(url: URL(string: req.query["next"]!)!), "audit")
+            }
+        ''')
+
+    def test_labeled_callable_reference_is_not_an_empty_destination_call(self):
+        for reference in ('URLSession.shared.data(from:)',
+                          'URLSession.shared.dataTask(with:completionHandler:)',
+                          'client.get(url:)', 'selected(url:)'):
+            with self.subTest(reference=reference):
+                with self.assertRaisesRegex(ValueError, 'callable reference.*incomplete'):
+                    self.check('''
+                        func selected(url: URL) async throws {
+                            _ = try await URLSession.shared.data(from: url)
+                        }
+                        func handle(req: Request, client: ExternalClient) async throws {
+                            let send = %s
+                            _ = try await send(URL(string: req.query["url"]!)!)
+                        }
+                    ''' % reference)
+
+    def test_native_looking_shadow_and_request_extension_do_not_grant_safety(self):
+        sources = ('''
+            enum Foundation { static var URLSession: ExternalSession { makeSession() } }
+            func handle(req: Request) async throws {
+                _ = try await Foundation.URLSession.shared.data(from: URL(string: req.query["url"]!)!)
+            }
+        ''', '''
+            extension URLRequest {
+                mutating func setValue(_ value: URL, forHTTPHeaderField field: String) { self.url = value }
+            }
+            func handle(req: Request) async throws {
+                var outgoing = URLRequest(url: URL(string: "https://api.example.com")!)
+                outgoing.setValue(URL(string: req.query["url"]!)!, forHTTPHeaderField: "X-Audit")
+                _ = try await URLSession.shared.data(for: outgoing)
+            }
+        ''')
+        for index, source in enumerate(sources):
+            with self.subTest(index=index):
+                with self.assertRaisesRegex(ValueError, 'incomplete'):
+                    self.check(source, suffix=str(index))
+
+    def test_unknown_member_keeps_its_place_in_a_client_union(self):
+        with self.assertRaisesRegex(ValueError, 'outbound HTTP.*incomplete'):
+            self.check('''
+                func handle(req: Request, enabled: Bool, service: ExternalService) async throws {
+                    let session = enabled ? URLSession.shared : service.session
+                    _ = try await session.data(from: URL(string: req.query["url"]!)!)
+                }
+            ''')
+
+    def test_without_an_outbound_operation_unrelated_closures_do_not_activate_it(self):
+        self.check('''
+            func handle(req: Request) {
+                let data = req.content
+                Task { consume(data) }
+            }
+        ''')
+
+    def test_analysis_budget_and_escaping_network_callbacks_remain_incomplete(self):
+        from ubs_core.analyzers.taint_swift_traversal import SwiftEngine
+        from ubs_core.taint_flow import AnalysisLimit
+        source = '''func handle(req: Request) async throws {
+            _ = try await URLSession.shared.data(from: URL(string: req.query["url"]!)!)
+        }'''
+        engine = SwiftEngine(self.artifacts / 'budget.swift', source, 'outbound')
+        engine.budget.remaining = 0
+        with self.assertRaises(AnalysisLimit):
+            engine.analyze()
+        with self.assertRaisesRegex(ValueError, 'closure.*incomplete'):
+            self.check('''
+                func handle(req: Request) {
+                    URLSession.shared.dataTask(with: URL(string: req.query["url"]!)!) { data, response, error in
+                        consume(data)
+                    }
+                }
+            ''')
+
+    def test_vapor_request_client_uses_selected_destination(self):
+        self.check('''
+            func handle(req: Request) async throws {
+                let client = req.client
+                _ = try await client.get(URI(string: req.query["url"]!))
+                _ = try await req.application.client.get(URI(string: "https://api.example.com"))
+            }
+        ''', (3,))
+
+    def test_local_redirect_proof_does_not_discharge_http_destination(self):
+        self.check(r'''
+            func handle(req: Request) async throws {
+                let target = req.query["url"]!
+                guard target.hasPrefix("/"), !target.hasPrefix("//"), !target.contains("\\"),
+                    !target.contains("\n"), !target.contains("\r"), !target.contains("\t") else { return }
+                _ = try await URLSession.shared.data(from: URL(string: target)!)
+            }
+        ''', (5,))
+
+    def test_relative_base_keeps_its_request_dependency(self):
+        self.check('''
+            func handle(req: Request) async throws {
+                let root = URL(string: req.query["base"]!)!
+                let target = URL(string: "status", relativeTo: root)!
+                _ = try await URLSession.shared.data(from: target)
+            }
+        ''', (4,))
+
+    def test_request_parameter_and_key_names_do_not_select_security(self):
+        self.check('''
+            func handle(incoming: Request) async throws {
+                let value = incoming.query["arbitrary"]!
+                _ = try await URLSession.shared.data(from: URL(string: value)!)
+            }
+        ''', (3,))
+
+    def test_rule_scoped_suppression_does_not_hide_other_http_sinks(self):
+        self.check('''
+            func handle(req: Request) async throws {
+                let target = URL(string: req.query["url"]!)!
+                _ = try await URLSession.shared.data(from: target) // ubs:ignore[swift.taint.outbound-url]
+                _ = try await URLSession.shared.data(from: target) // ubs:ignore[swift.taint.request_path_traversal]
+            }
+        ''', (4,))
+
+    def test_original_http_fixture_sites_and_local_client_decoy(self):
+        for relative, expected in (
+            ('ssrf_buggy/RequestURLs.swift', [25, 30, 36, 41, 51]),
+            ('ssrf_clean/RequestURLsSafe.swift', []),
+        ):
+            with self.subTest(fixture=relative):
+                path = ROOT / 'test-suite/swift' / relative
+                findings = list(scan(SimpleNamespace(project_dir=path.parent, files=[path])))
+                self.assertEqual([(row['rule'], row['line']) for row in findings],
+                                 [('swift.taint.outbound-url', line) for line in expected], findings)
+        # The fixture's local HTTPClient.get body just copies bytes into Data;
+        # its name is not evidence of an actual outbound operation at line 46.
 
     def test_checked_standardized_file_url(self):
         self.check('''

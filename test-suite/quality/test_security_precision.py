@@ -910,11 +910,31 @@ class JVMOutboundDataflowTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'class initialization.*incomplete'):
                     SSRFEngine(self.root / 'import-alias.kt', text).analyze()
 
+    def test_generic_kotlin_deferred_request_initializers_are_incomplete(self):
+        from ubs_core.java_detectors.ssrf_outbound_url import SSRFEngine
+
+        requests = ('RequestEntity.get(destination!!).build()',
+                    'RequestEntity.post(destination!!).header("X", "fixed").build()')
+        wrappers = ('lazy<RequestEntity<Void>> { %s }',
+                    'lazy<RequestEntity<Void>>(LazyThreadSafetyMode.NONE) { %s }',
+                    'kotlin.lazy<RequestEntity<Void>> { %s }')
+        for request in requests:
+            for wrapper in wrappers:
+                for assignment in ('=', 'by'):
+                    fields = ('var destination: URI? = null\nval later ' + assignment + ' '
+                              + wrapper % request + '\n')
+                    text = 'import org.springframework.http.RequestEntity\n' + self.program(
+                        'kotlin', 'destination = URI.create(request.getParameter("url"))\n', fields=fields)
+                    with self.subTest(request=request, wrapper=wrapper, assignment=assignment):
+                        with self.assertRaisesRegex(ValueError, 'class initialization.*incomplete'):
+                            SSRFEngine(self.root / 'generic-deferred.kt', text).analyze()
+
     def test_client_builders_do_not_become_request_initializers(self):
         from ubs_core.java_detectors.ssrf_outbound_url import SSRFEngine
 
         kotlin_fields = (
             'val client by lazy { OkHttpClient.Builder().build() }',
+            'val client by lazy<OkHttpClient> { OkHttpClient.Builder().build() }',
             'val client = lazy { OkHttpClient.Builder().build() }',
             'val client = { OkHttpClient.Builder().build() }',
             'val client by lazy { WebClient.builder().build() }',
@@ -930,7 +950,11 @@ class JVMOutboundDataflowTests(unittest.TestCase):
         )
         for index, fields in enumerate(kotlin_fields):
             fields = 'val fixedUrl = URI.create("https://api.example.com")\n' + fields
-            text = 'import org.springframework.http.RequestEntity\n' + self.program(
+            imports = ('import org.springframework.http.RequestEntity\n'
+                       'import okhttp3.OkHttpClient\n'
+                       'import org.springframework.web.reactive.function.client.WebClient\n'
+                       'import java.net.http.HttpClient\n')
+            text = imports + self.program(
                 'kotlin', 'request.getHeader("X-Request-ID")\n', fields=fields)
             with self.subTest(fields=fields):
                 self.assertEqual(SSRFEngine(self.root / f'client-{index}.kt', text).analyze(), {})
@@ -940,6 +964,66 @@ class JVMOutboundDataflowTests(unittest.TestCase):
             text = self.program('java', 'request.getHeader("X-Request-ID");', fields=fields)
             with self.subTest(java=fields):
                 self.assertEqual(SSRFEngine(self.root / 'client.java', text).analyze(), {})
+
+    def test_deferred_kotlin_initializers_report_partial_in_json_and_sarif(self):
+        imports = ('import org.springframework.http.RequestEntity\n'
+                   'import okhttp3.OkHttpClient\n')
+        cases = (
+            ('request', 'val later by lazy<RequestEntity<Void>> { RequestEntity.get(destination!!).build() }', True),
+            ('client', 'val client by lazy<OkHttpClient> { OkHttpClient.Builder().build() }', False),
+        )
+        for name, declaration, partial in cases:
+            directory = self.root / ('deferred-' + name + '-cli')
+            directory.mkdir()
+            fields = 'var destination: URI? = null\n' + declaration + '\n'
+            text = imports + self.program(
+                'kotlin', 'destination = URI.create(request.getParameter("url"))\n', fields=fields)
+            path = directory / 'DeferredProbe.kt'
+            path.write_text(text, encoding='utf-8')
+            for surface in ('module', 'runner'):
+                for format_ in ('json', 'sarif'):
+                    with self.subTest(case=name, surface=surface, format=format_):
+                        entry = REPO_ROOT / ('modules/ubs-kotlin.sh' if surface == 'module' else 'ubs')
+                        command = (str(entry), '--only=4' if surface == 'module' else '--only=kotlin',
+                                   '--format=' + format_, '--ci', str(path))
+                        started = time.monotonic()
+                        proc = subprocess.run(command, cwd=directory, capture_output=True, text=True, timeout=180,
+                                              env=dict(os.environ, PYTHONDONTWRITEBYTECODE='1', UBS_NO_AUTO_UPDATE='1',
+                                                       UBS_NO_CACHE='1', UBS_KEEP_TEMP='1', UBS_ALLOW_PARTIAL='0',
+                                                       UBS_ALLOW_NO_SCAN='0', UBS_PYTHON=sys.executable,
+                                                       TMPDIR=str(directory), ENABLE_UV_TOOLS='0'))
+                        label = surface + '-' + format_
+                        (directory / (label + '.stdout')).write_text(proc.stdout, encoding='utf-8')
+                        (directory / (label + '.stderr')).write_text(proc.stderr, encoding='utf-8')
+                        (directory / (label + '.command.json')).write_text(json.dumps({
+                            'command': command, 'exit': proc.returncode, 'seconds': time.monotonic() - started,
+                            'source_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                        }, indent=2), encoding='utf-8')
+                        context = f'exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}'
+                        self.assertEqual(proc.returncode, 2 if partial else 0, context)
+                        report = json.loads(proc.stdout)
+                        rule = 'kotlin.security.ssrf-outbound-url'
+                        if format_ == 'json':
+                            self.assertEqual(report['status'], 'partial' if partial else 'ok', context)
+                            if partial:
+                                error = report if surface == 'module' else report['failed_modules'][0]
+                                self.assertEqual(error['module_error'], 'ANALYZER_ERROR', context)
+                                self.assertIn('class initialization', error['message'], context)
+                            records = report.get('findings', [])
+                            key = 'rule' if surface == 'module' else 'rule_id'
+                            self.assertFalse(any(row[key] == rule for row in records), context)
+                        else:
+                            invocations = [item for run in report['runs'] for item in run.get('invocations', [])]
+                            if partial:
+                                self.assertTrue(invocations, context)
+                                for invocation in invocations:
+                                    self.assertIs(invocation['executionSuccessful'], False, context)
+                                self.assertIn('class initialization', proc.stdout, context)
+                            else:
+                                self.assertFalse(any(item.get('executionSuccessful') is False
+                                                     for item in invocations), context)
+                            records = [row for run in report['runs'] for row in run.get('results', [])]
+                            self.assertFalse(any(row.get('ruleId') == rule for row in records), context)
 
     def test_module_and_runner_json_sarif(self):
         for language in ("java", "kotlin"):

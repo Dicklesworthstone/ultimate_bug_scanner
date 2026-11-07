@@ -87,8 +87,9 @@ class InitSinkGuard:
             elif imported == 'kotlin.lazy' and alias:
                 lazy_names.append(re.escape(alias))
         self.factories = re.compile(r'(?<![\w.])(?:' + '|'.join(factories) + r')\s*\(')
+        type_arguments = r'(?:<[\w.\s,?*<>]+>)?'
         self.deferred = re.compile(r'(?:\b(?:' + '|'.join(lazy_names)
-                                   + r')\s*(?:\([^{}]*\))?|=)\s*\{')
+                                   + r')\s*' + type_arguments + r'\s*(?:\([^{}]*\))?|=)\s*\{')
 
     def request_build(self, text, start, end):
         """Follow the selected factory's member chain, not a nearby build."""

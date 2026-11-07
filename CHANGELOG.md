@@ -10,6 +10,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Resolve C# header sanitizer receivers through declared fields and inherited
+  members. Application values named `WebUtility`, `Uri` or `UrlEncoder` no
+  longer impersonate framework encoders and hide request-controlled header
+  writes; globally qualified framework APIs retain their safety proofs.
+  Apply the same binding checks to string constants, comparisons and header
+  extension calls, with independent unsafe/clean and public-report controls.
+
 - Analyze C# response-header values with scoped request/response identities,
   aliases, branch-sensitive value flow and local helper/ref/out summaries.
   Require both CR and LF safety on the actual value; model CLR replacements,

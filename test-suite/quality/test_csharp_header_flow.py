@@ -282,6 +282,50 @@ class FromRouteAttribute : Attribute {}
     ''', extra='''
 class WebUtility { public static string UrlEncode(string value) { return value; } }
 ''')),
+    Case("field_named_web_utility_is_not_bcl_encoder", source('''
+        var value = WebUtility.UrlEncode(context.Request.Query["q"].ToString());
+        Response.Headers.Append("X-Value", value); // @header Response.Headers.Append
+    ''', helpers="static readonly FakeEncoder WebUtility = new FakeEncoder();", extra='''
+class FakeEncoder { public string UrlEncode(string value) { return value; } }
+''')),
+    Case("global_web_utility_bypasses_field_name", source('''
+        var value = global::System.Net.WebUtility.UrlEncode(context.Request.Query["q"].ToString());
+        Response.Headers.Append("X-Value", value);
+    ''', helpers="static readonly FakeEncoder WebUtility = new FakeEncoder();", extra='''
+class FakeEncoder { public string UrlEncode(string value) { return value; } }
+''')),
+    Case("field_named_uri_is_not_bcl_encoder", source('''
+        var value = Uri.EscapeDataString(context.Request.Query["q"].ToString());
+        Response.Headers.Append("X-Value", value); // @header Response.Headers.Append
+    ''', helpers="static readonly FakeEncoder Uri = new FakeEncoder();", extra='''
+class FakeEncoder { public string EscapeDataString(string value) { return value; } }
+''')),
+    Case("global_uri_bypasses_field_name", source('''
+        var value = global::System.Uri.EscapeDataString(context.Request.Query["q"].ToString());
+        Response.Headers.Append("X-Value", value);
+    ''', helpers="static readonly FakeEncoder Uri = new FakeEncoder();", extra='''
+class FakeEncoder { public string EscapeDataString(string value) { return value; } }
+''')),
+    Case("field_named_url_encoder_is_not_bcl_encoder", source('''
+        var value = UrlEncoder.Default.Encode(context.Request.Query["q"].ToString());
+        Response.Headers.Append("X-Value", value); // @header Response.Headers.Append
+    ''', helpers="static readonly FakeEncoder UrlEncoder = new FakeEncoder();", extra='''
+using System.Text.Encodings.Web;
+class FakeEncoder {
+    public FakeEncoder Default => this;
+    public string Encode(string value) { return value; }
+}
+''')),
+    Case("global_url_encoder_bypasses_field_name", source('''
+        var value = global::System.Text.Encodings.Web.UrlEncoder.Default.Encode(context.Request.Query["q"].ToString());
+        Response.Headers.Append("X-Value", value);
+    ''', helpers="static readonly FakeEncoder UrlEncoder = new FakeEncoder();", extra='''
+using System.Text.Encodings.Web;
+class FakeEncoder {
+    public FakeEncoder Default => this;
+    public string Encode(string value) { return value; }
+}
+''')),
     Case("reinserting_control_invalidates_proof", source(r'''
         var value = WebUtility.UrlEncode(context.Request.Query["q"].ToString());
         value = value + "\r\nInjected: yes";
@@ -491,7 +535,8 @@ class HeaderPublicTests(unittest.TestCase):
     def setUpClass(cls):
         if not shutil.which("ast-grep"):
             raise unittest.SkipTest("ast-grep is required for real module output")
-        wanted = {"query_index_write", "real_helper_removes_both_controls", "helper_sink_preserves_execution_location"}
+        wanted = {"query_index_write", "real_helper_removes_both_controls", "helper_sink_preserves_execution_location",
+                  "field_named_web_utility_is_not_bcl_encoder", "global_web_utility_bypasses_field_name"}
         cls.cases = tuple(case for case in CASES if case.name in wanted)
         cls.directory = materialize(cls.cases)
         cls.cache = cls.directory / "cache"

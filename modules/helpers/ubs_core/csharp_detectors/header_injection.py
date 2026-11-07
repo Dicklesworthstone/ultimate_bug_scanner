@@ -140,6 +140,14 @@ class HeaderFlow(CSharpFlow):
         self.annotated = set()
         self.boundaries = {}
         self.issues = set()
+        self.fields = {}
+        self.field_cache = {}
+        for match in re.finditer(r"\b([\w.:]+)\s+(@?\w+)\s*(?=[=;{])", self.code):
+            if any(key >= 0 and function.declaration <= match.start() < function.end
+                   for key, function in self.parser.functions.items()):
+                continue
+            self.fields[(self.types.owner(match.start()), match.group(2).lstrip("@"))] = (
+                self.types.resolve(match.group(1), match.start()))
         for key, function in self.parser.functions.items():
             if key < 0:
                 continue
@@ -166,6 +174,43 @@ class HeaderFlow(CSharpFlow):
                             self.annotated.add((key, index))
                     position = closing + 1
 
+    def field_type(self, owner, name, visiting=()):
+        """Resolve declared members without treating their spelling as a type."""
+        key = (owner, name)
+        if key in self.fields:
+            return self.fields[key]
+        if key in self.field_cache:
+            return self.field_cache[key]
+        if owner in visiting or len(visiting) >= 12:
+            raise AnalysisLimit("C# header field inheritance is unresolved; analysis is incomplete")
+        self.budget.spend()
+        scope = self.types.local_types.get(".".join(owner))
+        found = set()
+        if scope is not None and ":" in scope.bases:
+            for spelling in scope.bases.split(":", 1)[1].split(","):
+                identity = self.types.resolve(spelling.strip(), scope.start)
+                if identity.startswith("local:"):
+                    inherited = self.field_type(tuple(identity[6:].split(".")), name, (*visiting, owner))
+                    if inherited:
+                        found.add(inherited)
+        identity = next(iter(found)) if len(found) == 1 else "ambiguous:" + name if found else ""
+        self.field_cache[key] = identity
+        return identity
+
+    def visible_field(self, name, position):
+        owner = self.types.owner(position)
+        for size in range(len(owner), 0, -1):
+            identity = self.field_type(owner[:size], name)
+            if identity:
+                return identity
+        return ""
+
+    def value_root(self, spelling, position, bindings):
+        if spelling.startswith("global::"):
+            return False
+        root = spelling.split(".")[0].lstrip("@")
+        return root in bindings or bool(self.visible_field(root, position))
+
     def is_source(self, name):
         return False
 
@@ -177,15 +222,20 @@ class HeaderFlow(CSharpFlow):
         return join(value, api_fact(self.types.resolve(spelling, function.key)))
 
     def name_value(self, name, position, state, bindings):
+        global_name = self.code[position:position + 8] == "global::"
         pieces = name.split(".")
+        explicit_this = pieces[0] == "this" and len(pieces) > 1
+        if explicit_this:
+            pieces = pieces[1:]
         root, members = pieces[0], pieces[1:]
-        value = state.get(bindings.get(root, ""), CLEAN)
+        field = self.visible_field(root, position) if not global_name else ""
+        value = state.get(bindings.get(root, ""), CLEAN) if not explicit_this and not global_name else CLEAN
+        if field and (explicit_this or root not in bindings):
+            value = api_fact(field)
         controller_members = {"Request": REQUEST, "Response": RESPONSE, "HttpContext": CONTEXT,
                               "ControllerContext": "Microsoft.AspNetCore.Mvc.ControllerContext"}
-        if root == "this" and members and members[0] in controller_members:
-            if self.types.controller(position):
-                value, members = api_fact(controller_members[members[0]]), members[1:]
-        elif root in controller_members and root not in bindings and self.types.controller(position):
+        if (root in controller_members and not field and (explicit_this or root not in bindings)
+                and self.types.controller(position)):
             value = api_fact(controller_members[root])
         for member in members:
             current = identities(value)
@@ -204,9 +254,12 @@ class HeaderFlow(CSharpFlow):
             elif member == "Value" and STRING in current:
                 value = join(provenance(value), api_fact(STRING))
             else:
-                value = provenance(value)
-        if not value and name.endswith(".Default") and root not in bindings:
-            if self.types.resolve(name.rsplit(".", 1)[0], position) == URL_ENCODER:
+                declared = [self.field_type(tuple(identity[6:].split(".")), member)
+                            for identity in current if identity.startswith("local:")]
+                value = join(provenance(value), *(api_fact(identity) for identity in declared if identity))
+        spelling = ("global::" if global_name else "") + name
+        if not value and name.endswith(".Default") and not self.value_root(spelling, position, bindings):
+            if self.types.resolve(spelling.rsplit(".", 1)[0], position) == URL_ENCODER:
                 return api_fact(URL_ENCODER)
         return value
 
@@ -215,10 +268,10 @@ class HeaderFlow(CSharpFlow):
         if len(pieces) == 1 or pieces[0] == "this":
             return super().call_candidates(name, args, values, state, bindings, position)
         owner = name.rsplit(".", 1)[0]
-        if pieces[0] in bindings:
+        raw = ("global::" if self.code[position:position + 8] == "global::" else "") + owner
+        if self.value_root(raw, position, bindings):
             owners = identities(self.name_value(owner, position, state, bindings))
         else:
-            raw = ("global::" if self.code[position:position + 8] == "global::" else "") + owner
             owners = {self.types.resolve(raw, position)}
         local = {identity.removeprefix("local:") for identity in owners if identity.startswith("local:")}
         return [function for function in self.parser.functions.values()
@@ -255,7 +308,7 @@ class HeaderFlow(CSharpFlow):
         if value is not None:
             return value
         match = re.fullmatch(r"([\w@.:]+)\.Empty", raw)
-        if match and match.group(1).split(".")[0] not in (bindings or {}):
+        if match and not self.value_root(match.group(1), start, bindings or {}):
             if self.types.resolve(match.group(1), start) == STRING:
                 return ""
         return None
@@ -306,12 +359,11 @@ class HeaderFlow(CSharpFlow):
             return CLEAN
         if method == "ToString" and not call.args and identities_ & {STRING, STRING_VALUES}:
             return join(frozenset(trace for trace in receiver if trace.kind != "api"), api_fact(STRING))
-        root = owner.split(".")[0]
         raw_owner = ("global::" if self.code[call.position:call.position + 8] == "global::" else "") + owner
-        identity = self.types.resolve(raw_owner, call.position) if root not in call.bindings else ""
+        identity = self.types.resolve(raw_owner, call.position) if not self.value_root(raw_owner, call.position, call.bindings) else ""
         encodes = (identity == "System.Uri" and method in {"EscapeDataString", "EscapeUriString"}
                    or identity in {"System.Net.WebUtility", "System.Web.HttpUtility"} and method == "UrlEncode"
-                   or URL_ENCODER in identities_ and method == "Encode")
+                   or identities_ == {URL_ENCODER} and method == "Encode")
         if encodes and len(call.values) == 1:
             return join(retag(provenance(call.values[0]), add=HEADER_SAFE), api_fact(STRING))
         constructor = self.code[max(0, call.position - 5):call.position]
@@ -338,8 +390,9 @@ class HeaderFlow(CSharpFlow):
         if method not in HEADER_METHODS:
             return []
         receiver, shift = self.receiver(call), 0
-        root = owner.split(".")[0]
-        if root not in call.bindings and self.types.resolve(owner, call.position) == HEADER_EXTENSIONS:
+        raw_owner = ("global::" if self.code[call.position:call.position + 8] == "global::" else "") + owner
+        if (not self.value_root(raw_owner, call.position, call.bindings)
+                and self.types.resolve(raw_owner, call.position) == HEADER_EXTENSIONS):
             index = self.argument(call.args, {"headers"}, 0)
             receiver = call.values[index] if index is not None else CLEAN
             shift = 1
@@ -507,7 +560,7 @@ class HeaderFlow(CSharpFlow):
         if len(args) == 2:
             option = re.sub(r"\s", "", self.code[slice(*args[1][1:])])
             owner, _, member = option.rpartition(".")
-            if (owner.split(".")[0] in bindings or self.types.resolve(owner, opening) != "System.StringComparison"
+            if (self.value_root(owner, opening, bindings) or self.types.resolve(owner, opening) != "System.StringComparison"
                     or member not in {"Ordinal", "OrdinalIgnoreCase"}):
                 return None
         char = self.constant(*args[0][1:], bindings)

@@ -10,6 +10,15 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Analyze C# outbound destinations with scoped request/client identities and
+  local helper summaries. Follow aliases, inherited HTTP clients, framework
+  request accessors and bound action parameters; distinguish request bodies
+  from destinations and require validation of the actual URI and allowed host.
+  Keep unresolved dispatch and request-derived heap effects explicitly
+  incomplete, preserve other findings, and prevent partial results from being
+  cached as clean. Retain public rule IDs, source-owned suppression and exact
+  sink locations, with native and public-report regression coverage.
+
 - Prevent false-clean Python SQL analysis when generator reducers can invoke
   state-changing user callbacks. Check yielded value and lambda-key shapes,
   live captured cells, and reducer arguments; report unresolved comparison,

@@ -5017,7 +5017,7 @@ class CSharpSecuritySuppressionTests(unittest.TestCase):
         (cs_header, 'var name = Request.Query["name"];\nResponse.Headers.Append("X-Name", name);\n',
          'var name = Request.Query["name"];\nResponse.Headers.Append("X-Name", Uri.EscapeDataString(name));\n'),
         (cs_outbound, 'var url = Request.Query["url"];\nawait client.GetAsync(url);\n',
-         'var url = Request.Query["url"];\nawait client.GetAsync(SafeOutboundUrl(url));\n'),
+         'var url = Request.Query["url"];\nawait client.GetAsync("https://api.example.com/");\n'),
         (cs_random, 'var rng = new Random();\nvar authToken = rng.Next();\n',
          'var authToken = RandomNumberGenerator.GetBytes(32);\n'),
     )
@@ -5027,9 +5027,22 @@ class CSharpSecuritySuppressionTests(unittest.TestCase):
         artifacts.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="ubs-csharp-ownership-", dir=artifacts) as tmp:
             source = Path(tmp) / "Ownership.cs"
+            original_lines = text.splitlines()
+            if detector in {cs_header, cs_outbound}:
+                # Supply actual API bindings without changing the fragment's
+                # line numbers; suppression tests must not rely on identifier
+                # spelling to establish an ASP.NET source or an HTTP client.
+                text = ('using System; using System.Net.Http; using System.Threading.Tasks; '
+                        'using Microsoft.AspNetCore.Http; class C { '
+                        'async Task Handle(HttpRequest Request, HttpResponse Response, HttpClient client) {'
+                        + text + '\n} }\n')
             source.write_text(text, encoding="utf-8")
             rows = list(detector.find([source], base_dir=source.parent))
-            self.assertTrue(all(row[0] == "Ownership.cs" and row[2] == 1 for row in rows), rows)
+            self.assertTrue(all(row[0] == "Ownership.cs" for row in rows), rows)
+            for row in rows:
+                expected_col = (original_lines[row[1] - 1].index('client.GetAsync') + 1
+                                if detector is cs_outbound else 1)
+                self.assertEqual(row[2], expected_col, rows)
             return rows
 
     def test_exact_sink_scope_and_lexical_marker_ownership(self):

@@ -266,8 +266,10 @@ def _rule_meta(rule: str):
     return None
 
 
-def run_detectors(files: Sequence, sink, skip: set, base_dir: Path) -> None:
-    """Run ubs_core.csharp_detectors.* modules (legacy heredoc detector ports).
+def run_detectors(files: Sequence, sink, skip: set, base_dir: Path,
+                  errors: list[str] | None = None,
+                  semantic_errors: list[str] | None = None) -> None:
+    """Run native C# detectors, preserving per-file incomplete outcomes.
 
     Protocol: RULE_ID / CATEGORY / TITLE / SEVERITY / DESCRIPTION constants
     and ``find(files, base_dir)`` yielding (path, line, col, detail).
@@ -276,13 +278,22 @@ def run_detectors(files: Sequence, sink, skip: set, base_dir: Path) -> None:
     import pkgutil
 
     from ubs_core import csharp_detectors
+    from ubs_core.taint_flow import AnalysisLimit
+
+    # This package contains category-8 security detectors. A deliberately
+    # excluded category must not import or execute its analysis machinery.
+    if 8 in skip:
+        return
 
     for module_info in sorted(pkgutil.iter_modules(csharp_detectors.__path__), key=lambda m: m.name):
         if module_info.name.startswith("_"):
             continue
         try:
             module = importlib.import_module(f"ubs_core.csharp_detectors.{module_info.name}")
-        except Exception as exc:  # legacy heredoc failures degraded gracefully too
+        except Exception as exc:
+            if errors is None:
+                raise
+            errors.append(f"detector module {module_info.name}: {type(exc).__name__}: {exc}")
             sys.stderr.write(f"[ubs_core.csharp_scan] detector module {module_info.name} failed: {exc}\n")
             continue
         find = getattr(module, "find", None)
@@ -294,18 +305,28 @@ def run_detectors(files: Sequence, sink, skip: set, base_dir: Path) -> None:
         rule_id = str(getattr(module, "RULE_ID", f"cs.detector.{module_info.name}"))
         title = str(getattr(module, "TITLE", rule_id))
         severity = str(getattr(module, "SEVERITY", "critical"))
-        for hit in find(files, base_dir):
-            path, line_no, col, detail = hit[0], hit[1], hit[2], hit[3]
-            sink.write(json.dumps({
-                "rule": rule_id,
-                "category_id": f"csharp.{slug_for_category(category)}",
-                "path": _source_path(str(path), base_dir),
-                "line": int(line_no),
-                "col": int(col),
-                "severity": severity,
-                "message": f"{title} — {detail}"[:300] if detail else title,
-                "suppressed": False,
-            }, ensure_ascii=False) + "\n")
+        batches = ([path] for path in files) if getattr(module, "FILE_SCOPED", False) else (files,)
+        for batch in batches:
+            try:
+                for path, line_no, col, detail in find(batch, base_dir):
+                    sink.write(json.dumps({
+                        "rule": rule_id,
+                        "category_id": f"csharp.{slug_for_category(category)}",
+                        "path": _source_path(str(path), base_dir),
+                        "line": int(line_no),
+                        "col": int(col),
+                        "severity": severity,
+                        "message": f"{title} — {detail}"[:300] if detail else title,
+                        "suppressed": False,
+                    }, ensure_ascii=False) + "\n")
+            except Exception as exc:
+                if errors is None:
+                    raise
+                source = str(batch[0]) if len(batch) == 1 else "selected files"
+                problem = f"{source}: detector {module_info.name}: {type(exc).__name__}: {exc}"
+                errors.append(problem)
+                if semantic_errors is not None and isinstance(exc, (AnalysisLimit, RecursionError)):
+                    semantic_errors.append(problem)
 
 
 def run_analyzers(files: Sequence, sink, skip: set, base_dir: Path,
@@ -695,7 +716,8 @@ def main(argv: list | None = None) -> int:
 
         capturing_sink = CapturingSink()
         scan_patterns(patterns, texts, capturing_sink, skip, phase=0, prefilter=prefilter_res)
-        run_detectors(files_to_scan, capturing_sink, skip, base_dir)
+        run_detectors(files_to_scan, capturing_sink, skip, base_dir,
+                      errors=scan_errors, semantic_errors=semantic_errors)
         run_analyzers(files_to_scan, capturing_sink, skip, base_dir, enable_new=args.enable_new_analyzers,
                       prefilter=prefilter_res, errors=scan_errors, semantic_errors=semantic_errors)
         if args.ast_rule_dir:

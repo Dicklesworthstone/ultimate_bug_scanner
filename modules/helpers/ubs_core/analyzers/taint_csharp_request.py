@@ -818,7 +818,7 @@ class CSharpFlow:
         position = start
         while position < end:
             self.budget.spend()
-            match = NAME.match(self.code, position)
+            match = NAME.match(self.code, position, end)
             if match is not None:
                 name = re.sub(r"\s|@", "", match.group()).replace("global::", "")
                 stop = match.end()
@@ -980,6 +980,10 @@ class CSharpFlow:
             solve(entry, initial, edges, lambda key, state: self.transfer(actions[key], state), self.budget)
         return Summary(self.returned, dict(self.effects), dict(self.outputs))
 
+    def concrete_effect(self, key, fact):
+        """Qualify an effect after helper arguments have been substituted."""
+        return frozenset(trace for trace in fact if trace.kind == "source")
+
     def analyze(self):
         self.pending = deque(sorted(self.summaries))
         self.queued = set(self.pending)
@@ -997,7 +1001,7 @@ class CSharpFlow:
         effects = {}
         for summary in self.summaries.values():
             for key, fact in summary.effects.items():
-                concrete = frozenset(trace for trace in fact if trace.kind == "source")
+                concrete = self.concrete_effect(key, fact)
                 if concrete:
                     effects[key] = join(effects.get(key, CLEAN), concrete)
         for (offset, sink), fact in sorted(effects.items()):

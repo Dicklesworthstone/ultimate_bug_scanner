@@ -163,8 +163,9 @@ class Import:
 class TypeIndex:
     """Resolve the selected external types with namespace and local shadowing."""
 
-    def __init__(self, flow):
+    def __init__(self, flow, known_types=()):
         self.flow = flow
+        self.known_types = KNOWN_TYPES | frozenset(known_types)
         self.scopes = []
         declaration = re.compile(
             r"\b(namespace|class|struct|interface|record)\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)"
@@ -182,7 +183,7 @@ class TypeIndex:
                 full = ".".join((*owner, scope.name))
                 self.local_types[full] = scope
         self.namespaces = {""}
-        for value in KNOWN_TYPES | frozenset(self.local_types):
+        for value in self.known_types | frozenset(self.local_types):
             segments = value.split(".")
             self.namespaces.update(".".join(segments[:index]) for index in range(1, len(segments)))
         self.imports = []
@@ -256,7 +257,7 @@ class TypeIndex:
         for candidate in candidates:
             if candidate in self.local_types:
                 return "local:" + candidate
-            if candidate in KNOWN_TYPES:
+            if candidate in self.known_types:
                 return candidate
         if not global_name and "." not in name:
             matches = set()
@@ -266,7 +267,7 @@ class TypeIndex:
                 candidate = self.qualify_namespace(item.target, item.position) + "." + name
                 if candidate in self.local_types:
                     matches.add("local:" + candidate)
-                elif candidate in KNOWN_TYPES:
+                elif candidate in self.known_types:
                     matches.add(candidate)
             if len(matches) == 1:
                 return matches.pop()

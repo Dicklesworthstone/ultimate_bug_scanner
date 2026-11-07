@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 import json
 import hashlib
+import importlib
+import io
 import re
 import shutil
 import subprocess
@@ -14,6 +16,7 @@ import textwrap
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 TYPE_HELPER = REPO_ROOT / "modules" / "helpers" / "type_narrowing_csharp.py"
@@ -1183,6 +1186,145 @@ class C {
         lexical = source.replace('class C {', 'namespace B { class C {').replace(
             'B.Receiver receiver', 'Receiver receiver') + '}'
         self.assert_negative_markers(lexical)
+
+
+class CSharpDetectorIntegrationTests(unittest.TestCase):
+    """Unsupported source and broken machinery have distinct, durable results."""
+
+    RULE = "csharp.security.outbound-url"
+    PARTIAL_SOURCE = '''using System.Net.Http;
+using Microsoft.AspNetCore.Http;
+class Requests {
+    void Run(HttpRequest incoming, HttpClient client, dynamic unknown) {
+        client.GetAsync(incoming.Query["first"]); // expected-finding
+        unknown.GetAsync(incoming.Query["unresolved"]);
+        client.GetAsync(incoming.Query["last"]); // expected-finding
+    }
+}
+'''
+    COMPLETE_SOURCE = '''using System.Net.Http;
+using Microsoft.AspNetCore.Http;
+class Requests {
+    void Run(HttpRequest incoming, HttpClient client) {
+        client.GetAsync(incoming.Query["value"]); // expected-finding
+    }
+}
+'''
+
+    def setUp(self):
+        artifacts = REPO_ROOT / "test-suite" / "artifacts" / "csharp-detector-integration"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        self.directory = Path(tempfile.mkdtemp(prefix="native-", dir=artifacts))
+        self.project = self.directory / "project"
+        self.project.mkdir()
+        self.attempt = 0
+
+    def sources(self, items):
+        paths = []
+        for name, source in items:
+            path = self.project / name
+            path.write_text(source, encoding="utf-8")
+            paths.append(path)
+        return paths
+
+    def execute(self, paths, *, skip_security=False, cached=False):
+        self.attempt += 1
+        attempt = self.directory / f"attempt-{self.attempt}"
+        attempt.mkdir()
+        selected = attempt / "files.txt"
+        selected.write_bytes(b"".join(os.fsencode(path) + b"\0" for path in paths))
+        sink, status, stats = (attempt / name for name in ("findings.jsonl", "status.json", "cache.json"))
+        skipped = ",".join(str(number) for number in range(1, 25)
+                           if skip_security or number != 8)
+        command = [sys.executable, "-B", "-m", "ubs_core.csharp_scan",
+                   "--files-from", str(selected), "--project-dir", str(self.project),
+                   "--sink", str(sink), "--status-out", str(status), "--skip", skipped]
+        environment = dict(os.environ, PYTHONPATH=str(REPO_ROOT / "modules/helpers"),
+                           PYTHONDONTWRITEBYTECODE="1", UBS_KEEP_TEMP="1",
+                           UBS_NO_AUTO_UPDATE="1", UBS_ENABLE_AUTO_UPDATE="0",
+                           UBS_NO_CACHE="0" if cached else "1",
+                           UBS_CACHE_DIR=str(self.directory / "cache"), UBS_CACHE_FILE=str(stats),
+                           TMPDIR=str(attempt))
+        result = subprocess.run(command, cwd=self.project, env=environment, text=True,
+                                capture_output=True, check=False, timeout=90)
+        (attempt / "stdout.log").write_text(result.stdout, encoding="utf-8")
+        (attempt / "stderr.log").write_text(result.stderr, encoding="utf-8")
+        details = f"{command!r}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        self.assertTrue(status.is_file(), details)
+        self.assertTrue(sink.is_file(), details)
+        report = json.loads(status.read_text(encoding="utf-8"))
+        findings = [json.loads(line) for line in sink.read_text(encoding="utf-8").splitlines()]
+        cache = json.loads(stats.read_text(encoding="utf-8"))
+        return result.returncode, report, findings, cache, details
+
+    def expected(self, paths):
+        return sorted((path.name, number, line.index("client.GetAsync") + 1)
+                      for path in paths for number, line in enumerate(path.read_text().splitlines(), 1)
+                      if "// expected-finding" in line)
+
+    def outbound_sites(self, findings):
+        return sorted((Path(row["path"]).name, row["line"], row["col"])
+                      for row in findings if row["rule"] == self.RULE)
+
+    def test_partial_source_retains_all_known_sites_and_semantic_status(self):
+        paths = self.sources((("a-partial.cs", self.PARTIAL_SOURCE),
+                              ("z-complete.cs", self.COMPLETE_SOURCE)))
+        code, report, findings, _, details = self.execute(paths)
+        self.assertEqual(code, 2, details)
+        self.assertEqual((report["status"], report["error"], report["reason"], report["module_error"]),
+                         ("partial", "analysis", "analysis-incomplete", "ANALYSIS_INCOMPLETE"), details)
+        self.assertEqual(self.outbound_sites(findings), self.expected(paths), details)
+        self.assertTrue(any("a-partial.cs" in message and "outbound_url" in message
+                            for message in report["errors"]), details)
+
+    def test_partial_source_cannot_reappear_as_a_clean_cache_hit(self):
+        paths = self.sources((("partial.cs", self.PARTIAL_SOURCE),))
+        for attempt in range(2):
+            with self.subTest(attempt=attempt):
+                code, report, findings, stats, details = self.execute(paths, cached=True)
+                self.assertEqual((code, report["status"], report["module_error"]),
+                                 (2, "partial", "ANALYSIS_INCOMPLETE"), details)
+                self.assertEqual(self.outbound_sites(findings), self.expected(paths), details)
+                self.assertEqual((stats["hits"], stats["misses"]), (0, 1), details)
+
+    def test_skipping_security_precedes_the_unsupported_source(self):
+        paths = self.sources((("partial.cs", self.PARTIAL_SOURCE),))
+        code, report, findings, _, details = self.execute(paths, skip_security=True)
+        self.assertEqual((code, report["status"]), (0, "ok"), details)
+        self.assertEqual(findings, [], details)
+
+    def test_detector_import_failure_retains_other_detectors_and_is_environmental(self):
+        from ubs_core import csharp_scan
+        paths = self.sources((("complete.cs", self.COMPLETE_SOURCE),))
+        original_import = importlib.import_module
+
+        def fail_selected(name, package=None):
+            if name == "ubs_core.csharp_detectors.security_randomness":
+                raise ImportError("injected missing randomness dependency")
+            return original_import(name, package)
+
+        errors, semantic_errors, sink = [], [], io.StringIO()
+        with patch("importlib.import_module", side_effect=fail_selected):
+            csharp_scan.run_detectors(paths, sink, set(), self.project,
+                                      errors=errors, semantic_errors=semantic_errors)
+        findings = [json.loads(line) for line in sink.getvalue().splitlines()]
+        self.assertEqual(self.outbound_sites(findings), self.expected(paths), findings)
+        self.assertEqual(semantic_errors, [])
+        self.assertEqual(len(errors), 1, errors)
+        report = csharp_scan.execution_status(1, errors, semantic_errors)
+        self.assertEqual((report["status"], report["exit_code"], report["error"],
+                          report["reason"], report["module_error"]),
+                         ("partial", 2, "environment", "module-failed", "ANALYZER_ERROR"), report)
+
+    def test_skipped_security_package_never_imports_a_broken_detector(self):
+        from ubs_core import csharp_scan
+        paths = self.sources((("partial.cs", self.PARTIAL_SOURCE),))
+        errors, semantic_errors, sink = [], [], io.StringIO()
+        with patch("importlib.import_module", side_effect=ImportError("must not import")) as importing:
+            csharp_scan.run_detectors(paths, sink, {8}, self.project,
+                                      errors=errors, semantic_errors=semantic_errors)
+        importing.assert_not_called()
+        self.assertEqual((sink.getvalue(), errors, semantic_errors), ("", [], []))
 
 
 @unittest.skipUnless(os.environ.get("UBS_CSHARP_SEMANTICS_PUBLIC") == "1",

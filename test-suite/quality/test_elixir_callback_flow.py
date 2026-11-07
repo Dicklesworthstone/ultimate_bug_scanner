@@ -210,6 +210,324 @@ REVIEW_CASES = (
     ''')),
 )
 
+# These labels describe selected execution, independently of the older blanket
+# apply refusal. Keep them separate from PUBLIC_CASES: the shell's generic
+# dynamic-call heuristic has a different rule contract from these flow oracles.
+APPLY_CASES = (
+    Case("apply_empty_callback_is_clean", "sql", module('''
+        apply(fn -> :ok end, [])
+    ''')),
+    Case("apply_callback_executes_captured_sql", "sql", module('''
+        sql = params["sql"]
+        callback = fn ->
+          Ecto.Adapters.SQL.query!(ApplicationRepo, sql, []) # @flow Ecto.Adapters.SQL.query!
+        end
+        sql = "SELECT 1"
+        apply(callback, [])
+    ''')),
+    Case("apply_literal_capture_survives_request_rebinding", "sql", module('''
+        sql = "SELECT 1"
+        callback = fn -> Ecto.Adapters.SQL.query!(ApplicationRepo, sql, []) end
+        sql = params["sql"]
+        apply(callback, [])
+    ''')),
+    Case("apply_callback_and_arguments_keep_selected_values", "redirect", module('''
+        callback = fn target -> target end
+        selected = callback
+        arguments = [params["next"]]
+        callback = fn _target -> "/home" end
+        Phoenix.Controller.redirect(conn, external: apply(selected, arguments)) # @flow Phoenix.Controller.redirect
+    ''')),
+    Case("apply_callback_parameter_shadows_capture", "sql", module('''
+        sql = params["sql"]
+        callback = fn sql -> Ecto.Adapters.SQL.query!(ApplicationRepo, sql, []) end
+        apply(callback, ["SELECT 1"])
+    ''')),
+    Case("apply_keyword_argument_is_runtime_tuple", "sql", module('''
+        callback = fn {:query, sql} ->
+          Ecto.Adapters.SQL.query!(ApplicationRepo, sql, []) # @flow Ecto.Adapters.SQL.query!
+        end
+        apply(callback, query: params["sql"])
+    ''')),
+    Case("apply_argument_list_is_eager", "sql", module('''
+        apply(fn _result -> :ok end, [Ecto.Adapters.SQL.query!(ApplicationRepo, params["sql"], [])]) # @flow Ecto.Adapters.SQL.query!
+    ''')),
+    Case("apply_in_untaken_branch_does_not_execute", "sql", module('''
+        false && apply(fn -> Ecto.Adapters.SQL.query!(ApplicationRepo, params["sql"], []) end, [])
+    ''')),
+    Case("kernel_and_erlang_apply_select_same_callback", "sql", module('''
+        callback = fn sql -> Ecto.Adapters.SQL.query!(ApplicationRepo, sql, []) end # @flow Ecto.Adapters.SQL.query!
+        Kernel.apply(callback, [params["sql"]])
+        :erlang.apply(callback, ["SELECT 1"])
+    ''')),
+    Case("nested_apply_executes_selected_callback", "path", module('''
+        callback = fn file -> File.read!(file) end # @flow File.read!
+        apply(Kernel, :apply, [callback, [params["file"]]])
+    ''')),
+    Case("erlang_applies_exported_sql", "sql", module('''
+        :erlang.apply(Ecto.Adapters.SQL, :query!, [ApplicationRepo, params["sql"], []]) # @flow :erlang.apply
+    ''')),
+    Case("apply_public_helper_reports_body_sink", "sql", module('''
+        apply(__MODULE__, :execute, [params["sql"]])
+    ''', helpers='''
+        def execute(sql), do: Ecto.Adapters.SQL.query!(ApplicationRepo, sql, []) # @flow Ecto.Adapters.SQL.query!
+    ''')),
+    Case("apply_public_helper_defaults_are_selected", "sql", module('''
+        apply(__MODULE__, :execute, [params["sql"]])
+    ''', helpers=r'''
+        def execute(sql, _options \\ []), do: Ecto.Adapters.SQL.query!(ApplicationRepo, sql, []) # @flow Ecto.Adapters.SQL.query!
+    ''')),
+    Case("apply_public_clauses_preserve_literal_control", "sql", module('''
+        apply(__MODULE__, :execute, [:skip, params["sql"]])
+    ''', helpers='''
+        def execute(:skip, _sql), do: :ok
+        def execute(:query, sql), do: Ecto.Adapters.SQL.query!(ApplicationRepo, sql, [])
+    ''')),
+    Case("apply_selected_ecto_query_is_sink", "sql", module('''
+        apply(Ecto.Adapters.SQL, :query!, [ApplicationRepo, params["sql"], []]) # @flow apply
+    ''')),
+    Case("apply_bound_sql_values_are_not_query", "sql", module('''
+        apply(Ecto.Adapters.SQL, :query!, [ApplicationRepo, "SELECT $1", [params["sql"]]])
+    ''')),
+    Case("apply_ecto_alias_and_captured_module", "sql", '''defmodule AppliedAlias do
+  alias Ecto.Adapters.SQL, as: Database
+  def handle(conn, params) do
+    adapter = Database
+    method = :query!
+    apply(adapter, method, [ApplicationRepo, params["sql"], []]) # @flow apply
+  end
+end
+'''),
+    Case("apply_absolute_module_bypasses_local_alias", "sql", '''defmodule AppliedAbsolute do
+  alias Pretend, as: Ecto
+  def handle(conn, params) do
+    apply(Elixir.Ecto.Adapters.SQL, :query!, [ApplicationRepo, params["sql"], []]) # @flow apply
+  end
+end
+'''),
+    Case("apply_alias_is_bound_at_function_definition", "sql", '''defmodule UnusedLocalSQL do
+  def query!(_repo, _sql, _params), do: :ok
+end
+defmodule AppliedAliasSnapshot do
+  alias Ecto.Adapters.SQL, as: Database
+  def handle(conn, params) do
+    apply(Database, :query!, [ApplicationRepo, params["sql"], []]) # @flow apply
+  end
+  alias UnusedLocalSQL, as: Database
+end
+'''),
+    Case("apply_same_file_ecto_repository", "sql", '''defmodule AppliedRepo do
+  use Ecto.Repo, otp_app: :demo, adapter: Ecto.Adapters.Postgres
+end
+defmodule AppliedRepository do
+  alias AppliedRepo, as: Store
+  def handle(conn, params) do
+    apply(Store, :query!, [params["sql"], []]) # @flow apply
+  end
+end
+'''),
+    Case("apply_local_export_overrides_framework_name", "sql", '''defmodule LocalSQL do
+  def query!(_repo, _sql, _params), do: :ok
+end
+defmodule AppliedShadow do
+  alias LocalSQL, as: Database
+  def handle(conn, params) do
+    apply(Database, :query!, [ApplicationRepo, params["sql"], []])
+  end
+end
+'''),
+    Case("apply_selected_redirect_keyword_list", "redirect", module('''
+        apply(Phoenix.Controller, :redirect, [conn, [external: params["next"]]]) # @flow apply
+    ''')),
+    Case("apply_fetch_runtime_keyword_success_keeps_sql", "sql", module('''
+        case apply(Keyword, :fetch, [[{:query, params["sql"]}], :query]) do
+          {:ok, sql} -> Ecto.Adapters.SQL.query!(ApplicationRepo, sql, []) # @flow Ecto.Adapters.SQL.query!
+          :error -> :ok
+        end
+    ''')),
+    Case("apply_fetch_missing_key_selects_error_clause", "sql", module('''
+        case apply(Keyword, :fetch, [[{:other, "SELECT 1"}], :query]) do
+          {:ok, _sql} -> :ok
+          :error -> Ecto.Adapters.SQL.query!(ApplicationRepo, params["sql"], []) # @flow Ecto.Adapters.SQL.query!
+        end
+    ''')),
+    Case("apply_fetch_bang_missing_key_raises_before_sink", "sql", module('''
+        apply(Map, :fetch!, [%{"other" => "SELECT 1"}, "query"])
+        Ecto.Adapters.SQL.query!(ApplicationRepo, params["sql"], [])
+    ''')),
+    Case("apply_redirect_runtime_keyword_tuples", "redirect", module('''
+        apply(Phoenix.Controller, :redirect, [conn, [{:external, params["next"]}]]) # @flow apply
+    ''')),
+    Case("apply_redirect_mapped_keyword_tuples", "redirect", module('''
+        options = Enum.map([params["next"]], fn value -> {:external, value} end)
+        apply(Phoenix.Controller, :redirect, [conn, options]) # @flow apply
+    ''')),
+    Case("apply_redirect_first_duplicate_keeps_request", "redirect", module('''
+        apply(Phoenix.Controller, :redirect, [conn, [external: params["next"], external: "/home"]]) # @flow apply
+    ''')),
+    Case("apply_redirect_first_duplicate_keeps_literal", "redirect", module('''
+        apply(Phoenix.Controller, :redirect, [conn, [{:external, "/home"}, {:external, params["next"]}]])
+    ''')),
+    Case("apply_selected_file_read", "path", module('''
+        apply(File, :read!, [params["file"]]) # @flow apply
+    ''')),
+    Case("apply_preserves_selected_path_sanitizer", "path", module('''
+        leaf = apply(Path, :basename, [params["file"]])
+        file = apply(Path, :join, [["/srv/public", leaf]])
+        apply(File, :read!, [file])
+    ''')),
+    Case("apply_finite_enum_map_arguments", "sql", module('''
+        arguments = Enum.map([params["sql"]], fn value -> value end)
+        apply(fn sql -> Ecto.Adapters.SQL.query!(ApplicationRepo, sql, []) end, arguments) # @flow Ecto.Adapters.SQL.query!
+    ''')),
+    Case("apply_finite_reduction_keeps_second_iteration", "sql", module('''
+        arguments = Enum.reduce(["ignored", params["sql"]], ["SELECT 1"], fn value, acc ->
+          case acc do
+            ["SELECT 1"] -> ["SELECT 2"]
+            _ -> [value]
+          end
+        end)
+        apply(fn sql -> Ecto.Adapters.SQL.query!(ApplicationRepo, sql, []) end, arguments) # @flow Ecto.Adapters.SQL.query!
+    ''')),
+    Case("apply_enum_each_invokes_selected_callback", "sql", module('''
+        callback = fn sql -> Ecto.Adapters.SQL.query!(ApplicationRepo, sql, []) end # @flow Ecto.Adapters.SQL.query!
+        apply(Enum, :each, [[params["sql"]], callback])
+    ''')),
+    Case("local_apply_export_keeps_its_own_body", "sql", '''defmodule LocalApply do
+  import Kernel, except: [apply: 2]
+  def apply(_callback, _arguments), do: :ok
+  def handle(conn, params) do
+    apply(fn -> Ecto.Adapters.SQL.query!(ApplicationRepo, params["sql"], []) end, [])
+  end
+end
+'''),
+)
+
+
+def apply_default_cases():
+    """A missing key selects the default; a present nil never selects it."""
+    lookups = (
+        ('map-known-missing', 'Map', '%{"fixed" => "SELECT 1"}', '"missing"', 'params["sql"]', True),
+        ('map-dynamic-key', 'Map', '%{"fixed" => "SELECT 1"}', 'params["key"]', 'params["sql"]', True),
+        ('map-unknown', 'Map', 'values', '"query"', 'params["sql"]', True),
+        ('map-dynamic-entry', 'Map', '%{params["key"] => "SELECT 1"}', '"query"', 'params["sql"]', True),
+        ('map-present-clean', 'Map', '%{"query" => "SELECT 1"}', '"query"', 'params["sql"]', False),
+        ('map-present-nil', 'Map', '%{"query" => nil}', '"query"', 'params["sql"]', False),
+        ('map-present-request', 'Map', '%{"query" => params["sql"]}', '"query"', '"SELECT 1"', True),
+        ('keyword-missing-tuple', 'Keyword', '[{:query, "SELECT 1"}]', ':missing', 'params["sql"]', True),
+        ('keyword-dynamic-key', 'Keyword', '[query: "SELECT 1"]', 'params["key"]', 'params["sql"]', True),
+        ('keyword-unknown', 'Keyword', 'values', ':query', 'params["sql"]', True),
+        ('keyword-present-nil', 'Keyword', '[{:query, nil}]', ':query', 'params["sql"]', False),
+        ('keyword-first-clean', 'Keyword', '[{:query, "SELECT 1"}, {:query, params["sql"]}]', ':query', 'params["sql"]', False),
+        ('keyword-first-request', 'Keyword', '[query: params["sql"], query: "SELECT 1"]', ':query', '"SELECT 1"', True),
+    )
+    for name, owner, values, key, default, unsafe in lookups:
+        for spelling, lookup in (
+                ('direct', f'{owner}.get({values}, {key}, {default})'),
+                ('indirect', f'apply({owner}, :get, [{values}, {key}, {default}])')):
+            body = (f'sql = {lookup}\n'
+                    'apply(Ecto.Adapters.SQL, :query!, [ApplicationRepo, sql, []])'
+                    + (' # @flow apply' if unsafe else ''))
+            yield Case('apply-default-' + name + '-' + spelling, 'sql',
+                       module(body, parameters='conn, params, values'))
+
+
+APPLY_CASES += tuple(apply_default_cases())
+
+APPLY_BOUNDARIES = (
+    Case("apply_unknown_callback_keeps_eager_sink", "sql", module('''
+        apply(params["callback"], [Ecto.Adapters.SQL.query!(ApplicationRepo, params["sql"], [])]) # @flow Ecto.Adapters.SQL.query!
+    '''), partial=True),
+    Case("apply_dynamic_module_remains_incomplete", "sql", module('''
+        apply(params["module"], :query!, [ApplicationRepo, params["sql"], []])
+    '''), partial=True),
+    Case("apply_dynamic_function_remains_incomplete", "sql", module('''
+        apply(Ecto.Adapters.SQL, params["method"], [ApplicationRepo, "SELECT 1", []])
+    '''), partial=True),
+    Case("apply_unknown_collection_remains_incomplete", "sql", module('''
+        apply(fn sql -> sql end, params["arguments"])
+    '''), partial=True),
+    Case("apply_tuple_is_not_argument_list", "sql", module('''
+        apply(fn sql -> sql end, {"SELECT 1"})
+    '''), partial=True),
+    Case("apply_wrong_callback_arity_is_incomplete", "sql", module('''
+        apply(fn first, second -> first end, ["SELECT 1"])
+    '''), partial=True),
+    Case("apply_wrong_builtin_arity_is_incomplete", "sql", module('''
+        apply(Ecto.Adapters.SQL, :query!, [])
+    '''), partial=True),
+    Case("apply_private_export_is_incomplete", "sql", module('''
+        apply(__MODULE__, :execute, [params["sql"]])
+    ''', helpers='''
+        defp execute(sql), do: Ecto.Adapters.SQL.query!(ApplicationRepo, sql, [])
+    '''), partial=True),
+    Case("apply_missing_export_is_incomplete", "sql", module('''
+        apply(__MODULE__, :missing, [])
+    '''), partial=True),
+    Case("apply_unknown_static_export_is_incomplete", "sql", module('''
+        apply(Unknown, :execute, [])
+    '''), partial=True),
+    Case("apply_unmodeled_file_export_is_incomplete", "sql", module('''
+        apply(File, :unmodeled, [])
+    '''), partial=True),
+    Case("apply_nonbang_file_result_needs_observation_model", "sql", module('''
+        apply(File, :read, ["/fixed"])
+    '''), partial=True),
+    Case("apply_foreign_eval_is_incomplete", "sql", module('''
+        apply(Code, :eval_string, ["1 + 2"])
+    '''), partial=True),
+    Case("apply_macro_is_not_exported_function", "sql", module('''
+        apply(Kernel, :tap, ["SELECT 1", fn _value -> :ok end])
+    '''), partial=True),
+    Case("apply_sql_stream_stays_incomplete", "sql", module('''
+        apply(Ecto.Adapters.SQL, :stream, [ApplicationRepo, "SELECT 1", []])
+    '''), partial=True),
+    Case("apply_import_is_not_kernel", "sql", '''defmodule ImportedApply do
+  import Other, only: [apply: 2]
+  def handle(conn, params), do: apply(fn -> :ok end, [])
+end
+''', partial=True),
+    Case("apply_shadow_module_has_no_native_exports", "sql", '''defmodule File do
+  def custom(), do: :ok
+end
+defmodule ShadowedFile do
+  def handle(conn, params), do: apply(File, :read!, ["/fixed"])
+end
+''', partial=True),
+    Case("apply_request_headers_have_unknown_arity", "sql", module('''
+        arguments = Plug.Conn.get_req_header(conn, "x-query")
+        apply(fn sql -> Ecto.Adapters.SQL.query!(ApplicationRepo, sql, []) end, arguments)
+    '''), partial=True),
+    Case("apply_mapped_request_headers_have_unknown_arity", "sql", module('''
+        arguments = Enum.map(Plug.Conn.get_req_header(conn, "x-query"), fn value -> value end)
+        apply(fn sql -> Ecto.Adapters.SQL.query!(ApplicationRepo, sql, []) end, arguments)
+    '''), partial=True),
+    Case("apply_reduced_headers_cannot_prove_finite_arguments", "sql", module('''
+        arguments = Enum.reduce(Plug.Conn.get_req_header(conn, "x-query"), ["SELECT 1"], fn value, acc ->
+          case acc do
+            ["SELECT 1"] -> ["SELECT 2"]
+            _ -> [value]
+          end
+        end)
+        apply(fn sql -> Ecto.Adapters.SQL.query!(ApplicationRepo, sql, []) end, arguments)
+    '''), partial=True),
+    Case("apply_reduced_headers_cannot_prove_scalar_query", "sql", module('''
+        sql = Enum.reduce(Plug.Conn.get_req_header(conn, "x-query"), "SELECT 1", fn value, acc ->
+          case acc do
+            "SELECT 1" -> "SELECT 2"
+            _ -> value
+          end
+        end)
+        apply(Ecto.Adapters.SQL, :query!, [ApplicationRepo, sql, []])
+    '''), partial=True),
+    Case("apply_redirect_unknown_keyword_options", "redirect", module('''
+        apply(Phoenix.Controller, :redirect, [conn, params["options"]])
+    '''), partial=True),
+    Case("apply_redirect_unknown_keyword_entry", "redirect", module('''
+        apply(Phoenix.Controller, :redirect, [conn, [{params["key"], params["next"]}]])
+    '''), partial=True),
+)
+
 # Literal eval/Erlang controls intentionally stay native controls: their old
 # generic security heuristics are not callback findings.  Public callback
 # checks use the other unchanged 18 sources and assert every ordinary result.
@@ -254,7 +572,7 @@ class ElixirCallbackNativeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.directory = ARTIFACTS / ("native-" + uuid.uuid4().hex[:12])
-        cls.paths = materialize(cls.directory, CASES + BOUNDARIES + REVIEW_CASES)
+        cls.paths = materialize(cls.directory, CASES + BOUNDARIES + REVIEW_CASES + APPLY_CASES + APPLY_BOUNDARIES)
 
     def check_case(self, case):
         from ubs_core.registry import RunContext
@@ -300,6 +618,79 @@ class ElixirCallbackNativeTests(unittest.TestCase):
         case = CASES[0]
         with self.assertRaisesRegex(ValueError, "(?i)budget|incomplete|limit"):
             native.ElixirEngine(self.paths[case.name], case.source, case.policy, Budget(5)).analyze()
+
+    def test_selected_apply_programs(self):
+        for case in APPLY_CASES:
+            with self.subTest(case=case.name):
+                self.check_case(case)
+
+    def test_selected_apply_boundaries(self):
+        for case in APPLY_BOUNDARIES:
+            with self.subTest(case=case.name):
+                self.check_case(case)
+
+    def test_recursive_apply_dispatch_is_bounded(self):
+        native = importlib.import_module("ubs_core.analyzers.taint_elixir_traversal")
+        source = "defmodule RecursiveApply do\n  def run(), do: apply(__MODULE__, :run, [])\nend\n"
+        with self.assertRaisesRegex(ValueError, "(?i)limit.*incomplete"):
+            native.ElixirEngine(self.directory / "recursive.ex", source, "sql").analyze()
+
+    def test_nested_builtin_apply_dispatch_is_bounded(self):
+        native = importlib.import_module("ubs_core.analyzers.taint_elixir_traversal")
+        arguments = '[File, :read!, ["/fixed"]]'
+        for _ in range(25):
+            arguments = '[Kernel, :apply, ' + arguments + ']'
+        source = module('apply(Kernel, :apply, ' + arguments + ')')
+        with self.assertRaisesRegex(ValueError, "apply dispatch limit.*incomplete"):
+            native.ElixirEngine(self.directory / "nested-apply.ex", source, "sql").analyze()
+
+    def test_applied_callback_keeps_file_result_policy(self):
+        from ubs_core.elixir_detectors.file_result import FileResultEngine
+
+        source = module('''
+            apply(fn -> File.write("/fixed", "data") end, [])
+            :ok
+        ''')
+        engine = FileResultEngine(self.directory / "apply-file-result.ex", source)
+        self.assertEqual(engine.analyze(), {(3, 17): "File.write"})
+
+    def test_selected_apply_helper_cli_preserves_completion(self):
+        cases = (next(case for case in APPLY_CASES if case.name == 'apply_bound_sql_values_are_not_query'),
+                 next(case for case in APPLY_CASES if case.name == 'apply_selected_ecto_query_is_sink'),
+                 next(case for case in APPLY_BOUNDARIES if case.name == 'apply_unknown_callback_keeps_eager_sink'))
+        for case in cases:
+            with self.subTest(case=case.name):
+                attempt = self.directory / ('helper-' + case.name)
+                attempt.mkdir()
+                paths = attempt / 'files.nul'
+                paths.write_bytes(os.fsencode(self.paths[case.name]) + b'\0')
+                report_path = attempt / 'report.json'
+                command = [sys.executable, '-B', '-m', 'ubs_core.elixir_scan',
+                           '--files-from', str(paths), '--sink', str(attempt / 'findings.jsonl'),
+                           '--json-out', str(report_path), '--project-dir', str(self.directory),
+                           '--skip', SKIP_NON_SECURITY]
+                environment = dict(os.environ, PYTHONPATH=str(ROOT / 'modules/helpers'),
+                                   PYTHONDONTWRITEBYTECODE='1', UBS_KEEP_TEMP='1', UBS_NO_CACHE='1',
+                                   UBS_NO_AUTO_UPDATE='1', UBS_PYTHON=sys.executable, TMPDIR=str(attempt))
+                started = time.monotonic()
+                result = subprocess.run(command, cwd=attempt, env=environment, text=True,
+                                        capture_output=True, timeout=60)
+                (attempt / 'stdout.log').write_text(result.stdout, encoding='utf-8')
+                (attempt / 'stderr.log').write_text(result.stderr, encoding='utf-8')
+                (attempt / 'command.json').write_text(json.dumps({
+                    'command': command, 'exit': result.returncode,
+                    'elapsed_seconds': time.monotonic() - started,
+                    'source_sha256': hashlib.sha256(case.source.encode()).hexdigest(),
+                }, indent=2), encoding='utf-8')
+                context = (result.returncode, result.stdout, result.stderr)
+                self.assertEqual(result.returncode, 2 if case.partial else int(bool(case.expected)), context)
+                report = json.loads(report_path.read_text(encoding='utf-8'))
+                self.assertEqual(report['status'], 'partial' if case.partial else 'ok', context)
+                if case.partial:
+                    self.assertEqual(report['module_error'], 'ANALYZER_ERROR', context)
+                self.assertEqual(sorted((row['rule'], row['line'], row['col']) for row in report['findings']),
+                                 sorted(case.expected), context)
+                print(f'[elixir-apply-helper:{case.name}] PASS ({time.monotonic() - started:.3f}s)', flush=True)
 
 
 for _case in CASES + BOUNDARIES + REVIEW_CASES:

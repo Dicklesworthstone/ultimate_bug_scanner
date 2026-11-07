@@ -52,6 +52,10 @@ class Case:
 
 
 CASES = (
+    Case('selected_apply_query', '''
+        def handle(conn, params) do
+          apply(Ecto.Adapters.SQL, :query!, [ApplicationRepo, params["sql"]]) # sql
+        end'''),
     Case('raw_concatenation', '''
         def handle(conn, params) do
           value = params["name"]
@@ -302,7 +306,7 @@ PARTIAL = (
         end'''),
     Case('dynamic_apply', '''
         def handle(conn, params) do
-          apply(Ecto.Adapters.SQL, :query!, [ApplicationRepo, params["sql"]])
+          apply(params["adapter"], :query!, [ApplicationRepo, params["sql"]])
         end'''),
     Case('unknown_query_transform', '''
         def handle(conn, params) do

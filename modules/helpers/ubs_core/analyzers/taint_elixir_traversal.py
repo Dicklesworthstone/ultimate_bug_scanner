@@ -22,6 +22,24 @@ from ubs_core.taint_flow import AnalysisLimit, Budget, CLEAN, Fact, Step, Trace,
 SQL_RULE = 'ex.security.sql-interpolation'
 SQL_CALLS = frozenset({'query', 'query!', 'query_many', 'query_many!'})
 SQL_ADAPTERS = frozenset({'Ecto.Adapters.Postgres', 'Ecto.Adapters.MyXQL', 'Ecto.Adapters.Tds'})
+# Only exported functions whose argument/return effects are modeled below may
+# be selected by apply/3. In particular, modeled macros (then/tap), evaluation,
+# lazy streams and the ordinary opaque-call fallback are not indirect targets.
+APPLIED_ARITIES = {
+    'Kernel.apply': {2, 3}, ':erlang.apply': {2, 3},
+    'Enum.each': {2}, 'Enum.map': {2}, 'Enum.reduce': {3},
+    'Phoenix.Controller.redirect': {2}, 'Phoenix.Controller.send_download': {2, 3},
+    'Plug.Conn.put_resp_header': {3}, 'Plug.Conn.put_resp_headers': {2},
+    'Plug.Conn.send_file': {3, 4, 5}, 'Plug.Conn.get_req_header': {2},
+    # Non-bang File results have a separate observation detector. Until its
+    # activation recognizes indirect operation names, keep those calls partial.
+    'File.read!': {1}, 'File.write!': {2, 3},
+    'Map.get': {2, 3}, 'Map.fetch': {2}, 'Map.fetch!': {2},
+    'Keyword.get': {2, 3}, 'Keyword.fetch': {2}, 'Keyword.fetch!': {2},
+    'Path.expand': {1, 2}, 'Path.basename': {1, 2}, 'Path.join': {1, 2},
+    'URI.parse': {1}, 'URI.to_string': {1}, 'String.to_integer': {1, 2},
+    'Kernel.hd': {1}, 'Kernel.elem': {2},
+}
 
 
 class ElixirSyntaxError(ValueError):
@@ -507,6 +525,7 @@ class Value:
     identity: tuple = ()
     items: tuple = ()
     test: tuple = ()
+    finite: bool = False
 
 
 @dataclass
@@ -555,6 +574,7 @@ class ElixirEngine:
         self.closures: dict[tuple, tuple] = {}
         self.closure_keys: dict[tuple, tuple] = {}
         self.callback_depth = 0
+        self.apply_depth = 0
         self.owner, self.context, self.call_stack = '', (), []
         self.function_scope: Function | None = None
 
@@ -572,7 +592,7 @@ class ElixirEngine:
     def derive(self, expr, values, kind='unknown', literal=None, items=()):
         fact = join(*(value.fact for value in values))
         fact = advance(fact, self.step(expr.token, 'transform', expr.value or expr.kind))
-        return Value(kind, literal, fact, self.identity(expr), items)
+        return Value(kind, literal, fact, self.identity(expr), items, finite=kind == 'list')
 
     def outcomes(self, outcomes):
         unique = {}
@@ -928,6 +948,74 @@ class ElixirEngine:
             results.extend(self.invoke_callback(expr, values[0], (*prepend, *values[1:]), after))
         return self.outcomes(results)
 
+    def selected_apply(self, expr, args, state):
+        """Execute a selected closure/export without interpreting unknown code."""
+        self.budget.spend()
+        if len(args) not in {2, 3} or args[-1].kind != 'list' or not args[-1].finite:
+            raise ElixirSyntaxError(f'Unresolved Elixir apply argument list at line {expr.token.line}; analysis is incomplete')
+        if self.apply_depth >= 24:
+            raise AnalysisLimit('Elixir apply dispatch limit exceeded; analysis is incomplete')
+        # A keyword entry in the runtime argument list is a tuple argument,
+        # not source-level trailing keyword syntax to group into another list.
+        actual = tuple(replace(value, kind='tuple', literal=None,
+                               items=(Value('atom', value.literal), value.items[0]))
+                       if value.kind == 'pair' else value for value in args[-1].items)
+        self.apply_depth += 1
+        try:
+            if len(args) == 2:
+                return self.invoke_callback(expr, args[0], actual, state)
+            target, function, _ = args
+            if (target.kind not in {'module', 'atom'} or target.fact
+                    or not isinstance(target.literal, str) or function.kind != 'atom'
+                    or function.fact or not isinstance(function.literal, str)):
+                raise ElixirSyntaxError(f'Unresolved Elixir apply target at line {expr.token.line}; analysis is incomplete')
+            # Module values have already captured lexical aliases. An atom
+            # such as :erlang denotes that Erlang module, never an Elixir alias.
+            module = target.literal.removeprefix('Elixir.') if target.kind == 'module' else ':' + target.literal
+            key = (module, function.literal, len(actual))
+            if key in self.functions:
+                if not all(clause.public for clause in self.functions[key]):
+                    raise ElixirSyntaxError(f'Private Elixir apply target at line {expr.token.line}; analysis is incomplete')
+                return self.invoke(key, actual, state, expr)
+            if module in self.attributes and module not in self.sql_repositories:
+                raise ElixirSyntaxError(f'Unknown Elixir apply export at line {expr.token.line}; analysis is incomplete')
+            actual = self.require_applied_export(expr, module, function.literal, actual)
+            # Keep policy subclasses in the dispatch path: selected File
+            # operations still create their result/ownership obligations.
+            return self.builtin(expr, module, function.literal, actual, state, True)
+        finally:
+            self.apply_depth -= 1
+
+    def require_applied_export(self, expr, module, name, args):
+        canonical = f'{module}.{name}'
+        direct_sql = module == 'Ecto.Adapters.SQL' and module not in self.attributes
+        repository_sql = module in self.sql_repositories
+        sql_arity = ({2, 3, 4} if direct_sql else {1, 2, 3}) if direct_sql or repository_sql else set()
+        allowed = sql_arity if name in SQL_CALLS and (direct_sql or repository_sql) else APPLIED_ARITIES.get(canonical, set())
+        if len(args) not in allowed:
+            raise ElixirSyntaxError(f'Unmodeled Elixir apply export {canonical}/{len(args)} at line '
+                                    f'{expr.token.line}; analysis is incomplete')
+        if canonical in {'Enum.each', 'Enum.map', 'Enum.reduce'} and (args[0].kind != 'list' or not args[0].finite):
+            raise ElixirSyntaxError(f'Unresolved Elixir applied enumeration at line {expr.token.line}; analysis is incomplete')
+        keyword_index = (1 if canonical == 'Phoenix.Controller.redirect' else
+                         2 if canonical == 'Phoenix.Controller.send_download' and len(args) == 3 else None)
+        if keyword_index is not None:
+            options = args[keyword_index]
+            if options.kind != 'list' or not options.finite:
+                raise ElixirSyntaxError(f'Unresolved Elixir apply keyword options at line {expr.token.line}; analysis is incomplete')
+            entries = self.keyword_entries(options)
+            if entries is None:
+                raise ElixirSyntaxError(f'Unresolved Elixir apply keyword entry at line {expr.token.line}; analysis is incomplete')
+            normalized, selected = [], set()
+            for key, value in entries:
+                # Keyword.get/fetch select the first occurrence. A later safe
+                # duplicate must not hide a request-derived first destination.
+                if key not in selected:
+                    selected.add(key)
+                    normalized.append(Value('pair', key, value.fact, items=(value,)))
+            args = (*args[:keyword_index], replace(options, items=tuple(normalized)), *args[keyword_index + 1:])
+        return args
+
     def analyze(self):
         # Tokens establish executable vocabulary: strings/comments cannot opt a
         # file into, or out of, the semantic parser.
@@ -1163,11 +1251,48 @@ class ElixirEngine:
             if len(possible) == 1:
                 return possible[0]
             return self.derive(expr, possible) if possible else Value('nil')
-        if collection.kind == 'list' and all(item.kind == 'pair' for item in collection.items):
-            return next((item.items[0] for item in collection.items if key.kind == 'atom' and item.literal == key.literal), Value('nil'))
+        entries = self.keyword_entries(collection)
+        if entries is not None:
+            if self.map_key(key)[0] == 'dynamic':
+                return self.derive(expr, tuple(value for _, value in entries))
+            return next((value for name, value in entries if key.kind == 'atom' and name == key.literal), Value('nil'))
         if collection.kind in {'tuple', 'list'} and isinstance(key.literal, int) and 0 <= key.literal < len(collection.items):
             return collection.items[key.literal]
         return self.derive(expr, (collection,))
+
+    def keyword_entries(self, collection):
+        """Both keyword syntax and runtime {:atom, value} pairs denote keywords."""
+        if collection.kind != 'list':
+            return None
+        entries = []
+        for item in collection.items:
+            self.budget.spend()
+            if item.kind == 'pair' and isinstance(item.literal, str) and len(item.items) == 1:
+                entries.append((item.literal, item.items[0]))
+            elif (item.kind == 'tuple' and len(item.items) == 2 and item.items[0].kind == 'atom'
+                  and not item.items[0].fact and isinstance(item.items[0].literal, str)):
+                entries.append((item.items[0].literal, item.items[1]))
+            else:
+                return None
+        return tuple(entries)
+
+    def lookup_presence(self, collection, key):
+        """Distinguish a missing key from a present nil and an unresolved key."""
+        selected = self.map_key(key)
+        if collection.kind == 'map':
+            keys = {item_key for item_key, _ in collection.items}
+            if selected[0] != 'dynamic' and selected in keys:
+                return True
+            if not keys or selected[0] != 'dynamic' and not any(item[0] == 'dynamic' for item in keys):
+                return False
+            return None
+        entries = self.keyword_entries(collection)
+        if entries is not None and collection.finite:
+            if not entries:
+                return False
+            if selected[0] != 'dynamic':
+                return key.kind == 'atom' and any(name == key.literal for name, _ in entries)
+        return None
 
     @staticmethod
     def map_key(value):
@@ -1189,7 +1314,7 @@ class ElixirEngine:
         for after, values in self.values(expr.args[1:], state):
             args = (*prepend, *values)
             first_keyword = next((index for index, value in enumerate(args) if value.kind == 'pair'), len(args))
-            selected_args = (*args[:first_keyword], Value('list', items=args[first_keyword:])) if first_keyword < len(args) else args
+            selected_args = (*args[:first_keyword], Value('list', items=args[first_keyword:], finite=True)) if first_keyword < len(args) else args
             key = (module, function_name, len(selected_args))
             if key in self.functions:
                 results.extend(self.invoke(key, selected_args, after, expr))
@@ -1486,7 +1611,7 @@ class ElixirEngine:
 
     def enumerate_callback(self, expr, name, args, state):
         if name == 'reduce':
-            if len(args) != 3 or args[0].kind != 'list':
+            if len(args) != 3 or args[0].kind != 'list' or not args[0].finite:
                 raise ElixirSyntaxError(f'Unknown Elixir Enum.{name} collection at line {expr.token.line}; analysis is incomplete')
             collection, initial_acc, callback = args
             if callback.kind != 'callback' or callback.identity not in self.closures:
@@ -1517,7 +1642,7 @@ class ElixirEngine:
             if len(following) > 512:
                 raise AnalysisLimit('Elixir enumeration state limit exceeded; analysis is incomplete')
             pending = following
-        return self.outcomes((after, self.derive(expr, values, 'list', items=values)
+        return self.outcomes((after, replace(self.derive(expr, values, 'list', items=values), finite=collection.finite)
                               if name == 'map' else Value('atom', 'ok')) for after, values in pending)
 
     def pure_literal_value(self, node, call):
@@ -1550,7 +1675,7 @@ class ElixirEngine:
         program = Parser(tokenize(args[0].literal, self.budget), self.budget).block()
         value = self.pure_literal_value(program, expr)
         # Code.eval_string/1 returns the evaluated value and its binding list.
-        result = Value('tuple', identity=self.identity(expr), items=(value, Value('list')))
+        result = Value('tuple', identity=self.identity(expr), items=(value, Value('list', finite=True)))
         return [(state, result)]
 
     def builtin(self, expr, module, name, args, state, qualified):
@@ -1601,6 +1726,10 @@ class ElixirEngine:
         imported = dict(self.function_scope.imports) if self.function_scope is not None else self.imports.get(self.owner, {})
         if not qualified and (name in imported or '*' in imported):
             raise ElixirSyntaxError(f'Unresolved imported Elixir call {name} at line {expr.token.line}; analysis is incomplete')
+        if canonical in {'apply', 'Kernel.apply', ':erlang.apply'} and (not qualified or module not in self.attributes):
+            first_keyword = next((index for index, value in enumerate(args) if value.kind == 'pair'), len(args))
+            actual = (*args[:first_keyword], Value('list', items=args[first_keyword:], finite=True)) if first_keyword < len(args) else args
+            return self.selected_apply(expr, actual, state)
         if canonical in {'apply', 'Kernel.apply', ':erlang.apply', 'Code.eval_string', 'Code.eval_file',
                          'Code.eval_quoted', 'Module.eval_quoted'}:
             raise ElixirSyntaxError(f'Dynamic or external Elixir execution {canonical} at line '
@@ -1656,16 +1785,18 @@ class ElixirEngine:
             if name == 'fetch':
                 success = (state, Value('tuple', fact=value.fact, identity=self.identity(expr), items=(Value('atom', 'ok'), value)))
                 failure = (state.copy(), Value('atom', 'error'))
-                if positional[0].kind == 'map' and self.map_key(positional[1])[0] != 'dynamic':
-                    if self.map_key(positional[1]) in dict(positional[0].items):
-                        return [success]
-                    if not any(key[0] == 'dynamic' for key, _ in positional[0].items):
-                        return [failure]
-                if positional[0].kind == 'list' and positional[1].literal is not None:
-                    return [success] if any(item.kind == 'pair' and item.literal == positional[1].literal for item in positional[0].items) else [failure]
+                present = self.lookup_presence(positional[0], positional[1])
+                if present is not None:
+                    return [success] if present else [failure]
                 return [success, failure]
-            if value.kind == 'nil' and len(positional) > 2:
-                value = positional[2]
+            if name == 'fetch!' and self.lookup_presence(positional[0], positional[1]) is False:
+                return []
+            if name == 'get' and len(positional) > 2:
+                present = self.lookup_presence(positional[0], positional[1])
+                if present is False:
+                    value = positional[2]
+                elif present is None:
+                    return self.outcomes([(state, value), (state.copy(), positional[2])])
             return [(state, value)]
         if canonical == 'get_in' and len(positional) >= 2:
             value = positional[0]

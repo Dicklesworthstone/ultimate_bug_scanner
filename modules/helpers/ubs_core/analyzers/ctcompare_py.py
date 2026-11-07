@@ -1010,6 +1010,8 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
             return any(self.expr_is_sensitive(value) for value in node.elts)
         if isinstance(node, ast.Dict):
             return any(self.expr_is_sensitive(value) for value in [*node.keys, *node.values] if value is not None)
+        if isinstance(node, ast.Starred):
+            return self.expr_is_sensitive(node.value)
         return False
 
     def expr_has_sensitive_container(self, node):
@@ -1130,6 +1132,57 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
             self.visit(statement)
         self.join_comparison_states(body, self.comparison_state())
 
+    def bind_iteration_target(self, target, values, source=None):
+        """Assign possible elements, preserving literal unpacking positions.
+
+        Iteration overwrites its target before the body executes. A secret
+        elsewhere in a literal row does not make its public label sensitive;
+        an unresolved iterable instead retains conservative aggregate facts.
+        """
+        if source is None:
+            source = self.comparison_state()
+        if isinstance(target, (ast.Tuple, ast.List)):
+            positioned = values and all(
+                isinstance(value, (ast.Tuple, ast.List)) and len(value.elts) == len(target.elts)
+                and not any(isinstance(item, ast.Starred) for item in value.elts)
+                for value in values
+            ) and not any(isinstance(item, ast.Starred) for item in target.elts)
+            for index, child in enumerate(target.elts):
+                self.bind_iteration_target(child,
+                                           [value.elts[index] for value in values] if positioned else values,
+                                           source)
+        elif isinstance(target, ast.Starred):
+            self.bind_iteration_target(target.value, values, source)
+        elif isinstance(target, ast.Name):
+            before = self.comparison_state()
+            completed = []
+            for value in values or [ast.Constant(value=None)]:
+                self.restore_comparison_state(source)
+                if isinstance(value, ast.Name) and value.id == target.id:
+                    # Keep the captured value's same-name provenance, but do
+                    # not revive a public-hash proof lost through mutation.
+                    if target.id not in before[1]:
+                        self.unkeyed_hash_names.discard(target.id)
+                else:
+                    self.mark_assignment([target.id], value)
+                completed.append(self.comparison_state())
+            self.join_comparison_states(*completed)
+            facts = [target.id in names for names in self.comparison_state()]
+            self.restore_comparison_state(before)
+            for names, present in zip((self.sensitive_names, self.unkeyed_hash_names,
+                                       self.explained_names, self.sensitive_containers), facts):
+                (names.add if present else names.discard)(target.id)
+        else:
+            # Attribute/subscript targets can execute their own comparisons.
+            self.visit(target)
+
+    def iteration_values(self, iterable):
+        if isinstance(iterable, ast.Dict) and all(key is not None for key in iterable.keys):
+            return iterable.keys
+        if isinstance(iterable, (ast.List, ast.Tuple, ast.Set)):
+            return iterable.elts
+        return [iterable]
+
     def visit_loop(self, node, condition):
         self.visit(condition)
         before = self.comparison_state()
@@ -1139,8 +1192,9 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
             if isinstance(node, ast.While):
                 self.visit(condition)
             else:
-                # A subscript target can evaluate comparisons and calls.
-                self.visit(node.target)
+                # The iterable expression is evaluated once, before any
+                # target writes or backedges can rebind its source names.
+                self.bind_iteration_target(node.target, self.iteration_values(condition), before)
             for statement in node.body:
                 self.visit(statement)
             # This join is monotone over the finite set of local name facts:

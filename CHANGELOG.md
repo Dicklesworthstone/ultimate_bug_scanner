@@ -10,6 +10,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Preserve secret provenance when Python `for` and `async for` loops bind
+  iteration targets. Track literal tuple positions and starred iterable values,
+  capture unpacking inputs before target writes, and keep public dictionary keys
+  separate from secret values. Preserve public roles for same-name values without
+  restoring hash proofs lost through mutation; retain the empty-iteration path
+  after the loop and add regression controls.
+
 - Preserve SQL execution reached through stable local helpers inside Python
   `any()` and `all()` generator predicates. Transfer actual query arguments
   into the helper body, retain the real execution location, and preserve

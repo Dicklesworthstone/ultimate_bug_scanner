@@ -1095,6 +1095,80 @@ class PythonSecretComparisonFlowTests(unittest.TestCase):
                     value = password
         ''')
 
+    def test_iteration_targets_keep_secret_element_provenance(self):
+        self.assert_sites('''
+            def verify(password, supplied):
+                values = [password]
+                for value in values:
+                    accepted = value == supplied  # expect-secret
+                for label, value in [("public", password)]:
+                    public = label == supplied
+                    accepted = value != supplied  # expect-secret
+                return accepted
+            async def verify_async(password, supplied):
+                values = [password]
+                async for value in values:
+                    accepted = value == supplied  # expect-secret
+        ''')
+
+    def test_iteration_unpacking_reads_all_elements_before_assigning_targets(self):
+        self.assert_sites('''
+            def verify(password, supplied):
+                first = password
+                second = "public"
+                for first, second in [(second, first)]:
+                    public = first == supplied
+                    accepted = second == supplied  # expect-secret
+                values = [password]
+                for value in [*values]:
+                    accepted = value == supplied  # expect-secret
+        ''')
+
+    def test_iteration_overwrites_before_the_body_but_preserves_empty_path(self):
+        self.assert_sites('''
+            def verify(password, supplied):
+                value = password
+                for value in ["public"]:
+                    accepted = value == supplied
+                for label in {"public": password}:
+                    accepted = label == supplied
+                value = password
+                for value in []:
+                    accepted = value == supplied
+                return value == supplied  # expect-secret
+        ''')
+
+    def test_iteration_same_binding_preserves_public_roles_and_mutations(self):
+        self.assert_sites('''
+            import hashlib
+            def public_checksum(payload, supplied):
+                h = hashlib.sha256(payload)
+                for h in (h,):
+                    accepted = h.hexdigest() == supplied
+                return accepted
+            def public_signature(self, node, supplied):
+                sig = self._call_signature(node)
+                for sig in (sig,):
+                    accepted = sig == supplied
+                return accepted
+            def repeated_signature(self, node, password, supplied):
+                sig = self._call_signature(node)
+                for sig, sig in [(password, sig)]:
+                    accepted = sig == supplied
+                return accepted
+            def hash_backedge(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                for h in (h, h):
+                    accepted = h.hexdigest() == supplied  # expect-secret
+                    h.update(password)
+                return accepted
+            def mutation_in_target(payload, password, supplied, slots):
+                h = hashlib.sha256(payload)
+                for slots[h.update(password)], h in [(0, h)]:
+                    accepted = h.hexdigest() == supplied  # expect-secret
+                return accepted
+        ''')
+
     def test_exception_handler_joins_intermediate_and_nested_statement_states(self):
         self.assert_sites('''
             def verify(state: State, password, supplied, flag):

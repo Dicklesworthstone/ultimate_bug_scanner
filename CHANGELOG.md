@@ -10,6 +10,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Preserve SQL execution reached through stable local helpers inside Python
+  `any()` and `all()` generator predicates. Transfer actual query arguments
+  into the helper body, retain the real execution location, and preserve
+  short-circuit, empty-iterator and parameterized-query behavior. Keep
+  unsupported callback effects incomplete and retain findings discovered
+  before those effects; add independent SQLite injection and safe controls.
+
 - Resolve C# header sanitizer receivers through declared fields and inherited
   members. Application values named `WebUtility`, `Uri` or `UrlEncoder` no
   longer impersonate framework encoders and hide request-controlled header

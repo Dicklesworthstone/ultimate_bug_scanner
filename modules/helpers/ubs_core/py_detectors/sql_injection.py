@@ -4501,14 +4501,28 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             raise SQLFlowLimit('SQL generator projection completion is unresolved; analysis is incomplete') from exc
         return facts, probe
 
-    @staticmethod
-    def generator_has_writes_or_sinks(identity):
+    def generator_has_writes_or_sinks(self, identity):
         deferred = [identity.elt]
         deferred.extend(condition for generator in identity.generators for condition in generator.ifs)
         deferred.extend(generator.iter for generator in identity.generators[1:])
-        return any(isinstance(child, ast.NamedExpr) or
-                   isinstance(child, ast.Call) and call_name(child.func).rsplit('.', 1)[-1] in EXECUTE_METHODS | {'extra'}
-                   for expression in deferred for child in ast.walk(expression))
+        bindings = self.ownership_bindings()
+        for expression in deferred:
+            for child in ast.walk(expression):
+                if isinstance(child, ast.NamedExpr):
+                    return True
+                if not isinstance(child, ast.Call):
+                    continue
+                if (call_name(child.func).rsplit('.', 1)[-1] in EXECUTE_METHODS | {'extra'}
+                        or sql_sink_name(child, bindings)):
+                    return True
+                target = bindings.resolve(child.func)
+                if (target and target[0] == 'function'
+                        and target[1] in bindings.local_sql_effects()):
+                    # A scalar helper can forward a dynamically built query
+                    # under any spelling. A private read-only projection must
+                    # not discard the sink reached with its actual inputs.
+                    return True
+        return False
 
     def visit_Assert(self, node):
         optimized = self.sql_state()
@@ -5563,15 +5577,19 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             if borrowed:
                 self._iterated_lists = self._iterated_lists | {
                     (self._generator_scope[-1], name) for name in borrowed}
-            if list_plan is None and isinstance(node.func, ast.Name) and self.string_result(node):
+            if list_plan is None and isinstance(node.func, ast.Name):
                 target = self.ownership_call_target(node)
                 if (target and target[0] == 'function' and target[1] not in self._sealed_closures
                         and self._generator_scope
                         and self.ownership_bindings().owner_scopes[target[1]]['parent']['node']
-                            is self._generator_scope[-1]):
+                            is self._generator_scope[-1]
+                        and (self.string_result(node) or self._short_circuiting
+                             and target[1] in self.ownership_bindings().local_sql_effects())):
                     # A return-shape proof alone is not a text-provenance
-                    # proof. Interpret a stable local string helper with its
-                    # actual inputs, even if it borrows no enclosing list.
+                    # proof. Interpret a stable local string or SQL helper
+                    # with its actual inputs, even with no enclosing list.
+                    # SQL effects inside a predicate need the same guarded
+                    # closure transfer as explicit calls to cursor.execute.
                     self.sealed_list_captures(target[1], allow_empty=True)
             handled = (list_plan is not None and self.local_list_effect_call(node, list_plan)
                        or self.sealed_closure_call(node) or self.generator_call(node) or joined is not None)

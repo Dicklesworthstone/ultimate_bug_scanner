@@ -692,6 +692,76 @@ class SQLValueCaptureTests(unittest.TestCase):
                 compile(source, '<boolean-' + name + '>', 'exec')
                 self.inspect('boolean-' + name, source, expected)
 
+    def test_boolean_generator_local_sql_helpers(self):
+        unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
+        safe = '"SELECT count(*) FROM users WHERE name = \'alice\'"'
+        helper = '    def send(statement):\n        return cursor.execute(statement)\n'
+        for consumer in ('any', 'all'):
+            for value_label, value in (('unsafe', unsafe), ('literal', safe)):
+                for shape, expression in (
+                        ('positional', f'send({value}) is None for _ in (1, 2)'),
+                        ('keyword', f'send(statement={value}) is None for _ in (1, 2)'),
+                        ('filter', f'True for _ in (1, 2) if send({value}) is None')):
+                    name = f'boolean-helper-{consumer}-{shape}-{value_label}'
+                    source = program(helper + f'    return {consumer}({expression})\n')
+                    with self.subTest(case=name):
+                        self.inspect(name, source, ((CRITICAL, 3),) if value_label == 'unsafe' else ())
+            parameterized = program(
+                '    def send(statement, params):\n        return cursor.execute(statement, params)\n'
+                f'    return {consumer}(send("SELECT name FROM users WHERE name = ?", (user,))'
+                ' is None for _ in (1, 2))\n')
+            self.inspect('boolean-helper-bound-data-' + consumer, parameterized, ())
+            for shape, expression in (
+                    ('empty', f'send({unsafe}) is None for _ in ()'),
+                    ('filtered', f'send({unsafe}) is None for _ in (1, 2) if False'),
+                    ('short-circuited', ('True or ' if consumer == 'any' else 'False and ')
+                     + f'send({unsafe}) is None for _ in (1, 2)')):
+                source = program(helper + f'    return {consumer}({expression})\n')
+                with self.subTest(consumer=consumer, unreachable=shape):
+                    self.inspect(f'boolean-helper-{consumer}-{shape}', source, ())
+
+    def test_boolean_generator_local_sql_helper_boundaries(self):
+        unsafe = 'f"SELECT {user}"'
+        for label, helper in (
+                ('variadic', '    def send(*statements):\n        return cursor.execute(*statements)\n'),
+                ('decorated', '    @decorate\n    def send(statement):\n'
+                 '        return cursor.execute(statement)\n'),
+                ('escaping', '    def send(statement):\n        return cursor.execute(statement)\n'
+                 '    expose(send)\n')):
+            source = program(helper + f'    return all(send({unsafe}) is None for _ in (1, 2))\n')
+            path = self.artifacts / ('boolean-helper-boundary-' + label + '.py')
+            path.write_text(source, encoding='utf-8')
+            with self.subTest(boundary=label):
+                with self.assertRaisesRegex(detector.SQLFlowLimit, 'incomplete'):
+                    list(detector.find([path]))
+        source = program('    def send(statement):\n'
+                         '        result = cursor.execute(statement)\n'
+                         '        callback()\n        return result\n'
+                         f'    return all(send({unsafe}) is None for _ in (1, 2))\n')
+        path = self.artifacts / 'boolean-helper-known-before-incomplete.py'
+        path.write_text(source, encoding='utf-8')
+        found = []
+        with self.assertRaisesRegex(detector.SQLFlowLimit, 'generator call effects.*incomplete'):
+            for finding in detector.find([path]):
+                found.append((finding[0], finding[2]))
+        self.assertEqual(found, [(CRITICAL, 3)])
+
+    def test_real_sqlite_boolean_generator_local_helpers(self):
+        unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
+        for consumer, comparison in (('all', 'is None'), ('any', 'is not None')):
+            for label, statement, params, rows in (
+                    ('unsafe', unsafe, '()', 2),
+                    ('bound-data', '"SELECT count(*) FROM users WHERE name = ?"', '(user,)', 0)):
+                source = program('    def send(statement, params):\n'
+                                 '        return cursor.execute(statement, params)\n'
+                                 f'    {consumer}(send({statement}, {params}) {comparison}'
+                                 ' for _ in (1, 2))\n'
+                                 '    return cursor.fetchone()[0]\n')
+                name = f'boolean-helper-witness-{consumer}-{label}'
+                with self.subTest(consumer=consumer, value=label):
+                    self.assertEqual(sqlite_witness(self.artifacts, name, source)['rows'], rows)
+                    self.inspect(name, source, ((CRITICAL, 3),) if label == 'unsafe' else ())
+
     def test_boolean_generator_boundaries_remain_incomplete(self):
         for name, source in boolean_generator_refusals():
             with self.subTest(case=name):

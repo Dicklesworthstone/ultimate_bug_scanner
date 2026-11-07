@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tracemalloc
 import unittest
 import uuid
 from pathlib import Path
@@ -21,7 +22,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "modules/helpers"))
-from ubs_core.external_tools import RubyFindings, ToolOutput, run_command, scan_ruby_tools
+from ubs_core.external_tools import RubyFindings, ToolOutput, ToolStreamOutput, run_command, scan_ruby_tools
 
 
 def rubocop_doc(path: str = "sample.rb") -> dict:
@@ -47,9 +48,8 @@ def reek_doc(path: str = "sample.rb") -> list:
 
 class RubyToolTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory(prefix="ubs-ruby-tools-")
-        self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
+        self.root = ROOT / "test-suite/artifacts/ruby-tools" / (self._testMethodName + "-" + uuid.uuid4().hex[:12])
+        self.root.mkdir(parents=True)
         self.source = self.root / "sample.rb"
         self.source.write_text('value = 1\nputs value\n', encoding="utf-8")
         (self.root / "config").mkdir()
@@ -60,7 +60,9 @@ class RubyToolTests(unittest.TestCase):
     def scan(self, tool: str, stdout: str, rc: int = 0) -> tuple[list, list, list]:
         errors = []
         with patch("ubs_core.external_tools.shutil.which", return_value="/tool"), \
-             patch("ubs_core.external_tools.run_command", return_value=ToolOutput(rc, stdout, "tool diagnostic")):
+             patch("ubs_core.external_tools.run_command", return_value=ToolOutput(rc, stdout, "tool diagnostic")), \
+             patch("ubs_core.external_tools.run_command_stream", return_value=contextlib.nullcontext(
+                 ToolStreamOutput(rc, io.BytesIO(stdout.encode()), "tool diagnostic"))):
             outcomes = scan_ruby_tools([self.source], self.sink, str(self.root), tool, 1, errors)
         return [json.loads(line) for line in self.sink.getvalue().splitlines()], errors, outcomes
 
@@ -120,15 +122,19 @@ class RubyToolTests(unittest.TestCase):
     def test_absent_and_inapplicable_tools_are_skipped(self) -> None:
         errors = []
         with patch("ubs_core.external_tools.shutil.which", return_value=None), \
-             patch("ubs_core.external_tools.run_command") as launch:
+             patch("ubs_core.external_tools.run_command") as launch, \
+             patch("ubs_core.external_tools.run_command_stream") as stream:
             outcomes = scan_ruby_tools([self.source], self.sink, str(self.root),
                                       "rubocop,brakeman,bundler-audit,reek,fasterer", 1, errors)
             launch.assert_not_called()
+            stream.assert_not_called()
         self.assertFalse(errors)
         self.assertTrue(all(out["status"] == "skipped" for out in outcomes))
-        with patch("ubs_core.external_tools.run_command") as launch:
+        with patch("ubs_core.external_tools.run_command") as launch, \
+             patch("ubs_core.external_tools.run_command_stream") as stream:
             scan_ruby_tools([], self.sink, str(self.root), "rubocop", 1, errors)
             launch.assert_not_called()
+            stream.assert_not_called()
 
     def test_selected_file_scope_and_suppression(self) -> None:
         self.assertEqual(self.scan("rubocop", json.dumps(rubocop_doc("unselected.rb")), 1)[:2], ([], []))
@@ -156,7 +162,8 @@ class RubyToolTests(unittest.TestCase):
         odd.write_text("value = 1\n")
         errors = []
         with patch("ubs_core.external_tools.shutil.which", return_value="/rubocop"), \
-             patch("ubs_core.external_tools.run_command", return_value=ToolOutput(0, '{"files":[]}', "")) as launch:
+             patch("ubs_core.external_tools.run_command_stream", return_value=contextlib.nullcontext(
+                 ToolStreamOutput(0, io.BytesIO(b'{"files":[]}'), ""))) as launch:
             scan_ruby_tools([self.source, odd], self.sink, str(self.root), "rubocop,rubocop", 1, errors)
             self.assertEqual(launch.call_count, 1)
             self.assertEqual(launch.call_args.args[1][-2:], [str(self.source), str(odd)])
@@ -178,9 +185,10 @@ class RubyToolTests(unittest.TestCase):
     def test_bundle_exec_runs_in_target_not_caller(self) -> None:
         (self.root / "Gemfile").write_text("# bundle fixture\n")
         errors = []
-        results = [ToolOutput(0, '{"rubocop":true}', ""), ToolOutput(0, '{"files":[]}', "")]
         with patch("ubs_core.external_tools.shutil.which", return_value="/bundle"), \
-             patch("ubs_core.external_tools.run_command", side_effect=results) as launch:
+             patch("ubs_core.external_tools.run_command", return_value=ToolOutput(0, '{"rubocop":true}', "")), \
+             patch("ubs_core.external_tools.run_command_stream", return_value=contextlib.nullcontext(
+                 ToolStreamOutput(0, io.BytesIO(b'{"files":[]}'), ""))) as launch:
             scan_ruby_tools([self.source], self.sink, str(self.root), "rubocop", 1, errors)
             self.assertEqual(launch.call_args.args[1][:3], ["/bundle", "exec", "rubocop"])
             self.assertEqual(launch.call_args.args[2], self.root)
@@ -200,6 +208,184 @@ class RubyToolTests(unittest.TestCase):
             errors = []
             self.assertIsNone(run_command("test", ["anything"], self.root, timeout, errors))
             self.assertTrue(errors)
+
+
+class RubyStreamingTests(unittest.TestCase):
+    """Real tool capture must retain large reports and valid diagnostic prefixes."""
+
+    def setUp(self) -> None:
+        self.root = ROOT / "test-suite/artifacts/ruby-streaming" / (self._testMethodName + "-" + uuid.uuid4().hex[:12])
+        self.root.mkdir(parents=True)
+        self.source = self.root / "sample.rb"
+        self.source.write_text("value = 1\nputs value\n", encoding="utf-8")
+        (self.root / "config").mkdir()
+        (self.root / "config/application.rb").write_text("# Rails application fixture\n")
+        (self.root / "Gemfile.lock").write_text("GEM\n  specs:\n    example (1.0)\n")
+
+    def scan(self, tool, body, sink=None):
+        executable = self.root / (tool + "-" + uuid.uuid4().hex[:8])
+        executable.write_text(f"#!{sys.executable}\nimport json, sys\n" + body, encoding="utf-8")
+        executable.chmod(0o755)
+        errors = []
+        sink = io.StringIO() if sink is None else sink
+        # Captured reports remain in the caller's scratch storage. Only small
+        # source fixtures and the emitter live under test-suite/artifacts.
+        with patch("ubs_core.external_tools.shutil.which", return_value=str(executable)), \
+                patch.dict(os.environ, UBS_KEEP_TEMP="1"):
+            outcomes = scan_ruby_tools([self.source], sink, str(self.root), tool, 30, errors)
+        return sink, errors, outcomes
+
+    @staticmethod
+    def reports():
+        return (
+            ("rubocop", b'{"files":[{"path":"sample.rb","offenses":[',
+             rubocop_doc()["files"][0]["offenses"][0], b"]}]}", 1),
+            ("brakeman", b'{"warnings":[', brakeman_doc()["warnings"][0], b'],"errors":[]}', 3),
+            ("bundler-audit", b'{"results":[', audit_doc()["results"][0], b"]}", 1),
+            ("reek", b"[", reek_doc()[0], b"]", 2),
+        )
+
+    def parse(self, tool, payload, *, source=None, files=None):
+        sink, errors = io.StringIO(), []
+        count = RubyFindings(files or [self.source], self.root, sink).json_report(
+            tool, source if source is not None else io.BytesIO(payload), errors)
+        # NDJSON has LF separators; Unicode separators inside filenames stay
+        # within their JSON record.
+        return [json.loads(line) for line in io.StringIO(sink.getvalue())], errors, count
+
+    def test_reordered_rubocop_fields_preserve_file_scope_across_fragmented_reads(self):
+        class FragmentedReader(io.BytesIO):
+            def read(self, size=-1):
+                if not 0 < size <= 64 * 1024:
+                    raise AssertionError("report reads must use bounded chunks")
+                return super().read(min(size, chunk))
+
+        other = self.root / 'unicode-µ-\u2028-".rb'
+        other.write_text("value = 1\nputs value\n", encoding="utf-8")
+        self.source.write_text("value = 1\nputs value # ubs:ignore[rb.rubocop.Lint-Syntax]\n")
+        offense = dict(rubocop_doc()["files"][0]["offenses"][0], message='Quotes " and \\ escapes, {brackets} µ')
+        files = [{"offenses": [offense], "path": "unselected.rb"},
+                 {"offenses": [offense], "path": "sample.rb"},
+                 {"offenses": [offense], "extra": [None, {"nested": [True, "]}"]}], "path": other.name},
+                 {"path": other.name, "offenses": [dict(offense, location={"start_line": 3, "start_column": 2})]}]
+        payload = json.dumps({"metadata": {"nested": [1, False, None]}, "files": files}, ensure_ascii=False).encode()
+        for chunk in (1, 2, 7, 64 * 1024):
+            with self.subTest(chunk=chunk):
+                records, errors, count = self.parse("rubocop", b"", source=FragmentedReader(payload),
+                                                   files=[self.source, other])
+                self.assertEqual(errors, [])
+                self.assertEqual(count, 4)  # suppressed/excluded diagnostics still prove the tool's finding exit
+                self.assertEqual([(row["path"], row["line"], row["col"]) for row in records],
+                                 [(str(other), 2, 1), (str(other), 3, 2)])
+                self.assertTrue(all(row["message"] == offense["message"] for row in records))
+
+    def test_malformed_siblings_and_required_arrays_preserve_independent_diagnostics(self):
+        documents = (
+            ("rubocop", {"files": [None, {"path": "sample.rb"}, {"path": "sample.rb", "offenses": None},
+                                    {"path": None, "offenses": []}, rubocop_doc()["files"][0]]}),
+            ("brakeman", {"errors": None, "warnings": brakeman_doc()["warnings"]}),
+            ("brakeman", {"warnings": brakeman_doc()["warnings"]}),
+            ("bundler-audit", {"results": [None, audit_doc()["results"][0]]}),
+            ("reek", [None, reek_doc()[0]]),
+        )
+        for tool, doc in documents:
+            with self.subTest(tool=tool, doc=doc):
+                records, errors, _count = self.parse(tool, json.dumps(doc).encode())
+                self.assertEqual(len(records), 1, errors)
+                self.assertTrue(errors)
+
+    def test_record_depth_and_metadata_errors_cannot_erase_a_valid_prefix(self):
+        from ubs_core import external_tools
+        for tool, prefix, row, suffix, _exit_code in self.reports():
+            for bad, message in ((json.dumps({"message": "x" * 2048}).encode(), "exceeds"),
+                                 (b"[" * 130 + b"0" + b"]" * 130, "nesting"),
+                                 (b'{"value":NaN}', "non-JSON")):
+                with self.subTest(tool=tool, message=message), patch.object(external_tools, "OUTPUT_RECORD_LIMIT", 512):
+                    records, errors, _count = self.parse(tool, prefix + json.dumps(row).encode() + b"," + bad + suffix)
+                    self.assertEqual(len(records), 1)
+                    self.assertIn(message, "; ".join(errors))
+        row = json.dumps(brakeman_doc()["warnings"][0]).encode()
+        for metadata in (b'{"x":NaN}', b'{"x":"\xff"}', b"[" * 130 + b"0" + b"]" * 130):
+            records, errors, _count = self.parse("brakeman", b'{"warnings":[' + row + b'],"errors":[],"scan_info":' + metadata + b"}")
+            self.assertEqual(len(records), 1)
+            self.assertTrue(errors)
+
+    def test_unused_metadata_containers_do_not_inherit_a_document_size_limit(self):
+        from ubs_core import external_tools
+        metadata = [{"text": "x" * 64, "index": n} for n in range(1000)]
+        payload = json.dumps(dict(brakeman_doc(), scan_info=metadata)).encode()
+        with patch.object(external_tools, "OUTPUT_RECORD_LIMIT", 512):
+            records, errors, _count = self.parse("brakeman", payload)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(errors, [])
+
+    def test_many_embedded_and_schema_errors_have_bounded_detail(self):
+        for tool, doc in (("brakeman", dict(brakeman_doc(), errors=[{"error": "could not parse model"}] * 1000)),
+                          ("rubocop", {"files": [{"path": "sample.rb", "offenses": [None] * 1000
+                                                  + rubocop_doc()["files"][0]["offenses"]}]})):
+            with self.subTest(tool=tool):
+                records, errors, _count = self.parse(tool, json.dumps(doc).encode())
+                self.assertEqual(len(records), 1)
+                self.assertEqual(len(errors), 5)
+                self.assertIn("996 additional report error(s)", errors[-1])
+
+    def test_duplicate_evidence_fields_are_partial_without_duplicate_findings(self):
+        row = json.dumps(rubocop_doc()["files"][0]).encode()
+        for payload in (b'{"files":[' + row + b'],"files":[' + row + b"]}",
+                        b'{"files":[{"path":"sample.rb","offenses":['
+                        + json.dumps(rubocop_doc()["files"][0]["offenses"][0]).encode()
+                        + b'],"path":"unselected.rb"}]}'):
+            records, errors, _count = self.parse("rubocop", payload)
+            self.assertEqual(len(records), 1)
+            self.assertTrue(any("duplicate" in error for error in errors))
+
+    def test_corrupt_tail_keeps_complete_diagnostics_and_partial_status(self):
+        for tool, prefix, row, suffix, exit_code in self.reports():
+            for tail in (b",", b",\xff", suffix + b"{}"):
+                with self.subTest(tool=tool, tail=tail):
+                    payload = prefix + json.dumps(row).encode() + tail
+                    sink, errors, outcomes = self.scan(tool, f"sys.stdout.buffer.write({payload!r})\nsys.exit({exit_code})\n")
+                    records = [json.loads(line) for line in sink.getvalue().splitlines()]
+                    self.assertEqual(len(records), 1, (errors, outcomes))
+                    self.assertTrue(errors)
+                    self.assertEqual(outcomes, [{"tool": tool, "status": "partial"}])
+
+    def test_reports_above_document_limit_keep_all_records_with_bounded_memory(self):
+        class CountingSink:
+            count = 0
+            last = None
+
+            def write(self, line):
+                self.last = json.loads(line)
+                self.count += 1
+
+        count = 8500
+        reports = (*self.reports(), (
+            "rubocop", b'{"files":[{"offenses":[',
+            rubocop_doc()["files"][0]["offenses"][0], b'],"path":"sample.rb"}]}', 1,
+        ))
+        for tool, prefix, row, suffix, exit_code in reports:
+            with self.subTest(tool=tool, prefix=prefix):
+                row = dict(row, message="diagnostic " + "x" * 2048)
+                self.assertGreater(len(json.dumps(row).encode()) * count, 16 * 1024 * 1024)
+                body = (f"row = {row!r}\n"
+                        f"sys.stdout.buffer.write({prefix!r})\n"
+                        f"for index in range({count}):\n"
+                        "    if index: sys.stdout.buffer.write(b',')\n"
+                        "    sys.stdout.buffer.write(json.dumps(row).encode())\n"
+                        f"sys.stdout.buffer.write({suffix!r})\n"
+                        f"sys.exit({exit_code})\n")
+                tracemalloc.start()
+                try:
+                    sink, errors, outcomes = self.scan(tool, body, CountingSink())
+                    _current, peak = tracemalloc.get_traced_memory()
+                finally:
+                    tracemalloc.stop()
+                self.assertEqual(sink.count, count, (errors, outcomes))
+                self.assertEqual(errors, [])
+                self.assertEqual(outcomes, [{"tool": tool, "status": "ok"}])
+                self.assertEqual(sink.last["extras"]["tool"], tool)
+                self.assertLess(peak, 4 * 1024 * 1024, f"report ingestion peaked at {peak} bytes")
 
 
 class RubyDriverFailures(unittest.TestCase):
@@ -313,9 +499,8 @@ class RubyDriverFailures(unittest.TestCase):
 
 class RubyIntegration(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory(prefix="ubs-ruby-integration-")
-        self.addCleanup(self.tmp.cleanup)
-        self.base = Path(self.tmp.name)
+        self.base = ROOT / "test-suite/artifacts/ruby-integration" / (self._testMethodName + "-" + uuid.uuid4().hex[:12])
+        self.base.mkdir(parents=True)
         self.project = self.base / "project with spaces"
         self.project.mkdir()
         self.source = self.project / "sample.rb"

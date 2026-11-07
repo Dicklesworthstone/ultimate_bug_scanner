@@ -593,6 +593,101 @@ class RubyFindings:
             record["extras"]["scope"] = "project"
         self.sink.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+    def _rubocop_records(self, reader, errors):
+        """Yield offenses with their file identity, regardless of key order.
+
+        Captured stdout is seekable. If offenses precede the path, validate
+        their framing now and replay that array once its path is known. Two
+        reader checkpoints retain at most two input chunks, never the file's
+        entire offense list or a second disk copy of the report.
+        """
+        if reader.token() != b"{":
+            reader.skip_value()
+            errors.append("rubocop: malformed file record")
+            return
+        seen, path, deferred = set(), None, None
+        for key in reader.members():
+            if key not in {"path", "offenses"}:
+                reader.skip_value()
+                continue
+            if key in seen:
+                raise reader.error(f"duplicate RuboCop file field {key!r}")
+            seen.add(key)
+            if key == "path":
+                value = reader.value()
+                try:
+                    path = _text(value)
+                except (TypeError, ValueError):
+                    errors.append("rubocop: malformed file path")
+                if deferred is not None and path is not None:
+                    resume = reader.checkpoint()
+                    try:
+                        reader.restore(deferred)
+                        for _ in reader.elements():
+                            yield path, reader.value()
+                    finally:
+                        reader.restore(resume)
+                    deferred = None
+            elif reader.token() != b"[":
+                reader.skip_value()
+                errors.append("rubocop: malformed offense array")
+            elif path is not None:
+                for _ in reader.elements():
+                    yield path, reader.value()
+            else:
+                if "path" not in seen:
+                    deferred = reader.checkpoint()
+                reader.skip_value()
+        if seen != {"path", "offenses"}:
+            errors.append("rubocop: malformed file record")
+
+    def json_report(self, tool: str, output: BinaryIO, errors: list[str]) -> int:
+        """Validate one report, retaining every complete diagnostic prefix.
+
+        These adapters reuse the same record validators as complete reports.
+        Only a diagnostic is decoded at once; large report/file containers
+        and unused metadata are traversed without materializing them.
+        """
+        reader = _JSONReportReader(output)
+        problems = _ReportErrors(errors, tool)
+        count = 0
+        required = {"rubocop": {"files"}, "brakeman": {"warnings", "errors"},
+                    "bundler-audit": {"results"}, "reek": set()}[tool]
+        seen = set()
+        try:
+            if tool == "reek":
+                for _ in reader.elements():
+                    count += self.reek([reader.value()], problems)
+            else:
+                for field in reader.members():
+                    if field not in required:
+                        reader.skip_value()
+                        continue
+                    if field in seen:
+                        raise reader.error(f"duplicate report field {field!r}")
+                    seen.add(field)
+                    if reader.token() != b"[":
+                        reader.skip_value()
+                        problems.append(f"{tool}: expected {field!r} array")
+                        continue
+                    for _ in reader.elements():
+                        if tool == "rubocop":
+                            for path, row in self._rubocop_records(reader, problems):
+                                count += self.rubocop({"files": [{"path": path, "offenses": [row]}]}, problems)
+                        elif tool == "brakeman":
+                            row = reader.value()
+                            count += self.brakeman({"warnings": [row] if field == "warnings" else [],
+                                                   "errors": [row] if field == "errors" else []}, problems)
+                        else:
+                            count += self.audit({"results": [reader.value()]}, problems)
+                for missing in sorted(required - seen):
+                    problems.append(f"{tool}: missing {missing!r} array")
+            if reader.token():
+                raise reader.error("unexpected data after JSON report")
+        except (OSError, UnicodeError, ValueError, RecursionError) as exc:
+            problems.append(f"{tool}: invalid or incomplete report: {exc}")
+        return count
+
     def rubocop(self, doc: object, errors: list[str]) -> int:
         count = 0
         for file in _array(doc, "files"):
@@ -772,30 +867,41 @@ def scan_ruby_tools(files: Sequence[Path], sink: TextIO, project_dir: str,
         if tool == "rubocop":
             batches = [["--format", "json", "--no-parallel", "--force-exclusion", "--", *sources[i:i+50]]
                        for i in range(0, len(sources), 50)]
-            parser, accepted, finding_exit = findings.rubocop, (0, 1), 1
+            accepted, finding_exit = (0, 1), 1
         elif tool == "brakeman":
             batches = [["--quiet", "--format", "json", "--exit-on-warn", "--exit-on-error", "--path", str(root)]]
-            parser, accepted, finding_exit = findings.brakeman, (0, 3), 3
+            accepted, finding_exit = (0, 3), 3
         elif tool == "bundler-audit":
             batches = [["check", "--update", "--quiet", "--format", "json"]]
-            parser, accepted, finding_exit = findings.audit, (0, 1), 1
+            accepted, finding_exit = (0, 1), 1
         elif tool == "reek":
             batches = [["--format", "json", *sources[i:i+50]] for i in range(0, len(sources), 50)]
-            parser, accepted, finding_exit = findings.reek, (0, 2), 2
+            accepted, finding_exit = (0, 2), 2
         else:
             # Fasterer consumes only ARGV[0]; passing the complete list would
             # silently inspect just its first file.
             batches = [[source] for source in sources]
-            parser, accepted, finding_exit = findings.fasterer, (0, 1), 1
+            accepted, finding_exit = (0, 1), 1
         for args in batches:
+            if tool != "fasterer":
+                with run_command_stream(tool, [*command, *args], root, timeout, errors, env=env) as result:
+                    if result is None:
+                        continue
+                    if result.returncode not in accepted:
+                        errors.append(f"{tool}: exited {result.returncode}: {result.stderr.strip()[:160]}")
+                    count = findings.json_report(tool, result.stdout, errors)
+                    if result.returncode == finding_exit and not count:
+                        errors.append(f"{tool}: finding exit without diagnostics")
+                continue
+            # Fasterer has a text-only report for one selected file. Its
+            # completion footer still uses the bounded document contract.
             result = run_command(tool, [*command, *args], root, timeout, errors, env=env)
             if result is None:
                 continue
             if result.returncode not in accepted:
                 errors.append(f"{tool}: exited {result.returncode}: {result.stderr.strip()[:160]}")
             try:
-                doc = result.stdout if tool == "fasterer" else json.loads(result.stdout)
-                count = parser(doc, errors)
+                count = findings.fasterer(result.stdout, errors)
                 if result.returncode == finding_exit and not count:
                     errors.append(f"{tool}: finding exit without diagnostics")
             except (ValueError, TypeError, KeyError, OSError, RuntimeError) as exc:
@@ -862,6 +968,29 @@ class _JSONReportReader:
 
     def error(self, message: str) -> ValueError:
         return ValueError(f"{message} at byte {self.offset + self.position}")
+
+    def checkpoint(self):
+        """Save a bounded reader position in an already captured report."""
+        return self.source.tell(), self.buffer, self.position, self.offset, self.eof
+
+    def restore(self, checkpoint) -> None:
+        position, buffer, cursor, offset, eof = checkpoint
+        self.source.seek(position)
+        self.buffer, self.position, self.offset, self.eof = buffer, cursor, offset, eof
+
+    def skip_value(self, depth: int = 0) -> None:
+        """Validate unused JSON without retaining arbitrarily large containers."""
+        if depth > self._DEPTH:
+            raise self.error(f"JSON value nesting exceeds {self._DEPTH}")
+        token = self.token()
+        if token == b"{":
+            for _ in self.members():
+                self.skip_value(depth + 1)
+        elif token == b"[":
+            for _ in self.elements():
+                self.skip_value(depth + 1)
+        else:
+            self.value()
 
     def expect(self, token: bytes) -> None:
         if self.token() != token:

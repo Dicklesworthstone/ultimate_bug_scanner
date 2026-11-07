@@ -10,6 +10,18 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Analyze C# response-header values with scoped request/response identities,
+  aliases, branch-sensitive value flow and local helper/ref/out summaries.
+  Require both CR and LF safety on the actual value; model CLR replacements,
+  terminating guards and URL encoding without trusting helper names or fake
+  framework types. Follow bound action parameters, typed headers and compound
+  writes, detect controls reintroduced by interpolation, and report unsupported
+  request-derived heap effects as incomplete while preserving known findings.
+  Parse named binding-attribute arguments separately from parameter defaults;
+  keep unrelated files out of request-flow parsing and classify unsupported
+  source syntax as incomplete analysis. Cover source selection, suppression,
+  JSON/SARIF/text and repeated cached scans.
+
 - Analyze C# outbound destinations with scoped request/client identities and
   local helper summaries. Follow aliases, inherited HTTP clients, framework
   request accessors and bound action parameters; distinguish request bodies

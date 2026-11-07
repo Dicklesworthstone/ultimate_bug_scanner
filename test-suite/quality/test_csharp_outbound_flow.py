@@ -317,6 +317,57 @@ class OutboundFlowTests(unittest.TestCase):
                 self.assertEqual([row[1] for row in rows],
                                  [line for line, text in enumerate(source.splitlines(), 1) if '// unsafe' in text])
 
+    def test_named_attribute_arguments_preserve_parameters_and_real_defaults(self):
+        marker = 'class MarkerAttribute : Attribute { public string Name { get; set; } }\n'
+        for attribute in ('FromQuery', 'FromHeader', 'FromRoute', 'FromForm'):
+            for kind in ('bound', 'overwritten', 'shadowed'):
+                helper = (f'class {attribute}Attribute : Attribute {{ public string Name {{ get; set; }} }}\n'
+                          if kind == 'shadowed' else '')
+                body = ('destination = "https://api.example.com/";\n' if kind == 'overwritten' else '')
+                body += 'transport.GetAsync(destination); // destination\n'
+                source = ('using Microsoft.AspNetCore.Mvc;\n' + program(body, helper,
+                          'HttpClient transport, [' + attribute + '(Name = "dest")] string destination'))
+                path = self.root / f'attribute-name-{attribute}-{kind}.cs'
+                path.write_text(source)
+                with self.subTest(attribute=attribute, kind=kind):
+                    rows = list(outbound_url.find([path], self.root))
+                    expected = [line for line, text in enumerate(source.splitlines(), 1)
+                                if '// destination' in text] if kind == 'bound' else []
+                    self.assertEqual([row[1] for row in rows], expected, rows)
+        for name, annotation, default in (
+                ('combined', 'Marker(Name = "metadata"), FromRoute(Name = "q")', ''),
+                ('optional', 'FromQuery(Name = "dest")', ' = "https://api.example.com/"')):
+            source = ('using Microsoft.AspNetCore.Mvc;\n' + program(
+                'transport.GetAsync(destination); // destination\n', marker,
+                'HttpClient transport, [' + annotation + '] string destination' + default))
+            path = self.root / ('attribute-name-' + name + '.cs')
+            path.write_text(source)
+            with self.subTest(shape=name):
+                engine = outbound_url.OutboundFlow(path, source)
+                handler = next(function for function in engine.parser.functions.values() if function.name == 'Handle')
+                self.assertEqual(handler.parameters, ('transport', 'destination'))
+                self.assertEqual(handler.parameter_types, ('HttpClient', 'string'))
+                self.assertEqual(handler.defaults, 1 if default else 0)
+                rows = list(outbound_url.find([path], self.root))
+                self.assertEqual([row[1] for row in rows],
+                                 [line for line, text in enumerate(source.splitlines(), 1) if '// destination' in text])
+        for name, returned, unsafe in (('identity', 'raw', True),
+                                       ('fixed', '"https://api.example.com/"', False)):
+            helpers = (marker + 'static string Change([Marker(Name = "input")] string raw, '
+                       '[Marker(Name = "mode")] string label = "x=y") => ' + returned + ';\n')
+            source = program('transport.GetAsync(Change(incoming.Query["q"])); // destination\n', helpers)
+            path = self.root / ('attribute-helper-default-' + name + '.cs')
+            path.write_text(source)
+            with self.subTest(helper=name):
+                engine = outbound_url.OutboundFlow(path, source)
+                helper = next(function for function in engine.parser.functions.values() if function.name == 'Change')
+                self.assertEqual(helper.parameters, ('raw', 'label'))
+                self.assertEqual(helper.defaults, 1)
+                rows = list(outbound_url.find([path], self.root))
+                expected = [line for line, text in enumerate(source.splitlines(), 1)
+                            if '// destination' in text] if unsafe else []
+                self.assertEqual([row[1] for row in rows], expected, rows)
+
     def test_uri_guards_bind_parser_scheme_and_allowlist_comparer(self):
         fake = '''class FakeUri {
             public string UriSchemeHttps = "https";

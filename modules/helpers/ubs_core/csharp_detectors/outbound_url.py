@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 from ubs_core.analyzers.taint_csharp_redirect import RedirectFlow
-from ubs_core.analyzers.taint_csharp_request import CSharpFlow, masked_source, parts
+from ubs_core.analyzers.taint_csharp_request import CSharpFlow, masked_source, parts, request_source_demand
 from ubs_core.analyzers.taint_csharp_sql import (
     CONTEXT, CONTROLLERS, REQUEST, REQUEST_MEMBERS, TypeIndex, api_fact, identities, provenance,
 )
@@ -372,10 +372,12 @@ def find(files: Sequence[Path], base_dir: Path | None = None) -> Iterable[tuple[
         if path.suffix.lower() not in {'.cs', '.csx'}:
             continue
         text = path.read_text(encoding='utf-8-sig')
-        if not SINK_RE.search(text):
+        if (not SINK_RE.search(text)
+                or not request_source_demand(text, REQUEST_MEMBERS | {'Host', 'RawTarget'}, ATTRIBUTES)):
             continue
         code = masked_source(text)
-        if not SINK_RE.search(code):
+        if (not SINK_RE.search(code)
+                or not request_source_demand(code, REQUEST_MEMBERS | {'Host', 'RawTarget'}, ATTRIBUTES)):
             continue
         suppression = SourceSuppressions('csharp').index(path, text)
         lines = text.splitlines()

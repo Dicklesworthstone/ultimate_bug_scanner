@@ -35,6 +35,21 @@ MODIFIERS = {"public", "private", "protected", "internal", "static", "async", "v
 CONTROL = {"if", "while", "for", "foreach", "switch", "catch", "using", "lock", "fixed"}
 
 
+def request_source_demand(text: str, members, attributes=()) -> bool:
+    """Keep every modeled member/attribute source before building the CFG.
+
+    This is only a necessary token check, never a source or safety proof.
+    Receiver aliases retain the accessed member; attribute aliases retain
+    their target type in the selected source. Both attribute spellings are
+    accepted, without requiring a particular request variable name.
+    """
+    words = set(members)
+    for identity in attributes:
+        name = identity.rsplit(".", 1)[-1]
+        words.update((name, name.removesuffix("Attribute")))
+    return bool(words and re.search(r"\b(?:" + "|".join(map(re.escape, sorted(words))) + r")\b", text))
+
+
 def masked_source(text: str, depth: int = 0) -> str:
     """Keep C# executable interpolation holes; mask inert text at exact offsets."""
     if depth > 64:
@@ -94,12 +109,12 @@ def masked_source(text: str, depth: int = 0) -> str:
                         braces -= 1
                     cursor += 1
                 if cursor >= len(text):
-                    raise ValueError("Unterminated C# interpolation; analysis is incomplete")
+                    raise AnalysisLimit("Unterminated C# interpolation; analysis is incomplete")
                 holes.append((beginning, cursor))
                 position = cursor + width
                 continue
             position += 1
-        raise ValueError("Unterminated C# literal; analysis is incomplete")
+        raise AnalysisLimit("Unterminated C# literal; analysis is incomplete")
 
     index = 0
     while index < len(text):
@@ -111,7 +126,7 @@ def masked_source(text: str, depth: int = 0) -> str:
         elif text.startswith("/*", index):
             end = text.find("*/", index + 2)
             if end < 0:
-                raise ValueError("Unterminated C# comment; analysis is incomplete")
+                raise AnalysisLimit("Unterminated C# comment; analysis is incomplete")
             blank(index, end + 2)
             index = end + 2
         elif text[index] in "@$\"'" and (value := literal(index)):
@@ -128,7 +143,7 @@ def masked_source(text: str, depth: int = 0) -> str:
             end = len(text) if end < 0 else end
             # Branching compilation cannot be modeled as a sequential kill.
             if re.match(r"#\s*(if|elif|else|endif)\b", text[index:end]):
-                raise ValueError("Conditional C# compilation requires a configured source view; analysis is incomplete")
+                raise AnalysisLimit("Conditional C# compilation requires a configured source view; analysis is incomplete")
             blank(index, end)
             index = end
         else:
@@ -143,11 +158,11 @@ def pairs(code: str) -> dict[int, int]:
             stack.append((char, index))
         elif char in ")]}":
             if not stack or stack[-1][0] != {")": "(", "]": "[", "}": "{"}[char]:
-                raise ValueError("Unbalanced C# source; analysis is incomplete")
+                raise AnalysisLimit("Unbalanced C# source; analysis is incomplete")
             _, opening = stack.pop()
             result[opening] = index
     if stack:
-        raise ValueError("Unbalanced C# source; analysis is incomplete")
+        raise AnalysisLimit("Unbalanced C# source; analysis is incomplete")
     return result
 
 
@@ -250,8 +265,14 @@ class Parser:
                 continue
             parameters, request_parameters, parameter_modes, parameter_types, defaults = [], set(), [], [], 0
             for start, end in parts(self.code, opening + 1, close, generics=True):
-                declaration = self.code[start:end].split("=", 1)
-                ids = re.findall(r"@?[A-Za-z_]\w*", declaration[0])
+                # Attribute named arguments are not parameter defaults. Their
+                # nested expressions stay inside the paired attribute block.
+                _, declaration_end = next(parts(self.code, start, end, separator="=", generics=True), (start, end))
+                declaration_start = self.skip(start, declaration_end)
+                while self.code[declaration_start:declaration_start + 1] == "[":
+                    declaration_start = self.skip(self.pairs[declaration_start] + 1, declaration_end)
+                declaration = self.code[declaration_start:declaration_end]
+                ids = re.findall(r"@?[A-Za-z_]\w*", declaration)
                 if len(ids) < 2:
                     break
                 parameter = ids[-1].lstrip("@")
@@ -259,14 +280,13 @@ class Parser:
                 mode = "out" if "out" in ids[:-1] else "in" if "in" in ids[:-1] or (
                     "ref" in ids[:-1] and "readonly" in ids[:-1]) else "ref" if "ref" in ids[:-1] else "value"
                 parameter_modes.append(mode)
-                variable = list(re.finditer(r"@?[A-Za-z_]\w*", declaration[0]))[-1]
-                spelling = declaration[0][:variable.start()]
-                spelling = re.sub(r"\[[^\]]*\]", " ", spelling)
+                variable = list(re.finditer(r"@?[A-Za-z_]\w*", declaration))[-1]
+                spelling = declaration[:variable.start()]
                 spelling = re.sub(r"\b(?:this|ref|out|in|readonly|params)\b", " ", spelling)
                 parameter_types.append(re.sub(r"\s+", "", spelling))
                 if any(word in {"HttpRequest", "HttpRequestBase", "HttpContext"} for word in ids[:-1]):
                     request_parameters.add(parameter)
-                defaults += len(declaration) == 2
+                defaults += declaration_end < end
             else:
                 if expression:
                     start = following + 2
@@ -387,7 +407,7 @@ class Parser:
         match = re.match(r"(return|throw|break|continue|goto)\b", self.code[start:finish])
         kind = match.group(1) if match else "simple"
         if kind == "goto":
-            raise ValueError("C# goto requires an explicit control-flow target; analysis is incomplete")
+            raise AnalysisLimit("C# goto requires an explicit control-flow target; analysis is incomplete")
         if kind == "simple":
             declaration = re.match(r"\s*(?:(?:using|await|const)\s+)*(?:var|[\w.@]+(?:\s*<[^;=]+>)?(?:\[\])?\??)\s+(@?\w+)\s*=", self.code[start:finish])
             if declaration:
@@ -558,7 +578,7 @@ class CSharpFlow:
                     if kind == "for":
                         segments = list(parts(self.code, *header, separator=";"))
                         if len(segments) != 3:
-                            raise ValueError("Invalid C# for header")
+                            raise AnalysisLimit("Invalid C# for header; analysis is incomplete")
                         initial, condition, update = segments
                         self.declare(loop_scope, initial)
                     if kind == "foreach":

@@ -1293,6 +1293,37 @@ class Requests {
         self.assertEqual((code, report["status"]), (0, "ok"), details)
         self.assertEqual(findings, [], details)
 
+    def test_unrelated_ast_rule_fixture_does_not_make_security_scan_incomplete(self):
+        fixture = REPO_ROOT / "test-suite/csharp/buggy/AstRulePackBuggy.cs"
+        paths = self.sources(((fixture.name, fixture.read_text(encoding="utf-8")),))
+        code, report, findings, _, details = self.execute(paths)
+        self.assertIn(code, (0, 1), details)
+        self.assertEqual(report["status"], "ok", details)
+        self.assertIsNone(report.get("module_error"), details)
+        self.assertEqual(self.outbound_sites(findings), [], details)
+
+    def test_unsupported_request_control_flow_is_semantic_and_retains_other_files(self):
+        unsupported = '''using System.Net.Http;
+using Microsoft.AspNetCore.Http;
+class Unsupported {
+    void Run(HttpRequest incoming, HttpClient client) {
+        goto target;
+        target:
+        client.GetAsync(incoming.Query["value"]);
+    }
+}
+'''
+        paths = self.sources((("a-complete.cs", self.COMPLETE_SOURCE),
+                              ("m-request-goto.cs", unsupported),
+                              ("z-complete.cs", self.COMPLETE_SOURCE)))
+        code, report, findings, _, details = self.execute(paths)
+        self.assertEqual(code, 2, details)
+        self.assertEqual((report["status"], report["error"], report["reason"], report["module_error"]),
+                         ("partial", "analysis", "analysis-incomplete", "ANALYSIS_INCOMPLETE"), details)
+        self.assertEqual(self.outbound_sites(findings), self.expected(paths), details)
+        self.assertTrue(any("m-request-goto.cs" in message and "outbound_url" in message
+                            for message in report["errors"]), details)
+
     def test_detector_import_failure_retains_other_detectors_and_is_environmental(self):
         from ubs_core import csharp_scan
         paths = self.sources((("complete.cs", self.COMPLETE_SOURCE),))
@@ -1315,6 +1346,22 @@ class Requests {
         self.assertEqual((report["status"], report["exit_code"], report["error"],
                           report["reason"], report["module_error"]),
                          ("partial", 2, "environment", "module-failed", "ANALYZER_ERROR"), report)
+
+    def test_detector_value_error_is_not_assumed_to_be_source_incompleteness(self):
+        from ubs_core import csharp_scan
+        from ubs_core.csharp_detectors import security_randomness
+        paths = self.sources((("complete.cs", self.COMPLETE_SOURCE),))
+        errors, semantic_errors, sink = [], [], io.StringIO()
+        with patch.object(security_randomness, "find", side_effect=ValueError("invalid detector configuration")):
+            csharp_scan.run_detectors(paths, sink, set(), self.project,
+                                      errors=errors, semantic_errors=semantic_errors)
+        findings = [json.loads(line) for line in sink.getvalue().splitlines()]
+        self.assertEqual(self.outbound_sites(findings), self.expected(paths), findings)
+        self.assertEqual(semantic_errors, [])
+        self.assertEqual(len(errors), 1, errors)
+        report = csharp_scan.execution_status(1, errors, semantic_errors)
+        self.assertEqual((report["status"], report["error"], report["module_error"]),
+                         ("partial", "environment", "ANALYZER_ERROR"), report)
 
     def test_skipped_security_package_never_imports_a_broken_detector(self):
         from ubs_core import csharp_scan

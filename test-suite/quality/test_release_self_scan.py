@@ -201,11 +201,12 @@ class ReleaseTests(unittest.TestCase):
     def git(self, *args):
         return subprocess.check_output(
             ["git", *args], cwd=self.repo, env=self.env, text=True, stderr=subprocess.PIPE,
+            timeout=30,
         ).strip()
 
-    def release(self, *args):
+    def release(self, *args, version="1.0.1"):
         return subprocess.run(
-            ["bash", str(self.repo / "scripts/cut-release.sh"), "1.0.1", *args],
+            ["bash", str(self.repo / "scripts/cut-release.sh"), version, *args],
             cwd=self.base, env=self.env, stdin=subprocess.DEVNULL,
             capture_output=True, timeout=30,
         )
@@ -217,6 +218,19 @@ class ReleaseTests(unittest.TestCase):
         for path, data in self.originals.items():
             self.assertEqual((self.repo / path).read_bytes(), data, path)
 
+    def test_unsupported_prerelease_versions_are_rejected_before_scan_or_mutation(self):
+        # The generation protocol only accepts numeric X.Y.Z versions. A
+        # successful self-scan must not let the cutter create an uninstallable
+        # release, including when only preparing or previewing the candidate.
+        for version in ("1.0.1-rc1", "1.0.1-beta.2", "1.0.1+build.7"):
+            for mode in ("--dry-run", "--no-commit", "--yes"):
+                with self.subTest(version=version, mode=mode):
+                    proc = self.release(mode, "--allow-dirty", version=version)
+                    self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                    self.assertIn(b"version", proc.stderr)
+                    self.assertFalse(self.record_path.exists(), "self-scan ran for an unsupported version")
+                    self.unchanged()
+
     def test_success_runs_strict_scan_then_creates_real_local_commit_and_tag(self):
         proc = self.release("--yes")
         self.assertEqual(proc.returncode, 0, proc.stderr.decode())
@@ -224,7 +238,10 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(self.git("tag", "--list"), "v1.0.1")
         self.assertEqual(self.git("cat-file", "-t", "v1.0.1"), "tag")
         self.assertEqual((self.repo / "VERSION").read_text(), "1.0.1\n")
-        record = json.loads(self.record_path.read_text())
+        try:
+            record = json.loads(self.record_path.read_text())
+        except json.JSONDecodeError as error:
+            self.fail(f"Invalid scanner invocation record: {error}")
         self.assertEqual(record["argv"], [".", "--ci", "--fail-on-warning", "--format=json"])
         self.assertEqual(Path(record["cwd"]).resolve(), self.repo.resolve())
         self.assertEqual(record["env"], {

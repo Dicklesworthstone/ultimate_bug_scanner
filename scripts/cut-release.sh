@@ -6,7 +6,7 @@
 #   scripts/cut-release.sh <version> [--dry-run] [--no-commit] [--allow-dirty] [--yes]
 #
 # Steps (see docs/release.md):
-#   1. sanity: semver, tag not taken, clean tree on main (unless --allow-dirty),
+#   1. sanity: numeric X.Y.Z, tag not taken, clean tree on main (unless --allow-dirty),
 #      and the self-scan gate `./ubs . --ci --fail-on-warning` (no opt-out)
 #   2. bump VERSION, UBS_VERSION in ubs, the README version badge
 #   3. regenerate MODULE_CHECKSUMS/HELPER_CHECKSUMS (in ubs) and SHA256SUMS
@@ -43,8 +43,8 @@ for arg in "$@"; do
 done
 
 if [[ -z "$VERSION_NEW" ]]; then usage >&2; exit 2; fi
-if [[ ! "$VERSION_NEW" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
-  echo "error: '$VERSION_NEW' is not a semantic version (X.Y.Z or X.Y.Z-rc1)" >&2
+if [[ ! "$VERSION_NEW" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "error: '$VERSION_NEW' is not a supported release version (numeric X.Y.Z; prereleases are not supported by the generation protocol)" >&2
   exit 2
 fi
 TAG="v$VERSION_NEW"
@@ -144,7 +144,7 @@ import re, sys
 new = sys.argv[1]
 edits = [
     ("ubs", r'^UBS_VERSION="[^"]+"$', f'UBS_VERSION="{new}"'),
-    # pre-release versions contain a hyphen (5.4.0-rc1), so match up to "-blue.svg"
+    # Match the complete badge value rather than a prefix of the old version.
     ("README.md", r"badge/version-.+?-blue\.svg", f"badge/version-{new}-blue.svg"),
 ]
 pending = []
@@ -200,5 +200,8 @@ git commit -q -m "chore(release): bump version to $VERSION_NEW" \
   -m "VERSION, UBS_VERSION, the README badge, MODULE_CHECKSUMS/HELPER_CHECKSUMS and SHA256SUMS regenerated together by scripts/cut-release.sh so the $TAG tag matches main byte for byte."
 git tag -a "$TAG" -m "UBS $TAG"
 say "committed and tagged $TAG (not pushed). Next:"
-say "  git push origin main --tags        # triggers .github/workflows/release.yml"
 say "  scripts/check-version-tag-drift.sh # should report all modules/helpers match $TAG"
+say "  # After publication approval, with GitHub Actions disabled per AGENTS.md:"
+say "  git push origin main"
+say "  git push origin refs/tags/$TAG:refs/tags/$TAG"
+say "  # Build, sign, verify and publish through the configured DSR job (docs/release.md)."

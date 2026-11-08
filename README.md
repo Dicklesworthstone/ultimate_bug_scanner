@@ -190,6 +190,25 @@ Request-derived field initialization that requires unmodeled object state report
 incomplete analysis. Unknown calls preserve existing input taint while dropping
 unsupported request-object identity; the separate JDBC analysis is unchanged.
 
+#### Kotlin JDBC SQL extensions
+
+Kotlin category 13 follows selected Servlet and JDK request values into JDBC
+execution. Same-file extension functions on supported request and JDBC types
+carry their actual receiver through the existing function summaries. Explicit
+`this` and unqualified selected getter or SQL calls use that receiver; a local
+getter overload keeps the provenance of its actual fallback argument.
+
+Extension dispatch follows the declared receiver type, including supported
+import and type aliases. Compatible API members keep precedence over a
+same-named extension. A prepared-statement receiver retains its captured SQL
+template across helper calls: binding a request value to a static placeholder
+stays clean, while binding a value cannot sanitize an already tainted template.
+
+This bounded adapter supports nonnullable top-level extensions on receivers
+whose declared type can be proved. Nullable or generic receivers, nested and
+member extensions, grouped or chained receiver calls, callback scopes and
+unresolved mutable receiver effects remain explicitly incomplete.
+
 #### Kotlin resource analysis and custom catch handlers
 
 Resource-free Kotlin code can continue through a supported catch handler whose

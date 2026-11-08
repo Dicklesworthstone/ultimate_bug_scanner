@@ -343,6 +343,114 @@ DEFAULT_CASES = (
 )
 CASES += DEFAULT_CASES
 
+EXTENSION_CASES = (
+    Case("extension_fallback_fixed", 'statement.execute(request.getParameter("query", "SELECT 1"))',
+         helpers='fun HttpServletRequest.getParameter(key: String, fallback: String): String = fallback'),
+    Case("extension_fallback_source", '''
+        statement.execute(request.getParameter("query", request.getParameter("fallback"))) // SQL_EXEC
+    ''', helpers='fun HttpServletRequest.getParameter(key: String, fallback: String?): String? = fallback'),
+    Case("extension_implicit_getter", 'statement.execute(request.selected()) // SQL_EXEC',
+         helpers='fun HttpServletRequest.selected(): String? = getParameter("query")'),
+    Case("extension_explicit_this", 'statement.execute(request.selected()) // SQL_EXEC',
+         helpers='fun HttpServletRequest.selected(): String? = this.getParameter("query")'),
+    Case("extension_implicit_property", 'statement.execute(request.selected()) // SQL_EXEC',
+         helpers='fun HttpServletRequest.selected(): String? = queryString'),
+    Case("extension_explicit_property", 'statement.execute(request.selected()) // SQL_EXEC',
+         helpers='fun HttpServletRequest.selected(): String? = this.queryString'),
+    Case("extension_property_passed_to_clean_helper", 'statement.execute(request.selected())', helpers='''
+        fun fixed(value: String?): String = "SELECT 1"
+        fun HttpServletRequest.selected(): String = fixed(queryString)
+    '''),
+    Case("extension_native_getter_precedes_body", 'statement.execute(request.getParameter("query")) // SQL_EXEC',
+         helpers='fun HttpServletRequest.getParameter(key: String): String = "SELECT 1"'),
+    Case("extension_implicit_native_precedes_top_level_helper", 'statement.execute(request.selected()) // SQL_EXEC',
+         helpers='''
+        fun getParameter(key: String): String = "SELECT 1"
+        fun HttpServletRequest.selected(): String? = getParameter("query")
+    '''),
+    Case("extension_different_argument_type", 'statement.execute(request.getParameter(7))',
+         helpers='fun HttpServletRequest.getParameter(index: Int): String = "SELECT 1"'),
+    Case("extension_named_source_argument", '''
+        statement.execute(request.selected(fallback = request.getParameter("query"), key = "name")) // SQL_EXEC
+    ''', helpers='fun HttpServletRequest.selected(key: String, fallback: String?): String? = fallback'),
+    Case("extension_literal_default", 'statement.execute(request.selected(key = "name"))',
+         helpers='fun HttpServletRequest.selected(key: String, fallback: String = "SELECT 1"): String = fallback'),
+    Case("extension_default_explicit_source", '''
+        statement.execute(request.selected(fallback = request.getParameter("query"))) // SQL_EXEC
+    ''', helpers='fun HttpServletRequest.selected(fallback: String? = "SELECT 1"): String? = fallback'),
+    Case("extension_statement_sink", 'statement.selected(request.getParameter("query"))', helpers='''
+        fun Statement.selected(value: String?) {
+            execute(value) // SQL_EXEC
+        }
+    '''),
+    Case("extension_implicit_sink_precedes_top_level_helper", 'statement.selected(request.getParameter("query"))',
+         helpers='''
+        fun execute(value: String?) { }
+        fun Statement.selected(value: String?) {
+            execute(value) // SQL_EXEC
+        }
+    '''),
+    Case("extension_prepared_static_template", '''
+        val prepared = connection.prepareStatement("SELECT * FROM users WHERE name = ?")
+        prepared.selected(request.getParameter("name"))
+    ''', parameters="request: HttpServletRequest, connection: Connection", helpers='''
+        fun PreparedStatement.selected(value: String?) {
+            setString(1, value)
+            executeQuery()
+        }
+    '''),
+    Case("extension_prepared_captured_template", '''
+        val prepared = connection.prepareStatement(request.getParameter("query"))
+        prepared.selected("alice")
+    ''', parameters="request: HttpServletRequest, connection: Connection", helpers='''
+        fun PreparedStatement.selected(value: String?) {
+            setString(1, value)
+            executeQuery() // SQL_EXEC
+        }
+    '''),
+    Case("extension_receiver_aliases", 'statement.execute(request.selected()) // SQL_EXEC',
+         parameters="request: RequestView, statement: Statement",
+         imports="import jakarta.servlet.http.HttpServletRequest as Incoming", helpers='''
+        typealias RequestView = Incoming
+        fun RequestView.selected(): String? = this.getParameter("query")
+    '''),
+    Case("extension_receiver_alias_chain", 'statement.execute(request.selected()) // SQL_EXEC',
+         parameters="request: RequestView, statement: Statement", helpers='''
+        typealias RequestAlias = HttpServletRequest
+        typealias RequestView = RequestAlias
+        fun RequestView.selected(): String? = this.getParameter("query")
+    '''),
+    Case("extension_declared_request_dispatch", '''
+        val inferred = request
+        val widened: ServletRequest = request
+        statement.execute(inferred.selected()) // SQL_EXEC
+        statement.execute(widened.selected())
+    ''', imports="import jakarta.servlet.ServletRequest", helpers='''
+        fun ServletRequest.selected(): String = "SELECT 1"
+        fun HttpServletRequest.selected(): String? = getParameter("query")
+    '''),
+    Case("extension_declared_jdbc_dispatch", '''
+        val inferred = connection.prepareStatement("SELECT 1")
+        val widened: Statement = connection.prepareStatement("SELECT 1")
+        statement.execute(inferred.selected(request))
+        statement.execute(widened.selected(request)) // SQL_EXEC
+    ''', parameters="request: HttpServletRequest, statement: Statement, connection: Connection", helpers='''
+        fun Statement.selected(input: HttpServletRequest): String? = input.getParameter("query")
+        fun PreparedStatement.selected(input: HttpServletRequest): String = "SELECT 1"
+    '''),
+    Case("extension_local_type_shadow", '''
+        class HttpServletRequest { fun getParameter(key: String): String = "SELECT 1" }
+        fun HttpServletRequest.selected(): String = this.getParameter("query")
+        val fixed = HttpServletRequest()
+        statement.execute(fixed.selected())
+    '''),
+    Case("unrelated_generic_extension_keeps_sql", 'statement.execute(request.getParameter("query")) // SQL_EXEC',
+         helpers='fun <T> List<T>.firstSelected(): T = get(0)'),
+    Case("unrelated_nullable_alias_extension_keeps_sql", 'statement.execute(request.getParameter("query")) // SQL_EXEC',
+         helpers='typealias MaybeText = String?\nfun MaybeText.fixed(): String = "fixed"'),
+)
+CASES += EXTENSION_CASES
+
 INCOMPLETE_CASES = (
     Case("nullable_request_assertion", 'statement.execute(request!!.getParameter("query"))',
          parameters="request: HttpServletRequest?, statement: Statement"),
@@ -375,10 +483,46 @@ INCOMPLETE_CASES = (
     Case("default_builder_helper", 'statement.execute(selected(builder))',
          parameters="request: HttpServletRequest, statement: Statement, builder: StringBuilder",
          helpers='fun selected(input: StringBuilder, mode: String = "fixed"): String = input.toString()'),
-    Case("request_extension_receiver", 'statement.execute(request.selected())',
-         helpers='fun HttpServletRequest.selected(): String? = this.getParameter("query")'),
-    Case("jdbc_extension_receiver", 'statement.selected(request.getParameter("query"))',
-         helpers='fun Statement.selected(value: String?) { execute(value) }'),
+    Case("nullable_extension_receiver", 'statement.execute(request.selected())',
+         parameters="request: HttpServletRequest?, statement: Statement",
+         helpers='fun HttpServletRequest?.selected(): String? = this?.getParameter("query")'),
+    Case("nullable_alias_extension_receiver", 'statement.execute(request.selected())',
+         parameters="request: RequestView, statement: Statement", helpers='''
+        typealias RequestAlias = HttpServletRequest?
+        typealias RequestView = RequestAlias
+        fun RequestView.selected(): String? = this?.getParameter("query")
+    '''),
+    Case("generic_extension_receiver", 'statement.execute(request.selected())',
+         helpers='fun <T : HttpServletRequest> T.selected(): String? = getParameter("query")'),
+    Case("where_bound_generic_extension_receiver", 'statement.execute(request.selected())',
+         helpers='fun <T> T.selected(): String? where T : HttpServletRequest = getParameter("query")'),
+    Case("member_extension_receiver", '', helpers='''
+        class Routes(private val statement: Statement) {
+            fun HttpServletRequest.selected() { statement.execute(getParameter("query")) }
+        }
+    '''),
+    Case("nested_extension_receiver", '''
+        fun HttpServletRequest.selected(): String? = getParameter("query")
+        statement.execute(request.selected())
+    '''),
+    Case("grouped_extension_receiver", 'statement.execute((request).selected())',
+         helpers='fun HttpServletRequest.selected(): String? = getParameter("query")'),
+    Case("extension_callable_reference", '''
+        val selected = HttpServletRequest::selected
+        statement.execute(selected(request))
+    ''', helpers='fun HttpServletRequest.selected(): String? = getParameter("query")'),
+    Case("extension_batch_receiver", 'statement.selected(request.getParameter("query"))',
+         helpers='fun Statement.selected(value: String?) { addBatch(value); executeBatch() }'),
+    Case("extension_callback_receiver", 'statement.execute(request.selected())',
+         helpers='fun HttpServletRequest.selected(): String? = run { getParameter("query") }'),
+    Case("extension_unproved_helper_receiver_type", '''
+        val selected = make(connection)
+        statement.execute(selected.query(request))
+    ''', parameters="request: HttpServletRequest, statement: Statement, connection: Connection", helpers='''
+        fun make(connection: Connection): Statement = connection.prepareStatement("SELECT 1")
+        fun Statement.query(input: HttpServletRequest): String? = input.getParameter("query")
+        fun PreparedStatement.query(input: HttpServletRequest): String = "SELECT 1"
+    '''),
 )
 
 

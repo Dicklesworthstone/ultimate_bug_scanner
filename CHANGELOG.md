@@ -10,6 +10,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Bind selected Kotlin SQL extension receivers through the existing JDBC
+  function summaries. Preserve implicit and explicit receiver calls, local
+  getter overload arguments, declared-type dispatch and API-member precedence.
+  Keep captured prepared SQL separate from bound values, with paired source,
+  shadowing and alias controls. Report unsupported nullable, generic and
+  dual-receiver extension shapes explicitly instead of silently scanning clean.
+
 - Complete Kotlin resource analysis for supported resource-free custom and
   cancellation catch handlers. Retain caught and uncaught control paths
   without inventing exception ancestry; carry unresolved hierarchy state

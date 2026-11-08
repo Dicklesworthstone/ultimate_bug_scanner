@@ -216,6 +216,73 @@ class CoroutineProcessIntegrationTests(SourceTest):
 
 
 class CallCompletionTests(SourceTest):
+    def test_exception_prefix_keeps_global_before_later_clean_write(self):
+        for incoming, expected in (('input()', [10]), ("'fixed'", [])):
+            with self.subTest(incoming=incoming):
+                findings = self.scan(f'''
+                    code = {incoming}
+                    def clean():
+                        global code
+                        code = 'fixed'
+                    try:
+                        may_fail()
+                        clean()
+                        may_fail()
+                    except Exception:
+                        eval(code)
+                    else:
+                        eval(code)
+                ''')
+                self.assertEqual([(hit['rule'], hit['line']) for hit in findings],
+                                 [('python.taint.eval', line) for line in expected], findings)
+
+    def test_exception_prefix_keeps_written_cell_for_escaped_reader(self):
+        for incoming, expected in (('input()', [14]), ("'fixed'", [])):
+            with self.subTest(incoming=incoming):
+                findings = self.scan(f'''
+                    def run():
+                        code = 'fixed'
+                        def store(value):
+                            nonlocal code
+                            code = value
+                        def read():
+                            return code
+                        try:
+                            may_fail()
+                            store({incoming})
+                            may_fail()
+                            store('fixed')
+                        except Exception:
+                            eval(read())
+                        else:
+                            eval(read())
+                    run()
+                ''')
+                self.assertEqual([(hit['rule'], hit['line']) for hit in findings],
+                                 [('python.taint.eval', line) for line in expected], findings)
+
+    def test_exception_prefix_keeps_rebound_cell_callable(self):
+        for target, expected in (('eval', [7]), ('print', [])):
+            with self.subTest(target=target):
+                findings = self.scan(f'''
+                    def run():
+                        execute = print
+                        def install():
+                            nonlocal execute
+                            execute = {target}
+                        def invoke():
+                            execute(input())
+                        try:
+                            may_fail()
+                            install()
+                            may_fail()
+                        except Exception:
+                            invoke()
+                    run()
+                ''')
+                self.assertEqual([(hit['rule'], hit['line']) for hit in findings],
+                                 [('python.taint.eval', line) for line in expected], findings)
+
     def test_loop_iterable_calls_reach_a_fixed_point_before_the_body(self):
         self.assert_rules('''
             def values(code):

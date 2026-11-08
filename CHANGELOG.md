@@ -10,6 +10,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Preserve Python global, captured-variable and callable state on every
+  reachable exception prefix. A later cleanup no longer erases earlier
+  request-derived values from exception handlers. Keep scalar-state join
+  optimizations and unsupported generator-analysis refusals unchanged; add
+  exact-sink regressions with paired clean controls.
+
 - Track Python secret comparisons through list, set, dictionary, and generator
   comprehensions, including nested iteration, filters, unpacking, and captured
   values. Keep comprehension targets and lambda bindings local while preserving

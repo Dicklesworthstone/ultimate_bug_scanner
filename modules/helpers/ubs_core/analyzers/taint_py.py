@@ -1790,6 +1790,23 @@ class _Flow:
         # those objects, including their evidence, independently of mutation
         # of the live input state.
         accumulated = self.exception_states[-1]
+        if (state.cells is not None or state.global_writes is not None or state.deleted_globals
+                or accumulated is not None and (accumulated.cells is not None
+                    or accumulated.global_writes is not None or accumulated.deleted_globals)):
+            # The scalar delta below does not represent lexical-cell stores
+            # or the initial/current pair of a global write. Joining only
+            # visible names can retain a later clean @global slot or an old
+            # closure cell and erase a reachable exceptional taint path.
+            # Use the complete state join for these namespaces, retaining
+            # the same no-op shortcut with a snapshot of every state channel.
+            snapshot = _identity_snapshot(state)
+            previous = getattr(accumulated, 'last_namespace_join', None)
+            if previous is not None and _same_snapshot(previous, snapshot):
+                return
+            joined = _join_states(accumulated, state)
+            joined.last_namespace_join = snapshot
+            self.exception_states[-1] = joined
+            return
         previous = getattr(accumulated, 'last_joined', None)
         if previous is None:
             joined = _join_states(accumulated, state)

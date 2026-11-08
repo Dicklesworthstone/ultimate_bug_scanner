@@ -10,6 +10,11 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Preserve C# redirect analysis when comments surround host allowlist literals
+  or `Location` header keys. Ignore only lexical trivia, keep computed or
+  dynamic host entries untrusted, and retain request-derived redirect findings
+  at commented header writes.
+
 - Distinguish C# comparisons from response-header assignments before trimming
   expression boundaries. URI guards no longer become fictitious heap writes,
   and real header writes remain detectable when their assigned value contains

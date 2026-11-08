@@ -791,6 +791,32 @@ class RedirectDataflowTests(unittest.TestCase):
         self.check(shadow + template.replace('MUTATE', 'Log("safe")'))
         self.check('using StringComparer = UnsafeComparer;\n' + template.replace('MUTATE', 'Log("safe")'))
 
+    def test_constant_host_literal_comments_preserve_validation(self):
+        original = (ROOT / 'test-suite/csharp/security/OpenRedirectClean.cs').read_text(encoding='utf-8')
+        for prefix, suffix in (('// explanation\n', ''), ('/* explanation */', ''),
+                               ('', '// explanation\n'), ('', '/* explanation */'),
+                               ('/* "untrusted.example" */', '/* trailing */')):
+            with self.subTest(prefix=prefix, suffix=suffix):
+                code = original.replace('"accounts.example.com"', prefix + '"accounts.example.com"' + suffix)
+                self.check(code, 0)
+
+    def test_host_comments_cannot_disguise_computed_or_dynamic_entries(self):
+        original = (ROOT / 'test-suite/csharp/security/OpenRedirectClean.cs').read_text(encoding='utf-8')
+        for entry in ('/* "accounts.example.com" */ Environment.GetEnvironmentVariable("REDIRECT_HOST")',
+                      '"accounts.example.com" /* ignored */ + Environment.GetEnvironmentVariable("REDIRECT_SUFFIX")',
+                      '$"accounts.{Environment.GetEnvironmentVariable("REDIRECT_SUFFIX")}"',
+                      '@"accounts./* not a comment */example.com"'):
+            with self.subTest(entry=entry):
+                self.check(original.replace('"accounts.example.com"', entry), 3)
+
+    def test_location_literal_comments_do_not_hide_or_invent_redirect_sinks(self):
+        for key in ('/* explain */ "Location"', '"Location" /* explain */',
+                    '// explain\n "Location"', '"Location" // explain\n'):
+            with self.subTest(key=key):
+                self.check('Response.Headers[' + key + '] = Request.Query["url"];')
+                self.check('Response.Headers.Append(' + key + ', Request.Query["url"]);')
+        self.check('Response.Headers[/* "Location" */ "X-Other"] = Request.Query["url"];', 0)
+
 
 class AnalysisBoundaryTests(unittest.TestCase):
     def test_null_coverage_limits_preserve_findings_in_later_files(self):

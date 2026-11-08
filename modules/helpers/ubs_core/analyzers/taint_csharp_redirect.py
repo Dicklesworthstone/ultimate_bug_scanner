@@ -42,12 +42,18 @@ class RedirectFlow(CSharpFlow):
 
     def literal(self, start, end):
         """Read only literal values at syntax-validated argument positions."""
-        value = self.text[start:end].strip()
-        if re.fullmatch(r'"[^"\\]*"', value):
-            return value[1:-1]
-        if re.fullmatch(r'@"(?:[^"\n]|"")*"', value):
-            return value[2:-1].replace('""', '"')
-        return None
+        # The masked source distinguishes outside comments from comment-like
+        # characters inside a literal. Keep the literal's original spelling,
+        # then require that its remaining argument span contains only trivia.
+        while start < end and self.code[start].isspace():
+            start += 1
+        if self.text[start:start + 3] == '"""':
+            return None  # Raw literals are not part of this bounded reader.
+        match = re.match(r'"[^"\\]*"|@"(?:[^"\n]|"")*"', self.text[start:end])
+        if match is None or self.code[start + match.end():end].strip():
+            return None
+        value = match.group()
+        return value[2:-1].replace('""', '"') if value.startswith('@"') else value[1:-1]
 
     def strip_parentheses(self, start, end):
         while True:

@@ -10,6 +10,14 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Track mutable Drizzle SQL objects through aliases, selected helper calls,
+  closures, and module boundaries. Preserve `append()` chunk-copy semantics,
+  live nested SQL references, independent allocations, and argument evaluation
+  order so later raw fragments cannot disappear before execution. Keep unknown
+  wrappers, provider/property mutation, escaped objects, and non-scalar raw
+  conversion explicitly incomplete without dropping independently proven sinks.
+  Add paired safe/unsafe controls and real JSON/SARIF regression coverage.
+
 - Analyze bounded Python comparison chains inside effectful `any()`/`all()`
   generators. Evaluate each operand once, preserve short-circuit mutation
   alternatives and SQL effects, and keep exception prefixes and nonreturning

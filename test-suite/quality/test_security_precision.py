@@ -5309,18 +5309,25 @@ class DrizzleBoundSqlTaintTests(unittest.TestCase):
         artifacts.mkdir(parents=True, exist_ok=True)
         cls.directory = Path(tempfile.mkdtemp(prefix="run-", dir=artifacts))
 
-    def inspect(self, name, source, expected):
+    def inspect(self, name, source, expected, *, partial=False):
         from ubs_core.analyzers import taint_js
+        from ubs_core.taint_flow import AnalysisLimit
 
         path = self.directory / (name + '.ts')
         path.write_text(source, encoding='utf-8')
-        findings = list(taint_js.scan_file_findings(path))
+        findings, incomplete = [], None
+        try:
+            findings.extend(taint_js.scan_file_findings(path))
+        except AnalysisLimit as exc:
+            incomplete = str(exc)
         actual = [(rule, line) for rule, line, _col, _trace in findings]
         (self.directory / (name + '.json')).write_text(json.dumps({
             'source_sha256': hashlib.sha256(source.encode()).hexdigest(),
             'findings': findings,
+            'incomplete': incomplete,
         }, indent=2), encoding='utf-8')
         self.assertEqual(actual, [('js.taint.sql', line) for line in expected], source)
+        self.assertEqual(incomplete is not None, partial, (source, incomplete))
 
     def test_direct_imported_tags_bind_request_values(self):
         bodies = {
@@ -5385,7 +5392,8 @@ class DrizzleBoundSqlTaintTests(unittest.TestCase):
         }
         for name, (body, expected) in cases.items():
             with self.subTest(case=name):
-                self.inspect(name, self.PREFIX + body + '}\n', expected)
+                self.inspect(name, self.PREFIX + body + '}\n', expected,
+                             partial=name == 'member-after-tag')
 
     def test_provider_identity_is_not_inferred_from_its_spelling(self):
         body = '  return db.execute(sql`SELECT ${value}`);\n}\n'
@@ -5448,7 +5456,8 @@ class DrizzleBoundSqlTaintTests(unittest.TestCase):
         }
         for name, (body, expected) in cases.items():
             with self.subTest(case=name):
-                self.inspect(name, self.PREFIX + body + '}\n', expected)
+                self.inspect(name, self.PREFIX + body + '}\n', expected,
+                             partial=name == 'unknown-mutated-tag')
 
     def test_local_summaries_bind_data_but_preserve_raw_actuals(self):
         prefix = ('import { sql } from "drizzle-orm";\n'
@@ -5518,6 +5527,415 @@ class DrizzleBoundSqlUncertainBindingsTests(unittest.TestCase):
                           else 'request-derived SQL reaches raw execution')
                 self.assertEqual([(line, message) for line, _sample, message in findings],
                                  [(4, reason)], findings)
+
+
+class DrizzleMutableSqlTests(unittest.TestCase):
+    """Predeclared mutable-SQL oracle, before the object-flow implementation.
+
+    The provider's SQL.append copies the donor's current queryChunks entries
+    and returns its receiver. A template stores nested SQL objects by reference;
+    copying a chunk that is itself an SQL object preserves that reference.
+    Source: https://github.com/drizzle-team/drizzle-orm/blob/main/drizzle-orm/src/sql/sql.ts
+
+    Every labeled sink is independent of scanner output. Unsupported mutations
+    must report incomplete analysis and preserve independently proven findings.
+    Existing source-bearing assigned-template conservative cases remain above.
+    """
+
+    @staticmethod
+    def programs():
+        def program(body, *, helpers='', imports='import { sql } from "drizzle-orm";\n'):
+            return (imports + helpers + 'export function run(req) {\n'
+                    '  const value = req.body.value;\n' + body + '\n}\n')
+
+        def case(name, body, *, helpers='', imports=None, partial=False):
+            options = {'helpers': helpers}
+            if imports is not None:
+                options['imports'] = imports
+            return name, {'main.ts': program(body, **options)}, partial
+
+        cases = [
+            case('static-raw-append',
+                 '  const query = sql`SELECT 1`;\n'
+                 '  query.append(sql.raw(value));\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('alias-append',
+                 '  const query = sql`SELECT 1`;\n'
+                 '  const alias = query;\n'
+                 '  alias.append(sql.raw(value));\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('append-returns-receiver',
+                 '  const query = sql`SELECT 1`;\n'
+                 '  const returned = query.append(sql` WHERE true`);\n'
+                 '  returned.append(sql.raw(value));\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('append-result-executed',
+                 '  const query = sql`SELECT 1`;\n'
+                 '  const returned = query.append(sql.raw(value));\n'
+                 '  return db.execute(returned); // expect:sql'),
+            case('postfix-append',
+                 '  return db.execute(sql`SELECT 1`.append(sql.raw(value))); // expect:sql'),
+            case('empty-factory',
+                 '  const query = sql.empty();\n'
+                 '  query.append(sql.raw(value));\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('literal-raw-factory',
+                 '  const query = sql.raw("SELECT 1");\n'
+                 '  query.append(sql.raw(value));\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('source-raw-factory',
+                 '  const query = sql.raw(value);\n'
+                 '  query.append(sql` LIMIT 1`);\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('import-alias',
+                 '  const query = statement`SELECT 1`;\n'
+                 '  query.append(statement.raw(value));\n'
+                 '  return db.execute(query); // expect:sql',
+                 imports='import { sql as statement } from "drizzle-orm";\n'),
+            case('distinct-objects',
+                 '  const changed = sql`SELECT 1`;\n'
+                 '  const untouched = sql`SELECT 2`;\n'
+                 '  changed.append(sql.raw(value));\n'
+                 '  db.execute(untouched);\n'
+                 '  return db.execute(changed); // expect:sql'),
+            case('rebind-preserves-old-alias',
+                 '  let query = sql`SELECT 1`;\n'
+                 '  const original = query;\n'
+                 '  original.append(sql.raw(value));\n'
+                 '  query = sql`SELECT 2`;\n'
+                 '  db.execute(query);\n'
+                 '  return db.execute(original); // expect:sql'),
+            case('execution-before-and-after',
+                 '  const query = sql`SELECT 1`;\n'
+                 '  db.execute(query);\n'
+                 '  query.append(sql.raw(value));\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('raw-value-snapshot',
+                 '  let text = value;\n'
+                 '  const query = sql`SELECT 1`;\n'
+                 '  query.append(sql.raw(text));\n'
+                 '  text = " WHERE true";\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('conditional-append',
+                 '  const query = sql`SELECT 1`;\n'
+                 '  if (req.query.include) { query.append(sql.raw(value)); }\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('local-mutator-summary',
+                 '  const query = sql`SELECT 1`;\n'
+                 '  appendClause(query, value);\n'
+                 '  return db.execute(query); // expect:sql',
+                 helpers='function appendClause(query, text) { query.append(sql.raw(text)); }\n'),
+            case('local-return-summary',
+                 '  const query = sql`SELECT 1`;\n'
+                 '  const returned = appendClause(query, value);\n'
+                 '  return db.execute(returned); // expect:sql',
+                 helpers='function appendClause(query, text) { return query.append(sql.raw(text)); }\n'),
+            case('captured-mutator-summary',
+                 '  const query = sql`SELECT 1`;\n'
+                 '  function appendClause() { query.append(sql.raw(value)); }\n'
+                 '  appendClause();\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('factory-return-summary',
+                 '  const query = freshQuery();\n'
+                 '  query.append(sql.raw(value));\n'
+                 '  return db.execute(query); // expect:sql',
+                 helpers='function freshQuery() { return sql`SELECT 1`; }\n'),
+            case('receiver-before-argument-rebind',
+                 '  let query = sql`SELECT 1`;\n'
+                 '  const original = query;\n'
+                 '  function replace(text) { query = sql`SELECT 2`; return sql.raw(text); }\n'
+                 '  query.append(replace(value));\n'
+                 '  db.execute(query);\n'
+                 '  return db.execute(original); // expect:sql'),
+            case('later-execution-argument-mutates-query',
+                 '  const query = sql`SELECT 1`;\n'
+                 '  function mutate() { query.append(sql.raw(value)); return []; }\n'
+                 '  return db.execute(query, mutate()); // expect:sql'),
+            case('nested-child-live',
+                 '  const child = sql`1`;\n'
+                 '  const query = sql`SELECT ${child}`;\n'
+                 '  child.append(sql.raw(value));\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('nested-child-rebind',
+                 '  let child = sql`1`;\n'
+                 '  const query = sql`SELECT ${child}`;\n'
+                 '  child = sql`2`;\n'
+                 '  child.append(sql.raw(value));\n'
+                 '  db.execute(query);\n'
+                 '  return db.execute(child); // expect:sql'),
+            case('append-donor-snapshot',
+                 '  const donor = sql`1`;\n'
+                 '  const query = sql`SELECT `;\n'
+                 '  query.append(donor);\n'
+                 '  donor.append(sql.raw(value));\n'
+                 '  db.execute(query);\n'
+                 '  return db.execute(donor); // expect:sql'),
+            case('append-donor-already-raw',
+                 '  const donor = sql`1`;\n'
+                 '  const query = sql`SELECT `;\n'
+                 '  donor.append(sql.raw(value));\n'
+                 '  query.append(donor);\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('append-copies-nested-reference',
+                 '  const child = sql`1`;\n'
+                 '  const donor = sql`${child}`;\n'
+                 '  const query = sql`SELECT `;\n'
+                 '  query.append(donor);\n'
+                 '  child.append(sql.raw(value));\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('literal-append-control',
+                 '  const query = sql`SELECT 1`;\n'
+                 '  query.append(sql.raw(" WHERE true"));\n'
+                 '  return db.execute(query);'),
+            case('direct-bound-control',
+                 '  return db.execute(sql`SELECT ${value}`);'),
+            case('local-append-name-control',
+                 '  const query = sql`SELECT 1`;\n'
+                 '  append(query, value);\n'
+                 '  return db.execute(query);',
+                 helpers='function append(query, text) { return "unchanged"; }\n'),
+            case('foreign-provider-control',
+                 '  return db.execute(sql`SELECT ${value}`); // expect:sql',
+                 imports='import { sql } from "custom-sql";\n'),
+            case('parameter-shadow-control',
+                 '  function query(sql) { return db.execute(sql`SELECT ${value}`); } // expect:sql\n'
+                 '  return query(replacement);'),
+            case('unknown-wrapper-escape',
+                 '  const query = sql`SELECT 1`;\n'
+                 '  externalMutation(query);\n'
+                 '  db.execute(query);\n'
+                 '  return db.execute("SELECT " + value); // expect:sql', partial=True),
+            case('computed-wrapper-escape',
+                 '  const query = sql`SELECT 1`;\n'
+                 '  handlers["mutate"](query);\n'
+                 '  return db.execute(query);', partial=True),
+            case('raw-array-conversion-boundary',
+                 '  const chunks = ["SELECT "];\n'
+                 '  const query = sql.raw(chunks);\n'
+                 '  chunks.push(value);\n'
+                 '  db.execute(query);\n'
+                 '  return db.execute("SELECT " + value); // expect:sql', partial=True),
+            case('raw-uncertain-first-spread-boundary',
+                 '  const chunks = ["SELECT "];\n'
+                 '  const query = sql.raw(...externalArgs, chunks);\n'
+                 '  chunks.push(value);\n'
+                 '  db.execute(query);\n'
+                 '  return db.execute("SELECT " + value); // expect:sql', partial=True),
+            case('raw-known-first-before-spread-control',
+                 '  const chunks = [value];\n'
+                 '  const query = sql.raw("SELECT 1", ...externalArgs, chunks);\n'
+                 '  return db.execute(query);'),
+            case('overwritten-append-method',
+                 '  const query = sql`SELECT 1`;\n'
+                 '  query.append = replacement;\n'
+                 '  query.append(sql` WHERE true`);\n'
+                 '  db.execute(query);\n'
+                 '  return db.execute("SELECT " + value); // expect:sql', partial=True),
+            case('overwritten-getsql-method',
+                 '  const query = sql`SELECT 1`;\n'
+                 '  query.getSQL = replacement;\n'
+                 '  db.execute(query);\n'
+                 '  return db.execute("SELECT " + value); // expect:sql', partial=True),
+            case('overwritten-query-chunks',
+                 '  const query = sql`SELECT 1`;\n'
+                 '  query.queryChunks = replacement;\n'
+                 '  db.execute(query);\n'
+                 '  return db.execute("SELECT " + value); // expect:sql', partial=True),
+            case('overwritten-raw-factory',
+                 '  const query = sql`SELECT 1`;\n'
+                 '  sql.raw = replacement;\n'
+                 '  query.append(sql.raw(" WHERE true"));\n'
+                 '  db.execute(query);\n'
+                 '  return db.execute("SELECT " + value); // expect:sql', partial=True),
+        ]
+        cases.append(('cross-file-mutator-summary', {
+            'helper.ts': ('import { sql as statement } from "drizzle-orm";\n'
+                          'export function appendClause(query, value) {\n'
+                          '  query.append(statement.raw(value));\n'
+                          '  return query;\n}\n'),
+            'main.ts': ('import { sql } from "drizzle-orm";\n'
+                        'import { appendClause } from "./helper.js";\n'
+                        'export function run(req) {\n'
+                        '  const query = sql`SELECT 1`;\n'
+                        '  const returned = appendClause(query, req.body.value);\n'
+                        '  return db.execute(returned); // expect:sql\n}\n'),
+        }, False))
+        cases.append(('source-free-wrapper-escape', {
+            'main.ts': ('import { sql } from "drizzle-orm";\n'
+                        'export function run() {\n'
+                        '  const query = sql`SELECT 1`;\n'
+                        '  externalMutation(query);\n'
+                        '  return db.execute(query);\n}\n'),
+        }, True))
+        return cases
+
+    @staticmethod
+    def expected_sites(files, rule='js.taint.sql'):
+        return sorted((name, rule, number, line.index('db.execute(') + 1)
+                      for name, source in files.items()
+                      for number, line in enumerate(source.splitlines(), 1)
+                      if '// expect:sql' in line)
+
+    @classmethod
+    def setUpClass(cls):
+        artifacts = REPO_ROOT / 'test-suite/artifacts/drizzle-mutable-sql'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        cls.root = Path(tempfile.mkdtemp(prefix='native-', dir=artifacts))
+
+    def inspect_case(self, name, files, partial):
+        from ubs_core.analyzers import taint_js
+        from ubs_core.taint_flow import AnalysisLimit
+
+        directory = self.root / name
+        directory.mkdir()
+        paths = []
+        for filename, source in files.items():
+            path = directory / filename
+            path.write_text(source, encoding='utf-8')
+            paths.append(path)
+        print(f'[drizzle-mutable-{name}] RUN {directory}', flush=True)
+        started = time.monotonic()
+        findings, incomplete = [], None
+        try:
+            findings.extend(taint_js.scan_project_findings(paths))
+        except AnalysisLimit as exc:
+            incomplete = str(exc)
+        actual = sorted((str(path.relative_to(directory)), rule, line, col)
+                        for path, rule, line, col, _trace in findings)
+        expected = self.expected_sites(files)
+        (directory / 'receipt.json').write_text(json.dumps({
+            'sources': {filename: hashlib.sha256(source.encode()).hexdigest()
+                        for filename, source in files.items()},
+            'helper_sha256': hashlib.sha256(Path(taint_js.__file__).read_bytes()).hexdigest(),
+            'expected': expected, 'actual': actual, 'expected_partial': partial,
+            'incomplete': incomplete, 'seconds': time.monotonic() - started,
+        }, indent=2) + '\n', encoding='utf-8')
+        context = (files, actual, incomplete)
+        self.assertEqual(actual, expected, context)
+        self.assertEqual(incomplete is not None, partial, context)
+        print(f'[drizzle-mutable-{name}] PASS ({time.monotonic() - started:.3f}s)', flush=True)
+
+    def test_declared_mutation_and_identity_programs(self):
+        for name, files, partial in self.programs():
+            with self.subTest(case=name):
+                self.inspect_case(name, files, partial)
+
+
+class DrizzleMutableSqlPublicTests(unittest.TestCase):
+    """Pair real JSON/SARIF scans with the frozen a6728ca2 incumbent.
+
+    The incumbent loses static-wrapper mutations and reports unsupported
+    escapes as complete. The candidate must add the exact missing SQL sites,
+    retain clean controls and existing findings, and expose partial status.
+    The same source programs are labeled by the independent native oracle.
+    """
+
+    def test_incumbent_and_candidate_mutation_reports(self):
+        baseline_path = os.environ.get('UBS_DRIZZLE_MUTATION_BASELINE')
+        if not baseline_path:
+            self.skipTest('set UBS_DRIZZLE_MUTATION_BASELINE to the a6728ca2 runner')
+        baseline = Path(baseline_path).resolve()
+        self.assertTrue(baseline.is_file(), 'the real a6728ca2 runner is required')
+        artifacts = REPO_ROOT / 'test-suite/artifacts/drizzle-mutable-sql'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        root = Path(tempfile.mkdtemp(prefix='public-', dir=artifacts))
+        programs = {name: (files, partial) for name, files, partial in DrizzleMutableSqlTests.programs()}
+        groups = {
+            'unsafe': ('static-raw-append', 'alias-append', 'empty-factory', 'nested-child-live',
+                       'receiver-before-argument-rebind', 'append-donor-snapshot',
+                       'cross-file-mutator-summary'),
+            'safe': ('literal-append-control', 'direct-bound-control', 'local-append-name-control'),
+            'partial': ('unknown-wrapper-escape', 'overwritten-append-method', 'overwritten-raw-factory',
+                        'source-free-wrapper-escape'),
+        }
+        for group, names in groups.items():
+            directory = root / group
+            directory.mkdir()
+            sources, sites = {}, []
+            for name in names:
+                files, _partial = programs[name]
+                case_dir = directory / name
+                case_dir.mkdir()
+                for filename, source in files.items():
+                    relative = str(Path(name) / filename)
+                    (directory / relative).write_text(source, encoding='utf-8')
+                    sources[relative] = hashlib.sha256(source.encode()).hexdigest()
+                sites.extend((str(Path(name) / filename), line, col)
+                             for filename, _rule, line, col in DrizzleMutableSqlTests.expected_sites(files))
+            sites.sort()
+            for label, runner in (('incumbent', baseline), ('candidate', REPO_ROOT / 'ubs')):
+                expected_partial = group == 'partial' and label == 'candidate'
+                expected_taint = sites if label == 'candidate' or group == 'partial' else []
+                expected_security = sites if group == 'partial' else []
+                critical_count = len(expected_taint) + len(expected_security)
+                for format_ in ('json', 'sarif'):
+                    case = f'{group}-{label}-{format_}'
+                    with self.subTest(case=case):
+                        env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1', UBS_KEEP_TEMP='1',
+                                   UBS_NO_AUTO_UPDATE='1', UBS_ENABLE_AUTO_UPDATE='0', UBS_NO_CACHE='1',
+                                   CI='1', NO_COLOR='1', UBS_CACHE_DIR=str(directory / (case + '-cache')),
+                                   XDG_CONFIG_HOME=str(directory / (case + '-config')),
+                                   XDG_DATA_HOME=str(directory / (case + '-data')))
+                        command = ['bash', str(runner), '--no-auto-update', '--only=js',
+                                   '--format=' + format_, '--ci', str(directory)]
+                        print(f'[drizzle-mutable-{case}] RUN {command!r}', flush=True)
+                        started = time.monotonic()
+                        proc = subprocess.run(command, cwd=directory, env=env,
+                                              capture_output=True, text=True, timeout=180)
+                        output = directory / case
+                        output.with_suffix('.stdout').write_text(proc.stdout, encoding='utf-8')
+                        output.with_suffix('.stderr').write_text(proc.stderr, encoding='utf-8')
+                        output.with_suffix('.receipt.json').write_text(json.dumps({
+                            'command': command, 'exit': proc.returncode,
+                            'seconds': time.monotonic() - started, 'sources': sources,
+                            'expected_taint': expected_taint, 'expected_security': expected_security,
+                            'expected_partial': expected_partial,
+                            'runner_sha256': hashlib.sha256(runner.read_bytes()).hexdigest(),
+                            'taint_helper_sha256': hashlib.sha256((runner.parent /
+                                'modules/helpers/ubs_core/analyzers/taint_js.py').read_bytes()).hexdigest(),
+                            'sql_helper_sha256': hashlib.sha256((runner.parent /
+                                'modules/helpers/ubs_core/analyzers/sec_sql_injection.py').read_bytes()).hexdigest(),
+                        }, indent=2) + '\n', encoding='utf-8')
+                        context = f'{command!r}\nexit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}'
+                        report = json.loads(proc.stdout)
+                        if format_ == 'json':
+                            self.assertEqual(report['status'], 'partial' if expected_partial else 'ok', context)
+                            rows = report.get('findings', [])
+                            def locations(rule):
+                                return sorted((str(Path(row['file']).resolve().relative_to(directory)),
+                                               row['line'], row.get('column', row.get('col', 1)))
+                                              for row in rows if row['rule_id'] == rule
+                                              and row['severity'] == 'critical')
+                            actual_taint = locations('javascript.taint.sql')
+                            actual_security = locations('js.security.sql-injection')
+                            self.assertEqual(report['totals']['critical'], critical_count, context)
+                        else:
+                            rows = [row for run in report['runs'] for row in run.get('results', [])]
+                            def locations(rule):
+                                selected = [row['locations'][0]['physicalLocation'] for row in rows
+                                            if row['ruleId'] == rule and row['level'] == 'error']
+                                return sorted((str(sarif_location_path(site['artifactLocation']['uri'], directory)
+                                                       .resolve().relative_to(directory)),
+                                               site['region']['startLine'], site['region'].get('startColumn', 1))
+                                              for site in selected)
+                            actual_taint = locations('javascript.taint.sql')
+                            actual_security = locations('js.security.sql-injection')
+                            invocations = [invocation for run in report['runs']
+                                           for invocation in run.get('invocations', [])]
+                            if expected_partial:
+                                self.assertTrue(invocations, context)
+                                self.assertTrue(all(item['executionSuccessful'] is False for item in invocations), context)
+                            else:
+                                self.assertTrue(all(item.get('executionSuccessful') is not False
+                                                    for item in invocations), context)
+                            self.assertEqual(sum(row['level'] == 'error' for row in rows), critical_count, context)
+                        self.assertEqual(actual_taint, expected_taint, context)
+                        # The independent SQL detector reports the statement
+                        # line, while the taint engine also preserves its column.
+                        self.assertEqual([(path, line) for path, line, _col in actual_security],
+                                         [(path, line) for path, line, _col in expected_security], context)
+                        self.assertEqual(proc.returncode, 2 if expected_partial else int(bool(critical_count)), context)
+                        print(f'[drizzle-mutable-{case}] PASS ({time.monotonic() - started:.3f}s)', flush=True)
 
 
 class PlaywrightMetadataAndEqualityPrecisionTests(unittest.TestCase):

@@ -10861,6 +10861,70 @@
       }
     },
     {
+      "id": "swift-d-closure-capture-leak-buggy",
+      "description": "A Timer captured by an escaping closure that never invalidates it is reported as a leak (#204 D).",
+      "path": "test-suite/swift/buggy/d_closure_capture_leak.swift",
+      "language": "swift",
+      "tags": ["swift", "lifecycle", "regression", "buggy"],
+      "args": ["--only=swift"],
+      "expect": {
+        "exit_code": "zero",
+        "totals": { "warning": { "min": 2 } },
+        "forbid_substrings": ["analysis is incomplete", "swift: partial"]
+      }
+    },
+    {
+      "id": "swift-d-closure-capture-release-clean",
+      "description": "A Timer invalidated inside the capturing escaping closure is released, not a leak (#204 D).",
+      "path": "test-suite/swift/clean/d_closure_capture_release.swift",
+      "language": "swift",
+      "tags": ["swift", "lifecycle", "regression", "clean"],
+      "args": ["--only=swift"],
+      "expect": {
+        "exit_code": "zero",
+        "totals": { "warning": { "max": 1 } },
+        "forbid_substrings": ["analysis is incomplete", "swift: partial"]
+      }
+    },
+    {
+      "id": "swift-d-acquire-in-closure-refuses",
+      "description": "A resource acquired inside an escaping closure keeps refusing (fail-closed, never clean) (#204 D).",
+      "path": "test-suite/swift/buggy/d_acquire_in_closure.swift",
+      "language": "swift",
+      "tags": ["swift", "lifecycle", "regression", "refuses"],
+      "args": ["--only=swift"],
+      "expect": {
+        "exit_code": "nonzero",
+        "require_substrings": ["analysis is incomplete"]
+      }
+    },
+    {
+      "id": "swift-d-two-timers-one-released-buggy",
+      "description": "Two captured Timers where the closure invalidates only one: the other leaks (#204 D).",
+      "path": "test-suite/swift/buggy/d_two_timers_one_released.swift",
+      "language": "swift",
+      "tags": ["swift", "lifecycle", "regression", "buggy"],
+      "args": ["--only=swift"],
+      "expect": {
+        "exit_code": "zero",
+        "totals": { "warning": { "min": 3 } },
+        "forbid_substrings": ["analysis is incomplete", "swift: partial"]
+      }
+    },
+    {
+      "id": "swift-d-nested-closure-release-clean",
+      "description": "A Timer invalidated inside a nested escaping closure is released, not a leak (#204 D).",
+      "path": "test-suite/swift/clean/d_nested_closure_release.swift",
+      "language": "swift",
+      "tags": ["swift", "lifecycle", "regression", "clean"],
+      "args": ["--only=swift"],
+      "expect": {
+        "exit_code": "zero",
+        "totals": { "warning": { "max": 1 } },
+        "forbid_substrings": ["analysis is incomplete", "swift: partial"]
+      }
+    },
+    {
       "id": "csharp-suppression-intervals-markers",
       "description": "A7 GH #91: all ubs:ignore placements (trailing, previous-line, multi-line statement, formatter-relocated, rule-scoped) suppress every finding line in the csharp module.",
       "path": "test-suite/csharp/suppression/suppression_buggy.cs",

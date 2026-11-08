@@ -510,10 +510,9 @@ class LifecycleEngine:
                 continue
             if token.value == '{':
                 finish = swift_close(tokens, cursor)
-                captured = any(self.value((item,), state, environment) for item in tokens[cursor + 1:finish]
-                               if item.kind == 'code' and re.fullmatch(IDENT, item.value))
-                if captured:
-                    raise ValueError('Swift lifecycle escaping callback captures a resource; analysis is incomplete')
+                if any(item.kind == 'code' and item.value in ACQUISITION_NAMES for item in tokens[cursor + 1:finish]):
+                    raise ValueError('Swift lifecycle resource acquired inside an escaping closure; analysis is incomplete')
+                self.release_calls(tokens[cursor + 1:finish], state, environment, exceptions, throwing)
                 cursor = finish + 1
                 continue
             if token.value != '(':

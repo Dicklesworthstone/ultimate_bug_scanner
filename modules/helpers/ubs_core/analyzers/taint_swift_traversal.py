@@ -37,6 +37,18 @@ class CallSite:
     callee: SwiftToken | None = None
 
 
+class SwiftUnsupported(ValueError):
+    """A well-formed construct whose effects need a conservative summary.
+
+    Proof consumers propagate this exception. The ordinary scanner can report
+    the affected scope and continue; lexical errors and work limits are never
+    converted into this diagnostic.
+    """
+    def __init__(self, message, offset=None):
+        super().__init__(message)
+        self.offset = offset
+
+
 class SwiftLexer:
     def __init__(self, text):
         self.text = text
@@ -261,14 +273,22 @@ class SwiftFunction:
 
 
 class SwiftParser:
-    def __init__(self, text, tokens=None, suppressed=frozenset(), obligation=None):
+    def __init__(self, text, tokens=None, suppressed=frozenset(), obligation=None, *, recover=False):
         self.tokens = swift_validated_tokens(text) if tokens is None else tokens
         self.suppressed = suppressed
         self.obligation = obligation
+        self.recover, self.diagnostics = recover, []
         self.functions, self.types, self.extensions, self.final_types = {}, set(), set(), set()
         self.value_types = set()
+        self.fields, self.field_functions = {}, {}
         body = self.block(self.tokens, (), (), declarations=True)
         self.functions[-1] = SwiftFunction(-1, '<script>', (), (), (), body)
+
+    def limitation(self, reason, tokens, owner):
+        offset = tokens[0].start if tokens else 0
+        if not self.recover:
+            raise SwiftUnsupported(reason + '; analysis is incomplete', offset)
+        self.diagnostics.append((offset, reason, owner))
 
     def statement_end(self, tokens, start):
         cursor = start
@@ -286,7 +306,8 @@ class SwiftParser:
                     while following < len(tokens) and tokens[following].value == '\n':
                         following += 1
                     next_value = tokens[following].value if following < len(tokens) and tokens[following].kind == 'code' else ''
-                    if previous not in continuation and next_value not in {'.', '&&', '||', '??', '+', ',', 'catch'}:
+                    repeat_tail = tokens[start].value == 'repeat' and next_value == 'while'
+                    if not repeat_tail and previous not in continuation and next_value not in {'.', '&&', '||', '??', '+', ',', 'catch'}:
                         return cursor
             cursor += 1
         return cursor
@@ -312,11 +333,29 @@ class SwiftParser:
                 if tokens[head].value == 'class' and head + 1 < len(tokens) and tokens[head + 1].value != 'func':
                     break
                 head += 1
-            if head < len(tokens) and tokens[head].value == 'func':
-                name_index = head + 1
+                if head < len(tokens) and tokens[head].value == '(':
+                    head = swift_close(tokens, head) + 1
+            constructor = (declarations and owner and head < len(tokens)
+                           and tokens[head].value in {'init', 'deinit'})
+            if head < len(tokens) and (tokens[head].value == 'func' or constructor):
+                name_index = head if constructor else head + 1
                 if name_index >= len(tokens):
                     raise ValueError('Missing Swift function name; analysis is incomplete')
                 name, opening = tokens[name_index].value, name_index + 1
+                if constructor and opening < len(tokens) and tokens[opening].value in {'?', '!'}:
+                    opening += 1
+                if name == 'deinit':
+                    while opening < len(tokens) and tokens[opening].value != '{':
+                        opening += 1
+                    if opening >= len(tokens):
+                        raise ValueError('Unterminated Swift deinitializer; analysis is incomplete')
+                    finish, key = swift_close(tokens, opening), tokens[head].start
+                    function = SwiftFunction(key, name, owner, scope, ())
+                    self.functions[key] = function
+                    function.body = self.block(tokens[opening + 1:finish], owner, (*scope, key), depth=depth + 1)
+                    statements.append(SwiftStatement('definition', tuple(tokens[start:finish + 1]), extra=(key,)))
+                    cursor = finish + 1
+                    continue
                 if opening < len(tokens) and tokens[opening].value == '<':
                     while opening < len(tokens) and tokens[opening].value != '>':
                         opening += 1
@@ -443,18 +482,38 @@ class SwiftParser:
             cursor = finish + 1
             if not part:
                 continue
+            if declarations and owner and head < finish and tokens[head].value in {'case', 'typealias', 'associatedtype'}:
+                # Enum cases and type requirements declare names. In particular,
+                # CodingKeys.case fileName is not a read of an uploaded filename.
+                statements.append(SwiftStatement('definition', part))
+                continue
             if declarations and owner:
                 # Stored fields/accessors require an object state model. Never
                 # silently discard an executable request source in this region.
                 source_region = part
                 if (head + 2 < finish and tokens[head].value in {'let', 'var'}
                         and re.fullmatch(r'[A-Za-z_]\w*', tokens[head + 1].value)
-                        and tokens[head + 1].value not in {'req', 'request'}
                         and tokens[head + 2].value in {':', '='}):
                     # A field's declared name is not a read of upload.filename.
                     # Keep attributes, types, initializers and getter bodies as
                     # witnesses, and retain the conservative request fields.
                     source_region = (*tokens[start:head], *tokens[head + 2:finish])
+                    field_name = tokens[head + 1].value
+                    declaration = swift_parts(tuple(tokens[head + 2:finish]), {'='})
+                    field_type = swift_text(declaration[0][1:]) if declaration[0] and declaration[0][0].value == ':' else ''
+                    self.fields.setdefault(owner, {})[field_name] = field_type
+                    if len(declaration) == 1 and not any(t.value == '{' and t.kind == 'code' for t in declaration[0]):
+                        continue
+                    if len(declaration) == 2:
+                        field_key = tokens[head].start
+                        initializer = SwiftFunction(field_key, '<field:' + field_name + '>', owner, scope, (),
+                                                    (SwiftStatement('return', declaration[1]),))
+                        self.functions[field_key] = initializer
+                        self.field_functions[(owner, field_name)] = field_key
+                        statements.append(SwiftStatement('definition', part, extra=(field_key,)))
+                        if self.obligation is not None and _swift_observer_obligation(part, self.obligation):
+                            self.limitation('Swift property observer with a sink needs assignment binding analysis', part, owner)
+                        continue
                 if swift_source_tokens(source_region, self.suppressed):
                     accessor_brace = next((i for i in range(head, finish)
                                            if tokens[i].kind == 'code' and tokens[i].value == '{'), -1)
@@ -466,18 +525,20 @@ class SwiftParser:
                         head_body = [t for t in body_tokens if t.kind == 'code' and t.value != '\n']
                         if head_body and head_body[0].value in {'get', 'set', 'willSet', 'didSet',
                                 '_modify', 'unsafeAddress', 'unsafeMutableAddress', '@'}:
-                            raise ValueError('Swift request-derived property accessor needs binding analysis; analysis is incomplete')
+                            self.limitation('Swift request-derived property accessor needs binding analysis', part, owner)
+                            continue
                         accessor_key = tokens[start].start
                         accessor = SwiftFunction(accessor_key, tokens[head + 1].value, owner, scope, ())
                         self.functions[accessor_key] = accessor
+                        self.field_functions[(owner, tokens[head + 1].value)] = accessor_key
                         accessor.body = self.block(body_tokens, owner, (*scope, accessor_key), depth=depth + 1)
                         statements.append(SwiftStatement('definition', part, extra=(accessor_key,)))
                         continue
-                    raise ValueError('Swift request-derived type initialization needs field analysis; analysis is incomplete')
+                    self.limitation('Swift request-derived type initialization needs field analysis', part, owner)
                 if self.obligation is not None:
                     obs_brace = next((i for i in range(head, finish) if tokens[i].kind == 'code' and tokens[i].value == '{'), -1)
                     if obs_brace >= 0 and _swift_observer_obligation(tokens[obs_brace + 1:swift_close(tokens, obs_brace)], self.obligation):
-                        raise ValueError('Swift property observer with a sink needs assignment binding analysis; analysis is incomplete')
+                        self.limitation('Swift property observer with a sink needs assignment binding analysis', part, owner)
                 continue
             if first in {'import', 'typealias', 'case', '@'}:
                 if first == 'typealias' and len(part) >= 2:
@@ -500,6 +561,8 @@ class SwiftParser:
         if len(parts) != 2:
             return None
         lhs = swift_ungroup(parts[0])
+        if len(lhs) > 1 and lhs[0].value == 'async' and lhs[1].value == 'let':
+            lhs = lhs[1:]
         declaration = bool(lhs and lhs[0].value in {'let', 'var'})
         if declaration:
             lhs = lhs[1:]
@@ -511,6 +574,68 @@ class SwiftParser:
             return ('', tuple(lhs), parts[1], '=', declaration)
         operator = tokens[len(parts[0])].value
         return binding[0].value, (binding[0],), parts[1], operator, declaration
+
+    @staticmethod
+    def closure_signature(inner):
+        """Separate a closure signature from its body without mistaking for/in.
+
+        A signature may have actor attributes, capture bindings, typed
+        parameters and async/throws/result annotations. Delimited expressions
+        in capture initializers are skipped when finding the signature's in.
+        """
+        cursor, split = 0, None
+        statements = {'for', 'if', 'guard', 'while', 'switch', 'repeat', 'do',
+                      'defer', 'return', 'throw', 'let', 'var'}
+        while cursor < len(inner):
+            token = inner[cursor]
+            if token.kind == 'code':
+                if token.value in {'(', '['}:
+                    cursor = swift_close(inner, cursor)
+                elif token.value == 'in':
+                    split = cursor
+                    break
+                elif token.value in statements | {'{', ';', '='}:
+                    break
+            cursor += 1
+        if split is None:
+            return (), (), tuple(inner), False
+        header = swift_ungroup(inner[:split])
+        body, captures, cursor = tuple(inner[split + 1:]), [], 0
+        while cursor < len(header) and header[cursor].value == '@':
+            if cursor + 1 >= len(header):
+                raise ValueError('Malformed Swift closure attribute; analysis is incomplete')
+            # Actor isolation and Sendable affect scheduling, not taint identity.
+            cursor += 2
+            if cursor < len(header) and header[cursor].value == '(':
+                cursor = swift_close(header, cursor) + 1
+        if cursor < len(header) and header[cursor].value == '[':
+            close = swift_close(header, cursor)
+            for capture in swift_parts(header[cursor + 1:close], {','}):
+                capture = swift_ungroup(capture)
+                if capture and capture[0].value in {'weak', 'unowned'}:
+                    capture = capture[1:]
+                    if capture and capture[0].value == '(':
+                        capture = capture[swift_close(capture, 0) + 1:]
+                pair = swift_parts(capture, {'='})
+                if (len(pair) not in {1, 2} or len(pair[0]) != 1
+                        or not re.fullmatch(r'[A-Za-z_]\w*', pair[0][0].value)):
+                    raise SwiftUnsupported('Swift closure capture pattern needs binding analysis; analysis is incomplete', header[cursor].start)
+                captures.append((pair[0][0], pair[-1]))
+            cursor = close + 1
+        signature = swift_parts(header[cursor:], {'->'})[0]
+        while signature and signature[-1].value in {'async', 'throws', 'rethrows'}:
+            signature = signature[:-1]
+        signature = swift_ungroup(signature)
+        parameters = []
+        for part in swift_parts(signature, {','}):
+            if not part:
+                continue
+            pieces = swift_parts(part, {':'})
+            names = swift_ungroup(pieces[0])
+            if len(names) != 1 or not re.fullmatch(r'[A-Za-z_]\w*', names[0].value):
+                raise SwiftUnsupported('Swift closure parameter pattern needs binding analysis; analysis is incomplete', part[0].start)
+            parameters.append((names[0], swift_text(pieces[1]) if len(pieces) == 2 else ''))
+        return tuple(captures), tuple(parameters), body, True
 
     @staticmethod
     def iteration_names(tokens, depth=0):
@@ -528,7 +653,8 @@ class SwiftParser:
                           for name in SwiftParser.iteration_names(part, depth + 1))
             if len({name.value for name in names}) == len(names):
                 return names
-        raise ValueError('Swift iteration binding needs pattern analysis; analysis is incomplete')
+        raise SwiftUnsupported('Swift iteration binding needs pattern analysis; analysis is incomplete',
+                               tokens[0].start if tokens else None)
 
     @staticmethod
     def uninitialized(tokens):
@@ -987,8 +1113,9 @@ class SwiftSummary:
 
 
 class SwiftEngine:
-    def __init__(self, path, text, policy='path', parser=None):
+    def __init__(self, path, text, policy='path', parser=None, *, recover=False):
         self.path, self.text, self.policy = Path(path).resolve(), text, policy
+        self.recover, self.diagnostics = recover, {}
         self.sink_label = {'path': 'file sink', 'redirect': 'redirect', 'header': 'response header',
                            'outbound': 'outbound HTTP destination'}[policy]
         self.parser = SwiftParser(text) if parser is None else parser
@@ -996,12 +1123,19 @@ class SwiftEngine:
         self.budget, self.graphs = Budget(), {}
         self.contexts, self.summaries, self.globals = {}, {}, {}
         self.capture_states, self.capture_revision, self.active_context = {}, 0, None
+        self.closure_keys, self.stored_closures = {}, {}
+        self.active_closures = set()
         self.callback_seen = False
         self.thrown = CLEAN
         self.url_reads = {}
         self.function = self.parser.functions[-1]
-        self.effects, self.mutations = {}, {}
+        self.effects, self.mutations, self.returned = {}, {}, CLEAN
+        self.opaque_owners = {}
         self.local_globals = set()
+        for offset, reason, owner in self.parser.diagnostics:
+            self.function = SwiftFunction(offset, '<declaration>', owner, (), ())
+            self.opaque_owners[owner] = join(self.opaque_owners.get(owner, CLEAN), self.limitation(reason, offset))
+        self.function = self.parser.functions[-1]
         for statement in self.function.body:
             assignment = self.parser.assignment(statement.tokens) if statement.kind == 'simple' else None
             if assignment and assignment[0]:
@@ -1010,12 +1144,13 @@ class SwiftEngine:
                     self.local_globals.add(name)
                     self.globals[name] = self.expression(rhs, dict(self.globals), {})
                     if swift_tainted(self.globals[name]):
-                        raise ValueError('Swift request-derived global state needs capture analysis; analysis is incomplete')
+                        self.globals[name] = join(self.globals[name], self.limitation(
+                            'Swift request-derived global state needs capture analysis', statement.tokens[0].start))
         for function in self.parser.functions.values():
             request_parameter = any(re.fullmatch(r'(?:Vapor\.)?Request\??', item[2]) for item in function.parameters)
             if function.key == -1 or request_parameter or swift_source_tokens(swift_statement_tokens(function.body), self.parser.suppressed):
                 if self.parser.obligation is not None and _swift_observer_obligation(swift_statement_tokens(function.body), self.parser.obligation):
-                    raise ValueError('Swift property observer with a sink needs assignment binding analysis; analysis is incomplete')
+                    self.limitation('Swift property observer with a sink needs assignment binding analysis', function.key)
                 self.context(function, tuple(CLEAN for _ in function.parameters), entry=True)
 
     def step(self, offset, kind, label):
@@ -1027,10 +1162,41 @@ class SwiftEngine:
         return frozenset({Trace('source', (str(self.path), offset, label),
             tags=frozenset({'swift-string'}), evidence=(self.step(offset, 'source', label),))})
 
-    def context(self, function, arguments, entry=False):
+    def limitation(self, reason, offset, state=None, bindings=None):
+        """Report an opaque effect at its site and retain unsafe alternatives.
+
+        This is deliberately separate from lexical/structural failures and
+        AnalysisLimit. A proof-only consumer still gets an exception. During
+        an ordinary scan, unknown effects cannot certify a sanitizer, a clean
+        return, or an unchanged captured alias.
+        """
+        offset = max(0, offset)
+        if not self.recover:
+            raise SwiftUnsupported(reason + '; analysis is incomplete', offset)
+        location = self.step(offset, 'analysis', reason)
+        scope = '.'.join((*self.function.owner, self.function.name))
+        self.diagnostics[(offset, reason)] = dict(
+            rule='swift.taint.analysis-limited', path=str(self.path),
+            line=location.line, col=location.column, lang='swift', layer='taint',
+            severity='warning', message=reason + '; effects are conservatively unknown in ' + scope,
+            extras={'analysis': 'conservative', 'construct': self.text[offset:offset + 100].split('\n')[0],
+                    'reason': reason, 'policy': self.policy, 'scope': scope})
+        unknown = retag(self.source(offset, 'unknown effects: ' + reason),
+                        add=frozenset({'unknown-provenance'}))
+        if state is not None:
+            for binding in set(state) | set((bindings or {}).values()):
+                if binding.startswith('@'):
+                    continue
+                value = state.get(binding, CLEAN)
+                shapes = frozenset(trace for trace in value if trace.kind == 'shape')
+                state[binding] = join(self.forget(value), shapes, unknown)
+        return unknown
+
+    def context(self, function, arguments, entry=False, receiver=CLEAN):
         if any(function.parameter_attributes):
-            raise ValueError('Swift attributed parameters need transformation analysis; analysis is incomplete')
-        key = function.key, arguments, entry
+            opaque = self.limitation('Swift attributed parameters need transformation analysis', function.key)
+            arguments = tuple(join(value, opaque) for value in arguments)
+        key = function.key, arguments, entry, receiver
         if key not in self.contexts:
             self.budget.spend()
             if len(self.contexts) >= 2048:
@@ -1070,7 +1236,8 @@ class SwiftEngine:
             unsafe = frozenset(trace for trace in swift_tainted(value)
                 if 'contained-path' not in trace.tags and not (file_leaf and 'file-leaf' in trace.tags))
         if any('unknown-provenance' in trace.tags for trace in unsafe):
-            raise ValueError('Swift unknown closure parameter reaches a sink; analysis is incomplete')
+            self.limitation('Swift unknown closure parameter or opaque value reaches a sink', offset)
+            unsafe = frozenset(trace for trace in unsafe if 'unknown-provenance' not in trace.tags)
         if unsafe:
             self.effects[offset] = join(self.effects.get(offset, CLEAN),
                 advance(unsafe, self.step(offset, 'sink', self.sink_label)))
@@ -1128,9 +1295,13 @@ class SwiftEngine:
             return [self.parser.functions[key] for key in function_values]
         if any(trace.kind == 'shape' and trace.key[0].startswith('dynamic-instance:') for trace in receiver):
             return []
+        if name in self.parser.types:
+            return [function for function in self.parser.functions.values()
+                    if function.name == 'init' and function.owner == tuple(name.split('.'))]
         if '.' in name:
             prefix = name.rsplit('.', 1)[0]
-            if prefix == 'self':
+            if prefix == 'self' or (prefix == 'Self'
+                    and '.'.join(self.function.owner) in self.parser.final_types):
                 owner = self.function.owner
             elif prefix in self.parser.types:
                 owner = tuple(prefix.split('.'))
@@ -1155,8 +1326,8 @@ class SwiftEngine:
     def bind(self, function, arguments, state, bindings):
         position, values = 0, []
         for name, label, declaration, default in function.parameters:
-            if '...' in declaration or '@escaping' in declaration or '@autoclosure' in declaration:
-                raise ValueError('Swift variadic/escaping parameters need call binding analysis; analysis is incomplete')
+            if '...' in declaration:
+                raise SwiftUnsupported('Swift variadic parameters need call binding analysis; analysis is incomplete', function.key)
             if position < len(arguments) and arguments[position][0] == label:
                 value = arguments[position][1]
                 position += 1
@@ -1171,12 +1342,17 @@ class SwiftEngine:
         if self.callback_seen and swift_request_dependency(value):
             # Lexical capture IDs do not establish object/heap alias identity.
             # A write through another reference may change a captured object.
-            raise ValueError('Swift callback with request-derived object mutation needs heap/capture analysis; analysis is incomplete')
+            value = join(value, self.limitation(
+                'Swift callback with request-derived object mutation needs heap/capture analysis',
+                self.function.key, state, bindings))
         binding = bindings.get(name, name)
         previous = state.get(binding, CLEAN)
-        state[binding] = self.forget(join(previous, value))
+        instances = frozenset(trace for trace in previous if trace.kind == 'shape'
+                              and trace.key[0].startswith(('instance:', 'dynamic-instance:')))
+        state[binding] = join(self.forget(join(previous, value)), instances)
         if name in self.local_globals and binding == name and swift_tainted(state[binding]):
-            raise ValueError('Swift request-derived global mutation needs shared-state analysis; analysis is incomplete')
+            state[binding] = join(state[binding], self.limitation(
+                'Swift request-derived global mutation needs shared-state analysis', self.function.key))
         self.invalidate_properties(binding, state)
         return state[binding]
 
@@ -1216,7 +1392,7 @@ class SwiftEngine:
         if self.http_request(receiver) and leaf in {'setValue', 'addValue'} and 'forHTTPHeaderField' in labeled:
             if any(function.owner and function.owner[-1].split('.')[-1] == 'URLRequest' and function.name == leaf
                    for function in self.parser.functions.values()):
-                raise ValueError('Swift URLRequest extension needs destination-mutation analysis; analysis is incomplete')
+                raise SwiftUnsupported('Swift URLRequest extension needs destination-mutation analysis; analysis is incomplete', token.start)
             return CLEAN
         method_refs = {trace.key[0] for trace in receiver if trace.kind == 'shape'
                        and trace.key[0].startswith('http-method:')}
@@ -1247,19 +1423,44 @@ class SwiftEngine:
                           vapor or foundation or any(label in {'url', 'with'} for label in labeled)
                           or name.startswith(('AF.', 'Alamofire.', 'req.client.', 'request.client.'))))
         if http_shape and any(swift_request_dependency(value) for value in [receiver, *values]):
-            raise ValueError('Swift outbound HTTP receiver or overload needs binding analysis; analysis is incomplete')
+            raise SwiftUnsupported('Swift outbound HTTP receiver or overload needs binding analysis; analysis is incomplete', token.start)
         return None
 
     def call(self, name, receiver, arguments, site, state, bindings):
         token, callee_token = site.expression, site.callee
         leaf = name.rsplit('.', 1)[-1]
+        native_calls = {trace.key[0] for trace in receiver if trace.kind == 'native-callable'}
+        stored = [trace for trace in receiver if trace.kind == 'closure']
+        if native_calls or stored:
+            # A branch may select a stored closure, a native sink or a named
+            # helper. Evaluate every possible callable against the same input
+            # state; one alternative must not erase another's effects.
+            ordinary = frozenset(trace for trace in receiver
+                                 if trace.kind not in {'native-callable', 'closure'})
+            base = frozenset(trace for trace in ordinary if trace.kind != 'function')
+            results, states = [], []
+            for target in sorted(native_calls):
+                branch = dict(state)
+                results.append(self.call(target, base, arguments, site, branch, bindings))
+                states.append(branch)
+            for closure in stored:
+                branch = dict(state)
+                results.append(self.invoke_stored(closure, tuple(fact for _, fact, _ in arguments), branch))
+                states.append(branch)
+            if ordinary:
+                branch = dict(state)
+                results.append(self.call(name, ordinary, arguments, site, branch, bindings))
+                states.append(branch)
+            state.clear()
+            state.update(join_states(*states))
+            return join(*results)
         if self.policy == 'outbound' and arguments and all(
                 label and (not part or re.fullmatch(r'(?:[A-Za-z_]\w*:)+', swift_text(part)))
                 for label, _, part in arguments):
             # Swift method references such as data(from:) are not calls with
             # empty (clean) destinations. Their later invocation needs a
             # callable binding that this bounded frontend does not provide.
-            raise ValueError('Swift labeled callable reference needs argument binding; analysis is incomplete')
+            return self.limitation('Swift labeled callable reference needs argument binding', token.start, state, bindings)
         values = [value for _, value, _ in arguments]
         labeled = {label: value for label, value, _ in arguments if label}
         value = join(receiver, *values)
@@ -1353,13 +1554,14 @@ class SwiftEngine:
                 for captured in names.intersection(bindings):
                     fact = state.get(bindings[captured], CLEAN)
                     if swift_tainted(fact) or swift_has_shape(fact, 'request'):
-                        raise ValueError('Swift request-derived nested capture needs capture analysis; analysis is incomplete')
+                        return join(self.forget(value), self.limitation(
+                            'Swift request-derived nested capture needs capture analysis', token.start, state, bindings))
             if any(item[2].startswith('inout') for item in function.parameters) and any(item[3] for item in function.parameters):
-                raise ValueError('Swift defaulted inout arguments need mutation binding analysis; analysis is incomplete')
+                raise SwiftUnsupported('Swift defaulted inout arguments need mutation binding analysis; analysis is incomplete', token.start)
             matched = True
             call = self.step(token.start, 'call', name + '()')
             facts = tuple(advance(fact, call) for fact in bound)
-            summary = self.summaries[self.context(function, facts)]
+            summary = self.summaries[self.context(function, facts, receiver=receiver)]
             returned = join(returned, advance(summary.returned, call))
             self.thrown = join(self.thrown, advance(summary.thrown, call))
             for offset, fact in summary.effects.items():
@@ -1376,9 +1578,12 @@ class SwiftEngine:
                         state[bindings.get(tokens[1].value, tokens[1].value)] = fact
                         self.invalidate_properties(bindings.get(tokens[1].value, tokens[1].value), state)
         if matched:
+            if name in self.parser.types:
+                return join(returned, swift_shape('instance:' + name, token.start))
             return returned
         if candidates and any(swift_tainted(fact) for fact in values):
-            raise ValueError('Swift selected helper arguments could not bind; analysis is incomplete')
+            return join(self.forget(value), self.limitation(
+                'Swift selected helper arguments could not bind', token.start, state, bindings))
         if self.policy == 'outbound':
             result = self.outbound_call(name, receiver, arguments, token, state, bindings)
             if result is not None:
@@ -1403,32 +1608,56 @@ class SwiftEngine:
             return values[0]
         if name in self.parser.types:
             if any(swift_tainted(fact) for fact in values):
-                raise ValueError('Swift request-derived object initialization needs field analysis; analysis is incomplete')
-            return swift_shape('instance:' + name, token.start)
+                value = join(value, self.limitation(
+                    'Swift request-derived object initialization needs field analysis', token.start))
+                return join(self.forget(value), swift_shape('instance:' + name, token.start))
+            self.escape_closures(join(*values), state)
+            return join(swift_shape('instance:' + name, token.start), *values)
         if leaf in {'get', 'first'} and any(swift_has_shape(receiver, kind) for kind in {'request-collection', 'request-content'}):
             return self.source(token.start, name + '()')
         if leaf in {'append', 'appendContentsOf', 'insert', 'remove', 'removeAll', 'removeFirst', 'removeLast', 'removeSubrange', 'replaceSubrange', 'replace', 'appendPathComponent', 'deleteLastPathComponent', 'deletePathExtension'}:
             return self.mutate(name.split('.', 1)[0], join(*values), state, bindings)
         if any(part and part[0].value == '&' for _, _, part in arguments) and swift_tainted(value):
-            raise ValueError('Swift unresolved inout call needs mutation analysis; analysis is incomplete')
+            return join(self.forget(value), self.limitation(
+                'Swift unresolved inout call needs mutation analysis', token.start, state, bindings))
         if any(trace.kind == 'function' for fact in values for trace in fact) and (
                 swift_tainted(value) or swift_has_shape(value, 'request')):
-            raise ValueError('Swift selected callback needs higher-order call analysis; analysis is incomplete')
+            return join(self.forget(value), self.limitation(
+                'Swift selected callback needs higher-order call analysis', token.start, state, bindings))
         if any(function.name == leaf for function in self.parser.functions.values()) and swift_tainted(value):
-            raise ValueError('Swift unresolved receiver dispatch needs binding analysis; analysis is incomplete')
+            return join(self.forget(value), self.limitation(
+                'Swift unresolved receiver dispatch needs binding analysis', token.start, state, bindings))
+        self.escape_closures(join(*values), state)
         if self.callback_seen and any(swift_request_dependency(fact) for fact in values) and (
                 '.' in name or any(not fact or any(trace.kind == 'shape' for trace in fact) for fact in values)):
             # An unmodeled method (or a function given an unknown object) can
             # mutate a captured alias. Returning joined arguments alone is not
             # a summary of those heap effects. Selected same-file helpers and
             # modeled native sinks above keep their established semantics.
-            raise ValueError('Swift callback with unknown request-derived call effects needs heap/capture analysis; analysis is incomplete')
+            return join(self.forget(value), self.limitation(
+                'Swift callback with unknown request-derived call effects needs heap/capture analysis',
+                token.start, state, bindings))
         if '.' in name and swift_tainted(receiver) and leaf not in {'hasPrefix', 'contains', 'hasSuffix', 'lowercased', 'uppercased', 'replacingOccurrences', 'addingPercentEncoding', 'dropFirst', 'dropLast'}:
             self.mutate(name.split('.', 1)[0], CLEAN, state, bindings)
         result = self.forget(value)
         return join(result, swift_shape('unknown', token.start)) if self.policy == 'outbound' else result
 
     def member(self, name, receiver, token, owner_binding=None):
+        if name in {'self', 'callAsFunction'} and any(trace.kind == 'native-callable' for trace in receiver):
+            return receiver
+        if name in {'file', 'sendFile', 'streamFile', 'readFile', 'serveFile', 'writeFile'}:
+            return join(self.forget(receiver), frozenset({Trace('native-callable', (name, token.start))}))
+        for instance in receiver:
+            if instance.kind != 'shape' or not instance.key[0].startswith(('instance:', 'dynamic-instance:')):
+                continue
+            owner = tuple(instance.key[0].split(':', 1)[1].split('.'))
+            declaration = self.parser.fields.get(owner, {}).get(name, '')
+            if re.fullmatch(r'(?:Vapor\.)?Request\??', declaration):
+                return join(self.forget(receiver), swift_shape('request', token.start))
+            key = self.parser.field_functions.get((owner, name))
+            if key is not None:
+                summary = self.summaries[self.context(self.parser.functions[key], (), receiver=receiver)]
+                return join(self.forget(receiver), summary.returned)
         if self.policy == 'outbound':
             if receiver and all(trace.kind == 'shape' and trace.key[0] == 'namespace:Foundation' for trace in receiver) and name == 'URLSession':
                 return swift_shape('native-type:URLSession', token.start)
@@ -1472,32 +1701,81 @@ class SwiftEngine:
         value = self.forget(receiver)
         return join(value, swift_shape('unknown', token.start)) if self.policy == 'outbound' else value
 
-    def inline_closure(self, tokens, argument, state, bindings, depth, *, catches_errors=False):
+    def store_closure(self, tokens, state, bindings, depth):
+        inner = SwiftLexer(self.text).scan(tokens[0].end, tokens[-1].start)
+        captures, _parameters, _body, _explicit = self.parser.closure_signature(inner)
+        snapshots = tuple((token.value, self.expression(expression, state, bindings, depth + 1))
+                          for token, expression in captures)
+        key = (tokens[0].start, tokens[-1].end, self.active_context, snapshots)
+        if key not in self.closure_keys:
+            self.budget.spend()
+            identifier = len(self.stored_closures)
+            self.closure_keys[key] = identifier
+            self.stored_closures[identifier] = (tuple(tokens), self.function, dict(bindings),
+                                                dict(state), dict(snapshots), self.active_context)
+        return frozenset({Trace('closure', (self.closure_keys[key],))})
+
+    def invoke_stored(self, closure, arguments, state):
+        if not self.callback_seen:
+            # Revisit mutations which preceded discovery of this invocation.
+            # A stored closure may capture an alias of the mutated object.
+            self.callback_seen = True
+            self.capture_revision += 1
+        tokens, function, bindings, captured, snapshots, context = self.stored_closures[closure.key[0]]
+        if closure.key[0] in self.active_closures:
+            return self.limitation('Swift recursive stored callback needs a recursive closure summary',
+                                   tokens[0].start, state, bindings)
+        if len(self.active_closures) >= 64:
+            raise AnalysisLimit('Swift stored closure nesting limit exceeded; analysis is incomplete')
+        parent, active = self.function, self.active_context
+        environment = join_states(captured, self.capture_states.get(context, {}), state)
+        self.active_closures.add(closure.key[0])
+        try:
+            self.function, self.active_context = function, context
+            value = self.inline_closure(tokens, join(*arguments), environment, bindings, 0,
+                                        capture_values=snapshots, argument_values=arguments)
+            for binding in bindings.values():
+                if binding in state:
+                    state[binding] = join(state[binding], environment.get(binding, CLEAN))
+            return value
+        finally:
+            self.function, self.active_context = parent, active
+            self.active_closures.remove(closure.key[0])
+
+    def escape_closures(self, value, state):
+        for closure in value:
+            if closure.kind != 'closure':
+                continue
+            if not self.callback_seen:
+                self.callback_seen = True
+                self.capture_revision += 1
+            tokens = self.stored_closures[closure.key[0]][0]
+            unknown = retag(self.source(tokens[0].start, 'unknown closure parameter'),
+                            add=frozenset({'unknown-provenance'}))
+            self.invoke_stored(closure, (unknown,), state)
+
+    def inline_closure(self, tokens, argument, state, bindings, depth, *, catches_errors=False,
+                       capture_values=None, argument_values=None):
         """Evaluate a collection callback with lexical captures and a loop join.
 
         A method name does not establish nonescaping execution. Captures also
         inherit the enclosing context's reachable future values. Zero or more
         calls are possible, so a callback cannot strongly kill a captured value
         or confer its element proof on the whole collection. Unknown callback
-        APIs, stored closures and capture lists still refuse analysis.
+        APIs can supply unknown arguments. Explicit capture-list entries are
+        snapshots; ordinary lexical captures also see reachable later writes.
         """
         if depth > 64:
             raise AnalysisLimit('Swift closure nesting limit exceeded; analysis is incomplete')
         # Expression normalization removes newlines. Recover this exact source
         # range so separate callback statements retain their control flow.
         inner = SwiftLexer(self.text).scan(tokens[0].end, tokens[-1].start)
-        signature = swift_parts(inner, {'in'})
-        if len(signature) > 2 or (inner and inner[0].value == '['):
-            raise ValueError('Swift closure capture list needs binding analysis; analysis is incomplete')
-        if len(signature) == 2:
-            names = swift_ungroup(signature[0])
-            if len(names) != 1 or not re.fullmatch(r'[A-Za-z_]\w*', names[0].value):
-                raise ValueError('Swift closure parameter pattern needs binding analysis; analysis is incomplete')
-            parameter, body_tokens = names[0].value, signature[1]
-        else:
-            parameter, body_tokens = '$0', inner
-        if any(re.fullmatch(r'\$[1-9]\d*', item.value) for item in body_tokens):
-            raise ValueError('Swift closure arity needs binding analysis; analysis is incomplete')
+        captures, parameters, body_tokens, explicit = self.parser.closure_signature(inner)
+        if not explicit:
+            names = {'$0', *(item.value for item in body_tokens
+                            if item.kind == 'code' and re.fullmatch(r'\$\d+', item.value))}
+            parameters = tuple((SwiftToken(name, tokens[0].start, tokens[0].end), '')
+                               for name in sorted(names))
         parent = self.function
         body = self.parser.block(body_tokens, parent.owner, (*parent.scope, parent.key))
         if len(body) == 1 and body[0].kind == 'simple' and not self.parser.assignment(body[0].tokens):
@@ -1505,13 +1783,25 @@ class SwiftEngine:
         function = SwiftFunction(tokens[0].start, '<closure>', parent.owner,
                                  (*parent.scope, parent.key), (), body)
         scope = dict(bindings)
-        scope[parameter] = 'closure-argument:' + str(tokens[0].start)
         initial = dict(state)
         initial.pop('@result', None)
         for binding in bindings.values():
             initial[binding] = join(initial.get(binding, CLEAN),
                                     self.capture_states.get(self.active_context, {}).get(binding, CLEAN))
-        initial[scope[parameter]] = argument
+        for capture, expression in captures:
+            # Evaluate in the creation environment before introducing aliases.
+            value = (capture_values[capture.value] if capture_values is not None
+                     else self.expression(expression, state, bindings, depth + 1))
+            scope[capture.value] = 'capture:' + str(capture.start)
+            initial[scope[capture.value]] = value
+        for index, (parameter, declaration) in enumerate(parameters):
+            if parameter.value == '_':
+                continue
+            scope[parameter.value] = 'closure-argument:' + str(parameter.start) + ':' + parameter.value
+            value = argument if argument_values is None or index >= len(argument_values) else argument_values[index]
+            if re.fullmatch(r'(?:Vapor\.)?Request\??', declaration):
+                value = join(value, swift_shape('request', parameter.start))
+            initial[scope[parameter.value]] = value
         initial['@reachable'] = swift_constant('true', 'code')
         entry, actions, edges = self.graph(function, scope)
         returned, mutations, context, thrown = self.returned, self.mutations, self.active_context, self.thrown
@@ -1648,7 +1938,7 @@ class SwiftEngine:
                                   for left, right in zip(self.parser.tokens, self.parser.tokens[1:]))
             if (len(tokens) < 3 or tokens[1].value not in {'expect', 'require'} or tokens[2].value != '('
                     or not imports_testing or any(item.value == 'macro' for item in self.parser.tokens)):
-                raise ValueError('Swift macro expansion needs analysis; analysis is incomplete')
+                raise SwiftUnsupported('Swift macro expansion needs analysis; analysis is incomplete', tokens[0].start)
             name, cursor, value, owner_binding = '#' + tokens[1].value, 2, CLEAN, None
         elif tokens[0].kind in {'literal', 'number', 'regex', 'template'}:
             token = tokens[0]
@@ -1686,7 +1976,9 @@ class SwiftEngine:
             value = self.expression(tokens[1:close], state, bindings, depth + 1)
             cursor, name, owner_binding = close + 1, '', None
         elif tokens[0].value == '{':
-            raise ValueError('Swift closure execution/capture needs closure analysis; analysis is incomplete')
+            close = swift_close(tokens, 0)
+            value = self.store_closure(tokens[:close + 1], state, bindings, depth)
+            cursor, name, owner_binding = close + 1, '', None
         elif tokens[0].value in {'nil', 'true', 'false'}:
             return swift_constant(tokens[0].value, 'code')
         elif tokens[0].value == '&':
@@ -1695,11 +1987,16 @@ class SwiftEngine:
             name = tokens[0].value
             owner_binding = bindings.get(name, name)
             value = state.get(owner_binding, self.globals.get(name, CLEAN))
+            if not value and name not in bindings and name in self.parser.fields.get(self.function.owner, {}):
+                value = self.member(name, state.get('self', CLEAN), tokens[0], 'self')
             if not value and name in {'req', 'request'} and name not in bindings and name not in state:
                 value = swift_shape('request', tokens[0].start)
             if not value:
                 functions = self.candidates(name, CLEAN, state, bindings)
                 value = frozenset(Trace('function', (function.key,)) for function in functions)
+            if (not value and name not in bindings and name not in state
+                    and name in {'file', 'sendFile', 'streamFile', 'readFile', 'serveFile', 'writeFile'}):
+                value = frozenset({Trace('native-callable', (name, tokens[0].start))})
             if self.policy == 'outbound' and not value and name not in bindings and name not in state:
                 if self.builtin(name, state, bindings) and name in {'URLSession', 'Foundation'}:
                     shape = 'native-type:URLSession' if name == 'URLSession' else 'namespace:Foundation'
@@ -1983,6 +2280,28 @@ class SwiftEngine:
         return state
 
     def graph(self, function, outer_scope=None):
+        """Build a graph, isolating unsupported semantics to their statement.
+
+        Structural failures and work limits are deliberately not caught here.
+        Each retry marks a distinct statement opaque, so unaffected statements
+        and other functions retain their ordinary source-to-sink analysis.
+        """
+        opaque = {}
+        while True:
+            try:
+                return self._graph(function, outer_scope, opaque)
+            except SwiftUnsupported as error:
+                if not self.recover:
+                    raise
+                offset = error.offset
+                if offset is None or offset in opaque:
+                    # A failure without a statement location cannot be safely
+                    # localized. Do not turn an internal error into a clean scan.
+                    raise
+                self.budget.spend()
+                opaque[offset] = str(error).removesuffix('; analysis is incomplete')
+
+    def _graph(self, function, outer_scope, opaque):
         actions, edges = {}, {}
         scope = dict(outer_scope or {})
         scope.update({name: 'parameter:' + name for name, _, _, _ in function.parameters})
@@ -2061,8 +2380,7 @@ class SwiftEngine:
             if '.' not in name and any(fn.name == leaf for fn in self.parser.functions.values()):
                 return False
             if '.' not in name and function.owner:
-                # An inherited member may shadow the global primitive. Module
-                # qualification is required when that lookup is unresolved.
+                # An inherited member may shadow the global primitive.
                 return False
             return True
 
@@ -2079,6 +2397,31 @@ class SwiftEngine:
                 if statement.kind == 'simple' and process_exit(statement.tokens, local):
                     return True
             return False
+
+        def pattern_names(tokens):
+            """Bind case/catch payloads without claiming their pattern matched.
+
+            Every arm remains possible; each component inherits the subject's
+            dependencies. Types, enum constructors, labels and wildcards are
+            not value bindings.
+            """
+            names, binding = {}, False
+            for index, token in enumerate(tokens):
+                if token.kind != 'code':
+                    continue
+                if token.value in {'let', 'var'}:
+                    binding = True
+                    continue
+                if token.value in {'where', 'is', 'as'}:
+                    binding = False
+                    continue
+                previous = tokens[index - 1].value if index else ''
+                following = tokens[index + 1].value if index + 1 < len(tokens) else ''
+                if (binding and re.fullmatch(r'[A-Za-z_]\w*', token.value)
+                        and token.value not in {'_', 'true', 'false', 'nil'}
+                        and previous != '.' and following not in {'(', ':', '.'}):
+                    names[token.value] = token
+            return tuple(names.values())
 
         def group_directives(statements):
             result, index, total = [], 0, len(statements)
@@ -2113,6 +2456,7 @@ class SwiftEngine:
                     continue
                 result.append(statement); index += 1
             return tuple(result)
+
         def register_arm_declarations(directive, local):
             for arm in directive.extra:
                 for statement in arm:
@@ -2124,6 +2468,7 @@ class SwiftEngine:
                     declaration = self.parser.uninitialized(statement.tokens) if statement.kind == 'simple' else None
                     if declaration:
                         local[declaration.value] = declaration.value + '@' + str(declaration.start)
+
         def block(statements, following, bindings, break_to=None, continue_to=None, exit_to=None):
             exit_target = exit_node if exit_to is None else exit_to
             deferred_bodies, normal_statements = [], []
@@ -2166,6 +2511,11 @@ class SwiftEngine:
                 kind, tokens = statement.kind, statement.tokens
                 if kind == 'definition':
                     continue
+                limitation = next(((offset, reason) for offset, reason in opaque.items()
+                                   if tokens and tokens[0].start <= offset < tokens[-1].end), None)
+                if limitation is not None:
+                    following = node('opaque', tokens, local, (following,), limitation, reads=before)
+                    continue
                 if kind == 'ifdirective':
                     arm_entries = [block(arm, following, before, break_to, continue_to, exit_target)
                                    for arm in statement.extra]
@@ -2191,11 +2541,16 @@ class SwiftEngine:
                 elif kind == 'for':
                     parts = swift_parts(tokens, {'in'})
                     if len(parts) != 2:
-                        raise ValueError('Swift iteration binding needs pattern analysis; analysis is incomplete')
-                    names = self.parser.iteration_names(parts[0])
+                        raise SwiftUnsupported('Swift iteration binding needs pattern analysis; analysis is incomplete', tokens[0].start)
+                    # Parentheses here are tuple patterns, not expression
+                    # grouping: retain them for recursive binding analysis.
+                    pattern = tuple(t for t in parts[0] if t.value != '\n')
+                    while pattern and pattern[0].value in {'try', 'await'}:
+                        pattern = pattern[1:]
+                    names = self.parser.iteration_names(pattern)
                     sequence = swift_parts(parts[1], {'where'})
                     if len(sequence) > 2 or not all(swift_ungroup(part) for part in sequence):
-                        raise ValueError('Swift iteration filter needs condition analysis; analysis is incomplete')
+                        raise SwiftUnsupported('Swift iteration filter needs condition analysis; analysis is incomplete', tokens[0].start)
                     inner = dict(local)
                     for name in names:
                         inner[name.value] = name.value + '@' + str(name.start)
@@ -2209,14 +2564,82 @@ class SwiftEngine:
                 elif kind in {'break', 'continue'}:
                     target = break_to if kind == 'break' else continue_to
                     if target is None or tokens:
-                        raise ValueError('Swift labeled/nonlocal loop exit needs control-flow analysis; analysis is incomplete')
+                        raise SwiftUnsupported('Swift labeled/nonlocal loop exit needs control-flow analysis; analysis is incomplete',
+                                               tokens[0].start if tokens else function.key)
                     following = node('branch', targets=(target,))
+                elif kind == 'jump':
+                    following = node('branch', targets=statement.extra)
                 elif kind in {'return', 'throw'}:
-                    following = node(kind, tokens, local, (exit_target,) if kind in {'return', 'throw'} else ())
+                    following = node(kind, tokens, local, (exit_target,))
                 elif kind == 'simple' and process_exit(tokens, before):
-                    # Evaluate arguments (which may contain sinks), but a real
-                    # Never-returning primitive has no successor edge.
                     following = node('eval', tokens, local, ())
+                elif kind == 'unsupported' and tokens and tokens[0].value == 'repeat':
+                    opening = next((i for i, t in enumerate(tokens) if t.kind == 'code' and t.value == '{'), -1)
+                    if opening < 1:
+                        raise ValueError('Swift malformed repeat block; analysis is incomplete')
+                    close = swift_close(tokens, opening)
+                    tail = swift_ungroup(tokens[close + 1:])
+                    if not tail or tail[0].value != 'while':
+                        raise ValueError('Swift repeat block has no while condition; analysis is incomplete')
+                    repeated = self.parser.block(tokens[opening + 1:close], function.owner, ())
+                    loop = node('branch')
+                    body = block(repeated, loop, local, following, loop, exit_target)
+                    edges[loop] = (condition(tail[1:], body, following, local),)
+                    following = body
+                elif kind == 'unsupported' and tokens and tokens[0].value == 'switch':
+                    opening = next((i for i, t in enumerate(tokens) if t.kind == 'code' and t.value == '{'), -1)
+                    if opening < 1:
+                        raise ValueError('Swift malformed switch; analysis is incomplete')
+                    close = swift_close(tokens, opening)
+                    subject, arms, cursor = tokens[1:opening], [], opening + 1
+                    while cursor < close:
+                        if tokens[cursor].value in {'\n', ';'}:
+                            cursor += 1
+                            continue
+                        if tokens[cursor].value not in {'case', 'default', '@'}:
+                            raise SwiftUnsupported('Swift switch arm needs pattern analysis; analysis is incomplete', tokens[cursor].start)
+                        if tokens[cursor].value == '@':
+                            cursor += 2  # @unknown default still has an ordinary body.
+                        marker, colon = tokens[cursor].value, cursor + 1
+                        while colon < close and tokens[colon].value != ':':
+                            if tokens[colon].kind == 'code' and tokens[colon].value in {'(', '['}:
+                                colon = swift_close(tokens, colon)
+                            colon += 1
+                        if colon >= close:
+                            raise ValueError('Swift switch case has no colon; analysis is incomplete')
+                        finish = colon + 1
+                        while finish < close:
+                            if tokens[finish].kind == 'code':
+                                if tokens[finish].value in {'(', '[', '{'}:
+                                    finish = swift_close(tokens, finish)
+                                elif tokens[finish].value in {'case', 'default', '@'}:
+                                    break
+                            finish += 1
+                        arms.append((marker, tokens[cursor + 1:colon], tokens[colon + 1:finish]))
+                        cursor = finish
+                    entries, fallthrough = [], following
+                    for marker, pattern, body_tokens in reversed(arms):
+                        inner, names = dict(local), pattern_names(pattern)
+                        for name in names:
+                            inner[name.value] = name.value + '@' + str(name.start)
+                        body_statements = self.parser.block(body_tokens, function.owner, ())
+                        def replace_fallthrough(items):
+                            return tuple(SwiftStatement('jump', (), extra=(fallthrough,))
+                                if st.kind == 'simple' and swift_text(st.tokens) == 'fallthrough'
+                                else replace(st, body=replace_fallthrough(st.body), alternate=replace_fallthrough(st.alternate))
+                                for st in items)
+                        entry = block(replace_fallthrough(body_statements), following, inner, following, continue_to, exit_target)
+                        fallthrough = entry
+                        # Case matching/where clauses are opaque predicates.
+                        # Evaluate their expressions but do not confer proof.
+                        where = swift_parts(pattern, {'where'})
+                        if len(where) == 2:
+                            entry = node('eval', where[1], inner, (entry,))
+                        entry = node('element', subject, inner, (entry,), tuple(name.value for name in names), reads=local)
+                        entries.append(entry)
+                    if not any(marker == 'default' for marker, _, _ in arms):
+                        entries.append(following)
+                    following = node('eval', subject, local, tuple(entries))
                 elif kind == 'unsupported' and tokens and tokens[0].value == 'do':
                     opening = next((i for i, t in enumerate(tokens) if t.value == '{'), -1)
                     if opening < 1:
@@ -2230,22 +2653,26 @@ class SwiftEngine:
                         brace = next((k for k in range(rest + 1, len(tokens)) if tokens[k].value == '{'), -1)
                         if brace < 0:
                             raise ValueError('Swift malformed catch; analysis is incomplete')
-                        sig = [t for t in tokens[rest + 1:brace] if t.kind == 'code' and t.value != '\n']
+                        signature = swift_ungroup(tokens[rest + 1:brace])
+                        names = pattern_names(signature)
+                        if not names:
+                            names = (SwiftToken('error', tokens[rest].start, tokens[rest].end),)
                         catch_scope = dict(local)
-                        if sig:
-                            if not (len(sig) == 2 and sig[0].value in {'let', 'var'}
-                                    and re.fullmatch(r'[A-Za-z_]\w*', sig[1].value)):
-                                raise ValueError('Swift do/catch pattern needs binding analysis; analysis is incomplete')
-                            catch_scope[sig[1].value] = sig[1].value + '@' + str(sig[1].start)
+                        for name in names:
+                            catch_scope[name.value] = name.value + '@' + str(name.start)
                         hclose = swift_close(tokens, brace)
-                        handler_stmts = self.parser.block(tokens[brace + 1:hclose], function.owner, {})
-                        catch_entries.append(block(handler_stmts, following, catch_scope, break_to, continue_to, exit_target))
+                        handler_stmts = self.parser.block(tokens[brace + 1:hclose], function.owner, ())
+                        entry = block(handler_stmts, following, catch_scope, break_to, continue_to, exit_target)
+                        where = swift_parts(signature, {'where'})
+                        if len(where) == 2:
+                            entry = node('eval', where[1], catch_scope, (entry,))
+                        catch_entries.append(node('catch', (), catch_scope, (entry,), tuple(name.value for name in names)))
                         rest = hclose + 1
                         while rest < len(tokens) and tokens[rest].value == '\n':
                             rest += 1
                     if rest != len(tokens):
                         raise ValueError('Swift do trailing tokens; analysis is incomplete')
-                    do_stmts = self.parser.block(tokens[opening + 1:do_close], function.owner, {})
+                    do_stmts = self.parser.block(tokens[opening + 1:do_close], function.owner, ())
                     before_key = len(actions)
                     do_entry = block(do_stmts, following, local, break_to, continue_to, exit_target)
                     for created in range(before_key, len(actions)):
@@ -2267,26 +2694,40 @@ class SwiftEngine:
         kind, tokens, bindings, extra, reads = action
         if kind == 'branch':
             return state
+        if kind == 'opaque':
+            offset, reason = extra
+            unknown = self.limitation(reason, offset, state, bindings)
+            # The skipped statement may return, throw or mutate an inout
+            # argument. Its summary cannot certify any of those effects clean.
+            self.returned = join(self.returned, unknown)
+            self.thrown = join(self.thrown, unknown)
+            for index, (_, _, declaration, _) in enumerate(self.function.parameters):
+                if declaration.startswith('inout'):
+                    self.mutations[index] = join(self.mutations.get(index, CLEAN), unknown)
+            return state
         if kind == 'exit':
             self.returned = join(self.returned, state.get('@result', CLEAN))
+            if self.function.name == 'init':
+                self.returned = join(self.returned, state.get('self', CLEAN))
             for index, (name, _, declaration, _) in enumerate(self.function.parameters):
                 if declaration.startswith('inout'):
                     self.mutations[index] = join(self.mutations.get(index, CLEAN), state.get('parameter:' + name, CLEAN))
             return state
         if kind == 'proof':
             return self.proof(tokens, extra, state, bindings)
-        if kind in {'unsupported', 'closure'}:
-            raise ValueError('Unsupported Swift control flow or closure; analysis is incomplete')
+        if kind == 'unsupported':
+            raise SwiftUnsupported('Unsupported Swift control flow or closure; analysis is incomplete',
+                                   tokens[0].start if tokens else self.function.key)
+        if kind == 'catch':
+            value = join(state.get('@exception', CLEAN),
+                         *(self.forget(fact) for name, fact in state.items() if not name.startswith('@')))
+            for name in extra:
+                state[bindings[name]] = value
+            return state
         if kind == 'element':
             value = self.expression(tokens, state, reads)
-            # Reading an element of request data is itself an untrusted read,
-            # just like subscripting it. Retaining only the collection shape
-            # would let a destructured header/query value reach a sink clean.
             if any(swift_has_shape(value, shape) for shape in {'request-collection', 'request-content'}):
                 value = join(value, self.source(tokens[0].start, 'request iteration'))
-            # Components conservatively inherit every element dependency, but
-            # never a collection/other component's validation. Request shapes
-            # must survive so destructured request.query remains a source.
             requests = frozenset(trace for trace in value if trace.kind == 'shape'
                 and trace.key[0] in {'request', 'request-collection', 'request-content'})
             value = join(self.forget(value), requests)
@@ -2303,11 +2744,12 @@ class SwiftEngine:
             return state
         assignment = self.parser.assignment(tokens) if kind in {'simple', 'optional'} else None
         if kind == 'optional' and not assignment:
-            raise ValueError('Unsupported Swift optional binding; analysis is incomplete')
+            raise SwiftUnsupported('Unsupported Swift optional binding; analysis is incomplete', tokens[0].start)
         if assignment:
             name, lhs, rhs, operator, _ = assignment
             value = self.expression(rhs, state, reads)
             if not name:
+                self.escape_closures(value, state)
                 header = swift_text(lhs)
                 header_assignment = re.fullmatch(r'(?:[A-Za-z_]\w*\.)?headers\[([\'\"])([^\'\"]+)\1\]', header, re.IGNORECASE)
                 if header_assignment:
@@ -2332,33 +2774,48 @@ class SwiftEngine:
                     self.mutate(member.group(1), value, state, bindings)
                     return state
                 if swift_tainted(value):
-                    raise ValueError('Swift request-derived field/element write needs heap analysis; analysis is incomplete')
+                    self.limitation('Swift request-derived field/element write needs heap analysis', lhs[0].start, state, bindings)
                 return state
             binding = bindings.get(name, name)
+            if name not in bindings and name in self.parser.fields.get(self.function.owner, {}):
+                # Unqualified stored-property writes inside an initializer or
+                # method have the same receiver effects as self.property = ... .
+                # A local declaration/parameter of that name remains lexical.
+                self.escape_closures(value, state)
+                self.mutate('self', value, state, bindings)
+                return state
             if operator != '=':
                 value = self.forget(join(state.get(reads.get(name, name), CLEAN), value))
             self.invalidate_properties(binding, state)
             state[binding] = advance(value, self.step(lhs[0].start, 'assign', name))
             if name in self.local_globals and binding == name and swift_tainted(value):
-                raise ValueError('Swift request-derived global write needs shared-state analysis; analysis is incomplete')
+                self.globals[name] = join(self.globals.get(name, CLEAN), value,
+                    self.limitation('Swift request-derived global write needs shared-state analysis', lhs[0].start))
             return state
         value = self.expression(tokens, state, bindings)
         if kind == 'return':
+            self.escape_closures(value, state)
             state['@result'] = advance(value, self.step(tokens[0].start if tokens else self.function.key, 'return', self.function.name))
         elif kind == 'throw':
             self.thrown = join(self.thrown, value)
+            state['@exception'] = join(state.get('@exception', CLEAN), value)
         return state
 
     def observe(self, action, state):
-        """Join reachable values for callbacks that may execute after this node.
-
-        Context and lexical binding IDs keep unrelated callers and shadowed
-        locals separate. The enclosing analysis repeats whenever this finite
-        map grows, including when a nested callback changes a captured object.
-        """
+        """Retain future values for escaping callbacks in this lexical context."""
         previous = self.capture_states.get(self.active_context, {})
         before = {key: value for key, value in state.items() if not key.startswith('@')}
-        output = self.transfer(action, state)
+        try:
+            output = self.transfer(action, state)
+        except SwiftUnsupported as error:
+            if not self.recover:
+                raise
+            kind, tokens, bindings, _extra, _reads = action
+            offset = error.offset if error.offset is not None else (tokens[0].start if tokens else self.function.key)
+            unknown = self.limitation(str(error).removesuffix('; analysis is incomplete'), offset, state, bindings)
+            if kind == 'return':
+                state['@result'] = join(state.get('@result', CLEAN), unknown)
+            output = state
         after = {key: value for key, value in output.items() if not key.startswith('@')}
         updated = join_states(previous, before, after)
         if updated != previous:
@@ -2372,8 +2829,6 @@ class SwiftEngine:
             changed = False
             before = len(self.contexts)
             capture_revision = self.capture_revision
-            # Keep the last complete iteration's observations, not guesses
-            # made before a selected callee's return summary was available.
             self.url_reads = {}
             for key, function in tuple(self.contexts.items()):
                 self.budget.spend()
@@ -2400,7 +2855,8 @@ class SwiftEngine:
                 if function.owner:
                     owner = '.'.join(function.owner)
                     kind = 'instance:' if owner in self.parser.final_types else 'dynamic-instance:'
-                    initial['self'] = swift_shape(kind + owner, function.key)
+                    initial['self'] = join(key[3], swift_shape(kind + owner, function.key),
+                                           self.opaque_owners.get(function.owner, CLEAN))
                 solve(entry, initial, edges, lambda node, state: self.observe(actions[node], state), self.budget)
                 updated = self.summaries[key].merged(SwiftSummary(self.returned, self.effects, self.mutations, self.thrown))
                 if updated != self.summaries[key]:
@@ -2415,15 +2871,9 @@ class SwiftEngine:
 
 
 def file_url_read_offsets(path, text):
-    """Character offsets of proven native String/Data file-URL readers.
+    """Offsets of proven native file-URL readers, using strict flow summaries.
 
-    The caller can exclude these from HTTP/SSRF findings even when the file
-    path itself is unsafe; path traversal is a distinct sink obligation. A
-    mixed/unknown URL kind never qualifies. Unsupported flow propagates its
-    error rather than granting a file-only exemption. Offsets identify the
-    String or Data identifier, including a qualified Foundation.String call,
-    so another network read on the same physical line remains an obligation.
-    Every selected call context contributes to the site's final value facts.
+    An opaque or incomplete summary cannot authorize a file-only exemption.
     """
     parser = SwiftParser(text)
     engine = SwiftEngine(path, text, 'path', parser)
@@ -2432,19 +2882,20 @@ def file_url_read_offsets(path, text):
         if value and all('file-url' in trace.tags and 'path-string' not in trace.tags for trace in value))
 
 
-def flow_findings(path, text, policy='path'):
+def flow_findings(path, text, policy='path', *, recover=False):
+    """Run scoped flow, optionally reporting local conservative limitations.
+
+    Strict proof consumers must not authorize an exemption from an opaque
+    summary. Ordinary scanner adapters opt into local warnings; lexical
+    failures, malformed syntax and work limits still fail the scan.
+    """
     tokens = swift_validated_tokens(text)
     suppressed, _drops, _warnings = swift_taint_source_drops(path, text, tokens)
-    # Lexing and delimiter validation still run on every selected source.
-    # With no selected request source, there is no source-to-sink obligation
-    # for these policies; unrelated Swift closure/actor syntax belongs to
-    # its own analyzer rather than being misreported as a failed taint pass.
     obligation_fn = swift_outbound_obligation if policy == 'outbound' else swift_flow_obligation
-    obligation = obligation_fn(tokens)
-    if not swift_request_source_tokens(tokens, suppressed) or not obligation:
+    if not swift_request_source_tokens(tokens, suppressed) or not obligation_fn(tokens):
         return []
-    parser = SwiftParser(text, tokens, suppressed, obligation_fn)
-    engine = SwiftEngine(path, text, policy, parser)
+    parser = SwiftParser(text, tokens, suppressed, obligation_fn, recover=recover)
+    engine = SwiftEngine(path, text, policy, parser, recover=recover)
     rule, message = {
         'path': ('swift.taint.request_path_traversal', 'Request-derived path reaches file read/write/serve sink'),
         'redirect': ('swift.taint.request_open_redirect', 'Unvalidated redirect from request data'),
@@ -2463,11 +2914,12 @@ def flow_findings(path, text, policy='path'):
             continue
         seen.add(sink.line)
         findings.append(dict(rule=rule, path=str(path.resolve()), line=sink.line, col=sink.column,
-            lang='swift', layer='taint', severity='critical',
-            message=message,
+            lang='swift', layer='taint', severity='critical', message=message,
             extras={'taint_path': [step.record() for step in traces[0].evidence],
                     'source_count': len({trace.key for trace in traces})}))
+    findings.extend(engine.diagnostics[key] for key in sorted(engine.diagnostics))
     return findings
+
 
 SKIP_DIRS = {'.git', '.hg', '.svn', '.venv', 'DerivedData', 'build', 'dist', 'vendor', '.build', '.swiftpm'}
 
@@ -2539,7 +2991,7 @@ def run(ctx: RunContext) -> Iterable[dict]:
         if path.suffix != '.swift':
             continue
         text = path.read_text(encoding='utf-8', errors='replace')
-        yield from flow_findings(path, text)
+        yield from flow_findings(path, text, recover=True)
 
 
 def _selftest_detects_tainted_file_sink() -> None:

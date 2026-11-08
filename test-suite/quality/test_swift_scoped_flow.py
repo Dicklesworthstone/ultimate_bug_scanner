@@ -341,13 +341,12 @@ class SwiftScopedFlowTests(unittest.TestCase):
                 _ = String(contentsOfFile: req.query["path"])
             }
         ''', (3,), 'path')
-        with self.assertRaisesRegex(ValueError, 'closure.*incomplete'):
-            self.check('''
-                func handle(req: Request) {
-                    let work = Task { consume(req.query["path"]) }
-                    output.append(contentsOf: ["fixed"])
-                }
-            ''')
+        self.check('''
+            func handle(req: Request) {
+                let work = Task { consume(req.query["path"]) }
+                output.append(contentsOf: ["fixed"])
+            }
+        ''')
 
     def test_if_optional_binding(self):
         self.check('''
@@ -809,6 +808,101 @@ class SwiftScopedFlowTests(unittest.TestCase):
             }
         ''', (3,))
 
+    def test_franken_ocr_page_marker_preserves_inner_quotes_and_interpolation(self):
+        # HtmlExport.swift at franken_ocr b77ba7ac6de17aeb82f104cf4a54eda86913b094.
+        source = r'''#"<div class="page-marker"><span>Page \#(number)</span></div>"#'''
+        tokens = swift_validated_tokens(source)
+        self.assertEqual(len(tokens), 1)
+        token = tokens[0]
+        self.assertEqual(token.kind, 'template')
+        self.assertEqual(token.value, '<div class="page-marker"><span>Page </span></div>')
+        self.assertEqual((token.start, token.end), (0, len(source)))
+        self.assertEqual([[part.value for part in hole] for hole in token.parts], [['number']])
+        self.assertEqual(token.parts[0][0].start, source.index('number'))
+
+    def test_extended_delimiter_count_does_not_hide_executable_interpolation(self):
+        for count in (1, 2, 33, 64):
+            hashes = '#' * count
+            target = hashes + '"<a href="\\' + hashes + '(req.query["next"])">"' + hashes
+            with self.subTest(count=count):
+                self.check('''
+                    func handle(req: Request) -> Response {
+                        let target = %s
+                        return req.redirect(to: target)
+                    }
+                ''' % target, (3,), suffix=str(count))
+                # Here the only source witness is inside the interpolation.
+                # Splitting a long delimiter must not make the policy skip it.
+                filename = hashes + '"/files/\\' + hashes + '(upload.filename)"' + hashes
+                self.check('''
+                    func export(upload: Upload) -> Response {
+                        let target = %s
+                        return Response.redirect(to: target)
+                    }
+                ''' % filename, (3,), suffix=str(count) + '-filename')
+
+    def test_raw_interpolation_with_fewer_hashes_is_inert(self):
+        self.check(r'''
+            func handle(req: Request) -> Response {
+                let target = ##"/local/\(req.query["next"])/\#(req.query["next"])"##
+                return req.redirect(to: target)
+            }
+        ''')
+
+    def test_nested_raw_strings_and_multiline_interpolation_keep_sources(self):
+        self.check(r'''
+            func handle(req: Request) -> Response {
+                let target = ##"outer \##(#"inner \#(req.query["next"] ?? #")"#)"#)"##
+                return req.redirect(to: target)
+            }
+        ''', (3,), suffix='single')
+        self.check(r'''
+            func handle(req: Request) -> Response {
+                let target = ##"""
+                <div class="content">\##(
+                    req.query["next"] /* ) /* nested */ */ ?? #"\#("quoted)")"#
+                )</div>
+                """##
+                return req.redirect(to: target)
+            }
+        ''', (7,), suffix='multiline')
+
+    def test_regex_parentheses_do_not_terminate_string_interpolation(self):
+        for literal in (
+            r'''"\(req.query["next"].replacing(/[)]/, with: ""))"''',
+            r'''#"\#(req.query["next"].replacing(#/[)]/#, with: ""))"#''',
+        ):
+            with self.subTest(literal=literal):
+                self.check('''
+                    func handle(req: Request) -> Response {
+                        let target = %s
+                        return req.redirect(to: target)
+                    }
+                ''' % literal, (3,), suffix=str(len(literal)))
+
+    def test_nested_interpolation_is_lexed_once_within_the_budget(self):
+        target = 'req.query["next"]'
+        for _ in range(20):
+            target = '"\\(' + target + ')"'
+        self.check('''
+            func handle(req: Request) -> Response {
+                return req.redirect(to: %s)
+            }
+        ''' % target, (2,))
+
+    def test_regex_continuation_and_division_share_interpolation_lexing(self):
+        source = r'''"\(text.replacing(
+            /* a regex begins after the call's opening parenthesis */
+            /[)]/,
+            with: "")) \((12
+            /* division continues after an operand */
+            / 3))"'''
+        token, = swift_validated_tokens(source)
+        self.assertEqual(token.kind, 'template')
+        self.assertEqual(len(token.parts), 2)
+        self.assertEqual([part.kind for part in token.parts[0] if part.value == '[)]'], ['regex'])
+        self.assertEqual([part.kind for part in token.parts[1] if part.value == '/'], ['code'])
+
     def test_request_byte_contents_are_not_the_destination(self):
         self.check('''
             func handle(req: Request) throws {
@@ -924,14 +1018,13 @@ class SwiftScopedFlowTests(unittest.TestCase):
                 }}
             ''')
 
-    def test_escaping_closure_is_explicitly_incomplete(self):
-        with self.assertRaisesRegex(ValueError, 'closure.*incomplete'):
-            self.check('''
-                func handle(req: Request) {
-                    let target = req.query["next"] ?? "/"
-                    DispatchQueue.main.async { Response.redirect(to: target) }
-                }
-            ''')
+    def test_escaping_closure_reports_the_captured_source_at_its_sink(self):
+        self.check('''
+            func handle(req: Request) {
+                let target = req.query["next"] ?? "/"
+                DispatchQueue.main.async { Response.redirect(to: target) }
+            }
+        ''', (3,))
 
     def test_nested_tainted_capture_is_explicitly_incomplete(self):
         with self.assertRaisesRegex(ValueError, 'nested capture.*incomplete'):
@@ -1040,14 +1133,17 @@ class SwiftScopedFlowTests(unittest.TestCase):
             with self.subTest(source=source), self.assertRaisesRegex(ValueError, 'attributed parameters.*incomplete'):
                 self.check(source)
 
-    def test_actual_source_without_sink_remains_conservatively_incomplete(self):
-        # Keep the old fail-closed boundary for actual incoming request state.
-        with self.assertRaisesRegex(ValueError, 'closure.*incomplete'):
-            self.check('''
-                func handle(input: Request) {
-                    let work = Task { consume(input.query["next"]) }
-                }
-            ''')
+    def test_actual_source_without_a_modeled_sink_completes(self):
+        self.check('''
+            func handle(input: Request) {
+                let work = Task { consume(input.query["next"]) }
+            }
+        ''')
+        self.check('''
+            func handle(input: Request) {
+                let work = Task { Response.redirect(to: input.query["next"]) }
+            }
+        ''', (2,), suffix='sink')
 
     def test_file_export_argument_labels_are_not_incoming_sources(self):
         for label in ('filename', 'fileName', 'originalFilename', 'originalFileName'):
@@ -1121,14 +1217,17 @@ class SwiftScopedFlowTests(unittest.TestCase):
                             forward(%s: req.query["target"])
                         }
                     ''' % (label, sink, label), (2,), policy=policy, suffix=f'-{label}-{policy}')
-                    with self.assertRaisesRegex(ValueError, 'closure.*incomplete'):
-                        self.check('''
-                            func handle(req: Request) {
-                                Task { forward(%s: req.query["target"]) }
-                            }
-                        ''' % label, policy=policy, suffix=f'-capture-{label}-{policy}')
+                    self.check('''
+                        func forward(%s target: String) {
+                            %s
+                        }
+                        func handle(req: Request) {
+                            Task { forward(%s: req.query["target"]) }
+                        }
+                    ''' % (label, sink, label), (2,), policy=policy,
+                               suffix=f'-capture-{label}-{policy}')
 
-    def test_actual_filename_capture_remains_explicitly_incomplete(self):
+    def test_filename_capture_without_a_path_or_redirect_sink_completes(self):
         sources = (
             'Task { IntentFile(filename: upload.filename) }',
             r'Task { IntentFile(filename: "copy-\(upload.fileName)") }',
@@ -1136,7 +1235,7 @@ class SwiftScopedFlowTests(unittest.TestCase):
         )
         for index, expression in enumerate(sources):
             for policy in ('path', 'redirect'):
-                with self.subTest(expression=expression, policy=policy), self.assertRaisesRegex(ValueError, 'closure.*incomplete'):
+                with self.subTest(expression=expression, policy=policy):
                     self.check('func handle(upload: Upload) { %s }' % expression,
                                policy=policy, suffix=f'-{index}-{policy}')
 
@@ -1175,13 +1274,12 @@ class SwiftScopedFlowTests(unittest.TestCase):
             with self.subTest(index=index):
                 self.check(source, lines, suffix=str(index))
 
-    def test_nested_literal_interpolation_still_activates_relevant_failure(self):
-        with self.assertRaisesRegex(ValueError, 'closure.*incomplete'):
-            self.check(r'''
-                func handle(req: Request) -> String {
-                    return "outer \("inner \(Task { Response.redirect(to: req.query["next"] ?? "/") })")"
-                }
-            ''')
+    def test_nested_literal_interpolation_still_activates_relevant_sink(self):
+        self.check(r'''
+            func handle(req: Request) -> String {
+                return "outer \("inner \(Task { Response.redirect(to: req.query["next"] ?? "/") })")"
+            }
+        ''', (2,))
 
     def test_file_record_members_are_not_file_serving_obligations(self):
         for access in ('file.name', 'file?.name', 'file!.name',
@@ -1198,11 +1296,11 @@ class SwiftScopedFlowTests(unittest.TestCase):
                         }
                     ''' % access, policy=policy, suffix=access + policy)
 
-    def test_file_record_members_keep_real_field_sources_incomplete(self):
+    def test_computed_getters_with_sources_and_no_sink_complete(self):
         for source in ('req.query["path"]', 'request.query["path"]',
-                       'upload.filename', 'request'):
+                       'upload.filename'):
             for policy in ('path', 'redirect'):
-                with self.subTest(source=source, policy=policy), self.assertRaisesRegex(ValueError, 'initialization.*incomplete'):
+                with self.subTest(source=source, policy=policy):
                     self.check('''
                         struct Reader {
                             var body: some View {
@@ -1213,27 +1311,41 @@ class SwiftScopedFlowTests(unittest.TestCase):
                         func incoming(req: Request) {}
                     ''' % source, policy=policy, suffix=source.split('.')[0] + policy)
 
+    def test_unknown_getter_call_with_a_request_object_is_incomplete(self):
+        with self.assertRaisesRegex(ValueError, 'unknown request-derived call effects.*incomplete'):
+            self.check('''
+                struct Reader {
+                    var body: some View {
+                        ForEach(attachments) { file in Text(file.name) }
+                        consume(request)
+                    }
+                }
+                func incoming(req: Request) {}
+            ''')
+
     def test_filename_field_binding_is_not_an_input_read(self):
-        for declaration in ('let filename: String', 'private let filename: String?',
-                            'var originalFilename: String',
-                            'let filename = "fixed.txt"',
-                            'var filename: String { "fixed.txt" }'):
+        declarations = (
+            'let filename: String', 'private let filename: String?',
+            'var originalFilename: String', 'let filename = "fixed.txt"',
+            'var filename: String { "fixed.txt" }',
+            'var filename: String { upload.filename }',
+            'let filename: Request', 'let request: Request',
+            'let value = upload.filename',
+            r'let value = "copy-\(upload.filename)"',
+        )
+        for index, declaration in enumerate(declarations):
             with self.subTest(declaration=declaration):
                 self.check('''
                     struct Upload { %s }
                     func handle(req: Request) {
                         _ = file(at: req.query["path"])
+                        _ = file(at: "/fixed")
                     }
-                ''' % declaration, (3,), policy='path', suffix=str(len(declaration)))
-        for declaration in ('let filename: Request', 'let request: Request',
-                            'var filename: String { upload.filename }',
-                            'let value = upload.filename',
-                            r'let value = "copy-\(upload.filename)"'):
-            with self.subTest(declaration=declaration), self.assertRaisesRegex(ValueError, 'initialization.*incomplete'):
+                ''' % declaration, (3,), policy='path', suffix=f'-{index}-unsafe')
                 self.check('''
                     struct Upload { %s }
-                    func handle(req: Request) { _ = file(at: req.query["path"]) }
-                ''' % declaration, policy='path', suffix=str(len(declaration)))
+                    func handle(req: Request) { _ = file(at: "/fixed") }
+                ''' % declaration, policy='path', suffix=f'-{index}-safe')
 
     def test_file_record_members_do_not_hide_real_sinks(self):
         for policy, sink in (('path', 'file(at: target)'),
@@ -1247,7 +1359,7 @@ class SwiftScopedFlowTests(unittest.TestCase):
                     }
                 ''' % sink, (4,), policy=policy, suffix=policy)
 
-    def test_file_operation_calls_aliases_and_captures_remain_obligations(self):
+    def test_file_operation_calls_aliases_and_captures_with_clean_values_complete(self):
         for index, call in enumerate((
             'file(request)', 'file?(request)', 'file!(request)',
             'file.callAsFunction(request)', 'file.self(request)',
@@ -1261,7 +1373,7 @@ class SwiftScopedFlowTests(unittest.TestCase):
             'file.name; consume(request.query["path"])',
         )):
             for policy in ('path', 'redirect'):
-                with self.subTest(call=call, policy=policy), self.assertRaisesRegex(ValueError, 'closure.*incomplete'):
+                with self.subTest(call=call, policy=policy):
                     self.check('func submit() { let request = UUID(); Task { %s } }' % call,
                                policy=policy, suffix=str(index) + policy)
 
@@ -1278,21 +1390,56 @@ class SwiftScopedFlowTests(unittest.TestCase):
                     self.check('func submit() { let request = UUID(); Task { %s } }' % call,
                                policy=policy, suffix=str(index) + policy)
 
-    def test_api_write_keeps_real_nested_and_unknown_file_obligations(self):
+    def test_api_write_with_nested_clean_file_operations_completes(self):
         for index, call in enumerate((
             'body.write(to: request)',
             'body.write(`to`: request)',
             'panel.write("/api", body: body.write(to: request))',
-            'panel.write("/api", body: { body.write(to: request) })',
             r'panel.write("/api", body: "value-\(body.write(to: request))")',
             'let writer = body.write; writer(to: request)',
             'panel.write("/api", body: request.query["path"])',
             'panel.write("/api", body: request); readFile(path: request)',
         )):
             for policy in ('path', 'redirect'):
-                with self.subTest(call=call, policy=policy), self.assertRaisesRegex(ValueError, 'closure.*incomplete'):
+                with self.subTest(call=call, policy=policy):
                     self.check('func submit() { let request = UUID(); Task { %s } }' % call,
                                policy=policy, suffix=str(index) + policy)
+
+    def test_api_write_does_not_hide_nested_tainted_file_sinks(self):
+        for index, call in enumerate((
+            'body.write(to: request)',
+            'body.write(`to`: request)',
+            'panel.write("/api", body: body.write(to: request))',
+            r'panel.write("/api", body: "value-\(body.write(to: request))")',
+        )):
+            with self.subTest(call=call):
+                self.check('func submit(req: Request) { let request = req.query["path"]; Task { %s } }' % call,
+                           (1,), policy='path', suffix=str(index))
+
+    def test_unknown_callback_method_with_tainted_input_requires_heap_analysis(self):
+        with self.assertRaisesRegex(ValueError, 'unknown request-derived call effects.*incomplete'):
+            self.check('''
+                func submit(req: Request) {
+                    let request = req.query["path"]
+                    Task { panel.write("/api", body: request); readFile(path: request) }
+                }
+            ''', policy='path')
+
+    def test_closure_arguments_preserve_captured_sources_at_the_real_sink(self):
+        self.check('''
+            func submit(req: Request) {
+                panel.write("/api", body: {
+                    body.write(to: req.query["path"])
+                })
+            }
+        ''', (3,), policy='path')
+        self.check('''
+            func submit(req: Request) {
+                panel.write("/api", body: {
+                    body.write(to: "/fixed")
+                })
+            }
+        ''', policy='path', suffix='-safe')
 
     def test_file_write_destination_still_reports_request_path(self):
         self.check('''
@@ -1301,19 +1448,19 @@ class SwiftScopedFlowTests(unittest.TestCase):
             }
         ''', (2,), policy='path')
 
-    def test_unrelated_unsupported_closure_with_a_sink_is_still_incomplete(self):
-        with self.assertRaisesRegex(ValueError, 'closure.*incomplete'):
-            self.check('''
-                func load() {
-                    let request = UUID()
-                    Task { consume(request) }
-                }
-                func output(_ target: String) -> Response {
-                    return Response.redirect(to: target)
-                }
-            ''')
+    def test_unrelated_clean_closure_does_not_prevent_other_function_analysis(self):
+        self.check('''
+            func load() {
+                let request = UUID()
+                Task { consume(request) }
+            }
+            func output(_ target: String) -> Response {
+                return Response.redirect(to: target)
+            }
+            func handle(req: Request) { output(req.query["next"]) }
+        ''', (6,))
 
-    def test_all_modeled_sink_families_keep_unknown_capture_fail_closed(self):
+    def test_all_modeled_sink_families_detect_real_sources_in_escaping_closures(self):
         calls = (
             'Response.redirect(to: request)',
             'HTTPResponse(headers: ["Location": request])',
@@ -1328,9 +1475,12 @@ class SwiftScopedFlowTests(unittest.TestCase):
             'serveFile(request)', 'writeFile(request)', 'file(request)', 'body.write(to: request)',
         )
         for index, call in enumerate(calls):
-            with self.subTest(call=call), self.assertRaisesRegex(ValueError, 'closure.*incomplete'):
+            policy = 'redirect' if index < 6 else 'path'
+            with self.subTest(call=call):
+                self.check('func work(req: Request) { let request = req.query["target"]; Task { %s } }' % call,
+                           (1,), policy=policy, suffix=str(index))
                 self.check('func work() { let request = UUID(); Task { %s } }' % call,
-                           suffix=str(index))
+                           policy=policy, suffix=str(index) + '-clean')
 
     def test_collection_closure_elements_reach_real_sink_sites(self):
         for callback in ('map', 'compactMap', 'flatMap', 'filter', 'forEach', 'contains', 'first'):
@@ -1437,26 +1587,82 @@ class SwiftScopedFlowTests(unittest.TestCase):
             }
         ''', (3, 5, 7), 'path')
 
-    def test_unresolved_collection_and_macro_dispatch_stays_incomplete(self):
-        for body in (
-            'let closure = { req.query["path"] }',
-            'Task { String(contentsOfFile: req.query["path"]) }',
-            'unknown { String(contentsOfFile: req.query["path"]) }',
-            'items.map { [path = req.query["path"]] in String(contentsOfFile: path) }',
-            'items.map { (left, right) in String(contentsOfFile: left) }',
-        ):
-            with self.subTest(body=body), self.assertRaisesRegex(ValueError, 'closure.*incomplete'):
-                self.check('func handle(req: Request) { %s }' % body, policy='path')
+    def test_stored_closure_returns_preserve_sources_at_the_call_site(self):
+        self.check('''
+            func handle(req: Request) {
+                let closure = { req.query["path"] }
+            }
+        ''', policy='path', suffix='-unused')
+        self.check('''
+            func handle(req: Request) {
+                let closure = { req.query["path"] }
+                _ = String(contentsOfFile: closure())
+            }
+        ''', (3,), policy='path')
+        self.check('''
+            func handle(req: Request) {
+                let closure = { "/fixed" }
+                _ = String(contentsOfFile: closure())
+            }
+        ''', policy='path', suffix='-safe')
+
+    def test_collection_capture_lists_preserve_sources_and_shadow_outer_values(self):
+        self.check('''
+            func handle(req: Request) {
+                items.map { [path = req.query["path"]] in
+                    String(contentsOfFile: path)
+                }
+            }
+        ''', (3,), policy='path')
+        self.check('''
+            func handle(req: Request) {
+                let path = req.query["path"]
+                items.map { [path = "/fixed"] in
+                    String(contentsOfFile: path)
+                }
+                _ = String(contentsOfFile: path)
+            }
+        ''', (6,), policy='path', suffix='-shadow')
+        self.check('''
+            func handle(req: Request) {
+                items.map { [path = "/fixed"] in
+                    String(contentsOfFile: path)
+                }
+            }
+        ''', policy='path', suffix='-safe')
+
+    def test_collection_tuple_closure_parameters_preserve_sources(self):
+        self.check('''
+            func handle(req: Request) {
+                _ = [(req.query["left"], req.query["right"])].map { (left, right) in
+                    _ = String(contentsOfFile: left)
+                    return String(contentsOfFile: right)
+                }
+            }
+        ''', (3, 4), policy='path')
+        self.check('''
+            func handle(req: Request) {
+                _ = [("/fixed-left", "/fixed-right")].map { (left, right) in
+                    _ = String(contentsOfFile: left)
+                    return String(contentsOfFile: right)
+                }
+            }
+        ''', policy='path', suffix='-safe')
+
+    def test_unresolved_macro_dispatch_stays_incomplete(self):
         for prefix in ('', 'import Testing\nmacro expect() = externalMacro()'):
             with self.subTest(prefix=prefix), self.assertRaisesRegex(ValueError, 'macro.*incomplete'):
                 self.check(prefix + '\nfunc handle(req: Request) { #expect(String(contentsOfFile: req.query["path"])) }', policy='path')
-        with self.assertRaisesRegex(ValueError, 'closure.*incomplete'):
-            self.check('''
-                struct Custom { func map(_ body: () -> String) {} }
-                func handle(req: Request) {
-                    Custom().map { String(contentsOfFile: req.query["path"]) }
-                }
-            ''', policy='path')
+        for callee in ('Task', 'unknown'):
+            with self.subTest(callee=callee):
+                self.check('func handle(req: Request) { %s { String(contentsOfFile: req.query["path"]) } }' % callee,
+                           (1,), policy='path', suffix=callee)
+        self.check('''
+            struct Custom { func map(_ body: () -> String) {} }
+            func handle(req: Request) {
+                Custom().map { String(contentsOfFile: req.query["path"]) }
+            }
+        ''', (3,), policy='path', suffix='custom')
 
     def test_closure_captures_do_not_hide_indirect_or_nested_sinks(self):
         self.check('''
@@ -1502,16 +1708,15 @@ class SwiftScopedFlowTests(unittest.TestCase):
         ''', (4,), 'path', 'short-circuit')
 
     def test_collection_callable_field_does_not_claim_nonescaping_semantics(self):
-        with self.assertRaisesRegex(ValueError, 'closure.*incomplete'):
-            self.check('''
-                struct Custom { let map: (@escaping () -> String) -> Void }
-                func handle(req: Request) {
-                    let custom = Custom(map: storeForLater)
-                    var target = "/fixed"
-                    custom.map { String(contentsOfFile: target) }
-                    target = req.query["path"]
-                }
-            ''', policy='path')
+        self.check('''
+            struct Custom { let map: (@escaping () -> String) -> Void }
+            func handle(req: Request) {
+                let custom = Custom(map: storeForLater)
+                var target = "/fixed"
+                custom.map { String(contentsOfFile: target) }
+                target = req.query["path"]
+            }
+        ''', (5,), policy='path')
 
     def test_unknown_collection_callback_sees_later_capture_mutations(self):
         self.check('''
@@ -1646,16 +1851,23 @@ class SwiftScopedFlowTests(unittest.TestCase):
             }
         ''', (4,), 'path')
 
-    def test_vapor_route_handler_trailing_closure_capturing_outer_taint_is_incomplete(self):
-        with self.assertRaisesRegex(ValueError, 'closure.*incomplete'):
-            self.check('''
-                func handle(outerReq: Request, app: Application) {
-                    let leaked = outerReq.query["next"] ?? "/"
-                    app.get("go") { req -> Response in
-                        return req.redirect(to: leaked)
-                    }
+    def test_vapor_route_handler_trailing_closure_reports_captured_outer_taint(self):
+        self.check('''
+            func handle(outerReq: Request, app: Application) {
+                let leaked = outerReq.query["next"] ?? "/"
+                app.get("go") { req -> Response in
+                    return req.redirect(to: leaked)
                 }
-            ''')
+            }
+        ''', (4,))
+        self.check('''
+            func handle(outerReq: Request, app: Application) {
+                let leaked = "/safe"
+                app.get("go") { req -> Response in
+                    return req.redirect(to: leaked)
+                }
+            }
+        ''', suffix='-safe')
 
     def test_collection_callback_throw_survives_a_discarded_helper_expression(self):
         for method in ('forEach', 'map', 'compactMap', 'flatMap', 'filter', 'contains', 'first'):
@@ -1690,27 +1902,51 @@ class SwiftScopedFlowTests(unittest.TestCase):
                 '''.replace('ASSERTION', assertion), (), 'path', suffix=assertion)
 
     def test_route_callback_cannot_drop_future_captured_request_values(self):
-        with self.assertRaisesRegex(ValueError, 'incomplete'):
-            self.check('''
-                func handle(outerReq: Request, app: Application) {
-                    var target = "/safe"
-                    app.get("go") { req -> Response in
-                        return req.redirect(to: target)
-                    }
-                    target = outerReq.query["next"] ?? "/"
+        self.check('''
+            func handle(outerReq: Request, app: Application) {
+                var target = "/safe"
+                app.get("go") { req -> Response in
+                    return req.redirect(to: target)
                 }
-            ''')
+                target = outerReq.query["next"] ?? "/"
+            }
+        ''', (4,))
+        self.check('''
+            func handle(outerReq: Request, app: Application) {
+                var target = "/safe"
+                app.get("go") { req -> Response in
+                    return req.redirect(to: target)
+                }
+                target = "/also-safe"
+            }
+        ''', suffix='-safe')
+        self.check('''
+            func handle(outerReq: Request, app: Application) {
+                var target = "/safe"
+                app.get("go") { [target] req -> Response in
+                    return req.redirect(to: target)
+                }
+                target = outerReq.query["next"] ?? "/"
+            }
+        ''', suffix='-snapshot')
 
     def test_route_callback_cannot_drop_request_collection_captures(self):
-        with self.assertRaisesRegex(ValueError, 'incomplete'):
-            self.check('''
-                func handle(outerReq: Request, app: Application) {
-                    let paths = outerReq.query
-                    app.get("read") { req -> String in
-                        return String(contentsOfFile: paths["file"])
-                    }
+        self.check('''
+            func handle(outerReq: Request, app: Application) {
+                let paths = outerReq.query
+                app.get("read") { req -> String in
+                    return String(contentsOfFile: paths["file"])
                 }
-            ''', policy='path')
+            }
+        ''', (4,), policy='path')
+        self.check('''
+            func handle(outerReq: Request, app: Application) {
+                let paths = ["file": "/fixed"]
+                app.get("read") { req -> String in
+                    return String(contentsOfFile: paths["file"])
+                }
+            }
+        ''', policy='path', suffix='-safe')
 
     def test_route_callback_cannot_drop_future_heap_alias_writes(self):
         with self.assertRaisesRegex(ValueError, 'incomplete'):
@@ -1930,17 +2166,40 @@ func unrelated() {
         self.assertEqual(self.probe('suppressed', source), [])
 
     def test_same_file_string_overload_is_not_native_sanitizer_proof(self):
-        from ubs_core.swift_detectors.header_injection import scan
+        from ubs_core.analyzers.taint_swift_traversal import SwiftUnsupported
         # This two-label overload can shadow Foundation's four-label method
         # (whose options/range have defaults). Its body preserves the input.
         source = self.program(
             r'let value = (req.query["name"] ?? "").replacingOccurrences(of: "\r", with: "").replacingOccurrences(of: "\n", with: "")' + '\n' +
-            'response.headers["X-Value"] = value\n',
+            'response.headers["X-Value"] = value\n' +
+            'response.headers["X-Direct"] = req.query["other"]\n' +
+            'response.headers["X-Fixed"] = "fixed"\n',
             'extension String { func replacingOccurrences(of target: String, with replacement: String) -> String { return self } }')
         target = self.artifacts / 'shadowed-string-method.swift'
-        target.write_text(source, encoding='utf-8')
-        with self.assertRaisesRegex(ValueError, r'dispatch.*incomplete'):
-            list(scan(SimpleNamespace(project_dir=self.artifacts, files=[target])))
+        rows = self.probe('shadowed-string-method', source)
+        with self.assertRaisesRegex(SwiftUnsupported, r'dispatch.*incomplete') as refused:
+            flow_findings(target, source, 'header')
+        self.assertEqual(refused.exception.offset, source.index('(req.query'))
+        sinks = [row for row in rows if row['rule'] == self.RULE]
+        self.assertEqual([(row['line'], row['severity']) for row in sinks],
+                         [(5, 'critical'), (6, 'critical')], rows)
+        for finding in sinks:
+            self.assertEqual(finding['extras']['taint_path'][0]['kind'], 'source', finding)
+            self.assertEqual(finding['extras']['taint_path'][-1]['line'], finding['line'], finding)
+        diagnostics = [row for row in rows if row['rule'] == 'swift.taint.analysis-limited']
+        self.assertEqual([(row['line'], row['col'], row['extras']['reason']) for row in diagnostics], [
+            (4, 13, 'Swift unresolved receiver dispatch needs binding analysis'),
+            (5, 1, 'Swift unknown closure parameter or opaque value reaches a sink'),
+        ], rows)
+        for finding in diagnostics:
+            self.assertEqual(finding['severity'], 'warning', finding)
+            self.assertEqual(finding['extras']['analysis'], 'conservative', finding)
+            self.assertEqual(finding['extras']['policy'], 'header', finding)
+            self.assertEqual(finding['extras']['scope'], 'handle', finding)
+            self.assertTrue(finding['extras']['construct'], finding)
+            self.assertNotIn('taint_path', finding['extras'], finding)
+            self.assertEqual(finding['title'], finding['message'], finding)
+            self.assertEqual(finding['description'], finding['message'], finding)
 
     def test_non_exiting_guard_is_explicitly_incomplete(self):
         # Swift requires guard's else arm to leave its enclosing scope. An

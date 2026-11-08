@@ -2,7 +2,8 @@
 
 The shared scoped frontend follows selected helpers, value overwrites and
 dominating scheme/host checks. File-URL readers keep their separate path
-obligation. Unknown HTTP receivers remain explicitly incomplete.
+obligation. Unknown HTTP receivers retain a local conservative-analysis
+diagnostic rather than aborting the remaining input.
 """
 from __future__ import annotations
 
@@ -31,13 +32,17 @@ def scan(ctx):
             continue
         text = path.read_text(encoding='utf-8')
         lines = text.splitlines()
-        for finding in flow_findings(path, text, 'outbound'):
+        for finding in flow_findings(path, text, 'outbound', recover=True):
             line_no = finding['line']
+            vulnerability = finding['rule'] == RULE_ID
             yield {
                 **finding,
                 "category": CATEGORY,
                 "count": 1,
-                "title": TITLE,
-                "description": "Validate the selected URL's HTTPS scheme and exact host before an outbound HTTP operation.",
+                "title": TITLE if vulnerability else finding.get('title', finding['message']),
+                "description": (
+                    "Validate the selected URL's HTTPS scheme and exact host before an outbound HTTP operation."
+                    if vulnerability else finding.get('description', finding['message'])
+                ),
                 "samples": [{"path": str(path), "line": line_no, "code": source_line(lines, line_no)}],
             }

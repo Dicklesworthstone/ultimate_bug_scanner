@@ -10772,15 +10772,19 @@
       }
     },
     {
-      "id": "swift-c2-if-in-expression-refuses",
-      "description": "#if inside an expression is unmodeled and keeps refusing (fail-closed) (#204 C2).",
+      "id": "swift-c2-if-in-expression-limited",
+      "description": "An unmodeled #if expression reports a local conservative diagnostic without making Swift partial (#204 C2).",
       "path": "test-suite/swift/buggy/c2_if_in_expr.swift",
       "language": "swift",
-      "tags": ["swift", "taint", "regression", "refuses"],
-      "args": ["--only=swift"],
+      "tags": ["swift", "taint", "regression", "limited"],
+      "args": ["--only=swift", "--format=json", "--fail-on-warning"],
       "expect": {
-        "exit_code": "nonzero",
-        "require_substrings": ["analysis is incomplete"]
+        "exit_code": 1,
+        "totals": { "files": { "min": 1, "max": 1 }, "critical": { "max": 0 }, "warning": { "min": 1 } },
+        "rule_ids": { "min": { "swift.taint.analysis-limited": 1 } },
+        "require_substrings": ["Swift macro expansion needs analysis", "\"failed_modules\":[]"],
+        "forbid_substrings": ["ANALYZER_ERROR", "analysis is incomplete", "\"status\":\"partial\""],
+        "forbid_substrings_stderr": ["ANALYZER_ERROR", "analysis is incomplete", "swift: partial"]
       }
     },
     {
@@ -10843,8 +10847,8 @@
       "tags": ["swift", "taint", "regression", "refuses"],
       "args": ["--only=swift"],
       "expect": {
-        "exit_code": "nonzero",
-        "require_substrings": ["analysis is incomplete"]
+        "exit_code": 2,
+        "require_substrings": ["Swift unterminated #if directive; analysis is incomplete", "[ANALYZER_ERROR] Swift analysis did not complete"]
       }
     },
     {
@@ -10874,28 +10878,31 @@
       }
     },
     {
-      "id": "swift-d-closure-capture-release-clean",
-      "description": "A Timer invalidated inside the capturing escaping closure is released, not a leak (#204 D).",
+      "id": "swift-d-closure-capture-release-not-guaranteed",
+      "description": "Cleanup inside an escaping callback may never execute, so the captured Timer keeps its lifecycle warning (#204 D).",
       "path": "test-suite/swift/clean/d_closure_capture_release.swift",
       "language": "swift",
-      "tags": ["swift", "lifecycle", "regression", "clean"],
-      "args": ["--only=swift"],
+      "tags": ["swift", "lifecycle", "regression", "buggy"],
+      "args": ["--only=swift", "--fail-on-warning"],
       "expect": {
-        "exit_code": "zero",
-        "totals": { "warning": { "max": 1 } },
+        "exit_code": "nonzero",
+        "totals": { "warning": { "min": 2 } },
+        "require_substrings": ["Resource cleanup is not guaranteed"],
         "forbid_substrings": ["analysis is incomplete", "swift: partial"]
       }
     },
     {
-      "id": "swift-d-acquire-in-closure-refuses",
-      "description": "A resource acquired inside an escaping closure keeps refusing (fail-closed, never clean) (#204 D).",
+      "id": "swift-d-acquire-in-closure-leaks",
+      "description": "A Timer acquired inside an escaping callback is analyzed and reported at its acquisition without making Swift partial (#204 D).",
       "path": "test-suite/swift/buggy/d_acquire_in_closure.swift",
       "language": "swift",
-      "tags": ["swift", "lifecycle", "regression", "refuses"],
-      "args": ["--only=swift"],
+      "tags": ["swift", "lifecycle", "regression", "buggy"],
+      "args": ["--only=swift", "--fail-on-warning"],
       "expect": {
         "exit_code": "nonzero",
-        "require_substrings": ["analysis is incomplete"]
+        "totals": { "warning": { "min": 1 } },
+        "require_substrings": ["Timer is never invalidated"],
+        "forbid_substrings": ["analysis is incomplete", "swift: partial"]
       }
     },
     {
@@ -10912,15 +10919,16 @@
       }
     },
     {
-      "id": "swift-d-nested-closure-release-clean",
-      "description": "A Timer invalidated inside a nested escaping closure is released, not a leak (#204 D).",
+      "id": "swift-d-nested-closure-release-not-guaranteed",
+      "description": "Nested escaping callbacks do not prove that a captured Timer will be invalidated (#204 D).",
       "path": "test-suite/swift/clean/d_nested_closure_release.swift",
       "language": "swift",
-      "tags": ["swift", "lifecycle", "regression", "clean"],
-      "args": ["--only=swift"],
+      "tags": ["swift", "lifecycle", "regression", "buggy"],
+      "args": ["--only=swift", "--fail-on-warning"],
       "expect": {
-        "exit_code": "zero",
-        "totals": { "warning": { "max": 1 } },
+        "exit_code": "nonzero",
+        "totals": { "warning": { "min": 2 } },
+        "require_substrings": ["Resource cleanup is not guaranteed"],
         "forbid_substrings": ["analysis is incomplete", "swift: partial"]
       }
     },
@@ -10951,39 +10959,51 @@
       }
     },
     {
-      "id": "swift-b-accessor-source-refuses",
-      "description": "An explicit get/set accessor carrying a request-source token keeps refusing (analyzed-or-refused, never clean) (#204 B).",
+      "id": "swift-b-accessor-source-limited",
+      "description": "An explicit request-derived accessor reports its local binding limitation without making Swift partial (#204 B).",
       "path": "test-suite/swift/buggy/b_accessor_source.swift",
       "language": "swift",
-      "tags": ["swift", "taint", "regression", "refuses"],
-      "args": ["--only=swift"],
+      "tags": ["swift", "taint", "regression", "limited"],
+      "args": ["--only=swift", "--format=json", "--fail-on-warning"],
       "expect": {
-        "exit_code": "nonzero",
-        "require_substrings": ["analysis is incomplete"]
+        "exit_code": 1,
+        "totals": { "files": { "min": 1, "max": 1 }, "critical": { "max": 0 }, "warning": { "min": 1 } },
+        "rule_ids": { "min": { "swift.taint.analysis-limited": 1 } },
+        "require_substrings": ["Swift request-derived property accessor needs binding analysis", "\"failed_modules\":[]"],
+        "forbid_substrings": ["ANALYZER_ERROR", "analysis is incomplete", "\"status\":\"partial\""],
+        "forbid_substrings_stderr": ["ANALYZER_ERROR", "analysis is incomplete", "swift: partial"]
       }
     },
     {
-      "id": "swift-b-stored-request-field-refuses",
-      "description": "A stored request field keeps refusing (object model unmodeled) (#204 B).",
+      "id": "swift-b-stored-request-field-no-sink-clean",
+      "description": "Declaring a stored Request field without a sink is modeled and completes cleanly (#204 B).",
       "path": "test-suite/swift/buggy/b_stored_request_field.swift",
       "language": "swift",
-      "tags": ["swift", "taint", "regression", "refuses"],
-      "args": ["--only=swift"],
+      "tags": ["swift", "taint", "regression", "clean"],
+      "args": ["--only=swift", "--format=json", "--fail-on-warning"],
       "expect": {
-        "exit_code": "nonzero",
-        "require_substrings": ["analysis is incomplete"]
+        "exit_code": 0,
+        "totals": { "files": { "min": 1, "max": 1 }, "critical": { "max": 0 }, "warning": { "max": 0 } },
+        "rule_ids": { "forbid": ["swift.taint.analysis-limited", "swift.taint.request_path_traversal"] },
+        "require_substrings": ["\"failed_modules\":[]"],
+        "forbid_substrings": ["ANALYZER_ERROR", "analysis is incomplete", "\"status\":\"partial\""],
+        "forbid_substrings_stderr": ["ANALYZER_ERROR", "analysis is incomplete", "swift: partial"]
       }
     },
     {
-      "id": "swift-b-init-request-refuses",
-      "description": "An init deriving a stored field from a request keeps refusing (heap model unmodeled) (#204 B).",
+      "id": "swift-b-init-request-no-sink-clean",
+      "description": "Initializing a stored field from a request without using a sink completes cleanly (#204 B).",
       "path": "test-suite/swift/buggy/b_init_request.swift",
       "language": "swift",
-      "tags": ["swift", "taint", "regression", "refuses"],
-      "args": ["--only=swift"],
+      "tags": ["swift", "taint", "regression", "clean"],
+      "args": ["--only=swift", "--format=json", "--fail-on-warning"],
       "expect": {
-        "exit_code": "nonzero",
-        "require_substrings": ["analysis is incomplete"]
+        "exit_code": 0,
+        "totals": { "files": { "min": 1, "max": 1 }, "critical": { "max": 0 }, "warning": { "max": 0 } },
+        "rule_ids": { "forbid": ["swift.taint.analysis-limited", "swift.taint.request_path_traversal"] },
+        "require_substrings": ["\"failed_modules\":[]"],
+        "forbid_substrings": ["ANALYZER_ERROR", "analysis is incomplete", "\"status\":\"partial\""],
+        "forbid_substrings_stderr": ["ANALYZER_ERROR", "analysis is incomplete", "swift: partial"]
       }
     },
     {
@@ -11040,26 +11060,34 @@
     },
     {
       "id": "swift-e-closure-request-param",
-      "description": "An unknown closure with an explicitly request-typed parameter keeps refusing (#204 E).",
+      "description": "An explicitly Request-typed closure parameter carries a real request path into its file sink (#204 E).",
       "path": "test-suite/swift/buggy/e_closure_request_param.swift",
       "language": "swift",
-      "tags": ["swift", "taint", "regression", "refuses"],
-      "args": ["--only=swift"],
+      "tags": ["swift", "security", "taint", "regression", "buggy"],
+      "args": ["--only=swift", "--format=json"],
       "expect": {
-        "exit_code": "nonzero",
-        "require_substrings": ["analysis is incomplete"]
+        "exit_code": 1,
+        "totals": { "files": { "min": 1, "max": 1 }, "critical": { "min": 1, "max": 1 } },
+        "rule_ids": { "min": { "swift.taint.request_path_traversal": 1 }, "forbid": ["swift.taint.analysis-limited"] },
+        "require_substrings": ["\"failed_modules\":[]"],
+        "forbid_substrings": ["ANALYZER_ERROR", "analysis is incomplete", "\"status\":\"partial\""],
+        "forbid_substrings_stderr": ["ANALYZER_ERROR", "analysis is incomplete", "swift: partial"]
       }
     },
     {
       "id": "swift-e-closure-unknown-sink",
-      "description": "An unknown-provenance closure parameter reaching a file sink refuses rather than silently clearing (#204 E rule 4; guards the refuse->clean regression).",
+      "description": "An unknown-provenance closure parameter reaching a file sink produces a local warning rather than a clean result or partial scan (#204 E rule 4).",
       "path": "test-suite/swift/buggy/e_closure_unknown_sink.swift",
       "language": "swift",
-      "tags": ["swift", "taint", "regression", "refuses"],
-      "args": ["--only=swift"],
+      "tags": ["swift", "taint", "regression", "limited"],
+      "args": ["--only=swift", "--format=json", "--fail-on-warning"],
       "expect": {
-        "exit_code": "nonzero",
-        "require_substrings": ["analysis is incomplete"]
+        "exit_code": 1,
+        "totals": { "files": { "min": 1, "max": 1 }, "critical": { "max": 0 }, "warning": { "min": 1 } },
+        "rule_ids": { "min": { "swift.taint.analysis-limited": 1 } },
+        "require_substrings": ["Swift unknown closure parameter or opaque value reaches a sink", "\"failed_modules\":[]"],
+        "forbid_substrings": ["ANALYZER_ERROR", "analysis is incomplete", "\"status\":\"partial\""],
+        "forbid_substrings_stderr": ["ANALYZER_ERROR", "analysis is incomplete", "swift: partial"]
       }
     },
     {
@@ -11077,6 +11105,7 @@
     },
     {
       "id": "swift-si-source-annotated-clean",
+      "description": "A same-line taint-source annotation with a reason suppresses the app-controlled export filename source (#204).",
       "path": "test-suite/swift/clean/si_source_annotated.swift",
       "language": "swift",
       "tags": ["swift", "security", "taint", "regression", "clean"],
@@ -11084,39 +11113,72 @@
       "expect": { "exit_code": "zero", "totals": { "critical": { "max": 0 } }, "require_substrings": ["taint-source drops: 1"], "forbid_substrings": ["analysis is incomplete", "swift: partial"] }
     },
     {
-      "id": "swift-si-source-unannotated-refuses",
+      "id": "swift-si-source-unannotated-reports",
+      "description": "An unsuppressed filename source reaches the export write sink while analysis completes (#204).",
       "path": "test-suite/swift/buggy/si_source_unannotated.swift",
       "language": "swift",
-      "tags": ["swift", "taint", "regression", "refuses"],
-      "args": ["--only=swift"],
-      "expect": { "exit_code": "nonzero", "require_substrings": ["analysis is incomplete"] }
+      "tags": ["swift", "security", "taint", "regression", "buggy"],
+      "args": ["--only=swift", "--format=json"],
+      "expect": {
+        "exit_code": 1,
+        "totals": { "files": { "min": 1, "max": 1 }, "critical": { "min": 1, "max": 1 } },
+        "rule_ids": { "min": { "swift.taint.request_path_traversal": 1 } },
+        "require_substrings": ["\"failed_modules\":[]"],
+        "forbid_substrings": ["ANALYZER_ERROR", "analysis is incomplete", "\"status\":\"partial\""],
+        "forbid_substrings_stderr": ["ANALYZER_ERROR", "analysis is incomplete", "swift: partial"]
+      }
     },
     {
-      "id": "swift-si-source-blanket-refuses",
+      "id": "swift-si-source-blanket-reports",
+      "description": "A blanket ignore comment does not suppress a filename source flowing into the later write sink (#204).",
       "path": "test-suite/swift/buggy/si_source_blanket.swift",
       "language": "swift",
-      "tags": ["swift", "taint", "regression", "refuses"],
-      "args": ["--only=swift"],
-      "expect": { "exit_code": "nonzero", "require_substrings": ["analysis is incomplete"] }
+      "tags": ["swift", "security", "taint", "regression", "buggy"],
+      "args": ["--only=swift", "--format=json"],
+      "expect": {
+        "exit_code": 1,
+        "totals": { "files": { "min": 1, "max": 1 }, "critical": { "min": 1, "max": 1 } },
+        "rule_ids": { "min": { "swift.taint.request_path_traversal": 1 } },
+        "require_substrings": ["\"failed_modules\":[]"],
+        "forbid_substrings": ["ANALYZER_ERROR", "analysis is incomplete", "\"status\":\"partial\""],
+        "forbid_substrings_stderr": ["ANALYZER_ERROR", "analysis is incomplete", "swift: partial"]
+      }
     },
     {
-      "id": "swift-si-source-empty-reason-refuses",
+      "id": "swift-si-source-empty-reason-reports",
+      "description": "A taint-source annotation without a reason cannot suppress the export path finding (#204).",
       "path": "test-suite/swift/buggy/si_source_empty_reason.swift",
       "language": "swift",
-      "tags": ["swift", "taint", "regression", "refuses"],
-      "args": ["--only=swift"],
-      "expect": { "exit_code": "nonzero", "require_substrings": ["analysis is incomplete"] }
+      "tags": ["swift", "security", "taint", "regression", "buggy"],
+      "args": ["--only=swift", "--format=json"],
+      "expect": {
+        "exit_code": 1,
+        "totals": { "files": { "min": 1, "max": 1 }, "critical": { "min": 1, "max": 1 } },
+        "rule_ids": { "min": { "swift.taint.request_path_traversal": 1 } },
+        "require_substrings": ["\"failed_modules\":[]"],
+        "forbid_substrings": ["ANALYZER_ERROR", "analysis is incomplete", "\"status\":\"partial\""],
+        "forbid_substrings_stderr": ["ANALYZER_ERROR", "analysis is incomplete", "swift: partial"]
+      }
     },
     {
-      "id": "swift-si-source-next-line-refuses",
+      "id": "swift-si-source-next-line-reports",
+      "description": "A taint-source annotation on a preceding line cannot suppress the filename source or its write sink (#204).",
       "path": "test-suite/swift/buggy/si_source_next_line.swift",
       "language": "swift",
-      "tags": ["swift", "taint", "regression", "refuses"],
-      "args": ["--only=swift"],
-      "expect": { "exit_code": "nonzero", "require_substrings": ["analysis is incomplete"] }
+      "tags": ["swift", "security", "taint", "regression", "buggy"],
+      "args": ["--only=swift", "--format=json"],
+      "expect": {
+        "exit_code": 1,
+        "totals": { "files": { "min": 1, "max": 1 }, "critical": { "min": 1, "max": 1 } },
+        "rule_ids": { "min": { "swift.taint.request_path_traversal": 1 } },
+        "require_substrings": ["\"failed_modules\":[]"],
+        "forbid_substrings": ["ANALYZER_ERROR", "analysis is incomplete", "\"status\":\"partial\""],
+        "forbid_substrings_stderr": ["ANALYZER_ERROR", "analysis is incomplete", "swift: partial"]
+      }
     },
     {
       "id": "swift-si-source-mixed-reports",
+      "description": "Suppressing an app-controlled filename source leaves an independent request-query path finding intact (#204).",
       "path": "test-suite/swift/buggy/si_source_mixed.swift",
       "language": "swift",
       "tags": ["swift", "security", "taint", "regression", "buggy"],
@@ -11124,31 +11186,56 @@
       "expect": { "exit_code": "nonzero", "totals": { "critical": { "min": 1 } }, "forbid_substrings": ["analysis is incomplete"] }
     },
     {
-      "id": "swift-g-observer-sink-refuses",
+      "id": "swift-g-observer-sink-limited",
+      "description": "A property observer with a file sink reports its local assignment-binding limitation (#204).",
       "path": "test-suite/swift/buggy/g_observer_sink.swift",
       "language": "swift",
-      "tags": ["swift", "taint", "regression", "refuses"],
-      "args": ["--only=swift"],
-      "expect": { "exit_code": "nonzero", "require_substrings": ["analysis is incomplete"] }
+      "tags": ["swift", "taint", "regression", "limited"],
+      "args": ["--only=swift", "--format=json", "--fail-on-warning"],
+      "expect": {
+        "exit_code": 1,
+        "totals": { "files": { "min": 1, "max": 1 }, "critical": { "max": 0 }, "warning": { "min": 1 } },
+        "rule_ids": { "min": { "swift.taint.analysis-limited": 1 } },
+        "require_substrings": ["Swift property observer with a sink needs assignment binding analysis", "\"failed_modules\":[]"],
+        "forbid_substrings": ["ANALYZER_ERROR", "analysis is incomplete", "\"status\":\"partial\""],
+        "forbid_substrings_stderr": ["ANALYZER_ERROR", "analysis is incomplete", "swift: partial"]
+      }
     },
     {
-      "id": "swift-g-named-observer-sink-refuses",
+      "id": "swift-g-named-observer-sink-limited",
+      "description": "A named property-observer parameter does not hide the local file-sink binding limitation (#204).",
       "path": "test-suite/swift/buggy/g_named_observer_sink.swift",
       "language": "swift",
-      "tags": ["swift", "taint", "regression", "refuses"],
-      "args": ["--only=swift"],
-      "expect": { "exit_code": "nonzero", "require_substrings": ["analysis is incomplete"] }
+      "tags": ["swift", "taint", "regression", "limited"],
+      "args": ["--only=swift", "--format=json", "--fail-on-warning"],
+      "expect": {
+        "exit_code": 1,
+        "totals": { "files": { "min": 1, "max": 1 }, "critical": { "max": 0 }, "warning": { "min": 1 } },
+        "rule_ids": { "min": { "swift.taint.analysis-limited": 1 } },
+        "require_substrings": ["Swift property observer with a sink needs assignment binding analysis", "\"failed_modules\":[]"],
+        "forbid_substrings": ["ANALYZER_ERROR", "analysis is incomplete", "\"status\":\"partial\""],
+        "forbid_substrings_stderr": ["ANALYZER_ERROR", "analysis is incomplete", "swift: partial"]
+      }
     },
     {
-      "id": "swift-g-outbound-observer-sink-refuses",
+      "id": "swift-g-outbound-observer-sink-limited",
+      "description": "An outbound URL in a property observer produces a local binding diagnostic without making Swift partial (#204).",
       "path": "test-suite/swift/buggy/g_outbound_observer_sink.swift",
       "language": "swift",
-      "tags": ["swift", "taint", "regression", "refuses"],
-      "args": ["--only=swift"],
-      "expect": { "exit_code": "nonzero", "require_substrings": ["analysis is incomplete"] }
+      "tags": ["swift", "taint", "regression", "limited"],
+      "args": ["--only=swift", "--format=json", "--fail-on-warning"],
+      "expect": {
+        "exit_code": 1,
+        "totals": { "files": { "min": 1, "max": 1 }, "critical": { "max": 0 }, "warning": { "min": 1 } },
+        "rule_ids": { "min": { "swift.taint.analysis-limited": 1 } },
+        "require_substrings": ["Swift property observer with a sink needs assignment binding analysis", "\"failed_modules\":[]"],
+        "forbid_substrings": ["ANALYZER_ERROR", "analysis is incomplete", "\"status\":\"partial\""],
+        "forbid_substrings_stderr": ["ANALYZER_ERROR", "analysis is incomplete", "swift: partial"]
+      }
     },
     {
       "id": "swift-g-observer-sink-no-request-source-clean",
+      "description": "A property observer with a file operation but no request source does not activate request-taint analysis (#204).",
       "path": "test-suite/swift/clean/g_observer_sink_no_request_source.swift",
       "language": "swift",
       "tags": ["swift", "security", "taint", "regression", "clean"],
@@ -11157,6 +11244,7 @@
     },
     {
       "id": "swift-g-observer-no-sink-clean",
+      "description": "An unrelated request source does not turn an observer without a relevant sink into an analysis limitation (#204).",
       "path": "test-suite/swift/clean/g_observer_no_sink.swift",
       "language": "swift",
       "tags": ["swift", "security", "taint", "regression", "clean"],
@@ -11165,6 +11253,7 @@
     },
     {
       "id": "swift-g-getter-sourceless-clean",
+      "description": "A computed getter without request-derived data or a sink remains clean beside an unrelated request handler (#204).",
       "path": "test-suite/swift/clean/g_getter_sourceless.swift",
       "language": "swift",
       "tags": ["swift", "security", "taint", "regression", "clean"],
@@ -11172,12 +11261,20 @@
       "expect": { "exit_code": "zero", "totals": { "critical": { "max": 0 } }, "forbid_substrings": ["analysis is incomplete", "swift: partial"] }
     },
     {
-      "id": "swift-g-local-observer-sink-refuses",
+      "id": "swift-g-local-observer-sink-limited",
+      "description": "A local property observer with a request-derived file sink keeps a conservative binding warning (#204).",
       "path": "test-suite/swift/buggy/g_local_observer_sink.swift",
       "language": "swift",
-      "tags": ["swift", "taint", "regression", "refuses"],
-      "args": ["--only=swift"],
-      "expect": { "exit_code": "nonzero", "require_substrings": ["analysis is incomplete"] }
+      "tags": ["swift", "taint", "regression", "limited"],
+      "args": ["--only=swift", "--format=json", "--fail-on-warning"],
+      "expect": {
+        "exit_code": 1,
+        "totals": { "files": { "min": 1, "max": 1 }, "critical": { "max": 0 }, "warning": { "min": 1 } },
+        "rule_ids": { "min": { "swift.taint.analysis-limited": 1 } },
+        "require_substrings": ["Swift property observer with a sink needs assignment binding analysis", "\"failed_modules\":[]"],
+        "forbid_substrings": ["ANALYZER_ERROR", "analysis is incomplete", "\"status\":\"partial\""],
+        "forbid_substrings_stderr": ["ANALYZER_ERROR", "analysis is incomplete", "swift: partial"]
+      }
     },
     {
       "id": "csharp-suppression-intervals-markers",

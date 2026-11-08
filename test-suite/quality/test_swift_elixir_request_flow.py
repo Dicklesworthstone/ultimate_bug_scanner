@@ -721,7 +721,7 @@ class SwiftLifecycleBindings(LoggedCase):
                 self.assertEqual(len(findings), expected, findings)
                 self.assertTrue(all(item[0] == 'timer' for item in findings), findings)
 
-    def test_switch_unmodeled_bindings_and_fallthrough_stay_incomplete(self):
+    def test_switch_bindings_and_local_limits_preserve_resource_obligations(self):
         from ubs_core.analyzers.lifecycle_swift import scan_text
         for arm in ('case let .some(timer): timer.invalidate()',
                     'case .cold where test(): timer.invalidate()',
@@ -730,8 +730,11 @@ class SwiftLifecycleBindings(LoggedCase):
             source = ('func run() {\n'
                       'let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }\n'
                       'switch state {\n' + arm + '\n}\n}')
-            with self.subTest(arm=arm), self.assertRaisesRegex(ValueError, 'analysis is incomplete'):
-                scan_text(self.artifact / 'unsupported-switch.swift', source, self.artifact)
+            with self.subTest(arm=arm):
+                findings = scan_text(self.artifact / 'unsupported-switch.swift', source, self.artifact)
+                self.assertEqual(sum(item[0] == 'timer' for item in findings), 1, findings)
+                if 'case let' not in arm:
+                    self.assertTrue(any(item[0] == 'analysis-limited' for item in findings), findings)
 
     def test_equivalent_switch_paths_compact_without_losing_leaks(self):
         from ubs_core.analyzers.lifecycle_swift import scan_text
@@ -754,6 +757,77 @@ class SwiftLifecycleBindings(LoggedCase):
                 self.assertEqual(len(findings), count)
                 if findings:
                     self.assertEqual(findings[0][3], 3)
+
+    def test_iteration_recovery_does_not_swallow_budget_or_internal_failures(self):
+        from unittest.mock import patch
+        from ubs_core.analyzers import lifecycle_swift
+        from ubs_core.taint_flow import AnalysisLimit
+        source = ('func start() {\n'
+                  'let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }\n'
+                  'for item in items { consume(item) }\n'
+                  'timer.invalidate()\n}\n')
+        for failure in (AnalysisLimit('iteration budget exhausted'), ValueError('unexpected parser failure')):
+            with self.subTest(failure=type(failure).__name__):
+                with patch.object(lifecycle_swift.SwiftParser, 'iteration_names', side_effect=failure):
+                    with self.assertRaises(type(failure)) as raised:
+                        lifecycle_swift.scan_text(self.artifact / 'iteration.swift', source, self.artifact)
+                    self.assertEqual(str(raised.exception), str(failure))
+
+    def test_mutable_callback_uncertainty_still_visits_known_bodies(self):
+        from ubs_core.analyzers.lifecycle_swift import scan_text
+        for invoke in ('install()', 'schedule(install)'):
+            source = ('import Foundation\nfunc start() {\n'
+                      'var install = { let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } }\n'
+                      'Task { ' + invoke + ' }\n}\n')
+            with self.subTest(invoke=invoke):
+                findings = scan_text(self.artifact / 'mutable-callback.swift', source, self.artifact)
+                self.assertEqual(sorted((finding[0], finding[3]) for finding in findings),
+                                 [('analysis-limited', 4), ('timer', 3)], findings)
+                self.assertTrue(any('mutable callback target is uncertain' in finding[1] for finding in findings))
+
+    def test_text_renderer_preserves_resource_findings_and_limitations(self):
+        from types import SimpleNamespace
+        from ubs_core.analyzers import lifecycle_swift
+        from ubs_core.swift_scan import _Renderer
+
+        args = SimpleNamespace(project='lifecycle fixtures', project_dir=str(self.artifact),
+                               detail_limit=3, max_detailed=250, ast_available=False)
+        good = 'All tracked resource acquisitions show matching cleanup or usage'
+
+        def render(records):
+            renderer = _Renderer(args, records)
+            renderer.render(set(range(1, 24)) - {16})
+            return renderer.text()
+
+        self.assertIn(good, render([]))
+        records = []
+        for relative in ('buggy/d_acquire_in_closure.swift', 'clean/d_closure_capture_release.swift',
+                         'clean/d_nested_closure_release.swift'):
+            path = ROOT / 'test-suite/swift' / relative
+            findings = list(lifecycle_swift.run(RunContext(lang='swift', files=[path])))
+            self.assertEqual(len(findings), 1, findings)
+            output = render(findings)
+            for finding in findings:
+                self.assertIn(finding['message'], output)
+                self.assertIn(f"{path}:{finding['line']}:{finding['col']} [rule:{finding['rule']}]", output)
+            self.assertIn('⚠ Warning (1 found)', output)
+            self.assertNotIn(good, output)
+            records.extend(findings)
+
+        legacy = {'rule': 'swift.lifecycle', 'severity': 'critical', 'count': 1,
+                  'message': 'Legacy resource obligation remains live', 'path': 'Legacy.swift', 'line': 2, 'col': 4}
+        limited = {'rule': 'swift.lifecycle.analysis-limited', 'severity': 'warning', 'count': 1,
+                   'message': 'Resource transfer has unknown ownership', 'path': 'Limited.swift', 'line': 7, 'col': 9}
+        output = render([*records, legacy, limited])
+        self.assertIn('🔥 CRITICAL (1 found)', output)
+        self.assertIn(legacy['message'], output)
+        self.assertIn('Legacy.swift:2:4 [rule:swift.lifecycle]', output)
+        self.assertEqual(output.count(limited['message']), 1, output)
+        self.assertIn('Limited.swift:7:9 [rule:swift.lifecycle.analysis-limited]', output)
+        self.assertNotIn(good, output)
+        limited_only = render([limited])
+        self.assertIn(limited['message'], limited_only)
+        self.assertNotIn(good, limited_only)
 
     @staticmethod
     def cases():
@@ -1137,6 +1211,353 @@ class SwiftLifecycleBindings(LoggedCase):
                   let stop = { timer.invalidate() }
                 }
             '''),
+            ('escaping_cleanup_is_not_guaranteed', '''
+                import Foundation
+                func start() {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                  DispatchQueue.main.async { timer.invalidate() }
+                }
+            '''),
+            ('escaping_cleanup_after_return_is_unreachable', '''
+                import Foundation
+                func start() {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                  Task { return; timer.invalidate() }
+                }
+            '''),
+            ('callback_local_acquisition_is_reported', '''
+                import Foundation
+                func start() {
+                  DispatchQueue.main.async {
+                    let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                  }
+                }
+            '''),
+            ('callback_local_defer_cleans_all_exits', '''
+                import Foundation
+                func start() {
+                  DispatchQueue.main.async {
+                    let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                    defer { timer.invalidate() }
+                    if cancelled { return }
+                    consume(timer)
+                  }
+                }
+            '''),
+            ('callback_conditional_cleanup_keeps_the_leak', '''
+                import Foundation
+                func start() {
+                  DispatchQueue.main.async {
+                    let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                    if enabled { timer.invalidate() }
+                  }
+                }
+            '''),
+            ('task_actor_capture_guard_and_typed_catches', '''
+                import Foundation
+                final class Owner {
+                  func start() {
+                    Task { @MainActor [weak self] in
+                      guard let self else { return }
+                      let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                      defer { timer.invalidate() }
+                      do { try await self.work() }
+                      catch is CancellationError { return }
+                      catch { recover(error) }
+                    }
+                  }
+                  func work() async throws {}
+                }
+            '''),
+            ('task_typed_catch_cannot_clean_success_exit', '''
+                import Foundation
+                func start() {
+                  Task { @MainActor in
+                    let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                    do { try await work() }
+                    catch is CancellationError { timer.invalidate() }
+                    catch { timer.invalidate() }
+                  }
+                }
+            '''),
+            ('catch_associated_value_shadows_outer_resource', '''
+                import Foundation
+                enum Failure: Error { case selected(Timer) }
+                func start() {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                  do { try work(); timer.invalidate() }
+                  catch let Failure.selected(timer) { timer.invalidate() }
+                  catch { timer.invalidate() }
+                }
+            '''),
+            ('nested_task_acquisition_keeps_local_identity', '''
+                import Foundation
+                func start() {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                  Task {
+                    let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                  }
+                  timer.invalidate()
+                }
+            '''),
+            ('direct_stored_callback_can_prove_cleanup', '''
+                import Foundation
+                func start() {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                  let stop = { timer.invalidate() }
+                  stop()
+                }
+            '''),
+            ('unused_capture_initializer_still_acquires_resource', '''
+                import Foundation
+                func start() {
+                  let stop = { [timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }] in // LEAK:timer
+                    timer.invalidate()
+                  }
+                }
+            '''),
+            ('invoked_capture_initializer_has_matching_cleanup', '''
+                import Foundation
+                func start() {
+                  let stop = { [timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }] in
+                    timer.invalidate()
+                  }
+                  stop()
+                }
+            '''),
+            ('escaping_capture_initializer_cleanup_is_optional', '''
+                import Foundation
+                func start() {
+                  Task { [timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }] in // LEAK:timer
+                    timer.invalidate()
+                  }
+                }
+            '''),
+            ('async_write_invalidates_later_repeat_constant', '''
+                import Foundation
+                func start() {
+                  var repeats = false
+                  Task { repeats = true }
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: repeats) { _ in } // LEAK:timer
+                }
+            '''),
+            ('async_write_can_follow_a_caller_reassignment', '''
+                import Foundation
+                func start() {
+                  var repeats = false
+                  Task { repeats = true }
+                  repeats = false
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: repeats) { _ in } // LEAK:timer
+                }
+            '''),
+            ('delayed_callback_reads_mutable_repeat_binding', '''
+                import Foundation
+                func start() {
+                  var repeats = false
+                  Task {
+                    let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: repeats) { _ in } // LEAK:timer
+                  }
+                  repeats = true
+                }
+            '''),
+            ('explicit_repeat_capture_preserves_immutable_snapshot', '''
+                import Foundation
+                func start() {
+                  var repeats = false
+                  Task { [repeats] in
+                    let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: repeats) { _ in }
+                  }
+                  repeats = true
+                }
+            '''),
+            ('immutable_repeat_capture_stays_known', '''
+                import Foundation
+                func start() {
+                  let repeats = false
+                  Task {
+                    let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: repeats) { _ in }
+                  }
+                }
+            '''),
+            ('callback_parameter_shadows_mutable_repeat_capture', '''
+                import Foundation
+                func start() {
+                  var repeats = false
+                  let callback = { (repeats: Bool) in
+                    let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: repeats) { _ in } // LEAK:timer
+                  }
+                  schedule(callback)
+                }
+            '''),
+            ('nested_callback_helper_acquisition', '''
+                import Foundation
+                func start() {
+                  Task {
+                    func install() {
+                      let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                    }
+                    install()
+                  }
+                }
+            '''),
+            ('callback_local_type_field_acquisition', '''
+                import Foundation
+                func start() {
+                  Task {
+                    final class Holder {
+                      let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                    }
+                    consume(Holder())
+                  }
+                }
+            '''),
+            ('callback_local_type_field_has_deinit_cleanup', '''
+                import Foundation
+                func start() {
+                  Task {
+                    final class Holder {
+                      let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                      deinit { timer.invalidate() }
+                    }
+                    consume(Holder())
+                  }
+                }
+            '''),
+            ('callback_local_type_nested_helper_is_not_cleanup_contract', '''
+                import Foundation
+                func start() {
+                  Task {
+                    final class Holder {
+                      let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                      func install() {
+                        func unusedCleanup() { timer.invalidate() }
+                      }
+                    }
+                    consume(Holder())
+                  }
+                }
+            '''),
+            ('observer_filter_join_keeps_both_registrations', '''
+                import Foundation
+                func start(flag: Bool) {
+                  let make = { () -> NSObjectProtocol in
+                    var sender = "first"
+                    if flag { sender = "second" }
+                    return NotificationCenter.default.addObserver(forName: nil, object: sender, queue: nil) { _ in } // LEAK:notification_token
+                  }
+                  let token = make()
+                  NotificationCenter.default.removeObserver(token, name: nil, object: "first")
+                }
+            '''),
+            ('observer_filter_join_unfiltered_cleanup', '''
+                import Foundation
+                func start(flag: Bool) {
+                  let make = { () -> NSObjectProtocol in
+                    var sender = "first"
+                    if flag { sender = "second" }
+                    return NotificationCenter.default.addObserver(forName: nil, object: sender, queue: nil) { _ in }
+                  }
+                  let token = make()
+                  NotificationCenter.default.removeObserver(token)
+                }
+            '''),
+            ('tuple_iteration_binding_shadows_outer_resource', '''
+                import Foundation
+                func start(items: [(Int, Timer)]) {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                  for (_, timer) in items { timer.invalidate() }
+                }
+            '''),
+            ('direct_stored_callback_respects_early_return', '''
+                import Foundation
+                func start() {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                  let stop = { if cancelled { return }; timer.invalidate() }
+                  stop()
+                }
+            '''),
+            ('explicit_capture_saves_resource_before_rebinding', '''
+                import Foundation
+                func start() {
+                  var timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                  let stop = { [saved = timer] in saved.invalidate() }
+                  timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in } // LEAK:timer
+                  stop()
+                }
+            '''),
+            ('implicit_capture_reads_resource_at_invocation', '''
+                import Foundation
+                func start() {
+                  var timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                  let stop = { timer.invalidate() }
+                  timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in }
+                  stop()
+                }
+            '''),
+            ('callback_parameter_shadows_outer_timer', '''
+                import Foundation
+                func start(other: Timer) {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                  let stop = { (timer: Timer) in timer.invalidate() }
+                  stop(other)
+                }
+            '''),
+            ('callback_parameter_cleans_actual_argument', '''
+                import Foundation
+                func start() {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                  let stop = { (selected: Timer) in selected.invalidate() }
+                  stop(timer)
+                }
+            '''),
+            ('callback_shorthand_cleans_actual_argument', '''
+                import Foundation
+                func start() {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                  let stop: (Timer) -> Void = { $0.invalidate() }
+                  stop(timer)
+                }
+            '''),
+            ('callback_mutation_can_abandon_a_captured_resource', '''
+                import Foundation
+                func start(other: Timer) {
+                  var timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                  Task { timer = other }
+                  timer.invalidate()
+                }
+            '''),
+            ('returned_callback_resource_is_bound_to_caller', '''
+                import Foundation
+                func start() {
+                  let make = { Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } }
+                  let timer = make()
+                  timer.invalidate()
+                }
+            '''),
+            ('returned_callback_resource_needs_caller_cleanup', '''
+                import Foundation
+                func start() {
+                  let make = { Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } } // LEAK:timer
+                  let timer = make()
+                }
+            '''),
+            ('immediately_invoked_closure_transfers_resource', '''
+                import Foundation
+                func start() {
+                  let timer = ({ Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } })()
+                  timer.invalidate()
+                }
+            '''),
+            ('stored_property_assignment_and_local_cleanup', '''
+                import Foundation
+                final class Owner {
+                  var timer: Timer?
+                  func start() {
+                    self.timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                    timer?.invalidate()
+                  }
+                }
+            '''),
             ('notification_cleanup_on_both_branches', '''
                 import Foundation
                 func start(flag: Bool) {
@@ -1366,7 +1787,7 @@ class SwiftLifecycleBindings(LoggedCase):
                 print(f'[swift-lifecycle-{name}] PASS ({time.monotonic() - started:.3f}s)', flush=True)
 
     @staticmethod
-    def incomplete_cases():
+    def ownership_boundary_cases():
         return {
             'malformed_catch_scope': '''
                 import Foundation
@@ -1435,19 +1856,43 @@ class SwiftLifecycleBindings(LoggedCase):
             ''',
         }
 
-    def test_unmodeled_ownership_is_explicitly_incomplete(self):
+    @staticmethod
+    def ownership_boundary_expectations():
+        return {
+            'malformed_catch_scope': None,
+            'selected_callback_execution': [],
+            'field_initialization_requires_owner_flow': [('timer', 5), ('analysis-limited', 5)],
+            'container_method_is_not_member_cleanup': [('timer', 6), ('timer', 7), ('analysis-limited', 8)],
+            'combine_owner_cycle_wrong_receiver': [('combine_sink', 6), ('combine_sink', 7),
+                                                   ('analysis-limited', 6), ('analysis-limited', 7)],
+            'combine_owner_cycle_selected_cleanup': [('combine_sink', 6), ('combine_sink', 7),
+                                                     ('analysis-limited', 6), ('analysis-limited', 7)],
+        }
+
+    def test_ownership_limits_are_local_and_malformed_syntax_stays_incomplete(self):
         from ubs_core.analyzers import lifecycle_swift
-        for name, source in self.incomplete_cases().items():
+        for name, source in self.ownership_boundary_cases().items():
             with self.subTest(case=name):
                 target = self.artifact / (name + '.swift')
                 target.write_text(textwrap.dedent(source).strip() + '\n', encoding='utf-8')
-                with self.assertRaisesRegex(ValueError, 'analysis is incomplete'):
-                    list(lifecycle_swift.run(RunContext(lang='swift', files=[target])))
+                expected = self.ownership_boundary_expectations()[name]
+                if expected is None:
+                    with self.assertRaisesRegex(ValueError, 'analysis is incomplete'):
+                        list(lifecycle_swift.run(RunContext(lang='swift', files=[target])))
+                    continue
+                findings = list(lifecycle_swift.run(RunContext(lang='swift', files=[target])))
+                actual = sorted((item['rule'], item['line']) for item in findings)
+                self.assertEqual(actual, sorted(('swift.lifecycle.' + kind, line) for kind, line in expected))
+                for finding in findings:
+                    if finding['rule'] == 'swift.lifecycle.analysis-limited':
+                        self.assertEqual(finding['severity'], 'warning')
+                        self.assertEqual(finding['extras']['analysis'], 'conservative')
+                        self.assertIn('reason', finding['extras'])
 
     @unittest.skipUnless(os.environ.get('UBS_SWIFT_LIFECYCLE_E2E') == '1',
-                         'set UBS_SWIFT_LIFECYCLE_E2E=1 for real incomplete-analysis scans')
-    def test_unmodeled_ownership_is_incomplete_in_public_reports(self):
-        for name, source in self.incomplete_cases().items():
+                         'set UBS_SWIFT_LIFECYCLE_E2E=1 for real ownership-boundary scans')
+    def test_ownership_limits_and_fatal_syntax_errors_in_public_reports(self):
+        for name, source in self.ownership_boundary_cases().items():
             target = self.artifact / (name + '.swift')
             target.write_text(textwrap.dedent(source).strip() + '\n', encoding='utf-8')
             for fmt in ('json', 'sarif'):
@@ -1467,32 +1912,43 @@ class SwiftLifecycleBindings(LoggedCase):
                         'python': sys.version, 'exit': result.returncode, 'elapsed': time.monotonic() - started,
                     }, indent=2), encoding='utf-8')
                     context = (command, result.returncode, result.stdout, result.stderr)
-                    self.assertEqual(result.returncode, 2, context)
+                    expected = self.ownership_boundary_expectations()[name]
+                    expected_exit = 2 if expected is None else int(bool(expected))
+                    self.assertEqual(result.returncode, expected_exit, context)
                     try:
                         payload = json.loads(result.stdout)
                     except json.JSONDecodeError as exc:
                         self.fail(f'Invalid public report JSON: {exc}; {context!r}')
                     if fmt == 'json':
-                        self.assertEqual(payload['status'], 'partial', context)
-                        self.assertEqual(payload['module_error'], 'ANALYZER_ERROR', context)
-                        self.assertIn('analysis is incomplete', payload['message'], context)
+                        self.assertEqual(payload['status'], 'partial' if expected is None else 'ok', context)
+                        if expected is None:
+                            self.assertEqual(payload['module_error'], 'ANALYZER_ERROR', context)
+                            self.assertIn('analysis is incomplete', payload['message'], context)
+                        else:
+                            findings = [f for f in payload['findings'] if f['severity'] in {'critical', 'warning'}]
+                            actual = sorted((f['rule'], f['line']) for f in findings)
+                            self.assertEqual(actual, sorted(('swift.lifecycle.' + kind, line) for kind, line in expected))
                     else:
-                        invocations = [invocation for run in payload['runs'] for invocation in run['invocations']]
-                        self.assertTrue(invocations, context)
+                        invocations = [invocation for run in payload['runs'] for invocation in run.get('invocations', [])]
+                        if expected is None:
+                            self.assertTrue(invocations, context)
                         for invocation in invocations:
-                            self.assertIs(invocation['executionSuccessful'], False, context)
-                            self.assertEqual(invocation['exitCode'], 2, context)
+                            self.assertIs(invocation['executionSuccessful'], expected is not None, context)
+                            self.assertEqual(invocation['exitCode'], expected_exit, context)
+                        if expected is not None:
+                            findings = [f for run in payload['runs'] for f in run.get('results', [])
+                                        if f.get('level') in {'error', 'warning'}]
+                            actual = sorted((f['ruleId'], f['locations'][0]['physicalLocation']['region']['startLine'])
+                                            for f in findings)
+                            self.assertEqual(actual, sorted(('swift.lifecycle.' + kind, line) for kind, line in expected))
 
     @unittest.skipUnless(os.environ.get('UBS_SWIFT_LIFECYCLE_E2E') == '1',
                          'set UBS_SWIFT_LIFECYCLE_E2E=1 for real Swift lifecycle JSON/SARIF scans')
     def test_selected_resource_bindings_through_public_json_and_sarif(self):
-        # This unchanged ownership control also deliberately uses try!. Its
-        # independent crash warning must survive the lifecycle correction.
-        extra_warnings = {
-            'owning_file_handle_property_closes_with_owner': [('swift.force-try', 3)],
-        }
+        # --only=16 selects resource lifecycle. The try! in the FileHandle
+        # ownership control belongs to category 1 (Optionals/Force Ops).
         for name, source, expected in self.cases():
-            public_expected = sorted([*expected, *extra_warnings.get(name, ())])
+            public_expected = sorted(expected)
             target = self.artifact / (name + '.swift')
             target.write_text(source, encoding='utf-8')
             for fmt in ('json', 'sarif'):

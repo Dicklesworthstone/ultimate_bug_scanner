@@ -1,8 +1,9 @@
 """Swift response-header values on the bounded shared dataflow frontend.
 
 Selected bindings, local helper summaries and dominating String checks carry
-CR/LF proofs to the actual header value. Unsupported dispatch remains explicit
-incomplete analysis, and Location values retain the separate redirect policy.
+CR/LF proofs to the actual header value. Unsupported dispatch produces a local
+conservative-analysis diagnostic, and Location values retain the separate
+redirect policy.
 """
 from __future__ import annotations
 
@@ -33,13 +34,17 @@ def scan(ctx):
         except OSError:
             continue
         lines = text.splitlines()
-        for finding in flow_findings(path, text, 'header'):
+        for finding in flow_findings(path, text, 'header', recover=True):
             line_no = finding['line']
+            vulnerability = finding['rule'] == RULE_ID
             yield {
                 **finding,
                 "category": CATEGORY,
                 "count": 1,
-                "title": TITLE,
-                "description": "Reject both CR and LF, strip both characters, or percent-encode with a proven safe character set before writing response headers.",
+                "title": TITLE if vulnerability else finding.get('title', finding['message']),
+                "description": (
+                    "Reject both CR and LF, strip both characters, or percent-encode with a proven safe character set before writing response headers."
+                    if vulnerability else finding.get('description', finding['message'])
+                ),
                 "samples": [{"path": str(path), "line": line_no, "code": source_line(lines, line_no)}],
             }

@@ -50,7 +50,7 @@ def run(ctx: RunContext) -> Iterable[dict]:
         if path.suffix != '.swift':
             continue
         text = path.read_text(encoding='utf-8', errors='replace')
-        yield from flow_findings(path, text, 'redirect')
+        yield from flow_findings(path, text, 'redirect', recover=True)
 
 
 def _selftest_detects_query_redirect() -> None:

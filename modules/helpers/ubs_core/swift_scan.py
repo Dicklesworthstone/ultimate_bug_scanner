@@ -666,6 +666,7 @@ CHECK_SPECS: tuple[CheckSpec, ...] = (
     CheckSpec(6, "swift.taint.outbound-url", "Request-derived outbound HTTP URLs",
               good="No request-derived outbound HTTP URL sinks detected",
               desc="Validate outbound URLs with URL parsing plus explicit https scheme and host allow-list checks before URLSession, URLRequest, Data(contentsOf:), or HTTP client calls.", order=80),
+    CheckSpec(6, "swift.taint.analysis-limited", "Swift flow analysis requires local review", order=85),
     CheckSpec(6, "swift.security.shell-exec", "Process/posix shell usage", order=90),
     CheckSpec(6, "swift.security.process-other", None,
               good="No Process/system invocations detected",
@@ -734,7 +735,9 @@ CHECK_SPECS: tuple[CheckSpec, ...] = (
               good_suppressed_by=("swift.quality.debt-heavy", "swift.quality.debt-moderate"), order=12),
     # 16. RESOURCE LIFECYCLE
     CheckSpec(16, "swift.lifecycle", "Resource lifecycle correlation (Swift)",
-              good="All tracked resource acquisitions show matching cleanup or usage", order=10),
+              good="All tracked resource acquisitions show matching cleanup or usage",
+              good_suppressed_by=("swift.lifecycle.analysis-limited",), order=10),
+    CheckSpec(16, "swift.lifecycle.analysis-limited", "Swift resource analysis requires local review", order=20),
     # 17. INFO.PLIST / ATS
     CheckSpec(17, "swift.infoplist.ats-parse", "Info.plist ATS precise parsing",
               good="No problematic ATS settings found via plist parsing", order=10),
@@ -905,6 +908,43 @@ class _Renderer:
         self.render_ast_section()
 
     def render_spec(self, spec: CheckSpec) -> None:
+        if spec.rule_id in {"swift.taint.analysis-limited", "swift.lifecycle.analysis-limited"}:
+            recs = self.buckets.get(spec.rule_id, [])
+            if recs:
+                self.finding("warning", self.count(spec.rule_id), spec.subheader or spec.rule_id,
+                             "The listed scopes retain conservative unknown effects; review these limitations.")
+                for rec in recs[:self.args.detail_limit]:
+                    self.lines.append(
+                        f" {rec.get('path', '')}:{rec.get('line', 0)}:{rec.get('col', 1)} "
+                        f"[rule:{rec['rule']}] → {rec.get('message', '')}"
+                    )
+            return
+        if spec.rule_id == "swift.lifecycle":
+            # The check is an overview; registered analyzers emit one rule
+            # per resource kind. Keep distinct reasons and severities visible
+            # instead of treating the absent overview bucket as proof of cleanup.
+            groups: dict[tuple[str, str, str], list[dict]] = {}
+            for rule, bucket in self.buckets.items():
+                if (rule != "swift.lifecycle" and not rule.startswith("swift.lifecycle.")) or rule == "swift.lifecycle.analysis-limited":
+                    continue
+                for rec in bucket:
+                    reason = str(rec.get("message") or rec.get("title") or "Resource cleanup requires review")
+                    key = (rule, str(rec.get("severity", "warning")), reason)
+                    groups.setdefault(key, []).append(rec)
+            if groups:
+                for (rule, severity, reason), recs in groups.items():
+                    self.finding(severity, sum(int(rec.get("count", 1) or 0) for rec in recs), reason, None)
+                    limit = max(0, self.args.detail_limit)
+                    for rec in recs[:limit]:
+                        if rec.get("path"):
+                            self.lines.append(
+                                f" {rec['path']}:{rec.get('line', 0)}:{rec.get('col', 1)} [rule:{rule}]"
+                            )
+                    if len(recs) > limit:
+                        self.lines.append(f" (and {len(recs) - limit} more)")
+            elif spec.good and not self.buckets.get("swift.lifecycle.analysis-limited"):
+                self.finding("good", 0, spec.good, None)
+            return
         if spec.rule_id == "swift.networking.correlation":
             # degradation/good records land under the check's own rule id;
             # per-finding buckets use the legacy ubs.correlation.* ids

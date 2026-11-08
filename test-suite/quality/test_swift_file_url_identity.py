@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'modules/helpers'))
 
 from ubs_core.swift_detectors.outbound_url import scan
+from ubs_core.analyzers.taint_swift_traversal import SwiftUnsupported, flow_findings
 
 
 class SwiftFileURLIdentityTests(unittest.TestCase):
@@ -43,6 +44,24 @@ class SwiftFileURLIdentityTests(unittest.TestCase):
             self.assertEqual(witness[-1]['kind'], 'sink')
             self.assertEqual(witness[-1]['line'], finding['line'])
         return path, source
+
+    def check_limited(self, source, lines, reason='outbound HTTP', suffix=''):
+        source = textwrap.dedent(source).strip('\n') + '\n'
+        path = self.artifacts / (self.id().rsplit('.', 1)[-1] + suffix + '.swift')
+        path.write_text(source, encoding='utf-8')
+        with self.assertRaisesRegex(SwiftUnsupported, reason + '.*incomplete'):
+            flow_findings(path, source, 'outbound')
+        findings = list(scan(SimpleNamespace(project_dir=path.parent, files=[path])))
+        path.with_suffix('.json').write_text(json.dumps(findings, indent=2), encoding='utf-8')
+        self.assertEqual([(row['rule'], row['line'], row['severity']) for row in findings],
+                         [('swift.taint.analysis-limited', line, 'warning') for line in lines], findings)
+        self.assertRegex(findings[0]['message'], reason)
+        for finding in findings:
+            self.assertEqual(finding['path'], str(path.resolve()))
+            self.assertEqual(finding['extras']['analysis'], 'conservative')
+            self.assertEqual(finding['extras']['policy'], 'outbound')
+            self.assertEqual(finding['extras']['scope'], 'handle')
+            self.assertNotIn('taint_path', finding['extras'])
 
     def test_safe_named_helpers_and_function_aliases_do_not_hide_request_urls(self):
         for name in ('safeURL', 'sanitizeURL', 'identity'):
@@ -231,8 +250,8 @@ class SwiftFileURLIdentityTests(unittest.TestCase):
             }
         ''')
 
-    def test_unknown_client_and_mixed_session_alternative_remain_incomplete(self):
-        for source in ('''
+    def test_unknown_client_and_mixed_session_alternative_remain_unproven(self):
+        for index, source in enumerate(('''
             func handle(req: Request, client: ExternalClient) {
                 _ = client.get(url: req.query["url"]!)
             }
@@ -245,12 +264,11 @@ class SwiftFileURLIdentityTests(unittest.TestCase):
             func handle(req: Request) {
                 _ = AF.request(req.query["url"]!)
             }
-        '''):
+        ''')):
             with self.subTest(source=source):
-                with self.assertRaisesRegex(ValueError, 'outbound HTTP.*incomplete'):
-                    self.check(source)
+                self.check_limited(source, (3,) if index == 1 else (2,), suffix=str(index))
 
-    def test_unresolved_consumers_of_native_requests_remain_incomplete(self):
+    def test_unresolved_consumers_of_native_requests_remain_unproven(self):
         for index, call in enumerate((
             'client.get(URLRequest(url: URL(string: req.query["url"]!)!))',
             'client.get(outgoing)',
@@ -259,25 +277,23 @@ class SwiftFileURLIdentityTests(unittest.TestCase):
             'consume(outgoing)',
         )):
             with self.subTest(call=call):
-                with self.assertRaisesRegex(ValueError, 'outbound HTTP.*incomplete'):
-                    self.check('''
-                        func handle(req: Request, client: ExternalClient) {
-                            let outgoing = URLRequest(url: URL(string: req.query["url"]!)!)
-                            _ = %s
-                        }
-                    ''' % call, suffix=str(index))
+                self.check_limited('''
+                    func handle(req: Request, client: ExternalClient) {
+                        let outgoing = URLRequest(url: URL(string: req.query["url"]!)!)
+                        _ = %s
+                    }
+                ''' % call, (3,), suffix=str(index))
 
     def test_helper_and_branch_request_values_keep_unresolved_dispatch_explicit(self):
-        with self.assertRaisesRegex(ValueError, 'outbound HTTP.*incomplete'):
-            self.check('''
-                func makeRequest(_ raw: String) -> URLRequest {
-                    return URLRequest(url: URL(string: raw)!)
-                }
-                func handle(req: Request, client: ExternalClient, enabled: Bool) {
-                    let outgoing = enabled ? makeRequest(req.query["url"]!) : unknownRequest()
-                    _ = client.get(outgoing)
-                }
-            ''')
+        self.check_limited('''
+            func makeRequest(_ raw: String) -> URLRequest {
+                return URLRequest(url: URL(string: raw)!)
+            }
+            func handle(req: Request, client: ExternalClient, enabled: Bool) {
+                let outgoing = enabled ? makeRequest(req.query["url"]!) : unknownRequest()
+                _ = client.get(outgoing)
+            }
+        ''', (6,))
 
     def test_selected_local_request_consumer_does_not_become_an_http_sink(self):
         self.check('''
@@ -297,16 +313,15 @@ class SwiftFileURLIdentityTests(unittest.TestCase):
                           'URLSession.shared.dataTask(with:completionHandler:)',
                           'client.get(url:)', 'selected(url:)'):
             with self.subTest(reference=reference):
-                with self.assertRaisesRegex(ValueError, 'callable reference.*incomplete'):
-                    self.check('''
-                        func selected(url: URL) async throws {
-                            _ = try await URLSession.shared.data(from: url)
-                        }
-                        func handle(req: Request, client: ExternalClient) async throws {
-                            let send = %s
-                            _ = try await send(URL(string: req.query["url"]!)!)
-                        }
-                    ''' % reference)
+                self.check_limited('''
+                    func selected(url: URL) async throws {
+                        _ = try await URLSession.shared.data(from: url)
+                    }
+                    func handle(req: Request, client: ExternalClient) async throws {
+                        let send = %s
+                        _ = try await send(URL(string: req.query["url"]!)!)
+                    }
+                ''' % reference, (5,), reason='callable reference', suffix=str(len(reference)))
 
     def test_native_looking_shadow_and_request_extension_do_not_grant_safety(self):
         sources = ('''
@@ -326,17 +341,17 @@ class SwiftFileURLIdentityTests(unittest.TestCase):
         ''')
         for index, source in enumerate(sources):
             with self.subTest(index=index):
-                with self.assertRaisesRegex(ValueError, 'incomplete'):
-                    self.check(source, suffix=str(index))
+                self.check_limited(source, (3,) if index == 0 else (6, 7),
+                                   reason='outbound HTTP' if index == 0 else 'URLRequest extension',
+                                   suffix=str(index))
 
     def test_unknown_member_keeps_its_place_in_a_client_union(self):
-        with self.assertRaisesRegex(ValueError, 'outbound HTTP.*incomplete'):
-            self.check('''
-                func handle(req: Request, enabled: Bool, service: ExternalService) async throws {
-                    let session = enabled ? URLSession.shared : service.session
-                    _ = try await session.data(from: URL(string: req.query["url"]!)!)
-                }
-            ''')
+        self.check_limited('''
+            func handle(req: Request, enabled: Bool, service: ExternalService) async throws {
+                let session = enabled ? URLSession.shared : service.session
+                _ = try await session.data(from: URL(string: req.query["url"]!)!)
+            }
+        ''', (3,))
 
     def test_without_an_outbound_operation_unrelated_closures_do_not_activate_it(self):
         self.check('''
@@ -346,7 +361,7 @@ class SwiftFileURLIdentityTests(unittest.TestCase):
             }
         ''')
 
-    def test_analysis_budget_and_escaping_network_callbacks_remain_incomplete(self):
+    def test_analysis_budget_is_fatal_but_network_callbacks_are_supported(self):
         from ubs_core.analyzers.taint_swift_traversal import SwiftEngine
         from ubs_core.taint_flow import AnalysisLimit
         source = '''func handle(req: Request) async throws {
@@ -356,14 +371,13 @@ class SwiftFileURLIdentityTests(unittest.TestCase):
         engine.budget.remaining = 0
         with self.assertRaises(AnalysisLimit):
             engine.analyze()
-        with self.assertRaisesRegex(ValueError, 'closure.*incomplete'):
-            self.check('''
-                func handle(req: Request) {
-                    URLSession.shared.dataTask(with: URL(string: req.query["url"]!)!) { data, response, error in
-                        consume(data)
-                    }
+        self.check('''
+            func handle(req: Request) {
+                URLSession.shared.dataTask(with: URL(string: req.query["url"]!)!) { data, response, error in
+                    consume(data)
                 }
-            ''')
+            }
+        ''', (2,))
 
     def test_vapor_request_client_uses_selected_destination(self):
         self.check('''

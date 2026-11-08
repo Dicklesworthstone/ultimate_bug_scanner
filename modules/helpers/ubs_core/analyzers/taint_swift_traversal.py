@@ -1967,7 +1967,18 @@ class SwiftEngine:
                     return True
             return False
 
-        def block(statements, following, bindings, break_to=None, continue_to=None):
+        def block(statements, following, bindings, break_to=None, continue_to=None, exit_to=None):
+            exit_target = exit_node if exit_to is None else exit_to
+            deferred_bodies, normal_statements = [], []
+            for deferred_st in statements:
+                if deferred_st.kind == 'unsupported' and deferred_st.tokens and deferred_st.tokens[0].value == 'defer':
+                    op = next((i for i, t in enumerate(deferred_st.tokens) if t.value == '{'), -1)
+                    if op < 0:
+                        raise ValueError('Swift malformed defer; analysis is incomplete')
+                    deferred_bodies.append(self.parser.block(deferred_st.tokens[op + 1:swift_close(deferred_st.tokens, op)], function.owner, {}))
+                else:
+                    normal_statements.append(deferred_st)
+            statements = tuple(normal_statements)
             snapshots, local = [], dict(bindings)
             for statement in statements:
                 before = dict(local)
@@ -1980,24 +1991,36 @@ class SwiftEngine:
                 if statement.kind == 'guard':
                     local = optional_scope(statement.tokens, local)
                 snapshots.append((dict(local), before))
+            if deferred_bodies:
+                flat = tuple(st for body in reversed(deferred_bodies) for st in body)
+                orig_break, orig_continue, orig_exit = break_to, continue_to, exit_target
+                defer_bindings = dict(local)
+                def defer_chain(target):
+                    return block(flat, target, defer_bindings, orig_break, orig_continue, orig_exit)
+                following = defer_chain(following)
+                exit_target = defer_chain(orig_exit)
+                if orig_break is not None:
+                    break_to = defer_chain(orig_break)
+                if orig_continue is not None:
+                    continue_to = defer_chain(orig_continue)
             for statement, (local, before) in reversed(list(zip(statements, snapshots))):
                 kind, tokens = statement.kind, statement.tokens
                 if kind == 'definition':
                     continue
                 if kind == 'if':
                     yes_scope = optional_scope(tokens, local)
-                    yes = block(statement.body, following, yes_scope, break_to, continue_to)
-                    no = block(statement.alternate, following, local, break_to, continue_to)
+                    yes = block(statement.body, following, yes_scope, break_to, continue_to, exit_target)
+                    no = block(statement.alternate, following, local, break_to, continue_to, exit_target)
                     following = condition(tokens, yes, no, yes_scope, local)
                 elif kind == 'guard':
                     if not terminates(statement.body, before):
                         raise ValueError('Swift guard else does not exit its enclosing scope; analysis is incomplete')
-                    failure = block(statement.body, following, before, break_to, continue_to)
+                    failure = block(statement.body, following, before, break_to, continue_to, exit_target)
                     following = condition(tokens, following, failure, local, before)
                 elif kind == 'while':
                     loop = node('branch')
                     inner = optional_scope(tokens, local)
-                    body = block(statement.body, loop, inner, following, loop)
+                    body = block(statement.body, loop, inner, following, loop, exit_target)
                     edges[loop] = (condition(tokens, body, following, inner, local),)
                     following = loop
                 elif kind == 'for':
@@ -2012,7 +2035,7 @@ class SwiftEngine:
                     for name in names:
                         inner[name.value] = name.value + '@' + str(name.start)
                     loop = node('branch')
-                    body = block(statement.body, loop, inner, following, loop)
+                    body = block(statement.body, loop, inner, following, loop, exit_target)
                     if len(sequence) == 2:
                         body = condition(sequence[1], body, loop, inner)
                     bound = node('element', sequence[0], inner, (body,), tuple(name.value for name in names), reads=local)
@@ -2024,11 +2047,45 @@ class SwiftEngine:
                         raise ValueError('Swift labeled/nonlocal loop exit needs control-flow analysis; analysis is incomplete')
                     following = node('branch', targets=(target,))
                 elif kind in {'return', 'throw'}:
-                    following = node(kind, tokens, local, (exit_node,) if kind == 'return' else ())
+                    following = node(kind, tokens, local, (exit_target,) if kind == 'return' else ())
                 elif kind == 'simple' and process_exit(tokens, before):
                     # Evaluate arguments (which may contain sinks), but a real
                     # Never-returning primitive has no successor edge.
                     following = node('eval', tokens, local, ())
+                elif kind == 'unsupported' and tokens and tokens[0].value == 'do':
+                    opening = next((i for i, t in enumerate(tokens) if t.value == '{'), -1)
+                    if opening < 1:
+                        raise ValueError('Swift malformed do block; analysis is incomplete')
+                    do_close = swift_close(tokens, opening)
+                    catch_entries = []
+                    rest = do_close + 1
+                    while rest < len(tokens) and tokens[rest].value == '\n':
+                        rest += 1
+                    while rest < len(tokens) and tokens[rest].value == 'catch':
+                        brace = next((k for k in range(rest + 1, len(tokens)) if tokens[k].value == '{'), -1)
+                        if brace < 0:
+                            raise ValueError('Swift malformed catch; analysis is incomplete')
+                        sig = [t for t in tokens[rest + 1:brace] if t.kind == 'code' and t.value != '\n']
+                        catch_scope = dict(local)
+                        if sig:
+                            if not (len(sig) == 2 and sig[0].value in {'let', 'var'}
+                                    and re.fullmatch(r'[A-Za-z_]\w*', sig[1].value)):
+                                raise ValueError('Swift do/catch pattern needs binding analysis; analysis is incomplete')
+                            catch_scope[sig[1].value] = sig[1].value + '@' + str(sig[1].start)
+                        hclose = swift_close(tokens, brace)
+                        handler_stmts = self.parser.block(tokens[brace + 1:hclose], function.owner, {})
+                        catch_entries.append(block(handler_stmts, following, catch_scope, break_to, continue_to, exit_target))
+                        rest = hclose + 1
+                        while rest < len(tokens) and tokens[rest].value == '\n':
+                            rest += 1
+                    if rest != len(tokens):
+                        raise ValueError('Swift do trailing tokens; analysis is incomplete')
+                    do_stmts = self.parser.block(tokens[opening + 1:do_close], function.owner, {})
+                    before_key = len(actions)
+                    do_entry = block(do_stmts, following, local, break_to, continue_to, exit_target)
+                    for created in range(before_key, len(actions)):
+                        edges[created] = edges[created] + tuple(catch_entries)
+                    following = do_entry
                 else:
                     following = node(kind, tokens, local, (following,), reads=before)
             return following

@@ -10473,6 +10473,175 @@
       }
     },
     {
+      "id": "swift-c1-docatch-minimal-clean",
+      "description": "A do/catch with no sink analyzes to completion (#204 C1).",
+      "path": "test-suite/swift/clean/c1_docatch_minimal.swift",
+      "language": "swift",
+      "tags": ["swift", "security", "taint", "regression", "clean"],
+      "args": ["--only=swift", "--skip=1,2,3,4,5,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23"],
+      "expect": {
+        "exit_code": "zero",
+        "totals": { "critical": { "max": 0 } },
+        "forbid_substrings": ["Request-derived path reaches file read/write/serve sink", "analysis is incomplete", "swift: partial"]
+      }
+    },
+    {
+      "id": "swift-c1-docatch-buggy",
+      "description": "A request-derived path reaching a file-read sink inside a catch body is reported (#204 C1).",
+      "path": "test-suite/swift/buggy/c1_docatch.swift",
+      "language": "swift",
+      "tags": ["swift", "security", "taint", "regression", "buggy"],
+      "args": ["--only=swift", "--fail-on-warning", "--skip=1,2,3,4,5,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23"],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": { "critical": { "min": 1 } },
+        "require_substrings": ["Request-derived path reaches file read/write/serve sink"]
+      }
+    },
+    {
+      "id": "swift-c1-docatch-clean",
+      "description": "A do/catch reading a constant path is clean (#204 C1).",
+      "path": "test-suite/swift/clean/c1_docatch.swift",
+      "language": "swift",
+      "tags": ["swift", "security", "taint", "regression", "clean"],
+      "args": ["--only=swift", "--skip=1,2,3,4,5,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23"],
+      "expect": {
+        "exit_code": "zero",
+        "totals": { "critical": { "max": 0 } },
+        "forbid_substrings": ["Request-derived path reaches file read/write/serve sink", "analysis is incomplete", "swift: partial"]
+      }
+    },
+    {
+      "id": "swift-c1-defer-falloff-buggy",
+      "description": "A sink in a defer is reported when the scope exits via falloff (#204 C1).",
+      "path": "test-suite/swift/buggy/c1_defer_falloff.swift",
+      "language": "swift",
+      "tags": ["swift", "security", "taint", "regression", "buggy"],
+      "args": ["--only=swift", "--fail-on-warning", "--skip=1,2,3,4,5,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23"],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": { "critical": { "min": 1 } },
+        "require_substrings": ["Request-derived path reaches file read/write/serve sink"]
+      }
+    },
+    {
+      "id": "swift-c1-defer-return-buggy",
+      "description": "A sink in a defer is reported when the scope exits via return (#204 C1).",
+      "path": "test-suite/swift/buggy/c1_defer_return.swift",
+      "language": "swift",
+      "tags": ["swift", "security", "taint", "regression", "buggy"],
+      "args": ["--only=swift", "--fail-on-warning", "--skip=1,2,3,4,5,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23"],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": { "critical": { "min": 1 } },
+        "require_substrings": ["Request-derived path reaches file read/write/serve sink"]
+      }
+    },
+    {
+      "id": "swift-c1-defer-guardelse-buggy",
+      "description": "A sink in a defer is reported when the scope exits via guardelse (#204 C1).",
+      "path": "test-suite/swift/buggy/c1_defer_guardelse.swift",
+      "language": "swift",
+      "tags": ["swift", "security", "taint", "regression", "buggy"],
+      "args": ["--only=swift", "--fail-on-warning", "--skip=1,2,3,4,5,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23"],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": { "critical": { "min": 1 } },
+        "require_substrings": ["Request-derived path reaches file read/write/serve sink"]
+      }
+    },
+    {
+      "id": "swift-c1-defer-throw-buggy",
+      "description": "A sink in a defer is reported when the scope exits via throw (#204 C1).",
+      "path": "test-suite/swift/buggy/c1_defer_throw.swift",
+      "language": "swift",
+      "tags": ["swift", "security", "taint", "regression", "buggy"],
+      "args": ["--only=swift", "--fail-on-warning", "--skip=1,2,3,4,5,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23"],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": { "critical": { "min": 1 } },
+        "require_substrings": ["Request-derived path reaches file read/write/serve sink"]
+      }
+    },
+    {
+      "id": "swift-c1-defer-break-buggy",
+      "description": "A sink in a defer is reported when the scope exits via break (#204 C1).",
+      "path": "test-suite/swift/buggy/c1_defer_break.swift",
+      "language": "swift",
+      "tags": ["swift", "security", "taint", "regression", "buggy"],
+      "args": ["--only=swift", "--fail-on-warning", "--skip=1,2,3,4,5,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23"],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": { "critical": { "min": 1 } },
+        "require_substrings": ["Request-derived path reaches file read/write/serve sink"]
+      }
+    },
+    {
+      "id": "swift-c1-defer-continue-buggy",
+      "description": "A sink in a defer is reported when the scope exits via continue (#204 C1).",
+      "path": "test-suite/swift/buggy/c1_defer_continue.swift",
+      "language": "swift",
+      "tags": ["swift", "security", "taint", "regression", "buggy"],
+      "args": ["--only=swift", "--fail-on-warning", "--skip=1,2,3,4,5,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23"],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": { "critical": { "min": 1 } },
+        "require_substrings": ["Request-derived path reaches file read/write/serve sink"]
+      }
+    },
+    {
+      "id": "swift-c1-defer-lateassign-buggy",
+      "description": "A sink in a defer is reported when the scope exits via lateassign (#204 C1).",
+      "path": "test-suite/swift/buggy/c1_defer_lateassign.swift",
+      "language": "swift",
+      "tags": ["swift", "security", "taint", "regression", "buggy"],
+      "args": ["--only=swift", "--fail-on-warning", "--skip=1,2,3,4,5,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23"],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": { "critical": { "min": 1 } },
+        "require_substrings": ["Request-derived path reaches file read/write/serve sink"]
+      }
+    },
+    {
+      "id": "swift-c1-defer-nested-buggy",
+      "description": "A sink in a defer is reported when the scope exits via nested (#204 C1).",
+      "path": "test-suite/swift/buggy/c1_defer_nested.swift",
+      "language": "swift",
+      "tags": ["swift", "security", "taint", "regression", "buggy"],
+      "args": ["--only=swift", "--fail-on-warning", "--skip=1,2,3,4,5,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23"],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": { "critical": { "min": 1 } },
+        "require_substrings": ["Request-derived path reaches file read/write/serve sink"]
+      }
+    },
+    {
+      "id": "swift-c1-defer-clean",
+      "description": "A defer with no sink is clean (#204 C1).",
+      "path": "test-suite/swift/clean/c1_defer_clean.swift",
+      "language": "swift",
+      "tags": ["swift", "security", "taint", "regression", "clean"],
+      "args": ["--only=swift", "--skip=1,2,3,4,5,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23"],
+      "expect": {
+        "exit_code": "zero",
+        "totals": { "critical": { "max": 0 } },
+        "forbid_substrings": ["Request-derived path reaches file read/write/serve sink", "analysis is incomplete", "swift: partial"]
+      }
+    },
+    {
+      "id": "swift-switch-binding-partial-release-buggy",
+      "description": "Releasing a stored Timer in only one switch-case arm leaks on the other path, identically to the equivalent if/else (#204 A parity).",
+      "path": "test-suite/swift/buggy/switch_binding_partial_release.swift",
+      "language": "swift",
+      "tags": ["swift", "lifecycle", "regression", "buggy"],
+      "args": ["--only=swift"],
+      "expect": {
+        "exit_code": "zero",
+        "totals": { "warning": { "min": 2 } },
+        "forbid_substrings": ["analysis is incomplete", "swift: partial"]
+      }
+    },
+    {
       "id": "csharp-suppression-intervals-markers",
       "description": "A7 GH #91: all ubs:ignore placements (trailing, previous-line, multi-line statement, formatter-relocated, rule-scoped) suppress every finding line in the csharp module.",
       "path": "test-suite/csharp/suppression/suppression_buggy.cs",

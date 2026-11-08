@@ -10,6 +10,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Resolve the supported C# string-conversion contract before propagating
+  Dapper SQL values. Argument-taking and generic `ToString` extensions on
+  commands, their properties or local aliases no longer inherit built-in
+  conversion safety. Keep proven numeric formatting and BCL provider overloads
+  complete; report custom or unresolved dispatch explicitly, with independent
+  unsafe and clean regressions through ordinary JSON/SARIF scans.
+
 - Verify both existing console advisories in the C# Dapper public acceptance
   tests when ast-grep is installed. Retain exact rule, location, severity,
   category and count assertions for the real module and runner output.

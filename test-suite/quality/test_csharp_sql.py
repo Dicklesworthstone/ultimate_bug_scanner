@@ -584,6 +584,34 @@ class C {
         var command = new CommandDefinition("select @value", http.Query["sql"].ToString());
         db.Execute((string)command.Parameters); // @sql db.Execute
     ''')),
+    Case("command_zero_argument_tostring_does_not_expose_captured_values", source('''
+        var command = new CommandDefinition(http.Query["sql"].ToString(), http.Query["data"].ToString(),
+            commandType: CommandType.Text);
+        db.Execute(command.ToString());
+    ''', extra='''static class CommandExtensions {
+    public static string ToString(this CommandDefinition value, string text) { return text; }
+}
+''')),
+    Case("command_text_tostring_retains_only_query_provenance", source('''
+        var command = new CommandDefinition(http.Query["sql"].ToString(), "ordinary data", commandType: CommandType.Text);
+        db.Execute(command.CommandText.ToString()); // @sql db.Execute
+    ''')),
+    Case("command_safe_text_tostring_does_not_expose_parameter_data", source('''
+        var command = new CommandDefinition("select @value", http.Query["sql"].ToString());
+        db.Execute(command.CommandText.ToString());
+    ''')),
+    Case("command_parameter_string_conversion_can_reach_sql", source('''
+        var command = new CommandDefinition("select @value", http.Query["sql"].ToString());
+        db.Execute(command.Parameters.ToString()); // @sql db.Execute
+    ''')),
+    Case("builtin_numeric_formatting_with_bound_value_stays_complete", source('''
+        var formatted = number.ToString("D");
+        db.Execute("select @value", new { value = formatted });
+    ''', parameters="IDbConnection db, int number")),
+    Case("builtin_string_provider_conversion_stays_complete", source('''
+        var copied = text.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        db.Execute("select @value", new { value = copied });
+    ''', parameters="IDbConnection db, string text")),
     Case("command_unused_construction_is_not_execution", source('''
         var command = new CommandDefinition(http.Query["sql"].ToString(), commandType: CommandType.Text);
         Console.WriteLine(command.CommandText);
@@ -613,6 +641,54 @@ class C {
 )
 
 COMMAND_BOUNDARIES = (
+    # C# considers extension methods when the instance has no applicable
+    # overload. Only the zero-argument, non-generic builtin conversion has the
+    # known struct/string behavior; these calls execute application methods.
+    # https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/language-specification/expressions#128103-extension-method-invocations
+    Case("command_tostring_argument_overload_is_not_builtin", source('''
+        var command = new CommandDefinition("select 1");
+        db.Execute(command.ToString(http.Query["sql"].ToString()));
+    ''', extra='''static class CommandExtensions {
+    public static string ToString(this CommandDefinition value, string text) { return text; }
+}
+'''), partial=True),
+    Case("command_tostring_generic_overload_is_not_builtin", source('''
+        var command = new CommandDefinition("select 1");
+        db.Execute(command.ToString<string>(http.Query["sql"].ToString()));
+    ''', extra='''static class CommandExtensions {
+    public static string ToString<T>(this CommandDefinition value, string text) { return text; }
+}
+'''), partial=True),
+    Case("command_text_tostring_extension_can_return_an_argument", source('''
+        var command = new CommandDefinition("select 1");
+        db.Execute(command.CommandText.ToString(http.Query["sql"].ToString()));
+    ''', extra='''static class TextExtensions {
+    public static string ToString(this string value, string text) { return text; }
+}
+'''), partial=True),
+    Case("command_parameters_tostring_extension_can_return_an_argument", source('''
+        var command = new CommandDefinition("select @value", "ordinary data");
+        db.Execute(command.Parameters.ToString(http.Query["sql"].ToString()));
+    ''', extra='''static class TextExtensions {
+    public static string ToString(this object value, string text) { return text; }
+}
+'''), partial=True),
+    Case("command_text_alias_tostring_extension_requires_dispatch", source('''
+        var command = new CommandDefinition("select 1");
+        var text = command.CommandText;
+        db.Execute(text.ToString(http.Query["sql"].ToString()));
+    ''', extra='''static class TextExtensions {
+    public static string ToString(this string value, string text) { return text; }
+}
+'''), partial=True),
+    Case("command_parameters_alias_tostring_extension_requires_dispatch", source('''
+        var command = new CommandDefinition("select @value", "ordinary data");
+        var data = command.Parameters;
+        db.Execute(data.ToString(http.Query["sql"].ToString()));
+    ''', extra='''static class TextExtensions {
+    public static string ToString(this object value, string text) { return text; }
+}
+'''), partial=True),
     Case("command_target_typed_construction_is_explicitly_partial", source('''
         CommandDefinition command = new(http.Query["sql"].ToString(), commandType: CommandType.Text);
         db.Execute(command);

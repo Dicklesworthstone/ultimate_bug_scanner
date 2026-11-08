@@ -815,6 +815,42 @@ class DapperFlow(CSharpFlow):
                 return None
         return slots["sql"]
 
+    def builtin_string_conversion(self, call):
+        """Prove selected BCL overloads before excluding extension dispatch.
+
+        A differently shaped ToString can be an application extension, even
+        on a genuine framework value. Numeric format strings and the selected
+        static BCL providers establish actual overloads without executing an
+        unmodeled user conversion or format provider.
+        """
+        if self.code[call.name_end:call.opening].strip():
+            return False
+        owners = identities(call.receiver)
+        if len(owners) != 1:
+            return False
+        owner = next(iter(owners))
+        numeric = (NUMBER_STYLES, "provider") in PARSE_OPTION_SHAPES.get(owner, ())
+        if owner != "System.String" and not numeric:
+            return False
+        if len(call.args) == 1:
+            keyword, low, high = call.args[0]
+            if (numeric and keyword in {None, "format"}
+                    and (self.proven_text_argument(call, 0) or self.request_text_argument(call, 0))):
+                return True
+            return keyword in {None, "provider"} and self.parse_option(call, low, high) == "provider"
+        if numeric and len(call.args) == 2:
+            slots = {}
+            for index, (keyword, _, _) in enumerate(call.args):
+                slot = keyword if keyword is not None else ("format", "provider")[index]
+                if slot not in {"format", "provider"} or slot in slots:
+                    return False
+                slots[slot] = index
+            _, low, high = call.args[slots["provider"]]
+            return ((self.proven_text_argument(call, slots["format"])
+                     or self.request_text_argument(call, slots["format"]))
+                    and self.parse_option(call, low, high) == "provider")
+        return False
+
     def call_value(self, call):
         name, args, values, receiver = call.name, call.args, call.values, call.receiver
         state, bindings, position = call.state, call.bindings, call.position
@@ -831,6 +867,11 @@ class DapperFlow(CSharpFlow):
             # SQL execution return values are not new request sources.
             return CLEAN
         source = self.name_value(name.rsplit(".", 1)[0], position, state, bindings) if "." in name else CLEAN
+        if method == "ToString" and (args or self.code[call.name_end:call.opening].strip()):
+            if self.builtin_string_conversion(call):
+                return provenance(join(receiver, source, *values))
+            self.incomplete(position, "String conversion overload requires resolved dispatch")
+            return CLEAN
         if method == "ToString" and COMMAND in identities(receiver):
             # The struct's own Object.ToString does not expose its SQL/data.
             # Property conversion reads only the selected property; the shared

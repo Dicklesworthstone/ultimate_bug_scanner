@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.5.47-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.5.48-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -370,7 +370,10 @@ statements that select `"*"` in both `Action` and `Resource`. It supports
 `jsonencode` expressions over selected literals and locals. It also resolves
 `.json` and `.minified_json` from selected `aws_iam_policy_document` data sources
 in the same Terraform module, including local aliases, static action/resource
-lists, and the provider's default `Allow` effect. Findings point to the consuming
+lists and condition blocks, and the provider's default `Allow` effect. Static
+conditions group values by operator and context-variable name, preserving the
+provider's IAM-variable substitutions without evaluating condition truth.
+Findings point to the consuming
 resource's `policy` attribute; an unused data document does not create a finding.
 Static `source_policy_documents` and `override_policy_documents` follow the
 provider's statement-ID merge order: sources first, inline statements next,
@@ -410,7 +413,7 @@ output are capped at 256 KiB, including expansion of shared local expressions
 and intermediate merged documents. Generated JSON and repeated composition
 input parsing each have an additional 32 MiB budget per selected module.
 Custom `--rules` and extra non-`.tf` extensions are explicitly refused. Other
-providers, dynamic/conditional data statements,
+providers, dynamic data statements,
 replicated data instances, arbitrary policy evaluation and deployed reachability
 remain outside this slice. Unresolved or cyclic data references stay incomplete.
 Confidence is uncalibrated.

@@ -1855,6 +1855,375 @@ POLICY_COMPOSITION_CASES = (
 )
 
 
+# Native condition blocks must survive as data until ordered SID replacement
+# and final grant classification. These labels do not evaluate AWS runtime
+# condition truth. The expected-red baseline precedes condition lowering.
+POLICY_CONDITION_CASES = (
+    Case("iam_condition_restricted_policy_is_complete", '''
+        data "aws_iam_policy_document" "restricted_condition" {
+          statement {
+            actions = ["s3:GetObject"]
+            resources = ["arn:aws:s3:::example/*"]
+            condition {
+              test = "StringEquals"
+              variable = "aws:PrincipalTag/team"
+              values = ["blue"]
+            }
+          }
+        }
+        resource "aws_iam_policy" "restricted_condition" {
+          policy = data.aws_iam_policy_document.restricted_condition.json
+        }
+    '''),
+    Case("iam_condition_own_statement_replaced_exposes_grant", '''
+        data "aws_iam_policy_document" "replaced_own_condition" {
+          statement {
+            sid = "Selected"
+            actions = ["*"]
+            resources = ["*"]
+            condition {
+              test = "Bool"
+              variable = "aws:MultiFactorAuthPresent"
+              values = ["true"]
+            }
+          }
+          override_policy_documents = [jsonencode({
+            Statement = [{ Sid = "Selected", Effect = "Allow", Action = "*", Resource = "*" }]
+          })]
+        }
+        resource "aws_iam_policy" "replaced_own_condition" {
+          policy = data.aws_iam_policy_document.replaced_own_condition.json # expect:iam
+        }
+    '''),
+    Case("iam_condition_source_statement_replaced_exposes_grant", '''
+        data "aws_iam_policy_document" "conditional_source" {
+          statement {
+            sid = "Selected"
+            actions = ["*"]
+            resources = ["*"]
+            condition {
+              test = "Bool"
+              variable = "aws:MultiFactorAuthPresent"
+              values = ["true"]
+            }
+          }
+        }
+        data "aws_iam_policy_document" "source_condition_replaced" {
+          source_policy_documents = [data.aws_iam_policy_document.conditional_source.json]
+          statement {
+            sid = "Selected"
+            actions = ["*"]
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "source_condition_replaced" {
+          policy = data.aws_iam_policy_document.source_condition_replaced.json # expect:iam
+        }
+    '''),
+    Case("iam_condition_later_override_removes_native_constraint", '''
+        data "aws_iam_policy_document" "conditional_override" {
+          statement {
+            sid = "Selected"
+            actions = ["*"]
+            resources = ["*"]
+            condition {
+              test = "Bool"
+              variable = "aws:MultiFactorAuthPresent"
+              values = ["true"]
+            }
+          }
+        }
+        data "aws_iam_policy_document" "later_unconditional_override" {
+          override_policy_documents = [
+            data.aws_iam_policy_document.conditional_override.minified_json,
+            jsonencode({ Statement = [{ Sid = "Selected", Effect = "Allow", Action = "*", Resource = "*" }] })
+          ]
+        }
+        resource "aws_iam_policy" "later_unconditional_override" {
+          policy = data.aws_iam_policy_document.later_unconditional_override.json # expect:iam
+        }
+    '''),
+    Case("iam_condition_restricted_override_removes_broad_grant", '''
+        data "aws_iam_policy_document" "restricted_override" {
+          statement {
+            sid = "Selected"
+            actions = ["s3:GetObject"]
+            resources = ["*"]
+            condition {
+              test = "StringEquals"
+              variable = "aws:PrincipalTag/team"
+              values = ["blue"]
+            }
+          }
+        }
+        data "aws_iam_policy_document" "restricted_final" {
+          source_policy_documents = [jsonencode({
+            Statement = [{ Sid = "Selected", Effect = "Allow", Action = "*", Resource = "*" }]
+          })]
+          override_policy_documents = [data.aws_iam_policy_document.restricted_override.json]
+        }
+        resource "aws_iam_policy" "restricted_final" {
+          policy = data.aws_iam_policy_document.restricted_final.json
+        }
+    '''),
+    Case("iam_condition_source_constraint_survives_composition", '''
+        data "aws_iam_policy_document" "surviving_source" {
+          statement {
+            sid = "Conditional"
+            actions = ["*"]
+            resources = ["*"]
+            condition {
+              test = "Bool"
+              variable = "aws:MultiFactorAuthPresent"
+              values = ["true"]
+            }
+          }
+        }
+        data "aws_iam_policy_document" "surviving_composition" {
+          source_policy_documents = [data.aws_iam_policy_document.surviving_source.json]
+        }
+        resource "aws_iam_policy" "surviving_composition" {
+          policy = data.aws_iam_policy_document.surviving_composition.json
+        }
+    ''', True),
+    Case("iam_condition_anonymous_statement_cannot_be_replaced", '''
+        data "aws_iam_policy_document" "anonymous_condition" {
+          statement {
+            actions = ["*"]
+            resources = ["*"]
+            condition {
+              test = "Bool"
+              variable = "aws:MultiFactorAuthPresent"
+              values = ["true"]
+            }
+          }
+          override_policy_documents = [jsonencode({
+            Statement = [{ Effect = "Allow", Action = "s3:GetObject", Resource = "*" }]
+          })]
+        }
+        resource "aws_iam_policy" "anonymous_condition" {
+          policy = data.aws_iam_policy_document.anonymous_condition.json
+        }
+    ''', True),
+    Case("iam_condition_old_version_literal_values_are_supported", '''
+        data "aws_iam_policy_document" "old_literal_condition" {
+          version = "2008-10-17"
+          statement {
+            actions = ["s3:ListBucket"]
+            resources = ["*"]
+            condition {
+              test = "StringLike"
+              variable = "s3:prefix"
+              values = [""]
+            }
+          }
+        }
+        resource "aws_iam_policy" "old_literal_condition" {
+          policy = data.aws_iam_policy_document.old_literal_condition.json
+        }
+    '''),
+    Case("iam_condition_own_version_controls_variable_substitution", '''
+        data "aws_iam_policy_document" "old_condition_variables" {
+          version = "2008-10-17"
+          source_policy_documents = [jsonencode({ Version = "2012-10-17", Statement = [] })]
+          statement {
+            actions = ["s3:ListBucket"]
+            resources = ["*"]
+            condition {
+              test = "StringLike"
+              variable = "s3:prefix"
+              values = ["home/&{aws:username}/*"]
+            }
+          }
+        }
+        resource "aws_iam_policy" "old_condition_variables" {
+          policy = data.aws_iam_policy_document.old_condition_variables.json
+        }
+    ''', True),
+    Case("iam_condition_unknown_values_cannot_be_hidden_by_replacement", '''
+        data "aws_iam_policy_document" "unknown_condition_values" {
+          statement {
+            sid = "Selected"
+            actions = ["*"]
+            resources = ["*"]
+            condition {
+              test = "StringEquals"
+              variable = "aws:PrincipalTag/team"
+              values = var.teams
+            }
+          }
+          override_policy_documents = [jsonencode({
+            Statement = [{ Sid = "Selected", Effect = "Allow", Action = "*", Resource = "*" }]
+          })]
+        }
+        resource "aws_iam_policy" "unknown_condition_values" {
+          policy = data.aws_iam_policy_document.unknown_condition_values.json
+        }
+    ''', True),
+    Case("iam_condition_unknown_operator_is_incomplete", '''
+        data "aws_iam_policy_document" "unknown_condition_operator" {
+          statement {
+            actions = ["s3:GetObject"]
+            resources = ["*"]
+            condition {
+              test = var.operator
+              variable = "aws:PrincipalTag/team"
+              values = ["blue"]
+            }
+          }
+        }
+        resource "aws_iam_policy" "unknown_condition_operator" {
+          policy = data.aws_iam_policy_document.unknown_condition_operator.json
+        }
+    ''', True),
+    Case("iam_condition_dynamic_blocks_are_incomplete", '''
+        data "aws_iam_policy_document" "dynamic_conditions" {
+          statement {
+            actions = ["s3:GetObject"]
+            resources = ["*"]
+            dynamic "condition" {
+              for_each = var.conditions
+              content {
+                test = "StringEquals"
+                variable = "aws:PrincipalTag/team"
+                values = ["blue"]
+              }
+            }
+          }
+        }
+        resource "aws_iam_policy" "dynamic_conditions" {
+          policy = data.aws_iam_policy_document.dynamic_conditions.json
+        }
+    ''', True),
+    Case("iam_condition_does_not_admit_principal_statements", '''
+        data "aws_iam_policy_document" "condition_and_principal" {
+          statement {
+            actions = ["*"]
+            resources = ["*"]
+            principals {
+              type = "AWS"
+              identifiers = ["*"]
+            }
+            condition {
+              test = "Bool"
+              variable = "aws:MultiFactorAuthPresent"
+              values = ["true"]
+            }
+          }
+        }
+        resource "aws_iam_policy" "condition_and_principal" {
+          policy = data.aws_iam_policy_document.condition_and_principal.json
+        }
+    ''', True),
+    Case("iam_condition_scalar_values_are_incomplete", '''
+        data "aws_iam_policy_document" "scalar_condition_values" {
+          statement {
+            actions = ["s3:GetObject"]
+            resources = ["*"]
+            condition {
+              test = "StringEquals"
+              variable = "aws:PrincipalTag/team"
+              values = "blue"
+            }
+          }
+        }
+        resource "aws_iam_policy" "scalar_condition_values" {
+          policy = data.aws_iam_policy_document.scalar_condition_values.json
+        }
+    ''', True),
+    Case("iam_condition_missing_context_variable_is_incomplete", '''
+        data "aws_iam_policy_document" "missing_condition_variable" {
+          statement {
+            actions = ["s3:GetObject"]
+            resources = ["*"]
+            condition {
+              test = "StringEquals"
+              values = ["blue"]
+            }
+          }
+        }
+        resource "aws_iam_policy" "missing_condition_variable" {
+          policy = data.aws_iam_policy_document.missing_condition_variable.json
+        }
+    ''', True),
+    Case("iam_condition_empty_operator_is_incomplete", '''
+        data "aws_iam_policy_document" "empty_condition_operator" {
+          statement {
+            actions = ["s3:GetObject"]
+            resources = ["*"]
+            condition {
+              test = ""
+              variable = "aws:PrincipalTag/team"
+              values = ["blue"]
+            }
+          }
+        }
+        resource "aws_iam_policy" "empty_condition_operator" {
+          policy = data.aws_iam_policy_document.empty_condition_operator.json
+        }
+    ''', True),
+    Case("iam_condition_empty_values_are_incomplete", '''
+        data "aws_iam_policy_document" "empty_condition_values" {
+          statement {
+            actions = ["s3:GetObject"]
+            resources = ["*"]
+            condition {
+              test = "StringEquals"
+              variable = "aws:PrincipalTag/team"
+              values = []
+            }
+          }
+        }
+        resource "aws_iam_policy" "empty_condition_values" {
+          policy = data.aws_iam_policy_document.empty_condition_values.json
+        }
+    ''', True),
+    Case("iam_condition_nested_unknown_block_is_incomplete", '''
+        data "aws_iam_policy_document" "nested_condition_block" {
+          statement {
+            actions = ["s3:GetObject"]
+            resources = ["*"]
+            condition {
+              test = "StringEquals"
+              variable = "aws:PrincipalTag/team"
+              values = ["blue"]
+              unexpected {
+                ignored = true
+              }
+            }
+          }
+        }
+        resource "aws_iam_policy" "nested_condition_block" {
+          policy = data.aws_iam_policy_document.nested_condition_block.json
+        }
+    ''', True),
+    Case("iam_condition_child_cycle_keeps_independent_finding", '''
+        locals {
+          context = { values = ["true"], generated = data.aws_iam_policy_document.condition_cycle.json }
+        }
+        data "aws_iam_policy_document" "condition_cycle" {
+          statement {
+            actions = ["s3:GetObject"]
+            resources = ["*"]
+            condition {
+              test = "Bool"
+              variable = "aws:MultiFactorAuthPresent"
+              values = local.context.values
+            }
+          }
+        }
+        resource "aws_iam_policy" "condition_cycle" {
+          policy = data.aws_iam_policy_document.condition_cycle.json
+        }
+        resource "aws_iam_policy" "condition_cycle_control" {
+          policy = jsonencode({ # expect:iam
+            Statement = [{ Effect = "Allow", Action = "*", Resource = "*" }]
+          })
+        }
+    ''', True),
+)
+
+
 class EvidenceTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -2227,6 +2596,217 @@ resource "aws_iam_policy" "document%d" {
                 self.assertEqual(records, [], (records, errors))
                 self.assertTrue(any("budget" in error.lower() for error in errors), (records, errors))
 
+    def test_iam_native_condition_grouping_and_variable_encoding(self):
+        analyzer = importlib.import_module("ubs_core.hcl_scan")
+        cases = (
+            (Case("iam_native_condition_groups", '''
+                data "aws_iam_policy_document" "groups" {
+                  statement {
+                    actions = ["s3:GetObject"]
+                    resources = ["*"]
+                    condition {
+                      test = "StringEquals"
+                      variable = "aws:PrincipalTag/team"
+                      values = ["blue"]
+                    }
+                    condition {
+                      test = "StringEquals"
+                      variable = "aws:PrincipalTag/team"
+                      values = ["green", "red"]
+                    }
+                    condition {
+                      test = "StringEquals"
+                      variable = "aws:PrincipalTag/team"
+                      values = ["blue"]
+                    }
+                    condition {
+                      test = "StringEquals"
+                      variable = "aws:PrincipalTag/project"
+                      values = ["demo"]
+                    }
+                    condition {
+                      test = "Bool"
+                      variable = "aws:MultiFactorAuthPresent"
+                      values = ["true"]
+                    }
+                  }
+                }
+                resource "aws_iam_policy" "groups" {
+                  policy = data.aws_iam_policy_document.groups.json
+                }
+            '''), {"StringEquals": {"aws:PrincipalTag/team": ["blue", "green", "red"],
+                                   "aws:PrincipalTag/project": "demo"},
+                   "Bool": {"aws:MultiFactorAuthPresent": "true"}}),
+            (Case("iam_native_condition_substitution", '''
+                locals {
+                  condition = { operator = "StringLike", context = "s3:prefix", prefixes = ["home/&{aws:username}/*", ""] }
+                }
+                data "aws_iam_policy_document" "substitution" {
+                  statement {
+                    actions = ["s3:ListBucket"]
+                    resources = ["*"]
+                    condition {
+                      test = local.condition.operator
+                      variable = local.condition.context
+                      values = local.condition.prefixes
+                    }
+                  }
+                }
+                resource "aws_iam_policy" "substitution" {
+                  policy = data.aws_iam_policy_document.substitution.minified_json
+                }
+            '''), {"StringLike": {"s3:prefix": ["", "home/${aws:username}/*"]}}),
+        )
+        for case, expected in cases:
+            with self.subTest(case=case.name):
+                directory = self.materialize((case,), case.name)
+                source = str(directory / case.filename)
+                module = analyzer.Module({source: case.source}, set(analyzer.RULES))
+                records, errors = module.run()
+                generated = module.values.attribute(module.resources[0], "policy")
+                policy = json.loads(generated) if isinstance(generated, str) else None
+                (directory / "receipt.json").write_text(json.dumps({
+                    **self.identity, "findings": records, "errors": errors, "generated_policy": policy,
+                    "expected_condition": expected,
+                    "analyzer_sha256": hashlib.sha256(Path(analyzer.__file__).read_bytes()).hexdigest(),
+                }, indent=2) + "\n", encoding="utf-8")
+                self.assertEqual((records, errors), ([], []), (records, errors))
+                self.assertIsNotNone(policy, generated)
+                actual = policy["Statement"][0]["Condition"]
+                # TypeSet block iteration need not follow source order. OR
+                # values retain their exact membership and scalar/list shape.
+                normalized = {operator: {name: sorted(value) if isinstance(value, list) else value
+                                         for name, value in terms.items()}
+                              for operator, terms in actual.items()}
+                self.assertEqual(normalized, expected, policy)
+
+    def test_iam_native_conditions_use_only_selected_module_locals(self):
+        analyzer = importlib.import_module("ubs_core.hcl_scan")
+        consumer = Case("main", '''
+            data "aws_iam_policy_document" "local_condition" {
+              statement {
+                sid = "Selected"
+                actions = ["*"]
+                resources = ["*"]
+                condition {
+                  test = local.condition.operator
+                  variable = local.condition.context
+                  values = local.condition.values
+                }
+              }
+              override_policy_documents = [jsonencode({
+                Statement = [{ Sid = "Selected", Effect = "Allow", Action = "*", Resource = "*" }]
+              })]
+            }
+            resource "aws_iam_policy" "local_condition" {
+              policy = data.aws_iam_policy_document.local_condition.json # expect:iam
+            }
+        ''')
+        settings = Case("settings", '''
+            locals {
+              condition = { operator = "Bool", context = "aws:MultiFactorAuthPresent", values = ["true"] }
+            }
+        ''')
+        directory = self.materialize((consumer, settings), "iam-native-condition-module")
+        source = str(directory / consumer.filename)
+        child = directory / "child-module"
+        child.mkdir()
+        (child / settings.filename).write_text(settings.source, encoding="utf-8")
+        for name, context, partial in (
+            ("selected-settings", {str(directory / settings.filename): settings.source}, False),
+            ("missing-settings", {}, True),
+            ("different-module", {str(child / settings.filename): settings.source}, True),
+        ):
+            with self.subTest(selection=name):
+                records, errors = analyzer.analyze_sources({source: consumer.source, **context})
+                actual = sorted((row["path"], row["rule"], row["line"], row["col"]) for row in records)
+                expected = [] if partial else [(source, rule, line, col) for rule, line, col in consumer.expected]
+                (directory / (name + ".json")).write_text(json.dumps({
+                    **self.identity, "expected": expected, "actual": actual, "findings": records,
+                    "errors": errors, "incomplete": partial,
+                    "analyzer_sha256": hashlib.sha256(Path(analyzer.__file__).read_bytes()).hexdigest(),
+                }, indent=2) + "\n", encoding="utf-8")
+                self.assertEqual(bool(errors), partial, (records, errors))
+                self.assertEqual(actual, expected, (records, errors))
+
+    def test_iam_native_condition_shared_values_are_bounded_before_encoding(self):
+        analyzer = importlib.import_module("ubs_core.hcl_scan")
+        value = "a" * 180 + "/&{aws:username}/*"
+        control = Case("iam_native_condition_expansion", '''
+            locals {
+              prefix = %s
+            }
+            data "aws_iam_policy_document" "condition_expansion" {
+              statement {
+                actions = ["s3:GetObject"]
+                resources = ["*"]
+                condition {
+                  test = "StringLike"
+                  variable = "s3:prefix"
+                  values = [local.prefix, local.prefix, local.prefix, local.prefix]
+                }
+              }
+            }
+            resource "aws_iam_policy" "condition_expansion" {
+              policy = data.aws_iam_policy_document.condition_expansion.json
+            }
+        ''' % json.dumps(value))
+        with self.subTest(budget="normal"):
+            self.check_native(control)
+        case = Case(control.name + "_limited", control.code, True)
+        directory = self.materialize((case,), case.name)
+        source = directory / case.filename
+        with mock.patch.object(analyzer, "MAX_POLICY_BYTES", 512), \
+                mock.patch.object(analyzer.json.JSONEncoder, "iterencode",
+                                  side_effect=AssertionError("oversized condition values reached the serializer")):
+            records, errors = analyzer.analyze_source(case.source, str(source))
+        (directory / "receipt.json").write_text(json.dumps({
+            **self.identity, "findings": records, "errors": errors, "per_document_limit": 512,
+            "analyzer_sha256": hashlib.sha256(Path(analyzer.__file__).read_bytes()).hexdigest(),
+        }, indent=2) + "\n", encoding="utf-8")
+        self.assertEqual(records, [], (records, errors))
+        self.assertTrue(any("budget" in error.lower() for error in errors), (records, errors))
+
+    def test_iam_native_condition_shared_empty_strings_have_an_expansion_budget(self):
+        analyzer = importlib.import_module("ubs_core.hcl_scan")
+        conditions = "\n".join('''
+                    condition {
+                      test = "StringEquals"
+                      variable = "aws:PrincipalTag/context%d"
+                      values = local.empty_values
+                    }
+        ''' % index for index in range(8))
+        control = Case("iam_native_condition_shared_empty_values", '''
+            locals {
+              empty_values = %s
+            }
+            data "aws_iam_policy_document" "empty_conditions" {
+              statement {
+                actions = ["s3:GetObject"]
+                resources = ["*"]
+                %s
+              }
+            }
+            resource "aws_iam_policy" "empty_conditions" {
+              policy = data.aws_iam_policy_document.empty_conditions.json
+            }
+        ''' % (json.dumps([""] * 32), conditions))
+        with self.subTest(budget="normal"):
+            self.check_native(control)
+        case = Case(control.name + "_limited", control.code, True)
+        directory = self.materialize((case,), case.name)
+        with mock.patch.object(analyzer, "MAX_POLICY_BYTES", 512), \
+                mock.patch.object(analyzer.json.JSONEncoder, "iterencode",
+                                  side_effect=AssertionError("shared empty condition strings reached the serializer")):
+            records, errors = analyzer.analyze_source(case.source, str(directory / case.filename))
+        (directory / "receipt.json").write_text(json.dumps({
+            **self.identity, "findings": records, "errors": errors, "per_document_limit": 512,
+            "shared_values": 32, "condition_references": 8,
+            "analyzer_sha256": hashlib.sha256(Path(analyzer.__file__).read_bytes()).hexdigest(),
+        }, indent=2) + "\n", encoding="utf-8")
+        self.assertEqual(records, [], (records, errors))
+        self.assertTrue(any("budget" in error.lower() for error in errors), (records, errors))
+
 
 def native_test(case):
     def run(self):
@@ -2234,7 +2814,7 @@ def native_test(case):
     return run
 
 
-for _case in CASES + REVIEW_CASES + IAM_CASES + TLS_CASES + POLICY_DOCUMENT_CASES + POLICY_COMPOSITION_CASES:
+for _case in CASES + REVIEW_CASES + IAM_CASES + TLS_CASES + POLICY_DOCUMENT_CASES + POLICY_COMPOSITION_CASES + POLICY_CONDITION_CASES:
     setattr(HCLNativeTests, "test_" + _case.name, native_test(_case))
 
 
@@ -2518,6 +3098,95 @@ class HCLPublicTests(EvidenceTest):
             with self.subTest(state="restricted-again-" + selected.name):
                 self.assert_report(*self.execute(directory, cached=True), "json",
                                    (consumer, composition, source, override))
+
+    def test_iam_native_conditions_public_formats_and_partial_retention(self):
+        cases_by_name = {case.name: case for case in POLICY_CONDITION_CASES}
+        cases = tuple(cases_by_name[name] for name in (
+            "iam_condition_restricted_policy_is_complete",
+            "iam_condition_own_statement_replaced_exposes_grant",
+            "iam_condition_source_statement_replaced_exposes_grant",
+            "iam_condition_later_override_removes_native_constraint"))
+        directory = self.materialize(cases, "iam-native-condition-formats")
+        for mode in ("module-json", "module-sarif", "json", "sarif"):
+            with self.subTest(mode=mode):
+                self.assert_report(*self.execute(directory, mode), mode, cases)
+        partial = (cases_by_name["iam_condition_source_constraint_survives_composition"],
+                   cases_by_name["iam_condition_own_statement_replaced_exposes_grant"])
+        directory = self.materialize(partial, "iam-native-condition-partial")
+        for mode in ("json", "sarif"):
+            with self.subTest(partial_mode=mode):
+                self.assert_report(*self.execute(directory, mode), mode, partial, partial=True)
+
+    def test_iam_native_conditions_cache_tracks_selected_context(self):
+        consumer = Case("main", '''
+            data "aws_iam_policy_document" "cached_conditions" {
+              source_policy_documents = [data.aws_iam_policy_document.cached_condition_source.json]
+              override_policy_documents = [data.aws_iam_policy_document.cached_condition_override.json]
+            }
+            resource "aws_iam_policy" "cached_conditions" {
+              policy = data.aws_iam_policy_document.cached_conditions.json
+            }
+        ''')
+        source = Case("source", '''
+            data "aws_iam_policy_document" "cached_condition_source" {
+              statement {
+                sid = "Selected"
+                actions = ["*"]
+                resources = ["*"]
+              }
+            }
+        ''')
+        override = Case("override", '''
+            data "aws_iam_policy_document" "cached_condition_override" {
+              statement {
+                sid = local.override_sid
+                actions = ["s3:GetObject"]
+                resources = ["*"]
+                condition {
+                  test = "StringEquals"
+                  variable = "aws:PrincipalTag/environment"
+                  values = local.condition_values
+                }
+              }
+            }
+        ''')
+        settings = Case("settings", '''
+            locals {
+              override_sid = "Selected"
+              condition_values = ["production"]
+            }
+        ''')
+        directory = self.materialize((consumer, source, override, settings), "iam-native-condition-cache")
+        for attempt in range(2):
+            with self.subTest(state="restricted-" + str(attempt)):
+                self.assert_report(*self.execute(directory, cached=True), "json",
+                                   (consumer, source, override, settings))
+        changed = Case(settings.name, '''
+            locals {
+              override_sid = "Different"
+              condition_values = ["production"]
+            }
+        ''')
+        settings_path = directory / settings.filename
+        settings_path.write_text(changed.source, encoding="utf-8")
+        exposed = Case(consumer.name, consumer.code, locations=(("iam", 6, 3),))
+        with self.subTest(state="source-grant-no-longer-replaced"):
+            self.assert_report(*self.execute(directory, cached=True), "json",
+                               (exposed, source, override, changed))
+        unknown = Case(settings.name, '''
+            locals {
+              override_sid = "Different"
+              condition_values = var.environments
+            }
+        ''', True)
+        settings_path.write_text(unknown.source, encoding="utf-8")
+        with self.subTest(state="unknown-condition-does-not-reuse-complete-result"):
+            self.assert_report(*self.execute(directory, cached=True), "json",
+                               (consumer, source, override, unknown), partial=True)
+        settings_path.write_text(settings.source, encoding="utf-8")
+        with self.subTest(state="restricted-context-restored"):
+            self.assert_report(*self.execute(directory, cached=True), "json",
+                               (consumer, source, override, settings))
 
 
 if __name__ == "__main__":

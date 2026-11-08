@@ -436,6 +436,13 @@ def policy_strings(value, field):
     return values
 
 
+def policy_variables(values, version):
+    """Apply the provider's IAM variable escape after the caller bounds input."""
+    if version == "2008-10-17" and any("&{" in item for item in values):
+        return Unknown("IAM policy variables require document version 2012-10-17")
+    return [item.replace("&{", "${") for item in values]
+
+
 def parse_policy_document(value, *, composition: bool = False) -> dict:
     """Validate the selected JSON shape before classifying or merging grants.
 
@@ -766,6 +773,46 @@ class Module:
         elif not ignored:
             self.emit(block, "acl", STORAGE, f"{acl} is configured without a selected effective ACL ignore control")
 
+    def policy_conditions(self, blocks: list[Block], version: str,
+                          visiting: tuple[str, ...], string_chars: int):
+        """Lower static provider condition blocks without deciding their truth.
+
+        Equal operator/context names collect values into one JSON condition.
+        The provider's condition set removes identical input blocks before
+        its IAM-variable conversion; distinct blocks retain all their values.
+        """
+        conditions, seen = {}, set()
+        for block in blocks:
+            if (block.kind != "condition" or block.labels or block.children
+                    or set(block.attributes) != {"test", "variable", "values"}):
+                return Unknown("IAM policy conditions require static test, variable and values fields; dynamic blocks and principals are unsupported")
+            test = self.values.attribute(block, "test", visiting=visiting)
+            variable = self.values.attribute(block, "variable", visiting=visiting)
+            values = self.values.attribute(block, "values", visiting=visiting)
+            if (not isinstance(test, str) or not test or not isinstance(variable, str) or not variable
+                    or not isinstance(values, list) or not values or any(not isinstance(value, str) for value in values)):
+                return Unknown("IAM policy condition fields are unresolved or outside the supported string model",
+                               cyclic=unknown([test, variable, values], cycles_only=True))
+            # Empty condition strings are legal provider input. Include their
+            # JSON quotes in the budget so shared lists of empty strings cannot
+            # amplify unboundedly before grouping or variable replacement.
+            string_chars += len(test) + len(variable) + sum(len(value) + 2 for value in values)
+            if string_chars > MAX_POLICY_BYTES:
+                return Unknown("IAM policy condition string expansion budget exhausted")
+            identity = (test, variable, tuple(values))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            replaced = policy_variables(values, version)
+            if isinstance(replaced, Unknown):
+                return replaced
+            conditions.setdefault(test, {}).setdefault(variable, []).extend(replaced)
+        for terms in conditions.values():
+            for variable, values in terms.items():
+                if len(values) == 1:
+                    terms[variable] = values[0]
+        return conditions, string_chars
+
     def policy_document(self, name: str, visiting: tuple[str, ...]):
         """Resolve selected static AWS data statements without executing Terraform.
 
@@ -789,9 +836,9 @@ class Module:
             return Unknown("IAM policy document version is unresolved or unsupported", cyclic=unknown(version, cycles_only=True))
         statements, string_chars, own_identifiers = [], 0, set()
         for child in block.children:
-            if (child.kind != "statement" or child.labels or child.children
+            if (child.kind != "statement" or child.labels
                     or set(child.attributes) - {"sid", "effect", "actions", "resources"}):
-                return Unknown("IAM policy document requires static identity statements without conditions, principals or complement operators")
+                return Unknown("IAM policy document requires static identity statements without principals or complement operators")
             effect = self.values.attribute(child, "effect", "Allow", visiting=visiting)
             if effect is None:
                 effect = "Allow"
@@ -825,10 +872,16 @@ class Module:
                 if string_chars > MAX_POLICY_BYTES:
                     return Unknown("IAM policy document string expansion budget exhausted")
                 if field == "resources":
-                    if version == "2008-10-17" and any("&{" in item for item in values):
-                        return Unknown("IAM policy variables require document version 2012-10-17")
-                    values = [item.replace("&{", "${") for item in values]
+                    values = policy_variables(values, version)
+                    if isinstance(values, Unknown):
+                        return values
                 statement[key] = values
+            lowered = self.policy_conditions(child.children, version, visiting, string_chars)
+            if isinstance(lowered, Unknown):
+                return lowered
+            conditions, string_chars = lowered
+            if conditions:
+                statement["Condition"] = conditions
             statements.append(statement)
         merged = {"Version": version, "Statement": []}
         positions, sizes, source_identifiers = {}, [], set()
@@ -1089,7 +1142,7 @@ def main(argv=None) -> int:
     context = hashlib.sha256(json.dumps(sources, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
     cache = ScanCache(lang="hcl", project_dir=args.project_dir,
                       skip=",".join(map(str, sorted((CATEGORIES - args.only) | args.skip))),
-                      extra="aws-config-v4:" + context)
+                      extra="aws-config-v5:" + context)
     cached, pending = cache.partition_files(files)
     sink = CapturingSink()
     if pending:

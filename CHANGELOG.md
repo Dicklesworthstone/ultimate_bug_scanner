@@ -10,6 +10,16 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Preserve Swift reference aliases and receiver/helper mutations through
+  constructors, casts, getters, and stored callbacks. Join every concrete
+  getter alternative and carry actual captured/inout writes through selected
+  helpers without replaying stale snapshots. Keep unresolved heap effects,
+  polymorphic dispatch, and unsupported property accessors locally conservative.
+  Preserve resource obligations when conditional callbacks lose an optional
+  cleanup receiver, and respect ternary/Boolean/nil-coalescing execution.
+  Add paired analyzer and public JSON/SARIF regressions while retaining the
+  complete pinned franken_ocr production scan for issue #204.
+
 - Analyze generated Terraform `.tf.json` configuration with the existing AWS
   ingress, S3 ACL, IAM policy-document and provider TLS checks. Discover compound
   suffixes in ordinary, direct and staged scans; share selected same-directory

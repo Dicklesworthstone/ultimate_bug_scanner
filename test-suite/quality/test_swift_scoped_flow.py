@@ -6,6 +6,7 @@ artifacts; assertions specify actual sink sites and genuine safe controls.
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
 import json
 from pathlib import Path
 import sys
@@ -1054,7 +1055,7 @@ class SwiftScopedFlowTests(unittest.TestCase):
             ''')
 
     def test_nonfinal_receiver_requires_dynamic_dispatch_analysis(self):
-        with self.assertRaisesRegex(ValueError, 'unresolved receiver dispatch.*incomplete'):
+        with self.assertRaisesRegex(ValueError, 'incoming polymorphic references.*incomplete'):
             self.check('''
                 class Router {
                     func chosen(_ value: String) -> String { "/home" }
@@ -1774,13 +1775,15 @@ class SwiftScopedFlowTests(unittest.TestCase):
             }
         ''', (8,), 'path', 'helper')
 
-    def test_callback_object_alias_mutations_are_explicitly_incomplete(self):
+    def test_callback_alias_writes_are_tracked_and_unknown_calls_stay_incomplete(self):
         for mutation in ('alias.path = req.query["path"]',
                          'alias.setPath(req.query["path"])',
                          'update(alias, req.query["path"])',
                          'alias.append(req.query["path"])'):
             for late in (False, True):
-                with self.subTest(mutation=mutation, late=late), self.assertRaisesRegex(ValueError, 'heap/capture.*incomplete'):
+                supported = mutation.startswith('alias.path =')
+                expected = nullcontext() if supported else self.assertRaisesRegex(ValueError, 'heap/alias.*incomplete')
+                with self.subTest(mutation=mutation, late=late), expected:
                     self.check('''
                         class Box {}
                         func handle(req: Request) {
@@ -1791,14 +1794,17 @@ class SwiftScopedFlowTests(unittest.TestCase):
                             %s
                             _ = Array(pending)
                         }
-                    ''' % ('' if late else mutation, mutation if late else ''), policy='path')
+                    ''' % ('' if late else mutation, mutation if late else ''),
+                               (6,) if supported else (), policy='path')
 
-    def test_callback_alias_request_objects_are_explicitly_incomplete(self):
+    def test_callback_alias_request_objects_retain_sources_or_report_unknown_calls(self):
         for value, access in (('req', 'box.value.query["path"]'),
                               ('req.query', 'box.value["path"]'),
                               ('req.content', 'box.value.decode(String.self)')):
             for mutation in (f'alias.value = {value}', f'alias.setValue({value})'):
-                with self.subTest(value=value, mutation=mutation), self.assertRaisesRegex(ValueError, 'heap/capture.*incomplete'):
+                supported = mutation.startswith('alias.value =')
+                expected = nullcontext() if supported else self.assertRaisesRegex(ValueError, 'heap/alias.*incomplete')
+                with self.subTest(value=value, mutation=mutation), expected:
                     self.check('''
                         class Box {}
                         func handle(req: Request) {
@@ -1808,7 +1814,7 @@ class SwiftScopedFlowTests(unittest.TestCase):
                             %s
                             _ = Array(pending)
                         }
-                    ''' % (access, mutation), policy='path')
+                    ''' % (access, mutation), (5,) if supported else (), policy='path')
 
     def test_malformed_interpolation_is_not_a_source_free_clean_result(self):
         for source in (r'func title() { print("\(broken[)") }', r'let x = "\( { )"'):
@@ -1949,18 +1955,17 @@ class SwiftScopedFlowTests(unittest.TestCase):
         ''', policy='path', suffix='-safe')
 
     def test_route_callback_cannot_drop_future_heap_alias_writes(self):
-        with self.assertRaisesRegex(ValueError, 'incomplete'):
-            self.check('''
-                class Box {}
-                func handle(outerReq: Request, app: Application) {
-                    let box = Box()
-                    let alias = box
-                    app.get("read") { req -> String in
-                        return String(contentsOfFile: box.value)
-                    }
-                    alias.value = outerReq.query["file"]
+        self.check('''
+            class Box {}
+            func handle(outerReq: Request, app: Application) {
+                let box = Box()
+                let alias = box
+                app.get("read") { req -> String in
+                    return String(contentsOfFile: box.value)
                 }
-            ''', policy='path')
+                alias.value = outerReq.query["file"]
+            }
+        ''', (6,), policy='path')
 
 
 class SwiftNarrowingOperators(unittest.TestCase):

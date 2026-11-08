@@ -205,6 +205,52 @@ class SwiftProductionCompletenessTests(unittest.TestCase):
                              if item['ruleId'] == 'swift.taint.request_path_traversal'}
                 self.assertEqual(lines, expected, payload)
 
+    def test_object_getter_and_helper_capture_flows_reach_public_reports(self):
+        for tainted in (False, True):
+            project = self.artifacts / ('object-callback-' + str(tainted))
+            project.mkdir()
+            source = textwrap.dedent('''
+                import Foundation
+                final class Store {
+                    var path = "/srv/fixed"
+                    func set(_ value: String) { path = value }
+                    var contents: String {
+                        get throws { try String(contentsOfFile: path) } // expect-path
+                    }
+                }
+                func invoke(_ body: () -> Void) { body() }
+                func handle(req: Request) throws {
+                    let store = Store()
+                    let alias = store
+                    alias.set(%s)
+                    _ = try store.contents
+                    var path = "/srv/fixed"
+                    invoke({ path = %s })
+                    _ = try String(contentsOfFile: path) // expect-path
+                }
+            ''' % (('req.query["path"]!',) * 2 if tainted else ('"/srv/fixed"',) * 2)).lstrip('\n')
+            (project / 'ObjectCallbacks.swift').write_text(source, encoding='utf-8')
+            expected = {number for number, line in enumerate(source.splitlines(), 1)
+                        if '// expect-path' in line} if tainted else set()
+            for fmt in ('json', 'sarif'):
+                with self.subTest(tainted=tainted, format=fmt):
+                    result, payload = self.scan(project, fmt, 'object-callback-' + str(tainted) + '-' + fmt)
+                    self.assert_complete(payload, fmt, 1)
+                    self.assertEqual(result.returncode, int(tainted), payload)
+                    if fmt == 'json':
+                        findings = payload['findings']
+                        lines = {item['line'] for item in findings
+                                 if item['rule_id'] == 'swift.taint.request_path_traversal'}
+                        self.assertFalse(any(item['rule_id'] == 'swift.taint.analysis-limited'
+                                             for item in findings), findings)
+                    else:
+                        findings = [item for run in payload['runs'] for item in run.get('results', [])]
+                        lines = {item['locations'][0]['physicalLocation']['region']['startLine']
+                                 for item in findings if item['ruleId'] == 'swift.taint.request_path_traversal'}
+                        self.assertFalse(any(item['ruleId'] == 'swift.taint.analysis-limited'
+                                             for item in findings), findings)
+                    self.assertEqual(lines, expected, payload)
+
     def test_strict_file_url_proof_remains_separate_from_conservative_scan(self):
         path = self.artifacts / 'FileURLProof.swift'
         safe = textwrap.dedent('''

@@ -279,8 +279,9 @@ class SwiftParser:
         self.obligation = obligation
         self.recover, self.diagnostics = recover, []
         self.functions, self.types, self.extensions, self.final_types = {}, set(), set(), set()
-        self.value_types = set()
+        self.value_types, self.protocols = set(), set()
         self.fields, self.field_functions = {}, {}
+        self.opaque_fields = {}
         body = self.block(self.tokens, (), (), declarations=True)
         self.functions[-1] = SwiftFunction(-1, '<script>', (), (), (), body)
 
@@ -428,6 +429,8 @@ class SwiftParser:
                     self.final_types.add(name)
                 if kind in {'struct', 'enum'}:
                     self.value_types.add(name)
+                if kind == 'protocol':
+                    self.protocols.add(name)
                 self.block(tokens[position + 1:finish], (*owner, name), scope, declarations=True, depth=depth + 1)
                 statements.append(SwiftStatement('definition', tuple(tokens[start:finish + 1])))
                 cursor = finish + 1
@@ -514,26 +517,50 @@ class SwiftParser:
                         if self.obligation is not None and _swift_observer_obligation(part, self.obligation):
                             self.limitation('Swift property observer with a sink needs assignment binding analysis', part, owner)
                         continue
-                if swift_source_tokens(source_region, self.suppressed):
-                    accessor_brace = next((i for i in range(head, finish)
-                                           if tokens[i].kind == 'code' and tokens[i].value == '{'), -1)
-                    if (accessor_brace >= 0 and tokens[head].value in {'var', 'let'}
-                            and not any(tokens[i].kind == 'code' and tokens[i].value == '='
-                                        for i in range(head, accessor_brace))):
-                        body_close = swift_close(tokens, accessor_brace)
-                        body_tokens = tokens[accessor_brace + 1:body_close]
-                        head_body = [t for t in body_tokens if t.kind == 'code' and t.value != '\n']
-                        if head_body and head_body[0].value in {'get', 'set', 'willSet', 'didSet',
-                                '_modify', 'unsafeAddress', 'unsafeMutableAddress', '@'}:
-                            self.limitation('Swift request-derived property accessor needs binding analysis', part, owner)
-                            continue
-                        accessor_key = tokens[start].start
-                        accessor = SwiftFunction(accessor_key, tokens[head + 1].value, owner, scope, ())
-                        self.functions[accessor_key] = accessor
-                        self.field_functions[(owner, tokens[head + 1].value)] = accessor_key
-                        accessor.body = self.block(body_tokens, owner, (*scope, accessor_key), depth=depth + 1)
-                        statements.append(SwiftStatement('definition', part, extra=(accessor_key,)))
+                accessor_brace = next((i for i in range(head, finish)
+                                       if tokens[i].kind == 'code' and tokens[i].value == '{'), -1)
+                if (accessor_brace >= 0 and tokens[head].value in {'var', 'let'}
+                        and not any(tokens[i].kind == 'code' and tokens[i].value == '='
+                                    for i in range(head, accessor_brace))):
+                    body_close = swift_close(tokens, accessor_brace)
+                    body_tokens = tokens[accessor_brace + 1:body_close]
+                    head_body = [t for t in body_tokens if t.kind == 'code' and t.value != '\n']
+                    if ('.'.join(owner) in self.protocols and head_body
+                            and all(t.value in {'get', 'set', 'async', 'throws'} for t in head_body)):
+                        # A protocol requirement declares dispatch, not an
+                        # executable accessor body or a source of input.
                         continue
+                    if head_body and head_body[0].value == 'get':
+                        opening = next((i for i, t in enumerate(body_tokens)
+                                        if t.kind == 'code' and t.value == '{'), -1)
+                        closing = swift_close(body_tokens, opening) if opening >= 0 else -1
+                        header = {t.value for t in body_tokens[:opening] if t.value != '\n'}
+                        if (opening < 0 or not header <= {'get', 'async', 'throws'}
+                                or any(t.value != '\n' for t in body_tokens[closing + 1:])):
+                            reason = 'Swift property accessor needs binding analysis'
+                            self.opaque_fields[(owner, tokens[head + 1].value)] = reason
+                            if swift_source_tokens(source_region, self.suppressed):
+                                self.limitation(reason, part, owner)
+                            continue
+                        body_tokens = body_tokens[opening + 1:closing]
+                    elif head_body and head_body[0].value in {'set', 'willSet', 'didSet',
+                            '_modify', 'unsafeAddress', 'unsafeMutableAddress', '@'}:
+                        reason = 'Swift property accessor needs binding analysis'
+                        self.opaque_fields[(owner, tokens[head + 1].value)] = reason
+                        if swift_source_tokens(source_region, self.suppressed):
+                            self.limitation(reason, part, owner)
+                        continue
+                    accessor_key = tokens[start].start
+                    accessor = SwiftFunction(accessor_key, tokens[head + 1].value, owner, scope, ())
+                    self.functions[accessor_key] = accessor
+                    self.field_functions[(owner, tokens[head + 1].value)] = accessor_key
+                    accessor.body = self.block(body_tokens, owner, (*scope, accessor_key), depth=depth + 1)
+                    if (len(accessor.body) == 1 and accessor.body[0].kind == 'simple'
+                            and not self.assignment(accessor.body[0].tokens)):
+                        accessor.body = (replace(accessor.body[0], kind='return'),)
+                    statements.append(SwiftStatement('definition', part, extra=(accessor_key,)))
+                    continue
+                if swift_source_tokens(source_region, self.suppressed):
                     self.limitation('Swift request-derived type initialization needs field analysis', part, owner)
                 if self.obligation is not None:
                     obs_brace = next((i for i in range(head, finish) if tokens[i].kind == 'code' and tokens[i].value == '{'), -1)
@@ -1101,15 +1128,20 @@ class SwiftSummary:
     effects: dict = field(default_factory=dict)
     mutations: dict = field(default_factory=dict)
     thrown: Fact = CLEAN
+    captures: dict = field(default_factory=dict)
+    # Exit mutations include unchanged inout arguments; these are real writes.
+    assigned: frozenset[int] = frozenset()
 
     def merged(self, other):
-        effects, mutations = dict(self.effects), dict(self.mutations)
+        effects, mutations, captures = dict(self.effects), dict(self.mutations), dict(self.captures)
         for key, value in other.effects.items():
             effects[key] = join(effects.get(key, CLEAN), value)
         for key, value in other.mutations.items():
             mutations[key] = join(mutations.get(key, CLEAN), value)
+        for key, value in other.captures.items():
+            captures[key] = join(captures.get(key, CLEAN), value)
         return SwiftSummary(join(self.returned, other.returned), effects, mutations,
-                            join(self.thrown, other.thrown))
+                            join(self.thrown, other.thrown), captures, self.assigned | other.assigned)
 
 
 class SwiftEngine:
@@ -1125,6 +1157,8 @@ class SwiftEngine:
         self.capture_states, self.capture_revision, self.active_context = {}, 0, None
         self.closure_keys, self.stored_closures = {}, {}
         self.active_closures = set()
+        self.capture_frames, self.captured_writes = [], {}
+        self.summary_context, self.assigned = None, set()
         self.callback_seen = False
         self.thrown = CLEAN
         self.url_reads = {}
@@ -1338,23 +1372,113 @@ class SwiftEngine:
             values.append(value)
         return tuple(values) if position == len(arguments) else None
 
+    @staticmethod
+    def reference_ids(value):
+        """Allocation identities are distinct from reusable type witnesses.
+
+        A source allocation site is finite, including repeated factory calls.
+        Unknown incoming references of the same type deliberately share -1:
+        separate formal parameters are not proof of separate objects.
+        """
+        return frozenset(trace.key for trace in value if trace.kind == 'shape'
+                         and trace.key[0].startswith('reference:'))
+
+    def reference_value(self, value, state):
+        identities = self.reference_ids(value)
+        if not identities:
+            return value
+        return join(value, *(fact for fact in state.values()
+                             if identities & self.reference_ids(fact)))
+
+    def allocation(self, name, offset):
+        value = swift_shape('instance:' + name, offset)
+        if name not in self.parser.value_types:
+            value = join(value, swift_shape('reference:' + name, offset))
+        return value
+
+    def object_payload(self, value):
+        # A stored Request/collection is still incoming data after projection
+        # through an aggregate field. Dropping its shape must not make all of
+        # its later query/content reads clean.
+        requests = (trace for trace in value if trace.kind == 'shape' and trace.key[0]
+                    in {'request', 'request-collection', 'request-content'})
+        return join(self.forget(value), *(self.source(trace.key[1], 'stored ' + trace.key[0])
+                                          for trace in requests))
+
+    def object_effect(self, receiver, value, state, binding=None):
+        """Weakly update every possible reference alias, or one value copy.
+
+        Fields remain an aggregate: writing a literal to one property cannot
+        certify that another property, or an alias, no longer holds input.
+        """
+        identities = self.reference_ids(receiver)
+        targets = {key for key, fact in state.items()
+                   if identities & self.reference_ids(fact)}
+        if not identities and binding in state:
+            targets.add(binding)
+        for key in targets:
+            previous = state[key]
+            shapes = frozenset(trace for trace in previous if trace.kind == 'shape'
+                               and trace.key[0].startswith(('instance:', 'dynamic-instance:', 'reference:')))
+            state[key] = join(self.object_payload(join(previous, value)), shapes)
+            self.invalidate_properties(key, state)
+
     def mutate(self, name, value, state, bindings):
-        if self.callback_seen and swift_request_dependency(value):
+        binding = bindings.get(name, name)
+        previous = state.get(binding, CLEAN)
+        if self.callback_seen and swift_request_dependency(value) and not self.reference_ids(previous):
             # Lexical capture IDs do not establish object/heap alias identity.
             # A write through another reference may change a captured object.
             value = join(value, self.limitation(
                 'Swift callback with request-derived object mutation needs heap/capture analysis',
                 self.function.key, state, bindings))
-        binding = bindings.get(name, name)
-        previous = state.get(binding, CLEAN)
         instances = frozenset(trace for trace in previous if trace.kind == 'shape'
-                              and trace.key[0].startswith(('instance:', 'dynamic-instance:')))
-        state[binding] = join(self.forget(join(previous, value)), instances)
+                              and trace.key[0].startswith(('instance:', 'dynamic-instance:', 'reference:')))
+        state[binding] = join(self.object_payload(join(previous, value)), instances)
+        self.object_effect(previous, state[binding], state, binding)
         if name in self.local_globals and binding == name and swift_tainted(state[binding]):
             state[binding] = join(state[binding], self.limitation(
                 'Swift request-derived global mutation needs shared-state analysis', self.function.key))
         self.invalidate_properties(binding, state)
         return state[binding]
+
+    def capture_visible(self, origin, binding, context=None):
+        context = self.active_context if context is None else context
+        return origin == context or any(
+            origin == frame and binding in slots for frame, slots, _ in self.capture_frames)
+
+    def note_write(self, binding, value, *, origin=None):
+        origin = self.active_context if origin is None else origin
+        if self.capture_frames:
+            frame, slots, writes = self.capture_frames[-1]
+            if binding in slots:
+                writes[binding] = join(writes.get(binding, CLEAN), value)
+                origin = frame
+        # A stored closure can execute in its creation context while its
+        # effects contribute to a different helper's function summary.
+        if origin == self.summary_context and origin in self.contexts:
+            for index, (name, _, declaration, _) in enumerate(self.contexts[origin].parameters):
+                if declaration.startswith('inout') and binding == 'parameter:' + name:
+                    self.assigned.add(index)
+
+    def apply_captures(self, writes, state, *, context=None):
+        """Carry callback writes through helpers to their lexical owner.
+
+        Function parameters can share names across call contexts. A captured
+        slot therefore belongs to its closure's creation context, not to an
+        unrelated callee parameter with the same spelling. These are may-write
+        summaries: an optional callback cannot certify that a tainted value was
+        overwritten, and transitive helper calls must retain each possible write.
+        """
+        for key, value in writes.items():
+            origin, binding = key
+            self.captured_writes[key] = join(self.captured_writes.get(key, CLEAN), value)
+            if self.capture_visible(origin, binding, context) and binding in state:
+                state[binding] = join(state[binding], value)
+                self.invalidate_properties(binding, state)
+                # A future-capture join can already contain this fact. The
+                # nested call still writes the enclosing capture.
+                self.note_write(binding, value, origin=origin)
 
     def invalidate_properties(self, binding, state):
         link = 'property-of:' + binding
@@ -1561,11 +1685,25 @@ class SwiftEngine:
             matched = True
             call = self.step(token.start, 'call', name + '()')
             facts = tuple(advance(fact, call) for fact in bound)
-            summary = self.summaries[self.context(function, facts, receiver=receiver)]
+            call_receiver = receiver
+            receiver_binding = bindings.get(name.split('.', 1)[0], name.split('.', 1)[0])
+            if function.name == 'init' and name in self.parser.types:
+                # The callable names an initializer, not a function-valued
+                # object field that should become part of the new self.
+                call_receiver = CLEAN
+            if (function.owner == self.function.owner and function.owner and not function.static
+                    and function.name != 'init' and '.' not in name and name not in bindings):
+                call_receiver, receiver_binding = state.get('self', CLEAN), 'self'
+            call_receiver = self.reference_value(call_receiver, state)
+            summary = self.summaries[self.context(function, facts, receiver=call_receiver)]
             returned = join(returned, advance(summary.returned, call))
             self.thrown = join(self.thrown, advance(summary.thrown, call))
             for offset, fact in summary.effects.items():
                 self.effects[offset] = join(self.effects.get(offset, CLEAN), fact)
+            self.apply_captures({key: advance(fact, call) for key, fact in summary.captures.items()}, state)
+            if function.owner and not function.static and function.name != 'init':
+                self.object_effect(call_receiver, summary.mutations.get('self', CLEAN),
+                                   state, receiver_binding)
             for index, parameter in enumerate(function.parameters):
                 if parameter[2].startswith('inout') and index < len(arguments):
                     # The callee's exit summary includes unchanged inout
@@ -1575,11 +1713,16 @@ class SwiftEngine:
                     fact = summary.mutations.get(index, CLEAN)
                     tokens = swift_ungroup(arguments[index][2])
                     if len(tokens) == 2 and tokens[0].value == '&':
-                        state[bindings.get(tokens[1].value, tokens[1].value)] = fact
-                        self.invalidate_properties(bindings.get(tokens[1].value, tokens[1].value), state)
+                        binding = bindings.get(tokens[1].value, tokens[1].value)
+                        state[binding] = fact
+                        self.invalidate_properties(binding, state)
+                        if index in summary.assigned:
+                            self.note_write(binding, fact)
+                elif index < len(bound) and self.reference_ids(bound[index]):
+                    self.object_effect(bound[index], summary.mutations.get(index, CLEAN), state)
         if matched:
             if name in self.parser.types:
-                return join(returned, swift_shape('instance:' + name, token.start))
+                return join(returned, self.allocation(name, token.start))
             return returned
         if candidates and any(swift_tainted(fact) for fact in values):
             return join(self.forget(value), self.limitation(
@@ -1610,12 +1753,16 @@ class SwiftEngine:
             if any(swift_tainted(fact) for fact in values):
                 value = join(value, self.limitation(
                     'Swift request-derived object initialization needs field analysis', token.start))
-                return join(self.forget(value), swift_shape('instance:' + name, token.start))
+                return join(self.forget(value), self.allocation(name, token.start))
             self.escape_closures(join(*values), state)
-            return join(swift_shape('instance:' + name, token.start), *values)
+            return join(self.allocation(name, token.start), *values)
         if leaf in {'get', 'first'} and any(swift_has_shape(receiver, kind) for kind in {'request-collection', 'request-content'}):
             return self.source(token.start, name + '()')
         if leaf in {'append', 'appendContentsOf', 'insert', 'remove', 'removeAll', 'removeFirst', 'removeLast', 'removeSubrange', 'replaceSubrange', 'replace', 'appendPathComponent', 'deleteLastPathComponent', 'deletePathExtension'}:
+            if self.reference_ids(receiver) and swift_request_dependency(join(*values)):
+                return join(self.forget(value), self.limitation(
+                    'Swift unresolved reference call needs heap/alias analysis',
+                    token.start, state, bindings))
             return self.mutate(name.split('.', 1)[0], join(*values), state, bindings)
         if any(part and part[0].value == '&' for _, _, part in arguments) and swift_tainted(value):
             return join(self.forget(value), self.limitation(
@@ -1628,6 +1775,12 @@ class SwiftEngine:
             return join(self.forget(value), self.limitation(
                 'Swift unresolved receiver dispatch needs binding analysis', token.start, state, bindings))
         self.escape_closures(join(*values), state)
+        references = frozenset(trace for fact in [receiver, *values] if self.reference_ids(fact)
+                               for trace in fact if trace.kind == 'shape' and trace.key[0].startswith(
+                                   ('instance:', 'dynamic-instance:', 'reference:')))
+        if references and any(swift_request_dependency(fact) for fact in values):
+            return join(self.forget(value), references, self.limitation(
+                'Swift unresolved reference call needs heap/alias analysis', token.start, state, bindings))
         if self.callback_seen and any(swift_request_dependency(fact) for fact in values) and (
                 '.' in name or any(not fact or any(trace.kind == 'shape' for trace in fact) for fact in values)):
             # An unmodeled method (or a function given an unknown object) can
@@ -1639,25 +1792,59 @@ class SwiftEngine:
                 token.start, state, bindings))
         if '.' in name and swift_tainted(receiver) and leaf not in {'hasPrefix', 'contains', 'hasSuffix', 'lowercased', 'uppercased', 'replacingOccurrences', 'addingPercentEncoding', 'dropFirst', 'dropLast'}:
             self.mutate(name.split('.', 1)[0], CLEAN, state, bindings)
-        result = self.forget(value)
+        # An opaque helper may return one of its reference arguments. Keeping
+        # those possible identities avoids silently treating it as disjoint.
+        result = join(self.forget(value), references)
         return join(result, swift_shape('unknown', token.start)) if self.policy == 'outbound' else result
 
-    def member(self, name, receiver, token, owner_binding=None):
+    def member(self, name, receiver, token, owner_binding=None, state=None):
         if name in {'self', 'callAsFunction'} and any(trace.kind == 'native-callable' for trace in receiver):
             return receiver
         if name in {'file', 'sendFile', 'streamFile', 'readFile', 'serveFile', 'writeFile'}:
             return join(self.forget(receiver), frozenset({Trace('native-callable', (name, token.start))}))
-        for instance in receiver:
-            if instance.kind != 'shape' or not instance.key[0].startswith(('instance:', 'dynamic-instance:')):
+        owners = {tuple(instance.key[0].split(':', 1)[1].split('.')) for instance in receiver
+                  if instance.kind == 'shape' and instance.key[0].startswith(('instance:', 'dynamic-instance:'))}
+        resolved, unresolved = [], []
+        for owner in sorted(owners):
+            if (owner, name) in self.parser.opaque_fields:
+                resolved.append(join(self.forget(receiver), self.limitation(
+                    self.parser.opaque_fields[(owner, name)], token.start, state)))
                 continue
-            owner = tuple(instance.key[0].split(':', 1)[1].split('.'))
             declaration = self.parser.fields.get(owner, {}).get(name, '')
             if re.fullmatch(r'(?:Vapor\.)?Request\??', declaration):
-                return join(self.forget(receiver), swift_shape('request', token.start))
+                resolved.append(swift_shape('request', token.start))
+                continue
             key = self.parser.field_functions.get((owner, name))
             if key is not None:
-                summary = self.summaries[self.context(self.parser.functions[key], (), receiver=receiver)]
-                return join(self.forget(receiver), summary.returned)
+                accessor = self.parser.functions[key]
+                selected = frozenset(trace for trace in receiver
+                    if trace.kind != 'shape' or not trace.key[0].startswith(
+                        ('instance:', 'dynamic-instance:', 'reference:'))
+                    or trace.key[0].split(':', 1)[1] == '.'.join(owner))
+                summary = self.summaries[self.context(accessor, (), receiver=selected)]
+                # A computed getter executes its body, so a literal result
+                # stays independent of other tainted receiver fields. Stored
+                # field initializers also need later aggregate field writes.
+                resolved.append(join(summary.returned, self.forget(receiver))
+                                if accessor.name.startswith('<field:') else summary.returned)
+                if (not accessor.name.startswith('<field:') and any(
+                        trace.kind == 'shape' and trace.key[0] == 'dynamic-instance:' + '.'.join(owner)
+                        for trace in selected)):
+                    resolved.append(self.limitation(
+                        'Swift dynamically dispatched property needs accessor binding analysis', token.start))
+                self.thrown = join(self.thrown, summary.thrown)
+                for offset, fact in summary.effects.items():
+                    self.effects[offset] = join(self.effects.get(offset, CLEAN), fact)
+                if state is not None:
+                    self.object_effect(receiver, summary.mutations.get('self', CLEAN), state, owner_binding)
+            else:
+                unresolved.append(owner)
+        if resolved:
+            value = join(*resolved)
+            if unresolved:
+                value = join(value, self.limitation(
+                    'Swift mixed property receivers need accessor binding analysis', token.start))
+            return value
         if self.policy == 'outbound':
             if receiver and all(trace.kind == 'shape' and trace.key[0] == 'namespace:Foundation' for trace in receiver) and name == 'URLSession':
                 return swift_shape('native-type:URLSession', token.start)
@@ -1728,15 +1915,18 @@ class SwiftEngine:
         if len(self.active_closures) >= 64:
             raise AnalysisLimit('Swift stored closure nesting limit exceeded; analysis is incomplete')
         parent, active = self.function, self.active_context
-        environment = join_states(captured, self.capture_states.get(context, {}), state)
+        visible = {binding: fact for binding, fact in state.items()
+                   if self.capture_visible(context, binding)}
+        environment = join_states(captured, self.capture_states.get(context, {}), visible)
+        writes = {}
         self.active_closures.add(closure.key[0])
         try:
             self.function, self.active_context = function, context
             value = self.inline_closure(tokens, join(*arguments), environment, bindings, 0,
-                                        capture_values=snapshots, argument_values=arguments)
-            for binding in bindings.values():
-                if binding in state:
-                    state[binding] = join(state[binding], environment.get(binding, CLEAN))
+                                        capture_values=snapshots, argument_values=arguments,
+                                        capture_writes=writes)
+            self.apply_captures({(context, binding): fact for binding, fact in writes.items()},
+                                state, context=active)
             return value
         finally:
             self.function, self.active_context = parent, active
@@ -1755,7 +1945,7 @@ class SwiftEngine:
             self.invoke_stored(closure, (unknown,), state)
 
     def inline_closure(self, tokens, argument, state, bindings, depth, *, catches_errors=False,
-                       capture_values=None, argument_values=None):
+                       capture_values=None, argument_values=None, capture_writes=None):
         """Evaluate a collection callback with lexical captures and a loop join.
 
         A method name does not establish nonescaping execution. Captures also
@@ -1810,6 +2000,8 @@ class SwiftEngine:
         # must not overwrite either a sibling closure or the enclosing return.
         captured = set(state) - {'@result', '@reachable'}
         captured.update(bindings.values())
+        writes = {} if capture_writes is None else capture_writes
+        self.capture_frames.append((context, captured, writes))
         try:
             self.function, self.mutations = function, {}
             self.active_context = (context, tokens[0].start)
@@ -1836,11 +2028,10 @@ class SwiftEngine:
                 if updated == initial:
                     break
                 initial = updated
-            for binding in captured:
-                if initial.get(binding):
-                    state[binding] = initial[binding]
+            self.apply_captures({(context, binding): fact for binding, fact in writes.items()}, state)
             return result
         finally:
+            self.capture_frames.pop()
             self.function, self.returned, self.mutations, self.active_context = parent, returned, mutations, context
             # Collection operations can rethrow even when their expression
             # result is discarded by a multi-statement enclosing helper.
@@ -1986,9 +2177,9 @@ class SwiftEngine:
         else:
             name = tokens[0].value
             owner_binding = bindings.get(name, name)
-            value = state.get(owner_binding, self.globals.get(name, CLEAN))
+            value = self.reference_value(state.get(owner_binding, self.globals.get(name, CLEAN)), state)
             if not value and name not in bindings and name in self.parser.fields.get(self.function.owner, {}):
-                value = self.member(name, state.get('self', CLEAN), tokens[0], 'self')
+                value = self.member(name, state.get('self', CLEAN), tokens[0], 'self', state)
             if not value and name in {'req', 'request'} and name not in bindings and name not in state:
                 value = swift_shape('request', tokens[0].start)
             if not value:
@@ -2040,12 +2231,12 @@ class SwiftEngine:
                                      retag(self.forget(addition, frozenset({'file-leaf'})), add=frozenset({'file-url'})),
                                      retag(swift_shape('file-url', member.start), add=frozenset({'file-url'})))
                     elif member.value == 'resolvingSymlinksInPath' and not arguments:
-                        value = self.member(member.value, value, member, owner_binding)
+                        value = self.member(member.value, value, member, owner_binding, state)
                     else:
                         value = self.call(name, value, arguments, CallSite(tokens[0], member), state, bindings)
                     cursor = close + 1
                 else:
-                    value = self.member(member.value, value, member, owner_binding)
+                    value = self.member(member.value, value, member, owner_binding, state)
                 continue
             if token.value == '(':
                 close = swift_close(tokens, cursor)
@@ -2076,6 +2267,14 @@ class SwiftEngine:
                 value = self.callback(name, value, tokens[cursor:close + 1], state, bindings, depth)
                 cursor = close + 1
                 continue
+            if token.value == 'as' and self.reference_ids(value):
+                target = swift_text(tokens[cursor + 1:]).lstrip('?!')
+                if target in self.parser.types or target in {'Any', 'AnyObject'}:
+                    identities = frozenset(trace for trace in value if trace.kind == 'shape'
+                        and trace.key[0].startswith(('instance:', 'dynamic-instance:', 'reference:')))
+                    # A checked/forced reference cast changes the static view,
+                    # not the object. It establishes no sanitizer proof.
+                    return join(self.forget(value), identities)
             # Preserve dependencies in selected casts, tuples and unfamiliar
             # operators, but do not preserve any validation across them.
             value = self.forget(join(value, self.expression(tokens[cursor + 1:], state, bindings, depth + 1)))
@@ -2704,13 +2903,16 @@ class SwiftEngine:
             for index, (_, _, declaration, _) in enumerate(self.function.parameters):
                 if declaration.startswith('inout'):
                     self.mutations[index] = join(self.mutations.get(index, CLEAN), unknown)
+                    self.assigned.add(index)
             return state
         if kind == 'exit':
             self.returned = join(self.returned, state.get('@result', CLEAN))
             if self.function.name == 'init':
                 self.returned = join(self.returned, state.get('self', CLEAN))
+            elif self.function.owner and not self.function.static:
+                self.mutations['self'] = join(self.mutations.get('self', CLEAN), state.get('self', CLEAN))
             for index, (name, _, declaration, _) in enumerate(self.function.parameters):
-                if declaration.startswith('inout'):
+                if declaration.startswith('inout') or self.reference_ids(state.get('parameter:' + name, CLEAN)):
                     self.mutations[index] = join(self.mutations.get(index, CLEAN), state.get('parameter:' + name, CLEAN))
             return state
         if kind == 'proof':
@@ -2762,6 +2964,18 @@ class SwiftEngine:
                 if member:
                     binding = bindings.get(member.group(1), member.group(1))
                     previous = state.get(binding, CLEAN)
+                    field_name = header.rsplit('.', 1)[-1]
+                    owners = {tuple(trace.key[0].split(':', 1)[1].split('.')) for trace in previous
+                              if trace.kind == 'shape' and trace.key[0].startswith(('instance:', 'dynamic-instance:'))}
+                    for owner in sorted(owners):
+                        if (owner, field_name) in self.parser.opaque_fields:
+                            self.limitation(self.parser.opaque_fields[(owner, field_name)],
+                                            lhs[0].start, state, bindings)
+                    if owners and all(re.fullmatch(r'(?:Vapor\.)?Request\??',
+                            self.parser.fields.get(owner, {}).get(field_name, '')) for owner in owners):
+                        # The declared Request field is modeled when read;
+                        # its presence does not taint every sibling property.
+                        value = self.forget(value)
                     if self.policy == 'outbound' and self.http_request(previous):
                         property_name = header.rsplit('.', 1)[-1]
                         if property_name == 'url' and operator == '=':
@@ -2782,12 +2996,18 @@ class SwiftEngine:
                 # method have the same receiver effects as self.property = ... .
                 # A local declaration/parameter of that name remains lexical.
                 self.escape_closures(value, state)
+                if (self.function.owner, name) in self.parser.opaque_fields:
+                    self.limitation(self.parser.opaque_fields[(self.function.owner, name)],
+                                    lhs[0].start, state, bindings)
+                if re.fullmatch(r'(?:Vapor\.)?Request\??', self.parser.fields[self.function.owner][name]):
+                    value = self.forget(value)
                 self.mutate('self', value, state, bindings)
                 return state
             if operator != '=':
                 value = self.forget(join(state.get(reads.get(name, name), CLEAN), value))
             self.invalidate_properties(binding, state)
             state[binding] = advance(value, self.step(lhs[0].start, 'assign', name))
+            self.note_write(binding, state[binding])
             if name in self.local_globals and binding == name and swift_tainted(value):
                 self.globals[name] = join(self.globals.get(name, CLEAN), value,
                     self.limitation('Swift request-derived global write needs shared-state analysis', lhs[0].start))
@@ -2817,6 +3037,11 @@ class SwiftEngine:
                 state['@result'] = join(state.get('@result', CLEAN), unknown)
             output = state
         after = {key: value for key, value in output.items() if not key.startswith('@')}
+        if self.capture_frames and action[0] != 'proof':
+            _context, slots, _writes = self.capture_frames[-1]
+            changed = {binding for binding in slots if before.get(binding, CLEAN) != after.get(binding, CLEAN)}
+            for binding in changed:
+                self.note_write(binding, after.get(binding, CLEAN))
         updated = join_states(previous, before, after)
         if updated != previous:
             self.capture_states[self.active_context] = updated
@@ -2833,6 +3058,8 @@ class SwiftEngine:
             for key, function in tuple(self.contexts.items()):
                 self.budget.spend()
                 self.function, self.effects, self.mutations, self.returned, self.thrown = function, {}, {}, CLEAN, CLEAN
+                self.captured_writes = {}
+                self.summary_context, self.assigned = key, set()
                 self.active_context = key
                 if function.key not in self.graphs:
                     self.graphs[function.key] = self.graph(function)
@@ -2850,15 +3077,33 @@ class SwiftEngine:
                         value = join(value, swift_shape('http-client:foundation', function.key))
                     elif declaration in self.parser.types:
                         kind = 'instance:' if declaration in self.parser.final_types else 'dynamic-instance:'
-                        value = join(value, swift_shape(kind + declaration, function.key))
+                        if not any(swift_has_shape(value, prefix + declaration)
+                                   for prefix in ('instance:', 'dynamic-instance:')):
+                            value = join(value, swift_shape(kind + declaration, function.key))
+                        if declaration not in self.parser.value_types and not self.reference_ids(value):
+                            value = join(value, swift_shape('reference:' + declaration))
                     initial['parameter:' + name] = value
                 if function.owner:
                     owner = '.'.join(function.owner)
                     kind = 'instance:' if owner in self.parser.final_types else 'dynamic-instance:'
-                    initial['self'] = join(key[3], swift_shape(kind + owner, function.key),
-                                           self.opaque_owners.get(function.owner, CLEAN))
+                    receiver = key[3]
+                    if not any(swift_has_shape(receiver, prefix + owner)
+                               for prefix in ('instance:', 'dynamic-instance:')):
+                        receiver = join(receiver, swift_shape(kind + owner, function.key))
+                    initial['self'] = join(receiver, self.opaque_owners.get(function.owner, CLEAN))
+                    if (function.name != 'init' and owner not in self.parser.value_types
+                            and not self.reference_ids(initial['self'])):
+                        initial['self'] = join(initial['self'], swift_shape('reference:' + owner))
+                if key[2] and any(declaration in self.parser.types
+                        and declaration not in self.parser.final_types
+                        and not self.reference_ids(key[1][index])
+                        for index, (_, _, declaration, _) in enumerate(function.parameters)):
+                    self.limitation('Swift incoming polymorphic references need subtype alias analysis',
+                                    function.key, initial)
                 solve(entry, initial, edges, lambda node, state: self.observe(actions[node], state), self.budget)
-                updated = self.summaries[key].merged(SwiftSummary(self.returned, self.effects, self.mutations, self.thrown))
+                updated = self.summaries[key].merged(SwiftSummary(
+                    self.returned, self.effects, self.mutations, self.thrown,
+                    self.captured_writes, frozenset(self.assigned)))
                 if updated != self.summaries[key]:
                     self.summaries[key], changed = updated, True
             changed = changed or before != len(self.contexts) or capture_revision != self.capture_revision

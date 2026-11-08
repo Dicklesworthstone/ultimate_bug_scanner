@@ -965,6 +965,164 @@ class SwiftLifecycleBindings(LoggedCase):
                   }
                 }
             '''),
+            ('callback_join_loses_optional_receiver', '''
+                import Foundation
+                func start(drop: Bool) {
+                  var timer: Timer? = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                  let change = { if drop { timer = nil } }
+                  change()
+                  timer?.invalidate()
+                }
+            '''),
+            ('callback_join_cleanup_before_losing_receiver', '''
+                import Foundation
+                func start(drop: Bool) {
+                  var timer: Timer? = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                  let change = { if drop { timer?.invalidate(); timer = nil } }
+                  change()
+                  timer?.invalidate()
+                }
+            '''),
+            ('callback_join_preserves_original_alias_cleanup', '''
+                import Foundation
+                func start(drop: Bool) {
+                  var timer: Timer? = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                  let original = timer
+                  let change = { if drop { timer = nil } }
+                  change()
+                  original?.invalidate()
+                }
+            '''),
+            ('callback_join_propagates_uncertainty_to_alias', '''
+                import Foundation
+                func start(drop: Bool) {
+                  var timer: Timer? = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                  let change = { if drop { timer = nil } }
+                  change()
+                  let selected = timer
+                  selected?.invalidate()
+                }
+            '''),
+            ('callback_join_propagates_uncertainty_to_snapshot', '''
+                import Foundation
+                func start(drop: Bool) {
+                  var timer: Timer? = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                  let change = { if drop { timer = nil } }
+                  change()
+                  let stop = { [saved = timer] in saved?.invalidate() }
+                  stop()
+                }
+            '''),
+            ('callback_join_propagates_uncertainty_to_parameter', '''
+                import Foundation
+                func start(drop: Bool) {
+                  var timer: Timer? = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                  let change = { if drop { timer = nil } }
+                  change()
+                  let stop = { (selected: Timer?) in selected?.invalidate() }
+                  stop(timer)
+                }
+            '''),
+            ('callback_return_can_omit_live_resource', '''
+                import Foundation
+                func start(drop: Bool) {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                  let choose = { () -> Timer? in if drop { return nil }; return timer }
+                  let selected = choose()
+                  selected?.invalidate()
+                }
+            '''),
+            ('callback_return_after_cleanup_can_omit_resource', '''
+                import Foundation
+                func start(drop: Bool) {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                  let choose = { () -> Timer? in
+                    if drop { timer.invalidate(); return nil }
+                    return timer
+                  }
+                  let selected = choose()
+                  selected?.invalidate()
+                }
+            '''),
+            ('uncertain_return_does_not_transfer_missing_resource', '''
+                import Foundation
+                func start(drop: Bool) -> Timer? {
+                  var timer: Timer? = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                  let change = { if drop { timer = nil } }
+                  change()
+                  return timer
+                }
+            '''),
+            ('ternary_callback_alias_write_is_conditional', '''
+                import Foundation
+                func start(drop: Bool) {
+                  var timer: Timer? = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                  let change = { timer = nil }
+                  drop ? change() : ()
+                  timer?.invalidate()
+                }
+            '''),
+            ('ternary_callback_cleanup_covers_missing_receiver', '''
+                import Foundation
+                func start(drop: Bool) {
+                  var timer: Timer? = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                  let change = { timer?.invalidate(); timer = nil }
+                  drop ? change() : ()
+                  timer?.invalidate()
+                }
+            '''),
+            ('and_callback_alias_write_is_conditional', '''
+                import Foundation
+                func start(drop: Bool) {
+                  var timer: Timer? = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                  let change = { timer = nil; return true }
+                  _ = drop && change()
+                  timer?.invalidate()
+                }
+            '''),
+            ('or_callback_alias_write_is_conditional', '''
+                import Foundation
+                func start(keep: Bool) {
+                  var timer: Timer? = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                  let change = { timer = nil; return true }
+                  _ = keep || change()
+                  timer?.invalidate()
+                }
+            '''),
+            ('nil_coalescing_cleanup_is_conditional', '''
+                import Foundation
+                func start(existing: Bool?) {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // LEAK:timer
+                  _ = existing ?? { timer.invalidate(); return true }()
+                }
+            '''),
+            ('nil_coalescing_nil_always_executes_cleanup', '''
+                import Foundation
+                func start() {
+                  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                  let existing: Bool? = nil
+                  _ = existing ?? { timer.invalidate(); return true }()
+                }
+            '''),
+            ('nil_coalescing_value_skips_acquisition', '''
+                import Foundation
+                func start() {
+                  let existing: Bool? = true
+                  _ = existing ?? {
+                    let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                    return true
+                  }()
+                }
+            '''),
+            ('and_false_skips_acquisition', '''
+                import Foundation
+                func start() {
+                  _ = false && {
+                    let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                    return true
+                  }()
+                }
+            '''),
             ('unrelated_function_invalidation', '''
                 import Foundation
                 func start() {
@@ -1136,7 +1294,7 @@ class SwiftLifecycleBindings(LoggedCase):
             ('owning_file_handle_property_closes_with_owner', '''
                 import Foundation
                 class Reader {
-                  let handle = try! FileHandle(forReadingFrom: URL(fileURLWithPath: "/tmp/input"))
+                  let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: "/tmp/input"))
                 }
             '''),
             ('owning_write_and_update_handles_close_on_deallocation', '''
@@ -1945,8 +2103,8 @@ class SwiftLifecycleBindings(LoggedCase):
     @unittest.skipUnless(os.environ.get('UBS_SWIFT_LIFECYCLE_E2E') == '1',
                          'set UBS_SWIFT_LIFECYCLE_E2E=1 for real Swift lifecycle JSON/SARIF scans')
     def test_selected_resource_bindings_through_public_json_and_sarif(self):
-        # --only=16 selects resource lifecycle. The try! in the FileHandle
-        # ownership control belongs to category 1 (Optionals/Force Ops).
+        # Resource controls also use safe error handling, so enabling the AST
+        # rules cannot add an unrelated force-try warning to a clean control.
         for name, source, expected in self.cases():
             public_expected = sorted(expected)
             target = self.artifact / (name + '.swift')

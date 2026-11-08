@@ -327,21 +327,32 @@ class LifecycleParser(SwiftParser):
 @dataclass
 class LifecycleState:
     values: dict = field(default_factory=dict)
+    uncertain_values: set = field(default_factory=set)
     constants: dict = field(default_factory=dict)
     filters: dict = field(default_factory=dict)
     active: set = field(default_factory=set)
     repeated: set = field(default_factory=set)
     returned: set = field(default_factory=set)
+    uncertain_return: bool = False
 
     def copy(self):
-        return LifecycleState(values=dict(self.values), constants=dict(self.constants),
+        return LifecycleState(values=dict(self.values), uncertain_values=set(self.uncertain_values),
+                              constants=dict(self.constants),
                               filters=dict(self.filters), active=set(self.active), repeated=set(self.repeated),
-                              returned=set(self.returned))
+                              returned=set(self.returned), uncertain_return=self.uncertain_return)
 
     def key(self):
-        return (tuple(sorted(self.values.items())), tuple(sorted(self.constants.items())),
+        return (tuple(sorted(self.values.items())), tuple(sorted(self.uncertain_values)),
+                tuple(sorted(self.constants.items())),
                 tuple(sorted(self.filters.items())), tuple(sorted(self.active)), tuple(sorted(self.repeated)),
-                tuple(sorted(self.returned)))
+                tuple(sorted(self.returned)), self.uncertain_return)
+
+    def set_value(self, key, value, uncertain=False):
+        self.values[key] = value
+        if uncertain:
+            self.uncertain_values.add(key)
+        else:
+            self.uncertain_values.discard(key)
 
 
 @dataclass(frozen=True)
@@ -382,13 +393,26 @@ class LifecycleEngine:
 
     @staticmethod
     def merge_states(target, states):
-        """Keep may-live obligations and only constants shared by every exit."""
+        """Join aliases without inventing a receiver on a live-resource path.
+
+        An alias may become nil on just one callback exit. Its remaining
+        possible object must not make a later optional cleanup unconditional.
+        Paths where that object was already cleaned need no receiver proof.
+        Returned objects remain relevant because the caller resumes ownership.
+        """
         if not states:
             return
+        states = [state.copy() if state is target else state for state in states]
         target.active = set().union(*(state.active for state in states))
         target.repeated = set().union(*(state.repeated for state in states))
+        values, uncertain = {}, set()
         for key in set().union(*(state.values.keys() for state in states)):
-            target.values[key] = tuple(sorted(set().union(*(state.values.get(key, ()) for state in states))))
+            values[key] = tuple(sorted(set().union(*(state.values.get(key, ()) for state in states))))
+            if any((resource in state.active or resource in state.returned) and (
+                    key in state.uncertain_values or resource not in state.values.get(key, ()))
+                   for state in states for resource in values[key]):
+                uncertain.add(key)
+        target.values, target.uncertain_values = values, uncertain
         target.constants = {key: value for key, value in states[0].constants.items()
                             if all(state.constants.get(key) == value for state in states[1:])}
         target.filters = {}
@@ -451,7 +475,8 @@ class LifecycleEngine:
                                         expression, name, state, environment)
                 key = ('capture', tokens[0].start, name)
                 captures.append((key, self.value(expression, state, environment) if acquired is None else acquired,
-                                 self.constant(expression, state, environment)))
+                                 self.constant(expression, state, environment),
+                                 acquired is None and self.value_uncertain(expression, state, environment)))
                 names[name] = key
             cursor = end + 1
         signature = header[cursor:]
@@ -489,17 +514,18 @@ class LifecycleEngine:
         if closure.key in self.executing_closures:
             self.limited(closure.key, 'recursive closure effects are unknown; resources remain live')
             self.leaked.update(state.active)
-            return ()
+            return (), False
         initial, names = state.copy(), dict(closure.names)
         initial.returned.clear()
+        initial.uncertain_return = False
         if optional:
             # An implicit var capture is a shared binding. Its creation-time
             # constant cannot establish how a delayed callback will observe it.
             for key in names.values():
                 if key in self.mutable_bindings:
                     initial.constants.pop(key, None)
-        for key, value, constant in closure.captures:
-            initial.values[key] = value
+        for key, value, constant, uncertain in closure.captures:
+            initial.set_value(key, value, uncertain)
             if constant is not None:
                 initial.constants[key] = constant
             else:
@@ -507,7 +533,8 @@ class LifecycleEngine:
         for index, name in enumerate(closure.parameters):
             key = ('closure-parameter', closure.key, name)
             names[name] = key
-            initial.values[key] = arguments[index] if index < len(arguments) else ()
+            value, uncertain = arguments[index] if index < len(arguments) else ((), False)
+            initial.set_value(key, value, uncertain)
             initial.constants.pop(key, None)
         parent_owner = self.owner
         self.executing_closures.add(closure.key)
@@ -539,14 +566,17 @@ class LifecycleEngine:
                 for key in state.values:
                     if after.values.get(key, ()) != state.values[key]:
                         self.leaked.update(set(state.values[key]) & after.active)
-            return ()
+            return (), False
         normal = [after for after, outcome in outcomes if outcome != 'throw']
         returned = set().union(*(after.returned for after in normal))
+        uncertain = any((resource in after.active or resource in after.returned) and (
+            after.uncertain_return or resource not in after.returned)
+            for after in normal for resource in returned)
         if exceptions is not None:
             exceptions.extend(after for after, outcome in outcomes if outcome == 'throw')
         self.merge_states(state, normal or [after for after, _ in outcomes])
         state.active.update(returned)
-        return tuple(sorted(returned))
+        return tuple(sorted(returned)), uncertain
 
     def binding(self, tokens, environment):
         tokens = swift_ungroup(tokens)
@@ -581,6 +611,23 @@ class LifecycleEngine:
         if len(pieces) > 1 and any(self.value(piece, state, environment) for piece in pieces):
             self.limited(tokens[0].start, 'resource tuple ownership is unknown; member obligations remain live')
         return ()
+
+    def value_uncertain(self, tokens, state, environment):
+        """Whether a value may omit its resource on a path that still owns it."""
+        tokens = swift_ungroup(tokens)
+        while tokens and tokens[0].value in {'try', 'await', '&'}:
+            tokens = tokens[1:]
+            if tokens and tokens[0].value in {'?', '!'}:
+                tokens = tokens[1:]
+        key = self.binding(tokens, environment)
+        if key is None and tokens:
+            key = ('call', tokens[0].start, tokens[-1].end)
+        return key in state.uncertain_values
+
+    def argument_values(self, arguments, state, environment):
+        return tuple((self.value(argument, state, environment),
+                      self.value_uncertain(argument, state, environment))
+                     for argument in arguments)
 
     def compact(self, outcomes):
         result = {}
@@ -710,20 +757,37 @@ class LifecycleEngine:
                     nesting -= 1
             if colon is not None:
                 self.release_calls(tokens[:question], state, environment, exceptions, throwing)
-                left, right = state.copy(), state.copy()
-                self.release_calls(tokens[question + 1:colon], left, environment, exceptions, throwing)
-                self.release_calls(tokens[colon + 1:], right, environment, exceptions, throwing)
-                state.active = left.active | right.active
-                state.repeated = left.repeated | right.repeated
+                predicate = self.constant(tokens[:question], state, environment)
+                arms = (tokens[question + 1:colon], tokens[colon + 1:])
+                if predicate in {'true', 'false'}:
+                    arms = (arms[predicate == 'false'],)
+                outcomes = []
+                for arm in arms:
+                    outcome = state.copy()
+                    self.release_calls(arm, outcome, environment, exceptions, throwing)
+                    outcomes.append(outcome)
+                self.merge_states(state, outcomes)
                 return
-        logical = [i for i in top if tokens[i].value in {'&&', '||'}]
-        if logical:
-            first = logical[0]
+        # Nil coalescing also evaluates its RHS lazily. Split at the lowest
+        # precedence operator so mixed Boolean expressions preserve execution
+        # order, and include the skipped RHS path unless a constant selects it.
+        first = next((i for operator in ('||', '&&', '??')
+                      for i in top if tokens[i].value == operator), None)
+        if first is not None:
             self.release_calls(tokens[:first], state, environment, exceptions, throwing)
+            predicate = self.constant(tokens[:first], state, environment)
+            operator = tokens[first].value
+            evaluate = ((operator == '&&' and predicate == 'true') or
+                        (operator == '||' and predicate == 'false') or
+                        (operator == '??' and predicate == 'nil'))
+            skip = ((operator == '&&' and predicate == 'false') or
+                    (operator == '||' and predicate == 'true') or
+                    (operator == '??' and predicate is not None and predicate != 'nil'))
+            if skip:
+                return
             conditional = state.copy()
             self.release_calls(tokens[first + 1:], conditional, environment, exceptions, throwing)
-            state.active.update(conditional.active)
-            state.repeated.update(conditional.repeated)
+            self.merge_states(state, [conditional] if evaluate else [state.copy(), conditional])
             return
         while cursor < len(tokens):
             self.budget.spend()
@@ -741,13 +805,14 @@ class LifecycleEngine:
                 arguments = ()
                 if immediate:
                     end = swift_close(tokens, cursor)
-                    arguments = tuple(self.value(arg, state, environment)
-                                      for arg in swift_parts(tokens[cursor + 1:end], {','}))
                     self.release_calls(tokens[cursor + 1:end], state, environment, exceptions, throwing)
+                    arguments = self.argument_values(swift_parts(tokens[cursor + 1:end], {','}),
+                                                     state, environment)
                     cursor = end + 1
-                returned = self.call_closure(closure, state, arguments, optional=not immediate, exceptions=exceptions)
+                returned, uncertain = self.call_closure(closure, state, arguments,
+                                                       optional=not immediate, exceptions=exceptions)
                 if immediate:
-                    state.values[('call', token.start, tokens[cursor - 1].end)] = returned
+                    state.set_value(('call', token.start, tokens[cursor - 1].end), returned, uncertain)
                 continue
             if token.value != '(':
                 cursor += 1
@@ -757,12 +822,11 @@ class LifecycleEngine:
             if (grouped and grouped[0].value == '{' and swift_close(grouped, 0) == len(grouped) - 1
                     and finish + 1 < len(tokens) and tokens[finish + 1].value == '('):
                 end = swift_close(tokens, finish + 1)
-                arguments = tuple(self.value(arg, state, environment)
-                                  for arg in swift_parts(tokens[finish + 2:end], {','}))
                 self.release_calls(tokens[finish + 2:end], state, environment, exceptions, throwing)
+                arguments = self.argument_values(swift_parts(tokens[finish + 2:end], {','}), state, environment)
                 closure = self.closure(grouped, state, environment)
-                returned = self.call_closure(closure, state, arguments, optional=False, exceptions=exceptions)
-                state.values[('call', token.start, tokens[end].end)] = returned
+                returned, uncertain = self.call_closure(closure, state, arguments, optional=False, exceptions=exceptions)
+                state.set_value(('call', token.start, tokens[end].end), returned, uncertain)
                 cursor = end + 1
                 continue
             start = cursor - 1
@@ -782,7 +846,7 @@ class LifecycleEngine:
                 values = self.value(call[:dot], state, environment)
                 # A merged callback exit can leave several possible aliases.
                 # Calling one receiver cannot prove every object was released.
-                if len(values) > 1:
+                if len(values) > 1 or self.value_uncertain(call[:dot], state, environment):
                     values = ()
                 for resource in values:
                     kind = self.resources[resource][0]
@@ -794,6 +858,8 @@ class LifecycleEngine:
             if name == 'NotificationCenter.default.removeObserver' and argument_count in {1, 3}:
                 filters = self.named_arguments(tokens[cursor + 1:finish])
                 values = self.value(arguments[0], state, environment)
+                if self.value_uncertain(arguments[0], state, environment):
+                    values = ()
                 for resource in values if len(values) == 1 else ():
                     if self.resources[resource][0] == 'notification_token':
                         registration = state.filters[resource]
@@ -806,9 +872,9 @@ class LifecycleEngine:
             called = self.binding(call, environment)
             constant = state.constants.get(called)
             if isinstance(constant, LifecycleClosure):
-                values = tuple(self.value(arg, state, environment) for arg in arguments)
-                returned = self.call_closure(constant, state, values, optional=False, exceptions=exceptions)
-                state.values[('call', call[0].start, tokens[finish].end)] = returned
+                values = self.argument_values(arguments, state, environment)
+                returned, uncertain = self.call_closure(constant, state, values, optional=False, exceptions=exceptions)
+                state.set_value(('call', call[0].start, tokens[finish].end), returned, uncertain)
                 known_release = True
             else:
                 if called in self.closure_bindings:
@@ -872,9 +938,10 @@ class LifecycleEngine:
             if acquired and key[:1] == ('field',) and self.function != -1:
                 self.assigned_fields.update(acquired)
             value = self.value(rhs, state, environment) if acquired is None else acquired
+            uncertain = acquired is None and self.value_uncertain(rhs, state, environment)
             constant = self.closure(expression, state, environment) if closure else self.constant(rhs, state, environment)
             environment[name] = key
-            state.values[key] = value
+            state.set_value(key, value, uncertain)
             if isinstance(constant, LifecycleClosure):
                 self.closure_bindings.setdefault(key, {})[constant.key] = constant
             if constant is not None and key not in self.asynchronous_writes:
@@ -888,7 +955,7 @@ class LifecycleEngine:
             if uninitialized:
                 key = ('local', uninitialized.start, uninitialized.value)
                 environment[uninitialized.value] = key
-                state.values[key] = ()
+                state.set_value(key, ())
                 if statement.tokens[0].value == 'var':
                     self.mutable_bindings.add(key)
             else:
@@ -932,7 +999,7 @@ class LifecycleEngine:
                                 bound_name = token.value
                                 key = ('case', statement.tokens[0].start, bound_name)
                                 arm_names[bound_name] = key
-                                arm_state.values[key] = ()
+                                arm_state.set_value(key, ())
                                 arm_state.constants.pop(key, None)
                         for child, outcome in self.block(arm.body, arm_state, arm_names, depth + 1):
                             next_paths.append((child, dict(names), deferred, '' if outcome == 'break' else outcome))
@@ -991,7 +1058,7 @@ class LifecycleEngine:
                             for name in bound:
                                 key = ('catch', statement.tokens[0].start, name)
                                 caught_names[name] = key
-                                caught.values[key] = ()
+                                caught.set_value(key, ())
                                 caught.constants.pop(key, None)
                             if len(parts) == 2:
                                 exceptional_filters = []
@@ -1030,7 +1097,7 @@ class LifecycleEngine:
                         for token in bindings:
                             key = ('iteration', token.start, token.value)
                             loop_names[token.value] = key
-                            state.values[key] = ()
+                            state.set_value(key, ())
                     pending, visited = [state.copy()], set()
                     while pending:
                         entry = pending.pop()
@@ -1060,7 +1127,10 @@ class LifecycleEngine:
                         acquired = self.acquire(statement, statement.tokens, '<return>', state, names)
                         returned = set(self.value(statement.tokens, state, names) if acquired is None else acquired)
                         state.returned.update(returned)
-                        state.active.difference_update(returned - self.property_resources)
+                        uncertain = acquired is None and self.value_uncertain(statement.tokens, state, names)
+                        state.uncertain_return = uncertain
+                        if not uncertain:
+                            state.active.difference_update(returned - self.property_resources)
                     if kind in {'break', 'continue'} and statement.tokens:
                         self.limited(statement.tokens[0].start,
                             'labeled control transfer may bypass cleanup; resource obligations are retained')
@@ -1126,9 +1196,11 @@ class LifecycleEngine:
                             name = assignment[0]
                             previous = names[name]
                             value = state.values.pop(previous)
+                            uncertain = previous in state.uncertain_values
+                            state.uncertain_values.discard(previous)
                             constant = state.constants.pop(previous, None)
                             names[name] = ('field', owner, name)
-                            state.values[names[name]] = value
+                            state.set_value(names[name], value, uncertain)
                             if previous in self.mutable_bindings:
                                 self.mutable_bindings.add(names[name])
                             if previous in self.asynchronous_writes:
@@ -1143,7 +1215,7 @@ class LifecycleEngine:
                             token = self.parser.uninitialized(statement.tokens)
                             if token is not None:
                                 names[token.value] = ('field', owner, token.value)
-                                state.values[names[token.value]] = ()
+                                state.set_value(names[token.value], ())
                                 if statement.tokens[0].value == 'var':
                                     self.mutable_bindings.add(names[token.value])
                     property_states[owner], property_names[owner] = state, names

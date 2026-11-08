@@ -180,6 +180,169 @@ class SwiftConcurrencyFlowTests(unittest.TestCase):
                        'req.query["path"]' if tainted else '"/srv/fixed"'),
                            suffix=str(tainted))
 
+    def test_selected_helper_exports_writes_to_a_callers_captured_variable(self):
+        for attribute in ('', '@escaping '):
+            for tainted in (False, True):
+                with self.subTest(attribute=attribute, tainted=tainted):
+                    self.check('''
+                        func invoke(_ body: %s() -> Void) { body() }
+                        func handle(req: Request) {
+                            var path = "/srv/fixed"
+                            let changePath = { path = %s }
+                            invoke(changePath)
+                            _ = String(contentsOfFile: path) %s
+                        }
+                    ''' % (attribute, 'req.query["path"]' if tainted else '"/srv/other"',
+                           '// expect-path' if tainted else ''),
+                               suffix=attribute.strip() + str(tainted))
+
+    def test_helper_callback_effects_are_conditional_on_reachable_invocation(self):
+        for body, invoked in (('body()', True), ('if enabled { body() }', True),
+                              ('if false { body() }', False), ('consume(enabled)', False)):
+            with self.subTest(body=body):
+                self.check('''
+                    func invoke(_ enabled: Bool, _ body: () -> Void) { %s }
+                    func handle(req: Request, enabled: Bool) {
+                        var path = "/srv/fixed"
+                        invoke(enabled, { path = req.query["path"] })
+                        _ = String(contentsOfFile: path) %s
+                    }
+                ''' % (body, '// expect-path' if invoked else ''),
+                           suffix=str(invoked) + str(len(body)))
+
+    def test_captured_writes_cross_transitive_and_nested_helper_calls(self):
+        for nested in (False, True):
+            for tainted in (False, True):
+                with self.subTest(nested=nested, tainted=tainted):
+                    assignment = 'path = ' + ('req.query["path"]' if tainted else '"/srv/other"')
+                    self.check('''
+                        func invoke(_ body: () -> Void) { body() }
+                        func forward(_ body: () -> Void) { invoke(body) }
+                        func handle(req: Request) {
+                            var path = "/srv/fixed"
+                            forward({ %s })
+                            _ = String(contentsOfFile: path) %s
+                        }
+                    ''' % ('invoke({ ' + assignment + ' })' if nested else assignment,
+                           '// expect-path' if tainted else ''),
+                               suffix=str(nested) + str(tainted))
+
+    def test_read_only_and_snapshot_callbacks_do_not_replay_stale_capture_values(self):
+        for capture in ('', '[path] in '):
+            with self.subTest(capture=capture):
+                self.check('''
+                    func invoke(_ body: () -> Void) { body() }
+                    func handle(req: Request) {
+                        var path = req.query["path"]
+                        let read = { %sconsume(path) }
+                        path = "/srv/fixed"
+                        invoke(read)
+                        _ = String(contentsOfFile: path)
+                    }
+                ''' % capture, suffix=str(bool(capture)))
+
+    def test_nested_helper_write_is_retained_when_capture_join_already_has_its_value(self):
+        for tainted in (False, True):
+            with self.subTest(tainted=tainted):
+                self.check('''
+                    func invoke(_ body: () -> Void) { body() }
+                    func handle(req: Request) {
+                        let input = %s
+                        var path = input
+                        let outer = { invoke({ path = input }) }
+                        path = "/srv/fixed"
+                        invoke(outer)
+                        _ = String(contentsOfFile: path) %s
+                    }
+                ''' % ('req.query["path"]' if tainted else '"/srv/other"',
+                       '// expect-path' if tainted else ''), suffix=str(tainted))
+
+    def test_callback_local_shadow_does_not_write_the_outer_capture(self):
+        self.check('''
+            func invoke(_ body: () -> Void) { body() }
+            func handle(req: Request) {
+                var path = "/srv/fixed"
+                invoke({
+                    var path = req.query["path"]
+                    consume(path)
+                })
+                _ = String(contentsOfFile: path)
+            }
+        ''')
+
+    def test_captured_inout_writes_are_distinct_from_unchanged_exit_values(self):
+        for body, written in (('path = value', True), ('consume(path)', False)):
+            for forwarded in (False, True):
+                for tainted in (False, True):
+                    with self.subTest(body=body, forwarded=forwarded, tainted=tainted):
+                        self.check('''
+                            func update(_ path: inout String, _ value: String) { %s }
+                            func forward(_ path: inout String, _ value: String) { update(&path, value) }
+                            func invoke(_ body: () -> Void) { body() }
+                            func handle(req: Request, fixed: String) {
+                                let requestInput = req.query["path"]
+                                let input = %s
+                                var path = input
+                                let outer = { %s(&path, input) }
+                                path = fixed
+                                invoke(outer)
+                                _ = String(contentsOfFile: path) %s
+                            }
+                        ''' % (body, 'requestInput' if tainted else '"/srv/other"',
+                               'forward' if forwarded else 'update',
+                               '// expect-path' if written and tainted else ''),
+                                   suffix=str(written) + str(forwarded) + str(tainted))
+
+    def test_captured_inout_write_metadata_keeps_parameter_positions(self):
+        for tainted in (False, True):
+            with self.subTest(tainted=tainted):
+                self.check('''
+                    func update(_ first: inout String, _ path: inout String, _ value: String) {
+                        path = value
+                    }
+                    func invoke(_ body: () -> Void) { body() }
+                    func handle(req: Request, fixed: String) {
+                        let requestInput = req.query["path"]
+                        let input = %s
+                        var first = "/srv/fixed"
+                        var path = input
+                        let outer = { update(&first, &path, input) }
+                        path = fixed
+                        invoke(outer)
+                        _ = String(contentsOfFile: first)
+                        _ = String(contentsOfFile: path) %s
+                    }
+                ''' % ('requestInput' if tainted else '"/srv/other"',
+                       '// expect-path' if tainted else ''), suffix=str(tainted))
+
+    def test_helper_callback_cannot_prove_a_conditional_capture_cleanup(self):
+        self.check('''
+            func invoke(_ enabled: Bool, _ body: () -> Void) {
+                if enabled { body() }
+            }
+            func handle(req: Request, enabled: Bool) {
+                var path = req.query["path"]
+                invoke(enabled, { path = "/srv/fixed" })
+                _ = String(contentsOfFile: path) // expect-path
+            }
+        ''')
+
+    def test_callee_parameter_name_does_not_alias_a_closure_capture(self):
+        for tainted in (False, True):
+            with self.subTest(tainted=tainted):
+                self.check('''
+                    func invoke(_ path: String, _ body: () -> Void) { body() }
+                    func use(_ path: String, other: String) {
+                        invoke(other, { _ = String(contentsOfFile: path) }) %s
+                    }
+                    func handle(req: Request) {
+                        use(%s, other: %s)
+                    }
+                ''' % ('// expect-path' if tainted else '',
+                       'req.query["path"]' if tainted else '"/srv/fixed"',
+                       '"/srv/fixed"' if tainted else 'req.query["path"]'),
+                           suffix=str(tainted))
+
     def test_stored_closure_preserves_return_dependencies_and_snapshot(self):
         self.check('''
             func handle(req: Request) {

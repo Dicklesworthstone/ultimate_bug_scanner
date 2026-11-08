@@ -1759,6 +1759,28 @@ promise of additivity for cross-file detectors, taint/data-flow analyses, other
 languages, or arbitrary source concatenation: concatenation can change syntax,
 string/comment boundaries, statement suppression and file-role exclusions.
 
+### JavaScript prototype pollution
+
+`js.security.prototype-pollution` follows request-derived merge inputs and
+computed property keys through local bindings, destructuring, reassignment,
+branches and loops. Findings point to the actual merge or property write.
+Names such as `safeMerge` or `validatePrototypeKeys` do not establish safety,
+and validation of an unrelated value cannot suppress a finding.
+
+A null-prototype exemption belongs to the actual `Object.create(null)`
+allocation and its aliases. It covers shallow writes and `Object.assign`,
+not arbitrary nested traversal or deep merges. Mutation or unresolved calls
+revoke receiver guarantees. Request-derived keys stored in such a bag remain
+dangerous when later copied into an ordinary object; fixed ordinary keys do
+not become prototype keys merely because their values came from a request.
+
+A selected local key validator must reject non-string inputs and all of
+`__proto__`, `constructor` and `prototype`, then return the same parameter.
+The rejection must dominate the write, and rebinding or shadowing revokes the
+proof. Arbitrary sanitizers and general interprocedural mutation effects remain
+outside this local model. Existing rule-specific statement suppressions apply
+at the sink; suppressing a source-line diagnostic does not clear its taint.
+
 ### Python subprocess taint
 
 `python.taint.command` distinguishes executable selection, shell command text,

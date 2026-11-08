@@ -6010,6 +6010,11 @@ async function unrelatedLogin(credentials) {
                                     if "=== expectedAuthToken" in line]
                     self.assertEqual(lines, unsafe_lines, (label, row))
                     self.assertTrue(set(unsafe_lines).issubset(previous), (label, row))
+                if classification == "sink-location":
+                    # The legacy lookahead duplicated the sink at its function
+                    # header. Retain the real operation, remove only that FP.
+                    self.assertEqual(lines, [5], (label, row))
+                    self.assertEqual(previous, [1, 5], (label, row))
             observations.append(row)
         helper = (HELPERS_DIR / "ubs_core" / "analyzers" /
                   ("ctcompare_js.py" if analyzer == "secret" else "sec_prototype_pollution.py"))
@@ -6135,16 +6140,389 @@ async function unrelatedLogin(credentials) {
             ("strict-read", 'return rows.find(entry => entry[0] === expected);', 0, "public"),
             ("loose-read", 'return rows.find(entry => entry[0] == expected);', 0, "public"),
             ("not-equal-read", 'return rows.find(entry => entry[0] !== expected);', 0, "public"),
-            # The incumbent emits both the enclosing function's bounded
-            # lookahead and the sink line. Keep both exact locations here.
-            ("direct-write", 'target[key] = request.body.value;', 2, "unsafe"),
-            ("trivia-write", 'target /* receiver */ [key] /* assignment */ = request.body.value;', 2, "unsafe"),
-            ("callable-write", 'target[key] = () => request.body.value;', 2, "unsafe"),
-            ("merge", 'return Object.assign(target, request.body);', 2, "unsafe"),
-            ("read-and-write", 'return rows.find(entry => entry[0] === expected && (target[key] = request.body.value));', 2, "unsafe"),
+            ("direct-write", 'target[key] = request.body.value;', 1, "sink-location"),
+            ("trivia-write", 'target /* receiver */ [key] /* assignment */ = request.body.value;', 1, "sink-location"),
+            ("callable-write", 'target[key] = () => request.body.value;', 1, "sink-location"),
+            ("merge", 'return Object.assign(target, request.body);', 1, "sink-location"),
+            ("read-and-write", 'return rows.find(entry => entry[0] === expected && (target[key] = request.body.value));', 1, "sink-location"),
         ]:
             cases.append((label, header + '  ' + statement + '\n}\n', expected, classification))
         self.compare(cases, "prototype")
+
+
+class PrototypePollutionBindingTests(unittest.TestCase):
+    """Independent safe/unsafe source oracles for receiver and key identity."""
+
+    VALIDATOR = ("function checkedKey(key) {\n"
+                 "  if (typeof key !== 'string' || key === '__proto__' || key === 'constructor' || key === 'prototype') throw new Error('unsafe key');\n"
+                 "  return key;\n}\n")
+
+    def setUp(self):
+        from ubs_core.analyzers import sec_prototype_pollution
+
+        self.analyzer = sec_prototype_pollution
+        artifacts = REPO_ROOT / "test-suite" / "artifacts" / "prototype-binding-precision"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        self.directory = Path(tempfile.mkdtemp(prefix="probe-", dir=artifacts))
+
+    def scan(self, label, source, expected):
+        from ubs_core.registry import RunContext
+
+        path = self.directory / (label + '.ts')
+        path.write_text(source, encoding='utf-8')
+        actual = list(self.analyzer.scan_file_findings(path))
+        (self.directory / (label + '.json')).write_text(json.dumps({
+            'source_sha256': hashlib.sha256(source.encode()).hexdigest(),
+            'expected_lines': expected, 'actual_lines': actual,
+        }, indent=2), encoding='utf-8')
+        self.assertEqual(actual, expected, (label, source, actual))
+        records = list(self.analyzer.run(RunContext(lang='javascript', files=[path])))
+        self.assertEqual([(row['rule'], row['severity'], row['line']) for row in records],
+                         [(self.analyzer.RULE, 'critical', line) for line in expected])
+        return path
+
+    def test_helper_spelling_and_unrelated_validation_never_clear_request_flow(self):
+        for name in ('safeMerge', 'secureMerge', 'stripPrototypeKeys', 'sanitizePrototypeKeys', 'identity'):
+            with self.subTest(name=name):
+                self.scan(name, f'function {name}(value) {{ return value; }}\n'
+                          f'const payload = {name}(req.body);\nObject.assign(target, payload);\n', [3])
+        self.scan('unrelated-guard', 'const safe = Object.create(null);\n'
+                  'validatePrototypeKeys(unrelated);\ntarget[req.body.key] = req.body.value;\n', [3])
+        self.scan('string-names', 'const payload = req.body;\n'
+                  'const label = "safeMerge Object.create(null) validatePrototypeKeys";\n'
+                  'Object.assign(target, payload);\n', [3])
+        self.scan('long-flow', 'const payload = req.body;\n' + '\n' * 14
+                  + 'Object.assign(target, payload);\n', [16])
+
+    def test_null_prototype_safety_follows_receiver_identity_and_mutation(self):
+        cases = [
+            ('null-write', 'const target = Object.create(null);\ntarget[req.body.key] = req.body.value;\n', []),
+            ('null-alias', 'const target = Object.create(null);\nconst alias = target;\nalias[req.body.key] = req.body.value;\n', []),
+            ('null-assertion', 'const target = Object.create(null);\ntarget! /* receiver */ [req.body.key] = req.body.value;\n', []),
+            ('null-merge', 'const target = Object.create(null);\nObject.assign(target, req.body);\n', []),
+            ('copy-null-bag', 'const target = Object.create(null);\nObject.assign(target, req.body);\nObject.assign({}, target);\n', [3]),
+            ('copy-written-null', 'const target = Object.create(null);\ntarget[req.body.key] = req.body.value;\nObject.assign({}, target);\n', [3]),
+            ('branch-receiver', 'let target = Object.create(null);\nif (flag) { target = {}; }\ntarget[req.body.key] = 1;\n', [3]),
+            ('aliased-prototype-mutation', 'const target = Object.create(null);\nconst alias = target;\nObject.setPrototypeOf(alias, {});\ntarget[req.body.key] = req.body.value;\n', [4]),
+            ('rhs-mutation', 'const target = Object.create(null);\ntarget[req.body.key] = mutate(target);\n', [2]),
+            ('deep-merge', 'const target = Object.create(null);\nlodash.merge(target, req.body);\n', [2]),
+            ('nested-null', 'const target = Object.create(null);\ntarget[req.body.parent][req.body.key] = 1;\n', [2]),
+            ('shadowed-object', 'function write(Object, req) {\nconst target = Object.create(null);\ntarget[req.body.key] = 1;\n}\n', [3]),
+            ('block-shadow', 'const target = Object.create(null);\n{\nconst target = {};\ntarget[req.body.key] = 1;\n}\n', [4]),
+        ]
+        for label, source, expected in cases:
+            with self.subTest(case=label):
+                self.scan(label, source, expected)
+
+    def test_property_keys_rebind_without_confusing_tainted_values(self):
+        cases = [
+            ('fixed-value', 'const value = req.body.value;\ntarget["color"] = value;\n', []),
+            ('dangerous-fixed-key', 'target["__proto__"] = req.body;\n', [1]),
+            ('dangerous-key-binding', 'const key = "__proto__";\ntarget[key] = req.body;\n', [2]),
+            ('escaped-dangerous-key', 'target["__pro\\u0074o__"] = req.body;\n', [1]),
+            ('quoted-concatenation', 'const key = "" + req.body.key + "";\ntarget[key] = 1;\n', [2]),
+            ('clean-rebind', 'let key = req.body.key;\nkey = "color";\ntarget[key] = req.body.value;\n', []),
+            ('branch-rebind', 'let key = req.body.key;\nif (flag) { key = "color"; }\ntarget[key] = 1;\n', [3]),
+            ('branch-taint', 'let key = "color";\nif (flag) { key = req.body.key; }\ntarget[key] = 1;\n', [3]),
+            ('destructured-key', 'const {key} = req.body;\ntarget[key] = 1;\n', [2]),
+            ('other-function', 'function source(req) { const key = req.body.key; }\nfunction write() { const key = "color"; target[key] = req.body.value; }\n', []),
+            ('block-local', 'const key = "color";\n{ const key = req.body.key; }\ntarget[key] = req.body.value;\n', []),
+            ('block-restored', 'const key = req.body.key;\n{ const key = "color"; target[key] = 1; }\ntarget[key] = 1;\n', [3]),
+            ('loop-carried', 'let key = "color";\nwhile (flag) {\ntarget[key] = 1;\nkey = req.body.key;\n}\n', [3]),
+            ('for-of-key', 'for (const key of req.body.keys) {\n target[key] = 1;\n}\n', [2]),
+            ('for-in-key', 'for (const key in req.body) {\n target[key] = 1;\n}\n', [2]),
+            ('for-entries', 'for (const [key, value] of Object.entries(req.body)) {\n target[key] = value;\n}\n', [2]),
+            ('loop-scope', 'const key = "color";\nfor (const key of req.body.keys) {\n target[key] = 1;\n}\ntarget[key] = req.body.value;\n', [3]),
+        ]
+        for label, source, expected in cases:
+            with self.subTest(case=label):
+                self.scan(label, source, expected)
+
+    def test_validator_requires_complete_dominating_guard_and_exact_binding(self):
+        tail = 'const key = checkedKey(req.body.key);\ntarget[key] = 1;\n'
+        self.scan('checked-key', self.VALIDATOR + tail, [])
+        self.scan('validator-alias', self.VALIDATOR + 'const validate = checkedKey;\n'
+                  'const key = validate(req.body.key);\ntarget[key] = 1;\n', [])
+        variants = {
+            'coercible-key': self.VALIDATOR.replace("typeof key !== 'string' || ", ''),
+            'missing-prototype': self.VALIDATOR.replace(" || key === 'prototype'", ''),
+            'wrong-binding': self.VALIDATOR.replace("key === 'prototype'", "other === 'prototype'"),
+            'wrong-return': self.VALIDATOR.replace('return key;', 'return req.body.key;'),
+            'nonterminating-rejection': self.VALIDATOR.replace("throw new Error('unsafe key')", 'log(key)'),
+        }
+        for name, validator in variants.items():
+            with self.subTest(variant=name):
+                self.scan(name, validator + tail, [6])
+        self.scan('shadowed-validator', self.VALIDATOR + 'function write(checkedKey, req) {\n'
+                  + tail + '}\n', [7])
+        self.scan('rebound-validator', self.VALIDATOR
+                  + 'checkedKey = value => value;\n' + tail, [7])
+        self.scan('conditional-validator', self.VALIDATOR
+                  + 'if (flag) { checkedKey = value => value; }\n' + tail, [7])
+        self.scan('rebound-key', self.VALIDATOR + 'let key = checkedKey(req.body.key);\n'
+                  'if (flag) { key = req.query.key; }\ntarget[key] = 1;\n', [7])
+        self.scan('guarded-write', 'const key = req.body.key;\n'
+                  + self.VALIDATOR.splitlines()[1] + '\ntarget[key] = 1;\n', [])
+        self.scan('late-guard', 'const key = req.body.key;\ntarget[key] = 1;\n'
+                  + self.VALIDATOR.splitlines()[1] + '\n', [2])
+        self.scan('caught-guard', 'const key = req.body.key;\ntry {\n'
+                  + self.VALIDATOR.splitlines()[1] + '\n} catch (error) {}\ntarget[key] = 1;\n', [5])
+        self.scan('nested-rebind', self.VALIDATOR + 'let key = checkedKey(req.body.key);\n'
+                  'if (flag && (key = req.query.key)) {}\ntarget[key] = 1;\n', [7])
+        self.scan('parenthesized-rebind', self.VALIDATOR + 'let key = checkedKey(req.body.key);\n'
+                  '(key = req.query.key);\ntarget[key] = 1;\n', [7])
+        self.scan('catch-shadowed-key', self.VALIDATOR + 'const key = checkedKey(req.body.key);\n'
+                  'try { throw req.body.key; } catch (key) {\ntarget[key] = 1;\n}\n', [7])
+
+    def test_registered_helper_preserves_selection_and_suppression(self):
+        unsafe = self.scan('native-unsafe', 'function safeMerge(value) { return value; }\n'
+                           'const payload = safeMerge(req.body);\nObject.assign(target, payload);\n', [3])
+        safe = self.scan('native-safe', 'const target = Object.create(null);\n'
+                         'target[req.body.key] = req.body.value;\n', [])
+        suppressed = self.scan('native-suppressed', 'const payload = req.body;\n'
+                               'Object.assign(target, payload); // ubs:ignore[js.security.prototype-pollution]\n', [])
+        source_marker = self.scan('native-source-marker', 'const payload = req.body; // ubs:ignore\n'
+                                  'Object.assign(target, payload);\n', [2])
+        self.scan('native-not-selected', 'Object.assign(target, req.body);\n', [1])
+        paths = self.directory / 'selected-inputs'
+        paths.write_bytes(b''.join(os.fsencode(path) + b'\0' for path in (unsafe, safe, suppressed, source_marker)))
+        command = [sys.executable, '-m', 'ubs_core', 'regex', '--lang', 'javascript', '--files-from', str(paths)]
+        env = dict(os.environ, PYTHONPATH=str(HELPERS_DIR), PYTHONDONTWRITEBYTECODE='1')
+        started = time.monotonic()
+        proc = subprocess.run(command, cwd=self.directory, env=env, text=True, capture_output=True, timeout=60)
+        (self.directory / 'native.stdout').write_text(proc.stdout, encoding='utf-8')
+        (self.directory / 'native.stderr').write_text(proc.stderr, encoding='utf-8')
+        (self.directory / 'native-command.json').write_text(json.dumps({
+            'command': command, 'elapsed_s': time.monotonic() - started,
+            'returncode': proc.returncode,
+            'helper_sha256': hashlib.sha256(Path(self.analyzer.__file__).read_bytes()).hexdigest(),
+        }, indent=2), encoding='utf-8')
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        records = [json.loads(line) for line in proc.stdout.splitlines()]
+        matches = [row for row in records if row['rule'] == self.analyzer.RULE]
+        self.assertEqual(sorted((Path(row['path']).name, row['line'], row['severity']) for row in matches),
+                         [('native-source-marker.ts', 2, 'critical'), ('native-unsafe.ts', 3, 'critical')])
+
+    def test_object_factory_identity_and_allocation_key_shape(self):
+        for label, patch in (
+            ('patched-factory', 'Object.create = () => ({});\n'),
+            ('computed-factory', 'Object["create"] = () => ({});\n'),
+            ('aliased-factory', 'const intrinsic = Object;\nintrinsic.create = () => ({});\n'),
+            ('global-factory-alias', 'const intrinsic = globalThis.Object;\nintrinsic.create = () => ({});\n'),
+            ('escaping-factory', 'mutate(Object);\n'),
+        ):
+            with self.subTest(case=label):
+                source = patch + 'const target = Object.create(null);\nObject.assign(target, req.body);\n'
+                self.scan(label, source, [4 if 'alias' in label else 3])
+        self.scan('fixed-key-copy', 'const bag = Object.create(null);\n'
+                  'bag["color"] = req.body;\nObject.assign({}, bag);\n', [])
+        self.scan('fixed-key-deep-merge', 'const bag = Object.create(null);\n'
+                  'bag["color"] = req.body;\nlodash.merge({}, bag);\n', [3])
+        self.scan('unknown-call-key-shape', 'const bag = Object.create(null);\n'
+                  'bag["color"] = req.body;\nmutate(bag);\nObject.assign({}, bag);\n', [4])
+        self.scan('nested-copy-identity', 'const bag = Object.assign(Object.create(null), req.body);\n'
+                  'Object.assign({}, bag);\n', [2])
+        self.scan('nested-safe-copy', 'const bag = Object.create(null);\nbag["color"] = req.body;\n'
+                  'const copy = Object.assign(Object.create(null), bag);\nObject.assign({}, copy);\n', [])
+        self.scan('destructured-receiver', 'const bag = Object.create(null);\nbag["target"] = {};\n'
+                  'const {target} = bag;\ntarget[req.body.key] = 1;\n', [4])
+
+    def test_loop_binding_mutability_is_independent_of_outer_binding(self):
+        guard = self.VALIDATOR.splitlines()[1]
+        self.scan('loop-mutable-shadow', 'const key = "color";\nconst target = {};\n'
+                  'for (let key of req.body.keys) {\n' + guard + '\n'
+                  'function mutate() { key = req.query.key; }\nmutate();\n'
+                  'target[key] = req.body.value;\n}\n', [7])
+        self.scan('loop-constant-shadow', 'let key = "color";\n'
+                  'for (const key of req.body.keys) {\n' + guard + '\n'
+                  'observe();\ntarget[key] = req.body.value;\n}\n'
+                  'target[key] = req.body.value;\n', [])
+
+    def test_switch_and_exception_paths_retain_pre_exit_stores(self):
+        cases = [
+            ('switch-return', 'function f() {\nswitch (flag) {\ncase 0: return;\n'
+             'default: Object.assign({}, req.body);\n}\n}\n', [4]),
+            ('throw-prefix', 'function f() {\nlet key = "color";\n'
+             'try { key = req.body.key; throw new Error("stop"); } catch (e) {}\n'
+             'target[key] = 1;\n}\n', [4]),
+            ('return-finally-prefix', 'function f() {\nlet key = "color";\n'
+             'try { key = req.body.key; return; } finally {\ntarget[key] = 1;\n}\n}\n', [4]),
+            ('catch-return-prefix', 'function f() {\nlet key = "color";\ntry { throw 0; }\n'
+             'catch (e) { key = req.body.key; return; }\nfinally { target[key] = 1; }\n}\n', [5]),
+            ('call-exception-prefix', 'function f() {\nlet key = "color";\ntry {\n'
+             'key = req.body.key;\nunknown();\nkey = "color";\n} catch (e) {\n'
+             'target[key] = 1;\n}\n}\n', [8]),
+            ('catch-parameter-restored', 'function f() {\nconst key = "color";\n'
+             'try { throw 0; } catch (key) { key = req.body.key; return; }\n'
+             'finally { target[key] = 1; }\n}\n', []),
+            ('try-local-restored', 'function f() {\nlet key = "color";\n'
+             'try { let key = req.body.key; unknown(); } catch (e) { target[key] = 1; }\n}\n', []),
+        ]
+        for name, source, expected in cases:
+            with self.subTest(case=name):
+                self.scan(name, source, expected)
+
+    def test_analysis_limit_preserves_discovered_sink_and_explicit_failure(self):
+        from unittest.mock import patch
+        from ubs_core.taint_flow import AnalysisLimit, Budget
+
+        fixture = self.directory / 'budget.ts'
+        fixture.write_text('Object.assign({}, req.body);\n' + 'touch();\n' * 20, encoding='utf-8')
+        with patch.object(self.analyzer, 'Budget', lambda: Budget(15)):
+            findings = self.analyzer.scan_file_findings(fixture)
+            self.assertEqual(next(findings), 1)
+            with self.assertRaisesRegex(AnalysisLimit, 'analysis is incomplete'):
+                list(findings)
+
+    @unittest.skipUnless(shutil.which('node'), 'Node is needed for the independent JavaScript semantics oracle')
+    def test_runtime_contract_rejects_unsafe_and_coercible_keys(self):
+        source = self.VALIDATOR + '''
+for (const key of ['__proto__', 'constructor', 'prototype', { toString() { return '__proto__'; } }]) {
+  let rejected = false;
+  try { checkedKey(key); } catch { rejected = true; }
+  if (!rejected) throw new Error('unsafe key passed validator');
+}
+if (checkedKey('color') !== 'color') throw new Error('ordinary key rejected');
+const payload = JSON.parse('{"__proto__":{"inherited":true}}');
+const plain = Object.assign({}, payload);
+if (plain.inherited !== true) throw new Error('ordinary receiver control did not change prototype');
+const safe = Object.assign(Object.create(null), payload);
+if (Object.getPrototypeOf(safe) !== null || safe.inherited !== undefined) throw new Error('null receiver changed prototype');
+if (Object.assign({}, safe).inherited !== true) throw new Error('copying the stored key lost the unsafe property');
+'''
+        fixture = self.directory / 'runtime-contract.js'
+        fixture.write_text(source, encoding='utf-8')
+        proc = subprocess.run(['node', str(fixture)], text=True, capture_output=True, timeout=30)
+        (self.directory / 'runtime-contract.stdout').write_text(proc.stdout, encoding='utf-8')
+        (self.directory / 'runtime-contract.stderr').write_text(proc.stderr, encoding='utf-8')
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+
+class PrototypePollutionPublicTests(unittest.TestCase):
+    """Exercise the ordinary verified module/runner with complete reports."""
+
+    RULE = 'js.security.prototype-pollution'
+
+    @classmethod
+    def setUpClass(cls):
+        cls.ast_grep = os.environ.get('UBS_AST_GREP_BIN') or shutil.which('ast-grep')
+        if not cls.ast_grep:
+            raise unittest.SkipTest('ast-grep is required for public JavaScript SARIF scans')
+        artifacts = REPO_ROOT / 'test-suite' / 'artifacts' / 'prototype-public-precision'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        cls.directory = Path(tempfile.mkdtemp(prefix='run-', dir=artifacts))
+
+    @staticmethod
+    def programs(clean):
+        if clean:
+            return {
+                'null-receiver.js': ('const target = Object.create(null);\n'
+                                     'target[req.body.key] = req.body.value;\n'
+                                     'Object.assign(target, req.body);\n', []),
+                'validated-key.js': (PrototypePollutionBindingTests.VALIDATOR
+                                      + 'const key = checkedKey(req.body.key);\n'
+                                      'target[key] = req.body.value;\n', []),
+                'fixed-key.js': ('const value = req.body.value;\n'
+                                  'target["color"] = value;\n', []),
+                'fixed-key-copy.js': ('const bag = Object.create(null);\n'
+                                       'bag["color"] = req.body;\nObject.assign({}, bag);\n', []),
+                'owned-sink-marker.js': ('const payload = req.body;\n'
+                                          'Object.assign(target, payload); // ubs:ignore[js.security.prototype-pollution]\n', []),
+            }
+        return {
+            'identity-safe-merge.js': ('function safeMerge(value) { return value; }\n'
+                                        'const payload = safeMerge(req.body);\n'
+                                        'Object.assign(target, payload);\n', [3]),
+            'unrelated-validation.js': ('const safe = Object.create(null);\n'
+                                         'validatePrototypeKeys(unrelated);\n'
+                                         'target[req.body.key] = req.body.value;\n', [3]),
+            'copied-null-bag.js': ('const bag = Object.create(null);\n'
+                                    'Object.assign(bag, req.body);\n'
+                                    'Object.assign({}, bag);\n', [3]),
+            'for-of-key.js': ('for (const key of req.body.keys) {\n'
+                               '  target[key] = 1;\n}\n', [2]),
+            'source-marker.js': ('const payload = req.body; // ubs:ignore\n'
+                                  'Object.assign(target, payload);\n', [2]),
+        }
+
+    def test_module_and_runner_json_sarif_exact_sites_and_totals(self):
+        for clean in (False, True):
+            project = self.directory / ('clean' if clean else 'unsafe')
+            project.mkdir()
+            programs = self.programs(clean)
+            for name, (source, _lines) in programs.items():
+                (project / name).write_text(source, encoding='utf-8')
+            expected = sorted((name, line, 1, 'critical')
+                              for name, (_source, lines) in programs.items() for line in lines)
+            for surface in ('module', 'runner'):
+                for format_ in ('json', 'sarif'):
+                    label = f'{project.name}-{surface}-{format_}'
+                    with self.subTest(case=label):
+                        run_dir = self.directory / label
+                        run_dir.mkdir()
+                        temporary = run_dir / 'tmp'
+                        temporary.mkdir()
+                        entry = REPO_ROOT / ('modules/ubs-js.sh' if surface == 'module' else 'ubs')
+                        command = ['bash', str(entry), '--ci', '--no-color', '--format=' + format_]
+                        if surface == 'runner':
+                            command.extend(('--only=js', '--no-auto-update'))
+                        command.append(str(project))
+                        env = dict(os.environ, UBS_AST_GREP_BIN=self.ast_grep,
+                                   UBS_NO_AUTO_UPDATE='1', UBS_ENABLE_AUTO_UPDATE='0', UBS_NO_CACHE='1',
+                                   UBS_KEEP_TEMP='1', UBS_ALLOW_PARTIAL='0', UBS_ALLOW_NO_SCAN='0',
+                                   UBS_ALLOW_UNVERIFIED_HELPERS='0', PYTHONDONTWRITEBYTECODE='1',
+                                   CI='1', NO_COLOR='1', TMPDIR=str(temporary), UBS_PYTHON=sys.executable,
+                                   UBS_CACHE_DIR=str(run_dir / 'cache'),
+                                   XDG_CONFIG_HOME=str(run_dir / 'config'), XDG_DATA_HOME=str(run_dir / 'data'))
+                        env.pop('UBS_VERIFIED_ASSET_DIR', None)
+                        started = time.monotonic()
+                        print(f'[prototype-{label}] RUN {command!r}', flush=True)
+                        proc = subprocess.run(command, cwd=project, env=env, text=True,
+                                              capture_output=True, timeout=180)
+                        (run_dir / 'stdout').write_text(proc.stdout, encoding='utf-8')
+                        (run_dir / 'stderr').write_text(proc.stderr, encoding='utf-8')
+                        (run_dir / 'receipt.json').write_text(json.dumps({
+                            'command': command, 'returncode': proc.returncode,
+                            'elapsed_s': time.monotonic() - started,
+                            'source_sha256': {name: hashlib.sha256(source.encode()).hexdigest()
+                                              for name, (source, _lines) in programs.items()},
+                            'entry_sha256': hashlib.sha256(entry.read_bytes()).hexdigest(),
+                            'helper_sha256': hashlib.sha256((HELPERS_DIR / 'ubs_core/analyzers/sec_prototype_pollution.py').read_bytes()).hexdigest(),
+                            'python': sys.executable, 'python_version': sys.version,
+                            'environment': {name: env[name] for name in (
+                                'UBS_AST_GREP_BIN', 'UBS_NO_CACHE', 'UBS_KEEP_TEMP', 'UBS_NO_AUTO_UPDATE',
+                                'UBS_ALLOW_UNVERIFIED_HELPERS', 'UBS_ALLOW_PARTIAL', 'UBS_ALLOW_NO_SCAN')},
+                            'expected': expected,
+                        }, indent=2), encoding='utf-8')
+                        context = f'{command!r}\nexit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}'
+                        self.assertEqual(proc.returncode, int(bool(expected)), context)
+                        report = json.loads(proc.stdout)
+                        if format_ == 'json':
+                            self.assertEqual(report['status'], 'ok', context)
+                            rule_key, path_key = ('rule', 'path') if surface == 'module' else ('rule_id', 'file')
+                            rows = report.get('findings', [])
+                            actual = sorted((Path(row[path_key]).name, row['line'], row['col'], row['severity'])
+                                            for row in rows if row[rule_key] == self.RULE)
+                            totals = report if surface == 'module' else report['totals']
+                            self.assertEqual(totals['critical'], len(expected), context)
+                            self.assertEqual(totals['files'], len(programs), context)
+                            self.assertFalse(any(row['severity'] == 'critical' and row[rule_key] != self.RULE
+                                                 for row in rows), context)
+                        else:
+                            self.assertEqual(report['version'], '2.1.0', context)
+                            rows = [row for run in report['runs'] for row in run.get('results', [])]
+                            target_rows = [row for row in rows if row['ruleId'] == self.RULE]
+                            self.assertTrue(all(row['level'] == 'error' for row in target_rows), context)
+                            actual = sorted((sarif_location_path(row['locations'][0]['physicalLocation']['artifactLocation']['uri'], project).name,
+                                             row['locations'][0]['physicalLocation']['region']['startLine'],
+                                             row['locations'][0]['physicalLocation']['region']['startColumn'], 'critical')
+                                            for row in target_rows)
+                            self.assertEqual(sum(row.get('level') == 'error' for row in rows), len(expected), context)
+                            for run in report['runs']:
+                                for invocation in run.get('invocations', []):
+                                    self.assertIs(invocation['executionSuccessful'], True, context)
+                        self.assertEqual(actual, expected, context)
+                        print(f'[prototype-{label}] PASS {time.monotonic() - started:.3f}s', flush=True)
 
 
 if __name__ == "__main__":

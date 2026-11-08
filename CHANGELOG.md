@@ -10,6 +10,17 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Tie JavaScript prototype-pollution safety to the actual receiver and key
+  binding. Stop trusting sanitizer names or unrelated nearby validation;
+  follow reassignment, destructuring and loop-carried request values to exact
+  sink lines. Recognize bounded complete string-key guards and null-prototype
+  receiver aliases, retaining dangerous stored keys through later copies.
+  Keep shadowing, mutation, deep merges and unresolved calls conservative;
+  retain findings on exceptional paths and before an analysis work limit.
+  Bound receiver lookup to the current token instead of rescanning file prefixes.
+  Add independent safe/unsafe source cases, Node witnesses and ordinary
+  module/runner JSON and SARIF regression checks.
+
 - Track mutable Drizzle SQL objects through aliases, selected helper calls,
   closures, and module boundaries. Preserve `append()` chunk-copy semantics,
   live nested SQL references, independent allocations, and argument evaluation

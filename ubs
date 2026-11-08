@@ -206,21 +206,21 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='2c273dd94f6a0c35232b05faa4e2b13cb416ab85d6d7043d4215dfae3d260862'
-  [cpp]='f1fa6eb62e06c9d3f9a36ef18f491677b5fd0720acf9005676ac940b863b08a8'
-  [csharp]='a56f7e094cd95df86bef76b99dec04c9c8388d9570efa763e8dbd8493d58abea'
-  [elixir]='9573e4f0d0639fa3d1409f48ab8771ca5f0473020da81a23516adc8addac5d3d'
-  [golang]='d50d0adc7a31839c0da01ffa06bf9f67c46d5953ca9074c7b0238f0cc6e32efe'
-  [hcl]='b90f2f5ccf2be019e7f2df3bcb2e3459433b4a077ce7d4926415a78cca3871f2'
-  [java]='4aa4da6117b57c3959b292ea7c2b6d2063ddd7777befe5419c5226c8a48dcb6f'
-  [js]='b764d587684f49246f75c53ea43cf95c2559da2c10a48c2c5e31244dcb367dce'
-  [kotlin]='d2d8675650fddb6faf056fc5624086ee65b4276e2af9e179ebd175f505d9e26d'
-  [php]='5608fa056da619f8ca7bde0f9bcfa6e93a17573e9eb0a6f33e039b239fa6ffbb'
-  [python]='47fd9ca53fec0e1b1b93ec171585c17b5056697b6da4d05f0c1f23ae0905a200'
-  [ruby]='dff17cca758c1e46c2289bf36ae58ae0542aa5ca4a8d2afd0a6d0b3cafd0bd0d'
-  [rust]='a1b1ec775e1eacf30dec6f1bf5a9735bf5199024a385446f3b1e1d010ae389b9'
-  [sql]='ff5639a269a2a035375d3ccc8359c4745563fa0924931ce4b80060ee4a8a40a6'
-  [swift]='cb13992979a5dd4a317c2eebdcd3866468d64e646354dbba565a4ffb2dc7a061'
+  [bash]='4e022e282d5a88ee67b52a9e048bc4c98c282ea97c10ec23dee0d80e321f1fb4'
+  [cpp]='7f5c4f23a8f6583498187cd5224fe4700772352ef7e4c1afdc495012880bc566'
+  [csharp]='9d9c5197be625235260a639edc72aaab73aae6243c17b68955d6124de8e38f29'
+  [elixir]='c1b99fdfc98bd04d831aef6becb244036a4b2558f075fddc3a26d080e075d91d'
+  [golang]='602bd7e116d953a4c44a98a5224dec81f74e1911d039bdb661a1be85237cac3f'
+  [hcl]='0d46d01f762f5579adc99b8abcd402e93406c7426a20b2f115f5787d46f2885e'
+  [java]='ebeffd97681d55493c94da68887ad98b024006677f4601702f3ce89d2a063e23'
+  [js]='c692112a787b47542054d4ab84401d7105cb57f17bb47448f31e9142fbe47a44'
+  [kotlin]='47f3cb1949e78061c0235200fa28d48185f524b227bab38383f1cc64bb191fa9'
+  [php]='61cfaf22ffe881fe5bb6963301cfef993f3753deeb49c32d6b4342673af3287e'
+  [python]='cd2ee948192d9ece084a80d173eb373cad5e1a30d2433d51640c3c6d12b270d5'
+  [ruby]='2b766fdf1f1d8e05ae36d5aec8b97c846ec12a9289375ffec81ae121cf5492a7'
+  [rust]='9b2260b581d0c99bec7ee00d21fb9b27396fe33e7a43c07ecfe87296654d2afc'
+  [sql]='68b456f98523584d53437c9720b810d0bc7dec74ddca6db7d4de64b070181847'
+  [swift]='1006cb10c7b52443dba5feb02442b781d2009bed0d4fd381bdd241e698b72855'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -333,7 +333,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/analyzers/taint_ruby_url.py']='c7e98db31c900d364f427aa65bc2ff3bb62a8a28f05b7dd78357b6f6a51a7a84'
   ['helpers/ubs_core/analyzers/taint_rust.py']='920988d1dd05014915d79e22127535735db0dee0ae25448f57cab89451fb4987'
   ['helpers/ubs_core/analyzers/taint_swift_redirect.py']='a0503c0be9ed06e4e68b9f4dc76748d6149bfcda12959a350c874a663ef23eda'
-  ['helpers/ubs_core/analyzers/taint_swift_traversal.py']='b0de7eaa38eb79229cfdad6103ee838d148293bc980bc960e3570e8cef1d4687'
+  ['helpers/ubs_core/analyzers/taint_swift_traversal.py']='23249eb06a6ef7f5863b47c6289a7855d04da6f8c1df7efd51b6686644368918'
   ['helpers/ubs_core/bash_rules.py']='21fb455e701160e12575b478819d8f52254bca2d672d6962992a93d8c186a20c'
   ['helpers/ubs_core/bash_scan.py']='aa224e5c69fb20539d1868f42a95b46c11eedf1b7c0ff6727d459acbe80c08ef'
   ['helpers/ubs_core/cache.py']='6fd060c27570c178c46015005fcc429b36518f1de77aa4abf3718165af53ce1e'
@@ -596,7 +596,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='77a16e60dce843652c053d069dcbffce17c8ffae543bf77693d2e8254a3967de'
   ['helpers/ubs_core/taint_flow.py']='83b941e15357a6a593db1d7f77a099b1707090301f695445356bfcede4baef26'
-  ['lib/ubs-common.sh']='537c4aad926ab5c6072617544ad338990b9fb0367ea0fa9af5802e979356bd33'
+  ['lib/ubs-common.sh']='dc681c5ecf2293b2d31853d356cf971edd6b5886189197059314adc8f8168f2f'
 )
 
 # contract.json as shipped by earlier releases (sha256 -> first tag), kept out

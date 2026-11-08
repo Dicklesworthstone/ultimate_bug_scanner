@@ -139,7 +139,14 @@ class SwiftLexer:
                         output.append(SwiftToken('\n', position, position + 1))
                 cursor = finish
                 continue
-            regex = char == '/' and (not output or output[-1].value in {'=', '(', ',', ':', 'return'})
+            prev_significant = next(
+                (tok for tok in reversed(output) if not (tok.kind == 'code' and not tok.value.strip())),
+                None,
+            )
+            regex = char == '/' and (
+                prev_significant is None
+                or prev_significant.value in {'=', '(', ',', ':', 'return'}
+            )
             if re.match(r'#{0,32}"|#+/', text[cursor:limit]) or regex:
                 token = self.literal(cursor, limit, depth)
                 output.append(token)

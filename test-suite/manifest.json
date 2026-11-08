@@ -10402,6 +10402,38 @@
       }
     },
     {
+      "id": "swift-regex-literal-linebreak-clean",
+      "description": "A Swift regex literal that begins a continuation line is lexed as a regex, not division, so swift analysis completes instead of failing with unbalanced delimiters (#204).",
+      "path": "test-suite/swift/clean/regex_literal_linebreak.swift",
+      "language": "swift",
+      "tags": ["swift", "lexer", "regression", "clean"],
+      "args": ["--only=swift"],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": { "min": 0, "max": 0 },
+          "warning": { "min": 0, "max": 0 }
+        },
+        "forbid_substrings": ["analysis is incomplete", "swift: partial"]
+      }
+    },
+    {
+      "id": "swift-regex-division-linebreak-clean",
+      "description": "Division whose operator begins a continuation line stays division after the regex heuristic skips the newline token (#204 false-positive guard).",
+      "path": "test-suite/swift/clean/regex_division_linebreak.swift",
+      "language": "swift",
+      "tags": ["swift", "lexer", "regression", "clean", "false-positive"],
+      "args": ["--only=swift"],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": { "min": 0, "max": 0 },
+          "warning": { "min": 0, "max": 0 }
+        },
+        "forbid_substrings": ["analysis is incomplete", "swift: partial"]
+      }
+    },
+    {
       "id": "csharp-suppression-intervals-markers",
       "description": "A7 GH #91: all ubs:ignore placements (trailing, previous-line, multi-line statement, formatter-relocated, rule-scoped) suppress every finding line in the csharp module.",
       "path": "test-suite/csharp/suppression/suppression_buggy.cs",

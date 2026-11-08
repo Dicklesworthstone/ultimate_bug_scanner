@@ -3,8 +3,9 @@
 The labels describe the selected in-file model: real Dapper string-SQL calls,
 resolved ADO.NET receivers and ASP.NET request inputs.  A clean label means no
 proven request-to-SQL flow in that model, not a claim about arbitrary callers.
-CommandDefinition, deferred execution and unresolved dispatch are explicit
-boundaries.  Sources are parsed with the actual C# grammar when available;
+Selected CommandDefinition values retain the query captured at construction;
+deferred execution and unresolved dispatch remain explicit boundaries.
+Sources are parsed with the actual C# grammar when available;
 this suite does not pretend that parsing compiles or executes Dapper.
 
 Runtime sources and complete CLI captures stay in test-suite/artifacts.  Set
@@ -340,10 +341,6 @@ class C : Microsoft.AspNetCore.Mvc.ControllerBase {
 )
 
 BOUNDARIES = (
-    Case("command_definition_is_explicitly_partial", source('''
-        var command = new CommandDefinition(http.Query["sql"].ToString());
-        db.Execute(command);
-    '''), partial=True),
     Case("deferred_query_is_explicitly_partial", source('''
         db.Query<int>(http.Query["sql"].ToString(), buffered: false);
     '''), partial=True),
@@ -358,9 +355,372 @@ BOUNDARIES = (
     ''', parameters="dynamic db, HttpRequest http"), partial=True),
     Case("known_finding_precedes_unsupported_command", source('''
         db.Execute(http.Query["sql"].ToString()); // @sql db.Execute
+        var command = new CommandDefinition(http.Query["sql"].ToString(), flags: CommandFlags.None);
+        db.Query<int>(command);
+    '''), partial=True),
+)
+
+
+# Independently specified before the CommandDefinition implementation.  Dapper's
+# readonly struct copies CommandText at construction; Parameters is a separate
+# operand.  Query<T> can defer execution, unlike Execute/Scalar/First/Single.
+# These are actual overloads, not all syntactically plausible combinations:
+# sync Query has no non-generic or Type-leading CommandDefinition overload.
+# API sources inspected 2026-11-08:
+# https://github.com/DapperLib/Dapper/blob/main/Dapper/CommandDefinition.cs
+# https://github.com/DapperLib/Dapper/blob/main/Dapper/CommandFlags.cs
+# https://github.com/DapperLib/Dapper/blob/main/Dapper/SqlMapper.cs
+# https://github.com/DapperLib/Dapper/blob/main/Dapper/SqlMapper.Async.cs
+COMMAND_CASES = (
+    Case("command_sync_eager_families", source('''
+        var command = new CommandDefinition(http.Query["sql"].ToString(), commandType: CommandType.Text);
+        db.Execute(command); // @sql db.Execute
+        db.ExecuteScalar(command); // @sql db.ExecuteScalar
+        db.ExecuteScalar<int>(command); // @sql db.ExecuteScalar
+        db.Query<int>(command); // @sql db.Query
+        db.QueryFirst<int>(command); // @sql db.QueryFirst
+        db.QueryFirstOrDefault<int>(command); // @sql db.QueryFirstOrDefault
+        db.QuerySingle<int>(command); // @sql db.QuerySingle
+        db.QuerySingleOrDefault<int>(command); // @sql db.QuerySingleOrDefault
+    ''')),
+    Case("command_async_eager_families", source('''
+        var command = new CommandDefinition(http.Query["sql"].ToString(), commandType: CommandType.Text);
+        await db.ExecuteAsync(command); // @sql db.ExecuteAsync
+        await db.ExecuteScalarAsync(command); // @sql db.ExecuteScalarAsync
+        await db.ExecuteScalarAsync<int>(command); // @sql db.ExecuteScalarAsync
+        await db.QueryAsync(command); // @sql db.QueryAsync
+        await db.QueryAsync<int>(command); // @sql db.QueryAsync
+        await db.QueryFirstAsync(command); // @sql db.QueryFirstAsync
+        await db.QueryFirstAsync<int>(command); // @sql db.QueryFirstAsync
+        await db.QueryFirstOrDefaultAsync(command); // @sql db.QueryFirstOrDefaultAsync
+        await db.QueryFirstOrDefaultAsync<int>(command); // @sql db.QueryFirstOrDefaultAsync
+        await db.QuerySingleAsync(command); // @sql db.QuerySingleAsync
+        await db.QuerySingleAsync<int>(command); // @sql db.QuerySingleAsync
+        await db.QuerySingleOrDefaultAsync(command); // @sql db.QuerySingleOrDefaultAsync
+        await db.QuerySingleOrDefaultAsync<int>(command); // @sql db.QuerySingleOrDefaultAsync
+    ''', async_=True)),
+    Case("command_async_type_leading_arguments", source('''
+        var command = new CommandDefinition(http.Query["sql"].ToString(), commandType: CommandType.Text);
+        await db.QueryAsync(typeof(Row), command); // @sql db.QueryAsync
+        await db.QueryFirstAsync(typeof(Row), command); // @sql db.QueryFirstAsync
+        await db.QueryFirstOrDefaultAsync(typeof(Row), command); // @sql db.QueryFirstOrDefaultAsync
+        await db.QuerySingleAsync(typeof(Row), command); // @sql db.QuerySingleAsync
+        await db.QuerySingleOrDefaultAsync(typeof(Row), command); // @sql db.QuerySingleOrDefaultAsync
+    ''', async_=True)),
+    Case("command_inline_constructor_is_consumed", source('''
+        db.Execute(new CommandDefinition(http.Query["sql"].ToString(), commandType: CommandType.Text)); // @sql db.Execute
+    ''')),
+    Case("command_default_policy_uses_sql_text", source('''
+        var sql = "select Id from Users where Name = '" + http.Query["name"].ToString() + "'";
+        var command = new CommandDefinition(sql);
+        db.Query<int>(command); // @sql db.Query
+    ''')),
+    Case("command_named_constructor_and_sink_arguments", source('''
+        var command = new CommandDefinition(parameters: new { id = 1 }, commandType: CommandType.Text,
+            commandText: http.Query["sql"].ToString());
+        SqlMapper.Execute(command: command, cnn: db); // @sql SqlMapper.Execute
+    ''')),
+    Case("command_positional_constructor_roles", source('''
+        var command = new CommandDefinition(http.Query["sql"].ToString(), new { id = 1 },
+            null, 30, CommandType.Text, CommandFlags.Buffered);
+        db.Execute(command: command); // @sql db.Execute
+    ''')),
+    Case("command_parameter_data_does_not_become_sql", source('''
+        var command = new CommandDefinition("select Id from Users where Name = @name",
+            new { name = http.Query["name"].ToString() });
+        db.Query<int>(command);
+        db.ExecuteScalar<int>(command);
+    ''')),
+    Case("command_named_parameters_do_not_become_sql", source('''
+        var command = new CommandDefinition(parameters: new { sql = http.Query["sql"].ToString() },
+            flags: CommandFlags.Buffered, commandText: "select @sql", commandType: CommandType.Text);
+        db.Execute(command: command);
+    ''')),
+    Case("command_parameters_do_not_sanitize_interpolation", source('''
+        var command = new CommandDefinition($"select Id from Users where Name = '{http.Query["name"]}' and Id = @id",
+            new { id = 1 });
+        db.Query<int>(command); // @sql db.Query
+    ''')),
+    Case("command_query_text_is_captured_before_reassignment", source('''
+        var sql = http.Query["sql"].ToString();
+        var command = new CommandDefinition(sql, commandType: CommandType.Text);
+        sql = "select 1";
+        db.Execute(command); // @sql db.Execute
+    ''')),
+    Case("command_safe_query_capture_survives_tainted_reassignment", source('''
+        var sql = "select @name";
+        var command = new CommandDefinition(sql, new { name = http.Query["name"].ToString() });
+        sql = http.Query["sql"].ToString();
+        db.Execute(command);
+    ''')),
+    Case("command_value_copy_retains_original_query", source('''
+        var command = new CommandDefinition(http.Query["sql"].ToString(), commandType: CommandType.Text);
+        var copied = command;
+        command = new CommandDefinition("select 1");
+        db.Execute(copied); // @sql db.Execute
+        db.Execute(command);
+    ''')),
+    Case("command_safe_value_copy_is_independent", source('''
+        var command = new CommandDefinition("select @name", new { name = http.Query["name"].ToString() });
+        var copied = command;
+        command = new CommandDefinition(http.Query["sql"].ToString(), commandType: CommandType.Text);
+        db.Execute(copied);
+        db.Execute(command); // @sql db.Execute
+    ''')),
+    Case("command_branch_join_retains_unsafe_query", source('''
+        var command = new CommandDefinition("select 1");
+        if (flag) {
+            command = new CommandDefinition(http.Query["sql"].ToString(), commandType: CommandType.Text);
+        }
+        db.Execute(command); // @sql db.Execute
+    ''')),
+    Case("command_branch_join_bound_data_stays_clean", source('''
+        var command = new CommandDefinition("select 1");
+        if (flag) {
+            command = new CommandDefinition("select @sql", new { sql = http.Query["sql"].ToString() });
+        }
+        db.Execute(command);
+    ''')),
+    Case("command_local_factory_returns_captured_query", source('''
+        var command = Make(http.Query["sql"].ToString());
+        db.Execute(command); // @sql db.Execute
+    ''', helpers='''
+        CommandDefinition Make(string text) {
+            return new CommandDefinition(text, commandType: CommandType.Text);
+        }
+    ''')),
+    Case("command_factory_preserves_separate_data_argument", source('''
+        var command = Make("select @value", http.Query["sql"].ToString());
+        db.Execute(command);
+    ''', helpers='''
+        CommandDefinition Make(string text, string data) {
+            return new CommandDefinition(text, new { value = data }, commandType: CommandType.Text);
+        }
+    ''')),
+    Case("command_factory_calls_do_not_share_query_state", source('''
+        var unsafeCommand = Make(http.Query["sql"].ToString());
+        var safeCommand = Make("select 1");
+        db.Execute(safeCommand);
+        db.Execute(unsafeCommand); // @sql db.Execute
+    ''', helpers='''
+        CommandDefinition Make(string text) {
+            return new CommandDefinition(text, commandType: CommandType.Text);
+        }
+    ''')),
+    Case("command_ref_helper_replaces_safe_query_with_request", source('''
+        var command = new CommandDefinition("select 1");
+        Replace(ref command, http.Query["sql"].ToString());
+        db.Execute(command); // @sql db.Execute
+    ''', helpers='''
+        void Replace(ref CommandDefinition value, string text) {
+            value = new CommandDefinition(text, commandType: CommandType.Text);
+        }
+    ''')),
+    Case("command_ref_helper_replaces_request_with_safe_query", source('''
+        var command = new CommandDefinition(http.Query["sql"].ToString(), commandType: CommandType.Text);
+        Replace(ref command, "select 1");
+        db.Execute(command);
+    ''', helpers='''
+        void Replace(ref CommandDefinition value, string text) {
+            value = new CommandDefinition(text, commandType: CommandType.Text);
+        }
+    ''')),
+    Case("command_value_parameter_replacement_does_not_modify_caller", source('''
+        var command = new CommandDefinition("select 1");
+        Replace(command, http.Query["sql"].ToString());
+        db.Execute(command);
+    ''', helpers='''
+        void Replace(CommandDefinition value, string text) {
+            value = new CommandDefinition(text, commandType: CommandType.Text);
+        }
+    ''')),
+    Case("command_factory_property_roles_survive_substitution", source('''
+        var command = Make("select @value", http.Query["sql"].ToString());
+        db.Execute(command.CommandText);
+        db.Execute((string)command.Parameters); // @sql db.Execute
+    ''', helpers='''
+        CommandDefinition Make(string text, string data) {
+            return new CommandDefinition(text, data, commandType: CommandType.Text);
+        }
+    ''')),
+    Case("command_unbuffered_flags_do_not_defer_eager_methods", source('''
+        var command = new CommandDefinition(http.Query["sql"].ToString(), commandType: CommandType.Text,
+            flags: CommandFlags.None);
+        db.Execute(command); // @sql db.Execute
+        db.ExecuteScalar<int>(command); // @sql db.ExecuteScalar
+        db.QueryFirst<int>(command); // @sql db.QueryFirst
+        db.QuerySingleOrDefault<int>(command); // @sql db.QuerySingleOrDefault
+    ''')),
+    Case("command_buffered_flag_combination_is_eager", source('''
+        var command = new CommandDefinition(http.Query["sql"].ToString(), commandType: CommandType.Text,
+            flags: CommandFlags.Buffered | CommandFlags.NoCache);
+        db.Query<int>(command); // @sql db.Query
+    ''')),
+    Case("command_type_and_namespace_aliases", '''using System.Data;
+using Microsoft.AspNetCore.Http;
+using QueryCommand = Dapper.CommandDefinition;
+using Database = Dapper;
+class C {
+    void Run(IDbConnection db, HttpRequest http) {
+        var command = new QueryCommand(http.Query["sql"].ToString(), commandType: CommandType.Text);
+        Database.SqlMapper.Execute(db, command); // @sql Database.SqlMapper.Execute
+    }
+}
+'''),
+    Case("command_global_qualified_binding", source('''
+        var command = new global::Dapper.CommandDefinition(http.Query["sql"].ToString(),
+            commandType: global::System.Data.CommandType.Text);
+        global::Dapper.SqlMapper.Execute(db, command); // @sql global::Dapper.SqlMapper.Execute
+    ''')),
+    Case("command_text_property_preserves_sql_provenance", source('''
+        var command = new CommandDefinition(http.Query["sql"].ToString(), commandType: CommandType.Text);
+        db.Execute(command.CommandText); // @sql db.Execute
+    ''')),
+    Case("command_text_property_does_not_expose_parameter_data", source('''
+        var command = new CommandDefinition("select @value", http.Query["sql"].ToString());
+        db.Execute(command.CommandText);
+    ''')),
+    Case("command_parameter_property_is_data_until_used_as_sql", source('''
+        var command = new CommandDefinition("select @value", http.Query["sql"].ToString());
+        db.Execute((string)command.Parameters); // @sql db.Execute
+    ''')),
+    Case("command_unused_construction_is_not_execution", source('''
+        var command = new CommandDefinition(http.Query["sql"].ToString(), commandType: CommandType.Text);
+        Console.WriteLine(command.CommandText);
+    ''')),
+    Case("command_local_lookalike_is_not_dapper", '''using System.Data;
+using Microsoft.AspNetCore.Http;
+using Dapper;
+class CommandDefinition {
+    public CommandDefinition(string text) { }
+}
+class LocalDatabase {
+    public void Execute(CommandDefinition value) { }
+}
+class C {
+    void Run(LocalDatabase db, HttpRequest http) {
         var command = new CommandDefinition(http.Query["sql"].ToString());
         db.Execute(command);
+    }
+}
+'''),
+    Case("command_comments_and_strings_are_not_calls", source('''
+        // db.Execute(new CommandDefinition(http.Query["sql"].ToString()));
+        var example = "new CommandDefinition(request); db.Execute(command)";
+        var command = new CommandDefinition("select @example", new { example });
+        db.Execute(command);
+    ''')),
+)
+
+COMMAND_BOUNDARIES = (
+    Case("command_target_typed_construction_is_explicitly_partial", source('''
+        CommandDefinition command = new(http.Query["sql"].ToString(), commandType: CommandType.Text);
+        db.Execute(command);
     '''), partial=True),
+    Case("command_local_helper_parameter_requires_projection_summary", source('''
+        var command = new CommandDefinition(http.Query["sql"].ToString(), commandType: CommandType.Text);
+        Send(db, command);
+    ''', helpers='''
+        void Send(IDbConnection connection, CommandDefinition selected) {
+            connection.Execute(selected);
+        }
+    '''), partial=True),
+    Case("command_helper_property_requires_projection_summary", source('''
+        var command = new CommandDefinition(http.Query["sql"].ToString(), commandType: CommandType.Text);
+        Send(db, command);
+    ''', helpers='''
+        void Send(IDbConnection connection, CommandDefinition selected) {
+            connection.Execute(selected.CommandText);
+        }
+    '''), partial=True),
+    Case("command_unbuffered_query_is_explicitly_partial", source('''
+        var command = new CommandDefinition(http.Query["sql"].ToString(), commandType: CommandType.Text,
+            flags: CommandFlags.None);
+        db.Query<int>(command);
+    '''), partial=True),
+    Case("command_unknown_query_flags_are_explicitly_partial", source('''
+        var command = new CommandDefinition(http.Query["sql"].ToString(), commandType: CommandType.Text,
+            flags: selectedFlags);
+        db.Query<int>(command);
+    ''', parameters="IDbConnection db, HttpRequest http, CommandFlags selectedFlags"), partial=True),
+    Case("command_unknown_command_type_is_explicitly_partial", source('''
+        var command = new CommandDefinition(http.Query["sql"].ToString(), commandType: selectedType);
+        db.Execute(command);
+    ''', parameters="IDbConnection db, HttpRequest http, CommandType selectedType"), partial=True),
+    Case("command_stored_procedure_is_not_text_sql", source('''
+        var command = new CommandDefinition(http.Query["procedure"].ToString(), commandType: CommandType.StoredProcedure);
+        db.Execute(command);
+    '''), partial=True),
+    Case("command_external_value_is_explicitly_partial", source('''
+        db.Execute(command);
+    ''', parameters="IDbConnection db, CommandDefinition command"), partial=True),
+    Case("command_mutable_field_is_not_a_stale_constructor_proof", source('''
+        stored = new CommandDefinition(http.Query["sql"].ToString(), commandType: CommandType.Text);
+        db.Execute(stored);
+    ''', helpers='''
+        CommandDefinition stored = new CommandDefinition("select 1");
+    '''), partial=True),
+    Case("command_unknown_ref_escape_revokes_captured_value", source('''
+        var command = new CommandDefinition("select 1");
+        mutator.Replace(ref command);
+        db.Execute(command);
+    ''', parameters="IDbConnection db, ICommandMutator mutator", extra='''interface ICommandMutator {
+    void Replace(ref CommandDefinition command);
+}
+'''), partial=True),
+    Case("command_target_typed_reassignment_revokes_old_value", source('''
+        var command = new CommandDefinition("select 1");
+        command = new(http.Query["sql"].ToString(), commandType: CommandType.Text);
+        db.Execute(command);
+    '''), partial=True),
+    Case("command_array_mutation_is_not_stale_safe_evidence", source('''
+        var commands = new[] { new CommandDefinition("select 1") };
+        commands[0] = new CommandDefinition(http.Query["sql"].ToString(), commandType: CommandType.Text);
+        db.Execute(commands[0]);
+    '''), partial=True),
+    Case("command_array_projection_does_not_union_unselected_query", source('''
+        var commands = new[] { new CommandDefinition("select 1"),
+            new CommandDefinition(http.Query["sql"].ToString(), commandType: CommandType.Text) };
+        db.Execute(commands[0]);
+    '''), partial=True),
+    Case("command_nullable_projection_requires_value_model", source('''
+        CommandDefinition? command = new CommandDefinition(http.Query["sql"].ToString(), commandType: CommandType.Text);
+        db.Execute(command.Value);
+    '''), partial=True),
+    Case("command_nullable_projection_does_not_promote_parameter_data", source('''
+        CommandDefinition? command = new CommandDefinition("select @value", http.Query["sql"].ToString());
+        db.Execute(command.Value);
+    '''), partial=True),
+    Case("command_default_value_has_no_captured_policy", source('''
+        CommandDefinition command = default;
+        db.Execute(command);
+    '''), partial=True),
+    Case("command_argument_assignment_requires_ordered_effects", source('''
+        var sql = "select @value";
+        var command = new CommandDefinition(parameters: (sql = http.Query["sql"].ToString()),
+            commandText: sql, commandType: CommandType.Text);
+        db.Execute(command);
+    '''), partial=True),
+    Case("command_later_argument_write_cannot_rewrite_captured_text", source('''
+        var sql = http.Query["sql"].ToString();
+        var command = new CommandDefinition(sql, parameters: (sql = "select 1"), commandType: CommandType.Text);
+        db.Execute(command);
+    '''), partial=True),
+    Case("command_shadowed_command_type_is_not_framework_policy", source('''
+        var command = new CommandDefinition(http.Query["sql"].ToString(), commandType: CommandType.Text);
+        db.Execute(command);
+    ''', extra='''static class CommandType {
+    public static System.Data.CommandType Text = System.Data.CommandType.StoredProcedure;
+}
+'''), partial=True),
+    Case("command_shadowed_flags_are_not_framework_policy", source('''
+        var command = new CommandDefinition(http.Query["sql"].ToString(), commandType: CommandType.Text,
+            flags: CommandFlags.Buffered);
+        db.Query<int>(command);
+    ''', extra='''static class CommandFlags {
+    public static Dapper.CommandFlags Buffered = Dapper.CommandFlags.None;
+}
+'''), partial=True),
 )
 
 
@@ -407,7 +767,8 @@ def materialize(directory: Path, cases=CASES) -> dict[str, Path]:
 
 def freeze_receipt(directory: Path) -> dict:
     """Persist independently assigned labels and their exact source bytes."""
-    paths = materialize(directory / "cases", CASES + BOUNDARIES)
+    cases = CASES + BOUNDARIES + COMMAND_CASES + COMMAND_BOUNDARIES
+    paths = materialize(directory / "cases", cases)
     receipt = {
         "rule": RULE,
         "labels_assigned_before_proposed_analyzer_inspection": True,
@@ -417,7 +778,7 @@ def freeze_receipt(directory: Path) -> dict:
             {"name": case.name, "source": str(paths[case.name]),
              "sha256": hashlib.sha256(case.code.encode()).hexdigest(),
              "expected": case.expected, "partial": case.partial}
-            for case in CASES + BOUNDARIES
+            for case in cases
         ],
     }
     (directory / "labels.json").write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
@@ -429,7 +790,7 @@ class DapperNativeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.directory = ARTIFACTS / ("native-" + uuid.uuid4().hex[:12])
-        cls.paths = materialize(cls.directory, CASES + BOUNDARIES + REVIEW_CASES)
+        cls.paths = materialize(cls.directory, CASES + BOUNDARIES + REVIEW_CASES + COMMAND_CASES + COMMAND_BOUNDARIES)
         cls.analyzer = importlib.import_module("ubs_core.analyzers.taint_csharp_sql")
 
     def scan_case(self, case: Case):
@@ -484,7 +845,7 @@ class DapperNativeTests(unittest.TestCase):
 
 
 def _install_native_tests():
-    for case in CASES + BOUNDARIES + REVIEW_CASES:
+    for case in CASES + BOUNDARIES + REVIEW_CASES + COMMAND_CASES + COMMAND_BOUNDARIES:
         def test(self, case=case):
             self.scan_case(case)
         setattr(DapperNativeTests, "test_" + case.name, test)
@@ -496,7 +857,7 @@ _install_native_tests()
 @unittest.skipUnless(os.environ.get("UBS_CSHARP_SQL_PUBLIC") == "1",
                      "set UBS_CSHARP_SQL_PUBLIC=1 after verified module/helper pins")
 class DapperPublicTests(unittest.TestCase):
-    """Fifteen real commands exercise the same independent semantic labels."""
+    """Real scanner commands exercise the independent semantic labels."""
 
     @classmethod
     def setUpClass(cls):
@@ -530,6 +891,7 @@ class DapperPublicTests(unittest.TestCase):
         attempt.mkdir()
         env = dict(os.environ, UBS_NO_AUTO_UPDATE="1", UBS_ENABLE_AUTO_UPDATE="0",
                    ENABLE_UV_TOOLS="0", PYTHONDONTWRITEBYTECODE="1", NO_COLOR="1",
+                   UBS_KEEP_TEMP="1",
                    UBS_NO_CACHE="0" if cached else "1", UBS_CACHE_DIR=str(self.directory / "cache"),
                    UBS_CACHE_FILE=str(attempt / "cache-stats.json"), TMPDIR=str(attempt))
         if environment:
@@ -580,7 +942,12 @@ class DapperPublicTests(unittest.TestCase):
         if not sql_enabled or not any(case.name == "concatenated_sql_execution_location" for case in cases):
             warnings = []
         inventory = [] if mode.startswith("module-") else [("", "cs.inventory.project", 0, 1, "info")]
-        expected = sorted(sql + warnings + inventory)
+        # The full runner also retains the existing debug advisory from the
+        # unused-command control; the module calls above select security only.
+        debug = ([] if mode.startswith("module-") or not any(
+            case.name == "command_unused_construction_is_not_execution" for case in cases) else [
+                ("command_unused_construction_is_not_execution.cs", "cs.pattern.console-write", 12, 1, "info")])
+        expected = sorted(sql + warnings + inventory + debug)
         self.assertEqual(result.returncode, 2 if partial else int(bool(sql)), context)
         actual = []
         if mode.endswith("sarif"):
@@ -601,14 +968,16 @@ class DapperPublicTests(unittest.TestCase):
         else:
             totals = report if mode.startswith("module-") else report["totals"]
             self.assertEqual((totals["critical"], totals["warning"], totals["info"], totals["files"]),
-                             (len(sql), len(warnings), len(inventory), len(cases)), context)
+                             (len(sql), len(warnings), len(inventory) + len(debug), len(cases)), context)
             self.assertEqual(report["status"], "partial" if partial else "ok", context)
             for row in report["findings"]:
                 rule = row.get("rule", row.get("rule_id"))
                 path = row.get("path", row.get("file"))
                 file = Path(path).name if path else ""
-                self.assertEqual(row["category_id"], "csharp.inventory" if rule == "cs.inventory.project"
-                                 else "csharp.security", context)
+                self.assertEqual(row["category_id"], {
+                    "cs.inventory.project": "csharp.inventory",
+                    "cs.pattern.console-write": "csharp.debug",
+                }.get(rule, "csharp.security"), context)
                 actual.append((file, rule, row["line"], row["col"], row["severity"]))
         self.assertEqual(sorted(actual), expected, context)
 
@@ -625,6 +994,58 @@ class DapperPublicTests(unittest.TestCase):
             with self.subTest(mode=mode):
                 self.assert_report(*self.execute(directory, mode), mode, cases)
 
+    def test_public_command_definitions_in_four_formats(self):
+        directory = self.project("command-complete", COMMAND_CASES)
+        for mode in ("module-json", "module-sarif", "json", "sarif"):
+            with self.subTest(mode=mode):
+                self.assert_report(*self.execute(directory, mode), mode, COMMAND_CASES)
+
+    def test_public_command_definition_clean_controls(self):
+        cases = tuple(case for case in COMMAND_CASES if not case.expected)
+        directory = self.project("command-clean", cases)
+        for mode in ("module-json", "json"):
+            with self.subTest(mode=mode):
+                self.assert_report(*self.execute(directory, mode), mode, cases)
+
+    def test_public_command_boundaries_keep_independent_findings(self):
+        cases = (COMMAND_CASES[0],) + COMMAND_BOUNDARIES
+        directory = self.project("command-partial", cases)
+        for mode in ("module-json", "module-sarif", "json", "sarif"):
+            with self.subTest(mode=mode):
+                self.assert_report(*self.execute(directory, mode), mode, cases, partial=True)
+
+    def test_public_command_selection_category_suppression_and_cache(self):
+        unsafe = next(case for case in COMMAND_CASES if case.name == "command_inline_constructor_is_consumed")
+        clean = next(case for case in COMMAND_CASES if case.name == "command_named_parameters_do_not_become_sql")
+        directory = self.project("command-selected", (unsafe, clean))
+        file_list = self.directory / "command-selected-inputs.nul"
+        file_list.write_bytes(os.fsencode(directory / (clean.name + ".cs")) + b"\0")
+        self.assert_report(*self.execute(directory, extra=("--files-from", str(file_list))),
+                           "module-json", (clean,))
+        self.assert_report(*self.execute(directory, extra=("--skip=8",),
+                                          environment={"UBS_CSHARP_SQL_MAX_TOKENS": "1"}),
+                           "module-json", (unsafe, clean), sql_enabled=False)
+
+        case = Case("command_cache_target", unsafe.code)
+        directory = self.project("command-cache", (case,))
+        for phase in ("cold", "warm"):
+            with self.subTest(phase=phase):
+                self.assert_report(*self.execute(directory, cached=True), "module-json", (case,))
+                stats = json.loads((self.last_attempt / "cache-stats.json").read_text())
+                self.assertEqual((stats["hits"], stats["misses"]), (1, 0) if phase == "warm" else (0, 1))
+        self.assert_report(*self.execute(directory, cached=True,
+                                          environment={"UBS_CSHARP_SQL_MAX_TOKENS": "16"}),
+                           "module-json", (case,), partial=True, expected_sql=[])
+        restricted_stats = json.loads((self.last_attempt / "cache-stats.json").read_text())
+        self.assertEqual(restricted_stats["hits"], 0, restricted_stats)
+        self.assert_report(*self.execute(directory, cached=True), "module-json", (case,))
+        suppressed = Case("command_cache_target", source('''
+            var command = new CommandDefinition(http.Query["sql"].ToString(), commandType: CommandType.Text);
+            db.Execute(command); // ubs:ignore[cs.security.sql-injection]
+        '''))
+        (directory / "command_cache_target.cs").write_text(suppressed.code, encoding="utf-8")
+        self.assert_report(*self.execute(directory, cached=True), "module-json", (suppressed,))
+
     def test_public_partial_preserves_earlier_finding_and_later_file(self):
         cases = (Case("a_partial", BOUNDARIES[-1].code, partial=True),
                  Case("z_neighbor", CASES[5].code))
@@ -633,7 +1054,13 @@ class DapperPublicTests(unittest.TestCase):
             with self.subTest(mode=mode):
                 result, report = self.execute(directory, mode)
                 self.assert_report(result, report, mode, cases, partial=True)
-                self.assertIn("a_partial.cs", result.stderr)
+                if mode.endswith("sarif"):
+                    notifications = [item["message"]["text"] for run in report["runs"]
+                                     for invocation in run.get("invocations", [])
+                                     for item in invocation.get("toolExecutionNotifications", [])]
+                    self.assertTrue(any("a_partial.cs" in text for text in notifications), notifications)
+                else:
+                    self.assertIn("a_partial.cs", result.stderr)
 
     def test_public_file_list_is_the_selected_scope(self):
         unsafe, clean = CASES[5], CASES[8]

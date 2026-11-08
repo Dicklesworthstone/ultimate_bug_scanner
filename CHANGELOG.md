@@ -10,6 +10,14 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Analyze selected C# Dapper `CommandDefinition` execution with captured SQL,
+  separate bound parameters, scoped API identities, local factories and value
+  copies. Cover synchronous and asynchronous eager overloads, named arguments,
+  and known buffering flags. Project `CommandText` and `Parameters` separately;
+  preserve explicit incomplete results for deferred queries, unknown command
+  policies, mutable fields, container projections and unmodeled argument writes.
+  Add independent unsafe, clean, boundary and native JSON/SARIF regressions.
+
 - Keep SQL reducer keys in their lexical scope and evaluate `sorted` keys
   after the generator has drained. Detect unsupported callback effects instead
   of certifying a shadowed generator local as a safe key. Support keyed

@@ -1,12 +1,13 @@
-"""Bounded, in-file ASP.NET request provenance for Dapper string-SQL calls.
+"""Bounded, in-file ASP.NET request provenance for Dapper SQL execution.
 
 This policy reuses the C# lexical frontend, lexical bindings, CFG and local
 helper summaries. API facts establish actual request/connection identities;
 an identifier named ``request`` or an arbitrary ``Query`` method is no proof.
 SQL and separately bound values occupy different argument slots. The selected
 model covers synchronous buffered and ordinary asynchronous string overloads,
-including Type-leading overloads; it does not simulate deferred enumeration,
-CommandDefinition, multimapping, reflection or cross-file mutable effects.
+including Type-leading overloads, and selected immutable CommandDefinition
+values. It does not simulate deferred enumeration, multimapping, reflection or
+cross-file mutable effects.
 
 Signatures were checked against Dapper SqlMapper.cs / SqlMapper.Async.cs at
 eb47546a408bbf6c178bda4f04dc205bc51ffbfe. The scanner needs only Python.
@@ -22,7 +23,7 @@ from typing import Iterable
 from ubs_core.analyzers.taint_csharp_request import CSharpFlow, masked_source, parts
 from ubs_core.registry import Analyzer, RunContext, register
 from ubs_core.suppression import SourceSuppressions
-from ubs_core.taint_flow import AnalysisLimit, Budget, CLEAN, Fact, Trace, join
+from ubs_core.taint_flow import AnalysisLimit, Budget, CLEAN, Fact, Trace, join, retag
 
 RULE = RULE_ID = "cs.security.sql-injection"
 MESSAGE = "Request-derived SQL reaches a Dapper execution call"
@@ -50,6 +51,10 @@ CONTEXT = "Microsoft.AspNetCore.Http.HttpContext"
 CONTROLLERS = frozenset({"Microsoft.AspNetCore.Mvc.ControllerBase", "Microsoft.AspNetCore.Mvc.Controller"})
 MAPPER = "Dapper.SqlMapper"
 COMMAND = "Dapper.CommandDefinition"
+COMMAND_FLAGS = "Dapper.CommandFlags"
+COMMAND_TEXT = "dapper-command-text"
+COMMAND_DATA = "dapper-command-parameters"
+COMMAND_ROLES = frozenset({COMMAND_TEXT, COMMAND_DATA})
 MAIL_ADDRESS = "System.Net.Mail.MailAddress"
 # BCL value types whose static two-argument TryParse(text, out T) writes only a
 # T and returns a Boolean (GH #171). None of them can hold a connection,
@@ -100,7 +105,7 @@ PARSE_OPTION_SHAPES = {
     "System.TimeSpan": frozenset({("provider",)}),
 }
 KNOWN_TYPES = CONNECTIONS | CONTROLLERS | PARSE_TYPES | frozenset(STYLE_MEMBERS) | frozenset(PROVIDER_MEMBERS) | frozenset({
-    REQUEST, CONTEXT, MAPPER, COMMAND, MAIL_ADDRESS, "System.Type", "System.String",
+    REQUEST, CONTEXT, MAPPER, COMMAND, COMMAND_FLAGS, MAIL_ADDRESS, "System.Type", "System.String",
     "System.Object", "System.Data.CommandType",
 })
 PRIMITIVES = {"string": "System.String", "object": "System.Object", "bool": "System.Boolean",
@@ -139,6 +144,18 @@ def identities(fact: Fact) -> frozenset[str]:
 
 def provenance(fact: Fact) -> Fact:
     return frozenset(trace for trace in fact if trace.kind in {"source", "parameter"})
+
+
+def command_property(fact: Fact, role: str) -> Fact:
+    """Project a captured immutable property without merging SQL and data.
+
+    Role tags also survive the shared engine's parameter substitution, so a
+    local factory may return a command built from independent string inputs.
+    Reading the property yields an ordinary value again, including when a
+    caller deliberately uses the Parameters value as SQL text.
+    """
+    selected = frozenset(trace for trace in provenance(fact) if role in trace.tags)
+    return retag(selected, remove=COMMAND_ROLES)
 
 
 @dataclass(frozen=True)
@@ -307,6 +324,14 @@ class DapperFlow(CSharpFlow):
         self.current_issues = set()
         self.extension_actuals = {}
         self.ambiguous_extensions = set()
+        self.command_fields = set()
+        declaration = re.compile(r"\b((?:global::)?[\w@.]+)\s+(@?\w+)\s*(?=[=;{])")
+        for match in declaration.finditer(self.code):
+            if self.types.resolve(match.group(1), match.start()) != COMMAND:
+                continue
+            if not any(function.start <= match.start() < function.end
+                       for key, function in self.parser.functions.items() if key >= 0):
+                self.command_fields.add(match.group(2).lstrip("@"))
 
     def incomplete(self, position, reason):
         location = self.step(position, "boundary", reason)
@@ -340,6 +365,23 @@ class DapperFlow(CSharpFlow):
             current = identities(value)
         if REQUEST in current and members and members[0] in REQUEST_MEMBERS:
             return self.source_fact(position, name)
+        if COMMAND in current and members:
+            if not any(trace.kind == "dapper-command" for trace in value):
+                self.incomplete(position, "CommandDefinition property requires a captured local value")
+                return CLEAN
+            if members[0] == "CommandText":
+                return command_property(value, COMMAND_TEXT)
+            if members[0] == "Parameters":
+                return command_property(value, COMMAND_DATA)
+            if members[0] in {"CommandType", "CommandTimeout", "Transaction", "Flags",
+                               "Buffered", "Pipelined", "CancellationToken"}:
+                return CLEAN
+            self.incomplete(position, "CommandDefinition member is outside the selected property model")
+            return api_fact(COMMAND)
+        if ((root in self.command_fields and root not in bindings)
+                or (root == "this" and members and members[0] in self.command_fields)):
+            self.incomplete(position, "CommandDefinition field requires mutable member-state analysis")
+            return api_fact(COMMAND)
         if members:
             # Members of an arbitrary local object are not ASP.NET sources.
             return provenance(value)
@@ -593,6 +635,93 @@ class DapperFlow(CSharpFlow):
             return None
         return kinds.pop()
 
+    def command_slots(self, call, formals):
+        slots = {}
+        for index, (keyword, _, _) in enumerate(call.args):
+            slot = keyword if keyword is not None else formals[index] if index < len(formals) else ""
+            if slot not in formals or slot in slots:
+                self.incomplete(call.position, "CommandDefinition argument binding is unresolved")
+                return None
+            slots[slot] = index
+        return slots
+
+    def command_enum_member(self, call, spelling, identity):
+        qualifier, _, member = spelling.rpartition(".")
+        if not qualifier or self.types.resolve(qualifier, call.position) != identity:
+            return None
+        if (not qualifier.startswith("global::")
+                and not self.unshadowed_type_root(qualifier.split(".")[0], call)):
+            return None
+        return member
+
+    def command_value(self, call):
+        """Capture the readonly struct's SQL and parameter operands separately."""
+        formals = ("commandText", "parameters", "transaction", "commandTimeout",
+                   "commandType", "flags", "cancellationToken")
+        slots = self.command_slots(call, formals)
+        if slots is None or "commandText" not in slots:
+            self.incomplete(call.position, "CommandDefinition requires a resolved commandText argument")
+            return api_fact(COMMAND)
+        text = retag(provenance(call.values[slots["commandText"]]),
+                     remove=COMMAND_ROLES, add=frozenset({COMMAND_TEXT}))
+        data = (retag(provenance(call.values[slots["parameters"]]),
+                      remove=COMMAND_ROLES, add=frozenset({COMMAND_DATA}))
+                if "parameters" in slots else CLEAN)
+        mode = "text"
+        if "commandType" in slots:
+            _, low, high = call.args[slots["commandType"]]
+            spelling = re.sub(r"\s|@", "", self.code[low:high])
+            if spelling != "null" and self.command_enum_member(call, spelling, "System.Data.CommandType") != "Text":
+                mode = "unresolved"
+        # The default infers command type from the SQL text. Attacker-controlled
+        # text can supply an ad-hoc statement; an explicit stored-procedure
+        # command remains a separate, unsupported execution policy.
+        buffered = "yes"
+        if "flags" in slots:
+            _, low, high = call.args[slots["flags"]]
+            spellings = re.sub(r"\s|@", "", self.code[low:high]).split("|")
+            flags = {self.command_enum_member(call, spelling, COMMAND_FLAGS) for spelling in spellings}
+            if not flags or not flags <= {"None", "Buffered", "Pipelined", "NoCache"}:
+                buffered = "unresolved"
+            else:
+                buffered = "yes" if "Buffered" in flags else "no"
+        policy = frozenset({Trace("dapper-command", (mode, buffered))})
+        return join(api_fact(COMMAND), text, data, policy)
+
+    def selected_command(self, call, *, static, typed, arity, family, asynchronous):
+        # CommandDefinition has no synchronous Type-leading overload; the
+        # synchronous row/query overloads require a generic result type.
+        if ((typed and not asynchronous)
+                or (not asynchronous and family.startswith("Query") and arity != 1)
+                or (family == "Execute" and arity)):
+            self.incomplete(call.position, "Dapper CommandDefinition overload is unresolved")
+            return None
+        formals = (["cnn"] if static else []) + (["type"] if typed else []) + ["command"]
+        slots = self.command_slots(call, formals)
+        if slots is None:
+            return None
+        if set(slots) != set(formals):
+            self.incomplete(call.position, "Dapper CommandDefinition call arguments are unresolved")
+            return None
+        if static and not identities(call.values[slots["cnn"]]) & CONNECTIONS:
+            self.incomplete(call.position, "Static Dapper connection argument is unresolved")
+            return None
+        if typed and "System.Type" not in identities(call.values[slots["type"]]):
+            self.incomplete(call.position, "Dapper CommandDefinition result type is unresolved")
+            return None
+        value = call.values[slots["command"]]
+        policies = {trace.key for trace in value if trace.kind == "dapper-command"}
+        if COMMAND not in identities(value) or not policies:
+            self.incomplete(call.position, "Dapper CommandDefinition execution requires a captured local value")
+            return None
+        if any(mode != "text" for mode, _ in policies):
+            self.incomplete(call.position, "Dapper command type is outside the selected text-SQL model")
+            return None
+        if family == "Query" and any(buffered != "yes" for _, buffered in policies):
+            self.incomplete(call.position, "Deferred or unknown CommandDefinition buffering requires enumeration analysis")
+            return None
+        return slots["command"]
+
     def selected_call(self, call):
         """Return the SQL slot only after resolving receiver, overload and mode."""
         name, args, values, receiver = call.name, call.args, call.values, call.receiver
@@ -625,6 +754,9 @@ class DapperFlow(CSharpFlow):
                 return None
             if any(item.startswith("local:") for item in receiver_types) or owner.startswith("local:"):
                 return None
+            if COMMAND in receiver_types:
+                self.incomplete(position, "SQL execution through a CommandDefinition member is unresolved")
+                return None
             if "." in raw and (provenance(join(*values)) or receiver_types & {"dynamic"}):
                 self.incomplete(position, "SQL execution receiver or Dapper dispatch is unresolved")
             return None
@@ -636,9 +768,6 @@ class DapperFlow(CSharpFlow):
         if arity > 1 or any("=>" in self.code[low:high] for _, low, high in args):
             self.incomplete(position, "Dapper multimapping overload is outside the selected model")
             return None
-        if any(COMMAND in identities(value) for value in values) or any(key == "command" for key, _, _ in args):
-            self.incomplete(position, "Dapper CommandDefinition execution is outside the selected model")
-            return None
         # Positional Type is after cnn for static calls; named arguments may be
         # in any legal order, and generic string overloads have no Type slot.
         first = 1 if static else 0
@@ -648,6 +777,11 @@ class DapperFlow(CSharpFlow):
         if typed and (arity or family not in {"Query", "QueryFirst", "QueryFirstOrDefault", "QuerySingle", "QuerySingleOrDefault"}):
             self.incomplete(position, "Unresolved Type-leading Dapper overload")
             return None
+        command_position = first + int(typed)
+        if (any(key == "command" for key, _, _ in args)
+                or (len(values) > command_position and COMMAND in identities(values[command_position]))):
+            return self.selected_command(call, static=static, typed=typed, arity=arity,
+                                         family=family, asynchronous=asynchronous)
         formals = (["cnn"] if static else []) + (["type"] if typed else []) + ["sql", "param", "transaction"]
         if family == "Query" and not asynchronous:
             formals.append("buffered")
@@ -689,7 +823,7 @@ class DapperFlow(CSharpFlow):
         if constructor:
             identity = self.types.resolve(raw, position)
             if identity == COMMAND:
-                self.incomplete(position, "Dapper CommandDefinition construction is outside the selected model")
+                return self.command_value(call)
             return join(api_fact(identity), provenance(join(*values)))
         method = name.split(".")[-1]
         family = method[:-5] if method.endswith("Async") else method
@@ -697,6 +831,11 @@ class DapperFlow(CSharpFlow):
             # SQL execution return values are not new request sources.
             return CLEAN
         source = self.name_value(name.rsplit(".", 1)[0], position, state, bindings) if "." in name else CLEAN
+        if method == "ToString" and COMMAND in identities(receiver):
+            # The struct's own Object.ToString does not expose its SQL/data.
+            # Property conversion reads only the selected property; the shared
+            # evaluator's receiver is the root local, not the member value.
+            return provenance(source) if name.count(".") > 1 else CLEAN
         if method in {"ToString", "ConfigureAwait", "AsString"}:
             return provenance(join(receiver, source))
         if raw in {"string.Format", "System.String.Format", "global::System.String.Format",
@@ -706,14 +845,88 @@ class DapperFlow(CSharpFlow):
             return CLEAN
         if any(re.match(r"\s*(?:ref|out)\b", self.code[low:high]) for _, low, high in args):
             self.incomplete(position, "Unresolved ref/out call effects require cross-file analysis")
-        elif (identities(join(receiver, *values)) & (CONNECTIONS | {REQUEST, CONTEXT})
+        elif (identities(join(receiver, *values)) & (CONNECTIONS | {REQUEST, CONTEXT, COMMAND})
               or any(trace.kind == "source" for trace in join(receiver, *values))):
             self.incomplete(position, "Unresolved external call effects require cross-file analysis")
         return provenance(join(receiver, source, *values))
 
     def call_sink_facts(self, call):
         index = self.selected_call(call)
-        return [(index, provenance(call.values[index]))] if index is not None else []
+        if index is None:
+            return []
+        value = call.values[index]
+        return [(index, command_property(value, COMMAND_TEXT) if COMMAND in identities(value) else provenance(value))]
+
+    def evaluate(self, start, end, state, bindings, depth=0):
+        value = super().evaluate(start, end, state, bindings, depth)
+        if self.expression_write(start, end):
+            # The shared expression walker captures argument values but does
+            # not perform embedded assignments. Their later-argument effects
+            # cannot supply a valid command snapshot or a proven SQL operand.
+            self.incomplete(start, "SQL expression assignment requires ordered value/effect analysis")
+            return CLEAN
+        if COMMAND in identities(value):
+            # The shared evaluator joins aggregate operands; it has no selected
+            # element identity or heap-write transport. A command reached via
+            # such an expression must not inherit a stale constructor proof.
+            position = start
+            while position < end:
+                char = self.code[position]
+                if char == "[" or char == "{":
+                    self.incomplete(position, "CommandDefinition container access requires element-state analysis")
+                    return api_fact(COMMAND)
+                if char == "(":
+                    position = self.parser.pairs[position] + 1
+                else:
+                    position += 1
+        return value
+
+    def expression_write(self, start, end, *, initializer=True):
+        if (initializer and self.code[start - 1:start] == "{"
+                and self.parser.pairs.get(start - 1) == end):
+            for low, high in parts(self.code, start, end, generics=True):
+                # The shared evaluator also visits an initializer's contents
+                # without its braces, so recognize that same context here.
+                member = re.match(r"\s*@?\w+\s*=(?!=|>)", self.code[low:high])
+                if self.expression_write(low + member.end() if member else low, high, initializer=False):
+                    return True
+            return False
+        position = start
+        while position < end:
+            self.budget.spend()
+            char = self.code[position]
+            if char in "([{":
+                close = self.parser.pairs[position]
+                if self.expression_write(position + 1, close):
+                    return True
+                position = close + 1
+                continue
+            if (char == "=" and self.code[position - 1:position] not in {"=", "!", "<", ">"}
+                    and self.code[position + 1:position + 2] not in {"=", ">"}):
+                return True
+            position += 1
+        return False
+
+    def transfer(self, action, state):
+        # Target-typed new and default-valued command locals need construction
+        # semantics beyond the shared lexical evaluator. Do not reinterpret
+        # their joined constructor operands as the string-SQL overload.
+        start, end = action.span
+        declaration = re.match(r"\s*((?:global::)?[\w@.]+)\s+(@?\w+)\s*=", self.code[start:end])
+        assignment = re.match(r"\s*(@?\w+)\s*=(?!=|>)", self.code[start:end])
+        old_cell = action.bindings.get(assignment.group(1).lstrip("@")) if assignment else None
+        was_command = COMMAND in identities(state.get(old_cell, CLEAN))
+        result = super().transfer(action, state)
+        if declaration and self.types.resolve(declaration.group(1), start) == COMMAND:
+            cell = action.bindings.get(declaration.group(2).lstrip("@"))
+            value = result.get(cell, CLEAN)
+            if cell and COMMAND not in identities(value):
+                self.incomplete(start, "CommandDefinition initializer requires explicit captured construction")
+                result[cell] = api_fact(COMMAND)
+        elif was_command and COMMAND not in identities(result.get(old_cell, CLEAN)):
+            self.incomplete(start, "CommandDefinition replacement requires explicit captured construction")
+            result[old_cell] = api_fact(COMMAND)
+        return result
 
     def analyze_function(self, function, context):
         self.current_issues = set()

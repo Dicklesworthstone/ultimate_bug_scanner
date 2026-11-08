@@ -987,6 +987,8 @@ class SwiftEngine:
         else:
             unsafe = frozenset(trace for trace in swift_tainted(value)
                 if 'contained-path' not in trace.tags and not (file_leaf and 'file-leaf' in trace.tags))
+        if any('unknown-provenance' in trace.tags for trace in unsafe):
+            raise ValueError('Swift unknown closure parameter reaches a sink; analysis is incomplete')
         if unsafe:
             self.effects[offset] = join(self.effects.get(offset, CLEAN),
                 advance(unsafe, self.step(offset, 'sink', self.sink_label)))
@@ -1493,7 +1495,17 @@ class SwiftEngine:
                 and trace.key[0] in {'request', 'request-collection', 'request-content'})
             argument = join(self.forget(argument), requests)
         else:
-            raise ValueError('Swift escaping/trailing closure needs capture analysis; analysis is incomplete')
+            # Unknown call: the closure parameter has unknown provenance. It is
+            # request-tainted if the receiver or any argument is (call() folds the
+            # call's argument taint into the receiver value). Otherwise it carries an
+            # 'unknown-provenance' source so that reaching a sink's checked position
+            # refuses -- an unknown call may invoke the closure with a request.
+            requests = frozenset(trace for trace in receiver if trace.kind == 'shape'
+                and trace.key[0] in {'request', 'request-collection', 'request-content'})
+            argument = join(self.forget(receiver), requests)
+            if not swift_request_dependency(argument):
+                argument = join(argument, retag(self.source(tokens[0].start, 'unknown closure parameter'),
+                                                add=frozenset({'unknown-provenance'})))
         value = self.inline_closure(tokens, argument, state, bindings, depth + 1,
                                     catches_errors=name in {'#expect', '#require'})
         # A method name also does not prove that its result is exactly the

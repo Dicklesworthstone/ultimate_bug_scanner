@@ -2,7 +2,7 @@
 
 Selected administrative ingress, public S3 ACLs, unrestricted IAM policy intent,
 and disabled AWS provider TLS verification are checked.
-Selected .tf files in one directory share locals and resource identities. Input
+Selected .tf and .tf.json files in one directory share locals and resource identities. Input
 variables, remote modules, templates and dynamic relevant configuration remain
 unknown. A complete result describes these selected checks, never deployed
 reachability or comprehensive infrastructure security.
@@ -10,8 +10,10 @@ reachability or comprehensive infrastructure security.
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_right
 from dataclasses import dataclass
 import datetime
+from decimal import Decimal, InvalidOperation
 import hashlib
 import ipaddress
 import json
@@ -83,6 +85,7 @@ class Token:
 class Attribute:
     anchor: Token
     tokens: tuple[Token, ...]
+    json_value: JSONValue | None = None
 
 
 @dataclass
@@ -257,6 +260,202 @@ class Parser:
         return attributes, blocks
 
 
+@dataclass(frozen=True)
+class JSONValue:
+    """An ordered JSON value, retaining duplicates and exact source spans."""
+    kind: str
+    anchor: Token
+    end: Token
+    items: tuple = ()
+    tokens: tuple[Token, ...] = ()
+
+
+class JSONParser:
+    """Lower the selected Terraform JSON schema into the native block model.
+
+    JSON objects represent both bodies and expressions. Preserve their member
+    sequence until the schema decides which interpretation applies; ordinary
+    json.loads would silently discard valid repeated blocks or invalid keys.
+    """
+    token_pattern = re.compile(
+        r'[ \t\r\n]+|"(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"'
+        r'|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?'
+        r'|true|false|null|[{}\[\],:]')
+    root_labels = {
+        "terraform": 0, "locals": 0, "variable": 1, "output": 1,
+        "provider": 1, "resource": 2, "data": 2, "module": 1,
+        "moved": 0, "removed": 0, "import": 0, "check": 1, "ephemeral": 2,
+    }
+
+    def __init__(self, text: str, path: str):
+        self.text, self.path, self.comments = text, path, []
+        self.tokens, self.cursor, self.expanded_tokens = [], 0, 0
+        starts = [0, *(match.end() for match in re.finditer("\n", text))]
+        pos = 0
+        while pos < len(text):
+            match = self.token_pattern.match(text, pos)
+            line = bisect_right(starts, pos)
+            if match is None:
+                raise Incomplete(f"line {line}: invalid Terraform JSON token")
+            raw, end = match.group(), match.end()
+            if not raw.isspace():
+                kind, value = "symbol", raw
+                if raw.startswith('"'):
+                    kind = "string"
+                    try:
+                        value = json.loads(raw)
+                        value.encode("utf-8")
+                    except (ValueError, UnicodeError) as exc:
+                        raise Incomplete(f"line {line}: invalid Terraform JSON string") from exc
+                elif raw[0] in "-0123456789":
+                    kind = "number"
+                elif raw in {"true", "false", "null"}:
+                    kind = "word"
+                self.tokens.append(Token(kind, value, pos, end, line, pos - starts[line - 1] + 1))
+                if len(self.tokens) > MAX_TOKENS:
+                    raise Incomplete("Terraform JSON token budget exhausted")
+            pos = end
+        self.root = self.value(0)
+        if self.cursor != len(self.tokens):
+            raise Incomplete("extra content after Terraform JSON configuration")
+
+    def take(self, expected=None):
+        if self.cursor >= len(self.tokens):
+            raise Incomplete("unexpected end of Terraform JSON configuration")
+        token = self.tokens[self.cursor]
+        if expected is not None and (token.kind != "symbol" or token.value != expected):
+            raise Incomplete(f"line {token.line}: expected JSON {expected!r}")
+        self.cursor += 1
+        return token
+
+    def value(self, depth):
+        if depth > MAX_NESTING:
+            raise Incomplete("Terraform JSON nesting budget exhausted")
+        token = self.take()
+        if token.kind != "symbol":
+            return JSONValue(token.kind, token, token)
+        if token.value not in {"{", "["}:
+            raise Incomplete(f"line {token.line}: expected a JSON value")
+        kind, close = ("object", "}") if token.value == "{" else ("array", "]")
+        items = []
+        if (self.cursor < len(self.tokens) and self.tokens[self.cursor].kind == "symbol"
+                and self.tokens[self.cursor].value == close):
+            return JSONValue(kind, token, self.take(close))
+        while True:
+            if kind == "object":
+                key = self.take()
+                if key.kind != "string":
+                    raise Incomplete(f"line {key.line}: JSON object property must be a string")
+                self.take(":")
+                items.append((JSONValue("string", key, key), self.value(depth + 1)))
+            else:
+                items.append(self.value(depth + 1))
+            separator = self.take()
+            if separator.kind == "symbol" and separator.value == close:
+                return JSONValue(kind, token, separator, tuple(items))
+            if separator.kind != "symbol" or separator.value != ",":
+                raise Incomplete(f"line {separator.line}: expected JSON comma or closing delimiter")
+
+    def objects(self, node):
+        values = node.items if node.kind == "array" else (node,)
+        for value in values:
+            if value.kind != "object":
+                raise Incomplete(f"line {value.anchor.line}: Terraform JSON body or labels require objects")
+            yield value
+
+    def expression(self, node, *, literal=False):
+        if node.kind == "array":
+            items = tuple(self.expression(item, literal=literal) for item in node.items)
+        elif node.kind == "object":
+            items = tuple((self.expression(key, literal=literal), self.expression(value, literal=literal))
+                          for key, value in node.items)
+        else:
+            items = ()
+        tokens = (node.anchor,)
+        if node.kind == "string":
+            anchor, value = node.anchor, node.anchor.value
+            if literal:
+                tokens = (anchor,)
+            elif not re.search(r"(?<!\$)\$\{|(?<!%)%\{", value):
+                tokens = (Token("string", value.replace("$${", "${").replace("%%{", "%{"),
+                                anchor.start, anchor.end, anchor.line, anchor.col),)
+            else:
+                tokens = (Token("unknown", "unsupported Terraform JSON string template",
+                                anchor.start, anchor.end, anchor.line, anchor.col),)
+                if value.startswith("${") and value.endswith("}"):
+                    inner = value[2:-1]
+                    try:
+                        expression = Parser(inner, self.path)
+                        if any(comment.end == len(inner) and not comment.value.startswith("/*")
+                               for comment in expression.comments):
+                            raise Incomplete("line comment hides the interpolation closing delimiter")
+                    except Incomplete:
+                        pass
+                    else:
+                        self.expanded_tokens += len(expression.tokens)
+                        if len(self.tokens) + self.expanded_tokens > MAX_TOKENS:
+                            raise Incomplete("Terraform JSON expression token budget exhausted")
+                        tokens = tuple(Token(token.kind, token.value, anchor.start, anchor.end,
+                                             anchor.line, anchor.col) for token in expression.tokens)
+        return JSONValue(node.kind, node.anchor, node.end, items, tokens)
+
+    @staticmethod
+    def child_labels(kind, labels):
+        if kind == "terraform":
+            return {"required_providers": 0, "backend": 1, "cloud": 0, "provider_meta": 1}
+        if kind == "data" and labels[:1] == ("aws_iam_policy_document",):
+            return {"statement": 0, "dynamic": 1, "lifecycle": 0}
+        if kind == "statement":
+            return {"condition": 0, "principals": 0, "not_principals": 0, "dynamic": 1}
+        if kind == "resource" and labels[:1] == ("aws_s3_bucket_ownership_controls",):
+            return {"rule": 0, "dynamic": 1, "lifecycle": 0}
+        if kind in {"resource", "data", "ephemeral"}:
+            # Security-group ingress is SchemaConfigModeAttr in the AWS
+            # provider: JSON always treats it as an expression, not blocks.
+            return {"dynamic": 1, "lifecycle": 0, "provisioner": 1, "connection": 0}
+        if kind == "dynamic":
+            return {"content": 0}
+        return {}
+
+    def blocks(self, kind, node, remaining, anchor, labels=(), *, literal=False):
+        if remaining:
+            for mapping in self.objects(node):
+                for key, value in mapping.items:
+                    yield from self.blocks(kind, value, remaining - 1, key.anchor,
+                                           (*labels, key.anchor.value), literal=literal)
+            return
+        for body in self.objects(node):
+            attributes, children = self.body(body, kind, labels, literal=literal or kind == "terraform")
+            location = body.anchor if node.kind == "array" and len(node.items) > 1 else anchor
+            yield Block(kind, labels, location, attributes, children, self.path, body.anchor.end)
+
+    def body(self, node=None, kind="", labels=(), *, literal=False):
+        node = self.root if node is None else node
+        schema = self.root_labels if not kind else self.child_labels(kind, labels)
+        attributes, blocks = {}, []
+        for body in self.objects(node):
+            for key, value in body.items:
+                name, anchor = key.anchor.value, key.anchor
+                if name == "//":
+                    continue  # Comment properties have meaning only in bodies.
+                if name in schema:
+                    blocks.extend(self.blocks(name, value, schema[name], anchor, literal=literal))
+                    continue
+                if not kind:
+                    raise Incomplete(f"line {anchor.line}: unsupported Terraform JSON root property {name}")
+                if name in attributes:
+                    raise Incomplete(f"line {anchor.line}: duplicate attribute {name}")
+                static = (literal or kind == "variable"
+                          or kind == "provider" and name in {"alias", "version"}
+                          or kind == "output" and name in {"description", "sensitive"}
+                          or kind == "module" and name in {"source", "version", "providers"}
+                          or kind in {"resource", "data", "ephemeral"} and name in {"provider", "depends_on"})
+                expression = self.expression(value, literal=static)
+                tokens = expression.tokens if value.kind not in {"object", "array"} else (value.anchor, value.end)
+                attributes[name] = Attribute(anchor, tokens, expression)
+        return attributes, blocks
+
+
 def split_items(tokens: tuple[Token, ...], *, newlines: bool = False) -> list[tuple[Token, ...]]:
     result, start, depth = [], 0, 0
     for index, token in enumerate(tokens):
@@ -283,6 +482,8 @@ class Values:
         self.encoded_bytes = 0
         self.decoded_bytes = 0
         self.evaluations = 0
+        self.evaluation_depth = 0
+        self.limits = set()
         for block in blocks:
             if block.kind == "locals" and not block.labels:
                 for name, attribute in block.attributes.items():
@@ -290,10 +491,84 @@ class Values:
                         self.duplicate_locals.add(name)
                     self.locals[name] = attribute
 
-    def evaluate(self, tokens: tuple[Token, ...], visiting: tuple[str, ...] = ()):
+    def evaluate_attribute(self, attribute: Attribute, visiting=()):
+        if attribute.json_value is not None:
+            return self.evaluate_json(attribute.json_value, visiting)
+        return self.evaluate(attribute.tokens, visiting)
+
+    def limited(self, reason):
+        self.limits.add(reason)
+        return Unknown(reason)
+
+    @staticmethod
+    def number(value):
+        # HCL numbers are decimal in both syntaxes. A rounded binary float
+        # must not prove an integral port, protocol or resource count.
+        try:
+            exact = Decimal(value)
+            if exact and abs(exact.adjusted()) > 308:
+                return Unknown("HCL number is outside the supported range")
+            if exact == exact.to_integral_value():
+                return int(exact)
+            number = float(exact)
+            if Decimal(str(number)) == exact:
+                return number
+        except (InvalidOperation, ValueError, OverflowError):
+            pass
+        return Unknown("HCL number requires unsupported precision")
+
+    def evaluate_json(self, node: JSONValue, visiting=()):
+        self.evaluation_depth += 1
+        try:
+            if self.evaluation_depth > MAX_NESTING:
+                return self.limited("HCL expression nesting budget exhausted")
+            return self.json_value(node, visiting)
+        finally:
+            self.evaluation_depth -= 1
+
+    def json_value(self, node: JSONValue, visiting):
         self.evaluations += 1
         if self.evaluations > MAX_EVALUATIONS:
-            return Unknown("HCL expression evaluation budget exhausted")
+            return self.limited("HCL expression evaluation budget exhausted")
+        if node.kind == "array":
+            return [self.evaluate_json(item, visiting) for item in node.items]
+        if node.kind == "object":
+            result = {}
+            for key_node, value_node in node.items:
+                key = self.evaluate_json(key_node, visiting)
+                if isinstance(key, Unknown):
+                    return Unknown("unresolved Terraform JSON object key", cyclic=key.cyclic)
+                if type(key) is bool:
+                    key = "true" if key else "false"
+                elif isinstance(key, int):
+                    key = str(key)
+                elif isinstance(key, float) and math.isfinite(key):
+                    key = format(Decimal(str(key)), "f")
+                    if "." in key:
+                        key = key.rstrip("0").rstrip(".")
+                if not isinstance(key, str):
+                    return Unknown("Terraform JSON object key cannot be converted to a string")
+                if key in result:
+                    return Unknown("duplicate Terraform JSON expression object key")
+                result[key] = self.evaluate_json(value_node, visiting)
+            return result
+        if node.kind == "number":
+            return self.number(node.anchor.value)
+        return self.evaluate(node.tokens, visiting)
+
+    def evaluate(self, tokens: tuple[Token, ...], visiting: tuple[str, ...] = ()):
+        self.evaluation_depth += 1
+        try:
+            if self.evaluation_depth > MAX_NESTING:
+                return self.limited("HCL expression nesting budget exhausted")
+            return self.native_value(tokens, visiting)
+        finally:
+            self.evaluation_depth -= 1
+
+    def native_value(self, tokens: tuple[Token, ...], visiting: tuple[str, ...]):
+        self.evaluations += 1
+        if self.evaluations > MAX_EVALUATIONS:
+            return self.limited("HCL expression evaluation budget exhausted")
         low, high = 0, len(tokens)
         while low < high and tokens[low].kind == "newline":
             low += 1
@@ -307,14 +582,12 @@ class Values:
             return Unknown("local expression budget exhausted")
         if len(tokens) == 1:
             token = tokens[0]
+            if token.kind == "unknown":
+                return Unknown(token.value)
             if token.kind == "string":
                 return token.value
             if token.kind == "number":
-                try:
-                    number = float(token.value) if re.search(r"[.eE]", token.value) else int(token.value)
-                    return number if not isinstance(number, float) or math.isfinite(number) else Unknown("number is outside the supported range")
-                except ValueError:
-                    return Unknown("invalid number")
+                return self.number(token.value)
             if token.value in {"true", "false", "null"}:
                 return {"true": True, "false": False, "null": None}[token.value]
         raw = "".join(t.value for t in tokens)
@@ -325,7 +598,7 @@ class Values:
             if name not in self.locals:
                 return Unknown(f"unresolved local {name}")
             if name not in self.memo:
-                value = self.evaluate(self.locals[name].tokens, (*visiting, name))
+                value = self.evaluate_attribute(self.locals[name], (*visiting, name))
                 # Terraform depends on the entire local expression, even
                 # when a caller selects one object member. Cache a cycle
                 # before projection; immutable cached values need no rescan.
@@ -380,7 +653,7 @@ class Values:
 
     def attribute(self, block: Block, name: str, default=None, *, visiting: tuple[str, ...] = ()):
         attribute = block.attributes.get(name)
-        return self.evaluate(attribute.tokens, visiting) if attribute else default
+        return self.evaluate_attribute(attribute, visiting) if attribute else default
 
     def encode_json(self, value):
         if unknown(value):
@@ -536,8 +809,9 @@ class Module:
             try:
                 if len(text.encode("utf-8")) > MAX_SOURCE_BYTES:
                     raise Incomplete("HCL source byte budget exhausted")
-                parser = Parser(text, path)
-                attributes, blocks = parser.body(0, len(parser.tokens))
+                parser = JSONParser(text, path) if path.endswith(".tf.json") else Parser(text, path)
+                attributes, blocks = (parser.body() if isinstance(parser, JSONParser)
+                                      else parser.body(0, len(parser.tokens)))
                 if attributes:
                     raise Incomplete("Terraform .tf files require top-level blocks, not variable assignments")
                 self.parsers[path] = parser
@@ -560,7 +834,7 @@ class Module:
                     if child.kind == "required_providers":
                         for name, attr in child.attributes.items():
                             self.required[name] = (Unknown("duplicate provider requirement") if name in self.required
-                                                   else self.values.evaluate(attr.tokens))
+                                                   else self.values.evaluate_attribute(attr))
         # Provider identity must be established before a data source can use
         # that provider's semantics. Do not retain provisional local values
         # evaluated while the data-source resolver was intentionally disabled.
@@ -699,10 +973,14 @@ class Module:
         if attribute is None:
             return None
         raw = "".join(t.value for t in attribute.tokens)
-        match = re.fullmatch(r"aws_s3_bucket\.([A-Za-z_][\w-]*)\.(?:id|bucket)", raw)
+        traversal = (len(attribute.tokens) == 5
+                     and all(attribute.tokens[index].kind == "word" for index in (0, 2, 4))
+                     and all(attribute.tokens[index].kind == "symbol" and attribute.tokens[index].value == "."
+                             for index in (1, 3)))
+        match = re.fullmatch(r"aws_s3_bucket\.([A-Za-z_][\w-]*)\.(?:id|bucket)", raw) if traversal else None
         if match:
             return (provider, "reference", match.group(1))
-        name = self.values.evaluate(attribute.tokens)
+        name = self.values.evaluate_attribute(attribute)
         if isinstance(name, str):
             matches = [resource for resource in self.resources if resource.labels[0] == "aws_s3_bucket"
                        and self.values.attribute(resource, "bucket") == name and self.provider(resource) == provider]
@@ -1063,6 +1341,7 @@ class Module:
                 self.acl(block, provider, protections)
         if TLS in self.enabled:
             self.provider_tls()
+        self.errors.extend(sorted(self.values.limits))
         return self.findings, list(dict.fromkeys(self.errors))
 
 
@@ -1127,8 +1406,8 @@ def main(argv=None) -> int:
     total_bytes = 0
     for path in files:
         try:
-            if path.suffix != ".tf":
-                raise Incomplete("only native Terraform .tf configuration is supported; tfvars and JSON are not configuration inputs")
+            if path.suffix != ".tf" and not path.name.endswith(".tf.json"):
+                raise Incomplete("only Terraform .tf and .tf.json configuration is supported; tfvars and generic JSON are not configuration inputs")
             with path.open("rb") as source:
                 data = source.read(MAX_SOURCE_BYTES + 1)
             total_bytes += len(data)
@@ -1142,7 +1421,7 @@ def main(argv=None) -> int:
     context = hashlib.sha256(json.dumps(sources, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
     cache = ScanCache(lang="hcl", project_dir=args.project_dir,
                       skip=",".join(map(str, sorted((CATEGORIES - args.only) | args.skip))),
-                      extra="aws-config-v5:" + context)
+                      extra="aws-config-v6:" + context)
     cached, pending = cache.partition_files(files)
     sink = CapturingSink()
     if pending:

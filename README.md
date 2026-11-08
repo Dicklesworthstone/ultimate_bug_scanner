@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.5.49-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.5.50-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -340,8 +340,8 @@ and [REVOKE semantics](https://www.postgresql.org/docs/current/sql-revoke.html).
 
 #### Terraform AWS configuration
 
-Native `.tf` files have four bounded AWS checks, without running Terraform,
-loading provider plugins, or contacting AWS:
+Native `.tf` and generated `.tf.json` configuration files have four bounded AWS
+checks, without running Terraform, loading provider plugins, or contacting AWS:
 
 ```bash
 ubs --only=hcl --fail-on-warning --format=json infrastructure/
@@ -351,7 +351,7 @@ ubs explain hcl.aws.public-admin-ingress
 
 `hcl.aws.public-admin-ingress` warns when an explicit world IPv4 or IPv6 CIDR
 allows TCP SSH/RDP ports (22/3389), including a containing port range, or all IP
-protocols. It supports inline `aws_security_group` ingress, legacy
+protocols. It supports native inline `aws_security_group` ingress, legacy
 `aws_security_group_rule`, and `aws_vpc_security_group_ingress_rule`. Public
 HTTP/HTTPS, UDP-only rules, restricted source networks and egress are separate
 from this administrative-ingress policy.
@@ -395,15 +395,26 @@ plugins do not acquire AWS semantics from a similarly named option.
 
 Selected files in the same directory share literal/local values and protective
 resource identities; nested directories remain distinct Terraform modules.
-Changes to any selected context file invalidate cached results. Actual `#`,
+Native and JSON files can provide configuration for each other. JSON files
+participate in automatic discovery, direct-file scans, and staged selections.
+The JSON frontend follows Terraform's [expression and block mappings](https://developer.hashicorp.com/terraform/language/syntax/json):
+a single `${...}` interpolation retains its value type, ordinary reference-shaped
+strings remain literal, and provider references and literal settings keep their
+distinct semantics. Repeated block properties retain their order; duplicate
+attributes or evaluated expression keys are invalid. Nonempty JSON security-group
+`ingress` attributes and unsupported mixed templates remain explicitly incomplete.
+
+Changes to any selected context file invalidate cached results. Native `#`,
 `//` and block comments support scoped `ubs:ignore[rule-id]`; quoted strings,
-templates and heredocs cannot act as suppression comments. Categories are
+templates and heredocs cannot act as suppression comments. JSON `"//"` body
+properties are ignored as configuration comments, while `"//"` expression-object
+keys remain ordinary data. Categories are
 `hcl.network` (1), `hcl.storage` (2), `hcl.iam` (3) and `hcl.tls` (4), including
 `--skip-hcl=3` and `.ubs.json` policy. All four rules emit warnings; `--fail-on-warning` or the strict profile
 makes them fail the scan.
 
-This first slice does not evaluate Terraform plans, state, remote modules,
-input variables, `.tfvars`, `.tf.json`, arbitrary functions or dynamic ingress.
+This bounded model does not evaluate Terraform plans, state, remote modules,
+input variables, `.tfvars`/`.tfvars.json`, arbitrary functions or dynamic ingress.
 Relevant unresolved expressions, malformed syntax and exhausted budgets
 produce partial reports and exit 2 while retaining proven findings. Ordinary
 directory scans exclude downloaded `.terraform` dependencies. Source bounds

@@ -10,6 +10,10 @@ https://github.com/hashicorp/terraform-provider-aws/blob/main/website/docs/r/s3_
 https://github.com/hashicorp/terraform-provider-aws/blob/main/website/docs/r/s3_bucket_acl.html.markdown
 https://github.com/hashicorp/terraform-provider-aws/blob/main/website/docs/d/iam_policy_document.html.markdown
 https://github.com/hashicorp/terraform-provider-aws/blob/main/internal/service/iam/policy_document_data_source.go
+https://github.com/hashicorp/hcl/blob/main/json/spec.md
+https://github.com/hashicorp/hcl/blob/main/json/public.go
+https://developer.hashicorp.com/terraform/language/syntax/json
+https://developer.hashicorp.com/terraform/language/attr-as-blocks
 https://developer.hashicorp.com/terraform/language/files
 https://github.com/hashicorp/hcl/blob/main/hclsyntax/spec.md
 
@@ -68,6 +72,12 @@ class Case:
                 for name in source.split("# expect:", 1)[1].strip().split(","):
                     result.append((RULES[name], line, len(source) - len(source.lstrip()) + 1))
         return sorted(result)
+
+
+class JSONCase(Case):
+    @property
+    def filename(self):
+        return self.name + ".tf.json"
 
 
 CASES = (
@@ -2224,6 +2234,336 @@ POLICY_CONDITION_CASES = (
 )
 
 
+JSON_CASES = (
+    JSONCase("tfjson_modern_public_ssh", '''
+        {
+          "resource": {
+            "aws_vpc_security_group_ingress_rule": {
+              "json_ssh": {
+                "security_group_id": "sg-example",
+                "cidr_ipv4": "0.0.0.0/0",
+                "ip_protocol": "tcp",
+                "from_port": 22,
+                "to_port": 22
+              }
+            }
+          }
+        }
+    ''', locations=(("network", 4, 7),)),
+    JSONCase("tfjson_legacy_public_rdp", '''
+        {
+          "resource": {"aws_security_group_rule": {
+            "json_rdp": {
+              "type": "ingress",
+              "security_group_id": "sg-example",
+              "protocol": "tcp",
+              "from_port": 3389,
+              "to_port": 3389,
+              "ipv6_cidr_blocks": ["::/0"]
+            }
+          }}
+        }
+    ''', locations=(("network", 3, 5),)),
+    JSONCase("tfjson_restricted_ingress", '''
+        {
+          "resource": {"aws_vpc_security_group_ingress_rule": {
+            "json_private": {
+              "security_group_id": "sg-example",
+              "cidr_ipv4": "10.0.0.0/8",
+              "ip_protocol": "tcp",
+              "from_port": 22,
+              "to_port": 22
+            }
+          }}
+        }
+    '''),
+    JSONCase("tfjson_public_bucket_acl", '''
+        {
+          "resource": {"aws_s3_bucket": {"json_public": {
+            "bucket": "json-public-example",
+            "acl": "public-read"
+          }}}
+        }
+    ''', locations=(("storage", 4, 5),)),
+    JSONCase("tfjson_bucket_reference_protection", '''
+        {
+          "resource": {
+            "aws_s3_bucket": {"json_protected": {
+              "bucket": "json-protected-example",
+              "acl": "public-read"
+            }},
+            "aws_s3_bucket_public_access_block": {"json_protected": {
+              "bucket": "${aws_s3_bucket.json_protected.id}",
+              "ignore_public_acls": true
+            }}
+          }
+        }
+    '''),
+    JSONCase("tfjson_bucket_ownership_conflict", '''
+        {
+          "resource": {
+            "aws_s3_bucket": {"json_conflict": {
+              "bucket": "json-conflict-example", "acl": "public-read"
+            }},
+            "aws_s3_bucket_ownership_controls": {"json_conflict": {
+              "bucket": "${aws_s3_bucket.json_conflict.id}",
+              "rule": {"object_ownership": "BucketOwnerEnforced"}
+            }}
+          }
+        }
+    ''', True),
+    JSONCase("tfjson_provider_tls_typed_interpolation", '''
+        {
+          "locals": {"disable_tls": true},
+          "provider": {"aws": {
+            "insecure": "${local.disable_tls}"
+          }}
+        }
+    ''', locations=(("tls", 4, 5),)),
+    JSONCase("tfjson_provider_secure_control", '''
+        {
+          "provider": {"aws": {"insecure": false}}
+        }
+    '''),
+    JSONCase("tfjson_provider_alias_static_traversal", '''
+        {
+          "terraform": {"required_providers": {
+            "cloud": {"source": "hashicorp/aws"}
+          }},
+          "provider": {"cloud": {"alias": "east", "insecure": false}},
+          "resource": {"aws_s3_bucket": {"json_alias": {
+            "provider": "cloud.east",
+            "bucket": "json-alias-example",
+            "acl": "public-read"
+          }}}
+        }
+    ''', locations=(("storage", 9, 5),)),
+    JSONCase("tfjson_iam_generated_identity_policy", '''
+        {
+          "data": {"aws_iam_policy_document": {"json_admin": {
+            "statement": {"actions": ["*"], "resources": ["*"]}
+          }}},
+          "resource": {"aws_iam_policy": {"json_admin": {
+            "policy": "${data.aws_iam_policy_document.json_admin.json}"
+          }}}
+        }
+    ''', locations=(("iam", 6, 5),)),
+    JSONCase("tfjson_iam_statement_condition_and_override", '''
+        {
+          "locals": {"replacement": {
+            "Statement": [{"Sid": "Selected", "Effect": "Allow", "Action": "*", "Resource": "*"}]
+          }},
+          "data": {"aws_iam_policy_document": {"json_conditions": {
+            "statement": [{
+              "sid": "Selected", "actions": ["*"], "resources": ["*"],
+              "condition": [{"test": "Bool", "variable": "aws:MultiFactorAuthPresent", "values": ["true"]}]
+            }],
+            "override_policy_documents": ["${jsonencode(local.replacement)}"]
+          }}},
+          "resource": {"aws_iam_policy": {"json_conditions": {
+            "policy": "${data.aws_iam_policy_document.json_conditions.minified_json}"
+          }}}
+        }
+    ''', locations=(("iam", 13, 5),)),
+    JSONCase("tfjson_iam_restricted_condition", '''
+        {
+          "data": {"aws_iam_policy_document": {"json_restricted": {
+            "statement": {
+              "actions": ["s3:GetObject"], "resources": ["*"],
+              "condition": {"test": "StringEquals", "variable": "aws:PrincipalTag/team", "values": ["blue"]}
+            }
+          }}},
+          "resource": {"aws_iam_policy": {"json_restricted": {
+            "policy": "${data.aws_iam_policy_document.json_restricted.json}"
+          }}}
+        }
+    '''),
+    JSONCase("tfjson_iam_surviving_condition_is_incomplete", '''
+        {
+          "data": {"aws_iam_policy_document": {"json_conditional": {
+            "statement": {
+              "actions": ["*"], "resources": ["*"],
+              "condition": {"test": "Bool", "variable": "aws:MultiFactorAuthPresent", "values": ["true"]}
+            }
+          }}},
+          "resource": {"aws_iam_policy": {"json_conditional": {
+            "policy": "${data.aws_iam_policy_document.json_conditional.json}"
+          }}}
+        }
+    ''', True),
+    JSONCase("tfjson_typed_list_and_number_interpolation", '''
+        {
+          "locals": {"ports": {"admin": 22}, "world": ["0.0.0.0/0"]},
+          "resource": {"aws_security_group_rule": {
+            "json_typed": {
+              "type": "ingress", "security_group_id": "sg-example", "protocol": "tcp",
+              "from_port": "${local.ports.admin}", "to_port": "${local.ports.admin}",
+              "cidr_blocks": "${local.world}"
+            }
+          }}
+        }
+    ''', locations=(("network", 4, 5),)),
+    JSONCase("tfjson_plain_reference_text_stays_literal", '''
+        {
+          "locals": {"acl": "public-read"},
+          "resource": {"aws_s3_bucket": {"json_literal": {
+            "bucket": "json-literal-example", "acl": "local.acl"
+          }}}
+        }
+    '''),
+    JSONCase("tfjson_mixed_template_is_explicitly_incomplete", '''
+        {
+          "locals": {"address": "0.0.0.0"},
+          "resource": {"aws_vpc_security_group_ingress_rule": {"json_template": {
+            "cidr_ipv4": "${local.address}/0", "ip_protocol": "tcp",
+            "from_port": 22, "to_port": 22, "security_group_id": "sg-example"
+          }}}
+        }
+    ''', True),
+    JSONCase("tfjson_input_default_does_not_resolve_variable", '''
+        {
+          "variable": {"world": {"default": "0.0.0.0/0"}},
+          "resource": {"aws_vpc_security_group_ingress_rule": {"json_variable": {
+            "cidr_ipv4": "${var.world}", "ip_protocol": "tcp",
+            "from_port": 22, "to_port": 22, "security_group_id": "sg-example"
+          }}}
+        }
+    ''', True),
+    JSONCase("tfjson_provider_reference_is_not_a_template", '''
+        {
+          "locals": {"binding": "aws"},
+          "resource": {"aws_s3_bucket": {"json_binding": {
+            "provider": "${local.binding}", "bucket": "json-binding-example", "acl": "public-read"
+          }}}
+        }
+    ''', True),
+    JSONCase("tfjson_terraform_provider_source_is_literal", '''
+        {
+          "locals": {"source": "hashicorp/aws"},
+          "terraform": {"required_providers": {"aws": {"source": "${local.source}"}}},
+          "resource": {"aws_s3_bucket": {"json_literal_source": {
+            "bucket": "json-literal-source-example", "acl": "public-read"
+          }}}
+        }
+    ''', True),
+    JSONCase("tfjson_provider_alias_is_literal", '''
+        {
+          "locals": {"alias": "east"},
+          "provider": {"aws": {"alias": "${local.alias}", "insecure": true}}
+        }
+    ''', True),
+    JSONCase("tfjson_body_comment_is_not_configuration", '''
+        {
+          "//": {"resource": {"aws_s3_bucket": {"fake": {"acl": "public-read"}}}},
+          "provider": {"aws": {
+            "//": "insecure=true is documentation, not an argument",
+            "insecure": false
+          }}
+        }
+    '''),
+    JSONCase("tfjson_expression_comment_key_is_not_discarded", '''
+        {
+          "locals": {"policy": {
+            "//": "This is an expression field, not a body comment",
+            "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}]
+          }},
+          "resource": {"aws_iam_policy": {"json_comment_field": {
+            "policy": "${jsonencode(local.policy)}"
+          }}}
+        }
+    ''', True),
+    JSONCase("tfjson_duplicate_block_properties_are_preserved", '''
+        {
+          "provider": {"aws": {"alias": "first",
+            "insecure": true
+          }},
+          "provider": {"aws": {"alias": "second",
+            "insecure": true
+          }}
+        }
+    ''', locations=(("tls", 3, 5), ("tls", 6, 5))),
+    JSONCase("tfjson_root_label_and_body_arrays", '''
+        [
+          {"provider": [{"aws": [
+            {"alias": "array_first", "insecure": false},
+            {"alias": "array_second",
+             "insecure": true}
+          ]}]},
+          {"resource": [{"aws_vpc_security_group_ingress_rule": [
+            {"json_array_ssh": {
+              "cidr_ipv4": "0.0.0.0/0", "ip_protocol": "tcp",
+              "from_port": 22, "to_port": 22, "security_group_id": "sg-example"
+            }}
+          ]}]}
+        ]
+    ''', locations=(("tls", 5, 6), ("network", 8, 6))),
+    JSONCase("tfjson_duplicate_attribute_is_incomplete", '''
+        {
+          "provider": {"aws": {"insecure": true, "insecure": false}}
+        }
+    ''', True),
+    JSONCase("tfjson_duplicate_expression_key_is_incomplete", '''
+        {
+          "locals": {"settings": {"acl": "public-read", "acl": "private"}},
+          "resource": {"aws_s3_bucket": {"json_duplicate": {
+            "bucket": "json-duplicate-example", "acl": "${local.settings.acl}"
+          }}}
+        }
+    ''', True),
+    JSONCase("tfjson_evaluated_expression_key_collision_is_incomplete", '''
+        {
+          "locals": {"key": "acl", "settings": {"${local.key}": "public-read", "acl": "private"}},
+          "resource": {"aws_s3_bucket": {"json_collision": {
+            "bucket": "json-collision-example", "acl": "${local.settings.acl}"
+          }}}
+        }
+    ''', True),
+    JSONCase("tfjson_nonintegral_number_cannot_round_to_admin_port", '''
+        {
+          "resource": {"aws_vpc_security_group_ingress_rule": {"json_precision": {
+            "cidr_ipv4": "0.0.0.0/0", "ip_protocol": "tcp",
+            "from_port": 22.00000000000000000001, "to_port": 22,
+            "security_group_id": "sg-example"
+          }}}
+        }
+    ''', True),
+    JSONCase("tfjson_attribute_ingress_is_not_a_nested_block", '''
+        {
+          "resource": {"aws_security_group": {"json_attribute_ingress": {
+            "ingress": [{"protocol": "tcp", "from_port": 22, "to_port": 22,
+                         "cidr_blocks": ["0.0.0.0/0"]}]
+          }}}
+        }
+    ''', True),
+    JSONCase("tfjson_empty_attribute_ingress", '''
+        {
+          "resource": {"aws_security_group": {"json_empty_ingress": {"ingress": []}}}
+        }
+    '''),
+    JSONCase("tfjson_dynamic_relevant_statement_is_incomplete", '''
+        {
+          "data": {"aws_iam_policy_document": {"json_dynamic": {
+            "dynamic": {"statement": {"for_each": "${var.statements}",
+              "content": {"actions": ["*"], "resources": ["*"]}
+            }}
+          }}},
+          "resource": {"aws_iam_policy": {"json_dynamic": {
+            "policy": "${data.aws_iam_policy_document.json_dynamic.json}"
+          }}}
+        }
+    ''', True),
+    JSONCase("tfjson_invalid_block_shape_is_incomplete", '''
+        {"resource": {"aws_iam_policy": {"policy": "not a labeled block body"}}}
+    ''', True),
+    JSONCase("tfjson_trailing_comma_is_incomplete", '''
+        {"provider": {"aws": {"insecure": false,}}}
+    ''', True),
+    JSONCase("tfjson_non_json_constant_is_incomplete", '''
+        {"provider": {"aws": {"insecure": NaN}}}
+    ''', True),
+)
+
+
 class EvidenceTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -2807,6 +3147,228 @@ resource "aws_iam_policy" "document%d" {
         self.assertEqual(records, [], (records, errors))
         self.assertTrue(any("budget" in error.lower() for error in errors), (records, errors))
 
+    def test_tfjson_mixed_syntax_context_and_module_isolation(self):
+        analyzer = importlib.import_module("ubs_core.hcl_scan")
+        consumer = JSONCase("main", '''
+            {"resource": {"aws_s3_bucket": {"json_mixed": {
+              "bucket": "json-mixed-example",
+              "acl": "${local.acl}"
+            }}}}
+        ''', locations=(("storage", 3, 3),))
+        settings = Case("settings", 'locals { acl = "public-read" }')
+        protector = Case("protection", '''
+            resource "aws_s3_bucket_public_access_block" "json_mixed" {
+              bucket = aws_s3_bucket.json_mixed.id
+              ignore_public_acls = true
+            }
+        ''')
+        directory = self.materialize((consumer, settings, protector), "tfjson-mixed-module")
+        sources = {str(directory / case.filename): case.source for case in (consumer, settings, protector)}
+        child = directory / "child-module"
+        child.mkdir()
+        child_settings = child / settings.filename
+        child_settings.write_text(settings.source, encoding="utf-8")
+        scenarios = (
+            ("selected-protection", sources, [], False),
+            ("without-protection", {path: source for path, source in sources.items()
+                                    if path != str(directory / protector.filename)}, consumer.expected, False),
+            ("unselected-local", {str(directory / consumer.filename): consumer.source}, [], True),
+            ("nested-module-local", {str(directory / consumer.filename): consumer.source,
+                                     str(child_settings): settings.source}, [], True),
+        )
+        for name, selected, expected, partial in scenarios:
+            with self.subTest(selection=name):
+                records, errors = analyzer.analyze_sources(selected)
+                actual = sorted((row["rule"], row["line"], row["col"]) for row in records)
+                (directory / (name + ".json")).write_text(json.dumps({
+                    **self.identity, "selected_files": sorted(selected), "expected": expected,
+                    "actual": actual, "findings": records, "errors": errors,
+                    "analyzer_sha256": hashlib.sha256(Path(analyzer.__file__).read_bytes()).hexdigest(),
+                }, indent=2) + "\n", encoding="utf-8")
+                self.assertEqual((actual, bool(errors)), (expected, partial), (records, errors))
+
+    def test_tfjson_json_local_objects_supply_native_policy_and_keep_cycles(self):
+        analyzer = importlib.import_module("ubs_core.hcl_scan")
+        consumer = Case("native_consumer", '''
+            resource "aws_iam_policy" "from_json" {
+              policy = jsonencode(local.json_identity) # expect:iam
+            }
+        ''')
+        settings = JSONCase("json_settings", '''
+            {"locals": {"json_identity": {
+              "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}]
+            }}}
+        ''')
+        directory = self.materialize((consumer, settings), "tfjson-native-consumer")
+        variants = (
+            ("literal", settings.source, consumer.expected, False),
+            ("duplicate-cross-syntax", settings.source, [], True),
+            ("hidden-cycle", '''{"locals": {"json_identity": {
+                "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}],
+                "unused": "${local.json_identity}"
+            }}}''', [], True),
+        )
+        for name, context, expected, partial in variants:
+            with self.subTest(context=name):
+                selected = {str(directory / consumer.filename): consumer.source,
+                            str(directory / settings.filename): context}
+                if name == "duplicate-cross-syntax":
+                    extra = directory / "duplicate.tf"
+                    selected[str(extra)] = 'locals { json_identity = {} }\n'
+                    extra.write_text(selected[str(extra)], encoding="utf-8")
+                (directory / (name + ".source.txt")).write_text(context, encoding="utf-8")
+                records, errors = analyzer.analyze_sources(selected)
+                actual = sorted((row["rule"], row["line"], row["col"]) for row in records)
+                (directory / (name + ".json")).write_text(json.dumps({
+                    **self.identity, "selected_files": sorted(selected), "expected": expected,
+                    "actual": actual, "findings": records, "errors": errors,
+                    "analyzer_sha256": hashlib.sha256(Path(analyzer.__file__).read_bytes()).hexdigest(),
+                }, indent=2) + "\n", encoding="utf-8")
+                self.assertEqual((actual, bool(errors)), (expected, partial), (records, errors))
+
+    def test_tfjson_source_context_token_and_nesting_budgets(self):
+        analyzer = importlib.import_module("ubs_core.hcl_scan")
+        case = next(case for case in JSON_CASES if case.name == "tfjson_modern_public_ssh")
+        directory = self.materialize((case,), "tfjson-budget-boundaries")
+        for name, limit in (("MAX_SOURCE_BYTES", len(case.source.encode("utf-8")) - 1),
+                            ("MAX_CONTEXT_BYTES", len(case.source.encode("utf-8")) - 1),
+                            ("MAX_TOKENS", 12), ("MAX_NESTING", 3)):
+            with self.subTest(budget=name):
+                with mock.patch.object(analyzer, name, limit):
+                    records, errors = analyzer.analyze_source(case.source, str(directory / case.filename))
+                (directory / (name + ".json")).write_text(json.dumps({
+                    **self.identity, "findings": records, "errors": errors, "limit": {name: limit},
+                    "analyzer_sha256": hashlib.sha256(Path(analyzer.__file__).read_bytes()).hexdigest(),
+                }, indent=2) + "\n", encoding="utf-8")
+                self.assertEqual(records, [], (records, errors))
+                self.assertTrue(any("budget" in error.lower() for error in errors), (records, errors))
+
+    def test_bucket_identity_literals_and_traversals_in_native_and_json(self):
+        native_literal = Case("bucket_native_literal_identity", '''
+            resource "aws_s3_bucket" "actual" {
+              bucket = "actual-identity-example"
+              acl = "public-read" # expect:storage
+            }
+            resource "aws_s3_bucket_public_access_block" "different_bucket" {
+              bucket = "aws_s3_bucket.actual.id"
+              ignore_public_acls = true
+            }
+        ''')
+        native_reference = Case("bucket_native_traversal_identity", native_literal.code.replace(
+            'bucket = "aws_s3_bucket.actual.id"', 'bucket = aws_s3_bucket.actual.id').replace(" # expect:storage", ""))
+        json_literal = JSONCase("bucket_json_literal_identity", '''
+            {
+              "resource": {
+                "aws_s3_bucket": {"actual": {
+                  "bucket": "actual-identity-example",
+                  "acl": "public-read"
+                }},
+                "aws_s3_bucket_public_access_block": {"different_bucket": {
+                  "bucket": "aws_s3_bucket.actual.id",
+                  "ignore_public_acls": true
+                }}
+              }
+            }
+        ''', locations=(("storage", 5, 7),))
+        json_reference = JSONCase("bucket_json_traversal_identity", json_literal.code.replace(
+            '"bucket": "aws_s3_bucket.actual.id"', '"bucket": "${aws_s3_bucket.actual.id}"'))
+        native_acl_literal = Case("acl_native_literal_identity", '''
+            resource "aws_s3_bucket" "actual" {
+              bucket = "actual-identity-example"
+            }
+            resource "aws_s3_bucket_acl" "different_bucket" {
+              bucket = "aws_s3_bucket.actual.id"
+              acl = "public-read" # expect:storage
+            }
+            resource "aws_s3_bucket_public_access_block" "actual" {
+              bucket = aws_s3_bucket.actual.id
+              ignore_public_acls = true
+            }
+        ''')
+        native_acl_reference = Case("acl_native_traversal_identity", native_acl_literal.code.replace(
+            'bucket = "aws_s3_bucket.actual.id"', 'bucket = aws_s3_bucket.actual.id').replace(" # expect:storage", ""))
+        json_acl_literal = JSONCase("acl_json_literal_identity", '''
+            {
+              "resource": {
+                "aws_s3_bucket": {"actual": {"bucket": "actual-identity-example"}},
+                "aws_s3_bucket_acl": {"different_bucket": {
+                  "bucket": "aws_s3_bucket.actual.id",
+                  "acl": "public-read"
+                }},
+                "aws_s3_bucket_public_access_block": {"actual": {
+                  "bucket": "${aws_s3_bucket.actual.id}",
+                  "ignore_public_acls": true
+                }}
+              }
+            }
+        ''', locations=(("storage", 6, 7),))
+        json_acl_reference = JSONCase("acl_json_traversal_identity", json_acl_literal.code.replace(
+            '"bucket": "aws_s3_bucket.actual.id"', '"bucket": "${aws_s3_bucket.actual.id}"'))
+        for case in (native_literal, native_reference, json_literal, json_reference,
+                     native_acl_literal, native_acl_reference, json_acl_literal, json_acl_reference):
+            with self.subTest(case=case.name):
+                self.check_native(case)
+
+    def test_tfjson_single_interpolation_precision_and_comment_boundaries(self):
+        precise = JSONCase("tfjson_interpolation_precision", '''
+            {
+              "resource": {"aws_vpc_security_group_ingress_rule": {
+                "json_interpolation": {
+                  "cidr_ipv4": "0.0.0.0/0", "ip_protocol": "tcp",
+                  "from_port": "${22.00000000000000000001}", "to_port": 22,
+                  "security_group_id": "sg-example"
+                }
+              }}
+            }
+        ''', True)
+        integral = JSONCase("tfjson_interpolation_integral_control", precise.code.replace(
+            "${22.00000000000000000001}", "${22.0}"), locations=(("network", 3, 5),))
+        unterminated = JSONCase("tfjson_interpolation_closing_brace_is_commented", '''
+            {
+              "provider": {"aws": {
+                "insecure": "${false #}"
+              }}
+            }
+        ''', True)
+        valid_comment = JSONCase("tfjson_interpolation_closes_after_comment", r'''
+            {
+              "provider": {"aws": {
+                "insecure": "${true # comment\n}"
+              }}
+            }
+        ''', locations=(("tls", 3, 5),))
+        for case in (precise, integral, unterminated, valid_comment):
+            with self.subTest(case=case.name):
+                self.check_native(case)
+
+    def test_tfjson_composed_local_depth_keeps_independent_finding(self):
+        # Every source value is shallow, but following the selected local
+        # chain composes 960 levels. Its final leaf is a valid private ACL;
+        # analysis exhaustion must retain the preceding independent finding.
+        declarations = {}
+        for index in range(40):
+            value = "${local.x%d}" % (index + 1) if index < 39 else "private"
+            for _ in range(24):
+                value = {"v": value}
+            declarations["x%d" % index] = value
+        case = JSONCase("tfjson_composed_local_depth", '''
+            {
+              "locals": %s,
+              "resource": {"aws_s3_bucket": {
+                "independent": {
+                  "bucket": "independent-json-depth-example",
+                  "acl": "public-read"
+                },
+                "private_at_depth": {
+                  "bucket": "private-json-depth-example",
+                  "acl": "${local.x0%s}"
+                }
+              }}
+            }
+        ''' % (json.dumps(declarations, separators=(",", ":")), ".v" * (40 * 24)),
+            True, locations=(("storage", 6, 7),))
+        self.check_native(case)
+
 
 def native_test(case):
     def run(self):
@@ -2814,7 +3376,7 @@ def native_test(case):
     return run
 
 
-for _case in CASES + REVIEW_CASES + IAM_CASES + TLS_CASES + POLICY_DOCUMENT_CASES + POLICY_COMPOSITION_CASES + POLICY_CONDITION_CASES:
+for _case in CASES + REVIEW_CASES + IAM_CASES + TLS_CASES + POLICY_DOCUMENT_CASES + POLICY_COMPOSITION_CASES + POLICY_CONDITION_CASES + JSON_CASES:
     setattr(HCLNativeTests, "test_" + _case.name, native_test(_case))
 
 
@@ -2898,7 +3460,7 @@ class HCLPublicTests(EvidenceTest):
         directory = self.materialize((unsafe, clean), "selection")
         (directory / "ignored.tf").write_text(unsafe.source, encoding="utf-8")
         (directory / "values.tfvars").write_text(unsafe.source, encoding="utf-8")
-        (directory / "example.tf.json").write_text('{"not": "native HCL"}\n', encoding="utf-8")
+        (directory / "example.json").write_text('{"not": "Terraform configuration"}\n', encoding="utf-8")
         self.assert_report(*self.execute(directory, extra=("--exclude=ignored.tf",)), "json", (unsafe, clean))
         selected = self.artifact / "selected-paths.nul"
         selected.write_bytes(os.fsencode(directory / clean.filename) + b"\0")
@@ -3187,6 +3749,104 @@ class HCLPublicTests(EvidenceTest):
         with self.subTest(state="restricted-context-restored"):
             self.assert_report(*self.execute(directory, cached=True), "json",
                                (consumer, source, override, settings))
+
+    def test_tfjson_public_formats_and_pure_json_autodetection(self):
+        by_name = {case.name: case for case in JSON_CASES}
+        cases = tuple(by_name[name] for name in (
+            "tfjson_modern_public_ssh", "tfjson_public_bucket_acl",
+            "tfjson_iam_generated_identity_policy", "tfjson_provider_tls_typed_interpolation",
+            "tfjson_restricted_ingress"))
+        directory = self.materialize(cases, "tfjson-formats")
+        for mode in ("module-json", "module-sarif", "json", "sarif"):
+            with self.subTest(mode=mode):
+                self.assert_report(*self.execute(directory, mode), mode, cases)
+
+    def test_tfjson_public_direct_selection_extensions_and_staged_manifest(self):
+        unsafe = next(case for case in JSON_CASES if case.name == "tfjson_modern_public_ssh")
+        native = Case("native_selected", '''
+            resource "aws_s3_bucket" "native_selected" {
+              bucket = "native-selected-example"
+              acl = "public-read" # expect:storage
+            }
+        ''')
+        directory = self.materialize((unsafe, native), "tfjson-selection")
+        for name in ("ignored.tf.json", "example.json", "values.tfvars.json"):
+            (directory / name).write_text(unsafe.source, encoding="utf-8")
+        terraform_cache = directory / ".terraform"
+        terraform_cache.mkdir()
+        (terraform_cache / "cached.tf.json").write_text(unsafe.source, encoding="utf-8")
+        # Both runner and module include-ext add to default extensions. Use
+        # explicit exclusions, direct paths or manifests to narrow selection.
+        attempts = (
+            ("mixed-directory", directory, "json", ("--exclude=ignored.tf.json",), (unsafe, native)),
+            ("compound-runner", directory, "json", ("--include-ext=.tf.json", "--exclude=ignored.tf.json"), (unsafe, native)),
+            ("compound-module", directory, "module-json", ("--include-ext=tf.json", "--exclude=ignored.tf.json"), (unsafe, native)),
+            ("additive-native", directory, "json", ("--include-ext=tf", "--exclude=ignored.tf.json"), (unsafe, native)),
+            ("native-only-exclusion", directory, "json", ("--exclude=*.tf.json",), (native,)),
+            ("explicit-file", directory / unsafe.filename, "json", (), (unsafe,)),
+        )
+        for name, target, mode, options, cases in attempts:
+            with self.subTest(selection=name):
+                self.assert_report(*self.execute(target, mode, options), mode, cases)
+        selected = self.artifact / "tfjson-selected.nul"
+        selected.write_bytes(os.fsencode(directory / unsafe.filename) + b"\0" +
+                             os.fsencode(directory / native.filename) + b"\0")
+        with self.subTest(selection="module-manifest"):
+            self.assert_report(*self.execute(directory, "module-json", ("--files-from=" + str(selected),)),
+                               "module-json", (unsafe, native))
+        commands = (["git", "init", "--initial-branch=main", str(directory)],
+                    ["git", "-C", str(directory), "add", "--", unsafe.filename, native.filename])
+        setup = []
+        for command in commands:
+            result = subprocess.run(command, text=True, capture_output=True, check=False)
+            setup.append({"command": command, "exit": result.returncode,
+                          "stdout": result.stdout, "stderr": result.stderr})
+            self.assertEqual(result.returncode, 0, setup)
+        (directory / "git-setup-receipt.json").write_text(json.dumps(setup, indent=2) + "\n", encoding="utf-8")
+        with self.subTest(selection="staged-manifest"):
+            self.assert_report(*self.execute(directory, extra=("--staged",)), "json", (unsafe, native))
+
+    def test_tfjson_public_malformed_neighbor_keeps_native_finding(self):
+        native = Case("native_neighbor", '''
+            resource "aws_s3_bucket" "native_neighbor" {
+              bucket = "native-neighbor-example"
+              acl = "public-read" # expect:storage
+            }
+        ''')
+        malformed = JSONCase("malformed_json", '{"resource": [true]}', True)
+        directory = self.materialize((native, malformed), "tfjson-malformed-neighbor")
+        for mode in ("module-json", "json", "sarif"):
+            with self.subTest(mode=mode):
+                self.assert_report(*self.execute(directory, mode), mode, (native, malformed), partial=True)
+
+    def test_tfjson_public_cache_tracks_cross_syntax_locals(self):
+        consumer = Case("native_cache", '''
+            resource "aws_iam_policy" "json_cache" {
+              policy = jsonencode(local.permissions)
+            }
+        ''')
+        settings = JSONCase("json_cache_settings", '''
+            {"locals": {"permissions": {
+              "Statement": [{"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}]
+            }}}
+        ''')
+        directory = self.materialize((consumer, settings), "tfjson-context-cache")
+        for attempt in range(2):
+            with self.subTest(context="restricted-" + str(attempt)):
+                self.assert_report(*self.execute(directory, cached=True), "json", (consumer, settings))
+        path = directory / settings.filename
+        changed = JSONCase(settings.name, settings.code.replace('"s3:GetObject"', '"*"'))
+        path.write_text(changed.source, encoding="utf-8")
+        exposed = Case(consumer.name, consumer.code, locations=(("iam", 2, 3),))
+        with self.subTest(context="changed-to-wildcard"):
+            self.assert_report(*self.execute(directory, cached=True), "json", (exposed, changed))
+        unresolved = JSONCase(settings.name, settings.code.replace('"s3:GetObject"', '"${var.action}"'), True)
+        path.write_text(unresolved.source, encoding="utf-8")
+        with self.subTest(context="unresolved-input"):
+            self.assert_report(*self.execute(directory, cached=True), "json", (consumer, unresolved), partial=True)
+        path.write_text(settings.source, encoding="utf-8")
+        with self.subTest(context="restricted-restored"):
+            self.assert_report(*self.execute(directory, cached=True), "json", (consumer, settings))
 
 
 if __name__ == "__main__":

@@ -10,6 +10,16 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Analyze generated Terraform `.tf.json` configuration with the existing AWS
+  ingress, S3 ACL, IAM policy-document and provider TLS checks. Discover compound
+  suffixes in ordinary, direct and staged scans; share selected same-directory
+  locals and resource identities across native and JSON files. Preserve ordered
+  structural properties, typed interpolation, literal settings and exact JSON
+  locations; reject duplicate expression keys and unsupported configuration.
+  Bound composed expression depth, retain findings on exhaustion, and prevent
+  numeric rounding or reference-shaped literal bucket names from inventing
+  security proofs. Add independent native and real JSON/SARIF regressions.
+
 - Tie JavaScript prototype-pollution safety to the actual receiver and key
   binding. Stop trusting sanitizer names or unrelated nearby validation;
   follow reassignment, destructuring and loop-carried request values to exact

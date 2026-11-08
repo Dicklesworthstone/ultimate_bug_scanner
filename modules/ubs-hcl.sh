@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 
 # Bootstrap the same checksum-pinned shared library as the other modules.
-UBS_LIB_CHECKSUM="acb1c38a2b085f21789bec13d8984b371be0bec6440d5c2d3f02f5449cfb551e"
+UBS_LIB_CHECKSUM="08fbf392792a50d78abd0a3d30cd3c66bb7c06d8706e030b404b64400c6f2d18"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -43,7 +43,7 @@ fi
 source "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh"
 ubs_export_locale
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 PROJECT_DIR="."
 SOURCE_PROJECT_DIR=""
 PROJECT_SET=0
@@ -54,7 +54,7 @@ FAIL_ON_WARNING=0
 VERBOSE=0
 QUIET=0
 JOBS=0
-INCLUDE_EXT="tf"
+INCLUDE_EXT="tf,tf.json"
 EXCLUDE_GLOBS=""
 SKIP_CSV=""
 ONLY_CSV=""
@@ -71,9 +71,10 @@ usage(){
   cat <<'USAGE'
 Usage: ubs-hcl.sh [PROJECT_DIR|FILE] [options] [OUTPUT_FILE]
 
-Selected Terraform AWS resource configuration in .tf files. Variables, modules,
-provider defaults and deployed state are not evaluated. Relevant unresolved
-expressions produce incomplete analysis; .tfvars files are not loaded.
+Selected Terraform AWS resource configuration in .tf and .tf.json files.
+Variables, modules, provider defaults and deployed state are not evaluated.
+Relevant unresolved expressions produce incomplete analysis; variable files
+(.tfvars and .tfvars.json) are not loaded.
 
 Options:
 --format=FMT        text|json|sarif (default: text); jsonl/toon come from the meta-runner
@@ -84,7 +85,7 @@ Options:
 --no-color          accepted; this module emits no ANSI colour
 --jobs=N            parallel hint (bounded native analysis is sequential)
 --exclude=GLOBS     additional path globs to skip (.terraform is excluded by default)
---include-ext=CSV   accepted only for tf; other input formats are unsupported
+--include-ext=CSV   accepted only for tf and tf.json; other input formats are unsupported
 --skip=CSV          skip category numbers (1 network, 2 storage, 3 iam, 4 tls)
 --only=CSV          run only these category numbers
 --report-json=FILE  write NDJSON findings to FILE
@@ -137,7 +138,7 @@ while [[ $# -gt 0 ]]; do
     --jobs) require_value "$@"; JOBS="$2"; shift 2;;
     --exclude=*) EXCLUDE_GLOBS="${1#*=}"; shift;;
     --exclude) require_value "$@"; EXCLUDE_GLOBS="$2"; shift 2;;
-    --include-ext=*) INCLUDE_EXT="${INCLUDE_EXT},${1#*=}"; shift;;
+    --include-ext=*) require_value --include-ext "${1#*=}"; INCLUDE_EXT="${INCLUDE_EXT},${1#*=}"; shift;;
     --include-ext) require_value "$@"; INCLUDE_EXT="${INCLUDE_EXT},$2"; shift 2;;
     --skip=*) SKIP_CSV="${1#*=}"; shift;;
     --skip) require_value "$@"; SKIP_CSV="$2"; shift 2;;
@@ -174,7 +175,10 @@ done
 [[ "$JOBS" =~ ^[0-9]+$ ]] || fail_scan "--jobs must be a nonnegative integer"
 IFS=',' read -r -a hcl_extensions <<< "$INCLUDE_EXT"
 for extension in "${hcl_extensions[@]}"; do
-  [[ "$extension" == "tf" || "$extension" == ".tf" ]] || fail_scan "--include-ext only supports tf for Terraform HCL; unsupported extension: $extension"
+  case "$extension" in
+    tf|.tf|tf.json|.tf.json) ;;
+    *) fail_scan "--include-ext only supports tf and tf.json for Terraform; unsupported extension: $extension";;
+  esac
 done
 if [[ "$LIST_CATEGORIES" -eq 1 ]]; then
   printf '1  network  Public AWS administrative ingress\n2  storage  Explicit public AWS S3 ACLs\n3  iam  Unrestricted AWS IAM identity policies\n4  tls  Disabled AWS provider TLS verification\n'

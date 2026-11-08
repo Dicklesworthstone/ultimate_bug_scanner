@@ -611,7 +611,7 @@
     "hcl": {
       "file": "ubs-hcl.sh",
       "display": "Terraform HCL",
-      "extensions": ["tf"],
+      "extensions": ["tf", "tf.json"],
       "manifest_files": [],
       "contract": 2,
       "extra_flags": [

@@ -64,7 +64,7 @@ class SwiftLexer:
     def literal(self, start, limit, depth):
         if depth > 64:
             raise AnalysisLimit('Swift interpolation nesting limit exceeded; analysis is incomplete')
-        marker = re.match(r'(#{0,32})("""|"|/)', self.text[start:limit])
+        marker = re.match(r'(#*)("""|"|/)', self.text[start:limit])
         if marker is None:
             raise ValueError('Invalid Swift literal; analysis is incomplete')
         hashes, quote = marker.groups()
@@ -77,8 +77,8 @@ class SwiftLexer:
                 return SwiftToken(''.join(content), start, cursor + len(closing), kind, tuple(holes))
             if self.text.startswith(escape + '(', cursor) and quote != '/':
                 opening = cursor + len(escape)
-                finish = self.interpolation_end(opening + 1, limit, depth + 1)
-                holes.append(tuple(self.scan(opening + 1, finish, depth + 1)))
+                part, finish = self.interpolation(opening + 1, limit, depth + 1)
+                holes.append(part)
                 cursor = finish + 1
                 continue
             if self.text.startswith(escape, cursor):
@@ -103,29 +103,29 @@ class SwiftLexer:
             cursor += 1
         raise ValueError('Unterminated Swift literal; analysis is incomplete')
 
-    def interpolation_end(self, start, limit, depth):
-        cursor, nesting = start, 1
-        while cursor < limit:
-            self.budget.spend()
-            if self.text.startswith(('//', '/*'), cursor):
-                cursor = self.comment(cursor, limit)
-                continue
-            if re.match(r'#{0,32}"', self.text[cursor:limit]):
-                cursor = self.literal(cursor, limit, depth).end
-                continue
-            if self.text[cursor] == '(':
+    def interpolation(self, start, limit, depth):
+        # The interpolation is executable Swift. Use the same lexer for its
+        # boundary and its tokens: regexes, nested strings and comments can all
+        # contain parentheses which do not close the surrounding expression.
+        # Retaining the tokens also avoids repeatedly lexing nested holes.
+        tokens, nesting = [], 1
+        for token in self.tokens(start, limit, depth):
+            if token.kind == 'code' and token.value == '(':
                 nesting += 1
-            elif self.text[cursor] == ')':
+            elif token.kind == 'code' and token.value == ')':
                 nesting -= 1
                 if not nesting:
-                    return cursor
-            cursor += 1
+                    return tuple(tokens), token.start
+            tokens.append(token)
         raise ValueError('Unterminated Swift interpolation; analysis is incomplete')
 
     def scan(self, start=0, limit=None, depth=0):
+        return tuple(self.tokens(start, limit, depth))
+
+    def tokens(self, start=0, limit=None, depth=0):
         text, cursor = self.text, start
         limit = len(text) if limit is None else limit
-        output = []
+        prev_significant = None
         while cursor < limit:
             self.budget.spend()
             char = text[cursor]
@@ -136,35 +136,37 @@ class SwiftLexer:
                 finish = self.comment(cursor, limit)
                 for position in range(cursor, finish):
                     if text[position] == '\n':
-                        output.append(SwiftToken('\n', position, position + 1))
+                        yield SwiftToken('\n', position, position + 1)
                 cursor = finish
                 continue
-            prev_significant = next(
-                (tok for tok in reversed(output) if not (tok.kind == 'code' and not tok.value.strip())),
-                None,
-            )
             regex = char == '/' and (
                 prev_significant is None
-                or prev_significant.value in {'=', '(', ',', ':', 'return'}
+                or (prev_significant.kind == 'code'
+                    and prev_significant.value in {'=', '(', '[', ',', ':', 'return'})
             )
-            if re.match(r'#{0,32}"|#+/', text[cursor:limit]) or regex:
+            if re.match(r'#*"|#+/', text[cursor:limit]) or regex:
                 token = self.literal(cursor, limit, depth)
-                output.append(token)
+                yield token
+                prev_significant = token
                 cursor = token.end
                 continue
             if char == '`':
                 finish = text.find('`', cursor + 1, limit)
                 if finish < 0:
                     raise ValueError('Unterminated Swift identifier; analysis is incomplete')
-                output.append(SwiftToken(text[cursor + 1:finish], cursor, finish + 1))
+                token = SwiftToken(text[cursor + 1:finish], cursor, finish + 1)
+                yield token
+                prev_significant = token
                 cursor = finish + 1
                 continue
             match = re.match(r'[A-Za-z_$][A-Za-z_0-9$]*|\d+(?:\.\d+)?|\.\.\.|\.\.<|->|==|!=|<=|>=|&&|\|\||\?\?|\+=|-=|\*=|/=', text[cursor:limit])
             finish = cursor + (match.end() if match else 1)
-            output.append(SwiftToken(text[cursor:finish], cursor, finish,
-                                     'number' if char.isdigit() else 'code'))
+            token = SwiftToken(text[cursor:finish], cursor, finish,
+                               'number' if char.isdigit() else 'code')
+            yield token
+            if token.value.strip():
+                prev_significant = token
             cursor = finish
-        return tuple(output)
 
 
 def swift_text(tokens):

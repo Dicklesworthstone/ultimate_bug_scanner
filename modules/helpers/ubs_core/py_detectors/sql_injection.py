@@ -2672,6 +2672,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         # recycled numeric ids) key these bounded per-analysis snapshots.
         self._evaluated_values = {}
         self._evaluated_call_targets = {}
+        self._evaluated_comparison_truths = {}
         self._indexed_receivers = {}
         # Generator objects carry identity, not their future yielded value.
         # Aliases share the fresh/exhausted state, including across branches.
@@ -2737,6 +2738,8 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             self._evaluated_values.pop(node, None)
             if isinstance(node, ast.Call):
                 self._evaluated_call_targets.pop(node, None)
+            if isinstance(node, ast.Compare):
+                self._evaluated_comparison_truths.pop(node, None)
             result = super().visit(node)
             if node not in self._evaluated_values:
                 self._evaluated_values[node] = self.value_facts(node)
@@ -3342,6 +3345,44 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         # known truth here; arbitrary conditions retain both possibilities.
         return bool(node.value) if isinstance(node, ast.Constant) else None
 
+    @staticmethod
+    def literal_comparison_truth(left, operator, right):
+        """Compare only parsed builtin constants, without invoking source code."""
+        if not isinstance(left, ast.Constant) or not isinstance(right, ast.Constant):
+            return None
+        a, b = left.value, right.value
+        if type(a) not in {type(None), bool, int, float, complex, str} or type(b) not in {
+                type(None), bool, int, float, complex, str}:
+            return None
+        if isinstance(operator, (ast.Is, ast.IsNot)):
+            # Only None/bool are language-guaranteed singletons. Equal string
+            # or numeric literals do not prove identity across implementations.
+            if not (a is None or b is None or isinstance(a, bool) or isinstance(b, bool)):
+                return None
+            return (a is b) if isinstance(operator, ast.Is) else (a is not b)
+        try:
+            if isinstance(operator, ast.Lt):
+                return a < b
+            if isinstance(operator, ast.LtE):
+                return a <= b
+            if isinstance(operator, ast.Gt):
+                return a > b
+            if isinstance(operator, ast.GtE):
+                return a >= b
+            if isinstance(operator, ast.Eq):
+                return a == b
+            if isinstance(operator, ast.NotEq):
+                return a != b
+            if isinstance(operator, ast.In):
+                return a in b
+            if isinstance(operator, ast.NotIn):
+                return a not in b
+        except TypeError:
+            # Incompatible builtin types retain the existing possible-raise
+            # edge; they are not evidence for either normal truth value.
+            return None
+        return None
+
     def condition_truth(self, node):
         """Truth testing inside an effectful predicate must be intrinsic.
 
@@ -3370,6 +3411,8 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
             truth = self.condition_truth(node.operand)
             return None if truth is None else not truth
+        if isinstance(node, ast.Compare):
+            return self._evaluated_comparison_truths.get(node)
         return self.literal_truth(node)
 
     def visit_For(self, node):
@@ -3705,29 +3748,49 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 self._evaluated_values[node] = self.with_kinds(
                     (None, None, None, False, 'static'), 'number')
             return
-        # Chained comparisons short-circuit between their operands. The
-        # ordinary visitor cannot treat later comparator effects as eager.
-        if len(node.ops) != 1:
-            raise SQLFlowLimit('SQL generator comparison chain is unsupported; analysis is incomplete')
+        # A middle operand is evaluated once and its captured value is reused
+        # by the next link. Keep stopped stores separate from the continuing
+        # path so a later write cannot erase a short-circuit alternative.
         self.visit(node.left)
-        self.visit(node.comparators[0])
-        left = self.value_kind(node.left)
-        right = self.value_kind(node.comparators[0])
-        operator = node.ops[0]
-        if isinstance(operator, (ast.Is, ast.IsNot)):
-            intrinsic = True
-        elif isinstance(operator, (ast.In, ast.NotIn)):
-            # Membership itself can dispatch __contains__/__eq__/__hash__
-            # even though its final result is always an exact bool.
-            intrinsic = (right[0] in {'tuple', 'list', 'set', 'frozenset', 'str'}
-                         and self.hash_safe_shape(right[1])
-                         and self.hash_safe_shape(self.element_shape(left)))
-        else:
-            intrinsic = (self.hash_safe_shape(self.element_shape(left))
-                         and self.hash_safe_shape(self.element_shape(right)))
-        if not intrinsic:
-            raise SQLFlowLimit('SQL generator comparison callbacks are unresolved; analysis is incomplete')
-        self.note_possible_raise()
+        left_node, bypass, result_truth = node.left, None, True
+        for index, (operator, right_node) in enumerate(zip(node.ops, node.comparators)):
+            self.step()
+            try:
+                self.visit(right_node)
+            except SQLNoNormalReturn:
+                if bypass is None:
+                    raise
+                self.restore_sql_state(bypass)
+                # Every surviving normal path stopped at an earlier false
+                # link. Preserve that fact for enclosing and/or predicates.
+                result_truth = False
+                break
+            left, right = self.value_kind(left_node), self.value_kind(right_node)
+            if isinstance(operator, (ast.Is, ast.IsNot)):
+                intrinsic = True
+            elif isinstance(operator, (ast.In, ast.NotIn)):
+                # Membership can dispatch __contains__/__eq__/__hash__ even
+                # though its final result is always an exact bool.
+                intrinsic = (right[0] in {'tuple', 'list', 'set', 'frozenset', 'str'}
+                             and self.hash_safe_shape(right[1])
+                             and self.hash_safe_shape(self.element_shape(left)))
+            else:
+                intrinsic = (self.hash_safe_shape(self.element_shape(left))
+                             and self.hash_safe_shape(self.element_shape(right)))
+            if not intrinsic:
+                raise SQLFlowLimit('SQL generator comparison callbacks are unresolved; analysis is incomplete')
+            self.note_possible_raise()
+            truth = self.literal_comparison_truth(left_node, operator, right_node)
+            if truth is False or result_truth is True:
+                result_truth = truth
+            if index < len(node.ops) - 1:
+                if truth is not True:
+                    bypass = self.join_sql_states(bypass, self.sql_state())
+                if truth is False:
+                    break
+            left_node = right_node
+        self.restore_sql_state(self.join_sql_states(bypass, self.sql_state()))
+        self._evaluated_comparison_truths[node] = result_truth
         self._evaluated_values[node] = self.with_kinds(
             (None, None, None, False, 'static'), 'number')
 
@@ -5191,6 +5254,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         probe.restore_sql_state(self.sql_state())
         probe._evaluated_values = self._evaluated_values.copy()
         probe._evaluated_call_targets = self._evaluated_call_targets.copy()
+        probe._evaluated_comparison_truths = self._evaluated_comparison_truths.copy()
         probe._indexed_receivers = self._indexed_receivers.copy()
         probe._generator_specs = self._generator_specs.copy()
         probe._generator_running = self._generator_running.copy()

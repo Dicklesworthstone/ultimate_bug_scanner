@@ -285,6 +285,49 @@ def boolean_generator_cases():
                 yield consumer + '-' + name, source, ((CRITICAL, 2),)
 
 
+def comparison_generator_cases():
+    """Chained predicates keep operand order and every short-circuit store."""
+    for consumer in ('any', 'all'):
+        cases = (
+            ('numeric-range', f'    return {consumer}(0 <= column <= 10 and cursor.execute("SELECT 1").fetchone() is None for column in (1, 2))\n', ()),
+            ('numeric-range-sql', f'    return {consumer}(0 <= column <= 10 and cursor.execute(f"SELECT {{user}}").fetchone() is None for column in (1, 2))\n', ((CRITICAL, 2),)),
+            ('filter-range-sql', f'    return {consumer}(cursor.execute(f"SELECT {{user}}").fetchone() is None for column in (1, 2) if 0 <= column <= 10)\n', ((CRITICAL, 2),)),
+            ('first-link-stops', f'    return {consumer}(2 < 1 < cursor.execute(f"SELECT {{user}}") for _ in (1, 2))\n', ()),
+            ('middle-link-stops', f'    return {consumer}(0 < 1 > 2 < cursor.execute(f"SELECT {{user}}") for _ in (1, 2))\n', ()),
+            ('skipped-opaque-call', f'    return {consumer}(2 < 1 < unknown() and cursor.execute(f"SELECT {{user}}") is None for _ in (1, 2))\n', ()),
+            ('optional-clean-write', '    query = f"SELECT {user}"\n'
+             + f'    {consumer}(user is None is (query := "SELECT 1") for _ in (1,))\n'
+             '    cursor.execute(query)\n', ((CRITICAL, 4),)),
+            ('optional-tainted-write', '    query = "SELECT 1"\n'
+             + f'    {consumer}(user is None is (query := f"SELECT {{user}}") for _ in (1,))\n'
+             '    cursor.execute(query)\n', ((CRITICAL, 4),)),
+            ('mandatory-clean-write', '    query = f"SELECT {user}"\n'
+             + f'    {consumer}(None is None is (query := "SELECT 1") for _ in (1,))\n'
+             '    cursor.execute(query)\n', ()),
+            ('comparison-result-is-boolean', f'    answer = {consumer}(cursor.execute(f"SELECT {{user}}") is not None is not user for _ in (1,))\n'
+             '    cursor.execute(f"SELECT {answer}")\n', ((CRITICAL, 2),)),
+            # Equal numeric/string literals need not be the same object on
+            # every Python implementation. Their identity is not a truth proof.
+            ('non-singleton-identity', f'    return {consumer}(1 is 1 is cursor.execute(f"SELECT {{user}}") for _ in (1,))\n', ((CRITICAL, 2),)),
+        )
+        for name, body, expected in cases:
+            yield consumer + '-' + name, program(body), expected
+        for name, true_expression, false_expression in (
+                ('lt', '1 < 2 < 3', '2 < 1 < 3'),
+                ('le', '1 <= 1 <= 2', '2 <= 1 <= 2'),
+                ('gt', '3 > 2 > 1', '2 > 3 > 1'),
+                ('ge', '3 >= 3 >= 2', '2 >= 3 >= 2'),
+                ('eq', '1 == 1 == 1', '1 == 2 == 2'),
+                ('ne', '1 != 2 != 3', '1 != 1 != 2'),
+                ('in', '"a" in "abc" == "abc"', '"z" in "abc" == "abc"'),
+                ('not-in', '"z" not in "abc" == "abc"', '"a" not in "abc" == "abc"'),
+                ('is', 'None is None is None', 'None is False is False'),
+                ('is-not', 'None is not False is not None', 'None is not None is not False')):
+            for truth, expression in ((True, true_expression), (False, false_expression)):
+                source = program(f'    return {consumer}({expression} and cursor.execute(f"SELECT {{user}}") is None for _ in (1,))\n')
+                yield f'{consumer}-literal-{name}-{truth}', source, ((CRITICAL, 2),) if truth else ()
+
+
 def boolean_external_cell_cases(consumer, safe, unsafe):
     """Calls and implicit protocols may write a generator's lexical captures."""
     cases = (
@@ -691,6 +734,109 @@ class SQLValueCaptureTests(unittest.TestCase):
             with self.subTest(case=name):
                 compile(source, '<boolean-' + name + '>', 'exec')
                 self.inspect('boolean-' + name, source, expected)
+
+    def test_boolean_generator_comparison_chains(self):
+        for name, source, expected in comparison_generator_cases():
+            with self.subTest(case=name):
+                self.inspect('comparison-' + name, source, expected)
+
+    def test_real_sqlite_comparison_middle_operand_runs_once(self):
+        unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
+        safe = '"SELECT count(*) FROM users WHERE name = \'alice\'"'
+        for consumer in ('any', 'all'):
+            for label, first, later, rows, expected in (
+                    ('clean-first', safe, unsafe, 1, ()),
+                    ('tainted-first', unsafe, safe, 2, ((CRITICAL, 3),))):
+                # The second argument changes query after its SQL value was
+                # captured. Re-evaluating this middle call executes a different
+                # statement; rebinding cannot change the first execution.
+                source = program(f'    query = {first}\n'
+                                 + f'    {consumer}(None is not cursor.execute(query, '
+                                 + f'(query := {later}) and ()) is not None for _ in (1,))\n'
+                                 '    return cursor.fetchone()[0]\n')
+                name = 'comparison-middle-once-' + consumer + '-' + label
+                with self.subTest(consumer=consumer, initial=label):
+                    self.assertEqual(sqlite_witness(self.artifacts, name, source)['rows'], rows)
+                    self.inspect(name, source, expected)
+
+    def test_comparison_chains_preserve_nonreturning_operand_bypasses(self):
+        unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
+        safe = '"SELECT count(*) FROM users WHERE name = \'alice\'"'
+        # The stable recursive SQL helper has no normal return. It uses the
+        # existing bounded recursive transfer, without an opaque callback.
+        stop = ('    def stop():\n        cursor.execute("SELECT 1")\n'
+                '        return stop()\n')
+        for consumer in ('any', 'all'):
+            for label, first, expected_rows, expected in (
+                    ('optional', 'user is None', 2, ((CRITICAL, 9),)),
+                    ('mandatory', 'None is None', 1, ())):
+                source = program(stop + '    try:\n'
+                                 + f'        {consumer}({first} is stop() for _ in (1,))\n'
+                                 '    except RecursionError:\n'
+                                 + f'        return cursor.execute({safe}).fetchone()[0]\n'
+                                 + f'    return cursor.execute({unsafe}).fetchone()[0]\n')
+                name = f'comparison-nonreturning-{consumer}-{label}'
+                with self.subTest(case=name):
+                    self.assertEqual(sqlite_witness(self.artifacts, name, source)['rows'], expected_rows)
+                    self.inspect(name, source, expected)
+            source = program(f'    query = {safe}\n' + stop + '    try:\n'
+                             + f'        {consumer}(None is not (query := {unsafe}) is not stop() for _ in (1,))\n'
+                             '    except RecursionError:\n'
+                             '        return cursor.execute(query).fetchone()[0]\n'
+                             '    return 0\n')
+            name = 'comparison-exception-prefix-' + consumer
+            self.assertEqual(sqlite_witness(self.artifacts, name, source)['rows'], 2)
+            self.inspect(name, source, ((CRITICAL, 9),))
+            source = program(f'    query = {unsafe}\n' + stop + '    try:\n'
+                             + f'        {consumer}((user is None is stop()) or (query := {safe}) for _ in (1,))\n'
+                             '    except RecursionError:\n'
+                             + f'        return cursor.execute({safe}).fetchone()[0]\n'
+                             '    return cursor.execute(query).fetchone()[0]\n')
+            name = 'comparison-nonreturning-false-bypass-' + consumer
+            self.assertEqual(sqlite_witness(self.artifacts, name, source)['rows'], 1)
+            self.inspect(name, source, ())
+
+    def test_comparison_chains_keep_callback_boundaries(self):
+        for consumer in ('any', 'all'):
+            for label, comparison in (
+                    ('rich-comparison', '0 < user < 10'),
+                    ('middle-rich-comparison', 'None is None == user'),
+                    ('membership', '"key" in user is not None'),
+                    ('middle-membership', 'None is None in user')):
+                source = program(f'    return {consumer}({comparison} and cursor.execute("SELECT 1") is None for _ in (1,))\n')
+                path = self.artifacts / f'comparison-callback-{consumer}-{label}.py'
+                path.write_text(source, encoding='utf-8')
+                with self.subTest(consumer=consumer, case=label), self.assertRaisesRegex(
+                        detector.SQLFlowLimit, 'comparison callbacks.*incomplete'):
+                    list(detector.find([path]))
+
+    def test_real_sqlite_overloaded_comparison_remains_incomplete(self):
+        for consumer in ('any', 'all'):
+            source = program('    class Gate:\n'
+                             '        def __gt__(self, other):\n            return True\n'
+                             '        def __lt__(self, other):\n'
+                             '            cursor.execute(f"SELECT count(*) FROM users WHERE name = \'{user}\'")\n'
+                             '            return True\n'
+                             '    gate = Gate()\n'
+                             + f'    {consumer}(0 < gate < 10 and False and cursor.execute("SELECT 1") is None for _ in (1,))\n'
+                             '    return cursor.fetchone()[0]\n')
+            name = 'comparison-overloaded-witness-' + consumer
+            self.assertEqual(sqlite_witness(self.artifacts, name, source)['rows'], 2)
+            path = self.artifacts / (name + '.py')
+            path.write_text(source, encoding='utf-8')
+            with self.subTest(consumer=consumer), self.assertRaisesRegex(
+                    detector.SQLFlowLimit, 'comparison callbacks.*incomplete'):
+                list(detector.find([path]))
+
+    def test_real_cli_boolean_comparison_chains(self):
+        for name, source, expected in comparison_generator_cases():
+            if name.split('-', 1)[1] in {
+                    'numeric-range', 'numeric-range-sql', 'first-link-stops',
+                    'optional-clean-write', 'mandatory-clean-write'}:
+                self._assert_boolean_generator_cli('comparison-' + name, source, expected)
+        source = program('    cursor.execute(f"SELECT {user}")\n'
+                         '    all(0 < user < 10 and cursor.execute("SELECT 1") is None for _ in (1,))\n')
+        self._assert_partial_cli('comparison-unresolved-callback', source, 2)
 
     def test_boolean_generator_local_sql_helpers(self):
         unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'

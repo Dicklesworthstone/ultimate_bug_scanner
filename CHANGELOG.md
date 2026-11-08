@@ -10,6 +10,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Analyze bounded Python comparison chains inside effectful `any()`/`all()`
+  generators. Evaluate each operand once, preserve short-circuit mutation
+  alternatives and SQL effects, and keep exception prefixes and nonreturning
+  operands separate from normal continuation. Proven builtin comparisons can
+  complete; unresolved overloaded comparisons and membership callbacks remain
+  explicitly incomplete. Add paired detection controls and SQLite witnesses.
+
 - Follow selected Elixir `Task.async`/`Task.await` and `spawn` callbacks through
   immutable captures, selected helpers and exact result aliases. Report SQL,
   path and redirect sinks inside workers and after awaiting their results;

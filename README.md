@@ -2417,6 +2417,15 @@ calls are included in this check; matching calls retain full analysis even
 when their arguments are unknown. Read, decode, parse, and applicable analysis
 failures continue to report incomplete coverage.
 
+Within supported effectful `any()` and `all()` generators, SQL analysis follows
+comparison chains such as `0 <= column <= 10` using proven builtin value shapes.
+Middle operands execute once; later operands run only on continuing paths.
+Literal comparisons can prove that a later SQL call is unreachable, while an
+unknown comparison result retains both mutation alternatives. Exceptions keep
+the SQL effects already observed, and a nonreturning operand cannot erase an
+earlier false path. Arbitrary rich-comparison, membership and truth callbacks
+still report incomplete analysis rather than receiving builtin guarantees.
+
 Taint and response-header analysis use the same bounded work policy. They run
 separately and each has its own counters; the header detector has no additional
 fixed 250,000-expression cutoff. Transfers, summary scheduling, and fact

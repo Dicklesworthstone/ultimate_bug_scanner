@@ -253,6 +253,8 @@ run_step contract-checksums "${PY[@]}" shareable/test_contract_checksums.py
 # Issues #128, #196, #197: real-toolchain Go adapter and lifecycle location checks.
 run_step go-analyzers "${PY[@]}" shareable/test_go_analyzers.py
 run_step skip-categories "${PY[@]}" shareable/test_skip_categories.py
+# Issue #203: a broad .ubsignore glob must not overflow bandit's -x argv (E2BIG).
+run_step bandit-exclude-argv "${PY[@]}" shareable/test_bandit_exclude_argv.py
 # SARIF parity (bead K5): asserted for the modules whose SARIF carries their
 # heuristic findings; the other languages are reported (json has no per-finding
 # records for them yet, bead K2).

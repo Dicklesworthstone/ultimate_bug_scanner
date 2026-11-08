@@ -617,13 +617,24 @@ PYRUFF
           fi
         done
         if [[ -n "$EXTRA_EXCLUDES" ]]; then
+          # #203: give bandit ONE -x entry per exclude pattern, never one entry
+          # per matched file. Expanding a '.ubsignore' glob (e.g. 'artifacts/**')
+          # with `find` built a single -x argument holding every matched path;
+          # past Linux MAX_ARG_STRLEN (128 KiB) execve fails E2BIG before bandit
+          # starts, so the scan is reported partial ("python: error"). For a
+          # 'dir/**' or 'dir/*' pattern pass the directory (bandit's -x excludes a
+          # directory recursively); otherwise pass the glob (bandit -x globs too).
           IFS=',' read -r -a _ign_pats < <(printf '%s\n' "$EXTRA_EXCLUDES")
           for _pat in "${_ign_pats[@]}"; do
             [[ "$_pat" != *'*'* && "$_pat" != *'?'* && "$_pat" != *'['* ]] && continue
-            while IFS= read -r _match; do
-              [[ -z "$_match" ]] && continue
-              _EXC="${_EXC:+$_EXC,}$_match"
-            done < <(find "$PROJECT_DIR" -path "$PROJECT_DIR/$_pat" 2>/dev/null || true)
+            case "$_pat" in
+              */'**') _pat="${_pat%/**}" ;;
+              */'*')  _pat="${_pat%/*}" ;;
+            esac
+            case "$_pat" in
+              /*) _EXC="${_EXC:+$_EXC,}$_pat" ;;
+              *)  _EXC="${_EXC:+$_EXC,}$PROJECT_DIR/$_pat" ;;
+            esac
           done
         fi
         # bandit exits 0 (no issues), 1 (issues reported) or 2 (error).

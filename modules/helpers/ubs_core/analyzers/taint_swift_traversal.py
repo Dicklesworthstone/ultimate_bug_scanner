@@ -1531,6 +1531,8 @@ class SwiftEngine:
                 return self.header_text(values)
             return self.forget(value)
         if tokens[0].value == '#':
+            if len(tokens) > 1 and tokens[1].value in {'available', 'unavailable'}:
+                return CLEAN
             imports_testing = any(left.value == 'import' and right.value == 'Testing'
                                   for left, right in zip(self.parser.tokens, self.parser.tokens[1:]))
             if (len(tokens) < 3 or tokens[1].value not in {'expect', 'require'} or tokens[2].value != '('
@@ -1967,6 +1969,50 @@ class SwiftEngine:
                     return True
             return False
 
+        def group_directives(statements):
+            result, index, total = [], 0, len(statements)
+            while index < total:
+                statement = statements[index]
+                if (statement.kind == 'unsupported' and statement.tokens
+                        and statement.tokens[0].value == '#' and len(statement.tokens) > 1
+                        and statement.tokens[1].value == 'if'):
+                    arms, has_else, depth, index, closed = [[]], False, 1, index + 1, False
+                    while index < total:
+                        inner = statements[index]
+                        marker = (inner.kind == 'unsupported' and inner.tokens
+                                  and inner.tokens[0].value == '#' and len(inner.tokens) > 1
+                                  and inner.tokens[1].value in {'if', 'elseif', 'else', 'endif'})
+                        name = inner.tokens[1].value if marker else ''
+                        if name == 'if':
+                            depth += 1; arms[-1].append(inner)
+                        elif name == 'endif':
+                            depth -= 1
+                            if depth == 0:
+                                index += 1; closed = True; break
+                            arms[-1].append(inner)
+                        elif name in {'elseif', 'else'} and depth == 1:
+                            arms.append([]); has_else = has_else or name == 'else'
+                        else:
+                            arms[-1].append(inner)
+                        index += 1
+                    if not closed:
+                        raise ValueError('Swift unterminated #if directive; analysis is incomplete')
+                    grouped = tuple(group_directives(tuple(arm)) for arm in arms)
+                    result.append(SwiftStatement('ifdirective', (), (True,) if has_else else (), (), grouped))
+                    continue
+                result.append(statement); index += 1
+            return tuple(result)
+        def register_arm_declarations(directive, local):
+            for arm in directive.extra:
+                for statement in arm:
+                    if statement.kind == 'ifdirective':
+                        register_arm_declarations(statement, local); continue
+                    assignment = self.parser.assignment(statement.tokens) if statement.kind == 'simple' else None
+                    if assignment and assignment[-1] and assignment[0]:
+                        local[assignment[0]] = assignment[0] + '@' + str(assignment[1][0].start)
+                    declaration = self.parser.uninitialized(statement.tokens) if statement.kind == 'simple' else None
+                    if declaration:
+                        local[declaration.value] = declaration.value + '@' + str(declaration.start)
         def block(statements, following, bindings, break_to=None, continue_to=None, exit_to=None):
             exit_target = exit_node if exit_to is None else exit_to
             deferred_bodies, normal_statements = [], []
@@ -1978,7 +2024,7 @@ class SwiftEngine:
                     deferred_bodies.append(self.parser.block(deferred_st.tokens[op + 1:swift_close(deferred_st.tokens, op)], function.owner, {}))
                 else:
                     normal_statements.append(deferred_st)
-            statements = tuple(normal_statements)
+            statements = group_directives(tuple(normal_statements))
             snapshots, local = [], dict(bindings)
             for statement in statements:
                 before = dict(local)
@@ -1990,6 +2036,8 @@ class SwiftEngine:
                     local[declaration.value] = declaration.value + '@' + str(declaration.start)
                 if statement.kind == 'guard':
                     local = optional_scope(statement.tokens, local)
+                if statement.kind == 'ifdirective':
+                    register_arm_declarations(statement, local)
                 snapshots.append((dict(local), before))
             if deferred_bodies:
                 flat = tuple(st for body in reversed(deferred_bodies) for st in body)
@@ -2006,6 +2054,12 @@ class SwiftEngine:
             for statement, (local, before) in reversed(list(zip(statements, snapshots))):
                 kind, tokens = statement.kind, statement.tokens
                 if kind == 'definition':
+                    continue
+                if kind == 'ifdirective':
+                    arm_entries = [block(arm, following, before, break_to, continue_to, exit_target)
+                                   for arm in statement.extra]
+                    targets = tuple(arm_entries) if statement.body else (*arm_entries, following)
+                    following = node('branch', targets=targets)
                     continue
                 if kind == 'if':
                     yes_scope = optional_scope(tokens, local)

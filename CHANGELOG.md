@@ -10,6 +10,11 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Require candidate qualification/signing and the Nix gate to succeed before
+  the retained DSR/local recipe can push OCI images or move registry tags.
+  Preserve the GitHub Release dependencies and default failure propagation;
+  test publication ordering without executing GitHub Actions.
+
 - Track bounded, read-only Python generator continuations: read supported
   globals on resume, retain argument/default snapshots, and share cursor
   exhaustion through aliases and returned methods. Preserve yielded heap

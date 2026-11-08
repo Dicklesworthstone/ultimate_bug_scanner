@@ -199,6 +199,12 @@ OCI/provenance artifacts only when they were actually produced and verified
 under the approved identity. Keep existing Nix, signature, and provenance
 requirements explicit in the approval plan; DSR does not waive them.
 
+The OCI image job also depends on successful candidate qualification/signing
+and the Nix gate. Preserve those dependencies in the DSR job: pushing an image
+or moving its version/latest tags is publication even before a GitHub Release
+is created. The retained recipe signs and attests the image after its initial
+push; this ordering does not establish atomic authenticated promotion.
+
 After a toolchain or recipe change, qualify signatures and installation end to
 end before announcing the release. If a published version is defective, fix
 forward with a new patch version; never move or re-tag a published version.

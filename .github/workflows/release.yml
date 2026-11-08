@@ -255,7 +255,12 @@ jobs:
 
   oci-image:
     runs-on: ubuntu-latest
-    needs: gather
+    # The image push is publication too: all qualification gates must finish
+    # successfully before the DSR/local recipe may update registry tags.
+    needs:
+      - gather
+      - build-artifacts
+      - nix-check
     env:
       TAG: ${{ needs.gather.outputs.tag }}
       VERSION: ${{ needs.gather.outputs.version }}

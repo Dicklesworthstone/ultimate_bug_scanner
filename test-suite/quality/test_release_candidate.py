@@ -356,5 +356,45 @@ class ReleaseCandidateTests(unittest.TestCase):
         self.assertTrue({"SHA256SUMS", "SHA256SUMS.minisig"} <= names)
 
 
+class ReleaseWorkflowTests(unittest.TestCase):
+    def test_publication_waits_for_successful_candidate_and_nix_gates(self) -> None:
+        # The image push is already public publication, before the later
+        # GitHub Release job. Check the recipe's dependency contract without
+        # executing Actions or adding a YAML dependency to the test suite.
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        jobs = workflow.split("\njobs:\n", 1)[1]
+        sections = re.split(r"^  ([A-Za-z0-9_-]+):[ \t]*$", jobs, flags=re.M)
+        bodies = dict(zip(sections[1::2], sections[2::2]))
+        required = {
+            "oci-image": {"gather", "build-artifacts", "nix-check"},
+            "publish": {"build-artifacts", "oci-image", "nix-check"},
+        }
+        for name, prerequisites in required.items():
+            with self.subTest(job=name):
+                self.assertIn(name, bodies)
+                header = bodies[name].split("\n    steps:", 1)[0]
+                needs = re.search(r"^    needs:[ \t]*([^\n]*)$", header, re.M)
+                self.assertIsNotNone(needs, name + " has no publication prerequisites")
+                value = needs[1].strip()
+                if value.startswith("[") and value.endswith("]"):
+                    dependencies = {part.strip() for part in value[1:-1].split(",")}
+                elif value:
+                    dependencies = {value}
+                else:
+                    block = re.match(r"(?:\n      - [A-Za-z0-9_-]+[ \t]*)+", header[needs.end():])
+                    self.assertIsNotNone(block, name + " has unrecognized prerequisite syntax")
+                    dependencies = set(re.findall(r"- ([A-Za-z0-9_-]+)", block[0]))
+                self.assertFalse(prerequisites - dependencies,
+                                 name + " can run before " + ", ".join(sorted(prerequisites - dependencies)))
+                self.assertNotRegex(header, r"(?m)^    if:",
+                                    name + " must retain default successful-dependency semantics")
+        for name in ("build-artifacts", "nix-check", "oci-image"):
+            with self.subTest(failure_propagation=name):
+                self.assertIn(name, bodies)
+                for value in re.findall(r"(?m)^\s+continue-on-error:[ \t]*([^\n]+)", bodies[name]):
+                    self.assertEqual(value.split("#", 1)[0].strip(), "false",
+                                     name + " must not tolerate failed qualification/signing steps")
+
+
 if __name__ == "__main__":
     unittest.main()

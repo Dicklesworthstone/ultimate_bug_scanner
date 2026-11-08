@@ -10925,6 +10925,68 @@
       }
     },
     {
+      "id": "swift-b-getter-false-match-clean",
+      "description": "A computed getter whose only source token is a non-request .filename member analyzes clean, not refused (#204 B).",
+      "path": "test-suite/swift/clean/b_getter_false_match.swift",
+      "language": "swift",
+      "tags": ["swift", "security", "taint", "regression", "clean"],
+      "args": ["--only=swift", "--skip=1,2,3,4,5,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23"],
+      "expect": {
+        "exit_code": "zero",
+        "totals": { "critical": { "max": 0 } },
+        "forbid_substrings": ["analysis is incomplete", "swift: partial"]
+      }
+    },
+    {
+      "id": "swift-b-getter-chain-clean",
+      "description": "A computed getter reading a non-request field's .filename analyzes clean (#204 B).",
+      "path": "test-suite/swift/clean/b_getter_chain.swift",
+      "language": "swift",
+      "tags": ["swift", "security", "taint", "regression", "clean"],
+      "args": ["--only=swift", "--skip=1,2,3,4,5,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23"],
+      "expect": {
+        "exit_code": "zero",
+        "totals": { "critical": { "max": 0 } },
+        "forbid_substrings": ["analysis is incomplete", "swift: partial"]
+      }
+    },
+    {
+      "id": "swift-b-accessor-source-refuses",
+      "description": "An explicit get/set accessor carrying a request-source token keeps refusing (analyzed-or-refused, never clean) (#204 B).",
+      "path": "test-suite/swift/buggy/b_accessor_source.swift",
+      "language": "swift",
+      "tags": ["swift", "taint", "regression", "refuses"],
+      "args": ["--only=swift"],
+      "expect": {
+        "exit_code": "nonzero",
+        "require_substrings": ["analysis is incomplete"]
+      }
+    },
+    {
+      "id": "swift-b-stored-request-field-refuses",
+      "description": "A stored request field keeps refusing (object model unmodeled) (#204 B).",
+      "path": "test-suite/swift/buggy/b_stored_request_field.swift",
+      "language": "swift",
+      "tags": ["swift", "taint", "regression", "refuses"],
+      "args": ["--only=swift"],
+      "expect": {
+        "exit_code": "nonzero",
+        "require_substrings": ["analysis is incomplete"]
+      }
+    },
+    {
+      "id": "swift-b-init-request-refuses",
+      "description": "An init deriving a stored field from a request keeps refusing (heap model unmodeled) (#204 B).",
+      "path": "test-suite/swift/buggy/b_init_request.swift",
+      "language": "swift",
+      "tags": ["swift", "taint", "regression", "refuses"],
+      "args": ["--only=swift"],
+      "expect": {
+        "exit_code": "nonzero",
+        "require_substrings": ["analysis is incomplete"]
+      }
+    },
+    {
       "id": "csharp-suppression-intervals-markers",
       "description": "A7 GH #91: all ubs:ignore placements (trailing, previous-line, multi-line statement, formatter-relocated, rule-scoped) suppress every finding line in the csharp module.",
       "path": "test-suite/csharp/suppression/suppression_buggy.cs",

@@ -452,6 +452,23 @@ class SwiftParser:
                     # witnesses, and retain the conservative request fields.
                     source_region = (*tokens[start:head], *tokens[head + 2:finish])
                 if swift_source_tokens(source_region):
+                    accessor_brace = next((i for i in range(head, finish)
+                                           if tokens[i].kind == 'code' and tokens[i].value == '{'), -1)
+                    if (accessor_brace >= 0 and tokens[head].value in {'var', 'let'}
+                            and not any(tokens[i].kind == 'code' and tokens[i].value == '='
+                                        for i in range(head, accessor_brace))):
+                        body_close = swift_close(tokens, accessor_brace)
+                        body_tokens = tokens[accessor_brace + 1:body_close]
+                        head_body = [t for t in body_tokens if t.kind == 'code' and t.value != '\n']
+                        if head_body and head_body[0].value in {'get', 'set', 'willSet', 'didSet',
+                                '_modify', 'unsafeAddress', 'unsafeMutableAddress', '@'}:
+                            raise ValueError('Swift request-derived property accessor needs binding analysis; analysis is incomplete')
+                        accessor_key = tokens[start].start
+                        accessor = SwiftFunction(accessor_key, tokens[head + 1].value, owner, scope, ())
+                        self.functions[accessor_key] = accessor
+                        accessor.body = self.block(body_tokens, owner, (*scope, accessor_key), depth=depth + 1)
+                        statements.append(SwiftStatement('definition', part, extra=(accessor_key,)))
+                        continue
                     raise ValueError('Swift request-derived type initialization needs field analysis; analysis is incomplete')
                 continue
             if first in {'import', 'typealias', 'case', '@'}:

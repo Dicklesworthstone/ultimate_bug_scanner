@@ -1,13 +1,16 @@
 """Call summaries must separate returned and exceptional continuations (D6)."""
 from __future__ import annotations
 
+import ast
 import json
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
+import textwrap
 import unittest
 
-from test_taint_python_dataflow import SourceTest
+from test_taint_python_dataflow import ROOT, SourceTest, taint_py
 
 
 class CoroutineProcessIntegrationTests(SourceTest):
@@ -816,6 +819,404 @@ except ValueError as error:
                 return choose(value)
             eval(choose(input()))
         ''', 'eval')
+
+
+class GeneratorResumeTests(SourceTest):
+    def assert_sites(self, source, *lines):
+        findings = self.scan(source)
+        self.assertEqual(sorted((item['rule'], item['line']) for item in findings),
+                         [('python.taint.eval', line) for line in sorted(lines)], findings)
+
+    def test_terminal_yield_reads_the_resumption_global(self):
+        for initial, final, expected in (("'fixed'", 'input()', (6,)),
+                                         ('input()', "'fixed'", ())):
+            with self.subTest(initial=initial, final=final):
+                self.assert_sites(f'''
+                    code = {initial}
+                    def values():
+                        yield code
+                    iterator = values()
+                    code = {final}
+                    eval(iterator.__next__())
+                ''', *expected)
+
+    def test_argument_and_default_values_are_creation_time_snapshots(self):
+        for initial, final, expected in (('input()', "'fixed'", (6,)),
+                                         ("'fixed'", 'input()', ())):
+            for signature, call in (('saved', 'values(code)'), ('saved=code', 'values()')):
+                with self.subTest(initial=initial, default='=' in signature):
+                    self.assert_sites(f'''
+                        code = {initial}
+                        def values({signature}):
+                            yield saved
+                        iterator = {call}
+                        code = {final}
+                        eval(iterator.__next__())
+                    ''', *expected)
+
+    def test_aliases_share_exhaustion_without_a_normal_else_path(self):
+        self.assert_sites('''
+            code = input()
+            def values():
+                yield code
+            iterator = values()
+            alias = iterator
+            iterator.__next__()
+            try:
+                alias.__next__()
+            except StopIteration:
+                eval(code)
+            else:
+                eval(code)
+        ''', 10)
+
+    def test_branch_join_retains_created_and_suspended_continuations(self):
+        self.assert_sites('''
+            code = input()
+            def values():
+                yield code
+            iterator = values()
+            if flag:
+                iterator.__next__()
+            try:
+                eval(iterator.__next__())
+            except StopIteration:
+                eval(code)
+        ''', 8, 10)
+
+    def test_returned_instances_have_distinct_cursors(self):
+        self.assert_sites('''
+            code = 'fixed'
+            def values():
+                yield code
+            def factory():
+                return values()
+            first = factory()
+            second = factory()
+            first.__next__()
+            code = input()
+            eval(second.__next__())
+            try:
+                first.__next__()
+            except StopIteration:
+                pass
+            else:
+                eval(input())
+        ''', 10)
+
+    def test_returned_next_method_preserves_its_instance(self):
+        self.assert_sites('''
+            code = 'fixed'
+            def values():
+                yield code
+            def factory():
+                return values().__next__
+            advance = factory()
+            code = input()
+            eval(advance())
+            try:
+                advance()
+            except StopIteration:
+                pass
+            else:
+                eval(code)
+        ''', 8)
+
+    def test_missing_name_failure_occurs_on_first_resume(self):
+        self.assert_sites('''
+            def values():
+                yield missing
+            iterator = values()
+            try:
+                iterator.__next__()
+            except NameError:
+                eval(input())
+            else:
+                eval(input())
+        ''', 7)
+
+    def test_for_uses_its_original_instance_and_exhausts_it(self):
+        self.assert_sites('''
+            code = input()
+            def values():
+                yield code
+            iterator = values()
+            original = iterator
+            for value in iterator:
+                iterator = None
+                eval(value)
+            try:
+                original.__next__()
+            except StopIteration:
+                eval(code)
+            else:
+                eval(code)
+        ''', 8, 12)
+        self.assert_sites('''
+            code = input()
+            def values():
+                yield code
+            def factory():
+                return values()
+            for value in factory():
+                eval(value)
+        ''', 7)
+
+    def test_break_leaves_the_cursor_suspended(self):
+        self.assert_sites('''
+            code = 'fixed'
+            def values():
+                yield code
+            iterator = values()
+            for value in iterator:
+                break
+            code = input()
+            try:
+                iterator.__next__()
+            except StopIteration:
+                eval(code)
+            else:
+                eval(code)
+        ''', 11)
+
+    def test_inert_string_proof_does_not_sanitize_its_contents(self):
+        for actual, expected in (('input()', ('command',)), ("'echo fixed'", ())):
+            with self.subTest(actual=actual):
+                self.assert_rules(f'''
+                    import os
+                    def values(value):
+                        yield value
+                    for command in values({actual}):
+                        os.system(command)
+                ''', *expected)
+
+    def test_unsupported_protocols_keep_explicit_incompleteness(self):
+        sources = (
+            "code='fixed'\ndef values():\n    yield code\n    yield code\n"
+            "g=values()\ncode=input()\neval(g.__next__())\n",
+            "code='fixed'\ndef read(): return code\ndef values():\n    yield read()\n"
+            "g=values()\ncode=input()\neval(g.__next__())\n",
+            "code='fixed'\ng=(code for unused in [0])\ncode=input()\neval(g.__next__())\n",
+            "def run():\n    code='fixed'\n    g=(code for unused in [0])\n"
+            "    code=input()\n    eval(g.__next__())\nrun()\n",
+            "def values():\n    yield 'fixed'\ng=values()\nlist(g)\n",
+            "def values():\n    yield 'fixed'\ng=values()\nnext(g)\n",
+            "def values():\n    yield 'fixed'\ng=values()\n[g]\n",
+            "def values():\n    yield 'fixed'\ng=values()\na,b=g\n",
+            "def values():\n    yield 'fixed'\ng=values()\n[x for x in g]\n",
+            "def values():\n    yield 'fixed'\ng=values()\nother == g\n",
+            "def values():\n    yield 'fixed'\ng=values()\ng.send(None)\n",
+            "def values():\n    yield 'fixed'\ndef relay():\n    yield from values()\nrelay()\n",
+            "def values(value):\n    yield value\nvalues()\n",
+            "def values(value):\n    yield value\nvalues('fixed',value='other')\n",
+            "def values(value):\n    yield value\nvalues(*unknown)\n",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                    self.scan(source)
+        self.assert_sites("code='fixed'\ng=(item for item in [code])\ncode=input()\neval(g.__next__())\n")
+
+    def test_live_global_mutation_channel_does_not_use_an_eager_fallback(self):
+        source = '''
+            eval(input())
+            code = 'fixed'
+            def add(box):
+                box.append(code)
+            def values(box):
+                add(box)
+                yield 'fixed'
+            box = []
+            iterator = values(box)
+            code = input()
+            for unused in iterator:
+                pass
+            eval(box[0])
+        '''
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete') as raised:
+            taint_py._Analysis(ast.parse(textwrap.dedent(source))).analyze()
+        self.assertIn(('eval', 2, 1), {key[:3] for key in raised.exception.effects})
+
+    def test_a_single_later_global_initialization_is_not_stable(self):
+        for declaration in (
+            "def values():\n    yield code\n    yield code\ng=values()\n",
+            "def read(): return code\ndef values():\n    yield read()\ng=values()\n",
+            "g=(code for unused in [0])\n",
+        ):
+            with self.subTest(declaration=declaration):
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                    self.scan(declaration + "code=input()\neval(g.__next__())\n")
+
+    def test_stable_generator_expression_bindings_use_their_lexical_owner(self):
+        for value, expected in (('input()', ('eval',)), ("'fixed'", ())):
+            for body in ("def run(value):\n    g=(value for unused in [0])\n    eval(g.__next__())\nrun(VALUE)\n",
+                         "def run():\n    value=VALUE\n    g=(value for unused in [0])\n"
+                         "    eval(g.__next__())\nrun()\n"):
+                source = "def unrelated():\n    value='one'\n    value='two'\n" + body.replace('VALUE', value)
+                with self.subTest(value=value, body=body):
+                    self.assert_rules(source, *expected)
+        for source in (
+            "def run():\n    value='fixed'\n    def replace():\n        nonlocal value\n"
+            "        value=input()\n    g=(value for unused in [0])\n    replace()\n"
+            "    eval(g.__next__())\nrun()\n",
+            "def run():\n    for unused in [0,1]:\n        value=input()\n"
+            "        g=(value for item in [0])\n    eval(g.__next__())\nrun()\n",
+        ):
+            with self.subTest(source=source), self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                self.scan(source)
+
+    def test_direct_for_borrows_only_an_independently_retained_module_list(self):
+        for actual, expected in (('input()', (6,)), ("'fixed'", ())):
+            self.assert_sites("def values(box):\n    yield box\nbox=[]\n"
+                              "for alias in values(*[box]):\n    alias.append(" + actual + ")\n"
+                              "eval(box[0])\n", *expected)
+        sources = (
+            "def values(box):\n    yield box\nbox=[]\ng=values(box)\n",
+            "def values(box):\n    yield box\ndef run():\n    box=[]\n"
+            "    for alias in values(box):\n        alias.append(input())\nrun()\n",
+            "def values(box):\n    yield box\nbox=[]\nfor alias in values(box):\n    del box\n",
+            "def values(box):\n    yield box\nbox=[]\ndef replace():\n    global box\n"
+            "    box=None\nfor alias in values(box):\n    replace()\n",
+            "def values(box):\n    yield box\nbox=[]\nfor alias in values(box):\n"
+            "    globals()['box']=None\n",
+            "def values(box):\n    yield box\nbox=[]\nfor box in values(box):\n    pass\n",
+        )
+        for source in sources:
+            with self.subTest(source=source), self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                self.scan(source)
+
+    def test_dynamic_loader_cannot_certify_an_inert_input_capture(self):
+        source = '''
+            import importlib as loader
+            code = 'fixed'
+            tainted = input()
+            class Value(str):
+                def __del__(self):
+                    global code
+                    code = tainted
+            class Reader:
+                def readline(self):
+                    return Value('value')
+            setattr(loader.import_module('s' + 'ys'), 'std' + 'in', Reader())
+            def values(payload):
+                yield None
+            iterator = values(input())
+            iterator = None
+            eval(code)
+        '''
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'captured value lifetime.*incomplete'):
+            self.scan(source)
+
+    def test_frame_capabilities_revoke_local_and_module_root_proofs(self):
+        readonly = ("import sys as runtime\nimport os\ndef stack_filename():\n"
+                    "    frame=runtime._getframe()\n    return frame.f_code.co_filename\n"
+                    "def run(code):\n    g=(code for unused in [0])\n"
+                    "    os.system(g.__next__())\nrun(input())\n")
+        self.assert_rules(readonly, 'command')
+        for replacement in ("runtime=unknown\n", "alias=runtime\nalias._getframe=unknown\n",
+                            "runtime.__dict__['_getframe']=unknown\n"):
+            with self.subTest(replacement=replacement):
+                source = readonly.replace('import os\n', 'import os\n' + replacement)
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                    self.scan(source)
+        for acquisition, call in (("import sys", 'sys._getframe()'),
+                                  ("import inspect", 'inspect.currentframe()'),
+                                  ("from sys import _getframe as frame", 'frame()'),
+                                  ("from inspect import currentframe as frame", 'frame()')):
+            with self.subTest(acquisition=acquisition):
+                source = acquisition + "\ndef run():\n    code='fixed'\n"
+                source += "    g=(code for unused in [0])\n    frame=" + call + "\n"
+                source += "    getattr(frame,'f_'+'locals')['code']=input()\n    eval(g.__next__())\nrun()\n"
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                    self.scan(source)
+                source = acquisition + "\ndef values(box):\n    yield None\nbox=[]\n"
+                source += "for unused in values(box):\n    frame=" + call + "\n"
+                source += "    del getattr(frame,'f_'+'globals')['box']\n"
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'captured value lifetime.*incomplete'):
+                    self.scan(source)
+
+    def test_borrowed_root_proof_covers_dynamic_execution_and_helper_aliases(self):
+        prefix = ("code='fixed'\ntainted=input()\nclass Trigger:\n    def __del__(self):\n"
+                  "        global code\n        code=tainted\ndef values(box):\n    yield None\nbox=[Trigger()]\n")
+        for helper, action in (
+            ('', "exec('del box')"),
+            ('', "eval(\"globals().pop('box')\")"),
+            ('execute=exec\n', "execute('del box')"),
+            ("def remove():\n    exec('del box', globals())\n", 'remove()'),
+            ("execute=exec\ndef remove(action):\n    action('del box')\n", 'remove(execute)'),
+        ):
+            source = prefix + helper + 'for unused in values(box):\n    ' + action + '\neval(code)\n'
+            with self.subTest(action=action), self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                self.scan(source)
+
+    def test_default_builtin_and_lifetime_mutations_are_not_trusted(self):
+        sources = (
+            "import builtins\ndef values():\n    yield input\ng=values()\n"
+            "builtins.input=eval\ng.__next__()(request.args['x'])\n",
+            "def helper(): pass\ndef values():\n    yield input\ng=values()\n"
+            "helper.__builtins__['input']=eval\ng.__next__()(request.args['x'])\n",
+            "def values(saved='fixed'):\n    yield saved\nvalues.__defaults__=(input(),)\n"
+            "g=values()\neval(g.__next__())\n",
+            "def values(saved='fixed'):\n    yield saved\nsetattr(values,'__defaults__',(input(),))\n"
+            "g=values()\neval(g.__next__())\n",
+            "def values(*,saved='fixed'):\n    yield saved\nvalues.__kwdefaults__={'saved':input()}\n"
+            "g=values()\neval(g.__next__())\n",
+            "def values():\n    yield 'fixed'\ndef other():\n    yield input()\n"
+            "values.__code__=other.__code__\ng=values()\neval(g.__next__())\n",
+            "code='fixed'\nclass Finalizer:\n    def __del__(self):\n        global code\n"
+            "        code=input()\ndef values(payload):\n    yield None\n"
+            "g=values(Finalizer())\ng=None\neval(code)\n",
+            "import sys\ncode='fixed'\nclass Value(str):\n    def __del__(self):\n"
+            "        global code\n        code='tainted'\nclass Reader:\n"
+            "    def readline(self): return Value('value')\nsys.stdin=Reader()\n"
+            "def values(payload):\n    yield 'fixed'\ng=values(input())\ng=None\neval(code)\n",
+        )
+        for source in sources:
+            with self.subTest(source=source), self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                self.scan(source)
+
+
+class GeneratorProjectTests(unittest.TestCase):
+    def project(self, sources):
+        artifacts = ROOT / 'test-suite' / 'artifacts' / 'generator-followup'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        root = Path(tempfile.mkdtemp(prefix='project-', dir=artifacts))
+        files = []
+        for name, source in sources.items():
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(source, encoding='utf-8')
+            files.append(path)
+        return taint_py._Project(files, root)
+
+    def test_mutated_defining_module_cannot_keep_stale_callable_identity(self):
+        library = "selected=print\ndef values():\n    yield selected\n"
+        for replacement in ('lib.selected=eval', 'alias=lib\nalias.selected=eval'):
+            with self.subTest(replacement=replacement):
+                project = self.project({'lib.py': library, 'app.py':
+                    "import lib\ng=lib.values()\n" + replacement + "\ng.__next__()(input())\n"})
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'defining module namespace.*incomplete'):
+                    list(project.findings())
+        project = self.project({'lib.py': library, 'app.py':
+            "import lib\ng=lib.values()\ng.__next__()(input())\n"})
+        self.assertEqual(list(project.findings()), [])
+
+    def test_ambiguous_module_keys_do_not_hide_selected_engines(self):
+        project = self.project({
+            'ambiguous.py': "VALUE='fixed'\n",
+            'ambiguous/__init__.py': "VALUE='fixed'\n",
+            'app.py': "def values(value):\n    yield value\ng=values(input())\neval(g.__next__())\n",
+        })
+        findings = list(project.findings())
+        self.assertEqual([(path.name, rule, line) for path, rule, line, _col, _message in findings],
+                         [('app.py', 'py.taint.eval', 4)])
+        project = self.project({
+            'ambiguous.py': "VALUE='fixed'\n",
+            'ambiguous/__init__.py': "import builtins\nbuiltins.input=eval\n",
+            'app.py': "def values():\n    yield input\ng=values()\ng.__next__()(request.args['x'])\n",
+        })
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'builtin binding.*incomplete'):
+            list(project.findings())
 
 
 if __name__ == '__main__':

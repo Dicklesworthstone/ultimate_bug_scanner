@@ -10,6 +10,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Track bounded, read-only Python generator continuations: read supported
+  globals on resume, retain argument/default snapshots, and share cursor
+  exhaustion through aliases and returned methods. Preserve yielded heap
+  aliases in direct loops only while an independent module root retains them.
+  Reject unresolved delayed reads, frame/namespace mutation and capture
+  lifetimes explicitly, retaining earlier findings and existing analysis limits.
+
 - Resolve the supported C# string-conversion contract before propagating
   Dapper SQL values. Argument-taking and generic `ToString` extensions on
   commands, their properties or local aliases no longer inherit built-in

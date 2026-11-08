@@ -35,7 +35,7 @@ import sys
 import tokenize
 from bisect import bisect_right
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Union
@@ -572,6 +572,58 @@ class _DeferredCall:
         if type(other) is not type(self):
             return NotImplemented
         return _same_analysis_value(self, other)
+
+
+@dataclass(frozen=True, eq=False)
+class _DeferredGenerator(_DeferredCall):
+    """A bounded generator owns captured operands and a state-local cursor.
+
+    The reserved cell records progress, separately from the immutable handle.
+    Copying a handle aliases that cell; copying a branch copies its contents.
+    """
+
+
+@dataclass(frozen=True, eq=False)
+class _GeneratorNext(_FunctionValue):
+    """The immutable __next__ method of one known generator instance."""
+
+
+@dataclass(frozen=True)
+class _GeneratorString:
+    """A proven builtin string, with unknown contents and no literal contract."""
+
+
+_GENERATOR_CURSOR = '@generator:cursor'
+_GENERATOR_CREATED = '@generator:created'
+_GENERATOR_SUSPENDED = '@generator:suspended'
+_GENERATOR_EXHAUSTED = '@generator:exhausted'
+
+
+def _terminal_generator(function):
+    """One direct yield has a finite continuation with no source suffix.
+
+    Reads are checked again at resumption. Assignments, calls, iteration,
+    delegation and cleanup require additional suspension/effect semantics.
+    """
+    if (not isinstance(function, ast.FunctionDef) or function.decorator_list
+            or getattr(function, 'type_params', ()) or function.type_comment
+            or function.returns is not None):
+        return False
+    signature = function.args
+    if (signature.vararg is not None or signature.kwarg is not None
+            or any(argument.annotation is not None for argument in
+                   (*signature.posonlyargs, *signature.args, *signature.kwonlyargs))):
+        return False
+    body = function.body
+    if not (body and isinstance(body[-1], ast.Expr)
+            and isinstance(body[-1].value, ast.Yield)
+            and (body[-1].value.value is None
+                 or isinstance(body[-1].value.value, (ast.Name, ast.Constant)))):
+        return False
+    return all(isinstance(statement, (ast.Pass, ast.Global, ast.Nonlocal))
+               or index == 0 and isinstance(statement, ast.Expr)
+               and isinstance(statement.value, ast.Constant) and isinstance(statement.value.value, str)
+               for index, statement in enumerate(body[:-1]))
 
 
 def _capture_metadata(value):
@@ -2307,6 +2359,249 @@ class _Flow:
                 return False
         return True
 
+    def generator_builtins_stable(self, owner=None):
+        engines = (self.engine, owner or self.engine)
+        project = self.engine.project
+        if project is not None:
+            # Ambiguous import keys deliberately map to None. Every selected
+            # engine still participates in this namespace proof.
+            engines = (engine for _path, _text, engine, _offset in project.sources)
+        return all(engine.generator_input_identity for engine in engines)
+
+    def generator_summary_globals(self, summary):
+        """Find delayed globals in every immutable summary channel.
+
+        A helper can expose a late read through an object write, exception,
+        saved callback or cell without returning that value directly. Walk
+        the shared analysis-value DAG, never the source AST or a project.
+        """
+        names, seen, pending = set(), set(), [summary]
+        while pending:
+            value = pending.pop()
+            if id(value) in seen:
+                continue
+            seen.add(id(value))
+            self.engine.budget.spend()
+            if isinstance(value, (TaintTrace, _SymbolicValue)):
+                parameter = value.parameter
+                if parameter and parameter.startswith('@global:'):
+                    names.add(parameter[8:])
+            elif isinstance(value, str):
+                if value.startswith('@global:'):
+                    names.add(value[8:])
+            elif isinstance(value, (tuple, frozenset)):
+                pending.extend(value)
+            elif not isinstance(value, _LiteralString) and is_dataclass(value):
+                pending.extend(getattr(value, item.name) for item in fields(value))
+        return names
+
+    def generator_borrowed_capture(self, node, references, state):
+        """Prove a direct for-frame does not own a mutable capture's lifetime."""
+        original = self.engine.original_calls.get(node, node)
+        consumer = self.engine.parents.get(original)
+        if (self.scope is not self.engine.tree or not isinstance(consumer, ast.For)
+                or self.engine.parents.get(consumer) is not self.engine.tree
+                or consumer.iter is not original or len(references) != 1
+                or not isinstance(next(iter(references)), ast.List)):
+            return False
+        engines = ((engine for _path, _text, engine, _offset in self.engine.project.sources)
+                   if self.engine.project is not None else (self.engine,))
+        for engine in engines:
+            for capability in engine.generator_execution_capabilities:
+                call = engine.parents.get(capability)
+                # A helper or saved eval/exec alias could delete the root
+                # during suspension. Only a direct module call strictly
+                # after this top-level loop is outside the borrowed lifetime.
+                if (engine is not self.engine or not isinstance(call, ast.Call)
+                        or call.func is not capability or engine.enclosing(call) is not engine.tree
+                        or call.lineno <= consumer.end_lineno):
+                    return False
+        # The contents need not be inert. A distinct, already established
+        # module root retains this exact list across every loop continuation,
+        # so releasing the generator frame cannot release the list itself.
+        return any(refs == references and name not in state.deleted_globals
+                   and self.engine.generator_stable_binding(name, self.engine.tree, original)
+                   for name, refs in state.references.items() if not name.startswith('@'))
+
+    def generator_value(self, target, node, inputs, bound, references, values, state, closure):
+        """Create a supported frame without evaluating its yield."""
+        if closure is not None:
+            return None  # Live-cell lifetimes retain the existing refusal.
+        captured_defaults = target if isinstance(target, _FunctionValue) else None
+        function = captured_defaults.function if captured_defaults is not None else target
+        signature = function.args
+        positional = [arg.arg for arg in (*signature.posonlyargs, *signature.args)]
+        parameters = (*positional, *(arg.arg for arg in signature.kwonlyargs))
+        positions = self.call_positions(node, inputs.arguments, state)
+        named = set(inputs.keywords)
+        if (any(isinstance(expression, ast.Starred) for expression, *_rest in positions)
+                or None in named or len(positions) > len(positional)
+                or named - set(parameters) or named & set(positional[:len(signature.posonlyargs)])
+                or named & set(positional[:len(positions)]) or set(parameters) - bound.keys()):
+            raise AnalysisLimit('generator argument binding requires exact operands; analysis is incomplete')
+        captured_values = {name: values.get(name) for name in parameters}
+        for name, (expression, _fact, binding, _refs) in zip(positional, positions):
+            if isinstance(expression, ast.Constant):
+                captured_values[name] = expression
+        for name, expression in inputs.keyword_nodes.items():
+            if isinstance(expression, ast.Constant):
+                captured_values[name] = expression
+        for name, expression in zip(positional[-len(signature.defaults):], signature.defaults):
+            if name not in positional[:len(positions)] and name not in named and isinstance(expression, ast.Constant):
+                captured_values[name] = expression
+        for argument, expression in zip(signature.kwonlyargs, signature.kw_defaults):
+            if argument.arg not in named and isinstance(expression, ast.Constant):
+                captured_values[argument.arg] = expression
+        if self.generator_builtins_stable():
+            for name, binding in captured_values.items():
+                refs = references.get(name, NO_REFERENCES)
+                if refs and all(isinstance(ref, ast.Call)
+                                and self.expression_bindings.get(ref.func) in {'input', 'builtins.input'}
+                                for ref in refs):
+                    captured_values[name] = _GeneratorString()
+        retained = all(choices and all(isinstance(value, (_LiteralString, ast.Constant, _GeneratorString))
+                                      for value in choices)
+                       or self.generator_borrowed_capture(node, references.get(name, NO_REFERENCES), state)
+                       for name, binding in captured_values.items() for choices in [_binding_choices(binding)])
+        if not retained:
+            raise AnalysisLimit('generator captured value lifetime is unresolved; analysis is incomplete')
+        default_values = (dict(captured_defaults.values) if captured_defaults is not None
+                          else self.definition_table('default_bindings', function))
+        default_refs = (dict(captured_defaults.references) if captured_defaults is not None
+                        else self.definition_table('default_references', function))
+        default_syntax = dict(zip(positional[-len(signature.defaults):], signature.defaults))
+        default_syntax.update((argument.arg, expression)
+                              for argument, expression in zip(signature.kwonlyargs, signature.kw_defaults))
+        # The frame also retains its function object. Even an overridden
+        # default can therefore own a finalizer until that frame is released.
+        for name, binding in default_values.items():
+            choices = _binding_choices(binding)
+            refs = default_refs.get(name, NO_REFERENCES)
+            primitive_input = (self.generator_builtins_stable() and refs
+                               and all(isinstance(ref, ast.Call)
+                                       and self.expression_bindings.get(ref.func) in {'input', 'builtins.input'}
+                                       for ref in refs))
+            if not (isinstance(default_syntax.get(name), ast.Constant)
+                    or choices and all(isinstance(value, (_LiteralString, ast.Constant, _GeneratorString))
+                                    for value in choices) or primitive_input):
+                raise AnalysisLimit('generator function default lifetime is unresolved; analysis is incomplete')
+        self.possible_exception(state)
+        ref = _CellRef(function, _GENERATOR_CURSOR, (node,))
+        cells = state.cell_state()
+        child = self.engine.original_calls.get(node, node)
+        parent = self.engine.parents.get(child)
+        while parent is not None and parent is not self.scope:
+            if isinstance(parent, (ast.For, ast.AsyncFor, ast.While, ast.GeneratorExp,
+                                   ast.ListComp, ast.SetComp, ast.DictComp)):
+                if not isinstance(parent, (ast.For, ast.AsyncFor)) or child is not parent.iter:
+                    cells.multiple.add(ref)
+                    break
+            child = parent
+            parent = self.engine.parents.get(parent)
+        if ref in cells.contents:
+            cells.multiple.add(ref)
+        state.put_cell(ref, _CellContents(binding=_GENERATOR_CREATED), written=True)
+        return _DeferredGenerator(function, node,
+                                  tuple((name, bound[name]) for name in parameters),
+                                  tuple((name, references.get(name, NO_REFERENCES)) for name in parameters),
+                                  tuple(captured_values.items()), ((_GENERATOR_CURSOR, ref),))
+
+    def generator_step(self, node, state, generator):
+        """Resume one read-only segment; return yield and exhaustion separately."""
+        cursor = dict(generator.cells).get(_GENERATOR_CURSOR)
+        if (state.cells is None or cursor not in state.cells.contents
+                or cursor in state.cells.multiple):
+            raise AnalysisLimit('generator cursor has ambiguous allocation; analysis is incomplete')
+        contents = state.cells.contents[cursor]
+        phases = _binding_choices(contents.binding)
+        if (contents.bound is not True or not phases
+                or not phases <= {_GENERATOR_CREATED, _GENERATOR_SUSPENDED, _GENERATOR_EXHAUSTED}):
+            raise AnalysisLimit('generator cursor state is unresolved; analysis is incomplete')
+        yielded, exhausted = [], []
+        for phase in phases:
+            branch = state.copy()
+            if phase != _GENERATOR_CREATED:
+                branch.put_cell(cursor, _CellContents(binding=_GENERATOR_EXHAUSTED), written=True)
+                exhausted.append(branch)
+                continue
+            function = generator.function
+            expression = function.body[-1].value.value
+            binding, refs, fact = None, NO_REFERENCES, CLEAN
+            if isinstance(expression, ast.Constant):
+                binding = (_LiteralString(expression.value) if isinstance(expression.value, str) else expression)
+            elif isinstance(expression, ast.Name):
+                parameters = dict(generator.arguments)
+                if expression.id in parameters:
+                    fact = parameters[expression.id]
+                    refs = dict(generator.references).get(expression.id, NO_REFERENCES)
+                    binding = dict(generator.values).get(expression.id)
+                else:
+                    owner = self.engine.owner(function)
+                    module_ref = owner.project.module_reference(owner) if owner.project is not None else None
+                    if owner is not self.engine and module_ref is not None and module_ref in branch.mutated:
+                        raise AnalysisLimit('generator defining module namespace was mutated; analysis is incomplete')
+                    globals_ = {key: (value, objects, identity)
+                                for key, value, objects, identity in self.global_arguments(function, branch)}
+                    key = '@global:' + expression.id
+                    missing = (owner is self.engine and isinstance(self.scope, ast.Module)
+                               and expression.id not in branch.bindings and key not in branch.bindings)
+                    if key in globals_ and not missing:
+                        fact, refs, binding = globals_[key]
+                        self.capture_globals.add((owner.tree, expression.id))
+                    else:
+                        binding = _implicit_identity(expression.id)
+                        if binding is None:
+                            branch.put_cell(cursor, _CellContents(binding=_GENERATOR_EXHAUSTED), written=True)
+                            self.pending.append(_Completion('raise', branch, exception_type='NameError'))
+                            continue
+                        if not self.generator_builtins_stable(owner):
+                            raise AnalysisLimit('generator implicit builtin binding is unresolved; analysis is incomplete')
+                    # An abstract module binding can include a missing-name
+                    # branch. Preserve that failure before yielding a value.
+                    if None in _binding_choices(binding):
+                        failed = branch.copy()
+                        failed.put_cell(cursor, _CellContents(binding=_GENERATOR_EXHAUSTED), written=True)
+                        self.pending.append(_Completion('raise', failed, exception_type='NameError'))
+            fact = join_facts(fact, *(branch.heap.get(ref, CLEAN) for ref in refs))
+            if refs & branch.mutated:
+                binding = _without_object_contract(binding)
+            branch.put_cell(cursor, _CellContents(binding=_GENERATOR_SUSPENDED), written=True)
+            yielded.append((branch, fact, binding, refs))
+        return yielded, _join_states(*exhausted)
+
+    def next_generator(self, node, state, generator):
+        yielded, exhausted = self.generator_step(node, state, generator)
+        if exhausted is not None:
+            self.pending.append(_Completion('raise', exhausted, exception_type='StopIteration'))
+        state.replace(_join_states(*(branch for branch, _fact, _binding, _refs in yielded)))
+        self.expression_bindings[node] = _join_bindings(*(binding for _branch, _fact, binding, _refs in yielded))
+        self.expression_references[node] = frozenset().union(*(refs for _branch, _fact, _binding, refs in yielded))
+        return join_facts(*(fact for _branch, fact, _binding, _refs in yielded))
+
+    def generator_loop(self, node, state, generators):
+        if (not isinstance(node, ast.For) or not isinstance(node.target, ast.Name)
+                or not all(isinstance(value, _DeferredGenerator) for value in generators)):
+            raise AnalysisLimit('generator iteration protocol is unmodeled; analysis is incomplete')
+        finished, broken, outgoing = [], [], []
+        for generator in generators:
+            yielded, exhausted = self.generator_step(node, state, generator)
+            finished.append(exhausted)
+            for branch, fact, binding, refs in yielded:
+                self.write_name(branch, node.target.id, _advance(fact, node.target.id), binding, refs)
+                normal, pending = self.capture(node.body, branch)
+                broken.extend(item.state for item in pending if item.kind == 'break')
+                outgoing.extend(item for item in pending if item.kind not in {'break', 'continue'})
+                for continuation in [normal, *(item.state for item in pending if item.kind == 'continue')]:
+                    if continuation is None:
+                        continue
+                    more, exhausted = self.generator_step(node, continuation, generator)
+                    if more:
+                        raise AnalysisLimit('generator cursor restarted during iteration; analysis is incomplete')
+                    finished.append(exhausted)
+        self.pending.extend(_merge_completions(outgoing))
+        normal = self.block(node.orelse, _join_states(*finished))
+        return _join_states(normal, *broken)
+
     def map_cell_bindings(self, binding, map_ref, memo=None, *, map_objects=None):
         """Rewrite cell edges without traversing their possibly cyclic store."""
         # Evaluated defaults form a shared DAG. Visiting each immutable value
@@ -2336,7 +2631,7 @@ class _Flow:
                                for name, child in value.values)
                 references = (tuple((name, map_objects(refs)) for name, refs in value.references)
                               if map_objects is not None else value.references)
-                value = (_DeferredCall(value.function, value.call, value.arguments, references, values,
+                value = (type(value)(value.function, value.call, value.arguments, references, values,
                                        tuple((name, map_ref(ref)) for name, ref in value.cells))
                          if isinstance(value, _DeferredCall) else
                          type(value)(value.function, value.arguments, references, values))
@@ -2437,12 +2732,15 @@ class _Flow:
             target = _CellRef(ref.owner, ref.name, sites[-2:])
             cell_map[ref] = target
             repeated = len(sites) > 2 or ref in multiple
-            parent = node
+            child, parent = node, self.engine.parents.get(node)
             while parent is not None and parent is not self.scope:
                 if isinstance(parent, (ast.For, ast.AsyncFor, ast.While, ast.GeneratorExp,
                                        ast.ListComp, ast.SetComp, ast.DictComp)):
-                    repeated = True
-                    break
+                    if (ref.name != _GENERATOR_CURSOR
+                            or not isinstance(parent, (ast.For, ast.AsyncFor)) or child is not parent.iter):
+                        repeated = True
+                        break
+                child = parent
                 parent = self.engine.parents.get(parent)
             if repeated:
                 cells.multiple.add(target)
@@ -2496,6 +2794,10 @@ class _Flow:
             self.put_global(name, projected, state)
 
     def assign(self, target, fact, state, value=None, *, target_references=None, deleting=False):
+        if (not isinstance(target, ast.Name)
+                and any(isinstance(choice, (_DeferredGenerator, _GeneratorNext))
+                        for choice in _binding_choices(self.expression_bindings.get(value)))):
+            raise AnalysisLimit('generator stored or unpacked outside a name; analysis is incomplete')
         if isinstance(target, ast.Name):
             self.write_name(state, target.id, _advance(fact, target.id), self.expression_bindings.get(value),
                             self.expression_references.get(value, NO_REFERENCES))
@@ -2533,6 +2835,12 @@ class _Flow:
                 if isinstance(target, ast.Subscript):
                     self.expr(target.slice, state)
             namespace = self.expression_bindings.get(target.value)
+            for choice in _binding_choices(namespace):
+                function = choice.function if isinstance(choice, (_FunctionValue, _ClosureValue)) else choice
+                if isinstance(choice, (_DeferredGenerator, _GeneratorNext)):
+                    raise AnalysisLimit('generator object mutation is unmodeled; analysis is incomplete')
+                if isinstance(function, ast.FunctionDef) and function in self.engine.generators:
+                    raise AnalysisLimit('generator function metadata mutation is unmodeled; analysis is incomplete')
             if (not isinstance(namespace, _GlobalNamespace)
                     and any(isinstance(choice, _GlobalNamespace) for choice in _binding_choices(namespace))):
                 raise AnalysisLimit('ambiguous globals mapping write; analysis is incomplete')
@@ -3347,7 +3655,7 @@ class _Flow:
                                                                        node, call_name, values,
                                                                        substitute=substitute, cells=cells))
                                         for name, value in target.values)
-                choices.append(_DeferredCall(target.function, target.call, arguments, actual, captured_values,
+                choices.append(type(target)(target.function, target.call, arguments, actual, captured_values,
                                               tuple((name, (cells or {}).get(ref, ref)) for name, ref in target.cells))
                                if isinstance(target, _DeferredCall)
                                else type(target)(target.function, arguments, actual, captured_values))
@@ -3736,6 +4044,19 @@ class _Flow:
         target, fallback_name = callee.binding, callee.fallback_name
         receiver, receiver_refs = callee.receiver, callee.references
         arguments, keywords, keyword_nodes = inputs.arguments, inputs.keywords, inputs.keyword_nodes
+        if isinstance(target, _GeneratorNext):
+            if node.args or node.keywords:
+                raise AnalysisLimit('generator __next__ argument binding; analysis is incomplete')
+            generator = dict(target.values).get(_GENERATOR_CURSOR)
+            if not isinstance(generator, _DeferredGenerator):
+                raise AnalysisLimit('generator method lost its cursor; analysis is incomplete')
+            return self.next_generator(node, state, generator)
+        if isinstance(target, _DeferredGenerator):
+            raise AnalysisLimit('generator called as a function; analysis is incomplete')
+        for expression in (*(node.args if isinstance(node, ast.Call) else ()), *keyword_nodes.values()):
+            if any(isinstance(value, (_DeferredGenerator, _GeneratorNext))
+                   for value in _binding_choices(self.expression_bindings.get(expression))):
+                raise AnalysisLimit('generator passed to an unmodeled consumer; analysis is incomplete')
         if isinstance(target, _PartialValue):
             return self.invoke_partial(node, state, target, inputs)
         if target == _PARTIAL_CHANGED_CONSTRUCTOR:
@@ -3948,6 +4269,13 @@ class _Flow:
                 receiver_keys = None
                 summary_keys = None
             self.bind_method_receivers(bound, references, values, state, receiver_keys)
+            if resumed is None and _terminal_generator(function):
+                generator = self.generator_value(captured_defaults or function, node, inputs,
+                                                 bound, references, values, state, closure)
+                if generator is not None:
+                    self.expression_bindings[node] = generator
+                    self.expression_references[node] = NO_REFERENCES
+                    return CLEAN
             if (isinstance(function, ast.AsyncFunctionDef)
                     and function not in self.engine.generators and resumed is None):
                 self.expression_bindings[node] = _DeferredCall(
@@ -4029,6 +4357,13 @@ class _Flow:
             if (function in owner.generators and (summary.global_writes
                     or any(exception.global_writes for exception in summary.exceptions))):
                 raise AnalysisLimit('generator global writes require resume-state analysis; analysis is incomplete')
+            if function in owner.generators and summary != FunctionSummary():
+                delayed_globals = set(owner.active_globals.get(function, ()))
+                delayed_globals.update(name for module, name in summary.capture_globals if module is owner.tree)
+                delayed_globals.update(self.generator_summary_globals(summary))
+                if any(not owner.generator_stable_binding(name, owner.tree, node)
+                       for name in owner.rebound_globals.intersection(delayed_globals)):
+                    raise AnalysisLimit('generator live global reads require resume-state analysis; analysis is incomplete')
             if summary.incomplete:
                 # Resumed coroutines use an Await node, not a Call, and their
                 # values were captured at construction. Use the already bound
@@ -4084,6 +4419,12 @@ class _Flow:
         deferred = [target for expression in [*node.args, *keyword_nodes.values()]
                     for target in _binding_choices(self.expression_bindings.get(expression))
                     if isinstance(target, _DeferredCall)]
+        for expression in (*node.args, *keyword_nodes.values()):
+            for value in _binding_choices(self.expression_bindings.get(expression)):
+                function = value.function if isinstance(value, (_FunctionValue, _ClosureValue)) else value
+                if (isinstance(function, ast.FunctionDef) and _terminal_generator(function)
+                        and name not in _DEPENDENCY_MARKERS):
+                    raise AnalysisLimit('generator function passed to an unresolved consumer; analysis is incomplete')
         awaitable = node.args[0] if node.args else keyword_nodes.get('main')
         alternatives = _binding_choices(self.expression_bindings.get(awaitable))
         if name == 'asyncio.run' and any(isinstance(item, _DeferredCall) for item in alternatives):
@@ -4377,6 +4718,10 @@ class _Flow:
             if state.mutated and (refs & state.mutated):
                 binding = _without_object_contract(binding)
             self.expression_bindings[node] = binding
+            if any(isinstance(value, (_DeferredGenerator, _GeneratorNext)) for value in _binding_choices(binding)):
+                parent = self.engine.parents.get(node)
+                if isinstance(parent, (ast.withitem, ast.AugAssign, ast.Match, ast.ClassDef)):
+                    raise AnalysisLimit('generator used by an unmodeled statement protocol; analysis is incomplete')
             return fact
         # Callable identity belongs to the point before its arguments execute:
         # Query(alias := other) still constructs the originally bound marker.
@@ -4392,6 +4737,11 @@ class _Flow:
         fact = self.expression(node, state)
         if not state.reachable:
             return CLEAN
+        if not isinstance(node, (ast.Call, ast.Attribute, ast.NamedExpr, ast.IfExp, ast.BoolOp)):
+            if any(isinstance(value, (_DeferredGenerator, _GeneratorNext))
+                   for child in ast.iter_child_nodes(node)
+                   for value in _binding_choices(self.expression_bindings.get(child))):
+                raise AnalysisLimit('generator used by an unmodeled expression protocol; analysis is incomplete')
         # Container summaries retain value provenance, not module write
         # authority. Refuse that escape before replacing the mapping with an
         # ordinary vector/heap value and falsely reporting a later call clean.
@@ -4412,6 +4762,17 @@ class _Flow:
             candidates = []
             receiver_refs = self.expression_references.get(node.value, NO_REFERENCES)
             receiver_fact = self.expression_facts.get(node.value, CLEAN)
+            bases = _binding_choices(self.expression_bindings.get(node.value))
+            if any(isinstance(base, (_DeferredGenerator, _GeneratorNext)) for base in bases):
+                if node.attr != '__next__' or not all(isinstance(base, _DeferredGenerator) for base in bases):
+                    raise AnalysisLimit('generator attribute protocol is unmodeled; analysis is incomplete')
+                binding = _join_bindings(*(_GeneratorNext(
+                    base.function, ((_GENERATOR_CURSOR, CLEAN),), ((_GENERATOR_CURSOR, NO_REFERENCES),),
+                    ((_GENERATOR_CURSOR, base),)) for base in bases))
+                self.expression_bindings[node] = binding
+                self.expression_facts[node] = CLEAN
+                self.expression_references[node] = NO_REFERENCES
+                return CLEAN
             if node.attr == 'communicate':
                 # A later global binding may be opaque even though this call
                 # received a process earlier. Keep the leaf's identity demand
@@ -4420,6 +4781,9 @@ class _Flow:
                                             for ref in receiver_refs
                                             if isinstance(ref, str) and ref.startswith('@global:'))
             for base in _binding_choices(self.expression_bindings.get(node.value)):
+                function = base.function if isinstance(base, (_FunctionValue, _ClosureValue)) else base
+                if isinstance(function, ast.FunctionDef) and function in self.engine.generators:
+                    raise AnalysisLimit('generator function metadata access is unmodeled; analysis is incomplete')
                 if base == _PARTIAL_CHANGED_MODULE:
                     if node.attr == 'partial':
                         candidates.append(_PARTIAL_CHANGED_CONSTRUCTOR)
@@ -4621,6 +4985,8 @@ class _Flow:
             branches, facts, bindings, references = [], [], [], []
             for target in _binding_choices(self.expression_bindings.get(node.value)):
                 branch = state.copy()
+                if isinstance(target, _DeferredGenerator):
+                    raise AnalysisLimit('synchronous generator used as an awaitable; analysis is incomplete')
                 if isinstance(target, _DeferredCall):
                     fact = self.invoke(node, branch, _CallTarget(target.function),
                                        _CallInputs([], {}, {}), resumed=target)
@@ -4683,6 +5049,26 @@ class _Flow:
             iterable = self.expr(first.iter, state)
             if not state.reachable:
                 return CLEAN
+            if any(isinstance(value, (_DeferredGenerator, _GeneratorNext))
+                   for value in _binding_choices(self.expression_bindings.get(first.iter))):
+                raise AnalysisLimit('generator expression consumes a resumable generator; analysis is incomplete')
+            delayed = [node.elt, *(condition for generator in node.generators for condition in generator.ifs),
+                       *(generator.iter for generator in node.generators[1:])]
+            names = {child.id for expression in delayed for child in ast.walk(expression)
+                     if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)} - self.engine.locals[node]
+            for name in names:
+                if (name not in self.engine.rebound_globals
+                        and name not in self.engine.locals.get(self.scope, ())
+                        and name not in self.engine.closures.get(self.scope, ())):
+                    continue
+                binding = state.bindings.get(name)
+                stable_value = isinstance(binding, (_LiteralString, ast.Constant, _GeneratorString))
+                stable_import = isinstance(binding, str) and name not in self.engine.rebound_globals
+                local = name in self.engine.locals.get(self.scope, ()) and self.scope is not self.engine.tree
+                stable = self.engine.generator_stable_binding(name, self.scope, node)
+                if not (stable and (local or stable_value or stable_import)):
+                    raise AnalysisLimit('generator expression live delayed reads require resume-state analysis; '
+                                        'analysis is incomplete')
             nested = state.copy()
             if nested.cells is not None:
                 for name in self.engine.locals[node]:
@@ -4719,6 +5105,9 @@ class _Flow:
         """
         first = node.generators[0]
         iterable = self.expr(first.iter, state)
+        if any(isinstance(value, (_DeferredGenerator, _GeneratorNext))
+               for value in _binding_choices(self.expression_bindings.get(first.iter))):
+            raise AnalysisLimit('comprehension consumes a resumable generator; analysis is incomplete')
         if not state.reachable:
             return CLEAN
         original = state.copy()
@@ -4770,6 +5159,8 @@ class _Flow:
                 return None
             refs = self.expression_references.get(generator.iter, NO_REFERENCES)
             binding = self.expression_bindings.get(generator.iter)
+            if any(isinstance(value, (_DeferredGenerator, _GeneratorNext)) for value in _binding_choices(binding)):
+                raise AnalysisLimit('comprehension consumes a resumable generator; analysis is incomplete')
             literal = generator.iter
             elements = None
             if (isinstance(literal, (ast.List, ast.Tuple))
@@ -5111,6 +5502,9 @@ class _Flow:
                 return None
             binding = self.expression_bindings.get(node.iter)
             references = self.expression_references.get(node.iter, NO_REFERENCES)
+            generators = _binding_choices(binding)
+            if any(isinstance(value, (_DeferredGenerator, _GeneratorNext)) for value in generators):
+                return self.generator_loop(node, state, generators)
         head = state.copy()
         exits, outgoing = [], []
         while True:
@@ -5254,6 +5648,21 @@ class _Analysis:
         # selected source here adds substantial setup cost before any flow is
         # analyzed, without providing new information.
         nodes = tuple(ast.walk(tree))
+        # Primitive input-result proofs must not outlive an exposed/replaced
+        # builtins namespace. Projects combine this property across modules.
+        self.generator_input_identity = not any(
+            isinstance(node, ast.Name) and node.id in {'builtins', '__builtins__', '__import__',
+                                                     'sys', 'importlib', 'import_module'}
+            or isinstance(node, ast.Import) and any(alias.name.split('.')[0] in {
+                'builtins', 'sys', 'importlib'} for alias in node.names)
+            or isinstance(node, ast.ImportFrom) and node.module
+            and node.module.split('.')[0] in {'builtins', 'sys', 'importlib'}
+            or isinstance(node, ast.Attribute) and node.attr in {
+                '__builtins__', '__globals__', 'f_builtins', 'f_globals', 'stdin', 'import_module'}
+            or isinstance(node, ast.Constant) and isinstance(node.value, str)
+            and node.value in {'builtins', '__builtins__', '__globals__', 'f_builtins', 'f_globals',
+                               'stdin', 'sys', 'importlib', 'import_module'}
+            for node in nodes)
         # An exhausted analysis is an explicit failure, never a clean result.
         # Scale with syntax size, while charging transfers and fact expansion
         # rather than only the number of outer fixed-point iterations.
@@ -5313,6 +5722,7 @@ class _Analysis:
                     and self.parents[node].comparators == [node] for node in uses):
                     self.url_allowlists.add(target.id)
         self.call_sites = {node: _expanded_call(node) for node in nodes if isinstance(node, ast.Call)}
+        self.original_calls = {view: node for node, view in self.call_sites.items()}
         self.imports = tuple(node for node in nodes if isinstance(node, (ast.Import, ast.ImportFrom)))
         self.method_calls = {}
         self.partial_calls = {}
@@ -5322,11 +5732,69 @@ class _Analysis:
         self.definition_writers = set()
         self.direct_global_functions = set()
         self.locals = {}
+        self.generator_binders = {}
+        self.generator_external_writers = {name for node in nodes if isinstance(node, (ast.Global, ast.Nonlocal))
+                                          for name in node.names}
+        self.generator_namespace_exposed = any(
+            isinstance(node, ast.Name) and node.id in {'globals', 'locals', '__builtins__', '__import__'}
+            or isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == 'vars' and not node.args and not node.keywords
+            or isinstance(node, ast.Attribute) and node.attr in {
+                '__globals__', '__builtins__', 'f_globals', 'f_locals', 'import_module'}
+            or isinstance(node, ast.Name) and node.id in {'setattr', 'delattr'}
+            or isinstance(node, ast.Import) and any(alias.name.split('.')[0] in {'builtins', 'importlib', 'sys'}
+                                                   for alias in node.names)
+            or isinstance(node, ast.ImportFrom) and node.module
+            and node.module.split('.')[0] in {'builtins', 'importlib', 'sys'}
+            for node in nodes)
+        self.generator_attribute_writes = {node.attr for node in nodes if isinstance(node, ast.Attribute)
+                                           and isinstance(node.ctx, (ast.Store, ast.Del))}
+        frame_capabilities = tuple(
+            node for node in nodes if
+            isinstance(node, ast.Name) and node.id in {'locals', '_getframe', 'currentframe', '_current_frames'}
+            or isinstance(node, ast.Attribute) and node.attr in {
+                'f_locals', '_getframe', 'currentframe', '_current_frames'}
+            or isinstance(node, ast.ImportFrom) and node.module in {'sys', 'inspect'}
+            and any(alias.name in {'_getframe', 'currentframe', '_current_frames'} for alias in node.names)
+            or isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == 'vars' and not node.args and not node.keywords)
+        self.generator_execution_capabilities = tuple(node for node in nodes
+            if isinstance(node, ast.Name) and node.id in {'eval', 'exec'}
+            or isinstance(node, ast.Attribute) and node.attr in {'eval', 'exec'})
         raw_used = {}
         self.declared_globals = {}
         for scope in [tree, *self.functions]:
             body = tuple(_scope_nodes(scope))
             self.locals[scope] = _local_names(scope, body)
+            # Count binding sites in their lexical owner, including eager
+            # child headers. A same-spelled local in another function is not
+            # a write to this frame. Comprehension targets have their own scope.
+            binding_nodes = list(body)
+            for child in body:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                    headers = [*getattr(child, 'decorator_list', ()), *child.args.defaults,
+                               *(value for value in child.args.kw_defaults if value is not None)]
+                    binding_nodes.extend(part for header in headers for part in ast.walk(header))
+            targets = {part for child in binding_nodes
+                       if isinstance(child, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp))
+                       for generator in child.generators for part in ast.walk(generator.target)}
+            binders = defaultdict(list)
+            for child in binding_nodes:
+                names = ([child.id] if isinstance(child, ast.Name)
+                         and isinstance(child.ctx, (ast.Store, ast.Del)) and child not in targets
+                         else [child.name] if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                                                 ast.ClassDef, ast.ExceptHandler))
+                         else [alias.asname or alias.name.split('.')[0] for alias in child.names]
+                         if isinstance(child, (ast.Import, ast.ImportFrom))
+                         else [_pattern_capture(child)] if _pattern_capture(child) is not None else [])
+                for name in names:
+                    if name is not None:
+                        binders[name].append(child)
+            if scope is not tree:
+                for argument in (*scope.args.posonlyargs, *scope.args.args, *scope.args.kwonlyargs,
+                                 *(arg for arg in (scope.args.vararg, scope.args.kwarg) if arg is not None)):
+                    binders[argument.arg].append(argument)
+            self.generator_binders[scope] = dict(binders)
             self.declared_globals[scope] = {name for node in body if isinstance(node, ast.Global)
                                              for name in node.names}
             if scope is not tree:
@@ -5347,6 +5815,8 @@ class _Analysis:
                 self.locals[node] = {child.id for generator in node.generators
                                      for child in ast.walk(generator.target)
                                      if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)}
+        self.generator_frame_exposed = any(not self.generator_readonly_frame(node) for node in frame_capabilities)
+        self.generator_namespace_exposed |= self.generator_frame_exposed
         self.global_names = self.locals[tree]
         self.rebound_globals = {node.id for node in nodes
                                 if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del))
@@ -5551,6 +6021,152 @@ class _Analysis:
                 in_iterable = child is parent.iter
             child, parent = parent, self.parents.get(parent)
         return None
+
+    def generator_stable_binding(self, name, scope, creation=None):
+        """Prove a delayed read cannot observe a later lexical rebinding."""
+        if name in self.generator_external_writers:
+            return False
+        if name in self.closures.get(scope, ()):
+            return False  # A different live frame needs its own resume state.
+        owner = scope if name in self.locals.get(scope, ()) else self.tree
+        binders = self.generator_binders.get(owner, {}).get(name, ())
+        if not binders:
+            return False
+        if owner is self.tree:
+            if self.generator_namespace_exposed or len(binders) != 1 or creation is None:
+                return False
+            engines = ((engine for _path, _text, engine, _offset in self.project.sources)
+                       if self.project is not None else (self,))
+            if any(engine.generator_namespace_exposed or name in engine.generator_attribute_writes
+                   for engine in engines):
+                return False
+            binder = binders[0]
+            statement = binder if isinstance(binder, ast.stmt) else self.parents.get(binder)
+            # A single top-level initialization is stable; a conditional or
+            # repeated binding is not certified by mere source ordering.
+            if (statement not in self.tree.body or isinstance(binder, ast.Name)
+                    and (not isinstance(statement, (ast.Assign, ast.AnnAssign))
+                         or not isinstance(binder.ctx, ast.Store))):
+                return False
+            # The original AST owns the execution position; normalized call
+            # views are not independent allocation/initialization evidence.
+            original = self.original_calls.get(creation, creation)
+            if original not in self.parents:
+                return False
+            return ((statement.end_lineno, statement.end_col_offset)
+                    < (original.lineno, original.col_offset))
+        if owner is not scope or creation is None or self.generator_frame_exposed:
+            return False
+        position = (creation.lineno, creation.col_offset)
+        if any(isinstance(binder, ast.Name) and isinstance(binder.ctx, ast.Del)
+               or isinstance(binder, ast.ExceptHandler) for binder in binders):
+            return False
+        if any(not isinstance(binder, ast.arg)
+               and (binder.lineno, binder.col_offset) >= position for binder in binders):
+            return False
+        if not any(isinstance(binder, ast.arg) for binder in binders):
+            # At least one initialization must dominate this construction.
+            child, parent = creation, self.parents.get(creation)
+            established = False
+            while parent is not None and parent is not scope:
+                for _field, statements in ast.iter_fields(parent):
+                    if isinstance(statements, list) and child in statements:
+                        earlier = statements[:statements.index(child)]
+                        established |= any(self.parents.get(binder) in earlier
+                                           and isinstance(self.parents.get(binder), (ast.Assign, ast.AnnAssign))
+                                           for binder in binders)
+                child, parent = parent, self.parents.get(parent)
+            if parent is scope and isinstance(getattr(scope, 'body', None), list):
+                earlier = scope.body[:scope.body.index(child)] if child in scope.body else ()
+                established |= any(self.parents.get(binder) in earlier
+                                   and isinstance(self.parents.get(binder), (ast.Assign, ast.AnnAssign))
+                                   for binder in binders)
+            if not established:
+                return False
+        child = creation
+        parent = self.parents.get(child)
+        while parent is not None and parent is not scope:
+            if isinstance(parent, (ast.For, ast.AsyncFor, ast.While)):
+                # A source-earlier store can execute again after construction.
+                if any(not isinstance(binder, ast.arg) and binder in set(ast.walk(parent))
+                       for binder in binders):
+                    return False
+            child, parent = parent, self.parents.get(parent)
+        return True
+
+    def generator_readonly_frame(self, capability):
+        """Recognize unescaped stack inspection, never a writable frame map."""
+        if (not isinstance(capability, ast.Attribute) or capability.attr != '_getframe'
+                or not isinstance(capability.value, ast.Name)):
+            return False
+        module_name = capability.value.id
+        imports = self.generator_binders[self.tree].get(module_name, ())
+        if (len(imports) != 1 or not isinstance(imports[0], ast.Import) or imports[0] not in self.tree.body
+                or not any(alias.name == 'sys' and (alias.asname or alias.name) == module_name
+                           for alias in imports[0].names)
+                or any(module_name in binders for scope, binders in self.generator_binders.items()
+                       if scope is not self.tree)
+                or {'_getframe', '__class__', 'getattr', 'hasattr'} & self.generator_attribute_writes):
+            return False
+        # Spelling alone cannot prove a standard frame. A replaced/imported
+        # alias or exposed module dictionary keeps the acquisition unresolved.
+        for node in ast.walk(self.tree):
+            if (isinstance(node, ast.Name) and node.id in {
+                    'globals', 'locals', 'vars', 'setattr', 'delattr', 'exec', 'eval', '__import__', '__builtins__'}
+                    or isinstance(node, ast.Attribute) and node.attr in {
+                        '__dict__', '__getattribute__', '__globals__', '__import__', '__builtins__',
+                        'f_globals', 'f_locals', 'import_module'}
+                    or isinstance(node, ast.Import) and any(alias.name.split('.')[0] == 'importlib'
+                                                           for alias in node.names)
+                    or isinstance(node, ast.ImportFrom) and node.module
+                    and node.module.split('.')[0] == 'importlib'):
+                return False
+            if isinstance(node, ast.Name) and node.id == module_name and isinstance(node.ctx, ast.Load):
+                parent = self.parents.get(node)
+                if isinstance(parent, ast.Attribute) and parent.value is node:
+                    continue
+                if (isinstance(parent, ast.Call) and isinstance(parent.func, ast.Name)
+                        and parent.func.id in {'getattr', 'hasattr'} and len(parent.args) >= 2 and parent.args[0] is node
+                        and not any(parent.func.id in binders for binders in self.generator_binders.values())
+                        and isinstance(parent.args[1], ast.Constant)
+                        and parent.args[1].value not in {'__dict__', '__getattribute__', '_getframe'}):
+                    continue
+                return False
+        call = self.parents.get(capability)
+        assignment = self.parents.get(call)
+        scope = self.enclosing(capability)
+        if (not isinstance(call, ast.Call) or call.func is not capability or call.args or call.keywords
+                or not isinstance(assignment, ast.Assign) or len(assignment.targets) != 1
+                or not isinstance(assignment.targets[0], ast.Name)
+                or not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef))):
+            return False
+        target = assignment.targets[0]
+        for node in ast.walk(scope):
+            if isinstance(node, (ast.Global, ast.Nonlocal)) and target.id in node.names:
+                return False
+            if not isinstance(node, ast.Name) or node.id != target.id or node is target:
+                continue
+            parent = self.parents.get(node)
+            if isinstance(node.ctx, ast.Load):
+                if (not isinstance(parent, ast.Attribute) or parent.value is not node
+                        or not isinstance(parent.ctx, ast.Load) or parent.attr not in {'f_code', 'f_back'}):
+                    return False
+                if parent.attr == 'f_code':
+                    continue
+                transfer = self.parents.get(parent)
+            else:
+                transfer = parent
+            # Walking f_back may replace only the very same local. Returning
+            # it, passing it onward or copying it to an alias exposes a frame.
+            destination = (transfer.targets[0] if isinstance(transfer, ast.Assign)
+                           and len(transfer.targets) == 1 else
+                           transfer.target if isinstance(transfer, ast.NamedExpr) else None)
+            value = getattr(transfer, 'value', None)
+            if (not isinstance(destination, ast.Name) or destination.id != target.id
+                    or not isinstance(value, ast.Attribute) or value.attr != 'f_back'
+                    or not isinstance(value.value, ast.Name) or value.value.id != target.id):
+                return False
+        return True
 
     def describe_framework(self, function, default_inputs, bindings, route, route_dependencies):
         inputs = {}
@@ -5790,6 +6406,8 @@ class _Analysis:
         variants = ({shape: index for index, shape, _vectors in _vector_variants(binding)}
                     if name in value_parameters else {})
         for value in _binding_choices(binding):
+            if isinstance(value, (_DeferredGenerator, _GeneratorNext)):
+                raise AnalysisLimit('generator passed through a callable context; analysis is incomplete')
             if isinstance(value, _GlobalNamespace):
                 raise AnalysisLimit('globals mapping captured by a callable; analysis is incomplete')
             if isinstance(value, _CellGraph):

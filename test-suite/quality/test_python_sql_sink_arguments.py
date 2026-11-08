@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Independent SQL argument-position and predicate regressions.
 
-Run directly with Python, or through unittest discovery. Fixtures are parsed by
-UBS, not executed against a database. Their expected public IDs and locations
-come from API argument semantics, not from another detector implementation.
+Run directly with Python, or through unittest discovery. Source fixtures are
+parsed by UBS; a separate in-memory SQLite witness checks saved-callable and
+parameter-binding semantics. Expected public IDs and locations come from API
+argument semantics, not from another detector implementation.
 
 API contracts:
 https://www.psycopg.org/psycopg3/docs/api/cursors.html
@@ -20,6 +21,7 @@ import ast
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -62,6 +64,132 @@ RAW_PROCESS_WRAPPER = textwrap.dedent('''\
         expected = [raw(*args) for args in reads]
         assert before == [result.stdout for result in expected]
 ''')
+
+# A saved Python bound method captures its receiver and function at the point
+# of attribute access. Later receiver/method/name assignments do not change
+# an already saved callable. These labels follow that execution contract.
+BOUND_SQL_CASES = (
+    ("bound-execute-alias", 'def run(db, user):\n    submit = db.execute\n    submit(f"SELECT {user}")\n', ((CRITICAL, 3),)),
+    ("bound-sqlite-alias", 'import sqlite3\ndef run(path, user):\n    db = sqlite3.connect(path)\n    submit = db.execute\n    submit(f"SELECT {user}")\n', ((CRITICAL, 5),)),
+    ("bound-query-keyword", 'def run(db, user):\n    submit = db.execute\n    submit(query=f"SELECT {user}")\n', ((CRITICAL, 3),)),
+    ("bound-statement-keyword", 'def run(db, user):\n    submit = db.execute\n    submit(statement=f"SELECT {user}")\n', ((CRITICAL, 3),)),
+    ("bound-executemany", 'def run(db, user, rows):\n    submit = db.executemany\n    submit(query=f"INSERT INTO {user} VALUES (?)", params_seq=rows)\n', ((CRITICAL, 3),)),
+    ("bound-executescript", 'def run(db, user):\n    submit = db.executescript\n    submit(f"SELECT {user}")\n', ((CRITICAL, 3),)),
+    ("bound-driver-sql", 'def run(db, user):\n    submit = db.exec_driver_sql\n    submit(statement=f"SELECT {user}")\n', ((CRITICAL, 3),)),
+    ("bound-raw-query", 'def run(manager, user):\n    submit = manager.raw\n    submit(raw_query=f"SELECT {user}")\n', ((CRITICAL, 3),)),
+    ("bound-extra-predicate", 'def run(queryset, user):\n    extend = queryset.extra\n    extend(where=[f"name = {user}"])\n', ((CRITICAL, 3),)),
+    ("bound-scalar", 'def run(db, user):\n    submit = db.scalar\n    submit(statement=f"SELECT {user}")\n', ((CRITICAL, 3),)),
+    ("bound-scalars", 'def run(db, user):\n    submit = db.scalars\n    submit(statement=f"SELECT {user}")\n', ((CRITICAL, 3),)),
+    ("bound-read-sql", 'import pandas as pd\ndef run(conn, user):\n    fetch = pd.read_sql\n    return fetch(con=conn, sql=f"SELECT {user}")\n', ((CRITICAL, 4),)),
+    ("bound-read-sql-query", 'import pandas as pd\ndef run(conn, user):\n    fetch = pd.read_sql_query\n    return fetch(sql=f"SELECT {user}", con=conn)\n', ((CRITICAL, 4),)),
+    ("bound-alias-chain", 'def run(db, user):\n    submit = db.execute\n    later = submit\n    later(f"SELECT {user}")\n', ((CRITICAL, 4),)),
+    ("bound-chained-assignment", 'def run(db, user):\n    first = second = db.execute\n    second(f"SELECT {user}")\n', ((CRITICAL, 3),)),
+    ("bound-receiver-reassigned", 'def run(db, user):\n    submit = db.execute\n    db = object()\n    submit(f"SELECT {user}")\n', ((CRITICAL, 4),)),
+    ("bound-saved-before-replacement", 'def run(db, user):\n    submit = db.execute\n    saved = submit\n    submit = print\n    saved(f"SELECT {user}")\n', ((CRITICAL, 5),)),
+    ("bound-method-replaced-after-capture", 'def run(db, user):\n    submit = db.execute\n    db.execute = print\n    submit(f"SELECT {user}")\n', ((CRITICAL, 4),)),
+    ("bound-nested-capture", 'def run(db, user):\n    submit = db.execute\n    def invoke():\n        return submit(f"SELECT {user}")\n    return invoke()\n', ((CRITICAL, 4),)),
+    ("bound-unproven-static", 'from settings import TABLE\ndef run(db):\n    submit = db.execute\n    submit(f"SELECT * FROM {TABLE}")\n', ((WARNING, 4),)),
+    ("bound-parameterized", 'def run(db, user):\n    submit = db.execute\n    submit("SELECT ?", (user,))\n', ()),
+    ("bound-keyword-parameterized", 'def run(db, user):\n    submit = db.execute\n    submit(query="SELECT %s", params=(user,))\n', ()),
+    ("bound-alias-sql-looking-data", 'def run(db, user):\n    submit = db.execute\n    submit("SELECT ?", (f"SELECT {user}",))\n', ()),
+    ("bound-known-slot-keyword-expansion", 'def run(db, options):\n    submit = db.execute\n    submit("SELECT ?", **options)\n', ()),
+    ("bound-unused", 'def run(db, user):\n    submit = db.execute\n    query = f"SELECT {user}"\n    return len(query)\n', ()),
+    ("bound-replaced-before-use", 'def run(db, user):\n    submit = db.execute\n    submit = print\n    submit(f"SELECT {user}")\n', ()),
+    ("bound-safe-copy-before-sql-replacement", 'def run(db, user):\n    submit = print\n    saved = submit\n    submit = db.execute\n    saved(f"SELECT {user}")\n', ()),
+    ("bound-parameter-shadow", 'def run(db):\n    submit = db.execute\n    def inner(submit, user):\n        return submit(f"SELECT {user}")\n    return inner\n', ()),
+    ("bound-local-function-shadow", 'def run(db, user):\n    submit = db.execute\n    def inner():\n        def submit(query):\n            return len(query)\n        return submit(f"SELECT {user}")\n    return inner()\n', ()),
+    ("bound-application-method", 'class Formatter:\n    def execute(self, query):\n        return len(query)\n    def run(self, user):\n        submit = self.execute\n        return submit(f"SELECT {user}")\n', ()),
+    ("bound-application-raw-method", 'class Formatter:\n    def raw(self, text):\n        return len(text)\n    def run(self, user):\n        render = self.raw\n        return render(f"SELECT {user}")\n', ()),
+    ("bound-application-extra-method", 'class Formatter:\n    def extra(self, text):\n        return len(text)\n    def run(self, user):\n        render = self.extra\n        return render(f"SELECT {user}")\n', ()),
+    ("bound-application-receiver-rebound", 'class Formatter:\n    def execute(self, query):\n        return len(query)\n    def run(self, db, user):\n        submit = self.execute\n        self = db\n        return submit(f"SELECT {user}")\n', ()),
+    ("bound-application-method-replaced-after-capture", 'class Formatter:\n    def raw(self, text):\n        return len(text)\n    def run(self, user):\n        render = self.raw\n        self.raw = len\n        return render(f"SELECT {user}")\n', ()),
+    ("bound-application-function", 'def execute(query):\n    return len(query)\ndef run(user):\n    submit = execute\n    return submit(f"SELECT {user}")\n', ()),
+    ("ordinary-raw-property", 'def render(record):\n    return record.raw\n', ()),
+    ("ordinary-extra-property", 'def render(record):\n    return record.extra\n', ()),
+    ("ordinary-raw-property-alias", 'def render(record, user):\n    raw = record.raw\n    return raw, f"SELECT {user}"\n', ()),
+    ("ordinary-extra-property-container", 'def render(record):\n    return {"extra": record.extra}\n', ()),
+    ("ordinary-raw-bound-parameter", 'def run(db, record):\n    db.execute("SELECT ?", (record.raw,))\n', ()),
+    ("ordinary-extra-bound-parameter", 'def run(db, record):\n    submit = db.execute\n    submit("SELECT ?", (record.extra,))\n', ()),
+    ("ordinary-raw-container-bound-data", 'def run(db, record):\n    values = [record.raw]\n    return db.execute("SELECT ?", (values[0],))\n', ()),
+    ("ordinary-raw-property-and-sql-text", 'def render(record, user):\n    return {"raw": record.raw, "sql": f"SELECT {user}"}\n', ()),
+    ("ordinary-extra-property-in-sql-text", 'def render(record, user):\n    extra = record.extra\n    return f"SELECT {user} {extra}"\n', ()),
+    ("ordinary-raw-print-data", 'def render(record):\n    print("SELECT 1", record.raw)\n', ()),
+    ("ordinary-extra-print-data", 'def render(record):\n    print("SELECT 1", record.extra)\n', ()),
+    ("ordinary-raw-print-alias-data", 'def render(record):\n    output = print\n    output("SELECT 1", record.raw)\n', ()),
+    ("ordinary-raw-str-data", 'def render(record):\n    return str(record.raw, "SELECT 1")\n', ()),
+    ("ordinary-extra-format-data", 'def render(record):\n    return format(record.extra, "SELECT 1")\n', ()),
+    ("ordinary-callback-storage", 'def run(user):\n    callbacks = [len]\n    return callbacks[0](f"SELECT {user}")\n', ()),
+    ("ordinary-callback-parameter", 'def run(invoke, user):\n    return invoke(f"SELECT {user}")\n', ()),
+    ("ordinary-getattr-lookalike", 'def getattr(obj, name):\n    return len\ndef run(user):\n    submit = getattr(None, "execute")\n    return submit(f"SELECT {user}")\n', ()),
+    ("kwargs-direct-query", 'def run(db, user):\n    db.execute(**{"query": f"SELECT {user}"})\n', ((CRITICAL, 2),)),
+    ("kwargs-saved-query", 'def run(db, user):\n    submit = db.execute\n    submit(**{"query": f"SELECT {user}"})\n', ((CRITICAL, 3),)),
+    ("kwargs-direct-statement", 'def run(db, user):\n    db.exec_driver_sql(**{"statement": f"SELECT {user}"})\n', ((CRITICAL, 2),)),
+    ("kwargs-fragment", 'def run(queryset, user):\n    queryset.extra(**{"where": [f"name = {user}"]})\n', ((CRITICAL, 2),)),
+    ("kwargs-bound-data", 'def run(db, user):\n    db.execute(**{"query": "SELECT ?", "params": (f"SELECT {user}",)})\n', ()),
+    ("kwargs-saved-bound-data", 'def run(db, user):\n    submit = db.execute\n    submit(**{"query": "SELECT ?", "params": (f"SELECT {user}",)})\n', ()),
+    ("kwargs-fragment-bound-data", 'def run(queryset, user):\n    queryset.extra(**{"where": ["name = %s"], "params": (f"SELECT {user}",)})\n', ()),
+)
+
+# These programs pass a real SQL capability beyond the currently modeled
+# call shapes. A partial result is honest; an empty complete scan is not.
+# Stable call shapes above are required to finish with their exact labels.
+BOUND_SQL_PARTIAL_CASES = (
+    ("conditional-alias", 'def run(db, user, flag):\n    submit = db.execute\n    if flag:\n        submit = print\n    submit(f"SELECT {user}")\n', []),
+    ("conditional-creation", 'def run(db, user, flag):\n    if flag:\n        submit = db.execute\n    else:\n        submit = print\n    submit(f"SELECT {user}")\n', []),
+    ("eager-map-callback", 'def run(db, user):\n    return list(map(db.execute, [f"SELECT {user}"]))\n', []),
+    ("unknown-callback-consumer", 'def run(db, user, invoke):\n    return invoke(db.execute, f"SELECT {user}")\n', []),
+    ("returned-execution-callable", 'def callback(db):\n    return db.execute\ndef run(db, user):\n    submit = callback(db)\n    return submit(f"SELECT {user}")\n', []),
+    ("container-callback", 'def run(db, user):\n    callbacks = [db.execute]\n    callbacks[0](f"SELECT {user}")\n', []),
+    ("keyword-callback", 'def run(db, user, invoke):\n    return invoke(fn=db.execute, query=f"SELECT {user}")\n', []),
+    ("callable-default", 'import sqlite3\ndb = sqlite3.connect(":memory:")\ndef run(user, submit=db.execute):\n    return submit(f"SELECT {user}")\n', []),
+    ("walrus-target", 'def run(db, user):\n    return (submit := db.execute)(f"SELECT {user}")\n', []),
+    ("conditional-expression", 'def run(db, user, flag):\n    submit = db.execute if flag else db.executescript\n    submit(f"SELECT {user}")\n', []),
+    ("literal-getattr", 'def run(db, user):\n    submit = getattr(db, "execute")\n    submit(f"SELECT {user}")\n', []),
+    ("local-getattr-alias", 'def run(db, user):\n    getter = getattr\n    submit = getter(db, "execute")\n    return submit(f"SELECT {user}")\n', []),
+    ("imported-getattr-alias", 'from builtins import getattr as grab\ndef run(db, user):\n    submit = grab(db, "execute")\n    return submit(f"SELECT {user}")\n', []),
+    ("imported-attrgetter-alias", 'from operator import attrgetter as grab\ndef run(db, user):\n    submit = grab("execute")(db)\n    return submit(f"SELECT {user}")\n', []),
+    ("imported-methodcaller-alias", 'from operator import methodcaller as invoke\ndef run(db, user):\n    return invoke("execute", f"SELECT {user}")(db)\n', []),
+    ("raw-container-callback", 'def run(qs, user):\n    callbacks = [qs.raw]\n    return callbacks[0](f"SELECT {user}")\n', []),
+    ("extra-container-callback", 'def run(qs, user):\n    callbacks = [qs.extra]\n    return callbacks[0](where=[f"id = {user}"])\n', []),
+    ("raw-keyword-callback", 'def run(qs, user, invoke):\n    return invoke(fn=qs.raw, query=f"SELECT {user}")\n', []),
+    ("extra-keyword-callback", 'def run(qs, user, invoke):\n    return invoke(fn=qs.extra, where=[f"id = {user}"])\n', []),
+    ("returned-raw-capability", 'def make(qs):\n    return qs.raw\ndef run(qs, user):\n    submit = make(qs)\n    return submit(f"SELECT {user}")\n', []),
+    ("default-raw-capability", 'def run(qs, user):\n    def submit(value, raw=qs.raw):\n        return raw(value)\n    return submit(f"SELECT {user}")\n', []),
+    ("raw-key-callback", 'def run(qs, user):\n    queries = [f"SELECT {user}"]\n    return min(queries, key=qs.raw)\n', []),
+    ("extra-key-callback", 'def run(qs, user):\n    fragments = [{"flag": f"name = {user}"}]\n    return sorted(fragments, key=qs.extra)\n', []),
+    ("shadowed-print-callback", 'def run(qs, user, print):\n    return print(qs.raw, f"SELECT {user}")\n', []),
+    ("replaced-builtin-print-callback", 'import builtins\ndef run(qs, user):\n    def invoke(fn, query):\n        return fn(query)\n    builtins.print = invoke\n    return print(qs.raw, f"SELECT {user}")\n', []),
+    ("metadata-replaces-saved-query-contract", 'class Wrapper:\n    def __init__(self, cursor):\n        self.cursor = cursor\n    def execute(self, query, params=()):\n        return len(query)\n    def replacement(self, query, params=()):\n        return self.cursor.execute(params[0])\ndef run(cursor, user):\n    wrapper = Wrapper(cursor)\n    submit = wrapper.execute\n    Wrapper.execute.__code__ = Wrapper.replacement.__code__\n    return submit("SELECT 1", (f"SELECT {user}",))\n', []),
+    ("metadata-activates-captured-default", 'def run(cursor, user):\n    class Wrapper:\n        def __init__(self):\n            self.cursor = cursor\n        def execute(self, query, params=(f"SELECT {user}",)):\n            return len(query)\n        def replacement(self, query, params=()):\n            return self.cursor.execute(params[0])\n    wrapper = Wrapper()\n    submit = wrapper.execute\n    Wrapper.execute.__code__ = Wrapper.replacement.__code__\n    return submit("SELECT 1")\n', []),
+    ("property-changes-query-family", 'class Wrapper:\n    @property\n    def execute(self):\n        return qs.extra\n    def run(self, user):\n        return self.execute(None, [f"name = {user}"])\n', []),
+    ("reflected-local-method-replacement", 'class Formatter:\n    def execute(self, query):\n        return len(query)\n    def run(self, db, user):\n        setattr(self, "execute", db.execute)\n        submit = self.execute\n        return submit(f"SELECT {user}")\n', []),
+    ("unknown-keyword-slot", 'def run(db, options):\n    db.execute(**options)\n', []),
+    ("unknown-fragment-keywords", 'def run(queryset, options):\n    queryset.extra(**options)\n', []),
+    ("retained-before-callback", 'def run(db, user, invoke):\n    db.execute(f"SELECT {user}")\n    invoke(db.execute, f"SELECT {user}")\n', [2]),
+    ("retained-before-unknown-keywords", 'def run(db, user, options):\n    db.execute(f"SELECT {user}")\n    db.execute(**options)\n', [2]),
+    ("known-keyword-overwritten-by-opaque-map", 'def run(db, options):\n    db.execute(**{"query": "SELECT 1", **options})\n', []),
+)
+
+# Literal dictionaries capture each value when that entry is evaluated.
+# Repeated dictionary keys keep the last value; duplicate names across call
+# expansions prevent invocation while preserving eager argument side effects.
+KEYWORD_CAPTURE_CASES = (
+    ("kwargs-earlier-value-taints-query", 'def run(db, user):\n    query = "SELECT 1"\n    db.execute(**{"params": ((query := f"SELECT {user}"),), "query": query})\n', ((CRITICAL, 3),)),
+    ("kwargs-later-value-cannot-taint-query", 'def run(db, user):\n    query = "SELECT 1"\n    db.execute(**{"query": query, "params": ((query := f"SELECT {user}"),)})\n', ()),
+    ("kwargs-earlier-value-cleans-query", 'def run(db, user):\n    query = f"SELECT {user}"\n    db.execute(**{"params": ((query := "SELECT 1"),), "query": query})\n', ()),
+    ("kwargs-later-value-cannot-clean-query", 'def run(db, user):\n    query = f"SELECT {user}"\n    db.execute(**{"query": query, "params": ((query := "SELECT 1"),)})\n', ((CRITICAL, 3),)),
+    ("kwargs-separate-expansion-capture", 'def run(db, user):\n    query = f"SELECT {user}"\n    db.execute(**{"query": query}, **{"params": ((query := "SELECT 1"),)})\n', ((CRITICAL, 3),)),
+    ("kwargs-separate-expansion-earlier-write", 'def run(db, user):\n    query = "SELECT 1"\n    db.execute(**{"params": ((query := f"SELECT {user}"),)}, **{"query": query})\n', ((CRITICAL, 3),)),
+    ("kwargs-duplicate-key-cleans", 'def run(db, user):\n    db.execute(**{"query": f"SELECT {user}", "query": "SELECT 1"})\n', ()),
+    ("kwargs-duplicate-key-taints", 'def run(db, user):\n    db.execute(**{"query": "SELECT 1", "query": f"SELECT {user}"})\n', ((CRITICAL, 2),)),
+    ("kwargs-nested-map-cleans", 'def run(db, user):\n    db.execute(**{"query": f"SELECT {user}", **{"query": "SELECT 1"}})\n', ()),
+    ("kwargs-nested-map-taints", 'def run(db, user):\n    db.execute(**{"query": "SELECT 1", **{"query": f"SELECT {user}"}})\n', ((CRITICAL, 2),)),
+    ("kwargs-opaque-map-then-fixed-query", 'def run(db, options):\n    db.execute(**{**options, "query": "SELECT 1"})\n', ()),
+    ("kwargs-duplicate-expansions-prevent-call", 'def run(db, user):\n    db.execute(**{"query": f"SELECT {user}"}, **{"query": "SELECT 1"})\n', ()),
+    ("kwargs-explicit-duplicate-prevents-call", 'def run(db, user):\n    db.execute(query=f"SELECT {user}", **{"query": "SELECT 1"})\n', ()),
+    ("kwargs-nonstring-key-prevents-call", 'def run(db, user):\n    db.execute(**{"query": f"SELECT {user}", 0: None})\n', ()),
+    ("kwargs-duplicate-keeps-eager-sink", 'def run(db, other, user):\n    db.execute(**{"query": "SELECT 1"}, **{"query": other.execute(f"SELECT {user}")})\n', ((CRITICAL, 2),)),
+)
 
 # Each case has a unique source file. The sink starts at line 2 unless a case
 # explicitly supplies a multi-line program and its expected location.
@@ -205,7 +333,7 @@ CASES = (
     ("literal-iterable-values-captured-before-body", 'def run(cursor, user):\n    query = f"SELECT {user}"\n    for saved in [query, "SELECT 1"]:\n        query = "SELECT 1"\n        cursor.execute(saved)\n', ((CRITICAL, 5),)),
     ("constant-format-does-not-enter-handler", 'def run(cursor, user):\n    query = f"SELECT {user}"\n    try:\n        query = f"SELECT {7}"\n    except:\n        cursor.execute(query)\n', ()),
     ("simple-class-does-not-enter-handler", 'def run(cursor, user):\n    query = f"SELECT {user}"\n    try:\n        class Marker:\n            pass\n    except:\n        cursor.execute(query)\n', ()),
-)
+) + BOUND_SQL_CASES + KEYWORD_CAPTURE_CASES
 
 
 class SQLSinkArguments(unittest.TestCase):
@@ -245,6 +373,103 @@ class SQLSinkArguments(unittest.TestCase):
                 for _, found_path, _, column, _ in findings:
                     self.assertEqual(found_path, path)
                     self.assertEqual(column, 1)
+
+    def test_saved_sql_capability_escape_is_explicitly_incomplete(self):
+        for name, source, retained_lines in BOUND_SQL_PARTIAL_CASES:
+            with self.subTest(case=name):
+                path = self.artifacts / ('bound-incomplete-' + name + '.py')
+                path.write_text(source, encoding='utf-8')
+                findings = []
+                previous = os.environ.pop(detector.SANITIZER_ENV, None)
+                try:
+                    with self.assertRaisesRegex(detector.SQLFlowLimit, 'incomplete'):
+                        findings.extend(detector.find([path]))
+                finally:
+                    if previous is not None:
+                        os.environ[detector.SANITIZER_ENV] = previous
+                actual = sorted((rule, line) for rule, _, line, _, _ in findings)
+                self.assertEqual(actual, [(CRITICAL, line) for line in retained_lines], source)
+
+    def test_saved_sqlite_callable_keeps_receiver_and_parameter_binding(self):
+        with sqlite3.connect(':memory:') as connection:
+            connection.execute('CREATE TABLE accounts (name TEXT)')
+            connection.executemany('INSERT INTO accounts VALUES (?)', [('alice',), ('bob',)])
+            receiver = connection
+            submit = receiver.execute
+            saved = submit
+            receiver = object()
+            submit = len
+            attacker = "alice' OR 1=1 --"
+            unsafe = saved("SELECT name FROM accounts WHERE name = '" + attacker + "'").fetchall()
+            bound = saved('SELECT name FROM accounts WHERE name = ?', (attacker,)).fetchall()
+            self.assertEqual(unsafe, [('alice',), ('bob',)])
+            self.assertEqual(bound, [])
+
+    def test_literal_reducer_admission_includes_saved_sql_capabilities(self):
+        namespace = ('import importlib\n'
+                     'def load_plugin(name):\n    return importlib.import_module(name)\n'
+                     'sum(item for item in (1, 2))\n')
+        selected = {'bound-execute-alias', 'bound-saved-before-replacement',
+                    'bound-nested-capture', 'bound-extra-predicate',
+                    'conditional-alias', 'eager-map-callback', 'container-callback',
+                    'keyword-callback', 'callable-default', 'walrus-target',
+                    'conditional-expression', 'literal-getattr',
+                    'local-getattr-alias', 'imported-getattr-alias',
+                    'imported-attrgetter-alias', 'imported-methodcaller-alias',
+                    'raw-container-callback', 'extra-container-callback',
+                    'raw-keyword-callback', 'extra-keyword-callback',
+                    'returned-raw-capability', 'default-raw-capability',
+                    'raw-key-callback', 'extra-key-callback', 'shadowed-print-callback',
+                    'replaced-builtin-print-callback',
+                    'metadata-replaces-saved-query-contract', 'metadata-activates-captured-default',
+                    'property-changes-query-family',
+                    'reflected-local-method-replacement'}
+        for name, body, _ in BOUND_SQL_CASES + BOUND_SQL_PARTIAL_CASES:
+            if name not in selected:
+                continue
+            with self.subTest(capability=name):
+                path = self.artifacts / ('literal-reducer-capability-' + name + '.py')
+                # The final literal cannot certify an earlier hidden dynamic
+                # sink or escaped callable as a file containing only fixed SQL.
+                path.write_text(namespace + body + '\ncursor.execute("SELECT 1")\n', encoding='utf-8')
+                with self.assertRaisesRegex(detector.SQLFlowLimit, 'incomplete'):
+                    list(detector.find([path]))
+
+    def test_literal_reducer_admission_keeps_non_sql_values_and_bound_parameters(self):
+        namespace = ('import importlib\n'
+                     'def load_plugin(name):\n    return importlib.import_module(name)\n'
+                     'sum(item for item in (1, 2))\n')
+        selected = {'bound-parameterized', 'bound-unused',
+                    'ordinary-raw-property', 'ordinary-extra-property',
+                    'ordinary-extra-property-container', 'ordinary-raw-bound-parameter',
+                    'ordinary-extra-bound-parameter', 'ordinary-raw-container-bound-data',
+                    'ordinary-raw-property-and-sql-text', 'ordinary-extra-property-in-sql-text'}
+        for name, body, _ in BOUND_SQL_CASES:
+            if name not in selected:
+                continue
+            with self.subTest(value=name):
+                path = self.artifacts / ('literal-reducer-non-sql-' + name + '.py')
+                path.write_text(namespace + body + '\ncursor.execute("SELECT 1")\n', encoding='utf-8')
+                self.assertEqual(list(detector.find([path])), [])
+
+    def test_literal_reducer_data_consumers_require_closed_builtin_identity(self):
+        namespace = ('import importlib\n'
+                     'def load_plugin(name):\n    return importlib.import_module(name)\n'
+                     'sum(item for item in (1, 2))\n')
+        selected = {'ordinary-raw-print-data', 'ordinary-extra-print-data',
+                    'ordinary-raw-print-alias-data', 'ordinary-raw-str-data',
+                    'ordinary-extra-format-data'}
+        for name, body, _ in BOUND_SQL_CASES:
+            if name not in selected:
+                continue
+            with self.subTest(consumer=name):
+                path = self.artifacts / ('literal-reducer-open-builtin-' + name + '.py')
+                # These same field values are clean with closed builtins.
+                # Namespace exposure removes that identity proof: a replaced
+                # print/str/format may invoke the supplied SQL capability.
+                path.write_text(namespace + body + '\ncursor.execute("SELECT 1")\n', encoding='utf-8')
+                with self.assertRaisesRegex(detector.SQLFlowLimit, 'incomplete'):
+                    list(detector.find([path]))
 
     def test_fixed_point_budget_is_not_a_clean_result(self):
         source = 'def run(cursor, user, rows):\n    for row in rows:\n        cursor.execute(f"SELECT {user}")\n'
@@ -396,7 +621,10 @@ class SQLSinkArgumentsCLI(unittest.TestCase):
              'def raw(cursor, value):\n    cursor.execute(f"SELECT {value}")\n'
              '    return dispatch(f"SELECT {value}")\n'
              'def run(cursor, user):\n    return raw(cursor, user)\n', [3], 'facade forwarding call'),
-        )
+        ) + tuple((name, source, retained_lines, 'incomplete')
+                  for name, source, retained_lines in BOUND_SQL_PARTIAL_CASES
+                  if name in {'keyword-callback', 'unknown-keyword-slot',
+                              'retained-before-callback', 'retained-before-unknown-keywords'})
         detector_hash = hashlib.sha256(Path(detector.__file__).read_bytes()).hexdigest()
         for name, source, expected_lines, expected_error in cases:
             for entry in ('module', 'runner'):
@@ -469,7 +697,12 @@ class SQLSinkArgumentsCLI(unittest.TestCase):
                     'local-raw-process-wrapper', 'local-raw-opaque-sql',
                     'imported-sql-alias-positional', 'imported-sql-alias-keyword',
                     'imported-sql-alias-bound-data', 'imported-sql-alias-unproven',
-                    'imported-sql-alias-local-copy', 'imported-sql-alias-parameter-shadow'}
+                    'imported-sql-alias-local-copy', 'imported-sql-alias-parameter-shadow',
+                    'bound-execute-alias', 'bound-extra-predicate',
+                    'bound-saved-before-replacement', 'bound-sql-looking-data',
+                    'bound-alias-sql-looking-data',
+                    'bound-application-raw-method', 'ordinary-raw-bound-parameter',
+                    'kwargs-direct-query', 'kwargs-saved-bound-data'}
         tools = {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
                  for name in ('ubs', 'modules/ubs-python.sh',
                               'modules/helpers/ubs_core/py_detectors/sql_injection.py')}

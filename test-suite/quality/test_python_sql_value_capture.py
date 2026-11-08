@@ -1591,6 +1591,51 @@ class SQLValueCaptureTests(unittest.TestCase):
                 with self.assertRaisesRegex(detector.SQLFlowLimit, 'generator reducer.*incomplete'):
                     list(detector.find([path]))
 
+    def test_literal_sql_keeps_unrelated_namespace_reducers_opaque(self):
+        namespace = ('import importlib\n'
+                     'def load_plugin(name):\n    return importlib.import_module(name)\n')
+        for name, expression in (
+                ('sum', 'sum(item for item in (1, 2))'),
+                ('sum-derived-count', 'sum(len(user) for _ in (1, 2))'),
+                ('min', 'min(item for item in (1, 2))'),
+                ('max', 'max(item for item in (1, 2))'),
+                ('sorted', 'sorted(item for item in (1, 2))')):
+            source = namespace + program(f'    result = {expression}\n'
+                                         '    return cursor.execute("SELECT count(*) FROM users WHERE name = ?", '
+                                         '(user,)).fetchone()[0]\n')
+            with self.subTest(reducer=name):
+                self.assertEqual(sqlite_witness(self.artifacts, 'literal-opaque-' + name, source)['rows'], 0)
+                self.inspect('literal-opaque-' + name, source, ())
+        source = namespace + 'import json\n' + program('    records = [json.loads(line) for line in rows]\n'
+                                     '    result = sum(record.get("count", 1) for record in records\n'
+                                     '                 if record["severity"] == "critical")\n'
+                                     '    cursor.execute("SELECT ?", (user,))\n')
+        self.inspect('literal-opaque-record-count', source, ())
+
+    def test_literal_sql_opaque_reducers_keep_unknown_results_and_cursor_state(self):
+        namespace = ('import importlib\n'
+                     'def load_plugin(name):\n    return importlib.import_module(name)\n')
+        cases = (
+            ('result-used-as-sql', '    query = sum(item for item in (1, 2))\n'
+             '    cursor.execute(query)\n', 'generator reducer binding'),
+            ('result-interpolated', '    result = sum(item for item in (1, 2))\n'
+             '    cursor.execute(f"SELECT {result}")\n', 'generator reducer binding'),
+            ('cursor-restarted', '    pending = (item for item in (1, 2))\n'
+             '    sum(pending)\n    list(pending)\n'
+             '    cursor.execute("SELECT 1")\n', 'partial generator'),
+            ('sink-in-generator', '    sum(cursor.execute("SELECT 1") is None for _ in (1, 2))\n',
+             'generator reducer binding'),
+            ('sql-export', '    sum(f"SELECT {user}" for _ in (1, 2))\n'
+             '    cursor.execute("SELECT 1")\n', 'generator reducer binding'),
+            ('write-in-generator', '    sum((value := item) for item in (1, 2))\n'
+             '    cursor.execute("SELECT 1")\n', 'generator reducer binding'),
+        )
+        for name, body, reason in cases:
+            path = self.artifacts / ('literal-opaque-boundary-' + name + '.py')
+            path.write_text(namespace + program(body), encoding='utf-8')
+            with self.subTest(boundary=name), self.assertRaisesRegex(detector.SQLFlowLimit, reason):
+                list(detector.find([path]))
+
     def test_generator_reducer_primitive_controls(self):
         unused_callbacks = ('    class Unused:\n'
                             '        def __lt__(self, other): return False\n'

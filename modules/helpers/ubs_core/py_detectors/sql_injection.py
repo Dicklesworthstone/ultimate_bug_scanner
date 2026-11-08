@@ -147,6 +147,7 @@ class SanitizerBindings:
         self.member_writes = set()
         self.indirect_rebindings = set()
         self.calls = []
+        self._sql_capability_candidates = []
         self.name_loads = {}
         self.direct_callees = set()
         self.literal_assignments = {}
@@ -169,6 +170,15 @@ class SanitizerBindings:
         self._instrumentation_lists = {}
         self._instrumentation_forwarders = set()
         self._possible_sql_imports = {}
+        self._possible_sql_methods = {}
+        self._saved_sql_methods = {}
+        self._closed_method_aliases = {}
+        self._sql_method_captures = {}
+        self._captured_receivers = {}
+        self._escaped_sql_methods = None
+        self._sql_escape_coverage = {}
+        self._sql_facade_call_coverage = {}
+        self.sql_method_escape_owners = frozenset()
         self._binding_resolutions = {}
         self._sql_binding_cells = {}
         self._sql_facade_flow = None
@@ -510,13 +520,14 @@ class SanitizerBindings:
             scope = scope['parent']
         return None
 
-    def class_escapes(self, owner):
-        if owner in self._escaped_classes:
-            return self._escaped_classes[owner]
+    def class_escapes(self, owner, captured_method=None):
+        cache_key = owner if captured_method is None else (owner, captured_method)
+        if cache_key in self._escaped_classes:
+            return self._escaped_classes[cache_key]
         if (owner.bases or owner.keywords or owner.decorator_list
                 or {'__new__', '__getattribute__', '__getattr__', '__setattr__', '__delattr__'}
                     & self.owner_scopes[owner]['names'].keys()):
-            self._escaped_classes[owner] = True
+            self._escaped_classes[cache_key] = True
             return True
         # Resolve the members from the closed class body, not from the global
         # member-write index. A write to another record's equally named field
@@ -528,10 +539,10 @@ class SanitizerBindings:
                        or decorator.id not in {'classmethod', 'staticmethod'}
                        or self.resolve(decorator) != ('unbound', decorator.id)
                        for decorator in statement.decorator_list):
-                    self._escaped_classes[owner] = True
+                    self._escaped_classes[cache_key] = True
                     return True
                 if len(self.owner_scopes[owner]['names'].get(statement.name, ())) != 1:
-                    self._escaped_classes[owner] = True
+                    self._escaped_classes[cache_key] = True
                     return True
                 methods[statement.name] = statement
             elif isinstance(statement, (ast.Assign, ast.AnnAssign)):
@@ -541,15 +552,15 @@ class SanitizerBindings:
                         or value is not None and not isinstance(value, ast.Constant)):
                     # An unknown class value can be a descriptor whose
                     # __set_name__/__get__ receives the owner implicitly.
-                    self._escaped_classes[owner] = True
+                    self._escaped_classes[cache_key] = True
                     return True
             elif not (isinstance(statement, ast.Pass)
                       or isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant)):
-                self._escaped_classes[owner] = True
+                self._escaped_classes[cache_key] = True
                 return True
         # Recursive lexical resolution during an escape check must not turn a
         # circular alias into a receiver proof.
-        self._escaped_classes[owner] = True
+        self._escaped_classes[cache_key] = True
         names = {owner.name}
         for statement in owner.body:
             if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -558,6 +569,8 @@ class SanitizerBindings:
         for name in names:
             for reference in self.name_loads.get(name, ()):
                 target = self.resolve(reference)
+                if target is None and captured_method is not None:
+                    target = self.captured_receiver(reference)
                 if not target or target[0] not in {'class', 'receiver'} or target[1] is not owner:
                     continue
                 scope = self.scope_of.get(reference) if target[0] == 'receiver' else None
@@ -576,7 +589,16 @@ class SanitizerBindings:
                 if isinstance(parent, ast.Attribute) and parent.value is reference:
                     method = methods.get(parent.attr)
                     decorators = [call_name(value) for value in method.decorator_list] if method else []
-                    if (method is not None and parent in self.direct_callees
+                    if (captured_method is not None and parent.attr == captured_method.attr
+                            and isinstance(parent.ctx, ast.Store)
+                            and self.saved_method_capture_is_stable(captured_method)):
+                        # Replacing this attribute after capture does not
+                        # replace the function/receiver already bound in the
+                        # saved method. The capture proof admits only later
+                        # ordinary assignments in this same function body.
+                        continue
+                    if (method is not None
+                            and (parent in self.direct_callees or self.closed_method_alias(parent))
                             and (decorators in (['staticmethod'], ['classmethod'])
                                  or target[0] == 'receiver' and target[2])):
                         continue
@@ -607,7 +629,7 @@ class SanitizerBindings:
                 break
             if escaped:
                 break
-        self._escaped_classes[owner] = escaped
+        self._escaped_classes[cache_key] = escaped
         return escaped
 
     def closed_receiver_generator(self, generator, owner):
@@ -725,6 +747,600 @@ class SanitizerBindings:
             self._possible_sql_imports[node] = result
         return result
 
+    def saved_sql_method(self, node, seen=frozenset()):
+        """Resolve a stable saved method to its original receiver expression.
+
+        A bound method does not become a new API when its local name changes.
+        Keep the actual attribute, so local application methods still receive
+        the same receiver/forwarding checks as a direct call. This deliberately
+        leaves the general import/function resolver unchanged.
+        """
+        if node in seen:
+            return None
+        if not seen and node in self._saved_sql_methods:
+            return self._saved_sql_methods[node]
+        self.budget[0] -= 1
+        if self.budget[0] < 0:
+            raise SQLFlowLimit('SQL saved method resolution budget exceeded; analysis is incomplete')
+        root = not seen
+        seen = seen | {node}
+        result = None
+        if isinstance(node, ast.Attribute) and node.attr in EXECUTE_METHODS | {'extra'}:
+            result = node
+        elif isinstance(node, ast.Name) and node.id not in self.indirect_rebindings:
+            source = self.local_alias_source(node)
+            if source is not None:
+                result = self.saved_sql_method(source, seen)
+        if root:
+            self._saved_sql_methods[node] = result
+        return result
+
+    def local_alias_source(self, node):
+        """Select the value copied at an unconditional local assignment.
+
+        A saved copy must not follow a later replacement of its source name.
+        Multiple definitions are admitted only in one straight-line function
+        body; branches, loops, exception paths and captured mutable cells keep
+        the existing unresolved-binding boundary.
+        """
+        if not isinstance(node, ast.Name) or node.id in self.indirect_rebindings:
+            return None
+        scope = self.lexical_owner(node)
+        candidates = scope['names'].get(node.id, ()) if scope is not None else ()
+        if len(candidates) == 1:
+            return candidates[0][1] if candidates[0] and candidates[0][0] == 'alias' else None
+        if (not candidates or scope is not self.scope_of.get(node)
+                or not isinstance(scope['node'], (ast.FunctionDef, ast.AsyncFunctionDef))):
+            return None
+        latest = None
+        for candidate in candidates:
+            self.budget[0] -= 1
+            if self.budget[0] < 0:
+                raise SQLFlowLimit('SQL saved method assignment budget exceeded; analysis is incomplete')
+            if not candidate or candidate[0] != 'alias':
+                return None
+            source = candidate[1]
+            assignment = self.parents.get(source)
+            if (not isinstance(assignment, (ast.Assign, ast.AnnAssign))
+                    or assignment.value is not source or self.parents.get(assignment) is not scope['node']):
+                return None
+            position = assignment.end_lineno, assignment.end_col_offset
+            if position <= (node.lineno, node.col_offset) and (latest is None or position > latest[0]):
+                latest = position, source
+        return latest[1] if latest is not None else None
+
+    def saved_method_capture_is_stable(self, method):
+        if method in self._sql_method_captures:
+            return self._sql_method_captures[method]
+        stable = (not self.dynamic_namespace and not self.reflective_member_writes
+                  and not {'__code__', '__globals__', '__defaults__', '__kwdefaults__'} & self.member_writes)
+        if stable and method.attr in self.member_writes:
+            owner = self.scope_of.get(method)
+            for node, scope in self.scope_of.items():
+                self.budget[0] -= 1
+                if self.budget[0] < 0:
+                    raise SQLFlowLimit('SQL saved method capture budget exceeded; analysis is incomplete')
+                if not (isinstance(node, ast.Attribute) and node.attr == method.attr
+                        and isinstance(node.ctx, (ast.Store, ast.Del))):
+                    continue
+                assignment = self.parents.get(node)
+                if (owner is None or scope is not owner
+                        or not isinstance(owner['node'], (ast.FunctionDef, ast.AsyncFunctionDef))
+                        or not isinstance(assignment, (ast.Assign, ast.AnnAssign))
+                        or self.parents.get(assignment) is not owner['node']
+                        or assignment.lineno <= method.lineno):
+                    stable = False
+                    break
+        self._sql_method_captures[method] = stable
+        return stable
+
+    def saved_non_sql_replacement(self, call):
+        """An unconditional replacement with the actual print builtin is not SQL."""
+        if (not isinstance(call.func, ast.Name) or self.dynamic_namespace or self.builtin_namespace
+                or self.reflective_member_writes):
+            return False
+        source, seen = call.func, set()
+        while source not in seen:
+            seen.add(source)
+            copied = self.local_alias_source(source)
+            if copied is None:
+                break
+            source = copied
+        return source is not call.func and self.resolve(source) == ('unbound', 'print')
+
+    def captured_receiver(self, node, seen=frozenset()):
+        """Keep the original local receiver across later name assignments."""
+        if node in seen:
+            return None
+        if not seen and node in self._captured_receivers:
+            return self._captured_receivers[node]
+        root = not seen
+        seen = seen | {node}
+        resolved = self.resolve(node)
+        if resolved and resolved[0] in {'class', 'receiver'}:
+            return resolved
+        result = None
+        if isinstance(node, ast.Name) and node.id not in self.indirect_rebindings:
+            copied = self.local_alias_source(node)
+            if copied is not None:
+                result = self.captured_receiver(copied, seen)
+            else:
+                scope = self.lexical_owner(node)
+                candidates = scope['names'].get(node.id, ()) if scope is not None else ()
+                if (scope is self.scope_of.get(node) and candidates and candidates[0]
+                        and candidates[0][0] == 'receiver'):
+                    latest, closed = None, True
+                    for target, target_scope in self.scope_of.items():
+                        self.budget[0] -= 1
+                        if self.budget[0] < 0:
+                            raise SQLFlowLimit('SQL saved receiver binding budget exceeded; analysis is incomplete')
+                        if not (target_scope is scope and isinstance(target, ast.Name)
+                                and target.id == node.id and isinstance(target.ctx, (ast.Store, ast.Del))):
+                            continue
+                        assignment = self.parents.get(target)
+                        if (not isinstance(assignment, (ast.Assign, ast.AnnAssign))
+                                or self.parents.get(assignment) is not scope['node']
+                                or assignment.value is None):
+                            closed = False
+                            break
+                        position = assignment.end_lineno, assignment.end_col_offset
+                        if position <= (node.lineno, node.col_offset) and (latest is None or position > latest[0]):
+                            latest = position, assignment.value
+                    if closed:
+                        result = (self.captured_receiver(latest[1], seen) if latest is not None else candidates[0])
+        if root:
+            self._captured_receivers[node] = result
+        return result
+
+    def captured_method_target(self, method):
+        if not self.saved_method_capture_is_stable(method):
+            return None
+        receiver = self.captured_receiver(method.value)
+        if not receiver:
+            return None
+        owner = receiver[1]
+        if owner.decorator_list or owner.bases or owner.keywords:
+            return None
+        candidates = self.owner_scopes[owner]['names'].get(method.attr, ())
+        target = candidates[0] if len(candidates) == 1 else None
+        if not target or target[0] != 'function':
+            return None
+        decorators = [call_name(value) for value in target[1].decorator_list]
+        if (decorators not in ([], ['classmethod'], ['staticmethod']) or any(
+                self.resolve(value) != ('unbound', call_name(value)) for value in target[1].decorator_list)):
+            return None
+        bound = decorators == ['classmethod'] or not decorators and receiver[0] == 'receiver' and receiver[2]
+        return 'function', target[1], bound
+
+    def possible_sql_methods(self, node, seen=frozenset()):
+        """Keep method origins when reassignment prevents a stable alias proof."""
+        if node in seen:
+            return frozenset()
+        if not seen and node in self._possible_sql_methods:
+            return self._possible_sql_methods[node]
+        self.budget[0] -= 1
+        if self.budget[0] < 0:
+            raise SQLFlowLimit('SQL saved method resolution budget exceeded; analysis is incomplete')
+        root = not seen
+        seen = seen | {node}
+        result = set()
+        if isinstance(node, ast.Attribute) and node.attr in EXECUTE_METHODS | {'extra'}:
+            result.add(node)
+        elif isinstance(node, ast.Name):
+            scope = self.sql_binding_cell(node.id, self.scope_of.get(node))
+            owners = [scope] if scope is not None else []
+            if node.id in self.indirect_rebindings:
+                for candidate in self.owner_scopes.values():
+                    self.budget[0] -= 1
+                    if self.budget[0] < 0:
+                        raise SQLFlowLimit('SQL saved method cell budget exceeded; analysis is incomplete')
+                    if (node.id in candidate['capture_barriers']
+                            and self.sql_binding_cell(node.id, candidate) is scope):
+                        owners.append(candidate)
+            for owner in owners:
+                for candidate in owner['names'].get(node.id, ()):
+                    if candidate and candidate[0] == 'alias':
+                        result.update(self.possible_sql_methods(candidate[1], seen))
+        result = frozenset(result)
+        if root:
+            self._possible_sql_methods[node] = result
+        return result
+
+    def closed_method_alias(self, method):
+        """A local saved method keeps its receiver private until direct calls."""
+        if method in self._closed_method_aliases:
+            return self._closed_method_aliases[method]
+        self._closed_method_aliases[method] = False
+        owner = self.scope_of.get(method)
+        if owner is None or not isinstance(owner['node'], (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return False
+        pending, visited = [method], set()
+        while pending:
+            value = pending.pop()
+            if value in visited:
+                continue
+            visited.add(value)
+            self.budget[0] -= 1
+            if self.budget[0] < 0:
+                raise SQLFlowLimit('SQL saved receiver ownership budget exceeded; analysis is incomplete')
+            parent = self.parents.get(value)
+            if isinstance(parent, ast.Call) and parent.func is value:
+                continue
+            if not (isinstance(parent, (ast.Assign, ast.AnnAssign)) and parent.value is value):
+                return False
+            targets = parent.targets if isinstance(parent, ast.Assign) else [parent.target]
+            for target in targets:
+                if not isinstance(target, ast.Name) or self.lexical_owner(target) is not owner:
+                    return False
+                if owner['names'].get(target.id) != [('alias', value)]:
+                    return False
+                for reference in self.name_loads.get(target.id, ()):
+                    if self.lexical_owner(reference) is not owner:
+                        continue
+                    scope = self.scope_of.get(reference)
+                    while scope is not None and isinstance(scope['node'], (ast.ListComp, ast.SetComp, ast.DictComp)):
+                        scope = scope['parent']
+                    if scope is not owner:
+                        return False
+                    pending.append(reference)
+        self._closed_method_aliases[method] = True
+        return True
+
+    def method_alias_references(self, value):
+        parent = self.parents.get(value)
+        if not (isinstance(parent, (ast.Assign, ast.AnnAssign)) and parent.value is value):
+            return None
+        targets = parent.targets if isinstance(parent, ast.Assign) else [parent.target]
+        if not all(isinstance(target, ast.Name) for target in targets):
+            return None
+        references = []
+        for target in targets:
+            owner = self.sql_binding_cell(target.id, self.scope_of.get(target))
+            for reference in self.name_loads.get(target.id, ()):
+                self.budget[0] -= 1
+                if self.budget[0] < 0:
+                    raise SQLFlowLimit('SQL saved method use budget exceeded; analysis is incomplete')
+                if self.sql_binding_cell(reference.id, self.scope_of.get(reference)) is owner:
+                    references.append(reference)
+        return references
+
+    def method_has_callable_use(self, method):
+        """Distinguish callable raw/extra aliases from ordinary data fields."""
+        pending, visited = [(method, ())], set()
+
+        def parameter_reads(function, name, path):
+            owner = self.owner_scopes[function]
+            for reference in self.name_loads.get(name, ()):
+                self.budget[0] -= 1
+                if self.budget[0] < 0:
+                    raise SQLFlowLimit('SQL callable-use budget exceeded; analysis is incomplete')
+                if self.sql_binding_cell(name, self.scope_of.get(reference)) is owner:
+                    pending.append((reference, path))
+
+        while pending:
+            value, path = pending.pop()
+            identity = value, path
+            if identity in visited:
+                continue
+            visited.add(identity)
+            self.budget[0] -= 1
+            if self.budget[0] < 0 or len(path) > 64:
+                raise SQLFlowLimit('SQL callable-use budget exceeded; analysis is incomplete')
+            parent = self.parents.get(value)
+            if isinstance(parent, (ast.List, ast.Tuple)) and value in parent.elts:
+                pending.append((parent, (('index', parent.elts.index(value), len(parent.elts)), *path)))
+                continue
+            if isinstance(parent, ast.Dict) and value in parent.values:
+                key = parent.keys[parent.values.index(value)]
+                selector = key.value if isinstance(key, ast.Constant) and isinstance(key.value, (str, int)) else None
+                pending.append((parent, (('key', selector, None), *path)))
+                continue
+            if isinstance(parent, ast.Subscript) and parent.value is value and path:
+                kind, selected, size = path[0]
+                index = parent.slice
+                actual = index.value if isinstance(index, ast.Constant) else None
+                if (isinstance(index, ast.UnaryOp) and isinstance(index.op, ast.USub)
+                        and isinstance(index.operand, ast.Constant) and type(index.operand.value) is int):
+                    actual = -index.operand.value
+                if kind == 'index' and type(actual) is int:
+                    actual = actual + size if actual < 0 else actual
+                if selected is None or actual is None or actual == selected:
+                    pending.append((parent, path[1:]))
+                continue
+            if isinstance(parent, ast.Return):
+                scope = self.scope_of.get(parent)
+                function = scope['node'] if scope is not None else None
+                if isinstance(function, ast.FunctionDef) and self.eager_function(function):
+                    owner = scope['parent']
+                    if (owner is not None and isinstance(owner['node'], ast.ClassDef)
+                            and len(function.decorator_list) == 1
+                            and self.resolve(function.decorator_list[0]) == ('unbound', 'property')):
+                        for reference in self._sql_capability_candidates:
+                            self.budget[0] -= 1
+                            if self.budget[0] < 0:
+                                raise SQLFlowLimit('SQL callable-property budget exceeded; analysis is incomplete')
+                            if (isinstance(reference, ast.Attribute) and reference.attr == function.name
+                                    and self.resolve(reference.value) == ('receiver', owner['node'], True)):
+                                pending.append((reference, path))
+                    for call in self.calls:
+                        self.budget[0] -= 1
+                        if self.budget[0] < 0:
+                            raise SQLFlowLimit('SQL callable-return budget exceeded; analysis is incomplete')
+                        target = self.resolve(call.func)
+                        if target and target[0] == 'function' and target[1] is function:
+                            pending.append((call, path))
+                continue
+            if isinstance(parent, ast.arguments):
+                function = self.parents.get(parent)
+                if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                    parameters = [*parent.posonlyargs, *parent.args]
+                    defaults = list(zip(parameters[len(parameters) - len(parent.defaults):], parent.defaults))
+                    defaults.extend(zip(parent.kwonlyargs, parent.kw_defaults))
+                    for parameter, default in defaults:
+                        if default is value:
+                            parameter_reads(function, parameter.arg, path)
+                continue
+            keyword = parent if isinstance(parent, ast.keyword) else None
+            if keyword is not None:
+                parent = self.parents.get(keyword)
+            if isinstance(parent, ast.Call):
+                if parent.func is value and not path:
+                    return True
+                if (parent.args and parent.args[0] is value
+                        and not path and self.resolve(parent.func) in {('unbound', 'map'), ('unbound', 'filter')}):
+                    return True
+                target = self.resolve(parent.func)
+                if (keyword is not None and keyword.arg == 'key' and not path
+                        and target in {('unbound', 'min'), ('unbound', 'max'), ('unbound', 'sorted')}):
+                    return True
+                if target and target[0] == 'function':
+                    parameters = _positional_parameters(target[1])[1 if target[2] else 0:]
+                    if value in parent.args and parent.args.index(value) < len(parameters):
+                        parameter_reads(target[1], parameters[parent.args.index(value)], path)
+                    elif keyword is not None and keyword.arg in _all_parameters(target[1]):
+                        parameter_reads(target[1], keyword.arg, path)
+                # A SQL-shaped callback invocation differs from returning or
+                # binding an ordinary raw/extra data field. Known SQL calls
+                # keep their query/data slots; ordinary local helper proofs
+                # also keep properties used only as data out of this path.
+                data_builtin = (not self.dynamic_namespace and not self.builtin_namespace
+                                and target is not None and target[0] == 'unbound'
+                                and target[1] in {'print', 'str', 'format', 'repr', 'ascii'})
+                if (parent.func is not value and not sql_sink_name(parent, self)
+                        and not data_builtin and not self.non_database_callable(parent)):
+                    others = [argument for argument in parent.args if argument is not value]
+                    others += [item.value for item in parent.keywords if item is not keyword]
+                    if (any(looks_like_sql(argument) for argument in others)
+                            or any(item is not keyword and item.arg in {'where', 'select'}
+                                   for item in parent.keywords)):
+                        return True
+            references = self.method_alias_references(value)
+            if references is not None:
+                pending.extend((reference, path) for reference in references)
+        return False
+
+    def escaped_sql_methods(self):
+        """Locate unsupported transfers of selected SQL execution capabilities.
+
+        Keep ordinary raw/extra properties out of the callable inventory.
+        Known methods and lexical callable uses retain receiver checks; a
+        capability exported through callbacks, containers or reflection must
+        not silently disappear from file admission or literal-SQL proofs.
+        """
+        if self._escaped_sql_methods is not None:
+            return self._escaped_sql_methods
+        escaped = set()
+        for node in self._sql_capability_candidates:
+            self.budget[0] -= 1
+            if self.budget[0] < 0:
+                raise SQLFlowLimit('SQL saved method inventory budget exceeded; analysis is incomplete')
+            reflected = reflected_sql_name(node, self)
+            if reflected:
+                target = self.resolve(node.func)
+                intrinsic = (target == ('unbound', 'getattr') or target in {
+                    ('import', 'builtins.getattr'), ('import', 'operator.attrgetter'),
+                    ('import', 'operator.methodcaller')})
+                explicit_protocol = (isinstance(node.func, ast.Attribute)
+                                     and node.func.attr in {'__getattribute__', '__getattr__'})
+                if (intrinsic or explicit_protocol) and (reflected not in {'raw', 'extra'}
+                                                        or self.method_has_callable_use(node)):
+                    escaped.add(node)
+                continue
+            if (not isinstance(node, ast.Attribute) or not isinstance(node.ctx, ast.Load)
+                    or node.attr not in EXECUTE_METHODS | {'extra'} or node in self.direct_callees):
+                continue
+            target = self.resolve(node)
+            if (node.attr in {'raw', 'extra'} and not (target and target[0] == 'function')
+                    and not self.method_has_callable_use(node)):
+                continue
+            probe = ast.Call(func=node, args=[], keywords=[])
+            if self.non_database_callable(probe):
+                continue
+            pending, visited = [node], set()
+            while pending:
+                value = pending.pop()
+                if value in visited:
+                    continue
+                visited.add(value)
+                self.budget[0] -= 1
+                if self.budget[0] < 0:
+                    raise SQLFlowLimit('SQL saved method escape budget exceeded; analysis is incomplete')
+                if isinstance(value, ast.Name):
+                    if self.saved_non_sql_replacement(ast.Call(func=value, args=[], keywords=[])):
+                        continue
+                parent = self.parents.get(value)
+                if isinstance(parent, ast.Call) and parent.func is value:
+                    continue
+                references = self.method_alias_references(value)
+                if references is not None:
+                    pending.extend(references)
+                    continue
+                # Eager argument/container evaluation can reach another SQL
+                # sink before the opaque transfer. Refuse at that boundary,
+                # after its children have contributed their known findings.
+                if isinstance(parent, ast.keyword):
+                    parent = self.parents.get(parent)
+                if (isinstance(parent, ast.NamedExpr)
+                        and isinstance(self.parents.get(parent), ast.Call)
+                        and self.parents[parent].func is parent):
+                    parent = self.parents[parent]
+                escaped.add(parent if isinstance(parent, (ast.Call, ast.List, ast.Tuple, ast.Set,
+                                                          ast.Dict, ast.Return, ast.Assign, ast.AnnAssign,
+                                                          ast.arguments)) else value)
+        owners = set()
+        for node in escaped:
+            scope = self.scope_of.get(node)
+            while scope is not None:
+                owners.add(scope['node'])
+                scope = scope['parent']
+        self.sql_method_escape_owners = frozenset(owners)
+        self._escaped_sql_methods = frozenset(escaped)
+        return self._escaped_sql_methods
+
+    def covered_sql_facade_call(self, call, family):
+        """A plain forwarding facade keeps every query at a modeled call site.
+
+        This does not certify an arbitrary callback or a facade merely by its
+        name. Every reference must remain a direct, recognized SQL call with
+        one query argument. The forwarded value is that same parameter, or
+        the sole variadic tuple inside a literal process argument vector.
+        """
+        key = call, family
+        if key in self._sql_facade_call_coverage:
+            return self._sql_facade_call_coverage[key]
+        self._sql_facade_call_coverage[key] = False
+        function = self.function_owner(call)
+        if (family not in EXECUTE_METHODS or not isinstance(function, ast.FunctionDef)
+                or function.name not in EXECUTE_METHODS or function.decorator_list
+                or not self.eager_function(function) or function.args.kwarg
+                or function.args.kwonlyargs or call.keywords or len(call.args) != 1):
+            return False
+        body = [statement for statement in function.body if not (
+            isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant)
+            and isinstance(statement.value.value, str))]
+        if len(body) != 1 or not isinstance(body[0], ast.Return) or body[0].value is not call:
+            return False
+        enclosing = self.owner_scopes[function]['parent']
+        method = enclosing is not None and isinstance(enclosing['node'], ast.ClassDef)
+        if method and self.class_escapes(enclosing['node']):
+            return False
+        parameters = _positional_parameters(function)[1 if method else 0:]
+        argument = call.args[0]
+        if len(parameters) == 1 and not function.args.vararg:
+            if not isinstance(argument, ast.Name) or argument.id != parameters[0]:
+                return False
+        elif not parameters and function.args.vararg:
+            if not isinstance(argument, (ast.List, ast.Tuple)):
+                return False
+            expansions = [value for value in argument.elts if isinstance(value, ast.Starred)]
+            if (len(expansions) != 1 or not isinstance(expansions[0].value, ast.Name)
+                    or expansions[0].value.id != function.args.vararg.arg
+                    or any(not isinstance(value, (ast.Constant, ast.Starred)) for value in argument.elts)):
+                return False
+        else:
+            return False
+        references = [*self.name_loads.get(function.name, ()), *(
+            value for value in self._sql_capability_candidates
+            if isinstance(value, ast.Attribute) and value.attr == function.name)]
+        for reference in references:
+            self.budget[0] -= 1
+            if self.budget[0] < 0:
+                raise SQLFlowLimit('SQL facade coverage budget exceeded; analysis is incomplete')
+            target = self.resolve(reference)
+            if (target and target[0] == 'function' and target[1] is function
+                    and reference not in self.direct_callees):
+                return False
+        found = False
+        for entry in self.calls:
+            self.budget[0] -= 1
+            if self.budget[0] < 0:
+                raise SQLFlowLimit('SQL facade coverage budget exceeded; analysis is incomplete')
+            target = self.resolve(entry.func)
+            if not (target and target[0] == 'function' and target[1] is function):
+                continue
+            if (sql_sink_name(entry, self) not in EXECUTE_METHODS or len(entry.args) != 1
+                    or isinstance(entry.args[0], ast.Starred) or entry.keywords
+                    or method and not target[2]):
+                return False
+            found = True
+        self._sql_facade_call_coverage[key] = found
+        return found
+
+    def covered_sql_method_escape(self, node):
+        """Retain capabilities in the inventory even when their uses are covered.
+
+        Literal-scope admission must still see these operations. Only the
+        execution refusal can defer to an existing SQL call boundary, and
+        only for a plain, closed forwarding shape with no alternate exports.
+        """
+        if node in self._sql_escape_coverage:
+            return self._sql_escape_coverage[node]
+        self._sql_escape_coverage[node] = False
+        parent = self.parents.get(node)
+        if (isinstance(node, ast.Attribute) and node.attr in EXECUTE_METHODS | {'extra'}
+                and isinstance(parent, ast.Attribute) and parent.value is node
+                and parent.attr == '__code__' and isinstance(parent.ctx, ast.Store)):
+            # Replacing function metadata does not export the bound callable.
+            # The global member-write/dispatch invalidation remains in force.
+            self._sql_escape_coverage[node] = True
+            return True
+        if (self.dynamic_namespace or self.builtin_namespace or self.reflective_member_writes
+                or {'__code__', '__globals__', '__defaults__', '__kwdefaults__'} & self.member_writes):
+            return False
+        if isinstance(node, ast.Return) and isinstance(node.value, ast.Attribute):
+            function = self.function_owner(node)
+            owner = self.owner_scopes.get(function, {}).get('parent')
+            if (function is not None and owner is not None and isinstance(owner['node'], ast.ClassDef)
+                    and function.name == node.value.attr and function.name in EXECUTE_METHODS
+                    and function.body == [node] and len(function.decorator_list) == 1
+                    and self.resolve(function.decorator_list[0]) == ('unbound', 'property')):
+                # A property with the same SQL API name preserves the selected
+                # argument family; its callers and saved aliases remain sinks.
+                self._sql_escape_coverage[node] = True
+                return True
+        if (isinstance(node, ast.Call) and self.resolve(node.func) == ('unbound', 'getattr')
+                and len(node.args) == 2 and not node.keywords
+                and isinstance(parent, ast.Call) and parent.func is node
+                and self.covered_sql_facade_call(parent, reflected_sql_name(node, self))):
+            self._sql_escape_coverage[node] = True
+            return True
+        if not (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Attribute) and isinstance(node.value, ast.Attribute)
+                and node.value.attr in EXECUTE_METHODS):
+            return False
+        field = node.targets[0]
+        receiver = self.resolve(field.value)
+        function = self.function_owner(node)
+        class_field = (receiver and receiver[0] == 'receiver' and receiver[2]
+                       and function is not None and function.name == '__init__'
+                       and self.parents.get(node) is function and not self.class_escapes(receiver[1]))
+        process_field = (receiver == ('import', 'subprocess') and function is None
+                         and field.attr in {'run', 'call', 'check_output', 'check_call'}
+                         and isinstance(self.parents.get(node), ast.Module))
+        if not (class_field or process_field):
+            return False
+        found = False
+        for value in self.scope_of:
+            self.budget[0] -= 1
+            if self.budget[0] < 0:
+                raise SQLFlowLimit('SQL stored callable coverage budget exceeded; analysis is incomplete')
+            if process_field and isinstance(value, (ast.Name, ast.Attribute)) and self.resolve(value) == receiver:
+                use = self.parents.get(value)
+                if not (isinstance(use, ast.Attribute) and use.value is value and use.attr == field.attr):
+                    return False
+            if not (isinstance(value, ast.Attribute) and value.attr == field.attr
+                    and self.resolve(value.value) == receiver):
+                continue
+            if value is field:
+                continue
+            use = self.parents.get(value)
+            if (not isinstance(value.ctx, ast.Load) or not isinstance(use, ast.Call) or use.func is not value
+                    or not self.covered_sql_facade_call(use, node.value.attr)):
+                return False
+            found = True
+        self._sql_escape_coverage[node] = found
+        return found
+
     def sql_binding_cell(self, name, scope):
         """Locate the declared lexical cell, including global/nonlocal writes."""
         key = name, scope['node'] if scope is not None else None
@@ -756,10 +1372,17 @@ class SanitizerBindings:
     def unresolved_sql_aliases(self, call):
         possible = frozenset(name.rsplit('.', 1)[-1] for name in self.possible_sql_imports(call.func)
                              if name.rsplit('.', 1)[-1] in EXECUTE_METHODS | {'extra'})
+        methods = (self.possible_sql_methods(call.func) if isinstance(call.func, ast.Name) else frozenset())
+        possible |= frozenset(method.attr for method in methods)
         if not possible:
             return possible
         target = self.resolve(call.func)
         if target and target[0] == 'import':
+            return frozenset()
+        saved = self.saved_sql_method(call.func) if methods else None
+        if saved is not None and self.saved_method_capture_is_stable(saved):
+            return frozenset()
+        if methods and self.saved_non_sql_replacement(call):
             return frozenset()
         return possible
 
@@ -1249,6 +1872,9 @@ class SanitizerBindings:
                 or {'__code__', '__globals__', '__defaults__', '__kwdefaults__'} & self.member_writes):
             return False
         target = self.resolve(call.func)
+        saved = self.saved_sql_method(call.func) if isinstance(call.func, ast.Name) else None
+        if saved is not None:
+            target = self.captured_method_target(saved) or target
         if not target or target[0] != 'function':
             return False
         owner = self.owner_scopes[target[1]]['parent']
@@ -1256,7 +1882,7 @@ class SanitizerBindings:
             return False
         if isinstance(owner['node'], ast.ClassDef):
             if ({'__getattribute__', '__getattr__'} & owner['names'].keys()
-                    or '__class__' in self.member_writes or self.class_escapes(owner['node'])):
+                    or '__class__' in self.member_writes or self.class_escapes(owner['node'], saved)):
                 return False
         elif target[1].decorator_list or not self.closed_local_callable(target[1]):
             return False
@@ -1288,6 +1914,8 @@ class SanitizerBindings:
         if isinstance(node, ast.Attribute):
             scope['references'].add(node.attr)
             scope['reflective'] |= node.attr in REFLECTIVE_LOOKUPS
+            if isinstance(node.ctx, ast.Load) and node.attr in EXECUTE_METHODS | {'extra'}:
+                self._sql_capability_candidates.append(node)
         elif isinstance(node, ast.Constant) and isinstance(node.value, str):
             scope['references'].add(node.value)
         elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
@@ -1463,6 +2091,9 @@ class SanitizerBindings:
         if isinstance(node, ast.Call):
             self.calls.append(node)
             self.direct_callees.add(node.func)
+            if any(isinstance(argument, ast.Constant) and isinstance(argument.value, str)
+                   and argument.value in EXECUTE_METHODS | {'extra'} for argument in node.args[:2]):
+                self._sql_capability_candidates.append(node)
         if isinstance(node, ast.NamedExpr):
             target_scope = scope
             while isinstance(target_scope['node'], (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
@@ -1796,13 +2427,39 @@ def call_name(node):
     return ''
 
 
+def reflected_sql_name(node, bindings=None):
+    if not isinstance(node, ast.Call):
+        return ''
+    short = call_name(node.func).rsplit('.', 1)[-1]
+    if bindings is not None:
+        target = bindings.resolve(node.func)
+        if target == ('unbound', 'getattr'):
+            short = 'getattr'
+        elif target and target[0] == 'import' and target[1] in {
+                'builtins.getattr', 'operator.attrgetter', 'operator.methodcaller'}:
+            short = target[1].rsplit('.', 1)[-1]
+    position = 1 if short == 'getattr' else 0 if short in {
+        '__getattribute__', '__getattr__', 'attrgetter', 'methodcaller'} else None
+    if position is not None and len(node.args) > position:
+        name = node.args[position]
+        if (isinstance(name, ast.Constant) and isinstance(name.value, str)
+                and name.value in EXECUTE_METHODS | {'extra'}):
+            return name.value
+    return ''
+
+
 def sql_sink_name(node, bindings=None):
     """Share the modeled sink families between admission and argument binding."""
     short = call_name(node.func).rsplit('.', 1)[-1]
     if bindings is not None:
+        if isinstance(node.func, ast.Name):
+            saved = bindings.saved_sql_method(node.func)
+            if saved is not None:
+                short = saved.attr
         if (short not in EXECUTE_METHODS | {'extra'} and not any(
                 name.rsplit('.', 1)[-1] in EXECUTE_METHODS | {'extra'}
-                for name in bindings.possible_sql_imports(node.func))):
+                for name in bindings.possible_sql_imports(node.func))
+                and not bindings.possible_sql_methods(node.func)):
             return ''
         target = bindings.resolve(node.func)
         if target and target[0] == 'import':
@@ -2005,6 +2662,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         self._sink_risks = {}
         self._suppression_index = None
         self._literal_statement_scopes = None
+        self._sql_callable_escape_sites = None
         self.remaining_steps = max_steps
         self._budget = [max_steps] if budget is None else budget
         self._pending_raise = None
@@ -2064,8 +2722,15 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         previous = self._binding_site
         self._binding_site = node
         try:
+            if (self._sql_callable_escape_sites is None
+                    and (self._ownership_bindings is not None or self._generator_scope)):
+                self._sql_callable_escape_sites = self.ownership_bindings().escaped_sql_methods()
             if not isinstance(node, ast.expr):
-                return super().visit(node)
+                result = super().visit(node)
+                if (self._sql_callable_escape_sites and node in self._sql_callable_escape_sites
+                        and not self.ownership_bindings().covered_sql_method_escape(node)):
+                    raise SQLFlowLimit('SQL execution callable escapes its modeled binding; analysis is incomplete')
+                return result
             self.step()
             # The same AST may run on another branch, loop iteration or finally
             # exit. Recompute its snapshot instead of reusing a previous store.
@@ -2075,6 +2740,9 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             result = super().visit(node)
             if node not in self._evaluated_values:
                 self._evaluated_values[node] = self.value_facts(node)
+            if (self._sql_callable_escape_sites and node in self._sql_callable_escape_sites
+                    and not self.ownership_bindings().covered_sql_method_escape(node)):
+                raise SQLFlowLimit('SQL execution callable escapes its modeled binding; analysis is incomplete')
             return result
         finally:
             self._binding_site = previous
@@ -2538,6 +3206,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             # including its callback, generator and ownership refusals.
             return
         if (node in bindings.independent_functions
+                and node not in bindings.sql_method_escape_owners
                 and not bindings.dynamic_namespace and not bindings.builtin_namespace):
             return
         sealed = self.sealed_list_captures(node)
@@ -3648,10 +4317,21 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         reducer_name = (target[1] if target and target[0] == 'unbound' else
                         target[1].removeprefix('builtins.') if target and target[0] == 'import'
                         and target[1] in {'builtins.min', 'builtins.max', 'builtins.sorted', 'builtins.sum'} else '')
+        opaque_literal_reducer = False
+        if (reducer_name in {'min', 'max', 'sorted', 'sum'}
+                and not self.closed_generator_reducer_binding(reducer_name)):
+            if (self._literal_statement_scopes is None or receiver
+                    or any(identity is None or self.generator_has_sql_effects(identity, include_fragments=False)
+                           for _, refs in arguments for identity in refs)):
+                raise SQLFlowLimit('SQL generator reducer binding is unresolved; analysis is incomplete')
+            # Every admitted SQL statement is a literal, and this generator
+            # neither supplies SQL nor changes its state. Treat the unresolved
+            # consumer as opaque below; do not prove its result or exhaustion.
+            # Computed SQL and ambiguous aliases never enter this scoped path.
+            reducer_name = ''
+            opaque_literal_reducer = True
         if reducer_name in {'min', 'max', 'sorted', 'sum'}:
             bindings = self.ownership_bindings()
-            if not self.closed_generator_reducer_binding(reducer_name):
-                raise SQLFlowLimit('SQL generator reducer binding is unresolved; analysis is incomplete')
             keywords = {keyword.arg: keyword.value for keyword in node.keywords}
             allowed = ({'start'} if reducer_name == 'sum' else
                        {'key', 'reverse'} if reducer_name == 'sorted' else {'key', 'default'})
@@ -3760,7 +4440,8 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 self._evaluated_values[argument] = self.materialize_generators(refs)
             return True
         references = receiver | frozenset().union(*(refs for _, refs in arguments))
-        if all(identity is not None and not self.generator_has_sql_effects(identity) for identity in references):
+        if opaque_literal_reducer or all(
+                identity is not None and not self.generator_has_sql_effects(identity) for identity in references):
             if self._short_circuiting:
                 # A read-only argument says nothing about its opaque
                 # consumer: that call can still mutate captured heap state.
@@ -4398,7 +5079,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         self._evaluated_values[node] = (None, None, None, False, 'static')
         return True
 
-    def generator_has_sql_effects(self, identity):
+    def generator_has_sql_effects(self, identity, *, include_fragments=True):
         """Inspect projected values without consuming the actual cursor.
 
         The iterable's construction arguments are not its yielded values.
@@ -4406,12 +5087,14 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         query. Reuse the bounded evaluator on private flow state so lexical
         captures, filters and generator-local bindings retain their normal
         semantics. Writes and SQL sinks still require a modeled consumer.
+        A proven literal-only SQL inventory cannot use projected values as
+        fragments; its opaque reducers still cannot export complete SQL text.
         """
         if identity not in self._generator_specs or self.generator_has_writes_or_sinks(identity):
             return True
         before = self.sql_state()
         facts, probe = self.generator_projection(identity)
-        return (any(facts[:3]) or bool(self.generator_refs(facts))
+        return (any(facts[:3] if include_fragments else facts[:1]) or bool(self.generator_refs(facts))
                 or self.generator_changes_sql_state(identity, before, probe))
 
     @staticmethod
@@ -5357,22 +6040,93 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             value = ast.copy_location(ast.BinOp(left=node.target, op=node.op, right=node.value), node)
             self.store_list_item(node.target, self.value_facts(value))
 
+    def sql_keyword_arguments(self, node):
+        """Bind exact keyword dictionaries without treating bound data as SQL.
+
+        Dictionary entries overwrite earlier entries, but separate keyword
+        expansions may not duplicate a name. An opaque mapping can overwrite
+        any earlier dictionary entry; later literal entries remain exact.
+        """
+        cache = self._ownership_syntax.setdefault('sql_keyword_arguments', {})
+        if node in cache:
+            return cache[node]
+
+        def mapping(value, depth=0):
+            if not isinstance(value, ast.Dict):
+                return {}, True, False
+            if depth >= 64:
+                raise SQLFlowLimit('SQL keyword expansion nesting exceeded; analysis is incomplete')
+            values, unknown, invalid = {}, False, False
+            for key, item in zip(value.keys, value.values):
+                self.step()
+                if key is None:
+                    incoming, opaque, malformed = mapping(item, depth + 1)
+                    if opaque:
+                        values.clear()
+                    values.update(incoming)
+                    unknown |= opaque
+                    invalid |= malformed
+                elif isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    values[key.value] = item
+                elif isinstance(key, ast.Constant):
+                    invalid = True
+                else:
+                    values.clear()
+                    unknown = True
+            return values, unknown, invalid
+
+        values, unknown, invalid = {}, False, False
+        for keyword in node.keywords:
+            self.step()
+            if keyword.arg is None:
+                incoming, opaque, malformed = mapping(keyword.value)
+                unknown |= opaque
+                invalid |= malformed or bool(values.keys() & incoming.keys())
+                values.update(incoming)
+            else:
+                invalid |= keyword.arg in values
+                values[keyword.arg] = keyword.value
+        result = values, unknown, invalid
+        cache[node] = result
+        return result
+
+    def unresolved_sql_argument_slots(self, node, short):
+        keywords, unknown, invalid = self.sql_keyword_arguments(node)
+        if invalid:
+            return False
+        if short in EXECUTE_METHODS:
+            if ((node.args and not isinstance(node.args[0], ast.Starred))
+                    or SQL_ARGUMENT_KEYWORDS.get(short, frozenset()) & keywords.keys()):
+                return False
+            # The ordinary sink flow already classifies *args as an aggregate
+            # value. An opaque **mapping can still supply an unmodeled SQL slot.
+            return unknown
+        if short == 'extra':
+            return any(name not in keywords
+                       and not (len(node.args) > index and not any(
+                           isinstance(argument, ast.Starred) for argument in node.args[:index + 1]))
+                       and (unknown or any(isinstance(argument, ast.Starred) for argument in node.args))
+                       for index, name in enumerate(('select', 'where')))
+        return False
+
     def sql_argument(self, node, short=None):
         if short is None:
             short = sql_sink_name(node, self.ownership_bindings())
+        if not short:
+            return None
+        keywords, _, invalid = self.sql_keyword_arguments(node)
+        if invalid:
+            return None
         if short in EXECUTE_METHODS:
             if node.args and not isinstance(node.args[0], ast.Starred):
                 return node.args[0]
-            keywords = SQL_ARGUMENT_KEYWORDS.get(short, frozenset())
-            for keyword in node.keywords:
-                if keyword.arg in keywords:
-                    return keyword.value
+            for name, value in keywords.items():
+                if name in SQL_ARGUMENT_KEYWORDS.get(short, frozenset()):
+                    return value
             if node.args:
                 return node.args[0]
         if short == 'extra':
-            for keyword in node.keywords:
-                if keyword.arg == 'where':
-                    return keyword.value
+            return keywords.get('where')
         return None
 
     def sql_arguments(self, node, short=None):
@@ -5389,9 +6143,11 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             if argument is not None:
                 yield argument, 'statement'
             return
+        keywords, _, invalid = self.sql_keyword_arguments(node)
+        if invalid:
+            return
         for index, name in enumerate(('select', 'where')):
-            argument = next((keyword.value for keyword in node.keywords
-                             if keyword.arg == name), None)
+            argument = keywords.get(name)
             if argument is None and len(node.args) > index:
                 # An unknown *args expansion makes subsequent positions
                 # ambiguous. Explicit keywords above remain identifiable.
@@ -5411,7 +6167,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         analysis, including callback refusals. This is not a larger budget.
         """
         bindings = self.ownership_bindings()
-        if bindings.sql_facade_flow()[1]:
+        if bindings.sql_facade_flow()[1] or bindings.escaped_sql_methods():
             return None
         found = False
         scopes = set()
@@ -5677,7 +6433,18 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             # find(), never execution.
             if is_sink:
                 self.classify_sink(node)
+            sql_method = sql_sink_name(node, self.ownership_bindings())
+            if sql_method and self.unresolved_sql_argument_slots(node, sql_method):
+                raise SQLFlowLimit('SQL execution argument slots are unresolved; analysis is incomplete')
             if uncertain_aliases:
+                bindings = self.ownership_bindings()
+                if ({'__code__', '__globals__', '__defaults__', '__kwdefaults__'} & bindings.member_writes
+                        and bindings.possible_sql_methods(node.func)):
+                    # A saved bound method retains the function object, not
+                    # an immutable copy of its code/defaults. A replacement
+                    # can execute hidden default values even when every
+                    # explicit argument is a literal SQL statement.
+                    raise SQLFlowLimit('SQL saved callable metadata is unresolved; analysis is incomplete')
                 replacement = self.ownership_bindings().plain_alias_replacement(node)
                 safe = replacement is not None and replacement[1] is None
                 if replacement is not None and replacement[1] is not None:
@@ -7130,7 +7897,9 @@ def find(files: Sequence[Path], *, max_steps=None) -> Iterable[tuple[str, Path, 
         # Decode and parse failures above must remain incomplete even when no
         # sink can be recognized. Applicable SQL flow keeps its ordinary budget.
         nodes = tuple(ast.walk(tree))
-        if not any(isinstance(node, ast.Call) and sql_sink_name(node)
+        if not any(isinstance(node, ast.Call) and (sql_sink_name(node) or reflected_sql_name(node)
+                       or any(isinstance(argument, ast.Constant) and isinstance(argument.value, str)
+                              and argument.value in EXECUTE_METHODS | {'extra'} for argument in node.args[:2]))
                    or isinstance(node, ast.Attribute) and node.attr in EXECUTE_METHODS | {'extra'}
                    or isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in EXECUTE_METHODS | {'extra'}
                    or isinstance(node, ast.ImportFrom) and any(
@@ -7147,7 +7916,8 @@ def find(files: Sequence[Path], *, max_steps=None) -> Iterable[tuple[str, Path, 
         budget = [steps]
         bindings = SanitizerBindings(tree, configured_sanitizer_targets(), budget)
         if (not any(sql_sink_name(call, bindings) or bindings.unresolved_sql_aliases(call)
-                    for call in bindings.calls) and not bindings.sql_facade_flow()[1]):
+                    for call in bindings.calls) and not bindings.sql_facade_flow()[1]
+                and not bindings.escaped_sql_methods()):
             continue
         summaries = build_sanitizer_summaries(tree, sanitizers, text=text, budget=budget, bindings=bindings)
         analyzer = SQLInjectionAnalyzer(

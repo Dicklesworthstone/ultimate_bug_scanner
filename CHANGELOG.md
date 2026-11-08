@@ -10,6 +10,15 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Follow saved Python SQL execution methods through local alias chains and
+  straight-line reassignments. Bind SQL keyword slots and literal `**` mappings
+  in evaluation order while keeping bound parameters separate from query text.
+  Preserve captured application-method receivers, and report escaped or
+  ambiguous SQL capabilities as incomplete without dropping known findings.
+  Permit unrelated opaque reducers only when the complete SQL inventory proves
+  literal statements; keep their results and cursor exhaustion unproven. Add
+  paired sink, capability-escape, real SQLite, and public-report regressions.
+
 - Preserve Python global, captured-variable and callable state on every
   reachable exception prefix. A later cleanup no longer erases earlier
   request-derived values from exception handlers. Keep scalar-state join

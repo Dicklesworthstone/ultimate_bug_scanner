@@ -10,6 +10,14 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Resolve delayed Python reads in their actual lexical scopes, including
+  nested comprehension targets, unpacked locals and stable literal bindings.
+  Keep namespace authority local to connected modules and require proven
+  consumer identity, capture retention and primitive truth testing before
+  bounding a generator expression's lifetime. Reject unknown callbacks,
+  mutable-member cleanup, metadata changes and stale alias provenance.
+  Use explicit first-match loops for suppression marker and header searches.
+
 - Require candidate qualification/signing and the Nix gate to succeed before
   the retained DSR/local recipe can push OCI images or move registry tags.
   Preserve the GitHub Release dependencies and default failure propagation;

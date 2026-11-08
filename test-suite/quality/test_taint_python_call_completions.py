@@ -840,6 +840,136 @@ class GeneratorResumeTests(SourceTest):
                     eval(iterator.__next__())
                 ''', *expected)
 
+    def test_immediate_predicates_bound_private_loop_capture_lifetime(self):
+        for value, expected in (('input()', ('eval',)), ("'fixed'", ())):
+            for predicate in ('any(code.startswith(prefix) for prefix in ("a", "b"))',
+                              'all(code.startswith(prefix) for prefix in ("a", "b"))',
+                              'next((code for unused in [0]), "fixed")'):
+                with self.subTest(value=value, predicate=predicate):
+                    self.assert_rules('def run():\n    for code in [' + value + ']:\n'
+                                      '        ' + predicate + '\n        eval(code)\nrun()\n', *expected)
+
+    def test_immediate_predicates_do_not_trust_replaced_or_opaque_consumers(self):
+        sources = (
+            "def run(any):\n    for code in ['fixed']:\n        any(code for unused in [0])\n"
+            "run(unknown)\n",
+            "import builtins\nbuiltins.any=unknown\ndef run():\n    for code in ['fixed']:\n"
+            "        any(code for unused in [0])\nrun()\n",
+            "exec('import builtins; builtins.next=unknown')\ndef run():\n"
+            "    for code in ['fixed']:\n        next((code for unused in [0]),None)\nrun()\n",
+            "def run():\n    for code in ['fixed']:\n        next((code for unused in opaque()),None)\nrun()\n",
+            "def run():\n    for code in ['fixed']:\n        next((code for unused in [0]),(code:=input()))\nrun()\n",
+            "def run():\n    code='fixed'\n    def alter():\n        nonlocal code\n"
+            "        code=input()\n    for code in ['fixed']:\n        any(alter() or code for unused in [0])\nrun()\n",
+            "def run():\n    for code in ['fixed']:\n        saved=(code for unused in [0])\n"
+            "    code=input()\n    eval(saved.__next__())\nrun()\n",
+        )
+        for source in sources:
+            with self.subTest(source=source), self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                self.scan(source)
+
+    def test_immediate_private_reads_finish_before_later_local_stores(self):
+        for value, expected in (('input()', ('eval',)), ("'fixed'", ())):
+            for iterable in ('"ab"', "b'ab'", '(0, 1)'):
+                with self.subTest(value=value, iterable=iterable):
+                    self.assert_rules('def run():\n    code=' + value + '\n    saved=code\n'
+                                      '    any(code for unused in ' + iterable + ')\n'
+                                      "    code='fixed'\n    eval(saved)\nrun()\n", *expected)
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+            self.scan("def run():\n    code='fixed'\n    any((code, (code:=input())) for unused in [0])\nrun()\n")
+
+    def test_stable_module_literals_survive_symbolic_function_environments(self):
+        for literal in ('3', "('fixed', (2, None))"):
+            with self.subTest(literal=literal):
+                self.assert_rules('VALUE=' + literal + '\ndef run(code):\n'
+                                  '    values=(VALUE for unused in [0])\n'
+                                  '    for value in values:\n        eval(code)\nrun(input())\n', 'eval')
+        self.assert_rules("VALUE=frozenset({'fixed', 'other'})\ndef run():\n"
+                          "    values=(VALUE for unused in [0])\n    for value in values:\n        print(value)\nrun()\n")
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+            self.scan("VALUE=(['fixed'],)\ndef run():\n    values=(VALUE[0][0] for unused in [0])\n"
+                      "    VALUE[0][0]=input()\n    eval(values.__next__())\nrun()\n")
+
+    def test_delayed_free_reads_respect_nested_comprehension_binders(self):
+        for value, expected in (('input()', ('eval',)), ("'fixed'", ())):
+            with self.subTest(value=value):
+                self.assert_rules("item='fixed'\ndef run(code):\n"
+                                  "    values=((code, any(item for item in ('x', 'y'))) for outer in (0,))\n"
+                                  "    for value in values:\n        eval(value[0])\nitem=input()\nrun(" + value + ")\n",
+                                  *expected)
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+            self.scan("items=['fixed']\nvalues=(any(item for item in items) for outer in [0])\n"
+                      "items=[input()]\neval(values.__next__())\n")
+
+    def test_dominating_unpack_assignment_establishes_delayed_local(self):
+        for value, expected in (('input()', ('eval',)), ("'fixed'", ())):
+            with self.subTest(value=value):
+                self.assert_rules('def run():\n    label, (code, other) = (None, (' + value + ', 0))\n'
+                                  '    values=(code for unused in [0])\n'
+                                  '    for value in values:\n        eval(value)\nrun()\n', *expected)
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+            self.scan("def run():\n    label, code=(None, 'fixed')\n    values=(code for unused in [0])\n"
+                      "    label, code=(None, input())\n    eval(values.__next__())\nrun()\n")
+
+    def test_mutable_iterator_root_must_not_release_or_escape_members(self):
+        for operation, prelude in (('values.clear()', ''), ('values.pop()', ''),
+                                   ('alias.clear()', '        alias=values\n'),
+                                   ('clear(values)', '')):
+            source = ("code='fixed'\ntainted=input()\nclass Trigger:\n    def __del__(self):\n"
+                      "        global code\n        code=tainted\ndef clear(items):\n    items.clear()\n"
+                      "def run():\n    for unused in [0]:\n        values=[Trigger()]\n" + prelude +
+                      '        any(' + operation + ' or item for item in values)\n    return eval(code)\nrun()\n')
+            with self.subTest(operation=operation), self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                self.scan(source)
+
+    def test_immediate_consumers_do_not_ignore_user_truthiness_callbacks(self):
+        for method, result in (('__bool__', 'True'), ('__len__', '1')):
+            for consumer in ('any(value for unused in [0])', 'all(value for unused in [0])',
+                             'next((unused for unused in [0] if value), None)'):
+                source = ("command='fixed'\ntainted=input()\nclass Trigger:\n    def " + method + "(self):\n"
+                          "        global command\n        command=tainted\n        return " + result + '\n'
+                          'def run():\n    for value in [Trigger()]:\n        ' + consumer + '\n'
+                          '    return eval(command)\nrun()\n')
+                with self.subTest(method=method, consumer=consumer), self.assertRaisesRegex(
+                        taint_py.AnalysisLimit, 'incomplete'):
+                    self.scan(source)
+
+    def test_truthiness_proof_preserves_captured_alias_and_target_scope(self):
+        prefix = ("command='fixed'\ntainted=input()\nclass Trigger:\n    def __bool__(self):\n"
+                  "        global command\n        command=tainted\n        return True\n")
+        cases = (
+            "def run():\n    for unused in [0]:\n        alias=Trigger()\n        code=alias\n"
+            "        alias='fixed'\n        any(code for item in [0])\n    return eval(command)\nrun()\n",
+            "def run():\n    values=(Trigger(),)\n    code='fixed'\n    for flag in [1]:\n"
+            "        any(code for code in values if flag)\n    return eval(command)\nrun()\n",
+            "def run():\n    values=((Trigger(),0),)\n    code='fixed'\n    for flag in [1]:\n"
+            "        any(code for code, other in values if flag)\n    return eval(command)\nrun()\n",
+        )
+        for source in cases:
+            with self.subTest(source=source), self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                self.scan(prefix + source)
+
+    def test_stable_helper_identity_does_not_snapshot_delayed_dependencies(self):
+        for value, expected in (('input()', ('eval',)), ("'fixed'", ())):
+            with self.subTest(value=value):
+                self.assert_rules('def run():\n    def identity(value):\n        return value\n'
+                                  '    values=(identity(value) for value in [' + value + '])\n'
+                                  '    for value in values:\n        eval(value)\nrun()\n', *expected)
+        for source in (
+            "code='fixed'\ndef read():\n    return code\nvalues=(read() for unused in [0])\n"
+            "code=input()\neval(values.__next__())\n",
+            "def run():\n    code='fixed'\n    def read():\n        return code\n"
+            "    values=(read() for unused in [0])\n    code=input()\n    eval(values.__next__())\nrun()\n",
+            "box=['fixed']\ndef read():\n    return box[0]\nvalues=(read() for unused in [0])\n"
+            "box[0]=input()\neval(values.__next__())\n",
+            "def read():\n    return 'fixed'\ndef other():\n    return input()\n"
+            "values=(read() for unused in [0])\nread.__code__=other.__code__\neval(values.__next__())\n",
+            "def run():\n    def read():\n        return 'fixed'\n    saved=read\n"
+            "    values=(read() for unused in [0])\n    unknown(saved)\n    eval(values.__next__())\nrun()\n",
+        ):
+            with self.subTest(source=source), self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                self.scan(source)
+
     def test_argument_and_default_values_are_creation_time_snapshots(self):
         for initial, final, expected in (('input()', "'fixed'", (6,)),
                                          ("'fixed'", 'input()', ())):
@@ -1200,6 +1330,53 @@ class GeneratorProjectTests(unittest.TestCase):
         project = self.project({'lib.py': library, 'app.py':
             "import lib\ng=lib.values()\ng.__next__()(input())\n"})
         self.assertEqual(list(project.findings()), [])
+
+    def test_unrelated_namespace_use_does_not_revoke_a_module_binding(self):
+        for value, expected in (('input()', [('app.py', 'py.taint.eval', 7)]), ("'fixed'", [])):
+            with self.subTest(value=value):
+                project = self.project({
+                    'app.py': "import sys\ncode=" + value + "\ndef values():\n"
+                              "    yield {'value':code}\nfor item in values():\n"
+                              "    selected=item['value']\n    eval(selected)\n",
+                    'unrelated.py': 'import sys\nnamespace=globals()\n',
+                })
+                self.assertEqual([(path.name, rule, line) for path, rule, line, _col, _message in project.findings()],
+                                 expected)
+
+    def test_importer_cannot_mutate_a_delayed_owner_namespace(self):
+        library = "code='fixed'\ndef values():\n    yield {'value':code}\n"
+        for mutation in ('lib.code=input()', "lib.values.__globals__['code']=input()"):
+            with self.subTest(mutation=mutation):
+                project = self.project({'lib.py': library,
+                    'app.py': "import lib\ng=lib.values()\n" + mutation + "\nfor item in g:\n    eval(item['value'])\n"})
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                    list(project.findings())
+
+    def test_related_dynamic_execution_invalidates_immediate_builtin_identity(self):
+        helper = ("saved=[]\ndef install():\n"
+                  "    exec('import builtins; builtins.any=lambda value: saved.append(value) or False')\n")
+        app = ("import helper\nhelper.install()\ndef run():\n"
+               "    for code in ['fixed', input()]:\n        any(code for unused in [0])\n"
+               "    return eval(helper.saved[0].__next__())\nrun()\n")
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+            list(self.project({'helper.py': helper, 'app.py': app}).findings())
+        project = self.project({'unrelated.py': helper, 'app.py':
+            "def run():\n    for code in ['fixed']:\n        any(code for unused in [0])\nrun()\n"})
+        self.assertEqual(list(project.findings()), [])
+
+    def test_related_namespace_mapping_invalidates_immediate_builtin_identity(self):
+        for prefix, target in (("import builtins\n", "builtins.__dict__"),
+                               ("import builtins\nnamespace=builtins.__dict__\n", 'namespace')):
+            helper = prefix + 'saved=[]\ndef install():\n    ' + target + \
+                "['any']=lambda value: saved.append(value) or False\n"
+            app = ("import helper\nhelper.install()\ndef run():\n"
+                   "    for code in ['fixed', input()]:\n        any(code for unused in [0])\n"
+                   "    return eval(helper.saved[0].__next__())\nrun()\n")
+            with self.subTest(target=target), self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                list(self.project({'helper.py': helper, 'app.py': app}).findings())
+            unrelated = self.project({'unrelated.py': helper, 'app.py':
+                "def run():\n    for code in ['fixed']:\n        any(code for unused in [0])\nrun()\n"})
+            self.assertEqual(list(unrelated.findings()), [])
 
     def test_ambiguous_module_keys_do_not_hide_selected_engines(self):
         project = self.project({

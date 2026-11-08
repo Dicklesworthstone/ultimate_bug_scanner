@@ -365,7 +365,10 @@ def parse_markers(text: str, lang: str = "python") -> list[Marker]:
         for match in BARE_ALIAS_RE.finditer(line):
             # An alias word inside an unknown or malformed scope is not a
             # second, bare directive (for example `ubs:ignore[noqa]`).
-            if not any(start <= match.start() < end for start, end in qualified_spans):
+            for qualified_start, qualified_end in qualified_spans:
+                if qualified_start <= match.start() < qualified_end:
+                    break
+            else:
                 markers.append(Marker(line=lineno, rules=None, standalone=standalone))
     return markers
 
@@ -542,8 +545,11 @@ def _build_index(text: str, lang: str = "python") -> SuppressionIndex:
     for block in brace_blocks:
         if lines[block.start_line - 1].strip() != "{":
             continue
-        header = next((statement for statement in index.statements
-                       if statement.end_line == block.start_line - 1), None)
+        header = None
+        for statement in index.statements:
+            if statement.end_line == block.start_line - 1:
+                header = statement
+                break
         if header is None:
             continue
         header_code = " ".join(lines[header.start_line - 1:header.end_line]).strip()

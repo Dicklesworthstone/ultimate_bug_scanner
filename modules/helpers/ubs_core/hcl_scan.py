@@ -52,11 +52,14 @@ MAX_TOKENS = 200_000
 MAX_NESTING = 64
 MAX_EVALUATIONS = 200_000
 MAX_POLICY_BYTES = 256 * 1024
+MAX_INGRESS_RULES = 4096
+MAX_INGRESS_ITEMS = 200_000
 NETWORK = "hcl.aws.public-admin-ingress"
 STORAGE = "hcl.aws.public-s3-acl"
 IAM = "hcl.aws.iam-wildcard-privilege"
 TLS = "hcl.aws.insecure-provider-tls"
 IAM_RESOURCES = frozenset({"aws_iam_policy", "aws_iam_role_policy", "aws_iam_user_policy", "aws_iam_group_policy"})
+SECURITY_GROUPS = frozenset({"aws_security_group", "aws_default_security_group"})
 AWS_SOURCES = frozenset({"hashicorp/aws", "registry.terraform.io/hashicorp/aws"})
 CATEGORIES = frozenset(category for _, category, _ in RULES.values())
 
@@ -805,6 +808,8 @@ class Module:
     def __init__(self, sources: dict[str, str], enabled: set[str]):
         self.sources, self.enabled = sources, enabled
         self.parsers, self.blocks, self.errors, self.findings = {}, [], [], []
+        self.ingress_items = self.ingress_rules = 0
+        self.ingress_rows, self.ingress_lists, self.ingress_cidrs = {}, {}, {}
         for path, text in sources.items():
             try:
                 if len(text.encode("utf-8")) > MAX_SOURCE_BYTES:
@@ -910,61 +915,197 @@ class Module:
                               "category_id": category, "suppressed": False,
                               "extras": {"scope": "selected Terraform configuration; deployment not evaluated"}})
 
-    def ingress(self, block: Block, *, modern: bool = False):
-        protocol = self.values.attribute(block, "ip_protocol" if modern else "protocol")
-        if unknown(protocol) or protocol is None:
-            self.error(block, "ingress protocol is unresolved")
+    def ingress_budget(self, count=1):
+        self.ingress_items += count
+        if self.ingress_items > MAX_INGRESS_ITEMS:
+            self.values.limited("HCL ingress item budget exhausted")
+            return False
+        return True
+
+    def ingress_rule_budget(self):
+        self.ingress_rules += 1
+        if self.ingress_rules > MAX_INGRESS_RULES:
+            self.values.limited("HCL ingress rule budget exhausted")
+            return False
+        return True
+
+    def ingress_strings(self, value):
+        """Apply the provider's list-of-strings conversion without evaluating unknowns."""
+        if value is None:
+            return []
+        if isinstance(value, Unknown):
+            return value
+        if not isinstance(value, list):
+            return Unknown("expected a list of strings")
+        identity = id(value)
+        if identity in self.ingress_lists:
+            return self.ingress_lists[identity][1]
+        if not self.ingress_budget(len(value)):
+            return Unknown("HCL ingress item budget exhausted")
+        result = []
+        for item in value:
+            if isinstance(item, (str, Unknown)):
+                result.append(item)
+            elif isinstance(item, bool):
+                result.append("true" if item else "false")
+            elif isinstance(item, int) or isinstance(item, float) and math.isfinite(item):
+                result.append(str(item))
+            else:
+                result = Unknown("ingress string collection contains an unsupported value")
+                break
+        # Retain the immutable input with the result so object IDs cannot be
+        # reused, and shared locals are converted only once in this module.
+        self.ingress_lists[identity] = (value, result)
+        return result
+
+    def ingress_protocol(self, value):
+        if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+            return Unknown("ingress protocol is unresolved or invalid")
+        if isinstance(value, float):
+            if not value.is_integer():
+                return Unknown("ingress protocol is not integral")
+            value = int(value)
+        protocol = str(value).lower()
+        if re.fullmatch(r"[+-]?[0-9]+", protocol):
+            number = self.values.number(protocol)
+            if not isinstance(number, int) or not -1 <= number <= 255:
+                return Unknown("ingress protocol number is outside the supported range")
+            protocol = str(number)
+        return "-1" if protocol == "all" else protocol
+
+    def ingress_port(self, value):
+        if isinstance(value, str):
+            value = self.values.number(value)
+        if isinstance(value, float) and value.is_integer():
+            value = int(value)
+        if isinstance(value, bool) or not isinstance(value, int) or not -(2 ** 31) <= value < 2 ** 31:
+            return Unknown("ingress port is unresolved or not a supported integer")
+        return value
+
+    def ingress_row(self, row):
+        """Normalize attribute-as-block input using the AWS rule object schema."""
+        fields = {"cidr_blocks", "description", "from_port", "ipv6_cidr_blocks",
+                  "prefix_list_ids", "protocol", "security_groups", "self", "to_port"}
+        if not isinstance(row, dict) or not fields <= row.keys():
+            return Unknown("ingress attribute rows require all nine AWS rule fields, including optional nulls")
+        # Terraform object conversion discards extra attributes. Unknown
+        # descriptive/group metadata cannot remove an explicit CIDR grant;
+        # known unconvertible values still make the row invalid.
+        description = row["description"]
+        if description is not None and not isinstance(description, (str, int, float, Unknown)):
+            return Unknown("ingress description is not convertible to a string")
+        own_group = row["self"]
+        if (own_group is not None and not isinstance(own_group, (bool, Unknown))
+                and not (isinstance(own_group, str) and own_group in {"true", "false"})):
+            return Unknown("ingress self is not convertible to a Boolean")
+        for name in ("security_groups", "prefix_list_ids"):
+            value = row[name]
+            if not isinstance(value, Unknown) and isinstance(self.ingress_strings(value), Unknown):
+                return Unknown("ingress " + name + " is not convertible to a string collection")
+        protocol = self.ingress_protocol(row["protocol"])
+        if isinstance(protocol, Unknown):
+            return protocol
+        ports = [self.ingress_port(row[name]) for name in ("from_port", "to_port")]
+        if any(isinstance(port, Unknown) for port in ports):
+            return Unknown("ingress from_port or to_port is unresolved or not a supported integer")
+        return {"protocol": protocol, "from_port": ports[0], "to_port": ports[1],
+                "cidr_blocks": self.ingress_strings(row["cidr_blocks"]),
+                "ipv6_cidr_blocks": self.ingress_strings(row["ipv6_cidr_blocks"])}
+
+    def attribute_ingress(self, block):
+        attribute = block.attributes["ingress"]
+        rows = self.values.evaluate_attribute(attribute)
+        if rows is None:
+            return  # Null omits this optional/computed rule set.
+        if not isinstance(rows, list):
+            self.error(block, "ingress attribute is not a supported rule collection", attribute)
             return
-        if isinstance(protocol, bool) or not isinstance(protocol, (str, int, float)):
-            self.error(block, "invalid ingress protocol")
-            return
-        if isinstance(protocol, float):
-            if not protocol.is_integer():
-                self.error(block, "invalid ingress protocol number")
-                return
-            protocol = int(protocol)
-        protocol = str(protocol).lower()
-        if protocol not in {"tcp", "6", "-1", "all"}:
-            if protocol not in {"udp", "icmp", "icmpv6", "ipv6-icmp", "gre", "esp", "ah"} and not re.fullmatch(r"[0-9]{1,3}", protocol):
-                self.error(block, "unsupported ingress protocol")
-            return
-        if protocol not in {"-1", "all"}:
-            low, high = (self.values.attribute(block, name) for name in ("from_port", "to_port"))
+        exposed = False
+        for index, row in enumerate(rows):
+            if not self.ingress_rule_budget():
+                break
+            if not self.ingress_budget():
+                break
+            identity = id(row)
+            if identity not in self.ingress_rows:
+                self.ingress_rows[identity] = (row, self.ingress_row(row))
+            normalized = self.ingress_rows[identity][1]
+            if isinstance(normalized, Unknown):
+                self.error(block, f"ingress row {index}: {normalized.reason}", attribute)
+                continue
+            exposed |= bool(self.ingress(block, configuration=normalized))
+        if exposed:
+            self.emit(block, "ingress", NETWORK, "an explicit ingress rule permits all addresses to reach SSH/RDP or all IP protocols")
+
+    def public_cidrs(self, entries, version):
+        if not isinstance(entries, list):
+            return False, True
+        identity = (id(entries), version)
+        if identity in self.ingress_cidrs:
+            return self.ingress_cidrs[identity][1]
+        if not self.ingress_budget(len(entries)):
+            return False, True
+        exposed, invalid = False, False
+        for entry in entries:
             try:
-                if (isinstance(low, bool) or isinstance(high, bool)
-                        or not isinstance(low, (str, int, float)) or not isinstance(high, (str, int, float))
-                        or float(low) != int(low) or float(high) != int(high)):
-                    raise ValueError("non-integral port")
-                low, high = int(low), int(high)
-            except (ValueError, TypeError, OverflowError):
-                self.error(block, "ingress port range is unresolved")
+                if not isinstance(entry, str) or not re.fullmatch(r"[^/]+/[0-9]{1,3}", entry):
+                    raise ValueError("unresolved CIDR")
+                network = ipaddress.ip_network(entry, strict=True)
+                if network.version != version:
+                    raise ValueError("CIDR address family mismatch")
+                exposed |= network.prefixlen == 0
+            except ValueError:
+                invalid = True
+        self.ingress_cidrs[identity] = (entries, (exposed, invalid))
+        return exposed, invalid
+
+    def ingress(self, block: Block, *, modern: bool = False, configuration=None):
+        if not self.ingress_budget() or configuration is None and not self.ingress_rule_budget():
+            return False
+
+        def read(name, default=None):
+            return (configuration.get(name, default) if configuration is not None
+                    else self.values.attribute(block, name, default))
+
+        def problem(message):
+            self.error(block, message, block.attributes.get("ingress") if configuration is not None else None)
+
+        protocol = self.ingress_protocol(read("ip_protocol" if modern else "protocol"))
+        if isinstance(protocol, Unknown):
+            problem(protocol.reason)
+            return
+        if protocol not in {"tcp", "6", "-1"}:
+            if protocol not in {"udp", "icmp", "icmpv6", "ipv6-icmp", "gre", "esp", "ah"} and not re.fullmatch(r"[0-9]{1,3}", protocol):
+                problem("unsupported ingress protocol")
+            return
+        # Inline rules share the provider's rule-object expansion, which
+        # requires zero ports for all protocols. Standalone rule resources
+        # have distinct schemas; modern all-protocol rules may omit ports.
+        if protocol != "-1" or configuration is not None or block.kind == "ingress":
+            low = self.ingress_port(read("from_port"))
+            high = self.ingress_port(read("to_port"))
+            if isinstance(low, Unknown) or isinstance(high, Unknown):
+                problem("ingress port range is unresolved")
                 return
-            if not 0 <= low <= high <= 65535:
-                self.error(block, "invalid ingress port range")
+            if protocol == "-1" and (low, high) != (0, 0):
+                problem("all-protocol ingress requires from_port and to_port to be zero")
                 return
-            if not any(low <= port <= high for port in (22, 3389)):
+            if protocol != "-1" and not 0 <= low <= high <= 65535:
+                problem("invalid ingress port range")
+                return
+            if protocol != "-1" and not any(low <= port <= high for port in (22, 3389)):
                 return
         public = False
         for name, version in (("cidr_ipv4", 4), ("cidr_ipv6", 6)) if modern else (("cidr_blocks", 4), ("ipv6_cidr_blocks", 6)):
-            value = self.values.attribute(block, name, [] if not modern else None)
-            entries = ([value] if value is not None else []) if modern else value
-            if not isinstance(entries, list):
-                self.error(block, f"{name} is unresolved")
-                continue
-            exposed = False
-            for entry in entries:
-                try:
-                    if not isinstance(entry, str) or not re.fullmatch(r"[^/]+/[0-9]{1,3}", entry):
-                        raise ValueError("unresolved CIDR")
-                    network = ipaddress.ip_network(entry, strict=True)
-                    if network.version != version:
-                        raise ValueError("CIDR address family mismatch")
-                    exposed |= network.prefixlen == 0
-                except ValueError:
-                    self.error(block, f"{name} contains an unresolved or invalid CIDR")
+            value = read(name, [] if not modern else None)
+            entries = ([value] if value is not None else []) if modern else self.ingress_strings(value)
+            exposed, invalid = self.public_cidrs(entries, version)
+            if invalid:
+                problem(f"{name} contains an unresolved or invalid CIDR")
             public |= exposed
-        if public:
+        if public and configuration is None:
             self.emit(block, "", NETWORK, "all addresses can reach SSH/RDP or all IP protocols")
+        return public
 
     def bucket_identity(self, block: Block, provider: str):
         if block.labels[0] == "aws_s3_bucket":
@@ -1303,7 +1444,7 @@ class Module:
         seen = set()
         for block in self.resources:
             kind = block.labels[0]
-            relevant = (NETWORK in self.enabled and kind in {"aws_security_group", "aws_security_group_rule", "aws_vpc_security_group_ingress_rule"}
+            relevant = (NETWORK in self.enabled and kind in SECURITY_GROUPS | {"aws_security_group_rule", "aws_vpc_security_group_ingress_rule"}
                         or STORAGE in self.enabled and kind in {"aws_s3_bucket", "aws_s3_bucket_acl"}
                         or IAM in self.enabled and kind in IAM_RESOURCES)
             if not relevant:
@@ -1317,11 +1458,13 @@ class Module:
             provider = self.provider(block)
             if provider is None:
                 continue
-            if kind == "aws_security_group":
+            if kind in SECURITY_GROUPS:
                 if "ingress" in block.attributes:
-                    value = self.values.attribute(block, "ingress")
-                    if value != []:
-                        self.error(block, "attribute-based ingress is outside the selected block model")
+                    if any(child.kind == "ingress" or child.kind == "dynamic" and child.labels == ("ingress",)
+                           for child in block.children):
+                        self.error(block, "ingress attributes cannot be mixed with ingress blocks", block.attributes["ingress"])
+                        continue
+                    self.attribute_ingress(block)
                 for child in block.children:
                     if child.kind == "ingress":
                         self.ingress(child)
@@ -1421,7 +1564,7 @@ def main(argv=None) -> int:
     context = hashlib.sha256(json.dumps(sources, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
     cache = ScanCache(lang="hcl", project_dir=args.project_dir,
                       skip=",".join(map(str, sorted((CATEGORIES - args.only) | args.skip))),
-                      extra="aws-config-v6:" + context)
+                      extra="aws-config-v7:" + context)
     cached, pending = cache.partition_files(files)
     sink = CapturingSink()
     if pending:

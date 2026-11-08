@@ -10,6 +10,14 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Analyze attribute-style ingress lists on ordinary and default AWS security
+  groups in native HCL and generated Terraform JSON. Resolve selected local
+  rule objects using the provider's required-field, null and primitive-conversion
+  semantics; share classification with inline rules and preserve exact consumer
+  locations. Retain proven exposure alongside unresolved rows, reject conflicting
+  declarations, and bound module-wide rule and collection work with memoized
+  conversions. Add independent paired cases and public JSON/SARIF coverage.
+
 - Bind selected Kotlin SQL extension receivers through the existing JDBC
   function summaries. Preserve implicit and explicit receiver calls, local
   getter overload arguments, declared-type dispatch and API-member precedence.

@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.5.51-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.5.52-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -384,10 +384,23 @@ ubs explain hcl.aws.public-admin-ingress
 
 `hcl.aws.public-admin-ingress` warns when an explicit world IPv4 or IPv6 CIDR
 allows TCP SSH/RDP ports (22/3389), including a containing port range, or all IP
-protocols. It supports native inline `aws_security_group` ingress, legacy
+protocols. It supports native inline and attribute-style ingress on
+`aws_security_group` and `aws_default_security_group`, legacy
 `aws_security_group_rule`, and `aws_vpc_security_group_ingress_rule`. Public
 HTTP/HTTPS, UDP-only rules, restricted source networks and egress are separate
 from this administrative-ingress policy.
+
+Ingress attributes may contain literal rule-object lists or selected local
+values in either syntax. Terraform's
+[attribute-as-block conversion](https://developer.hashicorp.com/terraform/language/attr-as-blocks)
+requires all nine rule fields; optional fields can use `null`. Empty or null
+collections add no explicit rule. Provider conversions preserve numeric protocol
+aliases and exact integer ports, including zero ports for inline all-protocol
+rules. A proven public rule produces one warning at its consuming `ingress`
+attribute, even when another row is unresolved. Unknown relevant values, invalid
+rows, or a mixture of ingress attributes and blocks make the report partial.
+Undeclared default-group rules and deployed prefix-list/group reachability are
+not inferred.
 
 `hcl.aws.public-s3-acl` warns for explicit public canned ACLs on
 `aws_s3_bucket` and `aws_s3_bucket_acl`. A selected `ignore_public_acls = true`
@@ -434,8 +447,8 @@ The JSON frontend follows Terraform's [expression and block mappings](https://de
 a single `${...}` interpolation retains its value type, ordinary reference-shaped
 strings remain literal, and provider references and literal settings keep their
 distinct semantics. Repeated block properties retain their order; duplicate
-attributes or evaluated expression keys are invalid. Nonempty JSON security-group
-`ingress` attributes and unsupported mixed templates remain explicitly incomplete.
+attributes or evaluated expression keys are invalid. Unsupported mixed templates
+remain explicitly incomplete.
 
 Changes to any selected context file invalidate cached results. Native `#`,
 `//` and block comments support scoped `ubs:ignore[rule-id]`; quoted strings,
@@ -456,6 +469,8 @@ levels. Local evaluation is memoized and bounded; JSON policy input and encoded
 output are capped at 256 KiB, including expansion of shared local expressions
 and intermediate merged documents. Generated JSON and repeated composition
 input parsing each have an additional 32 MiB budget per selected module.
+Ingress analysis shares memoized row, string-list and CIDR conversions, with
+module-wide limits of 4,096 selected rules and 200,000 work items.
 Custom `--rules` and extra non-`.tf` extensions are explicitly refused. Other
 providers, dynamic data statements,
 replicated data instances, arbitrary policy evaluation and deployed reachability

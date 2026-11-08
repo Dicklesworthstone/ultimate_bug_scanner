@@ -6,6 +6,8 @@ Authoritative semantics used to choose these cases:
 https://github.com/hashicorp/terraform-provider-aws/blob/main/website/docs/r/vpc_security_group_ingress_rule.html.markdown
 https://github.com/hashicorp/terraform-provider-aws/blob/main/website/docs/r/security_group_rule.html.markdown
 https://github.com/hashicorp/terraform-provider-aws/blob/main/website/docs/r/security_group.html.markdown
+https://github.com/hashicorp/terraform-provider-aws/blob/main/internal/service/ec2/vpc_security_group.go
+https://github.com/hashicorp/terraform-provider-aws/blob/main/internal/service/ec2/vpc_default_security_group.go
 https://github.com/hashicorp/terraform-provider-aws/blob/main/website/docs/r/s3_bucket_public_access_block.html.markdown
 https://github.com/hashicorp/terraform-provider-aws/blob/main/website/docs/r/s3_bucket_acl.html.markdown
 https://github.com/hashicorp/terraform-provider-aws/blob/main/website/docs/d/iam_policy_document.html.markdown
@@ -14,6 +16,7 @@ https://github.com/hashicorp/hcl/blob/main/json/spec.md
 https://github.com/hashicorp/hcl/blob/main/json/public.go
 https://developer.hashicorp.com/terraform/language/syntax/json
 https://developer.hashicorp.com/terraform/language/attr-as-blocks
+https://developer.hashicorp.com/terraform/language/expressions/type-constraints
 https://developer.hashicorp.com/terraform/language/files
 https://github.com/hashicorp/hcl/blob/main/hclsyntax/spec.md
 
@@ -2564,6 +2567,157 @@ JSON_CASES = (
 )
 
 
+@dataclass(frozen=True)
+class IngressExpression:
+    """Fixture-only expression spelling, independent of the analyzer's parser."""
+
+    source: str
+
+
+def ingress_literal(value, *, json_syntax=False):
+    if isinstance(value, IngressExpression):
+        return json.dumps("${" + value.source + "}") if json_syntax else value.source
+    if isinstance(value, dict):
+        return "{" + ", ".join(json.dumps(key) + ": " + ingress_literal(item, json_syntax=json_syntax)
+                               for key, item in value.items()) + "}"
+    if isinstance(value, list):
+        return "[" + ", ".join(ingress_literal(item, json_syntax=json_syntax) for item in value) + "]"
+    return json.dumps(value, allow_nan=False)
+
+
+def ingress_row(**overrides):
+    # ConfigModeAttr requires all nine members; null explicitly requests the
+    # provider's omitted optional value. Native nested-block defaults cannot
+    # be applied to a shortened expression object, including in Terraform JSON.
+    return {
+        "cidr_blocks": ["0.0.0.0/0"], "description": None,
+        "from_port": 22, "ipv6_cidr_blocks": None, "prefix_list_ids": None,
+        "protocol": "tcp", "security_groups": None, "self": None, "to_port": 22,
+        **overrides,
+    }
+
+
+def attribute_ingress_case(name, value, *, incomplete=False, exposed=False,
+                           json_syntax=False, default_group=False):
+    resource_type = "aws_default_security_group" if default_group else "aws_security_group"
+    name = "attribute_ingress_" + name + ("_json" if json_syntax else "_native")
+    literal = ingress_literal(value, json_syntax=json_syntax)
+    if json_syntax:
+        source = '{"resource":{"' + resource_type + '":{"' + name + '":{\n  "ingress": ' + literal + "\n}}}}\n"
+        case_type = JSONCase
+    else:
+        source = 'resource "' + resource_type + '" "' + name + '" {\n  ingress = ' + literal + "\n}\n"
+        case_type = Case
+    return case_type(name, source, incomplete, (("network", 2, 3),) if exposed else ())
+
+
+# Labels follow the AWS provider's schema and permission expansion, not the
+# scanner. In particular protocolForValue accepts ALL and 006, while
+# expandIPPerms rejects nonzero ports for -1. Independent valid rows survive
+# unresolved rows, and extra object keys are discarded by object conversion.
+ATTRIBUTE_INGRESS_SCENARIOS = (
+    ("public_ssh", [ingress_row()], False, True),
+    ("public_ipv6_rdp", [ingress_row(cidr_blocks=None, ipv6_cidr_blocks=["::/0"],
+                                      protocol=6, from_port="3389", to_port="3389")], False, True),
+    ("all_protocols", [ingress_row(protocol="-1", from_port=0, to_port=0)], False, True),
+    ("all_protocol_alias", [ingress_row(protocol="ALL", from_port=0, to_port=0)], False, True),
+    ("numeric_protocol_alias", [ingress_row(protocol="006")], False, True),
+    ("admin_port_range", [ingress_row(from_port=20, to_port=23)], False, True),
+    ("one_consumer_many_grants", [ingress_row(), ingress_row(),
+                                  ingress_row(from_port=3389, to_port=3389)], False, True),
+    ("private_ssh", [ingress_row(cidr_blocks=["10.0.0.0/8"])], False, False),
+    ("public_https", [ingress_row(from_port=443, to_port=443)], False, False),
+    ("public_udp", [ingress_row(protocol="udp")], False, False),
+    ("group_sources_only", [ingress_row(cidr_blocks=[], security_groups=["sg-example"],
+                                        prefix_list_ids=["pl-example"], self="true")], False, False),
+    ("null_collection", None, False, False),
+    ("empty_collection", [], False, False),
+    ("extra_object_members_discarded", [ingress_row(generated_metadata=IngressExpression("var.ignored"))], False, True),
+    ("unknown_metadata_does_not_hide_world_cidr", [ingress_row(
+        description=IngressExpression("var.description"), self=IngressExpression("var.self"),
+        security_groups=IngressExpression("var.groups"), prefix_list_ids=IngressExpression("var.prefixes"))], False, True),
+    ("malformed_metadata", [ingress_row(description=[]), ingress_row(self="maybe"),
+                             ingress_row(security_groups={"id": "sg-example"}),
+                             ingress_row(prefix_list_ids=[["pl-example"]])], True, False),
+    ("null_required_values", [ingress_row(protocol=None), ingress_row(from_port=None),
+                              ingress_row(to_port=None)], True, False),
+    ("missing_optional_member", [{key: value for key, value in ingress_row().items()
+                                  if key != "description"}], True, False),
+    ("missing_required_member", [{key: value for key, value in ingress_row().items()
+                                  if key != "protocol"}], True, False),
+    ("all_protocols_nonzero_ports", [ingress_row(protocol="-1"), ingress_row(protocol="all")], True, False),
+    ("fractional_port", [ingress_row(from_port=22.5)], True, False),
+    ("port_out_of_range", [ingress_row(to_port=70000)], True, False),
+    ("boolean_port", [ingress_row(from_port=True)], True, False),
+    ("noncanonical_cidr", [ingress_row(cidr_blocks=["0.0.0.1/0"])], True, False),
+    ("known_row_beside_unknown_cidr", [ingress_row(), ingress_row(
+        cidr_blocks=IngressExpression("var.cidrs"))], True, True),
+    ("known_cidr_beside_unknown_entry", [ingress_row(
+        cidr_blocks=["0.0.0.0/0", IngressExpression("var.other_cidr")])], True, True),
+    ("known_row_beside_unknown_row", [IngressExpression("var.rule"), ingress_row()], True, True),
+    ("known_row_beside_malformed_rows", [None, 22, [], ingress_row()], True, True),
+    ("wrong_collection_type", ingress_row(), True, False),
+    ("unknown_collection", IngressExpression("var.rules"), True, False),
+    ("unknown_protocol", [ingress_row(protocol=IngressExpression("var.protocol"))], True, False),
+    ("unknown_port", [ingress_row(from_port=IngressExpression("var.port"))], True, False),
+)
+ATTRIBUTE_INGRESS_CASES = tuple(
+    attribute_ingress_case(name, value, incomplete=incomplete, exposed=exposed, json_syntax=json_syntax)
+    for name, value, incomplete, exposed in ATTRIBUTE_INGRESS_SCENARIOS
+    for json_syntax in (False, True)
+) + tuple(
+    attribute_ingress_case("default_group_" + name, value, exposed=exposed,
+                           json_syntax=json_syntax, default_group=True)
+    for name, value, exposed in (("public", [ingress_row()], True),
+                                 ("private", [ingress_row(cidr_blocks=["10.0.0.0/8"])], False))
+    for json_syntax in (False, True)
+) + (
+    Case("attribute_ingress_default_group_public_native_block", '''
+        resource "aws_default_security_group" "public_default" {
+          ingress { # expect:network
+            protocol = "tcp"
+            from_port = 22
+            to_port = 22
+            cidr_blocks = ["0.0.0.0/0"]
+          }
+        }
+    '''),
+    Case("attribute_ingress_default_group_private_native_block", '''
+        resource "aws_default_security_group" "private_default" {
+          ingress {
+            protocol = "tcp"
+            from_port = 22
+            to_port = 22
+            cidr_blocks = ["10.0.0.0/8"]
+          }
+        }
+    '''),
+) + tuple(
+    Case("attribute_ingress_native_schema_" + name + "_" + kind, '''
+        resource "%s" "schema_%s" {
+          ingress {
+            protocol = %s
+            from_port = %s
+            to_port = %s
+            cidr_blocks = %s
+            ipv6_cidr_blocks = %s
+          }
+        }
+    ''' % (kind, name, ingress_literal(protocol), ingress_literal(low), ingress_literal(high),
+           ingress_literal(ipv4), ingress_literal(ipv6)), incomplete,
+        (("network", 2, 3),) if exposed else ())
+    for name, protocol, low, high, ipv4, ipv6, incomplete, exposed in (
+        ("numeric_protocol_alias", "006", 22, 22, ["0.0.0.0/0"], [], False, True),
+        ("numeric_string_ports", "tcp", "2.2e1", "22.0", ["0.0.0.0/0"], [], False, True),
+        ("all_zero_ports", "ALL", 0, 0, ["0.0.0.0/0"], [], False, True),
+        ("all_nonzero_ports", "-1", 22, 22, ["0.0.0.0/0"], [], True, False),
+        ("all_unknown_port", "all", IngressExpression("var.port"), 0, ["0.0.0.0/0"], [], True, False),
+        ("optional_null_cidr", "tcp", 22, 22, None, ["::/0"], False, True),
+    )
+    for kind in ("aws_security_group", "aws_default_security_group")
+)
+
+
 class EvidenceTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -3369,6 +3523,77 @@ resource "aws_iam_policy" "document%d" {
             True, locations=(("storage", 6, 7),))
         self.check_native(case)
 
+    def test_attribute_ingress_selected_module_locals_and_isolation(self):
+        analyzer = importlib.import_module("ubs_core.hcl_scan")
+        consumers = tuple(attribute_ingress_case("local_consumer", IngressExpression("local.rules"),
+                                                exposed=True, json_syntax=json_syntax)
+                          for json_syntax in (False, True))
+        settings = JSONCase("attribute_ingress_local_settings", json.dumps({"locals": {"rules": [ingress_row()]}}))
+        directory = self.materialize((*consumers, settings), "attribute-ingress-module-context")
+        sources = {str(directory / case.filename): case.source for case in (*consumers, settings)}
+        records, errors = analyzer.analyze_sources(sources)
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted((Path(row["path"]).name, row["rule"], row["line"], row["col"]) for row in records),
+                         sorted((case.filename, RULES["network"], 2, 3) for case in consumers))
+        child = directory / "child"
+        child.mkdir()
+        (child / settings.filename).write_text(settings.source, encoding="utf-8")
+        for name, selected in (("omitted", {str(directory / case.filename): case.source for case in consumers}),
+                               ("other-module", {**{str(directory / case.filename): case.source for case in consumers},
+                                                  str(child / settings.filename): settings.source})):
+            with self.subTest(context=name):
+                records, errors = analyzer.analyze_sources(selected)
+                self.assertEqual(records, [])
+                self.assertTrue(errors)
+
+    def test_attribute_ingress_conflicting_native_forms_retain_independent_rule(self):
+        for value in ([], [ingress_row()]):
+            name = "attribute_ingress_conflict_" + ("empty" if not value else "nonempty")
+            case = Case(name, '''
+                resource "aws_security_group" "conflicting" {
+                  ingress = %s
+                  ingress {
+                    protocol = "tcp"
+                    from_port = 22
+                    to_port = 22
+                    cidr_blocks = ["0.0.0.0/0"]
+                  }
+                }
+                resource "aws_s3_bucket" "independent" {
+                  bucket = "independent-ingress-conflict"
+                  acl = "public-read" # expect:storage
+                }
+            ''' % ingress_literal(value), True)
+            with self.subTest(case=name):
+                self.check_native(case)
+
+    def test_attribute_ingress_budgets_retain_preceding_independent_finding(self):
+        analyzer = importlib.import_module("ubs_core.hcl_scan")
+        for bound, value in (("MAX_INGRESS_RULES", [ingress_row(cidr_blocks=["10.0.0.0/8"])] * 8),
+                             ("MAX_INGRESS_ITEMS", [ingress_row(cidr_blocks=["10.0.0.0/8"] * 32)])):
+            with self.subTest(bound=bound):
+                known = attribute_ingress_case(bound.lower() + "_known", [ingress_row()], exposed=True)
+                large = attribute_ingress_case(bound.lower() + "_large", value, incomplete=True, json_syntax=True)
+                directory = self.materialize((known, large), "attribute-ingress-budget-" + bound.lower())
+                with mock.patch.object(analyzer, bound, 4 if bound.endswith("RULES") else 16, create=True):
+                    records, errors = analyzer.analyze_sources({str(directory / case.filename): case.source
+                                                              for case in (known, large)})
+                self.assertEqual([(Path(row["path"]).name, row["rule"], row["line"], row["col"]) for row in records],
+                                 [(known.filename, RULES["network"], 2, 3)])
+                self.assertTrue(errors)
+
+    def test_attribute_ingress_rule_budget_applies_across_consumers(self):
+        analyzer = importlib.import_module("ubs_core.hcl_scan")
+        cases = (attribute_ingress_case("module_budget_known", [ingress_row()], exposed=True),
+                 attribute_ingress_case("module_budget_private", [ingress_row(cidr_blocks=["10.0.0.0/8"])] * 3,
+                                         json_syntax=True))
+        directory = self.materialize(cases, "attribute-ingress-module-rule-budget")
+        with mock.patch.object(analyzer, "MAX_INGRESS_RULES", 3):
+            records, errors = analyzer.analyze_sources({str(directory / case.filename): case.source for case in cases})
+        self.assertEqual([(Path(row["path"]).name, row["rule"], row["line"], row["col"]) for row in records],
+                         [(cases[0].filename, RULES["network"], 2, 3)])
+        self.assertTrue(errors)
+
 
 def native_test(case):
     def run(self):
@@ -3376,7 +3601,7 @@ def native_test(case):
     return run
 
 
-for _case in CASES + REVIEW_CASES + IAM_CASES + TLS_CASES + POLICY_DOCUMENT_CASES + POLICY_COMPOSITION_CASES + POLICY_CONDITION_CASES + JSON_CASES:
+for _case in CASES + REVIEW_CASES + IAM_CASES + TLS_CASES + POLICY_DOCUMENT_CASES + POLICY_COMPOSITION_CASES + POLICY_CONDITION_CASES + JSON_CASES + ATTRIBUTE_INGRESS_CASES:
     setattr(HCLNativeTests, "test_" + _case.name, native_test(_case))
 
 
@@ -3847,6 +4072,46 @@ class HCLPublicTests(EvidenceTest):
         path.write_text(settings.source, encoding="utf-8")
         with self.subTest(context="restricted-restored"):
             self.assert_report(*self.execute(directory, cached=True), "json", (consumer, settings))
+
+
+    def test_attribute_ingress_public_formats_known_and_partial(self):
+        by_name = {case.name: case for case in ATTRIBUTE_INGRESS_CASES}
+        known = tuple(by_name[name] for name in (
+            "attribute_ingress_public_ssh_native", "attribute_ingress_private_ssh_json",
+            "attribute_ingress_public_ipv6_rdp_json", "attribute_ingress_default_group_public_native"))
+        partial = tuple(by_name[name] for name in (
+            "attribute_ingress_known_row_beside_unknown_cidr_native",
+            "attribute_ingress_known_cidr_beside_unknown_entry_json"))
+        for name, cases, incomplete in (("known", known, False), ("partial", partial, True)):
+            directory = self.materialize(cases, "attribute-ingress-formats-" + name)
+            for mode in ("module-json", "module-sarif", "json", "sarif"):
+                with self.subTest(state=name, mode=mode):
+                    self.assert_report(*self.execute(directory, mode), mode, cases, partial=incomplete)
+
+    def test_attribute_ingress_public_cache_tracks_selected_mixed_syntax_locals(self):
+        consumer = attribute_ingress_case("cache_consumer", IngressExpression("local.rules"))
+        settings = JSONCase("attribute_ingress_cache_settings", json.dumps({"locals": {
+            "rules": [ingress_row(cidr_blocks=["10.0.0.0/8"])]}}))
+        directory = self.materialize((consumer, settings), "attribute-ingress-context-cache")
+        for attempt in range(2):
+            with self.subTest(context="private-" + str(attempt)):
+                self.assert_report(*self.execute(directory, cached=True), "json", (consumer, settings))
+        path = directory / settings.filename
+        changed = JSONCase(settings.name, json.dumps({"locals": {"rules": [ingress_row()]}}))
+        path.write_text(changed.source, encoding="utf-8")
+        exposed = Case(consumer.name, consumer.code, locations=(("network", 2, 3),))
+        with self.subTest(context="changed-to-public"):
+            self.assert_report(*self.execute(directory, cached=True), "json", (exposed, changed))
+        unresolved = JSONCase(settings.name, '{"locals": {"rules": "${var.rules}"}}', True)
+        path.write_text(unresolved.source, encoding="utf-8")
+        with self.subTest(context="unresolved-does-not-reuse-complete-result"):
+            self.assert_report(*self.execute(directory, cached=True), "json", (consumer, unresolved), partial=True)
+        path.write_text(settings.source, encoding="utf-8")
+        with self.subTest(context="private-restored"):
+            self.assert_report(*self.execute(directory, cached=True), "json", (consumer, settings))
+        with self.subTest(context="excluded-context-cannot-supply-locals"):
+            self.assert_report(*self.execute(directory, extra=("--exclude=" + settings.filename,), cached=True),
+                               "json", (consumer,), partial=True, expected_override=[])
 
 
 if __name__ == "__main__":

@@ -89,6 +89,7 @@ class Marker:
     line: int
     rules: frozenset[str] | None  # None = bare marker (suppresses every rule)
     standalone: bool = False
+    reason: str = ''
 
 
 @dataclass(frozen=True)
@@ -186,6 +187,24 @@ class SuppressionIndex:
             )
             for marker in self.markers
         )
+
+    def taint_source_drops(self):
+        """({line: reason}, [warning line]) for ubs:ignore[taint-source] markers.
+
+        Only an exactly [taint-source] scope with a non-empty reason drops the
+        line's taint sources; a multi-id list or an empty reason warns and
+        drops nothing; a bare marker or any other id is not a source directive.
+        """
+        drops, warnings = {}, []
+        for marker in self.markers:
+            if not marker.rules or 'taint-source' not in marker.rules:
+                continue
+            reason = marker.reason.strip()
+            if marker.rules == frozenset({'taint-source'}) and reason:
+                drops[marker.line] = reason
+            else:
+                warnings.append(marker.line)
+        return drops, warnings
 
 
 @dataclass(frozen=True)
@@ -360,7 +379,7 @@ def parse_markers(text: str, lang: str = "python") -> list[Marker]:
                 rules = None
             else:
                 rules = frozenset(p.strip() for p in rules_blob.split(",") if p.strip()) or None
-            markers.append(Marker(line=lineno, rules=rules, standalone=standalone))
+            markers.append(Marker(line=lineno, rules=rules, standalone=standalone, reason=line[match.end():].strip()))
         qualified_spans = [match.span() for match in _QUALIFIED_MARKER_RE.finditer(line)]
         for match in BARE_ALIAS_RE.finditer(line):
             # An alias word inside an unknown or malformed scope is not a

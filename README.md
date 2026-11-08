@@ -1689,6 +1689,16 @@ current run.
 source suppression index removes matches before raw counts and thresholds are
 computed. Bare `# ubs:ignore` covers the applicable statement; scoped markers
 such as `# ubs:ignore[py.functions.high-param-count]` affect only the named rule.
+A `ubs:ignore[taint-source] <reason>` marker is different: on a source line it
+drops only that line's taint source(s), so a function whose only activator was
+that source is no longer analyzed. The `[taint-source]` id and a non-empty
+reason are both required. A bare `ubs:ignore` or any other id is not a source
+directive. A multi-id list containing `taint-source`, or an empty reason, does
+not drop and is reported as ignored. Every drop is listed (file:line, reason)
+in the summary and the JSON output, and a scan with drops is still complete.
+It is activation-only and can never clear a refusal: a function still activated
+by another, unannotated source is analyzed and reports or refuses exactly as
+before.
 Trailing, immediately preceding, multiline-statement and supported
 formatter-relocated markers use the same statement-interval semantics as normal
 findings. A marker inside a string is not a suppression. Suppressed matches are

@@ -259,8 +259,9 @@ class SwiftFunction:
 
 
 class SwiftParser:
-    def __init__(self, text, tokens=None):
+    def __init__(self, text, tokens=None, suppressed=frozenset()):
         self.tokens = swift_validated_tokens(text) if tokens is None else tokens
+        self.suppressed = suppressed
         self.functions, self.types, self.extensions, self.final_types = {}, set(), set(), set()
         self.value_types = set()
         body = self.block(self.tokens, (), (), declarations=True)
@@ -451,7 +452,7 @@ class SwiftParser:
                     # Keep attributes, types, initializers and getter bodies as
                     # witnesses, and retain the conservative request fields.
                     source_region = (*tokens[start:head], *tokens[head + 2:finish])
-                if swift_source_tokens(source_region):
+                if swift_source_tokens(source_region, self.suppressed):
                     accessor_brace = next((i for i in range(head, finish)
                                            if tokens[i].kind == 'code' and tokens[i].value == '{'), -1)
                     if (accessor_brace >= 0 and tokens[head].value in {'var', 'let'}
@@ -474,7 +475,7 @@ class SwiftParser:
             if first in {'import', 'typealias', 'case', '@'}:
                 if first == 'typealias' and len(part) >= 2:
                     self.types.add(part[1].value)
-                if first == '@' and swift_source_tokens(part):
+                if first == '@' and swift_source_tokens(part, self.suppressed):
                     raise ValueError('Swift attributed executable declaration needs binding analysis; analysis is incomplete')
                 statements.append(SwiftStatement('definition', part))
             elif first in {'switch', 'do', 'catch', 'defer', 'repeat'} or (
@@ -565,7 +566,50 @@ def swift_request_dependency(fact):
         for kind in {'request', 'request-collection', 'request-content'})
 
 
-def swift_source_tokens(tokens):
+def swift_source_witness_offsets(tokens, text, drop_lines):
+    if not drop_lines:
+        return frozenset()
+    line_starts = [0, *(index + 1 for index, ch in enumerate(text) if ch == '\n')]
+    witnesses = {'Request', 'req', 'request', 'filename', 'fileName', 'originalFilename', 'originalFileName'}
+    offsets = set()
+    def walk(items):
+        for token in items:
+            if token.kind == 'code' and token.value in witnesses and bisect_right(line_starts, token.start) in drop_lines:
+                offsets.add(token.start)
+            for part in token.parts:
+                walk(part)
+    walk(tokens)
+    return frozenset(offsets)
+
+
+def swift_taint_source_drops(path, text, tokens=None):
+    """One source of truth for ubs:ignore[taint-source] drops in a swift file.
+
+    Returns (offsets, drops, warnings): the witness offsets the activation gates
+    drop, the applied drops [{path,line,reason}] (a witness on the marked line),
+    and the warnings [{path,line}] (bad scope, empty reason, or a marker on a line
+    with no witness). The engine and the listing both call this, so an applied
+    drop is always listed; nothing is swallowed, so a parse failure fails closed.
+    """
+    from ubs_core.suppression import build_index
+    if tokens is None:
+        tokens = swift_validated_tokens(text)
+    dropped, warned = build_index(text, 'swift').taint_source_drops()
+    offsets = swift_source_witness_offsets(tokens, text, set(dropped))
+    line_starts = [0, *(index + 1 for index, ch in enumerate(text) if ch == '\n')]
+    active = {bisect_right(line_starts, offset) for offset in offsets}
+    drops, warnings = [], []
+    for line in sorted(warned):
+        warnings.append({'path': str(path), 'line': line})
+    for line, reason in sorted(dropped.items()):
+        if line in active:
+            drops.append({'path': str(path), 'line': line, 'reason': reason})
+        else:
+            warnings.append({'path': str(path), 'line': line})
+    return offsets, drops, warnings
+
+
+def swift_source_tokens(tokens, suppressed=frozenset()):
     # A request/filename *value/member* may be incoming data; an argument label
     # in Draft(request: draft) or IntentFile(filename: name) is not a value.
     # Only exclude a proven parenthesized label position, retaining dictionary keys, ternary values,
@@ -575,9 +619,9 @@ def swift_source_tokens(tokens):
     closing = {')': '(', ']': '[', '}': '{'}
     for index, token in enumerate(tokens):
         if token.kind == 'code':
-            if token.value == 'Request':
+            if token.value == 'Request' and token.start not in suppressed:
                 return True
-            if token.value in {'req', 'request', 'filename', 'fileName', 'originalFilename', 'originalFileName'}:
+            if token.value in {'req', 'request', 'filename', 'fileName', 'originalFilename', 'originalFileName'} and token.start not in suppressed:
                 previous = tokens[index - 1] if index else None
                 following = tokens[index + 1] if index + 1 < len(tokens) else None
                 is_label = (
@@ -591,12 +635,12 @@ def swift_source_tokens(tokens):
                 delimiters.append(token.value)
             elif token.value in closing and delimiters and delimiters[-1] == closing[token.value]:
                 delimiters.pop()
-        if any(swift_source_tokens(part) for part in token.parts):
+        if any(swift_source_tokens(part, suppressed) for part in token.parts):
             return True
     return False
 
 
-def swift_request_source_tokens(tokens):
+def swift_request_source_tokens(tokens, suppressed=frozenset()):
     """Keep unknown roots, but distinguish lexically bound Vision requests.
 
     This is only a negative source proof, not a source/sink suppression. Every
@@ -605,7 +649,7 @@ def swift_request_source_tokens(tokens):
     names and actual Request types keep the ordinary fail-closed analysis.
     """
     tokens = tuple(tokens)
-    if not swift_source_tokens(tokens):
+    if not swift_source_tokens(tokens, suppressed):
         return False
     native = {'VNCoreMLRequest', 'VNGenerateImageFeaturePrintRequest', 'VNRecognizeTextRequest'}
     code = tuple(t for t in tokens if t.kind == 'code' and t.value != '\n')
@@ -648,10 +692,10 @@ def swift_request_source_tokens(tokens):
                 end += 1
             if any(t.value in {'req', 'request'} for t in significant[index + 1:end]):
                 return True
-    if swift_source_tokens(t for t in significant if t.value not in {'req', 'request'}):
+    if swift_source_tokens((t for t in significant if t.value not in {'req', 'request'}), suppressed):
         return True
     # Interpolations and nested patterns need their own binding model.
-    if any(swift_source_tokens(part) for t in tokens for part in t.parts):
+    if any(swift_source_tokens(part, suppressed) for t in tokens for part in t.parts):
         return True
     ranges, type_ranges, bindings, declarations = [], [], [], set()
     parents, stack = {}, []
@@ -707,7 +751,7 @@ def swift_request_source_tokens(tokens):
             continue
         name = significant[index + 1]
         if name.value == '(':
-            if swift_source_tokens(significant[index + 2:swift_close(significant, index + 1)]):
+            if swift_source_tokens(significant[index + 2:swift_close(significant, index + 1)], suppressed):
                 return True
         if name.value not in {'req', 'request'}:
             continue
@@ -933,7 +977,7 @@ class SwiftEngine:
                         raise ValueError('Swift request-derived global state needs capture analysis; analysis is incomplete')
         for function in self.parser.functions.values():
             request_parameter = any(re.fullmatch(r'(?:Vapor\.)?Request\??', item[2]) for item in function.parameters)
-            if function.key == -1 or request_parameter or swift_source_tokens(swift_statement_tokens(function.body)):
+            if function.key == -1 or request_parameter or swift_source_tokens(swift_statement_tokens(function.body), self.parser.suppressed):
                 self.context(function, tuple(CLEAN for _ in function.parameters), entry=True)
 
     def step(self, offset, kind, label):
@@ -2352,14 +2396,15 @@ def file_url_read_offsets(path, text):
 
 def flow_findings(path, text, policy='path'):
     tokens = swift_validated_tokens(text)
+    suppressed, _drops, _warnings = swift_taint_source_drops(path, text, tokens)
     # Lexing and delimiter validation still run on every selected source.
     # With no selected request source, there is no source-to-sink obligation
     # for these policies; unrelated Swift closure/actor syntax belongs to
     # its own analyzer rather than being misreported as a failed taint pass.
     obligation = swift_outbound_obligation(tokens) if policy == 'outbound' else swift_flow_obligation(tokens)
-    if not swift_request_source_tokens(tokens) or not obligation:
+    if not swift_request_source_tokens(tokens, suppressed) or not obligation:
         return []
-    parser = SwiftParser(text, tokens)
+    parser = SwiftParser(text, tokens, suppressed)
     engine = SwiftEngine(path, text, policy, parser)
     rule, message = {
         'path': ('swift.taint.request_path_traversal', 'Request-derived path reaches file read/write/serve sink'),

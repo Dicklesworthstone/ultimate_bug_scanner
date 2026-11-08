@@ -1007,6 +1007,22 @@ def _legacy_report(records: list[dict], version: str) -> dict:
     return {"version": version, "findings": findings}
 
 
+def _swift_taint_source_drops(files):
+    """Aggregate ubs:ignore[taint-source] drops/warnings across the swift files
+    via the one engine-shared computation, so an applied drop is always listed.
+    Nothing is swallowed: a read/parse failure fails the scan closed (see main()).
+    """
+    from pathlib import Path
+    from ubs_core.analyzers.taint_swift_traversal import swift_taint_source_drops
+    drops, warnings = [], []
+    for path in files:
+        text = Path(path).read_text(encoding='utf-8', errors='replace')
+        _offsets, file_drops, file_warnings = swift_taint_source_drops(path, text)
+        drops.extend(file_drops)
+        warnings.extend(file_warnings)
+    return drops, warnings
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python3 -m ubs_core.swift_scan")
     parser.add_argument("--files-from", default="-", help="NUL-separated file list ('-' = stdin)")
@@ -1182,6 +1198,13 @@ def main(argv: list[str] | None = None) -> int:
         if severity in counters:
             counters[severity] += int(record.get("count", 1) or 0)
 
+    try:
+        taint_drops, taint_warn = _swift_taint_source_drops(files)
+    except Exception as exc:
+        scan_errors.append("taint-source drop listing failed: %s: %s" % (type(exc).__name__, exc))
+        taint_drops, taint_warn = [], []
+    for warning in taint_warn:
+        sys.stderr.write("ubs-swift: ubs:ignore[taint-source] ignored at %s:%s (needs exactly [taint-source] + a non-empty reason)\n" % (warning['path'], warning['line']))
     exit_code = 1 if counters["critical"] else 0
     if args.fail_on_warning and (counters["critical"] + counters["warning"]) > 0:
         exit_code = 1
@@ -1216,6 +1239,9 @@ def main(argv: list[str] | None = None) -> int:
             "report": _legacy_report(records, args.version),
             "extras": {"profile": profile_data},
         }
+        doc["taint_source_drops"] = taint_drops
+        if taint_warn:
+            doc["taint_source_drop_warnings"] = taint_warn
         if scan_errors:
             doc["module_error"] = "ANALYZER_ERROR"
             doc["message"] = (
@@ -1229,6 +1255,12 @@ def main(argv: list[str] | None = None) -> int:
         records = read_ndjson(args.sink)
         renderer = _Renderer(args, records)
         renderer.render(skip, complete=not scan_errors)
+        if taint_drops or taint_warn:
+            renderer.lines.append("taint-source drops: %d" % len(taint_drops))
+            for drop in taint_drops:
+                renderer.lines.append("  %s:%s  %s" % (drop['path'], drop['line'], drop['reason']))
+            for warning in taint_warn:
+                renderer.lines.append("  [warn] %s:%s ubs:ignore[taint-source] ignored (needs exactly [taint-source] + a reason)" % (warning['path'], warning['line']))
         if scan_errors:
             renderer.lines.append("Partial: [ANALYZER_ERROR] Swift analysis did not complete: "
                                   + "; ".join(scan_errors[:5]))

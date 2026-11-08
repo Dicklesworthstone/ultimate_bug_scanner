@@ -947,6 +947,10 @@ class DapperPublicTests(unittest.TestCase):
         debug = ([] if mode.startswith("module-") or not any(
             case.name == "command_unused_construction_is_not_execution" for case in cases) else [
                 ("command_unused_construction_is_not_execution.cs", "cs.pattern.console-write", 12, 1, "info")])
+        if debug and self.identity["ast_grep"]:
+            # The installed grammar also emits its existing console rule at
+            # the invocation column; both independent advisories are retained.
+            debug.append(("command_unused_construction_is_not_execution.cs", "cs-console-writeline", 12, 9, "info"))
         expected = sorted(sql + warnings + inventory + debug)
         self.assertEqual(result.returncode, 2 if partial else int(bool(sql)), context)
         actual = []
@@ -977,6 +981,7 @@ class DapperPublicTests(unittest.TestCase):
                 self.assertEqual(row["category_id"], {
                     "cs.inventory.project": "csharp.inventory",
                     "cs.pattern.console-write": "csharp.debug",
+                    "cs-console-writeline": "csharp.ast-grep",
                 }.get(rule, "csharp.security"), context)
                 actual.append((file, rule, row["line"], row["col"], row["severity"]))
         self.assertEqual(sorted(actual), expected, context)

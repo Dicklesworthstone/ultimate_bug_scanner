@@ -10,6 +10,10 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Verify both existing console advisories in the C# Dapper public acceptance
+  tests when ast-grep is installed. Retain exact rule, location, severity,
+  category and count assertions for the real module and runner output.
+
 - Preserve Python hash-object identity through selected list, tuple and
   dictionary entries, nested aliases, copies, slices and captured methods.
   Track slot replacement, deletion, lookup defaults and in-place collection

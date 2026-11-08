@@ -6,5 +6,7 @@ func work() {}
 func risky() throws {}
 func deferLateAssign(request: Request) { var p = "/safe"
   defer { _ = try? String(contentsOfFile: p) }
-  p = documentRoot + "/" + (request.query["file"] ?? "x")
+  if request.query["c"] != nil { p = documentRoot + "/" + (request.query["file"] ?? "x")
+    return }
+  p = "/safe-again"
 }

@@ -4,6 +4,7 @@ let documentRoot = "/srv/app/files"
 enum E: Error { case x }
 func work() {}
 func risky() throws {}
-func deferFalloff(request: Request) { defer { _ = try? String(contentsOfFile: documentRoot + "/" + (request.query["file"] ?? "x")) }
-  work()
+func deferFalloff(request: Request) { var p = "/safe"
+  defer { _ = try? String(contentsOfFile: p) }
+  p = documentRoot + "/" + (request.query["file"] ?? "x")
 }

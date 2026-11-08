@@ -2047,7 +2047,7 @@ class SwiftEngine:
                         raise ValueError('Swift labeled/nonlocal loop exit needs control-flow analysis; analysis is incomplete')
                     following = node('branch', targets=(target,))
                 elif kind in {'return', 'throw'}:
-                    following = node(kind, tokens, local, (exit_target,) if kind == 'return' else ())
+                    following = node(kind, tokens, local, (exit_target,) if kind in {'return', 'throw'} else ())
                 elif kind == 'simple' and process_exit(tokens, before):
                     # Evaluate arguments (which may contain sinks), but a real
                     # Never-returning primitive has no successor edge.
@@ -2087,7 +2087,11 @@ class SwiftEngine:
                         edges[created] = edges[created] + tuple(catch_entries)
                     following = do_entry
                 else:
-                    following = node(kind, tokens, local, (following,), reads=before)
+                    throw_targets = (exit_target,) if any(
+                        t.kind == 'code' and t.value == 'try'
+                        and (idx + 1 >= len(tokens) or tokens[idx + 1].value not in {'?', '!'})
+                        for idx, t in enumerate(tokens)) else ()
+                    following = node(kind, tokens, local, (following,) + throw_targets, reads=before)
             return following
 
         return block(function.body, exit_node, scope), actions, edges

@@ -14,6 +14,8 @@ https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/net/ServerSock
 https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/zip/GZIPInputStream.html
 https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/zip/GZIPOutputStream.html
 https://docs.oracle.com/en/java/javase/26/docs/api/java.base/java/util/zip/DeflaterOutputStream.html
+https://kotlinlang.org/docs/packages.html#default-imports
+https://kotlinlang.org/api/core/kotlin-stdlib/kotlin/-auto-closeable/
 
 Kotlin use closes its receiver on normal and exceptional exits, and returns the
 block's result. Returning that receiver therefore exports a closed resource.
@@ -1311,6 +1313,337 @@ GZIP_CASES = (
 )
 BY_NAME = {case.name: case for case in (*CASES, *WRAPPER_CASES, *NETWORK_CASES, *GZIP_CASES)}
 
+UNRELATED_CATCH_CASES = (
+    Case("unrelated_custom_catch", '''
+        class DomainFailure : Exception()
+        fun f() {
+            try { throw DomainFailure() }
+            catch (failure: DomainFailure) { println(failure.message) }
+        }
+        '''),
+    Case("unrelated_sync_cancellation_catch", '''
+        import kotlinx.coroutines.CancellationException
+        fun f() {
+            try { throw CancellationException("cancelled") }
+            catch (failure: CancellationException) { println(failure.message) }
+        }
+        '''),
+    Case("unrelated_catch_preserves_handler_assignment", '''
+        import java.io.FileInputStream
+        class DomainFailure : Exception()
+        fun f() {
+            var shouldOpen = true
+            try { throw DomainFailure() }
+            catch (failure: DomainFailure) { shouldOpen = false }
+            if (shouldOpen) { FileInputStream("input.bin") }
+        }
+        '''),
+    Case("unrelated_catch_preserves_return", '''
+        import java.io.FileInputStream
+        class DomainFailure : Exception()
+        fun f() {
+            try { throw DomainFailure() }
+            catch (failure: DomainFailure) { return }
+            FileInputStream("input.bin")
+        }
+        '''),
+    Case("unrelated_catch_preserves_finally_return", '''
+        import java.io.FileInputStream
+        class DomainFailure : Exception()
+        fun f() {
+            try { throw DomainFailure() }
+            catch (failure: DomainFailure) { println("handled") }
+            finally { return }
+            FileInputStream("input.bin")
+        }
+        '''),
+    Case("unrelated_catch_does_not_execute_unused_helper", '''
+        import java.io.FileInputStream
+        class DomainFailure : Exception()
+        fun open() = FileInputStream("input.bin")
+        fun f() {
+            try { throw DomainFailure() }
+            catch (failure: DomainFailure) { println("handled") }
+        }
+        '''),
+    Case("unrelated_catch_keeps_independent_resource_obligations", '''
+        import java.io.FileInputStream
+        class DomainFailure : Exception()
+        fun ordinary() {
+            try { throw DomainFailure() }
+            catch (failure: DomainFailure) { println("handled") }
+        }
+        fun leaked() { FileInputStream("input.bin") } // expect:unclosed
+        fun closed() { FileInputStream("input.bin").use { it.read() } }
+        '''),
+    Case("unrelated_catch_with_file_value", '''
+        import java.io.File
+        class DomainFailure : Exception()
+        fun f() {
+            val path = File("input.bin")
+            try { throw DomainFailure() }
+            catch (failure: DomainFailure) { println(path) }
+        }
+        '''),
+    Case("unrelated_catch_shadowed_auto_closeable", '''
+        class DomainFailure : Exception()
+        class AutoCloseable { fun close() { } }
+        fun f(value: AutoCloseable) {
+            try { throw DomainFailure() }
+            catch (failure: DomainFailure) { value.close() }
+        }
+        '''),
+    Case("pure_recursive_helper_after_closed_resource", '''
+        import java.io.FileInputStream
+        fun tick(n: Int): Int {
+            if (n > 0) { return tick(n - 1) }
+            return 0
+        }
+        fun f() {
+            val stream = FileInputStream("input.bin")
+            stream.close()
+            tick(2)
+        }
+        '''),
+    Case("pure_nested_recursive_helper_after_closed_resource", '''
+        import java.io.FileInputStream
+        fun f() {
+            val stream = FileInputStream("input.bin")
+            stream.close()
+            fun tick(n: Int): Int {
+                if (n > 0) { return tick(n - 1) }
+                return 0
+            }
+            tick(2)
+        }
+        '''),
+    Case("pure_recursive_helper_with_unrelated_borrowed_resource", '''
+        import java.io.Closeable
+        fun tick(n: Int): Int {
+            if (n > 0) { return tick(n - 1) }
+            return 0
+        }
+        fun f(stream: Closeable) { tick(2) }
+        '''),
+    Case("known_catch_recursive_helper_after_closed_resource", '''
+        import java.io.FileInputStream
+        fun tick(n: Int): Int {
+            try { throw IllegalArgumentException("fixed") }
+            catch (failure: IllegalArgumentException) {
+                if (n > 0) { return tick(n - 1) }
+            }
+            return 0
+        }
+        fun f() {
+            val stream = FileInputStream("input.bin")
+            stream.close()
+            tick(2)
+        }
+        '''),
+    Case("pure_recursive_helper_with_unused_catch_callback", '''
+        class DomainFailure : Exception()
+        fun tick(n: Int): Int {
+            val unused = {
+                try { throw DomainFailure() }
+                catch (failure: DomainFailure) { println(failure) }
+            }
+            if (n > 0) { return tick(n - 1) }
+            return 0
+        }
+        fun f() { tick(2) }
+        '''),
+)
+
+UNRESOLVED_CATCH_CASES = (
+    Case("unknown_catch_with_live_resource", '''
+        import java.io.FileInputStream
+        class DomainFailure : Exception()
+        fun f() {
+            val stream = FileInputStream("input.bin")
+            try { throw DomainFailure() }
+            catch (failure: DomainFailure) { stream.close() }
+        }
+        '''),
+    Case("unknown_catch_with_closed_resource", '''
+        import java.io.FileInputStream
+        class DomainFailure : Exception()
+        fun f() {
+            val stream = FileInputStream("input.bin")
+            stream.close()
+            try { throw DomainFailure() }
+            catch (failure: DomainFailure) { stream.read() }
+        }
+        '''),
+    Case("unknown_catch_with_borrowed_resource", '''
+        import java.io.Closeable
+        class DomainFailure : Exception()
+        fun f(stream: Closeable) {
+            try { throw DomainFailure() }
+            catch (failure: DomainFailure) { stream.close() }
+        }
+        '''),
+    Case("unknown_catch_with_default_auto_closeable", '''
+        class DomainFailure : Exception()
+        fun f(stream: AutoCloseable) {
+            try { throw DomainFailure() }
+            catch (failure: DomainFailure) { stream.close() }
+        }
+        '''),
+    Case("unknown_catch_with_kotlin_auto_closeable", '''
+        class DomainFailure : Exception()
+        fun f(stream: kotlin.AutoCloseable) {
+            try { throw DomainFailure() }
+            catch (failure: DomainFailure) { stream.close() }
+        }
+        '''),
+    Case("unknown_catch_in_helper_with_closed_capture", '''
+        import java.io.FileInputStream
+        class DomainFailure : Exception()
+        fun f() {
+            val stream = FileInputStream("input.bin")
+            stream.close()
+            fun inspect() {
+                try { throw DomainFailure() }
+                catch (failure: DomainFailure) { stream.read() }
+            }
+            inspect()
+        }
+        '''),
+    Case("unknown_catch_borrows_listener", '''
+        import java.net.ServerSocket
+        class DomainFailure : Exception()
+        fun f(listener: ServerSocket) {
+            try { throw DomainFailure() }
+            catch (failure: DomainFailure) { listener.accept().close() }
+        }
+        '''),
+    Case("unknown_catch_handler_acquires", '''
+        import java.io.FileInputStream
+        class DomainFailure : Exception()
+        fun f() {
+            try { throw DomainFailure() }
+            catch (failure: DomainFailure) { FileInputStream("input.bin") }
+        }
+        '''),
+    Case("unknown_catch_finally_acquires", '''
+        import java.io.FileInputStream
+        class DomainFailure : Exception()
+        fun f() {
+            try { throw DomainFailure() }
+            catch (failure: DomainFailure) { return }
+            finally { FileInputStream("input.bin").use { it.read() } }
+        }
+        '''),
+    Case("unknown_catch_later_acquires", '''
+        import java.io.FileInputStream
+        class DomainFailure : Exception()
+        fun f() {
+            try { throw DomainFailure() }
+            catch (failure: DomainFailure) { println("handled") }
+            FileInputStream("input.bin")
+        }
+        '''),
+    Case("unknown_catch_transitive_helper_acquires", '''
+        import java.io.FileInputStream
+        class DomainFailure : Exception()
+        fun leaf() = FileInputStream("input.bin")
+        fun middle() = leaf()
+        fun f() {
+            try { throw DomainFailure() }
+            catch (failure: DomainFailure) { middle().close() }
+        }
+        '''),
+    Case("unknown_catch_callback_acquires", '''
+        import java.io.FileInputStream
+        class DomainFailure : Exception()
+        fun f() {
+            val open = { FileInputStream("input.bin") }
+            try { throw DomainFailure() }
+            catch (failure: DomainFailure) { open().close() }
+        }
+        '''),
+    Case("unknown_catch_rethrow_retains_outer_uncertainty", '''
+        import java.io.FileInputStream
+        class DomainFailure : Exception()
+        fun f() {
+            try {
+                try { throw DomainFailure() }
+                catch (failure: DomainFailure) { throw failure }
+            } catch (failure: Exception) { FileInputStream("input.bin") }
+        }
+        '''),
+    Case("unknown_catch_in_transitive_helper_with_closed_capture", '''
+        import java.io.FileInputStream
+        class DomainFailure : Exception()
+        fun f() {
+            val stream = FileInputStream("input.bin")
+            stream.close()
+            fun inspect() {
+                try { throw DomainFailure() }
+                catch (failure: DomainFailure) { stream.read() }
+            }
+            fun middle() { inspect() }
+            middle()
+        }
+        '''),
+    Case("unknown_helper_catch_reaches_acquiring_caller", '''
+        import java.io.FileInputStream
+        class DomainFailure : Exception()
+        class OtherFailure : Exception()
+        fun fail() {
+            try { throw DomainFailure() }
+            catch (failure: OtherFailure) { println("handled") }
+        }
+        fun f() {
+            try { fail() }
+            catch (failure: DomainFailure) { FileInputStream("input.bin") }
+        }
+        '''),
+    Case("unknown_helper_throw_type_reaches_earlier_caller", '''
+        import java.io.FileInputStream
+        import java.sql.SQLException
+        fun f() {
+            try { fail() }
+            catch (failure: SQLException) { FileInputStream("input.bin") }
+        }
+        fun fail() {
+            try { throw SQLException("database") }
+            catch (failure: IllegalArgumentException) { println("handled") }
+        }
+        '''),
+    Case("unknown_transitive_helper_catch_reaches_acquiring_caller", '''
+        import java.io.FileInputStream
+        class DomainFailure : Exception()
+        class OtherFailure : Exception()
+        fun f() {
+            try { middle() }
+            catch (failure: DomainFailure) { FileInputStream("input.bin") }
+        }
+        fun middle() { fail() }
+        fun fail() {
+            try { throw DomainFailure() }
+            catch (failure: OtherFailure) { println("handled") }
+        }
+        '''),
+    Case("unknown_helper_callback_alias_reaches_acquiring_caller", '''
+        import java.io.FileInputStream
+        class DomainFailure : Exception()
+        class OtherFailure : Exception()
+        fun fail() {
+            val callback = {
+                try { throw DomainFailure() }
+                catch (failure: OtherFailure) { println(failure) }
+            }
+            val invoke = callback
+            invoke()
+        }
+        fun f() {
+            try { fail() }
+            catch (failure: DomainFailure) { FileInputStream("input.bin") }
+        }
+        '''),
+)
+
 UNSUPPORTED_CASES = (
     Case("unknown_resource_argument", '''
         import java.io.FileInputStream
@@ -1530,6 +1863,24 @@ class KotlinResourceAnalyzerTests(LoggedResourceCase):
     def test_gzip_constructor_failures_and_dependent_ownership(self):
         self.check_cases(GZIP_CASES)
 
+    def test_unrelated_catch_hierarchies_keep_resource_analysis_complete(self):
+        self.check_cases(UNRELATED_CATCH_CASES)
+
+    def test_unknown_catch_paths_cannot_certify_resource_effects(self):
+        for case in UNRESOLVED_CATCH_CASES:
+            with self.subTest(case=case.name):
+                directory, source = self.fixture(case, "-unresolved")
+                sink, errors = io.StringIO(), []
+                started = time.monotonic()
+                kotlin_scan.scan_analyzers([source], sink, ONLY_RESOURCE, errors=errors)
+                (directory / "result.json").write_text(json.dumps({
+                    "case": case.name, "expected": "incomplete", "errors": errors,
+                    "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                    "elapsed": time.monotonic() - started, "sink": sink.getvalue(),
+                }, indent=2) + "\n", encoding="utf-8")
+                self.assertTrue(errors, (case.name, sink.getvalue()))
+                self.assertTrue(any("catch hierarchy" in error for error in errors), errors)
+
     def test_gzip_has_no_archive_entry_names(self):
         from ubs_core.java_detectors import archive_extraction
         case = Case("gzip_output_has_no_archive_entries", '''
@@ -1725,6 +2076,46 @@ class KotlinResourceCliTests(LoggedResourceCase):
                             if not meta:
                                 self.assertEqual(payload["status"], "ok", payload)
                                 self.assertEqual(payload["files"], 1, payload)
+
+    def test_unrelated_catches_complete_through_public_formats(self):
+        names = {"unrelated_custom_catch", "unrelated_sync_cancellation_catch",
+                 "unrelated_catch_keeps_independent_resource_obligations",
+                 "pure_recursive_helper_after_closed_resource"}
+        for case in (case for case in UNRELATED_CATCH_CASES if case.name in names):
+            for meta in (False, True):
+                for fmt in ("json", "sarif"):
+                    with self.subTest(case=case.name, meta=meta, format=fmt):
+                        result, payload = self.scan(case, meta=meta, fmt=fmt)
+                        self.assertEqual(result.returncode, 1 if case.expected else 0,
+                                         (result.stdout, result.stderr))
+                        if fmt == "sarif":
+                            self.assert_sarif(case, payload)
+                            self.assertFalse(any(inv.get("executionSuccessful") is False
+                                                 for run in payload["runs"] for inv in run.get("invocations", [])))
+                        else:
+                            self.assertEqual(payload["status"], "ok", payload)
+                            self.assert_records(case, self.meta_records(payload) if meta else payload["findings"])
+                            totals = payload["totals"] if meta else payload
+                            self.assertEqual((totals["critical"], totals["warning"]), (0, len(case.expected)))
+
+    def test_unknown_catch_resource_effects_are_publicly_partial(self):
+        names = {"unknown_catch_handler_acquires", "unknown_catch_transitive_helper_acquires",
+                 "unknown_catch_in_helper_with_closed_capture",
+                 "unknown_helper_throw_type_reaches_earlier_caller"}
+        for case in (case for case in UNRESOLVED_CATCH_CASES if case.name in names):
+            for meta in (False, True):
+                for fmt in ("json", "sarif"):
+                    with self.subTest(case=case.name, meta=meta, format=fmt):
+                        result, payload = self.scan(case, meta=meta, fmt=fmt)
+                        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+                        self.assertIn("catch hierarchy", result.stdout + result.stderr)
+                        if fmt == "sarif":
+                            self.assertTrue(any(inv.get("executionSuccessful") is False
+                                                for run in payload["runs"] for inv in run.get("invocations", [])), payload)
+                        else:
+                            self.assertEqual(payload["status"], "partial", payload)
+                            if not meta:
+                                self.assertEqual(payload["module_error"], "ANALYZER_ERROR", payload)
 
     def test_scoped_suppression_and_profiles(self):
         unsafe = BY_NAME["file_input_unclosed"]

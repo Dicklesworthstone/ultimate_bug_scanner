@@ -10,6 +10,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Complete Kotlin resource analysis for supported resource-free custom and
+  cancellation catch handlers. Retain caught and uncaught control paths
+  without inventing exception ancestry; carry unresolved hierarchy state
+  through local helpers and callbacks, and refuse later ownership-sensitive
+  operations. Preserve borrowed and closed-handle boundaries and findings in
+  independent resource-owning functions, with native and public report tests.
+
 - Preserve Swift reference aliases and receiver/helper mutations through
   constructors, casts, getters, and stored callbacks. Join every concrete
   getter alternative and carry actual captured/inout writes through selected

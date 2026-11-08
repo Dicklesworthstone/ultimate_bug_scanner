@@ -175,6 +175,7 @@ class State:
     life: dict[ResourceId, str] = field(default_factory=dict)
     backing: dict[ResourceId, frozenset[ResourceId]] = field(default_factory=dict)
     borrowed_closed: bool = False
+    unresolved_catch: bool = False
     result: Value = UNIT
     position: int = 0
     exit: str = ""
@@ -191,7 +192,7 @@ class State:
     def signature(self):
         return (tuple(sorted(self.values.items())), tuple(sorted(self.life.items())),
                 tuple(sorted(self.backing.items())),
-                self.borrowed_closed,
+                self.borrowed_closed, self.unresolved_catch,
                 self.result, self.position, self.exit, self.exception, self.receiver,
                 self.implicit, self.managed, self.use_scopes, self.unwinding)
 
@@ -220,6 +221,7 @@ class Ownership:
         self.model.functions = functions
         self.parser.definitions = {self.offset(function.declaration): function for function in functions}
         self.functions = {fn.name: fn for fn in self.model.functions}
+        self.function_declarations = {fn.declaration: fn for fn in self.model.functions}
         self.active_calls: list[int] = []
         self.initializers: list[int] = []
         self.resources: dict[ResourceId, tuple[str, int]] = {}
@@ -268,7 +270,7 @@ class Ownership:
         if name in {"Boolean", "Int", "Long", "ByteArray"}:
             return "kotlin." + name
         if name in {"Exception", "Throwable", "Error", "RuntimeException", "IllegalStateException", "String",
-                    "IllegalArgumentException", "UnsupportedOperationException", "NullPointerException"}:
+                    "IllegalArgumentException", "UnsupportedOperationException", "NullPointerException", "AutoCloseable"}:
             return "java.lang." + name
         return ""
 
@@ -364,6 +366,7 @@ class Ownership:
         return failed
 
     def acquire(self, state: State, factory: str, kind: str, position: int) -> list[State]:
+        self.require_catch_proof(state)
         failed = self.thrown(state)
         slot = 0
         while (position, slot) in state.life:
@@ -374,6 +377,7 @@ class Ownership:
         return self.result(state, Value(frozenset({resource}), kind=kind), position) + [failed]
 
     def socket_resource(self, receiver: Value, name: str, position: int, state: State) -> list[State]:
+        self.require_catch_proof(state)
         closed = {resource for resource in receiver.resources if state.life.get(resource) == "closed"}
         for resource in closed:
             self.report("use-after-close", resource, position)
@@ -455,6 +459,7 @@ class Ownership:
         return self.unique(output)
 
     def mark_closed(self, receiver: Value, state: State) -> None:
+        self.require_catch_proof(state)
         if not receiver.resources:
             # Borrowed parameters do not have local acquisition identities.
             # Do not assume their close is unrelated to a live GZIP wrapper.
@@ -513,6 +518,7 @@ class Ownership:
         return False
 
     def io_operation(self, receiver: Value, name: str, position: int, state: State) -> list[State]:
+        self.require_catch_proof(state)
         for resource in receiver.resources:
             if state.life.get(resource) == "closed":
                 self.report("use-after-close", resource, position)
@@ -526,6 +532,7 @@ class Ownership:
     def wrap_stream(self, state: State, backing: Value, kind: str, options: tuple[Value, ...],
                     token: int, *, option_kind: str, reuse: bool = False,
                     charset_extension: bool = False) -> list[State]:
+        self.require_catch_proof(state)
         if len(options) > 1 or any(self.references(value, state) or value.callback >= 0 for value in options):
             raise ValueError("Unsupported Kotlin stream wrapper arguments; analysis is incomplete")
         position = self.offset(token)
@@ -595,6 +602,121 @@ class Ownership:
             pending.extend(state.values.get(key, captured) for key, captured in current.captured)
             pending.extend(captured for _, _, captured in current.implicit)
         return result
+
+    @staticmethod
+    def require_catch_proof(state: State) -> None:
+        if state.unresolved_catch:
+            raise ValueError("Unknown Kotlin resource catch hierarchy; analysis is incomplete")
+
+    def resource_context(self, state: State, *extra: Value, include_state: bool = True) -> bool:
+        """Owned, closed, borrowed and captured handles still need catch proof."""
+        pending = list(extra)
+        if include_state:
+            if state.life or state.backing or state.borrowed_closed or state.managed or state.use_scopes:
+                return True
+            pending.extend(state.values.values())
+            pending.extend((state.result, state.receiver, *state.unwinding))
+            for _, _, value in state.implicit:
+                pending.append(value)
+        seen = set()
+        while pending:
+            self.model.spend()
+            value = pending.pop()
+            if id(value) in seen:
+                continue
+            seen.add(id(value))
+            if (value.resources or value.escapes or value.kind in RESOURCE_TYPES
+                    or value.kind in {"java.io.Closeable", "java.lang.AutoCloseable", "kotlin.AutoCloseable"}):
+                return True
+            for key, captured in value.captured:
+                pending.append(state.values.get(key, captured))
+            for _, _, captured in value.implicit:
+                pending.append(captured)
+        return False
+
+    def helper_requires_flow(self, function, state: State, receiver: Value,
+                             arguments: tuple[Value, ...]) -> bool:
+        """Keep catch exits and accessible handles without activating unrelated helpers."""
+        if state.unresolved_catch or self.resource_context(state, receiver, *arguments, include_state=False):
+            return True
+        if any(value.callback >= 0 for value in arguments):
+            return True
+        pending, seen = [function], set()
+        has_catch = uncertain_throw = False
+        while pending:
+            current = pending.pop()
+            if current.name in seen:
+                continue
+            seen.add(current.name)
+            index = current.start
+            while index < current.end:
+                self.model.spend()
+                nested = self.function_declarations.get(index)
+                if nested is not None:
+                    # A declaration does not execute its body. Follow it only
+                    # through a reachable binding below, including forward calls.
+                    index = nested.end
+                    continue
+                word = self.model.value(index)
+                if word in {"val", "var"} and self.model.identifier(index + 1):
+                    _, finish = self.parser.statement(self.offset(index), self.offset(current.end))
+                    end = self.token(finish)
+                    equal = self.operator(index + 2, end, {"="})
+                    opening = equal + 1 if equal is not None else end
+                    while self.model.value(opening) == "(" and self.model.pairs.get(opening) == end - 1:
+                        opening, end = opening + 1, end - 1
+                    if self.model.value(opening) == "{" and self.model.pairs.get(opening) == end - 1:
+                        key, referenced = self.key(self.model.value(index + 1), index + 1), False
+                        for reference in range(current.start, current.end):
+                            self.model.spend()
+                            if index <= reference < self.token(finish):
+                                continue
+                            if (self.model.identifier(reference)
+                                    and self.key(self.model.value(reference), reference) == key):
+                                referenced = True
+                                break
+                        if not referenced:
+                            # Creating an unread lambda does not run its catches.
+                            # Keep referenced callbacks/aliases conservative; their
+                            # possible invocation still needs the normal evaluator.
+                            index = self.token(finish)
+                            continue
+                if word == "catch":
+                    has_catch = True
+                    opening = index + 1
+                    closing = self.model.pairs.get(opening)
+                    if self.model.value(opening) != "(" or closing is None:
+                        return True
+                    start = self.offset(opening + 1)
+                    parameter = re.match(r"\s*([A-Za-z_]\w*)\s*:\s*([\w.]+)",
+                                         self.code[start:self.offset(closing)])
+                    if parameter is None:
+                        return True
+                    kind = self.canonical(parameter.group(2), self.token(start + parameter.start(1)))
+                    if kind not in EXCEPTION_PARENTS and kind != "java.lang.Throwable":
+                        return True
+                elif word == "throw":
+                    end = index + 1
+                    while self.model.identifier(end) or self.model.value(end) == ".":
+                        self.model.spend()
+                        end += 1
+                    kind = self.canonical(self.model.path(index + 1, end), index + 1)
+                    # Only a direct known constructor proves this throw family.
+                    # Computed/borrowed exceptions and unknown JVM subclasses
+                    # must reach the evaluator even when the catch type is known.
+                    if (self.model.value(end) != "("
+                            or (kind not in EXCEPTION_PARENTS and kind != "java.lang.Throwable")):
+                        uncertain_throw = True
+                if self.model.identifier(index):
+                    value = self.value(state, word, index)
+                    if (self.model.value(index - 1) not in {".", "?.", "::"}
+                            and self.resource_context(state, value, include_state=False)):
+                        return True
+                    called = self.functions.get(self.key(value.symbol or word, index))
+                    if called is not None:
+                        pending.append(called)
+                index += 1
+        return has_catch and uncertain_throw
 
     def closure(self, opening: int, state: State) -> Value:
         keys = {self.key(self.model.value(index), index)
@@ -826,6 +948,8 @@ class Ownership:
     def call(self, callable_value: Value, receiver: Value, arguments: tuple[Value, ...],
              token: int, state: State) -> list[State]:
         name, position = callable_value.symbol, self.offset(token)
+        if state.unresolved_catch and self.resource_context(state, callable_value, receiver, *arguments):
+            self.require_catch_proof(state)
         if callable_value.callback >= 0:
             return self.callback(callable_value, arguments, state, "")
         if receiver.symbol:
@@ -837,6 +961,7 @@ class Ownership:
         if qualified in COMPRESSION_WRAPPERS:
             return self.compress_stream(state, qualified, arguments, token)
         if qualified in WRAPPERS:
+            self.require_catch_proof(state)
             family, option_kind = WRAPPERS[qualified]
             if not arguments or arguments[0].kind not in STREAM_TYPES[family]:
                 if (arguments and not any(self.references(value, state) for value in arguments)
@@ -873,8 +998,7 @@ class Ownership:
         function = self.functions.get(self.key(name, token))
         if function is not None and (not receiver.kind or function.receiver):
             if (not self.selected(function.start, function.end, state)
-                    and not any(self.references(value, state) for value in (receiver, *arguments))
-                    and not any(value.callback >= 0 for value in arguments)):
+                    and not self.helper_requires_flow(function, state, receiver, arguments)):
                 return self.result(state, UNKNOWN, position)
             return self.function(function, arguments, receiver, state)
         if receiver.kind in COMPRESSION_WRAPPERS and (name in COMPRESSION_IO[receiver.kind] or name == "close"):
@@ -1116,7 +1240,7 @@ class Ownership:
                     raise ValueError("Unsupported Kotlin resource catch binding; analysis is incomplete")
                 token = self.token(handler.header[0] + parameter.start(1))
                 kind = self.canonical(parameter.group(2), token)
-                caught, rest = self.catch_partition(remaining.exception, kind)
+                caught, rest = self.catch_partition(remaining.exception, kind, remaining)
                 if caught is not None:
                     branch = remaining.copy()
                     branch.exit, branch.exception = "", None
@@ -1151,7 +1275,8 @@ class Ownership:
             thrown = EXCEPTION_PARENTS.get(thrown, "")
         return False
 
-    def catch_partition(self, failure: ExceptionPath | None, handler: str) -> tuple[ExceptionPath | None, ExceptionPath | None]:
+    def catch_partition(self, failure: ExceptionPath | None, handler: str,
+                        state: State) -> tuple[ExceptionPath | None, ExceptionPath | None]:
         if failure is None:
             raise ValueError("Unknown Kotlin thrown resource effect; analysis is incomplete")
         if any(self.catches(excluded, handler) for excluded in failure.excluded):
@@ -1161,7 +1286,14 @@ class Ownership:
         if failure.exact and (failure.kind in EXCEPTION_PARENTS or failure.kind == "java.lang.Throwable"):
             return None, failure
         if handler not in EXCEPTION_PARENTS or failure.kind not in (*EXCEPTION_PARENTS, "java.lang.Throwable"):
-            raise ValueError("Unknown Kotlin resource catch hierarchy; analysis is incomplete")
+            if self.resource_context(state):
+                raise ValueError("Unknown Kotlin resource catch hierarchy; analysis is incomplete")
+            # Ordinary catch bodies must retain their assignments and exits.
+            # Explore both outcomes without claiming a type relation or adding
+            # an exclusion. If either path later observes/acquires a resource,
+            # its sticky flag requires the missing hierarchy proof then.
+            state.unresolved_catch = True
+            return failure, failure
         if not self.catches(failure.kind, handler):
             return None, failure
         # A subtype catch handles only its part of a declared exception family.
@@ -1182,6 +1314,8 @@ class Ownership:
 
     def finish(self, states: list[State], expression: bool = False) -> None:
         for state in states:
+            if state.unresolved_catch and self.resource_context(state):
+                self.require_catch_proof(state)
             returned = state.result if state.exit == "return" or (expression and not state.exit) else UNIT
             self.escaped(returned)
             if returned.callback >= 0 and self.references(returned, state) - {resource for resource, _ in returned.escapes}:

@@ -190,6 +190,20 @@ Request-derived field initialization that requires unmodeled object state report
 incomplete analysis. Unknown calls preserve existing input taint while dropping
 unsupported request-object identity; the separate JDBC analysis is unchanged.
 
+#### Kotlin resource analysis and custom catch handlers
+
+Resource-free Kotlin code can continue through a supported catch handler whose
+exception hierarchy is unresolved. The analyzer retains both caught and
+uncaught outcomes, including assignments, returns, rethrows and `finally`;
+it does not infer that one exception type inherits from another.
+
+The unresolved relation stays attached to those paths. If a path subsequently
+acquires or observes a selected resource, including through a local helper or
+captured handle, analysis remains explicitly incomplete. Owned, borrowed and
+previously closed handles still require the hierarchy proof. Independent
+functions keep their own ownership state, so an unrelated cancellation handler
+does not prevent their resource findings from being analyzed.
+
 #### Elixir raw SQL request flow
 
 Elixir category 4 tracks request-derived query text through local helpers, aliases,

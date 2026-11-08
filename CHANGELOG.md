@@ -10,6 +10,22 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Qualify release candidates before signing: check version declarations, the
+  generation protocol, runner/service and runtime digests, and transitive
+  dependency pins; stage a complete unsigned bundle without changing source or
+  creating a tag. Add candidate and transaction regression gates to the retained
+  release recipe, verify its Minisign signature with the published key, and
+  include `verify.sh` and `minisign.pub` in its publication list. Document the
+  required DSR execution path, production signing prerequisites, and explicit
+  approval before tag or release publication. Reject unsupported prerelease
+  version suffixes before the release cutter can scan or change any files.
+
+- Reconcile the Swift corpus golden with scoped outbound-client analysis: the
+  local `HTTPClient.get` fixture that only constructs `Data` is not an HTTP
+  sink. Remove that one obsolete expected result (196 to 195); keep all emitted
+  rule IDs and the five actual request-derived outbound findings covered by
+  the existing paired fixture regression.
+
 - Preserve secret provenance when Python `for` and `async for` loops bind
   iteration targets. Track literal tuple positions and starred iterable values,
   capture unpacking inputs before target writes, and keep public dictionary keys

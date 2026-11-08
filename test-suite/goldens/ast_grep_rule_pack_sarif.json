@@ -1009,7 +1009,7 @@
       "fixture": "test-suite/swift",
       "label": "swift-rule-pack",
       "module": "ubs-swift.sh",
-      "result_count": 196,
+      "result_count": 195,
       "result_rule_ids": [
         "swift.abort-call",
         "swift.assertion-failure",

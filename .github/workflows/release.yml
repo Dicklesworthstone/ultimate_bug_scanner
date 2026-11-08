@@ -1,5 +1,8 @@
 name: Release
 
+# Retained as a DSR/local build recipe. AGENTS.md prohibits executing this
+# workflow through GitHub Actions; keep Actions disabled before pushing tags.
+# Local execution does not supply the Actions OIDC identity used below.
 on:
   push:
     tags:
@@ -56,6 +59,7 @@ jobs:
     env:
       TAG: ${{ needs.gather.outputs.tag }}
       VERSION: ${{ needs.gather.outputs.version }}
+      PYTHONDONTWRITEBYTECODE: "1"
     steps:
       - name: Ensure minisign secret is present
         env:
@@ -102,16 +106,21 @@ jobs:
             exit 1
           fi
 
-      - name: Create dist directory
-        run: mkdir -p dist
-
-      - name: Assemble release payload
+      - name: Qualify release publication and verification
         run: |
-          cp install.sh dist/
-          cp ubs dist/
-          cp ubs-daemon dist/
-          cp scripts/verify.sh dist/
-          cp .claude/hooks/git_safety_guard.py dist/
+          set -euo pipefail
+          python3 test-suite/quality/test_release_candidate.py -v
+          python3 test-suite/quality/test_release_candidate_install.py -v
+          python3 test-suite/shareable/test_release_generation.py -v
+          python3 test-suite/shareable/test_installed_contract.py -v
+          python3 test-suite/quality/test_verified_release.py -v
+
+      - name: Require complete clean self-scan
+        run: python3 scripts/check_self_scan.py
+
+      - name: Assemble complete generation-capable release payload
+        run: |
+          python3 scripts/build_release_candidate.py --version "$VERSION" --output dist
 
       - name: Verify assembled canonical service
         run: |
@@ -130,12 +139,6 @@ jobs:
             test "$?" -eq 2
           fi
 
-      - name: Generate checksums
-        working-directory: dist
-        run: |
-          # Hash the assembled payload with the flat names used by its consumers.
-          sha256sum install.sh ubs ubs-daemon verify.sh git_safety_guard.py > SHA256SUMS
-
       - name: Sign checksums with minisign
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
@@ -147,6 +150,7 @@ jobs:
           printf "%s" "$MINISIGN_SECRET_KEY" | base64 --decode > "$minisign_key"
           chmod 600 "$minisign_key"
           minisign -S -s "$minisign_key" -m dist/SHA256SUMS -x dist/SHA256SUMS.minisig
+          minisign -Vm dist/SHA256SUMS -p minisign.pub -x dist/SHA256SUMS.minisig
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v4.1.2
@@ -157,7 +161,7 @@ jobs:
         # One Sigstore bundle per asset, next to it as <asset>.sigstore.json.
         # scripts/verify.sh verifies SHA256SUMS.sigstore.json when no minisign
         # key is configured: `cosign verify-blob --bundle SHA256SUMS.sigstore.json
-        #   --certificate-identity-regexp '^https://github.com/${{ github.repository }}/\.github/workflows/release\.yml@refs/tags/v'
+        #   --certificate-identity 'https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/<tag>'
         #   --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS`
         run: |
           for asset in install.sh ubs ubs-daemon SHA256SUMS git_safety_guard.py; do
@@ -396,6 +400,8 @@ jobs:
             dist/install.sh
             dist/ubs
             dist/ubs-daemon
+            dist/verify.sh
+            dist/minisign.pub
             dist/SHA256SUMS
             dist/SHA256SUMS.minisig
             dist/*.sigstore.json

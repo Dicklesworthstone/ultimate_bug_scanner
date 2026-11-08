@@ -10434,6 +10434,45 @@
       }
     },
     {
+      "id": "swift-switch-binding-lifecycle-clean",
+      "description": "A switch with an associated-value binding analyzes (no partial); the invalidated Timer yields no lifecycle leak (#204 A).",
+      "path": "test-suite/swift/clean/switch_binding_lifecycle.swift",
+      "language": "swift",
+      "tags": ["swift", "lifecycle", "regression", "clean"],
+      "args": ["--only=swift"],
+      "expect": {
+        "exit_code": "zero",
+        "totals": { "critical": { "min": 0, "max": 0 }, "warning": { "max": 1 } },
+        "forbid_substrings": ["analysis is incomplete", "swift: partial"]
+      }
+    },
+    {
+      "id": "swift-switch-binding-lifecycle-buggy",
+      "description": "A Timer acquired inside a case-binding arm and never invalidated is reported — the leak flows through the switch binding (#204 A).",
+      "path": "test-suite/swift/buggy/switch_binding_lifecycle.swift",
+      "language": "swift",
+      "tags": ["swift", "lifecycle", "regression", "buggy"],
+      "args": ["--only=swift"],
+      "expect": {
+        "exit_code": "zero",
+        "totals": { "critical": { "min": 0, "max": 0 }, "warning": { "min": 2 } },
+        "forbid_substrings": ["analysis is incomplete", "swift: partial"]
+      }
+    },
+    {
+      "id": "swift-switch-binding-tuple-clean",
+      "description": "Tuple / multi-name associated-value bindings analyze (no partial); the invalidated Timer yields no lifecycle leak (#204 A).",
+      "path": "test-suite/swift/clean/switch_binding_tuple.swift",
+      "language": "swift",
+      "tags": ["swift", "lifecycle", "regression", "clean"],
+      "args": ["--only=swift"],
+      "expect": {
+        "exit_code": "zero",
+        "totals": { "critical": { "min": 0, "max": 0 }, "warning": { "max": 1 } },
+        "forbid_substrings": ["analysis is incomplete", "swift: partial"]
+      }
+    },
+    {
       "id": "csharp-suppression-intervals-markers",
       "description": "A7 GH #91: all ubs:ignore placements (trailing, previous-line, multi-line statement, formatter-relocated, rule-scoped) suppress every finding line in the csharp module.",
       "path": "test-suite/csharp/suppression/suppression_buggy.cs",

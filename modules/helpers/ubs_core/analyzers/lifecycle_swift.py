@@ -215,9 +215,10 @@ class LifecycleParser(SwiftParser):
                 raise ValueError('Swift lifecycle malformed switch arm; analysis is incomplete')
             end = cursor + 1
             while end < limit and part[end].value != ':':
-                if part[end].kind == 'code' and part[end].value in {'let', 'var', 'where', '(', '[', '{', '=', 'is', 'as'}:
+                if part[end].kind == 'code' and part[end].value in {'where', '[', '{', '=', 'is', 'as'}:
                     raise ValueError('Swift lifecycle switch pattern needs binding analysis; analysis is incomplete')
                 end += 1
+            pattern = tuple(part[cursor + 1:end])
             if end == limit or (kind == 'default' and end != cursor + 1):
                 raise ValueError('Swift lifecycle malformed switch label; analysis is incomplete')
             exhaustive |= kind == 'default'
@@ -237,7 +238,7 @@ class LifecycleParser(SwiftParser):
                 if token.kind == 'code' and token.value == 'break' and body_tokens[index + 1].value not in {'\n', ';', '}'}:
                     raise ValueError('Swift lifecycle labeled break needs target analysis; analysis is incomplete')
             body = self.block(body_tokens, owner, scope, depth=depth + 1)
-            arms.append(SwiftStatement('case', (), body))
+            arms.append(SwiftStatement('case', pattern, body))
             cursor = end
         if not arms:
             raise ValueError('Swift lifecycle empty switch; analysis is incomplete')
@@ -625,7 +626,17 @@ class LifecycleEngine:
                     self.release_calls(statement.tokens, state, names, exceptions)
                     next_paths.extend((exceptional, dict(names), deferred, 'throw') for exceptional in exceptions)
                     for arm in statement.extra:
-                        for child, outcome in self.block(arm.body, state, names, depth + 1):
+                        arm_state, arm_names = state.copy(), dict(names)
+                        for index, token in enumerate(arm.tokens):
+                            if token.kind == 'code' and token.value in {'let', 'var'}:
+                                if index + 1 == len(arm.tokens) or not re.fullmatch(IDENT, arm.tokens[index + 1].value):
+                                    raise ValueError('Swift lifecycle switch pattern needs binding analysis; analysis is incomplete')
+                                bound_name = arm.tokens[index + 1].value
+                                key = ('case', statement.tokens[0].start, bound_name)
+                                arm_names[bound_name] = key
+                                arm_state.values[key] = ()
+                                arm_state.constants.pop(key, None)
+                        for child, outcome in self.block(arm.body, arm_state, arm_names, depth + 1):
                             next_paths.append((child, dict(names), deferred, '' if outcome == 'break' else outcome))
                     continue
                 if kind in {'if', 'guard'}:

@@ -10784,6 +10784,83 @@
       }
     },
     {
+      "id": "swift-c2-toplevel-if-arm-buggy",
+      "description": "A request->sink flow inside a top-level #if-wrapped struct method is reported (#204 C2b).",
+      "path": "test-suite/swift/buggy/c2_toplevel_if_arm.swift",
+      "language": "swift",
+      "tags": ["swift", "security", "taint", "regression", "buggy"],
+      "args": ["--only=swift", "--fail-on-warning", "--skip=1,2,3,4,5,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23"],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": { "critical": { "min": 1 } },
+        "require_substrings": ["Request-derived path reaches file read/write/serve sink"]
+      }
+    },
+    {
+      "id": "swift-c2-toplevel-else-arm-buggy",
+      "description": "A request->sink flow inside a top-level #else-wrapped struct method is reported (#204 C2b).",
+      "path": "test-suite/swift/buggy/c2_toplevel_else_arm.swift",
+      "language": "swift",
+      "tags": ["swift", "security", "taint", "regression", "buggy"],
+      "args": ["--only=swift", "--fail-on-warning", "--skip=1,2,3,4,5,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23"],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": { "critical": { "min": 1 } },
+        "require_substrings": ["Request-derived path reaches file read/write/serve sink"]
+      }
+    },
+    {
+      "id": "swift-c2-toplevel-func-buggy",
+      "description": "A request->sink flow inside a top-level #if-wrapped free function is reported (#204 C2b).",
+      "path": "test-suite/swift/buggy/c2_toplevel_func.swift",
+      "language": "swift",
+      "tags": ["swift", "security", "taint", "regression", "buggy"],
+      "args": ["--only=swift", "--fail-on-warning", "--skip=1,2,3,4,5,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23"],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": { "critical": { "min": 1 } },
+        "require_substrings": ["Request-derived path reaches file read/write/serve sink"]
+      }
+    },
+    {
+      "id": "swift-c2-nested-if-buggy",
+      "description": "A request->sink flow inside a nested #if is reported (#204 C2b).",
+      "path": "test-suite/swift/buggy/c2_nested_if.swift",
+      "language": "swift",
+      "tags": ["swift", "security", "taint", "regression", "buggy"],
+      "args": ["--only=swift", "--fail-on-warning", "--skip=1,2,3,4,5,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23"],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": { "critical": { "min": 1 } },
+        "require_substrings": ["Request-derived path reaches file read/write/serve sink"]
+      }
+    },
+    {
+      "id": "swift-c2-unbalanced-if-refuses",
+      "description": "An unterminated top-level #if keeps refusing (fail-closed) (#204 C2b).",
+      "path": "test-suite/swift/buggy/c2_unbalanced_if.swift",
+      "language": "swift",
+      "tags": ["swift", "taint", "regression", "refuses"],
+      "args": ["--only=swift"],
+      "expect": {
+        "exit_code": "nonzero",
+        "require_substrings": ["analysis is incomplete"]
+      }
+    },
+    {
+      "id": "swift-c2-toplevel-clean",
+      "description": "A top-level #if/#else with no request flow is clean (#204 C2b).",
+      "path": "test-suite/swift/clean/c2_toplevel_clean.swift",
+      "language": "swift",
+      "tags": ["swift", "taint", "regression", "clean"],
+      "args": ["--only=swift", "--skip=1,2,3,4,5,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23"],
+      "expect": {
+        "exit_code": "zero",
+        "totals": { "critical": { "max": 0 } },
+        "forbid_substrings": ["Request-derived path reaches file read/write/serve sink", "analysis is incomplete", "swift: partial"]
+      }
+    },
+    {
       "id": "csharp-suppression-intervals-markers",
       "description": "A7 GH #91: all ubs:ignore placements (trailing, previous-line, multi-line statement, formatter-relocated, rule-scoped) suppress every finding line in the csharp module.",
       "path": "test-suite/csharp/suppression/suppression_buggy.cs",

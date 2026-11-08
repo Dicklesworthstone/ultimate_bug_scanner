@@ -521,28 +521,92 @@ def _refs(fact):
 
 
 def _sql_object_ref(ref):
-    return len(ref) > 2 and ref[2] == 'drizzle-sql'
+    return isinstance(ref, tuple) and len(ref) > 2 and ref[2] == 'drizzle-sql'
+
+
+def _sql_name_ref(ref):
+    return isinstance(ref, tuple) and len(ref) > 2 and ref[2] == 'drizzle-name'
 
 
 def _sql_builtin_ref(ref):
-    return ref[:1] == ('builtin',) and ref[1].startswith('drizzle.')
+    return (isinstance(ref, tuple) and len(ref) > 1 and ref[0] == 'builtin'
+            and isinstance(ref[1], str) and ref[1].startswith('drizzle.'))
 
 
-def _materialize(fact, heap, seen=frozenset(), *, budget=None):
-    """Snapshot reachable taint at a consumption point; cycles are finite."""
+_SQL_FACTORIES = frozenset({'raw', 'empty', 'join', 'fromList', 'identifier'})
+_SQL_PROOF_PREFIX = '__drizzle_sql_call__:'
+_SQL_UNPROVEN = _Trace(('sql-unproven', None, None), ())
+
+
+def _materialize(fact, heap, seen=frozenset(), *, budget=None, array_lengths=None, incomplete=None):
+    """Snapshot taint using the current SQL chunks, including borrowed arrays.
+
+    Drizzle binds scalar chunks when it renders them. The same scalar remains
+    ordinary taint when consumed outside SQL; raw and opaque SQL provenance
+    must survive either route. Track the rendering context with each visited
+    reference so sharing does not collapse these alternatives.
+    """
     result = frozenset()
-    pending, visited = [fact], set(seen)
+    pending, visited, active = [('fact', fact, '', False)], set(), set(seen)
+    array_lengths = {} if array_lengths is None else array_lengths
+
+    def unsupported(reason):
+        if incomplete is not None:
+            incomplete.add(reason)
+
     while pending:
-        current = pending.pop()
-        if budget is not None:
-            budget.spend(1 + len(current) + len(_refs(current)))
-        result = _join(result, frozenset(current))
-        for ref in _refs(current) - visited:
-            visited.add(ref)
-            slots = heap.get(ref, {})
+        action, current, context, opaque = pending.pop()
+        if action == 'exit':
+            active.remove(current)
+            continue
+        if action == 'fact':
             if budget is not None:
-                budget.spend(1 + len(slots))
-            pending.extend(slots.values())
+                budget.spend(1 + len(current) + len(_refs(current)))
+            scalar = frozenset(current)
+            result = _join(result, _sql_transfer(scalar, 'opaque' if opaque else 'bound' if context else ''))
+            pending.extend(('ref', ref, context, opaque) for ref in _refs(current))
+            continue
+        ref = current
+        if ref in active:
+            if context:
+                unsupported('Drizzle SQL chunk cycle requires unsupported rendering semantics')
+            continue
+        key = (ref, context, opaque)
+        if key in visited:
+            continue
+        visited.add(key)
+        active.add(ref)
+        pending.append(('exit', ref, context, opaque))
+        slots = heap.get(ref, {})
+        if budget is not None:
+            budget.spend(1 + len(slots))
+        if _sql_object_ref(ref):
+            chunks = slots.get('queryChunks', _ABSENT)
+            if not _refs(chunks) or frozenset(chunks) or getattr(chunks, 'absent', False):
+                unsupported('Drizzle SQL rendering requires known query chunk lists')
+            pending.append(('fact', chunks, 'list', opaque))
+            pending.extend(('fact', value, '', True) for name, value in slots.items() if name != 'queryChunks')
+        elif _sql_name_ref(ref):
+            # A Name's escaping depends on the selected dialect. Only literal
+            # strings are proven at construction; retain source-bearing values.
+            pending.extend(('fact', value, '', True) for value in slots.values())
+        elif context and ref in array_lengths:
+            length = array_lengths[ref]
+            protocol = 'map' if context == 'list' else 'entries'
+            prototype = heap.get(('builtin', 'Array.prototype'), {})
+            if protocol in slots or protocol in prototype or None in prototype:
+                unsupported('Drizzle SQL chunk array uses an unsupported rendering protocol')
+            if length is None and not (isinstance(ref, tuple) and len(ref) > 2 and ref[2] == 'drizzle-chunks'):
+                unsupported('Drizzle SQL chunk array has an unknown extent')
+            for name, value in slots.items():
+                numeric = (isinstance(name, str) and len(name) <= 10
+                           and re.fullmatch(r'0|[1-9][0-9]*', name) and int(name) < 4294967295)
+                if name is None or (numeric and (length is None or int(name) < length)):
+                    pending.append(('fact', value, 'chunk', opaque))
+        else:
+            if context:
+                unsupported('Drizzle SQL chunk requires unsupported wrapper semantics')
+            pending.extend(('fact', value, '', opaque or bool(context)) for value in slots.values())
     return result
 
 
@@ -1300,10 +1364,30 @@ class _Flow:
 
     def effect(self, start, label, fact, state=None):
         if state is not None:
-            fact = _materialize(fact, state.heap, budget=self.engine.budget)
-        if fact:
+            fact = self.materialize(fact, state)
+        if fact or label.startswith(_SQL_PROOF_PREFIX):
             key = (start, label)
             self.effects[key] = _join(self.effects.get(key, frozenset()), fact)
+
+    def materialize(self, fact, state):
+        return _materialize(fact, state.heap, budget=self.engine.budget,
+                            array_lengths=state.array_lengths, incomplete=self.incomplete)
+
+    def sql_call_proof(self, start, end, role, value, state):
+        """Optional companion-detector evidence, carried by normal summaries.
+
+        A clean context must not erase an unknown callee or value seen at the
+        same source span in another context. These private observations never
+        become user findings; they certify exact calls only after convergence.
+        """
+        if not self.engine.collect_sql_proofs or self.rule != 'js.taint.sql':
+            return
+        proven = (role in {'factory', 'execute'} and value is not None
+                  and _refs(value) and not frozenset(value) and not getattr(value, 'absent', False)
+                  and all(_sql_object_ref(ref) or (role == 'factory' and _sql_name_ref(ref))
+                          for ref in _refs(value)))
+        fact = self.materialize(value, state) if proven else frozenset({_SQL_UNPROVEN})
+        self.effect(start, f'{_SQL_PROOF_PREFIX}{end}:{role}', fact)
 
     def reference(self, name, state):
         if name in state:
@@ -1435,10 +1519,10 @@ class _Flow:
         for ref in _refs(fact):
             slots = state.heap.get(ref, {})
             if self.rule == 'js.taint.sql':
-                if _sql_object_ref(ref):
+                if _sql_object_ref(ref) or _sql_name_ref(ref):
                     self.incomplete.add('Drizzle SQL object property access requires unsupported wrapper semantics')
                 elif _sql_builtin_ref(ref) and key not in slots and None not in slots:
-                    native = ('drizzle.' + key if ref == ('builtin', 'drizzle.sql') and key in {'raw', 'empty'} else
+                    native = ('drizzle.' + key if ref == ('builtin', 'drizzle.sql') and key in _SQL_FACTORIES else
                               'drizzle.SQL.prototype' if ref == ('builtin', 'drizzle.SQL') and key == 'prototype' else None)
                     if native is not None:
                         target = ('builtin', native)
@@ -1499,7 +1583,8 @@ class _Flow:
 
     def write_property(self, fact, key, value, state, *, initialize_export=False, optional=False):
         refs = _refs(fact)
-        if self.rule == 'js.taint.sql' and any(_sql_object_ref(ref) or _sql_builtin_ref(ref) for ref in refs):
+        if self.rule == 'js.taint.sql' and any(
+                _sql_object_ref(ref) or _sql_name_ref(ref) or _sql_builtin_ref(ref) for ref in refs):
             self.incomplete.add('Drizzle SQL object or provider property mutation requires unsupported wrapper semantics')
         strong = (len(refs) == 1 and key is not None and not frozenset(fact)
                   and not refs & state.weak_refs)
@@ -1540,7 +1625,7 @@ class _Flow:
                         # A computed property write can replace a method.
                         # Element spreads use the wildcard slot directly and
                         # must not be mistaken for prototype/method writes.
-                        for method in ('push', 'unshift', 'pop', 'shift', 'reverse', 'join'):
+                        for method in ('push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'entries', 'map'):
                             slots[method] = _join(slots.get(method, _ABSENT), present)
                 elif self.array_index(key) is not None and length is not None:
                     state.array_lengths[ref] = max(length, int(key) + 1)
@@ -1856,7 +1941,7 @@ class _Flow:
                         # not a materialized scalar that loses their aliases.
                         values = (self.property(spread, None, state)
                                   if refs and all(parent in state.array_lengths for parent in refs)
-                                  else _materialize(spread, state.heap, budget=self.engine.budget))
+                                  else self.materialize(spread, state))
                         slots[None] = _join(slots.get(None, frozenset()), values)
                 else:
                     refs = _refs(spread)
@@ -1921,25 +2006,130 @@ class _Flow:
                 continue
             seen.add(ref)
             self.engine.budget.spend()
-            if _sql_object_ref(ref) or _sql_builtin_ref(ref):
+            if _sql_object_ref(ref) or _sql_name_ref(ref) or _sql_builtin_ref(ref):
                 return True
             for value in state.heap.get(ref, {}).values():
                 pending.extend(_refs(value) - seen)
         return False
 
-    def sql_object(self, location, chunks, state):
+    def invalidate_sql_arrays(self, fact, state):
+        """Retain uncertainty on arrays that unknown code can mutate later.
+
+        An empty array can become a borrowed SQL chunk list after it escapes.
+        Record the uncertainty on that identity, rather than marking an old
+        join copy incomplete when only its former source array changes.
+        """
+        if self.rule != 'js.taint.sql' or not self.engine.drizzle_imports:
+            return
+        pending, seen = list(_refs(fact)), set()
+        while pending:
+            ref = pending.pop()
+            if ref in seen:
+                continue
+            seen.add(ref)
+            slots = state.heap.get(ref, {})
+            self.engine.budget.spend(1 + len(slots))
+            for value in slots.values():
+                pending.extend(_refs(value) - seen)
+            if ref in state.array_lengths:
+                self.write_property(_Fact(refs=(ref,)), None, frozenset(), state)
+
+    def sql_object(self, location, chunks, state, *, borrowed=None):
         """Allocate SQL and its chunk list with the ordinary finite heap rules."""
         ref, array = (self.scope, location, 'drizzle-sql'), (self.scope, location, 'drizzle-chunks')
-        slots = {str(index): value for index, value in enumerate(chunks)}
-        previous = state.heap.get(array)
+        if borrowed is None:
+            slots = {str(index): value for index, value in enumerate(chunks)}
+            previous = state.heap.get(array)
+            if previous is not None:
+                state.weak_refs.update((ref, array))
+                slots = {key: _join(previous.get(key, _ABSENT), slots.get(key, _ABSENT))
+                         for key in previous.keys() | slots.keys()}
+            state.heap[array] = slots
+            state.array_lengths[array] = len(chunks) if previous is None else None
+            borrowed = _Fact(refs=(array,))
+        previous = state.heap.get(ref, {}).get('queryChunks')
         if previous is not None:
-            state.weak_refs.update((ref, array))
-            slots = {key: _join(previous.get(key, _ABSENT), slots.get(key, _ABSENT))
-                     for key in previous.keys() | slots.keys()}
-        state.heap[array] = slots
-        state.array_lengths[array] = len(chunks) if previous is None else None
-        state.heap.setdefault(ref, {})['queryChunks'] = _Fact(refs=(array,))
+            state.weak_refs.add(ref)
+            borrowed = _join(previous, borrowed)
+        state.heap.setdefault(ref, {})['queryChunks'] = borrowed
         state.heap.setdefault(('builtin', 'drizzle.SQL.prototype'), {})
+        return _Fact(refs=(ref,))
+
+    def sql_array_input(self, fact, state, protocol):
+        """Prove the standard array operation without invoking arbitrary code."""
+        refs = _refs(fact)
+        known = bool(refs) and not frozenset(fact) and not getattr(fact, 'absent', False)
+        known = known and all(ref in state.array_lengths for ref in refs)
+        if not known:
+            self.incomplete.add('Drizzle SQL composition requires a known chunk array')
+            return False
+        if not self.sql_array_protocol(fact, state, protocol):
+            self.incomplete.add('Drizzle SQL composition uses an unsupported array protocol')
+        if any(state.array_lengths[ref] is None for ref in refs):
+            self.incomplete.add('Drizzle SQL chunk array has an unknown extent')
+        return True
+
+    @staticmethod
+    def sql_array_protocol(fact, state, protocol):
+        prototype = state.heap.get(('builtin', 'Array.prototype'), {})
+        return (protocol not in prototype and None not in prototype
+                and all(protocol not in state.heap.get(ref, {}) for ref in _refs(fact)))
+
+    def sql_composition(self, method, values, uncertain, state, location):
+        """Copy join's outer entries; retain fromList's original mutable list."""
+        first = _join(*values) if uncertain == 0 else values[0] if values else _ABSENT
+        known = self.sql_array_input(first, state, 'entries' if method == 'join' else None)
+        if uncertain == 0 or (method == 'join' and uncertain == 1):
+            self.incomplete.add('Drizzle SQL composition has uncertain argument positions')
+        if method == 'fromList':
+            return self.sql_object(location, [], state,
+                                   borrowed=first if known else _sql_transfer(first, 'opaque'))
+        if not self.sql_array_protocol(frozenset(), state, 'push'):
+            self.incomplete.add('Drizzle SQL join uses an unsupported chunk push protocol')
+
+        separator = (_join(*values[uncertain:]) if uncertain is not None and uncertain < 2 else
+                     values[1] if len(values) > 1 else frozenset())
+        refs = _refs(first)
+        lengths = [state.array_lengths.get(ref) for ref in refs]
+        if known and all(length is not None for length in lengths):
+            size = max(lengths)
+            self.engine.budget.spend(size)
+            chunks = []
+            for index in range(size):
+                if index:
+                    chunks.append(separator)
+                chunks.append(self.property(first, str(index), state))
+        else:
+            # Unknown extent still retains every established raw chunk. The
+            # original outer array must not remain reachable from join's copy.
+            chunks = [_sql_transfer(frozenset(first), 'opaque')]
+            for ref in refs:
+                if ref in state.array_lengths:
+                    chunks.extend(value for key, value in state.heap.get(ref, {}).items()
+                                  if key is None or self.array_index(key) is not None)
+                else:
+                    chunks.append(_sql_transfer(self.materialize(_Fact(refs=(ref,)), state), 'opaque'))
+            chunks.append(separator)
+        return self.sql_object(location, chunks, state)
+
+    def sql_literal_argument(self, arguments, values, uncertain):
+        first = _join(*values) if uncertain == 0 else values[0] if values else _ABSENT
+        literal = (self.engine.text[slice(*arguments[0])].strip() if arguments else '')
+        proven = (uncertain != 0 and not first and re.fullmatch(
+            r''''(?:\\[\s\S]|[^'\\])*'|"(?:\\[\s\S]|[^"\\])*"|`(?:\\[\s\S]|[^`$\\])*`''', literal))
+        return bool(proven)
+
+    def sql_identifier(self, arguments, values, uncertain, state, location):
+        first = _join(*values) if uncertain == 0 else values[0] if values else _ABSENT
+        if not self.sql_literal_argument(arguments, values, uncertain):
+            self.incomplete.add('Drizzle SQL identifier escaping requires a proven literal string')
+        ref = (self.scope, location, 'drizzle-name')
+        previous = state.heap.get(ref)
+        value = _sql_transfer(first, 'opaque')
+        if previous is not None:
+            state.weak_refs.add(ref)
+            value = _join(previous.get('value', _ABSENT), value)
+        state.heap[ref] = {'value': value}
         return _Fact(refs=(ref,))
 
     def sql_chunk_arrays(self, fact, state):
@@ -1970,7 +2160,7 @@ class _Flow:
                 target = self.reference(name, state)
                 if not frozenset(target) and len(_refs(target)) == 1:
                     ref = next(iter(_refs(target)))
-                    if ref in {('builtin', 'drizzle.raw'), ('builtin', 'drizzle.empty')}:
+                    if _sql_builtin_ref(ref) and ref[1].split('.')[-1] in _SQL_FACTORIES:
                         return 'sql-factory', target, ref[1].split('.')[-1]
                     if ref == ('builtin', 'drizzle.sql'):
                         return 'sql-tag', target, 'sql'
@@ -1985,10 +2175,10 @@ class _Flow:
         if self.rule == 'js.taint.sql' and refs:
             if refs == {('builtin', 'drizzle.sql')} and not frozenset(receiver):
                 slots = state.heap.get(('builtin', 'drizzle.sql'), {})
-                if method in {'raw', 'empty'} and method not in slots and None not in slots:
+                if method in _SQL_FACTORIES and method not in slots and None not in slots:
                     return 'sql-factory', receiver, method
                 return 'sql-unknown', receiver, method
-            if any(_sql_object_ref(ref) for ref in refs):
+            if any(_sql_object_ref(ref) or _sql_name_ref(ref) for ref in refs):
                 return self.sql_method(receiver, method, state)
         object_native = (refs == {('builtin', 'Object')} and not frozenset(receiver)
                          and method not in state.heap.get(('builtin', 'Object'), {})
@@ -2017,11 +2207,19 @@ class _Flow:
         if kind == 'sql-factory':
             if method == 'empty':
                 return self.sql_object(location, [], state)
+            if method in {'join', 'fromList'}:
+                return self.sql_composition(method, values, uncertain, state, location)
+            if method == 'identifier':
+                return self.sql_identifier(arguments, values, uncertain, state, location)
             raw_values = values if uncertain == 0 else values[:1]
             if any(_refs(value) for value in raw_values):
                 self.incomplete.add('Drizzle SQL raw object conversion requires unsupported wrapper semantics')
-            raw = _materialize(_join(*raw_values), state.heap,
-                               budget=self.engine.budget)
+            raw = self.materialize(_join(*raw_values), state)
+            if self.engine.collect_sql_proofs and not self.sql_literal_argument(arguments, values, uncertain):
+                # The companion rule recognizes additional request sources.
+                # Retained raw text needs positive literal proof, never merely
+                # an empty trace set from this engine's source vocabulary.
+                raw = _join(raw, frozenset({_SQL_UNPROVEN}))
             return self.sql_object(location, [_sql_transfer(raw, 'opaque')], state)
         if kind == 'sql-unknown':
             self.incomplete.add('Drizzle SQL method or factory call requires unsupported wrapper semantics')
@@ -2029,11 +2227,13 @@ class _Flow:
         if kind == 'sql-append':
             target = self.sql_chunk_arrays(receiver, state)
             donor = self.sql_chunk_arrays(values[0], state) if values and uncertain is None else None
+            if target is not None and not self.sql_array_protocol(target, state, 'push'):
+                self.incomplete.add('Drizzle SQL append uses an unsupported chunk push protocol')
+                donor = None
             if target is None or donor is None:
                 self.incomplete.add('Drizzle SQL append requires known query chunk lists')
                 if target is not None:
-                    possible = _sql_transfer(_materialize(_join(*values), state.heap,
-                                             budget=self.engine.budget), 'opaque')
+                    possible = _sql_transfer(self.materialize(_join(*values), state), 'opaque')
                     self.mutation_call(('array', target, 'push'), [], [], state,
                                        ([(possible, False)], 0, set(), {}))
                 return receiver
@@ -2084,6 +2284,8 @@ class _Flow:
                 not getattr(state.heap[ref]['value'], 'absent', False) for ref in refs)
             # Accessors are outside this lexical heap model. Their lack of a
             # value field is not evidence that an old property became clean.
+            if not definite:
+                self.invalidate_sql_arrays(values[0], state)
             self.write_property(values[0], key, self.property(descriptor, 'value', state),
                                 state, optional=not definite)
             return values[0]
@@ -2099,7 +2301,7 @@ class _Flow:
             if method == 'join':
                 elements = (_join(*numeric.values(), slots.get(None, frozenset()))
                             if length != 0 else frozenset())
-                returned = _join(returned, _materialize(elements, state.heap, budget=self.engine.budget))
+                returned = _join(returned, self.materialize(elements, state))
                 if length is None or length > 1:
                     returned = _join(returned, *values[:1] if uncertain is None else values)
             elif method in {'push', 'unshift'}:
@@ -2163,7 +2365,7 @@ class _Flow:
             values, prepared = self.evaluate_arguments(ranges, state)
             changed = self.mutation_call(native, ranges, values, state, prepared, location=cursor)
             fact = changed if changed is not None else _sql_transfer(
-                _materialize(_join(fact, *values), state.heap, budget=self.engine.budget), 'opaque')
+                self.materialize(_join(fact, *values), state), 'opaque')
             cursor = closing + 1
         return fact, cursor
 
@@ -2189,7 +2391,7 @@ class _Flow:
         if access and access[2] == right and all(key is not None and computed is None for key, computed in access[1]):
             name = '.'.join((access[0], *(key for key, _computed in access[1])))
         else:
-            optional = re.fullmatch(r'''([A-Za-z_$][\w$]*)\s*\?\.\s*\[\s*(['"])(raw|empty)\2\s*\]''', text[left:right])
+            optional = re.fullmatch(r'''([A-Za-z_$][\w$]*)\s*\?\.\s*\[\s*(['"])(raw|empty|join|fromList|identifier)\2\s*\]''', text[left:right])
             if optional:
                 name = optional.group(1) + '.' + optional.group(3)
         native = self.native_target(name, state) if name is not None else None
@@ -2199,7 +2401,8 @@ class _Flow:
                   if code[left:right].strip()]
         values, prepared = self.evaluate_arguments(ranges, state)
         result = self.mutation_call(native, ranges, values, state, prepared, location=start)
-        self.throws.append((_materialize(_join(*values), state.heap, budget=self.engine.budget), state.copy()))
+        self.sql_call_proof(start, end, 'factory', result, state)
+        self.throws.append((self.materialize(_join(*values), state), state.copy()))
         return result
 
     def operand_snapshot(self, start, end, state):
@@ -2217,7 +2420,7 @@ class _Flow:
             if parsed:
                 facts.append(self.read_access(parsed, state, evaluate_keys=False))
                 consumed = parsed[2] - start
-        return _materialize(_join(*facts), state.heap, budget=self.engine.budget)
+        return self.materialize(_join(*facts), state)
 
     def apply_writes(self, writes, callee, bound, state, incoming):
         # Substitute against one pre-call snapshot. Reading a preceding update
@@ -2630,7 +2833,7 @@ class _Flow:
                 if evaluated is None:
                     return old
             else:
-                old = _materialize(old, state.heap, budget=self.engine.budget)
+                old = self.materialize(old, state)
                 evaluated = state
                 fact = self.value(rhs, end, evaluated)
             if assignment.group(1) == '+=':
@@ -2760,6 +2963,7 @@ class _Flow:
                               and len(arguments) == 1 and self.drizzle_tag(*arguments[0], state))
             argument_facts, prepared = self.evaluate_arguments(
                 arguments, state, immediate_sql_tags=(bound_argument or drizzle and immediate_sql_tag))
+            proof_role, proof_value = 'other', None
             if isinstance(callee, _Scope) and callee.generator:
                 # A generator call creates an iterator; it does not execute
                 # the body. Iterator advancement is outside this call model.
@@ -2842,6 +3046,8 @@ class _Flow:
             else:
                 mutation = self.mutation_call(native, arguments, argument_facts, state, prepared,
                                               location=match_start)
+                if native is not None and native[0] == 'sql-factory':
+                    proof_role, proof_value = 'factory', mutation
                 call_fact = _join(*argument_facts)
                 if '.' in callee_name:
                     call_fact = _join(call_fact, self.reference(receiver, state))
@@ -2858,6 +3064,8 @@ class _Flow:
                     if bound_argument:
                         selected = [_sql_transfer(fact, 'bound') for fact in selected]
                     self.effect(match_start, sink[1], _join(*selected), state)
+                    if self.rule == 'js.taint.sql':
+                        proof_role, proof_value = 'execute', _join(*selected)
                 if self.rule == 'js.taint.sql' and self.engine.drizzle_imports:
                     if tag_call:
                         # Scalar request values become bound parameters only
@@ -2869,7 +3077,7 @@ class _Flow:
                         # Only directly nested tags inherit immediate binding.
                         chunks = []
                         for fact in argument_facts:
-                            if _refs(fact) and all(_sql_object_ref(ref) for ref in _refs(fact)):
+                            if _refs(fact) and all(_sql_object_ref(ref) or _sql_name_ref(ref) for ref in _refs(fact)):
                                 # A branch may supply either an SQL object or
                                 # a scalar. Bind only its scalar alternative;
                                 # nested SQL chunks remain live references.
@@ -2879,15 +3087,22 @@ class _Flow:
                                 if self.sql_reachable(fact, state):
                                     self.incomplete.add('Drizzle SQL interpolation requires unsupported wrapper semantics')
                                 mode = 'bound' if immediate_sql_tag and not _refs(fact) else 'opaque'
-                                chunks.append(_sql_transfer(_materialize(fact, state.heap,
-                                              budget=self.engine.budget), mode))
+                                chunk = self.materialize(fact, state)
+                                if self.engine.collect_sql_proofs and mode == 'opaque':
+                                    chunk = _join(chunk, frozenset({_SQL_UNPROVEN}))
+                                chunks.append(_sql_transfer(chunk, mode))
                         call_fact = mutation = self.sql_object(match_start, chunks, state)
                     else:
                         if ((native is None or native[0] == 'sql-tag') and not sink
                                 and self.sql_reachable(_join(call_fact, self.reference(callee_name.split('.')[0], state)), state)):
                             self.incomplete.add('Drizzle SQL object escaped to an unknown call')
+                        if (native is None or native[0] == 'sql-tag') and not sink:
+                            self.invalidate_sql_arrays(call_fact, state)
+                            if self.engine.collect_sql_proofs:
+                                self.incomplete.add('Drizzle SQL proof requires known call effects')
+                                call_fact = _join(call_fact, frozenset({_SQL_UNPROVEN}))
                         call_fact = _sql_transfer(
-                            _materialize(call_fact, state.heap, budget=self.engine.budget), 'opaque')
+                            self.materialize(call_fact, state), 'opaque')
                 regex = SANITIZERS_BY_RULE.get(self.rule)
                 following = code[closing + 1:end].lstrip()
                 if regex and regex.match(candidate) and not following.startswith(('.', '[')):
@@ -2908,14 +3123,14 @@ class _Flow:
                     call_fact = frozenset()
                 # Unknown calls may transform or serialize their arguments;
                 # their return is not proof of object identity.
-                call_fact = _materialize(call_fact, state.heap, budget=self.engine.budget)
+                call_fact = self.materialize(call_fact, state)
                 if mutation is not None:
                     call_fact = mutation
                     sole_local_call = (code[start:match_start].strip() in {'', 'await'} and closing + 1 == end)
                 # Unknown code may throw. Record the invocation-time store,
                 # not every unrelated statement prefix in a try block.
-                self.throws.append((_materialize(_join(*argument_facts), state.heap,
-                                                 budget=self.engine.budget), state.copy()))
+                self.throws.append((self.materialize(_join(*argument_facts), state), state.copy()))
+            self.sql_call_proof(match_start, closing + 1, proof_role, proof_value, state)
             call_fact, postfix_end = self.sql_postfix(call_fact, closing + 1, end, state)
             selectors, call_end = self.selectors(postfix_end, end, stop_at_call=True)
             for key, computed in selectors:
@@ -2964,14 +3179,17 @@ class _Flow:
             # require a real call/tag opening in the original source.
             # Inspect executable code, retaining this provenance across an
             # assignment before a later, otherwise-bound SQL interpolation.
-            if (any(remainder[match.end() - 1] == '(' for match in opaque_calls)
-                    and self.sql_reachable(result, state)):
-                self.incomplete.add('Drizzle SQL object escaped to an unsupported call expression')
-            result = _sql_transfer(_materialize(result, state.heap, budget=self.engine.budget), 'opaque')
+            if any(remainder[match.end() - 1] == '(' for match in opaque_calls):
+                if self.engine.collect_sql_proofs:
+                    self.incomplete.add('Drizzle SQL proof requires supported call dispatch')
+                if self.sql_reachable(result, state):
+                    self.incomplete.add('Drizzle SQL object escaped to an unsupported call expression')
+                self.invalidate_sql_arrays(result, state)
+            result = _sql_transfer(self.materialize(result, state), 'opaque')
         for location, expr_start, rule, label in self.engine.write_sinks:
             if rule == self.rule and start <= location < end:
                 self.effect(location, label, self.value(expr_start, end, state), state)
-        return result if sole_local_call else _materialize(result, state.heap, budget=self.engine.budget)
+        return result if sole_local_call else self.materialize(result, state)
 
     def expression(self, start, end, state):
         text = self.engine.text
@@ -3007,7 +3225,7 @@ class _Flow:
                 self.value(offset, end, state)
                 return state
             name = compound.group(1)
-            old = _materialize(self.reference(name, state), state.heap, budget=self.engine.budget)
+            old = self.materialize(self.reference(name, state), state)
             fact = self.value(offset + compound.start(3), end, state)
             self.assign(name, _join(old, fact), state, start)
             return state
@@ -3313,6 +3531,8 @@ class _Flow:
 class _Engine:
     def __init__(self, text, code, graph=None, modules=()):
         self.graph = graph
+        self.collect_sql_proofs = False
+        self.sql_proofs = {}
         self.source_free = False
         self.module_roots = {}
         self.drizzle_imports = set()
@@ -4245,18 +4465,18 @@ class _Engine:
         exits = [*(exit_state for _, exit_state in flow.returns), *([final] if final is not None else [])]
         joined = _join_states(*exits)
         writes = {} if joined is None else {key: value for key, value in joined.cells.items() if key[0] is not scope}
-        heap = (joined if joined is not None else state).heap
+        final_store = joined if joined is not None else state
         thrown = _join_states(*(exit_state for _, exit_state in flow.throws))
         throw_value = (None if thrown is None else
-                       _join(*(_materialize(value, store.heap, budget=self.budget)
+                       _join(*(flow.materialize(value, store)
                                for value, store in flow.throws)))
         throw_writes = ({} if thrown is None else
-                        {key: _materialize(value, thrown.heap, budget=self.budget)
+                        {key: flow.materialize(value, thrown)
                          for key, value in thrown.cells.items()
                          if key[0] is not scope})
-        return (_join(*(_materialize(value, store.heap, budget=self.budget)
+        return (_join(*(flow.materialize(value, store)
                        for value, store in flow.returns)), flow.effects,
-                {key: _materialize(value, heap, budget=self.budget) for key, value in writes.items()},
+                {key: flow.materialize(value, final_store) for key, value in writes.items()},
                 joined is not None, throw_value, throw_writes, frozenset(flow.incomplete))
 
     def concrete(self, fact, rule, visited=frozenset()):
@@ -4270,7 +4490,8 @@ class _Engine:
                 owner = key[0]
                 state = self.final_states.get((owner, rule))
                 if state is not None:
-                    captured = _materialize(_cell_value(key, state), state.heap, budget=self.budget)
+                    captured = _materialize(_cell_value(key, state), state.heap, budget=self.budget,
+                                            array_lengths=state.array_lengths)
                     captured = _sql_transfer(captured, trace.sql_state)
                     result = _join(result, self.concrete(captured, rule, visited | {trace.origin}))
             elif trace.origin[0] == 'parameter':
@@ -4330,6 +4551,7 @@ class _Engine:
     def rule_findings(self, rule):
         """Publish a rule's evidence only after its fixed point is resolved."""
         found = {}
+        self.sql_proofs = {}
         while self.pending:
             self.budget.spend()
             task = self.pending.popleft()
@@ -4378,6 +4600,11 @@ class _Engine:
                 # already publish the effects of their separate contexts.
                 continue
             for (location, label), fact in self.summaries[(scope, rule)][1].items():
+                if label.startswith(_SQL_PROOF_PREFIX):
+                    end, role = label[len(_SQL_PROOF_PREFIX):].split(':')
+                    key = (location, int(end), role)
+                    self.sql_proofs[key] = _join(self.sql_proofs.get(key, frozenset()), fact)
+                    continue
                 if self.dependents[(scope, rule)]:
                     # Known call sites already instantiated captures at
                     # their program points. Rebinding them to end-of-scope
@@ -4491,6 +4718,47 @@ def scan_file_findings(path: Path):
     """Single selected file, using the same module semantics as both CLIs."""
     for _path, rule, line, col, path_desc in scan_project_findings([path]):
         yield rule, line, col, path_desc
+
+
+def drizzle_sql_call_proofs(path: Path, text: str):
+    """Return bounded, exact call evidence for the companion lexical SQL rule.
+
+    This is an opt-in single-file proof, not absence-of-findings suppression.
+    Relative helpers outside the selected file, unknown protocols and exhausted
+    budgets cannot certify safety. No proof or heap is cached across scans.
+    """
+    from ubs_core.js_modules import ModuleGraph
+    graph = ModuleGraph([path])
+    source, _code = lexical_views(text)
+    result = []
+    for modules in graph.components():
+        if len(modules) != 1 or modules[0].text != source:
+            return []  # never attach new-file proofs to a stale source snapshot
+        engine = _Engine('', '', graph, modules)
+        try:
+            if engine.source_free or not engine.drizzle_imports:
+                continue
+            engine.collect_sql_proofs = True
+            engine.budget = Budget(engine.work_limit)
+            engine.pending, engine.queued = deque(reversed(engine.scopes)), set(engine.scopes)
+            engine.rule_findings('js.taint.sql')
+            if engine.rule_incomplete:
+                return []
+            grouped = defaultdict(list)
+            for (start, end, role), fact in engine.sql_proofs.items():
+                # Unresolved and opaque alternatives are not a safety proof,
+                # even when they have no concrete request origin in this file.
+                grouped[(start, end)].append((role, all(trace.sql_state == 'bound' for trace in fact)))
+            for (start, end), observations in grouped.items():
+                roles = {role for role, _safe in observations}
+                role = next(iter(roles)) if len(roles) == 1 else 'other'
+                result.append((start, end, role, role != 'other' and all(safe for _role, safe in observations)))
+        except AnalysisLimit:
+            return []
+        finally:
+            for module in modules:
+                module.root = None
+    return result
 
 
 def scan_project_findings(files):

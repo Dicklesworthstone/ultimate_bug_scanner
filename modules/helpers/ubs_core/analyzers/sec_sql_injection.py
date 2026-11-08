@@ -9,7 +9,8 @@ tagged-template suppression. Marker suppression uses shared lexical statement
 ownership and exact rule scopes without erasing annotated source or validation
 facts. The heredoc's os.walk over the project is replaced by iteration over
 ``RunContext.files``;
-per-file match logic is unchanged.
+per-file match logic is retained. Proven Drizzle SQL object calls may additionally
+use the shared bounded engine to distinguish bound chunks from raw SQL text.
 
 Legacy emission: print_finding "critical" / "Interpolated SQL reaches
 execution sink". The legacy title rides in the message so the contract-v2
@@ -19,6 +20,7 @@ js_rules.SUMMARY_MAP).
 from __future__ import annotations
 
 import re
+from bisect import bisect_left, bisect_right
 from pathlib import Path
 from typing import Iterable, Iterator
 
@@ -107,13 +109,20 @@ def strip_line_comments(line: str) -> str:
 
 
 def statement_from(lines: list[str], index: int, max_lines: int = 18) -> str:
+    return statement_window(lines, index, max_lines)[0]
+
+
+def statement_window(lines: list[str], index: int, max_lines: int = 18) -> tuple[str, int]:
+    """Return the legacy statement text and its exclusive physical-line end."""
     parts = []
     paren = brace = bracket = 0
+    end = index
     for offset in range(index, min(len(lines), index + max_lines)):
         current = strip_line_comments(lines[offset]).strip()
         if not current:
             continue
         parts.append(current)
+        end = offset + 1
         paren += current.count('(') - current.count(')')
         brace += current.count('{') - current.count('}')
         bracket += current.count('[') - current.count(']')
@@ -121,7 +130,7 @@ def statement_from(lines: list[str], index: int, max_lines: int = 18) -> str:
             break
         if ';' in current and paren <= 0 and brace <= 0 and bracket <= 0:
             break
-    return ' '.join(parts)
+    return ' '.join(parts), end
 
 
 def split_destructure_parts(blob: str) -> list[str]:
@@ -352,18 +361,90 @@ def source_line(lines: list[str], index: int) -> str:
     return ''
 
 
+def proven_drizzle_lines(path: Path, text: str) -> set[int]:
+    """Prove every SQL effect in each complete legacy statement window.
+
+    A genuine raw factory can be an ignored separator or argument inside a
+    proven composition. A nested execution is a separate effect and requires
+    its own proof, including when both calls share a physical source line.
+    """
+    if 'drizzle-orm' not in text:
+        return set()
+    from ubs_core.analyzers.taint_js import drizzle_sql_call_proofs
+    proofs = sorted(drizzle_sql_call_proofs(path, text), key=lambda item: (item[0], -item[1]))
+    if not proofs:
+        return set()
+    source, code = javascript_lexical_views(text)
+    line_starts, offset = [], 0
+    for line in text.splitlines(keepends=True):
+        line_starts.append(offset)
+        offset += len(line)
+    observations, unproven_executions, stack, cursor = [], [], [], 0
+    for match in sql_sink_re.finditer(source):
+        if code[match.start():match.end() - 1] != source[match.start():match.end() - 1]:
+            continue
+        while cursor < len(proofs) and proofs[cursor][0] <= match.start():
+            proof = proofs[cursor]
+            cursor += 1
+            while stack and stack[-1][1] <= proof[0]:
+                stack.pop()
+            if stack and proof[1] > stack[-1][1]:
+                return set()  # intersecting, non-nested spans cannot certify ownership
+            stack.append(proof)
+        while stack and stack[-1][1] <= match.start():
+            stack.pop()
+        certificate = None
+        if stack and match.end() <= stack[-1][1]:
+            _start, _end, role, own_safe = stack[-1]
+            if role == 'execute':
+                if own_safe:
+                    certificate = stack[-1]
+                else:
+                    unproven_executions.append(match.start())
+            elif role == 'factory':
+                certificate = next((proof for proof in reversed(stack) if proof[3]), None)
+            else:
+                unproven_executions.append(match.start())
+        else:
+            unproven_executions.append(match.start())
+        line = bisect_right(line_starts, match.start())
+        observations.append((line, certificate))
+    statuses = {}
+    for line, certificate in observations:
+        # Query-value safety does not excuse execution effects inside an
+        # ignored argument or chunk, including effects on another source line.
+        safe = certificate is not None and (
+            bisect_left(unproven_executions, certificate[1])
+            == bisect_left(unproven_executions, certificate[0]))
+        statuses[line] = statuses.get(line, True) and safe
+    lines = text.splitlines()
+    result = set()
+    for line, safe in statuses.items():
+        if not safe:
+            continue
+        _statement, end = statement_window(lines, line - 1)
+        # The legacy detector can attribute an ASI-separated sibling call to
+        # the preceding line. Certify that exact bounded window, not just the
+        # call that supplied its SQL keyword or its opening parenthesis.
+        if all(statuses.get(number, True) for number in range(line, end + 1)):
+            result.add(line)
+    return result
+
+
 def scan_file_findings(path: Path) -> Iterator[tuple[int, str, str]]:
     """Yield (line_number, sample_text, reason) per detection; heredoc-identical."""
     try:
         text = path.read_text(encoding='utf-8', errors='ignore')
     except OSError:
         return
+    original_text = text
     lines = text.splitlines()
     source_index = SourceSuppressions('javascript').index(path, text)
     text = '\n'.join(lines)
     if not (sql_sink_re.search(text) or sql_keyword_re.search(text)):
         return
     drizzle_bindings = permits_drizzle_bindings(text)
+    drizzle_proofs = None
     tainted: set[str] = set()
     tainted_sql: set[str] = set()
     seen: set[tuple[str, int, str]] = set()
@@ -420,6 +501,10 @@ def scan_file_findings(path: Path) -> Iterator[tuple[int, str, str]]:
             or (has_inline_sql and dynamic and untrusted)
             or (unsafe and (untrusted or sql_var_refs or (has_inline_sql and dynamic)))
         ):
+            continue
+        if drizzle_proofs is None:
+            drizzle_proofs = proven_drizzle_lines(path, original_text)
+        if idx + 1 in drizzle_proofs:
             continue
 
         reason = 'request-derived SQL reaches raw execution'

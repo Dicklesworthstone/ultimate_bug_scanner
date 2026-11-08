@@ -10,6 +10,15 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Follow Drizzle `sql.join()` and `sql.fromList()` through copied outer chunks,
+  borrowed mutable arrays, nested SQL references and selected helpers/modules.
+  Preserve scalar binding, live separators, cleanup and argument evaluation
+  order; support literal identifiers while keeping unknown dialect-dependent
+  names, accessors, cycles and escaped arrays explicitly incomplete. Share
+  opt-in exact call/value proofs with the lexical SQL detector so safe
+  compositions lose false positives without hiding nested or independent raw
+  execution. Add paired native, companion-detector and public JSON/SARIF cases.
+
 - Analyze attribute-style ingress lists on ordinary and default AWS security
   groups in native HCL and generated Terraform JSON. Resolve selected local
   rule objects using the provider's required-field, null and primitive-conversion

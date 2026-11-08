@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.5.52-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.5.53-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -875,7 +875,7 @@ Unlike traditional linters that fight AI-generated code, this scanner **embraces
 ✅ Actionable output (tells you WHAT's wrong and HOW to fix it)
 ✅ Fails fast in CI (catch bugs before they merge)
 ✅ React Hooks dependency analysis that spots missing deps, unstable objects, and stale closures
-✅ Lightweight taint analysis that traces req.body/window.location/localStorage → innerHTML/res.send/eval/exec/db.query and flags flows without DOMPurify/escapeHtml/parameterized SQL. Directly executed, imported Drizzle `sql` templates recognize bound values, including nested templates. Genuine SQL objects retain their identities through aliases and selected helpers: `sql.empty()`, `sql.raw()`, and `append()` preserve raw SQL provenance, copied chunk entries, and live nested query references. Stored source-bearing templates remain conservative; unknown mutation protocols, escaped query objects, and non-scalar raw conversion produce explicit incomplete results while retaining proven findings.
+✅ Lightweight taint analysis that traces req.body/window.location/localStorage → innerHTML/res.send/eval/exec/db.query and flags flows without DOMPurify/escapeHtml/parameterized SQL. Directly executed, imported Drizzle `sql` templates recognize bound values, including nested templates. Genuine SQL objects retain their identities through aliases and selected helpers: `sql.empty()`, `sql.raw()`, and `append()` preserve raw SQL provenance, copied chunk entries, and live nested query references. `sql.join()` copies its outer list entries, while `sql.fromList()` retains the original mutable list; both preserve live nested SQL and array references. Scalar chunks and separators retain binding semantics, and literal `sql.identifier()` names can be composed. Stored source-bearing templates and variable identifier names remain conservative. Unknown array protocols, accessors, escaped objects, and non-scalar raw conversion produce explicit incomplete results while retaining proven findings. The separate SQL detector uses bounded, exact call proofs from the same engine to clear safe composition findings, preserving independent and nested unsafe executions.
 ```
 
 ### 📊 **4. Real-World Impact**

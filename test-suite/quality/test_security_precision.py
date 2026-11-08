@@ -5831,15 +5831,6 @@ class DrizzleMutableSqlPublicTests(unittest.TestCase):
     """
 
     def test_incumbent_and_candidate_mutation_reports(self):
-        baseline_path = os.environ.get('UBS_DRIZZLE_MUTATION_BASELINE')
-        if not baseline_path:
-            self.skipTest('set UBS_DRIZZLE_MUTATION_BASELINE to the a6728ca2 runner')
-        baseline = Path(baseline_path).resolve()
-        self.assertTrue(baseline.is_file(), 'the real a6728ca2 runner is required')
-        artifacts = REPO_ROOT / 'test-suite/artifacts/drizzle-mutable-sql'
-        artifacts.mkdir(parents=True, exist_ok=True)
-        root = Path(tempfile.mkdtemp(prefix='public-', dir=artifacts))
-        programs = {name: (files, partial) for name, files, partial in DrizzleMutableSqlTests.programs()}
         groups = {
             'unsafe': ('static-raw-append', 'alias-append', 'empty-factory', 'nested-child-live',
                        'receiver-before-argument-rebind', 'append-donor-snapshot',
@@ -5848,6 +5839,25 @@ class DrizzleMutableSqlPublicTests(unittest.TestCase):
             'partial': ('unknown-wrapper-escape', 'overwritten-append-method', 'overwritten-raw-factory',
                         'source-free-wrapper-escape'),
         }
+        def expectations(label, group, sites):
+            return (sites if label == 'candidate' or group == 'partial' else [],
+                    sites if group == 'partial' else [],
+                    group == 'partial' and label == 'candidate')
+        self.check_public_reports(
+            'UBS_DRIZZLE_MUTATION_BASELINE', 'a6728ca2', 'drizzle-mutable-sql',
+            DrizzleMutableSqlTests.programs(), groups, expectations)
+
+    def check_public_reports(self, baseline_variable, revision, artifact_name, declared_programs,
+                             groups, expectations, labels=('incumbent', 'candidate')):
+        baseline_path = os.environ.get(baseline_variable)
+        if not baseline_path:
+            self.skipTest(f'set {baseline_variable} to the {revision} runner')
+        baseline = Path(baseline_path).resolve()
+        self.assertTrue(baseline.is_file(), f'the real {revision} runner is required')
+        artifacts = REPO_ROOT / 'test-suite/artifacts' / artifact_name
+        artifacts.mkdir(parents=True, exist_ok=True)
+        root = Path(tempfile.mkdtemp(prefix='public-', dir=artifacts))
+        programs = {name: (files, partial) for name, files, partial in declared_programs}
         for group, names in groups.items():
             directory = root / group
             directory.mkdir()
@@ -5864,9 +5874,9 @@ class DrizzleMutableSqlPublicTests(unittest.TestCase):
                              for filename, _rule, line, col in DrizzleMutableSqlTests.expected_sites(files))
             sites.sort()
             for label, runner in (('incumbent', baseline), ('candidate', REPO_ROOT / 'ubs')):
-                expected_partial = group == 'partial' and label == 'candidate'
-                expected_taint = sites if label == 'candidate' or group == 'partial' else []
-                expected_security = sites if group == 'partial' else []
+                if label not in labels:
+                    continue
+                expected_taint, expected_security, expected_partial = expectations(label, group, sites)
                 critical_count = len(expected_taint) + len(expected_security)
                 for format_ in ('json', 'sarif'):
                     case = f'{group}-{label}-{format_}'
@@ -5878,7 +5888,7 @@ class DrizzleMutableSqlPublicTests(unittest.TestCase):
                                    XDG_DATA_HOME=str(directory / (case + '-data')))
                         command = ['bash', str(runner), '--no-auto-update', '--only=js',
                                    '--format=' + format_, '--ci', str(directory)]
-                        print(f'[drizzle-mutable-{case}] RUN {command!r}', flush=True)
+                        print(f'[{artifact_name}-{case}] RUN {command!r}', flush=True)
                         started = time.monotonic()
                         proc = subprocess.run(command, cwd=directory, env=env,
                                               capture_output=True, text=True, timeout=180)
@@ -5935,7 +5945,545 @@ class DrizzleMutableSqlPublicTests(unittest.TestCase):
                         self.assertEqual([(path, line) for path, line, _col in actual_security],
                                          [(path, line) for path, line, _col in expected_security], context)
                         self.assertEqual(proc.returncode, 2 if expected_partial else int(bool(critical_count)), context)
-                        print(f'[drizzle-mutable-{case}] PASS ({time.monotonic() - started:.3f}s)', flush=True)
+                        print(f'[{artifact_name}-{case}] PASS ({time.monotonic() - started:.3f}s)', flush=True)
+
+
+class DrizzleSqlCompositionTests(DrizzleMutableSqlTests):
+    """Independent chunk-composition oracle declared before implementation.
+
+    sql.join copies current top-level entries, while sql.fromList passes its
+    original array to SQL. Both retain nested SQL/array references, and a join
+    uses its separator only between actual entries. Ordinary scalar chunks
+    follow runtime parameter binding; raw SQL objects retain their provenance.
+    Existing conservative assigned-tag and uncertain-provider controls remain
+    in the preceding suites. Unknown protocols retain independent findings.
+
+    https://github.com/drizzle-team/drizzle-orm/blob/main/drizzle-orm/src/sql/sql.ts
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        artifacts = REPO_ROOT / 'test-suite/artifacts/drizzle-sql-composition'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        cls.root = Path(tempfile.mkdtemp(prefix='native-', dir=artifacts))
+
+    @staticmethod
+    def programs():
+        def case(name, body, *, helpers='', imports='import { sql } from "drizzle-orm";\n', partial=False):
+            source = (imports + helpers + 'export function run(req) {\n'
+                      '  const value = req.body.value;\n' + body + '\n}\n')
+            return name, {'main.ts': source}, partial
+
+        cases = [
+            case('join-existing-raw',
+                 '  const query = sql.join([sql`SELECT `, sql.raw(value)]);\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('from-list-existing-raw',
+                 '  const query = sql.fromList([sql`SELECT `, sql.raw(value)]);\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('join-retains-nested-sql',
+                 '  const child = sql`SELECT 1`;\n'
+                 '  const query = sql.join([child]);\n'
+                 '  child.append(sql.raw(value));\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('from-list-retains-nested-sql',
+                 '  const child = sql`SELECT 1`;\n'
+                 '  const query = sql.fromList([child]);\n'
+                 '  child.append(sql.raw(value));\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('join-copies-list-before-push',
+                 '  const chunks = [sql`SELECT 1`];\n'
+                 '  const query = sql.join(chunks);\n'
+                 '  chunks.push(sql.raw(value));\n'
+                 '  return db.execute(query);'),
+            case('from-list-borrows-list-before-push',
+                 '  const chunks = [sql`SELECT 1`];\n'
+                 '  const query = sql.fromList(chunks);\n'
+                 '  chunks.push(sql.raw(value));\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('join-copies-list-before-replacement',
+                 '  const chunks = [sql`SELECT 1`];\n'
+                 '  const query = sql.join(chunks);\n'
+                 '  chunks[0] = sql.raw(value);\n'
+                 '  return db.execute(query);'),
+            case('from-list-observes-replacement',
+                 '  const chunks = [sql`SELECT 1`];\n'
+                 '  const query = sql.fromList(chunks);\n'
+                 '  chunks[0] = sql.raw(value);\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('join-retains-copy-after-list-cleanup',
+                 '  const chunks = [sql.raw(value)];\n'
+                 '  const query = sql.join(chunks);\n'
+                 '  chunks[0] = sql`SELECT 1`;\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('from-list-observes-list-cleanup',
+                 '  const chunks = [sql.raw(value)];\n'
+                 '  const query = sql.fromList(chunks);\n'
+                 '  chunks[0] = sql`SELECT 1`;\n'
+                 '  return db.execute(query);'),
+            case('from-list-observes-truncation',
+                 '  const chunks = [sql.raw(value)];\n'
+                 '  const query = sql.fromList(chunks);\n'
+                 '  chunks.length = 0;\n'
+                 '  return db.execute(query);'),
+            case('join-retains-nested-array',
+                 '  const nested = [sql`1`];\n'
+                 '  const query = sql.join([sql`SELECT `, nested]);\n'
+                 '  nested.push(sql.raw(value));\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('from-list-retains-nested-array',
+                 '  const nested = [sql`1`];\n'
+                 '  const query = sql.fromList([sql`SELECT `, nested]);\n'
+                 '  nested.push(sql.raw(value));\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('join-nested-array-rebinding-control',
+                 '  let nested = [sql`1`];\n'
+                 '  const query = sql.join([sql`SELECT `, nested]);\n'
+                 '  nested = [sql.raw(value)];\n'
+                 '  return db.execute(query);'),
+            case('join-raw-separator-used',
+                 '  const query = sql.join([sql`SELECT 1`, sql`SELECT 2`], sql.raw(value));\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('join-raw-separator-unused-empty',
+                 '  const query = sql.join([], sql.raw(value));\n'
+                 '  return db.execute(query);'),
+            case('join-raw-separator-unused-singleton',
+                 '  const query = sql.join([sql`SELECT 1`], sql.raw(value));\n'
+                 '  return db.execute(query);'),
+            case('join-separator-remains-live',
+                 '  const separator = sql` UNION `;\n'
+                 '  const query = sql.join([sql`SELECT 1`, sql`SELECT 2`], separator);\n'
+                 '  separator.append(sql.raw(value));\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('join-scalar-separator-is-bound',
+                 '  const query = sql.join([sql`SELECT 1`, sql`SELECT 2`], value);\n'
+                 '  return db.execute(query);'),
+            case('join-scalar-chunk-is-bound',
+                 '  const query = sql.join([sql`SELECT `, value]);\n'
+                 '  return db.execute(query);'),
+            case('from-list-later-scalar-is-bound',
+                 '  const chunks = [sql`SELECT `];\n'
+                 '  const query = sql.fromList(chunks);\n'
+                 '  chunks.push(value);\n'
+                 '  return db.execute(query);'),
+            case('join-import-alias',
+                 '  const query = statement.join([statement`SELECT `, statement.raw(value)]);\n'
+                 '  return db.execute(query); // expect:sql',
+                 imports='import { sql as statement } from "drizzle-orm";\n'),
+            case('join-factory-alias',
+                 '  const compose = sql.join;\n'
+                 '  const query = compose([sql`SELECT `, sql.raw(value)]);\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('join-computed-factory',
+                 '  const query = sql["join"]([sql`SELECT `, sql.raw(value)]);\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('from-list-grouped-factory',
+                 '  const chunks = [sql`SELECT 1`];\n'
+                 '  const query = (sql.fromList)(chunks);\n'
+                 '  chunks.push(sql.raw(value));\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('join-helper-retains-child',
+                 '  const child = sql`SELECT 1`;\n'
+                 '  const query = compose([child]);\n'
+                 '  child.append(sql.raw(value));\n'
+                 '  return db.execute(query); // expect:sql',
+                 helpers='function compose(chunks) { return sql.join(chunks); }\n'),
+            case('from-list-helper-retains-array',
+                 '  const chunks = [sql`SELECT 1`];\n'
+                 '  const query = compose(chunks);\n'
+                 '  chunks.push(sql.raw(value));\n'
+                 '  return db.execute(query); // expect:sql',
+                 helpers='function compose(chunks) { return sql.fromList(chunks); }\n'),
+            case('from-list-captured-array',
+                 '  const chunks = [sql`SELECT 1`];\n'
+                 '  function compose() { return sql.fromList(chunks); }\n'
+                 '  const query = compose();\n'
+                 '  chunks.push(sql.raw(value));\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('join-separate-factory-allocations',
+                 '  const changed = fresh();\n'
+                 '  const untouched = fresh();\n'
+                 '  changed.append(sql.raw(value));\n'
+                 '  db.execute(untouched);\n'
+                 '  return db.execute(changed); // expect:sql',
+                 helpers='function fresh() { return sql.join([sql`SELECT 1`]); }\n'),
+            case('from-list-shared-array-append',
+                 '  const chunks = [sql`SELECT 1`];\n'
+                 '  const first = sql.fromList(chunks);\n'
+                 '  const second = sql.fromList(chunks);\n'
+                 '  first.append(sql.raw(value));\n'
+                 '  return db.execute(second); // expect:sql'),
+            case('join-and-from-list-array-ownership',
+                 '  const chunks = [sql`SELECT 1`];\n'
+                 '  const copied = sql.join(chunks);\n'
+                 '  const borrowed = sql.fromList(chunks);\n'
+                 '  borrowed.append(sql.raw(value));\n'
+                 '  db.execute(copied);\n'
+                 '  return db.execute(borrowed); // expect:sql'),
+            case('join-evaluates-separator-before-copy',
+                 '  const chunks = [sql`SELECT 1`];\n'
+                 '  function separator() { chunks.push(sql.raw(value)); return sql` UNION `; }\n'
+                 '  const query = sql.join(chunks, separator());\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('join-ignores-third-argument',
+                 '  const query = sql.join([sql`SELECT 1`], undefined, sql.raw(value));\n'
+                 '  return db.execute(query);'),
+            case('from-list-ignores-second-argument',
+                 '  const query = sql.fromList([sql`SELECT 1`], sql.raw(value));\n'
+                 '  return db.execute(query);'),
+            case('join-known-empty-spread',
+                 '  const query = sql.join(...[[sql`SELECT `, sql.raw(value)]]);\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('join-unknown-list-boundary',
+                 '  const query = sql.join(externalChunks);\n'
+                 '  db.execute(query);\n'
+                 '  return db.execute("SELECT " + value); // expect:sql', partial=True),
+            case('from-list-unknown-list-boundary',
+                 '  const query = sql.fromList(externalChunks);\n'
+                 '  db.execute(query);\n'
+                 '  return db.execute("SELECT " + value); // expect:sql', partial=True),
+            case('join-overwritten-array-entries',
+                 '  const chunks = [sql`SELECT 1`];\n'
+                 '  chunks.entries = replacement;\n'
+                 '  const query = sql.join(chunks);\n'
+                 '  db.execute(query);\n'
+                 '  return db.execute("SELECT " + value); // expect:sql', partial=True),
+            case('join-overwritten-provider-method',
+                 '  sql.join = replacement;\n'
+                 '  db.execute(sql.join([]));\n'
+                 '  return db.execute("SELECT " + value); // expect:sql', partial=True),
+            case('from-list-cyclic-chunks',
+                 '  db.execute("SELECT " + value); // expect:sql\n'
+                 '  const chunks = [sql`SELECT 1`];\n'
+                 '  chunks.push(chunks);\n'
+                 '  return db.execute(sql.fromList(chunks));', partial=True),
+            case('join-array-accessor',
+                 '  const chunks = [sql`SELECT 1`];\n'
+                 '  Object.defineProperty(chunks, "0", { get() { return sql.raw(value); } });\n'
+                 '  db.execute(sql.join(chunks));\n'
+                 '  return db.execute("SELECT " + value); // expect:sql', partial=True),
+            case('from-list-array-accessor',
+                 '  const chunks = [sql`SELECT 1`];\n'
+                 '  const query = sql.fromList(chunks);\n'
+                 '  Object.defineProperty(chunks, "0", { get() { return sql.raw(value); } });\n'
+                 '  db.execute(query);\n'
+                 '  return db.execute("SELECT " + value); // expect:sql', partial=True),
+            case('join-empty-array-unknown-escape',
+                 '  const chunks = [];\n'
+                 '  unknownMutator(chunks);\n'
+                 '  db.execute(sql.join(chunks));\n'
+                 '  return db.execute("SELECT " + value); // expect:sql', partial=True),
+            case('from-list-empty-array-unknown-escape',
+                 '  const chunks = [];\n'
+                 '  const query = sql.fromList(chunks);\n'
+                 '  unknownMutator(chunks);\n'
+                 '  db.execute(query);\n'
+                 '  return db.execute("SELECT " + value); // expect:sql', partial=True),
+            case('join-array-prototype-replacement',
+                 '  const chunks = [];\n'
+                 '  Object.setPrototypeOf(chunks, replacement);\n'
+                 '  db.execute(sql.join(chunks));\n'
+                 '  return db.execute("SELECT " + value); // expect:sql', partial=True),
+            case('from-list-own-push-protocol',
+                 '  const chunks = [];\n'
+                 '  const query = sql.fromList(chunks);\n'
+                 '  chunks.push = replacement;\n'
+                 '  query.append(sql`SELECT 1`);\n'
+                 '  db.execute(query);\n'
+                 '  return db.execute("SELECT " + value); // expect:sql', partial=True),
+            case('from-list-prototype-push-protocol',
+                 '  const chunks = [];\n'
+                 '  const query = sql.fromList(chunks);\n'
+                 '  Array.prototype.push = replacement;\n'
+                 '  query.append(sql`SELECT 1`);\n'
+                 '  db.execute(query);\n'
+                 '  return db.execute("SELECT " + value); // expect:sql', partial=True),
+            case('join-result-prototype-push-protocol',
+                 '  Array.prototype.push = replacement;\n'
+                 '  db.execute(sql.join([sql`SELECT 1`]));\n'
+                 '  return db.execute("SELECT " + value); // expect:sql', partial=True),
+            case('join-copied-array-later-escape-control',
+                 '  const chunks = [value];\n'
+                 '  const query = sql.join(chunks);\n'
+                 '  unknownMutator(chunks);\n'
+                 '  return db.execute(query);'),
+            case('join-copied-array-later-accessor-control',
+                 '  const chunks = [value];\n'
+                 '  const query = sql.join(chunks);\n'
+                 '  Object.defineProperty(chunks, "0", { get() { return sql.raw(value); } });\n'
+                 '  return db.execute(query);'),
+            case('join-data-descriptor-raw-chunk',
+                 '  const chunks = [sql`SELECT 1`];\n'
+                 '  Object.defineProperty(chunks, "0", { value: sql.raw(value) });\n'
+                 '  return db.execute(sql.join(chunks)); // expect:sql'),
+            case('literal-identifier-composition',
+                 '  const query = sql.join([sql`SELECT * FROM `, sql.identifier("records")]);\n'
+                 '  return db.execute(query);'),
+            case('source-identifier-remains-conservative',
+                 '  const query = sql.join([sql`SELECT * FROM `, sql.identifier(value)]);\n'
+                 '  return db.execute(query); // expect:sql', partial=True),
+            case('foreign-composition-provider',
+                 '  const query = sql.join([value]);\n'
+                 '  return db.execute(query); // expect:sql',
+                 imports='import { sql } from "custom-sql";\n'),
+            case('assigned-source-tag-stays-conservative',
+                 '  const chunk = sql`SELECT ${value}`;\n'
+                 '  return db.execute(sql.join([chunk])); // expect:sql'),
+        ]
+        cases.append(('cross-file-from-list-array', {
+            'helper.ts': ('import { sql } from "drizzle-orm";\n'
+                          'export function compose(chunks) { return sql.fromList(chunks); }\n'),
+            'main.ts': ('import { sql } from "drizzle-orm";\n'
+                        'import { compose } from "./helper.js";\n'
+                        'export function run(req) {\n'
+                        '  const chunks = [sql`SELECT 1`];\n'
+                        '  const query = compose(chunks);\n'
+                        '  chunks.push(sql.raw(req.body.value));\n'
+                        '  return db.execute(query); // expect:sql\n}\n'),
+        }, False))
+        return cases
+
+
+class DrizzleSqlCompositionDetectorTests(unittest.TestCase):
+    """Companion SQL-rule proof must cover the exact composition it suppresses.
+
+    These controls are declared before the semantic bridge is implemented.
+    Safe chunks cannot erase other executions, later mutations, or unknown
+    provider behavior. Incumbent negative finding locations remain exact.
+    """
+
+    @staticmethod
+    def legacy_window_programs():
+        prefix = 'import { sql } from "drizzle-orm";\nexport function run(req) {\n'
+        cases = [
+            ('multiline-nested-legacy-execution', prefix
+             + '  return db.execute(sql.join([\n'
+               '    sql`SELECT `,\n'
+               '    db.execute(req.headers.query)\n'
+               '  ]));\n}\n', [3]),
+            ('multiline-ignored-legacy-execution', prefix
+             + '  return db.execute(sql.join([sql`SELECT `], undefined,\n'
+               '    db.execute(req.headers.query)\n'
+               '  ));\n}\n', [3]),
+            ('adjacent-legacy-execution-without-semicolon', prefix
+             + '  db.execute(sql.join([sql`SELECT `]))\n'
+               '  db.execute(req.headers.query);\n}\n', [3]),
+            ('ignored-grouped-legacy-execution', prefix
+             + '  return db.execute(sql.join([sql`SELECT `], undefined,\n'
+               '    (db.execute)(req.headers.query)\n'
+               '  ));\n}\n', [3]),
+            ('ignored-unknown-callback-effect', prefix
+             + '  return db.execute(sql.join([sql`SELECT `], undefined,\n'
+               '    unknownCallback(req.headers.query)\n'
+               '  ));\n}\n', [3]),
+        ]
+        for name, expression in (
+            ('grouped-legacy-execution', '(db.execute)(value)'),
+            ('computed-legacy-execution', 'db["execute"](value)'),
+            ('optional-legacy-execution', 'db.execute?.(value)'),
+        ):
+            cases.append((name, 'import { sql } from "drizzle-orm";\n'
+                          'const value = req.headers.query;\n'
+                          'db.execute(sql.join([\n'
+                          '  sql`SELECT `,\n'
+                          f'  {expression}\n'
+                          ']));\n', [3]))
+        return cases
+
+    @staticmethod
+    def programs():
+        declared = {name: files['main.ts'] for name, files, _partial
+                    in DrizzleSqlCompositionTests.programs() if 'main.ts' in files}
+        expected = {
+            'join-existing-raw': [4, 5],
+            'join-raw-separator-used': [4, 5],
+            'join-raw-separator-unused-empty': [],
+            'join-raw-separator-unused-singleton': [],
+            'join-scalar-separator-is-bound': [],
+            'join-scalar-chunk-is-bound': [],
+            'join-ignores-third-argument': [],
+            'from-list-ignores-second-argument': [],
+            'source-identifier-remains-conservative': [5],
+            'assigned-source-tag-stays-conservative': [5],
+            'join-unknown-list-boundary': [6],
+            'join-overwritten-provider-method': [6],
+        }
+        cases = [(name, declared[name], lines) for name, lines in expected.items()]
+        prefix = ('import { sql } from "drizzle-orm";\n'
+                  'export function run(req) {\n'
+                  '  const value = req.body.value;\n')
+        scalar_body = ('  const query = sql.join([sql`SELECT `, value]);\n'
+                       '  return db.execute(query);\n}\n')
+        cases.extend([
+            ('foreign-provider', prefix.replace('"drizzle-orm"', '"custom-sql"') + scalar_body, [5]),
+            ('shadowed-provider', prefix.replace('run(req)', 'run(req, sql)') + scalar_body, [5]),
+            ('overwritten-provider', prefix + '  sql.join = replacement;\n' + scalar_body, [6]),
+            ('later-raw-append', prefix
+             + '  const query = sql.join([sql`SELECT `, value]);\n'
+               '  query.append(sql.raw(value));\n'
+               '  return db.execute(query);\n}\n', [5, 6]),
+            ('ignored-argument-independent-execution', prefix
+             + '  const query = sql.join([sql`SELECT 1`], undefined, db.execute("SELECT " + value));\n'
+               '  return db.execute(query);\n}\n', [4]),
+            ('separate-independent-execution', prefix
+             + '  const query = sql.join([sql`SELECT `, value]);\n'
+               '  db.execute(query);\n'
+               '  return db.execute("SELECT " + value);\n}\n', [6]),
+            ('same-line-independent-execution', prefix
+             + '  const query = sql.join([sql`SELECT `, value]);\n'
+               '  db.execute(query); db.execute("SELECT " + value);\n}\n', [5]),
+        ])
+        # The lexical detector recognizes sources outside the native taint
+        # model. Missing native traces cannot prove that retained raw SQL is
+        # bound, while genuine scalar binding remains valid for these values.
+        for name, expression in (
+            ('legacy-header-source', 'req.headers.order'),
+            ('legacy-cookie-source', 'req.cookies.order'),
+            ('legacy-header-call-source', 'req.get("x-order")'),
+        ):
+            cases.append((name, declared['join-existing-raw'].replace('req.body.value', expression), [4, 5]))
+        cases.append(('legacy-header-bound-control',
+                      declared['join-scalar-chunk-is-bound'].replace('req.body.value', 'req.headers.order'), []))
+        for name, chunks, expected in (
+            ('top-level-legacy-raw-source', 'sql.raw(value)', [3, 4]),
+            ('top-level-legacy-bound-control', 'value', []),
+        ):
+            cases.append((name, 'import { sql } from "drizzle-orm";\n'
+                          'const value = req.headers.order;\n'
+                          f'const query = sql.join([sql`SELECT `, {chunks}]);\n'
+                          'db.execute(query);\n', expected))
+        cases.extend(DrizzleSqlCompositionDetectorTests.legacy_window_programs())
+        return cases
+
+    def test_exact_binding_proof_and_independent_findings(self):
+        from ubs_core.analyzers import sec_sql_injection, taint_js
+
+        artifacts = REPO_ROOT / 'test-suite/artifacts/drizzle-sql-composition'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        root = Path(tempfile.mkdtemp(prefix='detector-', dir=artifacts))
+        for name, source, expected in self.programs():
+            with self.subTest(case=name):
+                path = root / (name + '.ts')
+                path.write_text(source, encoding='utf-8')
+                findings = list(sec_sql_injection.scan_file_findings(path))
+                actual = [line for line, _sample, _reason in findings]
+                path.with_suffix('.receipt.json').write_text(json.dumps({
+                    'source_sha256': hashlib.sha256(source.encode()).hexdigest(),
+                    'helper_sha256': hashlib.sha256(Path(sec_sql_injection.__file__).read_bytes()).hexdigest(),
+                    'taint_helper_sha256': hashlib.sha256(Path(taint_js.__file__).read_bytes()).hexdigest(),
+                    'expected': expected, 'actual': actual, 'findings': findings,
+                }, indent=2) + '\n', encoding='utf-8')
+                self.assertEqual(actual, expected, (name, source, findings))
+
+    def test_changed_source_snapshot_cannot_supply_a_binding_proof(self):
+        from unittest.mock import patch
+        from ubs_core.analyzers import sec_sql_injection, taint_js
+
+        source = next(source for name, source, _expected in self.programs()
+                      if name == 'join-existing-raw')
+        # Preserve all offsets so source equality, rather than accidental
+        # span displacement, is what rejects this stale safety evidence.
+        changed = source.replace('sql.raw(value)', 'value         ')
+        self.assertEqual(len(source), len(changed))
+        artifacts = REPO_ROOT / 'test-suite/artifacts/drizzle-sql-composition'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        root = Path(tempfile.mkdtemp(prefix='source-snapshot-', dir=artifacts))
+        path = root / 'main.ts'
+        path.write_text(source, encoding='utf-8')
+        (root / 'original.ts').write_text(source, encoding='utf-8')
+        original = taint_js.drizzle_sql_call_proofs
+
+        def change_before_proof(*args, **kwargs):
+            path.write_text(changed, encoding='utf-8')
+            return original(*args, **kwargs)
+
+        with patch.object(taint_js, 'drizzle_sql_call_proofs', change_before_proof):
+            findings = list(sec_sql_injection.scan_file_findings(path))
+        (root / 'receipt.json').write_text(json.dumps({
+            'original_sha256': hashlib.sha256(source.encode()).hexdigest(),
+            'changed_sha256': hashlib.sha256(changed.encode()).hexdigest(),
+            'helper_sha256': hashlib.sha256(Path(sec_sql_injection.__file__).read_bytes()).hexdigest(),
+            'taint_helper_sha256': hashlib.sha256(Path(taint_js.__file__).read_bytes()).hexdigest(),
+            'expected': [4, 5], 'actual': [line for line, _sample, _reason in findings],
+            'findings': findings,
+        }, indent=2) + '\n', encoding='utf-8')
+        self.assertEqual([line for line, _sample, _reason in findings], [4, 5], findings)
+
+
+class DrizzleSqlCompositionPublicTests(unittest.TestCase):
+    """Real CLI qualification against the frozen 7fc27c30 incumbent.
+
+    The incumbent is already honest about unsupported composition, but misses
+    live-reference mutations and conservatively reports unused/raw or scalar
+    chunks. The candidate must settle supported reports and preserve partial
+    status plus independent findings at unsupported boundaries.
+    """
+
+    check_public_reports = DrizzleMutableSqlPublicTests.check_public_reports
+
+    def run_composition_reports(self, labels=('incumbent', 'candidate')):
+        groups = {
+            'unsafe': ('join-existing-raw', 'from-list-borrows-list-before-push',
+                       'join-retains-nested-sql', 'join-retains-nested-array',
+                       'join-separator-remains-live', 'join-helper-retains-child',
+                       'from-list-captured-array', 'from-list-shared-array-append',
+                       'join-separate-factory-allocations', 'cross-file-from-list-array'),
+            'safe': ('join-copies-list-before-push', 'join-copies-list-before-replacement',
+                     'from-list-observes-list-cleanup', 'from-list-observes-truncation',
+                     'join-raw-separator-unused-empty', 'join-raw-separator-unused-singleton',
+                     'join-scalar-chunk-is-bound', 'join-scalar-separator-is-bound',
+                     'from-list-later-scalar-is-bound', 'literal-identifier-composition'),
+            'partial': ('join-unknown-list-boundary', 'from-list-unknown-list-boundary',
+                        'join-overwritten-array-entries', 'from-list-cyclic-chunks',
+                        'source-identifier-remains-conservative', 'join-array-accessor',
+                        'from-list-empty-array-unknown-escape', 'from-list-own-push-protocol',
+                        'from-list-prototype-push-protocol', 'join-result-prototype-push-protocol'),
+            'legacy': tuple(name for name, _source, _expected
+                            in DrizzleSqlCompositionDetectorTests.legacy_window_programs()),
+        }
+        incumbent_false_positives = {
+            'from-list-observes-list-cleanup': 7,
+            'from-list-observes-truncation': 7,
+            'join-raw-separator-unused-empty': 5,
+            'join-raw-separator-unused-singleton': 5,
+            'join-scalar-chunk-is-bound': 5,
+            'join-scalar-separator-is-bound': 5,
+        }
+
+        def expectations(label, group, sites):
+            taint = sites
+            if label == 'incumbent':
+                if group == 'unsafe':
+                    taint = [site for site in sites if site[0] == 'join-existing-raw/main.ts']
+                elif group == 'safe':
+                    taint = sorted((name + '/main.ts', line, 10)
+                                   for name, line in incumbent_false_positives.items())
+            if group == 'unsafe':
+                security = [('join-existing-raw/main.ts', 4, 1),
+                            ('join-existing-raw/main.ts', 5, 1)]
+            elif group == 'legacy':
+                security = sorted((name + '/main.ts', 3, 1) for name in groups['legacy'])
+            elif group == 'partial':
+                security = sites
+            elif label == 'incumbent':
+                security = [('join-raw-separator-unused-singleton/main.ts', 4, 1),
+                            ('join-raw-separator-unused-singleton/main.ts', 5, 1),
+                            ('join-scalar-chunk-is-bound/main.ts', 5, 1),
+                            ('join-scalar-separator-is-bound/main.ts', 5, 1)]
+            else:
+                security = []
+            return taint, security, label == 'incumbent' or group == 'partial'
+
+        programs = DrizzleSqlCompositionTests.programs() + [
+            (name, {'main.ts': source}, False) for name, source, _expected
+            in DrizzleSqlCompositionDetectorTests.legacy_window_programs()
+        ]
+        self.check_public_reports(
+            'UBS_DRIZZLE_COMPOSITION_BASELINE', '7fc27c30', 'drizzle-sql-composition',
+            programs, groups, expectations, labels)
+
+    def test_incumbent_and_candidate_composition_reports(self):
+        self.run_composition_reports()
 
 
 class PlaywrightMetadataAndEqualityPrecisionTests(unittest.TestCase):

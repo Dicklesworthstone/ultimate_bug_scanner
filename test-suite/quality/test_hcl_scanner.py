@@ -8,6 +8,8 @@ https://github.com/hashicorp/terraform-provider-aws/blob/main/website/docs/r/sec
 https://github.com/hashicorp/terraform-provider-aws/blob/main/website/docs/r/security_group.html.markdown
 https://github.com/hashicorp/terraform-provider-aws/blob/main/website/docs/r/s3_bucket_public_access_block.html.markdown
 https://github.com/hashicorp/terraform-provider-aws/blob/main/website/docs/r/s3_bucket_acl.html.markdown
+https://github.com/hashicorp/terraform-provider-aws/blob/main/website/docs/d/iam_policy_document.html.markdown
+https://github.com/hashicorp/terraform-provider-aws/blob/main/internal/service/iam/policy_document_data_source.go
 https://developer.hashicorp.com/terraform/language/files
 https://github.com/hashicorp/hcl/blob/main/hclsyntax/spec.md
 
@@ -31,6 +33,7 @@ import sys
 import textwrap
 import time
 import unittest
+from unittest import mock
 import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -699,7 +702,7 @@ IAM_CASES = (
           policy = var.policy_json
         }
     ''', True),
-    Case("iam_policy_document_reference_is_not_guessed", '''
+    Case("iam_policy_document_reference_resolves_selected_definition", '''
         data "aws_iam_policy_document" "example" {
           statement {
             effect = "Allow"
@@ -708,9 +711,9 @@ IAM_CASES = (
           }
         }
         resource "aws_iam_policy" "from_data" {
-          policy = data.aws_iam_policy_document.example.json
+          policy = data.aws_iam_policy_document.example.json # expect:iam
         }
-    ''', True),
+    '''),
     Case("iam_unknown_jsonencode_member", '''
         resource "aws_iam_policy" "unknown_action" {
           policy = jsonencode({
@@ -870,6 +873,573 @@ TLS_CASES = (
 )
 
 
+# Independently labeled before policy-document resolution is implemented.
+# A data source generates JSON; only a selected identity-policy consumer is a
+# finding site. Conditions, deny interactions and document merging retain the
+# existing incomplete boundary instead of inventing effective AWS permissions.
+POLICY_DOCUMENT_CASES = (
+    Case("iam_data_default_allow", '''
+        data "aws_iam_policy_document" "default_allow" {
+          statement {
+            actions = ["*"]
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_role_policy" "default_allow" {
+          role = "example"
+          policy = data.aws_iam_policy_document.default_allow.json # expect:iam
+        }
+    '''),
+    Case("iam_data_minified_json", '''
+        data "aws_iam_policy_document" "minified" {
+          version = "2012-10-17"
+          statement {
+            effect = "Allow"
+            sid = "Administrator"
+            actions = ["*"]
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_user_policy" "minified" {
+          user = "example"
+          policy = data.aws_iam_policy_document.minified.minified_json # expect:iam
+        }
+    '''),
+    Case("iam_data_old_version_without_variables", '''
+        data "aws_iam_policy_document" "old_version" {
+          version = "2008-10-17"
+          statement {
+            actions = ["*"]
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "old_version" {
+          policy = data.aws_iam_policy_document.old_version.json # expect:iam
+        }
+    '''),
+    Case("iam_data_old_version_policy_variables_are_incomplete", '''
+        data "aws_iam_policy_document" "old_variables" {
+          version = "2008-10-17"
+          statement {
+            actions = ["*"]
+            resources = ["*", "arn:aws:s3:::example/&{aws:username}/*"]
+          }
+        }
+        resource "aws_iam_policy" "old_variables" {
+          policy = data.aws_iam_policy_document.old_variables.json
+        }
+    ''', True),
+    Case("iam_data_current_version_policy_variables_keep_wildcard", '''
+        data "aws_iam_policy_document" "current_variables" {
+          version = "2012-10-17"
+          statement {
+            actions = ["*"]
+            resources = ["*", "arn:aws:s3:::example/&{aws:username}/*"]
+          }
+        }
+        resource "aws_iam_policy" "current_variables" {
+          policy = data.aws_iam_policy_document.current_variables.json # expect:iam
+        }
+    '''),
+    Case("iam_data_local_output_chain_and_statement_values", '''
+        locals {
+          statement = { actions = ["*"], resources = ["*"] }
+          selected_json = data.aws_iam_policy_document.local_values.json
+          policy_json = (local.selected_json)
+        }
+        data "aws_iam_policy_document" "local_values" {
+          statement {
+            effect = "Allow"
+            actions = local.statement.actions
+            resources = local.statement.resources
+          }
+        }
+        resource "aws_iam_group_policy" "local_values" {
+          group = "example"
+          policy = local.policy_json # expect:iam
+        }
+    '''),
+    Case("iam_data_repeated_default_sid", '''
+        data "aws_iam_policy_document" "default_sids" {
+          statement {
+            actions = ["s3:GetObject"]
+            resources = ["arn:aws:s3:::example/*"]
+          }
+          statement {
+            actions = ["*"]
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "default_sids" {
+          policy = data.aws_iam_policy_document.default_sids.json # expect:iam
+        }
+    '''),
+    Case("iam_data_repeated_explicit_empty_sid", '''
+        data "aws_iam_policy_document" "empty_sids" {
+          statement {
+            sid = ""
+            actions = ["s3:GetObject"]
+            resources = ["*"]
+          }
+          statement {
+            sid = ""
+            actions = ["*"]
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "empty_sids" {
+          policy = data.aws_iam_policy_document.empty_sids.json # expect:iam
+        }
+    '''),
+    Case("iam_data_selected_provider_alias", '''
+        terraform {
+          required_providers {
+            cloud = { source = "hashicorp/aws" }
+          }
+        }
+        provider "cloud" {
+          alias = "selected"
+        }
+        data "aws_iam_policy_document" "selected_alias" {
+          provider = cloud.selected
+          statement {
+            actions = ["*"]
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "selected_alias" {
+          policy = data.aws_iam_policy_document.selected_alias.json # expect:iam
+        }
+    '''),
+    Case("iam_data_restricted_actions", '''
+        data "aws_iam_policy_document" "limited_actions" {
+          statement {
+            actions = ["s3:GetObject", "s3:ListBucket"]
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "limited_actions" {
+          policy = data.aws_iam_policy_document.limited_actions.json
+        }
+    '''),
+    Case("iam_data_restricted_resources", '''
+        data "aws_iam_policy_document" "limited_resources" {
+          statement {
+            actions = ["*"]
+            resources = ["arn:aws:s3:::selected/*"]
+          }
+        }
+        resource "aws_iam_policy" "limited_resources" {
+          policy = data.aws_iam_policy_document.limited_resources.json
+        }
+    '''),
+    Case("iam_data_deny_only", '''
+        data "aws_iam_policy_document" "only_deny" {
+          statement {
+            effect = "Deny"
+            actions = ["*"]
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "only_deny" {
+          policy = data.aws_iam_policy_document.only_deny.json
+        }
+    '''),
+    Case("iam_data_unused_grant_does_not_create_finding", '''
+        data "aws_iam_policy_document" "unused" {
+          statement {
+            actions = ["*"]
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "independent" {
+          policy = jsonencode({
+            Statement = [{ Effect = "Allow", Action = "s3:GetObject", Resource = "*" }]
+          })
+        }
+    '''),
+    Case("iam_data_inactive_consumer_is_not_evaluated", '''
+        data "aws_iam_policy_document" "inactive_consumer" {
+          statement {
+            actions = var.actions
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "inactive_consumer" {
+          count = 0
+          policy = data.aws_iam_policy_document.inactive_consumer.json
+        }
+    '''),
+    Case("iam_data_comment_and_literal_decoys", '''
+        # data "aws_iam_policy_document" "decoy" { statement { actions = ["*"] } }
+        locals {
+          message = "data.aws_iam_policy_document.decoy.json"
+        }
+        resource "aws_iam_policy" "literal_control" {
+          policy = jsonencode({
+            Statement = [{ Effect = "Allow", Action = "s3:GetObject", Resource = "*" }]
+          })
+        }
+    '''),
+    Case("iam_data_selected_consumer_suppression", '''
+        data "aws_iam_policy_document" "suppressed_data" {
+          statement {
+            actions = ["*"]
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "suppressed_data" {
+          policy = data.aws_iam_policy_document.suppressed_data.json # ubs:ignore[hcl.aws.iam-wildcard-privilege]
+        }
+    '''),
+    Case("iam_data_conditional_wildcard_is_incomplete", '''
+        data "aws_iam_policy_document" "conditional" {
+          statement {
+            actions = ["*"]
+            resources = ["*"]
+            condition {
+              test = "Bool"
+              variable = "aws:MultiFactorAuthPresent"
+              values = ["true"]
+            }
+          }
+        }
+        resource "aws_iam_policy" "conditional" {
+          policy = data.aws_iam_policy_document.conditional.json
+        }
+    ''', True),
+    Case("iam_data_allow_and_deny_is_incomplete", '''
+        data "aws_iam_policy_document" "deny_constraint" {
+          statement {
+            actions = ["*"]
+            resources = ["*"]
+          }
+          statement {
+            effect = "Deny"
+            actions = ["iam:*"]
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "deny_constraint" {
+          policy = data.aws_iam_policy_document.deny_constraint.json
+        }
+    ''', True),
+    Case("iam_data_dynamic_statement_is_incomplete", '''
+        data "aws_iam_policy_document" "dynamic_statement" {
+          dynamic "statement" {
+            for_each = var.statements
+            content {
+              actions = ["*"]
+              resources = ["*"]
+            }
+          }
+        }
+        resource "aws_iam_policy" "dynamic_statement" {
+          policy = data.aws_iam_policy_document.dynamic_statement.json
+        }
+    ''', True),
+    Case("iam_data_unknown_action_is_incomplete", '''
+        data "aws_iam_policy_document" "unknown_action" {
+          statement {
+            actions = var.actions
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "unknown_action" {
+          policy = data.aws_iam_policy_document.unknown_action.json
+        }
+    ''', True),
+    Case("iam_data_unknown_effect_is_incomplete", '''
+        data "aws_iam_policy_document" "unknown_effect" {
+          statement {
+            effect = var.effect
+            actions = ["*"]
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "unknown_effect" {
+          policy = data.aws_iam_policy_document.unknown_effect.json
+        }
+    ''', True),
+    Case("iam_data_principals_are_outside_identity_model", '''
+        data "aws_iam_policy_document" "principal" {
+          statement {
+            actions = ["*"]
+            resources = ["*"]
+            principals {
+              type = "AWS"
+              identifiers = ["*"]
+            }
+          }
+        }
+        resource "aws_iam_policy" "principal" {
+          policy = data.aws_iam_policy_document.principal.json
+        }
+    ''', True),
+    Case("iam_data_not_actions_are_outside_selected_model", '''
+        data "aws_iam_policy_document" "complement_actions" {
+          statement {
+            not_actions = ["iam:*"]
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "complement_actions" {
+          policy = data.aws_iam_policy_document.complement_actions.json
+        }
+    ''', True),
+    Case("iam_data_not_resources_are_outside_selected_model", '''
+        data "aws_iam_policy_document" "complement_resources" {
+          statement {
+            actions = ["*"]
+            not_resources = ["arn:aws:s3:::protected/*"]
+          }
+        }
+        resource "aws_iam_policy" "complement_resources" {
+          policy = data.aws_iam_policy_document.complement_resources.json
+        }
+    ''', True),
+    Case("iam_data_provider_rebinding_is_incomplete", '''
+        terraform {
+          required_providers {
+            aws = { source = "example/not-aws" }
+            actual = { source = "hashicorp/aws" }
+          }
+        }
+        data "aws_iam_policy_document" "foreign_default" {
+          statement {
+            actions = ["*"]
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "foreign_default" {
+          provider = actual
+          policy = data.aws_iam_policy_document.foreign_default.json
+        }
+    ''', True),
+    Case("iam_data_unknown_provider_is_incomplete", '''
+        data "aws_iam_policy_document" "unknown_provider" {
+          provider = var.provider
+          statement {
+            actions = ["*"]
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "unknown_provider" {
+          policy = data.aws_iam_policy_document.unknown_provider.json
+        }
+    ''', True),
+    Case("iam_data_duplicate_address_is_incomplete", '''
+        data "aws_iam_policy_document" "duplicate" {
+          statement {
+            actions = ["*"]
+            resources = ["*"]
+          }
+        }
+        data "aws_iam_policy_document" "duplicate" {
+          statement {
+            actions = ["s3:GetObject"]
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "duplicate" {
+          policy = data.aws_iam_policy_document.duplicate.json
+        }
+    ''', True),
+    Case("iam_data_missing_definition_is_incomplete", '''
+        resource "aws_iam_policy" "missing" {
+          policy = data.aws_iam_policy_document.missing.json
+        }
+    ''', True),
+    Case("iam_data_duplicate_named_sid_is_incomplete", '''
+        data "aws_iam_policy_document" "duplicate_sid" {
+          statement {
+            sid = "Same"
+            actions = ["s3:GetObject"]
+            resources = ["*"]
+          }
+          statement {
+            sid = "Same"
+            actions = ["*"]
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "duplicate_sid" {
+          policy = data.aws_iam_policy_document.duplicate_sid.json
+        }
+    ''', True),
+    Case("iam_data_unindexed_count_is_incomplete", '''
+        data "aws_iam_policy_document" "counted" {
+          count = 1
+          statement {
+            actions = ["*"]
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "counted" {
+          policy = data.aws_iam_policy_document.counted.json
+        }
+    ''', True),
+    Case("iam_data_indexed_count_is_outside_selected_model", '''
+        data "aws_iam_policy_document" "indexed" {
+          count = 1
+          statement {
+            actions = ["*"]
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "indexed" {
+          policy = data.aws_iam_policy_document.indexed[0].json
+        }
+    ''', True),
+    Case("iam_data_for_each_is_outside_selected_model", '''
+        data "aws_iam_policy_document" "instances" {
+          for_each = { selected = "example" }
+          statement {
+            actions = ["*"]
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "instances" {
+          policy = data.aws_iam_policy_document.instances.json
+        }
+    ''', True),
+    Case("iam_data_source_document_merge_is_incomplete", '''
+        data "aws_iam_policy_document" "source_merge" {
+          source_policy_documents = [jsonencode({
+            Statement = [{ Sid = "Selected", Effect = "Allow", Action = "*", Resource = "*" }]
+          })]
+          statement {
+            sid = "Selected"
+            actions = ["s3:GetObject"]
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "source_merge" {
+          policy = data.aws_iam_policy_document.source_merge.json
+        }
+    ''', True),
+    Case("iam_data_override_document_merge_is_incomplete", '''
+        data "aws_iam_policy_document" "override_merge" {
+          override_policy_documents = [jsonencode({
+            Statement = [{ Sid = "Selected", Effect = "Allow", Action = "s3:GetObject", Resource = "*" }]
+          })]
+          statement {
+            sid = "Selected"
+            actions = ["*"]
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "override_merge" {
+          policy = data.aws_iam_policy_document.override_merge.json
+        }
+    ''', True),
+    Case("iam_data_legacy_source_json_is_incomplete", '''
+        data "aws_iam_policy_document" "legacy_source" {
+          source_json = "{}"
+          statement {
+            actions = ["*"]
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "legacy_source" {
+          policy = data.aws_iam_policy_document.legacy_source.json
+        }
+    ''', True),
+    Case("iam_data_local_reference_cycle_is_incomplete", '''
+        locals {
+          document = data.aws_iam_policy_document.cycle.json
+        }
+        data "aws_iam_policy_document" "cycle" {
+          statement {
+            actions = local.document
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "cycle" {
+          policy = local.document
+        }
+    ''', True),
+    Case("iam_data_provider_requirement_cycle_is_incomplete", '''
+        terraform {
+          required_providers {
+            aws = { source = local.provider_source }
+          }
+        }
+        locals {
+          provider_source = local.document
+          document = data.aws_iam_policy_document.provider_cycle.json
+        }
+        data "aws_iam_policy_document" "provider_cycle" {
+          statement {
+            actions = local.document
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "provider_cycle" {
+          policy = local.document
+        }
+    ''', True),
+    Case("iam_data_object_member_cycle_keeps_independent_finding", '''
+        locals {
+          bundle = {
+            actions = ["*"]
+            generated = data.aws_iam_policy_document.hidden_cycle.json
+          }
+        }
+        data "aws_iam_policy_document" "hidden_cycle" {
+          statement {
+            actions = local.bundle.actions
+            resources = ["*"]
+          }
+        }
+        data "aws_iam_policy_document" "independent_cycle_control" {
+          statement {
+            actions = ["*"]
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "hidden_cycle" {
+          policy = data.aws_iam_policy_document.hidden_cycle.json
+        }
+        resource "aws_iam_policy" "independent_cycle_control" {
+          policy = data.aws_iam_policy_document.independent_cycle_control.json # expect:iam
+        }
+    ''', True),
+    Case("iam_data_cached_cycle_in_unused_object_member_is_incomplete", '''
+        locals {
+          recursive = { again = local.recursive }
+          bundle = { actions = ["*"], unused = local.recursive }
+        }
+        resource "aws_iam_policy" "first_cycle_use" {
+          policy = local.recursive
+        }
+        data "aws_iam_policy_document" "cached_cycle" {
+          statement {
+            actions = local.bundle.actions
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "second_cycle_use" {
+          policy = data.aws_iam_policy_document.cached_cycle.json
+        }
+    ''', True),
+    Case("iam_data_unknown_unselected_object_member_is_independent", '''
+        locals {
+          bundle = { actions = ["*"], unused = var.description }
+        }
+        data "aws_iam_policy_document" "selected_member" {
+          statement {
+            actions = local.bundle.actions
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "selected_member" {
+          policy = data.aws_iam_policy_document.selected_member.json # expect:iam
+        }
+    '''),
+)
+
+
 class EvidenceTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -982,6 +1552,147 @@ class HCLNativeTests(EvidenceTest):
         self.assertEqual(records, [], (records, errors))
         self.assertTrue(errors, "expanded policy must not produce a complete result")
 
+    def test_iam_data_selected_sibling_files_and_module_isolation(self):
+        analyzer = importlib.import_module("ubs_core.hcl_scan")
+        consumer = Case("main", '''
+            resource "aws_iam_policy" "selected_sibling" {
+              policy = local.policy_json # expect:iam
+            }
+        ''')
+        aliases = Case("aliases", '''
+            locals {
+              policy_json = data.aws_iam_policy_document.selected_sibling.json
+            }
+        ''')
+        document = Case("permissions", '''
+            data "aws_iam_policy_document" "selected_sibling" {
+              statement {
+                actions = ["*"]
+                resources = ["*"]
+              }
+            }
+        ''')
+        directory = self.materialize((consumer, aliases, document), "iam-data-module-context")
+        consumer_path, aliases_path, document_path = (str(directory / case.filename)
+                                                    for case in (consumer, aliases, document))
+        other = directory / "other-module"
+        other.mkdir()
+        (other / document.filename).write_text(document.source, encoding="utf-8")
+        scenarios = (
+            ("selected-siblings", {consumer_path: consumer.source, aliases_path: aliases.source,
+                                   document_path: document.source}, False),
+            ("definition-not-selected", {consumer_path: consumer.source, aliases_path: aliases.source}, True),
+            ("different-module", {consumer_path: consumer.source, aliases_path: aliases.source,
+                                  str(other / document.filename): document.source}, True),
+        )
+        for name, sources, partial in scenarios:
+            with self.subTest(selection=name):
+                records, errors = analyzer.analyze_sources(sources)
+                actual = sorted((row["path"], row["rule"], row["line"], row["col"]) for row in records)
+                expected = [] if partial else [(consumer_path, rule, line, col)
+                                               for rule, line, col in consumer.expected]
+                (directory / (name + ".json")).write_text(json.dumps({
+                    **self.identity, "selected_sources": list(sources), "expected": expected,
+                    "actual": actual, "findings": records, "errors": errors, "incomplete": partial,
+                    "analyzer_sha256": hashlib.sha256(Path(analyzer.__file__).read_bytes()).hexdigest(),
+                }, indent=2) + "\n", encoding="utf-8")
+                self.assertEqual(bool(errors), partial, (sources, records, errors))
+                self.assertEqual(actual, expected, (sources, records, errors))
+
+    def test_iam_data_encoded_document_budget_is_incomplete(self):
+        analyzer = importlib.import_module("ubs_core.hcl_scan")
+        # The source strings fit the cap, but JSON escaping expands the key
+        # well past it. This tests serialized bytes, not just source length.
+        resource = "arn:aws:s3:::example/" + "\u00e9" * 80
+        case = Case("iam_data_encoded_budget", '''
+            data "aws_iam_policy_document" "encoded_budget" {
+              statement {
+                actions = ["*"]
+                resources = ["*", %s]
+              }
+            }
+            resource "aws_iam_policy" "encoded_budget" {
+              policy = data.aws_iam_policy_document.encoded_budget.json # expect:iam
+            }
+        ''' % json.dumps(resource, ensure_ascii=False))
+        self.check_native(case)
+        limited = Case(case.name + "_limited", case.code.replace(" # expect:iam", ""), True)
+        with mock.patch.object(analyzer, "MAX_POLICY_BYTES", 256):
+            self.check_native(limited)
+
+    def test_iam_data_total_generated_document_budget_is_incomplete(self):
+        analyzer = importlib.import_module("ubs_core.hcl_scan")
+        # Each document fits comfortably, while many references to the same
+        # literal produce more retained JSON than the entire source context.
+        # Keep the cap above the input size so this reaches the output budget.
+        identifier = "A" * 256
+        declarations = [f'locals {{ identifier = "{identifier}" }}']
+        for index in range(12):
+            declarations.append('''
+data "aws_iam_policy_document" "document%d" {
+  statement {
+    sid = local.identifier
+    actions = ["*"]
+    resources = ["*"]
+  }
+}
+resource "aws_iam_policy" "document%d" {
+  policy = data.aws_iam_policy_document.document%d.json
+}
+''' % (index, index, index))
+        case = Case("iam_data_aggregate_budget", "\n".join(declarations))
+        directory = self.materialize((case,), case.name)
+        source = directory / case.filename
+        limit = len(case.source.encode("utf-8")) + 64
+        with mock.patch.object(analyzer, "MAX_CONTEXT_BYTES", limit), \
+                mock.patch.object(analyzer, "MAX_POLICY_BYTES", 1024):
+            records, errors = analyzer.analyze_source(case.source, str(source))
+        (directory / "receipt.json").write_text(json.dumps({
+            **self.identity, "findings": records, "errors": errors, "context_limit": limit,
+            "per_document_limit": 1024, "source_bytes": len(case.source.encode("utf-8")),
+            "analyzer_sha256": hashlib.sha256(Path(analyzer.__file__).read_bytes()).hexdigest(),
+        }, indent=2) + "\n", encoding="utf-8")
+        self.assertTrue(errors, (records, errors))
+        self.assertTrue(records, "retain independently proved earlier documents when a later document exhausts the budget")
+        self.assertLess(len(records), 12, (records, errors))
+        for record in records:
+            self.assertEqual(record["rule"], RULES["iam"], record)
+            self.assertEqual(record["path"], str(source), record)
+
+    def test_iam_data_shared_variable_substitutions_are_bounded_before_encoding(self):
+        analyzer = importlib.import_module("ubs_core.hcl_scan")
+        resource = "arn:aws:s3:::" + "a" * 96 + "/&{aws:username}/*"
+        case = Case("iam_data_shared_resource_budget", '''
+            locals {
+              resource = %s
+            }
+            data "aws_iam_policy_document" "shared_resources" {
+              statement {
+                actions = ["*"]
+                resources = ["*", local.resource, local.resource, local.resource, local.resource]
+              }
+            }
+            resource "aws_iam_policy" "shared_resources" {
+              policy = data.aws_iam_policy_document.shared_resources.json
+            }
+        ''' % json.dumps(resource), True)
+        directory = self.materialize((case,), case.name)
+        source = directory / case.filename
+        # The limit is deliberately tiny. A serializer-only limit is too late:
+        # transforming every repeated string has already allocated the larger
+        # result before the serializer can reject it.
+        with mock.patch.object(analyzer, "MAX_POLICY_BYTES", 256), \
+                mock.patch.object(analyzer.json.JSONEncoder, "iterencode",
+                                  side_effect=AssertionError("oversized transformed document reached the serializer")):
+            records, errors = analyzer.analyze_source(case.source, str(source))
+        (directory / "receipt.json").write_text(json.dumps({
+            **self.identity, "findings": records, "errors": errors, "per_document_limit": 256,
+            "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            "analyzer_sha256": hashlib.sha256(Path(analyzer.__file__).read_bytes()).hexdigest(),
+        }, indent=2) + "\n", encoding="utf-8")
+        self.assertEqual(records, [], (records, errors))
+        self.assertTrue(errors, "expanded resources must become incomplete before reaching the serializer")
+
 
 def native_test(case):
     def run(self):
@@ -989,7 +1700,7 @@ def native_test(case):
     return run
 
 
-for _case in CASES + REVIEW_CASES + IAM_CASES + TLS_CASES:
+for _case in CASES + REVIEW_CASES + IAM_CASES + TLS_CASES + POLICY_DOCUMENT_CASES:
     setattr(HCLNativeTests, "test_" + _case.name, native_test(_case))
 
 
@@ -1155,6 +1866,64 @@ class HCLPublicTests(EvidenceTest):
         (directory / changed.filename).write_text(changed.source, encoding="utf-8")
         exposed = Case(policy.name, policy.code, locations=(("iam", 2, 3),))
         self.assert_report(*self.execute(directory, cached=True), "json", (exposed, changed))
+
+    def test_iam_data_public_formats_suppression_and_categories(self):
+        cases_by_name = {case.name: case for case in POLICY_DOCUMENT_CASES}
+        cases = tuple(cases_by_name[name] for name in (
+            "iam_data_default_allow", "iam_data_minified_json", "iam_data_restricted_actions",
+            "iam_data_selected_consumer_suppression"))
+        directory = self.materialize(cases, "iam-data-formats")
+        for mode in ("module-json", "module-sarif", "json", "sarif"):
+            with self.subTest(mode=mode):
+                self.assert_report(*self.execute(directory, mode), mode, cases)
+        self.assert_report(*self.execute(directory, extra=("--skip-hcl=3",)),
+                           "json", cases, expected_override=[])
+
+    def test_iam_data_partial_keeps_independent_proven_finding(self):
+        cases_by_name = {case.name: case for case in POLICY_DOCUMENT_CASES}
+        cases = tuple(cases_by_name[name] for name in (
+            "iam_data_default_allow", "iam_data_conditional_wildcard_is_incomplete",
+            "iam_data_unknown_action_is_incomplete"))
+        directory = self.materialize(cases, "iam-data-partial")
+        for mode in ("module-json", "module-sarif", "json", "sarif"):
+            with self.subTest(mode=mode):
+                self.assert_report(*self.execute(directory, mode), mode, cases, partial=True)
+
+    def test_iam_data_cache_invalidates_changed_selected_definition(self):
+        consumer = Case("main", '''
+            resource "aws_iam_policy" "cached_document" {
+              policy = data.aws_iam_policy_document.cached_document.json
+            }
+        ''')
+        document = Case("permissions", '''
+            data "aws_iam_policy_document" "cached_document" {
+              statement {
+                actions = ["s3:GetObject"]
+                resources = ["*"]
+              }
+            }
+        ''')
+        directory = self.materialize((consumer, document), "iam-data-cache")
+        for attempt in range(2):
+            with self.subTest(cache_state="restricted-" + str(attempt)):
+                self.assert_report(*self.execute(directory, cached=True), "json", (consumer, document))
+        changed = Case(document.name, '''
+            data "aws_iam_policy_document" "cached_document" {
+              statement {
+                actions = ["*"]
+                resources = ["*"]
+              }
+            }
+        ''')
+        (directory / changed.filename).write_text(changed.source, encoding="utf-8")
+        exposed = Case(consumer.name, consumer.code, locations=(("iam", 2, 3),))
+        with self.subTest(cache_state="broadened-definition"):
+            self.assert_report(*self.execute(directory, cached=True), "json", (exposed, changed))
+        with self.subTest(selection="definition-excluded"):
+            self.assert_report(*self.execute(directory, extra=("--exclude=permissions.tf",), cached=True),
+                               "json", (consumer,), partial=True)
+        with self.subTest(selection="definition-restored"):
+            self.assert_report(*self.execute(directory, cached=True), "json", (exposed, changed))
 
 
 if __name__ == "__main__":

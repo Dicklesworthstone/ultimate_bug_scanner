@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.5.43-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.5.44-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -356,9 +356,13 @@ access. Missing account-wide controls and provider defaults are not inferred.
 statements that select `"*"` in both `Action` and `Resource`. It supports
 `aws_iam_policy`, `aws_iam_role_policy`, `aws_iam_user_policy` and
 `aws_iam_group_policy` with literal JSON strings, heredocs, or bounded
-`jsonencode` expressions over selected literals and locals. Conditions or deny
-statements constraining a candidate grant produce incomplete analysis. Malformed
-JSON, duplicate keys, unsupported complement operators and unresolved policy
+`jsonencode` expressions over selected literals and locals. It also resolves
+`.json` and `.minified_json` from selected `aws_iam_policy_document` data sources
+in the same Terraform module, including local aliases, static action/resource
+lists, and the provider's default `Allow` effect. Findings point to the consuming
+resource's `policy` attribute; an unused data document does not create a finding.
+Conditions or deny statements constraining a candidate grant produce incomplete
+analysis. Malformed JSON, duplicate keys, unsupported complement operators and unresolved policy
 documents also remain incomplete. The warning describes policy intent; it does
 not establish attachment, effective IAM permissions or permission-boundary state.
 
@@ -386,15 +390,18 @@ directory scans exclude downloaded `.terraform` dependencies. Source bounds
 are 4 MiB per file, 32 MiB per selected context, 200,000 tokens and 64 nesting
 levels. Local evaluation is memoized and bounded; JSON policy input and encoded
 output are capped at 256 KiB, including expansion of shared local expressions.
+Total generated JSON is additionally bounded to 32 MiB per selected module.
 Custom `--rules` and extra non-`.tf` extensions are explicitly refused. Other
-providers, generated `aws_iam_policy_document` data sources, arbitrary policy
-evaluation and deployed reachability remain outside this slice. Confidence is
-uncalibrated.
+providers, policy-document merging, dynamic/conditional data statements,
+replicated data instances, arbitrary policy evaluation and deployed reachability
+remain outside this slice. Unresolved or cyclic data references stay incomplete.
+Confidence is uncalibrated.
 
 The checks follow the AWS provider's
 [ingress rule contract](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/vpc_security_group_ingress_rule),
 [S3 public-access controls](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/s3_bucket_public_access_block),
 [IAM policy grammar](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_grammar.html),
+[IAM policy-document generation](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/iam_policy_document),
 [AWS provider TLS setting](https://registry.terraform.io/providers/hashicorp/aws/latest/docs),
 and Terraform's [module file boundaries](https://developer.hashicorp.com/terraform/language/files).
 

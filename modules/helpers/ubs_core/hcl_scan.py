@@ -66,6 +66,7 @@ class Incomplete(ValueError):
 @dataclass(frozen=True)
 class Unknown:
     reason: str
+    cyclic: bool = False
 
 
 @dataclass(frozen=True)
@@ -277,6 +278,9 @@ class Values:
         self.locals = {}
         self.duplicate_locals = set()
         self.memo = {}
+        self.policy_memo = {}
+        self.resolve_policy = None
+        self.encoded_bytes = 0
         self.evaluations = 0
         for block in blocks:
             if block.kind == "locals" and not block.labels:
@@ -316,15 +320,35 @@ class Values:
         if re.fullmatch(r"local\.[A-Za-z_][\w-]*(?:\.[A-Za-z_][\w-]*)*", raw):
             name, *members = raw.split(".")[1:]
             if name in visiting or name in self.duplicate_locals:
-                return Unknown(f"cyclic or duplicate local {name}")
+                return Unknown(f"cyclic or duplicate local {name}", cyclic=name in visiting)
             if name not in self.locals:
                 return Unknown(f"unresolved local {name}")
             if name not in self.memo:
-                self.memo[name] = self.evaluate(self.locals[name].tokens, (*visiting, name))
+                value = self.evaluate(self.locals[name].tokens, (*visiting, name))
+                # Terraform depends on the entire local expression, even
+                # when a caller selects one object member. Cache a cycle
+                # before projection; immutable cached values need no rescan.
+                self.memo[name] = (Unknown(f"cyclic local expression {name}", cyclic=True)
+                                   if unknown(value, cycles_only=True) else value)
             value = self.memo[name]
+            if isinstance(value, Unknown):
+                return value
             for member in members:
                 value = value.get(member, Unknown(f"unresolved local member {member}")) if isinstance(value, dict) else Unknown("unresolved local object")
             return value
+        if (len(tokens) == 7 and all(tokens[index].kind == "word" for index in (0, 2, 4, 6))
+                and all(tokens[index].kind == "symbol" and tokens[index].value == "." for index in (1, 3, 5))
+                and tokens[0].value == "data" and tokens[2].value == "aws_iam_policy_document"
+                and tokens[6].value in {"json", "minified_json"}):
+            name = tokens[4].value
+            identity = "data.aws_iam_policy_document." + name
+            if identity in visiting:
+                return Unknown("cyclic IAM policy document reference " + identity, cyclic=True)
+            if self.resolve_policy is None:
+                return Unknown("IAM policy documents cannot determine provider requirements")
+            if name not in self.policy_memo:
+                self.policy_memo[name] = self.resolve_policy(name, (*visiting, identity))
+            return self.policy_memo[name]
         if (len(tokens) >= 3 and tokens[0].kind == "word" and tokens[0].value == "jsonencode"
                 and tokens[1].value == "(" and tokens[-1].value == ")"):
             # Only the built-in single-argument function is evaluated. No file
@@ -334,20 +358,7 @@ class Values:
             if len(arguments) != 1:
                 return Unknown("jsonencode requires one supported argument")
             value = self.evaluate(arguments[0], visiting)
-            if unknown(value):
-                return Unknown("jsonencode contains unresolved configuration")
-            # Local DAGs can describe exponentially larger JSON than their
-            # source. Stream into a bounded buffer instead of expanding first.
-            chunks, size = [], 0
-            try:
-                for chunk in json.JSONEncoder(ensure_ascii=True, allow_nan=False, separators=(",", ":")).iterencode(value):
-                    size += len(chunk)
-                    if size > MAX_POLICY_BYTES:
-                        return Unknown("encoded JSON policy byte budget exhausted")
-                    chunks.append(chunk)
-                return "".join(chunks)
-            except (ValueError, TypeError, RecursionError):
-                return Unknown("JSON encoding exceeded the supported value or nesting limits")
+            return self.encode_json(value)
         if tokens[0].value == "[" and tokens[-1].value == "]":
             return [self.evaluate(part, visiting) for part in split_items(original[1:-1])]
         if tokens[0].value == "{" and tokens[-1].value == "}":
@@ -366,16 +377,36 @@ class Values:
             return self.evaluate(original[1:-1], visiting)
         return Unknown("unresolved expression " + raw[:100])
 
-    def attribute(self, block: Block, name: str, default=None):
+    def attribute(self, block: Block, name: str, default=None, *, visiting: tuple[str, ...] = ()):
         attribute = block.attributes.get(name)
-        return self.evaluate(attribute.tokens) if attribute else default
+        return self.evaluate(attribute.tokens, visiting) if attribute else default
+
+    def encode_json(self, value):
+        if unknown(value):
+            return Unknown("JSON policy contains unresolved configuration", cyclic=unknown(value, cycles_only=True))
+        # Shared locals can describe exponentially larger output than their
+        # source. Bound each document and the total retained/generated JSON,
+        # including documents reached through different data-source addresses.
+        chunks, size = [], 0
+        try:
+            for chunk in json.JSONEncoder(ensure_ascii=True, allow_nan=False, separators=(",", ":")).iterencode(value):
+                size += len(chunk)
+                self.encoded_bytes += len(chunk)
+                if size > MAX_POLICY_BYTES:
+                    return Unknown("encoded JSON policy byte budget exhausted")
+                if self.encoded_bytes > MAX_CONTEXT_BYTES:
+                    return Unknown("generated JSON policy context byte budget exhausted")
+                chunks.append(chunk)
+            return "".join(chunks)
+        except (ValueError, TypeError, RecursionError):
+            return Unknown("JSON encoding exceeded the supported value or nesting limits")
 
 
-def unknown(value) -> bool:
+def unknown(value, *, cycles_only: bool = False) -> bool:
     pending, seen = [value], set()
     while pending:
         item = pending.pop()
-        if isinstance(item, Unknown):
+        if isinstance(item, Unknown) and (not cycles_only or item.cyclic):
             return True
         if isinstance(item, (dict, list)) and id(item) not in seen:
             seen.add(id(item))
@@ -411,6 +442,8 @@ def wildcard_policy(value) -> bool:
     are deliberately excluded. A deny can restrict a candidate grant, so it
     requires an incomplete result instead of a guessed permission outcome.
     """
+    if isinstance(value, Unknown):
+        raise Incomplete(value.reason)
     if not isinstance(value, str):
         raise Incomplete("IAM policy must resolve to a JSON string")
     try:
@@ -476,6 +509,10 @@ class Module:
                 self.errors.append(f"{path}: {exc}")
         self.values = Values(self.blocks)
         self.resources = [b for b in self.blocks if b.kind == "resource" and len(b.labels) == 2]
+        self.policy_documents = {}
+        for block in self.blocks:
+            if block.kind == "data" and len(block.labels) == 2 and block.labels[0] == "aws_iam_policy_document":
+                self.policy_documents.setdefault(block.labels[1], []).append(block)
         self.required = {}
         for block in self.blocks:
             if block.kind == "terraform":
@@ -484,6 +521,11 @@ class Module:
                         for name, attr in child.attributes.items():
                             self.required[name] = (Unknown("duplicate provider requirement") if name in self.required
                                                    else self.values.evaluate(attr.tokens))
+        # Provider identity must be established before a data source can use
+        # that provider's semantics. Do not retain provisional local values
+        # evaluated while the data-source resolver was intentionally disabled.
+        self.values.memo.clear()
+        self.values.resolve_policy = self.policy_document
 
     def error(self, block: Block, message: str, attr: Attribute | None = None):
         self.errors.append(f"{block.path}:{(attr.anchor if attr else block.anchor).line}: {message}")
@@ -691,6 +733,66 @@ class Module:
         elif not ignored:
             self.emit(block, "acl", STORAGE, f"{acl} is configured without a selected effective ACL ignore control")
 
+    def policy_document(self, name: str, visiting: tuple[str, ...]):
+        """Resolve selected static AWS data statements without executing Terraform.
+
+        Generation alone does not grant permissions: only an identity-policy
+        resource consuming the JSON is a finding site. Merging, conditions,
+        principals and dynamic statements remain explicit unknown boundaries.
+        """
+        definitions = self.policy_documents.get(name, [])
+        if len(definitions) != 1:
+            return Unknown("missing or duplicate IAM policy document data source " + name)
+        block = definitions[0]
+        if set(block.attributes) - {"provider", "version"}:
+            return Unknown("IAM policy document data source has unsupported attributes, replication or document merging")
+        if self.provider(block) is None:
+            return Unknown("IAM policy document data source does not resolve to the HashiCorp AWS provider")
+        version = self.values.attribute(block, "version", "2012-10-17", visiting=visiting)
+        if version is None:
+            version = "2012-10-17"
+        if not isinstance(version, str) or version not in {"2008-10-17", "2012-10-17"}:
+            return Unknown("IAM policy document version is unresolved or unsupported", cyclic=unknown(version, cycles_only=True))
+        statements, string_chars = [], 0
+        for child in block.children:
+            if (child.kind != "statement" or child.labels or child.children
+                    or set(child.attributes) - {"sid", "effect", "actions", "resources"}):
+                return Unknown("IAM policy document requires static identity statements without conditions, principals or complement operators")
+            effect = self.values.attribute(child, "effect", "Allow", visiting=visiting)
+            if effect is None:
+                effect = "Allow"
+            sid = self.values.attribute(child, "sid", "", visiting=visiting)
+            if sid is None:
+                sid = ""
+            if not isinstance(effect, str) or effect not in {"Allow", "Deny"} or not isinstance(sid, str):
+                return Unknown("IAM policy document statement effect or identifier is unresolved",
+                               cyclic=unknown([effect, sid], cycles_only=True))
+            statement = {"Effect": effect}
+            # The provider permits repeated blank SIDs; those statements have
+            # no identity and cannot override one another. Omit only the blank
+            # value so the shared JSON checker still rejects duplicate names.
+            if sid:
+                statement["Sid"] = sid
+                string_chars += len(sid)
+            for field, key in (("actions", "Action"), ("resources", "Resource")):
+                values = self.values.attribute(child, field, visiting=visiting)
+                if not isinstance(values, list) or not values or any(not isinstance(item, str) or not item for item in values):
+                    return Unknown("IAM policy document " + field + " must resolve to a nonempty string collection",
+                                   cyclic=unknown(values, cycles_only=True))
+                # Count shared strings before transforming them: replacing
+                # policy variables in repeated references must not allocate
+                # an expanded document before the bounded encoder sees it.
+                string_chars += sum(len(item) for item in values)
+                if string_chars > MAX_POLICY_BYTES:
+                    return Unknown("IAM policy document string expansion budget exhausted")
+                if field == "resources":
+                    if version == "2008-10-17" and any("&{" in item for item in values):
+                        return Unknown("IAM policy variables require document version 2012-10-17")
+                    values = [item.replace("&{", "${") for item in values]
+                statement[key] = values
+            statements.append(statement)
+        return self.values.encode_json({"Version": version, "Statement": statements})
+
     def iam(self, block: Block):
         attribute = block.attributes.get("policy")
         if attribute is None:
@@ -878,7 +980,7 @@ def main(argv=None) -> int:
     context = hashlib.sha256(json.dumps(sources, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
     cache = ScanCache(lang="hcl", project_dir=args.project_dir,
                       skip=",".join(map(str, sorted((CATEGORIES - args.only) | args.skip))),
-                      extra="aws-config-v2:" + context)
+                      extra="aws-config-v3:" + context)
     cached, pending = cache.partition_files(files)
     sink = CapturingSink()
     if pending:

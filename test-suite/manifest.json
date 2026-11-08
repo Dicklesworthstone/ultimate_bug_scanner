@@ -11124,6 +11124,62 @@
       "expect": { "exit_code": "nonzero", "totals": { "critical": { "min": 1 } }, "forbid_substrings": ["analysis is incomplete"] }
     },
     {
+      "id": "swift-g-observer-sink-refuses",
+      "path": "test-suite/swift/buggy/g_observer_sink.swift",
+      "language": "swift",
+      "tags": ["swift", "taint", "regression", "refuses"],
+      "args": ["--only=swift"],
+      "expect": { "exit_code": "nonzero", "require_substrings": ["analysis is incomplete"] }
+    },
+    {
+      "id": "swift-g-named-observer-sink-refuses",
+      "path": "test-suite/swift/buggy/g_named_observer_sink.swift",
+      "language": "swift",
+      "tags": ["swift", "taint", "regression", "refuses"],
+      "args": ["--only=swift"],
+      "expect": { "exit_code": "nonzero", "require_substrings": ["analysis is incomplete"] }
+    },
+    {
+      "id": "swift-g-outbound-observer-sink-refuses",
+      "path": "test-suite/swift/buggy/g_outbound_observer_sink.swift",
+      "language": "swift",
+      "tags": ["swift", "taint", "regression", "refuses"],
+      "args": ["--only=swift"],
+      "expect": { "exit_code": "nonzero", "require_substrings": ["analysis is incomplete"] }
+    },
+    {
+      "id": "swift-g-observer-sink-no-request-source-clean",
+      "path": "test-suite/swift/clean/g_observer_sink_no_request_source.swift",
+      "language": "swift",
+      "tags": ["swift", "security", "taint", "regression", "clean"],
+      "args": ["--only=swift"],
+      "expect": { "exit_code": "zero", "totals": { "critical": { "max": 0 } }, "forbid_substrings": ["analysis is incomplete", "swift: partial"] }
+    },
+    {
+      "id": "swift-g-observer-no-sink-clean",
+      "path": "test-suite/swift/clean/g_observer_no_sink.swift",
+      "language": "swift",
+      "tags": ["swift", "security", "taint", "regression", "clean"],
+      "args": ["--only=swift"],
+      "expect": { "exit_code": "zero", "totals": { "critical": { "max": 0 } }, "forbid_substrings": ["analysis is incomplete", "swift: partial"] }
+    },
+    {
+      "id": "swift-g-getter-sourceless-clean",
+      "path": "test-suite/swift/clean/g_getter_sourceless.swift",
+      "language": "swift",
+      "tags": ["swift", "security", "taint", "regression", "clean"],
+      "args": ["--only=swift"],
+      "expect": { "exit_code": "zero", "totals": { "critical": { "max": 0 } }, "forbid_substrings": ["analysis is incomplete", "swift: partial"] }
+    },
+    {
+      "id": "swift-g-local-observer-sink-refuses",
+      "path": "test-suite/swift/buggy/g_local_observer_sink.swift",
+      "language": "swift",
+      "tags": ["swift", "taint", "regression", "refuses"],
+      "args": ["--only=swift"],
+      "expect": { "exit_code": "nonzero", "require_substrings": ["analysis is incomplete"] }
+    },
+    {
       "id": "csharp-suppression-intervals-markers",
       "description": "A7 GH #91: all ubs:ignore placements (trailing, previous-line, multi-line statement, formatter-relocated, rule-scoped) suppress every finding line in the csharp module.",
       "path": "test-suite/csharp/suppression/suppression_buggy.cs",

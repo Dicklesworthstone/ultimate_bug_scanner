@@ -259,9 +259,10 @@ class SwiftFunction:
 
 
 class SwiftParser:
-    def __init__(self, text, tokens=None, suppressed=frozenset()):
+    def __init__(self, text, tokens=None, suppressed=frozenset(), obligation=None):
         self.tokens = swift_validated_tokens(text) if tokens is None else tokens
         self.suppressed = suppressed
+        self.obligation = obligation
         self.functions, self.types, self.extensions, self.final_types = {}, set(), set(), set()
         self.value_types = set()
         body = self.block(self.tokens, (), (), declarations=True)
@@ -471,6 +472,10 @@ class SwiftParser:
                         statements.append(SwiftStatement('definition', part, extra=(accessor_key,)))
                         continue
                     raise ValueError('Swift request-derived type initialization needs field analysis; analysis is incomplete')
+                if self.obligation is not None:
+                    obs_brace = next((i for i in range(head, finish) if tokens[i].kind == 'code' and tokens[i].value == '{'), -1)
+                    if obs_brace >= 0 and _swift_observer_obligation(tokens[obs_brace + 1:swift_close(tokens, obs_brace)], self.obligation):
+                        raise ValueError('Swift property observer with a sink needs assignment binding analysis; analysis is incomplete')
                 continue
             if first in {'import', 'typealias', 'case', '@'}:
                 if first == 'typealias' and len(part) >= 2:
@@ -902,6 +907,35 @@ def swift_statement_tokens(statements):
         yield from swift_statement_tokens(statement.alternate)
 
 
+def _swift_observer_obligation(tokens, obligation):
+    """True if an accessor-position set/willSet/didSet observer's body meets the
+    active policy's obligation. A property observer is never wired to its
+    assignment site, so a request-tainted store into the property never reaches
+    the observer's newValue and a sink there would be silently missed -> refuse.
+    Matches the keyword at accessor position (not preceded by '.'), with its block
+    immediately or after a single named parameter '(name)'.
+    """
+    items = tuple(tokens)
+    for index, token in enumerate(items):
+        if token.kind != 'code' or token.value not in {'set', 'willSet', 'didSet'}:
+            continue
+        if index > 0 and items[index - 1].kind == 'code' and items[index - 1].value == '.':
+            continue
+        rest = [j for j in range(index + 1, len(items)) if not (items[j].kind == 'code' and items[j].value == '\n')]
+        brace = -1
+        if rest and items[rest[0]].kind == 'code' and items[rest[0]].value == '{':
+            brace = rest[0]
+        elif (len(rest) >= 4 and items[rest[0]].value == '(' and items[rest[1]].kind == 'code'
+              and re.fullmatch(r'[A-Za-z_]\w*', items[rest[1]].value) and items[rest[2]].value == ')'
+              and items[rest[3]].value == '{'):
+            brace = rest[3]
+        if brace < 0:
+            continue
+        if obligation(items[brace + 1:swift_close(items, brace)]):
+            return True
+    return False
+
+
 def swift_outbound_obligation(tokens):
     """Lexical activation only; native receiver identity is checked by flow."""
     significant = tuple(token for token in tokens if token.kind != 'code' or token.value != '\n')
@@ -978,6 +1012,8 @@ class SwiftEngine:
         for function in self.parser.functions.values():
             request_parameter = any(re.fullmatch(r'(?:Vapor\.)?Request\??', item[2]) for item in function.parameters)
             if function.key == -1 or request_parameter or swift_source_tokens(swift_statement_tokens(function.body), self.parser.suppressed):
+                if self.parser.obligation is not None and _swift_observer_obligation(swift_statement_tokens(function.body), self.parser.obligation):
+                    raise ValueError('Swift property observer with a sink needs assignment binding analysis; analysis is incomplete')
                 self.context(function, tuple(CLEAN for _ in function.parameters), entry=True)
 
     def step(self, offset, kind, label):
@@ -2401,10 +2437,11 @@ def flow_findings(path, text, policy='path'):
     # With no selected request source, there is no source-to-sink obligation
     # for these policies; unrelated Swift closure/actor syntax belongs to
     # its own analyzer rather than being misreported as a failed taint pass.
-    obligation = swift_outbound_obligation(tokens) if policy == 'outbound' else swift_flow_obligation(tokens)
+    obligation_fn = swift_outbound_obligation if policy == 'outbound' else swift_flow_obligation
+    obligation = obligation_fn(tokens)
     if not swift_request_source_tokens(tokens, suppressed) or not obligation:
         return []
-    parser = SwiftParser(text, tokens, suppressed)
+    parser = SwiftParser(text, tokens, suppressed, obligation_fn)
     engine = SwiftEngine(path, text, policy, parser)
     rule, message = {
         'path': ('swift.taint.request_path_traversal', 'Request-derived path reaches file read/write/serve sink'),

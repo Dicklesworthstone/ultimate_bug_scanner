@@ -10,6 +10,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Keep SQL reducer keys in their lexical scope and evaluate `sorted` keys
+  after the generator has drained. Detect unsupported callback effects instead
+  of certifying a shadowed generator local as a safe key. Support keyed
+  `min`, `max`, and `sorted` over fresh lists of immutable values while
+  preserving the original records' SQL provenance and exception prefixes.
+
 - Follow saved Python SQL execution methods through local alias chains and
   straight-line reassignments. Bind SQL keyword slots and literal `**` mappings
   in evaluation order while keeping bound parameters separate from query text.

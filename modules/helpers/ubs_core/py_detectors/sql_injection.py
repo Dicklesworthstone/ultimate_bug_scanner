@@ -3952,6 +3952,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         """
         if len(node.generators) > 64:
             raise SQLFlowLimit('SQL comprehension nesting exceeded; analysis is incomplete')
+        record_reducer = reducer is not None and isinstance(node.elt, ast.List)
         first = node.generators[0]
         # Python evaluates just the outermost iterable in the enclosing scope.
         if captured is None:
@@ -3992,9 +3993,10 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 if isinstance(node, ast.SetComp) and not isinstance(node.elt, ast.Constant):
                     self.note_possible_raise()
             if reducer is not None:
-                self.check_generator_reducer(facts, *reducer)
+                self.check_generator_reducer(facts, *reducer, yielded=node.elt)
             if consumer_can_raise:
                 if (self._short_circuiting
+                        and not record_reducer
                         and not self.hash_safe_shape(self.element_shape(self.fact_kinds(facts)))):
                     raise SQLFlowLimit('SQL generator reducer callbacks are unresolved; analysis is incomplete')
                 # A reducer/hash/comparison can fail after this yield while
@@ -4054,6 +4056,17 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             iterable = generator.iter
             if self.generator_refs(self.value_facts(iterable)):
                 raise SQLFlowLimit('SQL nested generator iteration is unsupported; analysis is incomplete')
+            if record_reducer:
+                kind, element = self.value_kind(iterable)
+                if not (self.hash_safe_shape(self.element_shape((kind, element)))
+                        or kind == 'range'
+                        or isinstance(iterable, ast.List) and not any(
+                            isinstance(item, ast.Starred) for item in iterable.elts)
+                        and self.hash_safe_shape(element)):
+                    # Fresh records do not make their input iterator or its
+                    # released elements callback-free. Retained mutable
+                    # iterables need ownership/lifetime identities first.
+                    raise SQLFlowLimit('SQL generator reducer iterator callbacks are unresolved; analysis is incomplete')
             if (self._short_circuiting and self.value_kind(iterable)[0]
                     not in {'list', 'tuple', 'str', 'range', 'dict', 'set', 'frozenset'}
                     and self.generator_protocol_names().intersection({'__iter__', '__next__'})):
@@ -4091,7 +4104,10 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         enclosing_short_circuit = self._short_circuiting
         try:
             self._comprehension_locals = enclosing_locals | local_names
-            self._short_circuiting = enclosing_short_circuit or short_circuit is not None
+            # The admitted mutable-record subset also needs the guarded
+            # visitor: filter/operator/property/call callbacks can mutate
+            # SQL even when the final yielded record has primitive fields.
+            self._short_circuiting = enclosing_short_circuit or short_circuit is not None or record_reducer
             result = level(0, self.sql_state())
             result = self.join_sql_states(result, stopped)
             if result is None:
@@ -4351,9 +4367,20 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                     raise SQLFlowLimit('SQL generator reducer argument callbacks are unresolved; analysis is incomplete')
             key = keywords.get('key')
             length_key = (isinstance(key, ast.Name) and key.id == 'len'
-                          and self.builtin_is_unshadowed('len'))
+                          and self.builtin_is_unshadowed('len')
+                          and self.closed_generator_reducer_binding('len'))
+            # sorted exhausts its iterable before invoking any key. min/max
+            # invoke their keys between yields, so free cells must be read
+            # at those different times. Shapes are bounded immutable facts;
+            # retaining them cannot retain an analyzed program's objects.
+            deferred_keys = set() if reducer_name == 'sorted' else None
             facts = self.materialize_generators(
-                arguments[0][1], consumer_can_raise=True, reducer=(key, length_key))
+                arguments[0][1], consumer_can_raise=True, reducer=(key, length_key, deferred_keys))
+            if deferred_keys is not None:
+                for shape in deferred_keys:
+                    self.check_generator_reducer_key(shape, key, length_key)
+                if deferred_keys:
+                    self.note_possible_raise()
             if start is not None:
                 facts = self.join_value_facts(facts, self.value_facts(start))
             if 'default' in keywords:
@@ -4742,17 +4769,39 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             cache['reducer_builtin_imports'] = closed
         return cache['reducer_builtin_imports']
 
-    def check_generator_reducer(self, facts, key, length_key):
+    def check_generator_reducer(self, facts, key, length_key, deferred_keys, *, yielded):
         """Prove implicit reducer dispatch from each actual yielded value.
 
         A read-only generator can still hand a reducer an object whose
         comparison, arithmetic or key protocols replace an enclosing query.
-        Exact immutable builtin values cannot do that. Checking at emission
-        also keeps empty, filtered and exhausted cursors free of callbacks.
+        Fresh list records may be keyed without comparing the lists, but
+        neither their contents nor their destruction may dispatch callbacks.
+        Checking at emission keeps empty/exhausted cursors free of callbacks.
         """
         shape = self.element_shape(self.fact_kinds(facts))
-        if not self.hash_safe_shape(shape):
+        has_key = key is not None and not (isinstance(key, ast.Constant) and key.value is None)
+        if (has_key and isinstance(yielded, ast.List)
+                and not any(isinstance(item, ast.Starred) for item in yielded.elts)
+                and self.fact_kinds(facts)[0] == 'list'
+                and self.hash_safe_shape(self.fact_kinds(facts)[1])):
+            # A directly yielded list literal is private to the reducer.
+            # Named/walrus-captured lists and mutable child elements cannot
+            # borrow this proof: later generator steps may mutate aliases.
+            shape = 'list', self.fact_kinds(facts)[1]
+        elif not self.hash_safe_shape(shape):
             raise SQLFlowLimit('SQL generator reducer callbacks are unresolved; analysis is incomplete')
+        if deferred_keys is not None:
+            deferred_keys.add(shape)
+        else:
+            self.check_generator_reducer_key(shape, key, length_key)
+
+    def check_generator_reducer_key(self, shape, key, length_key):
+        """Prove a key expression without substituting generator locals.
+
+        Only exact builtin operations are admitted; their result shape does
+        not replace the original yielded value's SQL provenance. An unknown
+        callback, comparison, coercion or cleanup remains incomplete.
+        """
         if key is None or isinstance(key, ast.Constant) and key.value is None or length_key:
             return
         if not isinstance(key, ast.Lambda):
@@ -4765,10 +4814,16 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         def key_shape(value):
             self.step()
             if isinstance(value, ast.Name):
-                # A lambda's free cells are read when the key runs, after
-                # this yield's effects, not when the lambda was created.
-                return shape if value.id == parameters[0].arg else self.element_shape(
-                    self.value_kind(ast.Name(id=value.id, ctx=ast.Load())))
+                if value.id == parameters[0].arg:
+                    return shape
+                # The comprehension's same-spelled local is a different
+                # cell from this lambda's capture. Until that outer frame
+                # is restored, do not certify its value from loop facts.
+                owner = self.ownership_bindings().lexical_owner(value)
+                if (value.id in self._comprehension_locals or owner is None
+                        or not self._generator_scope or owner['node'] is not self._generator_scope[-1]):
+                    return ''
+                return self.element_shape(self.value_kind(ast.Name(id=value.id, ctx=ast.Load())))
             if isinstance(value, ast.Constant):
                 return self.element_shape(self.value_kind(value))
             if isinstance(value, ast.Tuple):
@@ -4793,8 +4848,17 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 if index == 'number':
                     if container == 'str':
                         return 'str'
-                    if isinstance(container, tuple) and container[0] == 'tuple':
+                    if isinstance(container, tuple) and container[0] in {'tuple', 'list'}:
                         return container[1]
+            if (isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
+                    and value.func.id == 'len' and len(value.args) == 1 and not value.keywords
+                    and not isinstance(value.args[0], ast.Starred)
+                    and self.ownership_bindings().resolve(value.func) == ('unbound', 'len')
+                    and self.closed_generator_reducer_binding('len')):
+                argument = key_shape(value.args[0])
+                if (argument == 'str' or isinstance(argument, tuple)
+                        and argument[0] in {'tuple', 'list'}):
+                    return 'number'
             return ''
 
         if not self.hash_safe_shape(key_shape(key.body)):

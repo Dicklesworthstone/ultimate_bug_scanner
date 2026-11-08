@@ -1690,6 +1690,159 @@ class SQLValueCaptureTests(unittest.TestCase):
             with self.subTest(case=name):
                 self.inspect('reducer-effects-' + name, source, expected)
 
+    def test_generator_reducer_fresh_list_record_provenance(self):
+        expressions = (
+            'min(([query] for _ in (1, 2)), key=len)',
+            'max(([query] for _ in (1, 2)), key=lambda record: len(record))',
+            'sorted(([query] for _ in (1, 2)), key=len)[0]',
+            'min(([query] for _ in range(2)), key=lambda record: 0)',
+            'max(([query] for _ in (1, 2)), key=lambda record: record[0])',
+            'sorted(([query] for _ in (1, 2)), '
+            'key=lambda record: (len(record), record[0]))[0]',
+            'min(([query] for _ in [1, 2]), key=lambda record: len(record[0]))',
+        )
+        for index, expression in enumerate(expressions):
+            for label, query, sink, rows, unsafe in (
+                    ('clean', '"SELECT count(*) FROM users WHERE name = \'alice\'"',
+                     'cursor.execute(selected[0])', 1, False),
+                    ('unsafe', 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"',
+                     'cursor.execute(selected[0])', 2, True),
+                    ('bound', 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"',
+                     'cursor.execute("SELECT count(*) FROM users WHERE name = ?", (selected[0],))',
+                     0, False)):
+                name = f'reducer-list-record-{index}-{label}'
+                source = program(f'    query = {query}\n    selected = {expression}\n'
+                                 + f'    return {sink}.fetchone()[0]\n')
+                with self.subTest(case=name):
+                    self.assertEqual(sqlite_witness(self.artifacts, name, source)['rows'], rows)
+                    expected = ((CRITICAL, len(source.splitlines())),) if unsafe else ()
+                    self.inspect(name, source, expected)
+
+    def test_generator_reducer_keys_keep_lexical_cells(self):
+        safe = '"SELECT count(*) FROM users WHERE name = \'alice\'"'
+        unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
+        callback = (f'    query = {safe}\n    class Key:\n'
+                    '        def __lt__(self, other):\n            nonlocal query\n'
+                    + f'            query = {unsafe}\n            return False\n'
+                    '        __gt__ = __lt__\n    token = Key()\n')
+        for reducer in ('min', 'max', 'sorted'):
+            for label, key, rows in (('free-cell', 'lambda item: token', 2),
+                                     ('parameter', 'lambda token: token', 1)):
+                name = f'reducer-key-lexical-{reducer}-{label}'
+                source = program(callback + f'    {reducer}((1 for token in (0, 0)), key={key})\n'
+                                 '    return cursor.execute(query).fetchone()[0]\n')
+                with self.subTest(case=name):
+                    self.assertEqual(sqlite_witness(self.artifacts, name, source)['rows'], rows)
+                    if label == 'parameter':
+                        self.inspect(name, source, ())
+                    else:
+                        path = self.artifacts / (name + '.py')
+                        path.write_text(source, encoding='utf-8')
+                        with self.assertRaisesRegex(detector.SQLFlowLimit, 'generator reducer.*incomplete'):
+                            list(detector.find([path]))
+
+    def test_generator_reducer_list_callbacks_remain_incomplete(self):
+        safe = '"SELECT count(*) FROM users WHERE name = \'alice\'"'
+        unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
+        cases = (
+            ('element-comparison',
+             '    class Key:\n        def __lt__(self, other):\n            nonlocal query\n'
+             + f'            query = {unsafe}\n            return False\n',
+             'min(([Key()] for _ in (1, 2)), key=lambda record: record[0])'),
+            ('element-finalizer',
+             '    class Key:\n        def __del__(self):\n            nonlocal query\n'
+             + f'            query = {unsafe}\n',
+             'min(([Key()] for _ in (1, 2)), key=lambda record: 0)'),
+            ('opaque-key',
+             '    def poison(record):\n        nonlocal query\n'
+             + f'        query = {unsafe}\n        return 0\n',
+             'min((["ordinary"] for _ in (1, 2)), key=lambda record: poison(record))'),
+            ('iterator-callback',
+             '    class Source:\n        def __iter__(self):\n            nonlocal query\n'
+             + f'            query = {unsafe}\n            return iter((1, 2))\n',
+             'min((["ordinary"] for _ in Source()), key=len)'),
+            ('retained-list',
+             '    class Key:\n        def __lt__(self, other):\n            nonlocal query\n'
+             + f'            query = {unsafe}\n            return False\n'
+             '    record = [Key()]\n',
+             'min((record for _ in (1, 2)), key=lambda value: value[0])'),
+        )
+        for name, definitions, expression in cases:
+            source = program(f'    query = {safe}\n' + definitions + f'    {expression}\n'
+                             '    return cursor.execute(query).fetchone()[0]\n')
+            with self.subTest(case=name):
+                self.assertEqual(sqlite_witness(self.artifacts, name, source)['rows'], 2)
+                path = self.artifacts / ('reducer-list-boundary-' + name + '.py')
+                path.write_text(source, encoding='utf-8')
+                reason = ('generator call effects' if name in {'element-comparison', 'element-finalizer'}
+                          else 'generator reducer')
+                with self.assertRaisesRegex(detector.SQLFlowLimit, reason + '.*incomplete'):
+                    list(detector.find([path]))
+
+    def test_generator_reducer_list_key_exception_preserves_prefix(self):
+        safe = '"SELECT count(*) FROM users WHERE name = \'alice\'"'
+        unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
+        for reducer in ('min', 'max'):
+            source = program(f'    query = {safe}\n    try:\n'
+                             + f'        {reducer}(([(query := {unsafe} if index == 0 else {safe})]\n'
+                             '             for index in (0, 1)), key=lambda record: record[2])\n'
+                             '    except IndexError:\n        pass\n'
+                             '    return cursor.execute(query).fetchone()[0]\n')
+            name = 'reducer-list-key-prefix-' + reducer
+            with self.subTest(reducer=reducer):
+                self.assertEqual(sqlite_witness(self.artifacts, name, source)['rows'], 2)
+                self.inspect(name, source, ((CRITICAL, len(source.splitlines())),))
+
+    def test_generator_reducer_list_filters_keep_callback_boundaries(self):
+        safe = '"SELECT count(*) FROM users WHERE name = \'alice\'"'
+        unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
+        callbacks = (f'    query = {safe}\n'
+                     '    class Flag:\n        def __bool__(self):\n            nonlocal query\n'
+                     + f'            query = {unsafe}\n            return True\n'
+                     '        def __eq__(self, other):\n            return bool(self)\n'
+                     '        @property\n        def active(self):\n            return bool(self)\n'
+                     '        def ready(self):\n            return bool(self)\n'
+                     '    flag = Flag()\n')
+        for reducer in ('min', 'max', 'sorted'):
+            for label, condition in (
+                    ('truth', 'flag'), ('comparison', 'flag == 0'), ('property', 'flag.active'),
+                    ('coercion', 'bool(flag)'), ('call', 'flag.ready()'), ('primitive', 'index > 0')):
+                name = f'reducer-list-filter-{reducer}-{label}'
+                source = program(callbacks
+                                 + f'    {reducer}((["record"] for index in (1, 2) if {condition}), key=len)\n'
+                                 '    return cursor.execute(query).fetchone()[0]\n')
+                with self.subTest(case=name):
+                    self.assertEqual(sqlite_witness(self.artifacts, name, source)['rows'],
+                                     1 if label == 'primitive' else 2)
+                    if label == 'primitive':
+                        self.inspect(name, source, ())
+                    else:
+                        path = self.artifacts / (name + '.py')
+                        path.write_text(source, encoding='utf-8')
+                        with self.assertRaisesRegex(detector.SQLFlowLimit, 'generator.*incomplete'):
+                            list(detector.find([path]))
+
+    def test_generator_reducer_sorted_keys_read_after_drain(self):
+        safe = '"SELECT count(*) FROM users WHERE name = \'alice\'"'
+        unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
+        for reducer in ('min', 'max', 'sorted'):
+            source = program(f'    query = {safe}\n    class Key:\n'
+                             '        def __lt__(self, other):\n            nonlocal query\n'
+                             + f'            query = {unsafe}\n            return False\n'
+                             '        __gt__ = __lt__\n    bad = Key()\n    token = 0\n'
+                             + f'    {reducer}((1 for index in (0, 1, 2)\n'
+                             '         if ((token := bad) if index == 2 else False) is False),\n'
+                             '        key=lambda item: token)\n'
+                             '    return cursor.execute(query).fetchone()[0]\n')
+            name = 'reducer-key-after-drain-' + reducer
+            with self.subTest(reducer=reducer):
+                self.assertEqual(sqlite_witness(self.artifacts, name, source)['rows'],
+                                 2 if reducer == 'sorted' else 1)
+                path = self.artifacts / (name + '.py')
+                path.write_text(source, encoding='utf-8')
+                with self.assertRaisesRegex(detector.SQLFlowLimit, 'generator reducer.*incomplete'):
+                    list(detector.find([path]))
+
     def test_collection_primitive_keys_keep_sql_provenance(self):
         key_type = ('    class Key:\n        def __hash__(self): return 0\n'
                     '        def __eq__(self, other): return False\n')

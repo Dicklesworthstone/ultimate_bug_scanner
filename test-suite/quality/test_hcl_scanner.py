@@ -875,8 +875,9 @@ TLS_CASES = (
 
 # Independently labeled before policy-document resolution is implemented.
 # A data source generates JSON; only a selected identity-policy consumer is a
-# finding site. Conditions, deny interactions and document merging retain the
-# existing incomplete boundary instead of inventing effective AWS permissions.
+# finding site. Conditions and deny interactions retain the incomplete boundary
+# instead of inventing effective AWS permissions. Composition cases below are
+# independently labeled against the provider's ordered statement replacement.
 POLICY_DOCUMENT_CASES = (
     Case("iam_data_default_allow", '''
         data "aws_iam_policy_document" "default_allow" {
@@ -1303,7 +1304,7 @@ POLICY_DOCUMENT_CASES = (
           policy = data.aws_iam_policy_document.instances.json
         }
     ''', True),
-    Case("iam_data_source_document_merge_is_incomplete", '''
+    Case("iam_data_own_named_statement_restricts_source_grant", '''
         data "aws_iam_policy_document" "source_merge" {
           source_policy_documents = [jsonencode({
             Statement = [{ Sid = "Selected", Effect = "Allow", Action = "*", Resource = "*" }]
@@ -1317,8 +1318,8 @@ POLICY_DOCUMENT_CASES = (
         resource "aws_iam_policy" "source_merge" {
           policy = data.aws_iam_policy_document.source_merge.json
         }
-    ''', True),
-    Case("iam_data_override_document_merge_is_incomplete", '''
+    '''),
+    Case("iam_data_override_named_statement_restricts_own_grant", '''
         data "aws_iam_policy_document" "override_merge" {
           override_policy_documents = [jsonencode({
             Statement = [{ Sid = "Selected", Effect = "Allow", Action = "s3:GetObject", Resource = "*" }]
@@ -1332,7 +1333,7 @@ POLICY_DOCUMENT_CASES = (
         resource "aws_iam_policy" "override_merge" {
           policy = data.aws_iam_policy_document.override_merge.json
         }
-    ''', True),
+    '''),
     Case("iam_data_legacy_source_json_is_incomplete", '''
         data "aws_iam_policy_document" "legacy_source" {
           source_json = "{}"
@@ -1437,6 +1438,420 @@ POLICY_DOCUMENT_CASES = (
           policy = data.aws_iam_policy_document.selected_member.json # expect:iam
         }
     '''),
+)
+
+
+# Pre-implementation composition oracle: source SID uniqueness is checked
+# before replacement; own statements replace sources; overrides replace in
+# order. Anonymous statements append, and replacing a statement replaces its
+# complete Effect/Action/Resource/Condition rather than merging those fields.
+POLICY_COMPOSITION_CASES = (
+    Case("iam_composed_source_only_grant", '''
+        data "aws_iam_policy_document" "source_only" {
+          source_policy_documents = [jsonencode({
+            Statement = [{ Sid = "Administrator", Effect = "Allow", Action = "*", Resource = "*" }]
+          })]
+        }
+        resource "aws_iam_policy" "source_only" {
+          policy = data.aws_iam_policy_document.source_only.json # expect:iam
+        }
+    '''),
+    Case("iam_composed_last_override_broadens", '''
+        data "aws_iam_policy_document" "last_broadens" {
+          statement {
+            sid = "Selected"
+            actions = ["s3:GetObject"]
+            resources = ["*"]
+          }
+          override_policy_documents = [
+            jsonencode({ Statement = [{ Sid = "Selected", Effect = "Allow", Action = "s3:ListBucket", Resource = "*" }] }),
+            jsonencode({ Statement = [{ Sid = "Selected", Effect = "Allow", Action = "*", Resource = "*" }] })
+          ]
+        }
+        resource "aws_iam_policy" "last_broadens" {
+          policy = data.aws_iam_policy_document.last_broadens.minified_json # expect:iam
+        }
+    '''),
+    Case("iam_composed_last_override_restricts", '''
+        data "aws_iam_policy_document" "last_restricts" {
+          statement {
+            sid = "Selected"
+            actions = ["*"]
+            resources = ["*"]
+          }
+          override_policy_documents = [
+            jsonencode({ Statement = [{ Sid = "Selected", Effect = "Allow", Action = "*", Resource = "*" }] }),
+            jsonencode({ Statement = [{ Sid = "Selected", Effect = "Allow", Action = "s3:GetObject", Resource = "*" }] })
+          ]
+        }
+        resource "aws_iam_policy" "last_restricts" {
+          policy = data.aws_iam_policy_document.last_restricts.json
+        }
+    '''),
+    Case("iam_composed_repeated_override_sid_last_broadens", '''
+        data "aws_iam_policy_document" "same_document_broadens" {
+          override_policy_documents = [jsonencode({ Statement = [
+            { Sid = "Selected", Effect = "Allow", Action = "s3:GetObject", Resource = "*" },
+            { Sid = "Selected", Effect = "Allow", Action = "*", Resource = "*" }
+          ] })]
+        }
+        resource "aws_iam_policy" "same_document_broadens" {
+          policy = data.aws_iam_policy_document.same_document_broadens.json # expect:iam
+        }
+    '''),
+    Case("iam_composed_repeated_override_sid_last_restricts", '''
+        data "aws_iam_policy_document" "same_document_restricts" {
+          override_policy_documents = [jsonencode({ Statement = [
+            { Sid = "Selected", Effect = "Allow", Action = "*", Resource = "*" },
+            { Sid = "Selected", Effect = "Allow", Action = "s3:GetObject", Resource = "*" }
+          ] })]
+        }
+        resource "aws_iam_policy" "same_document_restricts" {
+          policy = data.aws_iam_policy_document.same_document_restricts.json
+        }
+    '''),
+    Case("iam_composed_absent_sid_is_not_overridden", '''
+        data "aws_iam_policy_document" "anonymous_source" {
+          source_policy_documents = [jsonencode({
+            Statement = [{ Effect = "Allow", Action = "*", Resource = "*" }]
+          })]
+          override_policy_documents = [jsonencode({
+            Statement = [{ Effect = "Allow", Action = "s3:GetObject", Resource = "*" }]
+          })]
+        }
+        resource "aws_iam_policy" "anonymous_source" {
+          policy = data.aws_iam_policy_document.anonymous_source.json # expect:iam
+        }
+    '''),
+    Case("iam_composed_empty_sid_is_not_overridden", '''
+        data "aws_iam_policy_document" "empty_source_sid" {
+          source_policy_documents = [jsonencode({
+            Statement = [{ Sid = "", Effect = "Allow", Action = "*", Resource = "*" }]
+          })]
+          statement {
+            sid = ""
+            actions = ["s3:GetObject"]
+            resources = ["*"]
+          }
+          override_policy_documents = [jsonencode({
+            Statement = [{ Sid = "", Effect = "Allow", Action = "s3:ListBucket", Resource = "*" }]
+          })]
+        }
+        resource "aws_iam_policy" "empty_source_sid" {
+          policy = data.aws_iam_policy_document.empty_source_sid.json # expect:iam
+        }
+    '''),
+    Case("iam_composed_duplicate_source_sids_are_incomplete", '''
+        data "aws_iam_policy_document" "duplicate_sources" {
+          source_policy_documents = [
+            jsonencode({ Statement = [{ Sid = "Same", Effect = "Allow", Action = "*", Resource = "*" }] }),
+            jsonencode({ Statement = [{ Sid = "Same", Effect = "Allow", Action = "s3:GetObject", Resource = "*" }] })
+          ]
+          statement {
+            sid = "Same"
+            actions = ["s3:GetObject"]
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "duplicate_sources" {
+          policy = data.aws_iam_policy_document.duplicate_sources.json
+        }
+    ''', True),
+    Case("iam_composed_duplicate_sids_within_source_are_incomplete", '''
+        data "aws_iam_policy_document" "duplicates_inside_source" {
+          source_policy_documents = [jsonencode({ Statement = [
+            { Sid = "Same", Effect = "Allow", Action = "*", Resource = "*" },
+            { Sid = "Same", Effect = "Allow", Action = "s3:GetObject", Resource = "*" }
+          ] })]
+          override_policy_documents = [jsonencode({
+            Statement = [{ Sid = "Same", Effect = "Allow", Action = "s3:ListBucket", Resource = "*" }]
+          })]
+        }
+        resource "aws_iam_policy" "duplicates_inside_source" {
+          policy = data.aws_iam_policy_document.duplicates_inside_source.json
+        }
+    ''', True),
+    Case("iam_composed_duplicate_own_sids_cannot_be_repaired_by_override", '''
+        data "aws_iam_policy_document" "duplicate_own" {
+          statement {
+            sid = "Same"
+            actions = ["*"]
+            resources = ["*"]
+          }
+          statement {
+            sid = "Same"
+            actions = ["s3:GetObject"]
+            resources = ["*"]
+          }
+          override_policy_documents = [jsonencode({
+            Statement = [{ Sid = "Same", Effect = "Allow", Action = "s3:ListBucket", Resource = "*" }]
+          })]
+        }
+        resource "aws_iam_policy" "duplicate_own" {
+          policy = data.aws_iam_policy_document.duplicate_own.json
+        }
+    ''', True),
+    Case("iam_composed_locals_and_selected_data_chain", '''
+        locals {
+          selected = data.aws_iam_policy_document.chain_source.minified_json
+          documents = [local.selected]
+          final_json = data.aws_iam_policy_document.chain_target.json
+        }
+        data "aws_iam_policy_document" "chain_source" {
+          statement {
+            actions = ["*"]
+            resources = ["*"]
+          }
+        }
+        data "aws_iam_policy_document" "chain_target" {
+          source_policy_documents = local.documents
+        }
+        resource "aws_iam_policy" "chain_target" {
+          policy = local.final_json # expect:iam
+        }
+    '''),
+    Case("iam_composed_inherited_deny_remains_incomplete", '''
+        data "aws_iam_policy_document" "inherited_deny" {
+          source_policy_documents = [jsonencode({ Statement = [
+            { Sid = "Grant", Effect = "Allow", Action = "*", Resource = "*" },
+            { Sid = "Restriction", Effect = "Deny", Action = "iam:*", Resource = "*" }
+          ] })]
+        }
+        resource "aws_iam_policy" "inherited_deny" {
+          policy = data.aws_iam_policy_document.inherited_deny.json
+        }
+    ''', True),
+    Case("iam_composed_replaced_deny_no_longer_constrains_grant", '''
+        data "aws_iam_policy_document" "replaced_deny" {
+          source_policy_documents = [jsonencode({ Statement = [
+            { Sid = "Grant", Effect = "Allow", Action = "*", Resource = "*" },
+            { Sid = "Restriction", Effect = "Deny", Action = "iam:*", Resource = "*" }
+          ] })]
+          statement {
+            sid = "Restriction"
+            actions = ["s3:GetObject"]
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "replaced_deny" {
+          policy = data.aws_iam_policy_document.replaced_deny.json # expect:iam
+        }
+    '''),
+    Case("iam_composed_inherited_condition_remains_incomplete", '''
+        data "aws_iam_policy_document" "inherited_condition" {
+          source_policy_documents = [jsonencode({ Statement = [{
+            Sid = "Conditional"
+            Effect = "Allow"
+            Action = "*"
+            Resource = "*"
+            Condition = { Bool = { "aws:MultiFactorAuthPresent" = "true" } }
+          }] })]
+        }
+        resource "aws_iam_policy" "inherited_condition" {
+          policy = data.aws_iam_policy_document.inherited_condition.json
+        }
+    ''', True),
+    Case("iam_composed_replaced_condition_no_longer_constrains_grant", '''
+        data "aws_iam_policy_document" "replaced_condition" {
+          source_policy_documents = [jsonencode({ Statement = [{
+            Sid = "Conditional"
+            Effect = "Allow"
+            Action = "*"
+            Resource = "*"
+            Condition = { Bool = { "aws:MultiFactorAuthPresent" = "true" } }
+          }] })]
+          override_policy_documents = [jsonencode({
+            Statement = [{ Sid = "Conditional", Effect = "Allow", Action = "*", Resource = "*" }]
+          })]
+        }
+        resource "aws_iam_policy" "replaced_condition" {
+          policy = data.aws_iam_policy_document.replaced_condition.json # expect:iam
+        }
+    '''),
+    Case("iam_composed_unknown_sources_are_incomplete", '''
+        data "aws_iam_policy_document" "unknown_sources" {
+          source_policy_documents = var.documents
+          statement {
+            actions = ["*"]
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "unknown_sources" {
+          policy = data.aws_iam_policy_document.unknown_sources.json
+        }
+        resource "aws_iam_policy" "known_independent_source_control" {
+          policy = jsonencode({ # expect:iam
+            Statement = [{ Effect = "Allow", Action = "*", Resource = "*" }]
+          })
+        }
+    ''', True),
+    Case("iam_composed_unknown_override_is_incomplete", '''
+        data "aws_iam_policy_document" "unknown_override" {
+          statement {
+            sid = "Selected"
+            actions = ["*"]
+            resources = ["*"]
+          }
+          override_policy_documents = [var.override_json]
+        }
+        resource "aws_iam_policy" "unknown_override" {
+          policy = data.aws_iam_policy_document.unknown_override.json
+        }
+    ''', True),
+    Case("iam_composed_cycle_is_incomplete", '''
+        data "aws_iam_policy_document" "cycle_left" {
+          source_policy_documents = [data.aws_iam_policy_document.cycle_right.json]
+        }
+        data "aws_iam_policy_document" "cycle_right" {
+          override_policy_documents = [data.aws_iam_policy_document.cycle_left.json]
+        }
+        resource "aws_iam_policy" "cycle_left" {
+          policy = data.aws_iam_policy_document.cycle_left.json
+        }
+    ''', True),
+    Case("iam_composed_invalid_json_is_incomplete", '''
+        data "aws_iam_policy_document" "invalid_source_json" {
+          source_policy_documents = ["{broken json}"]
+          statement {
+            actions = ["*"]
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "invalid_source_json" {
+          policy = data.aws_iam_policy_document.invalid_source_json.json
+        }
+    ''', True),
+    Case("iam_composed_complement_source_is_incomplete", '''
+        data "aws_iam_policy_document" "complement_source" {
+          source_policy_documents = [jsonencode({
+            Statement = [{ Effect = "Allow", NotAction = "iam:*", Resource = "*" }]
+          })]
+        }
+        resource "aws_iam_policy" "complement_source" {
+          policy = data.aws_iam_policy_document.complement_source.json
+        }
+    ''', True),
+    Case("iam_composed_principal_source_is_incomplete", '''
+        data "aws_iam_policy_document" "principal_source" {
+          source_policy_documents = [jsonencode({
+            Statement = [{ Effect = "Allow", Action = "*", Resource = "*", Principal = "*" }]
+          })]
+        }
+        resource "aws_iam_policy" "principal_source" {
+          policy = data.aws_iam_policy_document.principal_source.json
+        }
+    ''', True),
+    Case("iam_composed_source_statement_object_is_invalid", '''
+        data "aws_iam_policy_document" "statement_object" {
+          source_policy_documents = [jsonencode({
+            Statement = { Effect = "Allow", Action = "*", Resource = "*" }
+          })]
+        }
+        resource "aws_iam_policy" "statement_object" {
+          policy = data.aws_iam_policy_document.statement_object.json
+        }
+    ''', True),
+    Case("iam_composed_duplicate_source_json_keys_are_invalid", '''
+        data "aws_iam_policy_document" "duplicate_json_key" {
+          source_policy_documents = [<<POLICY
+        {"Statement":[{"Effect":"Deny","Effect":"Allow","Action":"*","Resource":"*"}]}
+        POLICY
+          ]
+        }
+        resource "aws_iam_policy" "duplicate_json_key" {
+          policy = data.aws_iam_policy_document.duplicate_json_key.json
+        }
+    ''', True),
+    Case("iam_composed_empty_lists_preserve_own_grant", '''
+        data "aws_iam_policy_document" "empty_lists" {
+          source_policy_documents = []
+          override_policy_documents = []
+          statement {
+            actions = ["*"]
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "empty_lists" {
+          policy = data.aws_iam_policy_document.empty_lists.json # expect:iam
+        }
+    '''),
+    Case("iam_composed_empty_documents_are_noops", '''
+        data "aws_iam_policy_document" "empty_documents" {
+          source_policy_documents = ["{}", jsonencode({ Version = "2012-10-17" }),
+                                     jsonencode({ Statement = [] }), jsonencode({ Statement = null })]
+          override_policy_documents = ["{}", jsonencode({ Statement = [] })]
+          statement {
+            actions = ["*"]
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "empty_documents" {
+          policy = data.aws_iam_policy_document.empty_documents.json # expect:iam
+        }
+    '''),
+    Case("iam_composed_optional_null_lists_are_omitted", '''
+        data "aws_iam_policy_document" "null_collections" {
+          source_policy_documents = null
+          override_policy_documents = null
+          statement {
+            actions = ["*"]
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "null_collections" {
+          policy = data.aws_iam_policy_document.null_collections.json # expect:iam
+        }
+    '''),
+    Case("iam_composed_null_list_members_are_skipped", '''
+        data "aws_iam_policy_document" "null_members" {
+          source_policy_documents = [null, jsonencode({
+            Statement = [{ Effect = "Allow", Action = "*", Resource = "*" }]
+          }), null]
+          override_policy_documents = [null]
+        }
+        resource "aws_iam_policy" "null_members" {
+          policy = data.aws_iam_policy_document.null_members.json # expect:iam
+        }
+    '''),
+    Case("iam_composed_source_version_cannot_enable_old_own_variables", '''
+        data "aws_iam_policy_document" "old_own_variables" {
+          version = "2008-10-17"
+          source_policy_documents = [jsonencode({ Version = "2012-10-17", Statement = [] })]
+          statement {
+            actions = ["*"]
+            resources = ["*", "arn:aws:s3:::example/&{aws:username}/*"]
+          }
+        }
+        resource "aws_iam_policy" "old_own_variables" {
+          policy = data.aws_iam_policy_document.old_own_variables.json
+        }
+    ''', True),
+    Case("iam_composed_cached_cycle_cannot_hide_in_object_projection", '''
+        locals {
+          inherited = data.aws_iam_policy_document.inherited_cycle.json
+          selected = { actions = ["*"], unused = local.inherited }
+        }
+        data "aws_iam_policy_document" "inherited_cycle" {
+          source_policy_documents = [local.inherited]
+        }
+        resource "aws_iam_policy" "first_cycle_use" {
+          policy = local.inherited
+        }
+        data "aws_iam_policy_document" "projected_cycle" {
+          statement {
+            actions = local.selected.actions
+            resources = ["*"]
+          }
+        }
+        resource "aws_iam_policy" "projected_cycle" {
+          policy = data.aws_iam_policy_document.projected_cycle.json
+        }
+        resource "aws_iam_policy" "independent_cycle_control" {
+          policy = jsonencode({ # expect:iam
+            Statement = [{ Effect = "Allow", Action = "*", Resource = "*" }]
+          })
+        }
+    ''', True),
 )
 
 
@@ -1693,6 +2108,125 @@ resource "aws_iam_policy" "document%d" {
         self.assertEqual(records, [], (records, errors))
         self.assertTrue(errors, "expanded resources must become incomplete before reaching the serializer")
 
+    def test_iam_composed_selected_siblings_and_module_isolation(self):
+        analyzer = importlib.import_module("ubs_core.hcl_scan")
+        consumer = Case("main", '''
+            resource "aws_iam_policy" "selected_composition" {
+              policy = local.composed_json # expect:iam
+            }
+        ''')
+        composition = Case("composition", '''
+            locals {
+              composed_json = data.aws_iam_policy_document.selected_composition.json
+            }
+            data "aws_iam_policy_document" "selected_composition" {
+              source_policy_documents = [data.aws_iam_policy_document.sibling_source.json]
+            }
+        ''')
+        source = Case("source", '''
+            data "aws_iam_policy_document" "sibling_source" {
+              statement {
+                actions = ["*"]
+                resources = ["*"]
+              }
+            }
+        ''')
+        directory = self.materialize((consumer, composition, source), "iam-composed-selected-module")
+        paths = {str(directory / case.filename): case.source for case in (consumer, composition)}
+        other = directory / "child-module"
+        other.mkdir()
+        (other / source.filename).write_text(source.source, encoding="utf-8")
+        scenarios = (
+            ("selected-source", {**paths, str(directory / source.filename): source.source}, False),
+            ("source-not-selected", paths, True),
+            ("source-in-child-module", {**paths, str(other / source.filename): source.source}, True),
+        )
+        for name, sources, partial in scenarios:
+            with self.subTest(selection=name):
+                records, errors = analyzer.analyze_sources(sources)
+                actual = sorted((row["path"], row["rule"], row["line"], row["col"]) for row in records)
+                expected = [] if partial else [(str(directory / consumer.filename), rule, line, col)
+                                               for rule, line, col in consumer.expected]
+                (directory / (name + ".json")).write_text(json.dumps({
+                    **self.identity, "selected_sources": list(sources), "expected": expected,
+                    "actual": actual, "findings": records, "errors": errors, "incomplete": partial,
+                    "analyzer_sha256": hashlib.sha256(Path(analyzer.__file__).read_bytes()).hexdigest(),
+                }, indent=2) + "\n", encoding="utf-8")
+                self.assertEqual(bool(errors), partial, (sources, records, errors))
+                self.assertEqual(actual, expected, (sources, records, errors))
+
+    def test_iam_composed_version_cannot_be_downgraded(self):
+        analyzer = importlib.import_module("ubs_core.hcl_scan")
+        case = Case("iam_composed_version", '''
+            data "aws_iam_policy_document" "version_order" {
+              version = "2008-10-17"
+              source_policy_documents = [jsonencode({ Version = "2012-10-17", Statement = [
+                { Effect = "Allow", Action = "*", Resource = "*" }
+              ] })]
+              override_policy_documents = [jsonencode({ Version = "2008-10-17", Statement = [] })]
+            }
+            resource "aws_iam_policy" "version_order" {
+              policy = data.aws_iam_policy_document.version_order.json # expect:iam
+            }
+        ''')
+        directory = self.materialize((case,), case.name)
+        source = str(directory / case.filename)
+        module = analyzer.Module({source: case.source}, set(analyzer.RULES))
+        records, errors = module.run()
+        actual = sorted((row["rule"], row["line"], row["col"]) for row in records)
+        # Observe the generated value that the real identity-policy consumer
+        # receives. Finding counts alone cannot reveal a version downgrade.
+        generated = module.values.attribute(module.resources[0], "policy")
+        self.assertIsInstance(generated, str, (records, errors, generated))
+        policy = json.loads(generated)
+        (directory / "receipt.json").write_text(json.dumps({
+            **self.identity, "expected": case.expected, "actual": actual,
+            "findings": records, "errors": errors, "generated_policy": policy,
+            "analyzer_sha256": hashlib.sha256(Path(analyzer.__file__).read_bytes()).hexdigest(),
+        }, indent=2) + "\n", encoding="utf-8")
+        self.assertEqual(errors, [], (records, errors))
+        self.assertEqual(actual, case.expected, (records, errors))
+        self.assertEqual(policy["Version"], "2012-10-17", policy)
+
+    def test_iam_composed_shared_documents_obey_resource_budgets(self):
+        analyzer = importlib.import_module("ubs_core.hcl_scan")
+        # These sources are only a few KiB. Repeated references expand the
+        # intermediate anonymous statement list; named override statements
+        # keep the result small while still requiring repeated decode work.
+        scenarios = (("source_policy_documents", False, "document"),
+                     ("override_policy_documents", False, "document"),
+                     ("override_policy_documents", True, "context"))
+        for field, named, budget in scenarios:
+            with self.subTest(field=field, named=named, budget=budget):
+                statement = {"Effect": "Allow", "Action": "*", "Resource": ["*", "arn:aws:s3:::example/" + "a" * 180]}
+                if named:
+                    statement["Sid"] = "Selected"
+                document = json.dumps({"Statement": [statement]}, separators=(",", ":"))
+                name = f"iam_composed_{field}_{budget}_budget"
+                code = ('locals { document = ' + json.dumps(document) + ' }\n'
+                        'data "aws_iam_policy_document" "repeated" {\n'
+                        f'  {field} = [' + ", ".join(["local.document"] * 32) + ']\n}\n'
+                        'resource "aws_iam_policy" "repeated" {\n'
+                        '  policy = data.aws_iam_policy_document.repeated.json # expect:iam\n}\n')
+                control = Case(name, code)
+                self.check_native(control)
+                limited = Case(name + "_limited", code.replace(" # expect:iam", ""), True)
+                directory = self.materialize((limited,), limited.name)
+                source = directory / limited.filename
+                caps = {"MAX_POLICY_BYTES": 1024} if budget == "document" else {
+                    "MAX_POLICY_BYTES": 1024, "MAX_CONTEXT_BYTES": len(limited.source.encode("utf-8")) + 64,
+                }
+                with mock.patch.multiple(analyzer, **caps):
+                    records, errors = analyzer.analyze_source(limited.source, str(source))
+                (directory / "receipt.json").write_text(json.dumps({
+                    **self.identity, "findings": records, "errors": errors, "limits": caps,
+                    "source_bytes": len(limited.source.encode("utf-8")), "shared_document_bytes": len(document),
+                    "references": 32,
+                    "analyzer_sha256": hashlib.sha256(Path(analyzer.__file__).read_bytes()).hexdigest(),
+                }, indent=2) + "\n", encoding="utf-8")
+                self.assertEqual(records, [], (records, errors))
+                self.assertTrue(any("budget" in error.lower() for error in errors), (records, errors))
+
 
 def native_test(case):
     def run(self):
@@ -1700,7 +2234,7 @@ def native_test(case):
     return run
 
 
-for _case in CASES + REVIEW_CASES + IAM_CASES + TLS_CASES + POLICY_DOCUMENT_CASES:
+for _case in CASES + REVIEW_CASES + IAM_CASES + TLS_CASES + POLICY_DOCUMENT_CASES + POLICY_COMPOSITION_CASES:
     setattr(HCLNativeTests, "test_" + _case.name, native_test(_case))
 
 
@@ -1924,6 +2458,66 @@ class HCLPublicTests(EvidenceTest):
                                "json", (consumer,), partial=True)
         with self.subTest(selection="definition-restored"):
             self.assert_report(*self.execute(directory, cached=True), "json", (exposed, changed))
+
+    def test_iam_composed_public_json_sarif(self):
+        cases_by_name = {case.name: case for case in POLICY_COMPOSITION_CASES}
+        cases = tuple(cases_by_name[name] for name in (
+            "iam_composed_source_only_grant", "iam_composed_last_override_restricts",
+            "iam_composed_absent_sid_is_not_overridden", "iam_composed_replaced_condition_no_longer_constrains_grant"))
+        directory = self.materialize(cases, "iam-composed-formats")
+        for mode in ("module-json", "module-sarif", "json", "sarif"):
+            with self.subTest(mode=mode):
+                self.assert_report(*self.execute(directory, mode), mode, cases)
+
+    def test_iam_composed_cache_tracks_source_and_override_changes(self):
+        consumer = Case("main", '''
+            resource "aws_iam_policy" "cached_composition" {
+              policy = data.aws_iam_policy_document.cached_composition.json
+            }
+        ''')
+        composition = Case("composition", '''
+            data "aws_iam_policy_document" "cached_composition" {
+              source_policy_documents = [data.aws_iam_policy_document.cached_source.json]
+              override_policy_documents = [data.aws_iam_policy_document.cached_override.minified_json]
+            }
+        ''')
+        source = Case("source", '''
+            data "aws_iam_policy_document" "cached_source" {
+              statement {
+                sid = "Source"
+                actions = ["s3:GetObject"]
+                resources = ["*"]
+              }
+            }
+        ''')
+        override = Case("override", '''
+            data "aws_iam_policy_document" "cached_override" {
+              statement {
+                sid = "Override"
+                actions = ["s3:GetObject"]
+                resources = ["*"]
+              }
+            }
+        ''')
+        directory = self.materialize((consumer, composition, source, override), "iam-composed-cache")
+        for attempt in range(2):
+            with self.subTest(state="restricted-" + str(attempt)):
+                self.assert_report(*self.execute(directory, cached=True), "json",
+                                   (consumer, composition, source, override))
+        exposed = Case(consumer.name, consumer.code, locations=(("iam", 2, 3),))
+        for selected in (source, override):
+            changed = Case(selected.name, selected.code.replace('"s3:GetObject"', '"*"'))
+            path = directory / changed.filename
+            path.write_text(changed.source, encoding="utf-8")
+            cases = (exposed, composition,
+                     changed if selected is source else source,
+                     changed if selected is override else override)
+            with self.subTest(state="broadened-" + selected.name):
+                self.assert_report(*self.execute(directory, cached=True), "json", cases)
+            path.write_text(selected.source, encoding="utf-8")
+            with self.subTest(state="restricted-again-" + selected.name):
+                self.assert_report(*self.execute(directory, cached=True), "json",
+                                   (consumer, composition, source, override))
 
 
 if __name__ == "__main__":

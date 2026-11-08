@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.5.45-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.5.46-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -361,8 +361,14 @@ statements that select `"*"` in both `Action` and `Resource`. It supports
 in the same Terraform module, including local aliases, static action/resource
 lists, and the provider's default `Allow` effect. Findings point to the consuming
 resource's `policy` attribute; an unused data document does not create a finding.
-Conditions or deny statements constraining a candidate grant produce incomplete
-analysis. Malformed JSON, duplicate keys, unsupported complement operators and unresolved policy
+Static `source_policy_documents` and `override_policy_documents` follow the
+provider's statement-ID merge order: sources first, inline statements next,
+then overrides in list order. Matching nonblank `Sid` values replace whole
+statements; unnamed statements always survive. Duplicate named source or inline
+statements are invalid even when an override would replace them. Conditions
+and deny statements are checked after replacement; those still constraining a
+candidate grant produce incomplete analysis. Malformed JSON, duplicate keys,
+unsupported complement operators and unresolved policy
 documents also remain incomplete. The warning describes policy intent; it does
 not establish attachment, effective IAM permissions or permission-boundary state.
 
@@ -389,10 +395,11 @@ produce partial reports and exit 2 while retaining proven findings. Ordinary
 directory scans exclude downloaded `.terraform` dependencies. Source bounds
 are 4 MiB per file, 32 MiB per selected context, 200,000 tokens and 64 nesting
 levels. Local evaluation is memoized and bounded; JSON policy input and encoded
-output are capped at 256 KiB, including expansion of shared local expressions.
-Total generated JSON is additionally bounded to 32 MiB per selected module.
+output are capped at 256 KiB, including expansion of shared local expressions
+and intermediate merged documents. Generated JSON and repeated composition
+input parsing each have an additional 32 MiB budget per selected module.
 Custom `--rules` and extra non-`.tf` extensions are explicitly refused. Other
-providers, policy-document merging, dynamic/conditional data statements,
+providers, dynamic/conditional data statements,
 replicated data instances, arbitrary policy evaluation and deployed reachability
 remain outside this slice. Unresolved or cyclic data references stay incomplete.
 Confidence is uncalibrated.

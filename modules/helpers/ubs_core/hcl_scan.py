@@ -281,6 +281,7 @@ class Values:
         self.policy_memo = {}
         self.resolve_policy = None
         self.encoded_bytes = 0
+        self.decoded_bytes = 0
         self.evaluations = 0
         for block in blocks:
             if block.kind == "locals" and not block.labels:
@@ -435,12 +436,12 @@ def policy_strings(value, field):
     return values
 
 
-def wildcard_policy(value) -> bool:
-    """Prove only an unconditional all-action/all-resource identity grant.
+def parse_policy_document(value, *, composition: bool = False) -> dict:
+    """Validate the selected JSON shape before classifying or merging grants.
 
-    Other policy types, complement operators and effective policy evaluation
-    are deliberately excluded. A deny can restrict a candidate grant, so it
-    requires an incomplete result instead of a guessed permission outcome.
+    The provider accepts only statement arrays in composition inputs. Named
+    statement uniqueness belongs to the merge phase: sources reject duplicates,
+    while later override statements replace earlier statements of the same name.
     """
     if isinstance(value, Unknown):
         raise Incomplete(value.reason)
@@ -458,27 +459,59 @@ def wildcard_policy(value) -> bool:
     if not isinstance(version, str) or version not in {"2008-10-17", "2012-10-17"}:
         raise Incomplete("unsupported IAM policy language version")
     statements = document.get("Statement")
-    statements = [statements] if isinstance(statements, dict) else statements
-    if not isinstance(statements, list) or not statements:
-        raise Incomplete("IAM policy requires a nonempty Statement object or array")
-    candidate, conditional, denied, identifiers = False, False, False, set()
+    if composition:
+        statements = [] if statements is None else statements
+        if not isinstance(statements, list):
+            raise Incomplete("IAM policy composition requires a Statement array")
+    else:
+        statements = [statements] if isinstance(statements, dict) else statements
+        if not isinstance(statements, list) or not statements:
+            raise Incomplete("IAM policy requires a nonempty Statement object or array")
+    identifiers = set()
     for statement in statements:
         if not isinstance(statement, dict) or set(statement) - {"Sid", "Effect", "Action", "Resource", "Condition"}:
             raise Incomplete("unsupported IAM statement fields, principal or complement operators")
         if "Sid" in statement:
             sid = statement["Sid"]
-            if not isinstance(sid, str) or not re.fullmatch(r"[A-Za-z0-9]*", sid) or sid in identifiers:
+            if (not isinstance(sid, str) or not re.fullmatch(r"[A-Za-z0-9]*", sid)
+                    or not composition and sid in identifiers):
                 raise Incomplete("invalid or duplicate IAM statement identifier")
             identifiers.add(sid)
+            if composition and not sid:
+                # The provider omits blank SIDs when encoding its merged
+                # document. Anonymous statements never replace one another.
+                del statement["Sid"]
         effect = statement.get("Effect")
         if not isinstance(effect, str) or effect not in {"Allow", "Deny"}:
             raise Incomplete("IAM statement Effect must be Allow or Deny")
-        actions = policy_strings(statement.get("Action"), "Action")
-        resources = policy_strings(statement.get("Resource"), "Resource")
+        policy_strings(statement.get("Action"), "Action")
+        policy_strings(statement.get("Resource"), "Resource")
         if "Condition" in statement:
             condition = statement["Condition"]
             if not isinstance(condition, dict) or not condition or any(not isinstance(v, dict) or not v for v in condition.values()):
                 raise Incomplete("unsupported IAM Condition structure")
+            if composition:
+                for terms in condition.values():
+                    for term in terms.values():
+                        if (not isinstance(term, (str, bool)) and
+                                (not isinstance(term, list) or not term or any(not isinstance(item, str) for item in term))):
+                            raise Incomplete("unsupported IAM Condition value in policy composition")
+    return {"Version": version, "Statement": statements}
+
+
+def wildcard_policy(value) -> bool:
+    """Prove only an unconditional all-action/all-resource identity grant.
+
+    Other policy types, complement operators and effective policy evaluation
+    are deliberately excluded. A deny can restrict a candidate grant, so it
+    requires an incomplete result instead of a guessed permission outcome.
+    """
+    document = parse_policy_document(value)
+    candidate, conditional, denied = False, False, False
+    for statement in document["Statement"]:
+        effect = statement["Effect"]
+        actions = policy_strings(statement["Action"], "Action")
+        resources = policy_strings(statement["Resource"], "Resource")
         denied |= effect == "Deny"
         if effect == "Allow" and "*" in actions and "*" in resources:
             conditional |= "Condition" in statement
@@ -737,15 +770,16 @@ class Module:
         """Resolve selected static AWS data statements without executing Terraform.
 
         Generation alone does not grant permissions: only an identity-policy
-        resource consuming the JSON is a finding site. Merging, conditions,
-        principals and dynamic statements remain explicit unknown boundaries.
+        resource consuming the JSON is a finding site. Sources, own statements
+        and overrides replace whole statements by nonblank SID, in that order.
+        Unsupported input never disappears merely because an override exists.
         """
         definitions = self.policy_documents.get(name, [])
         if len(definitions) != 1:
             return Unknown("missing or duplicate IAM policy document data source " + name)
         block = definitions[0]
-        if set(block.attributes) - {"provider", "version"}:
-            return Unknown("IAM policy document data source has unsupported attributes, replication or document merging")
+        if set(block.attributes) - {"provider", "version", "source_policy_documents", "override_policy_documents"}:
+            return Unknown("IAM policy document data source has unsupported attributes or replication")
         if self.provider(block) is None:
             return Unknown("IAM policy document data source does not resolve to the HashiCorp AWS provider")
         version = self.values.attribute(block, "version", "2012-10-17", visiting=visiting)
@@ -753,7 +787,7 @@ class Module:
             version = "2012-10-17"
         if not isinstance(version, str) or version not in {"2008-10-17", "2012-10-17"}:
             return Unknown("IAM policy document version is unresolved or unsupported", cyclic=unknown(version, cycles_only=True))
-        statements, string_chars = [], 0
+        statements, string_chars, own_identifiers = [], 0, set()
         for child in block.children:
             if (child.kind != "statement" or child.labels or child.children
                     or set(child.attributes) - {"sid", "effect", "actions", "resources"}):
@@ -764,9 +798,14 @@ class Module:
             sid = self.values.attribute(child, "sid", "", visiting=visiting)
             if sid is None:
                 sid = ""
-            if not isinstance(effect, str) or effect not in {"Allow", "Deny"} or not isinstance(sid, str):
+            if (not isinstance(effect, str) or effect not in {"Allow", "Deny"}
+                    or not isinstance(sid, str) or not re.fullmatch(r"[A-Za-z0-9]*", sid)):
                 return Unknown("IAM policy document statement effect or identifier is unresolved",
                                cyclic=unknown([effect, sid], cycles_only=True))
+            if sid and sid in own_identifiers:
+                return Unknown("duplicate IAM policy document statement identifier")
+            if sid:
+                own_identifiers.add(sid)
             statement = {"Effect": effect}
             # The provider permits repeated blank SIDs; those statements have
             # no identity and cannot override one another. Omit only the blank
@@ -791,7 +830,77 @@ class Module:
                     values = [item.replace("&{", "${") for item in values]
                 statement[key] = values
             statements.append(statement)
-        return self.values.encode_json({"Version": version, "Statement": statements})
+        merged = {"Version": version, "Statement": []}
+        positions, sizes, source_identifiers = {}, [], set()
+        # Bound the retained intermediate result, not just the final encoder:
+        # many small source documents can otherwise accumulate a large object.
+        merged_bytes = len('{"Version":"2012-10-17","Statement":[]}')
+
+        def merge(incoming, *, source: bool = False):
+            nonlocal merged_bytes
+            for statement in incoming:
+                sid = statement.get("Sid", "")
+                if source and sid:
+                    if sid in source_identifiers:
+                        raise Incomplete("duplicate IAM statement identifier in source policy documents")
+                    source_identifiers.add(sid)
+                encoded = self.values.encode_json(statement)
+                if isinstance(encoded, Unknown):
+                    raise Incomplete(encoded.reason)
+                position = positions.get(sid) if sid else None
+                size = len(encoded)
+                projected = merged_bytes + size
+                if position is None:
+                    projected += bool(merged["Statement"])
+                else:
+                    projected -= sizes[position]
+                if projected > MAX_POLICY_BYTES:
+                    raise Incomplete("merged IAM policy document byte budget exhausted")
+                merged_bytes = projected
+                if position is None:
+                    if sid:
+                        positions[sid] = len(sizes)
+                    sizes.append(size)
+                    merged["Statement"].append(statement)
+                else:
+                    sizes[position] = size
+                    merged["Statement"][position] = statement
+
+        def merge_documents(field):
+            documents = self.values.attribute(block, field, [], visiting=visiting)
+            if documents is None:
+                return None  # Null omits an optional collection.
+            if not isinstance(documents, list) or unknown(documents):
+                return Unknown("IAM " + field + " must resolve to a list of JSON policies",
+                               cyclic=unknown(documents, cycles_only=True))
+            for document in documents:
+                if document is None:
+                    continue  # The provider skips null list elements.
+                if not isinstance(document, str):
+                    return Unknown("IAM " + field + " contains a non-string policy")
+                # Charge every parse, including repeated references to a
+                # shared string, before allocating its decoded structure.
+                if len(document) > MAX_POLICY_BYTES:
+                    return Unknown("IAM JSON policy byte budget exhausted")
+                self.values.decoded_bytes += len(document.encode("utf-8"))
+                if self.values.decoded_bytes > MAX_CONTEXT_BYTES:
+                    return Unknown("decoded IAM policy context byte budget exhausted")
+                parsed = parse_policy_document(document, composition=True)
+                merged["Version"] = max(merged["Version"], parsed["Version"])
+                merge(parsed["Statement"], source=field == "source_policy_documents")
+            return None
+
+        try:
+            unresolved = merge_documents("source_policy_documents")
+            if unresolved is not None:
+                return unresolved
+            merge(statements)
+            unresolved = merge_documents("override_policy_documents")
+            if unresolved is not None:
+                return unresolved
+            return self.values.encode_json(merged)
+        except (Incomplete, UnicodeError) as exc:
+            return Unknown(str(exc))
 
     def iam(self, block: Block):
         attribute = block.attributes.get("policy")
@@ -980,7 +1089,7 @@ def main(argv=None) -> int:
     context = hashlib.sha256(json.dumps(sources, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
     cache = ScanCache(lang="hcl", project_dir=args.project_dir,
                       skip=",".join(map(str, sorted((CATEGORIES - args.only) | args.skip))),
-                      extra="aws-config-v3:" + context)
+                      extra="aws-config-v4:" + context)
     cached, pending = cache.partition_files(files)
     sink = CapturingSink()
     if pending:

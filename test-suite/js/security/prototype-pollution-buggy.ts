@@ -44,3 +44,9 @@ export function dynamicPropertyWrite(req: RequestLike): Record<string, unknown> 
   target[key ?? "name"] = value;
   return target;
 }
+
+// #205: `__proto__: <non-null>` — including `null || userInput` — sets a real
+// prototype and must stay flagged.
+export function pollutesViaNullOr(userInput: unknown): Record<string, unknown> {
+  return { __proto__: null || userInput };
+}

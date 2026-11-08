@@ -102,8 +102,13 @@ PATTERNS: list[Pattern] = [
         rule_id="js.security.prototype-pollution",
         title="Potential prototype pollution",
         regex=re.compile(
-            r"(\.__proto__|\['__proto__'\]|\[\"__proto__\"\]|__proto__\s*:"
-            r"|constructor\.prototype)"
+            # #205: the object-literal property `__proto__: null` (the defensive
+            # null-prototype idiom wasm-bindgen emits) is not pollution. Exempt it
+            # only when the value IS literal null (followed by `,`, `}` or EOL);
+            # keep `.__proto__`/`["__proto__"]` writes and non-null values flagged.
+            r"(\.__proto__|\['__proto__'\]|\[\"__proto__\"\]|__proto__\s*:(?!\s*null\s*(?:[,}]|$))"
+            r"|constructor\.prototype)",
+            re.M,  # whole-text finditer: make $ match end-of-line for the exemption
         ),
         thresholds=((0, "critical"),),
     ),

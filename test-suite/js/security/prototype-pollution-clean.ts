@@ -60,3 +60,10 @@ export function dynamicPropertyWrite(req: RequestLike): Record<string, unknown> 
   target[key] = value;
   return target;
 }
+
+// #205: wasm-bindgen's defensive null-prototype idiom creates a prototype-less
+// object; it is not prototype pollution and must not be flagged.
+export function wbgGetImports(): Record<string, unknown> {
+  const import0 = { __proto__: null, mem: 1 };
+  return { __proto__: null, "./x_bg.js": import0 };
+}

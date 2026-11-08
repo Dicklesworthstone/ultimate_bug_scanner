@@ -575,6 +575,8 @@ class ElixirEngine:
         self.closure_keys: dict[tuple, tuple] = {}
         self.callback_depth = 0
         self.apply_depth = 0
+        self.process_context = ()
+        self.process_serial = 0
         self.owner, self.context, self.call_stack = '', (), []
         self.function_scope: Function | None = None
 
@@ -582,6 +584,8 @@ class ElixirEngine:
         return Step(self.path, token.line, token.col, kind, label)
 
     def identity(self, expr):
+        if self.process_context:
+            return (self.owner, *self.context, 'worker', self.process_context, expr.token.offset)
         return (self.owner, *self.context, expr.token.offset)
 
     def source(self, expr, label, kind='unknown'):
@@ -947,6 +951,55 @@ class ElixirEngine:
         for after, values in self.values(expr.args, state):
             results.extend(self.invoke_callback(expr, values[0], (*prepend, *values[1:]), after))
         return self.outcomes(results)
+
+    def process_callback(self, expr, canonical, args, state):
+        """Inspect a selected worker without executing its effects in the caller."""
+        self.budget.spend()
+        if len(args) != 1 or args[0].kind != 'callback' or args[0].identity not in self.closures:
+            raise ElixirSyntaxError(f'Unresolved Elixir {canonical} worker at line '
+                                    f'{expr.token.line}; analysis is incomplete')
+        parent = self.process_context
+        self.process_serial += 1
+        worker = (*self.identity(expr), 'process', self.process_serial)
+        self.process_context = worker
+        try:
+            # Captured values are immutable. Proofs already established by the
+            # caller also hold in the worker, but no worker-only validation or
+            # failed completion may restrict the caller's continuation.
+            outcomes = self.invoke_callback(expr, args[0], (), FlowState(checks=dict(state.checks)))
+        finally:
+            self.process_context = parent
+        if canonical != 'Task.async':
+            return [(state, Value('pid', identity=worker))]
+        # The handle is not its result. Keep every normal result separately so
+        # awaiting a tuple, closure or another task preserves its exact value.
+        values = tuple(dict.fromkeys(value for _, value in outcomes))
+        return [(state, Value('task', parent, identity=worker, items=values))]
+
+    def await_task(self, expr, args, state):
+        self.budget.spend()
+        if len(args) not in {1, 2} or args[0].kind != 'task':
+            raise ElixirSyntaxError(f'Unresolved Elixir Task.await handle at line '
+                                    f'{expr.token.line}; analysis is incomplete')
+        task = args[0]
+        if task.literal != self.process_context:
+            raise ElixirSyntaxError(f'Elixir Task.await requires its creating process at line '
+                                    f'{expr.token.line}; analysis is incomplete')
+        if len(args) == 2:
+            timeout = args[1]
+            if not ((timeout.kind == 'number' and isinstance(timeout.literal, int) and timeout.literal >= 0)
+                    or (timeout.kind == 'atom' and timeout.literal == 'infinity')):
+                raise ElixirSyntaxError(f'Unresolved Elixir Task.await timeout at line '
+                                        f'{expr.token.line}; analysis is incomplete')
+        consumed = ('process.task.consumed', task.identity)
+        if consumed in state.checks:
+            # A task sends one reply. Re-awaiting the same handle cannot yield
+            # another normal value; its timeout/exit has no normal continuation.
+            return []
+        after = state.copy()
+        after.checks[consumed] = frozenset({('awaited', True)})
+        return self.outcomes((after.copy(), replace(value, fact=advance(
+            value.fact, self.step(expr.token, 'call', 'Task.await')))) for value in task.items)
 
     def selected_apply(self, expr, args, state):
         """Execute a selected closure/export without interpreting unknown code."""
@@ -1510,7 +1563,7 @@ class ElixirEngine:
             return [state.copy()] if bool(predicate.literal) == truth else []
         if predicate.kind == 'nil':
             return [] if truth else [state.copy()]
-        if predicate.kind in {'string', 'number', 'atom', 'tuple', 'list', 'map', 'conn', 'upload', 'uri', 'path', 'concat'}:
+        if predicate.kind in {'string', 'number', 'atom', 'tuple', 'list', 'map', 'conn', 'upload', 'uri', 'path', 'concat', 'task', 'pid'}:
             return [state.copy()] if truth else []
         if predicate.kind != 'test':
             return [state.copy()]
@@ -1601,7 +1654,9 @@ class ElixirEngine:
 
     def has_callback(self, value):
         self.budget.spend()
-        if value.kind == 'callback':
+        # A task also carries deferred user values. Unknown consumers must not
+        # discard a result that could contain request data or another closure.
+        if value.kind in {'callback', 'task'}:
             return True
         if value.kind == 'map':
             return any(self.has_callback(item) for _, item in value.items)
@@ -1726,6 +1781,13 @@ class ElixirEngine:
         imported = dict(self.function_scope.imports) if self.function_scope is not None else self.imports.get(self.owner, {})
         if not qualified and (name in imported or '*' in imported):
             raise ElixirSyntaxError(f'Unresolved imported Elixir call {name} at line {expr.token.line}; analysis is incomplete')
+        if self.policy in {'sql', 'path', 'redirect'} and (not qualified or module not in self.attributes):
+            # Lifecycle and File-result policies own their process/ownership
+            # contracts. This selected request-flow model must not bypass them.
+            if canonical in {'Task.async', 'spawn', 'Kernel.spawn', ':erlang.spawn'}:
+                return self.process_callback(expr, canonical, args, state)
+            if canonical == 'Task.await':
+                return self.await_task(expr, args, state)
         if canonical in {'apply', 'Kernel.apply', ':erlang.apply'} and (not qualified or module not in self.attributes):
             first_keyword = next((index for index, value in enumerate(args) if value.kind == 'pair'), len(args))
             actual = (*args[:first_keyword], Value('list', items=args[first_keyword:], finite=True)) if first_keyword < len(args) else args

@@ -10,6 +10,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Follow selected Elixir `Task.async`/`Task.await` and `spawn` callbacks through
+  immutable captures, selected helpers and exact result aliases. Report SQL,
+  path and redirect sinks inside workers and after awaiting their results;
+  keep worker-only validation and failure separate from caller continuation.
+  Preserve task ownership, single-reply consumption, lifecycle/File-result
+  policies and explicit incomplete results for unsupported process dispatch.
+
 - Resolve delayed Python reads in their actual lexical scopes, including
   nested comprehension targets, unpacked locals and stable literal bindings.
   Keep namespace authority local to connected modules and require proven

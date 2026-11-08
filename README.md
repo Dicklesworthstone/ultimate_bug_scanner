@@ -216,8 +216,19 @@ later rebinding does not change that capture. Creating an unused callback does
 not execute its body. The shared callback semantics also let the resource
 analyzer recognize a handle closed through a stored local callback.
 
-Unknown callback targets, deferred execution and external code evaluation remain
-explicit boundaries. Static Erlang module calls are distinguished from dynamic
+Selected zero-argument workers passed to `Task.async`, `spawn`, `Kernel.spawn`
+and `:erlang.spawn` retain their immutable captures and expose request-derived
+sinks in the worker body. `Task.await` follows the result of its exact task,
+including aliases, helper returns and tuple members. Worker-only validation or
+rebinding cannot certify the caller's values; a failed spawned worker does not
+erase the caller's reachable findings. Task handles remain distinct from their
+results, and awaiting a task requires its creating process and a single reply.
+The existing lifecycle and File-result policies keep their separate ownership
+contracts.
+
+Unknown callback targets, other deferred consumers, cross-process task waits,
+unresolved timeout values and external code evaluation remain explicit
+boundaries. Static Erlang module calls are distinguished from dynamic
 module dispatch. Only a bounded, pure arithmetic subset of literal
 `Code.eval_string` payloads is modeled; arbitrary dynamic or call-bearing payloads
 and `Code.eval_file` do not become trusted merely because their arguments are

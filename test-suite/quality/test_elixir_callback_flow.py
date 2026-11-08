@@ -528,6 +528,357 @@ end
     '''), partial=True),
 )
 
+# Process callbacks execute in another process with an immutable capture.
+# Starting one can expose its sinks even when its result is discarded, but
+# cannot rebind or validate the caller's values. Task.await selects only the
+# result of its own task. A worker exit does not make spawn's caller exit.
+# These labels were assigned before process-callback support was implemented.
+# Native contracts: https://hexdocs.pm/elixir/Task.html#async/1,
+# https://hexdocs.pm/elixir/Task.html#await/2 and
+# https://hexdocs.pm/elixir/Kernel.html#spawn/1.
+PROCESS_CASES = (
+    Case("task_clean_callback_with_unrelated_sql", "sql", module('''
+        task = Task.async(fn -> :ok end)
+        Task.await(task)
+        Ecto.Adapters.SQL.query!(ApplicationRepo, "SELECT 1", [])
+    ''')),
+    Case("spawn_clean_callback_with_unrelated_sql", "sql", module('''
+        spawn(fn -> :ok end)
+        Ecto.Adapters.SQL.query!(ApplicationRepo, "SELECT 1", [])
+    ''')),
+    Case("task_discarded_result_keeps_captured_sql_sink", "sql", module('''
+        sql = params["sql"]
+        Task.async(fn ->
+          Ecto.Adapters.SQL.query!(ApplicationRepo, sql, []) # @flow Ecto.Adapters.SQL.query!
+        end)
+        :ok
+    ''')),
+    Case("spawn_discarded_result_keeps_file_sink", "path", module('''
+        file = params["file"]
+        spawn(fn ->
+          File.read!(file) # @flow File.read!
+        end)
+        :ok
+    ''')),
+    Case("kernel_spawn_keeps_redirect_sink", "redirect", module('''
+        Kernel.spawn(fn ->
+          Phoenix.Controller.redirect(conn, external: params["next"]) # @flow Phoenix.Controller.redirect
+        end)
+    ''')),
+    Case("erlang_spawn_keeps_sql_sink", "sql", module('''
+        :erlang.spawn(fn ->
+          Ecto.Adapters.SQL.query!(ApplicationRepo, params["sql"], []) # @flow Ecto.Adapters.SQL.query!
+        end)
+    ''')),
+    Case("task_body_reads_captured_request_container", "sql", module('''
+        Task.async(fn ->
+          sql = params["sql"]
+          Ecto.Adapters.SQL.query!(ApplicationRepo, sql, []) # @flow Ecto.Adapters.SQL.query!
+        end)
+    ''')),
+    Case("task_body_calls_selected_source_and_sink_helper", "path", module('''
+        Task.async(fn -> read_selected(params) end)
+    ''', helpers='''
+        defp read_selected(input) do
+          File.read!(input["file"]) # @flow File.read!
+        end
+    ''')),
+    Case("task_await_return_reaches_sql", "sql", module('''
+        task = Task.async(fn -> params["sql"] end)
+        sql = Task.await(task)
+        Ecto.Adapters.SQL.query!(ApplicationRepo, sql, []) # @flow Ecto.Adapters.SQL.query!
+    ''')),
+    Case("task_await_with_timeout_keeps_returned_path", "path", module('''
+        task = Task.async(fn -> params["file"] end)
+        File.read!(Task.await(task, 5000)) # @flow File.read!
+    ''')),
+    Case("task_await_infinite_timeout_keeps_redirect", "redirect", module('''
+        task = Task.async(fn -> params["next"] end)
+        Phoenix.Controller.redirect(conn, external: Task.await(task, :infinity)) # @flow Phoenix.Controller.redirect
+    ''')),
+    Case("task_capture_precedes_parent_literal_rebinding", "sql", module('''
+        sql = params["sql"]
+        task = Task.async(fn -> sql end)
+        sql = "SELECT 1"
+        Ecto.Adapters.SQL.query!(ApplicationRepo, Task.await(task), []) # @flow Ecto.Adapters.SQL.query!
+    ''')),
+    Case("task_literal_capture_survives_parent_request_rebinding", "sql", module('''
+        sql = "SELECT 1"
+        task = Task.async(fn -> sql end)
+        sql = params["sql"]
+        Ecto.Adapters.SQL.query!(ApplicationRepo, Task.await(task), [])
+    ''')),
+    Case("task_handle_alias_survives_rebinding", "sql", module('''
+        task = Task.async(fn -> params["sql"] end)
+        selected = task
+        task = Task.async(fn -> "SELECT 1" end)
+        Ecto.Adapters.SQL.query!(ApplicationRepo, Task.await(selected), []) # @flow Ecto.Adapters.SQL.query!
+    ''')),
+    Case("task_await_selects_only_named_task_result", "sql", module('''
+        unsafe_task = Task.async(fn -> params["sql"] end)
+        clean_task = Task.async(fn -> "SELECT 1" end)
+        Ecto.Adapters.SQL.query!(ApplicationRepo, Task.await(clean_task), [])
+    ''')),
+    Case("task_same_helper_site_keeps_distinct_results", "sql", module('''
+        unsafe_task = launch(params["sql"])
+        clean_task = launch("SELECT 1")
+        Ecto.Adapters.SQL.query!(ApplicationRepo, Task.await(clean_task), [])
+        Ecto.Adapters.SQL.query!(ApplicationRepo, Task.await(unsafe_task), []) # @flow Ecto.Adapters.SQL.query!
+    ''', helpers='''
+        defp launch(sql), do: Task.async(fn -> sql end)
+    ''')),
+    Case("task_worker_rebinding_cannot_clear_caller_sql", "sql", module('''
+        sql = params["sql"]
+        task = Task.async(fn -> sql = "SELECT 1" end)
+        Task.await(task)
+        Ecto.Adapters.SQL.query!(ApplicationRepo, sql, []) # @flow Ecto.Adapters.SQL.query!
+    ''')),
+    Case("spawn_worker_rebinding_cannot_taint_caller_sql", "sql", module('''
+        sql = "SELECT 1"
+        spawn(fn -> sql = params["sql"] end)
+        Ecto.Adapters.SQL.query!(ApplicationRepo, sql, [])
+    ''')),
+    Case("task_child_validation_cannot_certify_parent_value", "sql", module('''
+        sql = params["sql"]
+        task = Task.async(fn ->
+          if sql == "SELECT 1", do: :ok, else: raise("invalid")
+        end)
+        Ecto.Adapters.SQL.query!(ApplicationRepo, sql, []) # @flow Ecto.Adapters.SQL.query!
+    ''')),
+    Case("spawn_child_validation_cannot_certify_parent_value", "sql", module('''
+        sql = params["sql"]
+        spawn(fn ->
+          if sql == "SELECT 1", do: :ok, else: raise("invalid")
+        end)
+        Ecto.Adapters.SQL.query!(ApplicationRepo, sql, []) # @flow Ecto.Adapters.SQL.query!
+    ''')),
+    Case("spawn_child_raise_keeps_caller_continuation", "sql", module('''
+        spawn(fn -> raise("worker stopped") end)
+        Ecto.Adapters.SQL.query!(ApplicationRepo, params["sql"], []) # @flow Ecto.Adapters.SQL.query!
+    ''')),
+    Case("task_child_raise_can_follow_caller_sink", "sql", module('''
+        Task.async(fn -> raise("worker stopped") end)
+        Ecto.Adapters.SQL.query!(ApplicationRepo, params["sql"], []) # @flow Ecto.Adapters.SQL.query!
+    ''')),
+    Case("task_await_raising_worker_has_no_normal_return", "sql", module('''
+        task = Task.async(fn -> raise("worker stopped") end)
+        Task.await(task)
+        Ecto.Adapters.SQL.query!(ApplicationRepo, params["sql"], [])
+    ''')),
+    Case("task_result_tuple_preserves_request_member", "sql", module('''
+        task = Task.async(fn -> {:ok, params["sql"]} end)
+        case Task.await(task) do
+          {:ok, sql} -> Ecto.Adapters.SQL.query!(ApplicationRepo, sql, []) # @flow Ecto.Adapters.SQL.query!
+          _ -> :ok
+        end
+    ''')),
+    Case("task_in_untaken_branch_does_not_execute", "sql", module('''
+        false && Task.async(fn -> Ecto.Adapters.SQL.query!(ApplicationRepo, params["sql"], []) end)
+    ''')),
+    Case("spawn_in_untaken_branch_does_not_execute", "path", module('''
+        false && spawn(fn -> File.read!(params["file"]) end)
+    ''')),
+    Case("task_source_alias_resolves_native_module", "sql", '''defmodule AliasedProcess do
+  alias Task, as: Background
+  def handle(conn, params) do
+    task = Background.async(fn -> params["sql"] end)
+    Ecto.Adapters.SQL.query!(ApplicationRepo, Background.await(task), []) # @flow Ecto.Adapters.SQL.query!
+  end
+end
+'''),
+    Case("local_task_alias_executes_its_own_noop_body", "sql", '''defmodule LocalTask do
+  def async(_callback), do: :ok
+end
+defmodule LocalTaskCaller do
+  alias LocalTask, as: Task
+  def handle(conn, params) do
+    Task.async(fn -> Ecto.Adapters.SQL.query!(ApplicationRepo, params["sql"], []) end)
+  end
+end
+'''),
+    Case("local_task_module_executes_its_own_noop_body", "sql", '''defmodule Task do
+  def async(_callback), do: :ok
+end
+defmodule LocalTaskCaller do
+  def handle(conn, params) do
+    Task.async(fn -> Ecto.Adapters.SQL.query!(ApplicationRepo, params["sql"], []) end)
+  end
+end
+'''),
+    Case("local_spawn_uses_its_own_noop_body", "sql", module('''
+        spawn(fn -> Ecto.Adapters.SQL.query!(ApplicationRepo, params["sql"], []) end)
+    ''', helpers='''
+        import Kernel, except: [spawn: 1]
+        def spawn(_callback), do: :ok
+    ''')),
+    Case("task_handle_is_truthy_when_worker_returns_false", "sql", module('''
+        task = Task.async(fn -> false end)
+        if task do
+          Ecto.Adapters.SQL.query!(ApplicationRepo, params["sql"], []) # @flow Ecto.Adapters.SQL.query!
+        end
+    ''')),
+    Case("task_handle_is_truthy_when_worker_returns_nil", "sql", module('''
+        task = Task.async(fn -> nil end)
+        task || Ecto.Adapters.SQL.query!(ApplicationRepo, params["sql"], [])
+    ''')),
+    Case("spawn_pid_is_truthy_when_worker_returns_false", "path", module('''
+        pid = spawn(fn -> false end)
+        if pid do
+          File.read!(params["file"]) # @flow File.read!
+        end
+    ''')),
+    Case("awaited_false_retains_false_branch_behavior", "sql", module('''
+        task = Task.async(fn -> false end)
+        if Task.await(task) do
+          Ecto.Adapters.SQL.query!(ApplicationRepo, params["sql"], [])
+        end
+    ''')),
+    Case("awaited_nil_retains_nil_branch_behavior", "sql", module('''
+        task = Task.async(fn -> nil end)
+        Task.await(task) || Ecto.Adapters.SQL.query!(ApplicationRepo, params["sql"], []) # @flow Ecto.Adapters.SQL.query!
+    ''')),
+    Case("task_result_can_be_awaited_only_once", "sql", module('''
+        task = Task.async(fn -> params["sql"] end)
+        Task.await(task)
+        Ecto.Adapters.SQL.query!(ApplicationRepo, Task.await(task), [])
+    ''')),
+    Case("task_alias_does_not_duplicate_awaitable_reply", "sql", module('''
+        task = Task.async(fn -> params["sql"] end)
+        selected = task
+        Task.await(selected)
+        Ecto.Adapters.SQL.query!(ApplicationRepo, Task.await(task), [])
+    ''')),
+    Case("await_consumption_propagates_through_local_helper", "sql", module('''
+        task = Task.async(fn -> params["sql"] end)
+        wait_selected(task)
+        Ecto.Adapters.SQL.query!(ApplicationRepo, Task.await(task), [])
+    ''', helpers='''
+        defp wait_selected(task), do: Task.await(task)
+    ''')),
+    Case("await_in_untaken_branch_does_not_consume_task", "sql", module('''
+        task = Task.async(fn -> params["sql"] end)
+        false && Task.await(task)
+        Ecto.Adapters.SQL.query!(ApplicationRepo, Task.await(task), []) # @flow Ecto.Adapters.SQL.query!
+    ''')),
+    Case("repeated_callback_site_allocates_fresh_tasks", "sql", module('''
+        Enum.each(["SELECT 1", params["sql"]], fn sql ->
+          task = Task.async(fn -> sql end)
+          Ecto.Adapters.SQL.query!(ApplicationRepo, Task.await(task), []) # @flow Ecto.Adapters.SQL.query!
+        end)
+    ''')),
+    Case("local_helper_can_await_task_in_its_owning_process", "sql", module('''
+        task = Task.async(fn -> params["sql"] end)
+        Ecto.Adapters.SQL.query!(ApplicationRepo, wait_selected(task), []) # @flow Ecto.Adapters.SQL.query!
+    ''', helpers='''
+        defp wait_selected(task), do: Task.await(task)
+    ''')),
+    Case("worker_can_await_its_own_nested_task", "sql", module('''
+        outer = Task.async(fn ->
+          inner = Task.async(fn -> params["sql"] end)
+          Task.await(inner)
+        end)
+        Ecto.Adapters.SQL.query!(ApplicationRepo, Task.await(outer), []) # @flow Ecto.Adapters.SQL.query!
+    ''')),
+    Case("separate_worker_checks_do_not_certify_sibling_reads", "sql", module('''
+        Task.async(fn ->
+          sql = params["sql"]
+          if sql == "SELECT 1", do: :ok, else: raise("invalid")
+        end)
+        Task.async(fn ->
+          Ecto.Adapters.SQL.query!(ApplicationRepo, params["sql"], []) # @flow Ecto.Adapters.SQL.query!
+        end)
+    ''')),
+)
+
+PROCESS_BOUNDARIES = (
+    Case("task_unknown_function_is_incomplete", "sql", module('''
+        Task.async(callback)
+        Ecto.Adapters.SQL.query!(ApplicationRepo, "SELECT 1", [])
+    ''', parameters="conn, params, callback"), partial=True),
+    Case("spawn_unknown_function_is_incomplete", "sql", module('''
+        spawn(callback)
+        Ecto.Adapters.SQL.query!(ApplicationRepo, "SELECT 1", [])
+    ''', parameters="conn, params, callback"), partial=True),
+    Case("task_bad_callback_arity_is_incomplete", "sql", module('''
+        Task.async(fn value -> value end)
+        Ecto.Adapters.SQL.query!(ApplicationRepo, "SELECT 1", [])
+    '''), partial=True),
+    Case("spawn_bad_callback_arity_is_incomplete", "sql", module('''
+        spawn(fn value -> value end)
+        Ecto.Adapters.SQL.query!(ApplicationRepo, "SELECT 1", [])
+    '''), partial=True),
+    Case("task_bad_api_arity_is_incomplete", "sql", module('''
+        Task.async(fn -> :ok end, [])
+        Ecto.Adapters.SQL.query!(ApplicationRepo, "SELECT 1", [])
+    '''), partial=True),
+    Case("task_await_unknown_handle_is_incomplete", "sql", module('''
+        Task.await(unknown)
+        Ecto.Adapters.SQL.query!(ApplicationRepo, "SELECT 1", [])
+    ''', parameters="conn, params, unknown"), partial=True),
+    Case("task_await_bad_api_arity_is_incomplete", "sql", module('''
+        task = Task.async(fn -> :ok end)
+        Task.await(task, 5000, [])
+        Ecto.Adapters.SQL.query!(ApplicationRepo, "SELECT 1", [])
+    '''), partial=True),
+    Case("task_mfa_target_remains_incomplete", "sql", module('''
+        Task.async(Unknown, :execute, [])
+        Ecto.Adapters.SQL.query!(ApplicationRepo, "SELECT 1", [])
+    '''), partial=True),
+    Case("spawn_mfa_target_remains_incomplete", "sql", module('''
+        spawn(Unknown, :execute, [])
+        Ecto.Adapters.SQL.query!(ApplicationRepo, "SELECT 1", [])
+    '''), partial=True),
+    Case("unknown_deferred_target_remains_incomplete", "sql", module('''
+        Unknown.enqueue(fn -> Ecto.Adapters.SQL.query!(ApplicationRepo, params["sql"], []) end)
+    '''), partial=True),
+    Case("task_child_unknown_execution_preserves_prior_sink", "sql", module('''
+        Task.async(fn ->
+          Ecto.Adapters.SQL.query!(ApplicationRepo, params["sql"], []) # @flow Ecto.Adapters.SQL.query!
+          Unknown.execute(params["sql"])
+        end)
+    '''), partial=True),
+    Case("spawn_import_is_not_native_kernel", "sql", '''defmodule ImportedProcess do
+  import Foreign, only: [spawn: 1]
+  def handle(conn, params) do
+    spawn(fn -> Ecto.Adapters.SQL.query!(ApplicationRepo, params["sql"], []) end)
+  end
+end
+''', partial=True),
+    Case("local_task_missing_native_export_is_incomplete", "sql", '''defmodule Task do
+  def custom(), do: :ok
+end
+defmodule ShadowedProcess do
+  def handle(conn, params) do
+    Task.async(fn -> :ok end)
+    Ecto.Adapters.SQL.query!(ApplicationRepo, "SELECT 1", [])
+  end
+end
+''', partial=True),
+    Case("spawn_cannot_await_parent_owned_task", "sql", module('''
+        task = Task.async(fn -> params["sql"] end)
+        spawn(fn -> Ecto.Adapters.SQL.query!(ApplicationRepo, Task.await(task), []) end)
+    '''), partial=True),
+    Case("task_cannot_await_parent_owned_task", "sql", module('''
+        parent_task = Task.async(fn -> params["sql"] end)
+        Task.async(fn -> Ecto.Adapters.SQL.query!(ApplicationRepo, Task.await(parent_task), []) end)
+    '''), partial=True),
+    Case("returned_nested_task_keeps_original_owner", "sql", module('''
+        outer = Task.async(fn -> Task.async(fn -> params["sql"] end) end)
+        inner = Task.await(outer)
+        Ecto.Adapters.SQL.query!(ApplicationRepo, Task.await(inner), [])
+    '''), partial=True),
+    Case("task_unknown_timeout_remains_incomplete", "sql", module('''
+        task = Task.async(fn -> params["sql"] end)
+        Task.await(task, params["timeout"])
+        Ecto.Adapters.SQL.query!(ApplicationRepo, "SELECT 1", [])
+    '''), partial=True),
+    Case("task_negative_timeout_remains_incomplete", "sql", module('''
+        task = Task.async(fn -> params["sql"] end)
+        Task.await(task, -1)
+        Ecto.Adapters.SQL.query!(ApplicationRepo, "SELECT 1", [])
+    '''), partial=True),
+)
+
 # Literal eval/Erlang controls intentionally stay native controls: their old
 # generic security heuristics are not callback findings.  Public callback
 # checks use the other unchanged 18 sources and assert every ordinary result.
@@ -572,7 +923,8 @@ class ElixirCallbackNativeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.directory = ARTIFACTS / ("native-" + uuid.uuid4().hex[:12])
-        cls.paths = materialize(cls.directory, CASES + BOUNDARIES + REVIEW_CASES + APPLY_CASES + APPLY_BOUNDARIES)
+        cls.paths = materialize(cls.directory, CASES + BOUNDARIES + REVIEW_CASES + APPLY_CASES + APPLY_BOUNDARIES
+                                + PROCESS_CASES + PROCESS_BOUNDARIES)
 
     def check_case(self, case):
         from ubs_core.registry import RunContext
@@ -628,6 +980,22 @@ class ElixirCallbackNativeTests(unittest.TestCase):
         for case in APPLY_BOUNDARIES:
             with self.subTest(case=case.name):
                 self.check_case(case)
+
+    def test_selected_process_programs(self):
+        for case in PROCESS_CASES:
+            with self.subTest(case=case.name):
+                started = time.monotonic()
+                print(f'[elixir-process-native:{case.name}] RUN', flush=True)
+                self.check_case(case)
+                print(f'[elixir-process-native:{case.name}] PASS ({time.monotonic() - started:.3f}s)', flush=True)
+
+    def test_selected_process_boundaries(self):
+        for case in PROCESS_BOUNDARIES:
+            with self.subTest(case=case.name):
+                started = time.monotonic()
+                print(f'[elixir-process-native:{case.name}] RUN', flush=True)
+                self.check_case(case)
+                print(f'[elixir-process-native:{case.name}] PASS ({time.monotonic() - started:.3f}s)', flush=True)
 
     def test_recursive_apply_dispatch_is_bounded(self):
         native = importlib.import_module("ubs_core.analyzers.taint_elixir_traversal")
@@ -796,7 +1164,7 @@ class ElixirCallbackPublicTests(unittest.TestCase):
             self.assertEqual((totals["critical"], totals["warning"], totals["info"], totals["files"]),
                              (len(expected), 0, 0, len(cases)), context)
             self.assertEqual(report["status"], "partial" if partial else "ok", context)
-            for row in report["findings"]:
+            for row in report.get("findings", []):
                 self.assertEqual(row["category_id"], "elixir.security", context)
                 actual.append((Path(row.get("path", row.get("file"))).name,
                                row.get("rule", row.get("rule_id")), row["line"], row["col"], row["severity"]))
@@ -830,6 +1198,54 @@ class ElixirCallbackPublicTests(unittest.TestCase):
         result, report = self.execute(directory, "json")
         self.assert_report(result, report, "json", cases, partial=True)
         self.assertIn("a_partial.ex", result.stderr)
+
+    def test_process_module_json_and_runner_sarif(self):
+        names = {
+            "task_clean_callback_with_unrelated_sql",
+            "task_discarded_result_keeps_captured_sql_sink",
+            "spawn_discarded_result_keeps_file_sink",
+            "kernel_spawn_keeps_redirect_sink",
+            "task_await_with_timeout_keeps_returned_path",
+            "task_capture_precedes_parent_literal_rebinding",
+            "task_child_validation_cannot_certify_parent_value",
+            "repeated_callback_site_allocates_fresh_tasks",
+            "worker_can_await_its_own_nested_task",
+        }
+        cases = tuple(case for case in PROCESS_CASES if case.name in names)
+        self.assertEqual(len(cases), len(names))
+        directory = self.project("process-positive", cases)
+        for mode in ("module-json", "sarif"):
+            with self.subTest(mode=mode):
+                self.assert_report(*self.execute(directory, mode), mode, cases)
+
+    def test_process_clean_module_sarif_and_runner_json(self):
+        names = {
+            "spawn_clean_callback_with_unrelated_sql",
+            "task_literal_capture_survives_parent_request_rebinding",
+            "local_task_alias_executes_its_own_noop_body",
+            "task_handle_is_truthy_when_worker_returns_nil",
+            "task_alias_does_not_duplicate_awaitable_reply",
+        }
+        cases = tuple(case for case in PROCESS_CASES if case.name in names)
+        self.assertEqual(len(cases), len(names))
+        directory = self.project("process-clean", cases)
+        for mode in ("module-sarif", "json"):
+            with self.subTest(mode=mode):
+                self.assert_report(*self.execute(directory, mode), mode, cases)
+
+    def test_process_partial_keeps_known_worker_and_neighbor(self):
+        boundary = next(case for case in PROCESS_BOUNDARIES
+                        if case.name == "task_child_unknown_execution_preserves_prior_sink")
+        neighbor = next(case for case in PROCESS_CASES
+                        if case.name == "spawn_discarded_result_keeps_file_sink")
+        cases = (Case("a_partial_worker", boundary.policy, boundary.source, partial=True),
+                 Case("z_worker_neighbor", neighbor.policy, neighbor.source))
+        directory = self.project("process-partial", cases)
+        for mode in ("module-sarif", "json"):
+            with self.subTest(mode=mode):
+                result, report = self.execute(directory, mode)
+                self.assert_report(result, report, mode, cases, partial=True)
+                self.assertIn("a_partial_worker.ex", result.stderr)
 
     def test_warm_cache_and_scoped_suppression(self):
         case = Case("cache_target", CASES[0].policy, CASES[0].source)

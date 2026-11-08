@@ -1007,6 +1007,22 @@ class StructuralFingerprintTests(unittest.TestCase):
 class PythonSecretComparisonFlowTests(unittest.TestCase):
     """Public fingerprint evidence must not erase a possible credential."""
 
+    HASH_ALLOCATION_PARTIAL = textwrap.dedent('''\
+        import hashlib
+        def known_before(password, supplied):
+            return password == supplied  # expect-secret
+        def repeated_allocation(payload, password, supplied):
+            h = hashlib.sha256(payload)
+            slots = []
+            for _ in (1, 2):
+                h = hashlib.sha256(payload)
+                slots.append(h)
+            slots[0].update(password)
+            return h.hexdigest() == supplied
+        def known_after(password, supplied):
+            return password != supplied  # expect-secret
+    ''')
+
     def assert_sites(self, source):
         code = StructuralFingerprintTests.RECORDS + textwrap.dedent(source)
         expected = [number for number, line in enumerate(code.splitlines(), 1)
@@ -1377,6 +1393,540 @@ class PythonSecretComparisonFlowTests(unittest.TestCase):
                 checks = [element == supplied for element in items]  # expect-secret
                 return value == supplied
         ''')
+
+    def test_hash_container_projections_revoke_the_selected_object_proof(self):
+        # These slots contain the actual hashlib object, not its digest bytes.
+        # Updating an alias changes the original object's authentication role.
+        cases = (
+            ('list', '[h]', '[0]'),
+            ('tuple', '(h,)', '[0]'),
+            ('mapping', '{"active": h}', '["active"]'),
+            ('negative-index', '(None, h)', '[-1]'),
+            ('nested-mapping-list', '{"outer": [h]}', '["outer"][0]'),
+            ('nested-list-mapping-tuple', '[{"active": (h,)}]', '[0]["active"][0]'),
+        )
+        for name, container, selector in cases:
+            with self.subTest(case=name):
+                self.assert_sites(
+                    'import hashlib\n'
+                    'def verify(payload, password, supplied):\n'
+                    '    h = hashlib.sha256(payload)\n'
+                    f'    slots = {container}\n'
+                    f'    slots{selector}.update(password)\n'
+                    '    return h.hexdigest() == supplied  # expect-secret\n'
+                )
+
+    def test_hash_container_other_elements_and_public_updates_stay_clean(self):
+        cases = (
+            ('other-list-element', '[h, fresh]', '[1]', 'password'),
+            ('other-tuple-element', '(fresh, h)', '[0]', 'password'),
+            ('other-dictionary-value', '{"first": h, "second": fresh}', '["second"]', 'password'),
+            ('nested-other-element', '[{"items": (h, fresh)}]', '[0]["items"][1]', 'password'),
+            ('last-element', '[h, fresh]', '[-1]', 'password'),
+            ('overwritten-dictionary-key', '{"active": h, "active": fresh}', '["active"]', 'password'),
+            ('equal-dictionary-keys', '{0: h, False: fresh}', '[0]', 'password'),
+            ('public-list-update', '[h]', '[0]', 'payload'),
+            ('public-mapping-update', '{"active": h}', '["active"]', 'payload'),
+        )
+        for name, container, selector, material in cases:
+            with self.subTest(case=name):
+                self.assert_sites(
+                    'import hashlib\n'
+                    'def verify(payload, password, supplied):\n'
+                    '    h = hashlib.sha256(payload)\n'
+                    '    fresh = hashlib.sha256(payload)\n'
+                    f'    slots = {container}\n'
+                    f'    slots{selector}.update({material})\n'
+                    '    return h.hexdigest() == supplied\n'
+                )
+        self.assert_sites('''
+            import hashlib
+            def dictionary_data(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                slots = {"active": h}
+                slots.update({"value": password})
+                return h.hexdigest() == supplied
+        ''')
+
+    def test_hash_container_aliases_and_rebinding_keep_object_identity(self):
+        self.assert_sites('''
+            import hashlib
+            def container_alias(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                slots = [h]
+                saved = slots
+                saved[0].update(password)
+                return h.hexdigest() == supplied  # expect-secret
+            def rebound_container(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                slots = [h]
+                saved = slots
+                slots = [hashlib.sha256(payload)]
+                saved[0].update(password)
+                return h.hexdigest() == supplied  # expect-secret
+            def extracted_object(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                slots = {"active": h}
+                saved = slots["active"]
+                slots["active"] = hashlib.sha256(payload)
+                saved.update(password)
+                return h.hexdigest() == supplied  # expect-secret
+            def nested_alias(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                inner = [h]
+                slots = {"active": inner}
+                inner = []
+                slots["active"][0].update(password)
+                return h.hexdigest() == supplied  # expect-secret
+            def rebound_original(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                slots = [h]
+                h = hashlib.sha256(payload)
+                slots[0].update(password)
+                return h.hexdigest() == supplied
+        ''')
+
+    def test_hash_container_slot_writes_replace_only_the_selected_reference(self):
+        self.assert_sites('''
+            import hashlib
+            def inserted_reference(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                slots = [hashlib.sha256(payload)]
+                slots[0] = h
+                slots[0].update(password)
+                return h.hexdigest() == supplied  # expect-secret
+            def replaced_reference(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                slots = [h]
+                slots[0] = hashlib.sha256(payload)
+                slots[0].update(password)
+                return h.hexdigest() == supplied
+            def alias_replaces_reference(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                slots = [h]
+                saved = slots
+                saved[0] = hashlib.sha256(payload)
+                slots[0].update(password)
+                return h.hexdigest() == supplied
+            def nested_alias_replaces_reference(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                inner = [h]
+                slots = {"active": inner}
+                inner[0] = hashlib.sha256(payload)
+                slots["active"][0].update(password)
+                return h.hexdigest() == supplied
+            def sibling_reference_survives(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                slots = [h, h]
+                slots[0] = hashlib.sha256(payload)
+                slots[1].update(password)
+                return h.hexdigest() == supplied  # expect-secret
+            def mapping_replacement(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                slots = {"active": h}
+                slots["active"] = hashlib.sha256(payload)
+                slots["active"].update(password)
+                return h.hexdigest() == supplied
+        ''')
+
+    def test_hash_container_uncertain_selection_preserves_possible_mutations(self):
+        self.assert_sites('''
+            import hashlib
+            def uncertain_index(payload, password, supplied, index):
+                h = hashlib.sha256(payload)
+                slots = [h, hashlib.sha256(payload)]
+                slots[index].update(password)
+                return h.hexdigest() == supplied  # expect-secret
+            def uncertain_key(payload, password, supplied, key):
+                h = hashlib.sha256(payload)
+                slots = {"first": h, "second": hashlib.sha256(payload)}
+                slots[key].update(password)
+                return h.hexdigest() == supplied  # expect-secret
+            def conditional_replacement(payload, password, supplied, flag):
+                h = hashlib.sha256(payload)
+                slots = [h]
+                if flag:
+                    slots[0] = hashlib.sha256(payload)
+                slots[0].update(password)
+                return h.hexdigest() == supplied  # expect-secret
+            def conditional_container(payload, password, supplied, flag):
+                h = hashlib.sha256(payload)
+                if flag:
+                    slots = [h]
+                else:
+                    slots = [hashlib.sha256(payload)]
+                slots[0].update(password)
+                return h.hexdigest() == supplied  # expect-secret
+            def unknown_slot_write(payload, password, supplied, index):
+                h = hashlib.sha256(payload)
+                slots = [h, hashlib.sha256(payload)]
+                slots[index] = hashlib.sha256(payload)
+                slots[0].update(password)
+                return h.hexdigest() == supplied  # expect-secret
+        ''')
+
+    def test_hash_container_comprehensions_keep_captured_and_local_objects_distinct(self):
+        self.assert_sites('''
+            import hashlib
+            def outer_projection(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                slots = [h]
+                updates = [slots[0].update(password) for _ in (1,)]
+                return h.hexdigest() == supplied  # expect-secret
+            def captured_container(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                slots = {"active": h}
+                updates = [box["active"].update(password) for box in (slots,)]
+                return h.hexdigest() == supplied  # expect-secret
+            def captured_nested_object(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                slots = [[h]]
+                updates = [row[0].update(password) for row in slots]
+                return h.hexdigest() == supplied  # expect-secret
+            def shadowed_container(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                slots = [h]
+                updates = [slots[0].update(password) for slots in ([hashlib.sha256(payload)],)]
+                return h.hexdigest() == supplied
+            def captured_before_shadow(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                slots = [h]
+                updates = [box[0].update(password) for box in (slots,) for slots in ([],)]
+                return h.hexdigest() == supplied  # expect-secret
+        ''')
+
+    def test_hash_container_receiver_and_literal_elements_capture_evaluation_order(self):
+        self.assert_sites('''
+            import hashlib
+            def receiver_before_argument(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                slots = [h]
+                slots[0].update((slots := [hashlib.sha256(payload)], password)[1])
+                return h.hexdigest() == supplied  # expect-secret
+            def indexed_receiver_before_argument(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                fresh = hashlib.sha256(payload)
+                slots = [h, fresh]
+                index = 0
+                slots[index].update((index := 1, password)[1])
+                return h.hexdigest() == supplied  # expect-secret
+            def literal_captures_old_object(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                slots = [h, (h := hashlib.sha256(payload))]
+                slots[0].update(password)
+                return h.hexdigest() == supplied
+            def literal_captures_new_object(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                slots = [h, (h := hashlib.sha256(payload))]
+                slots[1].update(password)
+                return h.hexdigest() == supplied  # expect-secret
+        ''')
+
+    def test_hash_container_loop_and_exception_paths_keep_heap_effects(self):
+        self.assert_sites('''
+            import hashlib
+            def loop_backedge(payload, password, supplied, items):
+                h = hashlib.sha256(payload)
+                slots = [h]
+                for item in items:
+                    accepted = h.hexdigest() == supplied  # expect-secret
+                    slots[0].update(password)
+                return accepted
+            def may_skip_replacement(payload, password, supplied, items):
+                h = hashlib.sha256(payload)
+                slots = [h]
+                for item in items:
+                    slots[0] = hashlib.sha256(payload)
+                slots[0].update(password)
+                return h.hexdigest() == supplied  # expect-secret
+            def exception_after_mutation(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                slots = [h]
+                try:
+                    slots[0].update(password)
+                    work()
+                except Exception:
+                    return h.hexdigest() == supplied  # expect-secret
+        ''')
+
+    def test_hash_container_mutators_do_not_leave_stale_slot_identities(self):
+        # Independent follow-up controls: adding subscript tracking must not
+        # turn a removed/replaced reference into a mutation of the old hash.
+        cases = (
+            ('append-other', 'slots = [h]\nslots.append(fresh)\nslots[-1].update(password)\n', False),
+            ('append-selected', 'slots = [fresh]\nslots.append(h)\nslots[-1].update(password)\n', True),
+            ('extend-other', 'slots = [h]\nslots.extend([fresh])\nslots[1].update(password)\n', False),
+            ('extend-selected', 'slots = [fresh]\nslots.extend([h])\nslots[1].update(password)\n', True),
+            ('insert-other', 'slots = [h]\nslots.insert(0, fresh)\nslots[0].update(password)\n', False),
+            ('insert-selected', 'slots = [fresh]\nslots.insert(0, h)\nslots[0].update(password)\n', True),
+            ('pop-shifts-other', 'slots = [h, fresh]\nslots.pop(0)\nslots[0].update(password)\n', False),
+            ('pop-captures-selected', 'slots = [h, fresh]\nsaved = slots.pop(0)\nsaved.update(password)\n', True),
+            ('reverse-selects-other', 'slots = [h, fresh]\nslots.reverse()\nslots[0].update(password)\n', False),
+            ('reverse-selects-original', 'slots = [h, fresh]\nslots.reverse()\nslots[1].update(password)\n', True),
+            ('clear-then-append-other', 'slots = [h]\nslots.clear()\nslots.append(fresh)\nslots[0].update(password)\n', False),
+            ('dict-update-other', 'slots = {"active": h}\nslots.update({"active": fresh})\nslots["active"].update(password)\n', False),
+            ('dict-update-selected', 'slots = {"active": fresh}\nslots.update({"active": h})\nslots["active"].update(password)\n', True),
+            ('dict-update-pairs-other', 'slots = {"active": h}\nslots.update([("active", fresh)])\nslots["active"].update(password)\n', False),
+            ('dict-update-pairs-selected', 'slots = {"active": fresh}\nslots.update([("active", h)])\nslots["active"].update(password)\n', True),
+            ('dict-clear-then-update-other', 'slots = {"active": h}\nslots.clear()\nslots.update({"active": fresh})\nslots["active"].update(password)\n', False),
+            ('delete-shifts-other', 'slots = [h, fresh]\ndel slots[0]\nslots[0].update(password)\n', False),
+            ('delete-sibling-keeps-selected', 'slots = [fresh, h]\ndel slots[0]\nslots[0].update(password)\n', True),
+        )
+        for name, body, sensitive in cases:
+            with self.subTest(case=name):
+                self.assert_sites(
+                    'import hashlib\n'
+                    'def verify(payload, password, supplied):\n'
+                    '    h = hashlib.sha256(payload)\n'
+                    '    fresh = hashlib.sha256(payload)\n'
+                    + textwrap.indent(body, '    ')
+                    + '    return h.hexdigest() == supplied'
+                    + ('  # expect-secret\n' if sensitive else '\n')
+                )
+
+    def test_hash_container_scalar_selector_aliases_retain_known_positions(self):
+        cases = (
+            ('known-other-index', '[h, fresh]', 'index = 1', 'index', False),
+            ('known-selected-index', '[h, fresh]', 'index = 0', 'index', True),
+            ('known-negative-index', '[h, fresh]', 'index = -1', 'index', False),
+            ('known-boolean-index', '[h, fresh]', 'index = True', 'index', False),
+            ('known-other-key', '{"active": h, "other": fresh}', 'label = "other"', 'label', False),
+            ('known-selected-key', '{"active": h, "other": fresh}', 'label = "active"', 'label', True),
+            ('rebound-selector', '[h, fresh]', 'index = 0\nindex = 1', 'index', False),
+            ('saved-selector', '[h, fresh]', 'index = 1\nsaved = index\nindex = 0', 'saved', False),
+        )
+        for name, container, setup, selector, sensitive in cases:
+            with self.subTest(case=name):
+                self.assert_sites(
+                    'import hashlib\n'
+                    'def verify(payload, password, supplied):\n'
+                    '    h = hashlib.sha256(payload)\n'
+                    '    fresh = hashlib.sha256(payload)\n'
+                    f'    slots = {container}\n'
+                    + textwrap.indent(setup + '\n', '    ')
+                    + f'    slots[{selector}].update(password)\n'
+                    + '    return h.hexdigest() == supplied'
+                    + ('  # expect-secret\n' if sensitive else '\n')
+                )
+
+    def test_hash_container_saved_mutators_capture_the_original_receiver(self):
+        self.assert_sites('''
+            import hashlib
+            def saved_pop(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                fresh = hashlib.sha256(payload)
+                slots = [h, fresh]
+                take = slots.pop
+                take(0)
+                slots[0].update(password)
+                return h.hexdigest() == supplied
+            def saved_pop_alias(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                slots = [h, hashlib.sha256(payload)]
+                take = slots.pop
+                captured = take
+                take = print
+                captured(0)
+                slots[0].update(password)
+                return h.hexdigest() == supplied
+            def rebound_container(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                slots = [h, hashlib.sha256(payload)]
+                take = slots.pop
+                slots = [h]
+                take(0)
+                slots[0].update(password)
+                return h.hexdigest() == supplied  # expect-secret
+            def rebound_callable(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                slots = [h, hashlib.sha256(payload)]
+                take = slots.pop
+                take = print
+                take(0)
+                slots[0].update(password)
+                return h.hexdigest() == supplied  # expect-secret
+            def saved_hash_update(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                slots = [h]
+                update = slots[0].update
+                slots[0] = hashlib.sha256(payload)
+                update(password)
+                return h.hexdigest() == supplied  # expect-secret
+            def rebound_hash_after_capture(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                slots = [h]
+                update = slots[0].update
+                h = hashlib.sha256(payload)
+                update(password)
+                return h.hexdigest() == supplied
+        ''')
+
+    def test_hash_container_dictionary_defaults_depend_on_key_presence(self):
+        # A known-present value with no local alias facts is still present.
+        # Returning the default because its reference set is nonempty would
+        # falsely attribute a different object's update to this fresh hash.
+        for method in ('get', 'setdefault', 'pop'):
+            with self.subTest(method=method):
+                self.assert_sites(f'''
+                    import hashlib
+                    def present(payload, password, supplied, candidate):
+                        h = hashlib.sha256(payload)
+                        slots = {{"active": candidate}}
+                        selected = slots.{method}("active", h)
+                        selected.update(password)
+                        return h.hexdigest() == supplied
+                    def missing(payload, password, supplied):
+                        h = hashlib.sha256(payload)
+                        slots = {{}}
+                        selected = slots.{method}("active", h)
+                        selected.update(password)
+                        return h.hexdigest() == supplied  # expect-secret
+                    def maybe_missing(payload, password, supplied, candidate, flag):
+                        h = hashlib.sha256(payload)
+                        slots = {{"active": candidate}}
+                        if flag:
+                            del slots["active"]
+                        selected = slots.{method}("active", h)
+                        selected.update(password)
+                        return h.hexdigest() == supplied  # expect-secret
+                ''')
+
+    def test_hash_container_repeated_allocations_are_incomplete_with_retained_findings(self):
+        source = self.HASH_ALLOCATION_PARTIAL
+        expected = [line for line, text in enumerate(source.splitlines(), 1)
+                    if '# expect-secret' in text]
+        with self.assertRaisesRegex(ctcompare_py.AnalysisLimit,
+                                    'repeated allocation site.*analysis is incomplete') as caught:
+            ctcompare_py._scan_code(source)
+        self.assertEqual([line for _path, line, _code in caught.exception.effects['findings']], expected)
+
+    def test_hash_container_native_partial_retains_only_independent_findings(self):
+        self.assert_hash_container_native_reports(
+            self.HASH_ALLOCATION_PARTIAL, partial_reason='repeated allocation site')
+
+    def test_hash_container_native_module_and_runner_report_exact_sites(self):
+        source = textwrap.dedent('''\
+            import hashlib
+            def selected(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                slots = [h]
+                updates = [slots[0].update(password) for _ in (1,)]
+                return h.hexdigest() == supplied  # expect-secret
+            def nested(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                inner = [h]
+                slots = {"active": inner}
+                saved = slots["active"][0]
+                inner[0] = hashlib.sha256(payload)
+                saved.update(password)
+                return h.hexdigest() == supplied  # expect-secret
+            def other_element(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                slots = [h, hashlib.sha256(payload)]
+                slots[1].update(password)
+                return h.hexdigest() == supplied
+            def replaced(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                slots = [h]
+                saved = slots
+                saved[0] = hashlib.sha256(payload)
+                slots[0].update(password)
+                return h.hexdigest() == supplied
+            def suppressed(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                slots = [h]
+                slots[0].update(password)
+                # ubs:ignore[python.ctcompare.secret_eq]
+                return h.hexdigest() == supplied
+            def present_key(payload, password, supplied, candidate):
+                h = hashlib.sha256(payload)
+                slots = {"active": candidate}
+                selected = slots.get("active", h)
+                selected.update(password)
+                return h.hexdigest() == supplied
+        ''')
+        self.assert_hash_container_native_reports(source)
+
+    def assert_hash_container_native_reports(self, source, *, partial_reason=None):
+        import hashlib
+        import json
+        import os
+        import shutil
+        import subprocess
+        import time
+
+        if shutil.which('rg') is None or shutil.which('jq') is None:
+            self.skipTest('Python module requires rg and jq')
+        artifacts = REPO_ROOT / 'test-suite' / 'artifacts'
+        artifacts.mkdir(exist_ok=True)
+        root = Path(tempfile.mkdtemp(prefix='ctcompare-heap-cli-', dir=artifacts))
+        expected_status = 'partial' if partial_reason else 'ok'
+        expected_exit = 2 if partial_reason else 1
+        expected = [line for line, text in enumerate(source.splitlines(), 1)
+                    if '# expect-secret' in text]
+        detector_sha = hashlib.sha256(Path(ctcompare_py.__file__).read_bytes()).hexdigest()
+        for entry in ('module', 'runner'):
+            for output_format in ('json', 'sarif'):
+                with self.subTest(entry=entry, format=output_format):
+                    folder = root / f'{entry}-{output_format}'
+                    folder.mkdir()
+                    path = folder / 'comparisons.py'
+                    path.write_text(source, encoding='utf-8')
+                    for child in ('tmp', 'cache', 'data'):
+                        (folder / child).mkdir()
+                    env = {key: value for key, value in os.environ.items()
+                           if not key.startswith('UBS_')}
+                    env.update(TMPDIR=str(folder / 'tmp'), XDG_CACHE_HOME=str(folder / 'cache'),
+                               XDG_DATA_HOME=str(folder / 'data'), NO_COLOR='1',
+                               PYTHONDONTWRITEBYTECODE='1', UBS_NO_AUTO_UPDATE='1',
+                               UBS_KEEP_TEMP='1', UBS_PROFILE='strict', ENABLE_UV_TOOLS='0')
+                    executable = REPO_ROOT / ('ubs' if entry == 'runner' else 'modules/ubs-python.sh')
+                    command = ['bash', str(executable), '--ci', '--no-color',
+                               '--format=' + output_format,
+                               '--skip=' + ','.join(str(n) for n in range(1, 24) if n != 7),
+                               '--only=python' if entry == 'runner' else '--no-uv', str(path)]
+                    for attempt in range(2 if (entry, output_format) == ('runner', 'json') else 1):
+                        started = time.perf_counter()
+                        completed = subprocess.run(command, cwd=folder, capture_output=True, text=True,
+                                                   check=False, timeout=120, env=env)
+                        (folder / f'{attempt}.stdout').write_text(completed.stdout, encoding='utf-8')
+                        (folder / f'{attempt}.stderr').write_text(completed.stderr, encoding='utf-8')
+                        (folder / f'{attempt}.run.json').write_text(json.dumps({
+                            'command': command, 'returncode': completed.returncode,
+                            'detector_sha256': detector_sha,
+                            'source_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                            'elapsed_seconds': time.perf_counter() - started,
+                        }, indent=2) + '\n', encoding='utf-8')
+                        print(f'[ctcompare-heap-{entry}-{output_format}-{attempt}] '
+                              f'exit={completed.returncode} artifacts={folder}')
+                        evidence = f'{folder}\n{completed.stdout}\n{completed.stderr}'
+                        self.assertEqual(completed.returncode, expected_exit, evidence)
+                        if partial_reason:
+                            self.assertIn(partial_reason, completed.stdout, evidence)
+                            self.assertIn('analysis is incomplete', completed.stdout, evidence)
+                        document = json.loads(completed.stdout)
+                        if output_format == 'json':
+                            self.assertEqual(document['status'], expected_status, evidence)
+                            scanners = document['scanners'] if entry == 'runner' else [document]
+                            self.assertEqual(len(scanners), 1, evidence)
+                            self.assertEqual(scanners[0]['status'], expected_status, evidence)
+                            rows = [row for row in scanners[0]['findings']
+                                    if row.get('rule_id', row.get('rule')) == ctcompare_py.RULE_ID]
+                            self.assertEqual([(sample['line'], row['severity']) for row in rows
+                                              for sample in row['samples']],
+                                             [(line, 'critical') for line in expected], evidence)
+                            self.assertEqual(sum(row['count'] for row in rows), len(expected), evidence)
+                            self.assertEqual(scanners[0]['critical'], len(expected), evidence)
+                        else:
+                            rows = [row for scan in document['runs'] for row in scan.get('results', [])
+                                    if row['ruleId'] == ctcompare_py.RULE_ID]
+                            self.assertEqual([row['locations'][0]['physicalLocation']['region']['startLine']
+                                              for row in rows], expected, evidence)
+                            self.assertTrue(all(row['level'] == 'error' for row in rows), evidence)
+                            unsuccessful = any(invocation.get('executionSuccessful') is False
+                                               for scan in document['runs']
+                                               for invocation in scan.get('invocations', []))
+                            self.assertEqual(unsuccessful, bool(partial_reason), evidence)
 
     def test_exception_handler_joins_intermediate_and_nested_statement_states(self):
         self.assert_sites('''

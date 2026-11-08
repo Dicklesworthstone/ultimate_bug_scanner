@@ -10,6 +10,14 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Preserve Python hash-object identity through selected list, tuple and
+  dictionary entries, nested aliases, copies, slices and captured methods.
+  Track slot replacement, deletion, lookup defaults and in-place collection
+  updates without contaminating unrelated public hashes. Keep branch, loop,
+  exception and comprehension effects; report repeated-allocation ambiguity as
+  incomplete while retaining independently established findings. Add independent
+  unsafe/clean, real-hashlib and ordinary JSON/SARIF regressions.
+
 - Analyze selected C# Dapper `CommandDefinition` execution with captured SQL,
   separate bound parameters, scoped API identities, local factories and value
   copies. Cover synchronous and asynchronous eager overloads, named arguments,

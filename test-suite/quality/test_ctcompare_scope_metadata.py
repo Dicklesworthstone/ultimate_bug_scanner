@@ -1169,6 +1169,215 @@ class PythonSecretComparisonFlowTests(unittest.TestCase):
                 return accepted
         ''')
 
+    def test_comprehension_elements_keep_secret_provenance(self):
+        self.assert_sites('''
+            def verify(password, supplied):
+                aliases = [password]
+                eager = [value == supplied for value in aliases]  # expect-secret
+                lazy = any(value != supplied for value in aliases)  # expect-secret
+                unique = {value == supplied for value in aliases}  # expect-secret
+                keyed = {value == supplied: value for value in aliases}  # expect-secret
+                filtered = [value for value in aliases if value == supplied]  # expect-secret
+                nested = [value == supplied for row in [[password]] for value in row]  # expect-secret
+                pairs = [value == supplied for label, value in [("public", password)]]  # expect-secret
+                labels = [label == supplied for label, value in [("public", password)]]
+                keys = [label == supplied for label in {"public": password}]
+                safe = [hmac.compare_digest(value, supplied) for value in aliases]
+                return eager, lazy, unique, keyed, filtered, nested, pairs, labels, keys, safe
+        ''')
+
+    def test_comprehension_targets_are_local_and_capture_the_first_iterable(self):
+        self.assert_sites('''
+            def verify(password, supplied):
+                value = password
+                public = [value == supplied for value in ["public"]]
+                captured = [value == supplied for value in [value]]  # expect-secret
+                return value == supplied  # expect-secret
+            def separate(password, supplied):
+                value = "public"
+                secret = [value == supplied for value in [password]]  # expect-secret
+                return value == supplied
+            def unpack(password, supplied):
+                first, second = "public", "public"
+                first = password
+                checks = [second == supplied for first, second in [(second, first)]]  # expect-secret
+                labels = [first == supplied for first, second in [(second, first)]]
+                return first == supplied  # expect-secret
+        ''')
+
+    def test_comprehension_results_retain_material_and_evaluation_order(self):
+        self.assert_sites('''
+            def verify(password, supplied):
+                values = [value for value in [password]]
+                alias = values
+                direct = alias == ["guess"]  # expect-secret
+                annotated: list[str] = [value for value in [password]]
+                copied = annotated != ["guess"]  # expect-secret
+                immediate = [value for value in [password]] == ["guess"]  # expect-secret
+                for value in values:
+                    accepted = value == supplied  # expect-secret
+                public = ["label" for value in [password]]
+                clean = public == ["label"]
+                lazy = (value for value in [password])
+                identity = lazy == supplied
+                return direct, copied, immediate, accepted, clean, identity
+            def evaluated_before_overwrite(password):
+                value = password
+                rows = [(value, (value := "public")) for _ in [1]]
+                return rows == [("guess", "public")]  # expect-secret
+        ''')
+
+    def test_comprehension_mutations_preserve_outer_hash_identity(self):
+        self.assert_sites('''
+            import hashlib
+            def direct(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                updates = [h.update(value) for value in [password]]
+                return h.hexdigest() == supplied  # expect-secret
+            def same_binding(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                updates = [h.update(password) for h in [h]]
+                return h.hexdigest() == supplied  # expect-secret
+            def captured_alias(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                updates = [alias.update(password) for alias in [h]]
+                return h.hexdigest() == supplied  # expect-secret
+            def captured_container(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                objects = [h]
+                updates = [alias.update(password) for alias in objects]
+                return h.hexdigest() == supplied  # expect-secret
+            def nested(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                updates = [[alias.update(password) for alias in [h]] for _ in [1]]
+                return h.hexdigest() == supplied  # expect-secret
+            def consumed_generator(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                any(h.update(value) for value in [password])
+                return h.hexdigest() == supplied  # expect-secret
+        ''')
+
+    def test_comprehension_fresh_hash_shadows_and_public_updates_are_clean(self):
+        self.assert_sites('''
+            import hashlib
+            def fresh_shadow(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                updates = [h.update(password) for h in [hashlib.sha256(payload)]]
+                return h.hexdigest() == supplied
+            def public_update(payload, supplied):
+                h = hashlib.sha256(payload)
+                updates = [h.update(value) for value in [payload]]
+                checks = [h.hexdigest() == supplied for h in [h]]
+                return h.hexdigest() == supplied, checks
+            def container_update(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                updates = [mapping.update({"value": password}) for mapping in [{"hash": h}]]
+                return h.hexdigest() == supplied
+        ''')
+
+    def test_comprehension_walrus_writes_escape_without_erasing_empty_paths(self):
+        self.assert_sites('''
+            def escape(password, supplied):
+                expected = "public"
+                values = [(expected := value) for value in [password]]
+                return expected == supplied  # expect-secret
+            def may_be_empty(password, supplied, items):
+                expected = password
+                values = [(expected := "public") for _ in items]
+                return expected == supplied  # expect-secret
+            def optional_write(password, supplied, flag):
+                expected = password
+                values = [(flag and (expected := "public"), expected == supplied) for _ in [1]]  # expect-secret
+            def conditional_write(password, supplied, flag):
+                expected = "public"
+                values = [((expected := password) if flag else "public") for _ in [1]]
+                return expected == supplied  # expect-secret
+        ''')
+
+    def test_comprehension_lambda_parameters_defaults_and_captures_have_scopes(self):
+        self.assert_sites('''
+            def verify(password, supplied):
+                expected = "public"
+                parameter = [lambda value: value == supplied for value in [password]]
+                captured = [lambda: value == supplied for value in [password]]  # expect-secret
+                default = [lambda value=value: value == supplied for value in [password]]  # expect-secret
+                local_write = [lambda: (expected := password) for _ in [1]]
+                return expected == supplied
+        ''')
+
+    def test_comprehension_exception_paths_keep_outer_writes_and_local_scope(self):
+        self.assert_sites('''
+            def escaped_write(password, supplied):
+                expected = "public"
+                try:
+                    values = [(expected := password, work(), expected := "public") for _ in [1]]
+                except Exception:
+                    return expected == supplied  # expect-secret
+            def local_target(password, supplied):
+                value = "public"
+                try:
+                    values = [work() for value in [password]]
+                except Exception:
+                    return value == supplied
+        ''')
+
+    def test_comprehension_starred_targets_do_not_escape_their_scope(self):
+        self.assert_sites('''
+            def verify(password, supplied):
+                rest = "public"
+                values = [rest for _, *rest in [(0, password)]]
+                captured = values == [["guess"]]  # expect-secret
+                labels = [first == supplied for first, *rest in [("public", password)]]
+                tails = [last == supplied for *rest, last in [(password, "public")]]
+                empty = [rest == ["guess"] for first, *rest in [("public",)]]
+                return rest == supplied
+        ''')
+
+    def test_comprehension_expression_facts_refresh_on_loop_backedges(self):
+        self.assert_sites('''
+            import hashlib
+            def alias_backedge(password, supplied, items):
+                value = "public"
+                for item in items:
+                    checks = [value == supplied for _ in [1]]  # expect-secret
+                    value = password
+            def hash_backedge(payload, password, supplied, items):
+                h = hashlib.sha256(payload)
+                for item in items:
+                    checks = [h.hexdigest() == supplied for _ in [1]]  # expect-secret
+                    h.update(password)
+            def chained_evaluation(password, supplied):
+                value = password
+                changed = value == (value := "public")  # expect-secret
+                value = password
+                conditional = 0 == 1 == (value := "public")
+                return value == supplied  # expect-secret
+        ''')
+
+    def test_comprehension_first_iterable_and_hash_rebinding_keep_evaluation_order(self):
+        self.assert_sites('''
+            import hashlib
+            def first_iterable(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                values = [h for _ in (h.update(password),)]
+                return h.hexdigest() == supplied  # expect-secret
+            def capture_before_shadow(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                alias = h
+                values = [alias.update(password) for h in [hashlib.sha256(payload)]]
+                return h.hexdigest() == supplied  # expect-secret
+            def rebound_outer_hash(payload, password, supplied):
+                h = hashlib.sha256(payload)
+                alias = h
+                values = [(h := hashlib.sha256(payload), alias.update(password)) for _ in [1]]
+                return h.hexdigest() == supplied
+            def value_capture(password, supplied):
+                value = password
+                items = (value, (value := "public"))
+                checks = [element == supplied for element in items]  # expect-secret
+                return value == supplied
+        ''')
+
     def test_exception_handler_joins_intermediate_and_nested_statement_states(self):
         self.assert_sites('''
             def verify(state: State, password, supplied, flag):

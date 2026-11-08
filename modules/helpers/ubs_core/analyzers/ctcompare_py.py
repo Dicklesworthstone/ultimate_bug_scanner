@@ -38,7 +38,7 @@ import ast
 import re
 import sys
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, NamedTuple
 
 from ubs_core.registry import Analyzer, RunContext, register
 from ubs_core.suppression import build_index
@@ -147,6 +147,8 @@ RULE_ID = 'python.ctcompare.secret_eq'
 def target_names(target):
     if isinstance(target, ast.Name):
         return [target.id]
+    if isinstance(target, ast.Starred):
+        return target_names(target.value)
     if isinstance(target, (ast.Tuple, ast.List)):
         names = []
         for elt in target.elts:
@@ -930,6 +932,20 @@ def local_unkeyed_digest_helpers(tree):
     return result
 
 
+class ComparisonValue(NamedTuple):
+    sensitive: bool
+    container: bool
+    hashes: frozenset
+    elements: frozenset
+    public_hash: bool = False
+
+
+class ComparisonScope(NamedTuple):
+    names: set
+    before: tuple
+    mutations: set
+
+
 class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
     def __init__(self, path, lines, suppressions=None):
         self.path = path
@@ -954,6 +970,13 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
         self.explained_names = set()
         self.public_signal_bindings = {}
         self.structural_values = set()
+        self.expression_values = {}
+        self.comprehension_values = {}
+        # Allocation identities only invalidate proofs; an alias alone does
+        # not establish that an unknown receiver is a public hashlib object.
+        self.hash_objects = {}
+        self.hash_elements = {}
+        self.expression_scopes = []
         self.issues = []
         self.seen_lines = set()
 
@@ -972,6 +995,10 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
     def expr_is_sensitive(self, node):
         if node in self.structural_values:
             return False
+        if node in self.expression_values:
+            return self.expression_values[node].sensitive
+        if node in self.comprehension_values:
+            return not isinstance(node, ast.GeneratorExp) and self.comprehension_values[node].sensitive
         if isinstance(node, ast.Name):
             return node.id in self.sensitive_names or (
                 node.id not in self.explained_names and name_is_sensitive(node.id)
@@ -1012,16 +1039,53 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
             return any(self.expr_is_sensitive(value) for value in [*node.keys, *node.values] if value is not None)
         if isinstance(node, ast.Starred):
             return self.expr_is_sensitive(node.value)
+        if isinstance(node, ast.NamedExpr):
+            return self.expr_is_sensitive(node.value)
         return False
 
     def expr_has_sensitive_container(self, node):
+        if node in self.expression_values:
+            return self.expression_values[node].container
+        if node in self.comprehension_values:
+            return self.comprehension_values[node].sensitive
         if isinstance(node, ast.Name):
             return node.id in self.sensitive_containers
         if isinstance(node, (ast.Tuple, ast.List, ast.Set, ast.Dict)):
             return self.expr_is_sensitive(node)
         if isinstance(node, ast.IfExp):
             return self.expr_has_sensitive_container(node.body) or self.expr_has_sensitive_container(node.orelse)
+        if isinstance(node, ast.NamedExpr):
+            return self.expr_has_sensitive_container(node.value)
         return False
+
+    def value_hashes(self, node, elements=False):
+        if node in self.expression_values:
+            value = self.expression_values[node]
+            return value.elements if elements else value.hashes
+        if node in self.comprehension_values:
+            return self.comprehension_values[node].elements if elements else frozenset()
+        if isinstance(node, ast.Name):
+            bindings = self.hash_elements if elements else self.hash_objects
+            return bindings.get(node.id, frozenset())
+        if isinstance(node, ast.Call) and self.is_unkeyed_hash_ctor(node):
+            return frozenset() if elements else frozenset((node,))
+        if isinstance(node, (ast.NamedExpr, ast.Starred)):
+            return self.value_hashes(node.value, elements)
+        if isinstance(node, ast.IfExp):
+            return self.value_hashes(node.body, elements) | self.value_hashes(node.orelse, elements)
+        if elements and isinstance(node, (ast.Tuple, ast.List, ast.Set, ast.Dict)):
+            values = [*node.keys, *node.values] if isinstance(node, ast.Dict) else node.elts
+            return frozenset().union(*(self.value_hashes(value) | self.value_hashes(value, True)
+                                       for value in values if value is not None))
+        return frozenset()
+
+    def public_hash_value(self, node):
+        if node in self.expression_values:
+            return self.expression_values[node].public_hash
+        if isinstance(node, ast.Name):
+            return node.id in self.unkeyed_hash_names
+        return (isinstance(node, ast.Call) and self.is_unkeyed_hash_ctor(node)
+                and not self.call_input_is_sensitive(node))
 
     def is_unkeyed_hash_ctor(self, call):
         """hashlib.sha256(...) / sha256(...) / hashlib.new(...) without a MAC key."""
@@ -1054,7 +1118,7 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
                 return self.call_input_is_sensitive(receiver)
             return True
         if isinstance(receiver, ast.Name):
-            return receiver.id not in self.unkeyed_hash_names
+            return not self.public_hash_value(receiver)
         return True
 
     def mark_assignment(self, names, value):
@@ -1085,33 +1149,72 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
                 self.sensitive_containers.add(name)
             else:
                 self.sensitive_containers.discard(name)
+            self.hash_objects[name] = self.value_hashes(value)
+            self.hash_elements[name] = self.value_hashes(value, True)
 
     def comparison_state(self):
         return (set(self.sensitive_names), set(self.unkeyed_hash_names),
-                set(self.explained_names), set(self.sensitive_containers))
+                set(self.explained_names), set(self.sensitive_containers),
+                dict(self.hash_objects), dict(self.hash_elements))
+
+    @staticmethod
+    def merge_hash_bindings(*bindings):
+        result = {}
+        for incoming in bindings:
+            for name, objects in incoming.items():
+                result[name] = result.get(name, frozenset()) | objects
+        return result
+
+    @staticmethod
+    def project_scope(state, scope):
+        for current, original in zip(state[:4], scope.before[:4]):
+            current.difference_update(scope.names)
+            current.update(original & scope.names)
+        for current, original in zip(state[4:], scope.before[4:]):
+            for name in scope.names:
+                current.pop(name, None)
+                if name in original:
+                    current[name] = original[name]
+        # Restoring a local name must not restore a hash object that a
+        # captured alias mutated while that name was shadowed.
+        state[1].difference_update(name for name, objects in state[4].items()
+                                   if objects & scope.mutations)
+        return state
 
     def record_exception_entry(self, state):
         if self.exception_entries:
+            for scope in reversed(self.expression_scopes):
+                self.project_scope(state, scope)
             incoming = self.exception_entries[-1]
             incoming[0].update(state[0])
             incoming[1].intersection_update(state[1])
             incoming[2].intersection_update(state[2])
             incoming[3].update(state[3])
+            for index in (4, 5):
+                incoming[index].update(self.merge_hash_bindings(incoming[index], state[index]))
 
     def visit(self, node):
         # An exception can leave a statement before its normal assignments
         # complete. Include nested statements, not only a try body's endpoint.
         statement = isinstance(node, ast.stmt)
+        expression = isinstance(node, ast.expr)
+        if expression:
+            self.expression_values.pop(node, None)
         if statement and self.exception_entries:
             self.record_exception_entry(self.comparison_state())
         result = super().visit(node)
+        if expression:
+            self.expression_values[node] = ComparisonValue(
+                self.expr_is_sensitive(node), self.expr_has_sensitive_container(node),
+                self.value_hashes(node), self.value_hashes(node, True), self.public_hash_value(node))
         if statement and self.exception_entries:
             self.record_exception_entry(self.comparison_state())
         return result
 
     def restore_comparison_state(self, state):
         (self.sensitive_names, self.unkeyed_hash_names,
-         self.explained_names, self.sensitive_containers) = map(set, state)
+         self.explained_names, self.sensitive_containers) = map(set, state[:4])
+        self.hash_objects, self.hash_elements = map(dict, state[4:])
 
     def join_comparison_states(self, *states):
         # Sensitive provenance may come from any path. A public explanation
@@ -1120,6 +1223,8 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
         self.unkeyed_hash_names = set.intersection(*(state[1] for state in states))
         self.explained_names = set.intersection(*(state[2] for state in states))
         self.sensitive_containers = set.union(*(state[3] for state in states))
+        self.hash_objects = self.merge_hash_bindings(*(state[4] for state in states))
+        self.hash_elements = self.merge_hash_bindings(*(state[5] for state in states))
 
     def visit_If(self, node):
         self.visit(node.test)
@@ -1132,7 +1237,7 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
             self.visit(statement)
         self.join_comparison_states(body, self.comparison_state())
 
-    def bind_iteration_target(self, target, values, source=None):
+    def bind_iteration_target(self, target, values, source=None, iterable=None):
         """Assign possible elements, preserving literal unpacking positions.
 
         Iteration overwrites its target before the body executes. A secret
@@ -1142,17 +1247,27 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
         if source is None:
             source = self.comparison_state()
         if isinstance(target, (ast.Tuple, ast.List)):
-            positioned = values and all(
-                isinstance(value, (ast.Tuple, ast.List)) and len(value.elts) == len(target.elts)
+            stars = [index for index, child in enumerate(target.elts) if isinstance(child, ast.Starred)]
+            positioned = values and len(stars) <= 1 and all(
+                isinstance(value, (ast.Tuple, ast.List))
+                and (len(value.elts) >= len(target.elts) - 1 if stars
+                     else len(value.elts) == len(target.elts))
                 and not any(isinstance(item, ast.Starred) for item in value.elts)
                 for value in values
-            ) and not any(isinstance(item, ast.Starred) for item in target.elts)
+            )
             for index, child in enumerate(target.elts):
-                self.bind_iteration_target(child,
-                                           [value.elts[index] for value in values] if positioned else values,
-                                           source)
+                selected = values
+                if positioned:
+                    if isinstance(child, ast.Starred):
+                        tail = len(target.elts) - index - 1
+                        selected = [ast.List(elts=value.elts[index:len(value.elts) - tail], ctx=ast.Load())
+                                    for value in values]
+                    else:
+                        selected = [value.elts[len(value.elts) - len(target.elts) + index]
+                                    if stars and index > stars[0] else value.elts[index] for value in values]
+                self.bind_iteration_target(child, selected, source, iterable)
         elif isinstance(target, ast.Starred):
-            self.bind_iteration_target(target.value, values, source)
+            self.bind_iteration_target(target.value, values, source, iterable)
         elif isinstance(target, ast.Name):
             before = self.comparison_state()
             completed = []
@@ -1165,13 +1280,20 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
                         self.unkeyed_hash_names.discard(target.id)
                 else:
                     self.mark_assignment([target.id], value)
+                if value is iterable:
+                    if self.expr_is_sensitive(value) or self.expr_has_sensitive_container(value):
+                        self.sensitive_names.add(target.id)
+                    self.hash_objects[target.id] = self.value_hashes(value, True)
                 completed.append(self.comparison_state())
             self.join_comparison_states(*completed)
-            facts = [target.id in names for names in self.comparison_state()]
+            assigned = self.comparison_state()
+            facts = [target.id in names for names in assigned[:4]]
             self.restore_comparison_state(before)
             for names, present in zip((self.sensitive_names, self.unkeyed_hash_names,
                                        self.explained_names, self.sensitive_containers), facts):
                 (names.add if present else names.discard)(target.id)
+            self.hash_objects[target.id] = assigned[4].get(target.id, frozenset())
+            self.hash_elements[target.id] = assigned[5].get(target.id, frozenset())
         else:
             # Attribute/subscript targets can execute their own comparisons.
             self.visit(target)
@@ -1194,7 +1316,7 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
             else:
                 # The iterable expression is evaluated once, before any
                 # target writes or backedges can rebind its source names.
-                self.bind_iteration_target(node.target, self.iteration_values(condition), before)
+                self.bind_iteration_target(node.target, self.iteration_values(condition), before, condition)
             for statement in node.body:
                 self.visit(statement)
             # This join is monotone over the finite set of local name facts:
@@ -1216,6 +1338,95 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
 
     def visit_While(self, node):
         self.visit_loop(node, node.test)
+
+    def visit_comprehension(self, node):
+        # Only the first iterable belongs to the surrounding lexical scope.
+        # Its value must be captured before any target is overwritten.
+        self.visit(node.generators[0].iter)
+        names = {name for generator in node.generators for name in target_names(generator.target)}
+        scope = ComparisonScope(names, self.comparison_state(), set())
+        self.expression_scopes.append(scope)
+        for index, generator in enumerate(node.generators):
+            if index:
+                self.visit(generator.iter)
+            self.bind_iteration_target(generator.target, self.iteration_values(generator.iter),
+                                       iterable=generator.iter)
+            for condition in generator.ifs:
+                self.visit(condition)
+        values = [node.key, node.value] if isinstance(node, ast.DictComp) else [node.elt]
+        for value in values:
+            self.visit(value)
+        self.comprehension_values[node] = ComparisonValue(
+            any(self.expr_is_sensitive(value) for value in values), True, frozenset(),
+            frozenset().union(*(self.value_hashes(value) | self.value_hashes(value, True) for value in values)))
+        after = self.project_scope(self.comparison_state(), scope)
+        self.expression_scopes.pop()
+        # A filter, empty iterable, or deferred generator can leave the outer
+        # bindings unchanged. Effects that may happen must still survive.
+        self.join_comparison_states(scope.before, after)
+
+    visit_ListComp = visit_comprehension
+    visit_SetComp = visit_comprehension
+    visit_DictComp = visit_comprehension
+    visit_GeneratorExp = visit_comprehension
+
+    def visit_NamedExpr(self, node):
+        self.visit(node.value)
+        self.mark_assignment(target_names(node.target), node.value)
+        # This write can precede a failing expression in the same statement.
+        # Projection keeps comprehension/lambda locals out of the handler.
+        self.record_exception_entry(self.comparison_state())
+
+    def visit_BoolOp(self, node):
+        self.visit(node.values[0])
+        for value in node.values[1:]:
+            before = self.comparison_state()
+            self.visit(value)
+            self.join_comparison_states(before, self.comparison_state())
+
+    def visit_IfExp(self, node):
+        self.visit(node.test)
+        before = self.comparison_state()
+        self.visit(node.body)
+        body = self.comparison_state()
+        self.restore_comparison_state(before)
+        self.visit(node.orelse)
+        self.join_comparison_states(body, self.comparison_state())
+
+    def visit_Lambda(self, node):
+        arguments = [*node.args.posonlyargs, *node.args.args]
+        defaults = [*node.args.defaults, *(value for value in node.args.kw_defaults if value is not None)]
+        for value in defaults:
+            self.visit(value)
+        parameters = arguments + list(node.args.kwonlyargs)
+        parameters += [arg for arg in (node.args.vararg, node.args.kwarg) if arg is not None]
+        names = {arg.arg for arg in parameters}
+        pending = [node.body]
+        while pending:
+            child = pending.pop()
+            if isinstance(child, ast.Lambda):
+                continue
+            if isinstance(child, ast.NamedExpr):
+                names.update(target_names(child.target))
+            pending.extend(ast.iter_child_nodes(child))
+        scope = ComparisonScope(names, self.comparison_state(), set())
+        self.expression_scopes.append(scope)
+        for bindings in (self.sensitive_names, self.unkeyed_hash_names,
+                         self.explained_names, self.sensitive_containers):
+            bindings.difference_update(names)
+        for bindings in (self.hash_objects, self.hash_elements):
+            for name in names:
+                bindings.pop(name, None)
+        self.sensitive_names.update(arg.arg for arg in parameters if name_is_sensitive(arg.arg))
+        pairs = list(zip(arguments[len(arguments) - len(node.args.defaults):], node.args.defaults))
+        pairs += [(arg, value) for arg, value in zip(node.args.kwonlyargs, node.args.kw_defaults)
+                  if value is not None]
+        for arg, value in pairs:
+            self.mark_assignment([arg.arg], value)
+        self.visit(node.body)
+        after = self.project_scope(self.comparison_state(), scope)
+        self.expression_scopes.pop()
+        self.join_comparison_states(scope.before, after)
 
     def visit_Try(self, node):
         before = self.comparison_state()
@@ -1251,6 +1462,10 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
     def visit_FunctionDef(self, node):
         old_sensitive = set(self.sensitive_names)
         old_containers = set(self.sensitive_containers)
+        old_hash_objects, old_hash_elements = self.hash_objects, self.hash_elements
+        old_expression_scopes = self.expression_scopes
+        self.hash_objects, self.hash_elements = {}, {}
+        self.expression_scopes = []
         old_exceptions = self.exception_entries
         self.exception_entries = []
         old_unkeyed = set(self.unkeyed_hash_names)
@@ -1276,6 +1491,8 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
         self.unkeyed_hash_names = old_unkeyed
         self.explained_names = old_explained
         self.public_signal_bindings = old_public_signals
+        self.hash_objects, self.hash_elements = old_hash_objects, old_hash_elements
+        self.expression_scopes = old_expression_scopes
 
     def visit_AsyncFunctionDef(self, node):
         self.visit_FunctionDef(node)
@@ -1286,34 +1503,51 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Assign(self, node):
+        self.visit(node.value)
         names = [name for target in node.targets for name in target_names(target)]
         if names:
             self.mark_assignment(names, node.value)
-        self.generic_visit(node)
+        for target in node.targets:
+            self.visit(target)
 
     def visit_AnnAssign(self, node):
         if node.value is not None:
+            self.visit(node.value)
             names = target_names(node.target)
             if names:
                 self.mark_assignment(names, node.value)
-        self.generic_visit(node)
+        self.visit(node.target)
+        self.visit(node.annotation)
 
     def visit_Call(self, node):
+        self.visit(node.func)
+        for argument in node.args:
+            self.visit(argument)
+        for keyword in node.keywords:
+            self.visit(keyword.value)
         # h = hashlib.sha256(); h.update(secret)  -> h is no longer a plain checksum.
         func = node.func
         if (
             isinstance(func, ast.Attribute)
             and func.attr == 'update'
-            and isinstance(func.value, ast.Name)
-            and func.value.id in self.unkeyed_hash_names
             and self.call_input_is_sensitive(node)
         ):
-            self.unkeyed_hash_names.discard(func.value.id)
-        self.generic_visit(node)
+            objects = self.value_hashes(func.value)
+            for scope in self.expression_scopes:
+                scope.mutations.update(objects)
+            self.unkeyed_hash_names.difference_update(
+                name for name, aliases in self.hash_objects.items() if objects & aliases)
+            if isinstance(func.value, ast.Name):
+                self.unkeyed_hash_names.discard(func.value.id)
 
     def visit_Compare(self, node):
+        self.visit(node.left)
         values = [node.left] + list(node.comparators)
-        for left, operator, right in zip(values, node.ops, values[1:]):
+        for index, (left, operator, right) in enumerate(zip(values, node.ops, values[1:])):
+            before = self.comparison_state()
+            self.visit(right)
+            if index:
+                self.join_comparison_states(before, self.comparison_state())
             if not isinstance(operator, (ast.Eq, ast.NotEq)):
                 continue
             # Adjacent pairs own their evidence: a numeric neighbor must not
@@ -1330,7 +1564,6 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
             )
             if not (scalar_literal or public_display) and any(self.expr_is_sensitive(value) for value in (left, right)):
                 self.remember_issue(node.lineno)
-        self.generic_visit(node)
 
 def analyze(path, issues):
     try:

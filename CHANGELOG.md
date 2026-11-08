@@ -10,6 +10,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Track Python secret comparisons through list, set, dictionary, and generator
+  comprehensions, including nested iteration, filters, unpacking, and captured
+  values. Keep comprehension targets and lambda bindings local while preserving
+  outer walrus writes and mutations of captured hash objects. Respect operand
+  evaluation order and loop backedges, and retain public checksum and structural
+  comparison controls with paired regressions.
+
 - Preserve C# redirect analysis when comments surround host allowlist literals
   or `Location` header keys. Ignore only lexical trivia, keep computed or
   dynamic host entries untrusted, and retain request-derived redirect findings

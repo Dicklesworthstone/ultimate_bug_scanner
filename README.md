@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.5.44-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.5.45-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -795,7 +795,7 @@ Unlike traditional linters that fight AI-generated code, this scanner **embraces
 ✅ Actionable output (tells you WHAT's wrong and HOW to fix it)
 ✅ Fails fast in CI (catch bugs before they merge)
 ✅ React Hooks dependency analysis that spots missing deps, unstable objects, and stale closures
-✅ Lightweight taint analysis that traces req.body/window.location/localStorage → innerHTML/res.send/eval/exec/db.query and flags flows without DOMPurify/escapeHtml/parameterized SQL
+✅ Lightweight taint analysis that traces req.body/window.location/localStorage → innerHTML/res.send/eval/exec/db.query and flags flows without DOMPurify/escapeHtml/parameterized SQL. Directly executed, imported Drizzle `sql` templates recognize bound values, including nested templates; raw fragments, unknown calls, and stored or mutated SQL objects remain conservative.
 ```
 
 ### 📊 **4. Real-World Impact**

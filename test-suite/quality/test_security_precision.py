@@ -5117,18 +5117,20 @@ class EvalRuleIdentifierBoundaryTests(unittest.TestCase):
         ]), ["eval(code)", "obj.instance_eval(code)"])
 
 
-@unittest.skipUnless(os.environ.get("UBS_DRIZZLE_BASELINE"),
-                     "set UBS_DRIZZLE_BASELINE to the incumbent runner for paired public CLI scans")
 class DrizzleBoundSqlPublicTests(unittest.TestCase):
     """Bound Drizzle calls lose SQL-rule false positives; raw SQL stays critical.
 
     Both real scanners run in this invocation on identical retained TS files.
     No fixture runs as application code, and no scanner result is substituted.
-    Three clean fixtures retain a companion taint-rule false positive and exit
-    nonzero on both scanners. Preserve those findings too: this is a SQL-rule
-    improvement, not whole-scanner cleanliness, a live database/security test
-    or complete JavaScript binding proof.
+    The original baseline predates both SQL and taint precision fixes. The
+    candidate must remove both findings from bound queries while preserving
+    raw execution, uncertain bindings, and the unsafe half of mixed queries.
+    This is scanner evidence, not a live database/security test or complete
+    JavaScript binding proof.
     """
+
+    BASELINE_HAS_BOUND_SQL_DETECTOR = False
+    BASELINE_ENV = "UBS_DRIZZLE_BASELINE"
 
     @classmethod
     def setUpClass(cls):
@@ -5183,7 +5185,10 @@ class DrizzleBoundSqlPublicTests(unittest.TestCase):
         return result
 
     def test_incumbent_and_candidate_json_sarif_exact_sql_sites(self):
-        baseline = Path(os.environ["UBS_DRIZZLE_BASELINE"]).resolve()
+        baseline_path = os.environ.get(self.BASELINE_ENV)
+        if not baseline_path:
+            self.skipTest(f"set {self.BASELINE_ENV} to the incumbent runner for paired public CLI scans")
+        baseline = Path(baseline_path).resolve()
         self.assertTrue(baseline.is_file(), "the real incumbent runner is required")
         for clean in (True, False):
             directory = self.root / ("bound" if clean else "unsafe")
@@ -5192,12 +5197,13 @@ class DrizzleBoundSqlPublicTests(unittest.TestCase):
             for name, source, _line in programs:
                 (directory / name).write_text(source, encoding="utf-8")
             for label, runner in (("incumbent", baseline), ("candidate", REPO_ROOT / "ubs")):
-                expected = [] if clean and label == "candidate" else sorted(
+                expected = [] if clean and (label == "candidate" or self.BASELINE_HAS_BOUND_SQL_DETECTOR) else sorted(
                     (name, line, "critical") for name, _source, line in programs)
                 companion = sorted(
                     (name, line, "critical") for name, _source, line in programs
-                    for _ in range(2 if name == "mixed.ts" else 1)
+                    for _ in range(2 if name == "mixed.ts" and label == "incumbent" else 1)
                     if name not in ({"lock.ts"} if clean else {"incomplete.ts", "prisma-unsafe.ts"})
+                    and not (clean and label == "candidate")
                 )
                 for format_ in ("json", "sarif"):
                     case = f"{directory.name}-{label}-{format_}"
@@ -5223,6 +5229,7 @@ class DrizzleBoundSqlPublicTests(unittest.TestCase):
                                         for name, source, _line in programs},
                             "runner": hashlib.sha256(runner.read_bytes()).hexdigest(),
                             "sql_helper": hashlib.sha256((runner.parent / "modules/helpers/ubs_core/analyzers/sec_sql_injection.py").read_bytes()).hexdigest(),
+                            "taint_helper": hashlib.sha256((runner.parent / "modules/helpers/ubs_core/analyzers/taint_js.py").read_bytes()).hexdigest(),
                         }, indent=2), encoding="utf-8")
                         context = f"{command!r}\nexit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
                         report = json.loads(proc.stdout)
@@ -5254,6 +5261,228 @@ class DrizzleBoundSqlPublicTests(unittest.TestCase):
                         self.assertEqual(actual, expected, context)
                         self.assertEqual(proc.returncode, int(bool(expected or companion)), context)
                         print(f"[drizzle-{case}] PASS {time.monotonic() - started:.3f}s", flush=True)
+
+
+class DrizzleBoundSqlTaintPublicTests(DrizzleBoundSqlPublicTests):
+    """Pair against an incumbent whose SQL detector already accepts bound tags.
+
+    This isolates the companion taint regression: both scanners must agree
+    on SQL-rule sites, while only the candidate accepts parameterized calls.
+    The same complete JSON/SARIF, critical-count and exit assertions apply.
+    """
+
+    BASELINE_HAS_BOUND_SQL_DETECTOR = True
+    BASELINE_ENV = "UBS_DRIZZLE_TAINT_BASELINE"
+
+    @staticmethod
+    def programs(clean):
+        programs = DrizzleBoundSqlPublicTests.programs(clean)
+        if not clean:
+            prefix = ('import { sql } from "drizzle-orm";\n'
+                      'export function run(req) {\n'
+                      '  const value = req.body.value;\n')
+            for name, expression in (
+                ('computed-raw', 'sql["raw"](value)'),
+                ('grouped-raw', '(sql.raw)(value)'),
+                ('global-builder', 'globalThis.makeClause(value)'),
+            ):
+                source = prefix + '  return db.execute(sql`SELECT ${' + expression + '}`);\n}\n'
+                programs.append((name + '.ts', source, 4))
+        return programs
+
+
+class DrizzleBoundSqlTaintTests(unittest.TestCase):
+    """Bound parameters and raw fragments keep distinct SQL-flow provenance.
+
+    These source programs exercise the ordinary project analyzer, including
+    local summaries and interpolation effects. Fixtures and results are kept
+    beneath artifacts so the regression does not remove any checkout files.
+    """
+
+    PREFIX = ('import { sql } from "drizzle-orm";\n'
+              'export function run(req) {\n'
+              '  const value = req.body.value;\n')
+
+    @classmethod
+    def setUpClass(cls):
+        artifacts = REPO_ROOT / "test-suite" / "artifacts" / "drizzle-bound-taint"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        cls.directory = Path(tempfile.mkdtemp(prefix="run-", dir=artifacts))
+
+    def inspect(self, name, source, expected):
+        from ubs_core.analyzers import taint_js
+
+        path = self.directory / (name + '.ts')
+        path.write_text(source, encoding='utf-8')
+        findings = list(taint_js.scan_file_findings(path))
+        actual = [(rule, line) for rule, line, _col, _trace in findings]
+        (self.directory / (name + '.json')).write_text(json.dumps({
+            'source_sha256': hashlib.sha256(source.encode()).hexdigest(),
+            'findings': findings,
+        }, indent=2), encoding='utf-8')
+        self.assertEqual(actual, [('js.taint.sql', line) for line in expected], source)
+
+    def test_direct_imported_tags_bind_request_values(self):
+        bodies = {
+            'direct': '  return db.execute(sql`SELECT name FROM records WHERE id = ${value}`);\n',
+            'query': '  return db.query(sql`SELECT name FROM records WHERE id = ${req.query.id}`);\n',
+            'multiline': ('  return db.execute(sql`SELECT name FROM records\n'
+                          '    WHERE id = ${value}\n    AND created_at >= ${req.body.since}`);\n'),
+            'parenthesized': '  return db.execute((sql`SELECT ${value}`));\n',
+            'literal-text': ('  const example = "sql.raw(req.body.value)";\n'
+                             '  return db.execute(sql`SELECT ${value}`);\n'),
+            'scalar-expression': '  return db.execute(sql`SELECT ${"prefix-" + value}`);\n',
+            'boolean-expression': '  return db.execute(sql`SELECT ${(0 < value) && (value > (1))}`);\n',
+            'nested-tag': '  return db.execute(sql`SELECT ${sql`COALESCE(${value}, 0)`}`);\n',
+        }
+        for name, body in bodies.items():
+            with self.subTest(case=name):
+                self.inspect('bound-' + name, self.PREFIX + body + '}\n', [])
+        self.inspect('named-import-alias', self.PREFIX.replace('{ sql }', '{ sql as statement }')
+                     + '  return db.execute(statement`SELECT ${value}`);\n}\n', [])
+
+    def test_raw_and_unknown_fragments_remain_critical(self):
+        cases = {
+            'plain-template': ('  return db.execute(`SELECT ${value}`);\n', [4]),
+            'concatenation': ('  return db.execute("SELECT " + value);\n', [4]),
+            'raw': ('  return db.execute(sql.raw(value));\n', [4]),
+            'nested-raw': ('  return db.execute(sql`SELECT ${sql.raw(value)}`);\n', [4]),
+            'raw-alias': ('  const raw = sql.raw;\n'
+                          '  return db.execute(sql`SELECT ${raw(value)}`);\n', [5]),
+            'raw-variable': ('  const fragment = sql.raw(value);\n'
+                             '  return db.execute(sql`SELECT ${fragment}`);\n', [5]),
+            'computed-raw': ('  return db.execute(sql`SELECT ${sql["raw"](value)}`);\n', [4]),
+            'computed-raw-variable': ('  const fragment = sql["raw"](value);\n'
+                                      '  return db.execute(sql`SELECT ${fragment}`);\n', [5]),
+            'grouped-raw': ('  return db.execute(sql`SELECT ${(sql.raw)(value)}`);\n', [4]),
+            'grouped-raw-variable': ('  const fragment = (sql.raw)(value);\n'
+                                    '  return db.execute(sql`SELECT ${fragment}`);\n', [5]),
+            'returned-function': ('  const fragment = getRaw()(value);\n'
+                                  '  return db.execute(sql`SELECT ${fragment}`);\n', [5]),
+            'optional-computed': ('  return db.execute(sql`SELECT ${sql?.["raw"](value)}`);\n', [4]),
+            'optional-call': ('  return db.execute(sql`SELECT ${makeClause?.(value)}`);\n', [4]),
+            'global-call': ('  return db.execute(sql`SELECT ${globalThis.makeClause(value)}`);\n', [4]),
+            'global-computed-call': ('  return db.execute(sql`SELECT ${globalThis["makeClause"](value)}`);\n', [4]),
+            'computed-tag': ('  return db.execute(sql`SELECT ${tags["unsafe"]`prefix ${value}`}`);\n', [4]),
+            'computed-tag-variable': ('  const fragment = tags["unsafe"]`prefix ${value}`;\n'
+                                      '  return db.execute(sql`SELECT ${fragment}`);\n', [5]),
+            'grouped-tag': ('  return db.execute(sql`SELECT ${(makeClause)`prefix ${value}`}`);\n', [4]),
+            'returned-tag': ('  return db.execute(sql`SELECT ${makeClause()`prefix ${value}`}`);\n', [4]),
+            'generic-call': ('  return db.execute(sql`SELECT ${makeClause<string>(value)}`);\n', [4]),
+            'nested-generic-call': ('  return db.execute(sql`SELECT ${makeClause<Array<{name: string}>>(value)}`);\n', [4]),
+            'nonnull-call': ('  return db.execute(sql`SELECT ${makeClause!(value)}`);\n', [4]),
+            'opaque-inline': ('  return db.execute(sql`SELECT ${makeClause(value)}`);\n', [4]),
+            'opaque-variable': ('  const fragment = makeClause(value);\n'
+                                '  return db.execute(sql`SELECT ${fragment}`);\n', [5]),
+            'object-fragment': ('  const fragment = { text: value };\n'
+                                '  return db.execute(sql`SELECT ${fragment}`);\n', [5]),
+            'assigned-template': ('  const statement = sql`SELECT ${value}`;\n'
+                                  '  return db.execute(statement);\n', [5]),
+            'mutated-template': ('  const statement = sql`SELECT ${value}`;\n'
+                                 '  statement.append(sql.raw(value));\n'
+                                 '  return db.execute(statement);\n', [6]),
+            'member-after-tag': ('  return db.execute(sql`SELECT ${value}`.toString());\n', [4]),
+        }
+        for name, (body, expected) in cases.items():
+            with self.subTest(case=name):
+                self.inspect(name, self.PREFIX + body + '}\n', expected)
+
+    def test_provider_identity_is_not_inferred_from_its_spelling(self):
+        body = '  return db.execute(sql`SELECT ${value}`);\n}\n'
+        cases = {
+            'unimported': self.PREFIX.replace('import { sql } from "drizzle-orm";', 'const unused = 1;') + body,
+            'other-provider': self.PREFIX.replace('"drizzle-orm"', '"custom-sql"') + body,
+            'parameter-shadow': self.PREFIX.replace('run(req)', 'run(req, sql)') + body,
+            'type-only': self.PREFIX.replace('import {', 'import type {') + body,
+        }
+        for name, source in cases.items():
+            with self.subTest(case=name):
+                self.inspect(name, source, [4])
+        self.inspect('local-tag-alias', self.PREFIX + '  const statement = sql;\n'
+                     '  return db.execute(statement`SELECT ${value}`);\n}\n', [5])
+        self.inspect('rebound-provider', self.PREFIX + '  sql = replacement;\n' + body, [5])
+        self.inspect('block-shadow', self.PREFIX + '  { const sql = replacement;\n'
+                     + body + '}\n', [5])
+
+    def test_interpolation_effects_and_mixed_sinks_are_preserved(self):
+        self.inspect('mixed', self.PREFIX
+                     + '  db.execute(sql`SELECT ${value}`);\n'
+                     + '  return db.execute(`SELECT ${value}`);\n}\n', [5])
+        self.inspect('nested-sink', self.PREFIX
+                     + '  return db.execute(sql`SELECT ${db.execute(`SELECT ${value}`)}`);\n}\n', [4])
+        self.inspect('argument-write', self.PREFIX
+                     + '  let fragment = value;\n'
+                     + '  db.execute(sql`SELECT ${(fragment = sql.raw(value))}`);\n'
+                     + '  return db.execute(sql`SELECT ${fragment}`);\n}\n', [5, 6])
+
+    def test_sql_binding_does_not_sanitize_other_domains(self):
+        from ubs_core.analyzers import taint_js
+
+        source = (self.PREFIX + '  shell.exec(sql`SELECT ${value}`);\n'
+                  + '  eval(sql`SELECT ${value}`);\n'
+                  + '  res.send(sql`SELECT ${value}`);\n}\n')
+        path = self.directory / 'other-domains.ts'
+        path.write_text(source, encoding='utf-8')
+        findings = list(taint_js.scan_file_findings(path))
+        self.assertEqual([(rule, line) for rule, line, _col, _trace in findings],
+                         [('js.taint.command', 4), ('js.taint.eval', 5), ('js.taint.xss', 6)])
+
+    def test_assigned_sql_objects_do_not_become_bound_scalars(self):
+        cases = {
+            'assigned-tag-interpolation': ('  const fragment = sql`WHERE id = ${value}`;\n'
+                                           '  return db.execute(sql`SELECT * FROM records ${fragment}`);\n', [5]),
+            'appended-tag-interpolation': ('  const fragment = sql`WHERE id = ${value}`;\n'
+                                           '  fragment.append(sql.raw(req.body.query));\n'
+                                           '  return db.execute(sql`SELECT * FROM records ${fragment}`);\n', [6]),
+            'returned-tag-interpolation': ('  function make(value) { return sql`WHERE id = ${value}`; }\n'
+                                           '  const fragment = make(value);\n'
+                                           '  fragment.append(sql.raw(req.body.query));\n'
+                                           '  return db.execute(sql`SELECT * FROM records ${fragment}`);\n', [7]),
+            'captured-tag-interpolation': ('  const fragment = sql`WHERE id = ${value}`;\n'
+                                           '  function extend() { fragment.append(sql.raw(req.body.query)); }\n'
+                                           '  extend();\n'
+                                           '  return db.execute(sql`SELECT * FROM records ${fragment}`);\n', [7]),
+            'unknown-mutated-tag': ('  const fragment = sql`WHERE id = ${value}`;\n'
+                                    '  mutate(fragment, req.body.query);\n'
+                                    '  return db.execute(sql`SELECT * FROM records ${fragment}`);\n', [6]),
+        }
+        for name, (body, expected) in cases.items():
+            with self.subTest(case=name):
+                self.inspect(name, self.PREFIX + body + '}\n', expected)
+
+    def test_local_summaries_bind_data_but_preserve_raw_actuals(self):
+        prefix = ('import { sql } from "drizzle-orm";\n'
+                  'function query(value) {\n'
+                  '  return db.execute(sql`SELECT ${value}`);\n}\n'
+                  'export function run(req) {\n')
+        self.inspect('helper-bound', prefix + '  return query(req.body.value);\n}\n', [])
+        self.inspect('helper-raw', prefix + '  return query(sql.raw(req.body.value));\n}\n', [3])
+        self.inspect('helper-opaque', prefix + '  return query(makeClause(req.body.value));\n}\n', [3])
+        identity = ('import { sql } from "drizzle-orm";\n'
+                    'function identity(value) { return value; }\n'
+                    'export function run(req) {\n')
+        self.inspect('local-identity', identity
+                     + '  return db.execute(sql`SELECT ${identity(req.body.value)}`);\n}\n', [])
+        self.inspect('local-identity-raw', identity
+                     + '  return db.execute(sql`SELECT ${identity(sql.raw(req.body.value))}`);\n}\n', [4])
+
+    def test_branch_and_capture_provenance_keep_raw_alternatives(self):
+        self.inspect('raw-branch', self.PREFIX
+                     + '  let fragment = value;\n'
+                     + '  if (req.query.raw) { fragment = sql.raw(value); }\n'
+                     + '  return db.execute(sql`SELECT ${fragment}`);\n}\n', [6])
+        self.inspect('literal-reassignment', self.PREFIX
+                     + '  let fragment = sql.raw(value);\n'
+                     + '  fragment = "fixed";\n'
+                     + '  return db.execute(sql`SELECT ${fragment}`);\n}\n', [])
+        capture = ('import { sql } from "drizzle-orm";\n'
+                   'let fragment = "fixed";\n'
+                   'function query() { return db.execute(sql`SELECT ${fragment}`); }\n'
+                   'export function run(req) {\n')
+        self.inspect('captured-bound', capture
+                     + '  fragment = req.body.value;\n  return query();\n}\n', [])
+        self.inspect('captured-raw', capture
+                     + '  fragment = sql.raw(req.body.value);\n  return query();\n}\n', [3])
 
 
 class DrizzleBoundSqlUncertainBindingsTests(unittest.TestCase):

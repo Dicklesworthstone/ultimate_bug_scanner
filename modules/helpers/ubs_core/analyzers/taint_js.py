@@ -471,6 +471,11 @@ class _Trace:
     # Evidence is deliberately outside equality: recursive calls cannot grow
     # the finite fact lattice by repeatedly appending their names to a path.
     path: tuple[str, ...] = field(default=(), compare=False)
+    # SQL binding is a transfer, not a spelling-based sanitizer. A summary's
+    # bound formal can receive a raw SQL wrapper at a concrete call site.
+    # Keep this finite state in equality so a raw alternative cannot disappear
+    # behind a shorter evidence path for the same request origin.
+    sql_state: str = ''
 
 
 class _Fact(frozenset):
@@ -564,8 +569,17 @@ def _step(fact, name):
         path = (*trace.path, name)
         if len(path) > PATH_LIMIT:
             path = (path[0], *path[-(PATH_LIMIT - 1):])
-        traces.append(_Trace(trace.origin, path))
+        traces.append(_Trace(trace.origin, path, trace.sql_state))
     return _Fact(traces, _refs(fact), absent=getattr(fact, 'absent', False))
+
+
+def _sql_transfer(fact, state):
+    """Defer parameter binding through summaries; opaque SQL stays opaque."""
+    if not state:
+        return fact
+    return _Fact((_Trace(trace.origin, trace.path,
+                         'opaque' if state == 'opaque' or trace.sql_state == 'opaque' else state)
+                  for trace in fact), _refs(fact), absent=getattr(fact, 'absent', False))
 
 
 class _State(dict):
@@ -2050,7 +2064,76 @@ class _Flow:
             return self.engine.call_target(self.scope, name, state, self.rule)
         return None
 
-    def evaluate_arguments(self, ranges, state):
+    def drizzle_tag(self, start, end, state):
+        """Resolve one complete immediate template to the imported SQL tag.
+
+        Runtime aliases, unknown providers, type-only imports, property calls
+        and shadowed/reassigned bindings do not establish parameterization.
+        Assigned SQL objects remain conservative: their append/getSQL mutation
+        protocol is outside this direct-execution model.
+        """
+        code, text = self.scope.code, self.engine.text
+        while start < end and code[start].isspace():
+            start += 1
+        while end > start and code[end - 1].isspace():
+            end -= 1
+        while start < end and code[start] == '(' and self.pairs.get(start) == end - 1:
+            start, end = start + 1, end - 1
+            while start < end and code[start].isspace():
+                start += 1
+            while end > start and code[end - 1].isspace():
+                end -= 1
+        head = re.match(r'([A-Za-z_$][\w$]*)\s*\(', code[start:end])
+        if head is None:
+            return False
+        name, opening = head.group(1), start + head.end() - 1
+        if (text[opening] != '`' or self.pairs.get(opening) != end - 1
+                or text[end - 1] != '`'):
+            return False
+        key = self.engine.lexical_binding(self.scope, name, start)
+        return ((key[0], name) in self.engine.drizzle_imports
+                and name not in state.bindings and key not in state.written_cells)
+
+    def template_arguments(self, opening, closing):
+        """Evaluate each interpolation once, in order, retaining its value kind."""
+        code, text = self.scope.code, self.engine.text
+        arguments, cursor = [], opening + 1
+        while cursor < closing:
+            self.engine.budget.spend()
+            if code[cursor] == '(' and text[cursor - 1:cursor + 1] == '${':
+                end = self.pairs.get(cursor)
+                if end is None or end >= closing:
+                    raise AnalysisLimit('Unfinished Drizzle SQL interpolation; analysis is incomplete')
+                arguments.append((cursor + 1, end))
+                cursor = end + 1
+            else:
+                cursor += 1
+        return arguments
+
+    def generic_arguments_before(self, start, closing):
+        """Match a local type-argument list, not unrelated comparisons."""
+        code, depth, cursor = self.scope.code, 1, closing - 1
+        while cursor >= start:
+            self.engine.budget.spend()
+            char = code[cursor]
+            if char in ')]}' and cursor in self.pairs:
+                cursor = self.pairs[cursor] - 1
+                continue
+            if char in '([{;' or code[cursor - 1:cursor + 1] in {'&&', '||'}:
+                return False
+            if char == '>' and code[cursor - 1:cursor] != '=':
+                depth += 1
+            elif char == '<':
+                depth -= 1
+                if depth == 0:
+                    cursor -= 1
+                    while cursor >= start and code[cursor].isspace():
+                        cursor -= 1
+                    return cursor >= start and (code[cursor].isalnum() or code[cursor] in '_$)]!')
+            cursor -= 1
+        return False
+
+    def evaluate_arguments(self, ranges, state, *, immediate_sql_tags=False):
         """Evaluate and snapshot each spread before the following argument.
 
         A later argument may mutate the iterable or replace one of its slots.
@@ -2109,7 +2192,8 @@ class _Flow:
                     # the array object itself. Retain borrowed element refs.
                     fact = self.property(fact, None, state)
             else:
-                fact = self.value(left, right, state)
+                fact = self.value(left, right, state, immediate_sql_tag=(
+                    immediate_sql_tags and self.drizzle_tag(left, right, state)))
             kind = self.binding_input(left, right, state)
             if kind is None and _refs(fact) and not frozenset(fact):
                 kind = 'present'
@@ -2286,11 +2370,12 @@ class _Flow:
         for trace in fact:
             if trace.origin[0] == 'capture':
                 incoming = _cell_value(trace.origin[1], state)
+                incoming = _sql_transfer(incoming, trace.sql_state)
                 result = _join(result, _step(incoming, self.engine.call_label(callee)))
                 continue
             kind, owner, name = trace.origin if trace.origin[0] != 'source' else ('source', None, None)
             if kind == 'parameter' and owner is callee:
-                incoming = bound.get(name, frozenset())
+                incoming = _sql_transfer(bound.get(name, frozenset()), trace.sql_state)
             else:
                 incoming = frozenset({trace})
             if incoming:
@@ -2301,7 +2386,7 @@ class _Flow:
             result = _join(result, incoming)
         return result
 
-    def value(self, start, end, state):
+    def value(self, start, end, state, *, immediate_sql_tag=False):
         self.engine.budget.spend()
         text, code = self.engine.text, self.scope.code
         while start < end and code[start].isspace():
@@ -2311,7 +2396,7 @@ class _Flow:
         if start >= end:
             return frozenset()
         if code[start] == '(' and self.pairs.get(start) == end - 1:
-            return self.value(start + 1, end - 1, state)
+            return self.value(start + 1, end - 1, state, immediate_sql_tag=immediate_sql_tag)
         if code[start] in '[{' and start in self.pairs:
             closing = self.pairs[start]
             assignment = re.match(r'\s*=(?!=|>)\s*', code[closing + 1:end])
@@ -2456,8 +2541,11 @@ class _Flow:
                 facts.append(self.operand_snapshot(cursor, match_start, state))
                 remainder[cursor - start:match_start - start] = [' '] * (match_start - cursor)
                 source_remainder[cursor - start:match_start - start] = [' '] * (match_start - cursor)
-            arguments = [(left, right) for left, right in _chunks(code, opening + 1, closing)
-                         if code[left:right].strip()]
+            drizzle = (self.rule == 'js.taint.sql'
+                       and self.drizzle_tag(match_start, closing + 1, state))
+            arguments = (self.template_arguments(opening, closing) if drizzle else
+                         [(left, right) for left, right in _chunks(code, opening + 1, closing)
+                          if code[left:right].strip()])
             # GetValue(callee) precedes ArgumentListEvaluation. An argument can
             # rebind a function or sanitizer for *later* calls, not this one.
             callee_name = re.sub(r'\s+', '', match.group(1))
@@ -2468,7 +2556,12 @@ class _Flow:
             if self.engine.relative_import(self.scope, receiver):
                 binding = None
             native = self.native_target(callee_name, state) if not isinstance(callee, _Scope) else None
-            argument_facts, prepared = self.evaluate_arguments(arguments, state)
+            sink = self.engine.call_sinks.get(match_start)
+            bound_argument = (self.rule == 'js.taint.sql' and sink and sink[0] == self.rule
+                              and sink_binding == 'imported' and not isinstance(callee, _Scope)
+                              and len(arguments) == 1 and self.drizzle_tag(*arguments[0], state))
+            argument_facts, prepared = self.evaluate_arguments(
+                arguments, state, immediate_sql_tags=(bound_argument or drizzle and immediate_sql_tag))
             if isinstance(callee, _Scope) and callee.generator:
                 # A generator call creates an iterator; it does not execute
                 # the body. Iterator advancement is outside this call model.
@@ -2559,10 +2652,26 @@ class _Flow:
                     if source_match and source_match.start() <= opening - match_start:
                         source = source_match.group(0)
                         call_fact = _join(call_fact, frozenset({_Trace(('source', source), (source,))}))
-                sink = self.engine.call_sinks.get(match_start)
                 if sink and sink[0] == self.rule and sink_binding == 'imported':
                     selected = argument_facts[:1] if self.rule == 'js.taint.sql' else argument_facts
+                    if bound_argument:
+                        selected = [_sql_transfer(fact, 'bound') for fact in selected]
                     self.effect(match_start, sink[1], _join(*selected), state)
+                if self.rule == 'js.taint.sql' and self.engine.drizzle_imports:
+                    if drizzle:
+                        # Scalar request values become bound parameters only
+                        # at a direct execution sink. An object can instead be
+                        # an SQLWrapper; opaque builders/raw chunks must keep
+                        # their SQL-text provenance even inside another tag.
+                        # Assigned/helper-returned tags are SQL objects, too:
+                        # their chunks can be mutated before interpolation.
+                        # Only directly nested tags inherit immediate binding.
+                        call_fact = _join(*(
+                            _sql_transfer(_materialize(fact, state.heap, budget=self.engine.budget), 'opaque')
+                            if not immediate_sql_tag or _refs(fact) else fact for fact in argument_facts))
+                    else:
+                        call_fact = _sql_transfer(
+                            _materialize(call_fact, state.heap, budget=self.engine.budget), 'opaque')
                 regex = SANITIZERS_BY_RULE.get(self.rule)
                 following = code[closing + 1:end].lstrip()
                 if regex and regex.match(candidate) and not following.startswith(('.', '[')):
@@ -2624,6 +2733,21 @@ class _Flow:
             if '.' in name and name in state and not _refs(self.reference(name.split('.')[0], state)):
                 facts.append(state[name])
         result = _join(*facts)
+        if (self.rule == 'js.taint.sql' and self.engine.drizzle_imports
+                and any(text[start + match.end() - 1] in '(`'
+                        and (not match.group().startswith('>')
+                             or self.generic_arguments_before(start, start + match.start()))
+                        for match in re.finditer(
+                            r'(?:[)\]>]\s*(?:\?\.\s*)?|\?\.\s*|[\w$)\]>]\s*!\s*)\(', code[start:end]))):
+            # Computed/grouped calls and calls of returned functions are not
+            # local summaries in this frontend. Their results can be raw SQL
+            # wrappers even when the argument is an ordinary request scalar.
+            # TypeScript generic/non-null calls have the same opaque result.
+            # Template interpolation braces are masked as parentheses, so
+            # require a real call/tag opening in the original source.
+            # Inspect executable code, retaining this provenance across an
+            # assignment before a later, otherwise-bound SQL interpolation.
+            result = _sql_transfer(_materialize(result, state.heap, budget=self.engine.budget), 'opaque')
         for location, expr_start, rule, label in self.engine.write_sinks:
             if rule == self.rule and start <= location < end:
                 self.effect(location, label, self.value(expr_start, end, state), state)
@@ -2971,6 +3095,7 @@ class _Engine:
         self.graph = graph
         self.source_free = False
         self.module_roots = {}
+        self.drizzle_imports = set()
         self.module_kinds, self.strict_modes = {}, {}
         self.global_undefined_vars = set()
         self.default_targets = {}
@@ -3038,6 +3163,8 @@ class _Engine:
                         code, scope.code, module.start)
                 module.root = root
                 self.module_roots[root] = module
+                self.drizzle_imports.update((root, name) for name, entry in module.imports.items()
+                                            if entry == ('drizzle-orm', 'sql'))
                 roots.append(root)
                 self.functions.extend(functions)
                 if module.anonymous_default is not None:
@@ -3909,13 +4036,15 @@ class _Engine:
         result = frozenset()
         for trace in fact:
             if trace.origin[0] == 'source':
-                result = _join(result, frozenset({trace}))
+                if rule != 'js.taint.sql' or trace.sql_state != 'bound':
+                    result = _join(result, frozenset({trace}))
             elif trace.origin[0] == 'capture' and trace.origin not in visited:
                 key = trace.origin[1]
                 owner = key[0]
                 state = self.final_states.get((owner, rule))
                 if state is not None:
                     captured = _materialize(_cell_value(key, state), state.heap, budget=self.budget)
+                    captured = _sql_transfer(captured, trace.sql_state)
                     result = _join(result, self.concrete(captured, rule, visited | {trace.origin}))
             elif trace.origin[0] == 'parameter':
                 _, scope, name = trace.origin
@@ -3924,10 +4053,10 @@ class _Engine:
                     # Framework entrypoint parameters supply external input.
                     # Known local calls substitute their actual arguments
                     # before this point, so a safe call remains safe.
-                    resolved = frozenset({_Trace(('source', source), (source,))})
+                    resolved = frozenset({_Trace(('source', source), (source,), trace.sql_state)})
                     for step in trace.path:
                         resolved = _step(resolved, step)
-                    result = _join(result, resolved)
+                    result = _join(result, self.concrete(resolved, rule, visited))
         return result
 
     def abandoned(self, context):

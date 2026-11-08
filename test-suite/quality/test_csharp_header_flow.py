@@ -477,10 +477,56 @@ class HeaderFlowTests(unittest.TestCase):
 
     def test_existing_fixture_pairs(self):
         for name, expected in (("HeaderInjectionBuggy.cs", [10, 16, 22, 27, 33]),
-                               ("HeaderInjectionClean.cs", [])):
+                               ("HeaderInjectionClean.cs", []),
+                               ("OpenRedirectBuggy.cs", []),
+                               ("OpenRedirectClean.cs", [])):
             with self.subTest(name=name):
                 path = ROOT / "test-suite/csharp/security" / name
                 self.assertEqual(expected, [row[1] for row in self.detector.find([path])])
+
+    def test_comparisons_read_headers_without_writing_or_sanitizing(self):
+        for operator in ("==", "!="):
+            for value in ('"fixed"', "value"):
+                with self.subTest(operator=operator, value=value):
+                    marker = " // @header Response.Headers.Append" if value == "value" else ""
+                    case = Case("comparison", source(f'''
+                        var value = context.Request.Query["q"].ToString();
+                        if (Response.ContentType {operator} value) {{ Console.WriteLine("compared"); }}
+                        Response.Headers.Append("X-Value", {value});{marker}
+                    '''))
+                    directory = materialize((case,))
+                    rows = list(self.detector.find([directory / "comparison.cs"]))
+                    self.assertEqual(case.expected, [(row[1], row[2]) for row in rows])
+
+    def test_uri_guard_does_not_sanitize_original_header_value(self):
+        case = Case("uri_guard", source('''
+            var value = context.Request.Query["q"].ToString();
+            if (!Uri.TryCreate(value, UriKind.Absolute, out var uri) ||
+                uri.Scheme != Uri.UriSchemeHttps || uri.Host != "app.example.com") return;
+            Response.Headers.Append("X-Value", value); // @header Response.Headers.Append
+        '''))
+        directory = materialize((case,))
+        rows = list(self.detector.find([directory / "uri_guard.cs"]))
+        self.assertEqual(case.expected, [(row[1], row[2]) for row in rows])
+
+    def test_assignment_with_comparison_rhs_still_writes_header(self):
+        case = Case("assignment_comparison", source('''
+            var value = context.Request.Query["q"].ToString();
+            Response.ContentType = value != "" ? value : "text/plain"; // @header Response
+        '''))
+        directory = materialize((case,))
+        rows = list(self.detector.find([directory / "assignment_comparison.cs"]))
+        self.assertEqual(case.expected, [(row[1], row[2]) for row in rows])
+
+    def test_assignment_with_comparison_rhs_preserves_heap_boundary(self):
+        case = Case("heap_assignment_comparison", source('''
+            var value = context.Request.Query["q"].ToString();
+            saved = value != "" ? value : "fixed";
+            Response.Headers.Append("X-Value", "fixed");
+        ''', helpers="string saved;"))
+        directory = materialize((case,))
+        with self.assertRaisesRegex(ValueError, "heap write.*incomplete"):
+            list(self.detector.find([directory / "heap_assignment_comparison.cs"]))
 
     def test_request_derived_heap_writes_are_incomplete(self):
         directory = materialize(INCOMPLETE_CASES)

@@ -581,11 +581,16 @@ class HeaderFlow(CSharpFlow):
         start, end = action.span
         if action.kind in {"simple", "eval"}:
             # Find a top-level setter; never mistake an assignment inside
-            # an initializer or a condition for a response header write.
-            segments = list(parts(self.code, start, end, separator="="))
-            if len(segments) == 2:
-                lhs_start, lhs_end = self.trim(*segments[0])
-                rhs_start, rhs_end = segments[1]
+            # an initializer for a response header write. Comparisons and
+            # lambda arrows are not setters, including when the RHS of an
+            # actual assignment also contains a comparison.
+            assignments = [position for _, position in parts(self.code, start, end, separator="=")
+                           if position < end
+                           and self.code[position - 1:position] not in {"!", "<", ">", "="}
+                           and self.code[position + 1:position + 2] not in {"=", ">"}]
+            if len(assignments) == 1:
+                lhs_start, lhs_end = self.trim(start, assignments[0])
+                rhs_start, rhs_end = assignments[0] + 1, end
                 if self.code[lhs_end - 1:lhs_end] == "+":
                     lhs_start, lhs_end = self.trim(lhs_start, lhs_end - 1)
                 header, receiver_end = None, None

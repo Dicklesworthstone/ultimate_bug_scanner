@@ -10,6 +10,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Distinguish C# comparisons from response-header assignments before trimming
+  expression boundaries. URI guards no longer become fictitious heap writes,
+  and real header writes remain detectable when their assigned value contains
+  a comparison. Preserve taint and unsupported heap-write failures, with
+  paired unsafe and clean regressions.
+
 - Qualify release candidates before signing: check version declarations, the
   generation protocol, runner/service and runtime digests, and transitive
   dependency pins; stage a complete unsigned bundle without changing source or

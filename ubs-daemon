@@ -605,10 +605,10 @@ class ScanService:
         if request.get('environment') != self.environment or request.get('scanner') != str(self.scanner):
             return {'protocol': PROTOCOL, 'unavailable': 'Invocation environment or scanner differs from the daemon'}
         started = time.monotonic()
-        # The Python text producer can include live dependency-audit results.
+        # Python scans can include live dependency-audit results in any format.
         # Its external environment/advisory database is not a source snapshot;
         # reuse only when callers explicitly disable those optional tools.
-        live_audit = request.get('format', 'json') == 'text' and os.environ.get('ENABLE_UV_TOOLS') != '0' \
+        live_audit = os.environ.get('ENABLE_UV_TOOLS') != '0' \
             and any(path.is_dir() or path.suffix.lower() in {'.py', '.pyi', '.pyw', '.ipynb'} for path in paths)
         # Project scans can run optional tools/build phases; Git selection
         # also depends on objects/metadata outside snapshot(). Those results

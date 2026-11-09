@@ -352,6 +352,196 @@ def _array(doc: object, key: str) -> list:
     return doc[key]
 
 
+def parse_pip_audit_report(output: str | BinaryIO, manifest: Path, sink: TextIO,
+                           errors: list[str]) -> dict[str, int]:
+    """Keep audited inventory and advisories separate from collection failures.
+
+    pip-audit uses exit 1 for both advisories and fatal errors. Only its JSON
+    report establishes which occurred; a skipped dependency is not audited.
+    Stream the inventory so a truncated tail cannot erase earlier advisories.
+    """
+    reader = _JSONReportReader(output)
+    problems = _ReportErrors(errors, "pip-audit")
+    counts = {"dependencies": 0, "vulnerabilities": 0, "skipped": 0}
+    seen_fields: set[str] = set()
+    seen_findings: set[tuple[str, str, str]] = set()
+    try:
+        for field in reader.members():
+            if field not in {"dependencies", "fixes"}:
+                reader.skip_value()
+                continue
+            if field in seen_fields:
+                raise reader.error(f"duplicate pip-audit field {field!r}")
+            seen_fields.add(field)
+            for _ in reader.elements():
+                row = reader.value()
+                if field == "fixes":
+                    problems.append("pip-audit: unexpected package modification in a read-only audit")
+                    continue
+                try:
+                    name = _text(row["name"])
+                    if "skip_reason" in row:
+                        reason = _text(row["skip_reason"])
+                        counts["skipped"] += 1
+                        problems.append(f"pip-audit: dependency {name} was not audited: {reason}")
+                        continue
+                    version = _text(row["version"])
+                    vulnerabilities = _array(row, "vulns")
+                except (KeyError, TypeError, ValueError):
+                    problems.append("pip-audit: malformed dependency record")
+                    continue
+                counts["dependencies"] += 1
+                package = re.sub(r"[-_.]+", "-", name).lower()
+                for vulnerability in vulnerabilities:
+                    try:
+                        advisory = _text(vulnerability["id"])
+                        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", advisory) is None:
+                            raise ValueError("invalid advisory ID")
+                        fixed = _array(vulnerability, "fix_versions")
+                        aliases = vulnerability.get("aliases", [])
+                        if not isinstance(aliases, list):
+                            raise ValueError("invalid advisory aliases")
+                        for value in [*fixed, *aliases]:
+                            _text(value)
+                        if not isinstance(vulnerability.get("description", ""), str):
+                            raise ValueError("invalid advisory description")
+                    except (KeyError, TypeError, ValueError):
+                        problems.append(f"pip-audit: malformed advisory for {name}")
+                        continue
+                    identity = (package, version, advisory)
+                    if identity in seen_findings:
+                        continue
+                    seen_findings.add(identity)
+                    counts["vulnerabilities"] += 1
+                    fix = "fixed in " + ", ".join(fixed) if fixed else "no fixed version reported"
+                    sink.write(json.dumps({
+                        # Every advisory is located at the manifest's first
+                        # line. Include its canonical package identity so a
+                        # baseline for one dependency cannot hide another.
+                        "rule": "py.pip-audit." + advisory + "." + package,
+                        "category_id": "python.uv-tools", "path": str(manifest),
+                        "line": 1, "col": 1, "severity": "critical",
+                        "message": f"{name} {version}: {advisory} ({fix})",
+                        "suppressed": False,
+                        "extras": {"tool": "pip-audit", "scope": "project",
+                                   "package": name, "version": version,
+                                   "advisory": advisory, "fix_versions": fixed,
+                                   "aliases": aliases},
+                    }, ensure_ascii=False) + "\n")
+        if "dependencies" not in seen_fields:
+            problems.append("pip-audit: missing dependencies array")
+        if reader.token():
+            raise reader.error("unexpected data after pip-audit report")
+    except (OSError, UnicodeError, ValueError, RecursionError) as exc:
+        problems.append(f"pip-audit: invalid or incomplete report: {exc}")
+    return counts
+
+
+def scan_python_audit(project_dir: str, sink: TextIO, timeout: float,
+                      errors: list[str], *, command: Sequence[str] = (),
+                      diagnostics: TextIO | None = None) -> dict:
+    """Audit selected project dependencies, never the tool's own environment.
+
+    Requirements have precedence over the PEP 621 runtime dependencies in
+    pyproject.toml. ``--path`` is intentionally absent: pip-audit reserves it
+    for installed distributions, and a manifest passed there audits nothing.
+    Missing tools/inputs are explicit skips; unsuccessful collection is partial.
+    """
+    root = Path(project_dir or ".").resolve()
+    outcome = {"tool": "pip-audit", "status": "skipped", "scope": "project"}
+    if not root.is_dir():
+        outcome["reason"] = "selected-file scan has no dependency manifest"
+        return outcome
+    requirements, pyproject = root / "requirements.txt", root / "pyproject.toml"
+    if requirements.is_file():
+        manifest, arguments = requirements, ["-r", str(requirements)]
+        outcome["input_kind"] = "requirements"
+    elif pyproject.is_file():
+        manifest, arguments = pyproject, [str(root)]
+        outcome["input_kind"] = "project-runtime-dependencies"
+    else:
+        outcome["reason"] = "no requirements.txt or pyproject.toml; dependency coverage not collected"
+        return outcome
+    outcome["input"] = str(manifest)
+    if not command:
+        outcome["reason"] = "pip-audit not available; dependency coverage not collected"
+        return outcome
+    before = len(errors)
+    if manifest == pyproject:
+        # pip-audit 2.x treats a missing dependencies array as empty even if
+        # the project declares dynamic dependencies. Reject that hollow pass.
+        # TOML parsing is optional for core scans, including the Python 3.9
+        # helper floor; older runtimes can supply tomli or requirements.txt.
+        try:
+            try:
+                import tomllib
+            except ImportError:
+                import tomli as tomllib
+            with manifest.open("rb") as source:
+                raw = source.read(OUTPUT_RECORD_LIMIT + 1)
+            if len(raw) > OUTPUT_RECORD_LIMIT:
+                raise ValueError("pyproject.toml exceeds the manifest size limit")
+            project = tomllib.loads(raw.decode("utf-8")).get("project")
+            if not isinstance(project, dict):
+                raise ValueError("no PEP 621 project section; export resolved requirements.txt")
+            dynamic = project.get("dynamic", [])
+            if not isinstance(dynamic, list) or any(not isinstance(item, str) for item in dynamic):
+                raise ValueError("invalid project.dynamic list")
+            if "dependencies" in dynamic:
+                raise ValueError("dynamic project dependencies require resolved requirements.txt")
+            dependencies = project.get("dependencies", [])
+            if not isinstance(dependencies, list) or any(not isinstance(dep, str) or not dep.strip()
+                                                       for dep in dependencies):
+                raise ValueError("invalid project.dependencies list")
+            if not dependencies:
+                outcome.update(dependencies=0, vulnerabilities=0, skipped=0,
+                               reason="pyproject.toml declares no runtime dependencies")
+                return outcome
+        except ImportError:
+            errors.append("pip-audit: validating pyproject.toml requires Python 3.11+ or tomli; "
+                          "export resolved requirements.txt")
+        except (OSError, ValueError, UnicodeError) as exc:
+            errors.append(f"pip-audit: cannot collect project dependencies: {exc}")
+        if len(errors) != before:
+            outcome["status"] = "partial"
+            return outcome
+    if os.environ.get("UBS_KEEP_TEMP") == "1":
+        errors.append("pip-audit refused: UBS_KEEP_TEMP=1 cannot retain external analyzer scratch")
+        outcome["status"] = "partial"
+        return outcome
+    environment = dict(os.environ, NO_COLOR="1", PYTHON_COLORS="0")
+    environment.pop("FORCE_COLOR", None)
+    environment.pop("CLICOLOR_FORCE", None)
+    # Explicit options prevent a user's output/format defaults from redirecting
+    # audit evidence out of the scanner or changing its machine-readable shape.
+    argv = [*command, "--format=json", "--progress-spinner=off", "--desc=off",
+            "--aliases=on", "--output", "stdout", *arguments]
+    counts = {"dependencies": 0, "vulnerabilities": 0, "skipped": 0}
+    with run_command_stream("pip-audit", argv, root, timeout, errors, env=environment) as output:
+        if output is not None:
+            counts = parse_pip_audit_report(output.stdout, manifest, sink, errors)
+            outcome["exit_code"] = output.returncode
+            if output.returncode not in (0, 1):
+                errors.append(f"pip-audit exited {output.returncode}")
+            elif (output.returncode == 1) != bool(counts["vulnerabilities"]):
+                errors.append(f"pip-audit exit {output.returncode} contradicts "
+                              f"{counts['vulnerabilities']} valid advisory findings")
+            if diagnostics is not None:
+                # Keep both streams on a failed invocation (including timeout
+                # evidence) without copying JSON inventory on successful runs.
+                streams = [output.stderr_stream]
+                if len(errors) != before:
+                    output.stdout.seek(0)
+                    streams.insert(0, output.stdout)
+                for stream in streams:
+                    if stream is not None:
+                        for chunk in iter(lambda: stream.read(64 * 1024), b""):
+                            diagnostics.write(chunk.decode("utf-8", "replace"))
+    outcome.update(counts)
+    outcome["status"] = "partial" if len(errors) != before else "ok"
+    return outcome
+
+
 def ast_rule_configs(rule_dir: Path, paths: Sequence[Path],
                      errors: list[str] | None = None, *,
                      prefix: str = "sgconfig-") -> list[Path]:

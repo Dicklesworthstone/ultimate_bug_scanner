@@ -18,7 +18,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="fe91c82e633864f65e6cdbdd763c9b89668f09d783e39a3addf00e8bdc8bb15d"
+UBS_LIB_CHECKSUM="09ebe868bd1a85a57739e1ec9ff5cbab8b1be42d5f5d64410d8dd3dd7c45e3eb"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -497,6 +497,68 @@ record_uv_tool_failure(){
   UV_TOOL_ERRORS+=("$1")
 }
 
+run_pip_audit_py() {
+  local sink="$1" summary="$2" helpers_dir=""
+  local -a command_args=()
+  if [[ "$HAS_UV" -eq 1 ]]; then
+    command_args=("${UVX_CMD[@]}" pip-audit)
+  elif command -v pip-audit >/dev/null 2>&1; then
+    command_args=(pip-audit)
+  fi
+  ubs_resolve_helpers_dir helpers_dir || helpers_dir="$SCRIPT_DIR/helpers"
+  (
+  if [[ "${UBS_KEEP_TEMP:-0}" == "1" ]]; then
+    BASH_COMPAT="${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"
+  fi
+  PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 - \
+    "$sink" "$PROJECT_DIR" "$UV_TIMEOUT" "$summary" "${command_args[@]}" <<'PYAUDIT'
+import json
+from pathlib import Path
+import sys
+from ubs_core.external_tools import scan_python_audit
+from ubs_core.io import read_ndjson
+from ubs_core.py_scan import _legacy_report
+
+sink_path, project, timeout, summary_path, *command = sys.argv[1:]
+errors = []
+try:
+    with open(sink_path, "a", encoding="utf-8") as sink:
+        outcome = scan_python_audit(project, sink, float(timeout), errors,
+                                    command=command, diagnostics=sys.stdout)
+    records = read_ndjson(sink_path)
+    if summary_path:
+        path = Path(summary_path)
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        counts = {"critical": 0, "warning": 0, "info": 0}
+        for record in records:
+            counts[record["severity"]] += 1
+        doc.update(counts)
+        doc["report"] = _legacy_report(records, doc.get("version", ""))
+        doc["findings"] = doc["report"]["findings"]
+        doc.setdefault("extras", {}).setdefault("external_tools", []).append(outcome)
+        if errors:
+            doc.setdefault("analysis_errors", []).extend(
+                {"stage": "pip-audit", "exception_type": "ExternalToolError", "message": error,
+                 "components": []}
+                for error in errors)
+        path.write_text(json.dumps(doc, ensure_ascii=False) + "\n", encoding="utf-8")
+except (OSError, ValueError, KeyError, TypeError) as exc:
+    errors.append(f"pip-audit: could not collect or deliver dependency evidence: {exc}")
+    outcome = {"status": "partial"}
+if outcome["status"] == "skipped":
+    print("pip-audit: " + outcome["reason"])
+elif not errors:
+    print(f"pip-audit audited {outcome['dependencies']} dependencies from {outcome['input']} "
+          f"({outcome['vulnerabilities']} advisories)")
+for error in errors:
+    print(error)
+if errors:
+    print("Dependency coverage is incomplete for this scan")
+sys.exit(2 if errors else 0)
+PYAUDIT
+  )
+}
+
 run_system_or_uv_tool() {
   local tool="$1"; shift
   if [[ "$HAS_UV" -eq 1 ]]; then ( set +o pipefail; "${UVX_CMD[@]}" "$tool" "$@" || true ); return; fi
@@ -510,20 +572,23 @@ run_system_or_uv_tool() {
 
 # ── Legacy-parity bridge: uv tools (category 20) ────────────────────────────
 run_v2_uv_tools_py(){
-  local sink="$1"
+  local sink="$1" summary="${2:-}"
   UV_EXTRA_INFO=0
   if [[ "$ENABLE_UV_TOOLS" -ne 1 ]]; then
     say "  ${GRAY}${INFO} uv extra analyzers disabled (--no-uv)${RESET}"
     return 0
   fi
-  local TOOL ruff_stdout ruff_stderr ruff_trimmed ruff_count ruff_parsed ruff_rc _EXC _ign_pats _pat _match _pa_input _tool_out
+  local TOOL ruff_stdout ruff_stderr ruff_trimmed ruff_count ruff_parsed ruff_rc _EXC _ign_pats _pat _match _tool_out
   IFS=',' read -r -a UVLIST < <(printf '%s\n' "$UV_TOOLS")
   # Optional analyzers/provisioners own caches and scratch outside UBS. Check
   # the selected available tools before launching any of them in this mode.
+  # pip-audit applies the same refusal after determining whether this scan
+  # actually has dependencies to audit; skipped inputs never launch a tool.
   if [[ "${UBS_KEEP_TEMP:-0}" == "1" ]]; then
     for TOOL in "${UVLIST[@]}"; do
+      [[ "$FORMAT" != "text" && "$TOOL" != "pip-audit" ]] && continue
       case "$TOOL" in
-        ruff|bandit|pip-audit|mypy|detect-secrets|safety)
+        ruff|bandit|mypy|detect-secrets|safety)
           if [[ "$HAS_UV" -eq 1 ]] || command -v "$TOOL" >/dev/null 2>&1; then
             echo "ERROR: UBS_KEEP_TEMP=1 cannot retain optional $TOOL/uv scratch; select --no-uv for static analysis or disable category 20." >&2
             record_uv_tool_failure "$TOOL refused: UBS_KEEP_TEMP=1 cannot retain external analyzer scratch"
@@ -534,6 +599,9 @@ run_v2_uv_tools_py(){
     done
   fi
   for TOOL in "${UVLIST[@]}"; do
+    # pip-audit contributes native findings in every format. The remaining
+    # legacy tools still expose their text-only passthrough reports.
+    [[ "$FORMAT" != "text" && "$TOOL" != "pip-audit" ]] && continue
     case "$TOOL" in
       ruff)
         print_subheader "ruff (lint)"
@@ -656,34 +724,9 @@ PYRUFF
         ;;
       pip-audit)
         print_subheader "pip-audit (dependencies)"
-        # pip-audit exits 0 (no known vulnerabilities), 1 (vulnerabilities
-        # found) and other codes on error. Scanning a source tree without a
-        # resolved environment is inventory coverage, not a clean audit — say
-        # which input was used so the claim stays qualified.
-        _pa_input="$PROJECT_DIR (source tree)"
-        _tool_out="$(mktemp -t ubs-pipaudit.XXXXXX 2>/dev/null || mktemp)"
-        if [ -f "$PROJECT_DIR/requirements.txt" ]; then
-          _pa_input="requirements.txt"
-          run_uv_tool_text pip-audit -r "$PROJECT_DIR/requirements.txt" >"$_tool_out" 2>&1
-        elif [ -f "$PROJECT_DIR/pyproject.toml" ]; then
-          _pa_input="pyproject.toml"
-          run_uv_tool_text pip-audit --path "$PROJECT_DIR/pyproject.toml" >"$_tool_out" 2>&1
-        else
-          run_uv_tool_text pip-audit --path "$PROJECT_DIR" >"$_tool_out" 2>&1
+        if ! run_pip_audit_py "$sink" "$summary"; then
+          record_uv_tool_failure "pip-audit dependency coverage is incomplete"
         fi
-        cat "$_tool_out" 2>/dev/null || true
-        if [[ "$UV_TOOL_STATUS" -eq -1 ]]; then
-          say "  ${GRAY}${INFO} pip-audit not available; dependency coverage not collected${RESET}"
-        elif [[ "$UV_TOOL_STATUS" -ne 0 && ! -s "$_tool_out" ]]; then
-          print_finding "warn" 1 "pip-audit produced no output (exit $UV_TOOL_STATUS)" "Dependency coverage is incomplete for this scan"
-          record_uv_tool_failure "pip-audit produced no output (exit $UV_TOOL_STATUS)"
-        elif [[ "$UV_TOOL_STATUS" -eq 0 || "$UV_TOOL_STATUS" -eq 1 ]]; then
-          print_finding "info" 0 "pip-audit ran against $_pa_input" "Review advisories above"
-        else
-          print_finding "warn" 1 "pip-audit did not complete (exit $UV_TOOL_STATUS)" "Dependency coverage is incomplete for this scan"
-          record_uv_tool_failure "pip-audit exited $UV_TOOL_STATUS"
-        fi
-        ubs_remove_temp -f "$_tool_out" 2>/dev/null || true
         ;;
       mypy)
         print_subheader "mypy (type-check)"
@@ -712,19 +755,22 @@ PYRUFF
 run_v2_legacy_parity_bridges_py(){
   local sink="$1" list_file="$2" py_exit="$3" text_out="${4:-}" extra_info="${5:-0}" skip_csv="${6:-}"
   local analyzer_errors="${7:-0}"
-  local files_n bridge_rc=0
+  local files_n bridge_rc=0 helpers_dir=""
+  ubs_resolve_helpers_dir helpers_dir || helpers_dir="$SCRIPT_DIR/helpers"
   files_n="$(tr -dc '\0' <"$list_file" 2>/dev/null | wc -c)"
   (
   if [[ "${UBS_KEEP_TEMP:-0}" == "1" ]]; then
     BASH_COMPAT="${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"
   fi
-  python3 - "$sink" "$text_out" "$files_n" "${FAIL_ON_WARNING:-0}" "$skip_csv" \
-    "$py_exit" "$extra_info" "$analyzer_errors" <<'PYV2BRIDGE'
+  PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 - \
+    "$sink" "$text_out" "$files_n" "${FAIL_ON_WARNING:-0}" "$skip_csv" \
+    "$py_exit" "$extra_info" "$analyzer_errors" "$list_file" \
+    "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}" "$PROJECT_DIR" <<'PYV2BRIDGE'
 import json
 import sys
 
 (sink_path, text_out, files_raw, fow_raw, skip_csv, py_exit_raw, extra_raw,
- analyzer_errors_raw) = sys.argv[1:9]
+ analyzer_errors_raw, list_path, project, project_dir) = sys.argv[1:12]
 files_n = int(files_raw or 0)
 fail_on_warning = fow_raw == "1"
 skip = {int(x) for x in skip_csv.split(",") if x.strip().isdigit()}
@@ -774,6 +820,18 @@ def emit(line=""):
 
 # Record-less section headers (text format only; json stdout stays machine-clean).
 if as_text:
+    # Optional dependency findings arrive after the native scanner rendered
+    # its first report. Render once more from the final sink so every visible
+    # counter and the normal per-rule details agree with the final result.
+    from argparse import Namespace
+    import os
+    from pathlib import Path
+    from ubs_core.py_scan import _render_text
+
+    files = [Path(os.fsdecode(raw)) for raw in Path(list_path).read_bytes().split(b"\0") if raw]
+    args = Namespace(sink=sink_path, text_out=text_out, project=project,
+                     project_dir=project_dir, skip=skip_csv)
+    _render_text(args, files, counts, complete=py_exit in (0, 1) and not analyzer_errors)
     covered = {str(rec.get("category_id", "")) for rec in records}
     for num in sorted(SECTION):
         if num in skip:
@@ -882,9 +940,14 @@ generate(Path('$ast_rule_dir'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' else 
   esac
   PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core.py_scan \
     "${scan_args[@]}" --version "${UBS_PY_VERSION:-unknown}" || exit_code=$?
-  # Category 20 parity bridge: raw uv-tool passthrough (not sink records, text mode only).
-  if [[ ",$v2_skip," != *",20,"* && "$FORMAT" == "text" ]]; then
-    run_v2_uv_tools_py "$sink"
+  # Dependency advisories are records, including JSON/SARIF. Route tool
+  # diagnostics to stderr there so stdout remains a single report document.
+  if [[ ",$v2_skip," != *",20,"* ]]; then
+    if [[ "$FORMAT" == "text" ]]; then
+      run_v2_uv_tools_py "$sink" "$v2_json_out"
+    else
+      run_v2_uv_tools_py "$sink" "$v2_json_out" >&2
+    fi
   fi
   # Record-less section headers + Summary Statistics + legacy exit formula.
   run_v2_legacy_parity_bridges_py "$sink" "$list_file" "$exit_code" "$text_out" \

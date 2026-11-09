@@ -1470,7 +1470,7 @@ entries and avoid Git's temporary-object cleanup during tree creation.
 This mode requires Bash >= 5.1 in its modern compatibility mode and supports
 static analysis. Older Bash creates and unlinks heredoc backing files internally.
 Select `--no-cargo` for Rust projects with
-enabled Cargo phases and `--no-uv` for direct Python text scans that would run
+enabled Cargo phases and `--no-uv` for direct Python scans that would run
 optional auditors. Build and auditor processes manage their own temporary files
 and are refused rather than silently skipped. Other languages, service and
 doctor commands, forced updates, and automatic tool installation are outside
@@ -1717,6 +1717,37 @@ Completeness is scoped to the selected inputs, rules and enabled analyses; it
 does not claim coverage of excluded files, skipped categories or all possible
 bugs. Cross-file thresholds remain selection-dependent, so combining separately
 scanned subsets is not generally equivalent to scanning their union.
+
+### Python dependency vulnerability audits
+
+When optional Python analyzers are enabled, `pip-audit` checks `requirements.txt`
+first, or the runtime dependencies declared in `[project]` in `pyproject.toml`.
+The project directory is passed to pip-audit's project resolver; a manifest is
+never treated as an installed-package directory. The audit runs for text, JSON
+and SARIF reports and contributes `py.pip-audit.<advisory>.<package>` critical findings,
+including the package version, available fixes and advisory aliases. Final
+counts and exit status include these findings. Package names are normalized in
+the finding identity so baselines remain stable across spelling aliases and
+cannot suppress a different package affected by the same advisory.
+
+The Python summary's `extras.external_tools` records the audit input, status,
+dependency and vulnerability counts, and skipped packages. A missing manifest
+or unavailable tool is explicit skipped coverage. Dynamic dependencies and
+non-PEP-621 project metadata require an exported `requirements.txt`; these
+unsupported inputs, failed resolution, skipped packages, invalid reports and
+timeouts make the scan incomplete while retaining any valid advisories already
+received. A project declaring no runtime dependencies is explicitly skipped.
+Audits run afresh even when the source-analysis cache hits.
+
+To select only the dependency auditor through the runner:
+
+```bash
+UV_TOOLS=pip-audit ubs . --only=python --format=json
+```
+
+The direct module also accepts `--uv-tools=pip-audit`. Use `ENABLE_UV_TOOLS=0`
+with the runner, or `--no-uv` with the direct module, to disable these optional
+analyzers.
 
 ### Python pattern count export
 

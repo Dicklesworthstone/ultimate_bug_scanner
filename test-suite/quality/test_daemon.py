@@ -78,7 +78,8 @@ class ServiceTests(unittest.TestCase):
         self.addCleanup(os.chdir, previous)
         self.env.update(XDG_RUNTIME_DIR=os.path.join(os.pardir, 'run'), HOME=str(self.home),
                         XDG_CONFIG_HOME=str(self.home / '.config'), XDG_CACHE_HOME=str(self.work / 'cache'),
-                        SCAN_COUNT=str(self.work / 'count'), PYTHONDONTWRITEBYTECODE='1', UBS_NO_AUTO_UPDATE='1')
+                        SCAN_COUNT=str(self.work / 'count'), PYTHONDONTWRITEBYTECODE='1', UBS_NO_AUTO_UPDATE='1',
+                        ENABLE_UV_TOOLS='0')
         self.environment = patch.dict(os.environ, self.env, clear=True)
         self.environment.start()
         self.addCleanup(self.environment.stop)
@@ -292,14 +293,20 @@ class ServiceTests(unittest.TestCase):
                 self.assertIsNone(daemon.snapshot(self.root, self.scanner))
 
     def test_live_dependency_audits_are_not_reused_as_source_only_reports(self):
-        request = self.request(format='text')
-        self.assertFalse(self.service.handle(request)['cached'])
-        self.assertFalse(self.service.handle(request)['cached'])
-        with patch.dict(os.environ, {'ENABLE_UV_TOOLS': '0'}):
-            native = daemon.ScanService(self.root, self.scanner, 10, 1024 * 1024)
-            request = self.request(format='text')
-            self.assertFalse(native.handle(request)['cached'])
-            self.assertTrue(native.handle(request)['cached'])
+        for enabled in (None, '1', '0'):
+            environment = dict(os.environ)
+            if enabled is None:
+                environment.pop('ENABLE_UV_TOOLS', None)
+            else:
+                environment['ENABLE_UV_TOOLS'] = enabled
+            for format_ in (None, 'text', 'json', 'jsonl', 'sarif'):
+                with self.subTest(enabled=enabled, format=format_), patch.dict(os.environ, environment, clear=True):
+                    service = daemon.ScanService(self.root, self.scanner, 10, 1024 * 1024)
+                    request = self.request(format=format_)
+                    if format_ is None:
+                        request.pop('format')
+                    self.assertFalse(service.handle(request)['cached'])
+                    self.assertEqual(service.handle(request)['cached'], enabled == '0')
 
     def test_directory_inventory_limit_is_bounded(self):
         for index in range(12):

@@ -54,7 +54,7 @@ class SnapshotTests(unittest.TestCase):
         env = {key: value for key, value in os.environ.items()
                if not key.startswith(('UBS_', 'GIT_', 'XDG_', 'SCAN_'))}
         env.update(HOME=str(self.home), XDG_CONFIG_HOME=str(self.home / '.config'),
-                   SCAN_COUNT=str(self.work / 'scans'), PYTHONDONTWRITEBYTECODE='1')
+                   SCAN_COUNT=str(self.work / 'scans'), PYTHONDONTWRITEBYTECODE='1', ENABLE_UV_TOOLS='0')
         environment = patch.dict(os.environ, env, clear=True)
         environment.start()
         self.addCleanup(environment.stop)

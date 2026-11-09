@@ -17,7 +17,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "modules/helpers"))
-from ubs_core import bash_scan
+from ubs_core import bash_scan, external_tools, findings_merge
 
 
 def diagnostic(**changes: object) -> dict:
@@ -25,6 +25,136 @@ def diagnostic(**changes: object) -> dict:
               "level": "warning", "message": "Double quote to prevent splitting"}
     result.update(changes)
     return result
+
+
+def audit_dependency(**changes: object) -> dict:
+    """The published pip-audit JSON schema, with fixed advisory service data."""
+    result = {"name": "example-package", "version": "1.0", "vulns": [
+        {"id": "PYSEC-2026-123", "fix_versions": ["1.1"], "aliases": ["CVE-2026-12345"]},
+    ]}
+    result.update(changes)
+    return result
+
+
+class PipAuditResults(unittest.TestCase):
+    def parse(self, doc=None, *, raw=None):
+        sink, errors = io.StringIO(), []
+        counts = external_tools.parse_pip_audit_report(
+            json.dumps(doc) if raw is None else raw, Path("requirements.txt"), sink, errors,
+        )
+        return counts, [json.loads(line) for line in sink.getvalue().splitlines()], errors
+
+    def normalized_scan(self, root, name, dependencies, *, baseline=""):
+        """Exercise the real sink, canonical ledger and new-only filter."""
+        manifest = root / "requirements.txt"
+        manifest.write_text("# resolved dependencies\n" + "".join(
+            f"{row['name']}=={row['version']}\n" for row in dependencies))
+        run = root / name
+        run.mkdir()
+        errors = []
+        with (run / "python.findings.json").open("w", encoding="utf-8") as sink:
+            counts = external_tools.parse_pip_audit_report(
+                json.dumps({"dependencies": dependencies, "fixes": []}), manifest, sink, errors)
+        self.assertFalse(errors)
+        severities = {"critical": counts["vulnerabilities"], "warning": 0, "info": 0}
+        report = run / "combined.json"
+        report.write_text(json.dumps({
+            "status": "ok", "totals": severities,
+            "scanners": [{"language": "python", "status": "ok", **severities}],
+        }), encoding="utf-8")
+        with patch.dict(os.environ, {"UBS_KEEP_TEMP": "1"}):
+            findings_merge.merge(run, report, project_dir=root,
+                                 baseline_path=baseline, new_only=bool(baseline))
+        return report, json.loads(report.read_text(encoding="utf-8")), counts
+
+    def identity_workspace(self):
+        artifacts = ROOT / "test-suite/artifacts"
+        artifacts.mkdir(exist_ok=True)
+        return Path(tempfile.mkdtemp(prefix="pip-audit-identity-", dir=artifacts))
+
+    def test_new_only_keeps_another_package_with_the_same_advisory(self):
+        root = self.identity_workspace()
+        old = audit_dependency(name="first-package")
+        new = audit_dependency(name="different-package")
+        baseline, previous, _counts = self.normalized_scan(root, "baseline", [old])
+        self.assertEqual(previous["totals"]["critical"], 1)
+        for index, dependencies in enumerate(([new], [old, new], [new, old])):
+            with self.subTest(dependencies=dependencies):
+                _report, current, counts = self.normalized_scan(
+                    root, f"current-{index}", dependencies, baseline=baseline)
+                self.assertEqual(counts["vulnerabilities"], len(dependencies))
+                self.assertEqual(current["totals"]["critical"], 1)
+                self.assertEqual([row["extras"]["package"] for row in current["findings"]],
+                                 ["different-package"])
+
+    def test_package_name_aliases_deduplicate_and_preserve_baseline_identity(self):
+        root = self.identity_workspace()
+        baseline, previous, _counts = self.normalized_scan(
+            root, "baseline", [audit_dependency(name="Example.Package")])
+        aliases = [audit_dependency(name=name, version="1.0.1")
+                   for name in ("example-package", "example_package", "EXAMPLE...Package")]
+        _report, all_findings, counts = self.normalized_scan(root, "unfiltered", aliases)
+        self.assertEqual(counts["vulnerabilities"], 1)
+        self.assertEqual(len(all_findings["findings"]), 1)
+        self.assertEqual(all_findings["findings"][0]["fingerprint"],
+                         previous["findings"][0]["fingerprint"])
+        _report, current, _counts = self.normalized_scan(root, "current", aliases, baseline=baseline)
+        self.assertEqual(current["totals"]["critical"], 0)
+        self.assertEqual(current["findings"], [])
+
+    def test_advisory_becomes_project_finding_with_remediation(self):
+        counts, rows, errors = self.parse({"dependencies": [audit_dependency()], "fixes": []})
+        self.assertEqual(counts, {"dependencies": 1, "vulnerabilities": 1, "skipped": 0})
+        self.assertEqual(errors, [])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["rule"], rows[0]["severity"], rows[0]["path"], rows[0]["line"]),
+                         ("py.pip-audit.PYSEC-2026-123.example-package", "critical", "requirements.txt", 1))
+        self.assertEqual(rows[0]["extras"], {
+            "tool": "pip-audit", "scope": "project", "package": "example-package", "version": "1.0",
+            "advisory": "PYSEC-2026-123", "fix_versions": ["1.1"], "aliases": ["CVE-2026-12345"],
+        })
+        self.assertIn("fixed in 1.1", rows[0]["message"])
+
+    def test_clean_inventory_and_empty_inventory_are_distinguishable(self):
+        for dependencies, expected in (([], 0), ([audit_dependency(vulns=[])], 1)):
+            with self.subTest(dependencies=dependencies):
+                counts, rows, errors = self.parse({"dependencies": dependencies, "fixes": []})
+                self.assertEqual(counts, {"dependencies": expected, "vulnerabilities": 0, "skipped": 0})
+                self.assertFalse(rows or errors)
+
+    def test_skipped_and_malformed_dependencies_keep_valid_advisories(self):
+        for bad in (None, {}, {"name": "unresolved", "skip_reason": "no distribution metadata"},
+                    audit_dependency(vulns=None), audit_dependency(version=1)):
+            with self.subTest(bad=bad):
+                counts, rows, errors = self.parse({"dependencies": [bad, audit_dependency()], "fixes": []})
+                self.assertTrue(errors)
+                self.assertEqual(counts["vulnerabilities"], 1)
+                self.assertEqual([row["rule"] for row in rows], ["py.pip-audit.PYSEC-2026-123.example-package"])
+
+    def test_malformed_advisory_does_not_erase_other_advisories(self):
+        good = audit_dependency()["vulns"][0]
+        for bad in (None, {}, {**good, "fix_versions": None}, {**good, "aliases": [1]},
+                    {**good, "id": "bad/id"}):
+            with self.subTest(bad=bad):
+                counts, rows, errors = self.parse({"dependencies": [audit_dependency(vulns=[bad, good])]})
+                self.assertTrue(errors)
+                self.assertEqual(counts["vulnerabilities"], 1)
+                self.assertEqual(len(rows), 1)
+
+    def test_truncation_preserves_complete_dependency_prefix(self):
+        raw = '{"dependencies":[' + json.dumps(audit_dependency()) + ',{"name":'
+        counts, rows, errors = self.parse(raw=raw)
+        self.assertEqual(counts["vulnerabilities"], 1)
+        self.assertEqual(len(rows), 1)
+        self.assertIn("incomplete report", errors[0])
+
+    def test_missing_duplicate_and_invalid_documents_are_incomplete(self):
+        for raw in ("", "[]", "null", "{}", '{"dependencies":null}',
+                    '{"dependencies":[],"dependencies":[]}', '{"dependencies":[]}junk'):
+            with self.subTest(raw=raw):
+                _counts, rows, errors = self.parse(raw=raw)
+                self.assertFalse(rows)
+                self.assertTrue(errors)
 
 
 class ShellCheckResults(unittest.TestCase):
@@ -337,7 +467,7 @@ cat "$TMPDIR_RUN/second.out"
 
 @unittest.skipUnless(os.name == "posix", "Python module requires a POSIX shell")
 class PythonOptionalIntegration(unittest.TestCase):
-    """Real module and child processes; injected tools only exercise failures."""
+    """Real module and processes; injected tools pin external report contracts."""
 
     def setUp(self):
         artifacts = ROOT / "test-suite/artifacts"
@@ -365,6 +495,8 @@ class PythonOptionalIntegration(unittest.TestCase):
     def failure_tool(self, tool, *, uv=False):
         # An executable with a recorded PID and real descendants verifies
         # cancellation without pretending to provide successful audit results.
+        if tool == "pip-audit":
+            (self.project / "requirements.txt").write_text("urllib3==1.26.0\n")
         script = f"#!{sys.executable}\n" + r'''
 import json, os, signal, subprocess, sys, time
 from pathlib import Path
@@ -385,13 +517,13 @@ sys.exit(int(os.environ.get("AUDIT_EXIT", "2")))
         target.write_text(script)
         target.chmod(0o755)
 
-    def command(self, tool):
+    def command(self, tool, *, format="text"):
         return [str(ROOT / "modules/ubs-python.sh"), str(self.project),
-                "--format=text", f"--uv-tools={tool}",
+                f"--format={format}", f"--uv-tools={tool}",
                 f"--summary-json={self.root / 'summary.json'}"]
 
-    def scan(self, tool, **env):
-        proc = subprocess.run(self.command(tool), cwd=self.root,
+    def scan(self, tool, *, format="text", **env):
+        proc = subprocess.run(self.command(tool, format=format), cwd=self.root,
                               env={**self.env, **env}, capture_output=True,
                               text=True, timeout=60, check=False)
         (self.root / "stdout.txt").write_text(proc.stdout)
@@ -420,6 +552,118 @@ sys.exit(int(os.environ.get("AUDIT_EXIT", "2")))
                     self.assert_partial(proc, summary, tool)
         self.assertEqual(len(self.calls.read_text().splitlines()), 6)
         self.assertGreater(summary["extras"]["profile"]["cache_hits"], 0)
+
+    def audit_tool(self, dependencies, *, code=0, uv=False):
+        """A transport fixture, not a substitute for dependency-resolution proof."""
+        (self.root / "audit.json").write_text(json.dumps({"dependencies": dependencies, "fixes": []}))
+        script = f"#!{sys.executable}\n" + r'''
+import json, os, sys
+from pathlib import Path
+with open(os.environ["AUDIT_CALLS"], "a") as stream:
+    stream.write(json.dumps(sys.argv[1:]) + "\n")
+sys.stdout.write(Path(os.environ["AUDIT_CALLS"]).with_name("audit.json").read_text())
+sys.exit(CODE)
+'''.replace("CODE", str(code))
+        target = self.bin / ("uv" if uv else "pip-audit")
+        target.write_text(script)
+        target.chmod(0o755)
+
+    def test_pyproject_uses_project_resolution_and_all_formats_keep_advisories(self):
+        self.source.write_text("answer = 42\n")
+        (self.project / "pyproject.toml").write_text(
+            '[project]\nname = "example"\nversion = "1.0"\ndependencies = ["example-package==1.0"]\n')
+        self.audit_tool([audit_dependency()], code=1)
+        for format in ("text", "json", "sarif"):
+            with self.subTest(format=format):
+                proc, summary = self.scan("pip-audit", format=format)
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertEqual(summary["status"], "ok", summary)
+                self.assertEqual(summary["critical"], 1)
+                self.assertEqual(summary["extras"]["external_tools"][0]["dependencies"], 1)
+                self.assertEqual([r["rule"] for r in summary["findings"]], ["py.pip-audit.PYSEC-2026-123.example-package"])
+                if format == "json":
+                    self.assertEqual(json.loads(proc.stdout), summary)
+                elif format == "sarif":
+                    results = json.loads(proc.stdout)["runs"][0]["results"]
+                    self.assertEqual([r["ruleId"] for r in results], ["py.pip-audit.PYSEC-2026-123.example-package"])
+                    self.assertTrue(results[0]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"].endswith("pyproject.toml"))
+                else:
+                    self.assertIn("example-package 1.0: PYSEC-2026-123 (fixed in 1.1)", proc.stdout)
+                    critical_lines = [line for line in proc.stdout.splitlines()
+                                      if line.startswith("Critical issues:")]
+                    self.assertTrue(critical_lines)
+                    self.assertEqual(set(critical_lines), {"Critical issues: 1"})
+        for line in self.calls.read_text().splitlines():
+            argv = json.loads(line)
+            self.assertNotIn("--path", argv)
+            self.assertEqual(argv[-1], str(self.project))
+            self.assertIn("--format=json", argv)
+
+    def test_requirements_precede_pyproject_and_audits_are_not_source_cached(self):
+        self.source.write_text("answer = 42\n")
+        (self.project / "requirements.txt").write_text("example-package==1.0\n")
+        (self.project / "pyproject.toml").write_text('[project]\ndynamic = ["dependencies"]\n')
+        self.audit_tool([audit_dependency(vulns=[])], uv=True)
+        clean, summary = self.scan("pip-audit", format="json")
+        self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
+        self.assertEqual(summary["critical"], 0)
+        self.audit_tool([audit_dependency()], code=1, uv=True)
+        vulnerable, summary = self.scan("pip-audit", format="json")
+        self.assertEqual(vulnerable.returncode, 1, vulnerable.stdout + vulnerable.stderr)
+        self.assertEqual(summary["critical"], 1)
+        self.assertGreater(summary["extras"]["profile"]["cache_hits"], 0)
+        calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
+        self.assertEqual(len(calls), 2)
+        for argv in calls:
+            self.assertEqual(argv[:4], ["tool", "run", "--quiet", "pip-audit"])
+            self.assertEqual(argv[-2:], ["-r", str(self.project / "requirements.txt")])
+            self.assertNotIn("--path", argv)
+
+    def test_no_manifest_is_explicit_skip_and_never_audits_tool_environment(self):
+        self.audit_tool([])
+        proc, summary = self.scan("pip-audit", format="json")
+        self.assertIn(proc.returncode, (0, 1), proc.stdout + proc.stderr)
+        self.assertFalse(self.calls.exists())
+        outcome = summary["extras"]["external_tools"][0]
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("no requirements.txt or pyproject.toml", outcome["reason"])
+
+    def test_dynamic_pyproject_dependencies_are_partial_instead_of_empty_audit(self):
+        (self.project / "pyproject.toml").write_text('[project]\ndynamic = ["dependencies"]\n')
+        self.audit_tool([])
+        proc, summary = self.scan("pip-audit")
+        self.assert_partial(proc, summary, "pip-audit")
+        self.assertFalse(self.calls.exists())
+        self.assertIn("dynamic project dependencies", proc.stdout)
+        self.assertTrue(any("dynamic project dependencies" in row["message"]
+                            for row in summary["analysis_errors"]))
+
+    def test_explicit_empty_runtime_dependencies_do_not_provision_an_audit(self):
+        (self.project / "pyproject.toml").write_text('[project]\ndependencies = []\n')
+        self.audit_tool([], uv=True)
+        proc, summary = self.scan("pip-audit", format="json")
+        self.assertIn(proc.returncode, (0, 1), proc.stdout + proc.stderr)
+        self.assertEqual(summary["status"], "ok", summary)
+        self.assertFalse(self.calls.exists())
+        outcome = summary["extras"]["external_tools"][0]
+        self.assertEqual(outcome["dependencies"], 0)
+        self.assertEqual(outcome["reason"], "pyproject.toml declares no runtime dependencies")
+
+    def test_skipped_packages_keep_advisories_but_make_the_scan_partial(self):
+        (self.project / "requirements.txt").write_text("example-package==1.0\n")
+        self.audit_tool([audit_dependency(), {"name": "private-package", "skip_reason": "not on PyPI"}], code=1)
+        proc, summary = self.scan("pip-audit")
+        self.assert_partial(proc, summary, "pip-audit")
+        self.assertIn("py.pip-audit.PYSEC-2026-123.example-package", {row["rule"] for row in summary["findings"]})
+        outcome = summary["extras"]["external_tools"][0]
+        self.assertEqual((outcome["status"], outcome["dependencies"], outcome["skipped"]), ("partial", 1, 1))
+
+    def test_exit_one_without_advisories_is_an_execution_failure(self):
+        (self.project / "requirements.txt").write_text("example-package==1.0\n")
+        self.audit_tool([audit_dependency(vulns=[])], code=1)
+        proc, summary = self.scan("pip-audit")
+        self.assert_partial(proc, summary, "pip-audit")
+        self.assertIn("exit 1 contradicts 0 valid advisory findings", proc.stdout)
 
     def test_uv_without_companion_preserves_both_streams_and_native_findings(self):
         self.failure_tool("ruff", uv=True)
@@ -501,6 +745,50 @@ sys.exit(int(os.environ.get("AUDIT_EXIT", "2")))
         self.assertIn('"code": "F401"', proc.stdout)
         self.assertIn("Ruff emitted findings", proc.stdout)
         self.assertNotIn("analysis incomplete", proc.stderr)
+
+    def test_retention_skips_inapplicable_dependency_audits_without_launching_tools(self):
+        self.source.write_text("answer = 42\n")
+        self.audit_tool([], uv=True)
+        scratch = self.root / "retained"
+        scratch.mkdir()
+        for scope in ("no-manifest", "empty-runtime", "selected-file"):
+            with self.subTest(scope=scope):
+                if scope == "empty-runtime":
+                    (self.project / "pyproject.toml").write_text('[project]\ndependencies = []\n')
+                elif scope == "selected-file":
+                    # A manifest next to the selected file must not widen a
+                    # targeted scan into a project dependency audit.
+                    (self.project / "pyproject.toml").write_text(
+                        '[project]\ndependencies = ["example-package==1.0"]\n')
+                    self.project = self.source
+                proc, summary = self.scan("pip-audit", format="json", UBS_KEEP_TEMP="1", TMPDIR=str(scratch))
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(summary["status"], "ok", summary)
+                self.assertFalse(self.calls.exists(), "a skipped audit launched an external tool")
+                outcome = summary["extras"]["external_tools"][0]
+                self.assertEqual(outcome["status"], "skipped", outcome)
+                self.assertFalse(summary.get("analysis_errors"))
+                self.assertNotIn("cannot retain", proc.stderr)
+
+    def test_retention_refuses_required_dependency_audit_before_launch(self):
+        self.source.write_text("answer = 42\n")
+        self.audit_tool([audit_dependency()], code=1, uv=True)
+        scratch = self.root / "retained"
+        scratch.mkdir()
+        for manifest in ("pyproject.toml", "requirements.txt"):
+            with self.subTest(manifest=manifest):
+                (self.project / manifest).write_text(
+                    '[project]\ndependencies = ["example-package==1.0"]\n'
+                    if manifest == "pyproject.toml" else "example-package==1.0\n")
+                proc, summary = self.scan("pip-audit", format="json", UBS_KEEP_TEMP="1", TMPDIR=str(scratch))
+                self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                self.assertEqual(summary["status"], "partial", summary)
+                self.assertEqual(summary["module_error"], "ANALYZER_ERROR", summary)
+                self.assertFalse(self.calls.exists(), "retention mode launched an external tool")
+                self.assertEqual(summary["extras"]["external_tools"][0]["status"], "partial")
+                self.assertTrue(any("cannot retain external analyzer scratch" in row["message"]
+                                    for row in summary["analysis_errors"]))
+                self.assertIn("UBS_KEEP_TEMP=1", proc.stderr)
 
 
 if __name__ == "__main__":

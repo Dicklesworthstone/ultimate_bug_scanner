@@ -14,12 +14,15 @@ from typing import Callable, Mapping
 class AnalysisLimit(ValueError):
     """The bounded analysis could not finish; callers must report failure."""
 
-    def __init__(self, message: str, *, effects=None):
+    def __init__(self, message: str, *, effects=None, components=()):
         super().__init__(message)
         # Frontends may retain independently established findings while
         # still reporting an incomplete scan. Never treat these as a complete
         # reusable summary or silently turn the exception into success.
         self.effects = effects if effects is not None else {}
+        # Human summaries may be sampled. Keep every failed source/scope as
+        # data so report consumers can act on the full coverage boundary.
+        self.components = tuple(dict(component) for component in components)
 
 
 @dataclass

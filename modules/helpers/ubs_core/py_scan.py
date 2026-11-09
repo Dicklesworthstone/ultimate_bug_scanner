@@ -589,11 +589,52 @@ def pattern_count_report(
     }
 
 
+class _AnalysisError(str):
+    """A printable failure with lossless structured report/worker metadata."""
+
+    def __new__(cls, stage: str, exception_type: str, message: str, components=()):
+        value = super().__new__(cls, f"{stage}: {exception_type}: {message}")
+        value.stage = stage
+        value.exception_type = exception_type
+        value.message = message
+        value.components = tuple(dict(component) for component in components)
+        return value
+
+    def record(self) -> dict:
+        return {"stage": self.stage, "exception_type": self.exception_type,
+                "message": self.message, "components": list(self.components)}
+
+
+def _error_records(errors: Sequence[str]) -> list[dict]:
+    return [error.record() if isinstance(error, _AnalysisError) else
+            {"stage": "scan", "exception_type": "AnalysisError",
+             "message": str(error), "components": []} for error in errors]
+
+
+def _error_from_record(record: object) -> _AnalysisError:
+    """Validate child-process diagnostics before trusting their completion."""
+    if not isinstance(record, dict) or not all(
+            isinstance(record.get(key), str) for key in ("stage", "exception_type", "message")):
+        raise ValueError("invalid analysis error record")
+    components = record.get("components")
+    if not isinstance(components, list):
+        raise ValueError("invalid analysis components")
+    for component in components:
+        if (not isinstance(component, dict)
+                or not all(isinstance(component.get(key), str) for key in ("file", "reason"))
+                or ("symbol" in component and not isinstance(component["symbol"], str))
+                or any(key in component and (type(component[key]) is not int or component[key] < 1)
+                       for key in ("start_line", "end_line"))):
+            raise ValueError("invalid analysis component")
+    return _AnalysisError(record["stage"], record["exception_type"], record["message"], components)
+
+
 def _analysis_error(errors: list[str] | None, stage: str, exc: BaseException) -> None:
     """Keep failures separate from findings; direct APIs still raise by default."""
     if errors is None:
         raise exc
-    errors.append(f"{stage}: {type(exc).__name__}: {exc}")
+    errors.append(_AnalysisError(stage, type(exc).__name__, str(exc),
+                                 getattr(exc, "components", ())))
 
 
 def _run_stage(problems: list[str], stage: str, run, *args, **kwargs):
@@ -856,7 +897,7 @@ def _detector_worker() -> None:
     errors: list[str] = []
     _run_detector(name, [Path(path) for path in paths], Stream(),
                   set(skip) if skip is not None else None, errors)
-    sys.stdout.write(json.dumps(['complete', errors], ensure_ascii=False) + '\n')
+    sys.stdout.write(json.dumps(['complete', _error_records(errors)], ensure_ascii=False) + '\n')
     sys.stdout.flush()
 
 
@@ -888,10 +929,13 @@ def _detector_response(output: bytes):
                 and all(isinstance(payload.get(key), int) and not isinstance(payload[key], bool)
                         for key in ('line', 'col'))):
             records.append(json.dumps(payload, ensure_ascii=False) + '\n')
-        elif (kind == 'complete' and isinstance(payload, list)
-              and all(isinstance(problem, str) for problem in payload)):
+        elif kind == 'complete' and isinstance(payload, list):
+            try:
+                problems = [_error_from_record(problem) for problem in payload]
+            except ValueError:
+                invalid = 'invalid analysis error record'
+                break
             complete = True
-            problems = payload
         else:
             invalid = 'invalid record type or payload'
             break
@@ -1312,7 +1356,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if count_report is not None:
         count_report.update(status="partial" if scan_errors else "ok",
-                            complete=not scan_errors, errors=list(scan_errors))
+                            complete=not scan_errors, errors=list(scan_errors),
+                            analysis_errors=_error_records(scan_errors))
         try:
             Path(args.pattern_counts_out).write_text(
                 json.dumps(count_report, ensure_ascii=False) + "\n", encoding="utf-8",
@@ -1362,6 +1407,7 @@ def main(argv: list[str] | None = None) -> int:
             "info": counters["info"],
             "version": args.version,
             "status": "partial" if scan_errors else "ok",
+            "analysis_errors": _error_records(scan_errors),
             "findings": legacy_findings,
             # Legacy issue-64 payload (title + samples) carried inside the
             # module summary so the combined JSON keeps per-finding samples.
@@ -1409,6 +1455,7 @@ def main(argv: list[str] | None = None) -> int:
         "prefilter": prefilter_res.to_dict(),
         "cache": cache.stats,
         "errors": scan_errors,
+        "analysis_errors": _error_records(scan_errors),
     }) + "\n")
     return exit_code
 

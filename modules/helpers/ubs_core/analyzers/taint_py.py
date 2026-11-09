@@ -71,8 +71,23 @@ def _work_setting(name, default):
     return value
 
 
-class _ScopeLimit(AnalysisLimit):
-    """A function exhausted its allowance; independent scopes can continue."""
+def _distinct_components(components):
+    """Collapse repeated callback failures without discarding their locations."""
+    distinct, seen = [], set()
+    for item in components:
+        key = (item['file'], item['symbol'], item['start_line'], item['end_line'], item['reason'])
+        if key not in seen:
+            seen.add(key)
+            distinct.append(item)
+    return tuple(distinct)
+
+
+class _ScopeIncomplete(AnalysisLimit):
+    """A function cannot finish; independent scopes can still be analyzed."""
+
+
+class _ScopeLimit(_ScopeIncomplete):
+    """A function exhausted its own allowance, not the total file budget."""
 
 
 class _ScopedBudget:
@@ -93,8 +108,9 @@ class _ScopedBudget:
         self.engine.scope_remaining[self.scope] = remaining
         if remaining < 0:
             limit = self.engine.scope_limits[self.scope]
-            raise _ScopeLimit(f'{self.engine.scope_name(self.scope)}: function work limit '
-                              f'exceeded ({limit} steps); analysis is incomplete')
+            reason = f'function work limit exceeded ({limit} steps); analysis is incomplete'
+            raise _ScopeLimit(f'{self.engine.scope_name(self.scope)}: {reason}',
+                              components=(self.engine.scope_diagnostic(self.scope, reason),))
 
 SOURCE_PATTERNS = [
     re.compile(r"request\.(?:args|get_json|json|form|values|data|body|GET|POST|query_params|path_params|headers|cookies|META)\b", re.IGNORECASE),
@@ -5783,11 +5799,13 @@ class _Analysis:
         self.writes = None
         self.local_journal = None
         self.failed_scopes = {}
+        self.failed_scope_diagnostics = {}
         self.failed_summaries = {}
         self.partial_scope_effects = {}
         self.observed_effects = {}
         self.escaping_callables = {}
         self.scope_errors = []
+        self.scope_diagnostics = []
         self.scope_remaining = {}
         self.scope_limits = {}
         self.line_offset = 0
@@ -6442,6 +6460,19 @@ class _Analysis:
     def scope_name(self, scope):
         if isinstance(scope, ast.Module):
             return '<module>'
+        location = self.scope_diagnostic(scope, '')
+        prefix = f'{self.source_path}: ' if self.source_path is not None else ''
+        return (f'{prefix}{location["symbol"]} '
+                f'(lines {location["start_line"]}-{location["end_line"]})')
+
+    def scope_diagnostic(self, scope, reason):
+        """Keep source coordinates separate from a bounded human summary."""
+        if isinstance(scope, ast.Module):
+            end = max((getattr(statement, 'end_lineno', self.line_offset + 1)
+                       for statement in scope.body), default=self.line_offset + 1)
+            return {'file': str(self.source_path) if self.source_path is not None else '<module>',
+                    'symbol': '<module>', 'start_line': 1, 'end_line': max(1, end - self.line_offset),
+                    'reason': reason}
         names = [getattr(scope, 'name', '<lambda>')]
         parent = self.enclosing(scope)
         while parent is not None and not isinstance(parent, ast.Module):
@@ -6450,8 +6481,9 @@ class _Analysis:
             parent = self.enclosing(parent)
         start = scope.lineno - self.line_offset
         end = getattr(scope, 'end_lineno', scope.lineno) - self.line_offset
-        prefix = f'{self.source_path}: ' if self.source_path is not None else ''
-        return f'{prefix}{".".join(reversed(names))} (lines {start}-{end})'
+        return {'file': str(self.source_path) if self.source_path is not None else '<module>',
+                'symbol': '.'.join(reversed(names)), 'start_line': start, 'end_line': end,
+                'reason': reason}
 
     def interrupted_effects(self, function, flow):
         """Keep established base findings when a later context is interrupted."""
@@ -6622,14 +6654,37 @@ class _Analysis:
                     provider = description.dependency
                     if provider is None:
                         continue
-                    summary = self.summaries.get(provider, FunctionSummary())
-                    delivered = summary.yielded if provider in self.generators else summary.returned
                     owner = self.owner(provider)
+                    # A failed foreign callback context can be rolled out of
+                    # the project's shared table. Its owner's quarantine is
+                    # authoritative even when an earlier complete summary was
+                    # restored there for unrelated import components.
+                    summary = owner.failed_summaries.get(provider)
+                    if summary is None:
+                        summary = self.summaries.get(provider, FunctionSummary())
+                    delivered = summary.yielded if provider in owner.generators else summary.returned
                     provider_globals = (global_bound if owner is self else
                                         {f'@global:{key}': owner.globals.value(key) for key in owner.globals})
                     provider_inputs = bound.get(provider, {}) if owner is self else owner.framework_values.get(provider, {})
                     incoming = self.flow_class.substitute(delivered, {**provider_globals, **provider_inputs},
                                                          provider.name + '()', budget=self.budget)
+                    if summary.incomplete:
+                        # Dependency injection calls the provider without the
+                        # ordinary incomplete_call transfer. Give it the same
+                        # opaque return policy: observed returns cannot retain
+                        # sanitizer proof, and an unvisited return may expose
+                        # an incoming request value or module global.
+                        possible = [incoming, *provider_inputs.values(), *provider_globals.values()]
+                        if owner is not self:
+                            # An imported helper may first become a dependency
+                            # here; its own module did not necessarily have a
+                            # Depends edge activating implicit request inputs.
+                            for parameter, input_ in owner.framework_inputs.get(provider, {}).items():
+                                if input_.kind in {'source', 'implicit'} and parameter not in provider_inputs:
+                                    possible.append(frozenset({TaintTrace(input_.name,
+                                        path=(input_.name, parameter))}))
+                        self.budget.spend(sum(len(fact) for fact in possible))
+                        incoming = self.flow_class.incomplete_result(join_facts(*possible))
                     previous = bound[function].get(name, CLEAN)
                     updated = join_facts(previous, incoming)
                     if updated != previous:
@@ -6963,7 +7018,15 @@ class _Analysis:
                 flow.normal_state, completed = flow.capture(function.body, state, exceptions=True)
                 flow.pending.extend(completed)
             return reads, writes, flow.summary()
-        except _ScopeLimit as exc:
+        except AnalysisLimit as exc:
+            diagnostics = exc.components or (owner.scope_diagnostic(function, str(exc)),)
+            # A total cutoff leaves no allowance for either recovery or
+            # independent functions. Semantic failures and per-function
+            # cutoffs instead quarantine only this body and all its contexts.
+            if total_budget.remaining < 0:
+                self.observed_effects[function] = owner.interrupted_effects(function, flow)
+                raise AnalysisLimit(f'{owner.scope_name(function)}: {exc}',
+                                    effects=exc.effects, components=diagnostics) from exc
             # A failed body may have installed provisional callback contexts
             # or nested defaults. Roll them back before other scopes run.
             for table, key, previous in owner.local_journal.values():
@@ -6986,14 +7049,17 @@ class _Analysis:
                 raise AnalysisLimit(
                     f'{owner.scope_name(function)}: UBS_PYTHON_FLOW_MAX_STEPS={owner.work_limit}: {recovery}',
                     effects=recovery.effects,
+                    components=(*diagnostics, *(recovery.components or (
+                        owner.scope_diagnostic(function, str(recovery)),))),
                 ) from recovery
             owner.failed_summaries[function] = failed
-            owner.failed_scopes[function] = str(exc)
+            reason = str(exc) if isinstance(exc, _ScopeIncomplete) else f'{owner.scope_name(function)}: {exc}'
+            owner.failed_scopes[function] = reason
+            owner.failed_scope_diagnostics[function] = diagnostics
             owner.partial_scope_effects[function] = owner.failed_summaries[function].effects
-            raise
-        except AnalysisLimit as exc:
-            self.observed_effects[function] = owner.interrupted_effects(function, flow)
-            raise AnalysisLimit(f'{owner.scope_name(function)}: {exc}', effects=exc.effects) from exc
+            if isinstance(exc, _ScopeIncomplete):
+                raise
+            raise _ScopeIncomplete(reason, effects=exc.effects, components=diagnostics) from exc
         finally:
             owner.reads = owner.writes = None
             owner.local_journal = None
@@ -7058,6 +7124,12 @@ class _Analysis:
             if self.budget.remaining < 0:
                 location = str(self.source_path) if self.source_path is not None else '<module>'
                 exc.args = (f'{location}: UBS_PYTHON_FLOW_MAX_STEPS={self.work_limit}: {exc}',)
+            if not exc.components:
+                exc.components = (self.scope_diagnostic(self.tree, str(exc)),)
+            previous = list(self.scope_diagnostics)
+            for items in self.failed_scope_diagnostics.values():
+                previous.extend(items)
+            exc.components = _distinct_components((*previous, *exc.components))
             raise
 
     def _analyze(self):
@@ -7229,8 +7301,9 @@ class _Analysis:
                             readers[key].pop(summary_key, None)
                 try:
                     reads, writes, summary = self.solve_function(function, context)
-                except _ScopeLimit as exc:
+                except _ScopeIncomplete as exc:
                     self.scope_errors.append(str(exc))
+                    self.scope_diagnostics.extend(exc.components)
                     # Revoke every context of this body, including a previous
                     # clean/nonreturning summary. Their readers must run again
                     # with the opaque-call continuation, not stale proof.
@@ -7349,13 +7422,19 @@ class _Analysis:
                         if concrete:
                             effects[key] = join_facts(effects.get(key, CLEAN), concrete)
                 problems = list(dict.fromkeys([*self.scope_errors, *self.failed_scopes.values()]))
+                diagnostics = list(self.scope_diagnostics)
+                for items in self.failed_scope_diagnostics.values():
+                    diagnostics.extend(items)
                 if self._escaping_namespace_factory():
-                    problems.append('globals mapping factory stored in an object; analysis is incomplete')
+                    reason = 'globals mapping factory stored in an object; analysis is incomplete'
+                    problems.append(reason)
+                    diagnostics.append(self.scope_diagnostic(self.tree, reason))
                 if problems:
                     more = (f'; and {len(problems) - 8} more failed scopes'
                             if len(problems) > 8 else '')
                     raise AnalysisLimit('Python flow analysis is incomplete: '
-                                        + '; '.join(problems[:8]) + more, effects=effects)
+                                        + '; '.join(problems[:8]) + more, effects=effects,
+                                        components=_distinct_components(diagnostics))
                 return effects
 
 
@@ -7366,8 +7445,13 @@ def _parse_source(path):
             text = source.read()
         return text, ast.parse(text, filename=str(path))
     except (OSError, UnicodeError, SyntaxError, ValueError, RecursionError, LookupError) as exc:
+        reason = f'{type(exc).__name__}: {exc}; analysis is incomplete'
+        start = getattr(exc, 'lineno', None) or 1
+        end = getattr(exc, 'end_lineno', None) or start
         raise AnalysisLimit(
-            f'Cannot analyze Python source {path}: {type(exc).__name__}: {exc}; analysis is incomplete'
+            f'Cannot analyze Python source {path}: {reason}',
+            components=({'file': str(path), 'symbol': '<module>',
+                         'start_line': start, 'end_line': end, 'reason': reason},),
         ) from exc
 
 
@@ -7402,6 +7486,7 @@ class _Project:
         self.journal = {}
         self.sources = []
         self.input_failures = []
+        self.input_diagnostics = []
         self.failed_inputs = 0
         self.modules = {}
         self.namespaces = set()
@@ -7421,6 +7506,7 @@ class _Project:
                 text, tree = _parse_source(path)
             except AnalysisLimit as exc:
                 self.failed_inputs += 1
+                self.input_diagnostics.extend(exc.components)
                 if len(self.input_failures) < 3:
                     self.input_failures.append(str(exc))
                 continue
@@ -7762,6 +7848,7 @@ class _Project:
     def findings(self):
         effects = {}
         failures, failed_components = [], 0
+        diagnostics = list(self.input_diagnostics)
         paths = self.paths
         for component in self.components():
             self.journal.clear()
@@ -7783,6 +7870,10 @@ class _Project:
                 for key, fact in completed.items():
                     effects[key] = join_facts(effects.get(key, CLEAN), fact)
             except AnalysisLimit as exc:
+                if exc.components:
+                    diagnostics.extend(exc.components)
+                else:
+                    diagnostics.extend(engine.scope_diagnostic(engine.tree, str(exc)) for engine in component)
                 for key, fact in completed.items():
                     effects[key] = join_facts(effects.get(key, CLEAN), fact)
                 for key, fact in exc.effects.items():
@@ -7822,7 +7913,10 @@ class _Project:
                        if failed_components > len(failures) else '')
             problems.append(f'{failed_components} component(s): ' + '; '.join(failures) + omitted)
         if problems:
-            raise AnalysisLimit('Python taint analysis is incomplete in ' + '; '.join(problems))
+            # Foreign callbacks can be reached from several import components.
+            # Report each source failure once without truncating the payload.
+            raise AnalysisLimit('Python taint analysis is incomplete in ' + '; '.join(problems),
+                                components=_distinct_components(diagnostics))
 
 
 def should_skip(path: Path) -> bool:

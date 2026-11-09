@@ -1109,11 +1109,14 @@ def to_sarif(
                     st = "error"
                 flang = str(fmod.get("language") or "unknown")
                 msg = str(fmod.get("message") or fmod.get("module_error") or "module did not complete")
-                notifications.append({
+                notification = {
                     "level": "error",
                     "descriptor": {"id": f"ubs/module-{st}"},
                     "message": {"text": f"{flang}: {st} — {msg}"},
-                })
+                }
+                if isinstance(fmod.get("analysis_errors"), list):
+                    notification["properties"] = {"analysis_errors": fmod["analysis_errors"]}
+                notifications.append(notification)
         try:
             exit_code = int(doc.get("exit_code", 2))
         except (TypeError, ValueError):

@@ -206,21 +206,21 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='d5866128c71e0e25076f037126edfe6967664941efb5eca202617486ddc95f8b'
-  [cpp]='1b5417b37550b86e20b65eb822a8fb7224151d0fac56cf817621421b55a6b4d7'
-  [csharp]='a4691e794f01678225f738293e3b4cc4cf6015b96172a2c3f981672389907baf'
-  [elixir]='6adb08225caf79b41ff75cf706a3c48b11670739efa151a737f8d2a2ed3b4503'
-  [golang]='4b6c59acfae1a6c76302a015db8fe9bd73dbb8324538980e108d4a3fd20fe3e5'
-  [hcl]='703bb0b5761ba886b9de3e1cd9c0b53d3b46f091beeffd612a1186af4160de57'
-  [java]='0b432d3750ae0f8bc88df3291003bd336fb0ddc639151421f59ddc8ff19d416b'
-  [js]='6ecf82d1734dbe2cb001a40dab211e737b91adf50bc6b55f8669a9deba2bb9a2'
-  [kotlin]='50871646bfa83c762434361622ab43dc92bf351979c2bf2c142b5a3fe610bb9d'
-  [php]='55fdf17a8a095d73316f600656cde616e7c8551111ee94dea03d89b4587e6516'
-  [python]='4896e5725d93d779924cf181fc7ad085cd532ce04109578551396d47087614db'
-  [ruby]='55d15d5c92faca15c3f819e239333195396c8aefec97a73a2bf290825955efca'
-  [rust]='ca29c6c2fb5dc6bd1ce8ef43113ad5756249d8a2b80b0f9faa0974f5be295682'
-  [sql]='e1d9490f995681f44a9161341721a77c19d87b37d327cf536004e3f9a415bd9d'
-  [swift]='670b984e9fcc0d95063e5226bc527fb5acf9751ffa01355a36c1da41c9f3ea98'
+  [bash]='6b7ce938b4e7caa17709e34d756c85e2f194ca80bb429455c5a450b8371f2119'
+  [cpp]='61bf1ad0a4805770f5d63b2cd8891436df942755106377bfe6b9df90d52ef90b'
+  [csharp]='ba318def6ef915d47194bda16e718229ce1f0dc245e184e6e38836a75abfdca0'
+  [elixir]='f6ce6092eff5ec76dbba40d6e16d70c3e3f9f9d05f42932eb75b8a7e804257a4'
+  [golang]='a0e3db4102d1242033603c2355d8fdffe5e55fb3751535fa27d76ee82225b217'
+  [hcl]='313c185b23f786d40b6055b505760f23f53fc492a07d35d58edde2d85dc11bf1'
+  [java]='60aa9f27e59137f66da3d2134204d9cf456f67346dfc7214ffc85e98bd5f2d8f'
+  [js]='1e5cdc3ea04105f84d14f1c0196f82f28e8fb4653c3125b26083cf03506c0972'
+  [kotlin]='a8746de37dc60824fe7783e8991cccd4d392b19ce96a581024c2f52530273042'
+  [php]='27a23d67ac37b5c1a2a822f9708e46ba740beb72d582838784663bdce50386d9'
+  [python]='6af001d3aef70effc06cc9b612b3b7496f794a9f5e4f29ee4b8f05e2fb3a0d39'
+  [ruby]='9cfdb1f8cb30bbca3234d7c07658c320289158c9fd183dddc2e238bc17eea854'
+  [rust]='2f45e9ff2be414940d5b4b65daf8f506ddc334dbf948f21450deb0051627ddce'
+  [sql]='b3ecc0eb64f027bb7aae19bfa7f55690cfed78125a71dcae3d70b0e23cf88d65'
+  [swift]='5eb5f4d4d0d5a24d66c62bbf436039e5dd10a4278087f7a253ff8c773e37e0de'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -328,7 +328,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/analyzers/taint_js.py']='769cc8954e461e53a34b8fae041da2f3677bb100e364637a9d4515097a00aad3'
   ['helpers/ubs_core/analyzers/taint_kotlin_sql.py']='dc16b75056c7811304168cf2071a58db4b9979847e74c6c6c3bb6899e62c71d3'
   ['helpers/ubs_core/analyzers/taint_php.py']='203035813900408c7d44f7244ab7e771225aeaa7c5e78a838049f031639411ed'
-  ['helpers/ubs_core/analyzers/taint_py.py']='0d8e15c287ee0fa74f103fd50944d1bca709e6c96c3ea8ba387f2e7eb91c8f0a'
+  ['helpers/ubs_core/analyzers/taint_py.py']='8bc2150df2112021c34261e3e5489cd3af8986905a6ae11df842a3e6299c99b9'
   ['helpers/ubs_core/analyzers/taint_ruby_traversal.py']='9f0607890770751d4821bb92319780f87c5632145d284967a0771cf352a6832d'
   ['helpers/ubs_core/analyzers/taint_ruby_url.py']='c7e98db31c900d364f427aa65bc2ff3bb62a8a28f05b7dd78357b6f6a51a7a84'
   ['helpers/ubs_core/analyzers/taint_rust.py']='920988d1dd05014915d79e22127535735db0dee0ae25448f57cab89451fb4987'
@@ -400,7 +400,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/elixir_scan.py']='6b9ef4f97ad0457bcc0e3dd0766d5ed6e7edb3c518da17ce5d1be782555bed64'
   ['helpers/ubs_core/explain.py']='9838afd5b0e30c9638be1a003d790ac970cabc4c658cc6cd43abd2de9335d2b6'
   ['helpers/ubs_core/external_tools.py']='d994aed7d6627b2d28eaaca6fc12ad8798c8355ca23def35695816492874e954'
-  ['helpers/ubs_core/findings_merge.py']='67609cabf26be3fd7c442653bce89e7be1a55df8c699b41a329c3eb995988e4a'
+  ['helpers/ubs_core/findings_merge.py']='d1666407750a67727738c9bc99b72013c364842c3ee202b7b7359c3ff92cedba'
   ['helpers/ubs_core/go_ast.py']='f459406b41a7aa4b5fd0af7cce5a961811d0bffd499fb99825ed631ec96d0f0d'
   ['helpers/ubs_core/go_detectors/__init__.py']='70cc7219036b6d704d9a9e9414c623b4d0eb65ef26e12aac19c8ba6aa055ba41'
   ['helpers/ubs_core/go_detectors/archive_extraction.py']='f0b25a44ccf1b0f374feb9e8fc7486b618eccf817348151d1a0583b7496fe6a7'
@@ -468,7 +468,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/kotlin_rules.py']='6dd77c16cd9fbba0e555162e2a8f378858ce70b4d70668f64ec8142983ba3c35'
   ['helpers/ubs_core/kotlin_scan.py']='df870233b07e656cba3c82b146f8f7cac10679ee6011d0f70fd95d230b7338e5'
   ['helpers/ubs_core/lexer.py']='8ad2f1ebf45306e74042efa330052a765b345568194570dff5480af215531023'
-  ['helpers/ubs_core/occurrences.py']='ba83124bd2bbcda620b532b76e24caf6c5c603cdddc800b338d67a1bf4a800e9'
+  ['helpers/ubs_core/occurrences.py']='4b03692e7c1e3465235c0c7261644c7c282a587b909d6532dbe9f6229419e0e7'
   ['helpers/ubs_core/php_frontend.py']='301b810b4addcc0c6c055cce15c2e0fdbf505cbd9ecd159d9a3975f3a77c8658'
   ['helpers/ubs_core/php_scan.py']='92349ae54795e4d1dbbc6ffd5846273ad11b33ed9cb006432ccea9f5efe57724'
   ['helpers/ubs_core/prefilter.py']='adda4a20eab6cf84bcb9691b9767af76bf46d0eba90bf0e4c000fd97a8996d6f'
@@ -506,7 +506,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/py_detectors/redos_regex.py']='0e737e99523445cbb9f207b411bc5e4770beb98ebcb69b74a5f4e0f5c03d7a44'
   ['helpers/ubs_core/py_detectors/safe_html_xss.py']='36fa16d15f40cea00b83222f8bb48d9b4df7ca5a1da53b93e7ea7d7e39bd5796'
   ['helpers/ubs_core/py_detectors/security_assert.py']='dd64618f914f4ed22eecf4398a491773c21409f9cf8eab3d2b68ce20c38382e9'
-  ['helpers/ubs_core/py_detectors/sql_injection.py']='3c1b0384ccb8f0845d278e2b202f71b2e274783ef054fa27e05b8ac9395611b4'
+  ['helpers/ubs_core/py_detectors/sql_injection.py']='6ef1fb06103510ddf7f272c2d13af5b72c4b3f10e00f3b61ad31e308a88c86e6'
   ['helpers/ubs_core/py_detectors/ssrf.py']='308d99bbd50c4dc84d9b963a29a5f9668fbf0634a1a994c250f48965e4615f46'
   ['helpers/ubs_core/py_detectors/subprocess_timeout.py']='cbd909b9f5e0ca4b099c71d47561652eb5377433b93686db5d277c76fd1c8779'
   ['helpers/ubs_core/py_detectors/template_autoescape.py']='54febae8dd46dd63e2bcf4a1a75a1c78f0eba5bd9bff488962ca0585b1251755'
@@ -522,7 +522,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/py_patterns/quality.py']='9d5c30686414b7d4fc967347b7dc6dfbfeaa055ca8d1b117a7eb93c7e9c772e7'
   ['helpers/ubs_core/py_patterns/security_rg.py']='72add761922edef8a654d3e7798aa9393db604d0c7bc24c067300871018e8ffb'
   ['helpers/ubs_core/py_rules.py']='e35ae329bddcaed0a0e9d4244b9907455d00d76abe9d46d3dad2a69a1313db13'
-  ['helpers/ubs_core/py_scan.py']='e66623d0a5ca863889b60da80febb20813db6b0eb1acae9de32f84169d928fb0'
+  ['helpers/ubs_core/py_scan.py']='245bff4b63a53117efd644ff5288cc9ddd3b96dd56720164f1cd50c7dc577691'
   ['helpers/ubs_core/registry.py']='782a14714bc9e5e6d3d048572e1c0ef9a65639be5d3d3a691eae3c39f026a19c'
   ['helpers/ubs_core/ruby_ast.py']='fe4372cbd257e2725e4fd584dfa6cffa338a17b252962ea6062f5c22c152d472'
   ['helpers/ubs_core/ruby_detectors/__init__.py']='7b5ef3809ebd50136d741ade03d1c56b4b16053753dd79a8d90dd9021ebb0db7'
@@ -595,8 +595,8 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_patterns/threading_perf.py']='3282b7f8ddb9df8476c315872f828905bd3b71e539e8834289578d9bc7abdd46'
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='d5741d91f55941631be362f0d0dd9982d5103fc1b6a43bfb734e4aeb1b06ba7e'
-  ['helpers/ubs_core/taint_flow.py']='83b941e15357a6a593db1d7f77a099b1707090301f695445356bfcede4baef26'
-  ['lib/ubs-common.sh']='d239f76d8f96989aeffc9756b8a66ee26dea533cc8f0548af61b705f2cc6d765'
+  ['helpers/ubs_core/taint_flow.py']='2e22d2e73f3eaaf242323ecc8b9ac73ce57fcb508fbdffc30d4248ab05f203b6'
+  ['lib/ubs-common.sh']='fe91c82e633864f65e6cdbdd763c9b89668f09d783e39a3addf00e8bdc8bb15d'
 )
 
 # contract.json as shipped by earlier releases (sha256 -> first tag), kept out
@@ -2522,6 +2522,27 @@ cat <<'JSON'
         },
         "additionalProperties": true
       },
+      "analysis_component": {
+        "type": "object",
+        "required": ["file", "reason"],
+        "properties": {
+          "file": {"type": "string"},
+          "symbol": {"type": "string"},
+          "start_line": {"type": "integer", "minimum": 1},
+          "end_line": {"type": "integer", "minimum": 1},
+          "reason": {"type": "string"}
+        }
+      },
+      "analysis_error": {
+        "type": "object",
+        "required": ["stage", "exception_type", "message", "components"],
+        "properties": {
+          "stage": {"type": "string"},
+          "exception_type": {"type": "string"},
+          "message": {"type": "string"},
+          "components": {"type": "array", "items": {"$ref": "#/$defs/analysis_component"}, "description": "Full failed source/scope list; never truncated to the human-readable summary limit"}
+        }
+      },
       "scanner": {
         "type": "object",
         "required": ["language", "files", "critical", "warning", "info"],
@@ -2539,6 +2560,7 @@ cat <<'JSON'
           "extras": {"type": "object"},
           "module_error": {"type": "string"},
           "module_timeout_secs": {"type": "integer"},
+          "analysis_errors": {"type": "array", "items": {"$ref": "#/$defs/analysis_error"}},
           "message": {"type": "string"}
         },
         "additionalProperties": true
@@ -2550,6 +2572,7 @@ cat <<'JSON'
           "language": {"type": "string"},
           "status": {"enum": ["timeout", "error", "partial"]},
           "module_error": {"type": ["string", "null"]},
+          "analysis_errors": {"type": "array", "items": {"$ref": "#/$defs/analysis_error"}},
           "message": {"type": ["string", "null"]}
         }
       },
@@ -9411,6 +9434,9 @@ def restore_pattern_counts(a) -> int:
         if not a.single_file:
             for row in doc["files"] + doc["counts"]:
                 row["file"] = restore_workspace(row["file"], a)
+            for error in doc.get("analysis_errors", []):
+                for component in error.get("components", []):
+                    component["file"] = restore_workspace(component["file"], a)
         doc["project"] = a.project
         doc["files"].sort(key=lambda row: row["file"])
         doc["counts"].sort(key=lambda row: (row["file"], row["rule_id"]))
@@ -10047,7 +10073,8 @@ merge_json_scanners(){
         project: $project,
         timestamp: $ts,
         status: (if ($sc.status // "ok") != "ok" then "partial" else "ok" end),
-        failed_modules: (if ($sc.status // "ok") != "ok" then [{language: $sc.language, status: $sc.status, module_error: $sc.module_error, message: $sc.message}] else [] end)
+        failed_modules: (if ($sc.status // "ok") != "ok" then [$sc | {language, status, module_error, message}
+          + (if (.analysis_errors|type) == "array" then {analysis_errors} else {} end)] else [] end)
       }
       + git_block
       + {
@@ -10067,7 +10094,8 @@ merge_json_scanners(){
   base_json=$(jq -s --arg project "$SOURCE_PROJECT_DIR" --arg ts "$(date_iso)" \
       --arg repo "${GIT_REMOTE_HTTP:-}" --arg commit "${GIT_COMMIT_SHA:-}" --arg blob "${GIT_BLOB_BASE:-}" '
     def nz(x): if (x|type)=="number" then x else 0 end;
-    def failed: map(select((.status // "ok") != "ok") | {language, status, module_error, message});
+    def failed: map(select((.status // "ok") != "ok") | {language, status, module_error, message}
+      + (if (.analysis_errors|type) == "array" then {analysis_errors} else {} end));
     def git_block:
       if ($repo|length) > 0 then
         {git: ({repository:$repo}
@@ -10446,12 +10474,14 @@ write_jsonl_summary(){
     jq -c --arg project "$SOURCE_PROJECT_DIR" --arg ts "$ts" '
       .scanners[] | {type:"scanner", project:$project, language, status:(.status // "ok"), files, critical, warning, info, timestamp:$ts}
       + (if .timestamp != null then {scanner_timestamp:.timestamp} else {} end)
+      + ({module_error, message, analysis_errors} | with_entries(select(.value != null)))
     ' "$COMBINED_JSON_FILE" >>"$tmp" || return 1
   else
     # Summary-only mode (legacy behavior)
     jq -c --arg project "$SOURCE_PROJECT_DIR" --arg ts "$ts" '
       .scanners[] | {type:"scanner", project:$project, language, status:(.status // "ok"), files, critical, warning, info, timestamp:$ts}
       + (if .timestamp != null then {scanner_timestamp:.timestamp} else {} end)
+      + ({module_error, message, analysis_errors} | with_entries(select(.value != null)))
     ' "$COMBINED_JSON_FILE" >"$tmp" || return 1
   fi
 
@@ -10938,7 +10968,8 @@ if need_cmd jq; then
     [[ -s "$TMPDIR_RUN/$L.json" ]] && scanner_jsons+=("$TMPDIR_RUN/$L.json")
   done
   if [[ ${#scanner_jsons[@]} -gt 0 ]]; then
-    FAILED_MODULES_JSON="$(jq -s -c '[.[] | select(type=="object") | select((.status // "ok") != "ok") | {language, status, module_error, message}]' "${scanner_jsons[@]}" 2>/dev/null || echo '[]')"
+    FAILED_MODULES_JSON="$(jq -s -c '[.[] | select(type=="object") | select((.status // "ok") != "ok") | {language, status, module_error, message}
+      + (if (.analysis_errors|type) == "array" then {analysis_errors} else {} end)]' "${scanner_jsons[@]}" 2>/dev/null || echo '[]')"
     [[ "$FAILED_MODULES_JSON" != "[]" ]] && RUN_STATUS="partial"
     USABLE_SCANNERS="$(jq -s -c '[.[] | select(type=="object") | select((.status // "ok") == "ok" or .status == "partial")] | length' "${scanner_jsons[@]}" 2>/dev/null || echo 0)"
     USABLE_SCANNERS="${USABLE_SCANNERS:-0}"

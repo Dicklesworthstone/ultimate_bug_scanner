@@ -3411,6 +3411,199 @@ apply(eval, sys.argv[1])
                          'A naturally exhausted scan must not admit partial cache entries')
 
 
+class SemanticFailureCompletionTests(unittest.TestCase):
+    """An unsupported body must not hide independent established findings."""
+
+    def incomplete(self, source):
+        engine = taint_py._Analysis(ast.parse(source))
+        with self.assertRaisesRegex(AnalysisLimit, 'incomplete') as caught:
+            engine.analyze()
+        return engine, caught.exception
+
+    def sites(self, error):
+        return {key[:3] for key in error.effects}
+
+    def test_semantic_failure_keeps_later_independent_scopes(self):
+        source = ('def unsupported(value):\n'
+                  '    pending=(value for item in [0])\n'
+                  '    value="fixed"\n'
+                  '    return next(pending)\n'
+                  'def clean():\n'
+                  '    eval("fixed")\n'
+                  'def vulnerable():\n'
+                  '    eval(input())\n')
+        engine, error = self.incomplete(source)
+        self.assertEqual(self.sites(error), {('eval', 8, 5)})
+        self.assertEqual({fn.name for fn in engine.failed_scopes}, {'unsupported'})
+        self.assertTrue(engine.failed_summaries[next(iter(engine.failed_scopes))].incomplete)
+        self.assertGreater(engine.budget.remaining, 0)
+        self.assertEqual(len(error.components), 1)
+        self.assertEqual(error.components[0]['symbol'], 'unsupported')
+        self.assertEqual((error.components[0]['start_line'], error.components[0]['end_line']), (1, 4))
+        self.assertIn('live delayed reads', error.components[0]['reason'])
+
+    def test_incomplete_return_never_reuses_a_sanitizer_proof(self):
+        helper = ('import html\n'
+                  'def transform(value):\n'
+                  '    if choice:\n'
+                  '        return html.escape(value)\n'
+                  '    pending=(value for item in [0])\n'
+                  '    value="fixed"\n'
+                  '    return next(pending)\n')
+        for value, expected in (('input()', {('xss', 8, 1)}), ('"fixed"', set())):
+            with self.subTest(value=value):
+                engine, error = self.incomplete(helper + 'HttpResponse(transform(' + value + '))\n')
+                self.assertEqual(self.sites(error), expected)
+                for fact in error.effects.values():
+                    self.assertTrue(all(taint_py._INCOMPLETE_PROOF in trace.sanitizers for trace in fact))
+                function = next(fn for fn in engine.functions if fn.name == 'transform')
+                self.assertTrue(all(summary.incomplete for key, summary in engine.summaries.items()
+                                    if (key[0] if isinstance(key, tuple) else key) is function))
+
+    def test_observed_heap_and_global_writes_survive_semantic_failure(self):
+        for dirty in (False, True):
+            source = ('code="fixed"\n'
+                      'def update(box, value):\n'
+                      '    global code\n'
+                      '    code=value\n'
+                      '    box.append(value)\n'
+                      '    pending=(value for item in [0])\n'
+                      '    value="fixed"\n'
+                      'box=[]\n'
+                      'update(box, ' + ('input()' if dirty else '"fixed"') + ')\n'
+                      'eval(code)\n'
+                      'eval(box[0])\n')
+            with self.subTest(dirty=dirty):
+                _engine, error = self.incomplete(source)
+                self.assertEqual(self.sites(error), {('eval', 10, 1), ('eval', 11, 1)} if dirty else set())
+
+    def test_incomplete_framework_providers_drop_return_and_yield_sanitizers(self):
+        for definition, observation in (('def', 'return'), ('async def', 'return'), ('def', 'yield')):
+            for early_return in (False, True):
+                helper = ('from fastapi import Depends\nimport html\n'
+                          + definition + ' transform(value: str):\n')
+                if early_return:
+                    helper += '    if choice:\n        ' + observation + ' html.escape(value)\n'
+                helper += ('    pending=(value for item in [0])\n'
+                           '    value=input()\n'
+                           '    return next(pending)\n')
+                for sink, expected in (('HttpResponse(code)', {'xss'}),
+                                       ('HttpResponse(html.escape(code))', set()),
+                                       ('eval(code)', {'eval'})):
+                    source = helper + 'def endpoint(code=Depends(transform)):\n    ' + sink + '\n'
+                    with self.subTest(definition=definition, observation=observation,
+                                      early_return=early_return, sink=sink):
+                        _engine, error = self.incomplete(source)
+                        self.assertEqual({kind for kind, _line, _col in self.sites(error)}, expected)
+                        if expected:
+                            self.assertEqual({line for _kind, line, _col in self.sites(error)},
+                                             {len(source.splitlines())})
+
+    def test_constant_only_incomplete_framework_provider_does_not_invent_input(self):
+        source = ('from fastapi import Depends\n'
+                  'def transform():\n'
+                  '    value="fixed"\n'
+                  '    pending=(value for item in [0])\n'
+                  '    value="safe"\n'
+                  '    return next(pending)\n'
+                  'def endpoint(code=Depends(transform)):\n'
+                  '    eval(code)\n')
+        _engine, error = self.incomplete(source)
+        self.assertEqual(self.sites(error), set())
+
+    def test_complete_downstream_dependency_can_establish_fresh_sanitizer_proof(self):
+        helper = ('from fastapi import Depends\nimport html\n'
+                  'def transform(value: str):\n'
+                  '    pending=(value for item in [0])\n'
+                  '    value=input()\n'
+                  '    return next(pending)\n'
+                  'def escaped(code=Depends(transform)):\n'
+                  '    return html.escape(code)\n'
+                  'def forwarded(code=Depends(escaped)):\n'
+                  '    return code\n')
+        for sink, expected in (('HttpResponse(code)', set()), ('eval(code)', {'eval'})):
+            with self.subTest(sink=sink):
+                source = helper + 'def endpoint(code=Depends(forwarded)):\n    ' + sink + '\n'
+                _engine, error = self.incomplete(source)
+                self.assertEqual({kind for kind, _line, _col in self.sites(error)}, expected)
+
+    def test_imported_provider_quarantine_overrides_restored_shared_summary(self):
+        root = Path('/__ubs_incomplete_framework_provider__')
+        sources = {
+            root / 'aa_lib.py': ('import html\nfrom fastapi import Query\n'
+                                'def provide(callback, key=Query()):\n'
+                                '    return html.escape(callback()[key])\n'),
+            root / 'bb_bad.py': 'from aa_lib import provide\nprovide(globals,input())\n',
+            root / 'zz_route.py': ('from fastapi import Depends\nfrom aa_lib import provide\n'
+                                  'def endpoint(code=Depends(provide)):\n'
+                                  '    HttpResponse(code)\n'
+                                  'def independent():\n    eval(input())\n'),
+        }
+        with patch.object(taint_py, '_parse_source',
+                          side_effect=lambda path: (sources[path], ast.parse(sources[path]))):
+            project = taint_py._Project(list(sources), root)
+        findings = []
+        with self.assertRaises(AnalysisLimit):
+            findings.extend(project.findings())
+        self.assertEqual({(path.name, rule, line) for path, rule, line, _col, _description in findings},
+                         {('zz_route.py', 'py.taint.xss', 4), ('zz_route.py', 'py.taint.eval', 6)})
+        owner = next(engine for path, _text, engine, _offset in project.sources if path.name == 'aa_lib.py')
+        provider = next(fn for fn in owner.functions if fn.name == 'provide')
+        self.assertTrue(owner.failed_summaries[provider].incomplete)
+        self.assertFalse(owner.summaries[provider].incomplete,
+                         'This control must exercise rollback to the earlier shared summary')
+
+    def test_all_failed_scopes_retain_untruncated_structured_locations(self):
+        lines = []
+        for index in range(12):
+            lines.extend((f'def unsupported_{index}(value):',
+                          '    pending=(value for item in [0])',
+                          '    value="fixed"'))
+        lines.extend(('def independent():', '    eval(input())'))
+        _engine, error = self.incomplete('\n'.join(lines) + '\n')
+        self.assertEqual(self.sites(error), {('eval', 38, 5)})
+        self.assertIn('4 more failed scopes', str(error))
+        self.assertEqual({item['symbol'] for item in error.components},
+                         {f'unsupported_{index}' for index in range(12)})
+        for item in error.components:
+            index = int(item['symbol'].rsplit('_', 1)[1])
+            self.assertEqual((item['start_line'], item['end_line']), (3 * index + 1, 3 * index + 3))
+
+    def test_project_diagnostics_keep_every_input_and_source_coordinate(self):
+        root = Path('/__ubs_semantic_failure_components__')
+        sources = {root / f'bad{index}.py': 'def broken(:\n' for index in range(5)}
+        sources[root / 'scoped.py'] = ('class Handler:\n'
+                                      '    def unsupported(self, value):\n'
+                                      '        pending=(value for item in [0])\n'
+                                      '        value="fixed"\n'
+                                      'def independent():\n'
+                                      '    eval(input())\n')
+        with patch('tokenize.open', side_effect=lambda path: io.StringIO(sources[path])):
+            project = taint_py._Project(list(sources), root)
+        findings = []
+        with self.assertRaises(AnalysisLimit) as caught:
+            findings.extend(project.findings())
+        self.assertEqual({(path.name, rule, line) for path, rule, line, _col, _description in findings},
+                         {('scoped.py', 'py.taint.eval', 6)})
+        components = caught.exception.components
+        self.assertEqual(len(components), 6)
+        self.assertEqual({Path(item['file']).name for item in components},
+                         {'bad0.py', 'bad1.py', 'bad2.py', 'bad3.py', 'bad4.py', 'scoped.py'})
+        function = next(item for item in components if item['symbol'] != '<module>')
+        self.assertEqual(function['symbol'], 'Handler.unsupported')
+        self.assertEqual((function['start_line'], function['end_line']), (2, 4))
+
+    def test_total_budget_failure_is_not_reclassified_as_a_recoverable_scope(self):
+        engine = taint_py._Analysis(ast.parse('def later():\n    eval(input())\n'))
+        engine.budget.remaining = 0
+        with self.assertRaisesRegex(AnalysisLimit, 'UBS_PYTHON_FLOW_MAX_STEPS') as caught:
+            engine.analyze()
+        self.assertFalse(engine.failed_scopes)
+        self.assertLess(engine.budget.remaining, 0)
+        self.assertEqual(len(caught.exception.components), 1)
+        self.assertEqual(caught.exception.components[0]['symbol'], '<module>')
+
+
 class PythonInputAdmissionTests(unittest.TestCase):
     """Real source decoding and partial results, without filesystem fixtures."""
 

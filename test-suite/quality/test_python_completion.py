@@ -22,6 +22,7 @@ sys.path.insert(0, str(HELPERS))
 from ubs_core import analyzers, py_detectors, py_patterns, py_scan
 from ubs_core.cache import CapturingSink, ScanCache
 from ubs_core.registry import Analyzer, analyzers_for_lang
+from ubs_core.taint_flow import AnalysisLimit
 
 
 class PythonCompletionTests(unittest.TestCase):
@@ -137,6 +138,112 @@ class PythonCompletionTests(unittest.TestCase):
             result = self.scan(files=[self.source, second])
         self.assert_partial(result, "project pass failed")
         self.assertEqual(observed, [[self.source, second]])
+
+    def test_analyzer_failure_preserves_every_structured_component(self):
+        components = [{"file": str(self.source), "symbol": f"Worker.method_{index}",
+                       "start_line": index + 1, "end_line": index + 2,
+                       "reason": f"unsupported operation {index}: " + "details " * 100}
+                      for index in range(9)]
+
+        def run(ctx):
+            yield self.finding(ctx, "python.taint.probe")
+            raise AnalysisLimit("nine independent scopes could not finish", components=components)
+
+        with patch("ubs_core.registry.analyzers_for_lang", return_value=[
+                Analyzer("taint", "python", "taint_py", run)]):
+            result = self.scan()
+        self.assert_partial(result, "nine independent scopes")
+        self.assertEqual(result[1]["analysis_errors"], [{
+            "stage": f"taint_py ({self.source})", "exception_type": "AnalysisLimit",
+            "message": "nine independent scopes could not finish", "components": components,
+        }])
+        self.assertIn("python.taint.probe", {row["rule"] for row in result[2]})
+
+    def test_detector_worker_preserves_structured_failure_metadata(self):
+        components = [{"file": str(self.source), "symbol": "query", "start_line": 2,
+                       "end_line": 8, "reason": "unresolved callback"}]
+
+        def broken(files):
+            yield files[0], 2, 1, "finding before failure"
+            raise AnalysisLimit("incomplete SQL coverage", components=components)
+
+        output = io.StringIO()
+        request = json.dumps(["sql_injection", [str(self.source)], None])
+        with patch("ubs_core.py_detectors.sql_injection.find", side_effect=broken), \
+                patch.object(sys, "stdin", io.StringIO(request)), contextlib.redirect_stdout(output):
+            py_scan._detector_worker()
+        records, errors, invalid = py_scan._detector_response(output.getvalue().encode())
+        self.assertIsNone(invalid)
+        self.assertTrue(records)
+        self.assertEqual(py_scan._error_records(errors), [{
+            "stage": "detector sql_injection", "exception_type": "AnalysisLimit",
+            "message": "incomplete SQL coverage", "components": components,
+        }])
+        for component in (None, {"file": "sample.py"},
+                          {**components[0], "start_line": 0},
+                          {**components[0], "end_line": True}):
+            with self.subTest(component=component):
+                detail = {**py_scan._error_records(errors)[0], "components": [component]}
+                wire = (json.dumps(["complete", [detail]]) + "\n").encode()
+                _records, _errors, invalid = py_scan._detector_response(wire)
+                self.assertIsNotNone(invalid)
+
+    @unittest.skipUnless(shutil.which("jq") and shutil.which("rg"), "public UBS requires jq and ripgrep")
+    def test_public_reports_keep_all_failed_components_and_independent_findings(self):
+        project = self.root / "project"
+        project.mkdir()
+        for index in range(5):
+            (project / f"boundary_{index}.py").write_text(
+                f"def update_{index}(key):\n    globals()[key] = 1\n", encoding="utf-8")
+        (project / "vulnerable.py").write_text("eval(input())\n", encoding="utf-8")
+        (project / "safe.sh").write_text("#!/bin/bash\nprintf '%s\\n' ok\n", encoding="utf-8")
+        expected = {f"boundary_{index}.py" for index in range(5)}
+        for languages in ("python", "python,bash"):
+            for output_format in ("json", "jsonl", "sarif"):
+                with self.subTest(languages=languages, format=output_format):
+                    command = [str(REPO_ROOT / "ubs"), "--ci", "--only=" + languages,
+                               "--format=" + output_format, str(project)]
+                    proc = subprocess.run(command, cwd=self.root, env=self.env, text=True,
+                                          capture_output=True, timeout=120)
+                    prefix = self.root / f"components-{languages}-{output_format}"
+                    prefix.with_suffix(".stdout").write_text(proc.stdout)
+                    prefix.with_suffix(".stderr").write_text(proc.stderr)
+                    detail = proc.stdout + proc.stderr
+                    self.assertEqual(proc.returncode, 2, detail)
+                    if output_format == "json":
+                        doc = self.decode_json(proc.stdout, str(prefix))
+                        self.assertEqual(doc["status"], "partial", detail)
+                        python = next(row for row in doc["scanners"] if row["language"] == "python")
+                        failed = next(row for row in doc["failed_modules"] if row["language"] == "python")
+                        diagnostics = python["analysis_errors"]
+                        self.assertEqual(diagnostics, failed["analysis_errors"], detail)
+                        rules = {row["rule_id"] for row in doc["findings"]}
+                    elif output_format == "jsonl":
+                        rows = [self.decode_json(line, str(prefix)) for line in proc.stdout.splitlines()]
+                        python = next(row for row in rows if row["type"] == "scanner"
+                                      and row["language"] == "python")
+                        diagnostics = python["analysis_errors"]
+                        failed = next(row for row in rows[-1]["failed_modules"] if row["language"] == "python")
+                        self.assertEqual(diagnostics, failed["analysis_errors"], detail)
+                        rules = {row["rule_id"] for row in rows if row["type"] == "finding"}
+                    else:
+                        doc = self.decode_json(proc.stdout, str(prefix))
+                        notifications = doc["runs"][0]["invocations"][0]["toolExecutionNotifications"]
+                        diagnostics = next(row["properties"]["analysis_errors"] for row in notifications
+                                           if row["message"]["text"].startswith("python:"))
+                        rules = {row["ruleId"] for run in doc["runs"] for row in run["results"]}
+                    components = [component for error in diagnostics if error["stage"].startswith("taint_py")
+                                  for component in error["components"]]
+                    self.assertEqual({Path(row["file"]).name for row in components}, expected, detail)
+                    self.assertEqual(len(components), 5, detail)
+                    for row in components:
+                        self.assertEqual(row["start_line"], 1, detail)
+                        self.assertEqual(row["end_line"], 2, detail)
+                        self.assertTrue(row["symbol"].startswith("update_"), detail)
+                        self.assertIn("dynamic globals mapping key", row["reason"], detail)
+                    self.assertIn("python.taint.eval", rules, detail)
+                    if languages == "python":
+                        self.assertFalse(list((self.root / "cache").glob("*/files/**/*.json")))
 
     def test_recovery_after_project_failure_is_cold_then_reusable(self):
         fail = True

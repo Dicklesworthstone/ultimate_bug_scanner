@@ -2520,6 +2520,10 @@ SQL_RISK_ORDER = {None: 0, 'warning': 1, 'critical': 2}
 class SQLFlowLimit(RuntimeError):
     """The bounded SQL pass could not establish a complete result."""
 
+    def __init__(self, message, *, components=()):
+        super().__init__(message)
+        self.components = tuple(components)
+
 
 class SQLNoNormalReturn(Exception):
     """Internal bottom edge while solving a recursive return summary."""
@@ -2747,6 +2751,20 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                     and not self.ownership_bindings().covered_sql_method_escape(node)):
                 raise SQLFlowLimit('SQL execution callable escapes its modeled binding; analysis is incomplete')
             return result
+        except SQLFlowLimit as exc:
+            if not exc.components:
+                component = {
+                    'symbol': '.'.join(getattr(scope, 'name', '<lambda>')
+                                       for scope in self._generator_scope
+                                       if isinstance(scope, (ast.ClassDef, ast.FunctionDef,
+                                                             ast.AsyncFunctionDef, ast.Lambda))) or '<module>',
+                    'reason': str(exc),
+                }
+                if getattr(node, 'lineno', None) is not None:
+                    component['start_line'] = node.lineno
+                    component['end_line'] = getattr(node, 'end_lineno', None) or node.lineno
+                exc.components = (component,)
+            raise
         finally:
             self._binding_site = previous
 
@@ -8009,71 +8027,101 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             self._sink_risks[id(node)] = (worst, node.lineno, source_line(self.lines, node.lineno))
 
 
+def _find_file(path: Path, *, max_steps=None) -> Iterable[tuple[str, Path, int, int, str]]:
+    """Analyze one independent source, retaining findings before a refusal."""
+    try:
+        with tokenize.open(path) as stream:
+            text = stream.read()
+        tree = ast.parse(text, filename=str(path))
+    except (OSError, UnicodeError, SyntaxError) as exc:
+        reason = f'Cannot analyze Python SQL source {path}: {exc}; analysis is incomplete'
+        component = {'file': str(path), 'symbol': '<module>', 'reason': reason}
+        if getattr(exc, 'lineno', None) is not None:
+            component['start_line'] = exc.lineno
+            component['end_line'] = getattr(exc, 'end_lineno', None) or exc.lineno
+        raise SQLFlowLimit(reason, components=(component,)) from exc
+    # Every emitted SQL finding goes through this same sink predicate.
+    # Walk all syntax, including deferred bodies and definition-time calls;
+    # a matching name admits full analysis regardless of its arguments.
+    # Decode and parse failures above must remain incomplete even when no
+    # sink can be recognized. Applicable SQL flow keeps its ordinary budget.
+    nodes = tuple(ast.walk(tree))
+    if not any(isinstance(node, ast.Call) and (sql_sink_name(node) or reflected_sql_name(node)
+                   or any(isinstance(argument, ast.Constant) and isinstance(argument.value, str)
+                          and argument.value in EXECUTE_METHODS | {'extra'} for argument in node.args[:2]))
+               or isinstance(node, ast.Attribute) and node.attr in EXECUTE_METHODS | {'extra'}
+               or isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in EXECUTE_METHODS | {'extra'}
+               or isinstance(node, ast.ImportFrom) and any(
+                   alias.name in EXECUTE_METHODS | {'extra'} for alias in node.names)
+               for node in nodes):
+        return
+    lines = text.splitlines()
+    param_names, name_risk = build_provenance(tree)
+    sanitizers = configured_sanitizers()
+    # The mandatory lexical index is linear in source size. Keep the
+    # ordinary small-file allowance, scale that floor for large modules,
+    # and retain a hard ceiling. Explicit caller budgets remain exact.
+    steps = max_steps if max_steps is not None else min(1_000_000, max(100_000, 2 * len(nodes)))
+    budget = [steps]
+    bindings = SanitizerBindings(tree, configured_sanitizer_targets(), budget)
+    if (not any(sql_sink_name(call, bindings) or bindings.unresolved_sql_aliases(call)
+                for call in bindings.calls) and not bindings.sql_facade_flow()[1]
+            and not bindings.escaped_sql_methods()):
+        return
+    summaries = build_sanitizer_summaries(tree, sanitizers, text=text, budget=budget, bindings=bindings)
+    analyzer = SQLInjectionAnalyzer(
+        text,
+        lines,
+        param_names,
+        name_risk,
+        sanitizers,
+        summaries,
+        max_steps=steps,
+        budget=budget,
+        bindings=bindings,
+    )
+    analyzer._literal_statement_scopes = analyzer.literal_statement_scopes()
+    failure = None
+    try:
+        analyzer.visit(tree)
+    except SQLFlowLimit as exc:
+        # The registry already retains streamed findings when a detector
+        # fails. Preserve the evidence discovered before the unsupported
+        # flow, then propagate the original incomplete-analysis error.
+        failure = exc
+    suppressions = build_index(text, "python") if may_have_markers(text) else SuppressionIndex()
+    for line_no, code in analyzer.issues:
+        if not suppressions.is_suppressed(line_no, RULE_CRITICAL):
+            yield RULE_CRITICAL, path, line_no, 1, code[:240]
+    for line_no, code in analyzer.warn_issues:
+        if not suppressions.is_suppressed(line_no, RULE_WARNING):
+            yield RULE_WARNING, path, line_no, 1, code[:240]
+    if failure is not None:
+        raise failure
+
+
 def find(files: Sequence[Path], *, max_steps=None) -> Iterable[tuple[str, Path, int, int, str]]:
+    """Keep independent files visible while reporting every incomplete source.
+
+    Each source owns its bindings, flow state and budget. A refusal cannot
+    certify that source, but must not discard later files' proven findings.
+    The final exception preserves fail-closed completion and an untruncated
+    component list independently of the bounded human-readable examples.
+    """
+    failures = []
     for path in files:
         if path.suffix.lower() not in {'.py', '.pyi'}:
             continue
         try:
-            with tokenize.open(path) as stream:
-                text = stream.read()
-            tree = ast.parse(text, filename=str(path))
-        except (OSError, UnicodeError, SyntaxError) as exc:
-            raise SQLFlowLimit(f'Cannot analyze Python SQL source {path}: {exc}; analysis is incomplete') from exc
-        # Every emitted SQL finding goes through this same sink predicate.
-        # Walk all syntax, including deferred bodies and definition-time calls;
-        # a matching name admits full analysis regardless of its arguments.
-        # Decode and parse failures above must remain incomplete even when no
-        # sink can be recognized. Applicable SQL flow keeps its ordinary budget.
-        nodes = tuple(ast.walk(tree))
-        if not any(isinstance(node, ast.Call) and (sql_sink_name(node) or reflected_sql_name(node)
-                       or any(isinstance(argument, ast.Constant) and isinstance(argument.value, str)
-                              and argument.value in EXECUTE_METHODS | {'extra'} for argument in node.args[:2]))
-                   or isinstance(node, ast.Attribute) and node.attr in EXECUTE_METHODS | {'extra'}
-                   or isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in EXECUTE_METHODS | {'extra'}
-                   or isinstance(node, ast.ImportFrom) and any(
-                       alias.name in EXECUTE_METHODS | {'extra'} for alias in node.names)
-                   for node in nodes):
-            continue
-        lines = text.splitlines()
-        param_names, name_risk = build_provenance(tree)
-        sanitizers = configured_sanitizers()
-        # The mandatory lexical index is linear in source size. Keep the
-        # ordinary small-file allowance, scale that floor for large modules,
-        # and retain a hard ceiling. Explicit caller budgets remain exact.
-        steps = max_steps if max_steps is not None else min(1_000_000, max(100_000, 2 * len(nodes)))
-        budget = [steps]
-        bindings = SanitizerBindings(tree, configured_sanitizer_targets(), budget)
-        if (not any(sql_sink_name(call, bindings) or bindings.unresolved_sql_aliases(call)
-                    for call in bindings.calls) and not bindings.sql_facade_flow()[1]
-                and not bindings.escaped_sql_methods()):
-            continue
-        summaries = build_sanitizer_summaries(tree, sanitizers, text=text, budget=budget, bindings=bindings)
-        analyzer = SQLInjectionAnalyzer(
-            text,
-            lines,
-            param_names,
-            name_risk,
-            sanitizers,
-            summaries,
-            max_steps=steps,
-            budget=budget,
-            bindings=bindings,
-        )
-        analyzer._literal_statement_scopes = analyzer.literal_statement_scopes()
-        failure = None
-        try:
-            analyzer.visit(tree)
+            yield from _find_file(path, max_steps=max_steps)
         except SQLFlowLimit as exc:
-            # The registry already retains streamed findings when a detector
-            # fails. Preserve the evidence discovered before the unsupported
-            # flow, then propagate the original incomplete-analysis error.
-            failure = exc
-        suppressions = build_index(text, "python") if may_have_markers(text) else SuppressionIndex()
-        for line_no, code in analyzer.issues:
-            if not suppressions.is_suppressed(line_no, RULE_CRITICAL):
-                yield RULE_CRITICAL, path, line_no, 1, code[:240]
-        for line_no, code in analyzer.warn_issues:
-            if not suppressions.is_suppressed(line_no, RULE_WARNING):
-                yield RULE_WARNING, path, line_no, 1, code[:240]
-        if failure is not None:
-            raise failure
+            components = exc.components or ({'symbol': '<module>', 'reason': str(exc)},)
+            failures.extend(dict(component, file=str(path)) for component in components)
+    if failures:
+        if len(failures) == 1:
+            raise SQLFlowLimit(failures[0]['reason'], components=failures)
+        examples = '; '.join(f"{component['file']}:{component['symbol']}: {component['reason']}"
+                             for component in failures[:3])
+        omitted = f'; and {len(failures) - 3} more failed files' if len(failures) > 3 else ''
+        raise SQLFlowLimit(f'Python SQL analysis is incomplete in {len(failures)} file(s): '
+                           + examples + omitted, components=failures)

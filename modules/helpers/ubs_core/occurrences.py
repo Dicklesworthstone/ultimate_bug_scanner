@@ -26,7 +26,7 @@ SOURCE_WORK_LIMIT = 256 * 1024 * 1024
 MAX_RULE_SUMMARIES = 10000
 _SCANNER_KEYS = frozenset({
     "language", "status", "files", "critical", "warning", "info", "timestamp",
-    "module_error", "message", "version", "module_timeout_secs",
+    "module_error", "message", "version", "module_timeout_secs", "analysis_errors",
 })
 _DOCUMENT_KEYS = frozenset({
     "project", "timestamp", "status", "failed_modules", "module_error",

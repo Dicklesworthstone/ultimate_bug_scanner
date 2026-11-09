@@ -1388,6 +1388,72 @@ class SQLValueCaptureTests(unittest.TestCase):
         self._assert_known_sql_before_incomplete('known-before-incomplete', incomplete_program(), 2)
         self._assert_known_sql_before_incomplete('closure-before-incomplete', incomplete_closure_program(), 4)
 
+    def test_incomplete_files_keep_independent_findings_and_all_components(self):
+        broken = []
+        for index in range(5):
+            path = self.artifacts / f'independent-partial-{index}.py'
+            path.write_text(incomplete_program(), encoding='utf-8')
+            broken.append(path)
+        unsafe = self.artifacts / 'independent-unsafe.py'
+        unsafe_source = program('    return cursor.execute('
+                                'f"SELECT count(*) FROM users WHERE name = \'{user}\'").fetchone()[0]\n')
+        unsafe.write_text(unsafe_source, encoding='utf-8')
+        clean = self.artifacts / 'independent-clean.py'
+        clean.write_text(program('    cursor.execute("SELECT ?", (user,))\n'), encoding='utf-8')
+        self.assertEqual(sqlite_witness(self.artifacts, 'independent-later-sql', unsafe_source)['rows'], 2)
+        for files in ([*broken, unsafe, clean], [unsafe, *reversed(broken), clean]):
+            findings = []
+            with self.subTest(order=[path.name for path in files]):
+                with self.assertRaises(detector.SQLFlowLimit) as raised:
+                    findings.extend(detector.find(files))
+                self.assertEqual(sorted((rule, path, line) for rule, path, line, _, _ in findings),
+                                 sorted((CRITICAL, path, 2) for path in [*broken, unsafe]))
+                failure = raised.exception
+                self.assertEqual([component['file'] for component in failure.components],
+                                 [str(path) for path in files if path in broken])
+                self.assertEqual(len(failure.components), 5)
+                self.assertIn('and 2 more failed files', str(failure))
+                for component in failure.components:
+                    self.assertEqual(component['symbol'], 'run')
+                    self.assertEqual((component['start_line'], component['end_line']), (5, 5))
+                    self.assertEqual(component['reason'],
+                                     'SQL unknown generator consumer is unsupported; analysis is incomplete')
+
+    def test_unreadable_or_invalid_files_do_not_hide_later_sql(self):
+        syntax = self.artifacts / 'independent-syntax.py'
+        syntax.write_text('def run():\n    return (\n', encoding='utf-8')
+        encoding = self.artifacts / 'independent-encoding.py'
+        encoding.write_bytes(b"# coding: ascii\nvalue = '\xff'\n")
+        missing = self.artifacts / 'independent-missing.py'
+        unsafe = self.artifacts / 'independent-after-invalid.py'
+        unsafe.write_text(program('    cursor.execute(f"SELECT {user}")\n'), encoding='utf-8')
+        findings = []
+        with self.assertRaises(detector.SQLFlowLimit) as raised:
+            findings.extend(detector.find([syntax, encoding, missing, unsafe]))
+        self.assertEqual([(rule, path, line) for rule, path, line, _, _ in findings],
+                         [(CRITICAL, unsafe, 2)])
+        self.assertEqual([component['file'] for component in raised.exception.components],
+                         [str(path) for path in (syntax, encoding, missing)])
+        self.assertEqual(raised.exception.components[0]['start_line'], 2)
+        self.assertTrue(all(component['symbol'] == '<module>'
+                            and 'Cannot analyze Python SQL source' in component['reason']
+                            for component in raised.exception.components))
+
+    def test_exhausted_file_does_not_spend_later_files_budget(self):
+        expensive = self.artifacts / 'independent-budget.py'
+        expensive.write_text('def run(cursor, user):\n' + '    value = 1\n' * 400
+                             + '    cursor.execute(f"SELECT {user}")\n', encoding='utf-8')
+        unsafe = self.artifacts / 'independent-after-budget.py'
+        unsafe.write_text(program('    cursor.execute(f"SELECT {user}")\n'), encoding='utf-8')
+        findings = []
+        with self.assertRaises(detector.SQLFlowLimit) as raised:
+            findings.extend(detector.find([expensive, unsafe], max_steps=1_000))
+        self.assertEqual([(rule, path, line) for rule, path, line, _, _ in findings],
+                         [(CRITICAL, unsafe, 2)])
+        self.assertEqual(len(raised.exception.components), 1)
+        self.assertEqual(raised.exception.components[0]['file'], str(expensive))
+        self.assertIn('budget exceeded', raised.exception.components[0]['reason'])
+
     def _assert_known_sql_before_incomplete(self, name, source, sink_line):
         from ubs_core.py_scan import _detector_job
 
@@ -1414,7 +1480,17 @@ class SQLValueCaptureTests(unittest.TestCase):
         self._assert_partial_cli('partial', incomplete_program(), 2)
         self._assert_partial_cli('closure-partial', incomplete_closure_program(), 4)
 
-    def _assert_partial_cli(self, name, source, sink_line):
+    @unittest.skipUnless((ROOT / 'ubs').is_file(), 'real CLI requires full checkout')
+    def test_real_cli_keeps_sql_findings_after_incomplete_files(self):
+        # Eight sources also exercise the parallel detector worker protocol.
+        sources = {f'error-{index}.py': (program('    min(row for row in rows)\n'
+                                                '    cursor.execute("SELECT 1")\n'), ())
+                   for index in range(5)}
+        sources['z-unsafe.py'] = (program('    cursor.execute(f"SELECT {user}")\n'), (2,))
+        sources['z-safe.py'] = (program('    cursor.execute("SELECT ?", (user,))\n'), ())
+        self._assert_partial_cli('independent-partial', incomplete_program(), 2, sources=sources)
+
+    def _assert_partial_cli(self, name, source, sink_line, *, sources=None):
         for entry in ('ubs', 'modules/ubs-python.sh'):
             for fmt in ('json', 'sarif'):
                 with self.subTest(entry=entry, format=fmt):
@@ -1422,6 +1498,10 @@ class SQLValueCaptureTests(unittest.TestCase):
                     folder.mkdir()
                     path = folder / 'case.py'
                     path.write_text(source, encoding='utf-8')
+                    expected = [('case.py', sink_line)]
+                    for filename, (body, lines) in (sources or {}).items():
+                        (folder / filename).write_text(body, encoding='utf-8')
+                        expected.extend((filename, line) for line in lines)
                     for child in ('home', 'cache', 'tmp'):
                         (folder / child).mkdir()
                     env = {key: value for key, value in os.environ.items() if not key.startswith('UBS_')}
@@ -1430,7 +1510,7 @@ class SQLValueCaptureTests(unittest.TestCase):
                                UBS_NO_AUTO_UPDATE='1', ENABLE_UV_TOOLS='0',
                                PYTHONDONTWRITEBYTECODE='1', NO_COLOR='1')
                     command = ['bash', str(ROOT / entry), '--ci', '--no-color', '--format=' + fmt,
-                               '--only=python' if entry == 'ubs' else '--no-uv', str(path)]
+                               '--only=python' if entry == 'ubs' else '--no-uv', str(folder if sources else path)]
                     started = time.perf_counter()
                     try:
                         result = subprocess.run(command, cwd=folder, env=env, capture_output=True,
@@ -1458,16 +1538,19 @@ class SQLValueCaptureTests(unittest.TestCase):
                         scans = report['scanners'] if entry == 'ubs' else [report]
                         self.assertEqual(len(scans), 1)
                         self.assertEqual(scans[0]['status'], 'partial')
-                        lines = [sample['line'] for finding in scans[0]['findings']
-                                 if finding.get('rule_id', finding.get('rule')) == CRITICAL
-                                 for sample in finding['samples']]
+                        actual = [(Path(sample['file']).name, sample['line'])
+                                  for finding in scans[0]['findings']
+                                  if finding.get('rule_id', finding.get('rule')) == CRITICAL
+                                  for sample in finding['samples']]
                     else:
                         self.assertTrue(any(invocation.get('executionSuccessful') is False
                                             for run in report['runs'] for invocation in run.get('invocations', [])))
-                        lines = [finding['locations'][0]['physicalLocation']['region']['startLine']
-                                 for run in report['runs'] for finding in run.get('results', [])
-                                 if finding['ruleId'] == CRITICAL]
-                    self.assertEqual(lines, [sink_line], folder)
+                        locations = [finding['locations'][0]['physicalLocation']
+                                     for run in report['runs'] for finding in run.get('results', [])
+                                     if finding['ruleId'] == CRITICAL]
+                        actual = [(Path(unquote(location['artifactLocation']['uri'])).name,
+                                   location['region']['startLine']) for location in locations]
+                    self.assertEqual(sorted(actual), sorted(expected), folder)
 
     def test_opaque_consumers_use_projected_values_without_advancing_aliases(self):
         cases = (

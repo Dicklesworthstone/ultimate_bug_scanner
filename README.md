@@ -1481,6 +1481,16 @@ and baseline destinations still use the existing atomic publication rules.
 
 **Machine-readable failures**
 
+Python failures include an `analysis_errors` array on the scanner summary and
+its `failed_modules` entry. Each error identifies the `stage`, `exception_type`,
+and full `message`. Its `components` array retains every failed source or scope,
+with `file`, `symbol`, `reason`, and `start_line` / `end_line` when known. These
+arrays are not truncated to the short human-readable examples. JSONL scanner
+and totals records preserve them; SARIF carries them in each failed module's
+notification `properties.analysis_errors`. Findings established before a limit
+and findings from independent Python functions and SQL source files remain
+available, while the scan stays incomplete and exits 2.
+
 In `--format=json|jsonl|sarif|toon` mode every failure is an object on stdout, never
 just text on stderr, so `ubs … --format=json | jq` always has something to parse:
 

@@ -1396,5 +1396,411 @@ class GeneratorProjectTests(unittest.TestCase):
             list(project.findings())
 
 
+class ImmediateGeneratorExpressionTests(SourceTest):
+    def test_materializers_preserve_creation_time_values_and_later_rebindings(self):
+        for collector in ('list', 'tuple'):
+            for initial, later, expected in (
+                ('input()', "'fixed'", ('eval',)),
+                ("'fixed'", 'input()', ()),
+            ):
+                with self.subTest(collector=collector, initial=initial):
+                    self.assert_rules(f'''
+                        def run():
+                            code = {initial}
+                            values = {collector}(code for unused in [0])
+                            code = {later}
+                            eval(values[0])
+                        run()
+                    ''', *expected)
+
+    def test_walrus_global_writes_follow_actual_iteration_order(self):
+        cases = (
+            ("'fixed'", "[input()]", ('eval',)),
+            ('input()', "['fixed']", ()),
+            ('input()', '[]', ('eval',)),
+            ("'fixed'", "[input(), 'fixed']", ()),
+            ("'fixed'", "['fixed', input()]", ('eval',)),
+        )
+        for collector in ('list', 'tuple'):
+            for initial, iterable, expected in cases:
+                with self.subTest(collector=collector, iterable=iterable):
+                    self.assert_rules(f'''
+                        code = {initial}
+                        values = {collector}((code := value) for value in {iterable})
+                        eval(code)
+                    ''', *expected)
+
+    def test_global_and_nonlocal_helper_writes_run_during_consumption(self):
+        self.assert_rules('''
+            code = 'fixed'
+            def replace():
+                global code
+                code = input()
+                return 'done'
+            values = list(replace() for unused in [0])
+            eval(code)
+        ''', 'eval')
+        self.assert_rules('''
+            def run():
+                code = 'fixed'
+                def replace():
+                    nonlocal code
+                    code = input()
+                    return 'done'
+                values = tuple(replace() for unused in [0])
+                eval(code)
+            run()
+        ''', 'eval')
+
+    def test_outer_iterable_is_evaluated_exactly_once(self):
+        # A second evaluation would replace the captured unsafe value with
+        # the already cleaned global and incorrectly lose the real flow.
+        self.assert_rules('''
+            code = input()
+            previous = 'fixed'
+            def items():
+                global previous, code
+                previous = code
+                code = 'fixed'
+                return [0]
+            values = list(previous for unused in items())
+            eval(values[0])
+        ''', 'eval')
+
+    def test_filters_preserve_writes_and_skip_unreachable_bodies(self):
+        self.assert_rules('''
+            code = 'fixed'
+            values = list((code := input()) for unused in [0] if False)
+            eval(code)
+        ''')
+        self.assert_rules('''
+            code = 'fixed'
+            values = tuple('fixed' for unused in [0] if (code := input()))
+            eval(code)
+        ''', 'eval')
+
+    def test_exceptional_exhaustion_keeps_writes_before_the_throw(self):
+        for header in ('list(replace() for unused in [0])',
+                       "tuple('fixed' for unused in [0] if replace())"):
+            with self.subTest(header=header):
+                self.assert_rules(f'''
+                    code = 'fixed'
+                    def replace():
+                        global code
+                        code = input()
+                        raise ValueError('stop')
+                    try:
+                        {header}
+                    except ValueError:
+                        eval(code)
+                ''', 'eval')
+
+    def test_known_collection_alias_keeps_primitive_snapshots(self):
+        self.assert_rules('''
+            code = input()
+            parts = [code, 'fixed']
+            code = 'fixed'
+            values = tuple(value for value in parts)
+            eval(values[0])
+        ''', 'eval')
+
+    def test_materializer_aliases_preserve_the_original_callable(self):
+        self.assert_rules('''
+            collect = list
+            code = 'fixed'
+            values = collect((code := input()) for unused in [0])
+            eval(code)
+        ''', 'eval')
+        self.assert_rules('''
+            from builtins import tuple as collect
+            code = 'fixed'
+            values = collect((code := 'changed') for unused in [0])
+            code = input()
+            eval(values[0])
+        ''')
+        self.assert_rules('''
+            import builtins
+            code = 'fixed'
+            values = builtins.list(code for unused in [0])
+            code = input()
+            eval(values[0])
+        ''')
+
+    def test_reflectively_replaced_materializers_remain_deferred(self):
+        for replacement in (
+            "import builtins\nbuiltins.__setattr__('list', Delayed())",
+            "print.__self__.__setattr__('list', Delayed())",
+            "from operator import attrgetter as acquire\nacquire('__self__.__setattr__')(print)('list', Delayed())",
+            "from builtins import vars as namespace\nnamespace(print.__self__)['list'] = Delayed()",
+        ):
+            source = '''
+                saved = None
+                class Delayed:
+                    def __call__(self, values):
+                        global saved
+                        saved = values
+                        return ()
+            '''
+            source = textwrap.dedent(source) + replacement
+            source += "\ncode = 'fixed'\nvalues = list(code for unused in [0])\ncode = input()\neval(next(saved))\n"
+            # Reflection really replaces the builtin, so isolate and restore
+            # it around the native semantic control rather than the test runner.
+            runtime = (
+                'import builtins\noriginal = builtins.list\nobserved = []\n'
+                "namespace = {'input': lambda: 'MARKER', 'eval': observed.append}\n"
+                f'try:\n    exec({source!r}, namespace)\n'
+                'finally:\n    builtins.list = original\n'
+                "assert observed == ['MARKER'], observed\n"
+            )
+            with self.subTest(replacement=replacement):
+                subprocess.run([sys.executable, '-I', '-c', runtime], capture_output=True, text=True, check=True)
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                    self.scan(source)
+
+    def test_custom_class_namespace_does_not_certify_a_builtin(self):
+        source = '''
+            saved = None
+            class Delayed:
+                def __call__(self, values):
+                    global saved
+                    saved = values
+                    return ()
+            class Namespace(dict):
+                def __missing__(self, name):
+                    if name == 'list':
+                        return Delayed()
+                    raise KeyError(name)
+            class Meta(type):
+                @classmethod
+                def __prepare__(metacls, name, bases):
+                    return Namespace()
+            code = 'fixed'
+            class Box(metaclass=Meta):
+                values = list(code for unused in [0])
+            code = input()
+            eval(next(saved))
+        '''
+        observed = []
+        exec(textwrap.dedent(source), {'input': lambda: 'MARKER', 'eval': observed.append})
+        self.assertEqual(observed, ['MARKER'])
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+            self.scan(source)
+
+    def test_owned_finalizers_and_opaque_iteration_remain_incomplete(self):
+        for expression in (
+            "list(Release() for unused in [0])",
+            "tuple('fixed' for unused in [Release()])",
+            "list(value for value in unknown)",
+            "list('fixed' for value in [0] if Release())",
+        ):
+            source = f'''
+                code = 'fixed'
+                class Release:
+                    def __del__(self):
+                        global code
+                        code = input()
+                    def __bool__(self):
+                        global code
+                        code = input()
+                        return True
+                {expression}
+                eval(code)
+            '''
+            with self.subTest(expression=expression), self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                self.scan(source)
+
+    def test_helper_owned_finalizers_remain_incomplete_on_both_exits(self):
+        for ending in ("return 'done'", "raise ValueError('stop')"):
+            source = f'''
+                code = 'fixed'
+                tainted = input()
+                class Release:
+                    def __del__(self):
+                        global code
+                        code = tainted
+                def replace():
+                    global code
+                    owned = Release()
+                    code = 'fixed'
+                    {ending}
+                try:
+                    values = list(replace() for unused in [0])
+                except ValueError:
+                    pass
+                eval(code)
+            '''
+            with self.subTest(ending=ending):
+                observed = []
+                exec(textwrap.dedent(source), {'input': lambda: 'MARKER', 'eval': observed.append})
+                self.assertEqual(observed, ['MARKER'])
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                    self.scan(source)
+
+    def test_helper_defaults_and_transitive_frames_require_lifetime_proofs(self):
+        for declaration, expression in (
+            ('''
+                def replace(unused=Release()):
+                    global code
+                    code = 'fixed'
+                    return 'done'
+                ''', "replace('overridden')"),
+            ('''
+                def inner():
+                    owned = Release()
+                    return 'done'
+                def replace():
+                    global code
+                    code = 'fixed'
+                    return inner()
+                ''', 'replace()'),
+        ):
+            prefix = '''
+                code = 'fixed'
+                class Release:
+                    def __del__(self):
+                        global code
+                        code = input()
+            '''
+            source = textwrap.dedent(prefix) + textwrap.dedent(declaration)
+            source += f'values = list({expression} for unused in [0])\neval(code)\n'
+            compile(source, '<lifetime-control>', 'exec')
+            with self.subTest(expression=expression), self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                self.scan(source)
+
+    def test_replaced_opaque_bindings_require_a_release_proof(self):
+        for expression in ("list((owned := 'fixed') for unused in [0])", 'list(replace() for unused in [0])'):
+            source = f'''
+                code = 'fixed'
+                class Release:
+                    def __del__(self):
+                        global code
+                        code = input()
+                owned = Release()
+                def replace():
+                    global owned
+                    owned = 'fixed'
+                    return 'done'
+                {expression}
+                eval(code)
+            '''
+            with self.subTest(expression=expression):
+                observed = []
+                exec(textwrap.dedent(source), {'input': lambda: 'MARKER', 'eval': observed.append})
+                self.assertEqual(observed, ['MARKER'])
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                    self.scan(source)
+
+    def test_opaque_protocols_cannot_hide_behind_primitive_results(self):
+        for expression in ("'fixed' if opaque else 'also fixed'", "(opaque[0], 'fixed')[1]",
+                           "(f'{opaque}', 'fixed')[1]"):
+            source = f'''
+                code = 'fixed'
+                class Protocol:
+                    def __bool__(self):
+                        global code
+                        code = input()
+                        return True
+                    def __getitem__(self, index):
+                        global code
+                        code = input()
+                        return 'fixed'
+                    def __format__(self, spec):
+                        global code
+                        code = input()
+                        return 'fixed'
+                opaque = Protocol()
+                values = list({expression} for unused in [0])
+                eval(code)
+            '''
+            with self.subTest(expression=expression):
+                observed = []
+                exec(textwrap.dedent(source), {'input': lambda: 'MARKER', 'eval': observed.append})
+                self.assertEqual(observed, ['MARKER'])
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                    self.scan(source)
+
+    def test_unhashable_collections_preserve_construction_failures(self):
+        for collection in ('{[]: 0}', '{([] ,): 0}', '{(({},),): 0}', '{[]}', '{({0} or {}): 0}'):
+            for clauses in (f'for unused in {collection}',
+                            f'for outer in [0] for unused in {collection}'):
+                source = f'''
+                    code = input()
+                    try:
+                        list((code := 'fixed') {clauses})
+                    except TypeError:
+                        eval(code)
+                '''
+                with self.subTest(collection=collection, clauses=clauses):
+                    observed = []
+                    exec(textwrap.dedent(source), {'input': lambda: 'MARKER', 'eval': observed.append})
+                    self.assertEqual(observed, ['MARKER'])
+                    with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                        self.scan(source)
+
+    def test_helper_collections_require_hashable_members(self):
+        for constructor in ('unused = {[]: 0}', 'unused = {([] ,): 0}', 'unused = {[]}',
+                            'key = []\nunused = {key: 0}'):
+            source = "code = input()\ndef replace():\n    global code\n"
+            source += textwrap.indent(constructor, '    ')
+            source += "\n    code = 'fixed'\n    return 'done'\n"
+            source += "try:\n    list(replace() for unused in [0])\nexcept TypeError:\n    eval(code)\n"
+            with self.subTest(constructor=constructor):
+                observed = []
+                exec(source, {'input': lambda: 'MARKER', 'eval': observed.append})
+                self.assertEqual(observed, ['MARKER'])
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                    self.scan(source)
+        for constructor in ('{[]: 0}', '{[]}', '{(({},),): 0}'):
+            source = f'''
+                code = input()
+                def items():
+                    return {constructor}
+                try:
+                    list((code := 'fixed') for unused in items())
+                except TypeError:
+                    eval(code)
+            '''
+            with self.subTest(returned=constructor):
+                observed = []
+                exec(textwrap.dedent(source), {'input': lambda: 'MARKER', 'eval': observed.append})
+                self.assertEqual(observed, ['MARKER'])
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                    self.scan(source)
+
+    def test_hashable_tuple_keys_keep_materialization_effects(self):
+        self.assert_rules('''
+            code = 'fixed'
+            values = tuple((code := input()) for unused in {('first', 1): 'fixed'})
+            eval(code)
+        ''', 'eval')
+        self.assert_rules('''
+            code = 'fixed'
+            def replace():
+                global code
+                key = ('first', 1)
+                unused = {key: 0}
+                code = input()
+                return 'done'
+            values = list(replace() for unused in [0])
+            eval(code)
+        ''', 'eval')
+
+    def test_custom_consumers_do_not_receive_synchronous_proofs(self):
+        for declaration, collector in (
+            ('def collect(values): return values', 'collect'),
+            ('def list(values): return values', 'list'),
+            ('collect = list if unknown else custom', 'collect'),
+        ):
+            source = f'''
+                {declaration}
+                code = 'fixed'
+                values = {collector}(code for unused in [0])
+                code = input()
+                eval(values.__next__())
+            '''
+            with self.subTest(collector=collector), self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                self.scan(source)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

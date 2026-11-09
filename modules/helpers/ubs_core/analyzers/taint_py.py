@@ -782,7 +782,7 @@ class _ModuleBinding:
 # Preserve the existing conventional unimported names, but never restore one
 # after a local assignment/parameter has explicitly shadowed it.
 _IMPLICIT_IDENTITIES = frozenset({
-    'eval', 'exec', 'input', 'raw_input', 'print', 'str', 'any', 'all', 'next', 'globals', 'builtins', 'staticmethod', 'classmethod',
+    'eval', 'exec', 'input', 'raw_input', 'print', 'str', 'list', 'tuple', 'any', 'all', 'next', 'globals', 'builtins', 'staticmethod', 'classmethod',
     'html', 'django', 'flask', 'markupsafe', 'bleach', 'shlex', 'subprocess', 'os', 'asyncio',
     'sys', 'request', 'cursor', 'session', 'conn', 'engine', 'db',
     'render_template', 'render_template_string', 'HttpResponse', 'Response',
@@ -1797,6 +1797,7 @@ class _Flow:
         self.value_parameters = set()
         self.observed_global_writes = None
         self.deferred_generator_depth = 0
+        self.materialized_generator_depth = 0
 
     def refine_url_guard(self, test, state, truth):
         """Recognize an exact, terminating local URL allow-list predicate.
@@ -2216,6 +2217,9 @@ class _Flow:
             raise AnalysisLimit('global write shadowed by an active class namespace; analysis is incomplete')
         self.engine.budget.spend(1 + len(contents.fact) + len(contents.references))
         initial = self.global_contents(name, state)
+        if (self.materialized_generator_depth and initial.bound is not False
+                and not self.materialized_generator_binding(initial.binding, initial.references, state)):
+            raise AnalysisLimit('generator materialization releases an opaque global; analysis is incomplete')
         if state.global_writes is None:
             state.global_writes = {}
         previous = state.global_writes.get(name)
@@ -2243,6 +2247,16 @@ class _Flow:
     def write_name(self, state, name, fact, binding, references=NO_REFERENCES, *, bound=True,
                    global_write=True):
         """A scalar rebinding replaces a cell; object writes still use mutate."""
+        if (self.materialized_generator_depth
+                and not any(name in self.engine.locals[scope] for scope, _outer in self.comprehension_environments)):
+            if state.cells is not None and name in state.cells.names:
+                previous = self.cell_contents(state.cells.names[name], state)
+            else:
+                previous = _CellContents(state.get(name, CLEAN), state.references.get(name, NO_REFERENCES),
+                                         state.bindings.get(name), name in state)
+            if (previous.bound is not False
+                    and not self.materialized_generator_binding(previous.binding, previous.references, state)):
+                raise AnalysisLimit('generator materialization releases an opaque binding; analysis is incomplete')
         declared = name in self.engine.declared_globals.get(self.scope, ())
         module_replacement = (isinstance(self.scope, ast.Module)
                               and '@global:' + name in state.bindings)
@@ -2474,6 +2488,257 @@ class _Flow:
             elif not isinstance(value, _LiteralString) and is_dataclass(value):
                 pending.extend(getattr(value, item.name) for item in fields(value))
         return names
+
+    def generator_exhaustion_consumer(self, node, state):
+        """Identify a direct, synchronous builtin materializer before its argument.
+
+        The callable was evaluated before constructing the generator. No
+        remaining operand can run between that construction and exhaustion.
+        Iterator, callback and value-lifetime proofs belong to the producer.
+        """
+        original = self.engine.original_calls.get(node, node)
+        consumer = self.engine.parents.get(original)
+        if (not isinstance(consumer, ast.Call) or consumer.args != [original]
+                or consumer.keywords or self.class_environments or self.engine.generator_namespace_exposed
+                or self.engine.generator_frame_exposed):
+            return False
+        choices = _binding_choices(self.expression_bindings.get(consumer.func))
+        if not choices or not choices <= {'list', 'tuple', 'builtins.list', 'builtins.tuple'}:
+            return False
+        names = {value.rsplit('.', 1)[-1] for value in choices}
+        for engine in self.engine.generator_peers:
+            if (engine.generator_builtin_reflection or names & engine.generator_attribute_writes
+                    or engine is not self.engine and engine.generator_namespace_exposed):
+                return False
+            for capability in engine.generator_execution_capabilities:
+                call = engine.parents.get(capability)
+                spelling = capability.id if isinstance(capability, ast.Name) else capability.attr
+                if (engine is not self.engine or spelling == 'exec'
+                        or not isinstance(call, ast.Call) or call.func is not capability
+                        or self.engine.enclosing(call) is not self.scope or call.lineno <= consumer.end_lineno):
+                    return False
+        return True
+
+    def materialized_generator_inert(self, node, state):
+        """Prove an evaluated operand cannot own an opaque finalizer/protocol.
+
+        Captured identities, not a variable's old initializer, supply type
+        evidence. In particular an input-result marker survives a later
+        rebinding without reinterpreting its creation AST in the new state.
+        """
+        self.engine.budget.spend()
+        references = self.expression_references.get(node, NO_REFERENCES)
+        if references & state.mutated:
+            return False
+        if isinstance(node, ast.Constant):
+            return type(node.value) in {str, bytes, int, float, complex, bool, type(None)}
+        if isinstance(node, ast.NamedExpr):
+            return self.materialized_generator_inert(node.value, state)
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            return all(self.materialized_generator_inert(value, state) for value in node.elts)
+        if isinstance(node, ast.Dict):
+            return all(key is not None and self.materialized_generator_inert(key, state)
+                       and self.materialized_generator_inert(value, state)
+                       for key, value in zip(node.keys, node.values))
+        if isinstance(node, ast.Call):
+            # A native prompt/conversion or summarized helper must not invoke
+            # an unmodeled protocol on an opaque passed object.
+            if (any(isinstance(value, ast.Starred) for value in node.args)
+                    or any(keyword.arg is None for keyword in node.keywords)
+                    or not all(self.materialized_generator_inert(value, state)
+                               for value in (*node.args, *(keyword.value for keyword in node.keywords)))):
+                return False
+        if isinstance(node, ast.Compare):
+            return all(self.materialized_generator_inert(value, state)
+                       for value in (node.left, *node.comparators))
+        if isinstance(node, ast.BoolOp):
+            return all(self.materialized_generator_inert(value, state) for value in node.values)
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            return self.materialized_generator_inert(node.operand, state)
+        return self.materialized_generator_binding(self.expression_bindings.get(node), references, state)
+
+    def materialized_generator_binding(self, binding, references, state):
+        """Only captured primitive identities certify reference release."""
+        choices = _binding_choices(binding)
+        if references & state.mutated or not choices:
+            return False
+        for value in choices:
+            self.engine.budget.spend()
+            if isinstance(value, (_LiteralString, _GeneratorString)):
+                continue
+            if (isinstance(value, ast.Constant)
+                    and type(value.value) in {str, bytes, int, float, complex, bool, type(None)}):
+                continue
+            if isinstance(value, _ArgumentVector) and all(
+                    self.materialized_generator_binding(operand, value.references_at(index), state)
+                    for index, (operand, _fact) in enumerate(value.operands)):
+                continue
+            return False
+        return True
+
+    def materialized_generator_hashable(self, node, state):
+        """Inert containers can still fail before iteration during hashing."""
+        self.engine.budget.spend()
+        if isinstance(node, ast.NamedExpr):
+            return self.materialized_generator_hashable(node.value, state)
+        if isinstance(node, ast.Tuple):
+            return all(self.materialized_generator_hashable(item, state) for item in node.elts)
+        if isinstance(node, (ast.List, ast.Set, ast.Dict)):
+            return False
+        if isinstance(node, ast.Constant):
+            return type(node.value) in {str, bytes, int, float, complex, bool, type(None)}
+        choices = _binding_choices(self.expression_bindings.get(node))
+        return (not any(isinstance(value, _ArgumentVector) for value in choices)
+                and self.materialized_generator_binding(self.expression_bindings.get(node),
+                    self.expression_references.get(node, NO_REFERENCES), state))
+
+    def materialized_generator_call(self, node, target, state):
+        """Prove calls cannot hide owned finalizers, including exceptional exits.
+
+        A primitive return alone says nothing about released locals/defaults.
+        Admit native input and a bounded straight-line helper subset whose
+        entire frame contains primitive values. General callbacks, defaults,
+        parameter binding and nested calls still need an ownership summary.
+        """
+        self.engine.budget.spend()
+        if (any(isinstance(value, ast.Starred) for value in node.args)
+                or any(keyword.arg is None for keyword in node.keywords)
+                or not all(self.materialized_generator_inert(value, state)
+                           for value in (*node.args, *(keyword.value for keyword in node.keywords)))):
+            return False
+        if target in ('input', 'builtins.input'):
+            return self.generator_builtins_stable()
+        closure = target if isinstance(target, _ClosureValue) else None
+        if closure is not None:
+            target = closure.value
+        if isinstance(target, _FunctionValue):
+            target = target.function
+        if (not isinstance(target, ast.FunctionDef) or self.engine.owner(target) is not self.engine
+                or target in self.engine.generators or target.decorator_list or target.returns is not None
+                or not self.engine.generator_helper_identity(target) or node.args or node.keywords):
+            return False
+        signature = target.args
+        if (signature.posonlyargs or signature.args or signature.kwonlyargs or signature.vararg
+                or signature.kwarg or signature.defaults or any(value is not None for value in signature.kw_defaults)):
+            return False
+        captured = {}
+        for name, ref in closure.cells if closure is not None else ():
+            contents = self.cell_contents(ref, state)
+            if (contents.bound is not True
+                    or not self.materialized_generator_binding(contents.binding, contents.references, state)):
+                return False
+            captured[name] = contents.binding
+        local_names = self.engine.locals.get(target, ())
+        values = {}
+
+        def lookup(name):
+            if name in values:
+                return values[name]
+            if name in local_names:
+                return None
+            if name in captured:
+                return captured[name]
+            if name not in self.engine.global_names:
+                return _implicit_identity(name)
+            contents = self.global_contents(name, state)
+            if contents.bound is False and name not in self.engine.global_names:
+                return _implicit_identity(name)
+            if contents.references & state.mutated:
+                return None
+            return contents.binding
+
+        def primitive(expression):
+            self.engine.budget.spend()
+            if isinstance(expression, ast.Constant):
+                return type(expression.value) in {str, bytes, int, float, complex, bool, type(None)}
+            if isinstance(expression, ast.Name):
+                return self.materialized_generator_binding(lookup(expression.id), NO_REFERENCES, state)
+            if isinstance(expression, (ast.Tuple, ast.List)):
+                return all(primitive(item) for item in expression.elts)
+            if isinstance(expression, ast.Set):
+                return all(hashable(item) for item in expression.elts)
+            if isinstance(expression, ast.Dict):
+                return all(key is not None and hashable(key) and primitive(value)
+                           for key, value in zip(expression.keys, expression.values))
+            if (isinstance(expression, ast.Call) and isinstance(expression.func, ast.Name)
+                    and lookup(expression.func.id) in ('input', 'builtins.input')
+                    and not expression.keywords and len(expression.args) <= 1
+                    and self.generator_builtins_stable()):
+                return all(primitive(argument) for argument in expression.args)
+            return False
+
+        def hashable(expression):
+            self.engine.budget.spend()
+            if isinstance(expression, ast.Tuple):
+                return all(hashable(item) for item in expression.elts)
+            if isinstance(expression, (ast.List, ast.Set, ast.Dict)):
+                return False
+            if isinstance(expression, ast.Name) and any(
+                    isinstance(value, _ArgumentVector) for value in _binding_choices(lookup(expression.id))):
+                return False
+            return primitive(expression)
+
+        def raised(expression):
+            if isinstance(expression, ast.Call) and isinstance(expression.func, ast.Name):
+                identity = lookup(expression.func.id)
+                if (not expression.keywords and all(primitive(argument) for argument in expression.args)
+                        and isinstance(identity, str) and identity.startswith('builtins.')
+                        and self.generator_builtins_stable()):
+                    exception = getattr(builtins, identity[9:], None)
+                    return isinstance(exception, type) and issubclass(exception, BaseException)
+            return False
+
+        for statement in target.body:
+            self.engine.budget.spend()
+            if isinstance(statement, (ast.Global, ast.Nonlocal, ast.Pass)):
+                continue
+            if isinstance(statement, ast.Assign) and primitive(statement.value):
+                for destination in statement.targets:
+                    if not isinstance(destination, ast.Name):
+                        return False
+                    if destination.id not in local_names:
+                        # Replacing a borrowed global/cell may release its
+                        # last owner even when the new value is just a string.
+                        if not self.materialized_generator_binding(lookup(destination.id), NO_REFERENCES, state):
+                            return False
+                    # The proof environment records ownership/hashability,
+                    # not a substitute runtime value. A list alias must not
+                    # become a supposedly hashable key on its next use.
+                    values[destination.id] = (_GeneratorString() if hashable(statement.value)
+                                               else _ArgumentVector(()))
+                continue
+            if isinstance(statement, ast.Expr) and primitive(statement.value):
+                continue
+            if isinstance(statement, ast.Return):
+                return statement.value is None or primitive(statement.value)
+            if isinstance(statement, ast.Raise):
+                return statement.cause is None and raised(statement.exc)
+            return False
+        return True
+
+    def materialized_generator_iterable(self, node, state):
+        """Only inert builtin collections have modeled iteration and teardown."""
+        if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)):
+            return True
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set, ast.Dict)):
+            return self.materialized_generator_inert(node, state)
+        # An evaluated fixed vector retains the actual operands and their
+        # aliases. Never recover a mutable collection from stale source text.
+        references = self.expression_references.get(node, NO_REFERENCES)
+        choices = _binding_choices(self.expression_bindings.get(node))
+        if (not references or references & state.mutated or not choices
+                or not all(isinstance(value, _ArgumentVector) for value in choices)):
+            return False
+        for vector in choices:
+            for index, (operand, _fact) in enumerate(vector.operands):
+                if vector.references_at(index) & state.mutated:
+                    return False
+                if not all(isinstance(value, (_LiteralString, _GeneratorString))
+                           or isinstance(value, ast.Constant)
+                           and type(value.value) in {str, bytes, int, float, complex, bool, type(None)}
+                           for value in _binding_choices(operand)):
+                    return False
+        return True
 
     def generator_expression_immediate(self, node, state):
         """Bound only private name lifetimes for an exact synchronous predicate."""
@@ -3922,7 +4187,7 @@ class _Flow:
         if literal == 'sys.executable':
             literal = _LiteralString('python')
         literal = _literal_choices(literal)
-        return (literal if isinstance(literal, (_LiteralString, _SymbolicValue, frozenset)) else node), fact
+        return (literal if isinstance(literal, (_LiteralString, _GeneratorString, _SymbolicValue, frozenset)) else node), fact
 
     def command_vector(self, node):
         """Expand literal argv without evaluating any argument a second time."""
@@ -4296,6 +4561,8 @@ class _Flow:
         target, fallback_name = callee.binding, callee.fallback_name
         receiver, receiver_refs = callee.receiver, callee.references
         arguments, keywords, keyword_nodes = inputs.arguments, inputs.keywords, inputs.keyword_nodes
+        if self.materialized_generator_depth and not self.materialized_generator_call(node, target, state):
+            raise AnalysisLimit('generator materialization helper frame lifetime is unresolved; analysis is incomplete')
         if isinstance(target, _GeneratorNext):
             if node.args or node.keywords:
                 raise AnalysisLimit('generator __next__ argument binding; analysis is incomplete')
@@ -4922,6 +5189,10 @@ class _Flow:
         )
         if name in SANITIZERS and not configurable_html:
             fact = _sanitize(fact, SANITIZERS[name])
+        if callee.binding in {'input', 'builtins.input'} and self.generator_builtins_stable():
+            # Retain this type proof with the evaluated value. Looking up an
+            # old call AST later could instead observe a rebound input name.
+            self.expression_bindings[node] = _GeneratorString()
         if not exception_constructor:
             self.possible_exception(state)
         return fact
@@ -4979,6 +5250,14 @@ class _Flow:
             if state.mutated and (refs & state.mutated):
                 binding = _without_object_contract(binding)
             self.expression_bindings[node] = binding
+            if self.materialized_generator_depth:
+                parent = self.engine.parents.get(node)
+                is_callee = isinstance(parent, ast.Call) and parent.func is node
+                if not is_callee and not self.materialized_generator_binding(binding, refs, state):
+                    # A primitive final result is insufficient: an earlier
+                    # truth test, index, format or discarded operand can have
+                    # invoked an opaque object's protocol along the way.
+                    raise AnalysisLimit('generator materialization reads an opaque operand; analysis is incomplete')
             if any(isinstance(value, (_DeferredGenerator, _GeneratorNext)) for value in _binding_choices(binding)):
                 parent = self.engine.parents.get(node)
                 if isinstance(parent, (ast.withitem, ast.AugAssign, ast.Match, ast.ClassDef)):
@@ -5179,6 +5458,13 @@ class _Flow:
                               *(state.heap.get(ref, CLEAN) for ref in references))
         if isinstance(node, ast.BinOp):
             return join_facts(self.expr(node.left, state), self.expr(node.right, state))
+        if isinstance(node, ast.Set) and self.materialized_generator_depth:
+            facts = []
+            for child in node.elts:
+                facts.append(self.expr(child, state))
+                if state.reachable and not self.materialized_generator_hashable(child, state):
+                    raise AnalysisLimit('generator materialization set hashing is unresolved; analysis is incomplete')
+            return join_facts(*facts)
         if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
             return join_facts(*(self.expr(child, state) for child in node.elts)) if node.elts else CLEAN
         if isinstance(node, ast.JoinedStr):
@@ -5189,6 +5475,15 @@ class _Flow:
                 return join_facts(value_fact, self.expr(node.format_spec, state))
             return value_fact
         if isinstance(node, ast.Dict):
+            if self.materialized_generator_depth:
+                facts = []
+                for key, value in zip(node.keys, node.values):
+                    facts.append(self.expr(key, state))
+                    facts.append(self.expr(value, state))
+                    if state.reachable and (key is None or not self.materialized_generator_hashable(key, state)):
+                        raise AnalysisLimit('generator materialization dictionary hashing is unresolved; '
+                                            'analysis is incomplete')
+                return join_facts(*facts)
             return join_facts(
                 *(self.expr(k, state) for k in node.keys if k is not None),
                 *(self.expr(v, state) for v in node.values),
@@ -5307,6 +5602,17 @@ class _Flow:
             # The outer iterable executes in the enclosing scope, even when
             # constructing a lazy generator. Inner iterations may be skipped.
             first = node.generators[0]
+            if self.generator_exhaustion_consumer(node, state):
+                if any(generator.is_async for generator in node.generators):
+                    raise AnalysisLimit('asynchronous generator materialization is unmodeled; analysis is incomplete')
+                # Iterator construction can own temporary helper frames too.
+                # Check calls before either normal or exceptional completion.
+                self.materialized_generator_depth += 1
+                try:
+                    iterable = self.expr(first.iter, state)
+                    return self.comprehension(node, state, iterable=iterable, synchronous_generator=True)
+                finally:
+                    self.materialized_generator_depth -= 1
             iterable = self.expr(first.iter, state)
             if not state.reachable:
                 return CLEAN
@@ -5385,7 +5691,7 @@ class _Flow:
         return join_facts(self.source(node, state), *(self.expr(child, state) for child in ast.iter_child_nodes(node)
                                               if isinstance(child, ast.expr)))
 
-    def comprehension(self, node, state):
+    def comprehension(self, node, state, *, iterable=_MISSING, synchronous_generator=False):
         """Execute eager comprehension clauses in their implicit local scope.
 
         Heap writes and walrus assignments escape that scope on both normal
@@ -5393,7 +5699,8 @@ class _Flow:
         branches, and mutable iterables participate in the loop fixed point.
         """
         first = node.generators[0]
-        iterable = self.expr(first.iter, state)
+        if iterable is _MISSING:
+            iterable = self.expr(first.iter, state)
         if any(isinstance(value, (_DeferredGenerator, _GeneratorNext))
                for value in _binding_choices(self.expression_bindings.get(first.iter))):
             raise AnalysisLimit('comprehension consumes a resumable generator; analysis is incomplete')
@@ -5409,6 +5716,7 @@ class _Flow:
             nested.bindings[name] = None
             nested.references[name] = NO_REFERENCES
         result = CLEAN
+        iterator_references = set()
 
         def project(current):
             if current is None:
@@ -5450,6 +5758,11 @@ class _Flow:
             binding = self.expression_bindings.get(generator.iter)
             if any(isinstance(value, (_DeferredGenerator, _GeneratorNext)) for value in _binding_choices(binding)):
                 raise AnalysisLimit('comprehension consumes a resumable generator; analysis is incomplete')
+            if synchronous_generator and not self.materialized_generator_iterable(generator.iter, entering):
+                raise AnalysisLimit('generator materialization iterator or captured lifetime is unresolved; '
+                                    'analysis is incomplete')
+            if synchronous_generator:
+                iterator_references.update(refs)
             literal = generator.iter
             elements = None
             if (isinstance(literal, (ast.List, ast.Tuple))
@@ -5464,15 +5777,22 @@ class _Flow:
             if empty:
                 return entering
 
-            def iteration(current, element=None):
+            def iteration(current, element=None, captured=None):
                 nonlocal result
                 if current is None or not current.reachable:
                     return None
-                if element is not None:
+                if captured is not None:
+                    element_binding, fact, element_refs = captured
+                    self.write_name(current, generator.target.id, fact, element_binding, element_refs)
+                elif element is not None:
                     element_refs = self.expression_references.get(element, NO_REFERENCES)
                     fact = join_facts(self.expression_facts.get(element, CLEAN),
                                       *(current.heap.get(ref, CLEAN) for ref in element_refs))
                     self.assign(generator.target, fact, current, element)
+                    if synchronous_generator and isinstance(generator.target, ast.Name) and isinstance(element, ast.Constant):
+                        # Ordinary numeric constants have no callable binding;
+                        # their exact primitive identity is still lifetime evidence.
+                        current.bindings[generator.target.id] = element
                 else:
                     fact = join_facts(value, *(current.heap.get(ref, CLEAN) for ref in refs))
                     self.assign(generator.target, fact, current)
@@ -5494,6 +5814,11 @@ class _Flow:
                 skipped = []
                 for condition in generator.ifs:
                     current, rejected = self.condition(condition, current)
+                    if (synchronous_generator and (current is not None or rejected is not None)
+                            and not self.materialized_generator_inert(
+                            condition, current if current is not None else rejected if rejected is not None else entering)):
+                        raise AnalysisLimit('generator materialization filter protocol is unresolved; '
+                                            'analysis is incomplete')
                     skipped.append(rejected)
                 if current is not None:
                     if index + 1 < len(node.generators):
@@ -5502,7 +5827,13 @@ class _Flow:
                         values = ((node.key, node.value) if isinstance(node, ast.DictComp) else (node.elt,))
                         fact = join_facts(*(self.expr(item, current) for item in values))
                         if current.reachable:
+                            if synchronous_generator and not self.materialized_generator_inert(node.elt, current):
+                                raise AnalysisLimit('generator materialization result lifetime is unresolved; '
+                                                    'analysis is incomplete')
                             result = join_facts(result, fact)
+                if synchronous_generator and current is not None and current.mutated & iterator_references:
+                    raise AnalysisLimit('generator materialization mutates its captured iterator; '
+                                        'analysis is incomplete')
                 return _join_states(current, *skipped)
 
             # Fresh sequence literals cannot acquire additional elements from
@@ -5514,6 +5845,14 @@ class _Flow:
                 current = entering
                 for element in elements:
                     current = iteration(current, element)
+                return current
+            if (synchronous_generator and isinstance(binding, _ArgumentVector)
+                    and isinstance(generator.target, ast.Name)
+                    and len(binding.operands) <= self.comprehension_budget):
+                self.comprehension_budget -= len(binding.operands)
+                current = entering
+                for position, (element_binding, fact) in enumerate(binding.operands):
+                    current = iteration(current, captured=(element_binding, fact, binding.references_at(position)))
                 return current
             if elements is not None:
                 value = join_facts(*(self.expression_facts.get(item, CLEAN) for item in elements))
@@ -5540,6 +5879,11 @@ class _Flow:
             self.comprehension_environments.pop()
             self.pending = pending
             exceptional = self.exception_states.pop() if collecting else None
+        if synchronous_generator and any(
+                current is not None and current.mutated & iterator_references
+                for current in (normal, exceptional, *(item.state for item in outgoing))):
+            raise AnalysisLimit('generator materialization mutates its captured iterator; '
+                                'analysis is incomplete')
         self.pending.extend(_Completion(item.kind, project(item.state), item.value,
                                         item.references, item.binding, item.exception_type)
                             for item in _merge_completions(outgoing))
@@ -6893,6 +7237,10 @@ class _Analysis:
                     references.append(NO_REFERENCES if isinstance(operand, _LiteralString) else frozenset({slot}))
                 value = _ArgumentVector(tuple(operands), tuple(references))
             elif isinstance(value, _LiteralString) and name in value_parameters:
+                pass
+            elif isinstance(value, _GeneratorString) and (captured or name in value_parameters):
+                # Ownership proofs need this identity; ordinary dataflow
+                # parameters must keep sharing their symbolic summaries.
                 pass
             elif isinstance(value, ast.Constant) and name in value_parameters:
                 # Partial captures may retain exact scalar options such as

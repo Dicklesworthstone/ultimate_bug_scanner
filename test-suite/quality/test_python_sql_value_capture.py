@@ -2534,6 +2534,165 @@ class SQLValueCaptureTests(unittest.TestCase):
         self.inspect('local-execute-next-to-db', source
                      + 'def count(cursor, user):\n    cursor.execute(f"SELECT {user}")\n', ((CRITICAL, 9),))
 
+    def test_private_constructed_receivers_preserve_local_sql_names(self):
+        for name in ('execute', 'raw', 'scalar'):
+            owner = ('class Runner:\n    def __init__(self):\n        self.count = 0\n'
+                     + f'    def {name}(self, query):\n'
+                     '        self.count += 1\n        return len(query)\n')
+            for label, allocation in (('plain', 'runner = Runner()'),
+                                      ('annotated', 'runner: object = Runner()')):
+                source = (owner + 'def run(cursor, params, user, rows):\n    ' + allocation + '\n'
+                          '    runner.label = "ordinary application"\n'
+                          + f'    return runner.{name}(f"SELECT {{user}}")\n')
+                with self.subTest(method=name, allocation=label):
+                    self.inspect('private-receiver-' + name + '-' + label, source, ())
+                    self.assertEqual(sqlite_witness(self.artifacts,
+                                     'private-receiver-' + name + '-' + label, source)['rows'],
+                                     len("SELECT ' OR 1=1 --"))
+            source = (owner + 'def summarize(user, records):\n    runner = Runner()\n'
+                      '    ordered = sorted((record.key, record.value) for record in records)\n'
+                      + f'    return runner.{name}(f"SELECT {{user}}")\n')
+            # An opaque record comparison matters to SQL only when there is
+            # an actual SQL-capable operation. A private pure method with an
+            # API-shaped name must not force this whole file into SQL flow.
+            self.inspect('private-receiver-records-' + name, source, ())
+            self.inspect('private-receiver-independent-db-' + name, source
+                         + 'def count(cursor, user):\n    cursor.execute(f"SELECT {user}")\n',
+                         ((CRITICAL, len(source.splitlines()) + 2),))
+
+    def test_private_constructed_receiver_exports_remain_conservative(self):
+        owner = ('class Runner:\n    def execute(self, query):\n        return len(query)\n')
+        effects = (
+            ('argument', '    configure(runner)\n'),
+            ('alias', '    saved = runner\n    configure(saved)\n'),
+            ('container', '    saved = [runner]\n    configure(saved[0])\n'),
+            ('method', '    configure(runner.execute)\n'),
+            ('closure', '    def expose():\n        return runner\n    configure(expose)\n'),
+            ('default', '    def expose(value=runner):\n        return value\n    configure(expose)\n'),
+            ('deferred', '    configure(runner.execute("plain") for _ in (1,))\n'),
+            ('rebound', '    runner = replacement\n'),
+            ('metadata', '    configure(runner.__class__)\n'),
+            ('reflection', '    configure(locals())\n'),
+        )
+        for name, effect in effects:
+            source = ('from backend import configure, replacement\n' + owner
+                      + 'def run(user):\n    runner = Runner()\n' + effect
+                      + '    return runner.execute(f"SELECT {user}")\n')
+            path = self.artifacts / ('private-receiver-export-' + name + '.py')
+            path.write_text(source, encoding='utf-8')
+            findings, incomplete = [], False
+            try:
+                findings.extend(detector.find([path]))
+            except detector.SQLFlowLimit:
+                incomplete = True
+            with self.subTest(escape=name):
+                self.assertTrue(incomplete or any(row[0] == CRITICAL for row in findings), source)
+        # The same lexical pattern can really redirect the receiver to SQL.
+        # Exercise the mutation against SQLite rather than inferring safety
+        # from a count of candidate diagnostics.
+        for name, exposure, mutate in (
+                ('argument', 'runner', 'value.execute = cursor.execute'),
+                ('alias', 'saved', 'value.execute = cursor.execute'),
+                ('container', '[runner]', 'value[0].execute = cursor.execute'),
+                ('closure', 'lambda: runner', 'value().execute = cursor.execute'),
+                ('bound-method', 'runner.execute', 'value.__self__.execute = cursor.execute')):
+            source = (owner + 'def run(cursor, params, user, rows):\n'
+                      '    def configure(value):\n        ' + mutate + '\n'
+                      '    runner = Runner()\n    saved = runner\n'
+                      '    configure(' + exposure + ')\n'
+                      '    return runner.execute(f"SELECT count(*) FROM users WHERE name = \'{user}\'").fetchone()[0]\n')
+            with self.subTest(witness=name):
+                self.assertEqual(sqlite_witness(self.artifacts,
+                                 'private-receiver-mutation-' + name, source)['rows'], 2)
+                path = self.artifacts / ('private-receiver-mutation-scan-' + name + '.py')
+                path.write_text(source, encoding='utf-8')
+                findings, incomplete = [], False
+                try:
+                    findings.extend(detector.find([path]))
+                except detector.SQLFlowLimit:
+                    incomplete = True
+                self.assertTrue(incomplete or any(row[0] == CRITICAL for row in findings), source)
+
+    def test_private_receiver_cells_cannot_hide_runtime_exports(self):
+        # Keep the backend outside the scanned source: a visible execute
+        # assignment would invalidate dispatch independently of receiver
+        # ownership and conceal the missing constructor/method escape.
+        backend = ('import types\nbackend = types.ModuleType("backend")\n'
+                   'def configure(value):\n    value.execute = cursor.execute\n'
+                   'backend.configure = configure\nsys.modules["backend"] = backend\n')
+        for kind, method, decorator, receiver, invocation in (
+                ('constructor', '__init__', '', 'self', ''),
+                ('instance', 'expose', '', 'self', '    runner.expose()\n'),
+                ('class', 'expose', '    @classmethod\n', 'cls', '    runner.expose()\n')):
+            for binding, signature, exported, replacement in (
+                    ('variadic', '*receivers', 'receivers[0]', ''),
+                    ('rebound', receiver, receiver, f'        {receiver} = None\n'),
+                    ('deleted', receiver, receiver, f'        del {receiver}\n'),
+                    ('nonlocal', receiver, receiver,
+                     f'        def clear():\n            nonlocal {receiver}\n'
+                     f'            {receiver} = None\n        clear()\n')):
+                source = ('from backend import configure\nclass Runner:\n' + decorator
+                          + f'    def {method}({signature}):\n        configure({exported})\n'
+                          + replacement
+                          + '    def execute(self, query):\n        return len(query)\n'
+                          'def run(cursor, params, user, rows):\n    runner = Runner()\n'
+                          + invocation
+                          + '    return runner.execute(f"SELECT count(*) FROM users WHERE name = \'{user}\'").fetchone()[0]\n')
+                name = 'private-receiver-cell-' + kind + '-' + binding
+                with self.subTest(method=kind, binding=binding):
+                    self.assertEqual(sqlite_witness(self.artifacts, name, backend + source)['rows'], 2)
+                    self.inspect(name, source, ((CRITICAL, len(source.splitlines())),))
+
+    def test_private_receivers_allow_explicit_and_static_variadic_methods(self):
+        source = ('class Runner:\n    def __init__(self, *args):\n        self.count = len(args)\n'
+                  '    @staticmethod\n    def unused(*args):\n        args = ()\n        return len(args)\n'
+                  '    @classmethod\n    def prepare(cls, *args):\n        return len(args)\n'
+                  '    def execute(self, query):\n        return len(query)\n'
+                  'def run(cursor, params, user, rows):\n    runner = Runner()\n'
+                  '    runner.unused("plain")\n    runner.prepare("plain")\n'
+                  '    return runner.execute(f"SELECT {user}")\n')
+        self.inspect('private-receiver-explicit-variadic', source, ())
+        self.assertEqual(sqlite_witness(self.artifacts, 'private-receiver-explicit-variadic', source)['rows'],
+                         len("SELECT ' OR 1=1 --"))
+
+    def test_private_receivers_keep_real_sql_and_dynamic_dispatch(self):
+        for name, assignment in (('attribute', 'record.runner = Runner()'),
+                                 ('subscript', 'record[0] = Runner()'),
+                                 ('unpacked', 'runner, = Runner()')):
+            source = ('class Runner:\n    def execute(self, query):\n        return len(query)\n'
+                      '    def run(self, user):\n        return self.execute(f"SELECT {user}")\n'
+                      'def store(record):\n    ' + assignment + '\n')
+            with self.subTest(storage=name):
+                self.inspect('private-receiver-storage-' + name, source, ((CRITICAL, 5),))
+        for name, owner in (
+                ('database', 'class Runner:\n    def execute(self, query):\n        return db.execute(query)\n'),
+                ('opaque-forward', 'class Runner:\n    def execute(self, query):\n        return send(query)\n'),
+                ('constructor-export', 'class Runner:\n    def __init__(self):\n        configure(self)\n'
+                 '    def execute(self, query):\n        return len(query)\n'),
+                ('inheritance', 'class Runner(Base):\n    def execute(self, query):\n        return len(query)\n'),
+                ('property', 'class Runner:\n    @property\n    def execute(self):\n        return db.execute\n'),
+                ('hook', 'class Runner:\n    def __getattribute__(self, name):\n        return lookup(name)\n'
+                 '    def execute(self, query):\n        return len(query)\n'),
+                ('descriptor', 'class Runner:\n    hook = Descriptor()\n'
+                 '    def execute(self, query):\n        return len(query)\n'),
+                ('new', 'class Runner:\n    def __new__(cls):\n        return db\n'
+                 '    def execute(self, query):\n        return len(query)\n')):
+            source = (owner + 'def run(user):\n    runner = Runner()\n'
+                      '    return runner.execute(f"SELECT {user}")\n')
+            with self.subTest(dispatch=name):
+                self.inspect('private-receiver-dispatch-' + name, source,
+                             ((CRITICAL, len(source.splitlines())),))
+        source = ('class Runner:\n    def execute(self, query):\n        return len(query)\n'
+                  'def run(cursor, params, user, rows):\n    runner = Runner()\n'
+                  '    values = sorted((record.key, record.value) for record in rows)\n'
+                  '    runner.execute("ordinary")\n    cursor.execute(f"SELECT {user}")\n')
+        path = self.artifacts / 'private-receiver-real-sql-records.py'
+        path.write_text(source, encoding='utf-8')
+        # Ownership of the receiver does not certify parameter record fields
+        # or erase callback hazards in the function that actually reaches SQL.
+        with self.assertRaisesRegex(detector.SQLFlowLimit, 'reducer callbacks.*incomplete'):
+            list(detector.find([path]))
+
     def test_imported_sql_sink_aliases_keep_query_provenance(self):
         for name, prefix, call in (
                 ('direct', 'from db_driver import execute as send\n', 'send(f"SELECT {user}")'),

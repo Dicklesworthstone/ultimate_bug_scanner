@@ -173,6 +173,7 @@ class SanitizerBindings:
         self._possible_sql_methods = {}
         self._saved_sql_methods = {}
         self._closed_method_aliases = {}
+        self._constructed_receivers = {}
         self._sql_method_captures = {}
         self._captured_receivers = {}
         self._escaped_sql_methods = None
@@ -620,9 +621,14 @@ class SanitizerBindings:
                         member = self.lookup(use.attr, self.owner_scopes[owner])
                         if member and member[0] == 'function':
                             continue
-                    # Stored/exported construction results expose an instance
-                    # even when the class name itself remains unmodified.
-                    # No instance-alias ownership summary proves these uses.
+                    if isinstance(use, (ast.Assign, ast.AnnAssign)) and use.value is parent:
+                        targets = use.targets if isinstance(use, ast.Assign) else [use.target]
+                        if len(targets) == 1:
+                            stored = self.constructed_receiver(targets[0])
+                            if stored is not None and stored[1] is owner:
+                                continue
+                    # Other storage/construction contexts lack a closed
+                    # lexical owner even if the class name stays unmodified.
                     escaped = True
                     break
                 escaped = True
@@ -631,6 +637,89 @@ class SanitizerBindings:
                 break
         self._escaped_classes[cache_key] = escaped
         return escaped
+
+    def constructed_receiver(self, reference):
+        """A single local allocation whose identity stays in its lexical cell.
+
+        The class escape proof separately checks constructor/method bodies,
+        descriptors and class aliases. This proof follows every use of the
+        allocated instance, so a local variable does not itself constitute an
+        export while passing, aliasing or capturing that variable still does.
+        """
+        if not isinstance(reference, ast.Name):
+            return None
+        scope = self.lexical_owner(reference)
+        if (scope is None or not isinstance(scope['node'], (ast.FunctionDef, ast.AsyncFunctionDef))
+                or len(scope['names'].get(reference.id, ())) != 1
+                or reference.id in scope['capture_barriers']):
+            return None
+        key = (scope['node'], reference.id)
+        if key in self._constructed_receivers:
+            return self._constructed_receivers[key]
+        self._constructed_receivers[key] = None
+        assignment = self.literal_assignments.get(key)
+        if not isinstance(assignment, (ast.Assign, ast.AnnAssign)):
+            return None
+        targets = assignment.targets if isinstance(assignment, ast.Assign) else [assignment.target]
+        if (len(targets) != 1 or not isinstance(targets[0], ast.Name)
+                or not isinstance(assignment.value, ast.Call)):
+            return None
+        target = self.resolve(assignment.value.func)
+        if not target or target[0] != 'class':
+            return None
+        owner = target[1]
+        members = self.owner_scopes[owner]['names']
+        if (owner.bases or owner.keywords or owner.decorator_list
+                or {'__new__', '__getattribute__', '__getattr__', '__setattr__', '__delattr__'}
+                    & members.keys()):
+            return None
+        for method in owner.body:
+            self.budget[0] -= 1
+            if self.budget[0] < 0:
+                raise SQLFlowLimit('SQL receiver ownership budget exceeded; analysis is incomplete')
+            if not isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            decorators = [call_name(value) for value in method.decorator_list]
+            if decorators == ['staticmethod']:
+                continue
+            positional = _positional_parameters(method)
+            if (not positional or positional[0] in self.indirect_rebindings
+                    or self.owner_scopes[method]['names'].get(positional[0])
+                        != [('receiver', owner, not decorators)]):
+                # The class escape proof follows explicit receiver cells.
+                # A receiver hidden in *args or lost to rebinding can export
+                # the allocated object without a resolvable receiver load.
+                # Saved bound methods have a separate capture-time proof;
+                # this allocation-wide certificate cannot borrow it.
+                return None
+        for use in self.name_loads.get(reference.id, ()):
+            self.budget[0] -= 1
+            if self.budget[0] < 0:
+                raise SQLFlowLimit('SQL receiver ownership budget exceeded; analysis is incomplete')
+            if self.lexical_owner(use) is not scope:
+                continue
+            if use.lineno <= assignment.lineno:
+                return None
+            cursor = self.scope_of.get(use)
+            while cursor is not None and cursor is not scope:
+                if isinstance(cursor['node'], (ast.FunctionDef, ast.AsyncFunctionDef,
+                                                ast.Lambda, ast.GeneratorExp)):
+                    return None
+                cursor = cursor['parent']
+            parent = self.parents.get(use)
+            if (not isinstance(parent, ast.Attribute) or parent.value is not use
+                    or parent.attr.startswith('__')):
+                return None
+            candidates = members.get(parent.attr, ())
+            if candidates:
+                if (len(candidates) != 1 or not candidates[0]
+                        or candidates[0][0] != 'function'
+                        or not isinstance(parent.ctx, ast.Load)
+                        or parent not in self.direct_callees):
+                    return None
+        result = ('receiver', owner, True)
+        self._constructed_receivers[key] = result
+        return result
 
     def closed_receiver_generator(self, generator, owner):
         """A receiver capture stays private only during an eager consumption."""
@@ -2147,7 +2236,8 @@ class SanitizerBindings:
             return None
         seen.add(node)
         if isinstance(node, ast.Name):
-            return self.lookup(node.id, self.scope_of.get(node), seen)
+            target = self.lookup(node.id, self.scope_of.get(node), seen)
+            return self.constructed_receiver(node) if target is None else target
         if not isinstance(node, ast.Attribute) or node.attr in self.member_writes:
             return None
         parent = self.resolve(node.value, seen)

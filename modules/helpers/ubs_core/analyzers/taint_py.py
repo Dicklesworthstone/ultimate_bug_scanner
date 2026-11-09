@@ -3075,7 +3075,15 @@ class _Flow:
         # and may execute user-defined hash/equality callbacks during lookup.
         if not choices or any(not isinstance(choice, _LiteralString) for choice in choices):
             raise AnalysisLimit('dynamic globals mapping key; analysis is incomplete')
-        return tuple(sorted({choice.value for choice in choices}))
+        names = tuple(sorted({choice.value for choice in choices}))
+        if (len(names) > 1 and self.class_environments
+                and (not self.generator_builtins_stable() or any(
+                    scope.bases or scope.keywords or scope.decorator_list
+                    for scope, _outer in self.class_environments))):
+            # LOAD_NAME can consult a metaclass's custom __prepare__ mapping.
+            # Lexical outer bindings cannot certify its globals factory/key.
+            raise AnalysisLimit('finite globals access in an unresolved class namespace; analysis is incomplete')
+        return names
 
     def write_global(self, namespace, key, fact, value, state):
         names = self.namespace_keys(namespace, key)

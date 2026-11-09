@@ -583,6 +583,30 @@ class Box:
                 effects = taint_py._Analysis(ast.parse(source)).analyze()
                 self.assertEqual({key[:3] for key in effects}, {('eval', 7, 5)})
 
+    def test_namespace_finite_reads_require_an_ordinary_class_namespace(self):
+        for lookup in ('globals()[key]', 'globals().get(key, print)'):
+            source = '''class Namespace(dict):
+    def __missing__(self, name):
+        if name == 'globals':
+            return lambda: {'left': eval, 'right': eval}
+        raise KeyError(name)
+class Meta(type):
+    @classmethod
+    def __prepare__(metacls, name, bases):
+        return Namespace()
+left = print
+right = print
+key = 'left' if input() else 'right'
+class Box(metaclass=Meta):
+''' + f'    {lookup}(input())\n'
+            with self.subTest(lookup=lookup):
+                observed = []
+                exec(compile(source, '<custom-class-namespace>', 'exec'),
+                     {'input': lambda: 'MARKER', 'eval': observed.append})
+                self.assertEqual(observed, ['MARKER'])
+                with self.assertRaisesRegex(AnalysisLimit, 'finite globals access in an unresolved class namespace'):
+                    taint_py._Analysis(ast.parse(source)).analyze()
+
     def test_namespace_class_reads_keep_mutations_of_module_objects(self):
         source = '''left = ['safe']
 right = ['safe']

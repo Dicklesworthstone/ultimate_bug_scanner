@@ -10,6 +10,7 @@ reuse disabled, and the cross-module shapes must report the known flow.
 from __future__ import annotations
 
 import ast
+import builtins
 import contextlib
 import io
 import json
@@ -459,6 +460,317 @@ def handler():
 '''
         effects = taint_py._Analysis(ast.parse(source)).analyze()
         self.assertEqual({key[:3] for key in effects}, {('command', 3, 22)})
+
+    def test_namespace_finite_keys_apply_weak_writes_to_each_possible_global(self):
+        for initial, replacement, unsafe in (('print', 'eval', True),
+                                             ('eval', 'print', True),
+                                             ('print', 'print', False)):
+            source = f'''left = {initial}
+right = {initial}
+key = 'left' if input() else 'right'
+globals()[key] = {replacement}
+left(input())
+right(input())
+'''
+            with self.subTest(initial=initial, replacement=replacement):
+                # Both selections execute the real namespace update. A weak
+                # clean write cannot erase the unselected unsafe binding.
+                for selection in ('left', ''):
+                    observed, inputs = [], iter((selection, 'MARKER', 'MARKER'))
+                    namespace = {'input': lambda: next(inputs), 'eval': observed.append}
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        exec(compile(source, '<finite-global-write>', 'exec'), namespace)
+                    self.assertEqual(observed, ['MARKER'] if unsafe else [])
+                effects = taint_py._Analysis(ast.parse(source)).analyze()
+                self.assertEqual({key[:3] for key in effects},
+                                 {('eval', 5, 1), ('eval', 6, 1)} if unsafe else set())
+
+    def test_namespace_equal_literal_alternatives_still_make_a_strong_write(self):
+        source = '''target = eval
+key = 'target' if input() else 'target'
+globals()[key] = print
+target(input())
+'''
+        self.assertEqual(taint_py._Analysis(ast.parse(source)).analyze(), {})
+
+    def test_namespace_finite_reads_retain_callable_choices_and_missing_defaults(self):
+        for lookup in ("globals()[key]", "globals().get(key)"):
+            for right in ('print', 'eval'):
+                source = f'''left = print
+right = {right}
+def choose(flag): return 'left' if flag else 'right'
+key = choose(input())
+{lookup}(input())
+'''
+                with self.subTest(lookup=lookup, right=right):
+                    effects = taint_py._Analysis(ast.parse(source)).analyze()
+                    self.assertEqual({key[:3] for key in effects},
+                                     {('eval', 5, 1)} if right == 'eval' else set())
+        for alternative, unsafe in (('right', False), ('missing', True)):
+            source = f'''left = print
+right = print
+key = 'left' if input() else '{alternative}'
+globals().get(key, eval)(input())
+'''
+            with self.subTest(default_alternative=alternative):
+                effects = taint_py._Analysis(ast.parse(source)).analyze()
+                self.assertEqual({key[:3] for key in effects}, {('eval', 4, 1)} if unsafe else set())
+
+    def test_namespace_finite_key_summary_keeps_shadowed_locals_separate(self):
+        source = '''left = print
+right = print
+def replace():
+    left = print
+    key = 'left' if input() else 'right'
+    globals()[key] = eval
+    left(input())
+def indirect(value):
+    left(value)
+    right(value)
+def handler():
+    replace()
+    indirect(input())
+'''
+        effects = taint_py._Analysis(ast.parse(source)).analyze()
+        self.assertEqual({key[:3] for key in effects}, {('eval', 9, 5), ('eval', 10, 5)})
+
+    def test_namespace_finite_get_retains_defaults_after_conditional_presence(self):
+        for declaration in ("if input():\n    right = print\n",
+                            "right = print\nif input():\n    del right\n"):
+            source = ("left = print\n" + declaration
+                      + "key = 'left' if input() else 'right'\n"
+                      + "globals().get(key, eval)(input())\n")
+            with self.subTest(declaration=declaration):
+                observed = []
+                inputs = iter(('delete' if 'del right' in declaration else '', '', 'MARKER'))
+                namespace = {'input': lambda: next(inputs), 'eval': observed.append}
+                exec(compile(source, '<conditional-global-presence>', 'exec'), namespace)
+                self.assertEqual(observed, ['MARKER'])
+                effects = taint_py._Analysis(ast.parse(source)).analyze()
+                self.assertEqual({key[:3] for key in effects}, {('eval', len(source.splitlines()), 1)})
+
+    def test_namespace_finite_get_distinguishes_present_none_and_opaque_values(self):
+        for value in ('None', 'object()'):
+            source = f'''left = {value}
+right = {value}
+key = 'left' if input() else 'right'
+globals().get(key, eval)(input())
+'''
+            with self.subTest(value=value):
+                observed = []
+                namespace = {'input': lambda: 'MARKER', 'eval': observed.append}
+                with self.assertRaises(TypeError):
+                    exec(compile(source, '<present-global-value>', 'exec'), namespace)
+                self.assertEqual(observed, [])
+                self.assertEqual(taint_py._Analysis(ast.parse(source)).analyze(), {})
+
+    def test_namespace_finite_reads_ignore_active_class_shadows(self):
+        for lookup in ('globals()[key]', 'globals().get(key, print)'):
+            source = f'''left = eval
+right = eval
+key = 'left' if input() else 'right'
+class Box:
+    left = print
+    right = print
+    {lookup}(input())
+'''
+            with self.subTest(lookup=lookup):
+                for choice in ('left', ''):
+                    observed, inputs = [], iter((choice, 'MARKER'))
+                    namespace = {'input': lambda: next(inputs), 'eval': observed.append}
+                    exec(compile(source, '<class-global-shadow>', 'exec'), namespace)
+                    self.assertEqual(observed, ['MARKER'])
+                effects = taint_py._Analysis(ast.parse(source)).analyze()
+                self.assertEqual({key[:3] for key in effects}, {('eval', 7, 5)})
+
+    def test_namespace_class_reads_keep_mutations_of_module_objects(self):
+        source = '''left = ['safe']
+right = ['safe']
+key = 'left' if input() else 'right'
+class Box:
+    left[0] = input()
+    right[0] = input()
+    left = ['safe']
+    right = ['safe']
+    eval(globals()[key][0])
+'''
+        effects = taint_py._Analysis(ast.parse(source)).analyze()
+        self.assertEqual({key[:3] for key in effects}, {('eval', 9, 5)})
+
+    def test_namespace_finite_reader_captures_temporary_replacements(self):
+        for lookup in ('globals()[key]', 'globals().get(key, print)'):
+            source = f'''left = print
+right = print
+def read(value):
+    key = 'left' if input() else 'right'
+    {lookup}(value)
+def relay(value):
+    left = right = print
+    read(value)
+globals()['left'] = eval
+relay(input())
+globals()['left'] = print
+'''
+            with self.subTest(lookup=lookup):
+                observed, inputs = [], iter(('MARKER', 'left'))
+                namespace = {'input': lambda: next(inputs), 'eval': observed.append}
+                exec(compile(source, '<temporary-global-read>', 'exec'), namespace)
+                self.assertEqual(observed, ['MARKER'])
+                effects = taint_py._Analysis(ast.parse(source)).analyze()
+                self.assertEqual({key[:3] for key in effects}, {('eval', 5, 5)})
+
+    def test_namespace_finite_reader_preserves_call_time_membership(self):
+        for local in ('', '    right = None\n'):
+            source = f'''left = print
+def read(value):
+    key = 'left' if input() else 'right'
+    globals().get(key, eval)(value)
+def relay(value):
+{local}    read(value)
+relay(input())
+right = None
+'''
+            with self.subTest(local_shadow=bool(local)):
+                observed, inputs = [], iter(('MARKER', ''))
+                namespace = {'input': lambda: next(inputs), 'eval': observed.append}
+                exec(compile(source, '<call-time-global-membership>', 'exec'), namespace)
+                self.assertEqual(observed, ['MARKER'])
+                effects = taint_py._Analysis(ast.parse(source)).analyze()
+                self.assertEqual({key[:3] for key in effects}, {('eval', 4, 5)})
+
+    def test_namespace_finite_reader_preserves_call_time_value_facts(self):
+        source = '''left = 'safe'
+right = 'safe'
+def read():
+    key = 'left' if input() else 'right'
+    eval(globals()[key])
+left = input()
+read()
+left = 'safe'
+'''
+        effects = taint_py._Analysis(ast.parse(source)).analyze()
+        self.assertEqual({key[:3] for key in effects}, {('eval', 5, 5)})
+
+    def test_namespace_finite_get_preserves_exceptional_membership(self):
+        source = '''left = print
+try:
+    if input():
+        right = print
+    raise ValueError()
+except ValueError:
+    key = 'left' if input() else 'right'
+    globals().get(key, eval)(input())
+'''
+        observed, inputs = [], iter(('', '', 'MARKER'))
+        namespace = {'input': lambda: next(inputs), 'eval': observed.append}
+        exec(compile(source, '<exceptional-global-presence>', 'exec'), namespace)
+        self.assertEqual(observed, ['MARKER'])
+        effects = taint_py._Analysis(ast.parse(source)).analyze()
+        self.assertEqual({key[:3] for key in effects}, {('eval', 8, 5)})
+
+    def test_namespace_finite_replacement_does_not_discard_finalizer_effects(self):
+        for declaration in (
+            'left = Release()\n',
+            'def left(owned=Release()):\n    pass\n',
+            'def make():\n    owned = Release()\n    def run():\n        return owned\n    return run\nleft = make()\n',
+        ):
+            source = '''code = 'safe'
+tainted = input()
+class Release:
+    def __del__(self):
+        global code
+        code = tainted
+''' + declaration + '''right = print
+key = 'left' if input() else 'right'
+globals()[key] = print
+eval(code)
+'''
+            with self.subTest(declaration=declaration):
+                observed, inputs = [], iter(('MARKER', 'left'))
+                namespace = {'input': lambda: next(inputs), 'eval': observed.append}
+                exec(compile(source, '<finite-global-finalizer>', 'exec'), namespace)
+                self.assertEqual(observed, ['MARKER'])
+                with self.assertRaisesRegex(AnalysisLimit, 'finite globals replacement lifetime is unresolved'):
+                    taint_py._Analysis(ast.parse(source)).analyze()
+
+    def test_namespace_native_replacement_proof_rejects_reflected_builtin_mutation(self):
+        for prefix, setter in (
+            ('', 'original.__self__.__setattr__'),
+            ('', "getattr(getattr(original, '__' + 'self__'), '__set' + 'attr__')"),
+            ('from operator import attrgetter as get\n', "get('__self__.__setattr__')(original)"),
+        ):
+            source = prefix + '''code = 'safe'
+tainted = input()
+class Release:
+    def __del__(self):
+        global code
+        code = tainted
+original = print
+''' + f'''{setter}('print', Release())
+left = print
+{setter}('print', original)
+right = original
+key = 'left' if input() else 'right'
+globals()[key] = original
+eval(code)
+'''
+            with self.subTest(setter=setter):
+                observed, original_print = [], builtins.print
+                try:
+                    exec(compile(source, '<reflected-builtin-ownership>', 'exec'),
+                         {'input': lambda: 'MARKER', 'eval': observed.append})
+                finally:
+                    builtins.print = original_print
+                self.assertEqual(observed, ['MARKER'])
+                with self.assertRaisesRegex(AnalysisLimit, 'finite globals replacement lifetime is unresolved'):
+                    taint_py._Analysis(ast.parse(source)).analyze()
+
+    def test_namespace_weak_write_to_maybe_missing_key_remains_incomplete(self):
+        source = '''left = print
+if input():
+    right = print
+key = 'left' if input() else 'right'
+globals()[key] = print
+globals().get('right', eval)(input())
+'''
+        observed, inputs = [], iter(('', 'left', 'MARKER'))
+        namespace = {'input': lambda: next(inputs), 'eval': observed.append}
+        exec(compile(source, '<weak-global-creation>', 'exec'), namespace)
+        self.assertEqual(observed, ['MARKER'])
+        with self.assertRaisesRegex(AnalysisLimit, 'global deletion requires namespace lifetime analysis'):
+            taint_py._Analysis(ast.parse(source)).analyze()
+
+    def test_namespace_finite_reads_preserve_mutable_aliases(self):
+        source = '''left = ['safe']
+right = ['safe']
+key = 'left' if input() else 'right'
+chosen = globals()[key]
+chosen[0] = input()
+eval(left[0])
+eval(right[0])
+'''
+        for selection in ('left', ''):
+            observed, inputs = [], iter((selection, 'MARKER'))
+            namespace = {'input': lambda: next(inputs), 'eval': observed.append}
+            exec(compile(source, '<finite-global-alias>', 'exec'), namespace)
+            self.assertEqual(sorted(observed), ['MARKER', 'safe'])
+        effects = taint_py._Analysis(ast.parse(source)).analyze()
+        self.assertEqual({key[:3] for key in effects}, {('eval', 6, 1), ('eval', 7, 1)})
+
+    def test_namespace_mixed_unknown_key_alternatives_remain_incomplete(self):
+        for key in ("'target' if input() else input()", "'target' if input() else 1"):
+            for access in ("globals()[key] = eval", "globals()[key](input())",
+                           "globals().get(key, eval)(input())"):
+                source = f'target = print\nkey = {key}\n{access}\n'
+                with self.subTest(key=key, access=access):
+                    with self.assertRaisesRegex(AnalysisLimit, 'dynamic globals mapping key'):
+                        taint_py._Analysis(ast.parse(source)).analyze()
+        source = '''target = print
+key = 'target' if input() else 'not_declared'
+globals()[key] = eval
+'''
+        with self.assertRaisesRegex(AnalysisLimit, 'new globals mapping declaration'):
+            taint_py._Analysis(ast.parse(source)).analyze()
 
     def test_namespace_escape_to_an_unmodeled_mutator_is_incomplete(self):
         source = '''import os

@@ -288,6 +288,9 @@ CLEAN: Fact = frozenset()
 References = frozenset[Union[ast.AST, str]]
 NO_REFERENCES: References = frozenset()
 _MISSING = object()  # absent-key sentinel for the state join
+_NAMESPACE_PRESENT = '@namespace:present'
+_NAMESPACE_ABSENT = '@namespace:absent'
+_NAMESPACE_MAYBE = '@namespace:maybe'
 
 
 @dataclass(frozen=True)
@@ -1125,6 +1128,7 @@ class _State(dict):
         global_writes = getattr(values, 'global_writes', None)
         self.global_writes = global_writes.copy() if global_writes is not None else None
         self.deleted_globals = getattr(values, 'deleted_globals', frozenset())
+        self.maybe_unbound = getattr(values, 'maybe_unbound', frozenset())
         self.reachable = getattr(values, 'reachable', True)
 
     def cell_state(self):
@@ -1144,6 +1148,8 @@ class _State(dict):
                 self[name] = contents.fact
                 self.bindings[name] = contents.binding
                 self.references[name] = contents.references
+                self.maybe_unbound = (self.maybe_unbound - {name} if contents.bound is True
+                                      else self.maybe_unbound | {name})
 
     def value(self, name):
         base = self.get(name, CLEAN)
@@ -1169,6 +1175,7 @@ class _State(dict):
         clone.cells = self.cells.copy() if self.cells is not None else None
         clone.global_writes = self.global_writes.copy() if self.global_writes is not None else None
         clone.deleted_globals = self.deleted_globals
+        clone.maybe_unbound = self.maybe_unbound
         clone.reachable = self.reachable
         return clone
 
@@ -1185,6 +1192,7 @@ class _State(dict):
         self.cells = other.cells.copy() if other.cells is not None else None
         self.global_writes = other.global_writes.copy() if other.global_writes is not None else None
         self.deleted_globals = other.deleted_globals
+        self.maybe_unbound = other.maybe_unbound
         self.reachable = other.reachable
 
     def __eq__(self, other):
@@ -1194,6 +1202,7 @@ class _State(dict):
                 and self.cells == other.cells
                 and self.global_writes == other.global_writes
                 and self.deleted_globals == other.deleted_globals
+                and self.maybe_unbound == other.maybe_unbound
                 and self.reachable == other.reachable)
 
     def __ne__(self, other):
@@ -1201,6 +1210,22 @@ class _State(dict):
         # value facts and bypasses our equality. A changed callable, heap or
         # alias must invalidate summaries even when scalar taint is unchanged.
         return not self == other
+
+
+def _namespace_presence(state, name):
+    """Mapping membership is independent from an opaque or None value."""
+    marker = state.bindings.get('@presence:' + name, _MISSING)
+    if marker is not _MISSING:
+        choices = _binding_choices(marker)
+        if choices == {_NAMESPACE_PRESENT}:
+            return _NAMESPACE_PRESENT
+        if choices == {_NAMESPACE_ABSENT}:
+            return _NAMESPACE_ABSENT
+        return _NAMESPACE_MAYBE
+    source = '@global:' + name if '@global:' + name in state.bindings else name
+    if name in state.deleted_globals or source in state.maybe_unbound:
+        return _NAMESPACE_MAYBE
+    return _NAMESPACE_PRESENT if source in state.bindings else _NAMESPACE_ABSENT
 
 
 def _join_states(*states):
@@ -1221,6 +1246,7 @@ def _join_states(*states):
                 clone.bindings[name] = next(iter(binding))
         return clone
     values = first.copy()
+    maybe_unbound = set(values.maybe_unbound)
     heap = values.heap
     references = values.references
     for other in others:
@@ -1246,6 +1272,7 @@ def _join_states(*states):
         if other.mutated:
             values.mutated.update(other.mutated)
         values.deleted_globals = values.deleted_globals | other.deleted_globals
+        maybe_unbound.update(other.maybe_unbound)
         if other.cells is not None:
             if values.cells is None:
                 values.cells = other.cells.copy()
@@ -1272,6 +1299,7 @@ def _join_states(*states):
             binding = bindings.get(name, _MISSING)
             if binding is _MISSING:
                 bindings[name] = _join_bindings(_implicit_identity(name), other)
+                maybe_unbound.add(name)
             elif binding is other:
                 matched += 1
                 if type(binding) is frozenset and len(binding) == 1:  # ubs:ignore[py.comparison.type-equality,py.type-equality]
@@ -1283,13 +1311,17 @@ def _join_states(*states):
             for name, binding in list(bindings.items()):
                 if name not in second:
                     bindings[name] = _join_bindings(binding, _implicit_identity(name))
+                    maybe_unbound.add(name)
     else:
         bindings = {}
         for name in set(first.bindings).union(*(state.bindings for state in others)):
             bindings[name] = _join_bindings(*(
                 state.bindings[name] if name in state.bindings else _implicit_identity(name)
                 for state in reachable))
+            if any(name not in state.bindings for state in reachable):
+                maybe_unbound.add(name)
         values.bindings = bindings
+    values.maybe_unbound = frozenset(maybe_unbound)
     if any(state.global_writes for state in reachable):
         changes = {}
         for state in reachable:
@@ -1312,8 +1344,11 @@ def _join_states(*states):
                     # a setter. Its current value, not the sibling's old entry
                     # snapshot, is the unwritten side of this call effect.
                     key = slot if slot in state.bindings else name
+                    presence = _namespace_presence(state, name)
                     incoming = _CellContents(state.get(key, CLEAN),
-                                             state.references.get(key, NO_REFERENCES), state.bindings[key])
+                                             state.references.get(key, NO_REFERENCES), state.bindings[key],
+                                             True if presence == _NAMESPACE_PRESENT else
+                                             False if presence == _NAMESPACE_ABSENT else None)
                 else:
                     incoming = write.initial
                 contents = incoming if contents is None else _join_cells(contents, incoming)
@@ -1323,6 +1358,10 @@ def _join_states(*states):
             values[slot] = contents.fact
             values.bindings[slot] = contents.binding
             values.references[slot] = contents.references
+            values.bindings['@presence:' + name] = _NAMESPACE_PRESENT
+            values.maybe_unbound = values.maybe_unbound - {slot, '@presence:' + name}
+            if write.raw_global:
+                values.maybe_unbound = values.maybe_unbound - {name}
         values.global_writes = changes
     return values
 
@@ -1346,7 +1385,7 @@ def _identity_snapshot(state):
             (tuple(state.cells.names.items()), tuple(state.cells.contents), tuple(state.cells.contents.values()),
              frozenset(state.cells.written), frozenset(state.cells.multiple)) if state.cells is not None else None,
             (tuple(state.global_writes), tuple(state.global_writes.values()))
-            if state.global_writes is not None else None, state.deleted_globals)
+            if state.global_writes is not None else None, state.deleted_globals, state.maybe_unbound)
 
 
 def _same_snapshot(left, right):
@@ -1358,7 +1397,7 @@ def _same_snapshot(left, right):
     globals_equal = (left[10] is right[10] or left[10] is not None and right[10] is not None
                      and left[10][0] == right[10][0]
                      and all(map(operator.is_, left[10][1], right[10][1])))
-    return (cells_equal and globals_equal and left[11] == right[11]
+    return (cells_equal and globals_equal and left[11] == right[11] and left[12] == right[12]
             and left[0] == right[0] and left[2] == right[2] and left[4] == right[4]
             and left[6] == right[6] and left[8] == right[8]
             and all(map(operator.is_, left[1], right[1]))
@@ -1884,16 +1923,18 @@ class _Flow:
                 state.references.copy(),
                 state.heap.copy(),
                 frozenset(state.mutated),
+                state.maybe_unbound,
             )
             self.exception_states[-1] = joined
             return
-        prev_vals, prev_bindings, prev_refs, prev_heap, prev_mutated = previous
+        prev_vals, prev_bindings, prev_refs, prev_heap, prev_mutated, prev_unbound = previous
         same_vals = _same_dict_identity(prev_vals, state)
         same_bindings = _same_dict_identity(prev_bindings, state.bindings)
         same_refs = _same_dict_identity(prev_refs, state.references)
         same_heap = _same_dict_identity(prev_heap, state.heap)
         same_mutated = (len(prev_mutated) == len(state.mutated) and prev_mutated == state.mutated)
-        if same_vals and same_bindings and same_refs and same_heap and same_mutated:
+        if (same_vals and same_bindings and same_refs and same_heap and same_mutated
+                and prev_unbound == state.maybe_unbound):
             return
         # This collector is owned exclusively by its active capture; it
         # is exposed as a completion only after being popped. Its state
@@ -1924,6 +1965,8 @@ class _Flow:
         if not same_bindings:
             for name, binding in state.bindings.items():
                 if prev_bindings.get(name, _MISSING) is not binding:
+                    if name not in joined.bindings:
+                        joined.maybe_unbound = joined.maybe_unbound | {name}
                     joined.bindings[name] = _join_bindings(
                         joined.bindings.get(name, _implicit_identity(name)), binding)
             # Unlike a missing fact/reference, a missing callable binding
@@ -1932,11 +1975,13 @@ class _Flow:
             if len(prev_bindings) > len(state.bindings) or prev_bindings.keys() != state.bindings.keys():
                 for name in prev_bindings.keys() - state.bindings.keys():
                     joined.bindings[name] = _join_bindings(joined.bindings[name], _implicit_identity(name))
+                    joined.maybe_unbound = joined.maybe_unbound | {name}
             prev_bindings = state.bindings.copy()
         if not same_mutated:
             joined.mutated.update(state.mutated)
             prev_mutated = frozenset(state.mutated)
-        joined.last_joined = (prev_vals, prev_bindings, prev_refs, prev_heap, prev_mutated)
+        joined.maybe_unbound = joined.maybe_unbound | state.maybe_unbound
+        joined.last_joined = (prev_vals, prev_bindings, prev_refs, prev_heap, prev_mutated, state.maybe_unbound)
         self.exception_states[-1] = joined
 
     @staticmethod
@@ -2127,25 +2172,33 @@ class _Flow:
     def global_contents(self, name, state):
         if name in state.deleted_globals:
             return _CellContents(bound=False)
+        namespace, source = self.global_namespace(name, state)
+        presence = _namespace_presence(state if '@presence:' + name in state.bindings else namespace, name)
+        bound = True if presence == _NAMESPACE_PRESENT else False if presence == _NAMESPACE_ABSENT else None
+        if source in namespace.bindings:
+            return _CellContents(namespace.get(source, CLEAN), namespace.references.get(source, NO_REFERENCES),
+                                 namespace.bindings[source], bound)
+        if isinstance(self.scope, ast.Module):
+            return _CellContents(bound=False)
+        fact, refs, _binding = self.engine.global_symbols[name]
+        return _CellContents(fact, refs, self.engine.globals.bindings.get(name), bound)
+
+    def global_namespace(self, name, state):
+        """Find the module slot without borrowing class or lexical shadows."""
         slot = '@global:' + name
         if slot in state.bindings:
-            return _CellContents(state.get(slot, CLEAN), state.references.get(slot, NO_REFERENCES),
-                                 state.bindings[slot])
-        lexical = (self.engine.locals.get(self.scope, ()) if not isinstance(self.scope, ast.Module) else ())
-        if name not in lexical and name not in self.engine.closures.get(self.scope, ()):
-            namespace = state
+            return state, slot
+        namespace = self.class_environments[0][1] if self.class_environments else state
+        if not self.class_environments:
             for scope, outer in self.comprehension_environments:
                 if name in self.engine.locals[scope]:
                     namespace = outer
                     break
-            key = slot if slot in namespace.bindings else name
-            if key in namespace.bindings:
-                return _CellContents(namespace.get(key, CLEAN), namespace.references.get(key, NO_REFERENCES),
-                                     namespace.bindings[key])
-        if isinstance(self.scope, ast.Module):
-            return _CellContents(bound=False)
-        fact, refs, _binding = self.engine.global_symbols[name]
-        return _CellContents(fact, refs, self.engine.globals.bindings.get(name))
+        local = (self.engine.locals.get(self.scope, frozenset()) | self.engine.closures.get(self.scope, frozenset())
+                 if not isinstance(self.scope, ast.Module) else frozenset())
+        if not isinstance(self.scope, ast.Module) and (name in local or name not in namespace.bindings):
+            namespace = self.engine.globals
+        return namespace, slot if slot in namespace.bindings else name
 
     def put_global(self, name, contents, state):
         """Replace one same-module global without touching a caller's local."""
@@ -2176,9 +2229,12 @@ class _Flow:
         slot = '@global:' + name
         state[slot], state.references[slot], state.bindings[slot] = (
             contents.fact, contents.references, contents.binding)
+        state.bindings['@presence:' + name] = _NAMESPACE_PRESENT
+        state.maybe_unbound = state.maybe_unbound - {slot, '@presence:' + name}
         if not self.global_shadowed(name):
             state[name], state.references[name], state.bindings[name] = (
                 contents.fact, contents.references, contents.binding)
+            state.maybe_unbound = state.maybe_unbound - {name}
         if not isinstance(self.scope, ast.Module):
             # A conditional write may retain the incoming identity. Request
             # that finite context through intermediaries, just like a read.
@@ -2209,6 +2265,14 @@ class _Flow:
         state[name] = fact
         state.bindings[name] = binding
         state.references[name] = references
+        state.maybe_unbound = (state.maybe_unbound - {name} if bound is True
+                              else state.maybe_unbound | {name})
+        if global_write and (declared or isinstance(self.scope, ast.Module) and not self.class_environments
+                and not any(name in self.engine.locals[scope] for scope, _outer in self.comprehension_environments)):
+            marker = '@presence:' + name
+            if marker in state.bindings:
+                state.bindings[marker] = _NAMESPACE_PRESENT if bound is True else _NAMESPACE_ABSENT
+                state.maybe_unbound = state.maybe_unbound - {marker}
         if state.cells is not None and name in state.cells.names:
             ref = state.cells.names[name]
             self.engine.budget.spend(1 + len(state.cells.names))
@@ -2999,32 +3063,69 @@ class _Flow:
                     self.write_name(state, base.id, join_facts(state.get(base.id, CLEAN), _advance(fact, base.id)),
                                     state.bindings.get(base.id))
 
-    def namespace_key(self, namespace, key):
+    def namespace_keys(self, namespace, key):
         if namespace.module is not self.engine.tree:
             raise AnalysisLimit('foreign globals mapping access; analysis is incomplete')
-        binding = self.expression_bindings.get(key)
-        name = key.value if isinstance(key, ast.Constant) else binding.value if isinstance(binding, _LiteralString) else None
-        if not isinstance(name, str):
+        if isinstance(key, ast.Constant) and isinstance(key.value, str):
+            return (key.value,)
+        choices = _binding_choices(self.expression_bindings.get(key))
+        self.engine.budget.spend(len(choices))
+        # A finite join of literal strings is a closed set of builtin keys.
+        # Unknown alternatives must stay refused: they can name other globals
+        # and may execute user-defined hash/equality callbacks during lookup.
+        if not choices or any(not isinstance(choice, _LiteralString) for choice in choices):
             raise AnalysisLimit('dynamic globals mapping key; analysis is incomplete')
-        return name
+        return tuple(sorted({choice.value for choice in choices}))
 
     def write_global(self, namespace, key, fact, value, state):
-        name = self.namespace_key(namespace, key)
-        if name not in self.engine.global_names:
+        names = self.namespace_keys(namespace, key)
+        if any(name not in self.engine.global_names for name in names):
             raise AnalysisLimit('new globals mapping declaration; analysis is incomplete')
-        self.put_global(name, _CellContents(_advance(fact, name),
-                                           self.expression_references.get(value, NO_REFERENCES),
-                                           self.expression_bindings.get(value)), state)
-        self.engine.rebound_globals.add(name)
+        for name in names:
+            contents = _CellContents(_advance(fact, name),
+                                    self.expression_references.get(value, NO_REFERENCES),
+                                    self.expression_bindings.get(value))
+            if len(names) > 1:
+                # One runtime key is written. Every other candidate retains
+                # its incoming facts, aliases and callable/sanitizer identity.
+                previous = self.global_contents(name, state)
+                if previous.bound is True and not self.namespace_replacement_inert(previous.binding):
+                    # Replacing the last owning reference can execute a
+                    # finalizer, including one retained by a function's
+                    # defaults, annotations, attributes or closure cells.
+                    raise AnalysisLimit('finite globals replacement lifetime is unresolved; analysis is incomplete')
+                contents = _join_cells(previous, contents)
+            self.put_global(name, contents, state)
+            self.engine.rebound_globals.add(name)
+
+    def namespace_replacement_inert(self, binding):
+        native = {'eval', 'exec', 'input', 'print', 'str', 'any', 'all', 'next',
+                  'globals', 'staticmethod', 'classmethod'}
+        for choice in _binding_choices(binding):
+            self.engine.budget.spend()
+            if isinstance(choice, _LiteralString) or isinstance(choice, ast.Constant):
+                continue
+            if (isinstance(choice, str) and choice.removeprefix('builtins.') in native
+                    and self.generator_builtins_stable()):
+                continue
+            return False
+        return True
 
     def read_global(self, namespace, key, state):
-        name = self.namespace_key(namespace, key)
-        slot = '@global:' + name
-        local = (self.engine.locals.get(self.scope, frozenset()) | self.engine.closures.get(self.scope, frozenset())
-                 if not isinstance(self.scope, ast.Module) else frozenset())
-        source = slot if slot in state.bindings else name
-        values = state if slot in state.bindings or name not in local and name in state.bindings else self.engine.globals
-        return values.value(source), values.bindings.get(source), values.references.get(source, NO_REFERENCES), source in values.bindings
+        names = self.namespace_keys(namespace, key)
+        facts, bindings, references, present = [], [], [], True
+        for name in names:
+            if name in self.engine.global_names:
+                self.capture_globals.add((self.engine.tree, name))
+                self.engine.namespace_read_names.add(name)
+            values, source = self.global_namespace(name, state)
+            presence = _namespace_presence(state if '@presence:' + name in state.bindings else values, name)
+            refs = values.references.get(source, NO_REFERENCES)
+            facts.append(join_facts(values.value(source), *(state.heap.get(ref, CLEAN) for ref in refs)))
+            bindings.append(values.bindings.get(source))
+            references.append(refs)
+            present &= presence == _NAMESPACE_PRESENT
+        return join_facts(*facts), _join_bindings(*bindings), frozenset().union(*references), present
 
     def condition(self, node, state):
         """Return truthy/falsy successors, preserving ordered guard effects."""
@@ -3265,15 +3366,20 @@ class _Flow:
         owner_bindings = owner.globals.bindings
         module_heap_fact = state_heap.get(module_ref, CLEAN) if module_ref is not None and state_heap else CLEAN
         module_mutated = module_ref in state_mutated if module_ref is not None and state_mutated else False
-        default_namespace = state if same_engine else owner.globals
+        default_namespace = (self.class_environments[0][1] if same_engine and self.class_environments
+                             else state if same_engine else owner.globals)
         for name in owner.global_names:
             key = f'@global:{name}'
+            presence_key = '@presence:' + name
             if same_engine and key in state.bindings:
                 yield key, state.value(key), state.references.get(key, NO_REFERENCES), state.bindings[key]
+                yield presence_key, CLEAN, NO_REFERENCES, _namespace_presence(state, name)
                 continue
             if shadowed_in_scope and name in shadowed_in_scope:
                 fact, refs, value = owner.global_symbols[name]
                 yield key, fact, refs, value
+                yield presence_key, CLEAN, NO_REFERENCES, _namespace_presence(
+                    state if presence_key in state.bindings else owner.globals, name)
                 continue
             if caller_used is not None and name not in caller_used and name not in state_bindings:
                 sym_fact, refs, _ = owner.global_symbols[name]
@@ -3284,9 +3390,11 @@ class _Flow:
                 if value is not None and state_mutated and (module_mutated or key in state_mutated):
                     value = _without_object_contract(value)
                 yield key, fact, refs, value
+                yield presence_key, CLEAN, NO_REFERENCES, _namespace_presence(
+                    state if presence_key in state.bindings else owner.globals, name)
                 continue
             namespace = default_namespace
-            if comp_envs:
+            if comp_envs and not self.class_environments:
                 for comprehension, outer in comp_envs:
                     if name in self.engine.locals[comprehension]:
                         namespace = outer
@@ -3303,6 +3411,8 @@ class _Flow:
             if state_mutated and (module_mutated or (refs and (refs & state_mutated))):
                 value = _without_object_contract(value)
             yield key, fact, refs, value
+            yield presence_key, CLEAN, NO_REFERENCES, _namespace_presence(
+                state if same_engine and presence_key in state.bindings else namespace, name)
 
     def call_positions(self, node, arguments=None, state=None):
         """Expand evaluated, exact *vectors without re-evaluating their AST.
@@ -4314,6 +4424,7 @@ class _Flow:
                 if (owner is self.engine
                         and not isinstance(self.scope, ast.Module)
                         and not self.comprehension_environments
+                        and not self.class_environments
                         and (module_ref is None or (module_ref not in state.heap and module_ref not in state.mutated))):
                     local_bound = self.bind(function, node, arguments, keywords, state, (), captured_defaults, closure)
                     local_refs = self.bind_references(function, node, keyword_nodes, state, (), captured_defaults, closure)
@@ -4360,7 +4471,7 @@ class _Flow:
                         values[gkey] = val
                         non_base_keys.append(gkey)
                     for gkey in state.bindings:
-                        if gkey.startswith('@global:'):
+                        if gkey.startswith(('@global:', '@presence:')):
                             self.engine.budget.spend()
                             bound[gkey] = state.value(gkey)
                             references[gkey] = state.references.get(gkey, NO_REFERENCES)
@@ -5788,6 +5899,9 @@ class _Analysis:
         self.journal = project.journal if project is not None else None
         self.function_owners = {}
         self.globals = _State()
+        # Mapping membership distinguishes only globals actually read through
+        # a namespace mapping; ordinary global reads keep compact summaries.
+        self.namespace_read_names = set()
         self.summaries = {}
         self.defaults = {}
         self.framework_inputs = {}
@@ -5820,9 +5934,22 @@ class _Analysis:
         # selected source here adds substantial setup cost before any flow is
         # analyzed, without providing new information.
         nodes = tuple(ast.walk(tree))
+        # Builtin functions expose their owning module through __self__.
+        # Reflective aliases revoke native identity proofs even when no
+        # import or direct attribute store names the builtins module.
+        reflection = {'getattr', 'hasattr', 'setattr', 'delattr', 'vars', 'attrgetter', 'methodcaller',
+                      'getattr_static'}
+        self.generator_builtin_reflection = any(
+            isinstance(node, ast.Name) and node.id in reflection
+            or isinstance(node, ast.Attribute) and node.attr in reflection | {
+                '__self__', '__func__', '__closure__', '__dict__', '__class__', '__subclasses__',
+                '__getattr__', '__getattribute__', '__setattr__', '__delattr__'}
+            or isinstance(node, ast.ImportFrom) and node.module in {'builtins', 'operator', 'inspect'}
+            and any(alias.name in reflection for alias in node.names)
+            for node in nodes)
         # Primitive input-result proofs must not outlive an exposed/replaced
         # builtins namespace. Projects combine this property across modules.
-        self.generator_input_identity = not any(
+        self.generator_input_identity = not self.generator_builtin_reflection and not any(
             isinstance(node, ast.Name) and node.id in {'builtins', '__builtins__', '__import__',
                                                      'sys', 'importlib', 'import_module'}
             or isinstance(node, ast.Import) and any(alias.name.split('.')[0] in {
@@ -6104,6 +6231,8 @@ class _Analysis:
             f'@global:{name}': bindings.get(name)
             for name in self.global_names
         }
+        self.base_global_values.update(
+            ('@presence:' + name, _namespace_presence(globals_, name)) for name in self.global_names)
         self.has_base_bound_methods = any(
             isinstance(choice, _BoundClassMethod)
             for val in self.base_global_values.values()
@@ -6818,10 +6947,20 @@ class _Analysis:
             candidate_keys = dict.fromkeys(candidate_keys)
             candidate_keys.update((f'@global:{name}', None) for module, name in capture_globals
                                   if module is owner.tree)
+            candidate_keys.update((f'@presence:{name}', None) for module, name in capture_globals
+                                  if module is owner.tree and name in owner.namespace_read_names)
         items = ((name, values.get(name)) for name in dict.fromkeys(candidate_keys)) if candidate_keys is not None else values.items()
         for name, binding in items:
             if name.startswith('@default:'):
                 continue  # Captures are carried by the enclosing callback identity.
+            if name.startswith('@presence:'):
+                if (name[10:] in owner.namespace_read_names
+                        and (owner.tree, name[10:]) in capture_globals):
+                    # Membership is a separate finite context dimension. An
+                    # existing opaque/None value is not an absent mapping key.
+                    context.append((name, binding if binding in {
+                        _NAMESPACE_PRESENT, _NAMESPACE_ABSENT, _NAMESPACE_MAYBE} else _NAMESPACE_MAYBE))
+                continue
             if name.startswith('@global:'):
                 gname = name[8:]
                 if (direct_globals is not None and gname not in direct_globals
@@ -6937,6 +7076,8 @@ class _Analysis:
                 binding = namespace.bindings.get(name, _MISSING)
                 if binding is not _MISSING:
                     state.bindings[name] = binding
+                if _namespace_presence(namespace, name) != _NAMESPACE_PRESENT:
+                    state.maybe_unbound = state.maybe_unbound | {name}
             for name in local:
                 state.bindings[name] = None
             arguments = function.args
@@ -6964,6 +7105,18 @@ class _Analysis:
                 for name, binding in context:
                     if name == '@cells':
                         cell_graph = binding
+                        continue
+                    if name.startswith('@presence:'):
+                        state.bindings[name] = binding
+                        raw = name[10:]
+                        symbolic = owner.global_symbols.get(raw)
+                        if symbolic is not None:
+                            slot = '@global:' + raw
+                            state.setdefault(slot, symbolic[0])
+                            state.references.setdefault(slot, symbolic[1])
+                            value = (namespace.bindings.get(raw) if raw in local or raw in owner.closures[function]
+                                     else state.bindings.get(raw, namespace.bindings.get(raw)))
+                            state.bindings.setdefault(slot, value)
                         continue
                     raw = name.removeprefix('@free:').removeprefix('@global:')
                     if name.startswith('@global:') and (raw in local or raw in owner.closures[function]):
@@ -7186,8 +7339,9 @@ class _Analysis:
                 return None  # Foreign namespace changes retain the full solve.
             names = ((owner.used_names[function] - owner.locals[function])
                      | {name for _module, name in required})
-            return owner.namespace_ready, {
-                name: owner.globals.bindings.get(name, _MISSING) for name in names}
+            return (owner.namespace_ready, frozenset(owner.namespace_read_names)), {
+                name: (owner.globals.bindings.get(name, _MISSING), _namespace_presence(owner.globals, name))
+                for name in names}
 
         def namespace_current(key):
             before = namespace_inputs.get(key)

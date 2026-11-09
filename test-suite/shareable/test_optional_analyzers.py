@@ -157,6 +157,78 @@ class PipAuditResults(unittest.TestCase):
                 self.assertTrue(errors)
 
 
+@unittest.skipUnless(os.environ.get("UBS_TEST_PIP_AUDIT"),
+                     "set UBS_TEST_PIP_AUDIT to explicitly enable live dependency audits")
+class RealPipAuditIntegration(unittest.TestCase):
+    """Opt-in real resolver/service tests; no network in the default suite.
+
+    UBS_TEST_PIP_AUDIT=/path/to/pip-audit python3 \
+        test-suite/shareable/test_optional_analyzers.py RealPipAuditIntegration -v
+    The selected pip-audit must support PEP 751 --locked (2.10.1 or newer).
+    """
+
+    def audit(self, filename, content):
+        artifacts = ROOT / "test-suite/artifacts"
+        artifacts.mkdir(exist_ok=True)
+        root = Path(tempfile.mkdtemp(prefix="pip-audit-live-", dir=artifacts))
+        project = root / "project"
+        project.mkdir()
+        (project / filename).write_text(content, encoding="utf-8")
+        sink, diagnostics, errors = io.StringIO(), io.StringIO(), []
+        outcome = external_tools.scan_python_audit(
+            str(project), sink, 90, errors,
+            command=[os.environ["UBS_TEST_PIP_AUDIT"]], diagnostics=diagnostics)
+        findings = [json.loads(line) for line in sink.getvalue().splitlines()]
+        (root / "audit-evidence.json").write_text(json.dumps({
+            "case": self.id(), "command": os.environ["UBS_TEST_PIP_AUDIT"],
+            "outcome": outcome, "errors": errors, "findings": findings,
+        }, indent=2) + "\n", encoding="utf-8")
+        (root / "diagnostics.txt").write_text(diagnostics.getvalue(), encoding="utf-8")
+        print(f"[{self.id()}] evidence: {root}")
+        return outcome, findings, errors
+
+    def assert_vulnerable(self, filename, content):
+        outcome, findings, errors = self.audit(filename, content)
+        self.assertFalse(errors, errors)
+        self.assertEqual(outcome["status"], "ok", outcome)
+        self.assertEqual(outcome["exit_code"], 1, outcome)
+        self.assertEqual(outcome["dependencies"], 1, outcome)
+        self.assertEqual({(row["extras"]["package"], row["extras"]["version"])
+                          for row in findings}, {("urllib3", "1.26.4")})
+        identities = {row["extras"]["advisory"] for row in findings}
+        identities.update(alias for row in findings for alias in row["extras"]["aliases"])
+        self.assertIn("PYSEC-2021-108", identities)
+        self.assertTrue(all(row["severity"] == "critical" for row in findings))
+
+    def test_real_pyproject_resolves_known_vulnerable_package(self):
+        self.assert_vulnerable("pyproject.toml",
+                               '[project]\nname = "ubs-audit-witness"\nversion = "0.0.0"\n'
+                               'dependencies = ["urllib3==1.26.4"]\n')
+
+    def test_real_requirements_resolves_known_vulnerable_package(self):
+        self.assert_vulnerable("requirements.txt", "urllib3==1.26.4\n")
+
+    def test_real_pep751_lock_audits_known_vulnerable_package(self):
+        self.assert_vulnerable("pylock.toml",
+                               'lock-version = "1.0"\ncreated-by = "ubs-regression-witness"\n'
+                               '[[packages]]\nname = "urllib3"\nversion = "1.26.4"\n')
+
+    def test_real_empty_requirements_is_partial(self):
+        outcome, findings, errors = self.audit("requirements.txt", "# empty inventory\n")
+        self.assertEqual(outcome["status"], "partial", outcome)
+        self.assertEqual(outcome["dependencies"], 0, outcome)
+        self.assertFalse(findings)
+        self.assertTrue(any("empty dependency inventory" in error for error in errors), errors)
+
+    def test_real_failed_resolution_is_partial(self):
+        outcome, findings, errors = self.audit(
+            "requirements.txt", "--no-index\nubs-impossible-dependency-207==0.0.0\n")
+        self.assertEqual(outcome["status"], "partial", outcome)
+        self.assertEqual(outcome["exit_code"], 1, outcome)
+        self.assertFalse(findings)
+        self.assertTrue(errors)
+
+
 class ShellCheckResults(unittest.TestCase):
     def invoke(self, result: subprocess.CompletedProcess | Exception,
                *, skip: set[int] | None = None, installed: bool = True,
@@ -503,6 +575,8 @@ from pathlib import Path
 with open(os.environ["AUDIT_CALLS"], "a") as stream:
     stream.write(json.dumps(sys.argv[1:]) + "\n")
 mode = os.environ.get("AUDIT_MODE", "empty")
+if mode == "resolution-error":
+    print("No matching distribution found for ubs-unresolvable-example==0", file=sys.stderr)
 if mode in ("output", "stall"):
     print('[{"message":"audit evidence before failure"}]', flush=True)
     print("audit stderr before failure", file=sys.stderr, flush=True)
@@ -603,6 +677,8 @@ sys.exit(CODE)
         self.source.write_text("answer = 42\n")
         (self.project / "requirements.txt").write_text("example-package==1.0\n")
         (self.project / "pyproject.toml").write_text('[project]\ndynamic = ["dependencies"]\n')
+        (self.project / "pylock.toml").write_text('lock-version = "1.0"\n')
+        (self.project / "uv.lock").write_text("version = 1\n")
         self.audit_tool([audit_dependency(vulns=[])], uv=True)
         clean, summary = self.scan("pip-audit", format="json")
         self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
@@ -618,6 +694,138 @@ sys.exit(CODE)
             self.assertEqual(argv[:4], ["tool", "run", "--quiet", "pip-audit"])
             self.assertEqual(argv[-2:], ["-r", str(self.project / "requirements.txt")])
             self.assertNotIn("--path", argv)
+
+    def test_pep751_locks_precede_dynamic_pyproject_and_keep_advisories(self):
+        self.source.write_text("answer = 42\n")
+        names = ("pylock.toml", "pylock.linux.toml", "pylock.windows.toml")
+        for name in names:
+            (self.project / name).write_text(
+                'lock-version = "1.0"\n[[packages]]\nname = "example-package"\nversion = "1.0"\n')
+        (self.project / "pyproject.toml").write_text('[project]\ndynamic = ["dependencies"]\n')
+        (self.project / "uv.lock").write_text("version = 1\n")
+        self.audit_tool([audit_dependency()], code=1)
+        for format in ("text", "json", "sarif"):
+            with self.subTest(format=format):
+                proc, summary = self.scan("pip-audit", format=format)
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertEqual(summary["status"], "ok", summary)
+                outcome = summary["extras"]["external_tools"][0]
+                self.assertEqual(outcome["input_kind"], "pylock")
+                self.assertEqual(outcome["input"], str(self.project / "pylock.toml"))
+                self.assertEqual(outcome["inputs"], [str(self.project / name) for name in names])
+                self.assertEqual(outcome["dependencies"], 1)
+                self.assertEqual([r["rule"] for r in summary["findings"]],
+                                 ["py.pip-audit.PYSEC-2026-123.example-package"])
+                if format == "sarif":
+                    row = json.loads(proc.stdout)["runs"][0]["results"][0]
+                    self.assertTrue(row["locations"][0]["physicalLocation"]
+                                    ["artifactLocation"]["uri"].endswith("pylock.toml"))
+        for line in self.calls.read_text().splitlines():
+            argv = json.loads(line)
+            self.assertEqual(argv[-2:], ["--locked", str(self.project)])
+            self.assertNotIn("--path", argv)
+
+    def test_named_lock_only_project_is_audited(self):
+        self.project = self.root / "lock-only"
+        self.project.mkdir()
+        lock = self.project / "pylock.production.toml"
+        lock.write_text('lock-version = "1.0"\n')
+        self.audit_tool([audit_dependency()], code=1, uv=True)
+        proc, summary = self.scan("pip-audit", format="json")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertEqual(summary["status"], "ok", summary)
+        outcome = summary["extras"]["external_tools"][0]
+        self.assertEqual(outcome["input_kind"], "pylock")
+        self.assertEqual(outcome["inputs"], [str(lock)])
+        argv = json.loads(self.calls.read_text().splitlines()[0])
+        self.assertEqual(argv[-2:], ["--locked", str(self.project)])
+        # Exercise automatic runner language detection with only a named
+        # PEP 751 lock, no .py file or --only=python selection to help it.
+        proc = subprocess.run([str(ROOT / "ubs"), str(self.project), "--format=json", "--ci"],
+                              cwd=self.root, env={**self.env, "UV_TOOLS": "pip-audit"},
+                              capture_output=True, text=True, timeout=60, check=False)
+        (self.root / "lock-only-runner.stdout.json").write_text(proc.stdout)
+        (self.root / "lock-only-runner.stderr.txt").write_text(proc.stderr)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        report = json.loads(proc.stdout)
+        self.assertEqual(report["status"], "ok", report)
+        self.assertEqual(report["totals"]["critical"], 1)
+        self.assertEqual([row["language"] for row in report["scanners"]], ["python"])
+        outcome = report["scanners"][0]["extras"]["external_tools"][0]
+        self.assertEqual(outcome["inputs"], [str(lock)])
+        self.assertEqual(outcome["dependencies"], 1)
+        self.assertEqual(len(self.calls.read_text().splitlines()), 2)
+
+    def test_unsupported_project_inventory_is_partial_without_guessing_versions(self):
+        self.audit_tool([audit_dependency(vulns=[])])
+        names = ("uv.lock", "poetry.lock", "Pipfile.lock", "setup.py", "setup.cfg", "Pipfile")
+        for filename in names:
+            # Static PEP 621 metadata is authoritative alongside legacy build
+            # files, but an unsupported lock must not be silently re-resolved.
+            for with_pyproject in ((False, True) if filename.endswith(".lock") else (False,)):
+                with self.subTest(filename=filename, with_pyproject=with_pyproject):
+                    self.project = self.root / (filename + ("-pyproject" if with_pyproject else "-alone"))
+                    self.project.mkdir()
+                    (self.project / filename).write_text("# project inventory\n")
+                    (self.project / "sample.py").write_text("answer = 42\n")
+                    if with_pyproject:
+                        (self.project / "pyproject.toml").write_text(
+                            '[project]\ndependencies = ["example-package>=1.0"]\n')
+                    proc, summary = self.scan("pip-audit", format="json")
+                    self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                    self.assertEqual(summary["status"], "partial", summary)
+                    self.assertEqual(summary["module_error"], "ANALYZER_ERROR")
+                    self.assertFalse(self.calls.exists(), "unsupported inventory launched an unconstrained audit")
+                    self.assertEqual(summary["extras"]["external_tools"][0]["status"], "partial")
+                    self.assertTrue(any(filename in row["message"]
+                                        for row in summary["analysis_errors"]))
+
+    def test_static_pyproject_preserves_hybrid_build_layouts(self):
+        self.source.write_text("answer = 42\n")
+        (self.project / "pyproject.toml").write_text(
+            '[project]\ndependencies = ["example-package==1.0"]\n')
+        for filename in ("setup.py", "setup.cfg", "Pipfile"):
+            (self.project / filename).write_text("# legacy build metadata\n")
+        self.audit_tool([audit_dependency(vulns=[])])
+        proc, summary = self.scan("pip-audit", format="json")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(summary["status"], "ok", summary)
+        outcome = summary["extras"]["external_tools"][0]
+        self.assertEqual(outcome["input_kind"], "project-runtime-dependencies")
+        self.assertEqual(outcome["dependencies"], 1)
+        argv = json.loads(self.calls.read_text().splitlines()[0])
+        self.assertEqual(argv[-1], str(self.project))
+        self.assertNotIn("--locked", argv)
+
+    def test_unavailable_auditor_is_an_explicit_optional_skip(self):
+        self.source.write_text("answer = 42\n")
+        for filename in ("requirements.txt", "uv.lock"):
+            with self.subTest(filename=filename):
+                self.project = self.root / (filename + "-optional")
+                self.project.mkdir()
+                (self.project / "sample.py").write_text("answer = 42\n")
+                (self.project / filename).write_text("# dependency manifest\n")
+                proc, summary = self.scan("pip-audit", format="json")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(summary["status"], "ok", summary)
+                outcome = summary["extras"]["external_tools"][0]
+                self.assertEqual(outcome["status"], "skipped")
+                self.assertIn("pip-audit not available", outcome["reason"])
+                self.assertFalse(summary["analysis_errors"])
+
+    def test_no_uv_disables_dependency_auditing(self):
+        self.source.write_text("answer = 42\n")
+        (self.project / "requirements.txt").write_text("urllib3==1.26.0\n")
+        self.audit_tool([])
+        proc = subprocess.run([*self.command("pip-audit", format="json"), "--no-uv"],
+                              cwd=self.root, env=self.env, capture_output=True,
+                              text=True, timeout=60, check=False)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        summary = json.loads(proc.stdout)
+        self.assertEqual(summary["status"], "ok", summary)
+        self.assertFalse(self.calls.exists(), "--no-uv launched pip-audit")
+        self.assertFalse(summary.get("extras", {}).get("external_tools"))
+        self.assertFalse(summary["analysis_errors"])
 
     def test_no_manifest_is_explicit_skip_and_never_audits_tool_environment(self):
         self.audit_tool([])
@@ -649,6 +857,44 @@ sys.exit(CODE)
         self.assertEqual(outcome["dependencies"], 0)
         self.assertEqual(outcome["reason"], "pyproject.toml declares no runtime dependencies")
 
+    def test_empty_audit_inventory_is_partial_in_every_format(self):
+        layouts = (
+            ("empty-requirements", "requirements.txt", ""),
+            ("comment-requirements", "requirements.txt", "# no resolved packages\n"),
+            ("pinned-requirements", "requirements.txt", "urllib3==1.26.0\n"),
+            ("pyproject", "pyproject.toml",
+             '[project]\nname = "example"\nversion = "1.0"\ndependencies = ["urllib3==1.26.0"]\n'),
+            ("pylock", "pylock.toml", 'lock-version = "1.0"\n'),
+        )
+        self.audit_tool([])
+        for label, filename, content in layouts:
+            self.project = self.root / label
+            self.project.mkdir()
+            self.source = self.project / "sample.py"
+            self.source.write_text('handle = open("data", encoding="utf-8")\n')
+            (self.project / filename).write_text(content)
+            for format in ("text", "json", "sarif"):
+                with self.subTest(layout=label, format=format):
+                    proc, summary = self.scan("pip-audit", format=format)
+                    self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                    self.assertEqual(summary["status"], "partial", summary)
+                    self.assertEqual(summary["module_error"], "ANALYZER_ERROR")
+                    outcome = summary["extras"]["external_tools"][0]
+                    self.assertEqual((outcome["status"], outcome["dependencies"]), ("partial", 0))
+                    self.assertTrue(any("empty dependency inventory" in row["message"]
+                                        for row in summary["analysis_errors"]))
+                    self.assertIn("python.lifecycle.file_handle",
+                                  {row["rule"] for row in summary["findings"]})
+                    self.assertNotIn("pip-audit audited 0 dependencies", proc.stdout + proc.stderr)
+                    if format == "json":
+                        self.assertEqual(json.loads(proc.stdout), summary)
+                    elif format == "sarif":
+                        run = json.loads(proc.stdout)["runs"][0]
+                        self.assertFalse(run["invocations"][0]["executionSuccessful"])
+                        self.assertIn("python.lifecycle.file_handle",
+                                      {row["ruleId"] for row in run["results"]})
+        self.assertEqual(len(self.calls.read_text().splitlines()), len(layouts) * 3)
+
     def test_skipped_packages_keep_advisories_but_make_the_scan_partial(self):
         (self.project / "requirements.txt").write_text("example-package==1.0\n")
         self.audit_tool([audit_dependency(), {"name": "private-package", "skip_reason": "not on PyPI"}], code=1)
@@ -664,6 +910,28 @@ sys.exit(CODE)
         proc, summary = self.scan("pip-audit")
         self.assert_partial(proc, summary, "pip-audit")
         self.assertIn("exit 1 contradicts 0 valid advisory findings", proc.stdout)
+
+    def test_failed_resolution_is_partial_and_retains_native_findings_in_every_format(self):
+        self.failure_tool("pip-audit")
+        for format in ("text", "json", "sarif"):
+            with self.subTest(format=format):
+                proc, summary = self.scan("pip-audit", format=format,
+                                          AUDIT_MODE="resolution-error", AUDIT_EXIT="1")
+                self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                self.assertEqual(summary["status"], "partial", summary)
+                self.assertEqual(summary["module_error"], "ANALYZER_ERROR")
+                self.assertEqual(summary["extras"]["external_tools"][0]["status"], "partial")
+                self.assertIn("No matching distribution found", proc.stdout + proc.stderr)
+                self.assertTrue(summary["analysis_errors"])
+                self.assertIn("python.lifecycle.file_handle",
+                              {row["rule"] for row in summary["findings"]})
+                if format == "json":
+                    self.assertEqual(json.loads(proc.stdout), summary)
+                elif format == "sarif":
+                    run = json.loads(proc.stdout)["runs"][0]
+                    self.assertFalse(run["invocations"][0]["executionSuccessful"])
+                    self.assertIn("python.lifecycle.file_handle",
+                                  {row["ruleId"] for row in run["results"]})
 
     def test_uv_without_companion_preserves_both_streams_and_native_findings(self):
         self.failure_tool("ruff", uv=True)

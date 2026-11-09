@@ -207,7 +207,7 @@ if ! declare -p UBS_HELPER_CHECKSUMS >/dev/null 2>&1; then
   declare -g -A UBS_HELPER_CHECKSUMS=()
 fi
 declare -g -A UBS_COMMON_HELPER_CHECKSUMS=(
-  ['contract.json']='952127e598e5fb63e3eb9c4d617d7a0f4a7eb9e2260d8456f81bccb1eaaf2d46'
+  ['contract.json']='55b1254428ff68c3d745f8d5b9ed727a2e7d8800c79b96f3610f560b73f2cea0'
   ['helpers/async_task_handles_csharp.py']='d5b029f8fe9452fafba22a9bd6a26db9952b8072fdee224d976f140c824af93d'
   ['helpers/cfg_test_only_modules_rust.py']='27dbd7f843d546c07743bf642f4dfa9912f0c205007c583c5e18d6b52fa39e68'
   ['helpers/resource_lifecycle_cpp.py']='886611236e8230551ad302bc2b91894935adb29f427dff92c5e0e18370e9f582'
@@ -381,7 +381,7 @@ declare -g -A UBS_COMMON_HELPER_CHECKSUMS=(
   ['helpers/ubs_core/elixir_rules.py']='3f8ca9a8d1cd898588005bb925b5b931d8d3947d41e7c235c48b9d8033ed65e4'
   ['helpers/ubs_core/elixir_scan.py']='6b9ef4f97ad0457bcc0e3dd0766d5ed6e7edb3c518da17ce5d1be782555bed64'
   ['helpers/ubs_core/explain.py']='9838afd5b0e30c9638be1a003d790ac970cabc4c658cc6cd43abd2de9335d2b6'
-  ['helpers/ubs_core/external_tools.py']='b44914e9571f0cbe8a884ece89f0d74bb15cab64e4b8fd021c8340079fb0b647'
+  ['helpers/ubs_core/external_tools.py']='e512a3c1dbb730ef3314f359fe67186eec7167c34fd45b3f65a65ec8a135fa61'
   ['helpers/ubs_core/findings_merge.py']='d1666407750a67727738c9bc99b72013c364842c3ee202b7b7359c3ff92cedba'
   ['helpers/ubs_core/go_ast.py']='f459406b41a7aa4b5fd0af7cce5a961811d0bffd499fb99825ed631ec96d0f0d'
   ['helpers/ubs_core/go_detectors/__init__.py']='70cc7219036b6d704d9a9e9414c623b4d0eb65ef26e12aac19c8ba6aa055ba41'

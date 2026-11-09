@@ -250,6 +250,9 @@ run_step installed-upgrades "${PY[@]}" shareable/test_installed_contract.py
 # Issue #199: the released-contract guard needs the release tags. Every workflow
 # that runs this file directly has a shallow checkout, where the guard skips.
 run_step contract-checksums "${PY[@]}" shareable/test_contract_checksums.py
+# Issues #128 and #207: optional-tool failures and dependency inventories must
+# preserve findings without reporting incomplete or empty audits as clean.
+run_step optional-analyzers "${PY[@]}" shareable/test_optional_analyzers.py
 # Issues #128, #196, #197: real-toolchain Go adapter and lifecycle location checks.
 run_step go-analyzers "${PY[@]}" shareable/test_go_analyzers.py
 run_step skip-categories "${PY[@]}" shareable/test_skip_categories.py

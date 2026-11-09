@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.5.53-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.5.54-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -1720,10 +1720,21 @@ scanned subsets is not generally equivalent to scanning their union.
 
 ### Python dependency vulnerability audits
 
-When optional Python analyzers are enabled, `pip-audit` checks `requirements.txt`
-first, or the runtime dependencies declared in `[project]` in `pyproject.toml`.
-The project directory is passed to pip-audit's project resolver; a manifest is
-never treated as an installed-package directory. The audit runs for text, JSON
+When optional Python analyzers are enabled, `pip-audit` selects the first
+available dependency inventory in this order:
+
+1. `requirements.txt`, resolved by pip-audit, including transitive dependencies
+   and any requirements/constraints files it references.
+2. PEP 751 `pylock.toml` and `pylock.*.toml` files, audited with
+   `pip-audit --locked PROJECT_DIR`. All listed package versions in all of
+   these lockfiles are checked; the audit does not filter lockfile markers or
+   validate that a lockfile is current with the project manifest.
+3. Static runtime dependencies declared in `[project]` in `pyproject.toml`,
+   resolved by pip-audit's positional project-directory interface.
+
+A manifest is never treated as an installed-package directory, and the tool's
+own installed environment is never used as the project's inventory.
+The audit runs for text, JSON
 and SARIF reports and contributes `py.pip-audit.<advisory>.<package>` critical findings,
 including the package version, available fixes and advisory aliases. Final
 counts and exit status include these findings. Package names are normalized in
@@ -1731,12 +1742,21 @@ the finding identity so baselines remain stable across spelling aliases and
 cannot suppress a different package affected by the same advisory.
 
 The Python summary's `extras.external_tools` records the audit input, status,
-dependency and vulnerability counts, and skipped packages. A missing manifest
-or unavailable tool is explicit skipped coverage. Dynamic dependencies and
-non-PEP-621 project metadata require an exported `requirements.txt`; these
-unsupported inputs, failed resolution, skipped packages, invalid reports and
-timeouts make the scan incomplete while retaining any valid advisories already
-received. A project declaring no runtime dependencies is explicitly skipped.
+dependency and vulnerability counts, and skipped packages. For a lockfile audit,
+`inputs` lists every selected lockfile; findings use the generic lockfile, or
+the first sorted named lockfile, as their project-level location.
+A missing manifest or unavailable tool is explicit skipped coverage. Dynamic
+dependencies, legacy project metadata, and unsupported lockfiles (`uv.lock`,
+`poetry.lock`, `Pipfile.lock`) require an exported resolved `requirements.txt`
+or PEP 751 lockfile. An unsupported lockfile is never silently replaced with
+fresh resolution of potentially different versions from `pyproject.toml`.
+
+These unsupported inputs, failed resolution, skipped packages, invalid reports,
+timeouts, and **any attempted audit with zero audited packages** make the scan
+incomplete (exit 2), retaining any valid advisories already received. A completed
+nonempty audit with vulnerabilities contributes critical findings (exit 1).
+An explicitly declared empty runtime-dependency list is skipped without running
+the tool; that skipped coverage is not a vulnerability-free audit result.
 Audits run afresh even when the source-analysis cache hits.
 
 To select only the dependency auditor through the runner:
@@ -1748,6 +1768,18 @@ UV_TOOLS=pip-audit ubs . --only=python --format=json
 The direct module also accepts `--uv-tools=pip-audit`. Use `ENABLE_UV_TOOLS=0`
 with the runner, or `--no-uv` with the direct module, to disable these optional
 analyzers.
+
+The optional-analyzer regression suite runs without advisory-service access by
+default. With pip-audit installed, enable the real resolver and advisory-service
+regressions explicitly:
+
+```bash
+UBS_TEST_PIP_AUDIT="$(command -v pip-audit)" \
+  python3 test-suite/shareable/test_optional_analyzers.py RealPipAuditIntegration -v
+```
+
+These live tests check a known vulnerable package through requirements, project,
+and PEP 751 inputs, plus empty inventories and failed dependency resolution.
 
 ### Python pattern count export
 

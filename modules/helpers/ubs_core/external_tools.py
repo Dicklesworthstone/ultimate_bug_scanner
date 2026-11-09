@@ -442,10 +442,10 @@ def scan_python_audit(project_dir: str, sink: TextIO, timeout: float,
                       diagnostics: TextIO | None = None) -> dict:
     """Audit selected project dependencies, never the tool's own environment.
 
-    Requirements have precedence over the PEP 621 runtime dependencies in
-    pyproject.toml. ``--path`` is intentionally absent: pip-audit reserves it
+    Requirements have precedence over PEP 751 locks, then PEP 621 runtime
+    dependencies. ``--path`` is intentionally absent: pip-audit reserves it
     for installed distributions, and a manifest passed there audits nothing.
-    Missing tools/inputs are explicit skips; unsuccessful collection is partial.
+    Missing tools/inputs are explicit skips; empty or failed audits are partial.
     """
     root = Path(project_dir or ".").resolve()
     outcome = {"tool": "pip-audit", "status": "skipped", "scope": "project"}
@@ -453,20 +453,50 @@ def scan_python_audit(project_dir: str, sink: TextIO, timeout: float,
         outcome["reason"] = "selected-file scan has no dependency manifest"
         return outcome
     requirements, pyproject = root / "requirements.txt", root / "pyproject.toml"
+    locks = sorted(path for path in root.glob("pylock.*.toml") if path.is_file())
+    if (root / "pylock.toml").is_file():
+        locks.insert(0, root / "pylock.toml")
+    unsupported_locks = [root / name for name in ("uv.lock", "poetry.lock", "Pipfile.lock")
+                         if (root / name).is_file()]
+    unsupported_projects = [root / name for name in ("setup.py", "setup.cfg", "Pipfile")
+                            if (root / name).is_file()]
+    input_error = ""
     if requirements.is_file():
         manifest, arguments = requirements, ["-r", str(requirements)]
         outcome["input_kind"] = "requirements"
+    elif locks:
+        # pip-audit --locked audits every pylock[.*].toml in the directory.
+        # Record the entire input set; the first path anchors project findings.
+        manifest, arguments = locks[0], ["--locked", str(root)]
+        outcome.update(input_kind="pylock", inputs=[str(path) for path in locks])
+    elif unsupported_locks:
+        manifest, arguments = unsupported_locks[0], []
+        outcome.update(input_kind="unsupported-lock", inputs=[str(path) for path in unsupported_locks])
+        # Resolving a broad pyproject constraint here could select a newer,
+        # unaffected version instead of the vulnerable version actually locked.
+        input_error = ("unsupported lockfile(s): " + ", ".join(path.name for path in unsupported_locks)
+                       + "; export resolved requirements.txt or PEP 751 pylock.toml")
     elif pyproject.is_file():
         manifest, arguments = pyproject, [str(root)]
         outcome["input_kind"] = "project-runtime-dependencies"
+    elif unsupported_projects:
+        manifest, arguments = unsupported_projects[0], []
+        outcome["input_kind"] = "unsupported-project"
+        input_error = ("unsupported project metadata: " + ", ".join(path.name for path in unsupported_projects)
+                       + "; export resolved requirements.txt or PEP 751 pylock.toml")
     else:
-        outcome["reason"] = "no requirements.txt or pyproject.toml; dependency coverage not collected"
+        outcome["reason"] = ("no requirements.txt or pyproject.toml or supported lockfile; "
+                             "dependency coverage not collected")
         return outcome
     outcome["input"] = str(manifest)
     if not command:
         outcome["reason"] = "pip-audit not available; dependency coverage not collected"
         return outcome
     before = len(errors)
+    if input_error:
+        errors.append("pip-audit: " + input_error)
+        outcome["status"] = "partial"
+        return outcome
     if manifest == pyproject:
         # pip-audit 2.x treats a missing dependencies array as empty even if
         # the project declares dynamic dependencies. Reject that hollow pass.
@@ -521,6 +551,8 @@ def scan_python_audit(project_dir: str, sink: TextIO, timeout: float,
         if output is not None:
             counts = parse_pip_audit_report(output.stdout, manifest, sink, errors)
             outcome["exit_code"] = output.returncode
+            if counts["dependencies"] == 0:
+                errors.append("pip-audit: empty dependency inventory; no packages were audited")
             if output.returncode not in (0, 1):
                 errors.append(f"pip-audit exited {output.returncode}")
             elif (output.returncode == 1) != bool(counts["vulnerabilities"]):

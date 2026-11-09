@@ -10,6 +10,14 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Complete the Python dependency-audit correction for issue #207. Reject empty
+  audited inventories even when pip-audit exits successfully; prefer PEP 751
+  lockfiles over fresh project resolution and explicitly refuse unsupported
+  locked inventories instead of auditing different versions. Preserve optional
+  skips, partial-scan exit status, and retained security findings across reports.
+  Add module/runner regressions and include optional-analyzer tests in the local
+  test gate.
+
 - Follow Drizzle `sql.join()` and `sql.fromList()` through copied outer chunks,
   borrowed mutable arrays, nested SQL references and selected helpers/modules.
   Preserve scalar binding, live separators, cleanup and argument evaluation

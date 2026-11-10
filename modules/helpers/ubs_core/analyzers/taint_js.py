@@ -2458,13 +2458,13 @@ class _Flow:
         return None
 
     def drizzle_tag(self, start, end, state):
-        """Resolve one complete immediate template to the imported SQL tag.
+        """Resolve one complete template to the imported SQL tag.
 
         Runtime aliases, unknown providers, type-only imports, property calls
         and shadowed/reassigned bindings do not establish parameterization.
-        Stored source-bearing tags retain conservative binding provenance.
-        Their append mutations use SQL-object heap identities; custom getSQL
-        and direct property mutation protocols remain explicitly unsupported.
+        Stored tags retain SQL-object heap identities and parameter slots;
+        custom getSQL and direct property mutation protocols remain explicitly
+        unsupported.
         """
         code, text = self.scope.code, self.engine.text
         while start < end and code[start].isspace():
@@ -2527,7 +2527,7 @@ class _Flow:
             cursor -= 1
         return False
 
-    def evaluate_arguments(self, ranges, state, *, immediate_sql_tags=False):
+    def evaluate_arguments(self, ranges, state):
         """Evaluate and snapshot each spread before the following argument.
 
         A later argument may mutate the iterable or replace one of its slots.
@@ -2586,8 +2586,7 @@ class _Flow:
                     # the array object itself. Retain borrowed element refs.
                     fact = self.property(fact, None, state)
             else:
-                fact = self.value(left, right, state, immediate_sql_tag=(
-                    immediate_sql_tags and self.drizzle_tag(left, right, state)))
+                fact = self.value(left, right, state)
             kind = self.binding_input(left, right, state)
             if kind is None and _refs(fact) and not frozenset(fact):
                 kind = 'present'
@@ -2781,7 +2780,7 @@ class _Flow:
             result = _join(result, incoming)
         return result
 
-    def value(self, start, end, state, *, immediate_sql_tag=False):
+    def value(self, start, end, state):
         self.engine.budget.spend()
         text, code = self.engine.text, self.scope.code
         while start < end and code[start].isspace():
@@ -2791,7 +2790,7 @@ class _Flow:
         if start >= end:
             return frozenset()
         if code[start] == '(' and self.pairs.get(start) == end - 1:
-            return self.value(start + 1, end - 1, state, immediate_sql_tag=immediate_sql_tag)
+            return self.value(start + 1, end - 1, state)
         if code[start] in '[{' and start in self.pairs:
             closing = self.pairs[start]
             assignment = re.match(r'\s*=(?!=|>)\s*', code[closing + 1:end])
@@ -2958,11 +2957,7 @@ class _Flow:
             if tag_call and not drizzle:
                 arguments = self.template_arguments(opening, closing)
             sink = self.engine.call_sinks.get(match_start)
-            bound_argument = (self.rule == 'js.taint.sql' and sink and sink[0] == self.rule
-                              and sink_binding == 'imported' and not isinstance(callee, _Scope)
-                              and len(arguments) == 1 and self.drizzle_tag(*arguments[0], state))
-            argument_facts, prepared = self.evaluate_arguments(
-                arguments, state, immediate_sql_tags=(bound_argument or drizzle and immediate_sql_tag))
+            argument_facts, prepared = self.evaluate_arguments(arguments, state)
             proof_role, proof_value = 'other', None
             if isinstance(callee, _Scope) and callee.generator:
                 # A generator call creates an iterator; it does not execute
@@ -3061,32 +3056,31 @@ class _Flow:
                         call_fact = _join(call_fact, frozenset({_Trace(('source', source), (source,))}))
                 if sink and sink[0] == self.rule and sink_binding == 'imported':
                     selected = argument_facts[:1] if self.rule == 'js.taint.sql' else argument_facts
-                    if bound_argument:
-                        selected = [_sql_transfer(fact, 'bound') for fact in selected]
                     self.effect(match_start, sink[1], _join(*selected), state)
                     if self.rule == 'js.taint.sql':
                         proof_role, proof_value = 'execute', _join(*selected)
                 if self.rule == 'js.taint.sql' and self.engine.drizzle_imports:
                     if tag_call:
-                        # Scalar request values become bound parameters only
-                        # at a direct execution sink. An object can instead be
-                        # an SQLWrapper; opaque builders/raw chunks must keep
-                        # their SQL-text provenance even inside another tag.
-                        # Assigned/helper-returned tags are SQL objects, too:
-                        # their chunks can be mutated before interpolation.
-                        # Only directly nested tags inherit immediate binding.
+                        # Parameter slots belong to the SQL value, regardless
+                        # of whether execution is immediate or follows an alias,
+                        # helper return, join or append. Preserve live SQL-object
+                        # references so a later raw mutation is still visible.
+                        # Unknown builders keep opaque provenance: binding a
+                        # scalar does not certify an arbitrary SQLWrapper.
                         chunks = []
                         for fact in argument_facts:
                             if _refs(fact) and all(_sql_object_ref(ref) or _sql_name_ref(ref) for ref in _refs(fact)):
                                 # A branch may supply either an SQL object or
-                                # a scalar. Bind only its scalar alternative;
+                                # a scalar. Rendering binds the scalar while
                                 # nested SQL chunks remain live references.
-                                scalar = _sql_transfer(frozenset(fact), 'bound' if immediate_sql_tag else 'opaque')
-                                chunks.append(_join(scalar, _Fact(refs=_refs(fact))))
+                                chunks.append(fact)
                             else:
-                                if self.sql_reachable(fact, state):
+                                if _refs(fact):
                                     self.incomplete.add('Drizzle SQL interpolation requires unsupported wrapper semantics')
-                                mode = 'bound' if immediate_sql_tag and not _refs(fact) else 'opaque'
+                                # Store ordinary scalar provenance. Only the
+                                # SQL rendering context binds it; reading the
+                                # same input elsewhere must retain its taint.
+                                mode = 'opaque' if _refs(fact) else ''
                                 chunk = self.materialize(fact, state)
                                 if self.engine.collect_sql_proofs and mode == 'opaque':
                                     chunk = _join(chunk, frozenset({_SQL_UNPROVEN}))

@@ -10,6 +10,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Preserve Drizzle parameter binding when SQL templates are stored, aliased,
+  composed, or returned by selected helpers. Keep raw SQL mutations and live
+  nested references visible without sanitizing the original request value.
+  Report custom SQLWrapper/getSQL protocols as incomplete instead of granting
+  an unsupported complete result. Add exact unsafe/clean regressions and
+  public JSON/SARIF coverage for retained queries.
+
 - Preserve Java request-source flows through selected bodyless local getters
   across path traversal, redirects, response headers and outbound requests.
   Respect String versus numeric overloads, lexical type ownership and proven

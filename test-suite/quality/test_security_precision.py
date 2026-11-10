@@ -5348,7 +5348,7 @@ class DrizzleBoundSqlTaintTests(unittest.TestCase):
         self.inspect('named-import-alias', self.PREFIX.replace('{ sql }', '{ sql as statement }')
                      + '  return db.execute(statement`SELECT ${value}`);\n}\n', [])
 
-    def test_raw_and_unknown_fragments_remain_critical(self):
+    def test_raw_unknown_and_stored_parameter_provenance(self):
         cases = {
             'plain-template': ('  return db.execute(`SELECT ${value}`);\n', [4]),
             'concatenation': ('  return db.execute("SELECT " + value);\n', [4]),
@@ -5384,7 +5384,7 @@ class DrizzleBoundSqlTaintTests(unittest.TestCase):
             'object-fragment': ('  const fragment = { text: value };\n'
                                 '  return db.execute(sql`SELECT ${fragment}`);\n', [5]),
             'assigned-template': ('  const statement = sql`SELECT ${value}`;\n'
-                                  '  return db.execute(statement);\n', [5]),
+                                  '  return db.execute(statement);\n', []),
             'mutated-template': ('  const statement = sql`SELECT ${value}`;\n'
                                  '  statement.append(sql.raw(value));\n'
                                  '  return db.execute(statement);\n', [6]),
@@ -5393,7 +5393,7 @@ class DrizzleBoundSqlTaintTests(unittest.TestCase):
         for name, (body, expected) in cases.items():
             with self.subTest(case=name):
                 self.inspect(name, self.PREFIX + body + '}\n', expected,
-                             partial=name == 'member-after-tag')
+                             partial=name in {'member-after-tag', 'object-fragment'})
 
     def test_provider_identity_is_not_inferred_from_its_spelling(self):
         body = '  return db.execute(sql`SELECT ${value}`);\n}\n'
@@ -5407,7 +5407,7 @@ class DrizzleBoundSqlTaintTests(unittest.TestCase):
             with self.subTest(case=name):
                 self.inspect(name, source, [4])
         self.inspect('local-tag-alias', self.PREFIX + '  const statement = sql;\n'
-                     '  return db.execute(statement`SELECT ${value}`);\n}\n', [5])
+                     '  return db.execute(statement`SELECT ${value}`);\n}\n', [])
         self.inspect('rebound-provider', self.PREFIX + '  sql = replacement;\n' + body, [5])
         self.inspect('block-shadow', self.PREFIX + '  { const sql = replacement;\n'
                      + body + '}\n', [5])
@@ -5438,7 +5438,7 @@ class DrizzleBoundSqlTaintTests(unittest.TestCase):
     def test_assigned_sql_objects_do_not_become_bound_scalars(self):
         cases = {
             'assigned-tag-interpolation': ('  const fragment = sql`WHERE id = ${value}`;\n'
-                                           '  return db.execute(sql`SELECT * FROM records ${fragment}`);\n', [5]),
+                                           '  return db.execute(sql`SELECT * FROM records ${fragment}`);\n', []),
             'appended-tag-interpolation': ('  const fragment = sql`WHERE id = ${value}`;\n'
                                            '  fragment.append(sql.raw(req.body.query));\n'
                                            '  return db.execute(sql`SELECT * FROM records ${fragment}`);\n', [6]),
@@ -5452,7 +5452,7 @@ class DrizzleBoundSqlTaintTests(unittest.TestCase):
                                            '  return db.execute(sql`SELECT * FROM records ${fragment}`);\n', [7]),
             'unknown-mutated-tag': ('  const fragment = sql`WHERE id = ${value}`;\n'
                                     '  mutate(fragment, req.body.query);\n'
-                                    '  return db.execute(sql`SELECT * FROM records ${fragment}`);\n', [6]),
+                                    '  return db.execute(sql`SELECT * FROM records ${fragment}`);\n', []),
         }
         for name, (body, expected) in cases.items():
             with self.subTest(case=name):
@@ -5539,7 +5539,7 @@ class DrizzleMutableSqlTests(unittest.TestCase):
 
     Every labeled sink is independent of scanner output. Unsupported mutations
     must report incomplete analysis and preserve independently proven findings.
-    Existing source-bearing assigned-template conservative cases remain above.
+    Source-bearing parameter slots and raw fragments remain distinct above.
     """
 
     @staticmethod
@@ -5850,10 +5850,11 @@ class DrizzleMutableSqlPublicTests(unittest.TestCase):
     def check_public_reports(self, baseline_variable, revision, artifact_name, declared_programs,
                              groups, expectations, labels=('incumbent', 'candidate')):
         baseline_path = os.environ.get(baseline_variable)
-        if not baseline_path:
+        if 'incumbent' in labels and not baseline_path:
             self.skipTest(f'set {baseline_variable} to the {revision} runner')
-        baseline = Path(baseline_path).resolve()
-        self.assertTrue(baseline.is_file(), f'the real {revision} runner is required')
+        baseline = Path(baseline_path).resolve() if baseline_path else None
+        if 'incumbent' in labels:
+            self.assertTrue(baseline.is_file(), f'the real {revision} runner is required')
         artifacts = REPO_ROOT / 'test-suite/artifacts' / artifact_name
         artifacts.mkdir(parents=True, exist_ok=True)
         root = Path(tempfile.mkdtemp(prefix='public-', dir=artifacts))
@@ -5955,8 +5956,8 @@ class DrizzleSqlCompositionTests(DrizzleMutableSqlTests):
     original array to SQL. Both retain nested SQL/array references, and a join
     uses its separator only between actual entries. Ordinary scalar chunks
     follow runtime parameter binding; raw SQL objects retain their provenance.
-    Existing conservative assigned-tag and uncertain-provider controls remain
-    in the preceding suites. Unknown protocols retain independent findings.
+    Existing assigned-tag and uncertain-provider controls remain in the
+    preceding suites. Unknown protocols retain independent findings.
 
     https://github.com/drizzle-team/drizzle-orm/blob/main/drizzle-orm/src/sql/sql.ts
     """
@@ -6226,9 +6227,9 @@ class DrizzleSqlCompositionTests(DrizzleMutableSqlTests):
                  '  const query = sql.join([value]);\n'
                  '  return db.execute(query); // expect:sql',
                  imports='import { sql } from "custom-sql";\n'),
-            case('assigned-source-tag-stays-conservative',
+            case('assigned-source-tag-retains-parameters',
                  '  const chunk = sql`SELECT ${value}`;\n'
-                 '  return db.execute(sql.join([chunk])); // expect:sql'),
+                 '  return db.execute(sql.join([chunk]));'),
         ]
         cases.append(('cross-file-from-list-array', {
             'helper.ts': ('import { sql } from "drizzle-orm";\n'
@@ -6242,6 +6243,228 @@ class DrizzleSqlCompositionTests(DrizzleMutableSqlTests):
                         '  return db.execute(query); // expect:sql\n}\n'),
         }, False))
         return cases
+
+
+class DrizzleStoredParameterTests(DrizzleMutableSqlTests):
+    """Stored SQL retains parameter slots, while raw chunks remain executable.
+
+    Drizzle's documented sql.join/fromList/append examples store parameterized
+    fragments before execution. Assignment and local helper return cannot turn
+    a bound scalar into raw SQL. The independent labels below distinguish that
+    value from later raw mutation and from escaping to unknown code.
+    https://orm.drizzle.team/docs/sql#sqlappend
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        artifacts = REPO_ROOT / 'test-suite/artifacts/drizzle-stored-parameters'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        cls.root = Path(tempfile.mkdtemp(prefix='native-', dir=artifacts))
+
+    @staticmethod
+    def programs():
+        def case(name, body, *, helpers='', imports='import { sql } from "drizzle-orm";\n', partial=False):
+            source = (imports + helpers + 'export function run(req) {\n'
+                      '  const value = req.body.value;\n' + body + '\n}\n')
+            return name, {'main.ts': source}, partial
+
+        cases = [
+            case('stored-bound',
+                 '  const query = sql`SELECT * FROM records WHERE id = ${value}`;\n'
+                 '  return db.execute(query);'),
+            case('stored-bound-alias',
+                 '  const query = sql`SELECT ${value}`;\n'
+                 '  const alias = query;\n'
+                 '  return db.execute(alias);'),
+            case('stored-bound-nested',
+                 '  const where = sql`WHERE id = ${value}`;\n'
+                 '  const query = sql`SELECT * FROM records ${where}`;\n'
+                 '  return db.execute(query);'),
+            case('stored-bound-append',
+                 '  const query = sql`SELECT * FROM records`;\n'
+                 '  query.append(sql`WHERE id = ${value}`);\n'
+                 '  return db.execute(query);'),
+            case('stored-bound-join',
+                 '  const where = sql`WHERE id = ${value}`;\n'
+                 '  const query = sql.join([sql`SELECT * FROM records`, where], sql` `);\n'
+                 '  return db.execute(query);'),
+            case('stored-bound-from-list',
+                 '  const chunks = [sql`SELECT ${value}`];\n'
+                 '  const query = sql.fromList(chunks);\n'
+                 '  chunks.push(sql`UNION SELECT ${req.query.next}`);\n'
+                 '  return db.execute(query);'),
+            case('stored-bound-import-alias',
+                 '  const query = statement`SELECT ${value}`;\n'
+                 '  return db.execute(query);',
+                 imports='import { sql as statement } from "drizzle-orm";\n'),
+            case('stored-bound-provider-alias',
+                 '  const statement = sql;\n'
+                 '  const query = statement`SELECT ${value}`;\n'
+                 '  return db.execute(query);'),
+            case('stored-bound-helper-return',
+                 '  const query = make(value);\n'
+                 '  return db.execute(query);',
+                 helpers='function make(value) { return sql`SELECT ${value}`; }\n'),
+            case('stored-bound-helper-execute',
+                 '  const query = sql`SELECT ${value}`;\n'
+                 '  return execute(query);',
+                 helpers='function execute(query) { return db.execute(query); }\n'),
+            case('stored-bound-closure',
+                 '  const query = sql`SELECT ${value}`;\n'
+                 '  function execute() { return db.execute(query); }\n'
+                 '  return execute();'),
+            case('stored-bound-snapshot',
+                 '  let parameter = value;\n'
+                 '  const query = sql`SELECT ${parameter}`;\n'
+                 '  parameter = sql.raw(req.query.sql);\n'
+                 '  return db.execute(query);'),
+            case('stored-bound-branch',
+                 '  let query = sql`SELECT ${value}`;\n'
+                 '  if (req.query.other) { query = sql`SELECT ${req.body.other}`; }\n'
+                 '  return db.execute(query);'),
+            case('stored-bound-raw-append',
+                 '  const query = sql`SELECT ${value}`;\n'
+                 '  query.append(sql.raw(req.query.sql));\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('stored-bound-alias-mutation',
+                 '  const query = sql`SELECT ${value}`;\n'
+                 '  const alias = query;\n'
+                 '  alias.append(sql.raw(req.query.sql));\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('stored-bound-nested-mutation',
+                 '  const where = sql`WHERE id = ${value}`;\n'
+                 '  const query = sql`SELECT * FROM records ${where}`;\n'
+                 '  where.append(sql.raw(req.query.sql));\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('stored-bound-helper-raw-return',
+                 '  const query = make(sql.raw(value));\n'
+                 '  return db.execute(query); // expect:sql',
+                 helpers='function make(value) { return sql`SELECT ${value}`; }\n'),
+            case('stored-bound-helper-raw-mutation',
+                 '  const query = make(value);\n'
+                 '  query.append(sql.raw(req.query.sql));\n'
+                 '  return db.execute(query); // expect:sql',
+                 helpers='function make(value) { return sql`SELECT ${value}`; }\n'),
+            case('stored-bound-captured-mutation',
+                 '  const query = sql`SELECT ${value}`;\n'
+                 '  function extend() { query.append(sql.raw(req.query.sql)); }\n'
+                 '  extend();\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('stored-bound-branch-raw',
+                 '  let query = sql`SELECT ${value}`;\n'
+                 '  if (req.query.raw) { query = sql.raw(req.query.sql); }\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('stored-bound-separate-invocations',
+                 '  const safe = make(value);\n'
+                 '  const unsafe = make(sql.raw(req.query.sql));\n'
+                 '  db.execute(safe);\n'
+                 '  return db.execute(unsafe); // expect:sql',
+                 helpers='function make(value) { return sql`SELECT ${value}`; }\n'),
+            case('stored-bound-used-before-mutation',
+                 '  const query = sql`SELECT ${value}`;\n'
+                 '  db.execute(query);\n'
+                 '  query.append(sql.raw(req.query.sql));\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('stored-binding-does-not-sanitize-input',
+                 '  const query = sql`SELECT ${value}`;\n'
+                 '  db.execute(query);\n'
+                 '  return db.execute("SELECT " + value); // expect:sql'),
+            case('stored-unknown-builder',
+                 '  const query = sql`SELECT ${makeClause(value)}`;\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('stored-rebound-provider',
+                 '  sql = replacement;\n'
+                 '  const query = sql`SELECT ${value}`;\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('stored-rebound-provider-alias',
+                 '  let statement = sql;\n'
+                 '  statement = replacement;\n'
+                 '  const query = statement`SELECT ${value}`;\n'
+                 '  return db.execute(query); // expect:sql'),
+            case('stored-foreign-provider',
+                 '  const query = sql`SELECT ${value}`;\n'
+                 '  return db.execute(query); // expect:sql',
+                 imports='import { sql } from "custom-sql";\n'),
+            case('stored-object-wrapper',
+                 '  const wrapper = { getSQL() { return sql.raw(value); } };\n'
+                 '  const query = sql`SELECT ${wrapper}`;\n'
+                 '  db.execute(query);\n'
+                 '  return db.execute("SELECT " + value); // expect:sql', partial=True),
+            case('stored-unknown-mutation',
+                 '  const query = sql`SELECT ${value}`;\n'
+                 '  unknownMutation(query);\n'
+                 '  db.execute(query);\n'
+                 '  return db.execute("SELECT " + value); // expect:sql', partial=True),
+        ]
+        cases.append(('stored-cross-file-helper', {
+            'helper.ts': ('import { sql } from "drizzle-orm";\n'
+                          'export function make(value) { return sql`SELECT ${value}`; }\n'),
+            'main.ts': ('import { sql } from "drizzle-orm";\n'
+                        'import { make } from "./helper.js";\n'
+                        'export function run(req) {\n'
+                        '  const safe = make(req.body.value);\n'
+                        '  const unsafe = make(sql.raw(req.query.sql));\n'
+                        '  db.execute(safe);\n'
+                        '  return db.execute(unsafe); // expect:sql\n}\n'),
+        }, False))
+        return cases
+
+
+class DrizzleStoredParameterPublicTests(unittest.TestCase):
+    """Exact real-runner findings, totals and exits for retained SQL parameters.
+
+    Candidate assertions always run. An opt-in frozen runner adds a same-run
+    comparison without changing the fixed safe/unsafe source programs.
+    """
+
+    check_public_reports = DrizzleMutableSqlPublicTests.check_public_reports
+
+    def run_stored_parameter_reports(self, labels):
+        groups = {
+            'bound': ('stored-bound', 'stored-bound-alias', 'stored-bound-nested',
+                      'stored-bound-helper-return', 'stored-bound-append'),
+            'unsafe': ('stored-bound-raw-append', 'stored-bound-nested-mutation',
+                       'stored-bound-helper-raw-return', 'stored-unknown-builder',
+                       'stored-foreign-provider'),
+            'wrapper': ('stored-object-wrapper',),
+            'escape': ('stored-unknown-mutation',),
+        }
+        security_sites = {
+            'bound': [],
+            'unsafe': [('stored-bound-raw-append/main.ts', 5, 1),
+                       ('stored-bound-raw-append/main.ts', 6, 1),
+                       ('stored-bound-nested-mutation/main.ts', 6, 1),
+                       ('stored-bound-nested-mutation/main.ts', 7, 1),
+                       ('stored-unknown-builder/main.ts', 5, 1),
+                       ('stored-foreign-provider/main.ts', 5, 1)],
+            'wrapper': [('stored-object-wrapper/main.ts', 6, 1),
+                        ('stored-object-wrapper/main.ts', 7, 1)],
+            'escape': [('stored-unknown-mutation/main.ts', 6, 1),
+                       ('stored-unknown-mutation/main.ts', 7, 1)],
+        }
+
+        def expectations(label, group, sites):
+            taint, security = sites, security_sites[group]
+            partial = group == 'escape' or (group == 'wrapper' and label == 'candidate')
+            if label == 'incumbent':
+                if group == 'bound':
+                    taint = [(name + '/main.ts', 5 if name == 'stored-bound' else 6, 10)
+                             for name in groups['bound']]
+                    security = [('stored-bound/main.ts', 5, 1),
+                                ('stored-bound-nested/main.ts', 6, 1)]
+                elif group == 'escape':
+                    taint = [*sites, ('stored-unknown-mutation/main.ts', 6, 3)]
+            return sorted(taint), sorted(security), partial
+
+        self.check_public_reports(
+            'UBS_DRIZZLE_STORED_BASELINE', '05b45b8', 'drizzle-stored-parameters',
+            DrizzleStoredParameterTests.programs(), groups, expectations, labels)
+
+    def test_stored_parameters_json_sarif(self):
+        self.run_stored_parameter_reports(('candidate',))
+
+    def test_incumbent_and_candidate_stored_parameters(self):
+        self.run_stored_parameter_reports(('incumbent', 'candidate'))
 
 
 class DrizzleSqlCompositionDetectorTests(unittest.TestCase):
@@ -6304,7 +6527,7 @@ class DrizzleSqlCompositionDetectorTests(unittest.TestCase):
             'join-ignores-third-argument': [],
             'from-list-ignores-second-argument': [],
             'source-identifier-remains-conservative': [5],
-            'assigned-source-tag-stays-conservative': [5],
+            'assigned-source-tag-retains-parameters': [],
             'join-unknown-list-boundary': [6],
             'join-overwritten-provider-method': [6],
         }

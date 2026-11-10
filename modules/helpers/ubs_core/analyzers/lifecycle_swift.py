@@ -279,8 +279,15 @@ class LifecycleParser(SwiftParser):
                     part = part[1:]
                 statement = replace(statement, tokens=part)
             first = part[0].value
-            if statement.kind == 'unsupported' and first == 'switch':
+            if statement.kind in {'unsupported', 'switch'} and first == 'switch':
+                # The shared parser's taint CFG stores cases in a different
+                # layout. Preserve the lifecycle adapter's own arm schema.
                 statement = self.switch(part, owner, scope, depth)
+            elif statement.kind == 'repeat':
+                # Taint support does not establish resource cleanup on every
+                # repeat path. Retain the existing opaque-flow diagnostics and
+                # live obligations instead of evaluating its raw body as simple.
+                statement = SwiftStatement('unsupported', part)
             elif statement.kind == 'unsupported' and first in {'defer', 'do'}:
                 opening = next((i for i, token in enumerate(part) if token.value == '{'), -1)
                 if opening < 0:

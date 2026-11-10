@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.5.54-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.5.55-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -1498,6 +1498,16 @@ just text on stderr, so `ubs … --format=json | jq` always has something to par
 - Incomplete runs: the normal envelope with `"status":"partial"` (or `"error"` when a module could not run at all and no other scanner produced a result) and `failed_modules:[{language,status,module_error,message}]`; each scanner carries its own `status` (`ok`, `timeout`, `error`). A module that exits 2 is reported the same way, with `"error":"environment"`, `"reason":"module-failed"` and `"exit_code":2` added — the results from the scanners that *did* complete stay in the envelope, and every requested `--report-json` / `--html-report` / `--beads-jsonl` is still written. SARIF runs get `invocations[].executionSuccessful=false`, `exitCode: 2` and one notification per failed module.
 - Requested artifacts are a separate outcome from the analysis. If a `--report-json`, `--html-report`, `--save-baseline` or `--beads-jsonl` was requested and could not be written, the run exits 2 and says which path failed; the previous file at that path is never truncated by a failed write.
 - Comparisons are qualified before they are shown. `--comparison` emits `comparison.delta` only when both the current scan and the baseline are complete; otherwise it emits `comparison.status: "unavailable"` with a `reason` (`current_scan_incomplete`, `baseline_incomplete`, `baseline_missing`, `baseline_unreadable`) instead of a number that would read as an improvement. `--save-baseline` refuses to record a baseline from an incomplete scan, leaving any existing baseline in place, and an HTML report from an incomplete scan carries a visible "Incomplete scan" banner.
+
+**Swift coverage limitations.** The Swift analyzers can continue past a scoped
+limitation to retain findings in that scope and in other files. A
+`swift.taint.analysis-limited` or `swift.lifecycle.analysis-limited` diagnostic
+still makes the scan `partial` with exit 2. Warning thresholds and ordinary
+finding suppressions cannot turn that coverage failure into a successful
+receipt, and incomplete scans do not populate the reusable analysis cache.
+The separately documented, reason-required `taint-source` directive retains
+its narrow source-activation behavior; it does not clear another active
+source's analysis failure.
 
 **Directory size guard**
 

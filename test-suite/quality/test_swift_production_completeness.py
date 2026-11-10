@@ -2,8 +2,9 @@
 
 The complete pinned snapshot matters: a reduced example can accidentally omit
 the unrelated getter, callback, or initializer that caused a file-wide refusal.
-CLI evidence is retained under artifacts, and a successful scan may still have
-ordinary security and code-quality findings.
+CLI evidence is retained under artifacts. Ordinary findings do not make
+coverage incomplete, but an explicit analysis limitation must never publish
+a successful completion receipt.
 """
 from __future__ import annotations
 
@@ -73,7 +74,7 @@ class SwiftProductionCompletenessTests(unittest.TestCase):
                 self.assertEqual(hashlib.sha1(blob, usedforsecurity=False).hexdigest(), BLOBS[name],
                                  f'{name} must match upstream {COMMIT} without suppressions or reductions')
 
-    def test_complete_snapshot_through_focused_analyzers(self):
+    def test_full_snapshot_retains_results_and_explicit_limits_through_focused_analyzers(self):
         evidence = {}
         for name in sorted(BLOBS):
             path = FIXTURES / name
@@ -88,8 +89,9 @@ class SwiftProductionCompletenessTests(unittest.TestCase):
                 ('lifecycle', lambda: lifecycle_findings(path, source, FIXTURES)),
             ):
                 with self.subTest(file=name, analyzer=label):
-                    # No exception is a completeness contract, not an assertion
-                    # that every production file is free of real findings.
+                    # Every selected file must produce results. A recovered
+                    # limitation is still incomplete coverage, as the public
+                    # report assertions below require.
                     result = analyze()
                     evidence[name][label] = len(result)
             with self.subTest(file=name, analyzer='file_url_proof'):
@@ -112,23 +114,27 @@ class SwiftProductionCompletenessTests(unittest.TestCase):
                     evidence[name]['file_url_proof'] = sorted(offsets)
         (self.artifacts / 'focused.json').write_text(json.dumps(evidence, indent=2), encoding='utf-8')
 
-    def scan(self, project, fmt, label, *, flags=(), complete=True):
+    def scan(self, project, fmt, label, *, flags=(), complete=True, cache_dir=None):
         evidence = self.artifacts / label
         evidence.mkdir()
-        command = [str(ROOT / 'ubs'), '--only=swift', '--ci', '--no-cache',
+        command = [str(ROOT / 'ubs'), '--only=swift', '--ci',
+                   *(['--no-cache'] if cache_dir is None else []),
                    '--format=' + fmt, *flags, str(project)]
         environment = {
             **os.environ, 'UBS_NO_AUTO_UPDATE': '1', 'UBS_ENABLE_AUTO_UPDATE': '0',
-            'UBS_NO_CACHE': '1', 'PYTHONDONTWRITEBYTECODE': '1',
-            'UBS_CACHE_DIR': str(evidence / 'cache'), 'NO_COLOR': '1',
+            'UBS_NO_CACHE': '1' if cache_dir is None else '0', 'PYTHONDONTWRITEBYTECODE': '1',
+            'UBS_CACHE_DIR': str(cache_dir or evidence / 'cache'), 'NO_COLOR': '1',
         }
         started = time.monotonic()
-        result = subprocess.run(command, cwd=evidence, env=environment, text=True,
+        # Cache keys include the working directory because detector paths can
+        # depend on it. Keep that context stable across the cache controls.
+        working_directory = project if cache_dir is not None else evidence
+        result = subprocess.run(command, cwd=working_directory, env=environment, text=True,
                                 capture_output=True, timeout=180)
         (evidence / 'stdout.log').write_text(result.stdout, encoding='utf-8')
         (evidence / 'stderr.log').write_text(result.stderr, encoding='utf-8')
         (evidence / 'identity.json').write_text(json.dumps({
-            'command': command, 'cwd': str(evidence), 'upstream_commit': COMMIT,
+            'command': command, 'cwd': str(working_directory), 'upstream_commit': COMMIT,
             'python': sys.version, 'exit': result.returncode,
             'elapsed': time.monotonic() - started,
         }, indent=2), encoding='utf-8')
@@ -153,13 +159,34 @@ class SwiftProductionCompletenessTests(unittest.TestCase):
                     self.assertTrue(invocation.get('executionSuccessful', True), invocation)
                     self.assertFalse(invocation.get('toolExecutionNotifications'), invocation)
 
-    def test_full_snapshot_completes_through_public_json_and_sarif(self):
+    def assert_incomplete(self, payload, fmt, files):
+        if fmt == 'json':
+            self.assertEqual(payload['status'], 'partial', payload)
+            self.assertEqual(payload['totals']['files'], files, payload)
+            self.assertTrue(any(item.get('language') == 'swift' and
+                                item.get('module_error') == 'ANALYZER_ERROR'
+                                for item in payload['failed_modules']), payload)
+            self.assertTrue(all(scanner['status'] == 'partial'
+                                for scanner in payload['scanners']), payload)
+        else:
+            invocations = [item for run in payload['runs'] for item in run.get('invocations') or []]
+            self.assertTrue(invocations, payload)
+            self.assertTrue(all(item['executionSuccessful'] is False for item in invocations), payload)
+            self.assertTrue(all(item['exitCode'] == 2 for item in invocations), payload)
+            notifications = [item for invocation in invocations
+                             for item in invocation.get('toolExecutionNotifications', [])]
+            self.assertTrue(any(item['level'] == 'error' and
+                                item['descriptor']['id'] == 'ubs/module-partial'
+                                for item in notifications), payload)
+
+    def test_full_snapshot_retains_findings_and_reports_unmodeled_effects(self):
         project = self.artifacts / 'production'
         shutil.copytree(FIXTURES / 'ios', project)
         for fmt in ('json', 'sarif'):
             with self.subTest(format=fmt):
-                _result, payload = self.scan(project, fmt, 'production-' + fmt)
-                self.assert_complete(payload, fmt, len(BLOBS))
+                result, payload = self.scan(project, fmt, 'production-' + fmt, complete=False)
+                self.assertEqual(result.returncode, 2, payload)
+                self.assert_incomplete(payload, fmt, len(BLOBS))
                 # A source snapshot with known quality findings must not be
                 # silently omitted in the name of completeness.
                 if fmt == 'json':
@@ -168,6 +195,7 @@ class SwiftProductionCompletenessTests(unittest.TestCase):
                     rules = {item['ruleId'] for run in payload['runs'] for item in run.get('results', [])}
                 self.assertIn('swift.networking.data-contents', rules)
                 self.assertIn('swift.memory.timers', rules)
+                self.assertIn('swift.taint.analysis-limited', rules)
 
     def test_raw_strings_and_callbacks_retain_security_findings_in_public_reports(self):
         project = self.artifacts / 'security'
@@ -261,21 +289,19 @@ class SwiftProductionCompletenessTests(unittest.TestCase):
         ''').lstrip('\n')
         self.assertEqual(file_url_read_offsets(path, safe), frozenset({safe.index('Data(')}))
         source = textwrap.dedent('''
-            struct Payload { let value: String }
             func uncertain(req: Request) {
-                let payload = Payload(value: req.query["value"]!)
+                for case let value as String in [req.query["value"]!] { consume(value) }
                 let target = URL(fileURLWithPath: "/fixed")
                 _ = try? Data(contentsOf: target)
-                consume(payload)
             }
         ''').lstrip('\n')
         path.write_text(source, encoding='utf-8')
-        with self.assertRaisesRegex(SwiftUnsupported, 'object initialization'):
+        with self.assertRaisesRegex(SwiftUnsupported, 'iteration binding'):
             file_url_read_offsets(path, source)
         diagnostics = [item for item in flow_findings(path, source, 'path', recover=True)
                        if item['rule'] == 'swift.taint.analysis-limited']
         self.assertTrue(diagnostics)
-        self.assertTrue(any('object initialization' in item['extras']['reason'] for item in diagnostics))
+        self.assertTrue(any('iteration binding' in item['extras']['reason'] for item in diagnostics))
         with self.assertRaises(SwiftUnsupported):
             file_url_read_offsets(path, source)
 
@@ -283,11 +309,10 @@ class SwiftProductionCompletenessTests(unittest.TestCase):
         project = self.artifacts / 'locality'
         project.mkdir()
         source = textwrap.dedent('''
-            struct Payload { let value: String }
+            import Foundation
             func uncertain(req: Request) {
-                let payload = Payload(value: req.query["value"]!)
+                for case let value as String in [req.query["value"]!] { consume(value) }
                 _ = try? String(contentsOfFile: req.query["after"]!)
-                consume(payload)
             }
             func sibling(req: Request) {
                 _ = try? String(contentsOfFile: req.query["sibling"]!)
@@ -298,13 +323,14 @@ class SwiftProductionCompletenessTests(unittest.TestCase):
             'func other(req: Request) {\n'
             '    _ = try? String(contentsOfFile: req.query["other"]!)\n'
             '}\n', encoding='utf-8')
-        result, payload = self.scan(project, 'json', 'locality-json', flags=('--fail-on-warning',))
-        self.assert_complete(payload, 'json', 2)
-        self.assertEqual(result.returncode, 1)
+        result, payload = self.scan(project, 'json', 'locality-json',
+                                    flags=('--fail-on-warning',), complete=False)
+        self.assert_incomplete(payload, 'json', 2)
+        self.assertEqual(result.returncode, 2)
         findings = payload['scanners'][0]['findings']
         sinks = {(Path(item['path']).name, item['line']) for item in findings
                  if item['rule'] == 'swift.taint.request_path_traversal'}
-        self.assertEqual(sinks, {('Mixed.swift', 4), ('Mixed.swift', 8), ('Other.swift', 2)})
+        self.assertEqual(sinks, {('Mixed.swift', 4), ('Mixed.swift', 7), ('Other.swift', 2)})
         diagnostics = [item for item in findings if item['rule'] == 'swift.taint.analysis-limited']
         self.assertTrue(diagnostics, findings)
         for item in diagnostics:
@@ -313,7 +339,7 @@ class SwiftProductionCompletenessTests(unittest.TestCase):
             self.assertGreater(item['col'], 0, item)
             self.assertEqual(item['severity'], 'warning', item)
             self.assertEqual(item['extras']['analysis'], 'conservative', item)
-            self.assertIn('object initialization', item['extras']['reason'], item)
+            self.assertIn('iteration binding', item['extras']['reason'], item)
             self.assertIn('uncertain', item['extras']['scope'], item)
             self.assertTrue(item['extras']['construct'], item)
             self.assertIn(item['extras']['policy'], {'path', 'redirect', 'header', 'outbound'}, item)
@@ -323,13 +349,12 @@ class SwiftProductionCompletenessTests(unittest.TestCase):
                 'Request-derived URL reaches outbound HTTP client',
             }, item)
 
-    def test_local_limitation_is_a_warning_and_obeys_fail_on_warning(self):
+    def test_local_limitation_is_incomplete_regardless_of_warning_threshold(self):
         project = self.artifacts / 'warning-only'
         project.mkdir()
         (project / 'Opaque.swift').write_text(textwrap.dedent('''
-            struct Payload { let value: String }
             func uncertain(req: Request) {
-                consume(Payload(value: req.query["value"]!))
+                for case let value as String in [req.query["value"]!] { consume(value) }
             }
             func ordinaryRead() {
                 _ = try? String(contentsOfFile: "/fixed")
@@ -338,9 +363,10 @@ class SwiftProductionCompletenessTests(unittest.TestCase):
         for strict in (False, True):
             with self.subTest(fail_on_warning=strict):
                 flags = ('--fail-on-warning',) if strict else ()
-                result, payload = self.scan(project, 'json', 'warning-only-' + str(strict), flags=flags)
-                self.assert_complete(payload, 'json', 1)
-                self.assertEqual(result.returncode, int(strict), payload)
+                result, payload = self.scan(project, 'json', 'warning-only-' + str(strict),
+                                            flags=flags, complete=False)
+                self.assert_incomplete(payload, 'json', 1)
+                self.assertEqual(result.returncode, 2, payload)
                 self.assertEqual(payload['totals']['critical'], 0, payload)
                 diagnostics = [item for item in payload['scanners'][0]['findings']
                                if item['rule'] == 'swift.taint.analysis-limited']
@@ -359,9 +385,9 @@ class SwiftProductionCompletenessTests(unittest.TestCase):
             '}\n', encoding='utf-8')
         for fmt in ('json', 'sarif'):
             with self.subTest(format=fmt):
-                result, payload = self.scan(project, fmt, 'opaque-callback-' + fmt)
-                self.assert_complete(payload, fmt, 1)
-                self.assertEqual(result.returncode, 1, payload)
+                result, payload = self.scan(project, fmt, 'opaque-callback-' + fmt, complete=False)
+                self.assert_incomplete(payload, fmt, 1)
+                self.assertEqual(result.returncode, 2, payload)
                 if fmt == 'json':
                     findings = payload['scanners'][0]['findings']
                     diagnostics = [item for item in findings if item['rule'] == 'swift.taint.analysis-limited']
@@ -388,30 +414,173 @@ class SwiftProductionCompletenessTests(unittest.TestCase):
                              for item in findings if item['ruleId'] == 'swift.taint.request_path_traversal']
                     self.assertEqual(known, [5], findings)
 
+    def test_suppressed_limitations_still_refuse_and_do_not_populate_success_cache(self):
+        project = self.artifacts / 'suppressed-coverage'
+        project.mkdir()
+        (project / 'Unsupported.swift').write_text(textwrap.dedent('''
+            func uncertain(req: Request) {
+                // ubs:ignore[swift.taint.analysis-limited] reviewed diagnostic display only
+                for case let value as String in [req.query["value"]!] { consume(value) }
+            }
+            func ordinaryRead() {
+                _ = try? String(contentsOfFile: "/fixed")
+            }
+        ''').lstrip('\n'), encoding='utf-8')
+        cache = self.artifacts / 'incomplete-cache'
+        for attempt in range(2):
+            with self.subTest(attempt=attempt):
+                result, payload = self.scan(project, 'json', 'suppressed-coverage-' + str(attempt),
+                                            complete=False, cache_dir=cache)
+                self.assertEqual(result.returncode, 2, payload)
+                self.assert_incomplete(payload, 'json', 1)
+                self.assertEqual(payload['totals']['critical'], 0, payload)
+                scanner = payload['scanners'][0]
+                self.assertFalse(any(item['rule'] == 'swift.taint.analysis-limited'
+                                     for item in scanner['findings']), scanner)
+                self.assertEqual(scanner['extras']['profile']['cache_hits'], 0, scanner)
+                self.assertTrue(any('iteration binding' in item.get('message', '')
+                                    for item in payload['failed_modules']), payload)
+        # Prove that the same cache is enabled and reusable after the source
+        # becomes fully supported. Zero hits above must reflect incomplete
+        # coverage, not a disabled cache or an unscanned input.
+        (project / 'Unsupported.swift').write_text(
+            'func supported(req: Request) {\n'
+            '    _ = try? String(contentsOfFile: "/fixed")\n'
+            '}\n', encoding='utf-8')
+        for attempt in range(2):
+            result, payload = self.scan(project, 'json', 'supported-cache-' + str(attempt),
+                                        cache_dir=cache)
+            self.assert_complete(payload, 'json', 1)
+            self.assertEqual(result.returncode, 0, payload)
+            self.assertEqual(payload['scanners'][0]['extras']['profile']['cache_hits'], attempt, payload)
+
+    def test_supported_initializer_switch_repeat_flow_in_all_public_policies(self):
+        rule_markers = {
+            'swift.taint.request_path_traversal': '// path-sink',
+            'swift.taint.request_open_redirect': '// redirect-sink',
+            'swift.taint.header-injection': '// header-sink',
+            'swift.taint.outbound-url': '// outbound-sink',
+        }
+        for tainted in (False, True):
+            project = self.artifacts / ('modeled-flow-' + str(tainted))
+            project.mkdir()
+            source = textwrap.dedent('''
+                import Foundation
+                struct Input { let target: String }
+                func handle(req: Request, flag: Bool) async {
+                    let input = Input(target: %s)
+                    var target = "/fixed"
+                    switch flag {
+                    case true: target = input.target
+                    case false: target = "/fixed"
+                    }
+                    repeat { target = target + "" } while false
+                    _ = try? String(contentsOfFile: target) // path-sink
+                    _ = req.redirect(to: target) // redirect-sink
+                    headers.replaceOrAdd(name: "X-Value", value: target) // header-sink
+                    _ = try? await URLSession.shared.data(from: URL(string: target)!) // outbound-sink
+                }
+            ''' % ('req.query["target"]!' if tainted else '"/fixed"')).lstrip('\n')
+            (project / 'Modeled.swift').write_text(source, encoding='utf-8')
+            for fmt in ('json', 'sarif'):
+                with self.subTest(tainted=tainted, format=fmt):
+                    result, payload = self.scan(project, fmt, 'modeled-flow-' + str(tainted) + '-' + fmt)
+                    self.assert_complete(payload, fmt, 1)
+                    self.assertEqual(result.returncode, int(tainted), payload)
+                    if fmt == 'json':
+                        findings = payload['scanners'][0]['findings']
+                        actual = {(item['rule'], item['line']) for item in findings
+                                  if item['rule'] in rule_markers}
+                        self.assertFalse(any(item['rule'] == 'swift.taint.analysis-limited'
+                                             for item in findings), findings)
+                    else:
+                        findings = [item for run in payload['runs'] for item in run.get('results', [])]
+                        actual = {(item['ruleId'], item['locations'][0]['physicalLocation']['region']['startLine'])
+                                  for item in findings if item['ruleId'] in rule_markers}
+                        self.assertFalse(any(item['ruleId'] == 'swift.taint.analysis-limited'
+                                             for item in findings), findings)
+                    expected = {(rule, number) for rule, marker in rule_markers.items()
+                                for number, line in enumerate(source.splitlines(), 1)
+                                if marker in line} if tainted else set()
+                    self.assertEqual(actual, expected, payload)
+
+    def test_resource_repeat_remains_incomplete_in_public_reports(self):
+        project = self.artifacts / 'resource-repeat'
+        project.mkdir()
+        (project / 'Resource.swift').write_text(textwrap.dedent('''
+            import Foundation
+            func handle(req: Request) {
+                let task = URLSession.shared.dataTask(with: URL(string: req.query["url"]!)!)
+                repeat { task.resume() } while false
+            }
+        ''').lstrip('\n'), encoding='utf-8')
+        for fmt in ('json', 'sarif'):
+            with self.subTest(format=fmt):
+                result, payload = self.scan(project, fmt, 'resource-repeat-' + fmt, complete=False)
+                self.assertEqual(result.returncode, 2, payload)
+                self.assert_incomplete(payload, fmt, 1)
+                if fmt == 'json':
+                    rules = {item['rule'] for item in payload['scanners'][0]['findings']}
+                else:
+                    rules = {item['ruleId'] for run in payload['runs'] for item in run.get('results', [])}
+                self.assertIn('swift.lifecycle.analysis-limited', rules)
+                self.assertIn('swift.taint.outbound-url', rules)
+
+    def test_global_field_mutation_retains_public_sink_and_incomplete_status(self):
+        for tainted in (False, True):
+            project = self.artifacts / ('global-field-' + str(tainted))
+            project.mkdir()
+            source = textwrap.dedent('''
+                final class Box { var path = "/fixed" }
+                let shared = Box()
+                func change(req: Request) { shared.path = %s }
+                func read() { _ = try? String(contentsOfFile: shared.path) }
+                func handle(req: Request) { change(req: req); read() }
+            ''' % ('req.query["path"]!' if tainted else '"/fixed"')).lstrip('\n')
+            (project / 'Global.swift').write_text(source, encoding='utf-8')
+            for fmt in ('json', 'sarif'):
+                with self.subTest(tainted=tainted, format=fmt):
+                    result, payload = self.scan(project, fmt, 'global-field-' + str(tainted) + '-' + fmt,
+                                                complete=not tainted)
+                    if tainted:
+                        self.assertEqual(result.returncode, 2, payload)
+                        self.assert_incomplete(payload, fmt, 1)
+                    else:
+                        self.assert_complete(payload, fmt, 1)
+                    if fmt == 'json':
+                        findings = payload['scanners'][0]['findings']
+                        sinks = {item['line'] for item in findings
+                                 if item['rule'] == 'swift.taint.request_path_traversal'}
+                    else:
+                        findings = [item for run in payload['runs'] for item in run.get('results', [])]
+                        sinks = {item['locations'][0]['physicalLocation']['region']['startLine']
+                                 for item in findings if item['ruleId'] == 'swift.taint.request_path_traversal'}
+                    self.assertEqual(sinks, {4} if tainted else set(), findings)
+
     def test_public_text_reports_local_limitation_reason_and_real_sink(self):
         project = self.artifacts / 'text-locality'
         project.mkdir()
         target = project / 'Mixed.swift'
         target.write_text(textwrap.dedent('''
-            struct Payload { let value: String }
+            import Foundation
             func uncertain(req: Request) {
-                let payload = Payload(value: req.query["value"]!)
+                for case let value as String in [req.query["value"]!] { consume(value) }
                 _ = try? String(contentsOfFile: req.query["after"]!)
-                consume(payload)
             }
         ''').lstrip('\n'), encoding='utf-8')
-        result, output = self.scan(project, 'text', 'locality-text', flags=('--fail-on-warning',))
-        self.assertEqual(result.returncode, 1, output)
+        result, output = self.scan(project, 'text', 'locality-text',
+                                   flags=('--fail-on-warning',), complete=False)
+        self.assertEqual(result.returncode, 2, output)
         self.assertIn('Swift flow analysis requires local review', output)
         self.assertIn('⚠ Warning', output)
-        self.assertIn(f'{target}:3:19 [rule:swift.taint.analysis-limited]', output)
-        self.assertIn('Swift request-derived object initialization needs field analysis', output)
+        self.assertIn(f'{target}:3:9 [rule:swift.taint.analysis-limited]', output)
+        self.assertIn('Swift iteration binding needs pattern analysis', output)
         self.assertIn('effects are conservatively unknown in uncertain', output)
         self.assertIn('🔥 CRITICAL (1 found)', output)
         self.assertIn('Request-derived path reaches file read/write/serve sink', output)
-        self.assertIn('SCAN COMPLETE', output)
-        self.assertNotIn('ANALYZER_ERROR', output)
-        self.assertNotIn('Swift analysis did not complete', output)
+        self.assertNotIn('SCAN COMPLETE', output)
+        self.assertIn('ANALYZER_ERROR', output)
+        self.assertIn('Swift analysis did not complete', output)
 
     def test_malformed_swift_is_still_fatal_in_public_json_and_sarif(self):
         project = self.artifacts / 'malformed'

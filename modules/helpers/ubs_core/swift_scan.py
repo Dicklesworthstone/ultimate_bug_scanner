@@ -1212,6 +1212,21 @@ def main(argv: list[str] | None = None) -> int:
             if recs is None and capturing_sink is not None:
                 recs = capturing_sink.get_for_file(f)
             if recs:
+                # Conservative recovery preserves findings from the rest of
+                # the file; it does not prove that the unsupported construct
+                # was analyzed. Keep that coverage failure separate from
+                # finding severity and suppression, and out of the reusable
+                # cache. A warning-only or suppressed limitation must never
+                # publish a successful scan receipt (#204).
+                for record in recs:
+                    if record.get("rule") in {
+                        "swift.taint.analysis-limited", "swift.lifecycle.analysis-limited"
+                    }:
+                        reason = record.get("extras", {}).get("reason") or record.get("message", "")
+                        problem = (f"{f}:{record.get('line', 0)}:{record.get('col', 1)}: "
+                                   f"{record['rule']}: {reason}; analysis is incomplete")
+                        if problem not in scan_errors:
+                            scan_errors.append(problem)
                 for r in suppressions.filter(recs):
                     sink_file.write(json.dumps(r, ensure_ascii=False) + "\n")
 

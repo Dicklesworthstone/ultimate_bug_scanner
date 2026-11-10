@@ -746,6 +746,26 @@ class SwiftLifecycleBindings(LoggedCase):
             with self.subTest(cleanup=cleanup):
                 self.assertEqual(len(scan_text(self.artifact / 'many-switches.swift', source, self.artifact)), count)
 
+    def test_taint_repeat_support_does_not_authorize_lifecycle_cleanup(self):
+        from ubs_core.analyzers.lifecycle_swift import scan_text
+        cases = (
+            ('body_cleanup', '', 'repeat { timer.invalidate() } while false', 1),
+            ('conditional_cleanup', '',
+             'repeat { if again { continue }; timer.invalidate() } while again', 1),
+            ('prior_cleanup', 'timer.invalidate()\n', 'repeat { consume(state) } while false', 0),
+        )
+        for name, before, repeated, leaks in cases:
+            source = ('func run() {\n'
+                      'let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }\n'
+                      + before + repeated + '\n}')
+            with self.subTest(case=name):
+                path = self.artifact / ('repeat-boundary-' + name + '.swift')
+                path.write_text(source)
+                findings = scan_text(path, source, self.artifact)
+                self.assertEqual(sum(item[0] == 'timer' for item in findings), leaks, findings)
+                self.assertTrue(any(item[0] == 'analysis-limited' and 'repeat control flow' in item[1]
+                                    for item in findings), findings)
+
     def test_whole_file_platform_guard_analyzes_enabled_body_at_original_lines(self):
         from ubs_core.analyzers.lifecycle_swift import scan_text
         for cleanup, count in (('timer.invalidate()', 0), ('', 1)):
@@ -2071,27 +2091,28 @@ class SwiftLifecycleBindings(LoggedCase):
                     }, indent=2), encoding='utf-8')
                     context = (command, result.returncode, result.stdout, result.stderr)
                     expected = self.ownership_boundary_expectations()[name]
-                    expected_exit = 2 if expected is None else int(bool(expected))
+                    incomplete = expected is None or any(kind == 'analysis-limited' for kind, _ in expected)
+                    expected_exit = 2 if incomplete else int(bool(expected))
                     self.assertEqual(result.returncode, expected_exit, context)
                     try:
                         payload = json.loads(result.stdout)
                     except json.JSONDecodeError as exc:
                         self.fail(f'Invalid public report JSON: {exc}; {context!r}')
                     if fmt == 'json':
-                        self.assertEqual(payload['status'], 'partial' if expected is None else 'ok', context)
-                        if expected is None:
+                        self.assertEqual(payload['status'], 'partial' if incomplete else 'ok', context)
+                        if incomplete:
                             self.assertEqual(payload['module_error'], 'ANALYZER_ERROR', context)
                             self.assertIn('analysis is incomplete', payload['message'], context)
-                        else:
+                        if expected is not None:
                             findings = [f for f in payload['findings'] if f['severity'] in {'critical', 'warning'}]
                             actual = sorted((f['rule'], f['line']) for f in findings)
                             self.assertEqual(actual, sorted(('swift.lifecycle.' + kind, line) for kind, line in expected))
                     else:
                         invocations = [invocation for run in payload['runs'] for invocation in run.get('invocations', [])]
-                        if expected is None:
+                        if incomplete:
                             self.assertTrue(invocations, context)
                         for invocation in invocations:
-                            self.assertIs(invocation['executionSuccessful'], expected is not None, context)
+                            self.assertIs(invocation['executionSuccessful'], not incomplete, context)
                             self.assertEqual(invocation['exitCode'], expected_exit, context)
                         if expected is not None:
                             findings = [f for run in payload['runs'] for f in run.get('results', [])
@@ -2107,6 +2128,7 @@ class SwiftLifecycleBindings(LoggedCase):
         # rules cannot add an unrelated force-try warning to a clean control.
         for name, source, expected in self.cases():
             public_expected = sorted(expected)
+            incomplete = any(kind == 'analysis-limited' for kind, _ in expected)
             target = self.artifact / (name + '.swift')
             target.write_text(source, encoding='utf-8')
             for fmt in ('json', 'sarif'):
@@ -2127,13 +2149,13 @@ class SwiftLifecycleBindings(LoggedCase):
                         'python': sys.version, 'exit': result.returncode, 'elapsed': time.monotonic() - started,
                     }, indent=2), encoding='utf-8')
                     context = (command, result.returncode, result.stdout, result.stderr)
-                    self.assertEqual(result.returncode, int(bool(public_expected)), context)
+                    self.assertEqual(result.returncode, 2 if incomplete else int(bool(public_expected)), context)
                     try:
                         payload = json.loads(result.stdout)
                     except json.JSONDecodeError as exc:
                         self.fail(f'Invalid public report JSON: {exc}; {context!r}')
                     if fmt == 'json':
-                        self.assertEqual(payload['status'], 'ok', context)
+                        self.assertEqual(payload['status'], 'partial' if incomplete else 'ok', context)
                         self.assertEqual(payload['critical'], 0, context)
                         self.assertEqual(payload['warning'], len(public_expected), context)
                         findings = [f for f in payload['findings'] if f['severity'] in {'critical', 'warning'}]

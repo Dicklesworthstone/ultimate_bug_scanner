@@ -39,6 +39,24 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
   possible. Keep custom receivers and unresolved protocols incomplete. Add
   paired source cases, live SQLite witnesses and module/runner report checks.
 
+- Trace selected Swift memberwise and explicit initializers through stored
+  properties, nested values, reference aliases, and local decoding bodies.
+  Model ordered switch cases, pattern bindings, fallthrough, switch results,
+  and repeat-loop control flow in taint analysis, including mutation and defer
+  effects. Run only the deferred cleanups reached before an early exit.
+  Bound callback and call-context work while preserving unsafe alternatives,
+  selected callable bodies, and writes to previously empty captured bindings.
+  Keep unresolved initialization, pattern matching, and callable effects
+  explicitly incomplete. Add paired security, adversarial, and work-bound
+  regressions for issue #204.
+
+- Report recovered Swift taint and resource-analysis limitations as partial
+  scans with exit 2, retaining independently established findings. Diagnostic
+  suppression and warning thresholds cannot turn a coverage failure into a
+  successful receipt, and incomplete results do not populate the scan cache.
+  Verify the unmodified franken_ocr snapshot and public JSON/SARIF/text outcomes
+  without treating a conservative analysis limitation as completed coverage.
+
 - Complete the Python dependency-audit correction for issue #207. Reject empty
   audited inventories even when pip-audit exits successfully; prefer PEP 751
   lockfiles over fresh project resolution and explicitly refuse unsupported

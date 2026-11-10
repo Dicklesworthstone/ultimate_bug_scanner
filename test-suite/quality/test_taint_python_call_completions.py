@@ -1397,6 +1397,135 @@ class GeneratorProjectTests(unittest.TestCase):
 
 
 class ImmediateGeneratorExpressionTests(SourceTest):
+    def test_string_join_captures_values_before_later_rebinding(self):
+        for receiver in ("''", 'separator'):
+            for initial, later, expected in (
+                ('input()', "'fixed'", [('python.taint.eval', 7)]),
+                ("'fixed'", 'input()', []),
+            ):
+                source = f'''
+                    def run():
+                        separator = ''
+                        code = {initial}
+                        joined = {receiver}.join(code for unused in [0])
+                        code = {later}
+                        separator = 'changed'
+                        eval(joined)
+                    run()
+                '''
+                with self.subTest(receiver=receiver, initial=initial):
+                    findings = self.scan(source)
+                    self.assertEqual([(item['rule'], item['line']) for item in findings], expected)
+
+    def test_string_join_global_writes_keep_iteration_order_and_collected_values(self):
+        for initial, iterable, expected in (
+            ("'fixed'", '[input()]', (3, 4)),
+            ('input()', "['fixed']", ()),
+            ('input()', '[]', (3,)),
+            ("'fixed'", "[input(), 'fixed']", (4,)),
+            ("'fixed'", "['fixed', input()]", (3, 4)),
+        ):
+            source = (f'code = {initial}\n'
+                      f"joined = ''.join((code := part) for part in {iterable})\n"
+                      'eval(code)\neval(joined)\n')
+            with self.subTest(iterable=iterable):
+                self.assertEqual([(item['rule'], item['line']) for item in self.scan(source)],
+                                 [('python.taint.eval', line) for line in expected])
+
+    def test_string_join_runs_global_and_nonlocal_helper_effects(self):
+        for source, line in (("""
+            code = 'fixed'
+            def replace():
+                global code
+                code = input()
+                return 'done'
+            ''.join(replace() for unused in [0])
+            eval(code)
+        """, 7), ("""
+            def run():
+                code = 'fixed'
+                def replace():
+                    nonlocal code
+                    code = input()
+                    return 'done'
+                ''.join(replace() for unused in [0])
+                eval(code)
+            run()
+        """, 8)):
+            with self.subTest(source=source):
+                self.assertEqual([(item['rule'], item['line']) for item in self.scan(source)],
+                                 [('python.taint.eval', line)])
+
+    def test_string_join_filters_and_exceptions_preserve_actual_effects(self):
+        self.assert_rules('''
+            code = 'fixed'
+            ''.join((code := input()) for unused in [0] if False)
+            eval(code)
+        ''')
+        self.assert_rules('''
+            code = 'fixed'
+            ''.join('done' for unused in [0] if (code := input()))
+            eval(code)
+        ''', 'eval')
+        self.assert_rules('''
+            code = 'fixed'
+            def replace():
+                global code
+                code = input()
+                raise ValueError('stop')
+            try:
+                ''.join(replace() for unused in [0])
+            except ValueError:
+                eval(code)
+        ''', 'eval')
+
+    def test_string_join_custom_receiver_keeps_deferred_semantics(self):
+        source = '''
+            saved = None
+            class Delayed:
+                def join(self, values):
+                    global saved
+                    saved = values
+                    return 'fixed'
+            separator = Delayed()
+            code = 'fixed'
+            separator.join(code for unused in [0])
+            code = input()
+            eval(next(saved))
+        '''
+        observed = []
+        exec(textwrap.dedent(source), {'input': lambda: 'MARKER', 'eval': observed.append})
+        self.assertEqual(observed, ['MARKER'])
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+            self.scan(source)
+
+    def test_string_join_does_not_certify_opaque_iterators_or_values(self):
+        for expression in ("''.join(value for value in unknown)",
+                           "''.join(Release() for unused in [0])",
+                           "''.join('fixed' for unused in [Release()])",
+                           "''.join('fixed' for unused in [0] if Release())"):
+            source = f'''
+                code = 'fixed'
+                class Release:
+                    def __del__(self):
+                        global code
+                        code = input()
+                    def __bool__(self):
+                        global code
+                        code = input()
+                        return True
+                {expression}
+                eval(code)
+            '''
+            with self.subTest(expression=expression), self.assertRaisesRegex(
+                    taint_py.AnalysisLimit, 'incomplete'):
+                self.scan(source)
+
+    def test_string_join_nonstring_elements_are_not_certified_successful(self):
+        for value in ('0', "b'bytes'", "['fixed']"):
+            with self.subTest(value=value), self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                self.scan(f"''.join(value for value in [{value}])\n")
+
     def test_materializers_preserve_creation_time_values_and_later_rebindings(self):
         for collector in ('list', 'tuple'):
             for initial, later, expected in (

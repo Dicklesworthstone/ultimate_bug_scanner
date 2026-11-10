@@ -213,6 +213,27 @@ VALUE_CASES = (
         replace()
         execute(input()) # expect:command
         '''),
+    Case('string_join_captures_unsafe_value_before_rebinding', '''
+        code = input()
+        joined = ''.join(code for unused in [0])
+        code = 'fixed'
+        eval(joined) # expect:eval
+        '''),
+    Case('string_join_captures_clean_value_before_rebinding', '''
+        code = 'fixed'
+        joined = ''.join(code for unused in [0])
+        code = input()
+        eval(joined)
+        '''),
+    Case('string_join_applies_global_helper_effect', '''
+        code = 'fixed'
+        def replace():
+            global code
+            code = input()
+            return 'done'
+        ''.join(replace() for unused in [0])
+        eval(code) # expect:eval
+        '''),
 )
 
 CONTROL_CASES = (
@@ -591,6 +612,10 @@ BOUNDARY_CASES = (
         pending = replace()
         eval(code)
         '''),
+    Case('string_join_opaque_iterator_stays_incomplete', '''
+        ''.join(value for value in unknown)
+        eval('fixed')
+        '''),
     Case('scheduled_global_write_cannot_certify_clean', '''
         import asyncio
         code = '1'
@@ -709,18 +734,24 @@ class GlobalWriteCliTests(unittest.TestCase):
     def test_module_and_runner_json_sarif(self):
         wanted = {'setter_argument_reaches_caller', 'strong_clean_replacement', 'callback_sink_replacement',
                   'helper_recreates_deleted_global_with_clean_callable',
-                  'write_before_exception_reaches_handler'}
+                  'write_before_exception_reaches_handler',
+                  'string_join_captures_unsafe_value_before_rebinding',
+                  'string_join_captures_clean_value_before_rebinding',
+                  'string_join_applies_global_helper_effect'}
         cases = [case for case in (*VALUE_CASES, *CONTROL_CASES) if case.name in wanted]
-        self.assertEqual(len(cases), 5)
+        self.assertEqual(len(cases), 8)
         cases.append(next(case for case in BOUNDARY_CASES
                           if case.name == 'deleted_builtin_shadow_survives_helper_sibling_join'))
+        cases.append(next(case for case in BOUNDARY_CASES
+                          if case.name == 'string_join_opaque_iterator_stays_incomplete'))
         cases.append(Case('foreign_module_write', '''
             import helper
             helper.replace(input())
             eval(helper.code)
             '''))
         for case in cases:
-            incomplete = case.name in {'foreign_module_write', 'deleted_builtin_shadow_survives_helper_sibling_join'}
+            incomplete = case.name in {'foreign_module_write', 'deleted_builtin_shadow_survives_helper_sibling_join',
+                                       'string_join_opaque_iterator_stays_incomplete'}
             # The full scanner also warns about eval syntax independently of
             # whether its operand is tainted. Keep those existing rules in
             # the oracle; the strong reset must remove only the taint finding.
@@ -799,6 +830,8 @@ class GlobalWriteCliTests(unittest.TestCase):
                                     actual.extend(sites)
                         if incomplete:
                             diagnostic = ('foreign module global write' if case.name == 'foreign_module_write'
+                                          else 'generator materialization reads an opaque operand'
+                                          if case.name == 'string_join_opaque_iterator_stays_incomplete'
                                           else 'conditional global creation or deletion')
                             self.assertIn(diagnostic, result.stdout + result.stderr)
                         else:

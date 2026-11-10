@@ -2502,10 +2502,19 @@ class _Flow:
                 or consumer.keywords or self.class_environments or self.engine.generator_namespace_exposed
                 or self.engine.generator_frame_exposed):
             return False
-        choices = _binding_choices(self.expression_bindings.get(consumer.func))
-        if not choices or not choices <= {'list', 'tuple', 'builtins.list', 'builtins.tuple'}:
-            return False
-        names = {value.rsplit('.', 1)[-1] for value in choices}
+        method = consumer.func
+        string_join = (isinstance(method, ast.Attribute) and method.attr == 'join'
+                       and self.materialized_generator_string(method.value, state))
+        choices = _binding_choices(self.expression_bindings.get(method))
+        if string_join:
+            # A bound method of an already evaluated, exact builtin string
+            # exhausts its sole argument synchronously. A name ending in
+            # "join" or a receiver's old initializer is not that proof.
+            names = set()
+        else:
+            if not choices or not choices <= {'list', 'tuple', 'builtins.list', 'builtins.tuple'}:
+                return False
+            names = {value.rsplit('.', 1)[-1] for value in choices}
         for engine in self.engine.generator_peers:
             if (engine.generator_builtin_reflection or names & engine.generator_attribute_writes
                     or engine is not self.engine and engine.generator_namespace_exposed):
@@ -2517,7 +2526,17 @@ class _Flow:
                         or not isinstance(call, ast.Call) or call.func is not capability
                         or self.engine.enclosing(call) is not self.scope or call.lineno <= consumer.end_lineno):
                     return False
-        return True
+        return 'str.join' if string_join else 'collection'
+
+    def materialized_generator_string(self, node, state):
+        """Require the evaluated value to be an exact, callback-free string."""
+        references = self.expression_references.get(node, NO_REFERENCES)
+        choices = _binding_choices(self.expression_bindings.get(node))
+        self.engine.budget.spend(1 + len(choices))
+        return (not references & state.mutated and bool(choices)
+                and all(isinstance(value, (_LiteralString, _GeneratorString))
+                        or isinstance(value, ast.Constant) and type(value.value) is str
+                        for value in choices))
 
     def materialized_generator_inert(self, node, state):
         """Prove an evaluated operand cannot own an opaque finalizer/protocol.
@@ -5602,7 +5621,8 @@ class _Flow:
             # The outer iterable executes in the enclosing scope, even when
             # constructing a lazy generator. Inner iterations may be skipped.
             first = node.generators[0]
-            if self.generator_exhaustion_consumer(node, state):
+            consumer = self.generator_exhaustion_consumer(node, state)
+            if consumer:
                 if any(generator.is_async for generator in node.generators):
                     raise AnalysisLimit('asynchronous generator materialization is unmodeled; analysis is incomplete')
                 # Iterator construction can own temporary helper frames too.
@@ -5610,7 +5630,8 @@ class _Flow:
                 self.materialized_generator_depth += 1
                 try:
                     iterable = self.expr(first.iter, state)
-                    return self.comprehension(node, state, iterable=iterable, synchronous_generator=True)
+                    return self.comprehension(node, state, iterable=iterable, synchronous_generator=True,
+                                              string_result=consumer == 'str.join')
                 finally:
                     self.materialized_generator_depth -= 1
             iterable = self.expr(first.iter, state)
@@ -5691,7 +5712,8 @@ class _Flow:
         return join_facts(self.source(node, state), *(self.expr(child, state) for child in ast.iter_child_nodes(node)
                                               if isinstance(child, ast.expr)))
 
-    def comprehension(self, node, state, *, iterable=_MISSING, synchronous_generator=False):
+    def comprehension(self, node, state, *, iterable=_MISSING, synchronous_generator=False,
+                      string_result=False):
         """Execute eager comprehension clauses in their implicit local scope.
 
         Heap writes and walrus assignments escape that scope on both normal
@@ -5827,6 +5849,9 @@ class _Flow:
                         values = ((node.key, node.value) if isinstance(node, ast.DictComp) else (node.elt,))
                         fact = join_facts(*(self.expr(item, current) for item in values))
                         if current.reachable:
+                            if string_result and not self.materialized_generator_string(node.elt, current):
+                                raise AnalysisLimit('string join generator element is not a proven builtin string; '
+                                                    'analysis is incomplete')
                             if synchronous_generator and not self.materialized_generator_inert(node.elt, current):
                                 raise AnalysisLimit('generator materialization result lifetime is unresolved; '
                                                     'analysis is incomplete')

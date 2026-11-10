@@ -2648,6 +2648,83 @@ class RubyPublicTests(LoggedCase):
                                              [(HEADER, line) for line in case.lines], payload)
                         print('RUBY_HEADER_PUBLIC', case.name, module, fmt, 'PASS', flush=True)
 
+    def test_redirect_header_identity_module_and_meta_json_sarif(self):
+        names = {'redirect_header_alias_assignment', 'redirect_response_alias_headers',
+                 'redirect_header_selected_sink_helper', 'redirect_header_selected_return_helper',
+                 'redirect_header_bound_key', 'redirect_header_merge_location',
+                 'redirect_header_implicit_mapping', 'redirect_header_keyword_mapping',
+                 'redirect_header_implicit_later_overwrite', 'redirect_header_literal_later_overwrite',
+                 'redirect_header_update_helper_mapping', 'redirect_header_guard_unrelated_value',
+                 'redirect_header_target_overwrite', 'redirect_header_guard_exact_value',
+                 'redirect_header_local_hash', 'redirect_header_request_receiver',
+                 'redirect_header_detached_dup', 'redirect_header_shadowed_accessor',
+                 'redirect_header_sink_suppression'}
+        for case in (case for case in REDIRECT_HEADER_CASES if case.name in names):
+            directory = self.artifact / case.name
+            directory.mkdir(exist_ok=True)
+            target = directory / 'selected source.rb'
+            target.write_text(case.source)
+            (directory / 'unselected.rb').write_text('redirect_to params[:next]\n')
+            for module in (False, True):
+                for fmt in ('json', 'sarif'):
+                    with self.subTest(case=case.name, module=module, format=fmt):
+                        result, payload = self.scan(directory / f'{module}-{fmt}', target, fmt, module=module)
+                        self.assertEqual(result.returncode, int(bool(case.lines)), (result.stdout, result.stderr))
+                        if fmt == 'json':
+                            self.assertEqual(payload['status'], 'ok', payload)
+                            self.assertEqual(payload['critical'] if module else payload['totals']['critical'],
+                                             len(case.lines), payload)
+                            field = 'rule' if module else 'rule_id'
+                            rows = [row for row in payload['findings'] if row[field] == REDIRECT_HEADER]
+                            self.assertEqual([row['line'] for row in rows], list(case.lines), payload)
+                        else:
+                            rows = [row for run in payload['runs'] for row in run.get('results', [])]
+                            self.assertEqual([(row['ruleId'], row['locations'][0]['physicalLocation']['region']['startLine'])
+                                              for row in rows if row['ruleId'] == REDIRECT_HEADER],
+                                             [(REDIRECT_HEADER, line) for line in case.lines], payload)
+                            self.assertFalse(any(invocation.get('executionSuccessful') is False
+                                                 for run in payload['runs']
+                                                 for invocation in run.get('invocations', [])), payload)
+                        print('RUBY_REDIRECT_HEADER_PUBLIC', case.name, module, fmt, 'PASS', flush=True)
+
+    def test_redirect_header_cache_and_policy(self):
+        directory = self.artifact / 'redirect-header-cache-policy'
+        directory.mkdir()
+        target = directory / 'handler.rb'
+        for attempt, source, expected in (
+                (0, 'output = response.headers\noutput["Location"] = params[:next]', 1),
+                (1, 'output = response.headers\noutput["Location"] = params[:next]', 1),
+                (2, 'output = response.headers\noutput["Location"] = "/home"', 0),
+                (3, 'output = response.headers\noutput["Location"] = "/home"', 0)):
+            if attempt in (0, 2):
+                target.write_text(source + '\n')
+            result, payload = self.scan(directory / str(attempt), target)
+            self.assertEqual(result.returncode, expected, (result.stdout, result.stderr))
+            self.assertEqual((payload['status'], payload['totals']['critical']), ('ok', expected), payload)
+            self.assertEqual(payload['scanners'][0]['extras']['profile']['cache_hits'], int(attempt in (1, 3)), payload)
+        for label, suffix, options, expected in (
+                ('suppressed', ' # ubs:ignore[ruby.redirect.open]', (), 0),
+                ('unrelated', ' # ubs:ignore[ruby.header-injection.response]', (), 1),
+                ('skipped', '', ('--skip=6',), 0)):
+            target.write_text('output = response.headers\noutput["Location"] = params[:next]' + suffix + '\n')
+            result, payload = self.scan(directory / label, target, extra=options, module=True)
+            self.assertEqual(result.returncode, expected, (result.stdout, result.stderr))
+            self.assertEqual((payload['status'], payload['critical']), ('ok', expected), payload)
+
+        target.write_text('fields = {"Location" => params[:next]}\n'
+                          'fields["X-Name"] = "fixed"\n'
+                          'response.headers.update(fields)\n')
+        for attempt, fmt in enumerate(('json', 'json', 'sarif')):
+            result, payload = self.scan(directory / f'partial-{attempt}', target, fmt)
+            self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+            if fmt == 'json':
+                self.assertEqual(payload['status'], 'partial', payload)
+                self.assertTrue(any(row.get('module_error') == 'ANALYZER_ERROR'
+                                    for row in payload['failed_modules']), payload)
+            else:
+                self.assertTrue(all(invocation['executionSuccessful'] is False
+                                    for run in payload['runs'] for invocation in run['invocations']), payload)
+
     def test_response_header_cache_suppression_and_partial(self):
         directory = self.artifact / 'header-cache-policy'
         directory.mkdir()
@@ -3694,6 +3771,177 @@ class RubyArchivePublicTests(unittest.TestCase):
                         print('RUBY_ARCHIVE_PUBLIC', label, module, fmt, 'PASS', flush=True)
 
 
+REDIRECT_HEADER = 'ruby.redirect.open'
+# These expectations describe writes to the live response's Location entry.
+# A local hash, a request header map, or a detached copy is not a response.
+REDIRECT_HEADER_CASES = (
+    Case('redirect_header_direct', REDIRECT_HEADER,
+         'response.headers["Location"] = params[:next]', (1,)),
+    Case('redirect_header_alias_assignment', REDIRECT_HEADER, '''
+        output = response.headers
+        output["Location"] = params[:next]''', (2,)),
+    Case('redirect_response_alias_assignment', REDIRECT_HEADER, '''
+        output = response
+        output["Location"] = params[:next]''', (2,)),
+    Case('redirect_header_alias_store', REDIRECT_HEADER, '''
+        output = headers
+        output.store("Location", params[:next])''', (2,)),
+    Case('redirect_response_alias_set_header', REDIRECT_HEADER, '''
+        output = response
+        output.set_header("Location", params[:next])''', (2,)),
+    Case('redirect_self_response_alias', REDIRECT_HEADER, '''
+        output = self.response.headers
+        output["Location"] = params[:next]''', (2,)),
+    Case('redirect_response_alias_headers', REDIRECT_HEADER, '''
+        output = response
+        field_map = output.headers
+        field_map["Location"] = params[:next]''', (3,)),
+    Case('redirect_header_selected_sink_helper', REDIRECT_HEADER, '''
+        def publish(output, target)
+          output["Location"] = target
+        end
+        publish(response.headers, params[:next])''', (2,)),
+    Case('redirect_header_selected_return_helper', REDIRECT_HEADER, '''
+        def output_headers
+          response.headers
+        end
+        output = output_headers
+        output["Location"] = params[:next]''', (5,)),
+    Case('redirect_header_bound_key', REDIRECT_HEADER, '''
+        field = "Location"
+        output = response.headers
+        output[field] = params[:next]''', (3,)),
+    Case('redirect_header_merge_location', REDIRECT_HEADER,
+         'response.headers.merge!({"Location" => params[:next]})', (1,)),
+    Case('redirect_header_implicit_mapping', REDIRECT_HEADER,
+         'response.headers.update("Location" => params[:next])', (1,)),
+    Case('redirect_header_keyword_mapping', REDIRECT_HEADER,
+         'response.headers.update(Location: params[:next])', (1,)),
+    Case('redirect_header_implicit_multiple_fields', REDIRECT_HEADER,
+         'response.headers.update("Location" => params[:next], "X-Fixed" => "fixed")', (1,)),
+    Case('redirect_header_implicit_later_overwrite', REDIRECT_HEADER,
+         'response.headers.update("Location" => params[:next], "Location" => "/fixed")', ()),
+    Case('redirect_header_literal_later_overwrite', REDIRECT_HEADER,
+         'response.headers.update({"Location" => params[:next], "Location" => "/fixed"})', ()),
+    Case('redirect_header_literal_later_unsafe_overwrite', REDIRECT_HEADER,
+         'response.headers.update({"Location" => "/fixed", "Location" => params[:next]})', (1,)),
+    Case('redirect_header_joined_key_assignment', REDIRECT_HEADER, '''
+        field = "X-Name"
+        if flag
+          field = "Location"
+        end
+        output = response.headers
+        output[field] = params[:next]''', (6,)),
+    Case('redirect_header_joined_key_mapping', REDIRECT_HEADER, '''
+        field = "X-Name"
+        if flag
+          field = "Location"
+        end
+        response.headers.update({field => params[:next]})''', (5,)),
+    Case('redirect_header_possible_key_does_not_clear_location', REDIRECT_HEADER, '''
+        field = "X-Name"
+        if flag
+          field = "Location"
+        end
+        response.headers.update({"Location" => params[:next], field => "/fixed"})''', (5,)),
+    Case('redirect_header_update_selected_mapping', REDIRECT_HEADER, '''
+        fields = {"Location" => params[:next], "X-Fixed" => "fixed"}
+        output = response.headers
+        output.update(fields)''', (3,)),
+    Case('redirect_header_update_helper_mapping', REDIRECT_HEADER, '''
+        def fields(target)
+          {"Location" => target}
+        end
+        response.headers.update(fields(params[:next]))''', (4,)),
+    Case('redirect_header_retained_receiver_alias', REDIRECT_HEADER, '''
+        output = response.headers
+        response = {}
+        output["Location"] = params[:next]''', (3,)),
+    Case('redirect_header_possible_response_receiver', REDIRECT_HEADER, '''
+        output = {}
+        if flag
+          output = response.headers
+        end
+        output["Location"] = params[:next]''', (5,)),
+    Case('redirect_header_literal_target', REDIRECT_HEADER, '''
+        output = response.headers
+        output["Location"] = "/home"''', ()),
+    Case('redirect_header_target_overwrite', REDIRECT_HEADER, '''
+        target = params[:next]
+        target = "/home"
+        output = response.headers
+        output["Location"] = target''', ()),
+    Case('redirect_header_guard_exact_value', REDIRECT_HEADER, '''
+        target = params[:next]
+        return unless target.start_with?("/") && !target.start_with?("//")
+        output = response.headers
+        output["Location"] = target''', ()),
+    Case('redirect_header_guard_unrelated_value', REDIRECT_HEADER, '''
+        target = params[:next]
+        other = params[:other]
+        return unless other.start_with?("/") && !other.start_with?("//")
+        output = response.headers
+        output["Location"] = target''', (5,)),
+    Case('redirect_header_guard_single_slash', REDIRECT_HEADER, '''
+        target = params[:next]
+        return unless target.start_with?("/")
+        output = response.headers
+        output["Location"] = target''', (4,)),
+    Case('redirect_header_helper_real_validation', REDIRECT_HEADER, '''
+        def publish(output, target)
+          return unless target.start_with?("/") && !target.start_with?("//")
+          output["Location"] = target
+        end
+        publish(response.headers, params[:next])''', ()),
+    Case('redirect_header_url_from', REDIRECT_HEADER, '''
+        output = response.headers
+        output["Location"] = url_from(params[:next])''', ()),
+    Case('redirect_header_local_hash', REDIRECT_HEADER, '''
+        headers = {}
+        headers["Location"] = params[:next]''', ()),
+    Case('redirect_response_local_hash', REDIRECT_HEADER, '''
+        response = {}
+        response["Location"] = params[:next]''', ()),
+    Case('redirect_header_receiver_overwrite', REDIRECT_HEADER, '''
+        output = response.headers
+        output = {}
+        output["Location"] = params[:next]''', ()),
+    Case('redirect_header_request_receiver', REDIRECT_HEADER, '''
+        output = request.headers
+        output["Location"] = params[:next]''', ()),
+    Case('redirect_header_local_receiver_helper', REDIRECT_HEADER, '''
+        def publish(output, target)
+          output["Location"] = target
+        end
+        publish({}, params[:next])''', ()),
+    Case('redirect_header_shadowed_accessor', REDIRECT_HEADER, '''
+        def response
+          {}
+        end
+        response["Location"] = params[:next]''', ()),
+    Case('redirect_header_detached_dup', REDIRECT_HEADER, '''
+        output = response.headers.dup
+        output["Location"] = params[:next]''', ()),
+    Case('redirect_header_detached_clone', REDIRECT_HEADER, '''
+        output = response.headers.clone
+        output.store("Location", params[:next])''', ()),
+    Case('redirect_header_nonmutating_merge', REDIRECT_HEADER,
+         'output = response.headers.merge({"Location" => params[:next]})', ()),
+    Case('redirect_header_other_field', REDIRECT_HEADER, '''
+        output = response.headers
+        output["X-Name"] = params[:name]''', ()),
+    Case('redirect_header_source_suppression_keeps_flow', REDIRECT_HEADER, '''
+        target = params[:next] # ubs:ignore ruby.redirect.open
+        output = response.headers
+        output["Location"] = target''', (3,)),
+    Case('redirect_header_sink_suppression', REDIRECT_HEADER, '''
+        output = response.headers
+        output["Location"] = params[:next] # ubs:ignore ruby.redirect.open''', ()),
+    Case('redirect_header_lexical_decoy', REDIRECT_HEADER,
+         '''text = 'output = response.headers; output["Location"] = params[:next]' ''', ()),
+)
+
+
 class RubyOpenRedirectFlowTests(unittest.TestCase):
     def _lines(self, code: str) -> tuple[int, ...]:
         from ubs_core.ruby_detectors import open_redirect
@@ -3702,6 +3950,59 @@ class RubyOpenRedirectFlowTests(unittest.TestCase):
         issues: list[tuple] = []
         open_redirect.analyze(source.splitlines(), issues, 'controller.rb')
         return tuple(line_no for _path, line_no, _col, _detail in issues)
+
+    def test_response_header_identity_cases(self) -> None:
+        for case in REDIRECT_HEADER_CASES:
+            with self.subTest(case=case.name):
+                self.assertEqual(self._lines(case.source), case.lines)
+
+    def test_unresolved_response_mapping_reports_incomplete(self) -> None:
+        cases = {
+            'dynamic_key': 'response.headers[params[:field]] = params[:next]',
+            'built_mapping': '''
+                fields = {}
+                fields["Location"] = params[:next]
+                response.headers.update(fields)''',
+            'unrelated_mutation': '''
+                fields = {"Location" => params[:next]}
+                fields["X-Name"] = "fixed"
+                response.headers.update(fields)''',
+            'unrelated_delete': '''
+                fields = {"Location" => params[:next], "X-Name" => "fixed"}
+                fields.delete("X-Name")
+                response.headers.update(fields)''',
+            'mutated_detached_map': '''
+                fields = response.headers.dup
+                fields["Location"] = params[:next]
+                response.headers.update(fields)''',
+            'unsupported_multi_hash_signature': '''
+                response.headers.update({"Location" => params[:next]}, {"Location" => "/fixed"})''',
+            'dynamic_map_key': 'response.headers.update({params[:field] => params[:next]})',
+            'computed_map_key': 'response.headers.update({"Location".downcase => params[:next]})',
+            'unknown_map_alternative': '''
+                fields = {"X-Name" => "fixed"}
+                if flag
+                  fields = external_fields(params[:next])
+                end
+                response.headers.update(fields)''',
+            'opaque_map_alternative_without_arguments': '''
+                unused = params[:unused]
+                fields = {"X-Name" => "fixed"}
+                if flag
+                  fields = external_fields()
+                end
+                response.headers.update(fields)''',
+            'mixed_case_insertion_order': '''
+                fields = {"Location" => "/first", "location" => params[:next], "Location" => "/last"}
+                response.headers.update(fields)''',
+            'symbol_and_string_insertion_order': '''
+                fields = {"Location" => "/first", :Location => params[:next], "Location" => "/last"}
+                response.headers.update(fields)''',
+        }
+        for name, source in cases.items():
+            with self.subTest(case=name):
+                with self.assertRaisesRegex(ValueError, 'incomplete'):
+                    self._lines(source)
 
     def test_literal_overwrite_clears_redirect_taint(self) -> None:
         self.assertEqual(

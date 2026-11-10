@@ -1,14 +1,10 @@
-"""ubs_core.ruby_detectors.open_redirect — category 6 security (bead 0xjg.10).
+"""Scoped Ruby redirects and Location writes through live response bindings.
 
-Port of run_open_redirect_checks (modules/ubs-ruby.sh 1628-1890): a line
-tracker that taints names assigned from redirect-keyed request sources
-(params[:return_url]-shaped keys, request.url/fullpath/referer/host
-accessors, Rack env REQUEST_URI/HTTP_REFERER/... values), then flags
-redirect sinks (redirect_to/redirect/head location/Location header writes)
-whose target is request-derived. Safe-redirect helpers, local-path
-start_with?('/'), url_from, allow_other_host: false, and URI.parse + host
-allow-list + reject contexts within the preceding 24 lines suppress the hit.
-Lexical statement-owned `ubs:ignore` markers suppress only matching rules.
+The shared Ruby frontend follows values, receiver aliases, selected helpers
+and branches. Only actual dominating URL checks or bound framework sanitizers
+establish safety; safe-looking helper names do not. Local hashes and detached
+header copies are not response sinks. Statement-owned suppression markers
+apply to the matching public rule without erasing subsequent value flow.
 """
 from __future__ import annotations
 
@@ -142,7 +138,8 @@ def analyze(lines, issues, path_str):
     if not lines:
         return
     text = "\n".join(lines)
-    if not (re.search(r'\b(?:params|request|req|rack_request|env|cookies|Rack::Request)\b', text) and SINK_RE.search(text)):
+    if not (re.search(r'\b(?:params|request|req|rack_request|env|cookies|Rack::Request)\b', text)
+            and (SINK_RE.search(text) or re.search(r'\b(?:response|headers)\b', text))):
         return
     from ubs_core.analyzers.taint_ruby_traversal import REDIRECT_RULE, flow_findings_from_text
 

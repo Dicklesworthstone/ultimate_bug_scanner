@@ -749,6 +749,34 @@ class GlobalWriteCliTests(unittest.TestCase):
             helper.replace(input())
             eval(helper.code)
             '''))
+        self.assert_cli_cases(cases)
+
+    def test_predicate_generators_module_and_runner_json_sarif(self):
+        cases = [
+            Case('any_stops_before_unsafe_write', """
+                code = input()
+                any((code := value) for value in ['fixed', input()])
+                eval(code)
+                """),
+            Case('any_preserves_executed_unsafe_write', """
+                code = 'fixed'
+                any((code := value) for value in ['', input()])
+                eval(code) # expect:eval
+                """),
+            Case('all_stops_before_unsafe_write', """
+                code = input()
+                all((code := value) for value in ['', input()])
+                eval(code)
+                """),
+            Case('all_preserves_executed_unsafe_write', """
+                code = 'fixed'
+                all((code := value) for value in ['fixed', input()])
+                eval(code) # expect:eval
+                """),
+        ]
+        self.assert_cli_cases(cases)
+
+    def assert_cli_cases(self, cases):
         for case in cases:
             incomplete = case.name in {'foreign_module_write', 'deleted_builtin_shadow_survives_helper_sibling_join',
                                        'string_join_opaque_iterator_stays_incomplete'}

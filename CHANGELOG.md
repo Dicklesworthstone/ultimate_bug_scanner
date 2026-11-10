@@ -10,6 +10,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Model synchronous Python `any()` and `all()` generator consumption with exact
+  short-circuit order, global/nonlocal writes, filters, nested clauses and
+  exceptional completion. Preserve captured builtin identities and Boolean
+  results without certifying replaced consumers, opaque truth protocols or
+  finalizers. Add native runtime witnesses, unsafe/clean controls and public
+  module/runner JSON/SARIF regressions.
+
 - Distinguish Swift callable properties from unrelated member calls, including
   closure, named-function and native-function fields. Revisit only dependent
   function and capture summaries during taint analysis, while preserving

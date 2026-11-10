@@ -875,8 +875,16 @@ class GeneratorResumeTests(SourceTest):
                     self.assert_rules('def run():\n    code=' + value + '\n    saved=code\n'
                                       '    any(code for unused in ' + iterable + ')\n'
                                       "    code='fixed'\n    eval(saved)\nrun()\n", *expected)
-        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
-            self.scan("def run():\n    code='fixed'\n    any((code, (code:=input())) for unused in [0])\nrun()\n")
+        # An immediately consumed tuple of primitive values has no delayed
+        # reads or user truth callback. Its walrus write happens before any()
+        # observes the nonempty tuple and short-circuits.
+        source = ("def run():\n    code='fixed'\n"
+                  "    any((code, (code:=input())) for unused in [0])\n"
+                  "    eval(code)\nrun()\n")
+        observed = []
+        exec(source, {'input': lambda: 'UNTRUSTED', 'eval': observed.append})
+        self.assertEqual(observed, ['UNTRUSTED'])
+        self.assert_rules(source, 'eval')
 
     def test_stable_module_literals_survive_symbolic_function_environments(self):
         for literal in ('3', "('fixed', (2, None))"):
@@ -1394,6 +1402,173 @@ class GeneratorProjectTests(unittest.TestCase):
         })
         with self.assertRaisesRegex(taint_py.AnalysisLimit, 'builtin binding.*incomplete'):
             list(project.findings())
+
+
+class PredicateGeneratorCompletionTests(SourceTest):
+    def test_short_circuit_keeps_the_last_executed_write(self):
+        cases = (
+            ('any', "['fixed', input()]", 'fixed', False),
+            ('any', "['', input()]", 'UNTRUSTED', True),
+            ('all', "['', input()]", '', False),
+            ('all', "['fixed', input()]", 'UNTRUSTED', True),
+            ('any', '[]', 'UNTRUSTED', True),
+            ('all', '[]', 'UNTRUSTED', True),
+        )
+        for consumer, values, final, unsafe in cases:
+            source = ("code = input()\n"
+                      f"{consumer}((code := value) for value in {values})\n"
+                      "eval(code)\n")
+            with self.subTest(consumer=consumer, values=values):
+                observed = []
+                exec(source, {'input': lambda: 'UNTRUSTED', 'eval': observed.append})
+                self.assertEqual(observed, [final])
+                self.assertEqual([(item['rule'], item['line']) for item in self.scan(source)],
+                                 [('python.taint.eval', 3)] if unsafe else [])
+
+    def test_boolean_results_are_not_executable_input(self):
+        for consumer in ('any', 'all'):
+            with self.subTest(consumer=consumer):
+                self.assert_rules(f'''
+                    code = 'fixed'
+                    accepted = {consumer}((code := input()) for unused in [0])
+                    eval(accepted)
+                    eval(code)
+                ''', 'eval')
+
+    def test_nonempty_primitive_containers_short_circuit_without_testing_items(self):
+        for expression in ('((code := value),)', '[(code := value)]'):
+            source = ("code = input()\n"
+                      f"any({expression} for value in ['fixed', input()])\n"
+                      "eval(code)\n")
+            with self.subTest(expression=expression):
+                observed = []
+                exec(source, {'input': lambda: 'UNTRUSTED', 'eval': observed.append})
+                self.assertEqual(observed, ['fixed'])
+                self.assert_rules(source)
+
+    def test_skipped_filters_and_nested_clauses_preserve_order(self):
+        for consumer, stop in (('any', 'True'), ('all', 'False')):
+            for expression in (
+                f'{stop} for outer in [0, 1] for inner in [0, 1] if (code := input())',
+                f'{stop} for unused in [0, 1] if (code := input())',
+            ):
+                with self.subTest(consumer=consumer, expression=expression):
+                    self.assert_rules(f"code = 'fixed'\n{consumer}({expression})\neval(code)\n", 'eval')
+            self.assert_rules(f"code = 'fixed'\n{consumer}((code := input()) for unused in [0] if False)\neval(code)\n")
+
+    def test_short_circuit_does_not_execute_later_boolean_operands(self):
+        for consumer, expression in (
+            ('any', "True or (code := input())"),
+            ('all', "False and (code := input())"),
+        ):
+            with self.subTest(consumer=consumer):
+                self.assert_rules(f"code = 'fixed'\n{consumer}({expression} for unused in [0])\neval(code)\n")
+
+    def test_global_and_nonlocal_callbacks_execute_before_the_result(self):
+        for consumer in ('any', 'all'):
+            with self.subTest(consumer=consumer, scope='global'):
+                self.assert_rules(f'''
+                    code = 'fixed'
+                    def replace():
+                        global code
+                        code = input()
+                        return True
+                    {consumer}(replace() for unused in [0])
+                    eval(code)
+                ''', 'eval')
+            with self.subTest(consumer=consumer, scope='nonlocal'):
+                self.assert_rules(f'''
+                    def run():
+                        code = 'fixed'
+                        def replace():
+                            nonlocal code
+                            code = input()
+                            return False
+                        {consumer}(replace() for unused in [0])
+                        eval(code)
+                    run()
+                ''', 'eval')
+
+    def test_exception_keeps_writes_before_the_throw(self):
+        for consumer in ('any', 'all'):
+            with self.subTest(consumer=consumer):
+                self.assert_rules(f'''
+                    code = 'fixed'
+                    def replace():
+                        global code
+                        code = input()
+                        raise ValueError('stop')
+                    try:
+                        {consumer}(replace() for unused in [0])
+                    except ValueError:
+                        eval(code)
+                ''', 'eval')
+
+    def test_bound_builtin_aliases_keep_the_captured_consumer(self):
+        for consumer in ('any', 'all'):
+            for declaration in (f'consume = {consumer}', f'from builtins import {consumer} as consume'):
+                with self.subTest(consumer=consumer, declaration=declaration):
+                    self.assert_rules(f"{declaration}\ncode = 'fixed'\n"
+                                      "consume((code := input()) for unused in [0])\neval(code)\n", 'eval')
+
+    def test_custom_consumer_keeps_deferred_reads_incomplete(self):
+        for consumer in ('any', 'all'):
+            source = textwrap.dedent(f'''
+                saved = None
+                def {consumer}(values):
+                    global saved
+                    saved = values
+                    return False
+                code = 'fixed'
+                {consumer}(code for unused in [0])
+                code = input()
+                eval(next(saved))
+            ''')
+            with self.subTest(consumer=consumer):
+                observed = []
+                exec(source, {'input': lambda: 'UNTRUSTED', 'eval': observed.append})
+                self.assertEqual(observed, ['UNTRUSTED'])
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                    self.scan(source)
+
+    def test_replaced_builtin_members_do_not_acquire_boolean_return_proofs(self):
+        for consumer in ('any', 'all'):
+            for module in ('builtins', 'native'):
+                source = (f'import builtins as {module}\n'
+                          f'{module}.{consumer} = lambda values: input()\n'
+                          f'eval({module}.{consumer}([input()]))\n')
+                with self.subTest(consumer=consumer, module=module):
+                    self.assertEqual([(item['rule'], item['line']) for item in self.scan(source)],
+                                     [('python.taint.eval', 3)])
+            self.assert_rules(f'''
+                import builtins
+                def replace():
+                    builtins.{consumer} = lambda values: input()
+                replace()
+                eval(builtins.{consumer}([input()]))
+            ''', 'eval')
+
+    def test_opaque_truth_protocol_and_finalizers_are_not_certified(self):
+        for consumer in ('any', 'all'):
+            for expression in ('Release() for unused in [0]',
+                               "True for unused in [Release()]",
+                               'value for value in unknown'):
+                source = f'''
+                    code = 'fixed'
+                    class Release:
+                        def __bool__(self):
+                            global code
+                            code = input()
+                            return True
+                        def __del__(self):
+                            global code
+                            code = input()
+                    {consumer}({expression})
+                    eval(code)
+                '''
+                with self.subTest(consumer=consumer, expression=expression):
+                    with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                        self.scan(source)
 
 
 class ImmediateGeneratorExpressionTests(SourceTest):

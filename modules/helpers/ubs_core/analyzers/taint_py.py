@@ -616,6 +616,7 @@ _GENERATOR_CURSOR = '@generator:cursor'
 _GENERATOR_CREATED = '@generator:created'
 _GENERATOR_SUSPENDED = '@generator:suspended'
 _GENERATOR_EXHAUSTED = '@generator:exhausted'
+_PREDICATE_RESULTS = (ast.Constant(value=False), ast.Constant(value=True))
 
 
 def _terminal_generator(function):
@@ -2490,7 +2491,7 @@ class _Flow:
         return names
 
     def generator_exhaustion_consumer(self, node, state):
-        """Identify a direct, synchronous builtin materializer before its argument.
+        """Identify a direct, synchronous builtin consumer before its argument.
 
         The callable was evaluated before constructing the generator. No
         remaining operand can run between that construction and exhaustion.
@@ -2512,9 +2513,19 @@ class _Flow:
             # "join" or a receiver's old initializer is not that proof.
             names = set()
         else:
-            if not choices or not choices <= {'list', 'tuple', 'builtins.list', 'builtins.tuple'}:
+            if not choices or not choices <= {
+                    'list', 'tuple', 'any', 'all',
+                    'builtins.list', 'builtins.tuple', 'builtins.any', 'builtins.all'}:
                 return False
             names = {value.rsplit('.', 1)[-1] for value in choices}
+            if names & {'any', 'all'}:
+                if len(names) != 1:
+                    return False  # Different callees do not share an exhaustion policy.
+                if self.generator_expression_immediate(node, state):
+                    # Keep the existing proof for read-only predicates over
+                    # retained collections. Effectful predicates below need
+                    # ordered consumption and explicit short-circuit exits.
+                    return False
         for engine in self.engine.generator_peers:
             if (engine.generator_builtin_reflection or names & engine.generator_attribute_writes
                     or engine is not self.engine and engine.generator_namespace_exposed):
@@ -2526,7 +2537,7 @@ class _Flow:
                         or not isinstance(call, ast.Call) or call.func is not capability
                         or self.engine.enclosing(call) is not self.scope or call.lineno <= consumer.end_lineno):
                     return False
-        return 'str.join' if string_join else 'collection'
+        return 'str.join' if string_join else next(iter(names)) if names <= {'any', 'all'} else 'collection'
 
     def materialized_generator_string(self, node, state):
         """Require the evaluated value to be an exact, callback-free string."""
@@ -3419,7 +3430,7 @@ class _Flow:
             present &= presence == _NAMESPACE_PRESENT
         return join_facts(*facts), _join_bindings(*bindings), frozenset().union(*references), present
 
-    def condition(self, node, state):
+    def condition(self, node, state, *, inert=False):
         """Return truthy/falsy successors, preserving ordered guard effects."""
         if state is None or not state.reachable:
             return None, None
@@ -3427,7 +3438,7 @@ class _Flow:
             stopped = []
             continuation = state
             for operand in node.values:
-                truthy, falsy = self.condition(operand, continuation)
+                truthy, falsy = self.condition(operand, continuation, inert=inert)
                 if isinstance(node.op, ast.And):
                     continuation = truthy
                     stopped.append(falsy)
@@ -3437,22 +3448,32 @@ class _Flow:
             return ((continuation, _join_states(*stopped)) if isinstance(node.op, ast.And)
                     else (_join_states(*stopped), continuation))
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
-            truthy, falsy = self.condition(node.operand, state)
+            truthy, falsy = self.condition(node.operand, state, inert=inert)
             return falsy, truthy
         if isinstance(node, ast.IfExp):
-            left, right = self.condition(node.test, state)
-            left_true, left_false = self.condition(node.body, left)
-            right_true, right_false = self.condition(node.orelse, right)
+            left, right = self.condition(node.test, state, inert=inert)
+            left_true, left_false = self.condition(node.body, left, inert=inert)
+            right_true, right_false = self.condition(node.orelse, right, inert=inert)
             return _join_states(left_true, right_true), _join_states(left_false, right_false)
         self.expr(node, state)
         if not state.reachable:
             return None, None
+        if inert and not self.materialized_generator_inert(node, state):
+            raise AnalysisLimit('generator predicate truth protocol is unresolved; analysis is incomplete')
         literal = node.value if isinstance(node, ast.NamedExpr) else node
         if isinstance(literal, ast.Constant):
             return (state, None) if bool(literal.value) else (None, state)
         binding = self.expression_bindings.get(node)
         if isinstance(binding, _LiteralString):
             return (state, None) if binding.value else (None, state)
+        if (isinstance(binding, ast.Constant)
+                and type(binding.value) in {str, bytes, int, float, complex, bool, type(None)}):
+            return (state, None) if bool(binding.value) else (None, state)
+        if (inert and isinstance(binding, _ArgumentVector)
+                and all(not isinstance(value, _ArgumentExpansion) for value, _fact in binding.operands)):
+            # Tuple/list truth depends on their captured length, not their
+            # elements' truth. The inert proof above also covers teardown.
+            return (state, None) if binding.operands else (None, state)
         return state.copy(), state
 
     def bind_pattern(self, pattern, fact, state, binding=None, references=NO_REFERENCES):
@@ -4701,6 +4722,19 @@ class _Flow:
             receiver = join_facts(target.receiver, *(state.heap.get(ref, CLEAN) for ref in receiver_refs))
         if name == 'functools.partial':
             return self.partial_value(node, state, inputs)
+        value = (self.expression_bindings.get(node.args[0])
+                 if isinstance(node, ast.Call) and len(node.args) == 1
+                 and isinstance(node.args[0], ast.GeneratorExp) else None)
+        choices = _binding_choices(value)
+        if (target in {'any', 'all', 'builtins.any', 'builtins.all'}
+                and choices and choices <= frozenset(_PREDICATE_RESULTS)):
+            # Only the synchronous producer's native-identity proof grants a
+            # bool result. A qualified spelling alone can still refer to a
+            # replaced builtins member and must retain opaque-call provenance.
+            self.expression_bindings[node] = value
+            self.expression_references[node] = NO_REFERENCES
+            self.possible_exception(state)
+            return CLEAN
         closure = target if isinstance(target, _ClosureValue) else None
         if closure is not None:
             target = closure.value
@@ -5631,7 +5665,8 @@ class _Flow:
                 try:
                     iterable = self.expr(first.iter, state)
                     return self.comprehension(node, state, iterable=iterable, synchronous_generator=True,
-                                              string_result=consumer == 'str.join')
+                                              string_result=consumer == 'str.join',
+                                              predicate=consumer if consumer in {'any', 'all'} else None)
                 finally:
                     self.materialized_generator_depth -= 1
             iterable = self.expr(first.iter, state)
@@ -5713,7 +5748,7 @@ class _Flow:
                                               if isinstance(child, ast.expr)))
 
     def comprehension(self, node, state, *, iterable=_MISSING, synchronous_generator=False,
-                      string_result=False):
+                      string_result=False, predicate=None):
         """Execute eager comprehension clauses in their implicit local scope.
 
         Heap writes and walrus assignments escape that scope on both normal
@@ -5739,6 +5774,7 @@ class _Flow:
             nested.references[name] = NO_REFERENCES
         result = CLEAN
         iterator_references = set()
+        stopped = []
 
         def project(current):
             if current is None:
@@ -5845,6 +5881,11 @@ class _Flow:
                 if current is not None:
                     if index + 1 < len(node.generators):
                         current = clause(index + 1, current)
+                    elif predicate:
+                        truthy, falsy = self.condition(node.elt, current, inert=True)
+                        finished, current = ((truthy, falsy) if predicate == 'any' else (falsy, truthy))
+                        if finished is not None:
+                            stopped.append(finished)
                     else:
                         values = ((node.key, node.value) if isinstance(node, ast.DictComp) else (node.elt,))
                         fact = join_facts(*(self.expr(item, current) for item in values))
@@ -5904,6 +5945,14 @@ class _Flow:
             self.comprehension_environments.pop()
             self.pending = pending
             exceptional = self.exception_states.pop() if collecting else None
+        if predicate:
+            choices = []
+            if normal is not None:
+                choices.append(_PREDICATE_RESULTS[predicate == 'all'])
+            if stopped:
+                choices.append(_PREDICATE_RESULTS[predicate == 'any'])
+            self.expression_bindings[node] = _join_bindings(*choices)
+            normal = _join_states(normal, *stopped)
         if synchronous_generator and any(
                 current is not None and current.mutated & iterator_references
                 for current in (normal, exceptional, *(item.state for item in outgoing))):
@@ -6332,7 +6381,9 @@ class _Analysis:
             or isinstance(node, ast.Import) and any(alias.name.split('.')[0] in {
                 'builtins', 'sys', 'importlib'} for alias in node.names)
             or isinstance(node, ast.ImportFrom) and node.module
-            and node.module.split('.')[0] in {'builtins', 'sys', 'importlib'}
+            and (node.module.split('.')[0] in {'sys', 'importlib'}
+                 or node.module == 'builtins' and any(alias.name not in {
+                     'list', 'tuple', 'any', 'all', 'next'} for alias in node.names))
             or isinstance(node, ast.Attribute) and node.attr in {
                 '__builtins__', '__globals__', 'f_builtins', 'f_globals', 'stdin', 'import_module'}
             or isinstance(node, ast.Constant) and isinstance(node.value, str)

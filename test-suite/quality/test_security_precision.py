@@ -1378,6 +1378,132 @@ class JVMRequestReceiverIdentityTests(unittest.TestCase):
                             self.assertEqual(actual, expected)
         (self.root / "observations.json").write_text(json.dumps(observations, indent=2), encoding="utf-8")
 
+    @classmethod
+    def kotlin_properties(cls, namespace):
+        """Java no-argument getters and Kotlin synthetic properties are equivalent.
+
+        Kotlin's Java interoperability contract exposes getQueryString(),
+        getRequestURI(), getPathInfo() and getServletPath() as properties.
+        The same spelling on a local Kotlin type has no such request contract.
+        https://kotlinlang.org/docs/java-interop.html#getters-and-setters
+        """
+        original = dict(cls.cases("kotlin", namespace))["http_query"]
+        getter = "incoming.getQueryString()"
+
+        def clean(source):
+            for policy in ("redirect", "header", "ssrf", "path"):
+                source = source.replace("// expect-" + policy, "// fixed value")
+            return source
+
+        for property_, method in (("queryString", "getQueryString"), ("requestURI", "getRequestURI"),
+                                  ("pathInfo", "getPathInfo"), ("servletPath", "getServletPath")):
+            yield "getter_" + property_, original.replace(getter, "incoming." + method + "()")
+            yield "property_" + property_, original.replace(getter, "incoming." + property_)
+        yield "property_typed_alias", original.replace("var value = " + getter,
+            "val alias: HttpServletRequest = incoming;\nvar value = alias.queryString")
+        yield "property_inferred_alias", original.replace("var value = " + getter,
+            "val alias = incoming;\nvar value = alias.queryString")
+        yield "property_helper_receiver", original.replace(getter, "same(incoming).queryString").replace(
+            "class RequestProbe {", "class RequestProbe {\n"
+            "fun same(selected: HttpServletRequest): HttpServletRequest { return selected }")
+        yield "property_helper_value", original.replace(getter, "read(incoming)").replace(
+            "class RequestProbe {", "class RequestProbe {\n"
+            "fun read(selected: HttpServletRequest): String { return selected.queryString }")
+        yield "property_qualified_type", original.replace(getter, "incoming.requestURI").replace(
+            "incoming: HttpServletRequest", "incoming: " + namespace + ".servlet.http.HttpServletRequest")
+        yield "property_import_alias", original.replace(getter, "incoming.pathInfo").replace(
+            "import " + namespace + ".servlet.http.HttpServletRequest;",
+            "import " + namespace + ".servlet.http.HttpServletRequest as Inbound").replace(
+            "incoming: HttpServletRequest", "incoming: Inbound")
+        yield "property_member_chain", original.replace(getter, "incoming.queryString.orEmpty().trim()")
+        yield "property_grouped_receiver", original.replace(getter, "(incoming).queryString")
+        yield "property_header_sanitizer", original.replace(getter,
+            'incoming.queryString.replace("\\r", "").replace("\\n", "")').replace(
+            "// expect-header", "// controls removed")
+        nullable = original.replace("incoming: HttpServletRequest", "incoming: HttpServletRequest?")
+        yield "property_safe_call", nullable.replace(getter, 'incoming?.queryString ?: "/fixed"')
+        yield "property_asserted_receiver", nullable.replace(getter, "incoming!!.queryString")
+        yield "property_nullable_alias", nullable.replace("var value = " + getter,
+            'val alias = incoming;\nvar value = alias?.requestURI ?: "/fixed"')
+        yield "property_nullable_helper", nullable.replace(getter, 'same(incoming)?.queryString ?: "/fixed"').replace(
+            "class RequestProbe {", "class RequestProbe {\n"
+            "fun same(selected: HttpServletRequest?): HttpServletRequest? { return selected }")
+        yield "property_reassigned", clean(original.replace("var value = " + getter + ";",
+            'var value = incoming.queryString;\nvalue = "/fixed";'))
+        local = 'class Local { val queryString: String = "/fixed" }\n'
+        yield "property_local", clean(original.replace(getter, "incoming.queryString").replace(
+            "incoming: HttpServletRequest", "incoming: Local").replace("class RequestProbe {", local + "class RequestProbe {"))
+        yield "property_nullable_local", clean(nullable.replace(getter, 'incoming?.queryString ?: "/fixed"').replace(
+            "incoming: HttpServletRequest?", "incoming: Local?").replace("class RequestProbe {", local + "class RequestProbe {"))
+        yield "property_shadowed_api", clean(original.replace(getter, "incoming.queryString").replace(
+            "class RequestProbe {", "class RequestProbe {\n" + local.replace("Local", "HttpServletRequest")))
+        # Calling an extension named like the property is a different API.
+        extension = '\nfun HttpServletRequest.queryString(): String { return "/fixed" }\n'
+        yield "property_extension_call", clean(original.replace(getter, "incoming.queryString()")) + extension
+        yield "property_extension_argument", original.replace(getter,
+            "incoming.queryString(incoming.queryString)") + (
+                '\nfun HttpServletRequest.queryString(value: String): String { return value }\n')
+        # A local getter/property override cannot manufacture Servlet identity.
+        local_override = ('open class Local { open val queryString: String = "/base" }\n'
+                          'class Fixed : Local() { override val queryString: String = "/fixed" }\n')
+        yield "property_local_override", clean(original.replace(getter, "incoming.queryString").replace(
+            "incoming: HttpServletRequest", "incoming: Fixed").replace(
+            "class RequestProbe {", local_override + "class RequestProbe {"))
+
+    def test_kotlin_synthetic_properties_preserve_request_provenance(self):
+        from ubs_core.analyzers.taint_java_redirect import RedirectEngine
+        from ubs_core.analyzers.taint_java_traversal import Engine
+        from ubs_core.java_detectors.header_injection import HeaderEngine
+        from ubs_core.java_detectors.ssrf_outbound_url import SSRFEngine
+
+        observations = []
+        for namespace in ("jakarta", "javax"):
+            for name, source in self.kotlin_properties(namespace):
+                path = self.root / (namespace + "_" + name + ".kt")
+                path.write_text(source, encoding="utf-8")
+                for policy, engine in (("redirect", RedirectEngine), ("header", HeaderEngine),
+                                       ("ssrf", SSRFEngine), ("path", Engine)):
+                    with self.subTest(namespace=namespace, case=name, policy=policy):
+                        expected = [line for line, content in enumerate(source.splitlines(), 1)
+                                    if "// expect-" + policy in content]
+                        started = time.monotonic()
+                        actual = sorted(engine(path, source).analyze())
+                        observations.append({"namespace": namespace, "case": name, "policy": policy,
+                                             "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+                                             "expected_lines": expected, "actual_lines": actual,
+                                             "elapsed_s": time.monotonic() - started})
+                        self.assertEqual(actual, expected)
+        (self.root / "property-observations.json").write_text(json.dumps(observations, indent=2), encoding="utf-8")
+
+    def test_synthetic_property_boundaries_are_explicit(self):
+        from ubs_core.analyzers.taint_java_redirect import RedirectEngine
+        from ubs_core.analyzers.taint_java_traversal import Engine
+        from ubs_core.java_detectors.header_injection import HeaderEngine
+        from ubs_core.java_detectors.ssrf_outbound_url import SSRFEngine
+
+        original = dict(self.kotlin_properties("jakarta"))["property_queryString"]
+        field = original.replace("class RequestProbe {", "class RequestProbe(val incoming: HttpServletRequest) {\n"
+                                 "val selected = incoming.queryString").replace(
+            "incoming: HttpServletRequest, ", "").replace("var value = incoming.queryString;", "var value = selected;")
+        default = original.replace("client: HttpClient)", "client: HttpClient, selected: String = incoming.queryString)").replace(
+            "var value = incoming.queryString;", "var value = selected;")
+        java = dict(self.cases("java", "jakarta"))["http_query"].replace(
+            "incoming.getQueryString()", "incoming.queryString").replace(
+            "HttpServletRequest incoming", "Local incoming").replace(
+            "class RequestProbe {", 'class RequestProbe {\nstatic class Local { String queryString = "/fixed"; }')
+        for name, source, suffix, error in (("field", field, ".kt", "Servlet initialization.*incomplete"),
+                                          ("default", default, ".kt", "Servlet parameter default.*incomplete"),
+                                          ("java_field", java, ".java", None)):
+            path = self.root / (name + suffix)
+            path.write_text(source, encoding="utf-8")
+            for engine in (RedirectEngine, HeaderEngine, SSRFEngine, Engine):
+                with self.subTest(case=name, engine=engine.__name__):
+                    if error:
+                        with self.assertRaisesRegex(ValueError, error):
+                            engine(path, source).analyze()
+                    else:
+                        self.assertEqual(engine(path, source).analyze(), {})
+
     @staticmethod
     def expected_sites(language, source, filename):
         rules = {"redirect": ".taint.open_redirect", "header": ".security.header-injection",
@@ -1509,6 +1635,12 @@ class Example {
             selected = [(name, cases[name]) for name in ("renamed_receiver", "helper_receiver", "fake_named_request")]
             if language == "kotlin":
                 selected.extend(self.kotlin_overloads())
+                properties = dict(self.kotlin_properties("jakarta"))
+                for name in (
+                    "property_queryString", "property_helper_value", "property_member_chain",
+                    "property_safe_call", "property_asserted_receiver", "property_nullable_helper",
+                    "property_local", "property_extension_call", "property_header_sanitizer"):
+                    selected.append((name, properties[name]))
             for name, source in selected:
                 source = source.replace("class RequestProbe", "class Probe_" + name)
                 if language == "kotlin":
@@ -1528,6 +1660,10 @@ class Example {
                 directory.mkdir()
                 cases = dict(self.cases(language, "javax"))
                 source = cases["renamed_receiver"]
+                clean_source = cases["fake_named_request"]
+                if language == "kotlin":
+                    properties = dict(self.kotlin_properties("javax"))
+                    source, clean_source = properties["property_safe_call"], properties["property_nullable_local"]
                 suffix = ".java" if language == "java" else ".kt"
                 selected = directory / ("Selected" + suffix)
                 selected.write_text(source, encoding="utf-8")
@@ -1552,7 +1688,7 @@ class Example {
                                      options=(*options, "--only=1"), cache=True)
                 self.assertEqual(disabled["hits"], 0, disabled)
 
-                selected.write_text(cases["fake_named_request"], encoding="utf-8")
+                selected.write_text(clean_source, encoding="utf-8")
                 repaired = self.scan(language, directory, "module", "json", [], "changed-receiver",
                                      options=options, cache=True)
                 self.assertEqual((repaired["hits"], repaired["misses"]), (0, 1), repaired)

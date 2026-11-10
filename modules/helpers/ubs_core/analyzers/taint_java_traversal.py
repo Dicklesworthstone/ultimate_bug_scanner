@@ -66,6 +66,12 @@ REQUEST_TYPES = SERVLET_TYPES | HTTP_SERVLET_TYPES
 REQUEST_GETTERS = {'getParameter': 1, 'getHeader': 1, 'getQueryString': 0,
                    'getRequestURI': 0, 'getPathInfo': 0, 'getServletPath': 0}
 REQUEST_GETTER_RE = re.compile(r'\.\s*(?:' + '|'.join(REQUEST_GETTERS) + r')\s*\(')
+REQUEST_PROPERTIES = {'queryString': 'getQueryString', 'requestURI': 'getRequestURI',
+                      'pathInfo': 'getPathInfo', 'servletPath': 'getServletPath'}
+REQUEST_PROPERTY_RE = re.compile(r'\.\s*(?:' + '|'.join(REQUEST_PROPERTIES) + r')\b')
+REQUEST_PROPERTY_PREFIX_RE = re.compile(
+    r'(?:this\s*\.\s*)?[A-Za-z_]\w*' + REQUEST_PROPERTY_RE.pattern)
+KOTLIN_SERVLET_SOURCE_RE = re.compile(REQUEST_GETTER_RE.pattern + '|' + REQUEST_PROPERTY_RE.pattern)
 KTOR_CALL_TYPES = frozenset({'io.ktor.server.application.ApplicationCall',
                             'io.ktor.server.application.PipelineCall', 'io.ktor.server.routing.RoutingCall'})
 KTOR_REQUEST_TYPES = frozenset({'io.ktor.server.request.ApplicationRequest',
@@ -74,7 +80,7 @@ KTOR_TYPES = KTOR_CALL_TYPES | KTOR_REQUEST_TYPES
 KTOR_COLLECTION_TYPES = frozenset({'io.ktor.http.Parameters', 'io.ktor.http.Headers'})
 KTOR_SOURCE_MEMBERS = frozenset({'parameters', 'pathParameters', 'queryParameters', 'rawQueryParameters', 'headers'})
 KTOR_MEMBER_RE = re.compile(r'\.\s*(?:request|' + '|'.join(sorted(KTOR_SOURCE_MEMBERS)) + r')\b')
-REQUEST_SOURCE_RE = re.compile(REQUEST_GETTER_RE.pattern + '|' + KTOR_MEMBER_RE.pattern)
+REQUEST_SOURCE_RE = re.compile(KOTLIN_SERVLET_SOURCE_RE.pattern + '|' + KTOR_MEMBER_RE.pattern)
 KTOR_MAP_TAG = 'ktor-request-map'
 FILE_LEAF_METHODS = frozenset({'readAllBytes', 'readString', 'readAllLines', 'write', 'writeString',
                                'newInputStream', 'newOutputStream', 'createFile'})
@@ -599,12 +605,33 @@ class Engine:
             return not any(function.key >= 0 and owner < function.declaration <= offset < function.end
                            for function in self.parser.functions.values())
 
-        for getter in REQUEST_GETTER_RE.finditer(self.code):
+        servlet_access = KOTLIN_SERVLET_SOURCE_RE if self.parser.kotlin else REQUEST_GETTER_RE
+        for getter in servlet_access.finditer(self.code):
             offset = getter.start()
-            if not in_initializer(offset):
+            signature = next((function for function in self.parser.functions.values()
+                              if self.parser.kotlin and function.key >= 0 and function.key < offset < function.start), None)
+            if not in_initializer(offset) and signature is None:
                 continue
             index = self.request_index()
-            if index.receiver_type(index.receiver_start(offset), offset) in REQUEST_TYPES:
+            property_ = REQUEST_PROPERTY_RE.fullmatch(getter.group()) is not None
+            if property_ and self.code[self.parser.skip(getter.end(), len(self.code)):].startswith('('):
+                continue  # A same-named extension call is not a synthetic property.
+            receiver_end = offset
+            if self.parser.kotlin and self.code[offset - 1:offset] == '?':
+                receiver_end -= 1
+            elif self.parser.kotlin and self.code[offset - 2:offset] == '!!':
+                receiver_end -= 2
+            receiver_start = index.receiver_start(receiver_end)
+            actual = index.receiver_type(receiver_start, receiver_end)
+            receiver_name = self.code[receiver_start:receiver_end].strip()
+            if actual is None and signature is not None and receiver_name in signature.parameters:
+                declaration = signature.parameter_declarations[signature.parameters.index(receiver_name)].split('=', 1)[0]
+                parameter_type = re.fullmatch(r'\s*[A-Za-z_]\w*\s*:\s*([\w.]+\??)\s*', declaration)
+                if parameter_type:
+                    actual = index.resolve_type(parameter_type.group(1), signature.key)
+            if actual in (HTTP_SERVLET_TYPES if property_ else REQUEST_TYPES):
+                if signature is not None:
+                    raise ValueError('Executable Kotlin Servlet parameter default needs call binding; analysis is incomplete')
                 raise ValueError('Executable Java/Kotlin Servlet initialization needs field-state analysis; analysis is incomplete')
         if not self.parser.kotlin:
             return
@@ -754,10 +781,10 @@ class Engine:
             # Parenthesized/cast receivers are separate atoms in the shared
             # expression frontend. The lexical binding index can still prove
             # their static API identity without guessing from a method name.
-            dot = offset - 1
+            dot = offset if self.code[offset:offset + 1] == '.' or self.code[offset:offset + 2] in {'?.', '!!'} else offset - 1
             while dot >= 0 and self.code[dot].isspace():
                 dot -= 1
-            if dot >= 0 and self.code[dot] == '.':
+            if dot >= 0 and (self.code[dot] == '.' or self.parser.kotlin and self.code[dot:dot + 2] in {'?.', '!!'}):
                 low = index.receiver_start(dot)
                 actual = index.receiver_type(low, dot)
                 if actual in REQUEST_TYPES | KTOR_TYPES:
@@ -848,20 +875,24 @@ class Engine:
         ktor = self.ktor_access(name, arguments, offset, bindings, state, receiver)
         if ktor is not None:
             return ktor
-        if arguments is None:
-            return None
         root, _, method = name.rpartition('.')
+        property_ = self.parser.kotlin and arguments is None and method in REQUEST_PROPERTIES
+        if arguments is None:
+            if not property_:
+                return None
+            method = REQUEST_PROPERTIES[method]
         if method not in REQUEST_GETTERS:
             return None
         types, _ = self.request_receiver(root, offset, bindings, state, receiver)
         types &= REQUEST_TYPES
         if not types:
             return None
-        if len(arguments) != REQUEST_GETTERS[method] or (method != 'getParameter' and not types & HTTP_SERVLET_TYPES):
+        arity = 0 if property_ else len(arguments)
+        if arity != REQUEST_GETTERS[method] or (method != 'getParameter' and not types & HTTP_SERVLET_TYPES):
             # A Kotlin extension/overload can have this name and return one
             # of its arguments. An unsupported signature is not a sanitizer.
             return None
-        return retag(self.source(offset, name + '('), add=frozenset({'jvm-string'}))
+        return retag(self.source(offset, name if property_ else name + '('), add=frozenset({'jvm-string'}))
 
     def request_argument_kind(self, low, high, seen=()):
         """Bounded static argument evidence for a local String overload.
@@ -1396,6 +1427,15 @@ class Engine:
                 cursor += 1
                 continue
             offset = cursor
+            if self.parser.kotlin and self.request_receiver_sources:
+                property_prefix = REQUEST_PROPERTY_PREFIX_RE.match(self.code[cursor:end])
+                if property_prefix is not None and property_prefix.end() < match.end():
+                    property_name = re.sub(r'\s+', '', property_prefix.group())
+                    if self.request_call(property_name, None, offset, bindings, state) is not None:
+                        # Read the verified Java synthetic property before its
+                        # String member chain. The normal postfix evaluator then
+                        # keeps each method's own argument/sanitizer semantics.
+                        match = property_prefix
             name = re.sub(r'\s+', '', match.group())
             root = name.split('.')[0]
             atom = state.get(bindings.get(root, root), CLEAN)
@@ -1454,6 +1494,18 @@ class Engine:
             while cursor < end:
                 tail = self.parser.skip(cursor, end)
                 member = re.match(r'\.\s*([A-Za-z_]\w*)', self.code[tail:end])
+                if member is None and self.parser.kotlin and self.request_receiver_sources:
+                    guarded = re.match(r'(?:\?\.|!!\s*\.)\s*([A-Za-z_]\w*)', self.code[tail:end])
+                    if guarded is not None and guarded.group(1) in REQUEST_PROPERTIES:
+                        following = self.parser.skip(tail + guarded.end(), end)
+                        if self.code[following:following + 1] != '(':
+                            request_result = self.request_call('.' + guarded.group(1), None, tail, bindings, state, atom)
+                            if request_result is not None:
+                                # ?. reads this source on its non-null path;
+                                # !!. reads it after the assertion succeeds.
+                                # Neither operation sanitizes the property.
+                                atom, cursor = request_result, following
+                                continue
                 if self.code[tail:tail + 1] == '[':
                     close = self.parser.pairs[tail]
                     atom = join(atom, self.expression(tail + 1, close, state, bindings, depth + 1))

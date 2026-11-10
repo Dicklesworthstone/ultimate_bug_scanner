@@ -3233,6 +3233,121 @@ class JavaKotlinDataflowTests(unittest.TestCase):
                     if finding['rule'] == lang + '.taint.' + rule]
         return findings, context
 
+    def test_bodyless_request_getters_reach_public_json_and_sarif(self):
+        template = '''import jakarta.servlet.http.HttpServletResponse;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+class Flow {
+  interface Request {
+    String getParameter(String name);
+    default String getParameter(int mode) { return "/srv/fixed"; }
+  }
+  void handle(Request request, HttpServletResponse response, HttpClient client)
+      throws java.io.IOException, InterruptedException {
+    String value = request.getParameter(%s); // source
+    Files.readString(Path.of(value)); // path_traversal
+    response.sendRedirect(value); // open_redirect
+    response.setHeader("X-Value", value); // header_injection
+    client.send(HttpRequest.newBuilder(URI.create(value)).build(), HttpResponse.BodyHandlers.discarding()); // outbound_url
+    String fixed = request.getParameter(7);
+    Files.readString(Path.of(fixed));
+    response.sendRedirect(fixed);
+    response.setHeader("X-Value", fixed);
+    client.send(HttpRequest.newBuilder(URI.create(fixed)).build(), HttpResponse.BodyHandlers.discarding());
+  }
+}
+'''
+        rules = {'path_traversal': 'java.taint.path_traversal',
+                 'open_redirect': 'java.taint.open_redirect',
+                 'header_injection': 'java.security.header-injection',
+                 'outbound_url': 'java.security.ssrf-outbound-url'}
+        flow_rules = {rules['path_traversal'], rules['open_redirect']}
+        for label, argument, unsafe in (('unsafe', '"value"', True), ('clean', '7', False)):
+            source = self.root / (label + '.java')
+            text = template % argument
+            source.write_text(text, encoding='utf-8')
+            expected = {(rules[line.rsplit('// ', 1)[-1]], number)
+                        for number, line in enumerate(text.splitlines(), 1)
+                        if line.rsplit('// ', 1)[-1] in rules}
+            source_line = next(number for number, line in enumerate(text.splitlines(), 1)
+                               if '// source' in line)
+            reference = None
+            for frontend in ('runner', 'module'):
+                for fmt in ('json', 'sarif'):
+                    with self.subTest(case=label, frontend=frontend, format=fmt):
+                        directory = self.root / (label + '-' + frontend + '-' + fmt)
+                        directory.mkdir()
+                        env = {key: value for key, value in os.environ.items()
+                               if not key.startswith(('UBS_', 'GIT_', 'XDG_'))}
+                        env.update(PYTHONDONTWRITEBYTECODE='1', UBS_NO_AUTO_UPDATE='1', UBS_NO_CACHE='1',
+                                   UBS_SKIP_TYPE_NARROWING='1', ENABLE_UV_TOOLS='0',
+                                   XDG_DATA_HOME=str(directory / 'data'), XDG_CACHE_HOME=str(directory / 'cache'))
+                        if frontend == 'runner':
+                            command = [str(REPO_ROOT / 'ubs'), '--ci', '--no-color', '--no-cache',
+                                       '--format=' + fmt, '--only=java', '--', str(source)]
+                        else:
+                            command = [str(REPO_ROOT / 'modules/ubs-java.sh'), str(source),
+                                       '--ci', '--no-color', '--format=' + fmt]
+                        started = time.monotonic()
+                        proc = subprocess.run(command, cwd=directory, env=env, capture_output=True,
+                                              text=True, timeout=180)
+                        (directory / 'stdout.log').write_text(proc.stdout)
+                        (directory / 'stderr.log').write_text(proc.stderr)
+                        (directory / 'command.json').write_text(json.dumps({
+                            'command': command, 'exit': proc.returncode,
+                            'source_sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
+                            'elapsed': time.monotonic() - started,
+                        }, indent=2))
+                        context = f'exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}'
+                        self.assertEqual(proc.returncode, int(unsafe), context)
+                        report = self.decode_report(proc)
+                        if fmt == 'json':
+                            self.assertEqual(report['status'], 'ok', context)
+                            if frontend == 'runner':
+                                self.assertEqual(report['failed_modules'], [], context)
+                                self.assertEqual(report['totals']['files'], 1, context)
+                                self.assertEqual(len(report['scanners']), 1, context)
+                                scanners = report['scanners']
+                            else:
+                                self.assertEqual(report['files'], 1, context)
+                                scanners = [report]
+                            self.assertTrue(all(scanner['status'] == 'ok' for scanner in scanners), context)
+                            findings = {(finding['rule'], finding['line']): finding.get('extras', {})
+                                        for scanner in scanners for finding in scanner['findings']
+                                        if finding['rule'] in rules.values()}
+                        else:
+                            findings = {}
+                            for run in report['runs']:
+                                for finding in run['results']:
+                                    if finding['ruleId'] not in rules.values():
+                                        continue
+                                    line = finding['locations'][0]['physicalLocation']['region']['startLine']
+                                    extras = finding.get('properties', {}).get('extras', {})
+                                    findings[finding['ruleId'], line] = extras
+                                    if finding['ruleId'] in flow_rules:
+                                        locations = finding['codeFlows'][0]['threadFlows'][0]['locations']
+                                        self.assertEqual(len(locations), len(extras['taint_path']), context)
+                                        self.assertEqual([item['executionOrder'] for item in locations],
+                                                         list(range(len(locations))), context)
+                        self.assertEqual(set(findings), expected if unsafe else set(), context)
+                        for (rule, sink_line), extras in findings.items():
+                            if rule not in flow_rules:
+                                continue
+                            steps = extras['taint_path']
+                            self.assertEqual(extras['source_count'], 1, context)
+                            self.assertEqual((steps[0]['kind'], steps[0]['line']), ('source', source_line), context)
+                            self.assertEqual((steps[-1]['kind'], steps[-1]['line']), ('sink', sink_line), context)
+                            self.assertTrue(all(Path(step['path']) == source.resolve() and step['col'] > 0
+                                                for step in steps), context)
+                        if reference is None:
+                            reference = findings
+                        else:
+                            self.assertEqual(findings, reference, context)
+
     def test_shared_engine_branches_loops_local_summaries_and_evidence(self):
         text = '''class Flow {
   String relay(String value) { return value; }
@@ -3288,6 +3403,411 @@ class JavaKotlinDataflowTests(unittest.TestCase):
 }'''
         _, effects = self.helper(text)
         self.assertEqual(set(effects), self.lines(text))
+
+    def test_bodyless_local_request_getters_keep_named_source_flows(self):
+        declarations = (
+            'interface Request { String getParameter(String name); String getPathInfo(); }',
+            'abstract class Request { abstract String getParameter(String name); '
+            'abstract String getPathInfo(); }',
+            'class Request { native String getParameter(String name); native String getPathInfo(); }',
+            'interface Request { String getParameter(@annotations.Nonnull final String name); '
+            'String getPathInfo(); }',
+            'interface Parent { String getParameter(String name); String getPathInfo(); } '
+            'interface Request extends Parent {}',
+        )
+        for declaration in declarations:
+            for literal in (False, True):
+                with self.subTest(declaration=declaration, literal=literal):
+                    parameter = '"/srv/fixed"' if literal else 'request.getParameter("file")'
+                    path = '"/srv/fixed"' if literal else 'request.getPathInfo()'
+                    marker = '' if literal else '// unsafe'
+                    text = ('class Flow {\n  ' + declaration + '\n'
+                            '  void handle(Request request) {\n'
+                            '    Files.readString(' + parameter + '); ' + marker + '\n'
+                            '    Files.readString(' + path + '); ' + marker + '\n'
+                            '  }\n}\n')
+                    _, effects = self.helper(text)
+                    self.assertEqual(set(effects), self.lines(text))
+                    for line, fact in effects.items():
+                        self.assertTrue(all(trace.evidence[0].kind == 'source' and
+                                            trace.evidence[-1].kind == 'sink' and
+                                            trace.evidence[-1].line == line for trace in fact))
+
+    def test_concrete_request_getters_do_not_borrow_bodyless_sources(self):
+        declarations = (
+            'class Request { String getParameter(String name) { return "fixed"; } '
+            'String getPathInfo() { return "fixed"; } }',
+            'interface Request { default String getParameter(String name) { return "fixed"; } '
+            'default String getPathInfo() { return "fixed"; } }',
+            'abstract class Request { String getParameter(String name) { return "fixed"; } '
+            'String getPathInfo() { return "fixed"; } abstract String unrelated(); }',
+            'interface Request { default String getParameter(String name) { return "fixed"; } '
+            'String getParameter(int number); default String getPathInfo() { return "fixed"; } '
+            'String getPathInfo(String name); }',
+        )
+        for declaration in declarations:
+            with self.subTest(declaration=declaration):
+                text = ('class Flow {\n  ' + declaration + '\n'
+                        '  void handle(Request request, @RequestParam String chosen) {\n'
+                        '    Files.readString(request.getParameter("file"));\n'
+                        '    Files.readString(request.getPathInfo());\n'
+                        '    Files.readString(chosen); // unsafe\n'
+                        '  }\n}\n')
+                _, effects = self.helper(text)
+                self.assertEqual(set(effects), self.lines(text))
+
+    def test_bodyless_request_getters_select_their_signature_and_scope(self):
+        cases = (
+            '''class Flow {
+  interface Request {
+    String getParameter(String name);
+    default String getParameter(int number) { return "fixed"; }
+    String getPathInfo();
+    default String getPathInfo(String name) { return "fixed"; }
+  }
+  void handle(Request request, int index) {
+    Files.readString(request.getParameter("file")); // unsafe
+    Files.readString(request.getParameter(7));
+    Files.readString(request.getParameter((7)));
+    Files.readString(request.getParameter(index));
+    Files.readString(request.getParameter((index)));
+    Files.readString(request.getPathInfo()); // unsafe
+    Files.readString(request.getPathInfo("fixed"));
+  }
+}''',
+            '''class Outer {
+  interface Request { String getParameter(String name); }
+}
+class Flow {
+  void handle(Outer.Request request) {
+    Files.readString(request.getParameter("file")); // unsafe
+  }
+}''',
+            '''class Flow {
+  interface Request { String getParameter(String name); }
+  class Inner {
+    class Request { String getParameter(String name) { return "fixed"; } }
+    void handle(Request request) { Files.readString(request.getParameter("file")); }
+  }
+  void handle(Request request) {
+    Files.readString(request.getParameter("file")); // unsafe
+  }
+}''',
+            '''class Other {
+  interface Request { String getParameter(String name); }
+}
+class Flow {
+  class Request { String getParameter(String name) { return "fixed"; } }
+  void handle(Request request) { Files.readString(request.getParameter("file")); }
+}''',
+            '''class Flow {
+  interface Request { String getParameter(String name); }
+  class Fixed { String getParameter(String name) { return "fixed"; } }
+  Request request;
+  void handle(Fixed request) {
+    Files.readString(request.getParameter("file"));
+    Files.readString(this.request.getParameter("file")); // unsafe
+  }
+}''',
+        )
+        for text in cases:
+            with self.subTest(source=text):
+                _, effects = self.helper(text)
+                self.assertEqual(set(effects), self.lines(text))
+
+    def test_request_interface_keeps_a_proven_concrete_literal_implementation(self):
+        for assignment in ('request = incoming;', 'if (choose) { request = incoming; }'):
+            with self.subTest(assignment=assignment):
+                text = '''class Flow {
+  interface Request { String getParameter(String name); String getPathInfo(); }
+  class FixedRequest implements Request {
+    public String getParameter(String name) { return "/srv/fixed"; }
+    public String getPathInfo() { return "/srv/fixed"; }
+  }
+  void handle(Request incoming, boolean choose) {
+    Request request = new FixedRequest();
+    Files.readString(request.getParameter("file"));
+    Files.readString(request.getPathInfo());
+    %s
+    Files.readString(request.getParameter("file")); // unsafe
+    Files.readString(request.getPathInfo()); // unsafe
+  }
+}''' % assignment
+                _, effects = self.helper(text)
+                self.assertEqual(set(effects), self.lines(text))
+
+    def test_request_interface_constructor_proof_observes_later_loop_writes(self):
+        for opening, closing in (('while (again) {', '}'),
+                                 ('for (int index = 0; index < 2; index++) {', '}'),
+                                 ('do {', '} while (again);')):
+            with self.subTest(loop=opening):
+                text = '''class Flow {
+  interface Request { String getParameter(String name); String getPathInfo(); }
+  class FixedRequest implements Request {
+    public String getParameter(String name) { return "/srv/fixed"; }
+    public String getPathInfo() { return "/srv/fixed"; }
+  }
+  void handle(Request incoming, boolean again) {
+    Request request = new FixedRequest();
+    Files.readString(request.getParameter("file"));
+    %s
+      Files.readString(request.getParameter("file")); // unsafe
+      request = incoming;
+      Files.readString(request.getPathInfo()); // unsafe
+    %s
+  }
+}''' % (opening, closing)
+                _, effects = self.helper(text)
+                self.assertEqual(set(effects), self.lines(text))
+
+    def test_bodyless_request_getter_overloads_keep_all_sink_policies(self):
+        from ubs_core.analyzers.taint_java_redirect import RedirectEngine
+        from ubs_core.analyzers.taint_java_traversal import Engine
+        from ubs_core.java_detectors.header_injection import HeaderEngine
+        from ubs_core.java_detectors.ssrf_outbound_url import SSRFEngine
+
+        # The actual implementation has an unsafe String getter and inherits
+        # a literal-returning numeric overload. Java's static argument type
+        # selects between them; the getter's spelling cannot select for it.
+        overloads = (
+            ('int', 'int mode = 1;', 'mode', False),
+            ('inferred-int', 'var mode = 1;', 'mode', False),
+            ('boxed', 'Integer mode = 1;', 'mode', False),
+            ('qualified-boxed', 'java.lang.Integer mode = 1;', 'mode', False),
+            ('boxed-factory', 'Integer mode = Integer.valueOf(1);', 'mode', False),
+            ('primitive-arithmetic', 'int mode = 1;', 'mode + 1', False),
+            ('inferred-arithmetic', 'var mode = 1;', 'mode * 2 + 1', False),
+            ('boxed-arithmetic', 'Integer mode = 1;', 'mode + 1', False),
+            ('inferred-alias', 'int mode = 1; var selected = mode;', 'selected', False),
+            ('character', "var mode = 'a';", 'mode', False),
+            ('grouped-character', '', "(('a'))", False),
+            ('inferred-grouped-character', "var mode = (('a'));", 'mode', False),
+            ('parenthesized', 'var mode = 1;', '(mode)', False),
+            ('numeric-cast', 'Integer mode = 1;', '(Integer) (mode + 1)', False),
+            ('qualified-numeric-cast', 'Object mode = 1;', '(java.lang.Integer) mode', False),
+            ('string-literal', '', '"1"', True),
+            ('declared-string', 'String key = "1";', 'key', True),
+            ('inferred-string', 'var key = "1";', 'key', True),
+            ('string-alias', 'var key = "1"; var selected = key;', 'selected', True),
+            ('string-left', 'var key = "1";', 'key + 1', True),
+            ('string-right', 'var key = "1";', '1 + key', True),
+            ('cast-string-concat', 'Integer mode = 1;', '(Integer) mode + "1"', True),
+            ('primitive-cast-string-concat', 'int mode = 1;', '(int) mode + "1"', True),
+            ('grouped-boxed-postfix', 'Integer mode = 1;',
+             '((java.lang.Integer) mode).toString()', True),
+            ('grouped-string-postfix', 'Object key = "key";',
+             '((java.lang.String) key).substring(0)', True),
+            ('cast-conditional', 'Boolean enabled = true;',
+             '(Boolean) enabled ? "key" : "other"', True),
+            ('numeric-cast-conditional', 'Integer mode = 0;',
+             '(Integer) mode == 0 ? "key" : "other"', True),
+            ('primitive-cast-conditional', 'boolean enabled = true;',
+             '(boolean) enabled ? "key" : "other"', True),
+            ('qualified-cast-conditional', 'java.lang.Boolean enabled = true;',
+             '(java.lang.Boolean) enabled ? "key" : "other"', True),
+        )
+        cases = [(label, declaration, 'request.getParameter(' + argument + ')', unsafe)
+                 for label, declaration, argument, unsafe in overloads]
+        cases.append(('plain-literal', '', '"/srv/fixed"', False))
+        policies = (('path', Engine, 'Files.readString(Path.of(value));'),
+                    ('redirect', RedirectEngine, 'response.sendRedirect(value);'),
+                    ('header', HeaderEngine, 'response.setHeader("X-Value", value);'),
+                    ('outbound', SSRFEngine,
+                     'client.send(HttpRequest.newBuilder(URI.create(value)).build(), HttpResponse.BodyHandlers.discarding());'))
+        for label, declaration, value, unsafe in cases:
+            source = '''import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+class Flow {
+  interface Request {
+    String getParameter(String name);
+    default String getParameter(int mode) { return "/srv/fixed"; }
+  }
+  final class Actual implements Request {
+    HttpServletRequest incoming;
+    public String getParameter(String name) { return incoming.getParameter(name); }
+  }
+  void handle(HttpServletResponse response, HttpClient client) throws Exception {
+    Request request = new Actual();
+    %s
+    String value = %s;
+%s
+  }
+}
+''' % (declaration, value, '\n'.join('    ' + sink + (' // expect-' + policy if unsafe else '')
+                                     for policy, _, sink in policies))
+            path = self.root / ('overload-' + label + '.java')
+            path.write_text(source, encoding='utf-8')
+            for policy, engine, _ in policies:
+                with self.subTest(case=label, policy=policy):
+                    expected = self.lines(source, '// expect-' + policy)
+                    effects = engine(path, source).analyze()
+                    self.assertEqual(set(effects), expected)
+
+    def test_request_interface_allocations_are_recreated_only_in_loop_bodies(self):
+        bodies = (
+            '''while (again) {
+      Request request = new FixedRequest();
+      Files.readString(request.getParameter("file"));
+      request = incoming;
+      Files.readString(request.getParameter("file")); // unsafe
+    }''',
+            '''for (int index = 0; index < 2; index++) {
+      Request request = new FixedRequest();
+      Files.readString(request.getParameter("file"));
+      request = incoming;
+      Files.readString(request.getParameter("file")); // unsafe
+    }''',
+            '''do {
+      Request request = new FixedRequest();
+      Files.readString(request.getParameter("file"));
+      request = incoming;
+      Files.readString(request.getParameter("file")); // unsafe
+    } while (again);''',
+            '''for (Request request = new FixedRequest(); again;) {
+      Files.readString(request.getParameter("file")); // unsafe
+      request = incoming;
+    }''',
+            '''while (again) {
+      Request request = new FixedRequest();
+      Files.readString(request.getParameter("file"));
+      while (again) {
+        Files.readString(request.getParameter("file")); // unsafe
+        request = incoming;
+      }
+    }''',
+            '''Request request = new FixedRequest();
+    for (; again; request = incoming)
+      Files.readString(request.getParameter("file")); // unsafe''',
+            '''Request request = new FixedRequest();
+    while (again) {
+      if (choose) { request = incoming; continue; }
+      Files.readString(request.getParameter("file")); // unsafe
+    }''',
+            '''Request request = new FixedRequest();
+    while (again)
+      Files.readString(request.getParameter("file"));
+    request = incoming;
+    Files.readString(request.getParameter("file")); // unsafe''',
+        )
+        for body in bodies:
+            with self.subTest(body=body):
+                text = '''class Flow {
+  interface Request { String getParameter(String name); }
+  class FixedRequest implements Request {
+    public String getParameter(String name) { return "/srv/fixed"; }
+  }
+  void handle(Request incoming, boolean again, boolean choose) {
+    %s
+  }
+}''' % body
+                _, effects = self.helper(text)
+                self.assertEqual(set(effects), self.lines(text))
+
+    def test_java_request_overload_and_allocation_runtime_oracle(self):
+        if shutil.which('java') is None:
+            self.skipTest('Java runtime unavailable for the independent request dispatch oracle')
+        source = self.root / 'NativeRequestOracle.java'
+        source.write_text('''class NativeRequestOracle {
+  interface Request {
+    String getParameter(String key);
+    default String getParameter(int mode) { return "integer"; }
+  }
+  static final class Actual implements Request {
+    public String getParameter(String key) { return "string"; }
+  }
+  static final class Fixed implements Request {
+    public String getParameter(String key) { return "fixed"; }
+  }
+  public static void main(String[] args) {
+    Request request = new Actual();
+    int mode = 1;
+    var inferred = 1;
+    Integer boxed = 1;
+    java.lang.Integer qualified = 1;
+    var key = "1";
+    Object value = 1, enabled = Boolean.TRUE;
+    boolean primitive = true;
+    System.out.println("overloads=" + String.join(",",
+      request.getParameter(mode), request.getParameter(inferred),
+      request.getParameter(boxed), request.getParameter(qualified),
+      request.getParameter(mode + 1), request.getParameter(boxed + 1),
+      request.getParameter('x'), request.getParameter("1"),
+      request.getParameter(key), request.getParameter(key + 1),
+      request.getParameter(mode + key),
+      request.getParameter((Integer) value + "key"),
+      request.getParameter((Integer) value + 1)));
+    System.out.println("postfix=" + String.join(",",
+      request.getParameter(((java.lang.Integer) value).toString()),
+      request.getParameter(((java.lang.String) key).substring(0)),
+      request.getParameter((java.lang.Integer) value)));
+    System.out.println("conditionals=" + String.join(",",
+      request.getParameter((Boolean) enabled ? "key" : "other"),
+      request.getParameter((boolean) primitive ? "key" : "other"),
+      request.getParameter((java.lang.Boolean) enabled ? "key" : "other"),
+      request.getParameter((Integer) value == 0 ? "key" : "other"),
+      request.getParameter((Integer) value == 0 ? "key" : "other" + mode),
+      request.getParameter(((Integer) value == 0 ? "key" : "other") + mode)));
+    String outside = "", reset = "", header = "", inner = "", after = "";
+    Request first = new Fixed();
+    for (int round = 0; round < 2; round++) {
+      outside += first.getParameter("file") + ",";
+      first = request;
+    }
+    for (int round = 0; round < 2; round++) {
+      Request fresh = new Fixed();
+      reset += fresh.getParameter("file") + ",";
+      fresh = request;
+    }
+    int rounds = 0;
+    for (Request selected = new Fixed(); rounds < 2; rounds++) {
+      header += selected.getParameter("file") + ",";
+      selected = request;
+    }
+    for (int outer = 0; outer < 2; outer++) {
+      Request selected = new Fixed();
+      for (int iteration = 0; iteration < 2; iteration++) {
+        inner += selected.getParameter("file") + ",";
+        selected = request;
+      }
+    }
+    for (int outer = 0; outer < 2; outer++) {
+      Request selected = new Fixed();
+      for (int iteration = 0; iteration < 2; iteration++) {
+        after += selected.getParameter("file") + ",";
+      }
+      selected = request;
+    }
+    System.out.println("outside=" + outside);
+    System.out.println("inside=" + reset);
+    System.out.println("header=" + header);
+    System.out.println("inner=" + inner);
+    System.out.println("afterInner=" + after);
+  }
+}
+''', encoding='utf-8')
+        expected = ('overloads=integer,integer,integer,integer,integer,integer,integer,'
+                    'string,string,string,string,string,integer\n'
+                    'postfix=string,string,integer\n'
+                    'conditionals=string,string,string,string,string,string\n'
+                    'outside=fixed,string,\ninside=fixed,fixed,\nheader=fixed,string,\n'
+                    'inner=fixed,string,fixed,string,\nafterInner=fixed,fixed,fixed,fixed,\n')
+        command = ['java', '-Xmx96m', str(source)]
+        started = time.monotonic()
+        proc = subprocess.run(command, cwd=self.root, capture_output=True, text=True, timeout=30)
+        (self.root / 'native-request-oracle.stdout').write_text(proc.stdout)
+        (self.root / 'native-request-oracle.stderr').write_text(proc.stderr)
+        (self.root / 'native-request-oracle.json').write_text(json.dumps({
+            'command': command, 'source_sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
+            'exit': proc.returncode, 'elapsed': time.monotonic() - started,
+        }, indent=2))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout, expected)
 
     def test_native_json_and_sarif_preserve_helper_flow_evidence(self):
         cases = (

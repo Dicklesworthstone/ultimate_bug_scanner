@@ -10,6 +10,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Preserve Java request-source flows through selected bodyless local getters
+  across path traversal, redirects, response headers and outbound requests.
+  Respect String versus numeric overloads, lexical type ownership and proven
+  concrete literal implementations; invalidate receiver proofs across loop
+  writes without discarding allocations recreated on each iteration. Add native
+  Java dispatch witnesses and runner/module JSON/SARIF regression coverage.
+
 - Model synchronous Python `any()` and `all()` generator consumption with exact
   short-circuit order, global/nonlocal writes, filters, nested clauses and
   exceptional completion. Preserve captured builtin identities and Boolean

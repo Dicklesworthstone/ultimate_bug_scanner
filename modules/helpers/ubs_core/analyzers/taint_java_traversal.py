@@ -863,6 +863,200 @@ class Engine:
             return None
         return retag(self.source(offset, name + '('), add=frozenset({'jvm-string'}))
 
+    def request_argument_kind(self, low, high, seen=()):
+        """Bounded static argument evidence for a local String overload.
+
+        Reuse the JVM declaration/cast index. Java ``var`` keeps its inferred
+        type after assignment, and arithmetic on proven numeric operands
+        cannot select a String overload. Unknown expressions stay unknown.
+        """
+        index = self.request_index()
+        if low >= high or (low, high) in seen or len(seen) >= 32:
+            return None
+        seen = (*seen, (low, high))
+        # The lexical mask represents quoted text with a numeric placeholder;
+        # characters can be entirely blank. Preserve the original literal's
+        # extent before the binding index trims masked whitespace away.
+        literal_low, literal_high = low, high
+        while literal_low < literal_high:
+            while literal_low < literal_high and self.text[literal_low].isspace():
+                literal_low += 1
+            while literal_high > literal_low and self.text[literal_high - 1].isspace():
+                literal_high -= 1
+            if self.text[literal_low:literal_low + 1] != '(' or self.parser.pairs.get(literal_low) != literal_high - 1:
+                break
+            literal_low, literal_high = literal_low + 1, literal_high - 1
+        raw = self.text[literal_low:literal_high]
+        if re.fullmatch(r'"(?:\\.|[^"\\])*"', raw):
+            return 'string'
+        if re.fullmatch(r"(?:[+-]?\d[\w.]*|'(?:\\.|[^'\\])+')", raw):
+            return 'number'
+        if raw in {'true', 'false'}:
+            return 'other'
+        low, high = index.trim(low, high)
+        if low >= high:
+            return None
+        # Split compound expressions before using cast evidence: a leading
+        # numeric cast does not make `(Integer) value + "key"` numeric.
+        cursor, operator = low, None
+        while cursor < high:
+            char = self.code[cursor]
+            if char in '([{':
+                cursor = self.parser.pairs[cursor] + 1
+                continue
+            if char in '?:=<>!&|^':
+                # A leading cast only types its operand, not an enclosing
+                # comparison, conditional or other compound expression.
+                return None
+            if char in '+-*/%' and operator is None:
+                operator = cursor, char
+            cursor += 1
+        if operator is not None:
+            cursor, char = operator
+            if cursor == low and char in '+-':
+                kind = self.request_argument_kind(cursor + 1, high, seen)
+                return kind if kind == 'number' else None
+            left = self.request_argument_kind(low, cursor, seen)
+            right = self.request_argument_kind(cursor + 1, high, seen)
+            if char == '+' and 'string' in {left, right}:
+                return 'string'
+            return 'number' if left == right == 'number' else None
+        if self.code[low] == '(':
+            closing = self.parser.pairs[low]
+            cast = self.code[low + 1:closing].strip()
+            operand = index.skip(closing + 1)
+            if (not re.fullmatch(r'[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)*', cast)
+                    or operand >= high or self.code[operand] in '.['):
+                # A grouped receiver followed by .toString()/substring() is
+                # not a cast of that whole call's result. The declaration
+                # index intentionally does not resolve such postfix returns.
+                return None
+        actual = index.argument_type(low, high)
+        if actual is not None:
+            if actual == ('api', 'java.lang.String'):
+                return 'string'
+            if actual in {('api', 'java.lang.Integer'), ('api', 'java.lang.Long')}:
+                return 'number'
+            return 'other'
+        name = re.sub(r'\s+', '', self.code[low:high])
+        binding = index.binding(name.removeprefix('this.'), low, field=name.startswith('this.'))
+        primitive_numbers = {'byte', 'short', 'int', 'long', 'float', 'double', 'char'}
+        if binding is not None:
+            if binding.type_name in primitive_numbers:
+                return 'number'
+            if binding.type_name == 'boolean':
+                return 'other'
+            if binding.type_name == 'var' and binding.initializer is not None:
+                return self.request_argument_kind(*binding.initializer, seen)
+        if self.code[low] == '(' and self.parser.pairs[low] < high - 1:
+            cast = self.code[low + 1:self.parser.pairs[low]].strip()
+            if cast in primitive_numbers | {'boolean'}:
+                return 'other' if cast == 'boolean' else 'number'
+        return None
+
+    def bodyless_request_getter(self, root, method, offset):
+        """An opaque local getter cannot prove a named request source clean.
+
+        Preserve the existing heuristic for a selected declaration without a
+        body, not Servlet identity for every interface. Concrete/default method
+        bodies and inherited dispatch keep their existing receiver semantics.
+        """
+        if self.parser.kotlin:
+            return False
+        index = self.request_index()
+        name = root.removeprefix('this.')
+        if not re.fullmatch(r'[A-Za-z_]\w*', name):
+            return False
+        binding = index.binding(name, offset, field=root.startswith('this.'))
+        if binding is None:
+            return False
+
+        def local_type(spelling, position):
+            parts, candidates = spelling.split('.'), []
+            for low, high, owner in self.parser.owners:
+                chain = [(start, end, parent) for start, end, parent in self.parser.owners
+                         if start < low < end] + [(low, high, owner)]
+                if [item[2] for item in chain[-len(parts):]] != parts:
+                    continue
+                scope = index.scope(chain[-len(parts)][0])
+                if scope[0] < position < scope[1]:
+                    candidates.append((scope[1] - scope[0], low, high))
+            return min(candidates) if candidates else None
+
+        selected = local_type(binding.type_name, binding.declaration)
+        if selected is None:
+            return False
+        opening = self.code.find('(', offset)
+        if opening not in self.parser.pairs:
+            return False
+        arguments = list(self.parser.parts(opening + 1, self.parser.pairs[opening]))
+        if len(arguments) != REQUEST_GETTERS[method]:
+            return False
+        argument_kind = self.request_argument_kind(*arguments[0]) if arguments else None
+        signature = r'\b(?:java\.lang\.)?String\s+' + re.escape(method) + r'\s*\('
+
+        def getter_tails(owner):
+            _, low, high = owner
+            body = self.code.find('{', low, high)
+            for match in re.finditer(signature, self.code[body + 1:high]):
+                start = body + 1 + match.start()
+                if index.scope(start) != (body, high):
+                    continue
+                parameter_open = body + match.end()
+                parameter_close = self.parser.pairs[parameter_open]
+                parameters = list(self.parser.parts(parameter_open + 1, parameter_close))
+                if len(parameters) != len(arguments):
+                    continue
+                if parameters:
+                    declaration = re.sub(r'@[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*(?:\s*\([^)]*\))?',
+                                         ' ', self.code[parameters[0][0]:parameters[0][1]])
+                    parameter = re.fullmatch(r'\s*(?:final\s+)?((?:java\.lang\.)?String)\s+[A-Za-z_]\w*\s*',
+                                             declaration)
+                    if not parameter:
+                        continue
+                    parameter_type = index.nominal_type(parameter.group(1), parameters[0][0])
+                    if parameter_type == ('api', 'java.lang.String') and argument_kind in {'number', 'other'}:
+                        continue
+                yield index.skip(parameter_close + 1), high
+
+        # The declaration may be abstract while this exact local object is
+        # concrete. Only an unchanged, explicit allocation and an actual
+        # literal-returning implementation can suppress that opaque fallback.
+        if binding.initializer is not None and not binding.field:
+            low, high = index.trim(*binding.initializer)
+            constructor = re.fullmatch(r'new\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\s*\(\s*\)', self.code[low:high])
+
+            def repeated_end(statements):
+                end = offset
+                for statement in statements:
+                    if statement.start <= offset < statement.end:
+                        if statement.kind in {'for', 'while', 'do'} and (
+                                high <= statement.start or statement.kind == 'for' and
+                                statement.header[0] <= binding.declaration < statement.header[1]):
+                            end = max(end, statement.end)
+                        end = max(end, repeated_end(statement.body), repeated_end(statement.otherwise))
+                return end
+
+            # A write later in an enclosing loop can reach this earlier call
+            # on its next iteration unless the loop body recreates the object
+            # before each call. A for initializer runs only once, so its later
+            # writes still reach the call across the backedge.
+            finish = repeated_end(self.function.body)
+            reassigned = any(index.binding(name, high + match.start()) == binding
+                             for match in re.finditer(r'(?<![\w$.])' + re.escape(name) + r'\s*=(?!=)',
+                                                      self.code[high:finish]))
+            concrete = local_type(constructor.group(1), low) if constructor and not reassigned else None
+            if concrete is not None and re.match(r'class\s+', self.code[concrete[1]:]):
+                for tail, _ in getter_tails(concrete):
+                    if self.code[tail:tail + 1] == '{' and re.fullmatch(
+                            r'\s*return\s+"(?:\\.|[^"\\])*"\s*;\s*',
+                            self.text[tail + 1:self.parser.pairs[tail]]):
+                        return False
+        for tail, high in getter_tails(selected):
+            if re.match(r'(?:throws\s+[\w.,\s]+)?;', self.code[tail:high]):
+                return True
+        return False
+
     def named_request_source(self, name, offset, bindings, state):
         if not self.request_receiver_sources:
             return True
@@ -896,7 +1090,7 @@ class Engine:
                 arity = sum(1 for _ in self.parser.parts(opening + 1, self.parser.pairs[opening]))
                 if arity != REQUEST_GETTERS[method] or (method != 'getParameter' and not types & HTTP_SERVLET_TYPES):
                     return False
-        return bool(types) or not known
+        return bool(types) or not known or self.bodyless_request_getter(root, method, offset)
 
     def without_request_identity(self, value):
         if not self.request_receiver_sources:

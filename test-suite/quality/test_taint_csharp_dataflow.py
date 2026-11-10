@@ -49,6 +49,32 @@ class LatticeTests(unittest.TestCase):
         for order in ((long, short), (short, long)):
             self.assertEqual(next(iter(join(*order))).evidence, next(iter(short)).evidence)
 
+    def test_shared_fact_joins_preserve_evidence_and_removed_sanitizers(self):
+        source = Step('flow.swift', 2, 3, 'source', 'request input')
+        early = Step('flow.swift', 4, 5, 'call', 'first()')
+        later = Step('flow.swift', 8, 5, 'call', 'other()')
+        raw = Trace('source', ('flow.swift', 20), evidence=(source, early))
+        longer = Trace('source', raw.key, evidence=(source, early, later))
+        tied = Trace('source', raw.key, evidence=(source, later))
+        safe = Trace('source', raw.key, tags=frozenset({'contained-path'}),
+                     evidence=(source, later))
+        invalidated = Trace('source', raw.key, removed_tags=frozenset({'contained-path'}),
+                            evidence=(source, early, later))
+        shared = frozenset({raw, safe, invalidated})
+        for arguments in ((shared,), (CLEAN, shared), (shared, CLEAN, shared),
+                          (shared, shared, CLEAN, shared)):
+            result = join(*arguments)
+            self.assertEqual(result, shared)
+            self.assertEqual({trace: trace.evidence for trace in result},
+                             {trace: trace.evidence for trace in shared})
+        # Semantically equal Facts with distinct evidence cannot use the
+        # identity shortcut: shortest length, then lexical evidence, still win.
+        for witnesses in itertools.permutations((raw, longer, tied)):
+            result = join(*(frozenset({trace}) for trace in witnesses), shared, CLEAN)
+            self.assertEqual({trace: trace.evidence for trace in result},
+                             {raw: raw.evidence, safe: safe.evidence,
+                              invalidated: invalidated.evidence})
+
     def test_cyclic_cfg_converges_and_reaches_a_long_chain(self):
         source = frozenset({Trace('source', ('a.cs', 0))})
         edges = {i: (i + 1,) for i in range(200)}

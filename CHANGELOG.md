@@ -10,6 +10,14 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Distinguish Swift callable properties from unrelated member calls, including
+  closure, named-function and native-function fields. Revisit only dependent
+  function and capture summaries during taint analysis, while preserving
+  invalidation for global writes and newly discovered callbacks. Keep all four
+  policies, operation budgets and incomplete-analysis reporting intact; add
+  nested-callback stress and stored-callable regressions. The large production
+  SwiftUI timeout remains unresolved.
+
 - Resolve Python `str.join()` from the evaluated builtin string receiver in
   SQL analysis, including aliases and selected generator consumers. Preserve
   receiver capture, generator writes and SQL provenance across later rebinding;

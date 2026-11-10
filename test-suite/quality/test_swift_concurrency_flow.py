@@ -180,6 +180,117 @@ class SwiftConcurrencyFlowTests(unittest.TestCase):
                        'req.query["path"]' if tainted else '"/srv/fixed"'),
                            suffix=str(tainted))
 
+    def test_callable_fields_receive_the_selected_argument(self):
+        # Member calls, optional invocation, and an extracted function value
+        # must all reach the same body. A receiver's other fields are not the
+        # selected callable and cannot supply its argument or return value.
+        for kind in ('closure', 'native', 'helper'):
+            for invocation in ('direct', 'extracted', 'optional'):
+                for tainted in (False, True):
+                    with self.subTest(kind=kind, invocation=invocation, tainted=tainted):
+                        marker = '// expect-path' if tainted else ''
+                        definition = ('func read(_ path: String) -> String {\n'
+                                      '    return String(contentsOfFile: path) ' + marker + '\n}\n'
+                                      if kind == 'helper' else '')
+                        initializer = ('{ (path: String) in path }'
+                                       if kind == 'closure' else 'readFile' if kind == 'native' else 'read')
+                        declaration = ': ((String) -> String)?' if invocation == 'optional' else ''
+                        argument = 'req.query["path"]' if tainted else '"/srv/fixed"'
+                        selected = ('selected' if invocation == 'extracted' else
+                                    'reader.load' + ('?' if invocation == 'optional' else ''))
+                        expression = selected + '(' + argument + ')'
+                        if kind == 'closure':
+                            expression = 'String(contentsOfFile: ' + expression + ')'
+                        call = ('let selected = reader.load\n    ' if invocation == 'extracted' else '') + '_ = ' + expression
+                        if kind in {'native', 'closure'}:
+                            call += ' ' + marker
+                        self.check(definition + 'struct Reader {\n    let load' + declaration + ' = '
+                                   + initializer + '\n}\nfunc handle(req: Request) {\n'
+                                   '    let reader = Reader()\n    ' + call + '\n}\n',
+                                   suffix='-' + kind + '-' + invocation + '-' + str(tainted))
+
+    def test_unrelated_methods_do_not_invoke_aggregate_callback_fields(self):
+        for stored in ('closure', 'helper', 'native'):
+            with self.subTest(stored=stored):
+                definition = ('func read(_ path: String) -> String { return String(contentsOfFile: path) }\n'
+                              if stored == 'helper' else '')
+                value = ('{ (path: String) in path }' if stored == 'closure'
+                         else 'readFile' if stored == 'native' else 'read')
+                self.check(definition + '''
+                    struct Reader {
+                        let load: (String) -> String
+                        func title(_ value: String) -> String { return "/srv/fixed" }
+                    }
+                    func handle(req: Request) {
+                        let reader = Reader(load: %s)
+                        _ = String(contentsOfFile: reader.title(req.query["path"]))
+                    }
+                ''' % value, suffix='-' + stored)
+
+    def test_callable_field_initializer_defers_its_sink_until_invocation(self):
+        for invocation in ('direct', 'extracted', 'optional'):
+            for tainted in (False, True):
+                with self.subTest(invocation=invocation, tainted=tainted):
+                    declaration = ': ((String) -> String)?' if invocation == 'optional' else ''
+                    selected = ('selected' if invocation == 'extracted' else
+                                'reader.load' + ('?' if invocation == 'optional' else ''))
+                    self.check('''
+                        struct Reader {
+                            let load%s = { (path: String) in
+                                return String(contentsOfFile: path) %s
+                            }
+                        }
+                        func handle(req: Request) {
+                            let reader = Reader()
+                            %s
+                            _ = %s(%s)
+                        }
+                    ''' % (declaration, '// expect-path' if tainted else '',
+                           'let selected = reader.load' if invocation == 'extracted' else '',
+                           selected, 'req.query["path"]' if tainted else '"/srv/fixed"'),
+                               suffix='-' + invocation + '-' + str(tainted))
+
+    def test_escaped_callable_field_retains_limitation_and_independent_sink(self):
+        source = textwrap.dedent('''
+            struct Reader {
+                let load = { (path: String) in
+                    return String(contentsOfFile: path)
+                }
+            }
+            func handle(req: Request) {
+                let reader = Reader()
+                consume(reader.load)
+                _ = String(contentsOfFile: req.query["path"])
+            }
+        ''').lstrip('\n')
+        path = self.artifacts / (self.id().rsplit('.', 1)[-1] + '.swift')
+        path.write_text(source, encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'unknown closure parameter.*incomplete'):
+            flow_findings(path, source, 'path')
+        findings = flow_findings(path, source, 'path', recover=True)
+        path.with_suffix('.json').write_text(json.dumps(findings, indent=2), encoding='utf-8')
+        self.assertEqual([(item['rule'], item['line']) for item in findings], [
+            ('swift.taint.request_path_traversal', 9),
+            ('swift.taint.analysis-limited', 3),
+        ], findings)
+
+    def test_declared_callable_field_shadows_a_native_sink_name(self):
+        for name in ('file', 'readFile'):
+            for returns_input in (False, True):
+                with self.subTest(name=name, returns_input=returns_input):
+                    self.check('''
+                        struct Reader {
+                            let %s = { (path: String) in %s }
+                        }
+                        func handle(req: Request) {
+                            let reader = Reader()
+                            let result = reader.%s(req.query["path"])
+                            _ = String(contentsOfFile: result) %s
+                        }
+                    ''' % (name, 'path' if returns_input else '"/srv/fixed"', name,
+                           '// expect-path' if returns_input else ''),
+                               suffix='-' + name + '-' + str(returns_input))
+
     def test_selected_helper_exports_writes_to_a_callers_captured_variable(self):
         for attribute in ('', '@escaping '):
             for tainted in (False, True):

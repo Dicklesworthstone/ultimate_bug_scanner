@@ -1607,6 +1607,50 @@ class SwiftScopedFlowTests(unittest.TestCase):
             }
         ''', policy='path', suffix='-safe')
 
+    def test_nested_callback_helper_chain_converges_with_all_sink_policies(self):
+        # These helpers force return summaries to propagate back through a
+        # deep call graph. Replaying every unrelated context at each change
+        # exhausted the normal 500,000-operation budget on this same source.
+        # Both request data and a literal control must complete under the
+        # unchanged production budget, with witnesses at the actual sink.
+        helpers = []
+        for index in range(140):
+            result = f'hop{index + 1}(transformed)' if index < 139 else 'transformed'
+            helpers.append('''func hop%d(_ value: String) -> String {
+    let transformed = [value].map { outer in
+        [outer].map { inner in inner }.first
+    }.first
+    return %s
+}
+''' % (index, result))
+        policies = (
+            ('path', 'String(contentsOfFile: target)', 'swift.taint.request_path_traversal'),
+            ('redirect', 'Response.redirect(to: target)', 'swift.taint.request_open_redirect'),
+            ('header', 'response.headers.add(name: "X-Trace", value: target)', 'swift.taint.header-injection'),
+            ('outbound', 'URLSession.shared.data(from: URL(string: target)!)', 'swift.taint.outbound-url'),
+        )
+        for policy, sink, rule in policies:
+            for tainted in (False, True):
+                with self.subTest(policy=policy, tainted=tainted):
+                    source = ''.join(helpers) + '''func handle(req: Request) {
+    let target = hop0(%s)
+    _ = %s
+}
+''' % ('req.query["input"]' if tainted else '"/srv/fixed"', sink)
+                    path = self.artifacts / ('nested-summaries-' + policy + '-' + str(tainted) + '.swift')
+                    path.write_text(source, encoding='utf-8')
+                    findings = flow_findings(path, source, policy)
+                    path.with_suffix('.json').write_text(json.dumps(findings, indent=2), encoding='utf-8')
+                    sink_line = next(number for number, line in enumerate(source.splitlines(), 1)
+                                     if line.strip() == '_ = ' + sink)
+                    self.assertEqual([(item['rule'], item['line']) for item in findings],
+                                     [(rule, sink_line)] if tainted else [], findings)
+                    if tainted:
+                        witness = findings[0]['extras']['taint_path']
+                        self.assertEqual(witness[0]['kind'], 'source')
+                        self.assertEqual(witness[-1]['kind'], 'sink')
+                        self.assertEqual(witness[-1]['line'], sink_line)
+
     def test_collection_capture_lists_preserve_sources_and_shadow_outer_values(self):
         self.check('''
             func handle(req: Request) {

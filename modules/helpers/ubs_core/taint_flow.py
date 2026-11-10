@@ -64,6 +64,20 @@ State = dict[str, Fact]
 
 def join(*facts: Fact) -> Fact:
     """Union with a deterministic, shortest witness for each semantic fact."""
+    # Solver states share immutable Facts. Joining a single value (including
+    # repeated references to that exact object) cannot improve its witnesses.
+    # Equality is insufficient here: Trace equality intentionally excludes
+    # evidence, so equal but distinct Facts still need the shortest-path merge.
+    single = CLEAN
+    for fact in facts:
+        if not fact:
+            continue
+        if not single:
+            single = fact
+        elif fact is not single:
+            break
+    else:
+        return single
     result: dict[Trace, Trace] = {}
     for fact in facts:
         for trace in fact:

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 from bisect import bisect_right
+from collections import deque
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Iterable
@@ -1154,6 +1155,8 @@ class SwiftEngine:
         self.lines = [0, *(index + 1 for index, char in enumerate(text) if char == '\n')]
         self.budget, self.graphs = Budget(), {}
         self.contexts, self.summaries, self.globals = {}, {}, {}
+        self.pending, self.queued = deque(), set()
+        self.summary_readers, self.capture_readers = {}, {}
         self.capture_states, self.capture_revision, self.active_context = {}, 0, None
         self.closure_keys, self.stored_closures = {}, {}
         self.active_closures = set()
@@ -1236,7 +1239,33 @@ class SwiftEngine:
             if len(self.contexts) >= 2048:
                 raise AnalysisLimit('Swift call-context limit exceeded; analysis is incomplete')
             self.contexts[key], self.summaries[key] = function, SwiftSummary()
+            self.enqueue(key)
+        if self.summary_context is not None:
+            self.summary_readers.setdefault(key, {})[self.summary_context] = None
         return key
+
+    def enqueue(self, key):
+        if key not in self.queued:
+            self.pending.append(key)
+            self.queued.add(key)
+
+    def future_captures(self, context):
+        # Captures can see writes after their creation/call site. Record which
+        # enclosing function summary consumed that future state, including a
+        # stored callback invoked from a different helper's context.
+        if self.summary_context is not None:
+            self.capture_readers.setdefault(context, {})[self.summary_context] = None
+        return self.capture_states.get(context, {})
+
+    def enable_callbacks(self):
+        if not self.callback_seen:
+            self.callback_seen = True
+            self.capture_revision += 1
+            # Callback-aware heap effects also apply to already visited calls.
+            # The first callback therefore invalidates every earlier context;
+            # subsequent capture changes invalidate only actual readers.
+            for key in self.contexts:
+                self.enqueue(key)
 
     def builtin(self, name, state=None, bindings=None):
         parts = name.split('.')
@@ -1322,9 +1351,10 @@ class SwiftEngine:
                 return retag(self.forget(receiver), add=SWIFT_HEADER_TAGS | frozenset({'swift-string'}))
         return None
 
-    def candidates(self, name, receiver, state, bindings):
+    def candidates(self, name, receiver, state, bindings, *, callable_value=True):
         leaf, owner = name.rsplit('.', 1)[-1], self.function.owner
-        function_values = {trace.key[0] for trace in receiver if trace.kind == 'function'}
+        function_values = {trace.key[0] for trace in receiver
+                           if callable_value and trace.kind == 'function'}
         if function_values:
             return [self.parser.functions[key] for key in function_values]
         if any(trace.kind == 'shape' and trace.key[0].startswith('dynamic-instance:') for trace in receiver):
@@ -1553,8 +1583,26 @@ class SwiftEngine:
     def call(self, name, receiver, arguments, site, state, bindings):
         token, callee_token = site.expression, site.callee
         leaf = name.rsplit('.', 1)[-1]
-        native_calls = {trace.key[0] for trace in receiver if trace.kind == 'native-callable'}
-        stored = [trace for trace in receiver if trace.kind == 'closure']
+        owners = {tuple(trace.key[0].split(':', 1)[1].split('.')) for trace in receiver
+                  if trace.kind == 'shape' and trace.key[0].startswith(('instance:', 'dynamic-instance:'))}
+        if callee_token is not None and any(
+                leaf in self.parser.fields.get(owner, {}) or (owner, leaf) in self.parser.field_functions
+                for owner in owners):
+            # Calling a stored/computed callable property first evaluates that
+            # property. An ordinary method call must not invoke every callback
+            # carried in the receiver's aggregate payload instead of the method.
+            binding = bindings.get(name.split('.', 1)[0], name.split('.', 1)[0])
+            selected = self.member(leaf, receiver, callee_token, binding, state)
+            if not selected and any((owner, leaf) in self.parser.field_functions for owner in owners):
+                # The selected getter/initializer summary may still be bottom.
+                # As with an ordinary selected call, its later summary supplies
+                # the return rather than an eager unknown-call approximation.
+                return CLEAN
+            return self.call('', selected, arguments, CallSite(token), state, bindings)
+        callable_value = callee_token is None or not owners and leaf in {'self', 'callAsFunction'}
+        native_calls = {trace.key[0] for trace in receiver
+                        if callable_value and trace.kind == 'native-callable'}
+        stored = [trace for trace in receiver if callable_value and trace.kind == 'closure']
         if native_calls or stored:
             # A branch may select a stored closure, a native sink or a named
             # helper. Evaluate every possible callable against the same input
@@ -1588,7 +1636,7 @@ class SwiftEngine:
         values = [value for _, value, _ in arguments]
         labeled = {label: value for label, value, _ in arguments if label}
         value = join(receiver, *values)
-        candidates = self.candidates(name, receiver, state, bindings)
+        candidates = self.candidates(name, receiver, state, bindings, callable_value=callable_value)
         native_redirect = ('.' in name and not any(swift_has_shape(fact, 'request') for fact in values)
                            and (not candidates or all(function.return_type in {'Response', 'HTTPResponse'} for function in candidates)))
         if leaf == 'redirect' and values and (native_redirect or not candidates):
@@ -1800,10 +1848,12 @@ class SwiftEngine:
     def member(self, name, receiver, token, owner_binding=None, state=None):
         if name in {'self', 'callAsFunction'} and any(trace.kind == 'native-callable' for trace in receiver):
             return receiver
-        if name in {'file', 'sendFile', 'streamFile', 'readFile', 'serveFile', 'writeFile'}:
-            return join(self.forget(receiver), frozenset({Trace('native-callable', (name, token.start))}))
         owners = {tuple(instance.key[0].split(':', 1)[1].split('.')) for instance in receiver
                   if instance.kind == 'shape' and instance.key[0].startswith(('instance:', 'dynamic-instance:'))}
+        if name in {'file', 'sendFile', 'streamFile', 'readFile', 'serveFile', 'writeFile'} and not any(
+                name in self.parser.fields.get(owner, {}) or (owner, name) in self.parser.field_functions
+                for owner in owners):
+            return join(self.forget(receiver), frozenset({Trace('native-callable', (name, token.start))}))
         resolved, unresolved = [], []
         for owner in sorted(owners):
             if (owner, name) in self.parser.opaque_fields:
@@ -1903,11 +1953,7 @@ class SwiftEngine:
         return frozenset({Trace('closure', (self.closure_keys[key],))})
 
     def invoke_stored(self, closure, arguments, state):
-        if not self.callback_seen:
-            # Revisit mutations which preceded discovery of this invocation.
-            # A stored closure may capture an alias of the mutated object.
-            self.callback_seen = True
-            self.capture_revision += 1
+        self.enable_callbacks()
         tokens, function, bindings, captured, snapshots, context = self.stored_closures[closure.key[0]]
         if closure.key[0] in self.active_closures:
             return self.limitation('Swift recursive stored callback needs a recursive closure summary',
@@ -1917,7 +1963,7 @@ class SwiftEngine:
         parent, active = self.function, self.active_context
         visible = {binding: fact for binding, fact in state.items()
                    if self.capture_visible(context, binding)}
-        environment = join_states(captured, self.capture_states.get(context, {}), visible)
+        environment = join_states(captured, self.future_captures(context), visible)
         writes = {}
         self.active_closures.add(closure.key[0])
         try:
@@ -1936,9 +1982,7 @@ class SwiftEngine:
         for closure in value:
             if closure.kind != 'closure':
                 continue
-            if not self.callback_seen:
-                self.callback_seen = True
-                self.capture_revision += 1
+            self.enable_callbacks()
             tokens = self.stored_closures[closure.key[0]][0]
             unknown = retag(self.source(tokens[0].start, 'unknown closure parameter'),
                             add=frozenset({'unknown-provenance'}))
@@ -1975,9 +2019,10 @@ class SwiftEngine:
         scope = dict(bindings)
         initial = dict(state)
         initial.pop('@result', None)
+        future = self.future_captures(self.active_context)
         for binding in bindings.values():
             initial[binding] = join(initial.get(binding, CLEAN),
-                                    self.capture_states.get(self.active_context, {}).get(binding, CLEAN))
+                                    future.get(binding, CLEAN))
         for capture, expression in captures:
             # Evaluate in the creation environment before introducing aliases.
             value = (capture_values[capture.value] if capture_values is not None
@@ -2040,11 +2085,7 @@ class SwiftEngine:
 
     # one Swift closure argument: name, receiver, token slice, state, bindings and depth, plus member_call; a parameter record is bead ultimate_bug_scanner-8tqg — ubs:ignore[py.functions.high-param-count]
     def callback(self, name, receiver, tokens, state, bindings, depth, member_call=False):
-        if not self.callback_seen:
-            self.callback_seen = True
-            # Revisit earlier contexts/statements too; a mutation may precede
-            # the first callback encountered in the solver's worklist order.
-            self.capture_revision += 1
+        self.enable_callbacks()
         leaf = name.rsplit('.', 1)[-1]
         if name in {'#expect', '#require'}:
             argument = CLEAN
@@ -2360,16 +2401,15 @@ class SwiftEngine:
         param_names = {item[0] for item in parameters}
         if outer_writes(body, set(param_names)):
             return False
-        if not self.callback_seen:
-            self.callback_seen = True
-            self.capture_revision += 1
+        self.enable_callbacks()
+        future = self.future_captures(self.active_context)
         names = set(identifiers(body)) - param_names
         for captured in names.intersection(bindings):
             binding = bindings[captured]
             # Route handlers escape too. A value written after registration
             # or through an object alias cannot become a clean capture.
             fact = join(state.get(binding, CLEAN),
-                        self.capture_states.get(self.active_context, {}).get(binding, CLEAN))
+                        future.get(binding, CLEAN))
             if swift_request_dependency(fact):
                 return False
         closure_fn = self.parser.functions.get(token.start)
@@ -3014,7 +3054,13 @@ class SwiftEngine:
             return state
         value = self.expression(tokens, state, bindings)
         if kind == 'return':
-            self.escape_closures(value, state)
+            # A stored-property initializer is represented as a synthetic
+            # return so member() can reuse its summary. Merely creating that
+            # property does not invoke its callback with an unknown argument.
+            # Actual calls and escapes of the selected property still analyze
+            # the callback, including its captured values and sink effects.
+            if not self.function.name.startswith('<field:'):
+                self.escape_closures(value, state)
             state['@result'] = advance(value, self.step(tokens[0].start if tokens else self.function.key, 'return', self.function.name))
         elif kind == 'throw':
             self.thrown = join(self.thrown, value)
@@ -3046,67 +3092,80 @@ class SwiftEngine:
         if updated != previous:
             self.capture_states[self.active_context] = updated
             self.capture_revision += 1
+            for reader in self.capture_readers.get(self.active_context, {}):
+                self.enqueue(reader)
         return output
 
     def analyze(self):
-        changed = True
-        while changed:
-            changed = False
-            before = len(self.contexts)
-            capture_revision = self.capture_revision
+        context_reads = {}
+        while self.pending:
+            key = self.pending.popleft()
+            self.queued.remove(key)
+            function = self.contexts[key]
+            globals_before = dict(self.globals)
+            self.budget.spend()
+            self.function, self.effects, self.mutations, self.returned, self.thrown = function, {}, {}, CLEAN, CLEAN
+            self.captured_writes = {}
+            self.summary_context, self.assigned = key, set()
+            self.active_context = key
             self.url_reads = {}
-            for key, function in tuple(self.contexts.items()):
-                self.budget.spend()
-                self.function, self.effects, self.mutations, self.returned, self.thrown = function, {}, {}, CLEAN, CLEAN
-                self.captured_writes = {}
-                self.summary_context, self.assigned = key, set()
-                self.active_context = key
-                if function.key not in self.graphs:
-                    self.graphs[function.key] = self.graph(function)
-                entry, actions, edges = self.graphs[function.key]
-                initial = dict(self.globals)
-                initial['@reachable'] = swift_constant('true', 'code')
-                for index, (name, _, declaration, _) in enumerate(function.parameters):
-                    value = key[1][index]
-                    if re.fullmatch(r'(?:Vapor\.)?Request\??', declaration):
-                        value = join(value, swift_shape('request', function.key))
-                    elif re.fullmatch(r'(?:inout)?(?:Swift\.)?String\??', declaration):
-                        value = retag(value, add=frozenset({'swift-string'}))
-                    elif (self.policy == 'outbound' and re.fullmatch(r'(?:Foundation\.)?URLSession\??', declaration)
-                          and self.builtin(declaration.rstrip('?'))):
-                        value = join(value, swift_shape('http-client:foundation', function.key))
-                    elif declaration in self.parser.types:
-                        kind = 'instance:' if declaration in self.parser.final_types else 'dynamic-instance:'
-                        if not any(swift_has_shape(value, prefix + declaration)
-                                   for prefix in ('instance:', 'dynamic-instance:')):
-                            value = join(value, swift_shape(kind + declaration, function.key))
-                        if declaration not in self.parser.value_types and not self.reference_ids(value):
-                            value = join(value, swift_shape('reference:' + declaration))
-                    initial['parameter:' + name] = value
-                if function.owner:
-                    owner = '.'.join(function.owner)
-                    kind = 'instance:' if owner in self.parser.final_types else 'dynamic-instance:'
-                    receiver = key[3]
-                    if not any(swift_has_shape(receiver, prefix + owner)
+            if function.key not in self.graphs:
+                self.graphs[function.key] = self.graph(function)
+            entry, actions, edges = self.graphs[function.key]
+            initial = dict(self.globals)
+            initial['@reachable'] = swift_constant('true', 'code')
+            for index, (name, _, declaration, _) in enumerate(function.parameters):
+                value = key[1][index]
+                if re.fullmatch(r'(?:Vapor\.)?Request\??', declaration):
+                    value = join(value, swift_shape('request', function.key))
+                elif re.fullmatch(r'(?:inout)?(?:Swift\.)?String\??', declaration):
+                    value = retag(value, add=frozenset({'swift-string'}))
+                elif (self.policy == 'outbound' and re.fullmatch(r'(?:Foundation\.)?URLSession\??', declaration)
+                      and self.builtin(declaration.rstrip('?'))):
+                    value = join(value, swift_shape('http-client:foundation', function.key))
+                elif declaration in self.parser.types:
+                    kind = 'instance:' if declaration in self.parser.final_types else 'dynamic-instance:'
+                    if not any(swift_has_shape(value, prefix + declaration)
                                for prefix in ('instance:', 'dynamic-instance:')):
-                        receiver = join(receiver, swift_shape(kind + owner, function.key))
-                    initial['self'] = join(receiver, self.opaque_owners.get(function.owner, CLEAN))
-                    if (function.name != 'init' and owner not in self.parser.value_types
-                            and not self.reference_ids(initial['self'])):
-                        initial['self'] = join(initial['self'], swift_shape('reference:' + owner))
-                if key[2] and any(declaration in self.parser.types
-                        and declaration not in self.parser.final_types
-                        and not self.reference_ids(key[1][index])
-                        for index, (_, _, declaration, _) in enumerate(function.parameters)):
-                    self.limitation('Swift incoming polymorphic references need subtype alias analysis',
-                                    function.key, initial)
-                solve(entry, initial, edges, lambda node, state: self.observe(actions[node], state), self.budget)
-                updated = self.summaries[key].merged(SwiftSummary(
-                    self.returned, self.effects, self.mutations, self.thrown,
-                    self.captured_writes, frozenset(self.assigned)))
-                if updated != self.summaries[key]:
-                    self.summaries[key], changed = updated, True
-            changed = changed or before != len(self.contexts) or capture_revision != self.capture_revision
+                        value = join(value, swift_shape(kind + declaration, function.key))
+                    if declaration not in self.parser.value_types and not self.reference_ids(value):
+                        value = join(value, swift_shape('reference:' + declaration))
+                initial['parameter:' + name] = value
+            if function.owner:
+                owner = '.'.join(function.owner)
+                kind = 'instance:' if owner in self.parser.final_types else 'dynamic-instance:'
+                receiver = key[3]
+                if not any(swift_has_shape(receiver, prefix + owner)
+                           for prefix in ('instance:', 'dynamic-instance:')):
+                    receiver = join(receiver, swift_shape(kind + owner, function.key))
+                initial['self'] = join(receiver, self.opaque_owners.get(function.owner, CLEAN))
+                if (function.name != 'init' and owner not in self.parser.value_types
+                        and not self.reference_ids(initial['self'])):
+                    initial['self'] = join(initial['self'], swift_shape('reference:' + owner))
+            if key[2] and any(declaration in self.parser.types
+                    and declaration not in self.parser.final_types
+                    and not self.reference_ids(key[1][index])
+                    for index, (_, _, declaration, _) in enumerate(function.parameters)):
+                self.limitation('Swift incoming polymorphic references need subtype alias analysis',
+                                function.key, initial)
+            solve(entry, initial, edges, lambda node, state: self.observe(actions[node], state), self.budget)
+            context_reads[key] = self.url_reads
+            updated = self.summaries[key].merged(SwiftSummary(
+                self.returned, self.effects, self.mutations, self.thrown,
+                self.captured_writes, frozenset(self.assigned)))
+            if updated != self.summaries[key]:
+                self.summaries[key] = updated
+                for reader in self.summary_readers.get(key, {}):
+                    self.enqueue(reader)
+            if self.globals != globals_before:
+                for reader in self.contexts:
+                    self.enqueue(reader)
+        # A file-URL proof uses the latest result of every reached context,
+        # including readers whose callees completed later in the worklist.
+        self.url_reads = {}
+        for reads in context_reads.values():
+            for offset, value in reads.items():
+                self.url_reads[offset] = join(self.url_reads.get(offset, CLEAN), value)
         effects = {}
         for summary in self.summaries.values():
             for offset, value in summary.effects.items():

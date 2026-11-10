@@ -197,6 +197,60 @@ def program(body):
     return 'def run(cursor, qs, user, rows):\n' + body
 
 
+STRING_JOIN_CASES = (
+    ('string-join-generator-write', '    separator = ""\n    query = "SELECT 1"\n'
+     '    separator.join((query := f"SELECT {user}") for unused in [0])\n'
+     '    cursor.execute(query)\n', ((CRITICAL, 5),)),
+    ('string-join-generator-clean', '    separator = ""\n    query = f"SELECT {user}"\n'
+     '    separator.join((query := "SELECT 1") for unused in [0])\n'
+     '    cursor.execute(query)\n', ()),
+    ('string-join-generator-empty', '    separator = ""\n    query = f"SELECT {user}"\n'
+     '    separator.join((query := "SELECT 1") for unused in [])\n'
+     '    cursor.execute(query)\n', ((CRITICAL, 5),)),
+    ('string-join-generator-filter', '    separator = ""\n    query = f"SELECT {user}"\n'
+     '    separator.join((query := "SELECT 1") for unused in [0] if False)\n'
+     '    cursor.execute(query)\n', ((CRITICAL, 5),)),
+    ('string-join-generator-value', '    separator = ""\n'
+     '    query = separator.join(piece for piece in [f"SELECT {user}"])\n'
+     '    cursor.execute(query)\n', ((CRITICAL, 4),)),
+    ('string-join-generator-static', '    separator = ""\n'
+     '    query = separator.join(piece for piece in ["SELECT 1"])\n'
+     '    cursor.execute(query)\n', ()),
+    ('string-join-separator-value', '    separator = f"SELECT {user}"\n'
+     '    query = separator.join(piece for piece in ["", ""])\n'
+     '    cursor.execute(query)\n', ((CRITICAL, 4),)),
+    ('string-join-captured-clean-receiver', '    separator = ""\n'
+     '    query = separator.join("SELECT 1" for unused in [0] if (separator := f"SELECT {user}"))\n'
+     '    cursor.execute(query)\n', ()),
+    ('string-join-captured-tainted-receiver', '    separator = f" {user}"\n'
+     '    query = separator.join(piece for piece in ["SELECT 1 WHERE 0", ""] if (separator := "") == "")\n'
+     '    cursor.execute(query)\n', ((CRITICAL, 4),)),
+    ('string-join-exhausted-alias', '    separator = ""\n    query = f"SELECT {user}"\n'
+     '    pending = ((query := "SELECT 1") for unused in [0])\n    alias = pending\n'
+     '    separator.join(pending)\n    query = f"SELECT {user}"\n'
+     '    separator.join(alias)\n    cursor.execute(query)\n', ((CRITICAL, 9),)),
+    ('string-join-list-static', '    separator = ""\n'
+     '    query = separator.join(["SELECT 1"])\n    cursor.execute(query)\n', ()),
+    ('string-join-list-value', '    separator = ""\n'
+     '    query = separator.join([f"SELECT {user}"])\n    cursor.execute(query)\n', ((CRITICAL, 4),)),
+    ('string-join-empty-omits-separator', '    separator = f"SELECT {user}"\n'
+     '    query = separator.join(piece for piece in [])\n    cursor.execute(query)\n', ()),
+    ('string-join-single-omits-separator', '    separator = f"SELECT {user}"\n'
+     '    query = separator.join(piece for piece in ["SELECT 1"])\n    cursor.execute(query)\n', ()),
+    ('string-join-single-list-omits-separator', '    separator = f"SELECT {user}"\n'
+     '    query = separator.join(["SELECT 1"])\n    cursor.execute(query)\n', ()),
+    ('string-join-nested-empty-omits-separator', '    separator = f"SELECT {user}"\n'
+     '    query = separator.join(piece for piece in ["", ""] for unused in [])\n'
+     '    cursor.execute(query)\n', ()),
+    ('string-join-nested-multiple-keeps-separator', '    separator = f"SELECT {user}"\n'
+     '    query = separator.join(piece for piece in [""] for unused in [0, 1])\n'
+     '    cursor.execute(query)\n', ((CRITICAL, 4),)),
+    ('string-join-exhausted-omits-separator', '    separator = f"SELECT {user}"\n'
+     '    pending = (piece for piece in ["", ""])\n    separator.join(pending)\n'
+     '    cursor.execute(separator.join(pending))\n', ()),
+)
+
+
 def boolean_generator_cases():
     """GH #201: SQL effects run only on reachable generator prefixes."""
     for consumer, stop, continuing in (('any', 'True', 'False'), ('all', 'False', 'True')):
@@ -728,6 +782,55 @@ class SQLValueCaptureTests(unittest.TestCase):
         for name, body, expected in GENERATOR_CASES:
             with self.subTest(case=name):
                 self.inspect(name, program(body), expected)
+
+    def test_exact_string_join_programs(self):
+        for name, body, expected in STRING_JOIN_CASES:
+            with self.subTest(case=name):
+                self.inspect(name, program(body), expected)
+
+    def test_string_join_does_not_trust_custom_or_rebound_receivers(self):
+        for name, prefix, receiver in (
+                ('custom', 'class Separator:\n    def join(self, values):\n        return ""\n', 'Separator()'),
+                ('subclass', 'class Separator(str):\n    def join(self, values):\n        return ""\n', 'Separator()'),
+                ('opaque', '', 'rows'),
+                ('branch', '', '"" if rows else user')):
+            with self.subTest(case=name):
+                source = prefix + program(
+                    f'    separator = {receiver}\n    query = f"SELECT {{user}}"\n'
+                    '    separator.join((query := "SELECT 1") for unused in [0] if (separator := "") == "")\n'
+                    '    cursor.execute(query)\n')
+                path = self.artifacts / ('string-join-unresolved-' + name + '.py')
+                path.write_text(source, encoding='utf-8')
+                with self.assertRaisesRegex(detector.SQLFlowLimit, 'generator.*incomplete'):
+                    list(detector.find([path]))
+
+    def test_sqlite_exact_string_join_witnesses(self):
+        unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
+        safe = '"SELECT count(*) FROM users WHERE name = \'alice\'"'
+        cases = (
+            ('result-unsafe', f'    query = separator.join(piece for piece in [{unsafe}])\n', 2, CRITICAL),
+            ('result-safe', f'    query = separator.join(piece for piece in [{safe}])\n', 1, None),
+            ('write-unsafe', f'    query = {safe}\n    separator.join((query := {unsafe}) for unused in [0])\n', 2, CRITICAL),
+            ('write-safe', f'    query = {unsafe}\n    separator.join((query := {safe}) for unused in [0])\n', 1, None),
+            ('empty-keeps-unsafe', f'    query = {unsafe}\n    separator.join((query := {safe}) for unused in [])\n', 2, CRITICAL),
+            ('captured-clean', f'    query = separator.join({safe} for unused in [0] if (separator := {unsafe}))\n', 1, None),
+            ('separator-unsafe', f'    separator = {unsafe}\n'
+             '    query = separator.join(piece for piece in ["", ""])\n', 2, CRITICAL),
+            ('captured-unsafe', f'    separator = {unsafe}\n'
+             f'    query = separator.join(piece for piece in ["", ""] if (separator := {safe}))\n', 2, CRITICAL),
+            ('single-omits-separator', f'    separator = {unsafe}\n'
+             f'    query = separator.join(piece for piece in [{safe}])\n', 1, None),
+            ('single-list-omits-separator', f'    separator = {unsafe}\n'
+             f'    query = separator.join([{safe}])\n', 1, None),
+        )
+        for name, body, count, rule in cases:
+            with self.subTest(case=name):
+                source = program('    separator = ""\n' + body
+                                 + '    return cursor.execute(query).fetchone()[0]\n')
+                witness = sqlite_witness(self.artifacts, 'string-join-' + name, source)
+                self.assertEqual(witness['rows'], count)
+                expected = () if rule is None else ((rule, len(source.splitlines())),)
+                self.inspect('sqlite-string-join-' + name, source, expected)
 
     def test_boolean_generator_programs(self):
         for name, source, expected in boolean_generator_cases():
@@ -5318,16 +5421,39 @@ class SQLValueCaptureTests(unittest.TestCase):
             ('next-default-static', '    pending = ("SELECT 1" for item in [])\n    cursor.execute(next(pending, "SELECT 2"))\n', ()),
             ('next-late-validation', '    pending = (validate_sql_identifier(user) if item else "id" for item in [0, 1])\n    next(pending)\n    cursor.execute(f"SELECT {user}")\n', ((CRITICAL, 4),)),
         )
-        for name, body, expected in CASES + GENERATOR_CASES + next_controls:
-            if name not in selected:
-                continue
+        cases = [case for case in CASES + GENERATOR_CASES + next_controls if case[0] in selected]
+        self.assert_real_cli_capture(cases)
+
+    @unittest.skipUnless((ROOT / 'ubs').is_file(), 'real CLI requires full checkout')
+    def test_real_cli_string_join(self):
+        # Ordinary scans also run taint_py, whose generator lifetime proof
+        # requires exact primitive inputs. Use actual builtin input strings
+        # here; the detector-level cases above retain opaque parameter coverage.
+        cases = (
+            ('string-join-cli-write', 'separator = ""\nquery = "1"\n'
+             'separator.join((query := input()) for unused in [0])\n'
+             'cursor.execute("SELECT " + query)\n', ((CRITICAL, 4),)),
+            ('string-join-cli-clean', 'separator = ""\nquery = input()\n'
+             'separator.join((query := "1") for unused in [0])\n'
+             'cursor.execute("SELECT " + query)\n', ()),
+            ('string-join-cli-separator', 'separator = f"SELECT {input()}"\n'
+             'query = separator.join(piece for piece in ["", ""])\n'
+             'cursor.execute(query)\n', ((CRITICAL, 3),)),
+            ('string-join-cli-captured-clean', 'separator = ""\n'
+             'query = separator.join("SELECT 1" for unused in [0] if (separator := input()))\n'
+             'cursor.execute(query)\n', ()),
+        )
+        self.assert_real_cli_capture(cases, wrap=False)
+
+    def assert_real_cli_capture(self, cases, *, wrap=True):
+        for name, body, expected in cases:
             for entry in ('ubs', 'modules/ubs-python.sh'):
                 for fmt in ('json', 'sarif'):
                     with self.subTest(case=name, entry=entry, format=fmt):
                         folder = self.artifacts / (name + '-' + entry.replace('/', '-') + '-' + fmt)
                         folder.mkdir()
                         source = folder / 'case.py'
-                        source.write_text(program(body), encoding='utf-8')
+                        source.write_text(program(body) if wrap else body, encoding='utf-8')
                         for child in ('home', 'cache', 'tmp'):
                             (folder / child).mkdir()
                         skip = ','.join(str(n) for n in range(1, 24) if n != 7)

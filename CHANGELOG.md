@@ -10,6 +10,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Resolve Python `str.join()` from the evaluated builtin string receiver in
+  SQL analysis, including aliases and selected generator consumers. Preserve
+  receiver capture, generator writes and SQL provenance across later rebinding;
+  detect injected separator text only when at least two joined elements are
+  possible. Keep custom receivers and unresolved protocols incomplete. Add
+  paired source cases, live SQLite witnesses and module/runner report checks.
+
 - Complete the Python dependency-audit correction for issue #207. Reject empty
   audited inventories even when pip-audit exits successfully; prefer PEP 751
   lockfiles over fresh project resolution and explicitly refuse unsupported

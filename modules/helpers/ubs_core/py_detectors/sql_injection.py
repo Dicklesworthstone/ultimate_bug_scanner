@@ -4611,11 +4611,16 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                     self.generator_phases[identity] = frozenset({'done'})
                 self._evaluated_values[node] = (None, None, None, False, 'static')
                 return True
-        if (isinstance(node.func, ast.Attribute) and node.func.attr == 'join'
-                and isinstance(node.func.value, ast.Constant) and isinstance(node.func.value.value, str)
-                and len(node.args) == 1 and not node.keywords and arguments):
+        if (self.intrinsic_string_join(node) and len(arguments) == 1
+                and arguments[0][0] is node.args[0]):
+            # The bound method captures its receiver before the argument and
+            # generator body run. Keep that text even when iteration rebinds
+            # the separator's name, and consume the selected cursor exactly
+            # once through the existing completion/effect model.
+            separator = (self.value_facts(node.func.value)
+                         if self.string_join_uses_separator(node.args[0], arguments[0][1])
+                         else (None, None, None, False, 'static'))
             facts = self.materialize_generators(arguments[0][1])
-            separator = self.value_facts(node.func.value)
             combined = self.join_value_facts(facts, separator)
             risk = None if combined[4] == 'static' else 'critical' if combined[4] == 'tainted' else 'warning'
             self._evaluated_values[node] = self.with_kinds((
@@ -6513,7 +6518,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 self.visit(keyword.value)
                 argument_epochs[keyword.value] = self.validation_epoch(keyword.value)
                 self.remember_list_argument(keyword.value)
-            joined = self.literal_join_facts(node)
+            joined = self.string_join_facts(node)
             if (isinstance(node.func, ast.Name) and node.func.id == 'getattr'
                     and self.builtin_is_unshadowed('getattr') and len(node.args) >= 2
                     and self.value_kind(node.args[0])[0] == 'list'
@@ -6656,7 +6661,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             if regex_shape is not None:
                 self._evaluated_values[node] = self.with_kinds(self.value_facts(node), *regex_shape)
             if joined is not None:
-                # A literal separator joining exact builtin string elements
+                # An exact string separator joining builtin string elements
                 # returns their text, not a new external-data source. Opaque
                 # iterables keep the normal call facts and effect boundaries.
                 risk = None if joined[4] == 'static' else 'critical' if joined[4] == 'tainted' else 'warning'
@@ -7104,12 +7109,26 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 and 1 <= len(call.args) <= 3 and not call.keywords
                 and not any(isinstance(argument, ast.Starred) for argument in call.args))
 
-    def literal_join_facts(self, call):
-        """Captured text facts for an intrinsic join over builtin strings."""
+    def intrinsic_string_join(self, call):
+        """Resolve join from the already evaluated exact builtin receiver.
+
+        A name or expression is sufficient only when the value lattice proves
+        an exact str. An annotation, subclass, similarly named method, or a
+        later assignment to the receiver cannot supply that proof.
+        """
         if (not isinstance(call.func, ast.Attribute) or call.func.attr != 'join'
-                or not isinstance(call.func.value, ast.Constant)
-                or not isinstance(call.func.value.value, str)
-                or len(call.args) != 1 or call.keywords
+                or len(call.args) != 1 or isinstance(call.args[0], ast.Starred) or call.keywords):
+            return False
+        receiver = call.func.value
+        if isinstance(receiver, ast.Constant) and isinstance(receiver.value, str):
+            return True
+        bindings = self.ownership_bindings()
+        return (not bindings.dynamic_namespace and not bindings.builtin_namespace
+                and self.value_kind(receiver)[0] == 'str')
+
+    def string_join_facts(self, call):
+        """Captured text facts for an intrinsic join over builtin strings."""
+        if (not self.intrinsic_string_join(call)
                 or self.ownership_bindings().dynamic_namespace
                 or self.ownership_bindings().builtin_namespace):
             return None
@@ -7121,7 +7140,39 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         if kind == 'list' and not (isinstance(argument, (ast.List, ast.ListComp))
                                   or isinstance(argument, ast.Name) and argument.id in self.exclusive_lists):
             return None
-        return self.join_value_facts(facts, self.value_facts(call.func.value))
+        if self.string_join_uses_separator(argument):
+            facts = self.join_value_facts(facts, self.value_facts(call.func.value))
+        return facts
+
+    def string_join_uses_separator(self, argument, references=None):
+        """Whether two yielded elements remain possible before consumption.
+
+        A separator contributes no text to an empty or singleton join. Use
+        only literal cardinality bounds (filters can decrease them) and known
+        exhausted cursors. Unknown iterables retain the separator's SQL facts.
+        """
+        def bound(value):
+            self.step()
+            if (isinstance(value, (ast.List, ast.Tuple))
+                    and not any(isinstance(item, ast.Starred) for item in value.elts)):
+                return min(2, len(value.elts))
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                return min(2, len(value.value))
+            return 2
+
+        if references is None:
+            return bound(argument) > 1
+        for identity in references:
+            if self.generator_phases.get(identity) == frozenset({'done'}):
+                continue
+            if not isinstance(identity, ast.GeneratorExp):
+                return True
+            maximum = 1
+            for generator in identity.generators:
+                maximum = min(2, maximum * bound(generator.iter))
+            if maximum > 1:
+                return True
+        return False
 
     def regex_result_shape(self, call):
         """Selected genuine stdlib regex results, without a spelling shortcut.

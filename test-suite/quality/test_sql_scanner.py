@@ -10,6 +10,9 @@ https://www.postgresql.org/docs/current/sql-createfunction.html
 https://www.postgresql.org/docs/current/runtime-config-client.html
 https://www.postgresql.org/docs/current/ddl-priv.html
 https://www.postgresql.org/docs/current/sql-alterdefaultprivileges.html
+https://www.postgresql.org/docs/current/sql-alterfunction.html
+https://www.postgresql.org/docs/current/sql-do.html
+https://www.postgresql.org/docs/current/functions-string.html#FUNCTIONS-STRING-FORMAT
 """
 from __future__ import annotations
 
@@ -339,6 +342,92 @@ CASES = (
         REVOKE ALL ON FUNCTION app.f("app.money") FROM PUBLIC;
         COMMIT;
     """),
+    Case("reported_owner_role_migration", """
+        CREATE ROLE app_mutator NOLOGIN;
+        CREATE FUNCTION public.f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;
+        DO $$ BEGIN
+          EXECUTE format('GRANT app_mutator TO %I WITH INHERIT FALSE', current_user);
+        END $$;
+        ALTER FUNCTION public.f() OWNER TO app_mutator;
+    """),
+    Case("owner_transfer_preserves_function_hardening", """
+        BEGIN;
+        CREATE ROLE "app mutator" NOLOGIN;
+        CREATE FUNCTION app.f() RETURNS integer LANGUAGE sql SECURITY DEFINER
+        SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        REVOKE ALL ON FUNCTION app.f() FROM PUBLIC;
+        ALTER FUNCTION app.f() OWNER TO "app mutator";
+        COMMIT;
+    """),
+    Case("owner_transfer_does_not_revoke_public", """
+        BEGIN;
+        CREATE FUNCTION app.f() RETURNS integer -- expect:public
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        ALTER FUNCTION app.f() OWNER TO app_mutator;
+        COMMIT;
+    """),
+    Case("owner_transfer_does_not_fix_search_path", """
+        BEGIN;
+        CREATE FUNCTION app.f() RETURNS integer -- expect:path
+        LANGUAGE sql SECURITY DEFINER AS $$ SELECT 1 $$;
+        REVOKE ALL ON FUNCTION app.f() FROM PUBLIC;
+        ALTER FUNCTION app.f() OWNER TO CURRENT_ROLE;
+        COMMIT;
+    """),
+    Case("owner_transfer_preserves_acl_for_replacement", """
+        BEGIN;
+        CREATE FUNCTION app.f() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$;
+        REVOKE ALL ON FUNCTION app.f() FROM PUBLIC;
+        ALTER FUNCTION app.f() OWNER TO SESSION_USER;
+        CREATE OR REPLACE FUNCTION app.f() RETURNS integer LANGUAGE sql SECURITY DEFINER
+        SET search_path = pg_catalog, pg_temp AS $$ SELECT 2 $$;
+        COMMIT;
+    """),
+    Case("owner_transfer_does_not_duplicate_published_hazards", """
+        CREATE FUNCTION app.f() RETURNS integer -- expect:path,public
+        LANGUAGE sql SECURITY DEFINER AS $$ SELECT 1 $$;
+        ALTER FUNCTION app.f() OWNER TO CURRENT_USER;
+    """),
+    Case("owner_transfer_and_savepoint_preserve_restricted_acl", """
+        BEGIN;
+        CREATE FUNCTION app.f() RETURNS integer LANGUAGE sql SECURITY DEFINER
+        SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        REVOKE ALL ON FUNCTION app.f() FROM PUBLIC;
+        SAVEPOINT secured;
+        GRANT EXECUTE ON FUNCTION app.f() TO PUBLIC;
+        ALTER FUNCTION app.f() OWNER TO app_mutator;
+        ROLLBACK TO secured;
+        COMMIT;
+    """),
+    Case("do_literal_and_static_membership_grants", """
+        DO LANGUAGE plpgsql $body$ BEGIN
+          GRANT app_reader TO CURRENT_USER, SESSION_USER WITH SET TRUE, INHERIT FALSE;
+          EXECUTE 'GRANT app_owner TO deployment_user WITH ADMIN OPTION';
+        END; $body$;
+        GRANT app_reader, app_writer TO application_user WITH INHERIT FALSE;
+    """),
+    Case("qualified_format_after_changed_search_path", """
+        SET search_path = public, pg_catalog;
+        DO $body$ BEGIN
+          EXECUTE pg_catalog.format('GRANT %1$I TO %2$I WITH INHERIT FALSE', 'app owner', current_user);
+        END $body$ LANGUAGE plpgsql;
+    """),
+    Case("format_identifier_arguments_cannot_inject_sql", """
+        DO $body$ BEGIN
+          EXECUTE pg_catalog.format('GRANT %I TO %I', 'role"; SELECT dangerous(); --', session_user);
+          EXECUTE pg_catalog.format('GRANT "rate%%role" TO %I', current_role);
+        END $body$;
+    """),
+    Case("role_membership_does_not_revoke_function_public_execute", """
+        BEGIN;
+        CREATE FUNCTION app.f() RETURNS integer -- expect:public
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        DO $$ BEGIN
+          EXECUTE format('GRANT app_mutator TO %I WITH INHERIT FALSE', current_user);
+        END $$;
+        ALTER FUNCTION app.f() OWNER TO app_mutator;
+        COMMIT;
+    """),
 )
 
 # Unknown deployment/dialect/control-flow inputs and malformed source cannot
@@ -402,6 +491,71 @@ INCOMPLETE_CASES = (
     """),
     Case("savepoint_nesting_exceeds_documented_limit",
          "BEGIN;\n" + "".join(f"SAVEPOINT s{number};\n" for number in range(65)) + "ROLLBACK;\n"),
+    Case("owner_target_requires_selected_signature", "ALTER FUNCTION app.f() OWNER TO app_mutator;\n"),
+    Case("owner_clause_cannot_hide_other_changes", """
+        CREATE FUNCTION app.f() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$;
+        ALTER FUNCTION app.f() OWNER TO app_mutator SECURITY DEFINER;
+    """),
+    Case("owner_clause_requires_one_role", """
+        CREATE FUNCTION app.f() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$;
+        ALTER FUNCTION app.f() OWNER TO;
+    """),
+    Case("owner_transfer_does_not_resolve_replacement_acl", """
+        BEGIN;
+        CREATE OR REPLACE FUNCTION app.f() RETURNS integer LANGUAGE sql SECURITY DEFINER
+        SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        ALTER FUNCTION app.f() OWNER TO app_mutator;
+        COMMIT;
+    """),
+    Case("do_other_language_is_not_plpgsql", "DO LANGUAGE plpython3u $$ BEGIN GRANT app TO CURRENT_USER; END $$;\n"),
+    Case("do_conditional_grant_requires_control_flow", """
+        DO $$ BEGIN IF allowed THEN GRANT app TO CURRENT_USER; END IF; END $$;
+    """),
+    Case("do_grant_function_privileges_requires_modeling", """
+        DO $$ BEGIN EXECUTE 'GRANT EXECUTE ON FUNCTION app.f() TO PUBLIC'; END $$;
+    """),
+    Case("do_dynamic_argument_can_execute_arbitrary_code", """
+        DO $$ BEGIN EXECUTE format('GRANT app TO %I', arbitrary_function()); END $$;
+    """),
+    Case("do_unused_format_argument_still_has_effects", """
+        DO $$ BEGIN EXECUTE format('GRANT app TO %1$I', current_user, arbitrary_function()); END $$;
+    """),
+    Case("do_raw_format_conversion_is_not_identifier_quoting", """
+        DO $$ BEGIN EXECUTE format('GRANT app TO %s', current_user); END $$;
+    """),
+    Case("do_format_identifier_must_be_a_whole_token", """
+        DO $$ BEGIN EXECUTE format('GRANT "%I" TO current_user', current_user); END $$;
+    """),
+    Case("do_format_cannot_execute_additional_statement", """
+        DO $$ BEGIN
+          EXECUTE format('GRANT app TO %I; GRANT EXECUTE ON FUNCTION app.f() TO PUBLIC', current_user);
+        END $$;
+    """),
+    Case("do_format_argument_position_must_exist", """
+        DO $$ BEGIN EXECUTE format('GRANT app TO %2$I', current_user); END $$;
+    """),
+    Case("do_unqualified_format_after_changed_search_path", """
+        SET search_path = app, pg_catalog;
+        DO $$ BEGIN EXECUTE format('GRANT app TO %I', current_user); END $$;
+    """),
+    Case("do_selected_format_definition_is_not_builtin", """
+        CREATE FUNCTION public.format(text, name) RETURNS text
+        LANGUAGE sql AS $$ SELECT 'SELECT dangerous()' $$;
+        DO $$ BEGIN EXECUTE format('GRANT app TO %I', current_user); END $$;
+    """),
+    Case("do_qualified_format_definition_is_not_builtin", """
+        CREATE OR REPLACE FUNCTION pg_catalog.format(text, name) RETURNS text
+        LANGUAGE sql AS $$ SELECT 'SELECT dangerous()' $$;
+        DO $$ BEGIN EXECUTE pg_catalog.format('GRANT app TO %I', current_user); END $$;
+    """),
+    Case("do_declarations_require_binding_analysis", """
+        DO $$ DECLARE target text := arbitrary_function();
+        BEGIN EXECUTE format('GRANT app TO %I', target); END $$;
+    """),
+    Case("do_exception_handler_can_hide_ddl", """
+        DO $$ BEGIN GRANT app TO current_user;
+        EXCEPTION WHEN others THEN EXECUTE 'SELECT dangerous()'; END $$;
+    """),
 )
 
 
@@ -470,6 +624,66 @@ for _case in CASES:
     setattr(SQLNativeTests, "test_" + _case.name, native_test(_case))
 for _case in INCOMPLETE_CASES:
     setattr(SQLNativeTests, "test_incomplete_" + _case.name, native_test(_case, True))
+
+
+class SQLHelperTests(EvidenceTest):
+    def test_selected_migrations_through_helper_reports(self):
+        """Exercise the actual helper/report boundary with retained scratch."""
+        supported = {case.name: case for case in CASES}
+        unsupported = {case.name: case for case in INCOMPLETE_CASES}
+        mixed = (supported["reported_owner_role_migration"],
+                 supported["owner_transfer_does_not_revoke_public"],
+                 unsupported["do_grant_function_privileges_requires_modeling"])
+        for name, cases, partial in (("complete", CASES, False), ("partial", mixed, True)):
+            with self.subTest(name=name):
+                directory = self.materialize(cases, name)
+                files = directory / "selected.nul"
+                files.write_bytes(b"".join(os.fsencode(directory / case.filename) + b"\0" for case in cases))
+                command = [sys.executable, "-B", "-m", "ubs_core.sql_scan",
+                           "--files-from", str(files), "--project-dir", str(directory),
+                           "--sink", str(directory / "findings.jsonl"),
+                           "--json-out", str(directory / "report.json"),
+                           "--sarif-out", str(directory / "report.sarif"),
+                           "--text-out", str(directory / "report.txt"),
+                           "--completion-out", str(directory / "complete.json"),
+                           "--ci", "--fail-on-warning"]
+                env = dict(os.environ, PYTHONPATH=str(ROOT / "modules/helpers"),
+                           PYTHONDONTWRITEBYTECODE="1", UBS_KEEP_TEMP="1", UBS_NO_CACHE="1",
+                           UBS_CACHE_DIR=str(directory / "cache"))
+                result = subprocess.run(command, env=env, cwd=directory, capture_output=True,
+                                        text=True, timeout=60, check=False)
+                (directory / "stdout.log").write_text(result.stdout, encoding="utf-8")
+                (directory / "stderr.log").write_text(result.stderr, encoding="utf-8")
+                analyzer = ROOT / "modules/helpers/ubs_core/sql_scan.py"
+                (directory / "receipt.json").write_text(json.dumps({
+                    **self.identity, "command": command, "exit": result.returncode,
+                    "analyzer_sha256": hashlib.sha256(analyzer.read_bytes()).hexdigest(),
+                    "source_sha256": {case.filename: hashlib.sha256(case.source.encode()).hexdigest()
+                                      for case in cases},
+                }, indent=2) + "\n", encoding="utf-8")
+                expected = sorted((case.filename, rule, line, col)
+                                  for case in cases for rule, line, col in case.expected)
+                context = (command, result.returncode, result.stdout, result.stderr)
+                code = 2 if partial else int(bool(expected))
+                self.assertEqual(result.returncode, code, context)
+                report = json.loads((directory / "report.json").read_text(encoding="utf-8"))
+                receipt = json.loads((directory / "complete.json").read_text(encoding="utf-8"))
+                self.assertEqual(receipt, {"language": "sql", "status": report["status"], "exit_code": code})
+                self.assertEqual(report["status"], "partial" if partial else "ok", context)
+                self.assertEqual((report["files"], report["critical"], report["warning"], report["info"]),
+                                 (len(cases), 0, len(expected), 0), context)
+                actual = sorted((Path(row["path"]).name, row["rule"], row["line"], row["col"])
+                                for row in report["findings"])
+                self.assertEqual(actual, expected, context)
+                sarif = json.loads((directory / "report.sarif").read_text(encoding="utf-8"))
+                actual = []
+                for run in sarif["runs"]:
+                    self.assertEqual(run["invocations"][0]["executionSuccessful"], not partial)
+                    for row in run["results"]:
+                        location = row["locations"][0]["physicalLocation"]
+                        actual.append((Path(location["artifactLocation"]["uri"]).name, row["ruleId"],
+                                       location["region"]["startLine"], location["region"]["startColumn"]))
+                self.assertEqual(sorted(actual), expected, context)
 
 
 @unittest.skipUnless(os.environ.get("UBS_SQL_E2E") == "1",

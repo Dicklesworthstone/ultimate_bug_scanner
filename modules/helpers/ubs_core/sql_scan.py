@@ -1,8 +1,9 @@
 """Bounded PostgreSQL migration checks, without executing SQL or loading a database.
 
 This is a selected-file DDL model, not a catalog or a PL/pgSQL interpreter.
-Dollar-quoted bodies are opaque. Function identity includes input argument
-types; privilege changes take effect at transaction publication boundaries.
+Function bodies are opaque; DO bodies accept only proven role-membership
+grants. Function identity includes input argument types; privilege changes
+take effect at transaction publication boundaries.
 Unknown DDL context is reported explicitly and is never cached as complete.
 """
 from __future__ import annotations
@@ -46,6 +47,7 @@ MAX_FUNCTIONS = 2000
 MAX_SAVEPOINTS = 64
 WHITESPACE_RE = re.compile(r"\s+")
 DOLLAR_RE = re.compile(r"\$(?:[A-Za-z_][A-Za-z_0-9]*)?\$")
+FORMAT_IDENTIFIER_RE = re.compile(r"%(?:([1-9][0-9]*)\$)?I")
 
 
 class Incomplete(ValueError):
@@ -335,6 +337,141 @@ class State:
     session_path_changed: bool = False
 
 
+def role_membership_grant(tokens: list[Token]) -> None:
+    """Check the membership form of GRANT, which changes no modeled object ACL.
+
+    Membership does not select a new current role or change function-local
+    settings. In particular, it cannot revoke or grant PUBLIC EXECUTE. Check
+    the entire statement so an object-privilege grant is never mistaken for
+    this form. Grant-chain evaluation remains outside the selected model.
+    """
+    if not sequence(tokens, "grant"):
+        raise Incomplete("only role-membership GRANT is supported in this DO block")
+    direction = word_index(tokens, "to")
+    if direction < 2:
+        raise Incomplete("unresolved role-membership grant")
+    options = word_index(tokens, "with", direction + 1)
+    end = options if options >= 0 else len(tokens)
+    for group in (*split_top(tokens[1:direction]), *split_top(tokens[direction + 1:end])):
+        if (len(group) != 1 or group[0].kind not in {"word", "quoted"}
+                or group[0].is_word("public")):
+            raise Incomplete("role-membership grant requires explicit role identifiers")
+    if options >= 0:
+        seen = set()
+        for group in split_top(tokens[options + 1:]):
+            if (len(group) != 2 or group[0].kind != "word"
+                    or group[0].value not in {"admin", "inherit", "set"}
+                    or group[0].value in seen or group[1].kind != "word"
+                    or group[1].value not in {"option", "true", "false"}):
+                raise Incomplete("unsupported role-membership grant options")
+            seen.add(group[0].value)
+
+
+def membership_command(expression: list[Token], state: State) -> list[Token]:
+    """Resolve only literal commands or builtin format with pure %I arguments.
+
+    Identifier substitutions are represented by whole quoted tokens; their
+    actual role names do not affect either modeled security property. Token
+    spans prove that a placeholder is not embedded in a literal, identifier,
+    or comment. Neither arbitrary expressions nor unused effectful arguments
+    are evaluated or accepted.
+    """
+    if len(expression) == 1 and expression[0].kind in {"string", "body"}:
+        return list(lex(expression[0].value, []))
+    qualified = (len(expression) > 3 and expression[0].kind in {"word", "quoted"}
+                 and expression[0].value == "pg_catalog" and expression[1].kind == "symbol"
+                 and expression[1].value == ".")
+    opening = 3 if qualified else 1
+    name = expression[opening - 1:opening]
+    if (not name or name[0].kind not in {"word", "quoted"} or name[0].value != "format"
+            or len(expression) <= opening + 1 or expression[opening].kind != "symbol"
+            or expression[opening].value != "(" or expression[-1].kind != "symbol"
+            or expression[-1].value != ")"):
+        raise Incomplete("dynamic SQL command requires a literal or builtin format with %I arguments")
+    if (not qualified and state.session_path_changed) or any(
+            key[0][-1] == "format" and (not qualified or key[0] in {("format",), ("pg_catalog", "format")})
+            for key in state.functions):
+        raise Incomplete("format function binding is unresolved in the selected migration")
+    arguments = split_top(expression[opening + 1:-1])
+    if not arguments or len(arguments[0]) != 1 or arguments[0][0].kind not in {"string", "body"}:
+        raise Incomplete("dynamic SQL format requires a literal template")
+    for argument in arguments[1:]:
+        if (len(argument) != 1 or not (argument[0].kind in {"string", "body"}
+                or (argument[0].kind == "word" and argument[0].value in
+                    {"current_user", "current_role", "session_user", "user"}))):
+            raise Incomplete("dynamic SQL format argument requires a literal or current/session role")
+    template = arguments[0][0].value
+    parts, spans = [], []
+    position, size, next_argument = 0, 0, 1
+    while position < len(template):
+        percent = template.find("%", position)
+        if percent < 0:
+            parts.append(template[position:])
+            size += len(parts[-1])
+            break
+        parts.append(template[position:percent])
+        size += len(parts[-1])
+        if template.startswith("%%", percent):
+            parts.append("%")
+            size += 1
+            position = percent + 2
+            continue
+        match = FORMAT_IDENTIFIER_RE.match(template, percent)
+        if not match or (match.group(1) and len(match.group(1)) > 6):
+            raise Incomplete("dynamic SQL format supports only %I identifier substitutions")
+        number = int(match.group(1)) if match.group(1) else next_argument
+        if number >= len(arguments):
+            raise Incomplete("dynamic SQL format argument is missing")
+        next_argument = number + 1
+        marker = '"__ubs_role_identifier__"'
+        parts.append(marker)
+        spans.append((size, size + len(marker)))
+        size += len(marker)
+        if size > MAX_SOURCE_BYTES:
+            raise Incomplete("SQL format expansion budget exhausted")
+        position = match.end()
+    if size > MAX_SOURCE_BYTES:
+        raise Incomplete("SQL format expansion budget exhausted")
+    command = list(lex("".join(parts), []))
+    identifiers = {(token.start, token.end) for token in command if token.kind == "quoted"}
+    if any(span not in identifiers for span in spans):
+        raise Incomplete("dynamic SQL %I substitution must occupy a complete role identifier")
+    return command
+
+
+def do_membership_grants(statement: list[Token], state: State) -> None:
+    """Admit a flat PL/pgSQL block consisting exclusively of membership grants."""
+    tail = statement[1:]
+    if len(tail) == 3:
+        language = tail[:2] if sequence(tail, "language") else tail[1:]
+        body = tail[2] if sequence(tail, "language") else tail[0]
+        if (not sequence(language, "language") or language[1].kind not in {"word", "quoted"}
+                or language[1].value != "plpgsql"):
+            raise Incomplete("DO membership proof requires LANGUAGE plpgsql")
+    elif len(tail) == 1:
+        body = tail[0]
+    else:
+        raise Incomplete("unresolved DO language or body")
+    if body.kind not in {"body", "string"}:
+        raise Incomplete("DO membership proof requires a literal body")
+    tokens = list(lex(body.value, []))
+    if tokens and tokens[-1].kind == "symbol" and tokens[-1].value == ";":
+        tokens = tokens[:-1]
+    if not sequence(tokens, "begin") or not tokens[-1].is_word("end"):
+        raise Incomplete("DO membership proof requires a flat BEGIN/END block without declarations")
+    commands = split_top(tokens[1:-1], ";")
+    if commands[-1] or len(commands) < 2:
+        raise Incomplete("DO membership statement requires a terminator")
+    if len(commands) > MAX_STATEMENTS:
+        raise Incomplete("SQL DO statement budget exhausted")
+    for command in commands[:-1]:
+        if not command:
+            raise Incomplete("empty or unresolved DO membership statement")
+        if command[0].is_word("execute"):
+            command = membership_command(command[1:], state)
+        role_membership_grant(command)
+
+
 def function_options(function: Function, tokens: list[Token], errors: list[str]) -> None:
     index, depth = 0, 0
     boundaries = {"set", "as", "language", "security", "external", "cost", "rows", "support",
@@ -484,6 +621,9 @@ def analyze_source(text: str, path: str = "<input>") -> tuple[list[dict], list[s
         if sequence(statement, "revoke", "grant", "option", "for"):
             return  # Delegation is revoked; the underlying privilege remains.
         on = word_index(statement, "on")
+        if on < 0 and grant:
+            role_membership_grant(statement)
+            return
         direction = word_index(statement, "to" if grant else "from", max(0, on))
         if on < 0 or direction < 0:
             raise Incomplete("unresolved privilege statement")
@@ -627,11 +767,20 @@ def analyze_source(text: str, path: str = "<input>") -> tuple[list[dict], list[s
             if key not in state.functions:
                 raise Incomplete("ALTER FUNCTION target is not resolved in the selected migration")
             function = state.functions[key]
-            function.anchor, function.end = first, statement[-1].end
             tail = statement[end:]
-            if any(token.is_word("rename") or token.is_word("schema") or token.is_word("owner") for token in tail):
-                raise Incomplete("ALTER FUNCTION identity/ownership change requires additional catalog context")
-            function_options(function, tail, errors)
+            if sequence(tail, "owner"):
+                if (len(tail) != 3 or not tail[1].is_word("to")
+                        or tail[2].kind not in {"word", "quoted"} or tail[2].is_word("public")):
+                    raise Incomplete("ALTER FUNCTION OWNER TO requires one role identifier")
+                # PostgreSQL transfers the owner's privileges; it does not
+                # reset PUBLIC grants, SECURITY DEFINER, or local search_path.
+                # Keep their original evidence location as well as their
+                # values. The new owner's deployed privileges are not proved.
+            else:
+                if any(token.is_word("rename") or token.is_word("schema") or token.is_word("owner") for token in tail):
+                    raise Incomplete("ALTER FUNCTION identity change requires additional catalog context")
+                function.anchor, function.end = first, statement[-1].end
+                function_options(function, tail, errors)
         elif first.value in {"grant", "revoke"}:
             privilege(statement)
         elif sequence(statement, "drop", "function"):
@@ -641,7 +790,9 @@ def analyze_source(text: str, path: str = "<input>") -> tuple[list[dict], list[s
             for group in split_top(tail):
                 key, _end = function_identity(group, 0)
                 state.functions.pop(key, None)
-        elif first.value in {"do", "execute", "prepare", "call"}:
+        elif first.is_word("do"):
+            do_membership_grants(statement, state)
+        elif first.value in {"execute", "prepare", "call"}:
             raise Incomplete("dynamic or external SQL execution is outside the selected migration model")
         elif first.is_word("set"):
             tail = statement[1:]

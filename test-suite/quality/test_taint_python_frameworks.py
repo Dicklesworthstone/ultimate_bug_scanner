@@ -1,11 +1,17 @@
 """Framework entry-point regressions. Fixture source is parsed, never imported."""
+import hashlib
 import json
 import os
 from pathlib import Path
 import subprocess
 import tempfile
+import textwrap
+import time
 import unittest
 from test_taint_python_dataflow import ROOT, SourceTest
+from ubs_core.analyzers import taint_py
+from ubs_core.io import temporary_directory
+from ubs_core.registry import RunContext
 
 
 class FastAPIInputTests(SourceTest):
@@ -128,6 +134,429 @@ class FastAPIInputTests(SourceTest):
                 eval(response.status_code)
                 eval(tasks)
         ''')
+
+
+class LiteralMappingTests(SourceTest):
+    """A lookup selects stored values; request bytes do not become those values."""
+
+    def setUp(self):
+        self.started = time.monotonic()
+        artifacts = ROOT / 'test-suite' / 'artifacts'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        self.work = Path(tempfile.mkdtemp(prefix='literal-mapping-', dir=artifacts))
+        self.case = 0
+        print(f'[{self.id()}] RUN', flush=True)
+
+    def tearDown(self):
+        print(f'[{self.id()}] END ({time.monotonic() - self.started:.3f}s)', flush=True)
+
+    def scan(self, source):
+        self.case += 1
+        path = self.work / f'case-{self.case}.py'
+        path.write_text(textwrap.dedent(source).lstrip('\n'), encoding='utf-8')
+        return list(taint_py.run(RunContext(lang='python', files=[path])))
+
+    def test_fixed_values_do_not_acquire_selection_key_taint(self):
+        for lookup in ('choices.get(key)', 'choices[key]', 'lookup(key)'):
+            with self.subTest(lookup=lookup):
+                self.assert_rules(f'''
+                    choices = {{'home': 'home', 'about': 'about'}}
+                    lookup = choices.get
+                    key = input()
+                    HttpResponse({lookup})
+                ''')
+                self.assert_rules(f'''
+                    choices = {{'home': 'home'}}
+                    def view(key):
+                        lookup = choices.get
+                        return {lookup}
+                    HttpResponse(view(input()))
+                ''')
+
+    def test_fastapi_constant_lookup_is_not_response_content(self):
+        self.assert_rules('''
+            from fastapi import FastAPI, HTTPException
+            from fastapi.responses import Response
+            app = FastAPI()
+            VIEW_INDEX = {'home': 'home'}
+            @app.get('/view/{name}')
+            def view(name: str):
+                canon = VIEW_INDEX.get(name)
+                if canon is None:
+                    raise HTTPException(404)
+                body = render(canon)
+                return Response(body, media_type='application/json')
+        ''')
+
+    def test_defaults_and_unknown_values_remain_tainted(self):
+        for source in (
+            "choices = {'home': 'home'}\nHttpResponse(choices.get(input(), input()))\n",
+            "choices = {'home': input()}\nHttpResponse(choices.get('home'))\n",
+            "choices = {'home': input()}\nHttpResponse(choices['home'])\n",
+            "choices = external\nHttpResponse(choices.get(input()))\n",
+            "choices = {'home': 'home'} if condition else external\nHttpResponse(choices.get(input()))\n",
+            "choices = {'home': 'home'} if condition else external\nHttpResponse(choices[input()])\n",
+        ):
+            with self.subTest(source=source):
+                self.assert_rules(source, 'xss')
+
+    def test_writes_through_aliases_revoke_the_literal_contract(self):
+        for write in (
+            "alias['home'] = input()",
+            "alias.update({'home': input()})",
+            "alias.setdefault('new', input())",
+            "alias.__setitem__('home', input())",
+        ):
+            for lookup in ("choices.get('home')", "choices['home']", "lookup('home')"):
+                with self.subTest(write=write, lookup=lookup):
+                    self.assert_rules(f'''
+                        choices = {{'home': 'home'}}
+                        lookup = choices.get
+                        alias = choices
+                        {write}
+                        HttpResponse({lookup})
+                    ''', 'xss')
+
+    def test_local_helper_writes_and_argument_evaluation_revoke_contracts(self):
+        for lookup in ('choices.get(replace())', 'choices[replace()]',
+                       "choices.get('home', replace())", 'lookup(replace())'):
+            with self.subTest(lookup=lookup):
+                self.assert_rules(f'''
+                    choices = {{'home': 'home'}}
+                    lookup = choices.get
+                    def replace():
+                        choices['home'] = input()
+                        return 'home'
+                    HttpResponse({lookup})
+                ''', 'xss')
+        self.assert_rules('''
+            def replace(choices, value):
+                choices['home'] = value
+            choices = {'home': 'home'}
+            replace(choices, input())
+            HttpResponse(choices.get('home'))
+        ''', 'xss')
+
+    def test_captured_method_keeps_its_original_receiver(self):
+        self.assert_rules('''
+            choices = {'home': 'home'}
+            lookup = choices.get
+            choices = {'home': input()}
+            HttpResponse(lookup(input()))
+        ''')
+        self.assert_rules('''
+            def lookup(read, choices, value):
+                choices['home'] = value
+                return read('home')
+            choices = {'home': 'home'}
+            HttpResponse(lookup(choices.get, choices, input()))
+        ''', 'xss')
+
+    def test_local_helpers_and_closures_preserve_literal_mapping_identity(self):
+        self.assert_rules('''
+            def choose(choices, key):
+                return choices.get(key)
+            HttpResponse(choose({'home': 'home'}, input()))
+        ''')
+        self.assert_rules('''
+            def make():
+                choices = {'home': 'home'}
+                def choose(key):
+                    return choices.get(key)
+                return choose
+            HttpResponse(make()(input()))
+        ''')
+        self.assert_rules('''
+            def make():
+                return {'home': 'home'}
+            HttpResponse(make().get(input()))
+        ''')
+
+    def test_opaque_escapes_do_not_reuse_literal_mapping_proofs(self):
+        for escape in ('unknown(choices)', 'holder.mapping = choices',
+                       'unknown([choices])', "holder['mapping'] = choices"):
+            with self.subTest(escape=escape):
+                self.assert_rules(f'''
+                    choices = {{'home': 'home'}}
+                    {escape}
+                    HttpResponse(choices.get(input()))
+                ''', 'xss')
+                self.assert_rules(f'''
+                    choices = {{'home': 'home'}}
+                    {escape}
+                    def choose(key):
+                        return choices.get(key)
+                    HttpResponse(choose(input()))
+                ''', 'xss')
+                self.assert_rules(f'''
+                    from fastapi import FastAPI
+                    app = FastAPI()
+                    choices = {{'home': 'home'}}
+                    {escape}
+                    @app.get('/view/{{name}}')
+                    def view(name: str):
+                        return HttpResponse(choices.get(name))
+                ''', 'xss')
+
+    def test_dynamic_and_nested_mapping_values_are_not_literal_contracts(self):
+        self.assert_rules('''
+            values = ['fixed']
+            choices = {'home': values}
+            values.append(input())
+            HttpResponse(choices.get('home'))
+        ''', 'xss')
+        self.assert_rules('''
+            class Lookup:
+                def get(self, key):
+                    return key
+            HttpResponse(Lookup().get(input()))
+        ''', 'xss')
+
+    def test_custom_key_protocols_retain_taint_and_revoke_later_reads(self):
+        setup = '''
+            choices = {'home': 'home'}
+            lookup = choices.get
+            class Key:
+                def __init__(self, payload):
+                    self.payload = payload
+                def __hash__(self):
+                    choices['home'] = self.payload
+                    return hash('home')
+                def __eq__(self, other):
+                    return other == 'home'
+            key = Key(input())
+        '''
+        for selection in ('choices.get(key)', 'choices[key]', 'lookup(key)'):
+            with self.subTest(selection=selection):
+                self.assert_rules(textwrap.dedent(setup) + f'HttpResponse({selection})\n', 'xss')
+                self.assert_rules(textwrap.dedent(setup) + f'''
+def choose(key):
+    return {selection}
+HttpResponse(choose(key))
+''', 'xss')
+                self.assert_rules(textwrap.dedent(setup) + f'''
+{selection}
+HttpResponse(choices.get('home'))
+''', 'xss')
+
+    def test_framework_string_proofs_do_not_apply_to_ordinary_calls(self):
+        for selection in ('choices.get(name)', 'choices[name]', 'lookup(name)'):
+            with self.subTest(selection=selection):
+                self.assert_rules(f'''
+                    from fastapi import FastAPI
+                    app = FastAPI()
+                    choices = {{'home': 'home'}}
+                    lookup = choices.get
+                    class Key:
+                        def __init__(self, payload):
+                            self.payload = payload
+                        def __hash__(self):
+                            choices['home'] = self.payload
+                            return hash('home')
+                        def __eq__(self, other):
+                            return other == 'home'
+                    @app.get('/view/{{name}}')
+                    def view(name: str):
+                        return {selection}
+                    HttpResponse(view(Key(input())))
+                ''', 'xss')
+        self.assert_rules('''
+            from fastapi import FastAPI
+            app = FastAPI()
+            choices = {'home': 'home'}
+            def choose(name):
+                return choices.get(name)
+            @app.get('/view/{name}')
+            def view(name: str):
+                return HttpResponse(choose(name))
+        ''')
+
+    def test_unknown_and_custom_annotated_keys_do_not_prove_inert_hashing(self):
+        for annotation, imports in (
+            ('Key', ''),
+            ('Annotated[str, AfterValidator(make_key)]',
+             'from typing import Annotated\nfrom pydantic import AfterValidator\n'),
+        ):
+            with self.subTest(annotation=annotation):
+                self.assert_rules(imports + f'''
+from fastapi import FastAPI
+app = FastAPI()
+choices = {{'home': 'home'}}
+@app.get('/view/{{name}}')
+def view(name: {annotation}):
+    return HttpResponse(choices.get(name))
+''', 'xss')
+        self.assert_rules('''
+            choices = {'home': 'home'}
+            key = input() if condition else external(input())
+            HttpResponse(choices.get(key))
+        ''', 'xss')
+
+    def test_global_key_replacement_does_not_reuse_primitive_proof(self):
+        self.assert_rules('''
+            choices = {'home': 'home'}
+            key = input()
+            def choose():
+                return choices.get(key)
+            key = external(input())
+            HttpResponse(choose())
+            key = input()
+        ''', 'xss')
+
+    def test_postponed_annotation_aliases_do_not_prove_native_keys(self):
+        for annotation, before, replacement in (
+            ('Alias', 'Alias = str', 'Alias = Annotated[str, AfterValidator(Key)]'),
+            ('str', '', 'str = Annotated[str, AfterValidator(Key)]'),
+        ):
+            with self.subTest(annotation=annotation):
+                self.assert_rules(f'''
+                    from __future__ import annotations
+                    from fastapi import FastAPI, Depends
+                    from fastapi.responses import Response
+                    from typing import Annotated
+                    from pydantic import AfterValidator
+                    choices = {{'home': 'safe'}}
+                    class Key:
+                        def __init__(self, payload):
+                            self.payload = payload
+                        def __hash__(self):
+                            choices['home'] = self.payload
+                            return hash('home')
+                        def __eq__(self, other):
+                            return other == 'home'
+                    {before}
+                    def choose(name: {annotation}):
+                        return choices.get(name)
+                    {replacement}
+                    app = FastAPI()
+                    @app.get('/view')
+                    def view(value=Depends(choose)):
+                        return Response(value, media_type='text/html')
+                ''', 'xss')
+        self.assert_rules('''
+            from __future__ import annotations
+            from fastapi import FastAPI
+            app = FastAPI()
+            choices = {'home': 'home'}
+            @app.get('/view/{name}')
+            def view(name: str):
+                return HttpResponse(choices.get(name))
+        ''')
+
+    def test_imported_helpers_preserve_framework_and_ordinary_call_contexts(self):
+        for ordinary in (False, True):
+            with self.subTest(ordinary=ordinary):
+                directory = self.work / ('ordinary' if ordinary else 'injected')
+                directory.mkdir()
+                helper = directory / 'helper.py'
+                helper.write_text("choices = {'home': 'home'}\ndef choose(name):\n"
+                                  "    return choices.get(name)\n", encoding='utf-8')
+                source = directory / 'view.py'
+                source.write_text('from fastapi import FastAPI\nfrom helper import choose\n'
+                                  'app = FastAPI()\n@app.get("/view/{name}")\n'
+                                  'def view(name: str):\n    return HttpResponse(choose(name))\n'
+                                  + ('HttpResponse(choose(external(input())))\n' if ordinary else ''),
+                                  encoding='utf-8')
+                findings = list(taint_py.run(RunContext(lang='python', files=[source, helper],
+                                                       profile={'project_dir': str(directory)})))
+                self.assertEqual([(row['rule'], row['line']) for row in findings],
+                                 [('python.taint.xss', 7)] if ordinary else [])
+
+    def test_deferred_provider_annotation_mutations_remain_opaque(self):
+        self.assert_rules('''
+            from fastapi import FastAPI, Depends
+            from typing import Annotated
+            from pydantic import AfterValidator
+            choices = {'home': 'safe'}
+            class Key:
+                def __init__(self, payload):
+                    self.payload = payload
+                def __hash__(self):
+                    choices['home'] = self.payload
+                    return hash('home')
+                def __eq__(self, other):
+                    return other == 'home'
+            def choose(name: str):
+                return choices.get(name)
+            choose.__annotations__['name'] = Annotated[str, AfterValidator(Key)]
+            app = FastAPI()
+            @app.get('/view')
+            def view(value=Depends(choose)):
+                return HttpResponse(value)
+        ''', 'xss')
+        self.assert_rules('''
+            from fastapi import FastAPI, Depends
+            choices = {'home': 'home'}
+            def choose(name: str):
+                return choices.get(name)
+            configure(choose)
+            app = FastAPI()
+            @app.get('/view')
+            def view(value=Depends(choose)):
+                return HttpResponse(value)
+        ''', 'xss')
+
+    def test_wrapped_route_annotations_do_not_prove_native_inputs(self):
+        self.assert_rules('''
+            from fastapi import FastAPI
+            from functools import wraps
+            app = FastAPI()
+            choices = {'home': 'home'}
+            @app.get('/view')
+            @wraps(custom_signature)
+            def view(name: str):
+                return HttpResponse(choices.get(name))
+        ''', 'xss')
+
+    def test_dictionary_pairs_keep_python_evaluation_order(self):
+        self.assert_rules('''
+            value = input()
+            choices = {'first': (saved := value), (value := 'safe'): 0}
+            HttpResponse(saved)
+        ''', 'xss')
+        self.assert_rules('''
+            value = 'safe'
+            choices = {'first': (saved := value), (value := input()): 0}
+            HttpResponse(saved)
+        ''')
+
+    def test_lookup_results_and_immutable_values_are_snapshots(self):
+        for lookup in ("choices['home']", "choices.get('home')"):
+            with self.subTest(lookup=lookup):
+                self.assert_rules(f'''
+                    choices = {{'home': 'home'}}
+                    saved = {lookup}
+                    choices['home'] = input()
+                    HttpResponse(saved)
+                ''')
+        self.assert_rules('''
+            saved = 'home'
+            choices = {'home': saved, 'unsafe': input()}
+            choices['home'] = input()
+            HttpResponse(saved)
+        ''')
+
+    def test_global_replacements_do_not_reuse_literal_contracts(self):
+        self.assert_rules('''
+            choices = {'home': 'home'}
+            def choose(key):
+                return choices.get(key)
+            def outer(key):
+                return choose(key)
+            saved = choices
+            choices = unknown
+            HttpResponse(outer(input()))
+            choices = saved
+        ''', 'xss')
+        self.assert_rules('''
+            choices = {'home': 'home'}
+            def choose(key):
+                return choices[key]
+            def mutate(value):
+                choices['home'] = value
+            mutate(input())
+            HttpResponse(choose('home'))
+        ''', 'xss')
 
 
 class DependencyInputTests(SourceTest):
@@ -467,6 +896,93 @@ class TypedRequestTests(SourceTest):
 
 @unittest.skipUnless(os.environ.get('UBS_TAINT_E2E') == '1', 'set UBS_TAINT_E2E=1 for real-scanner checks')
 class FrameworkRunnerTests(unittest.TestCase):
+    def test_literal_mapping_and_awaited_task_module_runner_formats(self):
+        artifacts = ROOT / 'test-suite' / 'artifacts'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        work = Path(tempfile.mkdtemp(prefix='literal-mapping-public-', dir=artifacts))
+        helper = ROOT / 'modules/helpers/ubs_core/analyzers/taint_py.py'
+        helper_hash = hashlib.sha256(helper.read_bytes()).hexdigest()
+        header = ("from fastapi import FastAPI\nfrom fastapi.responses import Response\n"
+                  "app = FastAPI()\nCHOICES = {'home': 'home'}\n"
+                  "@app.get('/view/{name}')\ndef view(name: str):\n")
+        cases = (
+            ('fixed-values', header + '    return Response(CHOICES.get(name))\n', []),
+            ('tainted-default', header + '    return Response(CHOICES.get(name, name))\n', [7]),
+            ('mutated-values', header + "    CHOICES['home'] = name\n"
+             "    return Response(CHOICES.get('home'))\n", [8]),
+            ('awaited-name', textwrap.dedent('''
+                import asyncio
+                from fastapi.responses import Response
+                async def handler():
+                    async def watch():
+                        await asyncio.sleep(1)
+                    watcher = asyncio.create_task(watch())
+                    try:
+                        return Response('ok')
+                    finally:
+                        watcher.cancel()
+                        try:
+                            await watcher
+                        except asyncio.CancelledError:
+                            pass
+            ''').lstrip('\n'), []),
+        )
+        environment = dict(os.environ, UBS_KEEP_TEMP='1', UBS_NO_CACHE='1',
+                           UBS_NO_AUTO_UPDATE='1', UBS_ENABLE_AUTO_UPDATE='0',
+                           XDG_CACHE_HOME=str(work / 'cache'), UBS_CACHE_DIR=str(work / 'cache'),
+                           XDG_DATA_HOME=str(work / 'data'), XDG_CONFIG_HOME=str(work / 'config'),
+                           PYTHONDONTWRITEBYTECODE='1', NO_COLOR='1')
+        skip = '--skip=' + ','.join(str(category) for category in range(1, 24) if category != 7)
+        for label, source, expected in cases:
+            selected = work / label
+            selected.mkdir()
+            path = selected / 'view.py'
+            path.write_text(source, encoding='utf-8')
+            temporary = selected / 'temporary'
+            temporary.mkdir()
+            for module in (True, False):
+                for output_format in ('json', 'sarif'):
+                    with self.subTest(case=label, module=module, format=output_format):
+                        prefix = (['bash', str(ROOT / 'modules/ubs-python.sh'), '--no-uv'] if module else
+                                  ['bash', str(ROOT / 'ubs'), '--only=python'])
+                        command = [*prefix, '--ci', '--format=' + output_format, skip, str(path)]
+                        name = ('module' if module else 'runner') + '-' + output_format
+                        print(f'[literal-mapping:{label}:{name}] RUN', flush=True)
+                        started = time.monotonic()
+                        result = subprocess.run(command, cwd=work, env={**environment, 'TMPDIR': str(temporary)},
+                                                capture_output=True, text=True, timeout=180)
+                        (selected / f'{name}.stdout').write_text(result.stdout, encoding='utf-8')
+                        (selected / f'{name}.stderr').write_text(result.stderr, encoding='utf-8')
+                        (selected / f'{name}.receipt.json').write_text(json.dumps({
+                            'command': command, 'returncode': result.returncode,
+                            'source_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                            'helper_sha256': helper_hash, 'elapsed': time.monotonic() - started,
+                        }, indent=2) + '\n', encoding='utf-8')
+                        self.assertEqual(result.returncode, int(bool(expected)), (command, result.stdout, result.stderr))
+                        payload = json.loads(result.stdout)
+                        if output_format == 'json':
+                            self.assertEqual(payload['status'], 'ok', payload)
+                            totals = payload if module else payload['totals']
+                            self.assertEqual(totals['critical'], len(expected), payload)
+                            rows = [row for row in payload.get('findings', [])
+                                    if row['rule' if module else 'rule_id'] == 'python.taint.xss']
+                            samples = [sample for row in rows for sample in row['samples']] if module else rows
+                            self.assertEqual([row['line'] for row in samples], expected, payload)
+                            for row in samples:
+                                self.assertEqual(Path(row['file']).name, 'view.py')
+                        else:
+                            self.assertEqual(payload['version'], '2.1.0', payload)
+                            self.assertTrue(payload['runs'], payload)
+                            rows = [row for run in payload['runs'] for row in run.get('results', [])
+                                    if row['ruleId'] == 'python.taint.xss']
+                            self.assertEqual([row['locations'][0]['physicalLocation']['region']['startLine']
+                                              for row in rows], expected, payload)
+                            self.assertTrue(all(invocation.get('executionSuccessful') is not False
+                                                for run in payload['runs']
+                                                for invocation in run.get('invocations', [])), payload)
+                        self.assertEqual(hashlib.sha256(helper.read_bytes()).hexdigest(), helper_hash)
+                        print(f'[literal-mapping:{label}:{name}] PASS', flush=True)
+
     def test_framework_sources_reach_the_actual_scanner(self):
         cases = (
             ('query-eval', 'from fastapi import Query\ndef endpoint(q=Query()):\n    eval(q)\n', 'eval', 3),
@@ -483,7 +999,7 @@ class FrameworkRunnerTests(unittest.TestCase):
         artifacts = ROOT / 'test-suite' / 'artifacts' / 'python-framework-sources'
         artifacts.mkdir(parents=True, exist_ok=True)
         for name, code, kind, line in cases:
-            with self.subTest(case=name), tempfile.TemporaryDirectory(prefix='ubs-framework-e2e-') as tmp:
+            with self.subTest(case=name), temporary_directory(prefix='ubs-framework-e2e-') as tmp:
                 source = Path(tmp) / 'view.py'
                 source.write_text(code, encoding='utf-8')
                 result = subprocess.run([str(ROOT / 'ubs'), str(source), '--only=python', '--ci', '--format=json'],

@@ -15,12 +15,13 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'modules' / 'helpers'))
 from ubs_core.analyzers import taint_py
+from ubs_core.io import temporary_directory
 from ubs_core.registry import RunContext
 
 
 class SourceTest(unittest.TestCase):
     def scan(self, source: str):
-        with tempfile.TemporaryDirectory(prefix='ubs-taint-dataflow-') as tmp:
+        with temporary_directory(prefix='ubs-taint-dataflow-') as tmp:
             path = Path(tmp) / 'view.py'
             path.write_text(textwrap.dedent(source).lstrip('\n'), encoding='utf-8')
             return list(taint_py.run(RunContext(lang='python', files=[path])))
@@ -172,14 +173,14 @@ class ReachingDefinitionTests(SourceTest):
         self.assert_rules("items = {}\nitems['q'] = input()\nitems['safe'] = 'safe'\neval(items['q'])\n", 'eval')
 
     def test_rule_profile_disables_findings(self):
-        with tempfile.TemporaryDirectory(prefix='ubs-taint-profile-') as tmp:
+        with temporary_directory(prefix='ubs-taint-profile-') as tmp:
             path = Path(tmp) / 'view.py'
             path.write_text('eval(input())\n')
             ctx = RunContext(lang='python', files=[path], profile={'disabled_rules': ['python.taint.eval']})
             self.assertEqual(list(taint_py.run(ctx)), [])
 
     def test_legacy_and_structured_outputs_agree(self):
-        with tempfile.TemporaryDirectory(prefix='ubs-taint-dialects-') as tmp:
+        with temporary_directory(prefix='ubs-taint-dialects-') as tmp:
             path = Path(tmp) / 'view.py'
             path.write_text(''.join('eval(input())\n' for _ in range(5)))
             findings = list(taint_py.run(RunContext(lang='python', files=[path])))
@@ -313,7 +314,7 @@ class RunnerIntegrationTests(unittest.TestCase):
                                ("q='safe'\nmatch payload:\n    case _ if (q := input()) and False:\n        pass\n"
                                 "    case _:\n        cursor.execute(q)\n", True),
                                ("match payload:\n    case _ if False:\n        cursor.execute(input())\n", False)):
-            with self.subTest(code=code), tempfile.TemporaryDirectory(prefix='ubs-taint-e2e-') as tmp:
+            with self.subTest(code=code), temporary_directory(prefix='ubs-taint-e2e-') as tmp:
                 path = Path(tmp) / 'view.py'
                 path.write_text(code)
                 env = dict(os.environ, UBS_NO_AUTO_UPDATE='1', UBS_SKIP_SIZE_CHECK='1')

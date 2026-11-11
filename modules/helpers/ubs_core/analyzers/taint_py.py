@@ -179,6 +179,7 @@ class _FrameworkInput:
     kind: str
     name: str
     dependency: ast.FunctionDef | ast.AsyncFunctionDef | None = None
+    native_string: bool = False
 
 
 def _imported_name(node, bindings):
@@ -349,6 +350,19 @@ class _BoundClassMethod:
 class _LiteralString:
     """A value is not an import/callable identity just because it is text."""
     value: str
+
+
+@dataclass(frozen=True)
+class _LiteralMapping:
+    """An exact builtin dict created solely from immutable scalar literals.
+
+    The finite marker proves that selecting a key does not copy that key into
+    the returned value. Writes or opaque escapes revoke this contract; it is
+    never inferred from a name, annotation or an arbitrary get() method.
+    """
+
+
+_LITERAL_MAPPING_GET = '@literal-mapping.get'
 
 
 @dataclass(frozen=True)
@@ -843,9 +857,16 @@ def _join_bindings(*bindings):
 def _without_object_contract(binding):
     if any(isinstance(value, _PartialValue) for value in _binding_choices(binding)):
         raise AnalysisLimit('mutated functools.partial object; analysis is incomplete')
-    return _join_bindings(*(None if isinstance(value, (_ArgumentVector, _ProcessInput, ast.ClassDef))
-                            else _PARTIAL_CHANGED_MODULE if value == 'functools' else value
-                            for value in _binding_choices(binding)))
+    choices = []
+    for value in _binding_choices(binding):
+        if isinstance(value, (_ArgumentVector, _LiteralMapping, _ProcessInput, ast.ClassDef)):
+            value = None
+        elif isinstance(value, _BoundCallable) and value.name == _LITERAL_MAPPING_GET:
+            value = _BoundCallable('<object>.get', value.references, value.receiver)
+        elif value == 'functools':
+            value = _PARTIAL_CHANGED_MODULE
+        choices.append(value)
+    return _join_bindings(*choices)
 
 
 _QUALIFIER_WIDTH = max(4, *(candidate.count('.') + 1 for candidate in SANITIZERS))
@@ -2156,6 +2177,32 @@ class _Flow:
                 state.heap[ref] = join_facts(state.heap.get(ref, CLEAN), fact)
             self.mutations[ref] = join_facts(self.mutations.get(ref, CLEAN), fact)
 
+    def escape_literal_mapping(self, binding, references, state):
+        """Heap aggregates do not retain a nested mapping's ownership graph."""
+        for value in _binding_choices(binding):
+            if isinstance(value, _LiteralMapping):
+                self.mutate(references, CLEAN, state)
+            elif isinstance(value, _BoundCallable) and value.name == _LITERAL_MAPPING_GET:
+                self.mutate(value.references, CLEAN, state)
+
+    def literal_mapping_contents(self, fact, references, state):
+        # A summarized getter and a separate parameter can alias the same
+        # dictionary. Until their alias relation is instantiated, a write to
+        # either symbolic receiver must remain a possible mapping mutation.
+        changed = (frozenset(ref for ref in state.mutated if isinstance(ref, str))
+                   if any(isinstance(ref, str) for ref in references)
+                   else references & state.mutated)
+        self.engine.budget.spend(len(changed))
+        return join_facts(fact, *(state.heap.get(ref, CLEAN) for ref in changed)), not changed
+
+    def literal_mapping_key(self, node, state):
+        # Hashing/equality on an arbitrary key can run user code and mutate
+        # this mapping. Only primitive identities permit a clean selection;
+        # callers specialize symbolic keys through the existing finite value
+        # contexts rather than assuming every request-derived object is str.
+        self.require_value(self.expression_bindings.get(node))
+        return self.materialized_generator_hashable(node, state)
+
     def effect(self, kind, node, label, fact):
         unsafe = frozenset(trace for trace in fact if not _safe_for(trace, kind, label))
         key = (kind, node.lineno, node.col_offset + 1, label)
@@ -3304,6 +3351,8 @@ class _Flow:
         elif isinstance(target, ast.Starred):
             self.assign(target.value, fact, state)
         elif isinstance(target, (ast.Subscript, ast.Attribute)):
+            self.escape_literal_mapping(self.expression_bindings.get(value),
+                                        self.expression_references.get(value, NO_REFERENCES), state)
             if any(isinstance(choice, _PartialValue)
                    for choice in _binding_choices(self.expression_bindings.get(value))):
                 raise AnalysisLimit('functools.partial stored in an object; analysis is incomplete')
@@ -3938,6 +3987,8 @@ class _Flow:
                     if isinstance(value, _BoundClassMethod):
                         value = _BoundClassMethod(value.function, value.owner, value.references, value.receiver,
                                                   value.valid and not bool(value.references & state.mutated))
+                    elif value.name == _LITERAL_MAPPING_GET and value.references & state.mutated:
+                        value = _BoundCallable('<object>.get', value.references, value.receiver)
                 choices.append(value)
             if refs:
                 slot = '@method:' + name
@@ -4720,6 +4771,22 @@ class _Flow:
             name = target.name
             receiver_refs = target.references
             receiver = join_facts(target.receiver, *(state.heap.get(ref, CLEAN) for ref in receiver_refs))
+            if name == _LITERAL_MAPPING_GET:
+                receiver, unchanged = self.literal_mapping_contents(receiver, receiver_refs, state)
+                if (unchanged and 1 <= len(arguments) <= 2 and not keywords
+                        and not any(isinstance(argument, ast.Starred) for argument in node.args)):
+                    # Evaluate both arguments before applying this transfer:
+                    # a key/default expression can mutate the captured dict.
+                    if self.literal_mapping_key(node.args[0], state):
+                        default = node.args[1] if len(arguments) == 2 else None
+                        self.expression_bindings[node] = _join_bindings(
+                            None, self.expression_bindings.get(default))
+                        self.expression_references[node] = self.expression_references.get(default, NO_REFERENCES)
+                        self.possible_exception(state)
+                        return join_facts(receiver, arguments[1] if default is not None else CLEAN)
+                    # A custom protocol may also affect later reads whose
+                    # own keys are primitive. Retain the possible write.
+                    self.mutate(receiver_refs, arguments[0], state)
         if name == 'functools.partial':
             return self.partial_value(node, state, inputs)
         value = (self.expression_bindings.get(node.args[0])
@@ -4873,7 +4940,7 @@ class _Flow:
                 if (isinstance(binding, _SymbolicValue)
                         or _same_witness(binding, nominal)):
                     continue
-                if any(isinstance(value, (str, _LiteralString, _ArgumentVector, _ProcessInput,
+                if any(isinstance(value, (str, _LiteralString, _GeneratorString, _LiteralMapping, _ArgumentVector, _ProcessInput,
                                           _FunctionValue, _ClosureValue,
                                           ast.FunctionDef, ast.AsyncFunctionDef,
                                           ast.Lambda, ast.Constant, _BoundClassMethod))
@@ -5218,6 +5285,7 @@ class _Flow:
             # This effect is summarized even for a symbolic helper parameter.
             for expression in (*node.args, *keyword_nodes.values()):
                 value = self.expression_bindings.get(expression)
+                self.escape_literal_mapping(value, self.expression_references.get(expression, NO_REFERENCES), state)
                 if {'functools', _PARTIAL_CHANGED_MODULE} & _binding_choices(value) and name not in {
                         'print', 'str', 'repr', 'bool', 'builtins.print', 'builtins.str', 'builtins.repr'}:
                     self.mutate(frozenset({_PARTIAL_MODULE_REF}), CLEAN, state)
@@ -5293,7 +5361,7 @@ class _Flow:
                                   and node.id not in self.context_globals)
                 identity = (str, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
                             ast.ClassDef, _FunctionValue, _ClosureValue, _BoundCallable,
-                            _BoundClassMethod, _ModuleBinding, _ArgumentVector, _LiteralString,
+                            _BoundClassMethod, _ModuleBinding, _ArgumentVector, _LiteralString, _GeneratorString, _LiteralMapping,
                             _ProcessInput, ast.Constant)
                 if (not nominal_helper and any(isinstance(value, identity)
                         for value in (*_binding_choices(binding), *_binding_choices(nominal)))):
@@ -5341,6 +5409,8 @@ class _Flow:
         if isinstance(node, (ast.Tuple, ast.List, ast.Dict, ast.Set, ast.Starred,
                              ast.ListComp, ast.DictComp, ast.SetComp, ast.GeneratorExp)):
             for child in ast.iter_child_nodes(node):
+                self.escape_literal_mapping(self.expression_bindings.get(child),
+                                            self.expression_references.get(child, NO_REFERENCES), state)
                 if 'functools' in _binding_choices(self.expression_bindings.get(child)):
                     self.mutate(frozenset({_PARTIAL_MODULE_REF}), CLEAN, state)
                 if any(isinstance(choice, _PartialValue)
@@ -5389,6 +5459,9 @@ class _Flow:
                                         'analysis is incomplete')
                 if isinstance(base, _GlobalNamespace) and base.member is None:
                     candidates.append(_GlobalNamespace(base.module, node.attr))
+                    continue
+                if isinstance(base, _LiteralMapping) and node.attr == 'get':
+                    candidates.append(_BoundCallable(_LITERAL_MAPPING_GET, receiver_refs, receiver_fact, True))
                     continue
                 if isinstance(base, ast.ClassDef):
                     members = self.engine.class_members.get(base, {})
@@ -5454,6 +5527,23 @@ class _Flow:
                 # Framework annotation tuples use a separate marker binding.
                 # Only unexpanded syntax has the same positions as its values.
                 binding = self.expression_bindings.get(node.value.elts[node.slice.value])
+            mappings = _binding_choices(self.expression_bindings.get(node.value))
+            if mappings and all(isinstance(value, _LiteralMapping) for value in mappings):
+                contents, unchanged = self.literal_mapping_contents(
+                    self.expression_facts.get(node.value, CLEAN),
+                    self.expression_references.get(node.value, NO_REFERENCES), state)
+                if unchanged and self.literal_mapping_key(node.slice, state):
+                    fact, binding = contents, None
+                    self.expression_references[node] = NO_REFERENCES
+                else:
+                    fact = join_facts(fact, contents)
+                    self.mutate(self.expression_references.get(node.value, NO_REFERENCES),
+                                self.expression_facts.get(node.slice, CLEAN), state)
+        elif isinstance(node, ast.Dict):
+            if all(isinstance(value, ast.Constant)
+                   and type(value.value) in {str, bytes, int, float, complex, bool, type(None)}
+                   for value in (*node.keys, *node.values)):
+                binding = _LiteralMapping()
         if is_call:
             if exception_type:
                 binding = '@exception:' + exception_type
@@ -5528,19 +5618,24 @@ class _Flow:
                 return join_facts(value_fact, self.expr(node.format_spec, state))
             return value_fact
         if isinstance(node, ast.Dict):
-            if self.materialized_generator_depth:
-                facts = []
-                for key, value in zip(node.keys, node.values):
-                    facts.append(self.expr(key, state))
-                    facts.append(self.expr(value, state))
-                    if state.reachable and (key is None or not self.materialized_generator_hashable(key, state)):
-                        raise AnalysisLimit('generator materialization dictionary hashing is unresolved; '
-                                            'analysis is incomplete')
-                return join_facts(*facts)
-            return join_facts(
-                *(self.expr(k, state) for k in node.keys if k is not None),
-                *(self.expr(v, state) for v in node.values),
-            )
+            facts, references = [], {node}
+            # Keys and values run in pairs, not as two independent lists.
+            # Capture each operand before a later one can rebind its name;
+            # nested mutable values remain aliases after construction.
+            for key, value in zip(node.keys, node.values):
+                for operand in (key, value):
+                    facts.append(self.expr(operand, state))
+                    immutable = (isinstance(operand, ast.Constant)
+                                 or all(isinstance(choice, (_LiteralString, _GeneratorString)) for choice
+                                        in _binding_choices(self.expression_bindings.get(operand))))
+                    if not immutable:
+                        references.update(self.expression_references.get(operand, NO_REFERENCES))
+                if (self.materialized_generator_depth and state.reachable
+                        and (key is None or not self.materialized_generator_hashable(key, state))):
+                    raise AnalysisLimit('generator materialization dictionary hashing is unresolved; '
+                                        'analysis is incomplete')
+            self.expression_references[node] = frozenset(references)
+            return join_facts(*facts, *(state.heap.get(ref, CLEAN) for ref in references))
         if isinstance(node, ast.Starred):
             return self.expr(node.value, state)
         if isinstance(node, ast.Slice):
@@ -5985,12 +6080,14 @@ class _Flow:
             # Decorator expressions run before defaults. Preserve the real
             # router identity even if a later default rebinds its name.
             route = False
+            native_route_decorators = True
             route_dependencies = []
             descriptors = []
             for decorator in node.decorator_list:
                 is_route = isinstance(decorator, ast.Call) and _imported_name(decorator.func, state.bindings) in {
                     f'@fastapi.router.{method}' for method in _ROUTE_METHODS}
                 route = route or is_route
+                native_route_decorators = native_route_decorators and is_route
                 self.expr(decorator, state)
                 descriptors.append(self.expression_bindings.get(decorator))
                 if is_route:
@@ -6015,7 +6112,9 @@ class _Flow:
                 name: self.expression_references.get(default, NO_REFERENCES) for name, default in defaults.items()})
             self.engine.define('default_bindings', node, {
                 name: self.expression_bindings.get(default) for name, default in defaults.items()})
-            self.engine.describe_framework(node, default_inputs, state.bindings, route, route_dependencies)
+            self.engine.describe_framework(node, default_inputs, state.bindings, route, route_dependencies,
+                                           native_builtins=(self.generator_builtins_stable()
+                                                            and native_route_decorators))
             descriptor = ('class' if descriptors in (['classmethod'], ['builtins.classmethod'])
                           else not descriptors or descriptors in (['staticmethod'], ['builtins.staticmethod']))
             self.engine.define('class_callables', node, descriptor)
@@ -6360,6 +6459,9 @@ class _Analysis:
         # selected source here adds substantial setup cost before any flow is
         # analyzed, without providing new information.
         nodes = tuple(ast.walk(tree))
+        self.framework_annotation_metadata = any(
+            isinstance(node, ast.Attribute) and node.attr in {
+                '__annotations__', '__signature__', '__wrapped__', '__annotate__'} for node in nodes)
         # Builtin functions expose their owning module through __self__.
         # Reflective aliases revoke native identity proofs even when no
         # import or direct attribute store names the builtins module.
@@ -6643,6 +6745,17 @@ class _Analysis:
         self.refresh_globals(self.globals, ready=False)
 
     def refresh_globals(self, globals_, *, ready=True):
+        # Framework entries are solved without an ordinary Python call site.
+        # Publish the effective mapping contracts after initialization, not a
+        # literal initializer whose object has since been mutated or escaped.
+        for name, binding in globals_.bindings.items():
+            for value in _binding_choices(binding):
+                references = (globals_.references.get(name, NO_REFERENCES) if isinstance(value, _LiteralMapping)
+                              else value.references if isinstance(value, _BoundCallable)
+                              and value.name == _LITERAL_MAPPING_GET else NO_REFERENCES)
+                if references & globals_.mutated:
+                    globals_.bindings[name] = _without_object_contract(binding)
+                    break
         self.globals = globals_
         self.namespace_ready = ready
         aliases = {}
@@ -6985,7 +7098,8 @@ class _Analysis:
                 return False
         return True
 
-    def describe_framework(self, function, default_inputs, bindings, route, route_dependencies):
+    def describe_framework(self, function, default_inputs, bindings, route, route_dependencies,
+                           *, native_builtins=False):
         inputs = {}
         for arg in (*function.args.posonlyargs, *function.args.args, *function.args.kwonlyargs):
             description = (default_inputs.get(arg.arg)
@@ -6993,7 +7107,22 @@ class _Analysis:
             if description is None:
                 description = _FrameworkInput('source' if route else 'implicit', 'fastapi.request')
             if description is not None:
-                inputs[arg.arg] = description
+                # A plain FastAPI string parameter is converted by framework
+                # invocation. Require the stable builtin spelling: postponed
+                # annotations can resolve an alias after its definition, at
+                # which point it may contain a custom validator. Reflected
+                # namespace writes also prevent this primitive proof.
+                native_string = (route and native_builtins and description.kind == 'source'
+                                 and isinstance(arg.annotation, ast.Name)
+                                 and arg.annotation.id == 'str'
+                                 and 'str' not in self.global_names
+                                 and 'str' not in self.generator_external_writers
+                                 and not self.generator_namespace_exposed
+                                 and not self.framework_annotation_metadata
+                                 and bindings.get(arg.annotation.id, _implicit_identity(arg.annotation.id))
+                                 in {'str', 'builtins.str'})
+                inputs[arg.arg] = _FrameworkInput(description.kind, description.name,
+                                                  description.dependency, native_string)
         # Capture import identities at the definition, before later rebinding.
         self.define('framework_inputs', function, inputs)
         self.define('framework_dependencies', function, tuple(route_dependencies))
@@ -7186,6 +7315,16 @@ class _Analysis:
                                 for (module, name), contents in global_writes.items()),
         )
 
+    def framework_summary_key(self, function):
+        owner = self.owner(function)
+        if function in owner.failed_scopes:
+            return function
+        required = self.summaries.get(function, FunctionSummary()).value_parameters
+        context = tuple(sorted((name, _GeneratorString())
+                               for name, description in owner.framework_inputs.get(function, {}).items()
+                               if description.native_string and name in required))
+        return (function, context) if context else function
+
     def framework_bound(self, globals_):
         """Solve local dependency values on the same finite taint lattice.
 
@@ -7322,7 +7461,7 @@ class _Analysis:
                 # Partial captures may retain exact scalar options such as
                 # shell=False. Their source AST identities are finite.
                 pass
-            elif not isinstance(value, (str, _ProcessInput, ast.FunctionDef, ast.AsyncFunctionDef,
+            elif not isinstance(value, (str, _LiteralMapping, _ProcessInput, ast.FunctionDef, ast.AsyncFunctionDef,
                                         ast.Lambda, ast.ClassDef)):
                 value = _SymbolicValue(name) if captured else None
             choices.append(value)
@@ -7420,7 +7559,7 @@ class _Analysis:
                     continue
                 if (binding is nominal
                         and not isinstance(binding, (frozenset, _BoundCallable, _BoundClassMethod, _FunctionValue, _ClosureValue,
-                                                     _ArgumentVector, _LiteralString, _ProcessInput))
+                                                     _ArgumentVector, _LiteralString, _GeneratorString, _LiteralMapping, _ProcessInput))
                         and not explicit_override
                         and gname in owner_bindings
                         and gname not in owner_fn.locals[function]
@@ -7432,7 +7571,7 @@ class _Analysis:
                 if not explicit_override and not any(
                         isinstance(value, (str, ast.FunctionDef, ast.AsyncFunctionDef,
                                            ast.Lambda, ast.ClassDef, _BoundCallable, _BoundClassMethod, _FunctionValue, _ClosureValue,
-                                           _ArgumentVector, _LiteralString, _ProcessInput, ast.Constant))
+                                           _ArgumentVector, _LiteralString, _GeneratorString, _LiteralMapping, _ProcessInput, ast.Constant))
                         for value in (*_binding_choices(binding), *_binding_choices(nominal))):
                     continue
             elif binding is None or isinstance(binding, _SymbolicValue):
@@ -7849,6 +7988,13 @@ class _Analysis:
                 readers.clear()
                 namespace_inputs.clear()
             self.refresh_globals(globals_)
+            # Type coercion belongs to framework entry, not the callable's
+            # ordinary summary. Request only demanded primitive contexts and
+            # let their helper dependencies settle on this same worklist.
+            for function in self.functions:
+                key = self.framework_summary_key(function)
+                if isinstance(key, tuple) and key not in self.summaries:
+                    self.publish('summaries', key, FunctionSummary())
             if initializing:
                 initializer_jobs.update(key for (table, key) in reads if table == 'summaries')
                 if not initializer_jobs:
@@ -7992,7 +8138,10 @@ class _Analysis:
                 # an invented standalone/framework entry into a foreign scope.
                 projections = [(self.tree, [(*key, fact) for key, fact in module.effects.items()])]
                 for function in self.functions:
-                    projections.append((function, solved[function][2]))
+                    key = self.framework_summary_key(function)
+                    scope_effects = (self.summaries[key].effects if isinstance(key, tuple)
+                                     else solved[function][2])
+                    projections.append((function, scope_effects))
                 for scope, scope_effects in projections:
                     bound = global_bound
                     if scope is not self.tree and framework_bound.get(scope):

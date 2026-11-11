@@ -305,11 +305,14 @@ def cargo_project_in_context(project: Path, environ=None) -> Path:
     """Keep explicitly selected Cargo manifests in their complete source tree.
 
     Static checks still inspect only the selected copies. Cargo requires the
-    original workspace's member manifests, configuration and modules. Refuse
-    a stale or unmapped manifest/lock instead of running against another input.
+    source context's member manifests, configuration and modules. Staged scans
+    map that context to an immutable index snapshot. Refuse an incomplete context
+    or a stale/unmapped manifest/lock instead of running against another input.
     Callers retain their existing skip when no Cargo.toml was selected.
     """
     env = os.environ if environ is None else environ
+    if env.get("UBS_INDEX_CONTEXT_ERROR"):
+        raise ValueError(env["UBS_INDEX_CONTEXT_ERROR"])
     if not env.get("UBS_SHADOW_WORKSPACE_DIR") and not env.get("UBS_SHADOW_SOURCE_DIR"):
         return project
     source = shadow_source_path(project / "Cargo.toml", env)

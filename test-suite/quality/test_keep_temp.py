@@ -27,6 +27,7 @@ import zlib
 
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "modules" / "helpers"))
 ARTIFACTS = ROOT / "test-suite" / "artifacts"
 SEVERITIES = ("critical", "warning", "info")
 CASES = {
@@ -354,21 +355,68 @@ class KeepTempCliTests(unittest.TestCase):
             self.assertRegex(removal, r"= -1 EPERM\b", f"fixture deletion was not denied: {evidence}")
         return result.stdout
 
-    def fixture_object(self, project: Path, kind: str, contents: str) -> str:
+    def fixture_object(self, project: Path, kind: str, contents: str | bytes) -> str:
         """Write authentic loose objects without Git's temporary-object unlink.
 
         These are real Git objects, independently decoded by git cat-file;
         no scanner response, executable, or detector input is substituted.
         """
-        payload = contents.encode("utf-8")
+        payload = contents.encode("utf-8") if isinstance(contents, str) else contents
         encoded = kind.encode("ascii") + b" " + str(len(payload)).encode("ascii") + b"\0" + payload
         object_id = hashlib.sha1(encoded, usedforsecurity=False).hexdigest()
         destination = project / ".git" / "objects" / object_id[:2] / object_id[2:]
         destination.parent.mkdir(exist_ok=True)
-        with destination.open("xb") as stream:
-            stream.write(zlib.compress(encoded))
-        self.assertEqual(self.fixture_git(project, "cat-file", kind, object_id), contents)
+        if destination.exists():
+            self.assertEqual(zlib.decompress(destination.read_bytes()), encoded)
+        else:
+            with destination.open("xb") as stream:
+                stream.write(zlib.compress(encoded))
+        self.assertEqual(self.fixture_git(project, "cat-file", "-t", object_id), kind + "\n")
+        self.assertEqual(self.fixture_git(project, "cat-file", "-s", object_id), str(len(payload)) + "\n")
+        if isinstance(contents, str):
+            self.assertEqual(self.fixture_git(project, "cat-file", kind, object_id), contents)
         return object_id
+
+    def fixture_tree(self, project: Path, entries: dict[str, tuple[str, str]]) -> str:
+        """Create native nested Git trees, without a checkout or object cleanup."""
+        root = {}
+        for path, entry in entries.items():
+            parts = path.split("/")
+            node = root
+            for part in parts[:-1]:
+                node = node.setdefault(part, {})
+            node[parts[-1]] = entry
+
+        def build(node):
+            payload = bytearray()
+            for name, entry in sorted(node.items(), key=lambda item: os.fsencode(
+                    item[0] + ("/" if isinstance(item[1], dict) else ""))):
+                mode, oid = ("40000", build(entry)) if isinstance(entry, dict) else entry
+                payload.extend(mode.encode("ascii") + b" " + os.fsencode(name) + b"\0" + bytes.fromhex(oid))
+            return self.fixture_object(project, "tree", bytes(payload))
+
+        tree = build(root)
+        actual = self.fixture_git(project, "ls-tree", "-r", tree)
+        expected = "".join(f"{mode} {'commit' if mode == '160000' else 'blob'} {oid}\t{path}\n"
+                           for path, (mode, oid) in sorted(entries.items()))
+        self.assertEqual(actual, expected)
+        return tree
+
+    def fixture_repository(self, name: str, contents: dict[str, tuple[str, str]]) -> tuple[Path, str]:
+        project = self.root / name
+        project.mkdir()
+        self.fixture_git(project, "init", "--object-format=sha1", "--initial-branch=main")
+        entries = {path: (mode, self.fixture_object(project, "blob", text))
+                   for path, (mode, text) in contents.items()}
+        tree = self.fixture_tree(project, entries)
+        commit = self.fixture_object(project, "commit",
+            f"tree {tree}\n"
+            "author Retention Test <retention@example.invalid> 1700000000 +0000\n"
+            "committer Retention Test <retention@example.invalid> 1700000000 +0000\n"
+            "\nReal index context fixture\n")
+        self.fixture_git(project, "update-ref", "refs/heads/main", commit)
+        self.fixture_git(project, "read-tree", tree)
+        return project, commit
 
     def staged_project(self, name: str, *, unmerged: bool) -> tuple[Path, Path]:
         project = self.root / name
@@ -705,6 +753,207 @@ class KeepTempCliTests(unittest.TestCase):
         self.checked_report("python", project, "--staged", buggy=True, finding_name="control.py")
         self.assertEqual(index.read_bytes(), before_index)
         self.assertEqual(source.read_bytes(), before_worktree)
+
+    def retained_rust_index_scan(self, project: Path, target: Path) -> tuple[Path, Path, Path]:
+        """Exercise real snapshot/static analysis; Cargo itself stays unevaluated."""
+        index = project / ".git" / "index"
+        before_index, before_project = index.read_bytes(), source_digest(project)
+        result, observations, run = self.run_scan("rust", target, "--staged", "--no-cargo")
+        context = f"{run}\n{result.stdout}\n{result.stderr}"
+        self.assertEqual(result.returncode, 1, context)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["status"], "ok", context)
+        # The Rust module counts the selected Cargo.toml as an input as well
+        # as the one changed .rs file. Context-only files must not add to it.
+        self.assertEqual(report["totals"]["files"], 2, context)
+        self.assertEqual(report["totals"]["critical"], 0, context)
+        warnings = [row for row in report["findings"] if row["severity"] == "warning"]
+        self.assertEqual(sorted((row["rule_id"], row["line"]) for row in warnings),
+                         [("rust.ownership.unwrap-expect", 2), ("rust.parsing.parse-unwrap", 2)], context)
+        phases = {row["rule_id"] for row in report["findings"]
+                  if row["severity"] == "info" and row["message"].startswith("Not evaluated:")}
+        self.assertEqual(phases, {"rust.lints.phase", "rust.build.phase", "rust.dependencies.phase"}, context)
+        for execution in observations["executions"]:
+            executable = re.search(r'execve\(("(?:[^"\\]|\\.)*")', execution)
+            self.assertIsNotNone(executable, execution)
+            self.assertNotIn(Path(json.loads(executable.group(1))).name,
+                             {"cargo", "cargo-fmt", "cargo-clippy", "rustc"}, execution)
+        self.assertEqual(index.read_bytes(), before_index)
+        self.assertEqual(source_digest(project), before_project)
+        selected = list((run / "tmp").rglob("git_scan"))
+        snapshots = list((run / "tmp").rglob("git_context"))
+        self.assertEqual(len(selected), 1, context)
+        self.assertEqual(len(snapshots), 1, context)
+        return selected[0], snapshots[0], run
+
+    def test_staged_rust_context_pins_unchanged_sources_and_excludes_noncommit_paths(self) -> None:
+        from ubs_core.rust_scan import cargo_project_in_context
+
+        clean, buggy = CASES["rust"][4], CASES["rust"][3]
+        manifest = '[package]\nname = "index_context"\nversion = "0.1.0"\nedition = "2021"\n'
+        staged_manifest = manifest.replace('"0.1.0"', '"0.1.1"')
+        head = {
+            "Cargo.toml": ("100644", manifest),
+            "Cargo.lock": ("100644", "version = 4\n"),
+            ".cargo/config.toml": ("100644", '[build]\ntarget-dir = "target"\n'),
+            "build.rs": ("100755", "fn main() {}\n"),
+            "src/lib.rs": ("100644", clean),
+            "src/util.rs": ("100644", buggy),
+            "src/index-only.rs": ("100644", "pub const INDEX_VALUE: u32 = 41;\n"),
+            "src/deleted.rs": ("100644", "pub const REMOVED_VALUE: u32 = 9;\n"),
+        }
+        project, _commit = self.fixture_repository("rust-index-context", head)
+        (project / "src").mkdir()
+        (project / "Cargo.toml").write_text('uncommitted_manifest = true\n', encoding="utf-8")
+        (project / "src/lib.rs").write_text(clean, encoding="utf-8")
+        (project / "src/util.rs").write_text("pub const WORKTREE_VALUE: u32 = 999;\n", encoding="utf-8")
+        (project / "src/deleted.rs").write_text(head["src/deleted.rs"][1], encoding="utf-8")
+        (project / "src/intent.rs").write_text(buggy, encoding="utf-8")
+        (project / "src/untracked.rs").write_text(buggy, encoding="utf-8")
+        manifest_oid = self.fixture_object(project, "blob", staged_manifest)
+        source_oid = self.fixture_object(project, "blob", buggy)
+        self.fixture_git(project, "update-index", "--index-info", input_text=(
+            f"100644 {manifest_oid} 0\tCargo.toml\n"
+            f"100644 {source_oid} 0\tsrc/lib.rs\n"
+            f"0 {'0' * 40}\tsrc/deleted.rs\n"))
+        self.fixture_object(project, "blob", "")  # Git add -N can reuse the real empty blob.
+        self.fixture_git(project, "add", "--intent-to-add", "--", "src/intent.rs")
+        self.assertIn("src/intent.rs", self.fixture_git(project, "ls-files", "--stage"))
+        changes = self.fixture_git(project, "diff", "--cached", "--name-status")
+        self.assertEqual(changes.splitlines(), ["M\tCargo.toml", "D\tsrc/deleted.rs", "M\tsrc/lib.rs"])
+        selected, snapshot, run = self.retained_rust_index_scan(project, project)
+        expected = {path: text for path, (_mode, text) in head.items() if path != "src/deleted.rs"}
+        expected.update({"Cargo.toml": staged_manifest, "src/lib.rs": buggy})
+        self.assertEqual({str(path.relative_to(snapshot)): path.read_text(encoding="utf-8")
+                          for path in snapshot.rglob("*") if path.is_file()}, expected)
+        self.assertEqual({str(path.relative_to(selected)) for path in selected.rglob("*") if path.is_file()},
+                         {"Cargo.toml", "src/lib.rs"})
+        self.assertEqual((selected / "src/lib.rs").read_text(encoding="utf-8"), buggy)
+        self.assertEqual((snapshot / "build.rs").stat().st_mode & 0o777, 0o755)
+        self.assertFalse((project / "src/index-only.rs").exists())
+        self.assertFalse((snapshot.parent / "git_context.incomplete").exists())
+        mapping = {"UBS_SHADOW_WORKSPACE_DIR": str(selected), "UBS_SHADOW_SOURCE_DIR": str(snapshot)}
+        self.assertEqual(cargo_project_in_context(selected, mapping), snapshot, str(run))
+
+    def test_staged_scoped_crate_context_keeps_workspace_and_outside_index_changes(self) -> None:
+        from ubs_core.rust_scan import cargo_project_in_context
+
+        clean, buggy = CASES["rust"][4], CASES["rust"][3]
+        workspace = '[workspace]\nmembers = ["crates/app", "crates/shared"]\nresolver = "2"\n'
+        manifest = '[package]\nname = "application"\nversion = "0.1.0"\nedition = "2021"\n'
+        updated = manifest.replace('"0.1.0"', '"0.1.1"')
+        head = {
+            "Cargo.toml": ("100644", workspace),
+            "crates/app/Cargo.toml": ("100644", manifest),
+            "crates/app/src/lib.rs": ("100644", clean),
+            "crates/shared/Cargo.toml": ("100644", '[package]\nname = "shared"\nversion = "0.1.0"\n'),
+            "crates/shared/src/lib.rs": ("100644", "pub const VALUE: u32 = 41;\n"),
+        }
+        project, _commit = self.fixture_repository("scoped-rust-context", head)
+        target = project / "crates/app"
+        (target / "src").mkdir(parents=True)
+        (target / "Cargo.toml").write_text(manifest, encoding="utf-8")
+        (target / "src/lib.rs").write_text(clean, encoding="utf-8")
+        (project / "Cargo.toml").write_text('[workspace]\nmembers = ["uncommitted"]\n', encoding="utf-8")
+        updates = {"crates/app/Cargo.toml": updated, "crates/app/src/lib.rs": buggy,
+                   "crates/shared/src/lib.rs": "pub const VALUE: u32 = 44;\n"}
+        entries = "".join(f"100644 {self.fixture_object(project, 'blob', text)} 0\t{path}\n"
+                          for path, text in updates.items())
+        self.fixture_git(project, "update-index", "--index-info", input_text=entries)
+        selected, snapshot, run = self.retained_rust_index_scan(project, target)
+        expected = {path: text for path, (_mode, text) in head.items()}
+        expected.update(updates)
+        self.assertEqual({str(path.relative_to(snapshot)): path.read_text(encoding="utf-8")
+                          for path in snapshot.rglob("*") if path.is_file()}, expected)
+        self.assertEqual({str(path.relative_to(selected)) for path in selected.rglob("*") if path.is_file()},
+                         {"Cargo.toml", "src/lib.rs"})
+        self.assertFalse((project / "crates/shared/src/lib.rs").exists())
+        mapping = {"UBS_SHADOW_WORKSPACE_DIR": str(selected),
+                   "UBS_SHADOW_SOURCE_DIR": str(snapshot / "crates/app")}
+        self.assertEqual(cargo_project_in_context(selected, mapping), snapshot / "crates/app", str(run))
+
+    def test_staged_rs_only_context_keeps_test_classification_and_selected_scope(self) -> None:
+        from ubs_core.rust_scan import integration_test_root_in_context
+
+        manifest = '[package]\nname = "staged_tests"\nversion = "0.1.0"\nedition = "2021"\n'
+        clean = "pub fn check() {}\n"
+        panic = 'pub fn check() {\n    panic!("selected panic");\n}\n'
+        head = {
+            "Cargo.toml": ("100644", manifest),
+            "tests/api.rs": ("100644", clean),
+            "tests/unchanged.rs": ("100644", panic),
+            "src/selected.rs": ("100644", clean),
+            "src/lib.rs": ("100644", panic),
+        }
+        project, _commit = self.fixture_repository("rust-rs-only-context", head)
+        (project / "tests").mkdir()
+        (project / "src").mkdir()
+        # Neither unstaged source fixes nor a local manifest disabling Cargo's
+        # test discovery may substitute for the exact index being scanned.
+        (project / "Cargo.toml").write_text(manifest + "autotests = false\n", encoding="utf-8")
+        for name in ("tests/api.rs", "src/selected.rs"):
+            (project / name).write_text(clean, encoding="utf-8")
+        staged_oid = self.fixture_object(project, "blob", panic)
+        self.fixture_git(project, "update-index", "--index-info", input_text="".join(
+            f"100644 {staged_oid} 0\t{name}\n" for name in ("tests/api.rs", "src/selected.rs")))
+        index = project / ".git" / "index"
+        before_index, before_project = index.read_bytes(), source_digest(project)
+        result, _observations, run = self.run_scan("rust", project, "--staged", "--no-cargo")
+        evidence = f"{run}\n{result.stdout}\n{result.stderr}"
+        self.assertEqual(result.returncode, 1, evidence)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["status"], "ok", evidence)
+        self.assertEqual(report["totals"], {"files": 2, "critical": 1, "warning": 1, "info": 4}, evidence)
+        actual = sorted((row["rule_id"], row["severity"], Path(row["file"]).relative_to(project).as_posix(),
+                         row["line"]) for row in report["findings"] if row["severity"] != "info")
+        self.assertEqual(actual, [
+            ("rust.ownership.panic-macro", "critical", "src/selected.rs", 2),
+            ("rust.ownership.panic-macro", "warning", "tests/api.rs", 2),
+        ], evidence)
+        selections = list((run / "tmp").rglob("git_scan"))
+        snapshots = list((run / "tmp").rglob("git_context"))
+        self.assertEqual(len(selections), 1, evidence)
+        self.assertEqual(len(snapshots), 1, evidence)
+        selected, snapshot = selections[0], snapshots[0]
+        self.assertEqual({str(path.relative_to(selected)): path.read_text(encoding="utf-8")
+                          for path in selected.rglob("*") if path.is_file()},
+                         {"tests/api.rs": panic, "src/selected.rs": panic}, evidence)
+        self.assertEqual({str(path.relative_to(snapshot)): path.read_text(encoding="utf-8")
+                          for path in snapshot.rglob("*") if path.is_file()},
+                         {"Cargo.toml": manifest, "tests/api.rs": panic, "src/selected.rs": panic}, evidence)
+        mapping = {"UBS_SHADOW_WORKSPACE_DIR": str(selected), "UBS_SHADOW_SOURCE_DIR": str(snapshot)}
+        self.assertTrue(integration_test_root_in_context(selected / "tests/api.rs", mapping), evidence)
+        self.assertFalse(integration_test_root_in_context(selected / "src/selected.rs", mapping), evidence)
+        self.assertEqual(index.read_bytes(), before_index)
+        self.assertEqual(source_digest(project), before_project)
+
+    def test_staged_links_refuse_cargo_context_without_following_checkout(self) -> None:
+        from ubs_core.rust_scan import cargo_project_in_context
+
+        manifest = '[package]\nname = "index_links"\nversion = "0.1.0"\n'
+        head = {"Cargo.toml": ("100644", manifest), "src/lib.rs": ("100644", CASES["rust"][4])}
+        for mode, name in (("120000", "linked-input"), ("160000", "submodule")):
+            with self.subTest(mode=mode):
+                project, commit = self.fixture_repository("rust-context-" + mode, head)
+                (project / "src").mkdir()
+                (project / "src/lib.rs").write_text(CASES["rust"][4], encoding="utf-8")
+                (project / "Cargo.toml").write_text(manifest, encoding="utf-8")
+                link_oid = self.fixture_object(project, "blob", "../outside-input") if mode == "120000" else commit
+                manifest_oid = self.fixture_object(project, "blob", manifest + "edition = \"2021\"\n")
+                source_oid = self.fixture_object(project, "blob", CASES["rust"][3])
+                self.fixture_git(project, "update-index", "--index-info", input_text=(
+                    f"100644 {manifest_oid} 0\tCargo.toml\n"
+                    f"100644 {source_oid} 0\tsrc/lib.rs\n"
+                    f"{mode} {link_oid} 0\t{name}\n"))
+                selected, snapshot, run = self.retained_rust_index_scan(project, project)
+                self.assertFalse((snapshot / name).exists())
+                self.assertFalse((snapshot / name).is_symlink())
+                problem = (snapshot.parent / "git_context.incomplete").read_text(encoding="utf-8")
+                self.assertIn("symlinks or submodules", problem)
+                mapping = {"UBS_SHADOW_WORKSPACE_DIR": str(selected), "UBS_SHADOW_SOURCE_DIR": str(snapshot),
+                           "UBS_INDEX_CONTEXT_ERROR": problem}
+                with self.assertRaisesRegex(ValueError, "symlinks or submodules", msg=str(run)):
+                    cargo_project_in_context(selected, mapping)
 
     def test_unmerged_index_refuses_before_language_filter_and_modules(self) -> None:
         project, source = self.staged_project("unmerged-index", unmerged=True)

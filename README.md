@@ -1410,8 +1410,9 @@ Rule Control:
   --skip-type-narrowing    Disable helper-backed guard analysis (falls back to text heuristics)
   --no-cargo               Rust: static analysis only. Skips every cargo phase (categories 12-14:
                            fmt/clippy, check/test --no-run, audit/deny/udeps/outdated). Each skipped
-                           category reports "Not evaluated" instead of "clean"; targeted scans
-                           (files, --staged, --diff) skip cargo automatically for the same reason.
+                           category reports "Not evaluated" instead of "clean". Cargo phases skip
+                           when the selection has no Cargo.toml; a staged manifest uses a complete
+                           index snapshot for Cargo while static checks keep their changed-file scope.
   --rules=DIR              Additional ast-grep rules directory
                            Rules are merged with built-in rules; repeatable
   --no-auto-update         Disable automatic self-update
@@ -1453,6 +1454,17 @@ Exit Codes:
                            This is NOT a pass. Set UBS_ALLOW_NO_SCAN=1 to restore the legacy exit-0
                            behaviour for callers that intentionally scan mixed/unsupported trees.
 ```
+
+**Rust context in staged scans**
+
+`ubs --staged` analyzes the indexed versions of changed files. When that selection
+includes `Cargo.toml` at the selected directory's root, Cargo phases use a separate
+snapshot of all regular files in the index, including unchanged modules, workspace
+members, local dependencies, build inputs, and `.cargo` configuration. Unstaged and
+untracked files cannot change that snapshot. Static checks still scan only the
+selected changed files. If indexed symlinks or submodules prevent a complete Cargo
+snapshot, Cargo phases report the missing context instead of using the worktree.
+Use `--no-cargo` for static analysis alone.
 
 **Retaining scan scratch**
 

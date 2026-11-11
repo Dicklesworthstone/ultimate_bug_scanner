@@ -206,21 +206,21 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='aaa92f5f7282fff1c9fa3650c9e6acc94e7f9df6f5d2f201b357becd06d2db70'
-  [cpp]='19ae3b651614c89862e48de0e02177cb881bc820b5a009b4d844c959fdc44f89'
-  [csharp]='acc24fc2c4f61dfcf59eb58531f83454d46becd657434343ae1bc371cc0ab68c'
-  [elixir]='667ad83914f9eb889e667a70c7fbe0ffd4e86a8e5b826d4452bf9859310f369d'
-  [golang]='7340e3690364948f466703e6057d3cc39d8c21c1a6c404adefe41e98f0d079e7'
-  [hcl]='0caf29fa75d4132f5c10a8a8c047716a10d0b12d8a20f87bbb8914d9434aafea'
-  [java]='291cfc0319454191304319867ae8c79d4dc069b86b1175da926cc77d07bdbae5'
-  [js]='ef37d1e0746a4a45a87da13cef193bb871d64c4a4f717014d1df6b4369a63719'
-  [kotlin]='49ed9c93dac7b9a20a22520f4fee3706dbced3d14c85a6957f3ce54f1df6146f'
-  [php]='b2460f597f6615a407fea077e925a8dd388e859e35efc6babbecfae28c127afc'
-  [python]='d75a0b3506c061cc382900649289b724811820afc460418e0bf53025690d4fbb'
-  [ruby]='d61f52c4b52a1a810d89ba869ffe45a4608c557bbce3b0ff89ffcc1a5cddb6ad'
-  [rust]='23f2ef50b82a0e3ee83df09294ed13c1884b2e14594891189aa24f64bc9f1d2c'
-  [sql]='3616e60ffff66d185eebb4ae4ce390ca66ac790b1fa2ec260d0a25f2f4e8db4c'
-  [swift]='a0a6cf4e750345c216068e1ed09f85e0132306f6a5e4afc3696d420f5d0b1128'
+  [bash]='e5ee5cd633be97c4cc8de050598f5d8829ad55c025272e43777182763776f572'
+  [cpp]='b3eda084c1dc92476693d4a9da0b169485444862ce8a975dd3e5bba5e8e16f8c'
+  [csharp]='dba6425fdf511750c3cea4074876afd8a634b7756b336c9d0f624a3d233d421e'
+  [elixir]='41862735df41be6930a320555901bb7374280ca1efa74b00158b32c0c4f2ca81'
+  [golang]='685a743419694f10d07e810f67d92063e2f87a3775f2a0bef465de4192d41188'
+  [hcl]='bcdb955db414eb43bbcde0d151f1e6defb2af6cec7bfe545670cc67639bf3185'
+  [java]='64688d5dd04dfa4a9838cc2f1edda13777a994a68c21194cf39af6238eda2831'
+  [js]='c0f324218a832f5f9cb160716fde0ea2a5c0387de40e2a31c1f7c3d5c405659d'
+  [kotlin]='a5913b68b98adece6f978c5d77661dca24012cf5630ae0060841275da4dc6584'
+  [php]='07da2092e3af48718e7cb8825955756fa775ed3eca3da66cc6dd9caa9dad394a'
+  [python]='140579a0853c7706e424b4c17a84b08e6d798414223037b4a6bcd1e5387fcd06'
+  [ruby]='8caa7dfc9530b33fd1c764d5d0aef2132aca00a5e41b8c91d03460f9297622ca'
+  [rust]='937ff10f197cda6c08cc3af99f047a383231d2ec123b26c8d87a8eb8e66a5875'
+  [sql]='0432887a13b9dcb2e706e0d8b0c9362bf4353d16ea725130c543327c4fb5a5fd'
+  [swift]='ab8b814f40e8963be99f63a89b43cecaadba26e57f287a1066460621aed657ce'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -570,7 +570,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/rust_detectors/tls_indirect.py']='120501344abdcddf96e6a40c7b4b38617dd0649b83cfc81a0863f38027b0a755'
   ['helpers/ubs_core/rust_detectors/unbounded_request_body.py']='72eaedc5e99846eadaab246cb6398dc189f541ca14ae62e8a305a316bde69f5f'
   ['helpers/ubs_core/rust_rules.py']='d35a4d6cb061f0eb7ff70a799b415414016a3ce8e10c8331e8a9ee4b484be211'
-  ['helpers/ubs_core/rust_scan.py']='5c2dbdf72988ea98635d78c3aef751e8e118ae1c920a2982e68634f66b8a6b80'
+  ['helpers/ubs_core/rust_scan.py']='a5e1689557ea5539f6c617f6004a86a950531572b6f03e49aa4b8437b9e56f93'
   ['helpers/ubs_core/scheduler.py']='ce86f556229c0875eb4ea11ef5958a7cd24768ffcce3b39d480a938d1c4879b7'
   ['helpers/ubs_core/selftest.py']='6ca3dd5e5534edc0b8a10e9aac1f80834f0d79b661c50c28bd00b33eb85bff08'
   ['helpers/ubs_core/shards.py']='cdc6ecab42bd962e65bb1ac1dc5e3f20b87c4d68632617286a2991274c0c98f7'
@@ -596,7 +596,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='7543f49117b6549a56771e737c8d57a828c238af50a660faf27b65a1227bfd5f'
   ['helpers/ubs_core/taint_flow.py']='b50925e0f4bf7263f41650a1274c208b5e2c2a994d7cdfd518fb26b3dd5251cf'
-  ['lib/ubs-common.sh']='59fd816750e5def7a2e1ba2dc01a27ef30a5cfd15adfd2427f94a0938e7b17ad'
+  ['lib/ubs-common.sh']='37ed99cc9206fc63dda5866189f517f4f9f0fe36f3c02b59242955c890a7261b'
 )
 
 # contract.json as shipped by earlier releases (sha256 -> first tag), kept out
@@ -1628,6 +1628,8 @@ REPORT_JSON_PATH=""
 PYTHON_PATTERN_COUNTS_PATH=""
 HTML_REPORT_PATH=""
 GIT_MODE=""  # staged, diff, or empty
+INDEX_CONTEXT_DIR=""  # immutable index context for staged Cargo/manifest checks
+INDEX_CONTEXT_ERROR=""
 SCAN_FILES=()  # explicit target list from --files or multiple positional args (files and/or directories)
 SINGLE_FILE_TARGET=""  # set by prepare_single_file_target: one source file scanned in place (bead C3)
 POSITIONAL_TARGETS=()  # raw positional path args; classified after the parse loop (issue #88)
@@ -2208,7 +2210,8 @@ Options:
                           phase (fmt/clippy, check/test --no-run, audit/deny/udeps/outdated); the
                           skipped categories report "Not evaluated" instead of "clean".
                           UBS_SKIP_RUST_BUILD=1 is the env equivalent. Cargo phases also skip
-                          themselves (loudly) on targeted scans, whose shadow workspace has no Cargo.toml.
+                          themselves (loudly) when no Cargo.toml is selected. A staged manifest
+                          runs Cargo against a separate complete index snapshot.
   --exclude-tests         Pass through to the Rust module: drop matches inside test functions/modules
                           and files reachable only through cfg(test)-gated mod declarations;
                           production findings still count.
@@ -4854,18 +4857,43 @@ report_rsync_failure(){
 prepare_index_workspace(){
   local repo_root="$1" scan_rel="$2" dest="$TMPDIR_RUN/git_scan"
   local snapshot base raw="$TMPDIR_RUN/index_changes.0" err="$TMPDIR_RUN/index_stderr.txt"
+  local entries="$TMPDIR_RUN/index_entries.0"
+  local context="$TMPDIR_RUN/git_context" index_path index_before index_after
   local count rc=0
   if [[ "$UBS_KEEP_TEMP" == "1" ]]; then
     # write-tree creates and unlinks loose-object scratch inside .git. Read
-    # the index once instead: each raw record pins the immutable blob to scan,
-    # so later git adds or unstaged fixes cannot substitute different bytes.
+    # the index instead. Verify it did not change while collecting the diff
+    # and complete entry inventory; all later reads use these pinned blobs.
     # --cached also handles an unborn HEAD. Keep U records so conflicts fail
     # explicitly rather than disappearing from the selected scan.
+    index_path="$(git -C "$repo_root" rev-parse --git-path index)" || \
+      refuse_scan "git-index-failed" "Could not locate the Git index" ""
+    [[ "$index_path" == /* ]] || index_path="$repo_root/$index_path"
+    index_before="missing"
+    if [[ -f "$index_path" ]]; then
+      index_before="$(compute_sha256 "$index_path")" || \
+        refuse_scan "git-index-failed" "Could not fingerprint the Git index" ""
+    fi
+    base="$(git -C "$repo_root" rev-parse --verify 'HEAD^{tree}' 2>/dev/null)" || base=""
     if ! GIT_OPTIONAL_LOCKS=0 git -C "$repo_root" diff --cached --raw -z --no-abbrev \
-         --no-renames --no-ext-diff --diff-filter=ACMRTU -- >"$raw" 2>"$err"; then
+         --no-renames --no-ext-diff --diff-filter=ACMRTUD -- >"$raw" 2>"$err"; then
       report_copy_failure git 2 "$err"
       refuse_scan "git-index-failed" "Could not enumerate staged changes" ""
     fi
+    : >"$entries"
+    if [[ -n "$base" ]] && ! git -C "$repo_root" ls-tree -r -z "$base" >"$entries" 2>"$err"; then
+      refuse_scan "git-index-failed" "Could not enumerate the Git index context" ""
+    fi
+    snapshot="$(git -C "$repo_root" rev-parse --verify 'HEAD^{tree}' 2>/dev/null)" || snapshot=""
+    [[ "$base" == "$snapshot" ]] || \
+      refuse_scan "git-index-failed" "Git HEAD changed while preparing the scan; retry --staged" ""
+    index_after="missing"
+    if [[ -f "$index_path" ]]; then
+      index_after="$(compute_sha256 "$index_path")" || \
+        refuse_scan "git-index-failed" "Could not fingerprint the Git index" ""
+    fi
+    [[ "$index_before" == "$index_after" ]] || \
+      refuse_scan "git-index-failed" "Git index changed while preparing the scan; retry --staged" ""
   else
     if ! snapshot="$(git -C "$repo_root" write-tree 2>"$err")"; then
       report_copy_failure git 2 "$err"
@@ -4885,11 +4913,15 @@ prepare_index_workspace(){
       report_copy_failure git 2 "$err"
       refuse_scan "git-index-failed" "Could not enumerate staged changes" ""
     fi
+    if ! git -C "$repo_root" ls-tree -r -z "$snapshot" >"$entries" 2>"$err"; then
+      refuse_scan "git-index-failed" "Could not enumerate the Git index snapshot" ""
+    fi
   fi
   ensure_ignore_matcher
   ensure_dir "$dest"
   count=$(UBS_IGNORE_MATCHER_DIR="$IGNORE_MATCHER_DIR" python3 - \
-    "$repo_root" "$scan_rel" "$raw" "$dest" "$GLOBAL_EXCLUDE_PATTERNS" <<'PY' 2>"$err"
+    "$repo_root" "$scan_rel" "$raw" "$dest" "$GLOBAL_EXCLUDE_PATTERNS" \
+    "$entries" "$context" <<'PY' 2>"$err"
 import os
 import subprocess
 import sys
@@ -4897,10 +4929,32 @@ import sys
 sys.path.insert(0, os.environ['UBS_IGNORE_MATCHER_DIR'])
 from ubs_ignore import IgnoreMatcher
 
-repo, scope, raw_path, dest, excludes = sys.argv[1:]
+repo, scope, raw_path, dest, excludes, entries_path, context = sys.argv[1:]
 matcher = IgnoreMatcher(excludes, os.path.join(repo, scope))
 
+def safe_path(raw):
+    path = os.fsdecode(raw)
+    if not path or os.path.isabs(path) or any(p in ('', '.', '..') for p in path.split('/')):
+        raise ValueError(f'unsafe staged path: {path!r}')
+    return path
+
 try:
+    # Keep build context separate from the static scan selection. Unchanged
+    # modules, workspace members, build inputs and local dependencies belong
+    # to Cargo's snapshot, but must not become additional static targets.
+    context_entries = {}
+    with open(entries_path, 'rb') as stream:
+        entries = stream.read().split(b'\0')
+    if entries[-1] != b'':
+        raise ValueError('incomplete Git entry inventory')
+    for entry in entries[:-1]:
+        header, raw_name = entry.split(b'\t', 1)
+        fields = header.split()
+        if len(fields) != 3:
+            raise ValueError('invalid Git entry inventory')
+        mode, _, oid = fields
+        path = safe_path(raw_name)
+        context_entries[path] = (mode, oid)
     with open(raw_path, 'rb') as stream:
         records = stream.read().split(b'\0')
     if records[-1] != b'' or (len(records) - 1) % 2:
@@ -4913,42 +4967,63 @@ try:
         if fields[4] == b'U':
             raise ValueError('unmerged Git index; resolve conflicts before scanning')
         mode, oid = fields[1], fields[3]
+        path = safe_path(records[offset + 1])
+        if fields[4] == b'D':
+            context_entries.pop(path, None)
+            continue
+        # Applying the cached diff to HEAD also excludes intent-to-add paths,
+        # which ls-files lists even though they are not part of the commit.
+        context_entries[path] = (mode, oid)
         # Symlinks and submodules are not source blobs. Never follow them to
         # files outside the snapshot, even when their names end in .py/.js.
         if mode not in (b'100644', b'100755'):
             continue
-        path = os.fsdecode(records[offset + 1])
         if scope:
             if not path.startswith(scope + '/'):
                 continue
             path = path[len(scope) + 1:]
-        if not path or os.path.isabs(path) or any(p in ('.', '..') for p in path.split('/')):
-            raise ValueError(f'unsafe staged path: {path!r}')
         if not matcher.excluded(path):
             selected.append((path, mode, oid))
 
     if selected:
+        needs_cargo = any(path == 'Cargo.toml' for path, _, _ in selected)
+        needs_manifest = needs_cargo or any(path.endswith('.rs') for path, _, _ in selected)
+        materialize = [(os.path.join(dest, path), mode, oid) for path, mode, oid in selected]
+        if needs_manifest:
+            os.makedirs(os.path.join(context, scope), exist_ok=True)
+            selected_rust = {scope + '/' + path if scope else path
+                             for path, _, _ in selected if path.endswith('.rs')}
+            materialize.extend((os.path.join(context, path), mode, oid)
+                               for path, (mode, oid) in context_entries.items()
+                               if mode in (b'100644', b'100755')
+                               and (needs_cargo or path.rsplit('/', 1)[-1] == 'Cargo.toml'
+                                    or path in selected_rust))
+            # Omitted links cannot authorize Cargo to use the mutable checkout.
+            incomplete_context = any(mode not in (b'100644', b'100755')
+                                     for mode, _ in context_entries.values())
+            if needs_cargo and incomplete_context:
+                with open(context + '.incomplete', 'x') as stream:
+                    stream.write('Git index contains symlinks or submodules; complete Cargo context is unavailable')
         # One bounded streaming process for all blobs, with object ids as the
         # protocol keys so spaces, tabs and newlines in paths remain literal.
         with subprocess.Popen(['git', '-C', repo, 'cat-file', '--batch'],
                               stdin=subprocess.PIPE, stdout=subprocess.PIPE) as process:
             try:
-                for path, mode, oid in selected:
+                for target, mode, oid in materialize:
                     process.stdin.write(oid + b'\n')
                     process.stdin.flush()
                     header = process.stdout.readline().split()
                     if len(header) != 3 or header[:2] != [oid, b'blob']:
-                        raise ValueError(f'could not read staged blob for {path!r}')
+                        raise ValueError(f'could not read staged blob for {target!r}')
                     remaining = int(header[2])
                     if remaining < 0:
                         raise ValueError('invalid Git blob size')
-                    target = os.path.join(dest, path)
                     os.makedirs(os.path.dirname(target), exist_ok=True)
                     with open(target, 'xb') as output:
                         while remaining:
                             chunk = process.stdout.read(min(remaining, 1024 * 1024))
                             if not chunk:
-                                raise ValueError(f'truncated staged blob for {path!r}')
+                                raise ValueError(f'truncated staged blob for {target!r}')
                             output.write(chunk)
                             remaining -= len(chunk)
                     if process.stdout.read(1) != b'\n':
@@ -4983,6 +5058,10 @@ PY
   fi
   FILTERED_PROJECT_DIR="$dest"
   PROJECT_DIR="$dest"
+  INDEX_CONTEXT_DIR="$context${scan_rel:+/$scan_rel}"
+  if [[ -f "$context.incomplete" ]]; then
+    INDEX_CONTEXT_ERROR="$(<"$context.incomplete")"
+  fi
   say "${BLUE}${INFO} Preparing shadow workspace from Git index (${count} files)${RESET}"
   say "${DIM}${INFO}${RESET} Scanning shadow workspace at ${FILTERED_PROJECT_DIR}"
 }
@@ -9771,11 +9850,17 @@ run_lang(){
   if [[ -n "${FILTERED_PROJECT_DIR:-}" ]]; then
     local shadow_source="$SOURCE_PROJECT_DIR"
     [[ -f "$shadow_source" ]] && shadow_source="$(dirname "$shadow_source")"
+    if [[ "$GIT_MODE" == "staged" ]]; then
+      shadow_source="$INDEX_CONTEXT_DIR"
+      export UBS_INDEX_CONTEXT_ERROR="$INDEX_CONTEXT_ERROR"
+    else
+      unset UBS_INDEX_CONTEXT_ERROR
+    fi
     export UBS_SHADOW_WORKSPACE_DIR="$FILTERED_PROJECT_DIR"
     export UBS_SHADOW_SOURCE_DIR="$shadow_source"
     export UBS_WORKSPACE_MIRROR_MAP="${WORKSPACE_MIRROR_MAP:-}"
   else
-    unset UBS_SHADOW_WORKSPACE_DIR UBS_SHADOW_SOURCE_DIR UBS_WORKSPACE_MIRROR_MAP
+    unset UBS_SHADOW_WORKSPACE_DIR UBS_SHADOW_SOURCE_DIR UBS_WORKSPACE_MIRROR_MAP UBS_INDEX_CONTEXT_ERROR
   fi
   export UBS_CONTRACT_V2="${UBS_CONTRACT_V2:-1}"
   export UBS_CONTRACT_V2_JS="${UBS_CONTRACT_V2_JS:-${UBS_CONTRACT_V2:-1}}"

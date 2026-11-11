@@ -5,9 +5,9 @@ helper summaries. API facts establish actual request/connection identities;
 an identifier named ``request`` or an arbitrary ``Query`` method is no proof.
 SQL and separately bound values occupy different argument slots. The selected
 model covers synchronous buffered and ordinary asynchronous string overloads,
-including Type-leading overloads, and selected immutable CommandDefinition
-values. It does not simulate deferred enumeration, multimapping, reflection or
-cross-file mutable effects.
+including Type-leading overloads, selected immutable CommandDefinition values,
+and eager ExecuteReader/QueryMultiple execution. It does not simulate deferred
+enumeration, multimapping, reflection or cross-file mutable effects.
 
 Signatures were checked against Dapper SqlMapper.cs / SqlMapper.Async.cs at
 eb47546a408bbf6c178bda4f04dc205bc51ffbfe. The scanner needs only Python.
@@ -52,6 +52,10 @@ CONTROLLERS = frozenset({"Microsoft.AspNetCore.Mvc.ControllerBase", "Microsoft.A
 MAPPER = "Dapper.SqlMapper"
 COMMAND = "Dapper.CommandDefinition"
 COMMAND_FLAGS = "Dapper.CommandFlags"
+COMMAND_BEHAVIOR = "System.Data.CommandBehavior"
+READER_BEHAVIORS = frozenset({
+    "Default", "SingleResult", "SchemaOnly", "KeyInfo", "SingleRow", "SequentialAccess", "CloseConnection",
+})
 COMMAND_TEXT = "dapper-command-text"
 COMMAND_DATA = "dapper-command-parameters"
 COMMAND_ROLES = frozenset({COMMAND_TEXT, COMMAND_DATA})
@@ -106,7 +110,7 @@ PARSE_OPTION_SHAPES = {
 }
 KNOWN_TYPES = CONNECTIONS | CONTROLLERS | PARSE_TYPES | frozenset(STYLE_MEMBERS) | frozenset(PROVIDER_MEMBERS) | frozenset({
     REQUEST, CONTEXT, MAPPER, COMMAND, COMMAND_FLAGS, MAIL_ADDRESS, "System.Type", "System.String",
-    "System.Object", "System.Data.CommandType",
+    "System.Object", "System.Data.CommandType", COMMAND_BEHAVIOR,
 })
 PRIMITIVES = {"string": "System.String", "object": "System.Object", "bool": "System.Boolean",
               "byte": "System.Byte", "sbyte": "System.SByte", "short": "System.Int16",
@@ -116,10 +120,11 @@ PRIMITIVES = {"string": "System.String", "object": "System.Object", "bool": "Sys
               "dynamic": "dynamic"}
 REQUEST_MEMBERS = frozenset({"Query", "Form", "Headers", "Cookies", "RouteValues",
                              "Path", "PathBase", "QueryString"})
+READER_METHODS = frozenset({"ExecuteReader", "QueryMultiple"})
 STRING_METHODS = frozenset({"Execute", "ExecuteScalar", "Query", "QueryFirst", "QueryFirstOrDefault",
-                            "QuerySingle", "QuerySingleOrDefault"})
+                            "QuerySingle", "QuerySingleOrDefault"}) | READER_METHODS
 SQL_CALL = re.compile(
-    r"\b(?:Execute(?:Scalar)?|Query(?:First(?:OrDefault)?|Single(?:OrDefault)?|Unbuffered|Multiple)?)"
+    r"\b(?:Execute(?:Scalar|Reader)?|Query(?:First(?:OrDefault)?|Single(?:OrDefault)?|Unbuffered|Multiple)?)"
     r"(?:Async)?\s*(?:<[\w@.,\s:< >\[\]?]+>)?\s*\(")
 
 
@@ -692,17 +697,27 @@ class DapperFlow(CSharpFlow):
         # CommandDefinition has no synchronous Type-leading overload; the
         # synchronous row/query overloads require a generic result type.
         if ((typed and not asynchronous)
-                or (not asynchronous and family.startswith("Query") and arity != 1)
+                or (not asynchronous and family.startswith("Query") and family != "QueryMultiple" and arity != 1)
                 or (family == "Execute" and arity)):
             self.incomplete(call.position, "Dapper CommandDefinition overload is unresolved")
             return None
         formals = (["cnn"] if static else []) + (["type"] if typed else []) + ["command"]
+        required = set(formals)
+        if family == "ExecuteReader":
+            formals.append("commandBehavior")
         slots = self.command_slots(call, formals)
         if slots is None:
             return None
-        if set(slots) != set(formals):
+        if not required <= set(slots):
             self.incomplete(call.position, "Dapper CommandDefinition call arguments are unresolved")
             return None
+        if "commandBehavior" in slots:
+            _, low, high = call.args[slots["commandBehavior"]]
+            spellings = re.sub(r"\s|@", "", self.code[low:high]).split("|")
+            behaviors = {self.command_enum_member(call, spelling, COMMAND_BEHAVIOR) for spelling in spellings}
+            if not behaviors <= READER_BEHAVIORS:
+                self.incomplete(call.position, "Dapper reader behavior requires resolved CommandBehavior constants")
+                return None
         if static and not identities(call.values[slots["cnn"]]) & CONNECTIONS:
             self.incomplete(call.position, "Static Dapper connection argument is unresolved")
             return None
@@ -731,7 +746,7 @@ class DapperFlow(CSharpFlow):
         method = name.split(".")[-1]
         asynchronous = method.endswith("Async")
         family = method[:-5] if asynchronous else method
-        if family not in STRING_METHODS and family not in {"QueryUnbuffered", "QueryMultiple"}:
+        if family not in STRING_METHODS and family != "QueryUnbuffered":
             return None
         raw = self.raw_name(position, name)
         owner = self.types.resolve(raw.rsplit(".", 1)[0], position) if "." in raw else ""
@@ -760,11 +775,17 @@ class DapperFlow(CSharpFlow):
             if "." in raw and (provenance(join(*values)) or receiver_types & {"dynamic"}):
                 self.incomplete(position, "SQL execution receiver or Dapper dispatch is unresolved")
             return None
-        if family in {"QueryUnbuffered", "QueryMultiple"}:
-            self.incomplete(position, "Deferred or multiple-result Dapper execution is outside the selected model")
+        if family == "QueryUnbuffered":
+            self.incomplete(position, "Deferred Dapper execution is outside the selected model")
             return None
         generic = self.code[name_end:opening].strip()
         arity = len(list(parts(generic, 1, len(generic) - 1, generics=True))) if generic.startswith("<") else 0
+        # These APIs execute the SQL before handing back a reader, even when
+        # CommandFlags.Buffered is absent. They have no generic or Type-leading
+        # overloads: a lookalike generic call may instead be an external extension.
+        if family in READER_METHODS and arity:
+            self.incomplete(position, "Dapper reader overload has no generic result type")
+            return None
         if arity > 1 or any("=>" in self.code[low:high] for _, low, high in args):
             self.incomplete(position, "Dapper multimapping overload is outside the selected model")
             return None
@@ -863,7 +884,7 @@ class DapperFlow(CSharpFlow):
             return join(api_fact(identity), provenance(join(*values)))
         method = name.split(".")[-1]
         family = method[:-5] if method.endswith("Async") else method
-        if family in STRING_METHODS | {"QueryUnbuffered", "QueryMultiple"}:
+        if family in STRING_METHODS | {"QueryUnbuffered"}:
             # SQL execution return values are not new request sources.
             return CLEAN
         source = self.name_value(name.rsplit(".", 1)[0], position, state, bindings) if "." in name else CLEAN

@@ -831,6 +831,185 @@ class C {
 )
 
 
+# Reader creation sends SQL to the provider before returning a reader or task;
+# result enumeration is not the execution boundary for these four APIs. These
+# labels come from SqlMapper.ExecuteReaderImpl / QueryMultipleImpl and their
+# async counterparts, not from the analyzer's family-name classification:
+# https://github.com/DapperLib/Dapper/blob/main/Dapper/SqlMapper.cs
+# https://github.com/DapperLib/Dapper/blob/main/Dapper/SqlMapper.Async.cs
+# CommandFlags.None affects row buffering, not this eager execution behavior.
+READER_CASES = (
+    Case("reader_sync_raw_sql", source('''
+        db.ExecuteReader(http.Query["sql"].ToString()); // @sql db.ExecuteReader
+    ''')),
+    Case("reader_async_raw_sql", source('''
+        await db.ExecuteReaderAsync(http.Query["sql"].ToString()); // @sql db.ExecuteReaderAsync
+    ''', async_=True)),
+    Case("multiple_sync_raw_sql", source('''
+        db.QueryMultiple(http.Query["sql"].ToString()); // @sql db.QueryMultiple
+    ''')),
+    Case("multiple_async_raw_sql", source('''
+        await db.QueryMultipleAsync(http.Query["sql"].ToString()); // @sql db.QueryMultipleAsync
+    ''', async_=True)),
+    Case("reader_bound_values_are_not_sql", source('''
+        db.ExecuteReader("select Id from Users where Name = @name", new { name = http.Query["name"].ToString() });
+        await db.ExecuteReaderAsync("select Id from Users where Name = @name", new { name = http.Query["name"].ToString() });
+    ''', async_=True)),
+    Case("multiple_bound_values_are_not_sql", source('''
+        db.QueryMultiple("select Id from Users where Name = @name; select 1", new { name = http.Query["name"].ToString() });
+        await db.QueryMultipleAsync("select Id from Users where Name = @name; select 1", new { name = http.Query["name"].ToString() });
+    ''', async_=True)),
+    Case("reader_command_executes_without_buffering", source('''
+        var command = new CommandDefinition(http.Query["sql"].ToString(), flags: CommandFlags.None);
+        db.ExecuteReader(command); // @sql db.ExecuteReader
+        await db.ExecuteReaderAsync(command); // @sql db.ExecuteReaderAsync
+    ''', async_=True)),
+    Case("multiple_command_executes_without_buffering", source('''
+        var command = new CommandDefinition(http.Query["sql"].ToString(), flags: CommandFlags.None);
+        db.QueryMultiple(command); // @sql db.QueryMultiple
+        await db.QueryMultipleAsync(command); // @sql db.QueryMultipleAsync
+    ''', async_=True)),
+    Case("reader_command_bound_data_stays_separate", source('''
+        var command = new CommandDefinition("select @value", new { value = http.Query["sql"].ToString() }, flags: CommandFlags.None);
+        db.ExecuteReader(command);
+        await db.ExecuteReaderAsync(command);
+        db.QueryMultiple(command);
+        await db.QueryMultipleAsync(command);
+    ''', async_=True)),
+    Case("reader_named_static_and_alias_overloads", source('''
+        Sql.ExecuteReader(param: new { id = 1 }, sql: http.Query["sql"].ToString(), cnn: db); // @sql Sql.ExecuteReader
+        await Sql.ExecuteReaderAsync(cnn: db, sql: http.Query["sql"].ToString(), commandType: CommandType.Text); // @sql Sql.ExecuteReaderAsync
+        Sql.QueryMultiple(cnn: db, param: new { id = 1 }, sql: http.Query["sql"].ToString()); // @sql Sql.QueryMultiple
+        await Sql.QueryMultipleAsync(sql: http.Query["sql"].ToString(), cnn: db); // @sql Sql.QueryMultipleAsync
+    ''', async_=True, extra="using Sql = Dapper.SqlMapper;\n")),
+    Case("reader_named_static_command_overloads", source('''
+        var command = new CommandDefinition(http.Query["sql"].ToString());
+        SqlMapper.ExecuteReader(command: command, cnn: db); // @sql SqlMapper.ExecuteReader
+        await SqlMapper.ExecuteReaderAsync(command: command, cnn: db); // @sql SqlMapper.ExecuteReaderAsync
+        SqlMapper.QueryMultiple(command: command, cnn: db); // @sql SqlMapper.QueryMultiple
+        await SqlMapper.QueryMultipleAsync(command: command, cnn: db); // @sql SqlMapper.QueryMultipleAsync
+    ''', async_=True)),
+    Case("reader_using_declaration_is_execution", source('''
+        using var reader = db.ExecuteReader(http.Query["sql"].ToString()); // @sql db.ExecuteReader
+    ''')),
+    Case("reader_using_block_is_execution", source('''
+        using (var reader = db.ExecuteReader(http.Query["sql"].ToString())) { // @sql db.ExecuteReader
+            reader.Read();
+        }
+    ''')),
+    Case("reader_helper_connection_and_sql_arguments", source('''
+        var alias = db;
+        Read(alias, http.Query["sql"].ToString());
+    ''', helpers='''
+        void Read(IDbConnection connection, string text) {
+            connection.ExecuteReader(text); // @sql connection.ExecuteReader
+            connection.QueryMultiple(text); // @sql connection.QueryMultiple
+        }
+    ''')),
+    Case("reader_helper_command_return", source('''
+        var command = Make(http.Query["sql"].ToString());
+        db.ExecuteReader(command); // @sql db.ExecuteReader
+        db.QueryMultiple(command); // @sql db.QueryMultiple
+    ''', helpers='''
+        CommandDefinition Make(string text) { return new CommandDefinition(text); }
+    ''')),
+    Case("reader_command_snapshot_survives_source_overwrite", source('''
+        var sql = http.Query["sql"].ToString();
+        var command = new CommandDefinition(sql);
+        sql = "select 1";
+        db.ExecuteReader(command); // @sql db.ExecuteReader
+        db.QueryMultiple(command); // @sql db.QueryMultiple
+    ''')),
+    Case("reader_literal_overwrite_kills_sql_provenance", source('''
+        var sql = http.Query["sql"].ToString();
+        sql = "select 1";
+        db.ExecuteReader(sql);
+        db.QueryMultiple(sql);
+    ''')),
+    Case("reader_branch_keeps_unsafe_sql", source('''
+        var sql = "select 1";
+        if (flag) { sql = http.Query["sql"].ToString(); }
+        db.ExecuteReader(sql); // @sql db.ExecuteReader
+        db.QueryMultiple(sql); // @sql db.QueryMultiple
+    ''')),
+    Case("reader_behavior_flags_do_not_parameterize_sql", source('''
+        var command = new CommandDefinition(http.Query["sql"].ToString());
+        db.ExecuteReader(command, CommandBehavior.SequentialAccess | CommandBehavior.CloseConnection); // @sql db.ExecuteReader
+        await db.ExecuteReaderAsync(commandBehavior: CommandBehavior.SingleResult, command: command); // @sql db.ExecuteReaderAsync
+    ''', async_=True)),
+    Case("reader_static_behavior_and_command_slots", source('''
+        var command = new CommandDefinition(http.Query["sql"].ToString());
+        SqlMapper.ExecuteReader(commandBehavior: Behavior.Default, command: command, cnn: db); // @sql SqlMapper.ExecuteReader
+        await SqlMapper.ExecuteReaderAsync(db, command, Behavior.SequentialAccess); // @sql SqlMapper.ExecuteReaderAsync
+    ''', async_=True, extra="using Behavior = System.Data.CommandBehavior;\n")),
+    Case("reader_bound_command_with_behavior_is_clean", source('''
+        var command = new CommandDefinition("select @value", new { value = http.Query["sql"].ToString() });
+        db.ExecuteReader(command, CommandBehavior.Default);
+        await db.ExecuteReaderAsync(command, CommandBehavior.SequentialAccess);
+    ''', async_=True)),
+    Case("reader_local_lookalikes_are_not_dapper", source('''
+        db.ExecuteReader(http.Query["sql"].ToString());
+        db.QueryMultiple(http.Query["sql"].ToString());
+    ''', parameters="LocalDatabase db, HttpRequest http", extra='''
+class LocalDatabase {
+    public object ExecuteReader(string text) { return null; }
+    public object QueryMultiple(string text) { return null; }
+}
+''')),
+    Case("reader_local_extensions_precede_dapper", source('''
+        db.ExecuteReader(http.Query["sql"].ToString());
+        db.QueryMultiple(http.Query["sql"].ToString());
+    ''', extra='''
+static class LocalExtensions {
+    public static object ExecuteReader(this IDbConnection db, string text) { return null; }
+    public static object QueryMultiple(this IDbConnection db, string text) { return null; }
+}
+''')),
+    Case("reader_global_mapper_survives_local_shadow", source('''
+        global::Dapper.SqlMapper.ExecuteReader(db, http.Query["sql"].ToString()); // @sql global::Dapper.SqlMapper.ExecuteReader
+        global::Dapper.SqlMapper.QueryMultiple(db, http.Query["sql"].ToString()); // @sql global::Dapper.SqlMapper.QueryMultiple
+    ''', extra="class SqlMapper { }\n")),
+    Case("reader_lexical_decoys_are_not_execution", source('''
+        // db.ExecuteReader(http.Query["sql"].ToString());
+        var example = "db.QueryMultiple(http.Query[sql])";
+        var command = new CommandDefinition(http.Query["sql"].ToString());
+    ''')),
+)
+
+READER_BOUNDARIES = (
+    Case("reader_dynamic_dispatch_is_partial", source('''
+        db.ExecuteReader(http.Query["sql"].ToString());
+    ''', parameters="dynamic db, HttpRequest http"), partial=True),
+    Case("reader_unresolved_command_is_partial", source('''
+        db.ExecuteReader(command);
+    ''', parameters="IDbConnection db, CommandDefinition command"), partial=True),
+    Case("reader_unknown_behavior_is_partial", source('''
+        var command = new CommandDefinition(http.Query["sql"].ToString());
+        db.ExecuteReader(command, behavior);
+    ''', parameters="IDbConnection db, HttpRequest http, CommandBehavior behavior"), partial=True),
+    Case("reader_shadowed_behavior_is_partial", source('''
+        var command = new CommandDefinition(http.Query["sql"].ToString());
+        db.ExecuteReader(command, CommandBehavior.Default);
+    ''', extra='''static class CommandBehavior {
+    public static System.Data.CommandBehavior Default { get; set; }
+}
+'''), partial=True),
+    Case("reader_procedure_mode_is_partial", source('''
+        db.ExecuteReader(http.Query["procedure"].ToString(), commandType: CommandType.StoredProcedure);
+    '''), partial=True),
+    Case("reader_generic_extension_is_not_assumed_dapper", source('''
+        db.ExecuteReader<int>(http.Query["sql"].ToString());
+    ''', extra="using ExternalExtensions;\n"), partial=True),
+    Case("multiple_generic_extension_is_not_assumed_dapper", source('''
+        db.QueryMultiple<int>(http.Query["sql"].ToString());
+    ''', extra="using ExternalExtensions;\n"), partial=True),
+    Case("reader_known_execution_survives_deferred_boundary", source('''
+        db.ExecuteReader(http.Query["sql"].ToString()); // @sql db.ExecuteReader
+        db.QueryUnbufferedAsync<int>(http.Query["sql"].ToString());
+    '''), partial=True),
+)
+
+
 def materialize(directory: Path, cases=CASES) -> dict[str, Path]:
     directory.mkdir(parents=True, exist_ok=True)
     paths = {}
@@ -843,7 +1022,7 @@ def materialize(directory: Path, cases=CASES) -> dict[str, Path]:
 
 def freeze_receipt(directory: Path) -> dict:
     """Persist independently assigned labels and their exact source bytes."""
-    cases = CASES + BOUNDARIES + COMMAND_CASES + COMMAND_BOUNDARIES
+    cases = CASES + BOUNDARIES + COMMAND_CASES + COMMAND_BOUNDARIES + READER_CASES + READER_BOUNDARIES
     paths = materialize(directory / "cases", cases)
     receipt = {
         "rule": RULE,
@@ -866,7 +1045,8 @@ class DapperNativeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.directory = ARTIFACTS / ("native-" + uuid.uuid4().hex[:12])
-        cls.paths = materialize(cls.directory, CASES + BOUNDARIES + REVIEW_CASES + COMMAND_CASES + COMMAND_BOUNDARIES)
+        cls.paths = materialize(cls.directory, CASES + BOUNDARIES + REVIEW_CASES + COMMAND_CASES
+                                + COMMAND_BOUNDARIES + READER_CASES + READER_BOUNDARIES)
         cls.analyzer = importlib.import_module("ubs_core.analyzers.taint_csharp_sql")
 
     def scan_case(self, case: Case):
@@ -921,7 +1101,7 @@ class DapperNativeTests(unittest.TestCase):
 
 
 def _install_native_tests():
-    for case in CASES + BOUNDARIES + REVIEW_CASES + COMMAND_CASES + COMMAND_BOUNDARIES:
+    for case in CASES + BOUNDARIES + REVIEW_CASES + COMMAND_CASES + COMMAND_BOUNDARIES + READER_CASES + READER_BOUNDARIES:
         def test(self, case=case):
             self.scan_case(case)
         setattr(DapperNativeTests, "test_" + case.name, test)
@@ -1087,6 +1267,43 @@ class DapperPublicTests(unittest.TestCase):
         for mode in ("module-json", "json"):
             with self.subTest(mode=mode):
                 self.assert_report(*self.execute(directory, mode), mode, cases)
+
+    def test_public_eager_readers_in_four_formats(self):
+        directory = self.project("eager-readers", READER_CASES)
+        for mode in ("module-json", "module-sarif", "json", "sarif"):
+            with self.subTest(mode=mode):
+                self.assert_report(*self.execute(directory, mode), mode, READER_CASES)
+
+    def test_public_eager_reader_boundaries_preserve_findings(self):
+        cases = (READER_CASES[0],) + READER_BOUNDARIES
+        directory = self.project("eager-reader-partial", cases)
+        for mode in ("module-json", "sarif"):
+            with self.subTest(mode=mode):
+                self.assert_report(*self.execute(directory, mode), mode, cases, partial=True)
+
+    def test_public_eager_reader_selection_suppression_and_cache(self):
+        unsafe = READER_CASES[0]
+        clean = next(case for case in READER_CASES if case.name == "reader_literal_overwrite_kills_sql_provenance")
+        directory = self.project("eager-reader-selected", (unsafe, clean))
+        file_list = self.directory / "eager-reader-selected.nul"
+        file_list.write_bytes(os.fsencode(directory / (clean.name + ".cs")) + b"\0")
+        self.assert_report(*self.execute(directory, extra=("--files-from", str(file_list))),
+                           "module-json", (clean,))
+        self.assert_report(*self.execute(directory, extra=("--skip=8",),
+                                          environment={"UBS_CSHARP_SQL_MAX_TOKENS": "1"}),
+                           "module-json", (unsafe, clean), sql_enabled=False)
+        case = Case("eager_reader_cache", unsafe.code)
+        directory = self.project("eager-reader-cache", (case,))
+        for phase in ("cold", "warm"):
+            with self.subTest(phase=phase):
+                self.assert_report(*self.execute(directory, cached=True), "module-json", (case,))
+                stats = json.loads((self.last_attempt / "cache-stats.json").read_text())
+                self.assertEqual((stats["hits"], stats["misses"]), (1, 0) if phase == "warm" else (0, 1))
+        suppressed = Case("eager_reader_cache", source('''
+            db.ExecuteReader(http.Query["sql"].ToString()); // ubs:ignore[cs.security.sql-injection]
+        '''))
+        (directory / "eager_reader_cache.cs").write_text(suppressed.code, encoding="utf-8")
+        self.assert_report(*self.execute(directory, cached=True), "module-json", (suppressed,))
 
     def test_public_command_boundaries_keep_independent_findings(self):
         cases = (COMMAND_CASES[0],) + COMMAND_BOUNDARIES

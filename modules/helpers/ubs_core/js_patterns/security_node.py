@@ -2,8 +2,8 @@ r"""ubs_core.js_patterns.security_node — categories 7 and 18 (bead 0xjg.4).
 
 Faithful ports of the legacy rg pipelines in modules/ubs-js.sh:
 - CATEGORY 7 SECURITY (5568-5728, 5939-5946): eval(), new Function(),
-  unsanitized innerHTML assignment, document.write, __proto__ /
-  constructor.prototype pollution, window.open(_blank) without noopener.
+  unsanitized innerHTML assignment, document.write,
+  window.open(_blank) without noopener.
 - CATEGORY 18 NODE.JS I/O & MODULES (10756-10762) plus run_node_api_checks
   (712-751): fs.*Sync calls, dynamic require(), Express req.body without
   body-parser / without validation, sensitive console logs.
@@ -96,22 +96,9 @@ PATTERNS: list[Pattern] = [
         regex=re.compile(r"\bdocument\.write\b"),
         thresholds=((0, "critical"),),
     ),
-    # ubs-js.sh 5723-5724: pure rg, no post-filters.
-    Pattern(
-        category=7,
-        rule_id="js.security.prototype-pollution",
-        title="Potential prototype pollution",
-        regex=re.compile(
-            # #205: the object-literal property `__proto__: null` (the defensive
-            # null-prototype idiom wasm-bindgen emits) is not pollution. Exempt it
-            # only when the value IS literal null (followed by `,`, `}` or EOL);
-            # keep `.__proto__`/`["__proto__"]` writes and non-null values flagged.
-            r"(\.__proto__|\['__proto__'\]|\[\"__proto__\"\]|__proto__\s*:(?!\s*null\s*(?:[,}]|$))"
-            r"|constructor\.prototype)",
-            re.M,  # whole-text finditer: make $ match end-of-line for the exemption
-        ),
-        thresholds=((0, "critical"),),
-    ),
+    # sec_prototype_pollution owns prototype writes and object-literal
+    # setters. Matching the property name here also counted reads, comments,
+    # strings and defensive null-prototype literals as critical findings.
     # ubs-js.sh 5940-5941: pure rg; legacy `grep -Ev
     # "noopener|noreferrer|ubs:ignore"` — the marker half is the engine's
     # built-in exclusion.

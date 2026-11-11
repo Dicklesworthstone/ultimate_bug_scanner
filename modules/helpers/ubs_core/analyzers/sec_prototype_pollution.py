@@ -1,4 +1,4 @@
-"""Request-derived object merges and property writes.
+"""Prototype mutations, object-literal setters and request-derived merges.
 
 Use the shared JavaScript lexical/statement parser for bounded local flow.
 Safety belongs to the actual receiver or validated key binding, never to a
@@ -53,6 +53,7 @@ class _Value:
     ref: int | None = None
     validator: int | None = None
     object_builtin: bool = False
+    prototype: bool = False
 
 
 UNKNOWN = _Value()
@@ -67,10 +68,11 @@ class _State:
     safe_keys: set = field(default_factory=set)
     object_methods: set = field(default_factory=lambda: {'create', 'assign'})
     allocated_refs: set = field(default_factory=set)
+    local_names: set = field(default_factory=set)
 
     def copy(self):
         return _State(dict(self.bindings), set(self.constants), set(self.null_refs), set(self.contents),
-                      set(self.safe_keys), set(self.object_methods), set(self.allocated_refs))
+                      set(self.safe_keys), set(self.object_methods), set(self.allocated_refs), set(self.local_names))
 
     def tainted(self, value):
         return value.tainted or value.ref is not None and value.ref in self.contents
@@ -92,7 +94,7 @@ class _State:
                 self.bindings[name] = replace(value, safe_key=False, validator=None)
 
     def restore(self, saved):
-        for name, (old, constant) in saved.items():
+        for name, (old, constant, local) in saved.items():
             if old is None:
                 self.bindings.pop(name, None)
             else:
@@ -100,6 +102,9 @@ class _State:
             self.constants.discard(name)
             if constant:
                 self.constants.add(name)
+            self.local_names.discard(name)
+            if local:
+                self.local_names.add(name)
 
 
 def _join(*branches):
@@ -115,17 +120,18 @@ def _join(*branches):
     for name in names:
         first = live[0].bindings.get(name, UNKNOWN)
         ref, validator = first.ref, first.validator
-        tainted, safe_key, object_builtin = False, True, False
+        tainted, safe_key, object_builtin, prototype = False, True, False, False
         for state in live:
             value = state.bindings.get(name, UNKNOWN)
             tainted = tainted or state.tainted(value)
             safe_key = safe_key and value.safe_key
             object_builtin = object_builtin or value.object_builtin
+            prototype = prototype or value.prototype
             if value.ref != first.ref:
                 ref = None
             if value.validator != first.validator:
                 validator = None
-        result.bindings[name] = _Value(tainted, safe_key, ref, validator, object_builtin)
+        result.bindings[name] = _Value(tainted, safe_key, ref, validator, object_builtin, prototype)
     for state in live:
         result.constants.intersection_update(state.constants)
         result.null_refs.intersection_update(state.null_refs)
@@ -133,6 +139,7 @@ def _join(*branches):
         result.safe_keys.intersection_update(state.safe_keys)
         result.object_methods.intersection_update(state.object_methods)
         result.allocated_refs.update(state.allocated_refs)
+        result.local_names.intersection_update(state.local_names)
     return result
 
 
@@ -218,6 +225,127 @@ class _PrototypeFlow:
                 and returned.kind == 'return'
                 and self.text[returned.start:returned.end].strip() == names[0])
 
+    def prototype_setters(self, code, start, end):
+        """Literal prototype setters, excluding computed/shorthand properties.
+
+        ECMAScript's PropertyDefinitionEvaluation gives the non-computed
+        ``__proto__: value`` production special meaning. Quoting the name
+        preserves that meaning; a computed key is an ordinary data property.
+        Comments have already been blanked by the shared lexical view.
+        """
+        pairs = _pairs(code, start, end)
+        for left, right in _chunks(code, start, end):
+            key_start, colon = next(_chunks(code, left, right, ':'))
+            while key_start < colon and self.text[key_start].isspace():
+                key_start += 1
+            key = self.text[key_start:colon].strip()
+            if colon == right or (key != '__proto__' and _literal(key) != '__proto__'):
+                continue
+            value_start, value_end = _trim(code, colon + 1, right, pairs, self.text)
+            yield key_start, code[value_start:value_end] == 'null'
+
+    def member_path(self, code, pairs, start, end):
+        """Read the actual left-hand member chain, retaining computed keys."""
+        result = []
+        while start < end:
+            while start < end and (code[end - 1].isspace() or code[end - 1] == '!'):
+                end -= 1
+            if code[end - 1:end] == ']' and end - 1 in pairs:
+                opening = pairs[end - 1]
+                if opening <= start:
+                    break
+                key_start, key_end = opening + 1, end - 1
+                result.append((opening, key_start, key_end, _literal(self.text[key_start:key_end])))
+                end = opening
+            else:
+                member = re.search(r'\.\s*(' + IDENTIFIER + r')$', code[start:end])
+                if member is None:
+                    break
+                result.append((start + member.start(), start + member.start(1),
+                               start + member.end(1), member.group(1)))
+                end = start + member.start()
+        result.reverse()
+        return result
+
+    def member_end(self, code, pairs, start, end):
+        """End of a balanced member expression, before an operator/delimiter."""
+        cursor = start
+        while cursor < end and code[cursor].isspace():
+            cursor += 1
+        root = re.match(IDENTIFIER, code[cursor:end])
+        if root is not None:
+            cursor += root.end()
+        elif code[cursor:cursor + 1] == '(' and cursor in pairs:
+            cursor = pairs[cursor] + 1
+        else:
+            return start
+        while cursor < end:
+            self.budget.spend()
+            while cursor < end and code[cursor].isspace():
+                cursor += 1
+            if code[cursor:cursor + 1] in {'[', '('} and cursor in pairs:
+                cursor = pairs[cursor] + 1
+            elif code[cursor:cursor + 1] == '.' and re.match(r'\.\s*' + IDENTIFIER, code[cursor:end]):
+                cursor += re.match(r'\.\s*' + IDENTIFIER, code[cursor:end]).end()
+            elif code[cursor:cursor + 1] == '!' and code[cursor + 1:cursor + 2] != '=':
+                cursor += 1
+            else:
+                break
+        return cursor
+
+    def dangerous_members(self, receiver, members):
+        names = [name for _opening, _left, _right, name in members]
+        if members and self.text[receiver:members[0][0]].strip() == 'constructor':
+            names.insert(0, 'constructor')
+        return '__proto__' in names or any(
+            first == 'constructor' and second == 'prototype'
+            for first, second in zip(names, names[1:]))
+
+    def explicit_mutation(self, scope, start, end, state, *, through_value=False):
+        """Preserve static prototype mutations without requiring a source name."""
+        code, pairs = scope.code, _pairs(scope.code, start, end)
+        start, end = _trim(code, start, end, pairs, self.text)
+        members = self.member_path(code, pairs, start, end)
+        if members:
+            destination = self.value(scope, start, end if through_value else members[-1][0], state)
+            if (self.dangerous_members(start, members) or destination.prototype) and destination.ref not in state.null_refs:
+                self.findings.add(start)
+        elif through_value and self.value(scope, start, end, state).prototype:
+            self.findings.add(start)
+
+    def prototype_escape(self, scope, start, end, state):
+        """An unmodeled consumer must not silently discard prototype identity.
+
+        Local aliases are tracked until a write. Calls, aggregate storage and
+        outward transfers have no equivalent effect/heap proof, so retain a
+        conservative diagnostic at the reference crossing that boundary.
+        """
+        raw = self.text[start:end]
+        if ('__proto__' not in raw and not ('constructor' in raw and 'prototype' in raw)
+                and not any(value.prototype for value in state.bindings.values())):
+            return
+        if self.value(scope, start, end, state).prototype:
+            start, _ = _trim(scope.code, start, end, _pairs(scope.code, start, end), self.text)
+            self.findings.add(start)
+
+    def destructuring_mutations(self, scope, start, end, state):
+        self.budget.spend()
+        code, pairs = scope.code, _pairs(scope.code, start, end)
+        start, end = _trim(code, start, end, pairs, self.text)
+        if code[start:start + 3] == '...':
+            start += 3
+        _, end = next(_chunks(code, start, end, '='))
+        start, end = _trim(code, start, end, pairs, self.text)
+        if code[start:start + 1] in {'{', '['} and pairs.get(start) == end - 1:
+            for left, right in _chunks(code, start + 1, end - 1):
+                if code[start] == '{':
+                    _, colon = next(_chunks(code, left, right, ':'))
+                    if colon < right:
+                        left = colon + 1
+                self.destructuring_mutations(scope, left, right, state)
+        else:
+            self.explicit_mutation(scope, start, end, state)
+
     def value(self, scope, start, end, state):
         self.budget.spend()
         code, pairs = scope.code, _pairs(scope.code, start, end)
@@ -268,7 +396,29 @@ class _PrototypeFlow:
         for reference in references:
             tainted = tainted or state.tainted(reference)
             object_builtin = object_builtin or reference.object_builtin
-        return _Value(tainted=tainted, object_builtin=object_builtin)
+        if code[start:start + 1] == '{' and pairs.get(start) == end - 1:
+            properties = [(left, right) for left, right in _chunks(code, start + 1, end - 1)
+                          if self.text[left:right].strip()]
+            setters = list(self.prototype_setters(code, start + 1, end - 1))
+            if len(properties) == 1 and len(setters) == 1 and setters[0][1]:
+                # The literal allocates a new receiver just as Object.create
+                # does. Aliases share its proof; later escapes/prototype writes
+                # invalidate it through the existing allocation state. Require
+                # an otherwise empty dictionary: own accessors can execute
+                # arbitrary code even when the receiver has no prototype.
+                if start not in state.allocated_refs:
+                    state.allocated_refs.add(start)
+                    state.null_refs.add(start)
+                    state.safe_keys.add(start)
+                if tainted:
+                    state.contents.add(start)
+                return _Value(tainted=tainted, ref=start)
+        prototype = False
+        members = self.member_path(code, pairs, start, end)
+        if members and self.member_end(code, pairs, start, end) == end:
+            owner = self.value(scope, start, members[0][0], state)
+            prototype = owner.prototype or self.dangerous_members(start, members)
+        return _Value(tainted=tainted, object_builtin=object_builtin, prototype=prototype)
 
     def receiver_start(self, code, pairs, end):
         cursor = end - 1
@@ -342,6 +492,7 @@ class _PrototypeFlow:
                     value = _Value(tainted=state.tainted(value))
                 for name in names:
                     state.bindings[name] = value
+                    state.local_names.add(name)
                     state.constants.discard(name)
                     if kind == 'const':
                         state.constants.add(name)
@@ -357,8 +508,11 @@ class _PrototypeFlow:
             self.expression(scope, equals + 1, end, state)
             value = self.value(scope, equals + 1, end, state)
             if target.startswith(('[', '{')):
+                self.destructuring_mutations(scope, left, equals, state)
                 value = _Value(tainted=state.tainted(value))
             for name in _binding_names(self.text[left:equals]):
+                if value.prototype and name not in state.local_names:
+                    self.findings.add(left)
                 state.bindings[name] = value
             return
         # A nested assignment can execute conditionally (&&, ?:, arguments).
@@ -369,25 +523,78 @@ class _PrototypeFlow:
             right = min(expression_end(code, rhs), end)
             before = state.copy()
             state.bindings[name] = self.value(scope, rhs, right, state)
+            if state.bindings[name].prototype and name not in state.local_names:
+                self.findings.add(start + assigned.start())
             state.bindings[name] = _join(before, state).bindings[name]
         pairs = _pairs(code, start, end)
         self.object_writes(scope, start, end, pairs, state)
         events = []
+        for opening, closing in pairs.items():
+            if opening >= closing:
+                continue
+            if code[opening] == '{':
+                for setter, is_null in self.prototype_setters(code, opening + 1, closing):
+                    if not is_null:
+                        self.findings.add(setter)
+                for left, right in _chunks(code, opening + 1, closing):
+                    _, colon = next(_chunks(code, left, right, ':'))
+                    if colon < right:
+                        self.prototype_escape(scope, colon + 1, right, state)
+                    elif re.fullmatch(IDENTIFIER, code[left:right].strip()):
+                        self.prototype_escape(scope, left, right, state)
+            elif code[opening] in '[(':
+                receiver = self.receiver_start(code, pairs, opening)
+                if code[opening] == '(' and receiver is not None and receiver >= start:
+                    events.append((closing, 'escape', (receiver, opening)))
+                elif code[opening] == '[' and (receiver is None or receiver < start):
+                    # A member's computed key is a read, not array storage.
+                    # Literal receivers are masked in code but remain in text.
+                    prefix = self.text[start:opening].rstrip()
+                    if not prefix or prefix[-1] not in "'\"`":
+                        for left, right in _chunks(code, opening + 1, closing):
+                            self.prototype_escape(scope, left, right, state)
         for match in CALL_RE.finditer(code, start, end):
             opening = match.end() - 1
             closing = pairs.get(opening)
             if closing is not None:
                 events.append((closing, 'call', match))
-        for opening, closing in pairs.items():
-            if opening < closing and code[opening] == '[' and re.match(r'\s*=(?!=|>)', code[closing + 1:end]):
+        for assigned in re.finditer(r'(?<![=!<>])=(?!=|>)', code[start:end]):
+            equals = start + assigned.start()
+            stop = equals
+            while stop > start and (code[stop - 1].isspace() or code[stop - 1] in '+-*/%&|^?'):
+                stop -= 1
+            receiver = self.receiver_start(code, pairs, stop)
+            if receiver is not None and receiver >= start:
+                members = self.member_path(code, pairs, receiver, stop)
+                if members:
+                    events.append((end, 'write', (receiver, members, equals)))
+        for update in re.finditer(r'\+\+|--|\bdelete\b', code[start:end]):
+            opening, closing = start + update.start(), start + update.end()
+            if update.group() != 'delete':
                 receiver = self.receiver_start(code, pairs, opening)
                 if receiver is not None and receiver >= start:
-                    events.append((end, 'write', (receiver, opening, closing)))
+                    self.explicit_mutation(scope, receiver, opening, state)
+                    continue
+            elif code[start:opening].rstrip().endswith('.'):
+                continue
+            stop = self.member_end(code, pairs, closing, end)
+            if stop > closing:
+                self.explicit_mutation(scope, closing, stop, state)
         for closing, kind, event in sorted(events, key=lambda event: event[0]):
-            if kind == 'call':
+            if kind == 'escape':
+                receiver, opening = event
+                self.prototype_escape(scope, receiver, opening, state)
+                for left, right in _chunks(code, opening + 1, closing):
+                    self.prototype_escape(scope, left, right, state)
+            elif kind == 'call':
                 name = re.sub(r'\s+', '', event.group(1))
-                facts = [self.value(scope, left, right, state)
-                         for left, right in _chunks(code, event.end(), closing)]
+                arguments = list(_chunks(code, event.end(), closing))
+                facts = [self.value(scope, left, right, state) for left, right in arguments]
+                if len(arguments) > 1 and (MERGE_SINK_RE.fullmatch(name + '(') or name in {
+                    'Object.defineProperty', 'Object.defineProperties', 'Object.setPrototypeOf',
+                    'Reflect.set', 'Reflect.defineProperty', 'Reflect.deleteProperty', 'Reflect.setPrototypeOf',
+                }):
+                    self.explicit_mutation(scope, *arguments[0], state, through_value=True)
                 if MERGE_SINK_RE.fullmatch(name + '('):
                     sources = facts if name == 'deepmerge' or len(facts) < 2 else facts[1:]
                     shallow = name == 'Object.assign' and state.builtin('assign')
@@ -424,11 +631,17 @@ class _PrototypeFlow:
                     exceptional.invalidate()
                     self.exceptional_prefixes[-1].append(exceptional)
             else:
-                receiver, opening, closing = event
-                key = self.value(scope, opening + 1, closing, state)
+                receiver, members, equals = event
+                opening, key_start, key_end, member = members[-1]
+                key = (_Value(safe_key=member not in BAD_KEYS) if member is not None
+                       else self.value(scope, key_start, key_end, state))
                 destination = self.value(scope, receiver, opening, state)
-                rhs = self.value(scope, closing + 1, end, state)
+                rhs = self.value(scope, equals + 1, end, state)
+                self.prototype_escape(scope, equals + 1, end, state)
                 risky = (state.tainted(key) or state.tainted(rhs)) and not key.safe_key
+                # Explicit prototype mutations remain findings even when the
+                # source is a parameter whose name is not a request heuristic.
+                risky |= destination.prototype or self.dangerous_members(receiver, members)
                 # A safe root does not certify traversal through nested values.
                 for before, after in pairs.items():
                     if receiver <= before < after < opening and code[before] == '[':
@@ -466,9 +679,10 @@ class _PrototypeFlow:
             if child.name:
                 declared.add(child.name)
         for name in declared:
-            saved[name] = (state.bindings.get(name), name in state.constants)
+            saved[name] = (state.bindings.get(name), name in state.constants, name in state.local_names)
             state.bindings[name] = UNKNOWN
             state.constants.discard(name)
+            state.local_names.add(name)
         for child in functions:
             state.bindings[child.name] = _Value(validator=child.start if child.start in self.validators else None)
         for stmt in statements:
@@ -520,6 +734,7 @@ class _PrototypeFlow:
                         for name in names:
                             state.bindings[name] = value
                             state.constants.discard(name)
+                            state.local_names.add(name)
                             if binding.group(1) == 'const':
                                 state.constants.add(name)
                         if binding.group(1) in {'const', 'let'}:
@@ -536,11 +751,13 @@ class _PrototypeFlow:
                     body = self.sequence(scope, stmt.body, state.copy(), stmt.start, stmt.end)
                     completed = self.exits.get(scope.start, ())[completed_before:] if stmt.kind == 'try' else ()
                     caught = _join(before, *completed, *exceptional)
-                    catch_saved = {name: (caught.bindings.get(name), name in caught.constants)
+                    catch_saved = {name: (caught.bindings.get(name), name in caught.constants,
+                                          name in caught.local_names)
                                    for name in stmt.catch_names}
                     for name in stmt.catch_names:
                         caught.bindings[name] = _Value(tainted=any(self.throws.get(scope.start, ())[thrown_before:]))
                         caught.constants.discard(name)
+                        caught.local_names.add(name)
                     catch_exit = len(self.exits.get(scope.start, ()))
                     catch_prefix = len(exceptional)
                     alternate = self.sequence(scope, stmt.alternate, caught, stmt.start, stmt.end) if stmt.alternate else None
@@ -565,6 +782,9 @@ class _PrototypeFlow:
                     state.constants.discard(name)
                     if name in incoming.constants:
                         state.constants.add(name)
+                    state.local_names.discard(name)
+                    if name in incoming.local_names:
+                        state.local_names.add(name)
                 if stmt.kind == 'try':
                     self.exceptional_prefixes.pop()
                     if self.exceptional_prefixes:
@@ -576,6 +796,7 @@ class _PrototypeFlow:
             else:
                 self.expression(scope, stmt.start, stmt.end, state)
                 if stmt.kind in {'return', 'throw'}:
+                    self.prototype_escape(scope, stmt.start, stmt.end, state)
                     if stmt.kind == 'throw':
                         self.throws.setdefault(scope.start, []).append(state.tainted(self.value(scope, stmt.start, stmt.end, state)))
                     self.budget.spend(len(state.bindings))
@@ -597,12 +818,16 @@ class _PrototypeFlow:
         pending = [(self.root, _State())]
         while pending:
             scope, state = pending.pop()
+            state.local_names = {scope.name} if scope.name else set()
             for names, *_ in scope.params:
                 for name in names:
                     state.bindings[name] = UNKNOWN
                     state.constants.discard(name)
+                    state.local_names.add(name)
             incoming = state.copy()
             final = self.sequence(scope, scope.statements, state, scope.body_start, scope.body_end, scoped=False)
+            if scope.concise and final is not None:
+                self.prototype_escape(scope, scope.body_start, scope.body_end, final)
             for child in scope.children:
                 captured = self.captures.get(child.start, final if final is not None
                                              else _join(*self.exits.get(scope.start, ())) or incoming)
@@ -617,7 +842,8 @@ def scan_file_findings(path: Path) -> Iterator[int]:
     except OSError:
         return
     text, code = javascript_lexical_views(source_text)
-    if not SOURCE_RE.search(code):
+    if (not SOURCE_RE.search(code) and '__proto__' not in text
+            and not ('constructor' in text and 'prototype' in text)):
         return
     suppressions = SourceSuppressions('javascript').index(path, source_text)
     flow, incomplete = _PrototypeFlow(text, code), None

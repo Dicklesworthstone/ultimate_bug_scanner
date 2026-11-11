@@ -7365,6 +7365,134 @@ class PrototypePollutionBindingTests(unittest.TestCase):
             with self.subTest(case=label):
                 self.scan(label, source, expected)
 
+    def test_prototype_access_requires_a_write_or_non_null_literal_setter(self):
+        cases = [
+            ('prototype-read', 'const value = target.__proto__;\n', []),
+            ('computed-prototype-read', 'const value = target["__proto__"];\n', []),
+            ('constructor-read', 'const value = target.constructor.prototype;\n', []),
+            ('lexical-decoys', '// target.__proto__ = payload;\n'
+             'const example = "target.__proto__ = payload";\n'
+             'const pattern = /constructor.prototype/;\n', []),
+            ('null-literal-trivia', 'const imports = {__proto__: /* dictionary */ (null)};\n', []),
+            ('quoted-null-literal', 'const imports = {"__proto__": (null), item: 1};\n', []),
+            ('non-null-literal', 'const imports = {__proto__: null || payload};\n', [1]),
+            ('nested-non-null-literal', 'take({nested: {"__proto__": payload}});\n', [1]),
+            ('computed-data-property', 'const data = {["__proto__"]: payload};\n', []),
+            ('unknown-dot-write', 'target.__proto__ = payload;\n', [1]),
+            ('unknown-computed-write', 'target /* receiver */ ["__proto__"] = payload;\n', [1]),
+            ('constructor-prototype-write', 'target.constructor.prototype.admin = true;\n', [1]),
+            ('computed-constructor-write', 'target["constructor"]["prototype"][key] = value;\n', [1]),
+            ('prototype-compound-write', 'target.__proto__.count += 1;\n', [1]),
+            ('prototype-update', 'target.__proto__.count++;\n', [1]),
+            ('prototype-prefix-update', '++target.constructor.prototype.count;\n', [1]),
+            ('prototype-delete', 'delete target.__proto__.admin;\n', [1]),
+            ('prototype-object-destructure', '({item: target.__proto__} = payload);\n', [1]),
+            ('prototype-array-destructure', '[target.__proto__] = payload;\n', [1]),
+            ('prototype-merge-receiver', 'Object.assign(target.__proto__, payload);\n', [1]),
+            ('prototype-setter-api', 'Object.defineProperty(target.__proto__, "polluted", {value: true});\n', [1]),
+            ('prototype-equality', 'const equal = target.__proto__ === other;\n', []),
+            ('unrelated-update-read', 'count++;\nconst value = target.__proto__;\n', []),
+            ('delete-method-read', 'collection.delete();\nconst value = target.__proto__;\n', []),
+            ('prototype-template-code', 'const message = `result ${target.__proto__ = payload}`;\n', [1]),
+            ('prototype-template-text', 'const message = `target.__proto__ = payload`;\n', []),
+            ('prototype-marker', 'target.__proto__ = payload; // ubs:ignore[js.security.prototype-pollution]\n', []),
+        ]
+        for label, source, expected in cases:
+            with self.subTest(case=label):
+                self.scan(label, source, expected)
+
+    def test_null_literal_receiver_proof_preserves_mutations_and_copy_hazards(self):
+        cases = [
+            ('literal-null-write', 'const target = {__proto__: null};\n'
+             'target[req.body.key] = req.body.value;\n', []),
+            ('literal-null-trailing-comma', 'const target = {__proto__: null,};\n'
+             'target[req.body.key] = req.body.value;\n', []),
+            ('literal-null-alias', 'const target = {"__proto__": /* dictionary */ (null)};\n'
+             'const alias = target;\nObject.assign(alias, req.body);\n', []),
+            ('literal-null-own-proto', 'const target = {__proto__: null};\n'
+             'target["__proto__"] = req.body;\n', []),
+            ('literal-null-copy', 'const target = {__proto__: null};\n'
+             'target[req.body.key] = req.body.value;\nObject.assign({}, target);\n', [3]),
+            ('literal-null-mutated', 'const target = {__proto__: null};\n'
+             'Object.setPrototypeOf(target, {});\ntarget[req.body.key] = 1;\n', [3]),
+            ('literal-null-escaped', 'const target = {__proto__: null};\n'
+             'mutate(target);\ntarget[req.body.key] = 1;\n', [3]),
+            ('literal-null-deep', 'const target = {__proto__: null};\n'
+             'lodash.merge(target, req.body);\n', [2]),
+            ('computed-null-is-data', 'const target = {["__proto__"]: null};\n'
+             'Object.assign(target, req.body);\n', [2]),
+            ('null-field-is-not-setter', 'const target = {nested: {__proto__: null}};\n'
+             'target[req.body.key] = 1;\n', [2]),
+            ('null-literal-accessor', 'const target = {__proto__: null, set color(value) { consume(value); }};\n'
+             'Object.assign(target, req.body);\n', [2]),
+            ('null-literal-spread', 'const target = {__proto__: null, ...unresolved};\n'
+             'Object.assign(target, req.body);\n', [2]),
+        ]
+        for label, source, expected in cases:
+            with self.subTest(case=label):
+                self.scan(label, source, expected)
+
+    def test_prototype_aliases_keep_writes_without_reporting_bare_reads(self):
+        cases = [
+            ('alias-read', 'const proto = target.__proto__;\nconst alias = proto;\n', []),
+            ('alias-write', 'const proto = target.__proto__;\nproto[key] = value;\n', [2]),
+            ('alias-member-write', 'const proto = target.constructor.prototype;\nproto.enabled = true;\n', [2]),
+            ('alias-merge', 'const proto = target.__proto__;\nObject.assign(proto, payload);\n', [2]),
+            ('alias-setter-api', 'const proto = target.__proto__;\nObject.defineProperty(proto, "enabled", {value: true});\n', [2]),
+            ('alias-update', 'const proto = target.__proto__;\nproto.count++;\n', [2]),
+            ('alias-delete', 'const proto = target.__proto__;\ndelete proto.enabled;\n', [2]),
+            ('alias-destructure', 'const proto = target.__proto__;\n({item: proto.enabled} = payload);\n', [2]),
+            ('alias-copy', 'const proto = target.__proto__;\nconst alias = proto;\nalias.enabled = true;\n', [3]),
+            ('alias-rebind', 'let proto = target.__proto__;\nproto = {};\nproto.enabled = true;\n', []),
+            ('alias-conditional-rebind', 'let proto = target.__proto__;\nif (flag) { proto = {}; }\nproto.enabled = true;\n', [3]),
+            ('alias-block-shadow', 'const proto = target.__proto__;\n{ const proto = {}; proto.enabled = true; }\n', []),
+            ('alias-block-restored', 'const proto = target.__proto__;\n{ const proto = {}; proto.enabled = true; }\nproto.enabled = true;\n', [3]),
+            ('alias-boolean-read', 'const proto = target.__proto__;\nconst equal = proto === other;\n', []),
+        ]
+        for label, source, expected in cases:
+            with self.subTest(case=label):
+                self.scan(label, source, expected)
+
+    def test_prototype_references_cannot_escape_unmodeled_effects_silently(self):
+        cases = [
+            ('function-escape', 'function poison(target, key, value) { target[key] = value; }\n'
+             'const obj = {};\npoison(obj.__proto__, "polluted", 7);\n', [3]),
+            ('alias-call-escape', 'const proto = target.__proto__;\nmutate(proto);\n', [2]),
+            ('computed-call-escape', 'handlers[name](target.__proto__);\n', [1]),
+            ('indirect-call-escape', '(mutate)(target.__proto__);\n', [1]),
+            ('method-receiver-escape', 'target.__proto__.mutate();\n', [1]),
+            ('alias-method-escape', 'const proto = target.__proto__;\nproto.mutate();\n', [2]),
+            ('method-name-is-not-proof', 'const collection = {delete(value) { value.polluted = 7; }};\n'
+             'collection.delete(target.__proto__);\n', [2]),
+            ('nested-container-escape', 'const obj = {};\n'
+             'const box = {nested: {reference: obj.__proto__}};\n'
+             'box.nested.reference.polluted = 7;\n', [2]),
+            ('array-container-escape', 'const box = [target.__proto__];\n', [1]),
+            ('nested-array-escape', 'const box = [[target.__proto__]];\n', [1]),
+            ('shorthand-container-escape', 'const proto = target.__proto__;\nconst box = {proto};\n', [2]),
+            ('property-store-escape', 'box.reference = target.__proto__;\n', [1]),
+            ('null-property-store-escape', 'const box = {__proto__: null};\n'
+             'box.reference = target.__proto__;\n', [2]),
+            ('returned-reference', 'function prototypeOf(target) { return target.__proto__; }\n', [1]),
+            ('concise-returned-reference', 'const prototypeOf = target => target.__proto__;\n', [1]),
+            ('thrown-reference', 'throw target.__proto__;\n', [1]),
+            ('outer-store-escape', 'let saved;\nfunction capture() { saved = target.__proto__; }\n', [2]),
+            ('unknown-store-escape', 'saved = target.__proto__;\n', [1]),
+            ('local-store-is-tracked', 'function observe(target) {\n'
+             'let saved;\nsaved = target.__proto__;\nconst same = saved;\n}\n', []),
+            ('rebound-before-call', 'let proto = target.__proto__;\nproto = {};\nmutate(proto);\n', []),
+            ('scalar-read-is-not-reference', 'const equal = target.__proto__ === other;\nconsume(equal);\n', []),
+            ('computed-key-read', 'const proto = target.__proto__;\nconst value = target[proto];\n', []),
+            ('null-dictionary-call', 'const dictionary = {__proto__: null};\nconsume(dictionary);\n', []),
+            ('nested-null-dictionary', 'const box = {nested: {__proto__: null}};\n', []),
+            ('escape-marker', 'const proto = target.__proto__;\n'
+             'consume(proto); // ubs:ignore[js.security.prototype-pollution]\n', []),
+            ('escape-source-marker', 'const proto = target.__proto__; // ubs:ignore\nconsume(proto);\n', [2]),
+        ]
+        for label, source, expected in cases:
+            with self.subTest(case=label):
+                self.scan(label, source, expected)
+
     def test_property_keys_rebind_without_confusing_tainted_values(self):
         cases = [
             ('fixed-value', 'const value = req.body.value;\ntarget["color"] = value;\n', []),
@@ -7540,6 +7668,30 @@ if (plain.inherited !== true) throw new Error('ordinary receiver control did not
 const safe = Object.assign(Object.create(null), payload);
 if (Object.getPrototypeOf(safe) !== null || safe.inherited !== undefined) throw new Error('null receiver changed prototype');
 if (Object.assign({}, safe).inherited !== true) throw new Error('copying the stored key lost the unsafe property');
+const literal = {"__proto__": /* deliberate dictionary */ (null)};
+const alias = literal;
+Object.assign(alias, payload);
+if (Object.getPrototypeOf(literal) !== null || literal.inherited !== undefined) throw new Error('literal receiver changed prototype');
+if (Object.assign({}, literal).inherited !== true) throw new Error('literal copy lost the unsafe property');
+const ordinary = {};
+const previous = ordinary.__proto__;
+if (Object.getPrototypeOf(ordinary) !== previous) throw new Error('prototype read changed the receiver');
+ordinary.__proto__ = {inherited: true};
+if (ordinary.inherited !== true) throw new Error('explicit prototype write did not affect inheritance');
+const prototypeAlias = ordinary.__proto__;
+prototypeAlias.changed = true;
+if (ordinary.changed !== true) throw new Error('prototype alias write did not affect inheritance');
+let settersRun = 0;
+const accessorTarget = {__proto__: null, set color(value) { settersRun++; }};
+Object.assign(accessorTarget, {color: 'blue'});
+if (settersRun !== 1) throw new Error('own setter on a null receiver was not invoked');
+function poison(target, key, value) { target[key] = value; }
+const escaped = {};
+poison(escaped.__proto__, 'ubs_escape_call', 7);
+if (({}).ubs_escape_call !== 7) throw new Error('function escape did not affect inheritance');
+const box = {nested: {reference: escaped.__proto__}};
+box.nested.reference.ubs_escape_container = 7;
+if (({}).ubs_escape_container !== 7) throw new Error('nested-container escape did not affect inheritance');
 '''
         fixture = self.directory / 'runtime-contract.js'
         fixture.write_text(source, encoding='utf-8')
@@ -7567,6 +7719,18 @@ class PrototypePollutionPublicTests(unittest.TestCase):
     def programs(clean):
         if clean:
             return {
+                'null-literal.js': ('const target = {"__proto__": /* dictionary */ (null)};\n'
+                                     'const alias = target;\nObject.assign(alias, req.body);\n', []),
+                'prototype-reads.js': ('const first = target.__proto__;\n'
+                                        'const second = target["__proto__"];\n'
+                                        'const third = target.constructor.prototype;\n', []),
+                'prototype-text.js': ('// target.__proto__ = payload;\n'
+                                       'const example = "target.__proto__ = payload";\n'
+                                       'const pattern = /constructor.prototype/;\n', []),
+                'prototype-alias-rebound.js': ('let proto = target.__proto__;\n'
+                                                'proto = {};\nproto.enabled = true;\n', []),
+                'null-dictionary-call.js': ('function consume(value) { return value; }\n'
+                                            'const dictionary = {__proto__: null};\nconsume(dictionary);\n', []),
                 'null-receiver.js': ('const target = Object.create(null);\n'
                                      'target[req.body.key] = req.body.value;\n'
                                      'Object.assign(target, req.body);\n', []),
@@ -7581,6 +7745,27 @@ class PrototypePollutionPublicTests(unittest.TestCase):
                                           'Object.assign(target, payload); // ubs:ignore[js.security.prototype-pollution]\n', []),
             }
         return {
+            'prototype-function-escape.js': ('function poison(target, key, value) { target[key] = value; }\n'
+                                              'const obj = {};\npoison(obj.__proto__, "polluted", 7);\n', [3]),
+            'prototype-container-escape.js': ('const obj = {};\n'
+                                               'const box = {nested: {reference: obj.__proto__}};\n'
+                                               'box.nested.reference.polluted = 7;\n', [2]),
+            'prototype-array-escape.js': ('const box = [target.__proto__];\n', [1]),
+            'prototype-computed-call-escape.js': ('handlers[name](target.__proto__);\n', [1]),
+            'prototype-return-escape.js': ('function prototypeOf(target) { return target.__proto__; }\n', [1]),
+            'prototype-outer-store-escape.js': ('let saved;\nfunction capture() { saved = target.__proto__; }\n', [2]),
+            'prototype-alias-write.js': ('const proto = target.__proto__;\nproto[key] = value;\n', [2]),
+            'prototype-alias-merge.js': ('const proto = target.constructor.prototype;\nObject.assign(proto, payload);\n', [2]),
+            'null-literal-accessor.js': ('const target = {__proto__: null, set color(value) { consume(value); }};\n'
+                                         'Object.assign(target, req.body);\n', [2]),
+            'explicit-prototype.js': ('target.__proto__ = payload;\n', [1]),
+            'computed-prototype.js': ('target["__proto__"] = payload;\n', [1]),
+            'constructor-prototype.js': ('target.constructor.prototype.admin = true;\n', [1]),
+            'prototype-update.js': ('target.__proto__.count++;\n', [1]),
+            'prototype-delete.js': ('delete target.__proto__.admin;\n', [1]),
+            'prototype-destructure.js': ('({item: target.__proto__} = payload);\n', [1]),
+            'prototype-merge-receiver.js': ('Object.assign(target.__proto__, payload);\n', [1]),
+            'non-null-literal.js': ('const imports = {__proto__: null || payload};\n', [1]),
             'identity-safe-merge.js': ('function safeMerge(value) { return value; }\n'
                                         'const payload = safeMerge(req.body);\n'
                                         'Object.assign(target, payload);\n', [3]),

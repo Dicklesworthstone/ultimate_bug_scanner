@@ -1379,6 +1379,205 @@ class JVMRequestReceiverIdentityTests(unittest.TestCase):
         (self.root / "observations.json").write_text(json.dumps(observations, indent=2), encoding="utf-8")
 
     @classmethod
+    def servlet_collections(cls, language, namespace):
+        """Servlet parameters/headers expose values; their sizes do not.
+
+        ServletRequest.getParameterMap returns Map<String, String[]> and
+        getParameterNames/getHeaders return Enumeration<String>. These API
+        contracts are independent of the receiving variable's name.
+        https://jakarta.ee/specifications/servlet/6.1/apidocs/jakarta.servlet/jakarta/servlet/ServletRequest.html
+        https://jakarta.ee/specifications/servlet/6.1/apidocs/jakarta.servlet/jakarta/servlet/http/HttpServletRequest.html
+        """
+        original = dict(cls.cases(language, namespace))["renamed_receiver"]
+        getter = 'incoming.getParameter("next")'
+
+        def case(expression, *, before="", members="", unsafe=True):
+            source = original.replace(getter, expression).replace(
+                "class RequestProbe {", "class RequestProbe {\n" + members)
+            declaration = "String value" if language == "java" else "var value"
+            source = source.replace(declaration + " = ", before + declaration + " = ")
+            if not unsafe:
+                for policy in ("redirect", "header", "ssrf", "path"):
+                    source = source.replace("// expect-" + policy, "// fixed or metadata")
+            return source
+
+        values = 'incoming.getParameterValues("next")'
+        mapping = 'incoming.getParameterMap()'
+        enumerated = 'incoming.getHeaders("X-Next")'
+        map_element = '.get("next")[0]' if language == "java" else '.get("next")!![0]'
+        yield "parameter_array", case(values + "[0]")
+        yield "parameter_map", case(mapping + map_element)
+        yield "parameter_names", case("incoming.getParameterNames().nextElement()")
+        yield "header_values", case(enumerated + ".nextElement()")
+        yield "header_names", case("incoming.getHeaderNames().nextElement()")
+        yield "parameter_keys", case(mapping + ".keySet().iterator().next()") if language == "java" else case(
+            mapping + ".keys.iterator().next()")
+        yield "parameter_value_view", case(mapping + ".values().iterator().next()[0]") if language == "java" else case(
+            mapping + ".values.iterator().next()[0]")
+        yield "header_iterator", case(enumerated + ".asIterator().next()")
+        yield "base_parameter_array", case(values + "[0]").replace(
+            "HttpServletRequest incoming", "ServletRequest incoming").replace(
+            "incoming: HttpServletRequest", "incoming: ServletRequest")
+        yield "base_parameter_map", case(mapping + map_element).replace(
+            "HttpServletRequest incoming", "ServletRequest incoming").replace(
+            "incoming: HttpServletRequest", "incoming: ServletRequest")
+        array_declaration = "String[] selected" if language == "java" else "val selected"
+        map_declaration = "java.util.Map<String, String[]> selected" if language == "java" else "val selected"
+        yield "array_alias", case("selected[0]", before=array_declaration + " = " + values + ";\n")
+        yield "map_alias", case('selected' + map_element, before=map_declaration + " = " + mapping + ";\n")
+        element = case(values + "[0]")
+        declaration = "String value" if language == "java" else "var value"
+        loop = "for (String value : " + values + ") {" if language == "java" else "for (value in " + values + ") {"
+        element = element.replace(declaration + " = " + values + "[0];", loop).replace("\n}\n}\n", "\n}\n}\n}\n")
+        yield "array_iteration", element
+        yield "array_iteration_sanitizer", element.replace(
+            'response.setHeader("X-Value", value); // expect-header',
+            'response.setHeader("X-Value", value.replace("\\r", "").replace("\\n", "")); // controls removed')
+        helper = ("String[] read(HttpServletRequest selected) { return selected.getParameterValues(\"next\"); }"
+                  if language == "java" else
+                  'fun read(selected: HttpServletRequest): Array<String> { return selected.getParameterValues("next") }')
+        yield "helper_array", case("read(incoming)[0]", members=helper)
+        helper = ("String first(String[] selected) { return selected[0]; }" if language == "java" else
+                  "fun first(selected: Array<String>): String { return selected[0] }")
+        yield "helper_element", case("first(" + values + ")", members=helper)
+        yield "header_sanitizer", case(enumerated + '.nextElement().replace("\\r", "").replace("\\n", "")').replace(
+            "// expect-header", "// header controls removed")
+        yield "array_overwrite", case('"/fixed"', before=array_declaration + " = " + values + ";\n", unsafe=False)
+        if language == "java":
+            length, size = values + ".length", mapping + ".size()"
+            literal_array = 'new String[] {"/fixed"}'
+            local = ('static class Local { String[] getParameterValues(String key) { return ' + literal_array + '; }\n'
+                     'java.util.Map<String, String[]> getParameterMap() { return java.util.Map.of("next", '
+                     + literal_array + '); } }')
+            count_helper = "int count(String[] selected) { return selected.length; }"
+            wrap = lambda expression: "String.valueOf(" + expression + ")"
+        else:
+            length, size = values + ".size", mapping + ".size"
+            local = ('class Local { fun getParameterValues(key: String): Array<String> { return arrayOf("/fixed") }\n'
+                     'fun getParameterMap(): Map<String, Array<String>> { return mapOf("next" to arrayOf("/fixed")) } }')
+            count_helper = "fun count(selected: Array<String>): Int { return selected.size }"
+            wrap = lambda expression: "(" + expression + ").toString()"
+            yield "property_map", case('incoming.parameterMap["next"]!![0]')
+            yield "property_names", case("incoming.parameterNames.nextElement()")
+            yield "property_header_names", case("incoming.headerNames.nextElement()")
+            yield "property_map_size", case("incoming.parameterMap.size.toString()", unsafe=False)
+            yield "property_map_nullable", case('incoming?.parameterMap?.get("next")!![0]').replace(
+                "incoming: HttpServletRequest", "incoming: HttpServletRequest?")
+            overload = ('\nfun HttpServletRequest.getParameterValues(index: Int): Array<String> '
+                        '{ return arrayOf("/fixed") }\n')
+            for receiver in ("incoming", "request"):
+                yield "numeric_getter_extension_" + receiver, case(
+                    "incoming.getParameterValues(0)[0]", unsafe=False).replace("incoming", receiver) + overload
+            yield "list_getter_extension", case('incoming.getParameterValues(listOf("next"))[0]', unsafe=False) + (
+                '\nfun HttpServletRequest.getParameterValues(keys: List<String>): Array<String> '
+                '{ return arrayOf("/fixed") }\n')
+            yield "contains_all_string_extension", case(
+                'incoming.parameterMap.keys.containsAll(incoming.getParameter("next"))') + (
+                '\nfun Collection<String>.containsAll(text: String): String { return text }\n')
+            yield "contains_int_extension", case("incoming.parameterMap.keys.contains(0)") + (
+                '\nfun Collection<String>.contains(index: Int): String { return first() }\n')
+            yield "contains_transformed_string_extension", case(
+                'incoming.parameterMap.keys.contains(incoming.getParameter("next").toBox())') + (
+                '\nclass Box\nfun String.toBox(): Box { return Box() }\n'
+                'fun Collection<String>.contains(value: Box): String { return first() }\n')
+            yield "array_get_string_extension", case(
+                values + '.get("selected").replace("\\r", "").replace("\\n", "")') + (
+                '\nfun Array<String>.get(key: String): StringBuilder { return StringBuilder(this[0]) }\n'
+                'fun StringBuilder.replace(old: String, replacement: String): String { return toString() }\n')
+            yield "array_get_index_sanitizer", case(
+                values + '.get(0).replace("\\r", "").replace("\\n", "")').replace(
+                "// expect-header", "// header controls removed")
+            yield "array_get_long_extension", case(
+                values + '.get(0L).replace("\\r", "").replace("\\n", "")') + (
+                '\nfun Array<String>.get(key: Long): StringBuilder { return StringBuilder(this[0]) }\n'
+                'fun StringBuilder.replace(old: String, replacement: String): String { return toString() }\n')
+            yield "map_contains_key", case(
+                'incoming.parameterMap.containsKey(incoming.getParameter("next")).toString()', unsafe=False)
+            yield "collection_contains_value", case(
+                'incoming.parameterMap.keys.contains(incoming.getParameter("next")).toString()', unsafe=False)
+            yield "collection_contains_all_values", case(
+                "incoming.parameterMap.keys.containsAll(incoming.parameterMap.keys).toString()", unsafe=False)
+        yield "array_length", case(wrap(length), unsafe=False)
+        yield "map_size", case(wrap(size), unsafe=False)
+        yield "map_is_empty", case(wrap(mapping + ".isEmpty()"), unsafe=False)
+        yield "enumeration_has_more", case(wrap(enumerated + ".hasMoreElements()"), unsafe=False)
+        yield "iterator_has_next", case(wrap(enumerated + ".asIterator().hasNext()"), unsafe=False)
+        yield "helper_length", case(wrap("count(" + values + ")"), members=count_helper, unsafe=False)
+        for name, expression in (("local_array", values + "[0]"), ("local_map", mapping + map_element)):
+            yield name, case(expression, members=local, unsafe=False).replace(
+                "HttpServletRequest incoming", "Local incoming").replace(
+                "incoming: HttpServletRequest", "incoming: Local")
+        yield "shadowed_api_array", case(values + "[0]", members=local.replace("Local", "HttpServletRequest"), unsafe=False)
+        yield "conventional_name_local_array", case(values + "[0]", members=local, unsafe=False).replace(
+            "HttpServletRequest incoming", "Local incoming").replace(
+            "incoming: HttpServletRequest", "incoming: Local").replace("incoming", "request")
+
+    def test_servlet_collection_values_and_metadata(self):
+        from ubs_core.analyzers.taint_java_redirect import RedirectEngine
+        from ubs_core.analyzers.taint_java_traversal import Engine
+        from ubs_core.java_detectors.header_injection import HeaderEngine
+        from ubs_core.java_detectors.ssrf_outbound_url import SSRFEngine
+
+        observations = []
+        for language in ("java", "kotlin"):
+            for namespace in ("jakarta", "javax"):
+                for name, source in self.servlet_collections(language, namespace):
+                    path = self.root / (language + "_" + namespace + "_" + name + (".java" if language == "java" else ".kt"))
+                    path.write_text(source, encoding="utf-8")
+                    for policy, engine in (("redirect", RedirectEngine), ("header", HeaderEngine),
+                                           ("ssrf", SSRFEngine), ("path", Engine)):
+                        with self.subTest(language=language, namespace=namespace, case=name, policy=policy):
+                            expected = [line for line, content in enumerate(source.splitlines(), 1)
+                                        if "// expect-" + policy in content]
+                            started = time.monotonic()
+                            actual = sorted(engine(path, source).analyze())
+                            observations.append({"language": language, "namespace": namespace, "case": name, "policy": policy,
+                                                 "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+                                                 "expected_lines": expected, "actual_lines": actual,
+                                                 "elapsed_s": time.monotonic() - started})
+                            self.assertEqual(actual, expected)
+        (self.root / "collection-observations.json").write_text(json.dumps(observations, indent=2), encoding="utf-8")
+
+    def test_servlet_collection_initializers_and_limits_remain_explicit(self):
+        from ubs_core.analyzers.taint_java_redirect import RedirectEngine
+        from ubs_core.analyzers.taint_java_traversal import Engine
+        from ubs_core.java_detectors.header_injection import HeaderEngine
+        from ubs_core.java_detectors.ssrf_outbound_url import SSRFEngine
+        from ubs_core.taint_flow import AnalysisLimit
+
+        for language in ("java", "kotlin"):
+            source = dict(self.servlet_collections(language, "jakarta"))["parameter_array"]
+            if language == "java":
+                field = source.replace("class RequestProbe {", "class RequestProbe {\n"
+                    'HttpServletRequest incoming;\nString[] selected = incoming.getParameterValues("next");').replace(
+                    "HttpServletRequest incoming, ", "").replace('incoming.getParameterValues("next")[0]', "selected[0]")
+            else:
+                field = source.replace("class RequestProbe {", "class RequestProbe(val incoming: HttpServletRequest) {\n"
+                    'val selected = incoming.getParameterValues("next")').replace(
+                    "incoming: HttpServletRequest, ", "").replace('incoming.getParameterValues("next")[0]', "selected[0]")
+            path = self.root / ("CollectionField.java" if language == "java" else "CollectionField.kt")
+            path.write_text(field, encoding="utf-8")
+            for engine in (RedirectEngine, HeaderEngine, SSRFEngine, Engine):
+                with self.subTest(language=language, engine=engine.__name__):
+                    with self.assertRaisesRegex(ValueError, "initialization.*incomplete"):
+                        engine(path, field).analyze()
+                    bounded = engine(path, source)
+                    bounded.budget.remaining = 0
+                    with self.assertRaises(AnalysisLimit):
+                        bounded.analyze()
+                    with self.assertRaisesRegex(ValueError, "Unbalanced.*incomplete"):
+                        engine(path, source + "{").analyze()
+                    if language == "kotlin":
+                        unknown_key = source.replace('getParameterValues("next")', 'getParameterValues(key())') + (
+                            '\nfun key(): String { return "next" }\n')
+                        shadowed_factory = source.replace('getParameterValues("next")',
+                                                          'getParameterValues(listOf("next"))') + (
+                            '\nfun listOf(key: String): String { return key }\n')
+                        for unresolved in (unknown_key, shadowed_factory):
+                            with self.assertRaisesRegex(ValueError, "String-key type proof.*incomplete"):
+                                engine(path, unresolved).analyze()
+
+    @classmethod
     def kotlin_properties(cls, namespace):
         """Java no-argument getters and Kotlin synthetic properties are equivalent.
 
@@ -1633,8 +1832,14 @@ class Example {
             directory.mkdir()
             expected = []
             selected = [(name, cases[name]) for name in ("renamed_receiver", "helper_receiver", "fake_named_request")]
+            collections = dict(self.servlet_collections(language, "jakarta"))
+            for name in ("parameter_array", "parameter_map", "header_values", "array_iteration_sanitizer",
+                         "helper_element", "array_length", "map_size", "conventional_name_local_array"):
+                selected.append((name, collections[name]))
             if language == "kotlin":
                 selected.extend(self.kotlin_overloads())
+                for name in ("property_map", "property_map_nullable", "property_header_names", "numeric_getter_extension_request"):
+                    selected.append((name, collections[name]))
                 properties = dict(self.kotlin_properties("jakarta"))
                 for name in (
                     "property_queryString", "property_helper_value", "property_member_chain",
@@ -1694,6 +1899,45 @@ class Example {
                 self.assertEqual((repaired["hits"], repaired["misses"]), (0, 1), repaired)
                 selected.write_text(source, encoding="utf-8")
                 restored = self.scan(language, directory, "module", "json", expected, "restored-receiver",
+                                     options=options, cache=True)
+                self.assertEqual((restored["hits"], restored["misses"]), (1, 0), restored)
+
+    def test_public_servlet_collection_selection_suppression_and_cache(self):
+        for language in ("java", "kotlin"):
+            with self.subTest(language=language):
+                directory = self.root / ("collection-selection-" + language)
+                directory.mkdir()
+                cases = dict(self.servlet_collections(language, "javax"))
+                source = cases["parameter_map"] if language == "java" else cases["parameter_array"]
+                suffix = ".java" if language == "java" else ".kt"
+                selected = directory / ("Selected" + suffix)
+                selected.write_text(source, encoding="utf-8")
+                (directory / ("Unselected" + suffix)).write_text("class Broken {", encoding="utf-8")
+                listing = directory / "files.nul"
+                listing.write_bytes(os.fsencode(selected) + b"\0")
+                options = ("--files-from=" + str(listing),)
+                expected = self.expected_sites(language, source, selected.name)
+                cold = self.scan(language, directory, "module", "json", expected, "collection-cold", options=options, cache=True)
+                warm = self.scan(language, directory, "module", "sarif", expected, "collection-warm", options=options, cache=True)
+                self.assertEqual((cold["hits"], cold["misses"]), (0, 1), cold)
+                self.assertEqual((warm["hits"], warm["misses"]), (1, 0), warm)
+                self.scan(language, selected, "runner", "json", expected, "collection-selected-runner")
+
+                suppressed = source.replace("// expect-redirect", "// ubs:ignore[" + language + ".taint.open_redirect]")
+                selected.write_text(suppressed, encoding="utf-8")
+                changed = self.scan(language, directory, "module", "json",
+                                    self.expected_sites(language, suppressed, selected.name), "collection-suppressed",
+                                    options=options, cache=True)
+                self.assertEqual((changed["hits"], changed["misses"]), (0, 1), changed)
+                disabled = self.scan(language, directory, "module", "json", [], "collection-disabled-security",
+                                     options=(*options, "--only=1"), cache=True)
+                self.assertEqual(disabled["hits"], 0, disabled)
+                selected.write_text(cases["conventional_name_local_array"], encoding="utf-8")
+                repaired = self.scan(language, directory, "module", "json", [], "collection-local-receiver",
+                                     options=options, cache=True)
+                self.assertEqual((repaired["hits"], repaired["misses"]), (0, 1), repaired)
+                selected.write_text(source, encoding="utf-8")
+                restored = self.scan(language, directory, "module", "json", expected, "collection-restored",
                                      options=options, cache=True)
                 self.assertEqual((restored["hits"], restored["misses"]), (1, 0), restored)
 

@@ -5307,7 +5307,15 @@ fun handler(request: Request, response: Response) {
             engine = Engine(self.root / ('Types' + suffix), '')
             for declaration in declarations:
                 with self.subTest(declaration=declaration):
-                    self.assertEqual(engine.parameter_tags(declaration), frozenset())
+                    # A real String array now carries its container kind so
+                    # extraction and length queries have distinct semantics.
+                    # It must still never inherit String/Path guard proofs.
+                    expected = (frozenset({'jvm-collection:string-array'})
+                                if declaration in {'String[] target', 'String target[]', 'target: Array<String>'}
+                                else frozenset())
+                    actual = engine.parameter_tags(declaration)
+                    self.assertEqual(actual, expected)
+                    self.assertFalse(actual & {'jvm-string', 'jvm-path'})
 
     def test_path_text_prefix_is_not_component_containment(self):
         for conversion in ('candidate.toString()', 'candidate.normalize().toString()'):

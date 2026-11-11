@@ -64,10 +64,22 @@ SERVLET_TYPES = frozenset({'jakarta.servlet.ServletRequest', 'javax.servlet.Serv
 HTTP_SERVLET_TYPES = frozenset({'jakarta.servlet.http.HttpServletRequest', 'javax.servlet.http.HttpServletRequest'})
 REQUEST_TYPES = SERVLET_TYPES | HTTP_SERVLET_TYPES
 REQUEST_GETTERS = {'getParameter': 1, 'getHeader': 1, 'getQueryString': 0,
-                   'getRequestURI': 0, 'getPathInfo': 0, 'getServletPath': 0}
+                   'getRequestURI': 0, 'getPathInfo': 0, 'getServletPath': 0,
+                   'getParameterValues': 1, 'getParameterMap': 0, 'getParameterNames': 0,
+                   'getHeaders': 1, 'getHeaderNames': 0}
+SERVLET_BASE_GETTERS = frozenset({'getParameter', 'getParameterValues', 'getParameterMap', 'getParameterNames'})
+REQUEST_COLLECTIONS = {'getParameterValues': 'string-array', 'getParameterMap': 'parameter-map',
+                       'getParameterNames': 'string-enumeration', 'getHeaders': 'string-enumeration',
+                       'getHeaderNames': 'string-enumeration'}
+COLLECTION_PREFIX = 'jvm-collection:'
+COLLECTION_KINDS = frozenset({'string-array', 'parameter-map', 'string-enumeration',
+                             'string-collection', 'array-collection', 'string-iterator', 'array-iterator'})
+COLLECTION_TAGS = frozenset(COLLECTION_PREFIX + kind for kind in COLLECTION_KINDS)
 REQUEST_GETTER_RE = re.compile(r'\.\s*(?:' + '|'.join(REQUEST_GETTERS) + r')\s*\(')
 REQUEST_PROPERTIES = {'queryString': 'getQueryString', 'requestURI': 'getRequestURI',
-                      'pathInfo': 'getPathInfo', 'servletPath': 'getServletPath'}
+                      'pathInfo': 'getPathInfo', 'servletPath': 'getServletPath',
+                      'parameterMap': 'getParameterMap', 'parameterNames': 'getParameterNames',
+                      'headerNames': 'getHeaderNames'}
 REQUEST_PROPERTY_RE = re.compile(r'\.\s*(?:' + '|'.join(REQUEST_PROPERTIES) + r')\b')
 REQUEST_PROPERTY_PREFIX_RE = re.compile(
     r'(?:this\s*\.\s*)?[A-Za-z_]\w*' + REQUEST_PROPERTY_RE.pattern)
@@ -629,7 +641,11 @@ class Engine:
                 parameter_type = re.fullmatch(r'\s*[A-Za-z_]\w*\s*:\s*([\w.]+\??)\s*', declaration)
                 if parameter_type:
                     actual = index.resolve_type(parameter_type.group(1), signature.key)
-            if actual in (HTTP_SERVLET_TYPES if property_ else REQUEST_TYPES):
+            member = re.sub(r'\s+', '', getter.group()).lstrip('.').rstrip('(')
+            method = REQUEST_PROPERTIES[member] if property_ else member
+            arity = 0 if property_ else sum(1 for _ in self.parser.parts(getter.end(), self.parser.pairs[getter.end() - 1]))
+            if (actual in (REQUEST_TYPES if method in SERVLET_BASE_GETTERS else HTTP_SERVLET_TYPES)
+                    and self.request_getter_signature(method, offset, arity)):
                 if signature is not None:
                     raise ValueError('Executable Kotlin Servlet parameter default needs call binding; analysis is incomplete')
                 raise ValueError('Executable Java/Kotlin Servlet initialization needs field-state analysis; analysis is incomplete')
@@ -869,9 +885,30 @@ class Engine:
                 types = frozenset()
         return value if selected else None
 
+    def request_getter_signature(self, method, offset, arity):
+        if arity != REQUEST_GETTERS[method]:
+            return False
+        if method in REQUEST_COLLECTIONS and arity == 1:
+            # Kotlin may choose a same-arity extension for a non-String key.
+            # Unresolved applicability cannot establish a request source or
+            # silently turn a genuine request getter into a clean call.
+            opening = self.code.find('(', offset)
+            if opening in self.parser.pairs:
+                spans = list(self.parser.parts(opening + 1, self.parser.pairs[opening]))
+                if len(spans) == 1:
+                    kind = self.request_argument_kind(*spans[0])
+                    if kind is None and self.parser.kotlin:
+                        raise ValueError('Kotlin Servlet collection getter needs String-key type proof; analysis is incomplete')
+                    if kind in {'number', 'other'}:
+                        return False
+        return True
+
     def request_call(self, name, arguments, offset, bindings, state, receiver=CLEAN):
         if not self.request_receiver_sources:
             return None
+        collection = self.request_collection_access(name, arguments, offset, bindings, state, receiver)
+        if collection is not None:
+            return collection
         ktor = self.ktor_access(name, arguments, offset, bindings, state, receiver)
         if ktor is not None:
             return ktor
@@ -888,11 +925,152 @@ class Engine:
         if not types:
             return None
         arity = 0 if property_ else len(arguments)
-        if arity != REQUEST_GETTERS[method] or (method != 'getParameter' and not types & HTTP_SERVLET_TYPES):
+        if (not self.request_getter_signature(method, offset, arity)
+                or method not in SERVLET_BASE_GETTERS and not types & HTTP_SERVLET_TYPES):
             # A Kotlin extension/overload can have this name and return one
             # of its arguments. An unsupported signature is not a sanitizer.
             return None
-        return retag(self.source(offset, name if property_ else name + '('), add=frozenset({'jvm-string'}))
+        source = self.source(offset, name if property_ else name + '(')
+        if method in REQUEST_COLLECTIONS:
+            return self.collection_value(source, REQUEST_COLLECTIONS[method])
+        return retag(source, add=frozenset({'jvm-string'}))
+
+    @staticmethod
+    def collection_value(value, kind):
+        """Carry request contents separately from the container's metadata."""
+        tags = frozenset({'jvm-string' if kind == 'string' else COLLECTION_PREFIX + kind})
+        return retag(value, add=tags, remove=COLLECTION_TAGS | frozenset({'jvm-string', 'jvm-path'}) | PATH_PROOF_TAGS)
+
+    def collection_argument_kind(self, value, span):
+        """Prove native Kotlin key/index applicability before retagging values."""
+        kinds = set()
+        for trace in value:
+            shapes = trace.tags & COLLECTION_TAGS
+            if len(shapes) == 1:
+                kinds.add(next(iter(shapes)).removeprefix(COLLECTION_PREFIX))
+            else:
+                kinds.add(None)
+        if len(kinds) == 1 and None not in kinds:
+            return next(iter(kinds))
+        if span is None:
+            return None
+        low, high = span
+        kind = self.request_argument_kind(low, high)
+        if kind == 'number':
+            # Array.get takes Int, not Long/Double/Char. A same-name extension
+            # for those types must not inherit String sanitizer eligibility.
+            actual = self.request_index().argument_type(low, high)
+            return 'int' if actual == ('api', 'java.lang.Integer') else 'other'
+        return kind
+
+    def collection_member(self, receiver, member, arguments, offset=None, spans=None):
+        """Evaluate selected native collection members, never same-name guesses.
+
+        A source-derived map/array/enumeration transports its contents through
+        extraction. Native size/presence queries instead produce bounded scalar
+        metadata. Every possible receiver must prove the same contract before
+        discarding provenance; an unknown member keeps the ordinary conservative
+        call semantics and loses container identity.
+        """
+        if not receiver:
+            return None
+        kinds = []
+        for trace in receiver:
+            shapes = trace.tags & COLLECTION_TAGS
+            if len(shapes) != 1:
+                return None
+            kinds.append(next(iter(shapes)).removeprefix(COLLECTION_PREFIX))
+        arity = None if arguments is None else len(arguments)
+        actuals = None
+        if self.parser.kotlin and arguments:
+            if spans is None and offset is not None:
+                opening = self.code.find('(', offset)
+                if opening in self.parser.pairs:
+                    spans = list(self.parser.parts(opening + 1, self.parser.pairs[opening]))
+            actuals = [self.collection_argument_kind(value, spans[index] if spans and index < len(spans) else None)
+                       for index, value in enumerate(arguments)]
+        result = None
+        for kind in kinds:
+            if actuals is not None:
+                signatures = {
+                    'parameter-map': {'get': ['string'], '[]': ['string'],
+                                      'getOrDefault': ['string', 'string-array'],
+                                      'containsKey': ['string'], 'containsValue': ['string-array']},
+                    'string-array': {'get': ['int'], '[]': ['int']},
+                    'string-collection': {'contains': ['string'], 'containsAll': ['string-collection']},
+                    'array-collection': {'contains': ['string-array'], 'containsAll': ['array-collection']},
+                }
+                if signatures.get(kind, {}).get(member) != actuals:
+                    return None
+            selected = None
+            if kind == 'parameter-map':
+                if ((member, arity) in {('get', 1), ('getOrDefault', 2)}
+                        or self.parser.kotlin and (member, arity) == ('[]', 1)):
+                    selected = 'string-array'
+                elif ((member, arity) == ('keySet', 0) and not self.parser.kotlin
+                      or (member, arity) == ('keys', None) and self.parser.kotlin):
+                    selected = 'string-collection'
+                elif ((member, arity) == ('values', 0) and not self.parser.kotlin
+                      or (member, arity) == ('values', None) and self.parser.kotlin):
+                    selected = 'array-collection'
+                elif ((member, arity) in {('isEmpty', 0), ('containsKey', 1), ('containsValue', 1)}
+                      or (member, arity) == ('size', None if self.parser.kotlin else 0)):
+                    selected = 'metadata'
+            elif kind == 'string-array':
+                if ((member, arity) in {('[]', 1), ('<foreach>', 0)}
+                        or self.parser.kotlin and (member, arity) == ('get', 1)):
+                    selected = 'string'
+                elif (member, arity) == ('size' if self.parser.kotlin else 'length', None):
+                    selected = 'metadata'
+                elif (member, arity) == ('clone', 0):
+                    selected = kind
+            elif kind == 'string-enumeration':
+                if (member, arity) == ('nextElement', 0):
+                    selected = 'string'
+                elif (member, arity) == ('asIterator', 0):
+                    selected = 'string-iterator'
+                elif (member, arity) == ('hasMoreElements', 0):
+                    selected = 'metadata'
+            elif kind in {'string-collection', 'array-collection'}:
+                if (member, arity) == ('iterator', 0):
+                    selected = kind.replace('collection', 'iterator')
+                elif (member, arity) == ('<foreach>', 0):
+                    selected = 'string' if kind == 'string-collection' else 'string-array'
+                elif ((member, arity) in {('isEmpty', 0), ('contains', 1), ('containsAll', 1)}
+                      or (member, arity) == ('size', None if self.parser.kotlin else 0)):
+                    selected = 'metadata'
+            elif kind in {'string-iterator', 'array-iterator'}:
+                if (member, arity) == ('next', 0):
+                    selected = 'string' if kind == 'string-iterator' else 'string-array'
+                elif (member, arity) == ('hasNext', 0):
+                    selected = 'metadata'
+            if selected is None or result is not None and result != selected:
+                return None
+            result = selected
+        if result == 'metadata':
+            return CLEAN
+        # An untrusted selector does not confer String/array API identity on
+        # itself. The contents carry the selected shape; a default value keeps
+        # its own facts and shape until an actual extraction proves otherwise.
+        value = self.collection_value(receiver, result)
+        if member == 'getOrDefault' and arguments is not None:
+            value = join(value, arguments[1])
+        return value
+
+    def request_collection_access(self, name, arguments, offset, bindings, state, receiver=CLEAN):
+        parts = name.split('.')
+        if len(parts) < 2:
+            return None
+        if parts[0] == 'this' and len(parts) > 2:
+            root, members = '.'.join(parts[:2]), parts[2:]
+        else:
+            root, members = parts[0], parts[1:]
+        value = state.get(bindings.get(root, root), receiver)
+        for position, member in enumerate(members):
+            value = self.collection_member(value, member, arguments if position == len(members) - 1 else None, offset)
+            if value is None:
+                return None
+        return value
 
     def request_argument_kind(self, low, high, seen=()):
         """Bounded static argument evidence for a local String overload.
@@ -962,7 +1140,23 @@ class Engine:
                 # not a cast of that whole call's result. The declaration
                 # index intentionally does not resolve such postfix returns.
                 return None
+        call = re.match(r'([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\s*\(', self.code[low:high])
+        if call and self.parser.pairs.get(low + call.end() - 1) == high - 1:
+            spelling = call.group(1)
+            receiver, _, method = spelling.rpartition('.')
+            if receiver and method in REQUEST_GETTERS and method not in REQUEST_COLLECTIONS:
+                actual = index.receiver_type(low, low + len(receiver))
+                spans = list(self.parser.parts(low + call.end(), high - 1))
+                if (actual in (REQUEST_TYPES if method in SERVLET_BASE_GETTERS else HTTP_SERVLET_TYPES)
+                        and len(spans) == REQUEST_GETTERS[method]
+                        and all(self.request_argument_kind(*span, seen) == 'string' for span in spans)):
+                    return 'string'
         actual = index.argument_type(low, high)
+        if self.parser.kotlin and call and actual is not None and actual[0] != 'api':
+            # The shared nominal index also treats call spellings as possible
+            # constructors. A qualified function can return String; its name
+            # alone cannot prove an incompatible argument type.
+            actual = None
         if actual is not None:
             if actual == ('api', 'java.lang.String'):
                 return 'string'
@@ -979,6 +1173,26 @@ class Engine:
                 return 'other'
             if binding.type_name == 'var' and binding.initializer is not None:
                 return self.request_argument_kind(*binding.initializer, seen)
+        if self.parser.kotlin:
+            # These standard factories have a non-String result. Qualify their
+            # callable identity: a local function/import named listOf may
+            # instead return a String and cannot borrow this negative proof.
+            if call and self.parser.pairs.get(low + call.end() - 1) == high - 1:
+                spelling = call.group(1)
+                root, _, tail = spelling.partition('.')
+                factories = {'listOf', 'mutableListOf', 'setOf', 'mutableSetOf',
+                             'arrayListOf', 'hashSetOf', 'linkedSetOf', 'mapOf', 'mutableMapOf'}
+                actual = index.imports.get(root)
+                if actual is not None:
+                    actual += '.' + tail if tail else ''
+                elif '.' in spelling:
+                    actual = spelling
+                elif root in factories and not index.wildcards:
+                    actual = 'kotlin.collections.' + root
+                if (actual in {'kotlin.collections.' + name for name in factories}
+                        and index.binding(root, low) is None
+                        and not any(name == root and start < low < end for name, start, end in index.classes)):
+                    return 'other'
         if self.code[low] == '(' and self.parser.pairs[low] < high - 1:
             cast = self.code[low + 1:self.parser.pairs[low]].strip()
             if cast in primitive_numbers | {'boolean'}:
@@ -1024,7 +1238,8 @@ class Engine:
         if len(arguments) != REQUEST_GETTERS[method]:
             return False
         argument_kind = self.request_argument_kind(*arguments[0]) if arguments else None
-        signature = r'\b(?:java\.lang\.)?String\s+' + re.escape(method) + r'\s*\('
+        result_type = r'String\s*\[\s*\]' if method == 'getParameterValues' else r'String'
+        signature = r'\b(?:java\.lang\.)?' + result_type + r'\s+' + re.escape(method) + r'\s*\('
 
         def getter_tails(owner):
             _, low, high = owner
@@ -1119,7 +1334,8 @@ class Engine:
             opening = self.code.find('(', offset)
             if opening in self.parser.pairs:
                 arity = sum(1 for _ in self.parser.parts(opening + 1, self.parser.pairs[opening]))
-                if arity != REQUEST_GETTERS[method] or (method != 'getParameter' and not types & HTTP_SERVLET_TYPES):
+                if (not self.request_getter_signature(method, offset, arity)
+                        or method not in SERVLET_BASE_GETTERS and not types & HTTP_SERVLET_TYPES):
                     return False
         return bool(types) or not known or self.bodyless_request_getter(root, method, offset)
 
@@ -1127,10 +1343,24 @@ class Engine:
         if not self.request_receiver_sources:
             return value
         return retag(value, remove=frozenset(tag for trace in value for tag in trace.tags
-                                            if tag.startswith(REQUEST_TYPE_PREFIX) or tag == KTOR_MAP_TAG))
+                                            if tag.startswith(REQUEST_TYPE_PREFIX) or tag == KTOR_MAP_TAG) | COLLECTION_TAGS)
 
     def parameter_tags(self, declaration):
         declaration = declaration.split('=', 1)[0].strip()
+        if self.request_receiver_sources:
+            if self.parser.kotlin:
+                array = re.fullmatch(r'[A-Za-z_]\w*\s*:\s*(?:kotlin\.)?Array\s*<\s*((?:[\w.]+)\??)\s*>\s*\??', declaration)
+                builtin_array = self.builtin_type('Array')
+            else:
+                array = re.fullmatch(r'(?:final\s+)?([\w.]+)\s*\[\s*\]\s*[A-Za-z_]\w*', declaration)
+                if array is None:
+                    array = re.fullmatch(r'(?:final\s+)?([\w.]+)\s+[A-Za-z_]\w*\s*\[\s*\]', declaration)
+                builtin_array = True
+            if array and builtin_array:
+                function = getattr(self, 'function', None)
+                actual = self.request_index().resolve_type(array.group(1), function.key if function else 0)
+                if actual == 'java.lang.String':
+                    return frozenset({COLLECTION_PREFIX + 'string-array'})
         type_name = r'[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*'
         if self.parser.kotlin:
             match = re.fullmatch(r'[A-Za-z_]\w*\s*:\s*(' + type_name + r')\s*\??', declaration)
@@ -1490,25 +1720,24 @@ class Engine:
                 elif direct and self.named_request_source(name, offset, bindings, state):
                     atom = join(atom, self.source(offset + direct.start(), direct.group().strip()))
             if '.' in name and not selected and request_result is None:
-                atom = self.member_value(name.rsplit('.', 1)[-1], atom, offset, arguments, direct_call=arguments is not None)
+                atom = self.without_request_identity(
+                    self.member_value(name.rsplit('.', 1)[-1], atom, offset, arguments, direct_call=arguments is not None))
             while cursor < end:
                 tail = self.parser.skip(cursor, end)
+                if self.parser.kotlin and self.request_receiver_sources and self.code[tail:tail + 2] == '!!':
+                    # A successful assertion preserves the same array/map
+                    # contents before a following index or member read.
+                    tail = self.parser.skip(tail + 2, end)
                 member = re.match(r'\.\s*([A-Za-z_]\w*)', self.code[tail:end])
                 if member is None and self.parser.kotlin and self.request_receiver_sources:
-                    guarded = re.match(r'(?:\?\.|!!\s*\.)\s*([A-Za-z_]\w*)', self.code[tail:end])
-                    if guarded is not None and guarded.group(1) in REQUEST_PROPERTIES:
-                        following = self.parser.skip(tail + guarded.end(), end)
-                        if self.code[following:following + 1] != '(':
-                            request_result = self.request_call('.' + guarded.group(1), None, tail, bindings, state, atom)
-                            if request_result is not None:
-                                # ?. reads this source on its non-null path;
-                                # !!. reads it after the assertion succeeds.
-                                # Neither operation sanitizes the property.
-                                atom, cursor = request_result, following
-                                continue
+                    # ?. evaluates the same member on its non-null branch.
+                    # The null branch contributes no attacker-controlled text.
+                    member = re.match(r'\?\.\s*([A-Za-z_]\w*)', self.code[tail:end])
                 if self.code[tail:tail + 1] == '[':
                     close = self.parser.pairs[tail]
-                    atom = join(atom, self.expression(tail + 1, close, state, bindings, depth + 1))
+                    index = self.expression(tail + 1, close, state, bindings, depth + 1)
+                    selected_value = self.collection_member(atom, '[]', [index], spans=[(tail + 1, close)]) if self.request_receiver_sources else None
+                    atom = selected_value if selected_value is not None else join(atom, index)
                     if any(KTOR_MAP_TAG in trace.tags for trace in atom):
                         atom = retag(self.without_request_identity(atom), add=frozenset({'jvm-string'}))
                     cursor = close + 1
@@ -1717,6 +1946,9 @@ class Engine:
             return self.apply_guard(guard, state, bindings)
         if kind == 'element':
             fact = self.expression(start, end, state, bindings)
+            selected = self.collection_member(fact, '<foreach>', []) if self.request_receiver_sources else None
+            if selected is not None:
+                fact = selected
             binding = bindings[guard]
             if fact:
                 state[binding] = advance(fact, self.step(start, 'assign', guard))

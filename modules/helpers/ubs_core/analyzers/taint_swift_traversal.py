@@ -51,21 +51,26 @@ class SwiftUnsupported(ValueError):
 
 
 class SwiftLexer:
+    _literal_start = re.compile(r'#*"|#+/')
+    _literal_marker = re.compile(r'(#*)("""|"|/)')
+    _unicode_escape = re.compile(r'u\{([0-9a-fA-F]{1,8})\}')
+    _token = re.compile(r'[A-Za-z_$][A-Za-z_0-9$]*|\d+(?:\.\d+)?|\.\.\.|\.\.<|->|==|!=|<=|>=|&&|\|\||\?\?|\+=|-=|\*=|/=')
+
     def __init__(self, text):
         self.text = text
         self.budget = Budget(max(1000, len(text) * 16))
 
     def comment(self, start, limit):
-        if self.text.startswith('//', start):
+        if self.text.startswith('//', start, limit):
             finish = self.text.find('\n', start, limit)
             return limit if finish < 0 else finish
         cursor, nesting = start + 2, 1
         while cursor < limit:
             self.budget.spend()
-            if self.text.startswith('/*', cursor):
+            if self.text.startswith('/*', cursor, limit):
                 nesting += 1
                 cursor += 2
-            elif self.text.startswith('*/', cursor):
+            elif self.text.startswith('*/', cursor, limit):
                 nesting -= 1
                 cursor += 2
                 if not nesting:
@@ -77,35 +82,35 @@ class SwiftLexer:
     def literal(self, start, limit, depth):
         if depth > 64:
             raise AnalysisLimit('Swift interpolation nesting limit exceeded; analysis is incomplete')
-        marker = re.match(r'(#*)("""|"|/)', self.text[start:limit])
+        marker = self._literal_marker.match(self.text, start, limit)
         if marker is None:
             raise ValueError('Invalid Swift literal; analysis is incomplete')
         hashes, quote = marker.groups()
         closing, escape = quote + hashes, '\\' + hashes
-        cursor, content, holes = start + marker.end(), [], []
+        cursor, content, holes = marker.end(), [], []
         while cursor < limit:
             self.budget.spend()
-            if self.text.startswith(closing, cursor):
+            if self.text.startswith(closing, cursor, limit):
                 kind = 'regex' if quote == '/' else 'template' if holes else 'literal'
                 return SwiftToken(''.join(content), start, cursor + len(closing), kind, tuple(holes))
-            if self.text.startswith(escape + '(', cursor) and quote != '/':
+            if self.text.startswith(escape + '(', cursor, limit) and quote != '/':
                 opening = cursor + len(escape)
                 part, finish = self.interpolation(opening + 1, limit, depth + 1)
                 holes.append(part)
                 cursor = finish + 1
                 continue
-            if self.text.startswith(escape, cursor):
+            if self.text.startswith(escape, cursor, limit):
                 after = cursor + len(escape)
                 if after >= limit:
                     break
                 char = self.text[after]
-                unicode_escape = re.match(r'u\{([0-9a-fA-F]{1,8})\}', self.text[after:limit])
+                unicode_escape = self._unicode_escape.match(self.text, after, limit)
                 if unicode_escape:
                     try:
                         content.append(chr(int(unicode_escape.group(1), 16)))
                     except ValueError as error:
                         raise ValueError('Invalid Swift Unicode escape; analysis is incomplete') from error
-                    cursor = after + unicode_escape.end()
+                    cursor = unicode_escape.end()
                 else:
                     content.append({'n': '\n', 'r': '\r', 't': '\t', '0': '\0'}.get(char, char))
                     cursor = after + 1
@@ -145,7 +150,7 @@ class SwiftLexer:
             if char in ' \t\r':
                 cursor += 1
                 continue
-            if text.startswith(('//', '/*'), cursor):
+            if text.startswith(('//', '/*'), cursor, limit):
                 finish = self.comment(cursor, limit)
                 for position in range(cursor, finish):
                     if text[position] == '\n':
@@ -157,7 +162,10 @@ class SwiftLexer:
                 or (prev_significant.kind == 'code'
                     and prev_significant.value in {'=', '(', '[', ',', ':', 'return'})
             )
-            if re.match(r'#*"|#+/', text[cursor:limit]) or regex:
+            # Match in the original source. Copying the entire suffix for
+            # every token makes lexing quadratic on production Swift files,
+            # including repeated scans of interpolations and callback bodies.
+            if self._literal_start.match(text, cursor, limit) or regex:
                 token = self.literal(cursor, limit, depth)
                 yield token
                 prev_significant = token
@@ -172,8 +180,8 @@ class SwiftLexer:
                 prev_significant = token
                 cursor = finish + 1
                 continue
-            match = re.match(r'[A-Za-z_$][A-Za-z_0-9$]*|\d+(?:\.\d+)?|\.\.\.|\.\.<|->|==|!=|<=|>=|&&|\|\||\?\?|\+=|-=|\*=|/=', text[cursor:limit])
-            finish = cursor + (match.end() if match else 1)
+            match = self._token.match(text, cursor, limit)
+            finish = match.end() if match else cursor + 1
             token = SwiftToken(text[cursor:finish], cursor, finish,
                                'number' if char.isdigit() else 'code')
             yield token

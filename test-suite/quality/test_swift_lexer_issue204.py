@@ -16,7 +16,7 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'modules/helpers'))
-from ubs_core.analyzers.taint_swift_traversal import flow_findings, swift_validated_tokens
+from ubs_core.analyzers.taint_swift_traversal import SwiftLexer, flow_findings, swift_validated_tokens
 from ubs_core.taint_flow import AnalysisLimit
 
 
@@ -159,6 +159,57 @@ class SwiftLexerIssue204Tests(unittest.TestCase):
                 return req.redirect(to: target)
             }
         ''', (3,))
+
+    def test_bounded_ranges_preserve_absolute_token_and_interpolation_offsets(self):
+        literal = r'#"\#(name) \#u{41}"#'
+        source = 'prefix ' + literal + ' suffix'
+        start, end = len('prefix '), len('prefix ') + len(literal)
+        token, = SwiftLexer(source).scan(start, end)
+        self.assertEqual((token.kind, token.value, token.start, token.end),
+                         ('template', ' A', start, end))
+        name, = token.parts[0]
+        self.assertEqual((name.value, name.start, name.end),
+                         ('name', source.index('name'), source.index('name') + 4))
+        with self.assertRaisesRegex(ValueError, 'Unterminated Swift literal'):
+            SwiftLexer(source).scan(start, end - 1)
+        # A bounded scan must not consume the rest of an identifier or number.
+        source = 'prefix identifier 123.45 suffix'
+        start = source.index('identifier')
+        token, = SwiftLexer(source).scan(start, start + 5)
+        self.assertEqual((token.value, token.start, token.end), ('ident', start, start + 5))
+        start = source.index('123')
+        token, = SwiftLexer(source).scan(start, start + 5)
+        self.assertEqual((token.value, token.start, token.end), ('123.4', start, start + 5))
+
+    def test_large_sources_copy_only_linear_source_text(self):
+        class MeasuredSource(str):
+            copied = 0
+
+            def __getitem__(self, position):
+                value = super().__getitem__(position)
+                if isinstance(position, slice):
+                    self.copied += len(value)
+                return value
+
+        receipts = []
+        for count in (64, 256):
+            source = MeasuredSource(''.join(
+                'let value%d = #"prefix \\#(values[%d]) suffix"#\n' % (index, index)
+                for index in range(count)))
+            tokens = swift_validated_tokens(source)
+            strings = [token for token in tokens if token.kind == 'template']
+            self.assertEqual(len(strings), count)
+            self.assertTrue(all(token.value == 'prefix  suffix' for token in strings))
+            for index, token in enumerate(strings):
+                self.assertEqual([item.value for item in token.parts[0]],
+                                 ['values', '[', str(index), ']'])
+            # This checks actual source-copy work, not machine-dependent wall
+            # time. Slicing each remaining suffix fails by orders of magnitude.
+            self.assertLessEqual(source.copied, 4 * len(source))
+            receipts.append({'bytes': len(source), 'copied': source.copied, 'tokens': len(tokens)})
+        self.assertLessEqual(receipts[1]['copied'], receipts[0]['copied'] * 5)
+        (self.artifacts / 'lexer-copy-work.json').write_text(
+            json.dumps(receipts, indent=2), encoding='utf-8')
 
     def test_malformed_interpolation_still_fails_before_applicability(self):
         for source in (

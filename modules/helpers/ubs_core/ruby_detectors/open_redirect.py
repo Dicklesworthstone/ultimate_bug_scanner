@@ -138,7 +138,7 @@ def analyze(lines, issues, path_str):
     if not lines:
         return
     text = "\n".join(lines)
-    if not (re.search(r'\b(?:params|request|req|rack_request|env|cookies|Rack::Request)\b', text)
+    if not (re.search(r'\b(?:params|request|req|rack_request|env|cookies|Rack::Request|ActionDispatch::Request)\b', text)
             and (SINK_RE.search(text) or re.search(r'\b(?:response|headers)\b', text))):
         return
     from ubs_core.analyzers.taint_ruby_traversal import REDIRECT_RULE, flow_findings_from_text

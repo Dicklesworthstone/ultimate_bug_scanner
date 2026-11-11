@@ -26,7 +26,7 @@ DESCRIPTION = (
 )
 
 def findings(path_str, text):
-    if not (re.search(r'\b(?:params|request|req|rack_request|env|Rack::Request|cookies)\b', text)
+    if not (re.search(r'\b(?:params|request|req|rack_request|env|Rack::Request|ActionDispatch::Request|cookies)\b', text)
             and re.search(r'\b(?:headers|response|send_data|send_file)\b', text)):
         return
     from ubs_core.analyzers.taint_ruby_traversal import HEADER_RULE, flow_findings_from_text

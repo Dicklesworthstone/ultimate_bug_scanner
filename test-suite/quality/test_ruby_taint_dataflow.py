@@ -2106,6 +2106,273 @@ NUMBERED_BOUNDARIES = (
 )
 
 
+# Independent source contracts: Rack's input stream contains request bytes;
+# its read(length, buffer) writes into the caller's buffer. Rails raw_post
+# returns those bytes, while parsed parameter/cookie accessors return maps.
+# A stream object, metadata call, local lookalike or fixed replacement is not
+# request content. API references: rack.github.io/rack/3.2/SPEC_rdoc.html and
+# api.rubyonrails.org/classes/ActionDispatch/Request.html.
+REQUEST_SOURCE_CASES = (
+    Case('body_read_path', PATH, 'File.read(request.body.read)', (1,)),
+    Case('body_gets_path', PATH, 'File.read(request.body.gets)', (1,)),
+    Case('body_raw_post_url', URL, 'Net::HTTP.get(URI.parse(request.raw_post))', (1,)),
+    Case('body_raw_post_execution', EVAL, 'eval(request.raw_post)', (1,)),
+    Case('body_read_execution', EVAL, 'eval(request.body.read)', (1,)),
+    Case('body_json_path', PATH, '''
+        payload = JSON.parse(request.body.read)
+        File.read(payload.fetch("path"))''', (2,)),
+    Case('body_request_alias', URL, '''
+        incoming = request
+        stream = incoming.body
+        bytes = stream.read
+        Net::HTTP.get(URI.parse(bytes))''', (4,)),
+    Case('body_selected_stream_helper', PATH, '''
+        def unpack(input)
+          input.read
+        end
+        File.read(unpack(request.body))''', (4,)),
+    Case('body_selected_request_helper', URL, '''
+        def bytes_from(incoming)
+          incoming.raw_post
+        end
+        Net::HTTP.get(URI.parse(bytes_from(request)))''', (4,)),
+    Case('body_selected_request_return', PATH, '''
+        def incoming
+          request
+        end
+        File.read(incoming.body.read)''', (4,)),
+    Case('body_self_request', PATH, 'File.read(self.request.body.read)', (1,)),
+    Case('body_rack_constructor', PATH, '''
+        incoming = Rack::Request.new(env)
+        File.read(incoming.body.read)''', (2,)),
+    Case('body_rails_constructor', URL, '''
+        incoming = ActionDispatch::Request.new(server_environment)
+        Net::HTTP.get(URI.parse(incoming.raw_post))''', (2,)),
+    Case('body_rails_constructor_alias', PATH, '''
+        Incoming = ActionDispatch::Request
+        incoming = Incoming.new(server_environment)
+        File.read(incoming.body.read)''', (3,)),
+    Case('body_output_buffer', PATH, '''
+        buffer = ""
+        request.body.read(nil, buffer)
+        File.read(buffer)''', (3,)),
+    Case('body_output_buffer_alias', URL, '''
+        buffer = ""
+        alias_buffer = buffer
+        request.body.read(4096, alias_buffer)
+        Net::HTTP.get(URI.parse(buffer))''', (4,)),
+    Case('body_output_buffer_return', PATH, '''
+        buffer = ""
+        result = request.body.read(nil, buffer)
+        File.read(result)''', (3,)),
+    Case('body_output_buffer_helper', PATH, '''
+        def receive(input, buffer)
+          input.read(nil, buffer)
+        end
+        buffer = ""
+        receive(request.body, buffer)
+        File.read(buffer)''', (6,)),
+    Case('body_environment_buffer', PATH, '''
+        buffer = ""
+        env["rack.input"].read(nil, buffer)
+        File.read(buffer)''', (3,)),
+    Case('body_get_header_buffer', PATH, '''
+        buffer = ""
+        request.get_header("rack.input").read(nil, buffer)
+        File.read(buffer)''', (3,)),
+    Case('body_fetch_header_buffer', PATH, '''
+        buffer = ""
+        request.fetch_header("rack.input").read(nil, buffer)
+        File.read(buffer)''', (3,)),
+    Case('body_rails_body_stream', PATH, 'File.read(request.body_stream.read)', (1,)),
+    Case('body_request_environment_buffer', PATH, '''
+        buffer = ""
+        request.env.fetch("rack.input").read(nil, buffer)
+        File.read(buffer)''', (3,)),
+    Case('body_static_dispatch_read', PATH,
+         'File.read(request.body.public_send(:read))', (1,)),
+    Case('body_each_yields_request_lines', PATH, '''
+        request.body.each do |line|
+          File.read(line)
+        end''', (2,)),
+    Case('body_each_numbered_line', URL, '''
+        request.body.each { Net::HTTP.get(URI.parse(_1)) }''', (1,)),
+    Case('body_each_extra_parameter_is_nil', PATH, '''
+        request.body.each do |line, absent|
+          File.read(absent.to_s)
+        end''', ()),
+    Case('body_read_only_one_branch', PATH, '''
+        target = "/srv/fixed"
+        if flag
+          target = request.body.read
+        end
+        File.read(target)''', (5,)),
+    Case('body_fixed_path_receives_content', PATH,
+         'File.write("/srv/log", request.body.read)', ()),
+    Case('body_literal_reassignment', PATH, '''
+        target = request.body.read
+        target = "/srv/fixed"
+        File.read(target)''', ()),
+    Case('body_zero_length_read', PATH, 'File.read(request.body.read(0))', ()),
+    Case('body_zero_length_clears_buffer', PATH, '''
+        buffer = params[:old_path]
+        alias_buffer = buffer
+        request.body.read(0, alias_buffer)
+        File.read(buffer)''', ()),
+    Case('body_stream_reference_is_not_content', PATH, '''
+        stream = request.body
+        File.read(stream.to_s)''', ()),
+    Case('body_control_operations_are_not_content', EVAL, '''
+        input = request.body
+        input.rewind
+        eval(input.eof?.to_s)''', ()),
+    Case('body_stream_alias_rebound', PATH, '''
+        input = request.body
+        input = StringIO.new("/srv/fixed")
+        File.read(input.read)''', ()),
+    Case('body_local_lookalike', PATH, '''
+        class FixedRequest
+          def raw_post
+            "/srv/fixed"
+          end
+        end
+        request = FixedRequest.new
+        File.read(request.raw_post)''', ()),
+    Case('body_shadowed_request_accessor', PATH, '''
+        class FixedRequest
+          def raw_post
+            "/srv/fixed"
+          end
+        end
+        def request
+          FixedRequest.new
+        end
+        File.read(request.raw_post)''', ()),
+    Case('body_local_rails_namespace', PATH, '''
+        module Local
+          module ActionDispatch
+            class Request
+              def raw_post
+                "/srv/fixed"
+              end
+            end
+          end
+          incoming = ActionDispatch::Request.new
+          File.read(incoming.raw_post)
+        end''', ()),
+    Case('body_source_suppression_keeps_flow', PATH, '''
+        target = request.body.read # ubs:ignore ruby.taint.path_traversal
+        File.read(target)''', (2,)),
+    Case('body_sink_suppression', PATH,
+         'File.read(request.body.read) # ubs:ignore ruby.taint.path_traversal', ()),
+    Case('body_lexical_decoy', PATH,
+         '''example = 'File.read(request.body.read)' ''', ()),
+    Case('cookie_bare_path', PATH, 'File.read(cookies[:path])', (1,)),
+    Case('cookie_request_url', URL, 'Net::HTTP.get(URI.parse(request.cookies["target"]))', (1,)),
+    Case('cookie_self_accessor', PATH, 'File.read(self.cookies[:path])', (1,)),
+    Case('cookie_bound_alias', PATH, '''
+        jar = request.cookies
+        File.read(jar.fetch("path"))''', (2,)),
+    Case('cookie_shadowed_accessor', PATH, '''
+        def cookies
+          {path: "/srv/fixed"}
+        end
+        File.read(cookies[:path])''', ()),
+    Case('cookie_local_map', PATH, '''
+        cookies = {path: "/srv/fixed"}
+        File.read(cookies[:path])''', ()),
+    Case('cookie_formal_shadows_accessor', PATH, '''
+        def load(cookies)
+          File.read(cookies[:path])
+        end
+        load({path: "/srv/fixed"})''', ()),
+    Case('cookie_formal_with_actual_request_map', PATH, '''
+        def load(cookies)
+          File.read(cookies[:path])
+        end
+        load(request.cookies)''', (2,)),
+    Case('cookie_values_path', PATH, 'File.read(request.cookies.values.first)', (1,)),
+    Case('cookie_values_at_path', PATH, 'File.read(request.cookies.values_at("path").first)', (1,)),
+    Case('cookie_fetch_values_path', PATH, 'File.read(request.cookies.fetch_values("path").first)', (1,)),
+    Case('cookie_empty_values_at', PATH, 'File.read(request.cookies.values_at.first.to_s)', ()),
+    Case('cookie_delete_returns_value', PATH, 'File.read(request.cookies.delete("path"))', (1,)),
+    Case('cookie_keys_are_request_data', PATH, 'File.read(request.cookies.keys.first)', (1,)),
+    Case('cookie_each_yields_value', PATH, '''
+        request.cookies.each do |key, value|
+          File.read(value)
+        end''', (2,)),
+    Case('cookie_each_pair_alias', PATH, '''
+        jar = request.cookies
+        jar.each_pair do |key, value|
+          File.read(value)
+        end''', (3,)),
+    Case('cookie_each_single_pair', PATH, '''
+        request.cookies.each { |pair| File.read(pair[1]) }''', (1,)),
+    Case('cookie_each_pair_numbered', PATH, '''
+        request.cookies.each_pair { File.read(_2) }''', (1,)),
+    Case('cookie_each_value_url', URL, '''
+        request.cookies.each_value { |value| Net::HTTP.get(URI.parse(value)) }''', (1,)),
+    Case('cookie_each_key_path', PATH, '''
+        request.cookies.each_key { |key| File.read(key) }''', (1,)),
+    Case('cookie_each_extra_parameter_is_nil', PATH, '''
+        request.cookies.each do |key, value, absent|
+          File.read(absent.to_s)
+        end''', ()),
+    Case('cookie_each_value_extra_parameter_is_nil', PATH, '''
+        request.cookies.each_value do |value, absent|
+          File.read(absent.to_s)
+        end''', ()),
+    Case('cookie_selected_values_helper', PATH, '''
+        def first_value(jar)
+          jar.values.first
+        end
+        File.read(first_value(request.cookies))''', (4,)),
+    Case('cookie_map_local_values_control', PATH, '''
+        cookies = {path: "/srv/fixed"}
+        File.read(cookies.values.first)''', ()),
+    Case('cookie_map_rebound_values_control', PATH, '''
+        jar = request.cookies
+        jar = {path: "/srv/fixed"}
+        File.read(jar.delete(:path))''', ()),
+    Case('cookie_map_local_each_control', PATH, '''
+        cookies = {path: "/srv/fixed"}
+        cookies.each_pair { |key, value| File.read(value) }''', ()),
+    Case('cookie_map_selected_lookalike_control', PATH, '''
+        class FixedJar
+          def values
+            ["/srv/fixed"]
+          end
+        end
+        jar = FixedJar.new
+        File.read(jar.values.first)''', ()),
+    Case('request_params_values_path', PATH, 'File.read(request.params.values.first)', (1,)),
+    Case('request_params_map_values', PATH, '''
+        paths = request.params.map { |key, value| value }
+        File.read(paths.first)''', (2,)),
+    Case('request_query_parameters', PATH,
+         'File.read(request.query_parameters.fetch("path"))', (1,)),
+    Case('request_body_parameters', URL,
+         'Net::HTTP.get(URI.parse(request.request_parameters["target"]))', (1,)),
+    Case('request_path_parameters', PATH,
+         'File.read(request.path_parameters[:path])', (1,)),
+    Case('request_parameters_alias', PATH,
+         'File.read(request.parameters[:path])', (1,)),
+    Case('body_sql_text', SQL,
+         'ActiveRecord::Base.connection.execute("SELECT * FROM items WHERE id = #{request.raw_post}")', (1,)),
+    Case('body_bound_sql_value', SQL,
+         'ActiveRecord::Base.connection.exec_query("SELECT * FROM items WHERE id = $1", "items", [request.raw_post])', ()),
+    Case('cookie_redirect', 'ruby.redirect.open', 'redirect_to request.cookies["next"]', (1,)),
+    Case('cookie_values_redirect', 'ruby.redirect.open', 'redirect_to request.cookies.values.first', (1,)),
+    Case('body_redirect', 'ruby.redirect.open', 'redirect_to request.raw_post', (1,)),
+    Case('body_redirect_checked', 'ruby.redirect.open', 'redirect_to url_from(request.raw_post)', ()),
+    Case('body_header', 'ruby.header-injection.response', 'headers["X-Name"] = request.body.read', (1,)),
+    Case('cookie_each_value_header', 'ruby.header-injection.response', '''
+        request.cookies.each_value { |value| headers["X-Name"] = value }''', (1,)),
+    Case('body_header_checked', 'ruby.header-injection.response',
+         r'headers["X-Name"] = request.body.read.delete("\r\n")', ()),
+)
+
+
 class LoggedCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -2153,6 +2420,130 @@ class LoggedCase(unittest.TestCase):
                 'elapsed': time.monotonic() - started, 'error': error, 'findings': records,
             }, indent=2) + '\n')
         return target, records
+
+
+class RubyRequestSourceTests(LoggedCase):
+    def native_scan(self, directory, target, skip=''):
+        directory.mkdir(parents=True, exist_ok=True)
+        report = directory / 'result.json'
+        command = [sys.executable, '-m', 'ubs_core.ruby_scan', '--files-from', '-',
+                   '--sink', str(directory / 'findings.ndjson'), '--json-out', str(report),
+                   '--project-dir', str(target.parent), '--skip', skip]
+        env = {**os.environ, 'PYTHONPATH': str(HELPERS), 'PYTHONDONTWRITEBYTECODE': '1',
+               'UBS_KEEP_TEMP': '1', 'UBS_CACHE_DIR': str(self.artifact / 'cache')}
+        started = time.monotonic()
+        result = subprocess.run(command, input=str(target) + '\0', cwd=target.parent,
+                                env=env, text=True, capture_output=True, timeout=120)
+        (directory / 'stdout.log').write_text(result.stdout)
+        (directory / 'stderr.log').write_text(result.stderr)
+        (directory / 'source.rb').write_text(target.read_text())
+        (directory / 'identity.json').write_text(json.dumps({
+            'command': command, 'cwd': str(target.parent), 'elapsed': time.monotonic() - started,
+            'exit': result.returncode, 'source_sha256': hashlib.sha256(target.read_bytes()).hexdigest(),
+        }, indent=2) + '\n')
+        self.assertTrue(report.is_file(), (command, result.returncode, result.stdout, result.stderr))
+        return result, json.loads(report.read_text()), env
+
+    def test_request_content_cases(self):
+        policies = {URL: 'url', 'ruby.redirect.open': 'redirect',
+                    'ruby.header-injection.response': 'header'}
+        for case in REQUEST_SOURCE_CASES:
+            with self.subTest(case=case.name):
+                directory = self.artifact / case.name
+                directory.mkdir()
+                target = directory / 'input.rb'
+                target.write_text(case.source, encoding='utf-8')
+                started = time.monotonic()
+                records, error = [], None
+                try:
+                    records = list(taint_ruby_traversal.flow_findings_from_text(
+                        target, case.source, policies.get(case.rule, 'path')))
+                except Exception as exc:
+                    error = f'{type(exc).__name__}: {exc}'
+                    raise
+                finally:
+                    (directory / 'result.json').write_text(json.dumps({
+                        'case': case.name, 'source_sha256': hashlib.sha256(target.read_bytes()).hexdigest(),
+                        'expected': [(case.rule, line) for line in case.lines],
+                        'findings': records, 'error': error, 'elapsed': time.monotonic() - started,
+                    }, indent=2) + '\n')
+                self.assertEqual([(row[0], row[1]) for row in records],
+                                 [(case.rule, line) for line in case.lines], case.source)
+
+    def test_unsupported_body_operations_are_explicitly_incomplete(self):
+        for source in ('File.read(request.body.read_chunks)',
+                       'File.read(request.body.read(1, "", true))',
+                       'File.read(request.body.gets("separator"))',
+                       'File.read(request.body.read(nil, holder.buffer))',
+                       'File.read(request.body.public_send(operation))',
+                       'key = params[:stream]\nbuffer = ""\nenv[key].read(nil, buffer)\nFile.read(buffer)'):
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(ValueError, 'incomplete'):
+                    list(taint_ruby_traversal.flow_findings_from_text(
+                        Path('request-body-boundary.rb'), source, 'path'))
+
+    def test_native_source_json_sarif_and_selected_file_contract(self):
+        names = {'body_read_path', 'body_request_alias', 'body_output_buffer_alias',
+                 'body_rails_constructor', 'body_environment_buffer',
+                 'body_fetch_header_buffer', 'cookie_each_pair_alias', 'cookie_values_redirect',
+                 'cookie_each_value_header', 'cookie_map_local_each_control',
+                 'cookie_request_url', 'body_fixed_path_receives_content', 'cookie_shadowed_accessor',
+                 'body_header', 'body_header_checked', 'cookie_redirect', 'body_bound_sql_value'}
+        for case in REQUEST_SOURCE_CASES:
+            if case.name not in names:
+                continue
+            with self.subTest(case=case.name):
+                directory = self.artifact / ('native-' + case.name)
+                directory.mkdir()
+                target = directory / 'selected source.rb'
+                target.write_text(case.source)
+                (directory / 'unselected.rb').write_text('File.read(params[:path])\n')
+                result, payload, env = self.native_scan(directory / 'json', target)
+                self.assertEqual((result.returncode, payload['status'], payload['files'], payload['critical']),
+                                 (int(bool(case.lines)), 'ok', 1, len(case.lines)),
+                                 (payload, result.stdout, result.stderr))
+                rows = [row for row in payload['findings'] if row['severity'] == 'critical']
+                self.assertEqual([(row['rule'], row['line']) for row in rows],
+                                 [(case.rule, line) for line in case.lines], payload)
+                self.assertTrue(all(Path(row['path']).name == target.name for row in rows), payload)
+                converted = subprocess.run(
+                    [sys.executable, '-m', 'ubs_core', 'findings-sarif', '--combined',
+                     str(directory / 'json/result.json')], cwd=target.parent, env=env,
+                    text=True, capture_output=True, timeout=60)
+                (directory / 'result.sarif').write_text(converted.stdout)
+                (directory / 'sarif.stderr.log').write_text(converted.stderr)
+                self.assertEqual(converted.returncode, 0, converted.stderr)
+                sarif = json.loads(converted.stdout)
+                rows = [row for run in sarif['runs'] for row in run.get('results', [])
+                        if row.get('level') == 'error']
+                self.assertEqual([(row['ruleId'], row['locations'][0]['physicalLocation']['region']['startLine'])
+                                  for row in rows], [(case.rule, line) for line in case.lines], sarif)
+
+    def test_native_cache_edit_suppression_category_and_incomplete_contract(self):
+        directory = self.artifact / 'native-policy'
+        directory.mkdir()
+        target = directory / 'selected.rb'
+        dangerous = 'target = request.body.read\nFile.read(target)\n'
+        controlled = 'target = request.body.read\ntarget = "/srv/fixed"\nFile.read(target)\n'
+        for attempt, (source, count, hits) in enumerate(((dangerous, 1, 0), (dangerous, 1, 1),
+                                                       (controlled, 0, 0), (controlled, 0, 1))):
+            target.write_text(source)
+            result, payload, _env = self.native_scan(directory / str(attempt), target)
+            self.assertEqual((result.returncode, payload['status'], payload['critical']),
+                             (int(bool(count)), 'ok', count), (payload, result.stderr))
+            self.assertEqual(payload['extras']['profile']['cache_hits'], hits, payload)
+        target.write_text('File.read(request.body.read) # ubs:ignore ruby.taint.path_traversal\n')
+        result, payload, _env = self.native_scan(directory / 'suppressed', target)
+        self.assertEqual((result.returncode, payload['critical']), (0, 0), (payload, result.stderr))
+        target.write_text('File.read(request.body.read_chunks)\n')
+        for attempt in range(2):
+            result, payload, _env = self.native_scan(directory / ('partial-' + str(attempt)), target)
+            self.assertEqual((result.returncode, payload['status'], payload['module_error']),
+                             (2, 'partial', 'ANALYZER_ERROR'), (payload, result.stderr))
+            self.assertEqual(payload['extras']['profile']['cache_hits'], 0, payload)
+        result, payload, _env = self.native_scan(directory / 'category-disabled', target, skip='6')
+        self.assertEqual((result.returncode, payload['status'], payload['critical']),
+                         (0, 'ok', 0), (payload, result.stderr))
 
 
 class RubySemanticTests(LoggedCase):

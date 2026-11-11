@@ -63,9 +63,25 @@ EXECUTION_RULES = frozenset({EVAL_RULE, DISPATCH_RULE, COMMAND_RULE})
 API_CONSTANTS = frozenset(tuple(name.split('::')) for name in (
     'File', 'IO', 'FileUtils', 'Dir', 'Pathname', 'URI', 'OpenURI',
     'Net', 'Net::HTTP', 'Addressable', 'Addressable::URI', 'Rack', 'Rack::Request',
+    'ActionDispatch', 'ActionDispatch::Request',
     'Faraday', 'HTTParty', 'RestClient', 'Excon', 'HTTP', 'Typhoeus', 'Curl',
     'ActiveRecord', 'ActiveRecord::Base', 'Arel', 'CGI', 'ERB', 'ERB::Util', 'Rack::Utils',
 ))
+REQUEST_BINDINGS = {
+    'request': 'request', 'req': 'request', 'rack_request': 'request',
+    'params': 'request-params', 'env': 'environment', 'cookies': 'request-params',
+}
+REQUEST_COLLECTION_METHODS = frozenset({
+    'params', 'parameters', 'query', 'query_parameters', 'request_parameters',
+    'path_parameters', 'get', 'post', 'GET', 'POST', 'cookies',
+})
+REQUEST_VALUE_METHODS = frozenset({
+    'path', 'path_info', 'fullpath', 'original_fullpath', 'query_string', 'url',
+    'original_url', 'referer', 'referrer', 'host', 'host_with_port', 'raw_host_with_port',
+    'domain', 'subdomain', 'subdomains', 'port', 'remote_ip', 'ip', 'raw_post',
+})
+REQUEST_MAP_SHAPES = frozenset({'request-params', 'request-headers', 'environment'})
+REQUEST_MAP_ITERATORS = frozenset({'each', 'each_pair', 'each_value', 'each_key'})
 # ActiveRecord::ConnectionAdapters::DatabaseStatements: query text is the
 # first positional operand, independently of log names and value bindings.
 SQL_CONNECTION_ARITIES = {
@@ -405,7 +421,8 @@ class RubyParser:
 
         Control/exception bodies and interpolation retain the enclosing block
         scope. A nested iterator's receiver belongs to that scope, while its
-        body has its own parameters. Only single-argument blocks are modeled.
+        body has its own parameters. A second implicit parameter requires a
+        selected map-pair contract when the receiver is bound in the CFG.
         """
         budget = Budget()
 
@@ -512,9 +529,9 @@ class RubyParser:
                     raise ValueError('Ruby explicit and numbered block parameters cannot be mixed; analysis is incomplete')
                 if outer_numbered:
                     raise ValueError('Ruby numbered block parameters cannot be nested; analysis is incomplete')
-                if names != {'_1'}:
+                if not names <= {'_1', '_2'}:
                     raise ValueError('Ruby higher numbered block parameters need arity binding; analysis is incomplete')
-                owner.names = ('_1',)
+                owner.names = ('_1', '_2') if '_2' in names else ('_1',)
             for statement in nested:
                 scope(statement.body, statement, outer_numbered or bool(names))
 
@@ -1810,6 +1827,105 @@ class RubyEngine:
                 self.mutations[index] = join(self.mutations.get(index, CLEAN), changed)
         return changed
 
+    def request_call(self, name, receiver, arguments, token, state):
+        """Expose request content only through a selected framework receiver.
+
+        The body is an IO-like object, not the bytes it contains. Rack's
+        read/gets/each contracts introduce source facts at consumption; read's
+        output buffer uses the same alias mutation model as ordinary strings.
+        Local selected methods have already been resolved by call().
+        """
+        method = name.rsplit('.', 1)[-1]
+        accessor = name.removeprefix('self.')
+        if not arguments and accessor in REQUEST_BINDINGS and name in {accessor, 'self.' + accessor}:
+            return shape(REQUEST_BINDINGS[accessor], token.start)
+        if name in {'Rack::Request.new', 'ActionDispatch::Request.new'} and len(arguments) == 1:
+            return shape('request', token.start)
+        environment_lookup = (has_shape(receiver, 'environment') and method in {'[]', 'fetch', 'dig'}
+                              or has_shape(receiver, 'request') and method in {'get_header', 'fetch_header'})
+        if environment_lookup and arguments:
+            key = frozenset(trace for trace in arguments[0]
+                            if not (trace.kind == 'constant' and trace.key[0] == 'header-string'))
+            selected_key = self.dispatch_target(key)
+            if (selected_key == 'rack.input'
+                    and not any(trace.kind == 'constant' and trace.key[0] == 'symbol' for trace in key)):
+                return self.fresh(shape('request-body', token.start), 'request-body', token.start)
+            if selected_key is None:
+                # A computed environment key may select rack.input. Preserve
+                # that uncertainty so a later IO output-buffer write cannot
+                # silently disappear into the ordinary string-call fallback.
+                return join(self.source(token.start, name), shape('request-environment-value', token.start))
+        if has_shape(receiver, 'request'):
+            if not arguments and method in REQUEST_COLLECTION_METHODS:
+                return shape('request-params', token.start)
+            if not arguments and method in {'headers', 'env'}:
+                return shape('request-headers' if method == 'headers' else 'environment', token.start)
+            if not arguments and method in {'body', 'body_stream'}:
+                return self.fresh(shape('request-body', token.start), 'request-body', token.start)
+            if ((not arguments and method in REQUEST_VALUE_METHODS)
+                    or (method in {'get_header', 'fetch_header'} and len(arguments) == 1)):
+                return self.source(token.start, name)
+        if any(has_shape(receiver, kind) for kind in REQUEST_MAP_SHAPES):
+            if method in {'values', 'keys'} and not arguments:
+                return self.collection(self.source(token.start, name), token.start)
+            if method in {'values_at', 'fetch_values'}:
+                value = self.source(token.start, name) if arguments else CLEAN
+                return self.collection(value, token.start)
+            if method == 'delete' and len(arguments) == 1:
+                # Hash#delete returns the removed value, not the map. Request
+                # maps remain aggregate sources; no per-key overwrite proof is
+                # inferred from a deletion or from an unrelated stored value.
+                return self.source(token.start, name)
+            if method in REQUEST_MAP_ITERATORS and not arguments:
+                return receiver
+        if has_shape(receiver, 'request-environment-value') and method in {
+                'read', 'gets', 'each', 'readpartial', 'sysread', 'readlines'}:
+            self.unresolved_calls.add(
+                f'{self.path}:{self.step(token.start, "call", name).line}: '
+                'Ruby request environment IO receiver needs a resolved rack.input key; analysis is incomplete')
+            return self.fresh(join(receiver, *arguments), 'unknown', token.start)
+        if not has_shape(receiver, 'request-body'):
+            return None
+        if method in {'read', 'gets'}:
+            valid = ((method == 'read' and len(arguments) <= 2)
+                     or (method == 'gets' and not arguments))
+            valid = valid and not any(trace.kind == 'keyword' for argument in arguments for trace in argument)
+            if valid:
+                empty = bool(method == 'read' and arguments
+                             and arguments[0] == constant('0', 'number'))
+                value = (self.fresh(constant(''), 'string', token.start) if empty
+                         else self.source(token.start, name))
+                if len(arguments) == 2:
+                    buffer = arguments[1]
+                    kinds = {trace.key[0] for trace in buffer if trace.kind == 'object'}
+                    if kinds and kinds <= {'string', 'request'}:
+                        return self.mutate(buffer, value, state, overwrite=True)
+                    # Unknown output-buffer identity can affect the caller's
+                    # later reads; returning tainted bytes alone is insufficient.
+                    self.unresolved_calls.add(
+                        f'{self.path}:{self.step(token.start, "call", name).line}: '
+                        'Ruby request body output buffer is unresolved; analysis is incomplete')
+                return value
+        elif method in {'rewind', 'close', 'closed?', 'eof?', 'eof', 'pos', 'tell', 'size',
+                        'to_s', 'inspect', 'object_id', 'class', 'respond_to?'}:
+            # These return stream state/identity, not request bytes.
+            return self.fresh(CLEAN, 'body-metadata', token.start)
+        elif method in {'freeze', 'itself', 'dup', 'clone'}:
+            return None
+        elif method in {'send', 'public_send', '__send__'} and arguments:
+            if self.dispatch_target(arguments[0]) is not None or tainted(arguments[0]):
+                # Bound dispatch is re-entered through call(); a request-selected
+                # method is handled by the existing terminal execution policy.
+                return None
+        elif method == 'each' and not arguments:
+            # The bound block introduces each yielded string in block-bind.
+            # Without a block the result remains a stream/enumerator object.
+            return receiver
+        self.unresolved_calls.add(
+            f'{self.path}:{self.step(token.start, "call", name).line}: '
+            f'Ruby request body operation {method} needs a supported IO contract; analysis is incomplete')
+        return self.fresh(join(receiver, *arguments), 'unknown', token.start)
+
     def pathname_call(self, method, receiver, arguments, token):
         """Resolve filesystem operands only on a constructed Pathname value.
 
@@ -1933,6 +2049,9 @@ class RubyEngine:
         sql_result = self.active_record_call(name, receiver, arguments, token, state)
         if sql_result is not None:
             return sql_result
+        request_result = self.request_call(name, receiver, arguments, token, state)
+        if request_result is not None:
+            return request_result
         if self.policy in {'header', 'redirect'}:
             if name in {'self.response', 'response'} and not arguments:
                 return shape('response', token.start)
@@ -2017,9 +2136,7 @@ class RubyEngine:
         if method == 'define_method' and arguments and tainted(arguments[0]):
             return self.execution_sink(token.start, arguments[0], DISPATCH_RULE,
                                        name + ' request-selected definition', state)
-        if name == 'Rack::Request.new':
-            return shape('request', token.start)
-        if method in {'fetch', 'dig', '[]'} and (has_shape(receiver, 'request-params') or has_shape(receiver, 'request-headers') or has_shape(receiver, 'environment')):
+        if method in {'fetch', 'dig', '[]'} and any(has_shape(receiver, kind) for kind in REQUEST_MAP_SHAPES):
             return self.source(token.start, name)
         if name in {'URI.parse', 'URI.join', 'Addressable::URI.parse', 'Addressable::URI.join', 'URI'}:
             return self.fresh(join(retag(value, add=frozenset({'parsed-uri'})), shape('uri', token.start)),
@@ -2251,14 +2368,7 @@ class RubyEngine:
                     elif cursor < len(tokens) and tokens[cursor].value not in {'.', '&.', '[', ',', ')', ']', '}'}:
                         arguments = self.call_arguments(tokens[cursor:], state, depth + 1)
                         cursor = len(tokens)
-                    if has_shape(atom, 'request') and member.value in {'params', 'query', 'get', 'post', 'GET', 'POST'}:
-                        atom = shape('request-params', member.start)
-                    elif has_shape(atom, 'request') and (member.value in {'headers', 'env'}
-                                                       or self.policy == 'header' and member.value == 'cookies'):
-                        atom = shape('request-headers' if member.value == 'headers' else 'environment', member.start)
-                    elif has_shape(atom, 'request') and member.value in {'path', 'path_info', 'fullpath', 'original_fullpath', 'query_string', 'url', 'referer', 'referrer', 'host', 'host_with_port', 'raw_host_with_port', 'domain', 'subdomain', 'subdomains', 'port', 'remote_ip', 'ip', 'get_header'}:
-                        atom = self.source(token.start, name)
-                    elif member.value in {'filename', 'original_filename'} and self.policy == 'path':
+                    if member.value in {'filename', 'original_filename'} and self.policy == 'path':
                         atom = self.source(token.start, name)
                     else:
                         atom = self.call(name, atom, arguments, token, state)
@@ -2370,7 +2480,7 @@ class RubyEngine:
             return None
         member = members[-1]
         method = member[0].value
-        if method not in {'map', 'collect', 'each', 'tap', 'then', 'yield_self', 'with_connection'}:
+        if method not in REQUEST_MAP_ITERATORS | {'map', 'collect', 'tap', 'then', 'yield_self', 'with_connection'}:
             return None
         if len(member) != 1 and token_text(member[1:]) != '()':
             raise ValueError('Ruby block-call arguments need selected iterator binding; analysis is incomplete')
@@ -2472,7 +2582,7 @@ class RubyEngine:
 
                     return_target, raise_target = leave(return_to), leave(exception_to)
                     output = node('block-result', targets=(finish,), extra=(slot, method, tokens[0].start))
-                    repeated = method in {'map', 'collect', 'each'}
+                    repeated = method in REQUEST_MAP_ITERATORS | {'map', 'collect'}
                     loop = node('branch') if repeated else output
                     collected = node('block-collect', targets=(loop,), extra=(slot, method, tokens[0].start)) if repeated else output
                     body = block(statement.body, collected, finish, collected,
@@ -2720,11 +2830,30 @@ class RubyEngine:
         if kind == 'block-bind':
             slot, parameters, locals_, method = extra
             value = state.get(slot + ':receiver', CLEAN)
-            if method in {'map', 'collect', 'each'} and any(
+            body_line = method == 'each' and has_shape(value, 'request-body')
+            map_entry = (method in REQUEST_MAP_ITERATORS | {'map', 'collect'}
+                         and any(has_shape(value, kind) for kind in REQUEST_MAP_SHAPES))
+            if '_2' in parameters and not (map_entry and method not in {'each_key', 'each_value'}):
+                raise ValueError('Ruby higher numbered block parameters need arity binding; analysis is incomplete')
+            arity = 1 if method == 'with_connection' or body_line else None
+            if body_line:
+                offset = min(trace.key[1] for trace in value
+                             if trace.kind == 'shape' and trace.key[0] == 'request-body')
+                value = self.source(offset, 'request body each yielded string')
+            elif map_entry:
+                offset = min(trace.key[1] for trace in value
+                             if trace.kind == 'shape' and trace.key[0] in REQUEST_MAP_SHAPES)
+                value = self.source(offset, 'request map ' + method + ' yielded entry')
+                arity = 1 if method in {'each_key', 'each_value'} else 2
+                if arity == 2 and len(parameters) == 1:
+                    # Hash#each gives one formal the [key, value] pair; Ruby
+                    # destructures it for two formals and fills extras with nil.
+                    value = self.collection(value, offset)
+            elif method in REQUEST_MAP_ITERATORS | {'map', 'collect'} and any(
                     trace.kind == 'object' and trace.key[0] == 'array' for trace in value):
                 value = self.elements(value)
             for index, name in enumerate(parameters):
-                state[name] = constant('nil', 'code') if method == 'with_connection' and index else value
+                state[name] = constant('nil', 'code') if arity is not None and index >= arity else value
             for name in locals_:
                 state[name] = constant('nil', 'code')
             state['@result'] = constant('nil', 'code')
@@ -2739,7 +2868,7 @@ class RubyEngine:
             slot, method, offset = extra
             if method in {'map', 'collect'}:
                 value = self.collection(state.get(slot + ':values', CLEAN), offset)
-            elif method in {'each', 'tap'}:
+            elif method in REQUEST_MAP_ITERATORS | {'tap'}:
                 value = state.get(slot + ':receiver', CLEAN)
             else:
                 value = state.get('@result', CLEAN)
@@ -2773,10 +2902,14 @@ class RubyEngine:
                 self.function, self.effects, self.returned, self.mutations, self.raised = function, {}, CLEAN, {}, CLEAN
                 self.unresolved_calls = set()
                 self.parameter_values = dict(enumerate(key[1]))
-                state = {'@reachable': constant('reachable'),
-                         'params': shape('request-params', function.key), 'env': shape('environment', function.key),
-                         **({'cookies': shape('request-params', function.key)} if self.policy in {'redirect', 'header'} else {}),
-                         **{name: shape('request', function.key) for name in ('request', 'req', 'rack_request')}}
+                state = {'@reachable': constant('reachable')}
+                for name, kind in REQUEST_BINDINGS.items():
+                    # A cookie-map formal shadows the controller accessor;
+                    # only actual request-map arguments introduce its identity.
+                    if name == 'cookies' and name in function.parameters:
+                        continue
+                    if name in function.parameters or not self.candidates(name, 0):
+                        state[name] = shape(kind, function.key)
                 if self.policy in {'header', 'redirect'}:
                     # The framework accessors have a receiver identity, not
                     # a permanently privileged local name. A visible method
@@ -2822,7 +2955,7 @@ class RubyEngine:
 
 def flow_findings_from_text(path, text, policy):
     # Skip files with no request vocabulary before parsing unrelated Ruby DSLs.
-    if not re.search(r'\b(?:params|request|req|rack_request|env|cookies|Rack::Request|original_filename|filename)\b', text):
+    if not re.search(r'\b(?:params|request|req|rack_request|env|cookies|Rack::Request|ActionDispatch::Request|original_filename|filename)\b', text):
         return
     engine = RubyEngine(path, text, policy)
     lines = text.splitlines()

@@ -1,0 +1,347 @@
+UNAPPLIED IMPLEMENTATION CHECKPOINT — 2026-11-12
+Base: b85615a03328f67b78054eb9a746be1d6d8c1ca3
+
+Captured native formatted-string provenance for Python generator consumers.
+The implementation proves exact primitive operand/lifetime identity and a
+bounded literal string-format grammar. It does not bless arbitrary __format__,
+__str__, __repr__, helper-frame finalizers, or dynamic format specifications.
+
+This patch is NOT active runtime code and is NOT qualified for release.
+The executor became unavailable while candidate DSR checks were running.
+Observed baseline: seven new analyzer methods, 22 incomplete-analysis errors,
+zero assertion failures or skips. The candidate focused/independent results
+were not recovered. Eight additional CLI cases (32 module/runner JSON/SARIF
+invocations) were authored but not executed. Existing test assertions remain.
+
+Reconstructed from exact manual edit inputs after executor loss. The analyzer
+test postimage must match the observed baseline-run SHA256
+f02780cb3e34f74907a7f34bfc11480c95dac511bfbd4bdfe1602cbb1fcdf666.
+This checkpoint uses zero-context hunks; git apply needs --unidiff-zero.
+After restoring a worktree, verify bytes, run paired DSR qualification, then
+regenerate canonical nested checksums before activating runtime changes.
+
+Unresolved candidate review blockers: large hexadecimal integer literals can
+parse successfully but fail during decimal formatting under Python's digit
+limit; the draft lacks that exceptional completion. Captured exact-value
+markers also need the pending helper-frame/finalizer ancestry checks. Neither
+issue has been corrected or requalified in this checkpoint. Do not activate
+this patch from source inspection alone.
+
+Independent review preserved pre-existing opaque-format/finalizer false-cleans;
+do not relax them or report a complete self-scan. Recovery oracle blobs:
+73a4eb489cf238d2cbf90a209381541128e04eac (native/captured formatting oracle)
+df0c940df078a92f0291a4bf6737397c38fb1a50 (paired wrapper)
+
+--- a/modules/helpers/ubs_core/analyzers/taint_py.py
++++ b/modules/helpers/ubs_core/analyzers/taint_py.py
+@@ -2771,1 +2771,62 @@
+-    def materialized_generator_inert(self, node, state):
++    def formatted_string_operand(self, node, state):
++        """Prove both a primitive value and its immediate evaluation lifetime.
++
++        A helper returning a string can still release opaque locals/defaults.
++        Likewise, native input can invoke an opaque prompt's __str__. Keep
++        those protocols outside the exact-string proof instead of inferring
++        safety from the final value's nominal type alone.
++        """
++        self.engine.budget.spend()
++        if isinstance(node, ast.Constant):
++            return type(node.value) in {str, bytes, int, float, complex, bool, type(None)}
++        references = self.expression_references.get(node, NO_REFERENCES)
++        choices = _binding_choices(self.expression_bindings.get(node))
++        if (references & state.mutated or not choices
++                or not all(isinstance(value, (_LiteralString, _GeneratorString))
++                           or isinstance(value, ast.Constant)
++                           and type(value.value) in {str, bytes, int, float, complex, bool, type(None)}
++                           for value in choices)):
++            return False
++        if isinstance(node, (ast.Name, ast.JoinedStr)):
++            return True
++        if isinstance(node, ast.Call):
++            callees = _binding_choices(self.expression_bindings.get(node.func))
++            return (bool(callees) and callees <= {'input', 'builtins.input'}
++                    and len(node.args) <= 1 and not node.keywords
++                    and self.generator_builtins_stable()
++                    and self.generator_consumer_stable(node, {'input'})
++                    and all(self.formatted_string_operand(argument, state) for argument in node.args))
++        return False
++
++    def formatted_string_spec(self, node, state):
++        """Accept only conversions/specs that cannot call user code or fail.
++
++        Empty formatting is valid for every supported exact scalar. Nonempty
++        specs are restricted to the builtin string grammar, after any explicit
++        !s/!r/!a conversion. Dynamic specs and numeric presentation need their
++        own normal/exceptional completions; they do not acquire this proof.
++        No analyzed value is formatted or executed to validate its spec.
++        """
++        if node.conversion not in {-1, ord('s'), ord('r'), ord('a')}:
++            return False
++        if node.format_spec is None:
++            return True
++        if (not isinstance(node.format_spec, ast.JoinedStr)
++                or not all(isinstance(value, ast.Constant) and type(value.value) is str
++                           for value in node.format_spec.values)):
++            return False
++        spec = ''.join(value.value for value in node.format_spec.values)
++        self.engine.budget.spend(1 + len(spec))
++        if not spec:
++            return True
++        if node.conversion == -1 and not self.materialized_generator_string(node.value, state):
++            return False
++        match = re.fullmatch(r'(?:(?:.)?[<^>])?(?P<width>[0-9]*)(?:\.(?P<precision>[0-9]+))?s?',
++                             spec, re.DOTALL)
++        # CPython rejects sizes outside Py_ssize_t before producing a value.
++        # Bound digit parsing too; leading zeroes need not expand our proof.
++        return (match is not None and all(
++            not digits or len(digits) <= 20 and int(digits) <= sys.maxsize
++            for digits in match.groups()))
++
++    def materialized_generator_inert(self, node, state):
+@@ -5827,7 +5888,17 @@
+-        if isinstance(node, ast.JoinedStr):
+-            return join_facts(*(self.expr(child, state) for child in node.values)) if node.values else CLEAN
+-        if isinstance(node, ast.FormattedValue):
+-            value_fact = self.expr(node.value, state)
+-            if node.format_spec is not None:
+-                return join_facts(value_fact, self.expr(node.format_spec, state))
+-            return value_fact
++        if isinstance(node, ast.JoinedStr):
++            facts = [self.expr(child, state) for child in node.values]
++            if (state.reachable and self.generator_consumer_stable(node, set())
++                    and self.generator_builtins_stable()
++                    and all(self.materialized_generator_string(child, state) for child in node.values)):
++                # A single opaque field may return a str subclass; joining
++                # multiple fields may release that subclass and run __del__.
++                # Only independently proved native fields certify either form.
++                self.expression_bindings[node] = _GeneratorString()
++            return join_facts(*facts)
++        if isinstance(node, ast.FormattedValue):
++            value_fact = self.expr(node.value, state)
++            primitive = self.formatted_string_operand(node.value, state)
++            spec_fact = self.expr(node.format_spec, state)
++            if state.reachable and primitive and self.formatted_string_spec(node, state):
++                self.expression_bindings[node] = _GeneratorString()
++            return join_facts(value_fact, spec_fact)
+--- a/test-suite/quality/test_taint_python_call_completions.py
++++ b/test-suite/quality/test_taint_python_call_completions.py
+@@ -1904,1 +1904,152 @@
+-class ImmediateGeneratorExpressionTests(SourceTest):
++class FormattedStringCompletionTests(SourceTest):
++    def assert_native(self, source, expected_values, *, incomplete=False):
++        source = textwrap.dedent(source).lstrip('\n')
++        # Keep the actual builtin input and native formatting protocols. Only
++        # the sink is recorded, so the witness never executes input as code.
++        witness = ('import json, sys\nobserved = []\n'
++                   'def record(value):\n'
++                   '    observed.append((sys._getframe(1).f_lineno, value))\n'
++                   + f"exec(compile({source!r}, '<formatted-string-witness>', 'exec'), {{'eval': record}})\n"
++                   + 'sys.stderr.write(json.dumps(observed))\n')
++        native = subprocess.run([sys.executable, '-I', '-B', '-c', witness],
++                                input='UNTRUSTED\n' * 16, capture_output=True, text=True, timeout=10)
++        self.assertEqual(native.returncode, 0, native.stdout + native.stderr)
++        observed = json.loads(native.stderr)
++        self.assertEqual([value for _line, value in observed], expected_values)
++        if incomplete:
++            with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
++                self.scan(source)
++        else:
++            self.assertEqual(sorted((item['rule'], item['line']) for item in self.scan(source)),
++                             [('python.taint.eval', line) for line in sorted({
++                                 line for line, value in observed if 'UNTRUSTED' in str(value)})])
++
++    def test_captured_formatted_strings_keep_named_reducer_provenance(self):
++        definition = 'def order(record):\n    return len(record)\n'
++        for reducer in ('min', 'max', 'sorted'):
++            for expression, expected in (("f'SELECT {input()}'", 'SELECT UNTRUSTED'),
++                                         ("f'SELECT {1}'", 'SELECT 1')):
++                selected = f'{reducer}(([query] for unused in (1, 2)), key=order)'
++                if reducer == 'sorted':
++                    selected += '[0]'
++                with self.subTest(reducer=reducer, expression=expression):
++                    self.assert_native(definition + f'query = {expression}\n'
++                                       + f'selected = {selected}\neval(selected[0])\n', [expected])
++
++    def test_formatted_aliases_keep_their_evaluated_values(self):
++        for original, replacement, expected in (
++                ('input()', "'fixed'", 'UNTRUSTED'), ("'fixed'", 'input()', 'fixed')):
++            for consumer in ('next(value for value in [saved])', "''.join(value for value in [saved])"):
++                source = (f'value = {original}\nsaved = f"{{value}}"\n'
++                          f'value = {replacement}\neval({consumer})\n')
++                with self.subTest(original=original, consumer=consumer):
++                    self.assert_native(source, [expected])
++        self.assert_native('''
++            def run():
++                original = f'{input()}'
++                saved = original
++                original = 'fixed'
++                values = [saved]
++                saved = 'changed'
++                eval(next(value for value in values))
++            run()
++        ''', ['UNTRUSTED'])
++
++    def test_native_conversions_and_literal_string_specs_are_inert(self):
++        cases = (
++            ("f'{input()}'", 'UNTRUSTED'),
++            ("f'{input()!s}'", 'UNTRUSTED'),
++            ("f'{input()!r}'", "'UNTRUSTED'"),
++            ("f'{input()!a}'", "'UNTRUSTED'"),
++            ("f'{input():}'", 'UNTRUSTED'),
++            ("f'{input():>12}'", '   UNTRUSTED'),
++            ("f'{input():*^13s}'", '**UNTRUSTED**'),
++            ("f'{input():<12.20s}'", 'UNTRUSTED   '),
++            ("f'{input()!r:*>13}'", "**'UNTRUSTED'"),
++            ('f"{f\'{input()}\'}"', 'UNTRUSTED'),
++        )
++        for expression, expected in cases:
++            with self.subTest(expression=expression):
++                self.assert_native(f'query = {expression}\neval(next(value for value in [query]))\n',
++                                   [expected])
++
++    def test_joined_fields_preserve_taint_and_primitive_branch_alternatives(self):
++        self.assert_native('''
++            value = input() if input() else 'fixed'
++            query = f'before {value} after {True!s}'
++            eval(next(value for value in [query]))
++        ''', ['before UNTRUSTED after True'])
++        self.assert_native('''
++            left = input()
++            right = 'fixed'
++            query = f'{left}:{right}'
++            left = 'changed'
++            right = input()
++            eval(next(value for value in [query]))
++        ''', ['UNTRUSTED:fixed'])
++
++    def test_opaque_formatting_and_temporary_subclass_release_stay_incomplete(self):
++        for method, arguments, expression in (
++                ('__format__', ', spec', "f'prefix{Value()}'"),
++                ('__str__', '', "f'prefix{Value()!s}'"),
++                ('__repr__', '', "f'prefix{Value()!r}'"),
++                ('__repr__', '', "f'prefix{Value()!a}'")):
++            source = ("code = 'fixed'\nclass Text(str):\n"
++                      '    def __del__(self):\n        global code\n        code = input()\n'
++                      + f'class Value:\n    def {method}(self{arguments}):\n'
++                      + "        return Text('fixed')\n"
++                      + f'query = {expression}\n'
++                      + 'min(query for unused in (1, 2))\neval(code)\n')
++            with self.subTest(method=method, expression=expression):
++                self.assert_native(source, ['UNTRUSTED'], incomplete=True)
++        self.assert_native('''
++            code = 'fixed'
++            class Text(str):
++                def __del__(self):
++                    global code
++                    code = input()
++            class Value:
++                def __format__(self, spec):
++                    return Text('fixed')
++            value = f'{Value()}'
++            list(((value := 'fixed'), (code := 'fixed')) for unused in [value])
++            eval(code)
++        ''', ['UNTRUSTED'], incomplete=True)
++
++    def test_opaque_prompt_and_helper_frame_lifetimes_stay_incomplete(self):
++        self.assert_native('''
++            code = 'fixed'
++            class Prompt:
++                def __str__(self):
++                    global code
++                    code = input()
++                    return ''
++            query = f'{input(Prompt())}'
++            min(query for unused in (1, 2))
++            eval(code)
++        ''', ['UNTRUSTED'], incomplete=True)
++        self.assert_native('''
++            code = 'fixed'
++            class Owned:
++                def __del__(self):
++                    global code
++                    code = input()
++            def render():
++                owned = Owned()
++                return 'fixed'
++            query = f'{render()}'
++            min(query for unused in (1, 2))
++            eval(code)
++        ''', ['UNTRUSTED'], incomplete=True)
++
++    def test_invalid_and_unknown_specs_do_not_certify_normal_completion(self):
++        for expression in ("f'{1!s:d}'", "f'{1!s:{input()}}'"):
++            source = ("code = 'fixed'\ntry:\n"
++                      + f'    query = {expression}\n'
++                      + "except ValueError:\n    code = input()\n    query = 'fixed'\n"
++                      + 'next(value for value in [query])\neval(code)\n')
++            with self.subTest(expression=expression):
++                self.assert_native(source, ['UNTRUSTED'], incomplete=True)
++
++
++class ImmediateGeneratorExpressionTests(SourceTest):
+
+diff --git a/test-suite/quality/test_taint_python_globals.py b/test-suite/quality/test_taint_python_globals.py
+--- a/test-suite/quality/test_taint_python_globals.py
++++ b/test-suite/quality/test_taint_python_globals.py
+@@ -853,0 +854,61 @@
++    def test_captured_formatted_values_module_and_runner_json_sarif(self):
++        cases = [
++            Case('formatted_min_named_key_keeps_source', """
++                def order(record):
++                    return len(record)
++                code = f"{input()}"
++                selected = min(([code] for unused in (1, 2)), key=order)
++                eval(selected[0]) # expect:eval
++                """),
++            Case('formatted_max_named_key_keeps_clean_replacement', """
++                def order(record):
++                    return (len(record), record[0])
++                code = input()
++                code = f"{'1'}"
++                selected = max(([code] for unused in (1, 2)), key=order)
++                eval(selected[0])
++                """),
++            Case('formatted_sorted_keeps_captured_unsafe_alias', """
++                def order(record):
++                    return record[0]
++                code = f"{input()}"
++                saved = code
++                code = '1'
++                selected = sorted(([saved] for unused in (1, 2)), key=order)[0]
++                eval(selected[0]) # expect:eval
++                """),
++            Case('formatted_min_keeps_captured_clean_alias', """
++                code = f"{'1'}"
++                saved = code
++                code = input()
++                selected = min(([saved] for unused in (1, 2)), key=len)
++                eval(selected[0])
++                """),
++            Case('formatted_next_keeps_native_string_spec', """
++                code = f"{input()!s:>3}"
++                selected = next(value for value in [code])
++                eval(selected) # expect:eval
++                """),
++            Case('formatted_next_keeps_native_numeric_value', """
++                code = f"{1}"
++                selected = next(value for value in [code])
++                eval(selected)
++                """),
++            Case('formatted_min_preserves_taint_at_branch_join', """
++                if input():
++                    code = f"{input()}"
++                else:
++                    code = f"{'1'}"
++                selected = min(([code] for unused in (1, 2)), key=len)
++                eval(selected[0]) # expect:eval
++                """),
++            Case('formatted_next_reads_live_value_on_resume', """
++                code = '1'
++                pending = (code for unused in [0])
++                code = f"{input()}"
++                selected = next(pending)
++                eval(selected) # expect:eval
++                """),
++        ]
++        self.assert_cli_cases(cases)
++

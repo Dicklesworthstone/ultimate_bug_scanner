@@ -1,3 +1,52 @@
+UNAPPLIED IMPLEMENTATION CHECKPOINT — 2026-11-12
+Base: b85615a03328f67b78054eb9a746be1d6d8c1ca3
+
+C/C++ selected-value outbound URL analysis and per-file failure retention.
+Replaces name/window heuristics with shared worklist binding/helper/guard
+semantics, distinguishes request endpoints from bodies and URI parsing, and
+preserves peer findings while refusing to cache an incomplete analysis.
+
+This patch is NOT active runtime code and is NOT qualified for release.
+The executor became unavailable during qualification. Exact edit inputs were
+reconstructed into this checkpoint, but pre-loss postimage hashes were not
+read. Do not equate reconstruction integrity with a completed candidate run.
+
+Observed baseline DSR: seven methods, 27 failing subcases, zero errors; all
+12 separately compiled/runtime endpoint witnesses pass. The immutable
+baseline receipt completed. Observed candidate2 check log: seven methods,
+zero assertion failures, one unsupported-heap ValueError in a newly authored
+test that had incorrectly expected complete clean. The 12 compiled/runtime
+witnesses and four real driver partial/retry/repair/warm-cache phases passed.
+The candidate2 source-after receipt was NOT observed.
+
+This full patch also contains later UNEXECUTED changes: parenthesized CPR
+options, an exact incomplete/peer-retention oracle for the heap-write case,
+unresolved-option controls, and the strengthened unbound safe-helper oracle.
+Candidate2 checkpoint blob: 34535f7a5fbe7fa80fde83ecddb31d073d9785a9.
+Later delta blob: c80f1ffc29a3ce6b1b6d5e259f6ba5d95af10550.
+
+BLOCKING SOURCE REVIEW FINDING (not fixed in this patch):
+  constexpr auto CURLOPT_POSTFIELDS = CURLOPT_URL;
+  curl_easy_setopt(curl, CURLOPT_POSTFIELDS, getenv("QUERY_STRING"));
+A local option alias can route request data into the URL while the draft
+trusts the option's spelling and reports clean. Add a scope-aware identity
+refusal/proof for shadowed curl option constants and native paired witnesses
+before activation. Tracking only transfer() actions is insufficient for
+calls in guards; preserve expression binding scope during recursion.
+
+ADDITIONAL BLOCKER IN THE UNEXECUTED PARENTHESIS CHANGE:
+  cpr::Get((cpr::Body{"ignored"}, cpr::Url{target}));
+The comma expression evaluates to Url, but the draft's prefix regex can
+mistake it for Body after stripping parentheses. Require a recognized CPR
+constructor to own the entire matched token span; do not approve an option
+from its prefix. This potential candidate-only false-clean is NOT fixed here.
+
+The same bounded frontend still refuses unresolved preprocessing, overloads,
+heap/alias operations and unsupported callbacks. Preserve those diagnostics,
+existing safe/unsafe controls and findings from other files. After repairing
+the blocker, run DSR paired source/native JSON/SARIF/cache qualification and
+canonical nested checksum regeneration before applying runtime changes.
+
 diff --git a/modules/helpers/ubs_core/cpp_detectors/outbound_url.py b/modules/helpers/ubs_core/cpp_detectors/outbound_url.py
 --- a/modules/helpers/ubs_core/cpp_detectors/outbound_url.py
 +++ b/modules/helpers/ubs_core/cpp_detectors/outbound_url.py
@@ -9,27 +58,34 @@ diff --git a/modules/helpers/ubs_core/cpp_detectors/outbound_url.py b/modules/he
 -(modules/ubs-cpp.sh 2172-2411). Critical: "Request-derived URL reaches
 -outbound HTTP client".
 +The shared C/C++ worklist resolves local helpers, assignment kills, reference
-+effects and branches. A helper's spelling never proves validation. This is the
-+same bounded lexical subset as path/redirect analysis, not a C++ type checker.
++effects and branches. A helper's spelling never proves validation. The
++frontend has the same bounded lexical scope as path and redirect analysis.
  """
  from __future__ import annotations
  
-@@ -10,7 +10,8 @@
+@@ -10,12 +10,15 @@
  from pathlib import Path
  from typing import Iterable, Sequence
  
 -from ubs_core.suppression import SourceSuppressions
 +from ubs_core.analyzers.taint_cpp_redirect import RedirectEngine
++from ubs_core.analyzers.taint_cpp_traversal import Engine
 +from ubs_core.taint_flow import AnalysisLimit, CLEAN
  
  RULE_ID = "cpp.detector.outbound-url"
  CATEGORY = 7
-@@ -29,202 +30,67 @@
+ TITLE = "Request-derived URL reaches outbound HTTP client"
+ SEVERITY = "critical"
++FILE_SCOPED = True
+ DESCRIPTION = ("Validate outbound URLs with explicit scheme and host "
+                "allow-lists before configuring or sending client requests")
+ 
+@@ -29,202 +32,87 @@
      r'target|raw_url|url)\s*(?:\(|\b)'
      r'|\b(?:req|request)(?:\.|->)(?:host|target|raw_url|url)\b'
      r'|\b(?:cgiFormString|FCGX_GetParam)\s*\('
 -    r'|\bgetenv\s*\(\s*"(?:QUERY_STRING|REQUEST_URI|HTTP_HOST|HTTP_[A-Z0-9_]+)"\s*\)'
-+    r'|\b(?:std::)?getenv\s*\(\s*"(?:QUERY_STRING|REQUEST_URI|HTTP_HOST|HTTP_[A-Z0-9_]+)"\s*\)'
++    r'|\b(?:std\s*::\s*)?getenv\s*\(\s*"(?:QUERY_STRING|REQUEST_URI|HTTP_HOST|HTTP_[A-Z0-9_]+)"\s*\)'
      r'|\bQUrlQuery\s*\([^;\n]*\)\.queryItemValue\s*\(',
      re.IGNORECASE,
  )
@@ -75,8 +131,8 @@ diff --git a/modules/helpers/ubs_core/cpp_detectors/outbound_url.py b/modules/he
 -    r'(?P<lhs>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<rhs>.+)$'
 -)
 -PATH_LIMIT = 4
- 
- 
+-
+-
 -def strip_line_comments(line: str) -> str:
 -    out = []
 -    quote = ''
@@ -155,16 +211,8 @@ diff --git a/modules/helpers/ubs_core/cpp_detectors/outbound_url.py b/modules/he
 -        path = path[-(PATH_LIMIT - 1):]
 -    path.append(ref)
 -    return {'path': path}
-+class OutboundEngine(RedirectEngine):
-+    source_re, sink_re = SOURCE_RE, SINK_RE
-+    sink_label = 'outbound HTTP'
-+    rule = RULE_ID
- 
-+    def safe(self, trace):
-+        # The selected URL itself must pass a literal HTTPS prefix and an
-+        # exact literal-host allowlist. Local-redirect/path proof is separate.
-+        return {'url-https', 'url-host'} <= trace.tags
- 
+-
+-
 -def has_allowlist_context(lines, line_no, refs):
 -    if not refs:
 -        return False
@@ -176,6 +224,29 @@ diff --git a/modules/helpers/ubs_core/cpp_detectors/outbound_url.py b/modules/he
 -        if SAFE_EXPR_RE.search(line) and any(re.search(rf'\b{re.escape(ref)}\b', line) for ref in refs):
 -            return True
 -    return bool(URL_PARSE_RE.search(context) and HOST_CHECK_RE.search(context) and REJECT_RE.search(context))
++
++
++class OutboundEngine(RedirectEngine):
++    source_re, sink_re = SOURCE_RE, SINK_RE
++    sink_label = 'outbound HTTP'
++    rule = RULE_ID
++
++    def safe(self, trace):
++        # These tags describe the exact selected value, not a nearby check or
++        # a helper name. Local redirect and filesystem proofs do not apply.
++        return {'url-https', 'url-host'} <= trace.tags
++
++    def transfer(self, action, state):
++        # RedirectEngine also owns Location-header assignments. Reuse the
++        # scalar transfer without importing that different sink policy.
++        return Engine.transfer(self, action, state)
++
++    def record(self, offset, value, file_leaf=False):
++        # The shared scalar transfer recognizes C++ file-stream constructors.
++        # Their filesystem operand is owned by the traversal analyzer.
++        if not file_leaf:
++            super().record(offset, value)
++
 +    def call_sink(self, name, spans, arguments, offset, receiver=CLEAN):
 +        targets = []
 +        if name in {'curl_easy_setopt', 'curl_url_set'}:
@@ -184,17 +255,26 @@ diff --git a/modules/helpers/ubs_core/cpp_detectors/outbound_url.py b/modules/he
 +                low, high = spans[1]
 +                while self.parser.value(low) == '(' and self.parser.pairs.get(low) == high - 1:
 +                    low, high = low + 1, high - 1
-+                if self.parser.compact(low, high) == option:
++                selected = self.parser.compact(low, high)
++                if selected == option:
 +                    targets = [2]
++                elif (not re.fullmatch(r'CURLOPT_[A-Z0-9_]+|CURLUPART_[A-Z0-9_]+', selected)
++                      and any(trace.kind in {'source', 'parameter'} for trace in arguments[2])):
++                    raise AnalysisLimit('C/C++ curl URL option identity is unresolved; analysis is incomplete')
 +        elif re.fullmatch(r'cpr::(?:Get|Post|Put|Delete|Patch|Head|Options)', name):
-+            # CPR named options can appear in any order. A Body or Parameters
-+            # value is not an outbound endpoint, even when it is request data.
-+            targets = [index for index, span in enumerate(spans)
-+                       if re.match(r'cpr::Url[({]', self.parser.compact(*span))]
-+            if not targets and any(trace.kind in {'source', 'parameter'}
-+                                   for argument in arguments for trace in argument):
-+                raise AnalysisLimit('C++ CPR URL option identity is unresolved; analysis is incomplete')
-+        elif SINK_RE.search(name + '('):
++            # CPR options are positional-independent. Body/Parameters carry
++            # payload data, while only Url supplies the selected endpoint.
++            for index, span in enumerate(spans):
++                low, high = span
++                while self.parser.value(low) == '(' and self.parser.pairs.get(low) == high - 1:
++                    low, high = low + 1, high - 1
++                raw = self.parser.compact(low, high)
++                if re.match(r'cpr::Url[({]', raw):
++                    targets.append(index)
++                elif (not re.match(r'cpr::(?:Body|Parameters|Payload|Header)[({]', raw)
++                      and any(trace.kind in {'source', 'parameter'} for trace in arguments[index])):
++                    raise AnalysisLimit('C++ CPR URL option identity is unresolved; analysis is incomplete')
++        elif SINK_RE.fullmatch(name + '('):
 +            targets = [0]
 +        for index in targets:
 +            if index < len(arguments):
@@ -267,28 +347,186 @@ diff --git a/modules/helpers/ubs_core/cpp_detectors/outbound_url.py b/modules/he
      return issues
  
  
+diff --git a/modules/helpers/ubs_core/cpp_scan.py b/modules/helpers/ubs_core/cpp_scan.py
+--- a/modules/helpers/ubs_core/cpp_scan.py
++++ b/modules/helpers/ubs_core/cpp_scan.py
+@@ -243,7 +243,8 @@
+     return None
+ 
+ 
+-def run_detectors(files: Sequence[Path], sink, skip: set[int] | None = None) -> None:
++def run_detectors(files: Sequence[Path], sink, skip: set[int] | None = None,
++                  errors: list[str] | None = None) -> None:
+     """Run ubs_core.cpp_detectors.* modules (legacy heredoc detector ports).
+ 
+     Protocol (matches ubs_core.py_detectors): single-rule modules expose
+@@ -262,7 +263,10 @@
+             continue
+         try:
+             module = importlib.import_module(f"ubs_core.cpp_detectors.{module_info.name}")
+-        except Exception as exc:  # legacy heredoc failures degraded gracefully too
++        except Exception as exc:
++            if errors is None:
++                raise
++            errors.append(f"detector module {module_info.name}: {type(exc).__name__}: {exc}")
+             sys.stderr.write(f"[ubs_core.cpp_scan] detector module {module_info.name} failed: {exc}\n")
+             continue
+         find = getattr(module, "find", None)
+@@ -288,31 +292,40 @@
+                      if spec["category"] not in skip}
+             if not specs:
+                 continue
+-        for hit in find(files):
+-            if len(hit) == 5:
+-                rule_id, path, line_no, col, detail = hit
+-            else:
+-                path, line_no, col, detail = hit  # single-rule convenience
+-                rule_id = next(iter(specs))
+-            spec = specs.get(rule_id)
+-            if spec is None:
+-                continue
+-            slug = slug_for_category(spec["category"])
+-            title = spec["title"]
+-            sink.write(json.dumps({
+-                "rule": rule_id,
+-                "category_id": f"cpp.{slug}",
+-                "path": str(path),
+-                "line": int(line_no),
+-                "col": int(col),
+-                "severity": spec["severity"],
+-                "message": f"{title} — {detail}"[:300] if detail else title,
+-                "suppressed": False,
+-            }, ensure_ascii=False) + "\n")
++        batches = ([path] for path in files) if getattr(module, "FILE_SCOPED", False) else (files,)
++        for batch in batches:
++            try:
++                for hit in find(batch):
++                    if len(hit) == 5:
++                        rule_id, path, line_no, col, detail = hit
++                    else:
++                        path, line_no, col, detail = hit  # single-rule convenience
++                        rule_id = next(iter(specs))
++                    spec = specs.get(rule_id)
++                    if spec is None:
++                        continue
++                    slug = slug_for_category(spec["category"])
++                    title = spec["title"]
++                    sink.write(json.dumps({
++                        "rule": rule_id,
++                        "category_id": f"cpp.{slug}",
++                        "path": str(path),
++                        "line": int(line_no),
++                        "col": int(col),
++                        "severity": spec["severity"],
++                        "message": f"{title} — {detail}"[:300] if detail else title,
++                        "suppressed": False,
++                    }, ensure_ascii=False) + "\n")
++            except Exception as exc:
++                if errors is None:
++                    raise
++                source = str(batch[0]) if len(batch) == 1 else "selected files"
++                errors.append(f"{source}: detector {module_info.name}: {type(exc).__name__}: {exc}")
+ 
+ 
+ def run_analyzers(files: Sequence[Path], sink, skip: set[int] | None = None,
+-                  enable_new: bool = False, prefilter: Any = None) -> None:
++                  enable_new: bool = False, prefilter: Any = None,
++                  errors: list[str] | None = None) -> None:
+     """Run registered cpp analyzers (taint traversal/redirect, lifecycle).
+ 
+     ``cpp.narrowing.*`` (bead D4) has no legacy cpp counterpart — it stays
+@@ -324,26 +337,35 @@
+     for analyzer in analyzers_for_lang("cpp"):
+         if analyzer.layer == "narrowing" and not enable_new:
+             continue
++        if skip and ((analyzer.layer == "taint" and 7 in skip) or
++                     (analyzer.layer == "lifecycle" and 16 in skip)):
++            continue
+         if prefilter is not None:
+             target_files = prefilter.filter_files_for_analyzer(analyzer.name, files)
+         else:
+             target_files = list(files)
+         if not target_files:
+             continue
+-        ctx = RunContext(lang="cpp", files=target_files)
+-        for finding in analyzer.run(ctx):
+-            if skip and _record_category(finding) in skip:
+-                continue
+-            sink.write(json.dumps({
+-                "rule": finding.get("rule", ""),
+-                "category_id": finding.get("category_id", f"cpp.{_CATEGORY_SLUGS.get(_record_category(finding), 'undefined-behavior')}"),
+-                "path": finding.get("path", ""),
+-                "line": int(finding.get("line", 0) or 0),
+-                "col": int(finding.get("col", 1) or 1),
+-                "severity": finding.get("severity", "warning"),
+-                "message": finding.get("message", ""),
+-                "suppressed": False,
+-            }, ensure_ascii=False) + "\n")
++        for path in target_files:
++            ctx = RunContext(lang="cpp", files=[path])
++            try:
++                for finding in analyzer.run(ctx):
++                    if skip and _record_category(finding) in skip:
++                        continue
++                    sink.write(json.dumps({
++                        "rule": finding.get("rule", ""),
++                        "category_id": finding.get("category_id", f"cpp.{_CATEGORY_SLUGS.get(_record_category(finding), 'undefined-behavior')}"),
++                        "path": finding.get("path", ""),
++                        "line": int(finding.get("line", 0) or 0),
++                        "col": int(finding.get("col", 1) or 1),
++                        "severity": finding.get("severity", "warning"),
++                        "message": finding.get("message", ""),
++                        "suppressed": False,
++                    }, ensure_ascii=False) + "\n")
++            except Exception as exc:
++                if errors is None:
++                    raise
++                errors.append(f"{path}: {analyzer.name}: {type(exc).__name__}: {exc}")
+ 
+ 
+ def _finding_title(rec: dict) -> str:
+@@ -483,8 +505,9 @@
+ 
+         capturing_sink = CapturingSink()
+         counters = scan_patterns(patterns, files_to_scan, capturing_sink, skip, prefilter=prefilter_res)
+-        run_detectors(files_to_scan, capturing_sink, skip)
+-        run_analyzers(files_to_scan, capturing_sink, skip, enable_new=args.enable_new_analyzers, prefilter=prefilter_res)
++        run_detectors(files_to_scan, capturing_sink, skip, errors=scan_errors)
++        run_analyzers(files_to_scan, capturing_sink, skip, enable_new=args.enable_new_analyzers,
++                      prefilter=prefilter_res, errors=scan_errors)
+         if args.custom_rules:
+             from ubs_core.external_tools import scan_custom_rules
+             scan_custom_rules(args.custom_rules, files_to_scan, capturing_sink, "cpp", scan_errors)
+@@ -577,7 +600,7 @@
+         _render_text(args, files, counters)
+ 
+     sys.stderr.write(json.dumps({"counters": counters, "patterns": len(patterns),
+-                                 "prefilter": prefilter_res.to_dict()}) + "\n")
++                                 "prefilter": prefilter_res.to_dict(), "errors": scan_errors}) + "\n")
+     return exit_code
+ 
+ 
 diff --git a/test-suite/quality/test_ubs_core.py b/test-suite/quality/test_ubs_core.py
 --- a/test-suite/quality/test_ubs_core.py
 +++ b/test-suite/quality/test_ubs_core.py
-@@ -6202,6 +6202,230 @@
+@@ -6202,6 +6202,375 @@
                      print(f'[{label}] PASS ({time.monotonic() - started:.3f}s)', flush=True)
  
  
 +class CppOutboundFlowTests(unittest.TestCase):
-+    """Request values, selected helpers and actual libcurl argument positions."""
++    """Outbound endpoint semantics, independent of safe-looking helper names."""
 +
 +    @classmethod
 +    def setUpClass(cls):
-+        artifacts = REPO_ROOT / 'test-suite/artifacts'
++        artifacts = Path(__file__).resolve().parents[2] / 'test-suite/artifacts'
 +        artifacts.mkdir(parents=True, exist_ok=True)
 +        cls.root = Path(tempfile.mkdtemp(prefix='cpp-outbound-flow-', dir=artifacts))
++        print(f'[CppOutboundFlowTests] artifacts={cls.root}', flush=True)
 +
 +    @staticmethod
 +    def cases():
 +        prelude = '''#include <cstdlib>
 +#include <string>
-+#include <stdexcept>
-+#include <unordered_set>
 +using CURL = void;
 +enum { CURLOPT_URL, CURLOPT_PROXY, CURLUPART_URL, CURLUPART_QUERY };
 +int curl_easy_setopt(CURL *, int, const char *);
@@ -330,12 +568,12 @@ diff --git a/test-suite/quality/test_ubs_core.py b/test-suite/quality/test_ubs_c
 +            }''', '''
 +                send_target(curl, getenv("QUERY_STRING"));
 +            '''),
-+            ('helper_literal_kill', '''void reset(std::string &value) { value = "https://fixed.example/"; }''', '''
++            ('helper_literal_kill', 'void reset(std::string &value) { value = "https://fixed.example/"; }', '''
 +                std::string target = getenv("QUERY_STRING");
 +                reset(target);
 +                curl_easy_setopt(curl, CURLOPT_URL, target.c_str());
 +            '''),
-+            ('helper_reference_source', '''void update(std::string &value) { value = getenv("QUERY_STRING"); }''', '''
++            ('helper_reference_source', 'void update(std::string &value) { value = getenv("QUERY_STRING"); }', '''
 +                std::string target = "https://fixed.example/";
 +                update(target);
 +                curl_easy_setopt(curl, CURLOPT_URL, target.c_str()); // SINK
@@ -351,7 +589,7 @@ diff --git a/test-suite/quality/test_ubs_core.py b/test-suite/quality/test_ubs_c
 +                else target = "https://two.example/";
 +                curl_easy_setopt(curl, CURLOPT_URL, target.c_str());
 +            '''),
-+            ('unrelated_function', '''void other() { std::string target = getenv("QUERY_STRING"); }''', '''
++            ('unrelated_function', 'void other() { std::string target = getenv("QUERY_STRING"); }', '''
 +                std::string target = "https://fixed.example/";
 +                curl_easy_setopt(curl, CURLOPT_URL, target.c_str());
 +            '''),
@@ -468,13 +706,15 @@ diff --git a/test-suite/quality/test_ubs_core.py b/test-suite/quality/test_ubs_c
 +                path.write_text(source, encoding='utf-8')
 +                self.assertEqual([line for _, line, _, _ in outbound_url.find([path])], expected, source)
 +
-+    def test_cpr_url_options_are_separate_from_request_bodies_and_uri_parsing(self):
++    def test_cpr_url_options_are_separate_from_bodies_and_uri_parsing(self):
 +        from ubs_core.cpp_detectors import outbound_url
 +        programs = (
 +            ('cpr::Get(cpr::Url{target});', [3]),
 +            ('cpr::Post(cpr::Body{target}, cpr::Url{"https://fixed.example/"});', []),
 +            ('cpr::Post(cpr::Url{"https://fixed.example/"}, cpr::Body{target});', []),
 +            ('cpr::Post(cpr::Body{"fixed"}, cpr::Url{target});', [3]),
++            ('cpr::Get(((cpr::Url{target})));', [3]),
++            ('cpr::Post(cpr::Body{target});', []),
 +            ('QUrl(target);', []),
 +            ('Poco::URI(target);', []),
 +            ('QNetworkRequest(QUrl(target));', [3]),
@@ -487,17 +727,169 @@ diff --git a/test-suite/quality/test_ubs_core.py b/test-suite/quality/test_ubs_c
 +                path.write_text(source, encoding='utf-8')
 +                self.assertEqual([line for _, line, _, _ in outbound_url.find([path])], expected, source)
 +
-+    @unittest.skipUnless(shutil.which('g++'), 'g++ is required for independent C++ syntax proof')
-+    def test_outbound_sources_are_valid_cpp(self):
-+        for name, source, _expected in self.cases():
-+            with self.subTest(case=name):
-+                path = self.root / (name + '.cpp')
++    def test_redirect_and_file_sinks_do_not_become_outbound_endpoints(self):
++        from ubs_core.cpp_detectors import outbound_url
++        for statement in ('res.headers["Location"] = target;', 'std::ifstream input(target);',
++                          'std::ofstream output(target);', 'res.set_header("Location", target);'):
++            with self.subTest(statement=statement):
++                source = ('void handle() {\nstd::string target = getenv("QUERY_STRING");\n'
++                          + statement + '\ncurl_easy_setopt(curl, CURLOPT_URL, "https://fixed.example/");\n}\n')
++                path = self.root / 'sink-policy.cpp'
 +                path.write_text(source, encoding='utf-8')
-+                command = ['g++', '-std=c++20', '-fsyntax-only', str(path)]
-+                proc = subprocess.run(command, capture_output=True, text=True, timeout=30)
-+                self.assertEqual(proc.returncode, 0, f'{command!r}\n{proc.stdout}\n{proc.stderr}')
++                if statement.startswith('res.headers['):
++                    # A request-derived heap write is outside the shared
++                    # frontend's alias model. It cannot become an outbound
++                    # finding or be silently accepted as a completed scan.
++                    with self.assertRaisesRegex(ValueError, 'heap or reference binding needs alias analysis'):
++                        list(outbound_url.find([path]))
++                    from ubs_core.cpp_scan import run_detectors
++                    peer = self.root / 'sink-policy-peer.cpp'
++                    peer.write_text('void fetch() {\n'
++                                    'curl_easy_setopt(curl, CURLOPT_URL, getenv("QUERY_STRING"));\n}\n', encoding='utf-8')
++                    sink, errors = io.StringIO(), []
++                    run_detectors([path, peer], sink, set(range(1, 17)) - {7}, errors=errors)
++                    rows = [json.loads(line) for line in sink.getvalue().splitlines()]
++                    self.assertEqual([(row['path'], row['line']) for row in rows
++                                      if row['rule'] == outbound_url.RULE_ID], [(str(peer), 2)])
++                    self.assertEqual(len(errors), 1, errors)
++                    self.assertIn(str(path) + ': detector outbound_url: ValueError:', errors[0])
++                    self.assertIn('heap or reference binding needs alias analysis', errors[0])
++                else:
++                    self.assertEqual(list(outbound_url.find([path])), [], source)
++
++    def test_unresolved_endpoint_options_are_explicitly_incomplete(self):
++        from ubs_core.cpp_detectors import outbound_url
++        from ubs_core.taint_flow import AnalysisLimit
++        statements = (
++            'const auto option = CURLOPT_URL; curl_easy_setopt(curl, option, target.c_str());',
++            'const auto option = CURLUPART_URL; curl_url_set(curl, option, target.c_str(), 0);',
++            'auto endpoint = cpr::Url{target}; cpr::Get(endpoint);',
++            'auto endpoint = cpr::Url{target}; cpr::Get(cpr::Url{"https://fixed.example/"}, endpoint);',
++        )
++        for index, statement in enumerate(statements):
++            with self.subTest(statement=statement):
++                path = self.root / f'unresolved-option-{index}.cpp'
++                path.write_text('void handle() {\nstd::string target = getenv("QUERY_STRING");\n'
++                                + statement + '\n}\n', encoding='utf-8')
++                with self.assertRaisesRegex(AnalysisLimit, 'URL option identity is unresolved; analysis is incomplete'):
++                    list(outbound_url.find([path]))
++
++    def test_real_driver_retains_other_files_and_refuses_incomplete_cache_entries(self):
++        root = self.root / 'driver-retention'
++        root.mkdir()
++        paths = [root / name for name in ('first.cpp', 'unsupported.cpp', 'last.cpp')]
++        paths[0].write_text('void first() {\n'
++                            'curl_easy_setopt(curl, CURLOPT_URL, getenv("QUERY_STRING"));\n}\n', encoding='utf-8')
++        paths[1].write_text('#if defined(USE_REQUEST)\nvoid conditional() {\n'
++                            'curl_easy_setopt(curl, CURLOPT_URL, getenv("QUERY_STRING"));\n}\n#endif\n', encoding='utf-8')
++        paths[2].write_text('void last() {\nfopen(getenv("QUERY_STRING"), "r");\n}\n', encoding='utf-8')
++        selected = root / 'files.nul'
++        selected.write_bytes(b'\0'.join(os.fsencode(path) for path in paths) + b'\0')
++        command = [sys.executable, '-m', 'ubs_core.cpp_scan', '--files-from', str(selected),
++                   '--sink', str(root / 'findings.jsonl'), '--json-out', str(root / 'report.json'),
++                   '--project-dir', str(root), '--skip', ','.join(str(i) for i in range(1, 17) if i != 7)]
++        env = dict(os.environ, PYTHONPATH=str(HELPERS_DIR), PYTHONDONTWRITEBYTECODE='1',
++                   UBS_NO_CACHE='0', UBS_CACHE_DIR=str(root / 'cache'), UBS_PROFILE='1')
++        expected = [('cpp.detector.outbound-url', str(paths[0]), 2),
++                    ('cpp.taint.path_traversal', str(paths[2]), 2)]
++        for phase, partial, hits in (('cold-partial', True, 0), ('repeat-partial', True, 0),
++                                     ('repaired', False, 0), ('warm-complete', False, 3)):
++            with self.subTest(phase=phase):
++                if phase == 'repaired':
++                    paths[1].write_text('void fixed() {\n'
++                                        'curl_easy_setopt(curl, CURLOPT_URL, "https://fixed.example/");\n}\n', encoding='utf-8')
++                started = time.monotonic()
++                proc = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=60)
++                (root / (phase + '.stdout.log')).write_text(proc.stdout, encoding='utf-8')
++                (root / (phase + '.stderr.log')).write_text(proc.stderr, encoding='utf-8')
++                (root / (phase + '.identity.json')).write_text(json.dumps({
++                    'command': command, 'exit': proc.returncode, 'elapsed': time.monotonic() - started,
++                    'sources': {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in paths},
++                }, indent=2) + '\n', encoding='utf-8')
++                context = f'{command!r}\nexit={proc.returncode}\n{proc.stdout}\n{proc.stderr}'
++                self.assertEqual(proc.returncode, 2 if partial else 1, context)
++                self.assertTrue((root / 'report.json').is_file(), context)
++                report = json.loads((root / 'report.json').read_text(encoding='utf-8'))
++                (root / (phase + '.report.json')).write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
++                self.assertEqual(report['status'], 'partial' if partial else 'ok', context)
++                self.assertEqual(sorted((f['rule'], f['path'], f['line']) for f in report['findings']), expected, context)
++                self.assertEqual((report['critical'], report['warning'], report['info']), (2, 0, 0), context)
++                self.assertEqual(report['profile']['cache_hits'], hits, context)
++                self.assertEqual(report['profile']['cache_misses'], len(paths) - hits, context)
++                if partial:
++                    self.assertEqual(report['module_error'], 'ANALYZER_ERROR', context)
++                    self.assertIn('Conditional C/C++ preprocessing', report['message'], context)
++                else:
++                    self.assertNotIn('module_error', report, context)
++                print(f'[cpp-outbound-retention-{phase}] PASS ({time.monotonic() - started:.3f}s)', flush=True)
++
++    def test_native_values_reach_the_selected_curl_operand(self):
++        compiler = shutil.which('g++') or shutil.which('clang++')
++        if not compiler:
++            self.skipTest('C++ compiler required for independent runtime witnesses')
++        runtime = self.root / 'native-runtime.cpp'
++        runtime.write_text('''#include <cstdlib>
++#include <iostream>
++#include <string>
++int curl_easy_setopt(void *, int option, const char *value) {
++  if (option == 0) std::cout << value << '\\n';
++  return 0;
++}
++int curl_url_set(void *, int option, const char *value, unsigned int) {
++  if (option == 2) std::cout << value << '\\n';
++  return 0;
++}
++void handle(void *, bool);
++int main(int argc, char **) { handle(nullptr, argc > 1); }
++''', encoding='utf-8')
++        expectations = {
++            'direct': ['https://attacker.example/private'],
++            'safe_named_identity': ['https://attacker.example/private'],
++            'ordinary_identity': ['https://attacker.example/private'],
++            'literal_overwrite': ['https://fixed.example/'],
++            'constant_helper': ['https://fixed.example/'],
++            'helper_sink': ['https://attacker.example/private'],
++            'helper_literal_kill': ['https://fixed.example/'],
++            'helper_reference_source': ['https://attacker.example/private'],
++            'conditional_overwrite': ['https://attacker.example/private'],
++            'both_branches_overwrite': ['https://two.example/'],
++            'copy_before_overwrite': ['https://attacker.example/private'],
++            'url_api_argument': ['https://attacker.example/private'],
++        }
++        for name, source, _expected in self.cases():
++            if name not in expectations:
++                continue
++            with self.subTest(case=name):
++                path, program = self.root / (name + '.cpp'), self.root / (name + '.bin')
++                path.write_text(source, encoding='utf-8')
++                commands = ([compiler, '-std=c++20', str(path), str(runtime), '-o', str(program)],
++                            [str(program)])
++                for phase, command in zip(('compile', 'execute'), commands):
++                    started = time.monotonic()
++                    proc = subprocess.run(command, capture_output=True, text=True, timeout=60,
++                                          env=dict(os.environ, QUERY_STRING='https://attacker.example/private'))
++                    label = f'{name}-{phase}'
++                    (self.root / (label + '.stdout.log')).write_text(proc.stdout, encoding='utf-8')
++                    (self.root / (label + '.stderr.log')).write_text(proc.stderr, encoding='utf-8')
++                    (self.root / (label + '.identity.json')).write_text(json.dumps({
++                        'command': command, 'source_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
++                        'runtime_sha256': hashlib.sha256(runtime.read_bytes()).hexdigest(),
++                        'exit': proc.returncode, 'elapsed': time.monotonic() - started,
++                    }, indent=2) + '\n', encoding='utf-8')
++                    self.assertEqual(proc.returncode, 0, f'{command!r}\n{proc.stdout}\n{proc.stderr}')
++                    if phase == 'execute':
++                        self.assertEqual(proc.stdout.splitlines(), expectations[name])
++                    print(f'[cpp-outbound-native-{label}] PASS ({time.monotonic() - started:.3f}s)', flush=True)
 +
 +
  class JavaDetectorSuppressionTests(unittest.TestCase):
      """Real legacy receivers: suppress findings without deleting source facts."""
  
+@@ -6786,6 +7155,7 @@
+     # shipped clean fixtures (original-safe) carry the safe side for them.
+     UNBOUND_SAFE = {
+         "swift_detectors.header_injection": [4],
++        "cpp_detectors.outbound_url": [4],
+         "analyzers.taint_swift_redirect": [6],
+         "analyzers.taint_cpp_traversal": [4],
+         "analyzers.taint_cpp_redirect": [4],

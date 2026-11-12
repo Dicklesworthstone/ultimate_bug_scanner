@@ -126,6 +126,7 @@ REFLECTIVE_LOOKUPS = frozenset({
     'getattr', '__getattribute__', '__getattr__', 'attrgetter', 'methodcaller',
     'globals', 'locals', 'vars', 'eval', 'exec', '__builtins__', '__import__',
     'builtins', '_getframe', 'currentframe', 'getouterframes', 'stack',
+    '__globals__', '__self__',
     'f_globals', 'f_locals', 'f_builtins', '__dict__', 'modules', 'import_module', '*',
 })
 
@@ -219,7 +220,8 @@ class SanitizerBindings:
                              (names := self.attribute_name_options(call.args[1])) is None
                              or bool(names & {
                                  '_getframe', 'currentframe', 'f_globals', 'f_locals', 'f_builtins',
-                                 '__builtins__', '__dict__', '__getattribute__', '__getattr__',
+                                 '__builtins__', '__dict__', '__globals__', '__self__',
+                                 '__getattribute__', '__getattr__',
                                  'modules', 'import_module', 'attrgetter', 'methodcaller'})))
                     and ((resolved_lookup := self.resolve(call.func)) == ('unbound', 'getattr')
                          or call.func.id == 'getattr' and resolved_lookup is None)):
@@ -2032,6 +2034,7 @@ class SanitizerBindings:
             self.regex_namespace_escape = True
         if (isinstance(node, ast.Attribute) and node.attr in {
                 '_getframe', 'currentframe', 'f_globals', 'f_locals', 'f_builtins',
+                '__globals__', '__self__',
                 '__getattribute__', '__getattr__', 'attrgetter', 'methodcaller'}
                 or isinstance(node, ast.ImportFrom) and
                 (node.module == 'sys' and any(alias.name == '_getframe' for alias in node.names)
@@ -2042,10 +2045,12 @@ class SanitizerBindings:
                 or isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                 and node.func.id == 'getattr' and len(node.args) >= 2
                 and isinstance(node.args[1], ast.Constant) and node.args[1].value in {
-                    '_getframe', 'currentframe', 'f_globals', 'f_locals', 'f_builtins'}):
+                    '_getframe', 'currentframe', 'f_globals', 'f_locals', 'f_builtins',
+                    '__globals__', '__self__'}):
             # Frame dictionaries and reflective attribute factories can
             # replace globals, fast locals and builtin callables without a
-            # Name(Store) or an explicit builtins import.
+            # Name(Store) or an explicit builtins import. Function globals
+            # and builtin callable owners expose the same mutable authority.
             # Neither a validator binding nor a builtin return shape remains
             # proved when this capability escapes ordinary lexical tracking.
             self.dynamic_namespace = True
@@ -4506,7 +4511,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                         and target[1] in {'builtins.min', 'builtins.max', 'builtins.sorted', 'builtins.sum'} else '')
         opaque_literal_reducer = False
         if (reducer_name in {'min', 'max', 'sorted', 'sum'}
-                and not self.closed_generator_reducer_binding(reducer_name)):
+                and not self.closed_generator_builtin_binding(reducer_name)):
             if (self._literal_statement_scopes is None or receiver
                     or any(identity is None or self.generator_has_sql_effects(identity, include_fragments=False)
                            for _, refs in arguments for identity in refs)):
@@ -4539,7 +4544,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             key = keywords.get('key')
             length_key = (isinstance(key, ast.Name) and key.id == 'len'
                           and self.builtin_is_unshadowed('len')
-                          and self.closed_generator_reducer_binding('len'))
+                          and self.closed_generator_builtin_binding('len'))
             # sorted exhausts its iterable before invoking any key. min/max
             # invoke their keys between yields, so free cells must be read
             # at those different times. Shapes are bounded immutable facts;
@@ -4562,6 +4567,15 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             return True
         if isinstance(node.func, ast.Name) and self.builtin_is_unshadowed(node.func.id):
             name = node.func.id
+            if (name in {'next', 'list', 'tuple', 'set', 'frozenset', 'iter',
+                         'str', 'repr', 'bool', 'id', 'type'}
+                    and not self.closed_generator_builtin_binding(name)):
+                # A lexical builtin name still reads the mutable builtin
+                # namespace. A replacement may skip an expected drain,
+                # return different SQL, or mutate a captured query while
+                # an apparent object observer runs. None of the native
+                # result, effect, or exhaustion proofs apply in that case.
+                raise SQLFlowLimit('SQL generator builtin binding is unresolved; analysis is incomplete')
             if (name == 'next' and len(node.args) in {1, 2} and not node.keywords
                     and len(arguments) == 1 and arguments[0][0] is node.args[0]):
                 refs = arguments[0][1]
@@ -4912,7 +4926,13 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         self._evaluated_values[call] = self.join_value_facts(*returned)
         return True
 
-    def closed_generator_reducer_binding(self, name):
+    def closed_generator_builtin_binding(self, name):
+        """Prove the native namespace before trusting a generator consumer.
+
+        Read-only imports with direct audited calls cannot replace a builtin.
+        Escaped namespaces, reflection, and member writes revoke this proof
+        even when the call's bare name has no lexical assignment.
+        """
         bindings = self.ownership_bindings()
         if (bindings.dynamic_namespace or bindings.reflective_member_writes
                 or name in bindings.member_writes):
@@ -4920,9 +4940,12 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         if not bindings.builtin_namespace:
             return True
         cache = self._ownership_syntax
-        if 'reducer_builtin_imports' not in cache:
+        if 'generator_builtin_imports' not in cache:
             closed = True
-            allowed = {'builtins.min', 'builtins.max', 'builtins.sorted', 'builtins.sum', 'builtins.len'}
+            allowed = {'builtins.' + builtin for builtin in {
+                'min', 'max', 'sorted', 'sum', 'len', 'next', 'list', 'tuple',
+                'set', 'frozenset', 'iter', 'str', 'repr', 'bool', 'id', 'type',
+            }}
             for node in bindings.scope_of:
                 self.step()
                 if (isinstance(node, ast.Name) and node.id in {'__builtins__', '__import__', 'vars'}
@@ -4942,8 +4965,8 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                         if target[1] not in allowed or node not in bindings.direct_callees:
                             closed = False
                             break
-            cache['reducer_builtin_imports'] = closed
-        return cache['reducer_builtin_imports']
+            cache['generator_builtin_imports'] = closed
+        return cache['generator_builtin_imports']
 
     def check_generator_reducer(self, facts, key, length_key, deferred_keys, *, yielded):
         """Prove implicit reducer dispatch from each actual yielded value.
@@ -5018,7 +5041,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                         consumer[1].removeprefix('builtins.')
                         if consumer and consumer[0] == 'import'
                         and consumer[1] in {'builtins.min', 'builtins.max', 'builtins.sorted'} else '')
-                if name not in {'min', 'max', 'sorted'} or not self.closed_generator_reducer_binding(name):
+                if name not in {'min', 'max', 'sorted'} or not self.closed_generator_builtin_binding(name):
                     return None
             cache[function] = body[0].value
         expression = cache[function]
@@ -5086,7 +5109,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                     and value.func.id == 'len' and len(value.args) == 1 and not value.keywords
                     and not isinstance(value.args[0], ast.Starred)
                     and self.ownership_bindings().resolve(value.func) == ('unbound', 'len')
-                    and self.closed_generator_reducer_binding('len')):
+                    and self.closed_generator_builtin_binding('len')):
                 argument = key_shape(value.args[0])
                 if (argument == 'str' or isinstance(argument, tuple)
                         and argument[0] in {'tuple', 'list'}):

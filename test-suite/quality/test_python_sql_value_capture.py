@@ -665,6 +665,60 @@ def incomplete_closure_program():
                    '    return queries[0]\n')
 
 
+def generator_builtin_replacement_program(consumer, *, mutation=None, keep_finding=False):
+    """A replaced consumer reaches injected SQL despite a harmless projection."""
+    safe = '"SELECT count(*) FROM users WHERE name = \'alice\'"'
+    unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
+    if consumer in {'list', 'tuple', 'set', 'frozenset'}:
+        initial = unsafe
+        replacement = '        return ()\n'
+        invocation = f'        {consumer}((query := {safe}) for _ in (0,))\n'
+    elif consumer == 'next':
+        initial = safe
+        replacement = f'        return {unsafe}\n'
+        invocation = f'        query = next({safe} for _ in (0,))\n'
+    else:
+        initial = safe
+        replacement = (f'        nonlocal query\n        query = {unsafe}\n'
+                       '        return values\n')
+        invocation = f'        {consumer}(None for _ in (0,))\n'
+    return program((f'    cursor.execute({unsafe})\n' if keep_finding else '')
+                   + f'    import builtins\n    query = {initial}\n'
+                   + f'    saved = builtins.{consumer}\n    def replacement(values):\n'
+                   + replacement
+                   + (mutation or f'    builtins.{consumer} = replacement\n')
+                   + '    try:\n' + invocation + '    finally:\n'
+                   + f'        builtins.{consumer} = saved\n'
+                   + '    return cursor.execute(query).fetchone()[0]\n')
+
+
+def generator_callable_namespace_programs(*, keep_finding=False):
+    """Callable metadata exposes writable globals without a builtins import."""
+    safe = '"SELECT count(*) FROM users WHERE name = \'alice\'"'
+    unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
+    cases = (
+        ('function-globals',
+         'patch.dict(namespace_anchor.__globals__, {"list": lambda values: ()})'),
+        ('function-globals-reflected',
+         'patch.dict(getattr(namespace_anchor, "__globals__"), {"list": lambda values: ()})'),
+        ('function-globals-computed',
+         'patch.dict(getattr(namespace_anchor, "__glo" + "bals__"), {"list": lambda values: ()})'),
+        ('builtin-owner',
+         'patch.object(next.__self__, "list", lambda values: ())'),
+        ('builtin-owner-reflected',
+         'patch.object(getattr(next, "__self__"), "list", lambda values: ())'),
+        ('builtin-owner-computed',
+         'patch.object(getattr(next, "__se" + "lf__"), "list", lambda values: ())'),
+    )
+    for name, manager in cases:
+        body = ((f'    cursor.execute({unsafe})\n' if keep_finding else '')
+                + '    from unittest.mock import patch\n'
+                + f'    query = {unsafe}\n    with {manager}:\n'
+                + f'        list((query := {safe}) for _ in (0,))\n'
+                + '    return cursor.execute(query).fetchone()[0]\n')
+        yield name, 'def namespace_anchor():\n    pass\n\n' + program(body)
+
+
 def sqlite_witness(artifacts, name, source, *, mode='capture', value="' OR 1=1 --", flag=False, optimize=False):
     """Execute test-authored source in a bounded child, with data in argv.
 
@@ -1593,7 +1647,7 @@ class SQLValueCaptureTests(unittest.TestCase):
         sources['z-safe.py'] = (program('    cursor.execute("SELECT ?", (user,))\n'), ())
         self._assert_partial_cli('independent-partial', incomplete_program(), 2, sources=sources)
 
-    def _assert_partial_cli(self, name, source, sink_line, *, sources=None):
+    def _assert_partial_cli(self, name, source, sink_line, *, sources=None, reason=None):
         for entry in ('ubs', 'modules/ubs-python.sh'):
             for fmt in ('json', 'sarif'):
                 with self.subTest(entry=entry, format=fmt):
@@ -1636,6 +1690,8 @@ class SQLValueCaptureTests(unittest.TestCase):
                     except json.JSONDecodeError as exc:
                         self.fail(f'CLI emitted invalid JSON: {command}; evidence: {folder}: {exc}')
                     self.assertIn('SQLFlowLimit', result.stdout)
+                    if reason is not None:
+                        self.assertIn(reason, result.stdout)
                     if fmt == 'json':
                         self.assertEqual(report['status'], 'partial')
                         scans = report['scanners'] if entry == 'ubs' else [report]
@@ -2000,6 +2056,97 @@ class SQLValueCaptureTests(unittest.TestCase):
                     self.assertEqual(sqlite_witness(self.artifacts, name, source)['rows'], rows)
                     line = len(source.splitlines())
                     self.inspect(name, source, tuple((rule, line) for rule in expected))
+
+    def test_generator_builtin_replacements_remain_incomplete(self):
+        for consumer in ('list', 'tuple', 'set', 'frozenset', 'next', 'iter',
+                         'str', 'repr', 'bool', 'id', 'type'):
+            name = 'generator-builtin-replaced-' + consumer
+            source = generator_builtin_replacement_program(consumer)
+            with self.subTest(consumer=consumer):
+                # Each interpreter restores the original builtin before
+                # returning; no analyzed fixture executes in the test runner.
+                self.assertEqual(sqlite_witness(self.artifacts, name, source)['rows'], 2)
+                path = self.artifacts / (name + '.py')
+                path.write_text(source, encoding='utf-8')
+                with self.assertRaisesRegex(detector.SQLFlowLimit, 'generator builtin binding.*incomplete'):
+                    list(detector.find([path]))
+
+    def test_generator_builtin_namespace_mutations_remain_incomplete(self):
+        mutations = (
+            ('alias', '    namespace = builtins\n    namespace.list = replacement\n'),
+            ('attribute', '    setattr(builtins, "list", replacement)\n'),
+            ('mapping', '    vars(builtins)["list"] = replacement\n'),
+            ('export', '    def install(namespace, function):\n'
+             '        namespace.list = function\n    install(builtins, replacement)\n'),
+        )
+        for label, mutation in mutations:
+            name = 'generator-builtin-namespace-' + label
+            source = generator_builtin_replacement_program('list', mutation=mutation)
+            with self.subTest(mutation=label):
+                self.assertEqual(sqlite_witness(self.artifacts, name, source)['rows'], 2)
+                path = self.artifacts / (name + '.py')
+                path.write_text(source, encoding='utf-8')
+                with self.assertRaisesRegex(detector.SQLFlowLimit, 'generator builtin binding.*incomplete'):
+                    list(detector.find([path]))
+
+    def test_generator_callable_namespaces_remain_incomplete(self):
+        for name, source in generator_callable_namespace_programs():
+            with self.subTest(namespace=name):
+                self.assertEqual(sqlite_witness(self.artifacts, name, source)['rows'], 2)
+                path = self.artifacts / ('callable-namespace-' + name + '.py')
+                path.write_text(source, encoding='utf-8')
+                with self.assertRaisesRegex(detector.SQLFlowLimit, 'generator builtin binding.*incomplete'):
+                    list(detector.find([path]))
+
+    @unittest.skipUnless((ROOT / 'ubs').is_file(), 'real CLI requires full checkout')
+    def test_real_cli_generator_callable_namespaces(self):
+        for name, source in generator_callable_namespace_programs(keep_finding=True):
+            if name in {'function-globals-computed', 'builtin-owner-reflected'}:
+                self._assert_partial_cli(
+                    'callable-namespace-' + name, source, 5,
+                    reason='SQL generator builtin binding is unresolved')
+
+    def test_generator_native_builtin_consumers_preserve_sql(self):
+        safe = '"SELECT count(*) FROM users WHERE name = \'alice\'"'
+        unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
+        for consumer in ('list', 'tuple', 'set', 'frozenset', 'next', 'iter',
+                         'str', 'repr', 'bool', 'id', 'type'):
+            for namespace, prefix in (
+                    ('bare', ''), ('readonly', '    import builtins\n    builtins.len(())\n')):
+                for label, query, opposite, rows in (
+                        ('unsafe', unsafe, safe, 2), ('clean', safe, unsafe, 1)):
+                    if consumer in {'list', 'tuple', 'set', 'frozenset'}:
+                        body = (f'    query = {opposite}\n'
+                                + f'    {consumer}((query := {query}) for _ in (0,))\n')
+                    elif consumer == 'next':
+                        body = f'    query = next({query} for _ in (0,))\n'
+                    else:
+                        # Iteration identity and object observers do not
+                        # execute the delayed write in an untouched generator.
+                        body = (f'    query = {query}\n'
+                                + f'    {consumer}((query := {opposite}) for _ in (0,))\n')
+                    name = f'generator-builtin-native-{consumer}-{namespace}-{label}'
+                    source = program(prefix + body + '    return cursor.execute(query).fetchone()[0]\n')
+                    with self.subTest(consumer=consumer, namespace=namespace, case=label):
+                        self.assertEqual(sqlite_witness(self.artifacts, name, source)['rows'], rows)
+                        expected = ((CRITICAL, len(source.splitlines())),) if label == 'unsafe' else ()
+                        self.inspect(name, source, expected)
+
+    @unittest.skipUnless((ROOT / 'ubs').is_file(), 'real CLI requires full checkout')
+    def test_real_cli_generator_builtin_bindings(self):
+        for consumer in ('list', 'next', 'iter'):
+            self._assert_partial_cli(
+                'builtin-binding-replaced-' + consumer,
+                generator_builtin_replacement_program(consumer, keep_finding=True), 2,
+                reason='SQL generator builtin binding is unresolved')
+        for name, body, expected in (
+                ('native-clean', '    query = f"SELECT {user}"\n'
+                 '    list((query := "SELECT 1") for _ in (0,))\n'
+                 '    cursor.execute(query)\n', ()),
+                ('readonly-unsafe', '    import builtins\n    builtins.len(())\n'
+                 '    query = next(f"SELECT {user}" for _ in (0,))\n'
+                 '    cursor.execute(query)\n', ((CRITICAL, 5),))):
+            self._assert_boolean_generator_cli('builtin-binding-' + name, program(body), expected)
 
     def test_generator_reducer_preserves_sql_effects_and_aliases(self):
         cases = (

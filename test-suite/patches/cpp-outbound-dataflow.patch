@@ -1,0 +1,503 @@
+diff --git a/modules/helpers/ubs_core/cpp_detectors/outbound_url.py b/modules/helpers/ubs_core/cpp_detectors/outbound_url.py
+--- a/modules/helpers/ubs_core/cpp_detectors/outbound_url.py
++++ b/modules/helpers/ubs_core/cpp_detectors/outbound_url.py
+@@ -1,8 +1,8 @@
+-"""ubs_core.cpp_detectors.outbound_url — category 7 SSRF taint (bead 0xjg.9).
++"""C/C++ outbound URLs using selected values and sink-specific host proof.
+ 
+-Verbatim port of the run_outbound_url_checks heredoc
+-(modules/ubs-cpp.sh 2172-2411). Critical: "Request-derived URL reaches
+-outbound HTTP client".
++The shared C/C++ worklist resolves local helpers, assignment kills, reference
++effects and branches. A helper's spelling never proves validation. This is the
++same bounded lexical subset as path/redirect analysis, not a C++ type checker.
+ """
+ from __future__ import annotations
+ 
+@@ -10,7 +10,8 @@
+ from pathlib import Path
+ from typing import Iterable, Sequence
+ 
+-from ubs_core.suppression import SourceSuppressions
++from ubs_core.analyzers.taint_cpp_redirect import RedirectEngine
++from ubs_core.taint_flow import AnalysisLimit, CLEAN
+ 
+ RULE_ID = "cpp.detector.outbound-url"
+ CATEGORY = 7
+@@ -29,202 +30,67 @@
+     r'target|raw_url|url)\s*(?:\(|\b)'
+     r'|\b(?:req|request)(?:\.|->)(?:host|target|raw_url|url)\b'
+     r'|\b(?:cgiFormString|FCGX_GetParam)\s*\('
+-    r'|\bgetenv\s*\(\s*"(?:QUERY_STRING|REQUEST_URI|HTTP_HOST|HTTP_[A-Z0-9_]+)"\s*\)'
++    r'|\b(?:std::)?getenv\s*\(\s*"(?:QUERY_STRING|REQUEST_URI|HTTP_HOST|HTTP_[A-Z0-9_]+)"\s*\)'
+     r'|\bQUrlQuery\s*\([^;\n]*\)\.queryItemValue\s*\(',
+     re.IGNORECASE,
+ )
+-CGI_FORM_OUT_RE = re.compile(
+-    r'\bcgiFormString\s*\(\s*[^,]+,\s*(?:&\s*)?(?P<lhs>[A-Za-z_][A-Za-z0-9_]*)\s*,'
+-)
+-SAFE_EXPR_RE = re.compile(
+-    r'\b(?:safe(?:URL|Url|Uri|URI|OutboundURL|OutboundUrl|OutboundURI|WebhookURL|CallbackURL|HttpURL)|'
+-    r'safe_(?:url|uri|outbound_url|webhook_url|callback_url|http_url)|'
+-    r'secure(?:URL|Url|Uri|URI|OutboundURL|WebhookURL|CallbackURL)|'
+-    r'secure_(?:url|uri|outbound_url|webhook_url|callback_url)|'
+-    r'allow(?:URL|Url|Uri|URI|Host|OutboundURL)|allowed(?:URL|Url|Uri|URI|Host|OutboundURL)|'
+-    r'validate(?:URL|Url|Uri|URI|Host|OutboundURL|WebhookURL|CallbackURL)|'
+-    r'validate_(?:url|uri|host|outbound_url|webhook_url|callback_url)|'
+-    r'sanitize(?:URL|Url|Uri|URI|OutboundURL)|sanitize_(?:url|uri|outbound_url)|'
+-    r'isAllowedHost|is_allowed_host|isSafeURL|isSafeUrl|is_safe_url)\b',
+-    re.IGNORECASE,
+-)
+-URL_PARSE_RE = re.compile(r'\b(?:Poco::URI|QUrl|ada::parse|boost::urls::parse_uri|boost::urls::url_view|curl_url)\s*\(')
+-HOST_CHECK_RE = re.compile(
+-    r'\b(?:allowedHosts|allowed_hosts|allowlist|hostAllowlist|host_allowlist|trustedHosts|trusted_hosts|isAllowedHost|is_allowed_host)\b'
+-    r'|\.\s*(?:host|scheme|getHost|getScheme|isValid)\s*\('
+-    r'|\b(?:starts_with|rfind|compare)\s*\([^;\n]*https://'
+-)
+-REJECT_RE = re.compile(
+-    r'\b(?:throw|return\s+false|return\s+\{\}|abort|forbid|deny|invalid_argument|runtime_error|domain_error)\b',
+-    re.IGNORECASE,
+-)
+ SINK_RE = re.compile(
+-    r'\bcurl_easy_setopt\s*\([^;\n]*\bCURLOPT_URL\b'
+-    r'|\bcurl_url_set\s*\([^;\n]*\bCURLUPART_URL\b'
+-    r'|\b(?:cpr::(?:Get|Post|Put|Delete|Patch|Head|Options)|QNetworkRequest|Poco::URI|QUrl)\s*\('
++    r'\b(?:curl_easy_setopt|curl_url_set)\s*\('
++    r'|\b(?:cpr::(?:Get|Post|Put|Delete|Patch|Head|Options)|QNetworkRequest)\s*\('
+     r'|\b(?:httplib::Client|httplib::SSLClient|Poco::Net::HTTPClientSession)\s*\('
+     r'|\b(?:client|httpClient|http_client|restClient|rest_client|webClient|web_client|session|request|manager|'
+     r'[A-Za-z_][A-Za-z0-9_]*(?:Client|Http|HTTP|Rest|Web|Session|Request|Curl)[A-Za-z0-9_]*)(?:\.|->)'
+     r'(?:Get|Post|Put|Patch|Delete|Head|get|post|put|patch|delete|head|request|send|setUrl|openUrl)\s*\(',
+ )
+-ASSIGN_RE = re.compile(
+-    r'^\s*(?:const\s+)?(?:auto|std::string(?:_view)?|string(?:_view)?|'
+-    r'QUrl|Poco::URI|boost::urls::url(?:_view)?|char\s*(?:const\s*)?\*|const\s+char\s*\*)?\s*'
+-    r'(?P<lhs>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<rhs>.+)$'
+-)
+-PATH_LIMIT = 4
+ 
+ 
+-def strip_line_comments(line: str) -> str:
+-    out = []
+-    quote = ''
+-    escape = False
+-    i = 0
+-    while i < len(line):
+-        ch = line[i]
+-        if quote:
+-            out.append(ch)
+-            if escape:
+-                escape = False
+-            elif ch == '\\':
+-                escape = True
+-            elif ch == quote:
+-                quote = ''
+-            i += 1
+-            continue
+-        if ch in ('"', "'"):
+-            quote = ch
+-            out.append(ch)
+-            i += 1
+-            continue
+-        if ch == '/' and i + 1 < len(line) and line[i + 1] == '/':
+-            break
+-        out.append(ch)
+-        i += 1
+-    return ''.join(out)
+-
+-
+-def logical_statement(lines, line_no):
+-    idx = line_no - 1
+-    statement = strip_line_comments(lines[idx])
+-    balance = statement.count('(') - statement.count(')')
+-    has_end = ';' in statement or '{' in statement or '}' in statement
+-    lookahead = idx + 1
+-    while (balance > 0 or not has_end) and lookahead < len(lines) and lookahead < idx + 8:
+-        next_line = strip_line_comments(lines[lookahead]).strip()
+-        statement += ' ' + next_line
+-        balance += next_line.count('(') - next_line.count(')')
+-        has_end = has_end or ';' in next_line or '{' in next_line or '}' in next_line
+-        lookahead += 1
+-    return statement
+-
+-
+-def source_line(lines, line_no):
+-    idx = line_no - 1
+-    if 0 <= idx < len(lines):
+-        return lines[idx].strip().replace('\t', ' ')
+-    return ''
+-
+-
+-def is_safe_expr(expr):
+-    return bool(SAFE_EXPR_RE.search(expr))
+-
+-
+-def refs_in_expr(expr, tainted):
+-    refs = []
+-    for name in tainted:
+-        if re.search(rf'\b{re.escape(name)}\b', expr):
+-            refs.append(name)
+-    return refs
+-
+-
+-def taint_from_expr(expr, tainted):
+-    if is_safe_expr(expr):
+-        return None
+-    direct = SOURCE_RE.search(expr)
+-    if direct:
+-        return {'path': [direct.group(0).strip('(')]}
+-    refs = refs_in_expr(expr, tainted)
+-    if not refs:
+-        return None
+-    ref = refs[0]
+-    path = list(tainted.get(ref, {}).get('path', [ref]))
+-    if len(path) >= PATH_LIMIT:
+-        path = path[-(PATH_LIMIT - 1):]
+-    path.append(ref)
+-    return {'path': path}
++class OutboundEngine(RedirectEngine):
++    source_re, sink_re = SOURCE_RE, SINK_RE
++    sink_label = 'outbound HTTP'
++    rule = RULE_ID
+ 
++    def safe(self, trace):
++        # The selected URL itself must pass a literal HTTPS prefix and an
++        # exact literal-host allowlist. Local-redirect/path proof is separate.
++        return {'url-https', 'url-host'} <= trace.tags
+ 
+-def has_allowlist_context(lines, line_no, refs):
+-    if not refs:
+-        return False
+-    start = max(0, line_no - 24)
+-    context = '\n'.join(strip_line_comments(line) for line in lines[start:line_no + 1])
+-    if not any(re.search(rf'\b{re.escape(ref)}\b', context) for ref in refs):
+-        return False
+-    for line in context.splitlines():
+-        if SAFE_EXPR_RE.search(line) and any(re.search(rf'\b{re.escape(ref)}\b', line) for ref in refs):
+-            return True
+-    return bool(URL_PARSE_RE.search(context) and HOST_CHECK_RE.search(context) and REJECT_RE.search(context))
++    def call_sink(self, name, spans, arguments, offset, receiver=CLEAN):
++        targets = []
++        if name in {'curl_easy_setopt', 'curl_url_set'}:
++            option = 'CURLOPT_URL' if name == 'curl_easy_setopt' else 'CURLUPART_URL'
++            if len(spans) >= 3:
++                low, high = spans[1]
++                while self.parser.value(low) == '(' and self.parser.pairs.get(low) == high - 1:
++                    low, high = low + 1, high - 1
++                if self.parser.compact(low, high) == option:
++                    targets = [2]
++        elif re.fullmatch(r'cpr::(?:Get|Post|Put|Delete|Patch|Head|Options)', name):
++            # CPR named options can appear in any order. A Body or Parameters
++            # value is not an outbound endpoint, even when it is request data.
++            targets = [index for index, span in enumerate(spans)
++                       if re.match(r'cpr::Url[({]', self.parser.compact(*span))]
++            if not targets and any(trace.kind in {'source', 'parameter'}
++                                   for argument in arguments for trace in argument):
++                raise AnalysisLimit('C++ CPR URL option identity is unresolved; analysis is incomplete')
++        elif SINK_RE.search(name + '('):
++            targets = [0]
++        for index in targets:
++            if index < len(arguments):
++                self.record(offset, arguments[index])
+ 
+ 
+ def analyze(path: Path, cwd: Path) -> list[tuple[str, int, str]]:
+-    try:
+-        text = path.read_text(encoding='utf-8', errors='ignore')
+-    except OSError:
+-        return []
++    text = path.read_text(encoding='utf-8')
+     if not (SOURCE_RE.search(text) and SINK_RE.search(text)):
+         return []
+-    suppressions = SourceSuppressions("cpp")
+-    suppressions.index(path, text)
+     lines = text.splitlines()
+-    tainted = {}
+     rel = str(path.resolve())
+-    seen = set()
+     issues = []
+-    for idx, _ in enumerate(lines, start=1):
+-        statement = logical_statement(lines, idx).strip()
+-        if not statement:
+-            continue
+-        cgi_out = CGI_FORM_OUT_RE.search(statement)
+-        if cgi_out:
+-            name = cgi_out.group('lhs')
+-            tainted[name] = {'path': [f"cgiFormString(..., {name}, ...)"]}
+-        assign = ASSIGN_RE.match(statement)
+-        if assign:
+-            name = assign.group('lhs')
+-            rhs = assign.group('rhs')
+-            taint = taint_from_expr(rhs, tainted)
+-            if taint:
+-                tainted[name] = taint
+-            elif name in tainted and is_safe_expr(rhs):
+-                tainted.pop(name, None)
+-        if not SINK_RE.search(statement):
+-            continue
+-        if is_safe_expr(statement):
+-            continue
+-        direct = SOURCE_RE.search(statement)
+-        refs = refs_in_expr(statement, tainted)
+-        if not direct and not refs:
+-            continue
+-        if has_allowlist_context(lines, idx, refs):
+-            continue
+-        if suppressions.is_suppressed(path, idx, RULE_ID):
+-            continue
+-        key = (rel, idx)
+-        if key in seen:
+-            continue
+-        seen.add(key)
+-        if direct:
+-            path_desc = f"{direct.group(0).strip('(')} -> outbound HTTP"
+-        else:
+-            ref = refs[0]
+-            seq = list(tainted.get(ref, {}).get('path', [ref]))
+-            if len(seq) >= PATH_LIMIT:
+-                seq = seq[-(PATH_LIMIT - 1):]
+-            seq.append('outbound HTTP')
+-            path_desc = ' -> '.join(seq)
+-        issues.append((rel, idx, f"{source_line(lines, idx)}  [{path_desc}]"))
++    for line, fact in sorted(OutboundEngine(path, text).analyze().items()):
++        witness = min(fact, key=lambda trace: (len(trace.evidence), trace.evidence))
++        source = witness.evidence[0].label if witness.evidence else 'request source'
++        code = lines[line - 1].strip().replace('\t', ' ')
++        issues.append((rel, line, f'{code}  [{source} -> outbound HTTP]'))
+     return issues
+ 
+ 
+diff --git a/test-suite/quality/test_ubs_core.py b/test-suite/quality/test_ubs_core.py
+--- a/test-suite/quality/test_ubs_core.py
++++ b/test-suite/quality/test_ubs_core.py
+@@ -6202,6 +6202,230 @@
+                     print(f'[{label}] PASS ({time.monotonic() - started:.3f}s)', flush=True)
+ 
+ 
++class CppOutboundFlowTests(unittest.TestCase):
++    """Request values, selected helpers and actual libcurl argument positions."""
++
++    @classmethod
++    def setUpClass(cls):
++        artifacts = REPO_ROOT / 'test-suite/artifacts'
++        artifacts.mkdir(parents=True, exist_ok=True)
++        cls.root = Path(tempfile.mkdtemp(prefix='cpp-outbound-flow-', dir=artifacts))
++
++    @staticmethod
++    def cases():
++        prelude = '''#include <cstdlib>
++#include <string>
++#include <stdexcept>
++#include <unordered_set>
++using CURL = void;
++enum { CURLOPT_URL, CURLOPT_PROXY, CURLUPART_URL, CURLUPART_QUERY };
++int curl_easy_setopt(CURL *, int, const char *);
++int curl_url_set(CURL *, int, const char *, unsigned int);
++int cgiFormString(const char *, char *, int);
++'''
++        bodies = (
++            ('direct', '', '''
++                std::string target = getenv("QUERY_STRING");
++                curl_easy_setopt(curl, CURLOPT_URL, target.c_str()); // SINK
++            '''),
++            ('standard_environment', '', '''
++                std::string target = std::getenv("HTTP_X_CALLBACK_URL");
++                curl_easy_setopt(curl, CURLOPT_URL, target.c_str()); // SINK
++            '''),
++            ('literal_overwrite', '', '''
++                std::string target = getenv("QUERY_STRING");
++                target = "https://fixed.example/";
++                curl_easy_setopt(curl, CURLOPT_URL, target.c_str());
++            '''),
++            ('safe_named_identity', 'std::string safe_url(std::string value) { return value; }', '''
++                std::string target = safe_url(getenv("QUERY_STRING"));
++                curl_easy_setopt(curl, CURLOPT_URL, target.c_str()); // SINK
++            '''),
++            ('ordinary_identity', 'std::string identity(std::string value) { return value; }', '''
++                std::string target = identity(getenv("QUERY_STRING"));
++                curl_easy_setopt(curl, CURLOPT_URL, target.c_str()); // SINK
++            '''),
++            ('constant_helper', 'std::string fixed(std::string value) { return "https://fixed.example/"; }', '''
++                std::string target = fixed(getenv("QUERY_STRING"));
++                curl_easy_setopt(curl, CURLOPT_URL, target.c_str());
++            '''),
++            ('unbound_safe_name', 'std::string safe_url(std::string);', '''
++                std::string target = safe_url(getenv("QUERY_STRING"));
++                curl_easy_setopt(curl, CURLOPT_URL, target.c_str()); // SINK
++            '''),
++            ('helper_sink', '''void send_target(CURL *curl, std::string target) {
++                curl_easy_setopt(curl, CURLOPT_URL, target.c_str()); // SINK
++            }''', '''
++                send_target(curl, getenv("QUERY_STRING"));
++            '''),
++            ('helper_literal_kill', '''void reset(std::string &value) { value = "https://fixed.example/"; }''', '''
++                std::string target = getenv("QUERY_STRING");
++                reset(target);
++                curl_easy_setopt(curl, CURLOPT_URL, target.c_str());
++            '''),
++            ('helper_reference_source', '''void update(std::string &value) { value = getenv("QUERY_STRING"); }''', '''
++                std::string target = "https://fixed.example/";
++                update(target);
++                curl_easy_setopt(curl, CURLOPT_URL, target.c_str()); // SINK
++            '''),
++            ('conditional_overwrite', '', '''
++                std::string target = getenv("QUERY_STRING");
++                if (enabled) target = "https://fixed.example/";
++                curl_easy_setopt(curl, CURLOPT_URL, target.c_str()); // SINK
++            '''),
++            ('both_branches_overwrite', '', '''
++                std::string target = getenv("QUERY_STRING");
++                if (enabled) target = "https://one.example/";
++                else target = "https://two.example/";
++                curl_easy_setopt(curl, CURLOPT_URL, target.c_str());
++            '''),
++            ('unrelated_function', '''void other() { std::string target = getenv("QUERY_STRING"); }''', '''
++                std::string target = "https://fixed.example/";
++                curl_easy_setopt(curl, CURLOPT_URL, target.c_str());
++            '''),
++            ('nested_shadow', '', '''
++                std::string target = getenv("QUERY_STRING");
++                { std::string target = "https://fixed.example/";
++                  curl_easy_setopt(curl, CURLOPT_URL, target.c_str()); }
++                curl_easy_setopt(curl, CURLOPT_URL, target.c_str()); // SINK
++            '''),
++            ('copy_before_overwrite', '', '''
++                std::string target = getenv("QUERY_STRING");
++                std::string copy = target;
++                target = "https://fixed.example/";
++                curl_easy_setopt(curl, CURLOPT_URL, copy.c_str()); // SINK
++            '''),
++            ('unrelated_validator', 'std::string safe_url(std::string value) { return value; }', '''
++                std::string target = getenv("QUERY_STRING");
++                safe_url(target);
++                curl_easy_setopt(curl, CURLOPT_URL, target.c_str()); // SINK
++            '''),
++            ('literal_mentions_variable', '', '''
++                std::string target = getenv("QUERY_STRING");
++                curl_easy_setopt(curl, CURLOPT_URL, "https://fixed.example/target");
++            '''),
++            ('different_url_option', '', '''
++                std::string target = getenv("QUERY_STRING");
++                curl_url_set(curl, CURLUPART_QUERY, target.c_str(), 0);
++                curl_easy_setopt(curl, CURLOPT_URL, "https://fixed.example/");
++            '''),
++            ('url_api_argument', '', '''
++                std::string target = getenv("QUERY_STRING");
++                curl_url_set(curl, CURLUPART_URL, target.c_str(), 0); // SINK
++            '''),
++            ('multiline_option', '', '''
++                std::string target = getenv("QUERY_STRING");
++                curl_easy_setopt( // SINK
++                    curl,
++                    ((CURLOPT_URL)),
++                    target.c_str());
++            '''),
++            ('local_sink_lookalike', '''namespace application {
++                int curl_easy_setopt(CURL *, int, const char *) { return 0; }
++            }''', '''
++                std::string target = getenv("QUERY_STRING");
++                application::curl_easy_setopt(curl, CURLOPT_URL, target.c_str());
++            '''),
++            ('local_source_lookalike', '''namespace application {
++                const char *getenv(const char *) { return "https://fixed.example/"; }
++            }''', '''
++                std::string target = application::getenv("QUERY_STRING");
++                curl_easy_setopt(curl, CURLOPT_URL, target.c_str());
++            '''),
++            ('cgi_output', '', '''
++                char target[512];
++                cgiFormString("url", target, sizeof(target));
++                curl_easy_setopt(curl, CURLOPT_URL, target); // SINK
++            '''),
++            ('comment_and_raw_string', '', '''
++                // std::string target = getenv("QUERY_STRING");
++                const char *example = R"(getenv("QUERY_STRING"); curl_easy_setopt(curl, CURLOPT_URL, target);)";
++                curl_easy_setopt(curl, CURLOPT_URL, "https://fixed.example/");
++            '''),
++            ('sink_suppressed', '', '''
++                std::string target = getenv("QUERY_STRING");
++                curl_easy_setopt(curl, CURLOPT_URL, target.c_str()); // ubs:ignore[cpp.detector.outbound-url]
++            '''),
++            ('source_suppressed', '', '''
++                std::string target = getenv("QUERY_STRING"); // ubs:ignore[cpp.detector.outbound-url]
++                curl_easy_setopt(curl, CURLOPT_URL, target.c_str()); // SINK
++            '''),
++        )
++        for name, helper, body in bodies:
++            source = prelude + textwrap.dedent(helper).strip() + '\n'
++            source += 'void handle(CURL *curl, bool enabled) {\n' + textwrap.dedent(body).strip() + '\n}\n'
++            expected = {line for line, text in enumerate(source.splitlines(), 1) if '// SINK' in text}
++            yield name, source, expected
++
++    def test_selected_outbound_values(self):
++        from ubs_core.cpp_detectors import outbound_url
++        for name, source, expected in self.cases():
++            with self.subTest(case=name):
++                started = time.monotonic()
++                path = self.root / (name + '.cpp')
++                path.write_text(source, encoding='utf-8')
++                rows = list(outbound_url.find([path]))
++                actual = [line for _, line, _, _ in rows]
++                print(f'[cpp-outbound-{name}] expected={sorted(expected)} actual={actual} '
++                      f'({time.monotonic() - started:.3f}s)', flush=True)
++                self.assertEqual(actual, sorted(expected), source)
++                self.assertTrue(all(Path(file) == path for file, _, _, _ in rows))
++
++    def test_shipped_outbound_controls(self):
++        from ubs_core.cpp_detectors import outbound_url
++        for filename, expected in (('ssrf_buggy.cpp', [17, 23, 29]), ('ssrf_clean.cpp', [])):
++            with self.subTest(filename=filename):
++                path = REPO_ROOT / 'test-suite/cpp/security' / filename
++                self.assertEqual([line for _, line, _, _ in outbound_url.find([path])], expected)
++
++    def test_allowlist_proof_is_bound_to_selected_value_and_branch(self):
++        from ubs_core.cpp_detectors import outbound_url
++        original = (REPO_ROOT / 'test-suite/cpp/security/ssrf_clean.cpp').read_text(encoding='utf-8')
++        variants = (
++            ('selected-proof', original, []),
++            ('helper-alpha-renaming', original.replace('safe_outbound_url', 'resolve_endpoint'), []),
++            ('no-reject', original.replace('throw std::invalid_argument("blocked host");', '(void)0;'), [36, 41]),
++            ('inverted-host-test', original.replace('allowed_hosts.find(host) ==', 'allowed_hosts.find(host) !='), [36, 41]),
++            ('different-checked-value', original.replace('value.substr(prefix.size(), host_end - prefix.size())',
++                                                        'std::string("api.example.com")'), [36, 41]),
++            ('mutated-return', original.replace('return value;', 'return value + "/" + getenv("QUERY_STRING");'), [36, 41]),
++        )
++        for name, source, expected in variants:
++            with self.subTest(case=name):
++                path = self.root / (name + '.cpp')
++                path.write_text(source, encoding='utf-8')
++                self.assertEqual([line for _, line, _, _ in outbound_url.find([path])], expected, source)
++
++    def test_cpr_url_options_are_separate_from_request_bodies_and_uri_parsing(self):
++        from ubs_core.cpp_detectors import outbound_url
++        programs = (
++            ('cpr::Get(cpr::Url{target});', [3]),
++            ('cpr::Post(cpr::Body{target}, cpr::Url{"https://fixed.example/"});', []),
++            ('cpr::Post(cpr::Url{"https://fixed.example/"}, cpr::Body{target});', []),
++            ('cpr::Post(cpr::Body{"fixed"}, cpr::Url{target});', [3]),
++            ('QUrl(target);', []),
++            ('Poco::URI(target);', []),
++            ('QNetworkRequest(QUrl(target));', [3]),
++        )
++        for index, (statement, expected) in enumerate(programs):
++            with self.subTest(statement=statement):
++                source = ('void handle() {\nstd::string target = getenv("QUERY_STRING");\n'
++                          + statement + '\n}\n')
++                path = self.root / f'url-option-{index}.cpp'
++                path.write_text(source, encoding='utf-8')
++                self.assertEqual([line for _, line, _, _ in outbound_url.find([path])], expected, source)
++
++    @unittest.skipUnless(shutil.which('g++'), 'g++ is required for independent C++ syntax proof')
++    def test_outbound_sources_are_valid_cpp(self):
++        for name, source, _expected in self.cases():
++            with self.subTest(case=name):
++                path = self.root / (name + '.cpp')
++                path.write_text(source, encoding='utf-8')
++                command = ['g++', '-std=c++20', '-fsyntax-only', str(path)]
++                proc = subprocess.run(command, capture_output=True, text=True, timeout=30)
++                self.assertEqual(proc.returncode, 0, f'{command!r}\n{proc.stdout}\n{proc.stderr}')
++
++
+ class JavaDetectorSuppressionTests(unittest.TestCase):
+     """Real legacy receivers: suppress findings without deleting source facts."""
+ 

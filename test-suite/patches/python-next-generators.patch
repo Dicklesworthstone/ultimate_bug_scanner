@@ -1,0 +1,627 @@
+diff --git a/modules/helpers/ubs_core/analyzers/taint_py.py b/modules/helpers/ubs_core/analyzers/taint_py.py
+--- a/modules/helpers/ubs_core/analyzers/taint_py.py
++++ b/modules/helpers/ubs_core/analyzers/taint_py.py
+@@ -626,6 +626,14 @@
+     """A proven builtin string, with unknown contents and no literal contract."""
+ 
+ 
++@dataclass(frozen=True)
++class _FirstGeneratorValue:
++    """A direct native next() result, after the producer's first-yield proof."""
++
++    binding: object
++    references: frozenset
++
++
+ _GENERATOR_CURSOR = '@generator:cursor'
+ _GENERATOR_CREATED = '@generator:created'
+ _GENERATOR_SUSPENDED = '@generator:suspended'
+@@ -2541,12 +2549,12 @@
+         """Identify a direct, synchronous builtin consumer before its argument.
+ 
+         The callable was evaluated before constructing the generator. No
+-        remaining operand can run between that construction and exhaustion.
++        remaining operand can run between that construction and consumption.
+         Iterator, callback and value-lifetime proofs belong to the producer.
+         """
+         original = self.engine.original_calls.get(node, node)
+         consumer = self.engine.parents.get(original)
+-        if (not isinstance(consumer, ast.Call) or consumer.args != [original]
++        if (not isinstance(consumer, ast.Call) or not consumer.args or consumer.args[0] is not original
+                 or consumer.keywords or self.class_environments or self.engine.generator_namespace_exposed
+                 or self.engine.generator_frame_exposed):
+             return False
+@@ -2561,18 +2569,25 @@
+             names = set()
+         else:
+             if not choices or not choices <= {
+-                    'list', 'tuple', 'any', 'all',
+-                    'builtins.list', 'builtins.tuple', 'builtins.any', 'builtins.all'}:
++                    'list', 'tuple', 'any', 'all', 'next',
++                    'builtins.list', 'builtins.tuple', 'builtins.any', 'builtins.all', 'builtins.next'}:
+                 return False
+             names = {value.rsplit('.', 1)[-1] for value in choices}
+-            if names & {'any', 'all'}:
++            if names & {'any', 'all', 'next'}:
+                 if len(names) != 1:
+                     return False  # Different callees do not share an exhaustion policy.
+-                if self.generator_expression_immediate(node, state):
++                if names != {'next'} and self.generator_expression_immediate(node, state):
+                     # Keep the existing proof for read-only predicates over
+                     # retained collections. Effectful predicates below need
+                     # ordered consumption and explicit short-circuit exits.
+                     return False
++        if len(consumer.args) != 1 and not (
++                names == {'next'} and len(consumer.args) == 2
++                and isinstance(consumer.args[1], ast.Constant)):
++            # next's default is evaluated before the generator resumes. An
++            # exact literal cannot change captured bindings or run callbacks;
++            # effectful defaults need a deferred frame instead of this proof.
++            return False
+         for engine in self.engine.generator_peers:
+             if (engine.generator_builtin_reflection or names & engine.generator_attribute_writes
+                     or engine is not self.engine and engine.generator_namespace_exposed):
+@@ -2584,7 +2599,8 @@
+                         or not isinstance(call, ast.Call) or call.func is not capability
+                         or self.engine.enclosing(call) is not self.scope or call.lineno <= consumer.end_lineno):
+                     return False
+-        return 'str.join' if string_join else next(iter(names)) if names <= {'any', 'all'} else 'collection'
++        return ('str.join' if string_join else next(iter(names))
++                if names <= {'any', 'all', 'next'} else 'collection')
+ 
+     def materialized_generator_string(self, node, state):
+         """Require the evaluated value to be an exact, callback-free string."""
+@@ -2628,8 +2644,6 @@
+         if isinstance(node, ast.Compare):
+             return all(self.materialized_generator_inert(value, state)
+                        for value in (node.left, *node.comparators))
+-        if isinstance(node, ast.BoolOp):
+-            return all(self.materialized_generator_inert(value, state) for value in node.values)
+         if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+             return self.materialized_generator_inert(node.operand, state)
+         return self.materialized_generator_binding(self.expression_bindings.get(node), references, state)
+@@ -3505,6 +3519,10 @@
+             right_true, right_false = self.condition(node.orelse, right, inert=inert)
+             return _join_states(left_true, right_true), _join_states(left_false, right_false)
+         self.expr(node, state)
++        return self.evaluated_truth(node, state, inert=inert)
++
++    def evaluated_truth(self, node, state, *, inert=False):
++        """Split an already evaluated value without repeating its effects."""
+         if not state.reachable:
+             return None, None
+         if inert and not self.materialized_generator_inert(node, state):
+@@ -4790,8 +4808,15 @@
+         if name == 'functools.partial':
+             return self.partial_value(node, state, inputs)
+         value = (self.expression_bindings.get(node.args[0])
+-                 if isinstance(node, ast.Call) and len(node.args) == 1
++                 if isinstance(node, ast.Call) and node.args
+                  and isinstance(node.args[0], ast.GeneratorExp) else None)
++        if target in {'next', 'builtins.next'} and isinstance(value, _FirstGeneratorValue):
++            # The generator proof already separated first-yield, exhaustion
++            # and exceptional continuations. A proven native next introduces
++            # no additional opaque-call edge or taint from an unused default.
++            self.expression_bindings[node] = value.binding
++            self.expression_references[node] = value.references
++            return arguments[0]
+         choices = _binding_choices(value)
+         if (target in {'any', 'all', 'builtins.any', 'builtins.all'}
+                 and choices and choices <= frozenset(_PREDICATE_RESULTS)):
+@@ -5511,10 +5536,6 @@
+             binding = self.expression_bindings.get(node.value)
+         elif isinstance(node, ast.Starred):
+             binding = self.expression_bindings.get(node.value)
+-        elif isinstance(node, ast.IfExp):
+-            binding = _join_bindings(self.expression_bindings.get(node.body), self.expression_bindings.get(node.orelse))
+-        elif isinstance(node, ast.BoolOp):
+-            binding = _join_bindings(*(self.expression_bindings.get(value) for value in node.values))
+         elif isinstance(node, ast.Subscript):
+             projected = self.vector_subscript(node, state)
+             if projected is not None:
+@@ -5662,24 +5683,46 @@
+             self.assign(node.target, fact, state, node.value)
+             return fact
+         if isinstance(node, ast.IfExp):
+-            self.expr(node.test, state)
+-            left, right = state.copy(), state.copy()
+-            fact = join_facts(self.expr(node.body, left), self.expr(node.orelse, right))
+-            self.expression_references[node] = (self.expression_references.get(node.body, NO_REFERENCES)
+-                                                | self.expression_references.get(node.orelse, NO_REFERENCES))
+-            state.replace(_join_states(left, right))
+-            return fact
++            left, right = self.condition(node.test, state, inert=bool(self.materialized_generator_depth))
++            branches, facts, bindings, references = [], [], [], []
++            for value, branch in ((node.body, left), (node.orelse, right)):
++                if branch is None:
++                    continue
++                fact = self.expr(value, branch)
++                if branch.reachable:
++                    branches.append(branch)
++                    facts.append(fact)
++                    bindings.append(self.expression_bindings.get(value))
++                    references.append(self.expression_references.get(value, NO_REFERENCES))
++            self.expression_bindings[node] = _join_bindings(*bindings)
++            self.expression_references[node] = frozenset().union(*references)
++            state.replace(_join_states(*branches))
++            return join_facts(*facts)
+         if isinstance(node, ast.BoolOp):
+-            fact = CLEAN
+-            exits = []
++            facts, bindings, references, exits = [], [], [], []
+             continuation = state.copy()
+-            for value in node.values:
+-                fact = join_facts(fact, self.expr(value, continuation))
+-                exits.append(continuation.copy())
+-            self.expression_references[node] = frozenset().union(*(self.expression_references.get(value, NO_REFERENCES)
+-                                                                   for value in node.values))
++            for index, value in enumerate(node.values):
++                if continuation is None:
++                    break
++                fact = self.expr(value, continuation)
++                if not continuation.reachable:
++                    break
++                if index + 1 == len(node.values):
++                    stopped = continuation
++                else:
++                    truthy, falsy = self.evaluated_truth(
++                        value, continuation, inert=bool(self.materialized_generator_depth))
++                    continuation, stopped = ((truthy, falsy) if isinstance(node.op, ast.And)
++                                             else (falsy, truthy))
++                if stopped is not None:
++                    exits.append(stopped)
++                    facts.append(fact)
++                    bindings.append(self.expression_bindings.get(value))
++                    references.append(self.expression_references.get(value, NO_REFERENCES))
++            self.expression_bindings[node] = _join_bindings(*bindings)
++            self.expression_references[node] = frozenset().union(*references)
+             state.replace(_join_states(*exits))
+-            return fact
++            return join_facts(*facts)
+         if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp)):
+             return self.comprehension(node, state)
+         if isinstance(node, ast.Await):
+@@ -5761,9 +5804,15 @@
+                     iterable = self.expr(first.iter, state)
+                     return self.comprehension(node, state, iterable=iterable, synchronous_generator=True,
+                                               string_result=consumer == 'str.join',
+-                                              predicate=consumer if consumer in {'any', 'all'} else None)
++                                              predicate=consumer if consumer in {'any', 'all', 'next'} else None)
+                 finally:
+                     self.materialized_generator_depth -= 1
++            parent = self.engine.parents.get(node)
++            if (isinstance(parent, ast.Call) and parent.args and parent.args[0] is node
++                    and _binding_choices(self.expression_bindings.get(parent.func))
++                    & {'next', 'builtins.next'}):
++                raise AnalysisLimit('native next generator lifetime or argument order is unresolved; '
++                                    'analysis is incomplete')
+             iterable = self.expr(first.iter, state)
+             if not state.reachable:
+                 return CLEAN
+@@ -5868,6 +5917,7 @@
+             nested.bindings[name] = None
+             nested.references[name] = NO_REFERENCES
+         result = CLEAN
++        first_bindings, first_references = [], []
+         iterator_references = set()
+         stopped = []
+ 
+@@ -5966,17 +6016,12 @@
+                                         current.references.get(name, NO_REFERENCES))
+                 skipped = []
+                 for condition in generator.ifs:
+-                    current, rejected = self.condition(condition, current)
+-                    if (synchronous_generator and (current is not None or rejected is not None)
+-                            and not self.materialized_generator_inert(
+-                            condition, current if current is not None else rejected if rejected is not None else entering)):
+-                        raise AnalysisLimit('generator materialization filter protocol is unresolved; '
+-                                            'analysis is incomplete')
++                    current, rejected = self.condition(condition, current, inert=synchronous_generator)
+                     skipped.append(rejected)
+                 if current is not None:
+                     if index + 1 < len(node.generators):
+                         current = clause(index + 1, current)
+-                    elif predicate:
++                    elif predicate in {'any', 'all'}:
+                         truthy, falsy = self.condition(node.elt, current, inert=True)
+                         finished, current = ((truthy, falsy) if predicate == 'any' else (falsy, truthy))
+                         if finished is not None:
+@@ -5992,6 +6037,11 @@
+                                 raise AnalysisLimit('generator materialization result lifetime is unresolved; '
+                                                     'analysis is incomplete')
+                             result = join_facts(result, fact)
++                            if predicate == 'next':
++                                first_bindings.append(self.expression_bindings.get(node.elt))
++                                first_references.append(self.expression_references.get(node.elt, NO_REFERENCES))
++                                stopped.append(current)
++                                current = None
+                 if synchronous_generator and current is not None and current.mutated & iterator_references:
+                     raise AnalysisLimit('generator materialization mutates its captured iterator; '
+                                         'analysis is incomplete')
+@@ -6040,7 +6090,28 @@
+             self.comprehension_environments.pop()
+             self.pending = pending
+             exceptional = self.exception_states.pop() if collecting else None
+-        if predicate:
++        if synchronous_generator:
++            # StopIteration escaping a generator body becomes RuntimeError;
++            # it is not native next's exhaustion/default continuation. The
++            # outer iterable was evaluated before entering this body.
++            outgoing = [(_Completion(item.kind, item.state, item.value, item.references,
++                                     '@exception:RuntimeError', 'RuntimeError')
++                         if item.kind == 'raise' and item.exception_type == 'StopIteration' else item)
++                        for item in outgoing]
++        if predicate == 'next':
++            consumer = self.engine.parents[node]
++            if normal is not None:
++                if len(consumer.args) == 2:
++                    default = consumer.args[1]
++                    first_bindings.append(_LiteralString(default.value)
++                                          if isinstance(default.value, str) else default)
++                else:
++                    outgoing.append(_Completion('raise', normal, exception_type='StopIteration'))
++                    normal = None
++            self.expression_bindings[node] = _FirstGeneratorValue(
++                _join_bindings(*first_bindings), frozenset().union(*first_references))
++            normal = _join_states(normal, *stopped)
++        elif predicate:
+             choices = []
+             if normal is not None:
+                 choices.append(_PREDICATE_RESULTS[predicate == 'all'])
+@@ -6331,6 +6402,20 @@
+                 # an ordinary iterable object is not itself that callable.
+                 if isinstance(node.target, ast.Name) and node.iter in self.generator_returns:
+                     self.write_name(body, node.target.id, body.get(node.target.id, CLEAN), binding, references)
++                elif (isinstance(node.target, ast.Name) and isinstance(binding, _ArgumentVector)
++                      and not references & body.mutated
++                      and not any(isinstance(value, _ArgumentExpansion) for value, _fact in binding.operands)):
++                    # Preserve the captured elements' identities, never the
++                    # iterable's own identity. A later mutation revokes this
++                    # finite-vector proof on the next worklist iteration.
++                    element_bindings, element_references = [], []
++                    for index, (value_binding, _fact) in enumerate(binding.operands):
++                        refs = binding.references_at(index)
++                        element_bindings.append(_without_object_contract(value_binding)
++                                                if refs & body.mutated else value_binding)
++                        element_references.append(refs)
++                    self.write_name(body, node.target.id, body.get(node.target.id, CLEAN),
++                                    _join_bindings(*element_bindings), frozenset().union(*element_references))
+             back, pending = self.capture(node.body, None if always is False else body)
+             exits = [_join_states(*exits, *(item.state for item in pending if item.kind == 'break'))]
+             outgoing = _merge_completions([*outgoing, *(item for item in pending
+@@ -6459,6 +6544,7 @@
+         # selected source here adds substantial setup cost before any flow is
+         # analyzed, without providing new information.
+         nodes = tuple(ast.walk(tree))
++        self.parents = {child: parent for parent in nodes for child in ast.iter_child_nodes(parent)}
+         self.framework_annotation_metadata = any(
+             isinstance(node, ast.Attribute) and node.attr in {
+                 '__annotations__', '__signature__', '__wrapped__', '__annotate__'} for node in nodes)
+@@ -6477,11 +6563,30 @@
+             for node in nodes)
+         # Primitive input-result proofs must not outlive an exposed/replaced
+         # builtins namespace. Projects combine this property across modules.
++        builtin_modules = {alias.asname or alias.name for node in nodes if isinstance(node, ast.Import)
++                           for alias in node.names if alias.name == 'builtins'}
++        readonly_builtins = set()
++        for name in builtin_modules:
++            uses = [node for node in nodes if isinstance(node, ast.Name) and node.id == name]
++            if all(isinstance(node.ctx, ast.Load)
++                   and isinstance(self.parents.get(node), ast.Attribute)
++                   and self.parents[node].value is node
++                   and isinstance(self.parents[node].ctx, ast.Load)
++                   and self.parents[node].attr in {'input', 'list', 'tuple', 'any', 'all', 'next'}
++                   and isinstance(self.parents.get(self.parents[node]), ast.Call)
++                   and self.parents[self.parents[node]].func is self.parents[node]
++                   for node in uses):
++                # Only direct calls expose neither the module nor a callable
++                # alias. Attribute writes, reflective access and passing the
++                # namespace to unknown code all revoke this narrow proof.
++                readonly_builtins.add(name)
+         self.generator_input_identity = not self.generator_builtin_reflection and not any(
+             isinstance(node, ast.Name) and node.id in {'builtins', '__builtins__', '__import__',
+                                                      'sys', 'importlib', 'import_module'}
+-            or isinstance(node, ast.Import) and any(alias.name.split('.')[0] in {
+-                'builtins', 'sys', 'importlib'} for alias in node.names)
++            and node.id not in readonly_builtins
++            or isinstance(node, ast.Import) and any(alias.name.split('.')[0] in {'sys', 'importlib'}
++                or alias.name == 'builtins' and (alias.asname or alias.name) not in readonly_builtins
++                for alias in node.names)
+             or isinstance(node, ast.ImportFrom) and node.module
+             and (node.module.split('.')[0] in {'sys', 'importlib'}
+                  or node.module == 'builtins' and any(alias.name not in {
+@@ -6499,7 +6604,6 @@
+                                        min(10_000_000, max(500_000, 128 * len(nodes))))
+         scope_override = _work_setting('UBS_PYTHON_FLOW_SCOPE_STEPS', None)
+         self.budget = Budget(self.work_limit)
+-        self.parents = {child: parent for parent in nodes for child in ast.iter_child_nodes(parent)}
+         # A literal allow-list is a proof only if every other use is exact
+         # membership testing. Rebinding, mutation, aliasing or passing the set
+         # to an opaque call invalidates it throughout this conservative model.
+diff --git a/test-suite/quality/test_taint_python_call_completions.py b/test-suite/quality/test_taint_python_call_completions.py
+--- a/test-suite/quality/test_taint_python_call_completions.py
++++ b/test-suite/quality/test_taint_python_call_completions.py
+@@ -1571,6 +1571,221 @@
+                         self.scan(source)
+ 
+ 
++class NextGeneratorCompletionTests(SourceTest):
++    def assert_runtime_sites(self, source, observed, *lines):
++        source = textwrap.dedent(source).lstrip('\n')
++        actual = []
++        exec(source, {'input': lambda: 'UNTRUSTED', 'eval': actual.append})
++        self.assertEqual(actual, observed)
++        self.assertEqual(sorted((item['rule'], item['line']) for item in self.scan(source)),
++                         [('python.taint.eval', line) for line in sorted(lines)])
++
++    def test_only_first_yield_changes_the_result_and_enclosing_binding(self):
++        for values, expected, lines in (
++            ("['fixed', input()]", ['fixed', 'fixed'], ()),
++            ("[input(), 'fixed']", ['UNTRUSTED', 'UNTRUSTED'], (3, 4)),
++        ):
++            source = ("code = 'initial'\n"
++                      f"chosen = next((code := value) for value in {values})\n"
++                      "eval(chosen)\neval(code)\n")
++            with self.subTest(values=values):
++                self.assert_runtime_sites(source, expected, *lines)
++
++    def test_skipped_filters_and_nested_clauses_stop_after_first_accepted_value(self):
++        self.assert_runtime_sites('''
++            code = 'fixed'
++            chosen = next((code := input()) for outer in [0, 1] for inner in [0, 1])
++            eval(chosen)
++            eval(code)
++        ''', ['UNTRUSTED', 'UNTRUSTED'], 3, 4)
++        self.assert_runtime_sites('''
++            code = 'fixed'
++            chosen = next(((code := input()) for unused in [0] if False), 'fallback')
++            eval(chosen)
++            eval(code)
++        ''', ['fallback', 'fixed'])
++        self.assert_runtime_sites('''
++            code = 'fixed'
++            chosen = next(('selected' for unused in [0, 1] if (code := input())), 'fallback')
++            eval(chosen)
++            eval(code)
++        ''', ['selected', 'UNTRUSTED'], 4)
++
++    def test_exhaustion_returns_default_or_raises_stop_iteration(self):
++        for values in ('[]', '[0] if False'):
++            with self.subTest(values=values):
++                self.assert_runtime_sites(f'''
++                    code = input()
++                    chosen = next(((code := 'fixed') for unused in {values}), 'fallback')
++                    eval(chosen)
++                    eval(code)
++                ''', ['fallback', 'UNTRUSTED'], 4)
++                self.assert_runtime_sites(f'''
++                    code = input()
++                    try:
++                        next((code := 'fixed') for unused in {values})
++                        eval(code)
++                    except StopIteration:
++                        eval(code)
++                ''', ['UNTRUSTED'], 6)
++
++    def test_nonempty_next_does_not_enter_the_exhaustion_handler(self):
++        self.assert_runtime_sites('''
++            code = input()
++            try:
++                chosen = next('fixed' for unused in [0])
++            except StopIteration:
++                eval(code)
++            eval(chosen)
++        ''', ['fixed'])
++
++    def test_conditional_and_boolean_yields_do_not_execute_skipped_effects(self):
++        for expression in ("(code := input()) if False else 'fixed'",
++                           "'fixed' if True else (code := input())",
++                           "'fixed' or (code := input())",
++                           "'' and (code := input())"):
++            with self.subTest(expression=expression):
++                self.assert_runtime_sites("code = 'initial'\n"
++                                          f"next({expression} for unused in [0])\n"
++                                          "eval(code)\n", ['initial'])
++        for expression in ("(code := input()) if True else 'fixed'",
++                           "'fixed' if False else (code := input())",
++                           "'' or (code := input())",
++                           "'fixed' and (code := input())"):
++            with self.subTest(expression=expression):
++                self.assert_runtime_sites("code = 'initial'\n"
++                                          f"next({expression} for unused in [0])\n"
++                                          "eval(code)\n", ['UNTRUSTED'], 3)
++
++    def test_global_and_nonlocal_helpers_complete_before_the_result(self):
++        self.assert_runtime_sites('''
++            code = 'fixed'
++            def replace():
++                global code
++                code = input()
++                return 'chosen'
++            chosen = next(replace() for unused in [0, 1])
++            eval(chosen)
++            eval(code)
++        ''', ['chosen', 'UNTRUSTED'], 8)
++        self.assert_runtime_sites('''
++            def run():
++                code = 'fixed'
++                def replace():
++                    nonlocal code
++                    code = input()
++                    return 'chosen'
++                chosen = next(replace() for unused in [0, 1])
++                eval(chosen)
++                eval(code)
++            run()
++        ''', ['chosen', 'UNTRUSTED'], 9)
++
++    def test_exception_before_first_yield_keeps_preceding_writes(self):
++        self.assert_runtime_sites('''
++            code = 'fixed'
++            def replace():
++                global code
++                code = input()
++                raise ValueError('stop')
++            try:
++                next(replace() for unused in [0])
++                eval('unreachable')
++            except ValueError:
++                eval(code)
++        ''', ['UNTRUSTED'], 10)
++
++    def test_stop_iteration_raised_inside_generator_is_runtime_error(self):
++        self.assert_runtime_sites('''
++            code = 'fixed'
++            def replace():
++                global code
++                code = input()
++                raise StopIteration('stop')
++            try:
++                next((replace() for unused in [0]), 'fallback')
++            except RuntimeError:
++                eval(code)
++        ''', ['UNTRUSTED'], 9)
++
++    def test_captured_result_survives_later_rebinding(self):
++        for initial, later, expected, lines in (
++            ('input()', "'fixed'", ['UNTRUSTED'], (4,)),
++            ("'fixed'", 'input()', ['fixed'], ()),
++        ):
++            with self.subTest(initial=initial):
++                self.assert_runtime_sites(f'code = {initial}\n'
++                                          'chosen = next(code for unused in [0])\n'
++                                          f'code = {later}\neval(chosen)\n', expected, *lines)
++
++    def test_binding_verified_aliases_include_readonly_builtin_modules(self):
++        for declaration, callee in (
++            ('consume = next', 'consume'),
++            ('from builtins import next as consume', 'consume'),
++            ('import builtins', 'builtins.next'),
++            ('import builtins as native', 'native.next'),
++        ):
++            source = (f'{declaration}\ncode = input()\n'
++                      f'chosen = {callee}(code for unused in [0])\n'
++                      "code = 'fixed'\neval(chosen)\n")
++            with self.subTest(declaration=declaration):
++                self.assert_runtime_sites(source, ['UNTRUSTED'], 5)
++
++    def test_custom_consumers_and_effectful_defaults_remain_incomplete(self):
++        for source in ('''
++            saved = None
++            def next(values):
++                global saved
++                saved = values
++                return 'fixed'
++            code = 'fixed'
++            next(code for unused in [0])
++            code = input()
++            eval(saved.__next__())
++        ''', '''
++            code = 'fixed'
++            chosen = next((code for unused in [0]), (code := input()))
++            eval(chosen)
++        '''):
++            with self.subTest(source=source), self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
++                self.scan(source)
++
++    def test_replaced_or_escaped_builtin_modules_never_certify_native_next(self):
++        for operation in ('native.next = replacement',
++                          'native.input = replacement',
++                          'expose(native)',
++                          'native.__dict__["next"] = replacement'):
++            source = (f'import builtins as native\n{operation}\n'
++                      "code = 'fixed'\n"
++                      'chosen = native.next((code := input()) for unused in [0])\n'
++                      'eval(code)\n')
++            with self.subTest(operation=operation), self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
++                self.scan(source)
++
++    def test_opaque_iterators_values_truth_and_finalizers_remain_incomplete(self):
++        for expression in ('value for value in unknown',
++                           'Release() for unused in [0]',
++                           "'fixed' for unused in [Release()]",
++                           "'fixed' for unused in [0] if Release()",
++                           "'fixed' if Release() else 'other' for unused in [0]",
++                           "Release() or 'fixed' for unused in [0]"):
++            source = f'''
++                code = 'fixed'
++                class Release:
++                    def __bool__(self):
++                        global code
++                        code = input()
++                        return True
++                    def __del__(self):
++                        global code
++                        code = input()
++                next({expression})
++                eval(code)
++            '''
++            with self.subTest(expression=expression), self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
++                self.scan(source)
++
++
+ class ImmediateGeneratorExpressionTests(SourceTest):
+     def test_string_join_captures_values_before_later_rebinding(self):
+         for receiver in ("''", 'separator'):
+diff --git a/test-suite/quality/test_taint_python_globals.py b/test-suite/quality/test_taint_python_globals.py
+--- a/test-suite/quality/test_taint_python_globals.py
++++ b/test-suite/quality/test_taint_python_globals.py
+@@ -776,10 +776,47 @@
+         ]
+         self.assert_cli_cases(cases)
+ 
++    def test_next_generators_module_and_runner_json_sarif(self):
++        cases = [
++            Case('next_stops_before_unsafe_write', """
++                code = input()
++                next((code := value) for value in ['fixed', input()])
++                eval(code)
++                """),
++            Case('next_preserves_first_unsafe_write', """
++                code = 'fixed'
++                next((code := value) for value in [input(), 'fixed'])
++                eval(code) # expect:eval
++                """),
++            Case('next_applies_filter_effects', """
++                code = 'fixed'
++                next(('chosen' for unused in [0] if (code := input())), 'fallback')
++                eval(code) # expect:eval
++                """),
++            Case('next_builtin_alias_preserves_captured_value', """
++                import builtins as native
++                code = input()
++                chosen = native.next(code for unused in [0])
++                code = 'fixed'
++                eval(chosen) # expect:eval
++                """),
++            Case('next_empty_iterator_keeps_unexecuted_write', """
++                code = input()
++                next(((code := 'fixed') for unused in []), 'fallback')
++                eval(code) # expect:eval
++                """),
++            Case('next_opaque_iterator_stays_incomplete', """
++                next(value for value in unknown)
++                eval('fixed')
++                """),
++        ]
++        self.assert_cli_cases(cases)
++
+     def assert_cli_cases(self, cases):
+         for case in cases:
+             incomplete = case.name in {'foreign_module_write', 'deleted_builtin_shadow_survives_helper_sibling_join',
+-                                       'string_join_opaque_iterator_stays_incomplete'}
++                                       'string_join_opaque_iterator_stays_incomplete',
++                                       'next_opaque_iterator_stays_incomplete'}
+             # The full scanner also warns about eval syntax independently of
+             # whether its operand is tainted. Keep those existing rules in
+             # the oracle; the strong reset must remove only the taint finding.
+@@ -859,7 +896,8 @@
+                         if incomplete:
+                             diagnostic = ('foreign module global write' if case.name == 'foreign_module_write'
+                                           else 'generator materialization reads an opaque operand'
+-                                          if case.name == 'string_join_opaque_iterator_stays_incomplete'
++                                          if case.name in {'string_join_opaque_iterator_stays_incomplete',
++                                                           'next_opaque_iterator_stays_incomplete'}
+                                           else 'conditional global creation or deletion')
+                             self.assertIn(diagnostic, result.stdout + result.stderr)
+                         else:

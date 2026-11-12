@@ -851,6 +851,67 @@ class GlobalWriteCliTests(unittest.TestCase):
         ]
         self.assert_cli_cases(cases)
 
+    def test_captured_formatted_values_module_and_runner_json_sarif(self):
+        cases = [
+            Case('formatted_min_named_key_keeps_source', """
+                def order(record):
+                    return len(record)
+                code = f"{input()}"
+                selected = min(([code] for unused in (1, 2)), key=order)
+                eval(selected[0]) # expect:eval
+                """),
+            Case('formatted_max_named_key_keeps_clean_replacement', """
+                def order(record):
+                    return (len(record), record[0])
+                code = input()
+                code = f"{'1'}"
+                selected = max(([code] for unused in (1, 2)), key=order)
+                eval(selected[0])
+                """),
+            Case('formatted_sorted_keeps_captured_unsafe_alias', """
+                def order(record):
+                    return record[0]
+                code = f"{input()}"
+                saved = code
+                code = '1'
+                selected = sorted(([saved] for unused in (1, 2)), key=order)[0]
+                eval(selected[0]) # expect:eval
+                """),
+            Case('formatted_min_keeps_captured_clean_alias', """
+                code = f"{'1'}"
+                saved = code
+                code = input()
+                selected = min(([saved] for unused in (1, 2)), key=len)
+                eval(selected[0])
+                """),
+            Case('formatted_next_keeps_native_string_spec', """
+                code = f"{input()!s:>3}"
+                selected = next(value for value in [code])
+                eval(selected) # expect:eval
+                """),
+            Case('formatted_next_keeps_native_numeric_value', """
+                code = f"{1}"
+                selected = next(value for value in [code])
+                eval(selected)
+                """),
+            Case('formatted_min_preserves_taint_at_branch_join', """
+                if input():
+                    code = f"{input()}"
+                else:
+                    code = f"{'1'}"
+                selected = min(([code] for unused in (1, 2)), key=len)
+                eval(selected[0]) # expect:eval
+                """),
+            Case('formatted_next_reads_live_value_on_resume', """
+                code = '1'
+                pending = (code for unused in [0])
+                code = f"{input()}"
+                selected = next(pending)
+                eval(selected) # expect:eval
+                """),
+        ]
+        self.assert_cli_cases(cases)
+
     def assert_cli_cases(self, cases):
         for case in cases:
             incomplete = case.name in {'foreign_module_write', 'deleted_builtin_shadow_survives_helper_sibling_join',
@@ -858,7 +919,10 @@ class GlobalWriteCliTests(unittest.TestCase):
                                        'next_replaced_builtin_stays_incomplete',
                                        'literal_next_loop_replacement',
                                        'literal_next_saved_cursor_replacement',
-                                       'literal_next_repeated_function_replacement'}
+                                       'literal_next_repeated_function_replacement',
+                                       'formatted_max_named_key_keeps_clean_replacement',
+                                       'formatted_min_preserves_taint_at_branch_join',
+                                       'formatted_next_reads_live_value_on_resume'}
             # The full scanner also warns about eval syntax independently of
             # whether its operand is tainted. Keep those existing rules in
             # the oracle; the strong reset must remove only the taint finding.
@@ -943,8 +1007,21 @@ class GlobalWriteCliTests(unittest.TestCase):
                                           if case.name == 'next_replaced_builtin_stays_incomplete'
                                           else 'generator next consumer identity is unresolved'
                                           if case.name.startswith('literal_next_')
+                                          else 'generator expression live delayed reads require resume-state analysis'
+                                          if case.name.startswith('formatted_')
                                           else 'conditional global creation or deletion')
                             self.assertIn(diagnostic, result.stdout + result.stderr)
+                            if case.name.startswith('formatted_'):
+                                # Captured formatting does not yet model a
+                                # delayed global read across multiple stores.
+                                # Keep these boundaries explicit and retain
+                                # both syntax findings in the partial report.
+                                self.assertEqual(actual, [], payload)
+                                self.assertEqual(sorted(all_sites), sorted(syntax_sites), payload)
+                                if output == 'json':
+                                    totals = payload['totals'] if meta else payload
+                                    self.assertEqual(totals['critical'], len(syntax_sites), payload)
+                                    self.assertEqual(totals['warning'], 0, payload)
                             if case.name.startswith('literal_next_'):
                                 # Refusing later dynamic execution must retain
                                 # the already observed command-injection sink.

@@ -350,6 +350,9 @@ class _BoundClassMethod:
 class _LiteralString:
     """A value is not an import/callable identity just because it is text."""
     value: str
+    # Exact contents do not prove that producing this value had an inert
+    # lifetime. Keep that narrower authority with aliases and call summaries.
+    format_safe: bool = True
 
 
 @dataclass(frozen=True)
@@ -624,6 +627,7 @@ class _GeneratorNext(_FunctionValue):
 @dataclass(frozen=True)
 class _GeneratorString:
     """A proven builtin string, with unknown contents and no literal contract."""
+    format_safe: bool = True
 
 
 _GENERATOR_CURSOR = '@generator:cursor'
@@ -2768,6 +2772,97 @@ class _Flow:
                         or isinstance(value, ast.Constant) and type(value.value) is str
                         for value in choices))
 
+    @staticmethod
+    def formatted_string_scalar(value):
+        # Decimal conversion of a huge exact int can raise ValueError.
+        # 2048 bits fit below Python's minimum configurable 640-digit limit,
+        # independently of the scanning process's configuration.
+        return (type(value) in {str, bytes, float, complex, bool, type(None)}
+                or type(value) is int and value.bit_length() <= 2048)
+
+    def formatted_string_operand(self, node, state):
+        """Prove both a primitive value and its immediate evaluation lifetime.
+
+        A helper returning a string can still release opaque locals/defaults.
+        Likewise, native input can invoke an opaque prompt's __str__. Keep
+        those protocols outside the exact-string proof instead of inferring
+        safety from the final value's nominal type alone.
+        """
+        self.engine.budget.spend()
+
+        if isinstance(node, ast.Constant):
+            return self.formatted_string_scalar(node.value)
+        references = self.expression_references.get(node, NO_REFERENCES)
+        choices = _binding_choices(self.expression_bindings.get(node))
+        if (references & state.mutated or not choices
+                or not all(isinstance(value, (_LiteralString, _GeneratorString)) and value.format_safe
+                           or isinstance(value, ast.Constant) and self.formatted_string_scalar(value.value)
+                           for value in choices)):
+            return False
+        if isinstance(node, (ast.Name, ast.JoinedStr)):
+            return True
+        if isinstance(node, ast.Call):
+            callees = _binding_choices(self.expression_bindings.get(node.func))
+            return (bool(callees) and callees <= {'input', 'builtins.input'}
+                    and len(node.args) <= 1 and not node.keywords
+                    and self.generator_builtins_stable()
+                    and self.generator_consumer_stable(node, {'input'})
+                    and all(self.formatted_string_operand(argument, state) for argument in node.args))
+        return False
+
+    def without_format_authority(self, binding):
+        """Retain value contracts without certifying an opaque producer frame.
+
+        A helper returning its argument can retain only the argument's object
+        references, losing the helper's own finalizers. This separate bit is
+        monotone across aliases, alternatives, vectors and summary returns.
+        """
+        choices = []
+        for value in _binding_choices(binding):
+            self.engine.budget.spend()
+            if isinstance(value, _LiteralString):
+                value = _LiteralString(value.value, format_safe=False)
+            elif isinstance(value, _GeneratorString):
+                value = _GeneratorString(format_safe=False)
+            elif isinstance(value, ast.Constant):
+                value = None
+            elif isinstance(value, _ArgumentVector):
+                value = _ArgumentVector(tuple((self.without_format_authority(operand), fact)
+                                              for operand, fact in value.operands), value.references)
+            choices.append(value)
+        return _join_bindings(*choices)
+
+    def formatted_string_spec(self, node, state):
+        """Accept only conversions/specs that cannot call user code or fail.
+
+        Empty formatting is valid for every admitted exact scalar. Nonempty
+        specs are restricted to the builtin string grammar, after any explicit
+        !s/!r/!a conversion. Dynamic specs and numeric presentation need their
+        own normal/exceptional completions; they do not acquire this proof.
+        No analyzed value is formatted or executed to validate its spec.
+        """
+        if node.conversion not in {-1, ord('s'), ord('r'), ord('a')}:
+            return False
+        if node.format_spec is None:
+            return True
+        if (not isinstance(node.format_spec, ast.JoinedStr)
+                or not all(isinstance(value, ast.Constant) and type(value.value) is str
+                           for value in node.format_spec.values)):
+            return False
+        spec = ''.join(value.value for value in node.format_spec.values)
+        self.engine.budget.spend(1 + len(spec))
+        if not spec:
+            return True
+        if node.conversion == -1 and not self.materialized_generator_string(node.value, state):
+            return False
+        match = re.fullmatch(r'(?:(?:.)?[<^>])?(?P<width>[0-9]*)(?:\.(?P<precision>[0-9]+))?s?',
+                             spec, re.DOTALL)
+        # CPython rejects sizes outside Py_ssize_t before producing a value.
+        # Bound digit parsing too; leading zeroes need not expand our proof.
+        return (match is not None and all(
+            not digits or len(digits) <= 20 and int(digits) <= sys.maxsize
+            for digits in match.groups()))
+
     def materialized_generator_inert(self, node, state):
         """Prove an evaluated operand cannot own an opaque finalizer/protocol.
 
@@ -2858,7 +2953,8 @@ class _Flow:
                            for value in (*node.args, *(keyword.value for keyword in node.keywords)))):
             return False
         if target in ('input', 'builtins.input'):
-            return self.generator_builtins_stable()
+            return (self.generator_builtins_stable() and len(node.args) <= 1 and not node.keywords
+                    and all(self.formatted_string_operand(argument, state) for argument in node.args))
         closure = target if isinstance(target, _ClosureValue) else None
         if closure is not None:
             target = closure.value
@@ -2894,6 +2990,10 @@ class _Flow:
         values = {name: (expression if isinstance(expression, ast.Constant)
                          else self.expression_bindings.get(expression))
                   for name, expression in arguments.items()}
+        # Ownership/hashability alone does not authorize decimal conversion
+        # when input() prints a prompt. Keep the evaluated scalar separately
+        # from the abstract ownership markers used by this bounded proof.
+        prompt_values = values.copy()
 
         def lookup(name):
             if name in values:
@@ -2928,8 +3028,22 @@ class _Flow:
                     and lookup(expression.func.id) in ('input', 'builtins.input')
                     and not expression.keywords and len(expression.args) <= 1
                     and self.generator_builtins_stable()):
-                return all(primitive(argument) for argument in expression.args)
+                return all(prompt(argument) for argument in expression.args)
             return False
+
+        def prompt(expression):
+            self.engine.budget.spend()
+            if isinstance(expression, ast.Constant):
+                return self.formatted_string_scalar(expression.value)
+            if isinstance(expression, ast.Name):
+                binding = (prompt_values[expression.id] if expression.id in prompt_values
+                           else lookup(expression.id))
+                choices = _binding_choices(binding)
+                return bool(choices) and all(
+                    isinstance(value, (_LiteralString, _GeneratorString)) and value.format_safe
+                    or isinstance(value, ast.Constant) and self.formatted_string_scalar(value.value)
+                    for value in choices)
+            return isinstance(expression, ast.Call) and primitive(expression)
 
         def hashable(expression):
             self.engine.budget.spend()
@@ -2957,6 +3071,11 @@ class _Flow:
             if isinstance(statement, (ast.Global, ast.Nonlocal, ast.Pass)):
                 continue
             if isinstance(statement, ast.Assign) and primitive(statement.value):
+                expression = statement.value
+                prompt_value = (expression if isinstance(expression, ast.Constant)
+                                else prompt_values.get(expression.id, lookup(expression.id))
+                                if isinstance(expression, ast.Name)
+                                else _GeneratorString() if isinstance(expression, ast.Call) else None)
                 for destination in statement.targets:
                     if not isinstance(destination, ast.Name):
                         return False
@@ -2970,6 +3089,7 @@ class _Flow:
                     # become a supposedly hashable key on its next use.
                     values[destination.id] = (_GeneratorString() if hashable(statement.value)
                                                else _ArgumentVector(()))
+                    prompt_values[destination.id] = prompt_value
                 continue
             if isinstance(statement, ast.Expr) and primitive(statement.value):
                 continue
@@ -3189,7 +3309,11 @@ class _Flow:
                 if refs and all(isinstance(ref, ast.Call)
                                 and self.expression_bindings.get(ref.func) in {'input', 'builtins.input'}
                                 for ref in refs):
-                    captured_values[name] = _GeneratorString()
+                    # Preserve the evaluated producer's lifetime evidence;
+                    # the old input AST alone cannot recover that authority.
+                    captured_values[name] = _GeneratorString(format_safe=bool(binding) and all(
+                        isinstance(value, (_LiteralString, _GeneratorString)) and value.format_safe
+                        for value in _binding_choices(binding)))
         retained = all(choices and all(isinstance(value, (_LiteralString, ast.Constant, _GeneratorString))
                                       for value in choices)
                        or self.generator_borrowed_capture(node, references.get(name, NO_REFERENCES), state)
@@ -5252,6 +5376,16 @@ class _Flow:
             if not summary.can_return and function not in self.engine.generators:
                 state.reachable = False
                 return CLEAN
+            # Materialized calls already proved their frame at invoke entry.
+            # For captured results, prove it before applying effects. Do not
+            # substitute returned handles yet: apply_cells first allocates
+            # the caller's distinct generator/closure cells.
+            format_frame_inert = (bool(self.materialized_generator_depth) or not any(
+                isinstance(value, (_LiteralString, _GeneratorString, _ArgumentVector,
+                                   _SymbolicValue, ast.Constant))
+                for value in _binding_choices(summary.returned_binding)))
+            if not format_frame_inert and isinstance(node, ast.Call):
+                format_frame_inert = self.materialized_generator_call(node, target, state)
             for parameter, written in summary.mutations:
                 fact = substitute(written)
                 self.mutate(self._lookup_refs(references, parameter), fact, state)
@@ -5262,9 +5396,11 @@ class _Flow:
             returned_refs = frozenset().union(*(self._lookup_refs(references, parameter)
                                                for parameter in summary.returned_references))
             self.expression_references[node] = returned_refs or frozenset({node})
-            self.expression_bindings[node] = self.substitute_binding(
+            returned_binding = self.substitute_binding(
                 summary.returned_binding, bound, references, node, call_name, values,
                 substitute=substitute, cells=cell_map)
+            self.expression_bindings[node] = (returned_binding if format_frame_inert
+                                             else self.without_format_authority(returned_binding))
             returned = substitute(summary.returned)
             if function in self.engine.generators:
                 self.generator_returns[node] = returned
@@ -5526,7 +5662,9 @@ class _Flow:
         if callee.binding in {'input', 'builtins.input'} and self.generator_builtins_stable():
             # Retain this type proof with the evaluated value. Looking up an
             # old call AST later could instead observe a rebound input name.
-            self.expression_bindings[node] = _GeneratorString()
+            self.expression_bindings[node] = _GeneratorString(format_safe=(
+                len(node.args) <= 1 and not node.keywords
+                and all(self.formatted_string_operand(argument, state) for argument in node.args)))
         if not exception_constructor:
             self.possible_exception(state)
         return fact
@@ -5825,12 +5963,22 @@ class _Flow:
         if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
             return join_facts(*(self.expr(child, state) for child in node.elts)) if node.elts else CLEAN
         if isinstance(node, ast.JoinedStr):
-            return join_facts(*(self.expr(child, state) for child in node.values)) if node.values else CLEAN
+            facts = [self.expr(child, state) for child in node.values]
+            if (state.reachable and self.generator_consumer_stable(node, set())
+                    and self.generator_builtins_stable()
+                    and all(self.materialized_generator_string(child, state) for child in node.values)):
+                # A single opaque field may return a str subclass; joining
+                # multiple fields may release that subclass and run __del__.
+                # Only independently proved native fields certify either form.
+                self.expression_bindings[node] = _GeneratorString()
+            return join_facts(*facts)
         if isinstance(node, ast.FormattedValue):
             value_fact = self.expr(node.value, state)
-            if node.format_spec is not None:
-                return join_facts(value_fact, self.expr(node.format_spec, state))
-            return value_fact
+            primitive = self.formatted_string_operand(node.value, state)
+            spec_fact = self.expr(node.format_spec, state)
+            if state.reachable and primitive and self.formatted_string_spec(node, state):
+                self.expression_bindings[node] = _GeneratorString()
+            return join_facts(value_fact, spec_fact)
         if isinstance(node, ast.Dict):
             facts, references = [], {node}
             # Keys and values run in pairs, not as two independent lists.
@@ -6205,7 +6353,7 @@ class _Flow:
                             current.references[generator.target.id] = frozenset().union(*(
                                 self.expression_references.get(item, NO_REFERENCES) for item in elements))
                         elif synchronous_generator and isinstance(binding, (_LiteralString, _GeneratorString)):
-                            current.bindings[generator.target.id] = _GeneratorString()
+                            current.bindings[generator.target.id] = _GeneratorString(format_safe=binding.format_safe)
                         elif generator.iter in self.generator_returns:
                             current.bindings[generator.target.id] = binding
                             current.references[generator.target.id] = refs

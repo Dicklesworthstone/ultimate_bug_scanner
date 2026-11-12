@@ -1901,6 +1901,241 @@ class PredicateGeneratorCompletionTests(SourceTest):
                         self.scan(source)
 
 
+class FormattedStringCompletionTests(SourceTest):
+    def assert_native(self, source, expected_values, *, incomplete=False):
+        source = textwrap.dedent(source).lstrip('\n')
+        # Keep the actual builtin input and native formatting protocols. Only
+        # the sink is recorded, so the witness never executes input as code.
+        witness = ('import json, sys\nobserved = []\n'
+                   "if hasattr(sys, 'set_int_max_str_digits'):\n    sys.set_int_max_str_digits(4300)\n"
+                   'def record(value):\n'
+                   '    observed.append((sys._getframe(1).f_lineno, value))\n'
+                   + f"exec(compile({source!r}, '<formatted-string-witness>', 'exec'), {{'eval': record}})\n"
+                   + 'sys.stderr.write(json.dumps(observed))\n')
+        native = subprocess.run([sys.executable, '-I', '-B', '-c', witness],
+                                input='UNTRUSTED\n' * 16, capture_output=True, text=True, timeout=10)
+        self.assertEqual(native.returncode, 0, native.stdout + native.stderr)
+        observed = json.loads(native.stderr)
+        self.assertEqual([value for _line, value in observed], expected_values)
+        if incomplete:
+            with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                self.scan(source)
+        else:
+            self.assertEqual(sorted((item['rule'], item['line']) for item in self.scan(source)),
+                             [('python.taint.eval', line) for line in sorted({
+                                 line for line, value in observed if 'UNTRUSTED' in str(value)})])
+
+    def test_captured_formatted_strings_keep_named_reducer_provenance(self):
+        definition = 'def order(record):\n    return len(record)\n'
+        for reducer in ('min', 'max', 'sorted'):
+            for expression, expected in (("f'SELECT {input()}'", 'SELECT UNTRUSTED'),
+                                         ("f'SELECT {1}'", 'SELECT 1')):
+                selected = f'{reducer}(([query] for unused in (1, 2)), key=order)'
+                if reducer == 'sorted':
+                    selected += '[0]'
+                with self.subTest(reducer=reducer, expression=expression):
+                    self.assert_native(definition + f'query = {expression}\n'
+                                       + f'selected = {selected}\neval(selected[0])\n', [expected])
+
+    def test_formatted_aliases_keep_their_evaluated_values(self):
+        for original, replacement, expected in (
+                ('input()', "'fixed'", 'UNTRUSTED'), ("'fixed'", 'input()', 'fixed')):
+            for consumer in ('next(value for value in [saved])', "''.join(value for value in [saved])"):
+                source = (f'value = {original}\nsaved = f"{{value}}"\n'
+                          f'value = {replacement}\neval({consumer})\n')
+                with self.subTest(original=original, consumer=consumer):
+                    self.assert_native(source, [expected])
+        self.assert_native('''
+            def run():
+                original = f'{input()}'
+                saved = original
+                original = 'fixed'
+                values = [saved]
+                saved = 'changed'
+                eval(next(value for value in values))
+            run()
+        ''', ['UNTRUSTED'])
+
+    def test_native_conversions_and_literal_string_specs_are_inert(self):
+        cases = (
+            ("f'{input()}'", 'UNTRUSTED'),
+            ("f'{input()!s}'", 'UNTRUSTED'),
+            ("f'{input()!r}'", "'UNTRUSTED'"),
+            ("f'{input()!a}'", "'UNTRUSTED'"),
+            ("f'{input():}'", 'UNTRUSTED'),
+            ("f'{input():>12}'", '   UNTRUSTED'),
+            ("f'{input():*^13s}'", '**UNTRUSTED**'),
+            ("f'{input():<12.20s}'", 'UNTRUSTED   '),
+            ("f'{input()!r:*>13}'", "**'UNTRUSTED'"),
+            ('f"{f\'{input()}\'}"', 'UNTRUSTED'),
+        )
+        for expression, expected in cases:
+            with self.subTest(expression=expression):
+                self.assert_native(f'query = {expression}\neval(next(value for value in [query]))\n',
+                                   [expected])
+
+    def test_joined_fields_preserve_taint_and_primitive_branch_alternatives(self):
+        self.assert_native('''
+            value = input() if input() else 'fixed'
+            query = f'before {value} after {True!s}'
+            eval(next(value for value in [query]))
+        ''', ['before UNTRUSTED after True'])
+        self.assert_native('''
+            left = input()
+            right = 'fixed'
+            query = f'{left}:{right}'
+            left = 'changed'
+            right = input()
+            eval(next(value for value in [query]))
+        ''', ['UNTRUSTED:fixed'])
+
+    def test_opaque_formatting_and_temporary_subclass_release_stay_incomplete(self):
+        for method, arguments, expression in (
+                ('__format__', ', spec', "f'prefix{Value()}'"),
+                ('__str__', '', "f'prefix{Value()!s}'"),
+                ('__repr__', '', "f'prefix{Value()!r}'"),
+                ('__repr__', '', "f'prefix{Value()!a}'")):
+            source = ("code = 'fixed'\nclass Text(str):\n"
+                      '    def __del__(self):\n        global code\n        code = input()\n'
+                      + f'class Value:\n    def {method}(self{arguments}):\n'
+                      + "        return Text('fixed')\n"
+                      + f'query = {expression}\n'
+                      + 'min(query for unused in (1, 2))\neval(code)\n')
+            with self.subTest(method=method, expression=expression):
+                self.assert_native(source, ['UNTRUSTED'], incomplete=True)
+        self.assert_native('''
+            code = 'fixed'
+            class Text(str):
+                def __del__(self):
+                    global code
+                    code = input()
+            class Value:
+                def __format__(self, spec):
+                    return Text('fixed')
+            value = f'{Value()}'
+            list(((value := 'fixed'), (code := 'fixed')) for unused in [value])
+            eval(code)
+        ''', ['UNTRUSTED'], incomplete=True)
+
+    def test_opaque_prompt_and_helper_frame_lifetimes_stay_incomplete(self):
+        self.assert_native('''
+            code = 'fixed'
+            class Prompt:
+                def __str__(self):
+                    global code
+                    code = input()
+                    return ''
+            query = f'{input(Prompt())}'
+            min(query for unused in (1, 2))
+            eval(code)
+        ''', ['UNTRUSTED'], incomplete=True)
+        self.assert_native('''
+            code = 'fixed'
+            class Owned:
+                def __del__(self):
+                    global code
+                    code = input()
+            def render():
+                owned = Owned()
+                return 'fixed'
+            query = f'{render()}'
+            min(query for unused in (1, 2))
+            eval(code)
+        ''', ['UNTRUSTED'], incomplete=True)
+
+    def test_invalid_and_unknown_specs_do_not_certify_normal_completion(self):
+        for expression in ("f'{1!s:d}'", "f'{1!s:{input()}}'"):
+            source = ("code = 'fixed'\ntry:\n"
+                      + f'    query = {expression}\n'
+                      + "except ValueError:\n    code = input()\n    query = 'fixed'\n"
+                      + 'next(value for value in [query])\neval(code)\n')
+            with self.subTest(expression=expression):
+                self.assert_native(source, ['UNTRUSTED'], incomplete=True)
+
+    def test_captured_helper_results_keep_opaque_frame_ancestry(self):
+        for result, invocation in (("'fixed'", 'render()'), ('value', "render('fixed')")):
+            parameters = 'value' if result == 'value' else ''
+            for capture in ('saved = result', 'saved = alias = result\nsaved = alias'):
+                source = ("code = 'fixed'\nclass Owned:\n"
+                          '    def __del__(self):\n        global code\n        code = input()\n'
+                          + f'def render({parameters}):\n    owned = Owned()\n    return {result}\n'
+                          + f'result = {invocation}\n{capture}\n'
+                          + "query = f'{saved}'\n"
+                          + 'min(query for unused in (1, 2))\neval(code)\n')
+                with self.subTest(result=result, capture=capture):
+                    self.assert_native(source, ['UNTRUSTED'], incomplete=True)
+        self.assert_native('''
+            code = 'fixed'
+            class Owned:
+                def __del__(self):
+                    global code
+                    code = input()
+            def render():
+                owned = Owned()
+                return True
+            saved = render()
+            query = f'{saved}'
+            min(query for unused in (1, 2))
+            eval(code)
+        ''', ['UNTRUSTED'], incomplete=True)
+
+    def test_captured_input_prompt_does_not_gain_format_authority(self):
+        self.assert_native('''
+            code = 'fixed'
+            class Prompt:
+                def __str__(self):
+                    global code
+                    code = input()
+                    return ''
+            saved = input(Prompt())
+            alias = saved
+            query = f'{alias}'
+            min(query for unused in (1, 2))
+            eval(code)
+        ''', ['UNTRUSTED'], incomplete=True)
+
+    def test_inert_helper_results_keep_native_format_authority(self):
+        for result, invocation, expected in (
+                ("'fixed'", 'render()', 'fixed'), ('value', 'render(input())', 'UNTRUSTED')):
+            parameters = 'value' if result == 'value' else ''
+            source = (f'def render({parameters}):\n    return {result}\n'
+                      + f'saved = {invocation}\n'
+                      + "query = f'{saved}'\neval(next(value for value in [query]))\n")
+            with self.subTest(result=result):
+                self.assert_native(source, [expected])
+
+    @unittest.skipUnless(hasattr(sys, 'set_int_max_str_digits'), 'Python has no integer conversion limit')
+    def test_oversized_integer_formatting_keeps_exception_boundaries(self):
+        # Hexadecimal literals parse without the decimal digit restriction.
+        # Configure only the native witness, never the analyzed program.
+        huge = '0x' + 'f' * 5000
+        for conversion in ('', '!s', '!r', '!a'):
+            for assignment, operand in (('', huge), (f'number = {huge}\n', 'number')):
+                source = (assignment + "code = 'fixed'\ntry:\n"
+                          + f"    query = f'{{{operand}{conversion}}}'\n"
+                          + "except ValueError:\n    code = input()\n    query = 'fixed'\n"
+                          + 'next(value for value in [query])\neval(code)\n')
+                with self.subTest(conversion=conversion, captured=bool(assignment)):
+                    self.assert_native(source, ['UNTRUSTED'], incomplete=True)
+            self.assert_native(
+                "code = 'fixed'\ntry:\n"
+                + f"    query = next(f'{{number{conversion}}}' for number in [{huge}])\n"
+                + "except ValueError:\n    code = input()\n    query = 'fixed'\n"
+                + 'next(value for value in [query])\neval(code)\n', ['UNTRUSTED'], incomplete=True)
+
+    @unittest.skipUnless(hasattr(sys, 'set_int_max_str_digits'), 'Python has no integer conversion limit')
+    def test_helper_input_prompts_keep_integer_conversion_boundaries(self):
+        huge = '0x' + 'f' * 5000
+        for setup, prompt in (('', huge), (f'    number = {huge}\n', 'number')):
+            source = ("code = 'fixed'\ndef render():\n" + setup
+                      + f'    input({prompt})\n'
+                      + "    return 'fixed'\ntry:\n    saved = render()\n"
+                      + "except ValueError:\n    code = input()\n    saved = 'fixed'\n"
+                      + "query = f'{saved}'\nnext(value for value in [query])\neval(code)\n")
+            with self.subTest(captured=bool(setup)):
+                self.assert_native(source, ['UNTRUSTED'], incomplete=True)
+
+
 class ImmediateGeneratorExpressionTests(SourceTest):
     def test_string_join_captures_values_before_later_rebinding(self):
         for receiver in ("''", 'separator'):

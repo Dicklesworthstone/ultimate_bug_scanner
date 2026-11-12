@@ -246,6 +246,37 @@ def is_sensitive_text(text):
     return bool(sensitive_families(text))
 
 
+def mask_safe_compare_results(expression):
+    """Replace complete timing-safe call results with a public boolean value.
+
+    These calls consume secrets but return a comparison result. Their inputs
+    therefore do not taint that result, even inside a larger boolean expression.
+    Only the call itself is masked: adjacent comparisons, other operands and
+    separate assignments still need analysis. The comparison and assignment
+    walkers independently visit expressions inside the call's arguments.
+    """
+    _source, code = javascript_lexical_views(expression)
+    parts, previous = [], 0
+    for match in safe_compare_re.finditer(code):
+        if match.start() < previous:
+            continue
+        depth = 1
+        end = match.end()
+        while end < len(code) and depth:
+            if code[end] == '(':
+                depth += 1
+            elif code[end] == ')':
+                depth -= 1
+            end += 1
+        if depth:
+            # An incomplete call cannot prove a non-secret result.
+            continue
+        parts.extend((expression[previous:match.start()], 'false'))
+        previous = end
+    parts.append(expression[previous:])
+    return ''.join(parts)
+
+
 CONTINUATION_TAIL = ('=', '(', '[', ',', '&&', '||', '?', ':', '+', '=>', '.')
 CONTINUATION_HEAD = ('.', '?', ':', ')', ']', '&&', '||', '+', '===', '!==', '==', '!=')
 
@@ -368,8 +399,6 @@ def collect_sensitive_bindings(lines, code_lines):
         stripped = code.strip()
         if not stripped:
             continue
-        if safe_compare_re.search(code):
-            continue
         for match in assignment_head_re.finditer(lexical_lines[idx]):
             prefix = tag_prefixes[idx] + ' ' + code[:match.start()]
             tag = open_jsx_tag(prefix)
@@ -393,7 +422,7 @@ def collect_sensitive_bindings(lines, code_lines):
                 if suffix.startswith(('++', '--')):
                     break
                 end = expression_end(lexical_code, following)
-            expr = strip_string_literals(source[start:end])
+            expr = strip_string_literals(mask_safe_compare_results(source[start:end]))
             # String contents and JSX attribute names cannot taint locals;
             # real assignment expressions still propagate secret material.
             named = bool(sensitive_families(name))
@@ -716,8 +745,6 @@ def callback_parameter_ranges(text, sensitive_vars):
 def unsafe_secret_compare(statement, sensitive_vars, *, call_results=frozenset(),
                           comparison_start=0, comparison_limit=None,
                           response_ranges=(), parameter_ranges=(), source_offset=0):
-    if safe_compare_re.search(statement):
-        return False
     # Match within each term, never across &&/||. An exempt comparison only
     # exempts that term; later terms may still compare actual secret values.
     for offset, left, right in comparison_operands(statement):
@@ -769,8 +796,8 @@ def unsafe_secret_operands(left, right, sensitive_vars, call_results=frozenset()
                            response_names=frozenset(), path_names=frozenset(), independent=frozenset()):
     left_metadata = response_metadata_read(left, response_names, path_names)
     right_metadata = response_metadata_read(right, response_names, path_names)
-    left = clean_operand_text(left)
-    right = clean_operand_text(right)
+    left = clean_operand_text(mask_safe_compare_results(left))
+    right = clean_operand_text(mask_safe_compare_results(right))
     if operand_is_nullish_or_shape_check(left) or operand_is_nullish_or_shape_check(right):
         return False
 

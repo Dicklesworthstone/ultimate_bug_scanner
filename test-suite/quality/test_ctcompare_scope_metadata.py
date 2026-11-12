@@ -413,6 +413,157 @@ const other = typeof link === "string" ? true : password === supplied;
                 self.assertEqual(scan_lines("js", source), [1])
 
 
+class JavascriptTimingSafeOperandTests(unittest.TestCase):
+    """A safe equality call protects its result, not nearby secret comparisons."""
+
+    @staticmethod
+    def programs():
+        bodies = {
+            'safe-before-and': 'return crypto.timingSafeEqual(expectedSignature, supplied) && password === candidate; // expect-secret',
+            'safe-after-or': 'return password !== candidate || crypto.timingSafeEqual(expectedSignature, supplied); // expect-secret',
+            'safe-next-statement': 'crypto.timingSafeEqual(expectedSignature, supplied); return password === candidate; // expect-secret',
+            'safe-next-line': ('return password === candidate // expect-secret\n'
+                               '  && crypto.timingSafeEqual(expectedSignature, supplied);'),
+            'safe-conditional': 'return ready ? crypto.timingSafeEqual(expectedSignature, supplied) : password === candidate; // expect-secret',
+            'quoted-decoy': 'const example = "timingSafeEqual("; return password === candidate; // expect-secret',
+            'template-decoy': 'const example = `timingSafeEqual(`; return password === candidate; // expect-secret',
+            'nested-comparison': 'return crypto.timingSafeEqual(Buffer.from(password === candidate ? "yes" : "no"), supplied); // expect-secret',
+            'alias-after-call': ('crypto.timingSafeEqual(expectedSignature, supplied); const value = password;\n'
+                                 'return value === candidate; // expect-secret'),
+            'alias-before-call': ('const value = password; crypto.timingSafeEqual(expectedSignature, supplied);\n'
+                                  'return value === candidate; // expect-secret'),
+            'alias-comma-declaration': ('const matches = crypto.timingSafeEqual(expectedSignature, supplied), value = password;\n'
+                                       'return value === candidate; // expect-secret'),
+            'conditional-secret-alias': ('const value = crypto.timingSafeEqual(expectedSignature, supplied) ? password : candidate;\n'
+                                         'return value === candidate; // expect-secret'),
+            'mixed-operand': 'return crypto.timingSafeEqual(expectedSignature, supplied) + password === candidate; // expect-secret',
+            'nested-assignment': ('let value;\n'
+                                 'crypto.timingSafeEqual(value = password, supplied);\n'
+                                 'return value === candidate; // expect-secret'),
+            'plain-unsafe-control': 'return password === candidate; // expect-secret',
+            'plain-safe-control': 'return crypto.timingSafeEqual(expectedSignature, supplied);',
+            'safe-boolean-comparison': 'return crypto.timingSafeEqual(expectedSignature, supplied) === ready;',
+            'safe-boolean-alias': ('const value = crypto.timingSafeEqual(expectedSignature, supplied);\n'
+                                  'return value === ready;'),
+            'safe-conjunction-alias': ('const value = crypto.timingSafeEqual(expectedSignature, supplied) && ready;\n'
+                                      'return value === ready;'),
+            'safe-public-comparison': 'return crypto.timingSafeEqual(expectedSignature, supplied) && mode === "read";',
+            'safe-length-guard': 'return expectedSignature.length === supplied.length && crypto.timingSafeEqual(expectedSignature, supplied);',
+            'quoted-public-control': 'const example = "password === candidate timingSafeEqual("; return mode === "read";',
+            'suppressed-control': 'return password === candidate || crypto.timingSafeEqual(expectedSignature, supplied); // ubs:ignore javascript.ctcompare.unsafe_secret_compare',
+        }
+        return {
+            name: 'function verify(password, candidate, expectedSignature, supplied, ready, mode) {\n'
+            + textwrap.indent(body, '  ') + '\n}\n'
+            for name, body in bodies.items()
+        }
+
+    def test_safe_call_exemption_is_local_to_its_result(self):
+        import time
+
+        for name, source in self.programs().items():
+            with self.subTest(case=name):
+                started = time.monotonic()
+                print(f'[ctcompare-js-safe-call-{name}] RUN', flush=True)
+                expected = [number for number, line in enumerate(source.splitlines(), 1)
+                            if '// expect-secret' in line]
+                self.assertEqual(scan_lines('js', source), expected, source)
+                print(f'[ctcompare-js-safe-call-{name}] PASS ({time.monotonic() - started:.3f}s)', flush=True)
+
+    def test_each_recognized_comparator_keeps_adjacent_unsafe_equality(self):
+        for name in ('timingSafeEqual', 'crypto.timingSafeEqual', 'safeEqual',
+                     'safeCompare', 'constantTimeEqual', 'compareDigest',
+                     'verifyWebhookSignature', 'subtle.verify', 'crypto.subtle.verify'):
+            with self.subTest(comparator=name):
+                self.assertEqual(scan_lines('js',
+                    f'return {name}(password, candidate) && password === candidate;\n'), [1])
+                self.assertEqual(scan_lines('js',
+                    f'const value = {name}(password, candidate);\nreturn value === ready;\n'), [])
+
+    def test_native_module_and_runner_keep_exact_security_sites(self):
+        import hashlib
+        import json
+        import os
+        import shutil
+        import subprocess
+        import time
+        from urllib.parse import unquote, urlparse
+
+        if not all(shutil.which(tool) for tool in ('ast-grep', 'rg', 'jq')):
+            self.skipTest('native JavaScript JSON/SARIF scans require ast-grep, rg and jq')
+        artifacts = REPO_ROOT / 'test-suite' / 'artifacts'
+        artifacts.mkdir(exist_ok=True)
+        root = Path(tempfile.mkdtemp(prefix='ctcompare-js-safe-calls-', dir=artifacts))
+        programs = self.programs()
+        expected = sorted((name + '.js', number, 'critical')
+                          for name, source in programs.items()
+                          for number, line in enumerate(source.splitlines(), 1)
+                          if '// expect-secret' in line)
+        for name, source in programs.items():
+            (root / (name + '.js')).write_text(source, encoding='utf-8')
+        for label, runner in (('module', REPO_ROOT / 'modules/ubs-js.sh'),
+                              ('runner', REPO_ROOT / 'ubs')):
+            for output_format in ('json', 'sarif'):
+                case = label + '-' + output_format
+                with self.subTest(case=case):
+                    command = ['bash', str(runner), str(root), '--ci', '--format=' + output_format]
+                    if label == 'runner':
+                        command += ['--only=js', '--no-auto-update']
+                    started = time.monotonic()
+                    print(f'[ctcompare-js-safe-call-{case}] RUN {command!r}', flush=True)
+                    completed = subprocess.run(
+                        command, cwd=root, capture_output=True, text=True, timeout=120,
+                        env={**os.environ, 'UBS_KEEP_TEMP': '1', 'UBS_NO_CACHE': '1',
+                             'UBS_NO_AUTO_UPDATE': '1', 'UBS_ENABLE_AUTO_UPDATE': '0',
+                             'UBS_CACHE_DIR': str(root / (case + '-cache')),
+                             'XDG_CONFIG_HOME': str(root / (case + '-config')),
+                             'XDG_DATA_HOME': str(root / (case + '-data'))},
+                    )
+                    (root / (case + '.stdout')).write_text(completed.stdout, encoding='utf-8')
+                    (root / (case + '.stderr')).write_text(completed.stderr, encoding='utf-8')
+                    (root / (case + '.receipt.json')).write_text(json.dumps({
+                        'command': command, 'exit': completed.returncode,
+                        'seconds': time.monotonic() - started,
+                        'source_hashes': {name: hashlib.sha256(source.encode()).hexdigest()
+                                          for name, source in programs.items()},
+                        'helper_sha256': hashlib.sha256(Path(ctcompare_js.__file__).read_bytes()).hexdigest(),
+                    }, indent=2), encoding='utf-8')
+                    context = f'{command!r}\nstdout:\n{completed.stdout}\nstderr:\n{completed.stderr}'
+                    self.assertEqual(completed.returncode, 1, context)
+                    try:
+                        report = json.loads(completed.stdout)
+                    except ValueError:
+                        self.fail(context)
+                    if output_format == 'json':
+                        self.assertEqual(report['status'], 'ok', context)
+                        if label == 'runner':
+                            actual = sorted((Path(row['file']).name, row['line'], row['severity'])
+                                            for row in report['findings']
+                                            if row['rule_id'] == 'javascript.ctcompare.unsafe_secret_compare')
+                            self.assertEqual(report['totals']['critical'], len(expected), context)
+                        else:
+                            actual = sorted((Path(row['path']).name, row['line'], row['severity'])
+                                            for row in report['findings']
+                                            if row['rule'] == 'javascript.ctcompare.unsafe_secret_compare')
+                            self.assertEqual(report['critical'], len(expected), context)
+                    else:
+                        results = [row for run in report['runs'] for row in run.get('results', [])]
+                        actual = []
+                        for row in results:
+                            if row['ruleId'] != 'javascript.ctcompare.unsafe_secret_compare':
+                                continue
+                            location = row['locations'][0]['physicalLocation']
+                            filename = Path(unquote(urlparse(location['artifactLocation']['uri']).path)).name
+                            actual.append((filename, location['region']['startLine'], 'critical'))
+                            self.assertEqual(row['level'], 'error', context)
+                        actual.sort()
+                        self.assertEqual(sum(row['level'] == 'error' for row in results), len(expected), context)
+                        self.assertTrue(all(invocation.get('executionSuccessful') is not False
+                                            for run in report['runs'] for invocation in run.get('invocations', [])), context)
+                    self.assertEqual(actual, expected, context)
+                    print(f'[ctcompare-js-safe-call-{case}] PASS ({time.monotonic() - started:.3f}s)', flush=True)
+
+
 class JavascriptParameterBindingTests(unittest.TestCase):
     """A new parameter binding cannot inherit an unrelated local's value."""
 

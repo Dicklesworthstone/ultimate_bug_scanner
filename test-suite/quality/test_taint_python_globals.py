@@ -776,10 +776,55 @@ class GlobalWriteCliTests(unittest.TestCase):
         ]
         self.assert_cli_cases(cases)
 
+    def test_first_yield_generators_module_and_runner_json_sarif(self):
+        cases = [
+            Case('next_preserves_first_unsafe_write', """
+                code = '1'
+                next((code := value) for value in [input(), '1'])
+                eval(code) # expect:eval
+                """),
+            Case('next_stops_before_unsafe_tail_write', """
+                code = input()
+                next((code := value) for value in ['1', input()])
+                eval(code)
+                """),
+            Case('next_default_taints_before_resume', """
+                code = '1'
+                result = next((code for unused in [1]), (code := input()))
+                eval(result) # expect:eval
+                """),
+            Case('next_default_cleans_before_resume', """
+                code = input()
+                result = next((code for unused in [1]), (code := '1'))
+                eval(result)
+                """),
+            Case('next_uses_tainted_default_after_exhaustion', """
+                result = next((value for value in []), input())
+                eval(result) # expect:eval
+                """),
+            Case('next_discards_unused_tainted_default', """
+                result = next((value for value in ['1']), input())
+                eval(result)
+                """),
+            Case('next_readonly_builtin_alias_selects_first_value', """
+                import builtins as native
+                result = native.next(value for value in [input(), '1'])
+                eval(result) # expect:eval
+                """),
+            Case('next_replaced_builtin_stays_incomplete', """
+                import builtins
+                builtins.next = lambda iterator: input()
+                result = builtins.next(value for value in ['1'])
+                eval(result)
+                """),
+        ]
+        self.assert_cli_cases(cases)
+
     def assert_cli_cases(self, cases):
         for case in cases:
             incomplete = case.name in {'foreign_module_write', 'deleted_builtin_shadow_survives_helper_sibling_join',
-                                       'string_join_opaque_iterator_stays_incomplete'}
+                                       'string_join_opaque_iterator_stays_incomplete',
+                                       'next_replaced_builtin_stays_incomplete'}
             # The full scanner also warns about eval syntax independently of
             # whether its operand is tainted. Keep those existing rules in
             # the oracle; the strong reset must remove only the taint finding.
@@ -860,6 +905,8 @@ class GlobalWriteCliTests(unittest.TestCase):
                             diagnostic = ('foreign module global write' if case.name == 'foreign_module_write'
                                           else 'generator materialization reads an opaque operand'
                                           if case.name == 'string_join_opaque_iterator_stays_incomplete'
+                                          else 'generator next computed callable lifetime is unresolved'
+                                          if case.name == 'next_replaced_builtin_stays_incomplete'
                                           else 'conditional global creation or deletion')
                             self.assertIn(diagnostic, result.stdout + result.stderr)
                         else:

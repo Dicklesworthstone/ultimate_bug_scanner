@@ -1186,7 +1186,7 @@ class SQLValueCaptureTests(unittest.TestCase):
         for name, source, expected in cases:
             self._assert_boolean_generator_cli(name, source, expected)
 
-    def _assert_boolean_generator_cli(self, name, source, expected):
+    def _assert_boolean_generator_cli(self, name, source, expected, *, expected_taint=()):
         for entry in ('ubs', 'modules/ubs-python.sh'):
             for fmt in ('json', 'sarif'):
                 with self.subTest(case=name, entry=entry, format=fmt):
@@ -1222,6 +1222,7 @@ class SQLValueCaptureTests(unittest.TestCase):
                         'detector_sha256': self.identity,
                         'entry_sha256': hashlib.sha256((ROOT / entry).read_bytes()).hexdigest(),
                         'elapsed_seconds': elapsed, 'expected_sql_findings': expected,
+                        'expected_taint_findings': expected_taint,
                     }, indent=2) + '\n', encoding='utf-8')
                     evidence = result.stdout + '\n' + result.stderr
                     self.assertEqual(result.returncode, int(any(rule == CRITICAL for rule, _ in expected)), evidence)
@@ -1230,14 +1231,15 @@ class SQLValueCaptureTests(unittest.TestCase):
                     except json.JSONDecodeError as exc:
                         self.fail(f'CLI emitted invalid JSON: {command}; evidence: {folder}: {exc}\n{evidence}')
                     self.assertNotIn('SQLFlowLimit', evidence)
-                    actual = []
+                    actual, actual_taint = [], []
                     if fmt == 'json':
                         self.assertEqual(report['status'], 'ok', evidence)
                         scans = report['scanners'] if entry == 'ubs' else [report]
                         self.assertEqual(len(scans), 1)
                         scan = scans[0]
                         self.assertEqual((scan['status'], scan['files']), ('ok', 1), evidence)
-                        self.assertEqual(scan['critical'], sum(rule == CRITICAL for rule, _ in expected), evidence)
+                        self.assertEqual(scan['critical'], sum(rule == CRITICAL for rule, _ in expected)
+                                         + len(expected_taint), evidence)
                         for finding in scan['findings']:
                             rule = finding.get('rule_id', finding.get('rule'))
                             if rule in {CRITICAL, WARNING}:
@@ -1245,6 +1247,11 @@ class SQLValueCaptureTests(unittest.TestCase):
                                 for sample in finding['samples']:
                                     self.assertEqual(Path(sample['file']).name, path.name)
                                     actual.append((rule, sample['line']))
+                            if expected_taint and rule.startswith(('python.taint.', 'py.taint.')):
+                                self.assertEqual(finding['count'], len(finding['samples']))
+                                for sample in finding['samples']:
+                                    self.assertEqual(Path(sample['file']).name, path.name)
+                                    actual_taint.append((rule, sample['line']))
                     else:
                         self.assertTrue(report['runs'], evidence)
                         for run in report['runs']:
@@ -1256,7 +1263,13 @@ class SQLValueCaptureTests(unittest.TestCase):
                                     self.assertEqual(Path(unquote(location['artifactLocation']['uri'])).name, path.name)
                                     self.assertEqual(location['region']['startColumn'], 1)
                                     actual.append((finding['ruleId'], location['region']['startLine']))
+                                if expected_taint and finding['ruleId'].startswith(('python.taint.', 'py.taint.')):
+                                    location = finding['locations'][0]['physicalLocation']
+                                    self.assertEqual(Path(unquote(location['artifactLocation']['uri'])).name, path.name)
+                                    actual_taint.append((finding['ruleId'], location['region']['startLine']))
                     self.assertEqual(sorted(actual), sorted(expected), evidence)
+                    if expected_taint:
+                        self.assertEqual(sorted(actual_taint), sorted(expected_taint), evidence)
                     print(f'[{case}] PASS ({elapsed:.3f}s)', flush=True)
 
     def test_real_cli_boolean_generator_refusals(self):
@@ -1647,7 +1660,8 @@ class SQLValueCaptureTests(unittest.TestCase):
         sources['z-safe.py'] = (program('    cursor.execute("SELECT ?", (user,))\n'), ())
         self._assert_partial_cli('independent-partial', incomplete_program(), 2, sources=sources)
 
-    def _assert_partial_cli(self, name, source, sink_line, *, sources=None, reason=None):
+    def _assert_partial_cli(self, name, source, sink_line, *, sources=None, reason=None,
+                            error_type='SQLFlowLimit'):
         for entry in ('ubs', 'modules/ubs-python.sh'):
             for fmt in ('json', 'sarif'):
                 with self.subTest(entry=entry, format=fmt):
@@ -1689,7 +1703,7 @@ class SQLValueCaptureTests(unittest.TestCase):
                         report = json.loads(result.stdout)
                     except json.JSONDecodeError as exc:
                         self.fail(f'CLI emitted invalid JSON: {command}; evidence: {folder}: {exc}')
-                    self.assertIn('SQLFlowLimit', result.stdout)
+                    self.assertIn(error_type, result.stdout)
                     if reason is not None:
                         self.assertIn(reason, result.stdout)
                     if fmt == 'json':
@@ -2008,9 +2022,11 @@ class SQLValueCaptureTests(unittest.TestCase):
              '    cursor.execute(query)\n', 'generator reducer binding'),
             ('result-interpolated', '    result = sum(item for item in (1, 2))\n'
              '    cursor.execute(f"SELECT {result}")\n', 'generator reducer binding'),
+            # The unresolved namespace invalidates list's native identity
+            # before the analyzer can attempt to restart its partial cursor.
             ('cursor-restarted', '    pending = (item for item in (1, 2))\n'
              '    sum(pending)\n    list(pending)\n'
-             '    cursor.execute("SELECT 1")\n', 'partial generator'),
+             '    cursor.execute("SELECT 1")\n', 'generator builtin binding'),
             ('sink-in-generator', '    sum(cursor.execute("SELECT 1") is None for _ in (1, 2))\n',
              'generator reducer binding'),
             ('sql-export', '    sum(f"SELECT {user}" for _ in (1, 2))\n'
@@ -2140,13 +2156,35 @@ class SQLValueCaptureTests(unittest.TestCase):
                 generator_builtin_replacement_program(consumer, keep_finding=True), 2,
                 reason='SQL generator builtin binding is unresolved')
         for name, body, expected in (
-                ('native-clean', '    query = f"SELECT {user}"\n'
+                ('native-clean', '    query = input()\n'
                  '    list((query := "SELECT 1") for _ in (0,))\n'
                  '    cursor.execute(query)\n', ()),
-                ('readonly-unsafe', '    import builtins\n    builtins.len(())\n'
-                 '    query = next(f"SELECT {user}" for _ in (0,))\n'
-                 '    cursor.execute(query)\n', ((CRITICAL, 5),))):
-            self._assert_boolean_generator_cli('builtin-binding-' + name, program(body), expected)
+                ('readonly-unsafe', '    import builtins\n    builtins.list(())\n'
+                 '    query = next(value for value in [input()])\n'
+                 '    cursor.execute(f"SELECT {query}")\n', ((CRITICAL, 5),))):
+            self._assert_boolean_generator_cli(
+                'builtin-binding-' + name, program(body), expected,
+                expected_taint=(('python.taint.sql', 5),) if name == 'readonly-unsafe' else ())
+        # Native input returns a string. Formatting an opaque parameter can
+        # invoke callbacks or release temporary values before materialization.
+        self._assert_partial_cli(
+            'builtin-binding-opaque-format',
+            program('    cursor.execute(f"SELECT {user}")\n'
+                    '    query = f"SELECT {user}"\n'
+                    '    list((query := "SELECT 1") for _ in (0,))\n'
+                    '    cursor.execute(query)\n'), 2,
+            reason='generator materialization releases an opaque binding',
+            error_type='AnalysisLimit')
+        # Keep the wider builtin access and opaque formatting case explicit:
+        # they do not establish the identity and lifetime proofs exercised by
+        # the bounded readonly native-input control above.
+        self._assert_partial_cli(
+            'builtin-binding-readonly-opaque-format',
+            program('    import builtins\n    builtins.len(())\n'
+                    '    query = next(f"SELECT {user}" for _ in (0,))\n'
+                    '    cursor.execute(query)\n'), 5,
+            reason='generator next consumer identity is unresolved',
+            error_type='AnalysisLimit')
 
     def test_generator_reducer_preserves_sql_effects_and_aliases(self):
         cases = (

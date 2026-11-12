@@ -633,6 +633,46 @@ _GENERATOR_EXHAUSTED = '@generator:exhausted'
 _PREDICATE_RESULTS = (ast.Constant(value=False), ast.Constant(value=True))
 
 
+def _readonly_builtin_modules(nodes, parents):
+    """Recognize private imports used only to call selected native builtins.
+
+    Importing builtins does not itself mutate input/next, but an escaped
+    module alias would expose every member. Reject rebinding and every use
+    beyond a direct supported call, including namespace reads and stores.
+    """
+    if any(isinstance(node, ast.ImportFrom) and any(alias.name == '*' for alias in node.names)
+           for node in nodes):
+        return frozenset()  # Exported names can replace even an earlier module alias.
+    names = {alias.asname or alias.name for node in nodes if isinstance(node, ast.Import)
+             for alias in node.names if alias.name == 'builtins'}
+    allowed = {'input', 'list', 'tuple', 'any', 'all', 'next'}
+    result = set()
+    for name in names:
+        valid = True
+        for node in nodes:
+            if isinstance(node, ast.Name) and node.id == name:
+                attribute = parents.get(node)
+                call = parents.get(attribute)
+                if not (isinstance(node.ctx, ast.Load) and isinstance(attribute, ast.Attribute)
+                        and attribute.value is node and isinstance(attribute.ctx, ast.Load)
+                        and attribute.attr in allowed and isinstance(call, ast.Call) and call.func is attribute):
+                    valid = False
+                    break
+            elif (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == name
+                  or isinstance(node, ast.arg) and node.arg == name
+                  or isinstance(node, ast.ExceptHandler) and node.name == name):
+                valid = False
+                break
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                if any((alias.asname or alias.name.split('.')[0]) == name
+                       and not (isinstance(node, ast.Import) and alias.name == 'builtins') for alias in node.names):
+                    valid = False
+                    break
+        if valid:
+            result.add(name)
+    return frozenset(result)
+
+
 def _terminal_generator(function):
     """One direct yield has a finite continuation with no source suffix.
 
@@ -2573,6 +2613,25 @@ class _Flow:
                     # retained collections. Effectful predicates below need
                     # ordered consumption and explicit short-circuit exits.
                     return False
+        if not self.generator_consumer_stable(consumer, names):
+            return False
+        return 'str.join' if string_join else next(iter(names)) if names <= {'any', 'all'} else 'collection'
+
+    def generator_consumer_stable(self, consumer, names):
+        """Require native consumer identities without exposed execution state."""
+        if (self.class_environments or self.engine.generator_namespace_exposed
+                or self.engine.generator_frame_exposed):
+            return False
+        # An enclosing sink such as eval(next(...)) executes after its
+        # argument finishes. A same-line source position does not make that
+        # call an intervening namespace mutation during consumption.
+        enclosing_calls = set()
+        child = self.engine.original_calls.get(consumer, consumer)
+        while child in self.engine.parents:
+            parent = self.engine.parents[child]
+            if isinstance(parent, ast.Call) and parent.func is not child:
+                enclosing_calls.add(parent)
+            child = parent
         for engine in self.engine.generator_peers:
             if (engine.generator_builtin_reflection or names & engine.generator_attribute_writes
                     or engine is not self.engine and engine.generator_namespace_exposed):
@@ -2582,9 +2641,74 @@ class _Flow:
                 spelling = capability.id if isinstance(capability, ast.Name) else capability.attr
                 if (engine is not self.engine or spelling == 'exec'
                         or not isinstance(call, ast.Call) or call.func is not capability
-                        or self.engine.enclosing(call) is not self.scope or call.lineno <= consumer.end_lineno):
+                        or self.engine.enclosing(call) is not self.scope
+                        or call.lineno <= consumer.end_lineno and call not in enclosing_calls):
                     return False
-        return 'str.join' if string_join else next(iter(names)) if names <= {'any', 'all'} else 'collection'
+        return True
+
+    def immediate_next(self, node, state, binding):
+        """Capture an iterator, evaluate the default, then resume to one yield.
+
+        Generator construction evaluates only the outer iterable. Consuming
+        it while evaluating the first argument would run before the default
+        and could observe stale globals, lose prefix writes, or execute a
+        body whose default argument raises. Keep those phases explicit.
+        """
+        if (not node.args or not isinstance(node.args[0], ast.GeneratorExp)
+                or len(node.args) not in {1, 2} or node.keywords):
+            return _MISSING
+        choices = _binding_choices(binding)
+        if not choices or not choices <= {'next', 'builtins.next'}:
+            return _MISSING
+        if isinstance(node.func, ast.Name):
+            refs = self.expression_references.get(node.func, NO_REFERENCES)
+            if any(not isinstance(ref, str) or not ref.startswith('@global:')
+                   or self.engine.globals.references.get(ref[8:], NO_REFERENCES) for ref in refs):
+                raise AnalysisLimit('generator next callable capture lifetime is unresolved; analysis is incomplete')
+        elif not (isinstance(node.func, ast.Attribute) and node.func.attr == 'next'
+                  and isinstance(node.func.value, ast.Name)
+                  and node.func.value.id in self.engine.generator_readonly_builtins
+                  and self.expression_bindings.get(node.func.value) == 'builtins'):
+            raise AnalysisLimit('generator next computed callable lifetime is unresolved; analysis is incomplete')
+        if (not self.generator_consumer_stable(node, {'next'})
+                or not self.generator_builtins_stable()):
+            raise AnalysisLimit('generator next consumer identity is unresolved; analysis is incomplete')
+        generator = node.args[0]
+        if any(clause.is_async for clause in generator.generators):
+            raise AnalysisLimit('asynchronous generator next consumption is unmodeled; analysis is incomplete')
+        self.materialized_generator_depth += 1
+        try:
+            first = generator.generators[0].iter
+            iterable = self.expr(first, state)
+            if not state.reachable:
+                return CLEAN
+            if not self.materialized_generator_iterable(first, state):
+                raise AnalysisLimit('generator next iterator or captured lifetime is unresolved; analysis is incomplete')
+            default = node.args[1] if len(node.args) == 2 else None
+            if default is not None:
+                self.expr(default, state)
+                if not state.reachable:
+                    return CLEAN
+                if not self.materialized_generator_inert(default, state):
+                    raise AnalysisLimit('generator next default lifetime is unresolved; analysis is incomplete')
+            # A private outer local keeps its value alive after this cursor
+            # is discarded. A direct Name read has no protocol, and next
+            # does not test the yielded object's truth. Reuse the existing
+            # retained-capture proof only when no clause can replace it.
+            borrowed = (isinstance(generator.elt, ast.Name)
+                        and generator.elt.id in self.engine.locals.get(self.scope, ())
+                        and generator.elt.id not in self.engine.locals[generator]
+                        and len(generator.generators) == 1 and not generator.generators[0].ifs
+                        and self.generator_expression_immediate(generator, state)
+                        and self.engine.generator_stable_binding(
+                            generator.elt.id, self.scope, generator, immediate=True))
+            fact = self.comprehension(generator, state, iterable=iterable, synchronous_generator=True,
+                                      first_result=True, default=default, borrowed_result=borrowed)
+            self.expression_bindings[node] = self.expression_bindings.get(generator)
+            self.expression_references[node] = self.expression_references.get(generator, NO_REFERENCES)
+            return fact
+        finally:
+            self.materialized_generator_depth -= 1
 
     def materialized_generator_string(self, node, state):
         """Require the evaluated value to be an exact, callback-free string."""
@@ -2629,6 +2753,8 @@ class _Flow:
             return all(self.materialized_generator_inert(value, state)
                        for value in (node.left, *node.comparators))
         if isinstance(node, ast.BoolOp):
+            if node in self.expression_bindings:
+                return self.materialized_generator_binding(self.expression_bindings[node], references, state)
             return all(self.materialized_generator_inert(value, state) for value in node.values)
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
             return self.materialized_generator_inert(node.operand, state)
@@ -2675,7 +2801,7 @@ class _Flow:
         A primitive return alone says nothing about released locals/defaults.
         Admit native input and a bounded straight-line helper subset whose
         entire frame contains primitive values. General callbacks, defaults,
-        parameter binding and nested calls still need an ownership summary.
+        argument expansion and nested calls still need an ownership summary.
         """
         self.engine.budget.spend()
         if (any(isinstance(value, ast.Starred) for value in node.args)
@@ -2692,11 +2818,22 @@ class _Flow:
             target = target.function
         if (not isinstance(target, ast.FunctionDef) or self.engine.owner(target) is not self.engine
                 or target in self.engine.generators or target.decorator_list or target.returns is not None
-                or not self.engine.generator_helper_identity(target) or node.args or node.keywords):
+                or not self.engine.generator_helper_identity(target)):
             return False
         signature = target.args
-        if (signature.posonlyargs or signature.args or signature.kwonlyargs or signature.vararg
-                or signature.kwarg or signature.defaults or any(value is not None for value in signature.kw_defaults)):
+        positional = [*signature.posonlyargs, *signature.args]
+        if (signature.vararg or signature.kwarg or signature.defaults
+                or any(value is not None for value in signature.kw_defaults)
+                or any(argument.annotation is not None for argument in (*positional, *signature.kwonlyargs))
+                or len(node.args) > len(positional)):
+            return False
+        arguments = {argument.arg: value for argument, value in zip(positional, node.args)}
+        accepted = {argument.arg for argument in (*signature.args, *signature.kwonlyargs)}
+        for keyword in node.keywords:
+            if keyword.arg not in accepted or keyword.arg in arguments:
+                return False
+            arguments[keyword.arg] = keyword.value
+        if set(arguments) != {argument.arg for argument in (*positional, *signature.kwonlyargs)}:
             return False
         captured = {}
         for name, ref in closure.cells if closure is not None else ():
@@ -2706,7 +2843,9 @@ class _Flow:
                 return False
             captured[name] = contents.binding
         local_names = self.engine.locals.get(target, ())
-        values = {}
+        values = {name: (expression if isinstance(expression, ast.Constant)
+                         else self.expression_bindings.get(expression))
+                  for name, expression in arguments.items()}
 
         def lookup(name):
             if name in values:
@@ -2803,6 +2942,9 @@ class _Flow:
         # aliases. Never recover a mutable collection from stale source text.
         references = self.expression_references.get(node, NO_REFERENCES)
         choices = _binding_choices(self.expression_bindings.get(node))
+        if (not references & state.mutated and choices
+                and all(isinstance(value, (_LiteralString, _GeneratorString)) for value in choices)):
+            return True
         if (not references or references & state.mutated or not choices
                 or not all(isinstance(value, _ArgumentVector) for value in choices)):
             return False
@@ -3505,6 +3647,10 @@ class _Flow:
             right_true, right_false = self.condition(node.orelse, right, inert=inert)
             return _join_states(left_true, right_true), _join_states(left_false, right_false)
         self.expr(node, state)
+        return self.evaluated_truth(node, state, inert=inert)
+
+    def evaluated_truth(self, node, state, *, inert=False):
+        """Split an evaluated operand without executing its effects twice."""
         if not state.reachable:
             return None, None
         if inert and not self.materialized_generator_inert(node, state):
@@ -4591,6 +4737,15 @@ class _Flow:
                         if _INCOMPLETE_PROOF in trace.sanitizers))
         receiver_refs = (self.expression_references.get(node.func.value, NO_REFERENCES)
                          if isinstance(node.func, ast.Attribute) else NO_REFERENCES)
+        first = self.immediate_next(node, state, binding)
+        if first is not _MISSING:
+            if original is not node:
+                for values in (self.expression_references, self.expression_bindings):
+                    if node in values:
+                        values[original] = values[node]
+                    else:
+                        values.pop(original, None)
+            return first
         arguments = [self.expr(arg, state) for arg in node.args]
         keywords = {}
         keyword_nodes = {}
@@ -4652,6 +4807,14 @@ class _Flow:
         target, fallback_name = callee.binding, callee.fallback_name
         receiver, receiver_refs = callee.receiver, callee.references
         arguments, keywords, keyword_nodes = inputs.arguments, inputs.keywords, inputs.keyword_nodes
+        if (target in {'next', 'builtins.next'} and any(
+                engine.generator_builtin_reflection or engine.generator_namespace_exposed
+                or engine.generator_frame_exposed or 'next' in engine.generator_attribute_writes
+                for engine in self.engine.generator_peers)):
+            # A builtin-qualified spelling can outlive replacement of the
+            # native callable. Opaque fallback only propagates argument data
+            # and would miss a replacement that returns a fresh source.
+            raise AnalysisLimit('generator next consumer identity is unresolved; analysis is incomplete')
         if self.materialized_generator_depth and not self.materialized_generator_call(node, target, state):
             raise AnalysisLimit('generator materialization helper frame lifetime is unresolved; analysis is incomplete')
         if isinstance(target, _GeneratorNext):
@@ -5374,6 +5537,11 @@ class _Flow:
             if self.materialized_generator_depth:
                 parent = self.engine.parents.get(node)
                 is_callee = isinstance(parent, ast.Call) and parent.func is node
+                if (isinstance(parent, ast.Attribute) and parent.value is node
+                        and isinstance(self.engine.parents.get(parent), ast.Call)
+                        and self.engine.parents[parent].func is parent
+                        and binding == 'builtins' and node.id in self.engine.generator_readonly_builtins):
+                    is_callee = True
                 if not is_callee and not self.materialized_generator_binding(binding, refs, state):
                     # A primitive final result is insufficient: an earlier
                     # truth test, index, format or discarded operand can have
@@ -5511,10 +5679,6 @@ class _Flow:
             binding = self.expression_bindings.get(node.value)
         elif isinstance(node, ast.Starred):
             binding = self.expression_bindings.get(node.value)
-        elif isinstance(node, ast.IfExp):
-            binding = _join_bindings(self.expression_bindings.get(node.body), self.expression_bindings.get(node.orelse))
-        elif isinstance(node, ast.BoolOp):
-            binding = _join_bindings(*(self.expression_bindings.get(value) for value in node.values))
         elif isinstance(node, ast.Subscript):
             projected = self.vector_subscript(node, state)
             if projected is not None:
@@ -5662,24 +5826,45 @@ class _Flow:
             self.assign(node.target, fact, state, node.value)
             return fact
         if isinstance(node, ast.IfExp):
-            self.expr(node.test, state)
-            left, right = state.copy(), state.copy()
-            fact = join_facts(self.expr(node.body, left), self.expr(node.orelse, right))
-            self.expression_references[node] = (self.expression_references.get(node.body, NO_REFERENCES)
-                                                | self.expression_references.get(node.orelse, NO_REFERENCES))
-            state.replace(_join_states(left, right))
-            return fact
+            left, right = self.condition(node.test, state, inert=bool(self.materialized_generator_depth))
+            branches, facts, bindings, references = [], [], [], []
+            for expression, branch in ((node.body, left), (node.orelse, right)):
+                if branch is None:
+                    continue
+                fact = self.expr(expression, branch)
+                if branch.reachable:
+                    branches.append(branch)
+                    facts.append(fact)
+                    bindings.append(self.expression_bindings.get(expression))
+                    references.append(self.expression_references.get(expression, NO_REFERENCES))
+            self.expression_bindings[node] = _join_bindings(*bindings)
+            self.expression_references[node] = frozenset().union(*references)
+            state.replace(_join_states(*branches))
+            return join_facts(*facts)
         if isinstance(node, ast.BoolOp):
-            fact = CLEAN
-            exits = []
+            facts, bindings, references, exits = [], [], [], []
             continuation = state.copy()
-            for value in node.values:
-                fact = join_facts(fact, self.expr(value, continuation))
-                exits.append(continuation.copy())
-            self.expression_references[node] = frozenset().union(*(self.expression_references.get(value, NO_REFERENCES)
-                                                                   for value in node.values))
+            for index, value in enumerate(node.values):
+                if continuation is None:
+                    break
+                fact = self.expr(value, continuation)
+                if not continuation.reachable:
+                    break
+                if index + 1 == len(node.values):
+                    stopped, continuation = continuation, None
+                else:
+                    truthy, falsy = self.evaluated_truth(
+                        value, continuation, inert=bool(self.materialized_generator_depth))
+                    stopped, continuation = ((falsy, truthy) if isinstance(node.op, ast.And) else (truthy, falsy))
+                if stopped is not None:
+                    exits.append(stopped)
+                    facts.append(fact)
+                    bindings.append(self.expression_bindings.get(value))
+                    references.append(self.expression_references.get(value, NO_REFERENCES))
+            self.expression_bindings[node] = _join_bindings(*bindings)
+            self.expression_references[node] = frozenset().union(*references)
             state.replace(_join_states(*exits))
-            return fact
+            return join_facts(*facts)
         if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp)):
             return self.comprehension(node, state)
         if isinstance(node, ast.Await):
@@ -5843,7 +6028,7 @@ class _Flow:
                                               if isinstance(child, ast.expr)))
 
     def comprehension(self, node, state, *, iterable=_MISSING, synchronous_generator=False,
-                      string_result=False, predicate=None):
+                      string_result=False, predicate=None, first_result=False, default=None, borrowed_result=False):
         """Execute eager comprehension clauses in their implicit local scope.
 
         Heap writes and walrus assignments escape that scope on both normal
@@ -5868,6 +6053,7 @@ class _Flow:
             nested.bindings[name] = None
             nested.references[name] = NO_REFERENCES
         result = CLEAN
+        result_bindings, result_references = [], []
         iterator_references = set()
         stopped = []
 
@@ -5921,12 +6107,24 @@ class _Flow:
             if (isinstance(literal, (ast.List, ast.Tuple))
                     and not any(isinstance(item, ast.Starred) for item in literal.elts)):
                 elements = literal.elts
+            elif synchronous_generator and isinstance(literal, ast.Set):
+                elements = literal.elts
             elif isinstance(literal, ast.Dict) and all(key is not None for key in literal.keys):
                 # Iterating a dictionary yields its keys, not its values.
                 # Unknown/duplicate keys cannot establish an exact count.
                 elements = literal.keys
+            scalar = (literal.value if isinstance(literal, ast.Constant)
+                      and isinstance(literal.value, (str, bytes))
+                      else binding.value if isinstance(binding, _LiteralString) else None)
+            if synchronous_generator and scalar is not None and len(scalar) <= self.comprehension_budget:
+                key = (literal, scalar)
+                elements = self.engine.generator_literal_elements.get(key)
+                if elements is None:
+                    elements = tuple(ast.copy_location(ast.Constant(value=value), literal) for value in scalar)
+                    self.engine.generator_literal_elements[key] = elements
             empty = (elements == [] or isinstance(literal, ast.Constant)
-                     and isinstance(literal.value, (str, bytes)) and not literal.value)
+                     and isinstance(literal.value, (str, bytes)) and not literal.value
+                     or scalar is not None and not scalar)
             if empty:
                 return entering
 
@@ -5952,9 +6150,12 @@ class _Flow:
                     if isinstance(generator.target, ast.Name):
                         if elements is not None:
                             current.bindings[generator.target.id] = _join_bindings(*(
-                                self.expression_bindings.get(item) for item in elements))
+                                item if synchronous_generator and isinstance(item, ast.Constant)
+                                else self.expression_bindings.get(item) for item in elements))
                             current.references[generator.target.id] = frozenset().union(*(
                                 self.expression_references.get(item, NO_REFERENCES) for item in elements))
+                        elif synchronous_generator and isinstance(binding, (_LiteralString, _GeneratorString)):
+                            current.bindings[generator.target.id] = _GeneratorString()
                         elif generator.iter in self.generator_returns:
                             current.bindings[generator.target.id] = binding
                             current.references[generator.target.id] = refs
@@ -5983,15 +6184,27 @@ class _Flow:
                             stopped.append(finished)
                     else:
                         values = ((node.key, node.value) if isinstance(node, ast.DictComp) else (node.elt,))
-                        fact = join_facts(*(self.expr(item, current) for item in values))
+                        if borrowed_result:
+                            self.materialized_generator_depth -= 1
+                        try:
+                            fact = join_facts(*(self.expr(item, current) for item in values))
+                        finally:
+                            if borrowed_result:
+                                self.materialized_generator_depth += 1
                         if current.reachable:
                             if string_result and not self.materialized_generator_string(node.elt, current):
                                 raise AnalysisLimit('string join generator element is not a proven builtin string; '
                                                     'analysis is incomplete')
-                            if synchronous_generator and not self.materialized_generator_inert(node.elt, current):
+                            if (synchronous_generator and not borrowed_result
+                                    and not self.materialized_generator_inert(node.elt, current)):
                                 raise AnalysisLimit('generator materialization result lifetime is unresolved; '
                                                     'analysis is incomplete')
                             result = join_facts(result, fact)
+                            if first_result:
+                                result_bindings.append(self.expression_bindings.get(node.elt))
+                                result_references.append(self.expression_references.get(node.elt, NO_REFERENCES))
+                                stopped.append(current)
+                                current = None
                 if synchronous_generator and current is not None and current.mutated & iterator_references:
                     raise AnalysisLimit('generator materialization mutates its captured iterator; '
                                         'analysis is incomplete')
@@ -6000,7 +6213,7 @@ class _Flow:
             # Fresh sequence literals cannot acquire additional elements from
             # the body. Preserve evaluation order and element/callable aliases
             # without inventing a second iteration of a singleton sequence.
-            if (elements is not None and isinstance(literal, (ast.List, ast.Tuple))
+            if (elements is not None and (isinstance(literal, (ast.List, ast.Tuple)) or scalar is not None)
                     and len(elements) <= self.comprehension_budget):
                 self.comprehension_budget -= len(elements)
                 current = entering
@@ -6018,7 +6231,7 @@ class _Flow:
             if elements is not None:
                 value = join_facts(*(self.expression_facts.get(item, CLEAN) for item in elements))
             head = entering.copy()
-            exits = None if elements else entering.copy()
+            exits = None if elements or scalar else entering.copy()
             while True:
                 back = iteration(head.copy())
                 exits = _join_states(exits, back)
@@ -6048,6 +6261,24 @@ class _Flow:
                 choices.append(_PREDICATE_RESULTS[predicate == 'any'])
             self.expression_bindings[node] = _join_bindings(*choices)
             normal = _join_states(normal, *stopped)
+        if first_result:
+            # Explicit StopIteration raised inside a generator is converted
+            # to RuntimeError. Natural exhaustion below remains a separate
+            # edge, and a supplied default handles only that edge.
+            outgoing = [_Completion(item.kind, item.state, item.value, item.references,
+                                    '@exception:RuntimeError', 'RuntimeError')
+                        if item.kind == 'raise' and item.exception_type == 'StopIteration' else item
+                        for item in outgoing]
+            if normal is not None:
+                if default is None:
+                    outgoing.append(_Completion('raise', normal, exception_type='StopIteration'))
+                else:
+                    result = join_facts(result, self.expression_facts.get(default, CLEAN))
+                    result_bindings.append(self.expression_bindings.get(default))
+                    result_references.append(self.expression_references.get(default, NO_REFERENCES))
+                    stopped.append(normal)
+            normal = _join_states(*stopped)
+            self.expression_bindings[node] = _join_bindings(*result_bindings)
         if synchronous_generator and any(
                 current is not None and current.mutated & iterator_references
                 for current in (normal, exceptional, *(item.state for item in outgoing))):
@@ -6059,7 +6290,8 @@ class _Flow:
         if exceptional is not None:
             self.exception_states[-1] = _join_states(self.exception_states[-1], project(exceptional))
         state.replace(project(normal))
-        self.expression_references[node] = frozenset({node})
+        self.expression_references[node] = (frozenset().union(*result_references)
+                                            if first_result else frozenset({node}))
         return result
 
     def block(self, statements, state):
@@ -6459,6 +6691,8 @@ class _Analysis:
         # selected source here adds substantial setup cost before any flow is
         # analyzed, without providing new information.
         nodes = tuple(ast.walk(tree))
+        self.parents = {child: parent for parent in nodes for child in ast.iter_child_nodes(parent)}
+        self.generator_readonly_builtins = _readonly_builtin_modules(nodes, self.parents)
         self.framework_annotation_metadata = any(
             isinstance(node, ast.Attribute) and node.attr in {
                 '__annotations__', '__signature__', '__wrapped__', '__annotate__'} for node in nodes)
@@ -6478,14 +6712,18 @@ class _Analysis:
         # Primitive input-result proofs must not outlive an exposed/replaced
         # builtins namespace. Projects combine this property across modules.
         self.generator_input_identity = not self.generator_builtin_reflection and not any(
-            isinstance(node, ast.Name) and node.id in {'builtins', '__builtins__', '__import__',
+            isinstance(node, ast.ImportFrom) and any(alias.name == '*' for alias in node.names)
+            or isinstance(node, ast.Name) and node.id in {'builtins', '__builtins__', '__import__',
                                                      'sys', 'importlib', 'import_module'}
+            and node.id not in self.generator_readonly_builtins
             or isinstance(node, ast.Import) and any(alias.name.split('.')[0] in {
-                'builtins', 'sys', 'importlib'} for alias in node.names)
+                'builtins', 'sys', 'importlib'} and not (
+                    alias.name == 'builtins' and (alias.asname or alias.name) in self.generator_readonly_builtins)
+                for alias in node.names)
             or isinstance(node, ast.ImportFrom) and node.module
             and (node.module.split('.')[0] in {'sys', 'importlib'}
                  or node.module == 'builtins' and any(alias.name not in {
-                     'list', 'tuple', 'any', 'all', 'next'} for alias in node.names))
+                     'input', 'list', 'tuple', 'any', 'all', 'next'} for alias in node.names))
             or isinstance(node, ast.Attribute) and node.attr in {
                 '__builtins__', '__globals__', 'f_builtins', 'f_globals', 'stdin', 'import_module'}
             or isinstance(node, ast.Constant) and isinstance(node.value, str)
@@ -6499,7 +6737,6 @@ class _Analysis:
                                        min(10_000_000, max(500_000, 128 * len(nodes))))
         scope_override = _work_setting('UBS_PYTHON_FLOW_SCOPE_STEPS', None)
         self.budget = Budget(self.work_limit)
-        self.parents = {child: parent for parent in nodes for child in ast.iter_child_nodes(parent)}
         # A literal allow-list is a proof only if every other use is exact
         # membership testing. Rebinding, mutation, aliasing or passing the set
         # to an opaque call invalidates it throughout this conservative model.
@@ -6560,6 +6797,7 @@ class _Analysis:
         self.generator_peers = (self,)
         self.generator_helper_proofs = {}
         self.generator_receiver_proofs = {}
+        self.generator_literal_elements = {}
         self.definition_writers = set()
         self.direct_global_functions = set()
         self.locals = {}
@@ -6575,7 +6813,8 @@ class _Analysis:
                 'globals', 'locals', 'vars', 'import_module'}
             or isinstance(node, ast.Name) and node.id in {'setattr', 'delattr'}
             or isinstance(node, ast.ImportFrom)
-            and (node.module == 'importlib' and any(alias.name in {'import_module', 'reload'} for alias in node.names)
+            and (any(alias.name == '*' for alias in node.names)
+                 or node.module == 'importlib' and any(alias.name in {'import_module', 'reload'} for alias in node.names)
                  or node.module == 'sys' and any(alias.name == 'modules' for alias in node.names)
                  or node.module == 'builtins' and any(alias.name in {
                      'globals', 'locals', 'vars', '__import__'} for alias in node.names))

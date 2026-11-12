@@ -1404,6 +1404,240 @@ class GeneratorProjectTests(unittest.TestCase):
             list(project.findings())
 
 
+class NextGeneratorCompletionTests(SourceTest):
+    def assert_native(self, source, expected_values):
+        source = textwrap.dedent(source).lstrip('\n')
+        observed = []
+
+        def record(value):
+            observed.append((sys._getframe(1).f_lineno, value))
+
+        exec(compile(source, '<next-generator-witness>', 'exec'),
+             {'input': lambda: 'UNTRUSTED', 'eval': record})
+        self.assertEqual([value for _line, value in observed], expected_values)
+        self.assertEqual(sorted((item['rule'], item['line']) for item in self.scan(source)),
+                         [('python.taint.eval', line) for line in sorted({
+                             line for line, value in observed if 'UNTRUSTED' in str(value)})])
+
+    def test_first_yield_preserves_result_and_last_executed_write(self):
+        cases = (("['fixed', input()]", ['fixed', 'fixed']),
+                 ("[input(), 'fixed']", ['UNTRUSTED', 'UNTRUSTED']),
+                 ("['', input()]", ['', '']),
+                 ('[]', ['fallback', 'before']))
+        for values, expected in cases:
+            with self.subTest(values=values):
+                self.assert_native("code = 'before'\n"
+                                   f"chosen = next(((code := value) for value in {values}), 'fallback')\n"
+                                   "eval(chosen)\neval(code)\n", expected)
+
+    def test_default_runs_before_resume_but_after_outer_iterable_capture(self):
+        cases = (("code for unused in [0]", ['UNTRUSTED', 'UNTRUSTED']),
+                 ("value for value in [code]", ['fixed', 'UNTRUSTED']),
+                 ("value for unused in [0] for value in [code]", ['UNTRUSTED', 'UNTRUSTED']))
+        for expression, expected in cases:
+            with self.subTest(expression=expression):
+                self.assert_native("code = 'fixed'\n"
+                                   f"chosen = next(({expression}), (code := input()))\n"
+                                   "eval(chosen)\neval(code)\n", expected)
+        for values, expected in (("['fixed']", ['fixed']), ('[]', ['UNTRUSTED'])):
+            with self.subTest(values=values):
+                self.assert_native(f'eval(next((value for value in {values}), input()))\n', expected)
+
+    def test_default_helpers_preserve_creation_and_resumption_values(self):
+        for initial, replacement in (('input()', "'fixed'"), ("'fixed'", 'input()')):
+            for expression in ('code for unused in [0]', 'value for value in [code]'):
+                final = 'UNTRUSTED' if replacement == 'input()' else 'fixed'
+                captured = 'UNTRUSTED' if initial == 'input()' else 'fixed'
+                expected = final if expression.startswith('code ') else captured
+                with self.subTest(initial=initial, expression=expression):
+                    self.assert_native(f'code = {initial}\ndef fallback():\n'
+                                       f'    global code\n    code = {replacement}\n    return "fallback"\n'
+                                       f'chosen = next(({expression}), fallback())\n'
+                                       'eval(chosen)\neval(code)\n', [expected, final])
+
+    def test_filters_nested_clauses_and_targets_keep_their_own_effects(self):
+        self.assert_native("code = input()\n"
+                           "next(((code := value) for value in ['fixed', input()] for inner in [0, 1]), 'fallback')\n"
+                           "eval(code)\n", ['fixed'])
+        self.assert_native("code = input()\n"
+                           "eval(next((value for value in [input()] if (code := '')), 'fallback'))\n"
+                           "eval(code)\n", ['fallback', ''])
+        self.assert_native("eval(next((value for value in [input()] for unused in []), 'fallback'))\n", ['fallback'])
+        self.assert_native("value = input()\neval(next(value for value in ['fixed']))\neval(value)\n",
+                           ['fixed', 'UNTRUSTED'])
+        self.assert_native("eval(next(value for value in ['', input()] if value))\n", ['UNTRUSTED'])
+
+    def test_exhaustion_selects_only_the_correct_continuation(self):
+        cases = (
+            ("next(value for value in [])", 'StopIteration', ['UNTRUSTED']),
+            ("next((value for value in []), 'fallback')", 'StopIteration', []),
+            ("next(value for value in ['fixed'])", 'StopIteration', []),
+        )
+        for expression, handler, expected in cases:
+            with self.subTest(expression=expression):
+                self.assert_native(f'try:\n    {expression}\nexcept {handler}:\n    eval(input())\n', expected)
+        self.assert_native("try:\n    next(value for value in [])\n    eval(input())\n"
+                           "except StopIteration:\n    pass\n", [])
+
+    def test_conditional_and_boolean_yields_skip_unselected_effects(self):
+        for expression in ("'fixed' if True else (code := input())",
+                           "(code := input()) if False else 'fixed'",
+                           "True or (code := input())", "False and (code := input())"):
+            with self.subTest(expression=expression):
+                self.assert_native("code = 'fixed'\n"
+                                   f"next(({expression} for unused in [0]), 'fallback')\n"
+                                   "eval(code)\n", ['fixed'])
+        self.assert_native("code = input()\n"
+                           "next(('fixed' if True else (code := 'fixed') for unused in [0]), 'fallback')\n"
+                           "eval(code)\n", ['UNTRUSTED'])
+        self.assert_native("eval(next((input() if True else 'fixed' for unused in [0]), 'fallback'))\n",
+                           ['UNTRUSTED'])
+
+    def test_primitive_helper_arguments_preserve_global_and_nonlocal_writes(self):
+        for signature, call in (('value', 'replace(value)'), ('*, value', 'replace(value=value)')):
+            with self.subTest(signature=signature):
+                self.assert_native(f"code = 'fixed'\ndef replace({signature}):\n"
+                                   "    global code\n    code = value\n    return value\n"
+                                   f"chosen = next(({call} for value in [input(), 'fixed']), 'fallback')\n"
+                                   "eval(chosen)\neval(code)\n", ['UNTRUSTED', 'UNTRUSTED'])
+        self.assert_native('''
+            def run():
+                code = 'fixed'
+                def replace(value):
+                    nonlocal code
+                    code = value
+                    return value
+                chosen = next((replace(value) for value in [input(), 'fixed']), 'fallback')
+                eval(chosen)
+                eval(code)
+            run()
+        ''', ['UNTRUSTED', 'UNTRUSTED'])
+
+    def test_generator_and_eager_default_exceptions_remain_distinct(self):
+        for expression, actual in (('next((fail() for unused in [0]), "fallback")', 'RuntimeError'),
+                                   ('next(("fixed" for unused in [0]), fail())', 'StopIteration')):
+            for handler in ('RuntimeError', 'StopIteration'):
+                other = 'StopIteration' if handler == 'RuntimeError' else 'RuntimeError'
+                with self.subTest(expression=expression, handler=handler):
+                    self.assert_native("code = 'fixed'\ndef fail():\n"
+                                       "    global code\n    code = input()\n    raise StopIteration('stop')\n"
+                                       f'try:\n    {expression}\nexcept {handler}:\n    eval(code)\n'
+                                       f'except {other}:\n    pass\n', ['UNTRUSTED'] if actual == handler else [])
+        self.assert_native("code = 'fixed'\ndef fallback():\n    raise ValueError('stop')\n"
+                           "try:\n    next(((code := input()) for unused in [0]), fallback())\n"
+                           "except ValueError:\n    eval(code)\n", ['fixed'])
+
+    def test_native_aliases_keep_first_value_selection(self):
+        for declaration, consumer in (('', 'next'), ('consume = next\n', 'consume'),
+                                      ('from builtins import next as consume\n', 'consume'),
+                                      ('import builtins\n', 'builtins.next'),
+                                      ('import builtins as native\n', 'native.next')):
+            with self.subTest(declaration=declaration):
+                self.assert_native(declaration + f"eval({consumer}(value for value in ['fixed', input()]))\n", ['fixed'])
+                self.assert_native(declaration + f"eval({consumer}(value for value in [input(), 'fixed']))\n", ['UNTRUSTED'])
+
+    def test_builtin_string_bytes_and_set_iterators_preserve_primitive_values(self):
+        cases = (("'ab'", 'a'), ("b'ab'", 97), ("b'\\x00\\x01'", 0),
+                 ("{'fixed'}", 'fixed'), ('{0}', 0), ('{False}', False))
+        for iterable, first in cases:
+            with self.subTest(iterable=iterable):
+                self.assert_native(f"eval(next((value for value in {iterable}), input()))\n", [first])
+        self.assert_native("letters = 'ab'\neval(next(value for value in letters))\n", ['a'])
+        for iterable in ("''", "b''"):
+            with self.subTest(empty=iterable):
+                self.assert_native(f'eval(next((value for value in {iterable}), input()))\n', ['UNTRUSTED'])
+                self.assert_native(f'try:\n    next(value for value in {iterable})\n    eval(input())\n'
+                                   'except StopIteration:\n    pass\n', [])
+        for iterable in ("{'first', 'second'}", '{0, 1}', '{0, 1.5}'):
+            with self.subTest(unordered=iterable):
+                # Set order is not a source-order guarantee. These effects are
+                # the same for every possible first member of the set.
+                self.assert_native("code = 'fixed'\n"
+                                   f"next(((code := input()) for value in {iterable}), 'fallback')\n"
+                                   'eval(code)\n', ['UNTRUSTED'])
+                self.assert_rules(f'eval(next(value for value in {iterable}))\n')
+
+    def test_computed_consumer_factories_cannot_hide_finalizers(self):
+        prefix = ("code = 'fixed'\nclass Release:\n    def __del__(self):\n"
+                  "        global code\n        code = input()\ndef choose():\n"
+                  "    owned = Release()\n    return next\n")
+        for call in ("chosen = choose()(code for unused in [0])\n",
+                     "consume = choose()\nchosen = consume(code for unused in [0])\n"):
+            source = prefix + call + 'eval(chosen)\n'
+            with self.subTest(call=call):
+                observed = []
+                exec(source, {'input': lambda: 'UNTRUSTED', 'eval': observed.append})
+                self.assertEqual(observed, ['UNTRUSTED'])
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                    self.scan(source)
+
+    def test_opaque_iterators_defaults_and_frame_lifetimes_remain_incomplete(self):
+        sources = (
+            "def run(items):\n    next((value for value in items), 'fixed')\n",
+            "async def run(items):\n    next((value async for value in items), 'fixed')\n",
+            "def run(default):\n    next((value for value in ['fixed']), default)\n",
+            "class Release:\n    def __del__(self):\n        print('cleanup')\n"
+            "next((value for value in [Release()]), 'fixed')\n",
+            "class Release:\n    def __del__(self):\n        print('cleanup')\n"
+            "def fallback():\n    owned = Release()\n    return 'fixed'\n"
+            "next((value for value in ['fixed']), fallback())\n",
+            "values = ['fixed']\nnext((value for value in values), values.clear())\n",
+        )
+        for source in sources:
+            with self.subTest(source=source), self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                self.scan(source)
+
+    def test_changed_builtin_next_cannot_certify_any_call_shape_clean(self):
+        sources = (
+            "import builtins\nbuiltins.next = lambda values: input()\n"
+            "eval(builtins.next(value for value in ['fixed']))\n",
+            "import builtins as native\nnative.next = lambda values: input()\n"
+            "eval(native.next(value for value in ['fixed']))\n",
+            "import builtins\nbuiltins.next = lambda values: input()\n"
+            "consume = builtins.next\neval(consume(value for value in ['fixed']))\n",
+            "import builtins\nbuiltins.next = lambda values: input()\n"
+            "values = (value for value in ['fixed'])\neval(builtins.next(values))\n",
+            "import builtins\nbuiltins.next = lambda values: input()\n"
+            "eval(builtins.next(iter(['fixed'])))\n",
+            "import builtins\nbuiltins.next = lambda *, values: input()\n"
+            "eval(builtins.next(values=(value for value in ['fixed'])))\n",
+            "import builtins\nbuiltins.next = lambda: input()\neval(builtins.next())\n",
+            "namespace = vars(next.__self__)\nnamespace['next'] = lambda values: input()\n"
+            "eval(next(value for value in ['fixed']))\n",
+            "import builtins\nbuiltins.__dict__['next'] = lambda values: input()\n"
+            "eval(builtins.next(value for value in ['fixed']))\n",
+        )
+        for source in sources:
+            with self.subTest(source=source), self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                self.scan(source)
+        self.assert_rules("def next(values):\n    return input()\n"
+                          "eval(next(value for value in ['fixed']))\n", 'eval')
+
+    def test_wildcard_imports_can_replace_native_consumers_and_module_aliases(self):
+        cases = (('', 'next'), ('consume = next\n', 'consume'),
+                 ('from builtins import next as consume\n', 'consume'),
+                 ('import builtins as native\n', 'native.next'))
+        for declaration, consumer in cases:
+            source = (declaration + 'from consumer_exports import *\n'
+                      "code = input()\n"
+                      f"{consumer}((code := 'fixed') for unused in [0])\n"
+                      'eval(code)\n')
+            with self.subTest(declaration=declaration):
+                # The external module supplies a consumer that never resumes
+                # the generator. Its exported module alias is equally opaque.
+                witness = ('import sys, types\n'
+                           "exports = types.ModuleType('consumer_exports')\n"
+                           "exports.next = exports.consume = lambda values: 'skipped'\n"
+                           'exports.native = types.SimpleNamespace(next=exports.next)\n'
+                           "sys.modules['consumer_exports'] = exports\n"
+                           f"exec({source!r}, {{'input': lambda: 'UNTRUSTED', 'eval': print}})\n")
+                native = subprocess.run([sys.executable, '-B', '-c', witness],
+                                        capture_output=True, text=True, timeout=10, check=True)
+                self.assertEqual(native.stdout, 'UNTRUSTED\n')
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                    self.scan(source)
+
+
 class PredicateGeneratorCompletionTests(SourceTest):
     def test_short_circuit_keeps_the_last_executed_write(self):
         cases = (

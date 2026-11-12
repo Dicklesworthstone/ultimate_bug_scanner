@@ -912,6 +912,50 @@ class GlobalWriteCliTests(unittest.TestCase):
         ]
         self.assert_cli_cases(cases)
 
+    def test_module_next_borrowing_boundaries_json_sarif(self):
+        cases = [
+            Case('module_next_opaque_formatter_stays_incomplete', """
+                code = 'fixed'
+                class Opaque:
+                    def __format__(self, spec):
+                        global code
+                        code = input()
+                        return 'fixed'
+                text = f"{Opaque()}"
+                next((text for unused in (0,)))
+                eval(code)
+                """),
+            Case('module_next_helper_finalizer_stays_incomplete', """
+                code = 'fixed'
+                class Owned:
+                    def __del__(self):
+                        global code
+                        code = input()
+                def helper():
+                    owned = Owned()
+                    return 'fixed'
+                value = helper()
+                text = f"{value}"
+                next((text for unused in (0,)))
+                eval(code)
+                """),
+            Case('module_next_native_string_keeps_clean_value', """
+                text = f'<{1}>'
+                saved = text
+                next(text for unused in (0,))
+                text = 'changed'
+                eval(saved)
+                """),
+            Case('module_next_native_string_keeps_tainted_value', """
+                text = f'<{input()!s}>'
+                saved = text
+                next(text for unused in (0,))
+                text = 'changed'
+                eval(saved) # expect:eval
+                """),
+        ]
+        self.assert_cli_cases(cases)
+
     def assert_cli_cases(self, cases):
         for case in cases:
             incomplete = case.name in {'foreign_module_write', 'deleted_builtin_shadow_survives_helper_sibling_join',
@@ -922,7 +966,9 @@ class GlobalWriteCliTests(unittest.TestCase):
                                        'literal_next_repeated_function_replacement',
                                        'formatted_max_named_key_keeps_clean_replacement',
                                        'formatted_min_preserves_taint_at_branch_join',
-                                       'formatted_next_reads_live_value_on_resume'}
+                                       'formatted_next_reads_live_value_on_resume',
+                                       'module_next_opaque_formatter_stays_incomplete',
+                                       'module_next_helper_finalizer_stays_incomplete'}
             # The full scanner also warns about eval syntax independently of
             # whether its operand is tainted. Keep those existing rules in
             # the oracle; the strong reset must remove only the taint finding.
@@ -1002,7 +1048,8 @@ class GlobalWriteCliTests(unittest.TestCase):
                         if incomplete:
                             diagnostic = ('foreign module global write' if case.name == 'foreign_module_write'
                                           else 'generator materialization reads an opaque operand'
-                                          if case.name == 'string_join_opaque_iterator_stays_incomplete'
+                                          if (case.name == 'string_join_opaque_iterator_stays_incomplete'
+                                              or case.name.startswith('module_next_'))
                                           else 'generator next computed callable lifetime is unresolved'
                                           if case.name == 'next_replaced_builtin_stays_incomplete'
                                           else 'generator next consumer identity is unresolved'
@@ -1016,6 +1063,16 @@ class GlobalWriteCliTests(unittest.TestCase):
                                 # delayed global read across multiple stores.
                                 # Keep these boundaries explicit and retain
                                 # both syntax findings in the partial report.
+                                self.assertEqual(actual, [], payload)
+                                self.assertEqual(sorted(all_sites), sorted(syntax_sites), payload)
+                                if output == 'json':
+                                    totals = payload['totals'] if meta else payload
+                                    self.assertEqual(totals['critical'], len(syntax_sites), payload)
+                                    self.assertEqual(totals['warning'], 0, payload)
+                            if case.name.startswith('module_next_'):
+                                # Module globals do not establish private
+                                # borrowing. Refusal retains both independent
+                                # syntax findings and their exact counts.
                                 self.assertEqual(actual, [], payload)
                                 self.assertEqual(sorted(all_sites), sorted(syntax_sites), payload)
                                 if output == 'json':

@@ -2135,6 +2135,92 @@ class FormattedStringCompletionTests(SourceTest):
             with self.subTest(captured=bool(setup)):
                 self.assert_native(source, ['UNTRUSTED'], incomplete=True)
 
+    def test_discarded_module_next_rejects_opaque_format_protocols(self):
+        # These are module-scope borrowing regressions. Earlier opaque
+        # producer effects on function-local text remain a separate summary
+        # limitation; retaining a local does not model those earlier effects.
+        for method, arguments, expression in (
+                ('__format__', ', spec', "f'{Opaque()}'"),
+                ('__format__', ', spec', "f'prefix-{Opaque()}-suffix'"),
+                ('__str__', '', "f'{Opaque()!s}'"),
+                ('__repr__', '', "f'{Opaque()!r}'"),
+                ('__repr__', '', "f'{Opaque()!a}'")):
+            source = ("code = 'fixed'\nclass Opaque:\n"
+                      + f'    def {method}(self{arguments}):\n'
+                      + "        global code\n        code = input()\n        return 'fixed'\n"
+                      + f'text = {expression}\n'
+                      + 'next(text for unused in (0,))\neval(code)\n')
+            with self.subTest(method=method, expression=expression):
+                self.assert_native(source, ['UNTRUSTED'], incomplete=True)
+        self.assert_native('''
+            code = 'fixed'
+            class Opaque:
+                def __format__(self, spec):
+                    global code
+                    code = input()
+                    return 'fixed'
+            value = 'fixed'
+            if input():
+                value = Opaque()
+            text = f'{value}'
+            next(text for unused in (0,))
+            eval(code)
+        ''', ['UNTRUSTED'], incomplete=True)
+        self.assert_native('''
+            code = 'fixed'
+            class Subclass(str):
+                def __format__(self, spec):
+                    global code
+                    code = input()
+                    return 'fixed'
+            value = Subclass('fixed')
+            text = f'{value}'
+            next(text for unused in (0,))
+            eval(code)
+        ''', ['UNTRUSTED'], incomplete=True)
+
+    def test_discarded_module_next_rejects_unproved_finalizer_ancestry(self):
+        owned = ("code = 'fixed'\nclass Owned:\n"
+                 '    def __del__(self):\n        global code\n        code = input()\n')
+        helper = "def helper():\n    owned = Owned()\n    return 'fixed'\n"
+        cases = (
+            ('captured helper', owned + helper + "value = helper()\ntext = f'{value}'\n"),
+            ('inline helper', owned + helper + "text = f'{helper()}'\n"),
+            ('owned walrus', owned + "old = Owned()\ntext = f\"{(old := 'fixed')}\"\n"),
+            ('ordered fields', "code = 'fixed'\nclass Opaque:\n"
+             '    def __format__(self, spec):\n        global code\n        code = input()\n'
+             + "        return 'fixed'\nvalue = Opaque()\n"
+             + "text = f\"{value}{(value := 'fixed')}\"\n"),
+        )
+        for label, prefix in cases:
+            with self.subTest(case=label):
+                self.assert_native(prefix + 'next(text for unused in (0,))\neval(code)\n',
+                                   ['UNTRUSTED'], incomplete=True)
+
+    def test_discarded_next_preserves_module_and_private_native_strings(self):
+        for expression, expected in (("'fixed'", 'fixed'), ('input()', 'UNTRUSTED'),
+                                     ("f'<{input()!s}>'", '<UNTRUSTED>'), ("f'<{1}>'", '<1>')):
+            body = (f'text = {expression}\nsaved = text\nnext(text for unused in (0,))\n'
+                    + "text = 'changed'\neval(saved)\n")
+            for scope in ('module', 'private'):
+                source = (body if scope == 'module'
+                          else 'def run():\n' + textwrap.indent(body, '    ') + 'run()\n')
+                with self.subTest(expression=expression, scope=scope):
+                    self.assert_native(source, [expected])
+
+    def test_discarded_private_next_keeps_opaque_arguments_retained(self):
+        for body in ('next(value for unused in (0,))\neval(code)\n',
+                     "saved = value\nnext(saved for unused in (0,))\nsaved = 'changed'\neval(code)\n"):
+            # The parameter retains the object until run returns. Reading it
+            # through next neither tests its truth nor releases that owner.
+            source = ("code = 'fixed'\nclass Retained:\n"
+                      + '    def __bool__(self):\n        raise AssertionError("unexpected truth test")\n'
+                      + '    def __del__(self):\n        global code\n        code = input()\n'
+                      + 'def run(value):\n' + textwrap.indent(body, '    ')
+                      + 'run(Retained())\n')
+            with self.subTest(body=body):
+                self.assert_native(source, ['fixed'])
+
 
 class ImmediateGeneratorExpressionTests(SourceTest):
     def test_string_join_captures_values_before_later_rebinding(self):

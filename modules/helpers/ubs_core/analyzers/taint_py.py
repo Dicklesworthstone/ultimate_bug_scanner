@@ -2747,7 +2747,10 @@ class _Flow:
             # is discarded. A direct Name read has no protocol, and next
             # does not test the yielded object's truth. Reuse the existing
             # retained-capture proof only when no clause can replace it.
-            borrowed = (isinstance(generator.elt, ast.Name)
+            # The module locals inventory includes global assignments;
+            # those operands still require the ordinary primitive proof.
+            borrowed = (self.scope is not self.engine.tree
+                        and isinstance(generator.elt, ast.Name)
                         and generator.elt.id in self.engine.locals.get(self.scope, ())
                         and generator.elt.id not in self.engine.locals[generator]
                         and len(generator.generators) == 1 and not generator.generators[0].ifs

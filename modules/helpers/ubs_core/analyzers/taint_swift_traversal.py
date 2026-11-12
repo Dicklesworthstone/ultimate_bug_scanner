@@ -1485,8 +1485,16 @@ class SwiftEngine:
             severity='warning', message=reason + '; effects are conservatively unknown in ' + scope,
             extras={'analysis': 'conservative', 'construct': self.text[offset:offset + 100].split('\n')[0],
                     'reason': reason, 'policy': self.policy, 'scope': scope})
-        unknown = retag(self.source(offset, 'unknown effects: ' + reason),
-                        add=frozenset({'unknown-provenance', 'analysis-limited'}))
+        # Every refusal above retains its own location and reason. Its value,
+        # however, is the same abstract unknown, not a distinct request source.
+        # Giving that value a new identity at every opaque operation makes
+        # joins and callback contexts grow with the number of diagnostics.
+        # Keep field paths and validation tags on the individual values; only
+        # their unknowable origin is shared. Real request sources keep their
+        # original identities and never merge into this conservative marker.
+        unknown = frozenset({Trace('source', (str(self.path), -1, 'unknown effects'),
+            tags=frozenset({'swift-string', 'unknown-provenance', 'analysis-limited'}),
+            evidence=(self.step(offset, 'source', 'unknown effects: ' + reason),))})
         self.apply_unknown_effects(unknown, state, bindings)
         return unknown
 

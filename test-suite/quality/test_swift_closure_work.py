@@ -29,11 +29,16 @@ class CountingSwiftEngine(SwiftEngine):
     """Count actual callback evaluations without replacing their execution."""
     def __init__(self, *args, **kwargs):
         self.closure_evaluations = 0
+        self.transformed_traces = 0
         super().__init__(*args, **kwargs)
 
     def inline_closure(self, *args, **kwargs):
         self.closure_evaluations += 1
         return super().inline_closure(*args, **kwargs)
+
+    def forget(self, value, keep=frozenset()):
+        self.transformed_traces += len(value)
+        return super().forget(value, keep)
 
 
 class SwiftClosureWorkTests(unittest.TestCase):
@@ -400,6 +405,122 @@ func body(req: Request) {
         findings = flow_findings(path, source, 'path', recover=True)
         self.assertEqual({item['line'] for item in findings if item['rule'] == PATH_RULE}, {5})
         self.assertTrue(any(item['rule'] == 'swift.taint.analysis-limited' for item in findings), findings)
+
+    def test_opaque_callback_work_keeps_every_diagnostic_and_request_source(self):
+        receipts = []
+        for unsafe in (False, True):
+            runs = []
+            for count in (10, 40, 80):
+                value = 'req.query["first"]! + req.query["second"]!' if unsafe else '"/srv/fixed"'
+                statements = '\n'.join('external.store(path)' for _ in range(count))
+                path, source = self.fixture('''
+                    func handle(req: Request) {
+                        var path = %s
+                        Task {
+                    %s
+                        }
+                        _ = String(contentsOfFile: path) // expect-path
+                    }
+                ''' % (value, statements), f'-{count}-{unsafe}')
+                engine = CountingSwiftEngine(path, source,
+                    parser=SwiftParser(source, recover=True), recover=True)
+                started = time.monotonic()
+                effects = engine.analyze()
+                elapsed = time.monotonic() - started
+                sink = source.index('String(contentsOfFile:')
+                self.assertEqual(set(effects), {sink} if unsafe else set())
+                expected_limits = {number for number, line in enumerate(source.splitlines(), 1)
+                    if 'external.store(' in line or '// expect-path' in line} if unsafe else set()
+                self.assertEqual({item['line'] for item in engine.diagnostics.values()}, expected_limits)
+                if unsafe:
+                    sources = {trace.key[1] for trace in effects[sink]}
+                    self.assertEqual(sources, {source.index('req.query["first"]'),
+                                               source.index('req.query["second"]')})
+                    with self.assertRaisesRegex(SwiftUnsupported, 'heap/capture'):
+                        flow_findings(path, source)
+                else:
+                    self.assertEqual(flow_findings(path, source), [])
+                receipt = dict(statements=count, unsafe=unsafe, elapsed=elapsed,
+                    transformed_traces=engine.transformed_traces,
+                    diagnostics=len(engine.diagnostics), effects=sorted(effects))
+                runs.append(receipt)
+                receipts.append(receipt)
+            # Repeated opaque calls add diagnostics, not new origins of the
+            # same unknowable value. Real independent request origins above
+            # must remain distinct. Count actual processed facts rather than
+            # relying on machine-dependent wall-clock thresholds.
+            self.assertLessEqual(runs[1]['transformed_traces'],
+                                 runs[0]['transformed_traces'] * 4 + 128)
+            self.assertLessEqual(runs[2]['transformed_traces'],
+                                 runs[1]['transformed_traces'] * 2 + 128)
+        (self.artifacts / 'opaque-work.json').write_text(json.dumps(receipts, indent=2), encoding='utf-8')
+
+    def test_unknown_values_do_not_share_validation_or_hide_independent_sinks(self):
+        cases = (
+            ('path', 'URL(fileURLWithPath: %s).lastPathComponent', '',
+             'serveFile(%s)', 'swift.taint.request_path_traversal'),
+            ('redirect', '%s', '''
+                guard left.hasPrefix("/"), !left.hasPrefix("//"), !left.contains("\\\\"),
+                      !left.contains("\\n"), !left.contains("\\r"), !left.contains("\\t") else { return }
+                ''', 'req.redirect(to: %s)', 'swift.taint.request_open_redirect'),
+            ('header', '%s', '''
+                let left = left.replacingOccurrences(of: "\\r", with: "")
+                               .replacingOccurrences(of: "\\n", with: "")
+                ''', 'HTTPHeaders([("X-Trace", %s)])', 'swift.taint.header-injection'),
+            ('outbound', 'URL(string: %s)!', '''
+                guard left.scheme == "https", left.host == "api.example.com" else { return }
+                ''', 'URLSession.shared.data(from: %s)', 'swift.taint.outbound-url'),
+        )
+        for policy, value, proof, sink, rule in cases:
+            left = value % 'first.value'
+            right = 'second.value' if policy == 'path' else value % 'second.value'
+            known = 'URL(string: req.query["known"]!)!' if policy == 'outbound' else 'req.query["known"]!'
+            path, source = self.fixture('''
+                final class Box { @Wrapped var value = "/srv/fixed" }
+                func handle(req: Request) {
+                    let first = Box()
+                    let second = Box()
+                    let left = %s
+                    let right = %s
+                    %s
+                    _ = %s // safe-value
+                    _ = %s // unknown-value
+                    _ = %s // known-source
+                }
+            ''' % (left, right, proof, sink % 'left', sink % 'right', sink % known), '-' + policy)
+            with self.subTest(policy=policy):
+                with self.assertRaisesRegex(SwiftUnsupported, 'wrapped stored property'):
+                    flow_findings(path, source, policy)
+                findings = flow_findings(path, source, policy, recover=True)
+                lines = {marker: next(number for number, line in enumerate(source.splitlines(), 1)
+                                      if marker in line)
+                         for marker in ('safe-value', 'unknown-value', 'known-source')}
+                self.assertEqual([(item['rule'], item['line']) for item in findings
+                                  if item['rule'] != 'swift.taint.analysis-limited'],
+                                 [(rule, lines['known-source'])], findings)
+                sink_limits = [item['line'] for item in findings
+                    if item['rule'] == 'swift.taint.analysis-limited'
+                    and 'reaches a sink' in item['extras']['reason']]
+                self.assertEqual(sink_limits, [lines['unknown-value']], findings)
+                self.assertFalse(any(item['line'] == lines['safe-value'] for item in findings), findings)
+            # An opaque effect after validation must invalidate the proof,
+            # even when its unknown origin was already present in the value.
+            first_sink = '_ = ' + sink % 'left'
+            mutated = source.replace(first_sink,
+                'Task {}\nexternal.change(req.query["mutation"])\n' + first_sink, 1)
+            path, mutated = self.fixture(mutated, '-' + policy + '-mutated')
+            with self.subTest(policy=policy, mutation=True):
+                findings = flow_findings(path, mutated, policy, recover=True)
+                expected = [number for number, line in enumerate(mutated.splitlines(), 1)
+                            if 'safe-value' in line or 'unknown-value' in line]
+                self.assertEqual([item['line'] for item in findings
+                    if item['rule'] == 'swift.taint.analysis-limited'
+                    and 'reaches a sink' in item['extras']['reason']], expected, findings)
+                expected_source = next(number for number, line in enumerate(mutated.splitlines(), 1)
+                                       if 'known-source' in line)
+                self.assertEqual([(item['rule'], item['line']) for item in findings
+                                  if item['rule'] != 'swift.taint.analysis-limited'],
+                                 [(rule, expected_source)], findings)
 
     def joined_engine(self, source, unsafe, suffix, policy='path'):
         path, source = self.fixture(source, suffix)

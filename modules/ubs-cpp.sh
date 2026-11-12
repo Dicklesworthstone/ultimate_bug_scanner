@@ -16,7 +16,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="3375f43ed062ee2b8e2b95023b59aae4d2827e29e45a3e4425cb49c528ec0359"
+UBS_LIB_CHECKSUM="ab2ce24fb01d013bb6abb8b33f107d742437b77fb8144af86c9e9b309436ef0a"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -265,7 +265,7 @@ PYRULES
   if [[ "${LIST_RULES:-0}" -eq 1 ]]; then
     ( set +o pipefail; awk 'BEGIN{FS=":"}/^id:[[:space:]]*/{gsub(/^[[:space:]]*id:[[:space:]]*/,"");print;}' "$tmp_rules"/rules/*.yml "$tmp_rules"/*.yml 2>/dev/null || true ) | LC_ALL=C sort -u
   fi
-  rm -rf "$tmp_rules" 2>/dev/null || true
+  ubs_remove_temp -rf "$tmp_rules" 2>/dev/null || true
   exit 0
 fi
 
@@ -425,7 +425,7 @@ run_contract_v2_cpp(){
       echo "ERROR: cannot deliver SARIF report; analysis is incomplete" >&2
       exit_code=2
     fi
-    rm -f "$v2_json_out" 2>/dev/null || true
+    ubs_remove_temp -f "$v2_json_out" 2>/dev/null || true
   else
     # Record-less section headers + Summary Statistics + legacy exit formula.
     run_v2_legacy_parity_bridges_cpp "$sink" "$list_file" "$exit_code" "$text_out" || exit_code=$?
@@ -434,7 +434,7 @@ run_contract_v2_cpp(){
         echo "ERROR: cannot deliver text report; analysis is incomplete" >&2
         exit_code=2
       fi
-      rm -f "$text_out" 2>/dev/null || true
+      ubs_remove_temp -f "$text_out" 2>/dev/null || true
     fi
   fi
   if [[ -n "$REPORT_JSON" ]]; then
@@ -443,7 +443,7 @@ run_contract_v2_cpp(){
       exit_code=2
     fi
   fi
-  rm -f "$list_file" "$sink" 2>/dev/null || true
+  ubs_remove_temp -f "$list_file" "$sink" 2>/dev/null || true
   return "$exit_code"
 }
 

@@ -666,6 +666,102 @@ class KeepTempCliTests(unittest.TestCase):
                 }
                 self.assertEqual(set(listed), dumped, context)
 
+    def test_cpp_outbound_reports_retain_scratch_and_partial_findings(self) -> None:
+        skip = "--skip=1,2,3,4,5,6,8,9,10,11,12,13,14,15,16"
+        unsafe = (
+            "std::string safe_url(std::string value) { return value; }\n"
+            "void first() {\n"
+            'curl_easy_setopt(curl, CURLOPT_URL, safe_url(getenv("QUERY_STRING")));\n'
+            "}\n"
+        )
+        clean = (
+            "void first() {\n"
+            'std::string target = getenv("QUERY_STRING");\n'
+            'target = "https://example.invalid/fixed";\n'
+            "curl_easy_setopt(curl, CURLOPT_URL, target.c_str());\n"
+            "}\n"
+        )
+        for scenario in ("complete", "clean", "partial"):
+            project = self.root / ("cpp-" + scenario)
+            project.mkdir()
+            (project / "first.cpp").write_text(clean if scenario == "clean" else unsafe, encoding="utf-8")
+            (project / "last.cpp").write_text(
+                'void last() {\nfopen("fixed.txt", "r");\n}\n' if scenario == "clean" else
+                'void last() {\nfopen(getenv("QUERY_STRING"), "r");\n}\n', encoding="utf-8")
+            if scenario == "partial":
+                (project / "unsupported.cpp").write_text(
+                    "#if defined(USE_REQUEST)\nvoid conditional() {\n"
+                    'curl_easy_setopt(curl, CURLOPT_URL, getenv("QUERY_STRING"));\n'
+                    "}\n#endif\n", encoding="utf-8")
+            expected = [] if scenario == "clean" else [
+                ("cpp.detector.outbound-url", "first.cpp", 3),
+                ("cpp.taint.path_traversal", "last.cpp", 2),
+            ]
+            for direct in (True, False):
+                for output_format in ("json", "sarif"):
+                    with self.subTest(scenario=scenario, direct=direct, format=output_format):
+                        arguments = [f"--format={output_format}", "--fail-on-warning", skip]
+                        if not direct:
+                            arguments.extend(("--only=cpp", f"--module-dir={ROOT / 'modules'}"))
+                        arguments.append(str(project))
+                        result, observations, run = self.run_scan(
+                            "cpp", project, *arguments, command_mode="--ci", direct_module=direct)
+                        context = f"{run}\n{result.stdout}\n{result.stderr}"
+                        self.assertEqual(result.returncode,
+                                         2 if scenario == "partial" else 0 if scenario == "clean" else 1,
+                                         context)
+                        document = json.loads(result.stdout)
+                        if output_format == "json":
+                            actual = sorted((row["rule"] if direct else row["rule_id"],
+                                             Path(row["path"] if direct else row["file"]).name,
+                                             row["line"]) for row in document.get("findings", []))
+                            self.assertEqual(document["status"],
+                                             "partial" if scenario == "partial" else "ok", context)
+                            counts = document if direct else document["totals"]
+                            self.assertEqual({key: counts[key] for key in SEVERITIES},
+                                             {"critical": len(expected), "warning": 0, "info": 0}, context)
+                        else:
+                            actual = sorted((row["ruleId"],
+                                             Path(row["locations"][0]["physicalLocation"]
+                                                  ["artifactLocation"]["uri"]).name,
+                                             row["locations"][0]["physicalLocation"]["region"]["startLine"])
+                                            for scan in document["runs"] for row in scan["results"])
+                            unsuccessful = any(invocation["executionSuccessful"] is False
+                                               for scan in document["runs"]
+                                               for invocation in scan.get("invocations", []))
+                            self.assertEqual(unsuccessful, scenario == "partial", context)
+                        self.assertEqual(actual, expected, context)
+                        if scenario == "partial":
+                            self.assertIn("Conditional C/C++ preprocessing",
+                                          result.stdout + result.stderr, context)
+                        self.assertTrue(observations["created_paths"], context)
+
+    def test_cpp_text_and_rule_listing_retain_generated_files(self) -> None:
+        source = self.source("cpp-text.cpp",
+            'void request() {\n  curl_easy_setopt(curl, CURLOPT_URL, getenv("QUERY_STRING"));\n}\n')
+        result, observations, run = self.run_scan(
+            "cpp", source, "--format=text", "--fail-on-warning",
+            "--skip=1,2,3,4,5,6,8,9,10,11,12,13,14,15,16", str(source),
+            command_mode="--ci", direct_module=True)
+        context = f"{run}\n{result.stdout}\n{result.stderr}"
+        self.assertEqual(result.returncode, 1, context)
+        self.assertIn("Request-derived outbound HTTP URLs", result.stdout, context)
+        self.assertTrue(observations["created_paths"], context)
+        destination = self.root / "cpp-dumped-rules"
+        result, observations, run = self.run_scan(
+            "cpp", source, "--dump-rules=" + str(destination),
+            command_mode="--list-rules", direct_module=True)
+        context = f"{run}\n{result.stdout}\n{result.stderr}"
+        self.assertEqual(result.returncode, 0, context)
+        listed = result.stdout.splitlines()
+        self.assertTrue(listed, context)
+        dumped = {line.split(":", 1)[1].strip()
+                  for path in destination.rglob("*.yml")
+                  for line in path.read_text(encoding="utf-8").splitlines()
+                  if line.startswith("id:")}
+        self.assertEqual(set(listed), dumped, context)
+        self.assertTrue(observations["created_paths"], context)
+
     def test_unsupported_php_refuses_before_module_execution(self) -> None:
         source = self.source("unsupported.php", '<?php eval($_GET["code"]);\n')
         (source.parent / "supported.py").write_text(CASES["python"][3], encoding="utf-8")

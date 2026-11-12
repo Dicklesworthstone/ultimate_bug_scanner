@@ -229,7 +229,9 @@ class Parser:
                 yield beginning, start
                 beginning = start + 1
             start += 1
-        if beginning < end:
+        # A C-style for header always has three semicolon-separated fields,
+        # including an empty increment. Empty call arguments still disappear.
+        if beginning < end or separator == ';':
             yield beginning, end
 
     def definitions(self, start, end, owner):

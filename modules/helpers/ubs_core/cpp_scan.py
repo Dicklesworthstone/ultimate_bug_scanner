@@ -243,7 +243,8 @@ def _record_category(finding: dict) -> int | None:
     return None
 
 
-def run_detectors(files: Sequence[Path], sink, skip: set[int] | None = None) -> None:
+def run_detectors(files: Sequence[Path], sink, skip: set[int] | None = None,
+                  errors: list[str] | None = None) -> None:
     """Run ubs_core.cpp_detectors.* modules (legacy heredoc detector ports).
 
     Protocol (matches ubs_core.py_detectors): single-rule modules expose
@@ -262,7 +263,10 @@ def run_detectors(files: Sequence[Path], sink, skip: set[int] | None = None) -> 
             continue
         try:
             module = importlib.import_module(f"ubs_core.cpp_detectors.{module_info.name}")
-        except Exception as exc:  # legacy heredoc failures degraded gracefully too
+        except Exception as exc:
+            if errors is None:
+                raise
+            errors.append(f"detector module {module_info.name}: {type(exc).__name__}: {exc}")
             sys.stderr.write(f"[ubs_core.cpp_scan] detector module {module_info.name} failed: {exc}\n")
             continue
         find = getattr(module, "find", None)
@@ -288,31 +292,40 @@ def run_detectors(files: Sequence[Path], sink, skip: set[int] | None = None) -> 
                      if spec["category"] not in skip}
             if not specs:
                 continue
-        for hit in find(files):
-            if len(hit) == 5:
-                rule_id, path, line_no, col, detail = hit
-            else:
-                path, line_no, col, detail = hit  # single-rule convenience
-                rule_id = next(iter(specs))
-            spec = specs.get(rule_id)
-            if spec is None:
-                continue
-            slug = slug_for_category(spec["category"])
-            title = spec["title"]
-            sink.write(json.dumps({
-                "rule": rule_id,
-                "category_id": f"cpp.{slug}",
-                "path": str(path),
-                "line": int(line_no),
-                "col": int(col),
-                "severity": spec["severity"],
-                "message": f"{title} — {detail}"[:300] if detail else title,
-                "suppressed": False,
-            }, ensure_ascii=False) + "\n")
+        batches = ([path] for path in files) if getattr(module, "FILE_SCOPED", False) else (files,)
+        for batch in batches:
+            try:
+                for hit in find(batch):
+                    if len(hit) == 5:
+                        rule_id, path, line_no, col, detail = hit
+                    else:
+                        path, line_no, col, detail = hit  # single-rule convenience
+                        rule_id = next(iter(specs))
+                    spec = specs.get(rule_id)
+                    if spec is None:
+                        continue
+                    slug = slug_for_category(spec["category"])
+                    title = spec["title"]
+                    sink.write(json.dumps({
+                        "rule": rule_id,
+                        "category_id": f"cpp.{slug}",
+                        "path": str(path),
+                        "line": int(line_no),
+                        "col": int(col),
+                        "severity": spec["severity"],
+                        "message": f"{title} — {detail}"[:300] if detail else title,
+                        "suppressed": False,
+                    }, ensure_ascii=False) + "\n")
+            except Exception as exc:
+                if errors is None:
+                    raise
+                source = str(batch[0]) if len(batch) == 1 else "selected files"
+                errors.append(f"{source}: detector {module_info.name}: {type(exc).__name__}: {exc}")
 
 
 def run_analyzers(files: Sequence[Path], sink, skip: set[int] | None = None,
-                  enable_new: bool = False, prefilter: Any = None) -> None:
+                  enable_new: bool = False, prefilter: Any = None,
+                  errors: list[str] | None = None) -> None:
     """Run registered cpp analyzers (taint traversal/redirect, lifecycle).
 
     ``cpp.narrowing.*`` (bead D4) has no legacy cpp counterpart — it stays
@@ -324,26 +337,35 @@ def run_analyzers(files: Sequence[Path], sink, skip: set[int] | None = None,
     for analyzer in analyzers_for_lang("cpp"):
         if analyzer.layer == "narrowing" and not enable_new:
             continue
+        if skip and ((analyzer.layer == "taint" and 7 in skip) or
+                     (analyzer.layer == "lifecycle" and 16 in skip)):
+            continue
         if prefilter is not None:
             target_files = prefilter.filter_files_for_analyzer(analyzer.name, files)
         else:
             target_files = list(files)
         if not target_files:
             continue
-        ctx = RunContext(lang="cpp", files=target_files)
-        for finding in analyzer.run(ctx):
-            if skip and _record_category(finding) in skip:
-                continue
-            sink.write(json.dumps({
-                "rule": finding.get("rule", ""),
-                "category_id": finding.get("category_id", f"cpp.{_CATEGORY_SLUGS.get(_record_category(finding), 'undefined-behavior')}"),
-                "path": finding.get("path", ""),
-                "line": int(finding.get("line", 0) or 0),
-                "col": int(finding.get("col", 1) or 1),
-                "severity": finding.get("severity", "warning"),
-                "message": finding.get("message", ""),
-                "suppressed": False,
-            }, ensure_ascii=False) + "\n")
+        for path in target_files:
+            ctx = RunContext(lang="cpp", files=[path])
+            try:
+                for finding in analyzer.run(ctx):
+                    if skip and _record_category(finding) in skip:
+                        continue
+                    sink.write(json.dumps({
+                        "rule": finding.get("rule", ""),
+                        "category_id": finding.get("category_id", f"cpp.{_CATEGORY_SLUGS.get(_record_category(finding), 'undefined-behavior')}"),
+                        "path": finding.get("path", ""),
+                        "line": int(finding.get("line", 0) or 0),
+                        "col": int(finding.get("col", 1) or 1),
+                        "severity": finding.get("severity", "warning"),
+                        "message": finding.get("message", ""),
+                        "suppressed": False,
+                    }, ensure_ascii=False) + "\n")
+            except Exception as exc:
+                if errors is None:
+                    raise
+                errors.append(f"{path}: {analyzer.name}: {type(exc).__name__}: {exc}")
 
 
 def _finding_title(rec: dict) -> str:
@@ -483,8 +505,9 @@ def main(argv: list[str] | None = None) -> int:
 
         capturing_sink = CapturingSink()
         counters = scan_patterns(patterns, files_to_scan, capturing_sink, skip, prefilter=prefilter_res)
-        run_detectors(files_to_scan, capturing_sink, skip)
-        run_analyzers(files_to_scan, capturing_sink, skip, enable_new=args.enable_new_analyzers, prefilter=prefilter_res)
+        run_detectors(files_to_scan, capturing_sink, skip, errors=scan_errors)
+        run_analyzers(files_to_scan, capturing_sink, skip, enable_new=args.enable_new_analyzers,
+                      prefilter=prefilter_res, errors=scan_errors)
         if args.custom_rules:
             from ubs_core.external_tools import scan_custom_rules
             scan_custom_rules(args.custom_rules, files_to_scan, capturing_sink, "cpp", scan_errors)
@@ -577,7 +600,7 @@ def main(argv: list[str] | None = None) -> int:
         _render_text(args, files, counters)
 
     sys.stderr.write(json.dumps({"counters": counters, "patterns": len(patterns),
-                                 "prefilter": prefilter_res.to_dict()}) + "\n")
+                                 "prefilter": prefilter_res.to_dict(), "errors": scan_errors}) + "\n")
     return exit_code
 
 

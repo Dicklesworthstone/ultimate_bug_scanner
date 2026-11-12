@@ -633,6 +633,53 @@ _GENERATOR_EXHAUSTED = '@generator:exhausted'
 _PREDICATE_RESULTS = (ast.Constant(value=False), ast.Constant(value=True))
 
 
+def _literal_execution_authority(nodes):
+    """Inspect literal eval/exec syntax only for exposed execution authority.
+
+    Embedded code never participates in ordinary flow or source positions.
+    The bounded extra syntax merely revokes native identities using the same
+    reflection/namespace inventory as source code. Unknown computed strings
+    remain outside this proof; exceeding its bounds must not certify them.
+    """
+    pending = [node for node in nodes if isinstance(node, ast.Call)]
+    extra, seen = [], set()
+    characters, remaining = 65_536, 4_096
+    while pending:
+        call = pending.pop()
+        spelling = (call.func.id if isinstance(call.func, ast.Name)
+                    else call.func.attr if isinstance(call.func, ast.Attribute) else None)
+        if (spelling not in {'eval', 'exec'} or not call.args
+                or not isinstance(call.args[0], ast.Constant)
+                or type(call.args[0].value) not in {str, bytes}):
+            continue
+        source = call.args[0].value
+        key = (spelling, source)
+        if key in seen:
+            continue
+        seen.add(key)
+        characters -= len(source)
+        if characters < 0:
+            return tuple(extra), True
+        if spelling == 'eval':
+            # eval strips spaces/tabs before compiling; ast.parse does not.
+            # Keep that distinction from hiding a valid indented payload.
+            source = source.strip(b' \t' if isinstance(source, bytes) else ' \t')
+        try:
+            tree = ast.parse(source, mode=spelling)
+        except (SyntaxError, UnicodeError):
+            continue  # Native execution also fails before this code can run.
+        except RecursionError:
+            return tuple(extra), True
+        for node in ast.walk(tree):
+            remaining -= 1
+            if remaining < 0:
+                return tuple(extra), True
+            extra.append(node)
+            if isinstance(node, ast.Call):
+                pending.append(node)
+    return tuple(extra), False
+
+
 def _readonly_builtin_modules(nodes, parents):
     """Recognize private imports used only to call selected native builtins.
 
@@ -2633,7 +2680,8 @@ class _Flow:
                 enclosing_calls.add(parent)
             child = parent
         for engine in self.engine.generator_peers:
-            if (engine.generator_builtin_reflection or names & engine.generator_attribute_writes
+            if (engine.generator_builtin_reflection or engine.generator_literal_authority_exposed
+                    or names & engine.generator_attribute_writes
                     or engine is not self.engine and engine.generator_namespace_exposed):
                 return False
             for capability in engine.generator_execution_capabilities:
@@ -2974,7 +3022,8 @@ class _Flow:
                                             and isinstance(consumer.args[1], ast.Constant)):
             return False
         for engine in self.engine.generator_peers:
-            if engine is not self.engine and engine.generator_namespace_exposed:
+            if (engine.generator_literal_authority_exposed
+                    or engine is not self.engine and engine.generator_namespace_exposed):
                 return False
             for capability in engine.generator_execution_capabilities:
                 call = engine.parents.get(capability)
@@ -4808,7 +4857,8 @@ class _Flow:
         receiver, receiver_refs = callee.receiver, callee.references
         arguments, keywords, keyword_nodes = inputs.arguments, inputs.keywords, inputs.keyword_nodes
         if (target in {'next', 'builtins.next'} and any(
-                engine.generator_builtin_reflection or engine.generator_namespace_exposed
+                engine.generator_builtin_reflection or engine.generator_literal_authority_exposed
+                or engine.generator_namespace_exposed
                 or engine.generator_frame_exposed or 'next' in engine.generator_attribute_writes
                 for engine in self.engine.generator_peers)):
             # A builtin-qualified spelling can outlive replacement of the
@@ -6693,6 +6743,7 @@ class _Analysis:
         nodes = tuple(ast.walk(tree))
         self.parents = {child: parent for parent in nodes for child in ast.iter_child_nodes(parent)}
         self.generator_readonly_builtins = _readonly_builtin_modules(nodes, self.parents)
+        literal_authority, literal_authority_limited = _literal_execution_authority(nodes)
         self.framework_annotation_metadata = any(
             isinstance(node, ast.Attribute) and node.attr in {
                 '__annotations__', '__signature__', '__wrapped__', '__annotate__'} for node in nodes)
@@ -6701,14 +6752,16 @@ class _Analysis:
         # import or direct attribute store names the builtins module.
         reflection = {'getattr', 'hasattr', 'setattr', 'delattr', 'vars', 'attrgetter', 'methodcaller',
                       'getattr_static'}
-        self.generator_builtin_reflection = any(
+        reflection_flags = tuple(any(
             isinstance(node, ast.Name) and node.id in reflection
             or isinstance(node, ast.Attribute) and node.attr in reflection | {
                 '__self__', '__func__', '__closure__', '__dict__', '__class__', '__subclasses__',
                 '__getattr__', '__getattribute__', '__setattr__', '__delattr__'}
             or isinstance(node, ast.ImportFrom) and node.module in {'builtins', 'operator', 'inspect'}
             and any(alias.name in reflection for alias in node.names)
-            for node in nodes)
+            for node in group) for group in (nodes, literal_authority))
+        self.generator_builtin_reflection = reflection_flags[0]
+        self.generator_literal_authority_exposed = literal_authority_limited or reflection_flags[1]
         # Primitive input-result proofs must not outlive an exposed/replaced
         # builtins namespace. Projects combine this property across modules.
         self.generator_input_identity = not self.generator_builtin_reflection and not any(
@@ -6804,7 +6857,7 @@ class _Analysis:
         self.generator_binders = {}
         self.generator_external_writers = {name for node in nodes if isinstance(node, (ast.Global, ast.Nonlocal))
                                           for name in node.names}
-        self.generator_namespace_exposed = any(
+        namespace_flags = tuple(any(
             isinstance(node, ast.Name) and node.id in {'globals', 'locals', '__builtins__', '__import__'}
             or isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
             and node.func.id == 'vars' and not node.args and not node.keywords
@@ -6818,11 +6871,23 @@ class _Analysis:
                  or node.module == 'sys' and any(alias.name == 'modules' for alias in node.names)
                  or node.module == 'builtins' and any(alias.name in {
                      'globals', 'locals', 'vars', '__import__'} for alias in node.names))
-            for node in nodes)
+            for node in group) for group in (nodes, literal_authority))
+        self.generator_namespace_exposed = namespace_flags[0]
+        literal_comprehension_targets = {part for node in literal_authority
+                                        if isinstance(node, ast.comprehension)
+                                        for part in ast.walk(node.target)}
+        self.generator_literal_authority_exposed |= namespace_flags[1] or any(
+            isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del))
+            or isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del))
+            and node not in literal_comprehension_targets
+            or isinstance(node, (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            or isinstance(node, ast.ExceptHandler) and node.name is not None
+            or _pattern_capture(node) is not None
+            for node in literal_authority)
         self.generator_attribute_writes = {node.attr for node in nodes if isinstance(node, ast.Attribute)
                                            and isinstance(node.ctx, (ast.Store, ast.Del))}
-        frame_capabilities = tuple(
-            node for node in nodes if
+        frame_capabilities, literal_frames = (tuple(
+            node for node in group if
             isinstance(node, ast.Name) and node.id in {'locals', '_getframe', 'currentframe', '_current_frames'}
             or isinstance(node, ast.Attribute) and node.attr in {
                 'f_locals', '_getframe', 'currentframe', '_current_frames'}
@@ -6830,6 +6895,8 @@ class _Analysis:
             and any(alias.name in {'_getframe', 'currentframe', '_current_frames'} for alias in node.names)
             or isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
             and node.func.id == 'vars' and not node.args and not node.keywords)
+            for group in (nodes, literal_authority))
+        self.generator_literal_authority_exposed |= bool(literal_frames)
         self.generator_execution_capabilities = tuple(node for node in nodes
             if isinstance(node, ast.Name) and node.id in {'eval', 'exec'}
             or isinstance(node, ast.Attribute) and node.attr in {'eval', 'exec'})

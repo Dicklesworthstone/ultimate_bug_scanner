@@ -1637,6 +1637,102 @@ class NextGeneratorCompletionTests(SourceTest):
                 with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
                     self.scan(source)
 
+    def native_system_calls(self, source):
+        # Each witness has its own builtin namespace. The executable sink is
+        # recorded, so the fixture never runs a supplied shell command.
+        witness = ("import builtins, os\nbuiltins.input = lambda: 'UNTRUSTED'\n"
+                   'os.system = print\n' + source)
+        native = subprocess.run([sys.executable, '-B', '-c', witness],
+                                capture_output=True, text=True, timeout=10, check=True)
+        return native.stdout.splitlines()
+
+    def test_literal_eval_namespace_mutation_invalidates_repeated_consumers(self):
+        mutation = "__import__('builtins').__dict__.__setitem__('next', lambda values: input())"
+        bodies = (
+            "chosen = next(value for value in ['fixed'])\n",
+            "consume = next\nchosen = consume(value for value in ['fixed'])\n",
+            "pending = (value for value in ['fixed'])\nchosen = next(pending)\n",
+            "chosen = native.next(value for value in ['fixed'])\n",
+        )
+        cases = []
+        for body in bodies:
+            prefix = 'import builtins as native\n' if 'native.next' in body else ''
+            statements = body + f'eval({mutation!r})\nos.system(chosen)\n'
+            cases.append(prefix + 'for unused in [0, 1]:\n' + textwrap.indent(statements, '    '))
+        cases.append('count = 0\nwhile count < 2:\n    count += 1\n'
+                     "    chosen = next(value for value in ['fixed'])\n"
+                     f'    eval({mutation!r})\n    os.system(chosen)\n')
+        cases.append("def run():\n    chosen = next(value for value in ['fixed'])\n"
+                     f'    eval({mutation!r})\n    os.system(chosen)\nrun()\nrun()\n')
+        for body in cases:
+            source = 'import os\n' + body
+            with self.subTest(body=body):
+                self.assertEqual(self.native_system_calls(source), ['fixed', 'UNTRUSTED'])
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'consumer identity.*incomplete'):
+                    self.scan(source)
+
+    def test_literal_execution_handles_bytes_nested_calls_and_binding_writes(self):
+        mutation = "__import__('builtins').__dict__.__setitem__('next', lambda values: input())"
+        expressions = (repr(mutation), repr(mutation.encode()), repr(' \t' + mutation + '\t '),
+                       repr(b' \t' + mutation.encode() + b'\t '),
+                       repr(f'eval({mutation!r})'), repr(f'eval({mutation.encode()!r})'),
+                       repr('(next := lambda values: input())'))
+        for expression in expressions:
+            source = ("import os\nfor unused in [0, 1]:\n"
+                      "    chosen = next(value for value in ['fixed'])\n"
+                      f'    eval({expression})\n    os.system(chosen)\n')
+            with self.subTest(expression=expression):
+                self.assertEqual(self.native_system_calls(source), ['fixed', 'UNTRUSTED'])
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'consumer identity.*incomplete'):
+                    self.scan(source)
+        source = ("import os\nconsume = next\nfor unused in [0, 1]:\n"
+                  "    chosen = consume(value for value in ['fixed'])\n"
+                  "    eval('(consume := lambda values: input())')\n    os.system(chosen)\n")
+        self.assertEqual(self.native_system_calls(source), ['fixed', 'UNTRUSTED'])
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'consumer identity.*incomplete'):
+            self.scan(source)
+
+    def test_literal_code_data_and_harmless_execution_keep_native_consumers(self):
+        mutation = "__import__('builtins').__dict__.__setitem__('next', lambda values: input())"
+        for code in ('1 + 2', ' \t1 + 2\t ', "'builtins'", repr(mutation),
+                     '[value for value in [1]]', "b'__import__'"):
+            source = ("import os\nfor unused in [0, 1]:\n"
+                      "    chosen = next(value for value in ['fixed'])\n"
+                      f'    eval({code!r})\n    os.system(chosen)\n')
+            with self.subTest(code=code):
+                self.assertEqual(self.native_system_calls(source), ['fixed', 'fixed'])
+                self.assert_rules(source)
+        source = (f'payload = {mutation!r}\n'
+                  "import os\nfor unused in [0, 1]:\n"
+                  "    os.system(next(value for value in ['fixed']))\n")
+        self.assertEqual(self.native_system_calls(source), ['fixed', 'fixed'])
+        self.assert_rules(source)
+
+    def test_literal_authority_inspection_limits_cannot_certify_mutation_clean(self):
+        mutation = "__import__('builtins').__dict__.__setitem__('next', lambda values: input())"
+        for code in (mutation + ' ' * 65_536, '(' + '0,' * 4_500 + mutation + ')'):
+            source = ("import os\nfor unused in [0, 1]:\n"
+                      "    chosen = next(value for value in ['fixed'])\n"
+                      f'    eval({code!r})\n    os.system(chosen)\n')
+            with self.subTest(length=len(code)):
+                self.assertEqual(self.native_system_calls(source), ['fixed', 'UNTRUSTED'])
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'consumer identity.*incomplete'):
+                    self.scan(source)
+
+    def test_malformed_literal_execution_preserves_independent_findings(self):
+        for consumer in ('eval', 'exec'):
+            for code in ('\ud800', b'\xff', 'value\x00'):
+                source = 'import os\nos.system(input())\n'
+                expected = ['UNTRUSTED']
+                if consumer == 'eval':
+                    source += "os.system(next(value for value in ['fixed']))\n"
+                    expected.append('fixed')
+                source += (f'try:\n    {consumer}({code!r})\n'
+                           'except (SyntaxError, UnicodeError):\n    pass\n')
+                with self.subTest(consumer=consumer, code=repr(code)):
+                    self.assertEqual(self.native_system_calls(source), expected)
+                    self.assert_rules(source, 'command')
+
 
 class PredicateGeneratorCompletionTests(SourceTest):
     def test_short_circuit_keeps_the_last_executed_write(self):

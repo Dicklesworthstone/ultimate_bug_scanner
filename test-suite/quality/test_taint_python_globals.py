@@ -820,11 +820,45 @@ class GlobalWriteCliTests(unittest.TestCase):
         ]
         self.assert_cli_cases(cases)
 
+    def test_literal_execution_revokes_next_authority_json_sarif(self):
+        cases = [
+            Case('literal_next_loop_replacement', """
+                import os
+                os.system(input()) # expect:command
+                for unused in [0, 1]:
+                    result = next(value for value in ["'fixed'"])
+                    eval("__import__('builtins').__dict__.__setitem__('next', lambda values: input())")
+                    os.system(result)
+                """),
+            Case('literal_next_saved_cursor_replacement', """
+                import os
+                os.system(input()) # expect:command
+                pending = (value for value in ["'fixed'"])
+                eval("__import__('builtins').__dict__.__setitem__('next', lambda values: input())")
+                result = next(pending)
+                os.system(result)
+                """),
+            Case('literal_next_repeated_function_replacement', """
+                import os
+                os.system(input()) # expect:command
+                def read():
+                    result = next(value for value in ["'fixed'"])
+                    eval("__import__('builtins').__dict__.__setitem__('next', lambda values: input())")
+                    return result
+                os.system(read())
+                os.system(read())
+                """),
+        ]
+        self.assert_cli_cases(cases)
+
     def assert_cli_cases(self, cases):
         for case in cases:
             incomplete = case.name in {'foreign_module_write', 'deleted_builtin_shadow_survives_helper_sibling_join',
                                        'string_join_opaque_iterator_stays_incomplete',
-                                       'next_replaced_builtin_stays_incomplete'}
+                                       'next_replaced_builtin_stays_incomplete',
+                                       'literal_next_loop_replacement',
+                                       'literal_next_saved_cursor_replacement',
+                                       'literal_next_repeated_function_replacement'}
             # The full scanner also warns about eval syntax independently of
             # whether its operand is tainted. Keep those existing rules in
             # the oracle; the strong reset must remove only the taint finding.
@@ -907,8 +941,14 @@ class GlobalWriteCliTests(unittest.TestCase):
                                           if case.name == 'string_join_opaque_iterator_stays_incomplete'
                                           else 'generator next computed callable lifetime is unresolved'
                                           if case.name == 'next_replaced_builtin_stays_incomplete'
+                                          else 'generator next consumer identity is unresolved'
+                                          if case.name.startswith('literal_next_')
                                           else 'conditional global creation or deletion')
                             self.assertIn(diagnostic, result.stdout + result.stderr)
+                            if case.name.startswith('literal_next_'):
+                                # Refusing later dynamic execution must retain
+                                # the already observed command-injection sink.
+                                self.assertEqual(sorted(actual), case.expected, payload)
                         else:
                             self.assertEqual(sorted(actual), case.expected, payload)
                             self.assertEqual(sorted(all_sites), expected_sites, payload)

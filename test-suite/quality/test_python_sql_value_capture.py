@@ -2073,6 +2073,139 @@ class SQLValueCaptureTests(unittest.TestCase):
                         with self.assertRaisesRegex(detector.SQLFlowLimit, 'generator reducer.*incomplete'):
                             list(detector.find([path]))
 
+    def test_generator_reducer_named_keys_preserve_sql_provenance(self):
+        expressions = (
+            ('min', 'len(record)', 'min(([query] for _ in (1, 2)), key=order)'),
+            ('max', '(len(record), record[0])', 'max(([query] for _ in (1, 2)), key=order)'),
+            ('sorted', 'record[0]', 'sorted(([query] for _ in (1, 2)), key=order)[0]'),
+            ('positional', 'len(record[0])', 'min(([query] for _ in (1, 2)), key=order)'),
+        )
+        for name, body, expression in expressions:
+            parameter = 'record, /' if name == 'positional' else 'record'
+            for label, query, sink, rows, unsafe in (
+                    ('clean', '"SELECT count(*) FROM users WHERE name = \'alice\'"',
+                     'cursor.execute(selected[0])', 1, False),
+                    ('unsafe', 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"',
+                     'cursor.execute(selected[0])', 2, True),
+                    ('bound', 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"',
+                     'cursor.execute("SELECT count(*) FROM users WHERE name = ?", (selected[0],))',
+                     0, False)):
+                case = f'reducer-named-key-{name}-{label}'
+                source = program(f'    def order({parameter}):\n'
+                                 '        """Order records by a builtin value."""\n'
+                                 + f'        return {body}\n    query = {query}\n'
+                                 + f'    selected = {expression}\n'
+                                 + f'    return {sink}.fetchone()[0]\n')
+                with self.subTest(case=case):
+                    self.assertEqual(sqlite_witness(self.artifacts, case, source)['rows'], rows)
+                    expected = ((CRITICAL, len(source.splitlines())),) if unsafe else ()
+                    self.inspect(case, source, expected)
+
+    def test_generator_reducer_named_keys_keep_lexical_cells(self):
+        for reducer in ('min', 'max', 'sorted'):
+            for name, parameter, expression in (
+                    ('capture', 'item', 'offset'), ('parameter', 'offset', 'offset')):
+                case = f'reducer-named-capture-{reducer}-{name}'
+                source = program('    offset = 1\n'
+                                 + f'    def order({parameter}):\n        return {expression}\n'
+                                 + f'    {reducer}((1 for offset in (2, 3)), key=order)\n'
+                                 '    return cursor.execute("SELECT 1").fetchone()[0]\n')
+                with self.subTest(case=case):
+                    self.assertEqual(sqlite_witness(self.artifacts, case, source)['rows'], 1)
+                    if name == 'capture' and reducer != 'sorted':
+                        path = self.artifacts / (case + '.py')
+                        path.write_text(source, encoding='utf-8')
+                        # A same-spelled loop local is not the helper's free
+                        # cell. sorted checks its keys after restoring the
+                        # outer frame; streaming reducers cannot borrow it.
+                        with self.assertRaisesRegex(detector.SQLFlowLimit, 'generator reducer.*incomplete'):
+                            list(detector.find([path]))
+                    else:
+                        self.inspect(case, source, ())
+
+    def test_generator_reducer_named_key_exceptions_keep_prefix_writes(self):
+        safe = '"SELECT count(*) FROM users WHERE name = \'alice\'"'
+        unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
+        for reducer in ('min', 'max'):
+            source = program(f'    query = {safe}\n'
+                             '    def order(record):\n        return record[2]\n'
+                             '    try:\n'
+                             + f'        {reducer}(([(query := {unsafe} if index == 0 else {safe})]\n'
+                             '             for index in (0, 1)), key=order)\n'
+                             '    except IndexError:\n        pass\n'
+                             '    return cursor.execute(query).fetchone()[0]\n')
+            name = 'reducer-named-key-prefix-' + reducer
+            with self.subTest(reducer=reducer):
+                self.assertEqual(sqlite_witness(self.artifacts, name, source)['rows'], 2)
+                self.inspect(name, source, ((CRITICAL, len(source.splitlines())),))
+
+    def test_generator_reducer_named_key_effects_and_exports_remain_incomplete(self):
+        safe = '"SELECT count(*) FROM users WHERE name = \'alice\'"'
+        unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
+        cases = (
+            ('body-write', '    def order(record):\n        nonlocal query\n'
+             + f'        query = {unsafe}\n        return 0\n'),
+            ('body-call', '    def poison(record):\n        nonlocal query\n'
+             + f'        query = {unsafe}\n        return 0\n'
+             '    def order(record):\n        return poison(record)\n'),
+            ('escaped-code', '    def poison(record):\n        return 0\n'
+             '    def order(record):\n        return 0\n'
+             '    def replace(function):\n        function.__code__ = poison.__code__\n'
+             '    replace(order)\n'),
+            ('unknown-export', '    def order(record):\n        return 0\n'
+             '    rows(order)\n'),
+            ('alias-export', '    def order(record):\n        return 0\n'
+             '    exported = [order]\n'),
+            ('conditional-definition', '    if rows:\n'
+             '        def order(record):\n            return 0\n'),
+            ('default', '    def order(record, unused=0):\n        return 0\n'),
+            ('decorator', '    @rows\n    def order(record):\n        return 0\n'),
+            ('async', '    async def order(record):\n        return 0\n'),
+            ('generator', '    def order(record):\n        yield 0\n'),
+        )
+        for name, definition in cases:
+            source = program(f'    query = {safe}\n' + definition
+                             + '    min((["ordinary"] for _ in (1, 2)), key=order)\n'
+                             '    return cursor.execute(query).fetchone()[0]\n')
+            with self.subTest(boundary=name):
+                if name in {'body-write', 'body-call'}:
+                    self.assertEqual(sqlite_witness(self.artifacts, name, source)['rows'], 2)
+                path = self.artifacts / ('reducer-named-boundary-' + name + '.py')
+                path.write_text(source, encoding='utf-8')
+                with self.assertRaisesRegex(detector.SQLFlowLimit, 'generator reducer.*incomplete'):
+                    list(detector.find([path]))
+
+    def test_generator_reducer_named_keys_cannot_certify_another_binding(self):
+        cases = (
+            ('alias', '    def order(record):\n        return 0\n    selected = order\n', 'selected'),
+            ('rebound', '    def order(record):\n        return 0\n    order = rows\n', 'order'),
+            ('method', '    class Ordering:\n        def order(self, record):\n            return 0\n'
+             '    ordering = Ordering()\n', 'ordering.order'),
+            ('code-store', '    def order(record):\n        return 0\n'
+             '    order.__code__ = rows\n', 'order'),
+            ('keyword-only', '    def order(*, record):\n        return 0\n', 'order'),
+        )
+        for name, definition, key in cases:
+            source = program(definition
+                             + f'    min((["ordinary"] for _ in (1, 2)), key={key})\n'
+                             '    cursor.execute("SELECT 1")\n')
+            path = self.artifacts / ('reducer-key-binding-' + name + '.py')
+            path.write_text(source, encoding='utf-8')
+            with self.subTest(binding=name), self.assertRaisesRegex(
+                    detector.SQLFlowLimit, 'generator reducer.*incomplete'):
+                list(detector.find([path]))
+
+    def test_generator_reducer_named_keys_are_name_independent(self):
+        for helper in ('order', 'sanitize_query', 'untrusted_key'):
+            name = 'reducer-key-renamed-' + helper
+            source = program(f'    def {helper}(record):\n        return record[0]\n'
+                             '    query = f"SELECT count(*) FROM users WHERE name = \'{user}\'"\n'
+                             + f'    selected = min(([query] for _ in (1, 2)), key={helper})\n'
+                             '    return cursor.execute(selected[0]).fetchone()[0]\n')
+            with self.subTest(helper=helper):
+                self.assertEqual(sqlite_witness(self.artifacts, name, source)['rows'], 2)
+                self.inspect(name, source, ((CRITICAL, 6),))
+
     def test_generator_reducer_list_callbacks_remain_incomplete(self):
         safe = '"SELECT count(*) FROM users WHERE name = \'alice\'"'
         unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
@@ -5442,6 +5575,29 @@ class SQLValueCaptureTests(unittest.TestCase):
             ('string-join-cli-captured-clean', 'separator = ""\n'
              'query = separator.join("SELECT 1" for unused in [0] if (separator := input()))\n'
              'cursor.execute(query)\n', ()),
+        )
+        self.assert_real_cli_capture(cases, wrap=False)
+
+    @unittest.skipUnless((ROOT / 'ubs').is_file(), 'real CLI requires full checkout')
+    def test_real_cli_named_reducer_keys(self):
+        definition = 'def order(record):\n    return len(record)\n'
+        cases = (
+            ('named-key-cli-min-unsafe', definition
+             + 'query = f"SELECT {input()}"\n'
+             'selected = min(([query] for _ in (1, 2)), key=order)\n'
+             'cursor.execute(selected[0])\n', ((CRITICAL, 5),)),
+            ('named-key-cli-min-clean', definition
+             + 'query = "SELECT 1"\n'
+             'selected = min(([query] for _ in (1, 2)), key=order)\n'
+             'cursor.execute(selected[0])\n', ()),
+            ('named-key-cli-sorted-unsafe', definition
+             + 'query = f"SELECT {input()}"\n'
+             'selected = sorted(([query] for _ in (1, 2)), key=order)[0]\n'
+             'cursor.execute(selected[0])\n', ((CRITICAL, 5),)),
+            ('named-key-cli-max-bound', definition
+             + 'query = f"SELECT {input()}"\n'
+             'selected = max(([query] for _ in (1, 2)), key=order)\n'
+             'cursor.execute("SELECT ?", (selected[0],))\n', ()),
         )
         self.assert_real_cli_capture(cases, wrap=False)
 

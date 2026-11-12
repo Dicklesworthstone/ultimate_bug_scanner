@@ -4971,6 +4971,59 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         else:
             self.check_generator_reducer_key(shape, key, length_key)
 
+    def generator_reducer_key_function(self, key):
+        """Resolve a private, already defined key without calling opaque code.
+
+        Only a direct same-scope name may borrow this proof. Every use must
+        pass it to a binding-verified builtin reducer; an alias, export or
+        reflective mutation could replace the function's code or captures.
+        The cached part is syntax only. Definition order and branch presence
+        remain live flow facts, checked separately on every consumption.
+        """
+        bindings = self.ownership_bindings()
+        target = bindings.resolve(key) if isinstance(key, ast.Name) else None
+        if (not target or target[0] != 'function' or target[2]
+                or not isinstance(target[1], ast.FunctionDef)
+                or key.id != target[1].name or bindings.dynamic_namespace
+                or bindings.reflective_member_writes
+                or {'__code__', '__globals__', '__defaults__', '__kwdefaults__'} & bindings.member_writes):
+            return None
+        function = target[1]
+        owner = bindings.owner_scopes[function]['parent']
+        if (owner is None or isinstance(owner['node'], ast.ClassDef)
+                or not self._generator_scope or owner['node'] is not self._generator_scope[-1]
+                or self.binding_sites.get(function) != frozenset({function})):
+            return None
+        cache = self._ownership_syntax.setdefault('reducer_key_functions', {})
+        if function not in cache:
+            cache[function] = None
+            body = function.body
+            if (body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                body = body[1:]
+            if (function.decorator_list or len(body) != 1 or not isinstance(body[0], ast.Return)
+                    or body[0].value is None):
+                return None
+            for reference in bindings.name_loads.get(function.name, ()):
+                self.step()
+                if bindings.lexical_owner(reference) is not owner:
+                    continue
+                keyword = bindings.parents.get(reference)
+                call = bindings.parents.get(keyword)
+                if (not isinstance(keyword, ast.keyword) or keyword.arg != 'key'
+                        or keyword.value is not reference or not isinstance(call, ast.Call)):
+                    return None
+                consumer = bindings.resolve(call.func)
+                name = (consumer[1] if consumer and consumer[0] == 'unbound' else
+                        consumer[1].removeprefix('builtins.')
+                        if consumer and consumer[0] == 'import'
+                        and consumer[1] in {'builtins.min', 'builtins.max', 'builtins.sorted'} else '')
+                if name not in {'min', 'max', 'sorted'} or not self.closed_generator_reducer_binding(name):
+                    return None
+            cache[function] = body[0].value
+        expression = cache[function]
+        return (function.args, expression) if expression is not None else None
+
     def check_generator_reducer_key(self, shape, key, length_key):
         """Prove a key expression without substituting generator locals.
 
@@ -4980,11 +5033,14 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         """
         if key is None or isinstance(key, ast.Constant) and key.value is None or length_key:
             return
-        if not isinstance(key, ast.Lambda):
+        selected = ((key.args, key.body) if isinstance(key, ast.Lambda)
+                    else self.generator_reducer_key_function(key))
+        if selected is None:
             raise SQLFlowLimit('SQL generator reducer key callbacks are unresolved; analysis is incomplete')
-        parameters = (*key.args.posonlyargs, *key.args.args)
-        if (len(parameters) != 1 or key.args.defaults or key.args.kwonlyargs
-                or key.args.vararg is not None or key.args.kwarg is not None):
+        args, expression = selected
+        parameters = (*args.posonlyargs, *args.args)
+        if (len(parameters) != 1 or args.defaults or args.kwonlyargs
+                or args.vararg is not None or args.kwarg is not None):
             raise SQLFlowLimit('SQL generator reducer key signature is unresolved; analysis is incomplete')
 
         def key_shape(value):
@@ -4993,7 +5049,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 if value.id == parameters[0].arg:
                     return shape
                 # The comprehension's same-spelled local is a different
-                # cell from this lambda's capture. Until that outer frame
+                # cell from this key's capture. Until that outer frame
                 # is restored, do not certify its value from loop facts.
                 owner = self.ownership_bindings().lexical_owner(value)
                 if (value.id in self._comprehension_locals or owner is None
@@ -5037,7 +5093,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                     return 'number'
             return ''
 
-        if not self.hash_safe_shape(key_shape(key.body)):
+        if not self.hash_safe_shape(key_shape(expression)):
             raise SQLFlowLimit('SQL generator reducer key callbacks are unresolved; analysis is incomplete')
 
     def local_list_effect_plan(self, call, epochs, enclosing_reads):

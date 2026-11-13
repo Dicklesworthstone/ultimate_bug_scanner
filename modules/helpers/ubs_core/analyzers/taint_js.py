@@ -39,6 +39,9 @@ PATH_LIMIT = 5
 # summary (_Engine.heap_call): one weak object per allocation site and context
 # into a recursion, instead of one per subset of call sites.
 WIDENED = '<widened>'
+# Metadata for array objects whose indexed writes can invoke opaque protocols.
+# It survives heap joins/summaries but is never copied as a JavaScript property.
+_ARRAY_WRITE_CONTRACT = ('array-write-contract',)
 
 
 def _collapsed(ref):
@@ -728,6 +731,8 @@ def _join_states(*states):
         objects = [state.heap[ref] for state in states if ref in state.heap]
         keys = set().union(*(slots.keys() for slots in objects))
         result.heap[ref] = {key: _join(*(slots.get(key, slots.get(None, _ABSENT)) for slots in objects)) for key in keys}
+        if _ARRAY_WRITE_CONTRACT in keys:
+            result.heap[ref][_ARRAY_WRITE_CONTRACT] = frozenset()
     result.weak_refs = set().union(*(state.weak_refs for state in states))
     result.written_cells = set().union(*(state.written_cells for state in states))
     for key in set().union(*(state.binding_kinds.keys() for state in states)):
@@ -1473,7 +1478,7 @@ class _Flow:
 
     @staticmethod
     def array_index(key):
-        if key is not None and re.fullmatch(r'0|[1-9][0-9]*', key):
+        if isinstance(key, str) and re.fullmatch(r'0|[1-9][0-9]*', key):
             # Other numeric-looking names are ordinary properties, not indices.
             return int(key) if len(key) <= 10 and int(key) < 4294967295 else None
         return None
@@ -1596,7 +1601,7 @@ class _Flow:
                 # An unknown property may override every currently named key.
                 # A later definite write can still replace that key precisely.
                 for known in tuple(slots):
-                    if known is not None:
+                    if known is not None and known != _ARRAY_WRITE_CONTRACT:
                         prior = slots[known]
                         joined = _join(prior, present)
                         slots[known] = _Fact(joined, _refs(joined), absent=getattr(prior, 'absent', False))
@@ -1625,7 +1630,7 @@ class _Flow:
                         # A computed property write can replace a method.
                         # Element spreads use the wildcard slot directly and
                         # must not be mistaken for prototype/method writes.
-                        for method in ('push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'entries', 'map'):
+                        for method in ('push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'fill', 'entries', 'map'):
                             slots[method] = _join(slots.get(method, _ABSENT), present)
                 elif self.array_index(key) is not None and length is not None:
                     state.array_lengths[ref] = max(length, int(key) + 1)
@@ -1836,6 +1841,8 @@ class _Flow:
                     ref, slots = (self.scope, left, 'binding-rest'), {}
                     for parent in _refs(fact):
                         for key, value in state.heap.get(parent, {}).items():
+                            if key == _ARRAY_WRITE_CONTRACT:
+                                continue
                             if array:
                                 numeric = self.array_index(key)
                                 if key is not None and (numeric is None or numeric < index):
@@ -1953,7 +1960,7 @@ class _Flow:
                             slots[key] = _Fact(merged, _refs(merged), absent=getattr(old, 'absent', False))
                         slots[None] = _Fact(_join(slots.get(None, frozenset()), wildcard),
                                             _refs(_join(slots.get(None, frozenset()), wildcard)), absent=True)
-                    for key in set().union(*(obj.keys() for obj in objects)) - {None}:
+                    for key in set().union(*(obj.keys() for obj in objects)) - {None, _ARRAY_WRITE_CONTRACT}:
                         incoming = self.property(spread, key, state)
                         definite = not frozenset(spread) and all(
                             key in obj and not getattr(obj[key], 'absent', False) for obj in objects)
@@ -2152,6 +2159,133 @@ class _Flow:
             return 'sql-append', receiver, method
         return 'sql-unknown', receiver, method
 
+    def mark_array_write_contracts(self, fact, state, *, recursive=False):
+        """Keep opaque descriptors/escapes on object identity, not user keys."""
+        pending, seen = list(_refs(fact)), set()
+        prototypes = {('builtin', 'Array.prototype'), ('builtin', 'Object.prototype')}
+        while pending:
+            ref = pending.pop()
+            if ref in seen:
+                continue
+            seen.add(ref)
+            slots = state.heap.get(ref, {})
+            self.engine.budget.spend(1 + len(slots))
+            if recursive:
+                for value in slots.values():
+                    pending.extend(_refs(value) - seen)
+            if ref in state.array_lengths or ref in prototypes:
+                state.heap.setdefault(ref, {})[_ARRAY_WRITE_CONTRACT] = frozenset()
+
+    def array_fill_bound(self, arguments, prepared, index, length):
+        """Resolve pure primitive bounds; keep unknown coercions explicit.
+
+        ECMAScript fill snapshots length before converting start/end. An
+        omitted or undefined end uses that length; null instead converts to 0.
+        Unknown primitive values need only weak writes. Unknown objects can
+        run conversion methods, so absence of taint is not a complete proof.
+        """
+        actual, uncertain, maybe_missing, kinds = prepared
+        if uncertain is not None and index >= uncertain:
+            return None, False
+        default = 0 if index == 1 else length
+        if (index >= len(actual) or kinds.get(index) == 'undefined'
+                or (actual[index][1] and index not in maybe_missing)):
+            return default, True
+        if kinds.get(index) == 'null':
+            return 0, True
+        if index >= len(arguments) or any(
+                self.engine.text[left:right].lstrip().startswith('...')
+                for left, right in arguments[:index + 1]):
+            return None, kinds.get(index) == 'noniterable'
+        left, right = arguments[index]
+        text, code = self.engine.text, self.scope.code
+        while left < right and text[left].isspace():
+            left += 1
+        while right > left and text[right - 1].isspace():
+            right -= 1
+        while code[left:left + 1] == '(' and text[left:left + 1] == '(' and self.pairs.get(left) == right - 1:
+            left, right = left + 1, right - 1
+            while left < right and text[left].isspace():
+                left += 1
+            while right > left and text[right - 1].isspace():
+                right -= 1
+        raw = text[left:right]
+        number = None
+        if raw in {'true', 'false', 'null'}:
+            number = 1.0 if raw == 'true' else 0.0
+        elif re.fullmatch(r'[+-]?\s*(?:(?:0|[1-9][0-9]*)(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?', raw):
+            number = float(re.sub(r'\s+', '', raw))
+        else:
+            special = re.fullmatch(r'([+-]?)\s*(NaN|Infinity)', raw)
+            if special:
+                name = special.group(2)
+                scope, position = self.binding_context(name, left)
+                owner, begin, _ = self.engine.lexical_binding(scope, name, position)
+                if not any(local == name and start == begin
+                           for start, _end, local in self.engine.binding_regions[owner]):
+                    number = (0.0 if name == 'NaN' else
+                              float('-inf') if special.group(1) == '-' else float('inf'))
+        if number is None:
+            if re.fullmatch(r'[+-]?\s*(?:0[xX][\da-fA-F]+|0[bB][01]+|0[oO][0-7]+|[0-9][\d_]*)n', raw):
+                return None, False  # BigInt conversion throws; no normal fill proof.
+            quoted = (re.fullmatch(r"'(?:\\[\s\S]|[^'\\])*'", raw) is not None
+                      or re.fullmatch(r'"(?:\\[\s\S]|[^"\\])*"', raw) is not None)
+            return None, quoted or kinds.get(index) == 'noniterable'
+        if length is None:
+            return None, True
+        # Clamp before int(): infinities and huge finite numbers need no
+        # allocation or exceptional numeric conversion.
+        if number >= length:
+            return length, True
+        if number <= -length:
+            return 0, True
+        number = int(number)
+        return (max(length + number, 0) if number < 0 else number), True
+
+    def array_fill(self, receiver, arguments, prepared, state):
+        """Fill indexed slots without changing length or losing aliases."""
+        actual, uncertain, _missing, _kinds = prepared
+        values = [value for value, _missing in actual]
+        value = _join(*values) if uncertain == 0 else values[0] if values else frozenset()
+        refs = _refs(receiver)
+        prototypes = (state.heap.get(('builtin', name), {})
+                      for name in ('Array.prototype', 'Object.prototype'))
+        inherited = any(_ARRAY_WRITE_CONTRACT in slots or None in slots
+                        or '__proto__' in slots or any(self.array_index(key) is not None for key in slots)
+                        for slots in prototypes)
+        for ref in refs:
+            slots = state.heap[ref]
+            length = state.array_lengths[ref]
+            start, start_pure = self.array_fill_bound(arguments, prepared, 1, length)
+            end, end_pure = self.array_fill_bound(arguments, prepared, 2, length)
+            pure = start_pure and end_pure
+            if not pure:
+                self.incomplete.add('Array.fill bound coercion requires unsupported value semantics')
+            # Coercions above still happen for an empty array/range.
+            if length == 0 or (start is not None and end is not None and end <= start):
+                continue
+            constrained = inherited or _ARRAY_WRITE_CONTRACT in slots or '__proto__' in slots
+            if constrained:
+                self.incomplete.add('Array.fill requires ordinary writable indexed properties')
+            definite = (pure and not constrained and len(refs) == 1 and ref not in state.weak_refs
+                        and start is not None and end is not None)
+            if length is not None:
+                first, last = start if start is not None else 0, end if end is not None else length
+                self.engine.budget.spend(max(0, last - first))
+                for index in range(first, last):
+                    self.write_property(_Fact(refs=(ref,)), str(index), value, state, optional=not definite)
+            else:
+                numeric = [key for key in slots if self.array_index(key) is not None]
+                self.engine.budget.spend(1 + len(numeric))
+                present = _Fact(value, _refs(value))
+                for key in numeric:
+                    old = slots[key]
+                    joined = _join(old, present)
+                    slots[key] = _Fact(joined, _refs(joined), absent=getattr(old, 'absent', False))
+                joined = _join(slots.get(None, _ABSENT), present)
+                slots[None] = _Fact(joined, _refs(joined), absent=True)
+        return receiver
+
     def native_target(self, name, state):
         """Capture GetValue(callee) before arguments can replace a method."""
         receiver_name, dot, method = name.rpartition('.')
@@ -2183,10 +2317,16 @@ class _Flow:
         object_native = (refs == {('builtin', 'Object')} and not frozenset(receiver)
                          and method not in state.heap.get(('builtin', 'Object'), {})
                          and None not in state.heap.get(('builtin', 'Object'), {}))
-        if object_native and method in {'assign', 'defineProperty'}:
+        if object_native and method in {'assign', 'defineProperty', 'defineProperties', 'freeze',
+                                        'seal', 'preventExtensions', 'setPrototypeOf'}:
             return 'object', receiver, method
+        reflect_native = (refs == {('builtin', 'Reflect')} and not frozenset(receiver)
+                          and method not in state.heap.get(('builtin', 'Reflect'), {})
+                          and None not in state.heap.get(('builtin', 'Reflect'), {}))
+        if reflect_native and method in {'defineProperty', 'preventExtensions', 'setPrototypeOf'}:
+            return 'reflect', receiver, method
         prototype = state.heap.get(('builtin', 'Array.prototype'), {})
-        if (method in {'push', 'unshift', 'pop', 'shift', 'reverse', 'join'}
+        if (method in {'push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'fill'}
                 and refs and not frozenset(receiver) and method not in prototype and None not in prototype
                 and all(ref in state.array_lengths and method not in state.heap[ref] for ref in refs)):
             return 'array', receiver, method
@@ -2204,6 +2344,35 @@ class _Flow:
         kind, receiver, method = native
         actual, uncertain, _missing, _kinds = prepared
         values = [value for value, _missing in actual]
+        if kind == 'array' and method == 'fill':
+            return self.array_fill(receiver, arguments, prepared, state)
+        if values and (kind == 'reflect' or (kind == 'object' and method in {
+                'defineProperty', 'defineProperties', 'freeze', 'seal', 'preventExtensions', 'setPrototypeOf'})):
+            target = _join(*values) if uncertain == 0 else values[0]
+            self.mark_array_write_contracts(target, state)
+            refs = _refs(target)
+            modeled = {ref for ref in refs if ref in state.array_lengths or
+                       ref in {('builtin', 'Array.prototype'), ('builtin', 'Object.prototype')}}
+            if modeled and (frozenset(target) or modeled != refs):
+                self.incomplete.add(f'{kind.title()}.{method} has an uncertain array target')
+            # Object APIs return the captured target. Preserve that alias
+            # without dropping prior descriptor/prototype provenance; their
+            # writes remain unsupported and must not certify a clean result.
+            if kind == 'object' and method == 'defineProperty':
+                if modeled and (uncertain is not None or len(values) < 3):
+                    self.incomplete.add('Object.defineProperty has unsupported descriptor arguments')
+                    return _join(target, self.materialize(_join(*values[1:]), state))
+                # Keep the existing precise descriptor value-write handling.
+            elif modeled:
+                if method in {'defineProperty', 'defineProperties', 'setPrototypeOf'}:
+                    self.incomplete.add(f'{kind.title()}.{method} requires unsupported write semantics')
+                if kind == 'reflect':
+                    return frozenset()  # Reflect returns a Boolean, not the target.
+                if method in {'defineProperties', 'setPrototypeOf'}:
+                    return _join(target, self.materialize(_join(*values[1:]), state))
+                return target
+            else:
+                return None  # Nonarray calls retain their existing fallback.
         if kind == 'sql-factory':
             if method == 'empty':
                 return self.sql_object(location, [], state)
@@ -2261,7 +2430,7 @@ class _Flow:
                 wildcard = _join(frozenset(source), *(obj.get(None, frozenset()) for obj in objects))
                 if wildcard:
                     self.write_property(target, None, wildcard, state)
-                keys = set().union(*(obj.keys() for obj in objects)) - {None}
+                keys = set().union(*(obj.keys() for obj in objects)) - {None, _ARRAY_WRITE_CONTRACT}
                 for key in keys:
                     incoming = self.property(source, key, state)
                     # Missing keys on an alternative source must retain the
@@ -2791,6 +2960,16 @@ class _Flow:
             return frozenset()
         if code[start] == '(' and self.pairs.get(start) == end - 1:
             return self.value(start + 1, end - 1, state)
+        # The comma operator has lower precedence than assignment. Evaluate
+        # each operand for effects, but only its final value reaches the
+        # caller. In a.fill((a = other, input)), the assignment must not store
+        # input in a or replace the receiver captured before the arguments.
+        parts = list(_chunks(code, start, end)) if ',' in code[start:end] else ()
+        if len(parts) > 1:
+            value = frozenset()
+            for left, right in parts:
+                value = self.value(left, right, state)
+            return value
         if code[start] in '[{' and start in self.pairs:
             closing = self.pairs[start]
             assignment = re.match(r'\s*=(?!=|>)\s*', code[closing + 1:end])
@@ -3059,6 +3238,8 @@ class _Flow:
                     self.effect(match_start, sink[1], _join(*selected), state)
                     if self.rule == 'js.taint.sql':
                         proof_role, proof_value = 'execute', _join(*selected)
+                if native is None and not sink:
+                    self.mark_array_write_contracts(call_fact, state, recursive=True)
                 if self.rule == 'js.taint.sql' and self.engine.drizzle_imports:
                     if tag_call:
                         # Parameter slots belong to the SQL value, regardless
@@ -4232,6 +4413,8 @@ class _Engine:
                 previous = state.heap[new]
                 slots = {key: _join(previous.get(key, previous.get(None, _ABSENT)), slots.get(key, slots.get(None, _ABSENT)))
                          for key in previous.keys() | slots.keys()}
+            if _ARRAY_WRITE_CONTRACT in slots:
+                slots[_ARRAY_WRITE_CONTRACT] = frozenset()
             collapsed = len(originals) > 1 or collision or _collapsed(new)
             if collapsed or any(old in output.weak_refs for old in originals):
                 state.weak_refs.add(new)

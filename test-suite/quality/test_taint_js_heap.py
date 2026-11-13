@@ -1339,6 +1339,216 @@ class HeapTaintTests(unittest.TestCase):
         self.scan('const items = [req.query.html, "safe"]; const alias = items.reverse(); res.send(items[0]);')
         self.scan('const items = [req.query.html, "safe"]; const alias = items.reverse(); res.send(alias[1]);', 'xss')
 
+    def test_fill_mutates_alias_and_returns_same_array(self):
+        self.scan('const items = ["safe"]; const alias = items; '
+                  'const returned = alias.fill(req.query.html); '
+                  'res.send(items[0]); res.send(returned[0]);', 'xss', 'xss')
+        self.scan('const items = ["safe"]; res.send(items.fill(req.query.html).length);')
+
+    def test_fill_literal_ranges_match_native_javascript(self):
+        # Labels are predeclared from the ECMAScript fill contract, not scanner
+        # output. Node checks the same examples independently when available.
+        cases = [
+            ('', (0, 1, 2)), (',1', (1, 2)), (',-2,-1', (1,)),
+            (',1.9,2.8', (1,)), (',3,0', ()), (',0,0', ()),
+            (',-99,99', (0, 1, 2)), (',null,undefined', (0, 1, 2)),
+            (',false,true', (0,)), (',NaN,Infinity', (0, 1, 2)),
+            (',1e309', ()), (',-1e309', (0, 1, 2)), (',0,NaN', ()),
+            (',0,null', ()), (',0,-0.1', ()), (',(+1),(-1)', (1,)),
+        ]
+        for suffix, changed in cases:
+            with self.subTest(suffix=suffix):
+                source = ('const items = ["a", "b", "c"];\n'
+                          f'items.fill(req.query.html{suffix});\n'
+                          'res.send(items[0]);\nres.send(items[1]);\nres.send(items[2]);')
+                findings = self.scan(source, *('xss' for _ in changed))
+                self.assertEqual([finding['line'] for finding in findings], [3 + i for i in changed])
+                self.assert_runtime_sends(source, [
+                    'review-input' if i in changed else value for i, value in enumerate(('a', 'b', 'c'))])
+
+    def test_fill_cleanup_only_replaces_selected_indices(self):
+        self.scan('const items = [req.query.html, req.query.html, req.query.html]; '
+                  'items.fill("safe", 1, 2); res.send(items[0]); res.send(items[1]); '
+                  'res.send(items[2]);', 'xss', 'xss')
+        self.scan('const items = [req.query.html]; items.fill("safe"); res.send(items[0]);')
+        self.scan('const items = [req.query.html]; items.fill(); res.send(items[0]);')
+
+    def test_fill_creates_holes_but_preserves_length_and_named_properties(self):
+        self.scan('const items = [,,]; items.label = "safe"; '
+                  'items.fill(req.query.html); res.send(items[0]); res.send(items[1]); '
+                  'res.send(items.length); res.send(items.label); res.send(items[2]);', 'xss', 'xss')
+        self.scan('const items = [req.query.html]; items["-1"] = req.query.html; '
+                  'items.fill("safe"); res.send(items[0]); res.send(items["-1"]);', 'xss')
+        self.scan('const items = []; items.fill(req.query.html); res.send(items[0]);')
+        self.scan('const items = []; Object.freeze(items); items.fill(req.query.html); res.send(items[0]);')
+        self.scan('const items = ["safe"]; Object.freeze(items); '
+                  'items.fill(req.query.html, 1, 0); res.send(items[0]);')
+
+    def test_fill_preserves_shared_object_value_identity(self):
+        source = ('const value = {html: "safe"}; const items = [null, null]; '
+                  'items.fill(value); items[0].html = req.query.html; res.send(items[1].html);')
+        self.scan(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input'])
+
+    def test_fill_captures_receiver_and_callee_before_evaluating_arguments(self):
+        source = ('let items = ["old"]; const original = items; '
+                  'function input() { items = ["new"]; return req.query.html; } '
+                  'const returned = items.fill(input()); '
+                  'res.send(original[0]); res.send(items[0]); res.send(returned[0]);')
+        self.scan(source, 'xss', 'xss')
+        self.assert_runtime_sends(source, ['review-input', 'new', 'review-input'])
+        source = ('function foreign() {} const items = ["old"]; function input() { '
+                  'items.fill = foreign; return req.query.html; } '
+                  'items.fill(input()); res.send(items[0]);')
+        self.scan(source, 'xss')
+        self.scan('const items = ["old"]; function input() { '
+                  'items.length = 2; return req.query.html; } '
+                  'items.fill(input()); res.send(items[1]);', 'xss')
+
+    def test_fill_summaries_reach_caller_and_keep_sanitizer_domains(self):
+        self.scan('function fill(items, value) { return items.fill(value); } '
+                  'const items = ["safe"]; const returned = fill(items, req.query.html); '
+                  'res.send(items[0]); res.send(returned[0]);', 'xss', 'xss')
+        self.scan('const items = ["safe"]; items.fill(DOMPurify.sanitize(req.query.html)); '
+                  'res.send(items[0]); eval(items[0]);', 'eval')
+        self.scan('const items = ["safe"]; items.fill(req.query.html); '
+                  'res.send(items[0]); eval(items[0]); db.query(items[0]); shell.exec(items[0]);',
+                  'xss', 'eval', 'sql', 'command')
+
+    def test_fill_comma_arguments_preserve_receiver_and_last_value(self):
+        source = ('let items = ["old"]; const original = items;\n'
+                  'const returned = items.fill((items = ["new"], req.query.html));\n'
+                  'res.send(original[0]);\nres.send(items[0]);\nres.send(returned[0]);')
+        findings = self.scan(source, 'xss', 'xss')
+        self.assertEqual([finding['line'] for finding in findings], [3, 5])
+        self.assert_runtime_sends(source, ['review-input', 'new', 'review-input'])
+        source = ('const items = [req.query.html];\n'
+                  'items.fill((req.query.html, "safe"));\nres.send(items[0]);')
+        self.scan(source)
+        self.assert_runtime_sends(source, ['safe'])
+        source = ('const items = ["old"]; const other = {html: "old"};\n'
+                  'items.fill((other.html = req.query.html, "safe"));\n'
+                  'res.send(items[0]);\nres.send(other.html);')
+        findings = self.scan(source, 'xss')
+        self.assertEqual([finding['line'] for finding in findings], [4])
+        self.assert_runtime_sends(source, ['safe', 'review-input'])
+
+    def test_fill_uncertain_receiver_and_branch_do_not_prove_cleanup(self):
+        self.scan('const first = [req.query.html]; const second = [req.query.html]; '
+                  'const items = flag ? first : second; items.fill("safe"); '
+                  'res.send(first[0]); res.send(second[0]);', 'xss', 'xss')
+        self.scan('const items = [req.query.html]; if (flag) items.fill("safe"); '
+                  'res.send(items[0]);', 'xss')
+        self.scan('const start = 1; const items = [req.query.html]; '
+                  'items.fill("safe", start); res.send(items[0]);', 'xss')
+
+    def test_fill_overrides_are_not_native_cleanup(self):
+        for override in ('items.fill = external;', 'Array.prototype.fill = external;',
+                         'items[method] = external;'):
+            with self.subTest(override=override):
+                self.scan('const items = [req.query.html]; ' + override
+                          + 'items.fill("safe"); res.send(items[0]);', 'xss')
+
+    def assert_fill_partial(self, source, *rules, reason='Array.fill'):
+        with tempfile.TemporaryDirectory(prefix='ubs-fill-partial-') as scratch:
+            path = Path(scratch) / 'handler.js'
+            path.write_text(source + '\n', encoding='utf-8')
+            findings = []
+            with self.assertRaisesRegex(taint.AnalysisLimit, reason):
+                findings.extend(taint.run(RunContext(lang='javascript', files=[path])))
+        self.assertEqual(Counter(f['rule'].removeprefix('javascript.taint.') for f in findings),
+                         Counter(rules), (source, findings))
+
+    def test_fill_opaque_bounds_keep_evidence_and_report_incomplete(self):
+        self.assert_fill_partial('const items = [req.query.html]; '
+                                 'items.fill("safe", offset); res.send(items[0]);', 'xss')
+        self.assert_fill_partial('const items = ["safe"]; '
+                                 'items.fill("safe", req.query.offset); res.send(items[0]);')
+        self.assert_fill_partial('const undefined = external; const items = [req.query.html]; '
+                                 'items.fill("safe", 0, undefined); res.send(items[0]);', 'xss')
+        self.assert_fill_partial('const source = req.query.html; const items = []; '
+                                 'items.fill(source, {valueOf: external}); res.send(items[0]);')
+        self.assert_fill_partial('const items = ["safe"]; '
+                                 'items.fill(...req.query.values); res.send(items[0]);', 'xss')
+        self.assert_fill_partial('const items = [req.query.html]; '
+                                 'try { items.fill("safe", 1n); } catch (error) {} '
+                                 'res.send(items[0]);', 'xss')
+
+    def test_fill_nonstandard_write_contract_cannot_certify_cleanup(self):
+        for setup in ('Object.freeze(items);', 'Object.seal(items);',
+                      'Object.preventExtensions(items);',
+                      'Object.defineProperty(items, "0", {value: "locked"});',
+                      'Object.defineProperties(items, {0: {value: "locked"}});',
+                      'Reflect.defineProperty(items, "0", {value: "locked"});',
+                      'Object.defineProperty(items, ...req.query.options);',
+                      'Object.defineProperty(items, "note", {get value() { Object.freeze(items); return 0; }});',
+                      'external({items});'):
+            with self.subTest(setup=setup):
+                self.assert_fill_partial('const items = [,req.query.html]; ' + setup
+                                         + 'try { items.fill("safe"); } catch (error) {} '
+                                         'res.send(items[1]);', 'xss')
+
+    def test_fill_fresh_copies_do_not_inherit_descriptor_metadata(self):
+        for copy in ('const copied = [...items];',
+                     'const copied = Object.assign([], items);',
+                     'const copy = {...items}; const copied = Object.assign([], copy);',
+                     'const {...copy} = items; const copied = Object.assign([], copy);'):
+            with self.subTest(copy=copy):
+                self.scan('const items = [req.query.html]; Object.freeze(items); ' + copy
+                          + 'copied.fill("safe"); res.send(copied[0]);')
+        self.scan('const items = [req.query.html]; Object.freeze({items}); '
+                  'items.fill("safe"); res.send(items[0]);')
+
+    def test_array_restriction_results_keep_returned_aliases(self):
+        for expression in ('Object.preventExtensions(items)', 'Object.seal(items)',
+                           'Object.defineProperties(items, {})',
+                           'Object.setPrototypeOf(items, Array.prototype)',
+                           'Object.defineProperty(items, ...opaqueOptions)'):
+            with self.subTest(expression=expression):
+                self.assert_fill_partial('const items = ["safe"]; '
+                    f'const alias = {expression}; '
+                    'alias.fill(req.query.html); res.send(items[0]);', 'xss',
+                    reason='Array.fill|Object[.]')
+        self.assert_fill_partial('const items = [req.query.html]; '
+            'const alias = Object.freeze(items); '
+            'try { alias.fill("safe"); } catch (error) {} res.send(items[0]);', 'xss')
+
+    def test_array_descriptor_returns_retain_prior_provenance(self):
+        for expression, reason in (
+                ('Object.defineProperties(items, {0: {value: req.query.html}})', 'Object[.]defineProperties'),
+                ('Object.setPrototypeOf(items, {0: req.query.html})', 'Object[.]setPrototypeOf')):
+            with self.subTest(expression=expression):
+                self.assert_fill_partial('const items = []; items.length = 1; '
+                    f'const alias = {expression}; res.send(alias[0]);', 'xss', reason=reason)
+        # Nonarray callers retain the existing conservative descriptor result.
+        self.scan('const result = Object.defineProperties({}, {html: {value: req.query.html}}); '
+                  'res.send(result.html);', 'xss')
+
+    def test_array_reflect_results_are_booleans(self):
+        self.scan('const items = [req.query.html]; '
+                  'const result = Reflect.preventExtensions(items); res.send(result);')
+        for expression, reason in (
+                ('Reflect.defineProperty(items, "0", {value: req.query.html})', 'Reflect[.]defineProperty'),
+                ('Reflect.setPrototypeOf(items, {0: req.query.html})', 'Reflect[.]setPrototypeOf')):
+            with self.subTest(expression=expression):
+                self.assert_fill_partial('const items = []; '
+                    f'const result = {expression}; res.send(result);', reason=reason)
+
+    def test_array_restriction_mixed_targets_cannot_report_complete_cleanup(self):
+        self.assert_fill_partial('const items = [req.query.html]; '
+            'let target = items; if (flag) target = {}; '
+            'const alias = Object.preventExtensions(target); '
+            'try { alias.fill("safe"); } catch (error) {} res.send(items[0]);',
+            'xss', reason='Object[.]preventExtensions')
+
+    def test_fill_large_extent_obeys_work_budget(self):
+        with tempfile.TemporaryDirectory(prefix='ubs-fill-budget-') as scratch:
+            path = Path(scratch) / 'handler.js'
+            path.write_text('const items = []; items.length = 4294967295; '
+                            'items.fill(req.query.html); res.send(items[0]);\n', encoding='utf-8')
+            with self.assertRaises(taint.AnalysisLimit):
+                list(taint.run(RunContext(lang='javascript', files=[path])))
+
     def test_nested_array_mutation(self):
         self.scan('const box = {items: []}; box.items.push(req.query.html); res.send(box.items[0]);', 'xss')
 
@@ -1604,6 +1814,11 @@ class HeapTaintTests(unittest.TestCase):
             ('alias-clean', 'const a={html:req.query.html}; const b=a; b.html="safe"; res.send(a.html);', set()),
             ('push-source', 'const a=[]; const b=a; b.push(req.query.code); eval(a[0]);', {'eval'}),
             ('push-count', 'const a=[]; res.send(a.push(req.query.html));', set()),
+            ('fill-source', 'const a=["safe"]; const b=a; b.fill(req.query.code); eval(a[0]);', {'eval'}),
+            ('fill-clean', 'const a=[req.query.html]; a.fill("safe"); res.send(a[0]);', set()),
+            ('fill-range', 'const a=["safe", "safe"]; a.fill(req.query.html, 1); res.send(a[0]);', set()),
+            ('fill-length', 'const a=["safe"]; res.send(a.fill(req.query.html).length);', set()),
+            ('fill-shared-value', 'const box={html:"safe"}; const a=[null,null]; a.fill(box); a[0].html=req.query.html; res.send(a[1].html);', {'xss'}),
             ('assign-source', 'const a={}; Object.assign(a,{html:req.query.html}); res.send(a.html);', {'xss'}),
             ('assign-clean', 'const a={html:req.query.html}; Object.assign(a,{html:"safe"}); res.send(a.html);', set()),
             ('cycle-source', 'const a={}; a.self=a; a.html=req.query.html; res.send(a);', {'xss'}),

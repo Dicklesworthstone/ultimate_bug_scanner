@@ -1653,6 +1653,119 @@ class HeapTaintTests(unittest.TestCase):
             with self.assertRaises(taint.AnalysisLimit):
                 list(taint.run(RunContext(lang='javascript', files=[path])))
 
+    def test_own_function_method_mutates_captured_receiver(self):
+        source = ('const items = ["safe"];\n'
+                  'items.fill = function(value) { this[0] = req.query.html; return this; };\n'
+                  'const alias = items.fill("clean");\n'
+                  'res.send(items[0]);\nres.send(alias[0]);')
+        findings = self.scan(source, 'xss', 'xss')
+        self.assertEqual([finding['line'] for finding in findings], [4, 5])
+        self.assert_runtime_sends(source, ['review-input', 'review-input'])
+
+    def test_own_shorthand_method_uses_body_return(self):
+        source = ('const object = {fill(value) { return "clean"; }};\n'
+                  'res.send(object.fill(req.query.html));')
+        self.scan(source)
+        self.assert_runtime_sends(source, ['clean'])
+        self.scan('const object = {fill(value) { return value; }}; '
+                  'res.send(object.fill(req.query.html));', 'xss')
+
+    def test_own_method_borrowing_binds_call_site_receiver(self):
+        source = ('const first = {html: "safe", put(value) { this.html = value; return this; }};\n'
+                  'const second = {html: "other", put: first.put};\n'
+                  'const returned = second.put(req.query.html);\n'
+                  'res.send(first.html);\nres.send(second.html);\nres.send(returned.html);')
+        findings = self.scan(source, 'xss', 'xss')
+        self.assertEqual([finding['line'] for finding in findings], [5, 6])
+        self.assert_runtime_sends(source, ['safe', 'review-input', 'review-input'])
+
+    def test_own_method_captures_receiver_and_callee_before_arguments(self):
+        source = ('let object = {html: "old", put(value) { this.html = value; return this; }};\n'
+                  'const old = object;\n'
+                  'const returned = object.put((object = {html: "new"}, req.query.html));\n'
+                  'res.send(old.html);\nres.send(object.html);\nres.send(returned.html);')
+        findings = self.scan(source, 'xss', 'xss')
+        self.assertEqual([finding['line'] for finding in findings], [4, 6])
+        self.assert_runtime_sends(source, ['review-input', 'new', 'review-input'])
+        self.scan('const object = {html: "safe", put(value) { this.html = value; }}; '
+                  'object.put((object.put = function() {}, req.query.html)); res.send(object.html);', 'xss')
+
+    def test_own_literal_computed_method_and_delete(self):
+        source = ('const box = {html: "safe", run(value) { this.html = value; }};\n'
+                  'box["run"](req.query.html);\nres.send(box.html);')
+        self.scan(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input'])
+        source = ('const box = {html: "safe", run() { this.html = req.query.html; }};\n'
+                  'delete box.run;\ntry { box.run(); } catch (error) {}\nres.send(box.html);')
+        self.scan(source)
+        self.assert_runtime_sends(source, ['safe'])
+        source = ('const items = ["safe"]; items.fill = function() { return this; };\n'
+                  'delete items.fill; items.fill(req.query.html); res.send(items[0]);')
+        self.scan(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input'])
+        source = ('const box = {html: "safe", run(value) { this.html = value; }};\n'
+                  'box.run((delete box.run, req.query.html));\nres.send(box.html);')
+        self.scan(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input'])
+
+    def test_own_method_defaults_observe_captured_this(self):
+        self.scan('const box = {html: req.query.html, read(value=this.html) { return value; }}; '
+                  'res.send(box.read());', 'xss')
+        self.scan('const box = {html: req.query.html, read(value=this.html) { return value; }}; '
+                  'res.send(box.read("clean"));')
+        source = ('const box = {html: "safe", run(value=(this.html=req.query.html,"clean")) { return value; }};\n'
+                  'res.send(box.run());\nres.send(box.html);')
+        findings = self.scan(source, 'xss')
+        self.assertEqual([finding['line'] for finding in findings], [3])
+        self.assert_runtime_sends(source, ['clean', 'review-input'])
+
+    def test_own_method_unknown_and_descriptor_paths_stay_partial(self):
+        for setup in ('external(box);', 'Object.freeze(box);',
+                      'box.run = flag ? box.run : external;'):
+            with self.subTest(setup=setup):
+                self.assert_fill_partial('const box = {html:req.query.html, run(){this.html="clean";}}; '
+                                         + setup + ' try { box.run(); } catch(error) {} res.send(box.html);',
+                                         'xss', reason='Own method')
+        self.assert_fill_partial('const box={html:"clean",get run(){return function(){this.html=req.query.html;}}}; '
+                                 'box.run(); res.send(box.html);', reason='Own method')
+
+    def test_own_method_unknown_replacement_retains_callable_boundary(self):
+        for returned in ('req.query.html', '"clean"'):
+            with self.subTest(returned=returned):
+                self.assert_fill_partial('const supplied=req.query.html; const box={run(){return "clean";}}; '
+                    'box.run=Reflect.get({run:function(){return ' + returned + ';}},"run"); '
+                    'res.send(box.run());', reason='Own method|Callable')
+
+    def test_own_method_unknown_computed_selection_keeps_possible_absence(self):
+        for initial, returned, observed, rules in (
+                ('req.query.html', '"clean"', 'review-input', ('xss',)),
+                ('"safe"', 'req.query.html', 'safe', ())):
+            for call in ('html=box[key]();', 'const read=box[key]; html=read();'):
+                with self.subTest(initial=initial, call=call):
+                    source = ('let html=' + initial + '; const box={run(){return ' + returned + ';}}; '
+                              'const key="missing"; try {' + call + '} catch(error) {} res.send(html);')
+                    self.assert_runtime_sends(source, [observed])
+                    self.assert_fill_partial(source, *rules, reason='Own method|Callable')
+
+    def test_own_method_unbound_and_escaped_receivers_remain_partial(self):
+        self.assert_fill_partial('const box={html:req.query.html,read(){return this.html;}}; '
+                                 'const read=box.read; try { res.send(read()); } catch(error) {}',
+                                 reason='receiver')
+        self.assert_fill_partial('function make(value){return {read(){return value;}};} '
+                                 'const dirty=make(req.query.html); const clean=make("clean"); '
+                                 'res.send(dirty.read()); res.send(clean.read());', reason='closure')
+        self.assert_fill_partial('const box={html:"clean",read:()=>this.html}; '
+                                 'this.html=req.query.html; res.send(box.read());', reason='lexical receiver')
+
+    def test_own_method_delete_does_not_erase_prototype_evidence(self):
+        self.assert_fill_partial('const items=[req.query.html]; '
+                                 'items.__proto__={fill(){return this;}}; delete items.__proto__; '
+                                 'items.fill("clean"); res.send(items[0]);', 'xss', reason='Array.fill')
+        source = ('const items=[req.query.html]; items.extra={fill(){return this;}}; '
+                  'delete items.extra; items.fill("clean"); res.send(items[0]);')
+        self.scan(source)
+        self.assert_runtime_sends(source, ['clean'])
+
     def test_nested_array_mutation(self):
         self.scan('const box = {items: []}; box.items.push(req.query.html); res.send(box.items[0]);', 'xss')
 

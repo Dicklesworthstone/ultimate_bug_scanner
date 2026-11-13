@@ -39,9 +39,12 @@ PATH_LIMIT = 5
 # summary (_Engine.heap_call): one weak object per allocation site and context
 # into a recursion, instead of one per subset of call sites.
 WIDENED = '<widened>'
-# Metadata for array objects whose indexed writes can invoke opaque protocols.
+# Metadata for objects whose property writes can invoke opaque protocols.
 # It survives heap joins/summaries but is never copied as a JavaScript property.
 _ARRAY_WRITE_CONTRACT = ('array-write-contract',)
+_METHOD_LOOKUP_CONTRACT = ('method-lookup-contract',)
+_HEAP_METADATA = {_ARRAY_WRITE_CONTRACT, _METHOD_LOOKUP_CONTRACT}
+_OPAQUE_CALLABLE = ('builtin', 'opaque-callable')
 
 
 def _collapsed(ref):
@@ -523,6 +526,18 @@ def _refs(fact):
     return getattr(fact, 'refs', frozenset())
 
 
+def _function_scope(ref):
+    return ref[0] if len(ref) > 2 and ref[2] == 'function' else None
+
+
+def _function_target(fact):
+    refs = _refs(fact)
+    scopes = {_function_scope(ref) for ref in refs}
+    if refs and not frozenset(fact) and not getattr(fact, 'absent', False) and len(scopes) == 1:
+        return next(iter(scopes))
+    return None
+
+
 def _sql_object_ref(ref):
     return isinstance(ref, tuple) and len(ref) > 2 and ref[2] == 'drizzle-sql'
 
@@ -648,6 +663,15 @@ def _step(fact, name):
     return _Fact(traces, _refs(fact), absent=getattr(fact, 'absent', False))
 
 
+def _alternatives(*facts):
+    """Join possible values without erasing an unknown callable alternative."""
+    result = _join(*facts)
+    if (any(_function_scope(ref) is not None for ref in _refs(result))
+            and any(not _refs(fact) for fact in facts)):
+        result = _join(result, _Fact(refs=(_OPAQUE_CALLABLE,)))
+    return result
+
+
 def _sql_transfer(fact, state):
     """Defer parameter binding through summaries; opaque SQL stays opaque."""
     if not state:
@@ -714,25 +738,25 @@ def _join_states(*states):
     for name in set().union(*(state.bindings.keys() for state in states)):
         candidates = [state.bindings.get(name) for state in states]
         bindings[name] = candidates[0] if all(value is candidates[0] for value in candidates) else None
-    result = _State({name: _join(*(state.get(name, frozenset()) for state in states)) for name in names},
+    result = _State({name: _alternatives(*(state.get(name, frozenset()) for state in states)) for name in names},
                     bindings, budget=budget)
     for state in states:
         result.owners.update(state.owners)
     for name, key in result.owners.items():
         if name in names:
-            result[name] = _join(*(state[name] if name in state else _cell_value(key, state) for state in states))
+            result[name] = _alternatives(*(state[name] if name in state else _cell_value(key, state) for state in states))
     for key in set().union(*(state.cells.keys() for state in states)):
         # A branch without a write preserves the incoming cell, not bottom.
         # This also permits a definitely executed clean setter to kill taint.
-        result.cells[key] = _join(*(_cell_value(key, state) for state in states))
+        result.cells[key] = _alternatives(*(_cell_value(key, state) for state in states))
     for ref in set().union(*(state.heap.keys() for state in states)):
         # Allocation sites can be absent on one branch; only paths on which
         # the object exists contribute its property values.
         objects = [state.heap[ref] for state in states if ref in state.heap]
         keys = set().union(*(slots.keys() for slots in objects))
-        result.heap[ref] = {key: _join(*(slots.get(key, slots.get(None, _ABSENT)) for slots in objects)) for key in keys}
-        if _ARRAY_WRITE_CONTRACT in keys:
-            result.heap[ref][_ARRAY_WRITE_CONTRACT] = frozenset()
+        result.heap[ref] = {key: _alternatives(*(slots.get(key, slots.get(None, _ABSENT)) for slots in objects)) for key in keys}
+        for key in _HEAP_METADATA & keys:
+            result.heap[ref][key] = frozenset()
     result.weak_refs = set().union(*(state.weak_refs for state in states))
     result.written_cells = set().union(*(state.written_cells for state in states))
     for key in set().union(*(state.binding_kinds.keys() for state in states)):
@@ -810,6 +834,7 @@ class _Scope:
     asynchronous: bool = False
     generator: bool = False
     method: bool = False
+    arrow: bool = False
 
 
 # Slots reduce the retained statement graph on runtimes whose dataclasses
@@ -1107,7 +1132,7 @@ def _function_scopes(text, code):
                 arrow_parameters[arrow] = (opening, closing)
 
     # a nested helper recording one function's start, parameter span and body with four syntax flags; a parameter record is bead ultimate_bug_scanner-8tqg — ubs:ignore[py.functions.high-param-count]
-    def add(start, parameter_span, body, name='', declaration=False, concise=False, method=False):
+    def add(start, parameter_span, body, name='', declaration=False, concise=False, method=False, arrow=False):
         params_start, params_end = parameter_span
         if body in body_starts:
             return
@@ -1133,6 +1158,7 @@ def _function_scopes(text, code):
         scope.asynchronous = async_prefix is not None
         scope.generator = generator
         scope.method = method
+        scope.arrow = arrow
         scopes.append(scope)
 
     for match in re.finditer(r'\bfunction\s*\*?\s*([A-Za-z_$][\w$]*)?', code):
@@ -1195,7 +1221,7 @@ def _function_scopes(text, code):
             body += 1
         name_match = re.search(r'\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)(?:\s*:[^=;\n]+)?\s*=\s*(?:async\s+)?$', code[:start])
         add(start, (params_start, params_end), body, name_match.group(1) if name_match else '',
-            concise=code[body:body + 1] != '{')
+            concise=code[body:body + 1] != '{', arrow=True)
 
     # Methods are analyzed as isolated scopes even when dynamic receiver
     # dispatch cannot be resolved to a local summary.
@@ -1397,6 +1423,8 @@ class _Flow:
     def reference(self, name, state):
         if name in state:
             return state[name]
+        if isinstance(state.bindings.get(name), _Scope):
+            return self.function_value(state.bindings[name], state)
         key = self.engine.binding(self.scope, name)
         captured_require = ((key[0], name) in self.engine.commonjs_locals
                             and self.scope is not key[0])
@@ -1429,6 +1457,8 @@ class _Flow:
     def binding_context(self, name, position):
         scope = self.scope
         if self.parameter_context:
+            if name == 'this' and not scope.arrow:
+                return scope, scope.body_start
             # All formals exist in the parameter environment; body declarations
             # do not. A default's assignment follows the same lookup as a read.
             if any(name in names for names, _, _, _ in scope.params):
@@ -1521,6 +1551,7 @@ class _Flow:
         # Unknown objects retain the original conservative parameter/source
         # fact. Known allocations allow unrelated clean fields to stay clean.
         result = frozenset(fact)
+        selected = []
         for ref in _refs(fact):
             slots = state.heap.get(ref, {})
             if self.rule == 'js.taint.sql':
@@ -1540,10 +1571,19 @@ class _Flow:
             if index is not None and length is not None and index >= length:
                 continue  # truncated elements and out-of-bounds reads are undefined
             if key is None:
-                result = _join(result, *slots.values())
+                value = _alternatives(*slots.values())
+                if any(_function_scope(child) is not None for child in _refs(value)):
+                    # An unresolved key can select no property, even when
+                    # every stored value names the same function. Preserve
+                    # that possibility through extracted callable aliases.
+                    value = _alternatives(value, _ABSENT)
             else:
-                result = _join(result, slots.get(key, slots.get(None, _ABSENT)))
-        return result
+                value = slots.get(key, slots.get(None, _ABSENT))
+            if (_ARRAY_WRITE_CONTRACT in slots
+                    and any(_function_scope(child) is not None for child in _refs(value))):
+                value = _join(value, _Fact(refs=(_OPAQUE_CALLABLE,)))
+            selected.append(value)
+        return _join(result, _alternatives(*selected))
 
     def read_access(self, parsed, state, evaluate_keys=True):
         root, selectors, _end = parsed
@@ -1601,11 +1641,11 @@ class _Flow:
                 # An unknown property may override every currently named key.
                 # A later definite write can still replace that key precisely.
                 for known in tuple(slots):
-                    if known is not None and known != _ARRAY_WRITE_CONTRACT:
+                    if known is not None and known not in _HEAP_METADATA:
                         prior = slots[known]
-                        joined = _join(prior, present)
+                        joined = _alternatives(prior, present)
                         slots[known] = _Fact(joined, _refs(joined), absent=getattr(prior, 'absent', False))
-            joined = present if strong and not optional else _join(old, present)
+            joined = present if strong and not optional else _alternatives(old, present)
             slots[key] = _Fact(joined, _refs(joined), absent=(key is None or
                 (not (strong and not optional) and getattr(old, 'absent', False))))
             owner = self.engine.commonjs_namespace_refs.get(ref)
@@ -1631,7 +1671,7 @@ class _Flow:
                         # Element spreads use the wildcard slot directly and
                         # must not be mistaken for prototype/method writes.
                         for method in ('push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'fill', 'entries', 'map'):
-                            slots[method] = _join(slots.get(method, _ABSENT), present)
+                            slots[method] = _alternatives(slots.get(method, _ABSENT), present)
                 elif self.array_index(key) is not None and length is not None:
                     state.array_lengths[ref] = max(length, int(key) + 1)
 
@@ -1841,7 +1881,7 @@ class _Flow:
                     ref, slots = (self.scope, left, 'binding-rest'), {}
                     for parent in _refs(fact):
                         for key, value in state.heap.get(parent, {}).items():
-                            if key == _ARRAY_WRITE_CONTRACT:
+                            if key in _HEAP_METADATA:
                                 continue
                             if array:
                                 numeric = self.array_index(key)
@@ -1926,6 +1966,17 @@ class _Flow:
                     length += 1  # an interior hole contributes to array length
                 continue
             length += 1
+            method = next((child for child in self.scope.children
+                           if child.method and left <= child.start and child.end <= right
+                           and not text[child.end:right].strip()), None) if not array else None
+            if method is not None:
+                spelling = text[left:method.body_start]
+                named = re.match(r'\s*(?:(get|set|async)\s+)?([A-Za-z_$][\w$]*)\s*\(', spelling)
+                if named is not None:
+                    key = named.group(2)
+                    slots[key] = (self.function_value(method, state) if named.group(1) not in {'get', 'set'}
+                                  else _Fact(refs=(_OPAQUE_CALLABLE,)))
+                    continue
             if raw.startswith('...'):
                 begin = left + text[left:right].index('...') + 3
                 spread = self.value(begin, right, state)
@@ -1956,16 +2007,16 @@ class _Flow:
                     wildcard = _join(frozenset(spread), *(obj.get(None, frozenset()) for obj in objects))
                     if wildcard:
                         for key, old in tuple(slots.items()):
-                            merged = _join(old, wildcard)
+                            merged = _alternatives(old, wildcard)
                             slots[key] = _Fact(merged, _refs(merged), absent=getattr(old, 'absent', False))
                         slots[None] = _Fact(_join(slots.get(None, frozenset()), wildcard),
                                             _refs(_join(slots.get(None, frozenset()), wildcard)), absent=True)
-                    for key in set().union(*(obj.keys() for obj in objects)) - {None, _ARRAY_WRITE_CONTRACT}:
+                    for key in set().union(*(obj.keys() for obj in objects)) - {None} - _HEAP_METADATA:
                         incoming = self.property(spread, key, state)
                         definite = not frozenset(spread) and all(
                             key in obj and not getattr(obj[key], 'absent', False) for obj in objects)
                         old = slots.get(key, slots.get(None, _ABSENT))
-                        merged = incoming if definite else _join(old, incoming)
+                        merged = incoming if definite else _alternatives(old, incoming)
                         slots[key] = _Fact(merged, _refs(merged),
                                            absent=not definite and getattr(old, 'absent', False))
                 continue
@@ -1986,7 +2037,7 @@ class _Flow:
             value = self.value(begin, right, state)
             if key is None and not array:
                 for known, old in tuple(slots.items()):
-                    merged = _join(old, value)
+                    merged = _alternatives(old, value)
                     slots[known] = _Fact(merged, _refs(merged), absent=getattr(old, 'absent', False))
             merged = _join(slots.get(key, frozenset()), value) if key is None else value
             slots[key] = _Fact(merged, _refs(merged), absent=key is None)
@@ -1995,7 +2046,7 @@ class _Flow:
         previous = state.heap.get(ref)
         if previous is not None:
             state.weak_refs.add(ref)
-            slots = {key: _join(previous.get(key, _ABSENT), slots.get(key, _ABSENT))
+            slots = {key: _alternatives(previous.get(key, _ABSENT), slots.get(key, _ABSENT))
                      for key in previous.keys() | slots.keys()}
         state.heap[ref] = slots
         if array:
@@ -2162,12 +2213,14 @@ class _Flow:
     def mark_array_write_contracts(self, fact, state, *, recursive=False, objects=False):
         """Keep opaque descriptors/escapes on object identity, not user keys."""
         pending, seen = list(_refs(fact)), set()
+        callable_value = False
         prototypes = {('builtin', 'Array.prototype'), ('builtin', 'Object.prototype')}
         while pending:
             ref = pending.pop()
             if ref in seen:
                 continue
             seen.add(ref)
+            callable_value = callable_value or _function_scope(ref) is not None or ref == _OPAQUE_CALLABLE
             slots = state.heap.get(ref, {})
             self.engine.budget.spend(1 + len(slots))
             if recursive:
@@ -2175,6 +2228,7 @@ class _Flow:
                     pending.extend(_refs(value) - seen)
             if ref in state.array_lengths or ref in prototypes or (objects and ref in state.heap):
                 state.heap.setdefault(ref, {})[_ARRAY_WRITE_CONTRACT] = frozenset()
+        return callable_value
 
     def ordinary_heap_object(self, fact, state):
         """Recognize literal/rest/CommonJS allocations, excluding opaque returns."""
@@ -2267,14 +2321,17 @@ class _Flow:
                        for name in ('Array.prototype', 'Object.prototype'))):
             return False
         for ref in _refs(actual[0][0]):
-            if any(key in state.heap[ref] for key in (None, '__proto__', _ARRAY_WRITE_CONTRACT)):
+            if (any(key in state.heap[ref] for key in (None, '__proto__', _ARRAY_WRITE_CONTRACT))
+                    or any(_OPAQUE_CALLABLE in _refs(value) for value in state.heap[ref].values())):
                 return False
         for index, (source, _absent) in enumerate(actual[1:], 1):
             if kinds.get(index) in {'null', 'undefined', 'noniterable'}:
                 continue
             if not self.ordinary_heap_object(source, state):
                 return False
-            if any(None in state.heap[ref] or '__proto__' in state.heap[ref] for ref in _refs(source)):
+            if any(None in state.heap[ref] or '__proto__' in state.heap[ref]
+                   or any(_OPAQUE_CALLABLE in _refs(value) for value in state.heap[ref].values())
+                   for ref in _refs(source)):
                 return False
         return True
 
@@ -2462,6 +2519,9 @@ class _Flow:
                     self.mark_array_write_contracts(
                         _Fact(refs=(('builtin', 'Array.prototype'),)), state)
             refs = _refs(target)
+            if method in {'defineProperty', 'defineProperties', 'setPrototypeOf'}:
+                for ref in refs:
+                    state.heap.setdefault(ref, {})[_METHOD_LOOKUP_CONTRACT] = frozenset()
             modeled = {ref for ref in refs if ref in state.array_lengths or
                        ref in {('builtin', 'Array.prototype'), ('builtin', 'Object.prototype')}}
             if modeled and (frozenset(target) or modeled != refs):
@@ -2544,7 +2604,7 @@ class _Flow:
                 wildcard = _join(frozenset(source), *(obj.get(None, frozenset()) for obj in objects))
                 if wildcard:
                     self.write_property(target, None, wildcard, state)
-                keys = set().union(*(obj.keys() for obj in objects)) - {None, _ARRAY_WRITE_CONTRACT}
+                keys = set().union(*(obj.keys() for obj in objects)) - {None} - _HEAP_METADATA
                 for key in keys:
                     incoming = self.property(source, key, state)
                     # Missing keys on an alternative source must retain the
@@ -2697,7 +2757,7 @@ class _Flow:
         for match in re.finditer(r'(?<![\w$.])[A-Za-z_$][\w$]*', code):
             if match.start() < consumed or code[match.end():].lstrip().startswith(':'):
                 continue
-            if match.group() in {'true', 'false', 'null', 'undefined', 'new', 'await', 'typeof', 'void', 'this'}:
+            if match.group() in {'true', 'false', 'null', 'undefined', 'new', 'await', 'typeof', 'void'}:
                 continue
             parsed = self.access(start + match.start(), end)
             if parsed:
@@ -2718,6 +2778,72 @@ class _Flow:
                 state[name], state.owners[name] = value, key
                 state.bindings[name] = None
 
+    def function_value(self, scope, state):
+        """Keep a selected function's identity when stored in an own property."""
+        ref = (scope, scope.start, 'function')
+        state.heap.setdefault(ref, {})
+        if self.scope.parent is not None and self.scope not in self.engine.heap_scopes:
+            self.engine.heap_scopes.add(self.scope)
+            for caller in self.engine.dependents[(self.scope, self.rule)]:
+                self.engine.enqueue(caller)
+        return _Fact(refs=(ref,))
+
+    def escaped_callable(self, callee):
+        active, scope = set(), self.scope
+        while scope is not None:
+            active.add(scope)
+            scope = scope.parent
+        for key in self.engine.capture_keys[callee]:
+            owner = key[0]
+            if owner.parent is None or owner in active:
+                continue
+            # Transitive helper captures include the callee's own formals and
+            # locals. This invocation creates those cells; they have not
+            # escaped from a previous invocation of an enclosing function.
+            while owner is not None and owner is not callee:
+                owner = owner.parent
+            if owner is None:
+                return True
+        return False
+
+    def own_method(self, name, state, *, report=True, access=None):
+        if access is None:
+            parts = name.split('.')
+            access = (parts[0], [(part, None) for part in parts[1:]], None)
+        root, selectors, _end = access
+        if not selectors:
+            return None, None
+        receiver = self.reference(root, state)
+        for key, computed in selectors[:-1]:
+            if computed is not None and report:
+                self.value(*computed, state)
+            receiver = self.property(receiver, key, state)
+        key, computed = selectors[-1]
+        if computed is not None and report:
+            self.value(*computed, state)
+        if any(ref in self.engine.commonjs_namespace_refs for ref in _refs(receiver)):
+            return None, receiver  # Existing module binding resolution owns these interfaces.
+        value = self.property(receiver, key, state)
+        candidate = _function_target(value)
+        callable_value = any(_function_scope(ref) is not None or ref == _OPAQUE_CALLABLE
+                             for ref in _refs(value))
+        constrained = any(_ARRAY_WRITE_CONTRACT in state.heap.get(ref, {}) for ref in _refs(receiver))
+        opaque_lookup = any(_METHOD_LOOKUP_CONTRACT in state.heap.get(ref, {}) or
+                            '__proto__' in state.heap.get(ref, {}) for ref in _refs(receiver))
+        if (constrained and candidate is not None) or (opaque_lookup and self.native_target(name, state) is None):
+            if report:
+                self.incomplete.add('Own method requires ordinary property and receiver semantics')
+            return None, receiver
+        if candidate is not None:
+            if self.escaped_callable(candidate):
+                if report:
+                    self.incomplete.add('Own method requires an unsupported escaped closure environment')
+                return None, receiver
+            return candidate, receiver
+        if callable_value and report:
+            self.incomplete.add('Own method requires an unambiguous callable and ordinary property semantics')
+        return None, receiver
+
     def callable(self, start, end, state):
         # Parentheses around an arrow do not turn it into an unknown callee.
         # Trim original whitespace: the scope mask also blanks real functions.
@@ -2737,7 +2863,8 @@ class _Flow:
                 return child
         name = self.engine.text[start:end].strip()
         if re.fullmatch(r'[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*', name):
-            return self.engine.call_target(self.scope, name, state, self.rule)
+            return (self.own_method(name, state, report=False)[0]
+                    or self.engine.call_target(self.scope, name, state, self.rule))
         return None
 
     def drizzle_tag(self, start, end, state):
@@ -2891,9 +3018,12 @@ class _Flow:
             expand = None
         return facts, (actual, uncertain, maybe_missing, input_kinds)
 
-    def bind(self, callee, prepared, state, call_location):
+    def bind(self, callee, prepared, state, call_location, *, receiver=None):
         actual, uncertain, maybe_missing, input_kinds = prepared
         bound = _BoundValues()
+        if receiver is not None and not callee.arrow:
+            bound['this'] = receiver
+            bound.kinds['this'] = 'present'
         default_flow = None
         default_state = None
 
@@ -3066,12 +3196,31 @@ class _Flow:
     def value(self, start, end, state):
         self.engine.budget.spend()
         text, code = self.engine.text, self.scope.code
+        # A child function is blanked in its enclosing lexical code. Recognize
+        # the original value span before trimming that mask as whitespace.
+        left, right = start, end
+        while left < right and text[left].isspace():
+            left += 1
+        while right > left and text[right - 1].isspace():
+            right -= 1
+        function = next((child for child in self.scope.children
+                         if child.start == left and child.end == right), None)
+        if function is not None:
+            return self.function_value(function, state)
         while start < end and code[start].isspace():
+            if any(child.start == start and child.end <= end for child in self.scope.children):
+                break
             start += 1
         while end > start and code[end - 1].isspace():
+            if any(child.end == end and start <= child.start for child in self.scope.children):
+                break
             end -= 1
         if start >= end:
             return frozenset()
+        function = next((child for child in self.scope.children
+                         if child.start == start and child.end == end), None)
+        if function is not None:
+            return self.function_value(function, state)
         if code[start] == '(' and self.pairs.get(start) == end - 1:
             return self.value(start + 1, end - 1, state)
         # The comma operator has lower precedence than assignment. Evaluate
@@ -3084,6 +3233,26 @@ class _Flow:
             for left, right in parts:
                 value = self.value(left, right, state)
             return value
+        deletion = re.match(r'delete\b\s*', code[start:end])
+        if deletion is not None:
+            target = self.access(start + deletion.end(), end)
+            if target is not None and target[1] and target[2] == end:
+                receiver = self.read_access((target[0], target[1][:-1], target[2]), state)
+                key, computed = target[1][-1]
+                if computed is not None:
+                    self.value(*computed, state)
+                refs = _refs(receiver)
+                for ref in refs:
+                    slots = state.heap.get(ref, {})
+                    exact = (key not in {None, '__proto__'} and len(refs) == 1 and not frozenset(receiver)
+                             and ref not in state.weak_refs and _ARRAY_WRITE_CONTRACT not in slots)
+                    if exact:
+                        slots.pop(key, None)
+                    else:
+                        for name in ((key,) if key is not None else tuple(slots)):
+                            if name not in _HEAP_METADATA:
+                                slots[name] = _alternatives(slots.get(name, _ABSENT), _ABSENT)
+                return frozenset()
         if code[start] in '[{' and start in self.pairs:
             closing = self.pairs[start]
             assignment = re.match(r'\s*=(?!=|>)\s*', code[closing + 1:end])
@@ -3100,7 +3269,11 @@ class _Flow:
                       if access else None)
         if assignment:
             target = re.sub(r'\s+', '', text[start:access[2]])
-            rhs = access[2] + assignment.end()
+            rhs = access[2] + assignment.end(1)
+            while rhs < end and code[rhs].isspace():
+                if any(child.start == rhs for child in self.scope.children):
+                    break
+                rhs += 1
             receiver = None
             if access[1]:
                 receiver = self.read_access((access[0], access[1][:-1], access[2]), state)
@@ -3196,7 +3369,7 @@ class _Flow:
             if merged is None:
                 raise _NoNormalCompletion
             self.replace_state(state, merged)
-            return _join(left_fact, right_fact)
+            return _alternatives(left_fact, right_fact)
         if operators:
             _, operator = min(operators, key=lambda item: (item[0], -item[1]))
             left = self.value(start, operator, state)
@@ -3204,7 +3377,7 @@ class _Flow:
             right, branch = self.branch_value(operator + 2, end, branch)
             merged = _join_states(state, branch)
             self.replace_state(state, merged)
-            return _join(left, right)
+            return _alternatives(left, right)
         remainder = list(code[start:end])
         source_remainder = list(text[start:end])
         for child in self.scope.children:
@@ -3213,7 +3386,8 @@ class _Flow:
                 source_remainder[left - start:right - start] = [' '] * (right - left)
         facts = []
         sole_local_call = False
-        call_pattern = re.compile(r'(?<![\w$])(?:new\s+)?([A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)\s*\(')
+        call_pattern = re.compile(r'(?<![\w$])(?:new\s+)?([A-Za-z_$][\w$]*'
+                                  r'(?:(?:\s*\.\s*[A-Za-z_$][\w$]*)|(?:\s*\[[^\]\n;]*\]))*)\s*\(')
         call_code, call_offset = ((code.masked, code.offset) if isinstance(code, _ComponentCode)
                                   else (code, 0))
         cursor = start
@@ -3238,14 +3412,45 @@ class _Flow:
                           if code[left:right].strip()])
             # GetValue(callee) precedes ArgumentListEvaluation. An argument can
             # rebind a function or sanitizer for *later* calls, not this one.
-            callee_name = re.sub(r'\s+', '', match.group(1))
+            callee_access = self.access(match_start, opening)
+            if callee_access is not None and code[callee_access[2]:opening].strip():
+                callee_access = None
+            if (callee_access is not None and all(key is not None and re.fullmatch(r'[A-Za-z_$][\w$]*', key)
+                                                 for key, _ in callee_access[1])):
+                callee_name = '.'.join((callee_access[0], *(key for key, _ in callee_access[1])))
+            else:
+                callee_name = re.sub(r'\s+', '', re.sub(r'^new\s+', '', text[match_start:opening]))
             callee = self.engine.call_target(self.scope, callee_name, state, self.rule)
-            receiver = callee_name.split('.')[0]
+            native = self.native_target(callee_name, state) if not isinstance(callee, _Scope) else None
+            method, method_receiver = ((None, None) if native is not None else
+                                       self.own_method(callee_name, state, access=callee_access))
+            if method is not None:
+                callee = method
+            if isinstance(callee, _Scope):
+                if self.escaped_callable(callee):
+                    self.incomplete.add('Callable requires an unsupported escaped closure environment')
+                    callee = None
+                elif not callee.arrow and method is None and any(
+                        re.search(r'\bthis\b', callee.code[left:right]) for left, right in (
+                            (callee.body_start, callee.body_end),
+                            *(default for _, _, default, _ in callee.params if default is not None))):
+                    self.incomplete.add('Unbound callable requires unsupported receiver semantics')
+                    callee = None
+                elif callee.arrow and any(key[2] == 'this' and not _refs(_cell_value(key, state))
+                                          for key in self.engine.capture_keys[callee]):
+                    self.incomplete.add('Arrow callable requires a known lexical receiver')
+                    callee = None
+            elif callee_access is not None and not callee_access[1]:
+                value = self.reference(callee_access[0], state)
+                if any(_function_scope(ref) is not None or ref == _OPAQUE_CALLABLE for ref in _refs(value)):
+                    self.incomplete.add('Callable requires an unambiguous selected function')
+            receiver = callee_access[0] if callee_access is not None else callee_name.split('.')[0]
             binding = state.bindings.get(receiver, 'imported')
             sink_binding = state.bindings.get(callee_name, 'imported')
             if self.engine.relative_import(self.scope, receiver):
                 binding = None
-            native = self.native_target(callee_name, state) if not isinstance(callee, _Scope) else None
+            if isinstance(callee, _Scope):
+                native = None
             tag_call = drizzle or (native is not None and native[0] == 'sql-tag' and text[opening] == '`')
             if tag_call and not drizzle:
                 arguments = self.template_arguments(opening, closing)
@@ -3272,7 +3477,8 @@ class _Flow:
                 self.engine.dependents[(callee, self.rule)][self.scope] = None
                 throw_count = len(self.throws)
                 try:
-                    bound = self.bind(callee, prepared, state, match_start)
+                    bound = self.bind(callee, prepared, state, match_start,
+                                      receiver=method_receiver if method is not None else None)
                 except _NoNormalCompletion:
                     if not deferred:
                         raise
@@ -3337,7 +3543,9 @@ class _Flow:
                 if native is not None and native[0] == 'sql-factory':
                     proof_role, proof_value = 'factory', mutation
                 call_fact = _join(*argument_facts)
-                if '.' in callee_name:
+                if method_receiver is not None:
+                    call_fact = _join(call_fact, method_receiver)
+                elif '.' in callee_name:
                     call_fact = _join(call_fact, self.reference(receiver, state))
                 # Argument facts already retain precise local-call returns.
                 # Only a source in the callee itself introduces new input.
@@ -3352,8 +3560,11 @@ class _Flow:
                     self.effect(match_start, sink[1], _join(*selected), state)
                     if self.rule == 'js.taint.sql':
                         proof_role, proof_value = 'execute', _join(*selected)
+                opaque_callable = False
                 if native is None and not sink:
-                    self.mark_array_write_contracts(call_fact, state, recursive=True)
+                    opaque_callable = self.mark_array_write_contracts(call_fact, state, recursive=True, objects=True)
+                opaque_callable = opaque_callable or any(_function_scope(ref) is not None
+                                                         for ref in _refs(call_fact))
                 if self.rule == 'js.taint.sql' and self.engine.drizzle_imports:
                     if tag_call:
                         # Parameter slots belong to the SQL value, regardless
@@ -3413,6 +3624,8 @@ class _Flow:
                 # Unknown calls may transform or serialize their arguments;
                 # their return is not proof of object identity.
                 call_fact = self.materialize(call_fact, state)
+                if mutation is None and opaque_callable:
+                    call_fact = _join(call_fact, _Fact(refs=(_OPAQUE_CALLABLE,)))
                 if mutation is not None:
                     call_fact = mutation
                     sole_local_call = (code[start:match_start].strip() in {'', 'await'} and closing + 1 == end)
@@ -3442,7 +3655,7 @@ class _Flow:
                 continue
             name = match.group(0)
             name = re.sub(r'\s+', '', name)
-            if name in {'true', 'false', 'null', 'undefined', 'new', 'await', 'typeof', 'void', 'this'}:
+            if name in {'true', 'false', 'null', 'undefined', 'new', 'await', 'typeof', 'void'}:
                 continue
             after = remaining[match.end():].lstrip()
             if after.startswith(':'):
@@ -4245,6 +4458,10 @@ class _Engine:
 
     def call_target(self, scope, name, state, rule):
         parts = name.split('.')
+        if len(parts) == 1 and parts[0] in state:
+            function = _function_target(state[parts[0]])
+            if function is not None:
+                return function
         local = self.lexical_binding(scope, parts[0])
         if (local[0], parts[0]) in self.commonjs_locals and parts[0] not in state.bindings:
             # An independently analyzed closure may read its defining module's
@@ -4470,7 +4687,7 @@ class _Engine:
                 context.dirty = True
                 self.enqueue(context)
                 return context
-        joined_bound = {name: _join(context.bound.get(name, frozenset()), bound.get(name, frozenset()))
+        joined_bound = {name: _alternatives(context.bound.get(name, frozenset()), bound.get(name, frozenset()))
                         for name in context.bound.keys() | bound.keys()}
         joined = _join_states(context.incoming, incoming)
         # Lengths that differ become unknown anyway; unknown from the start
@@ -4520,15 +4737,15 @@ class _Engine:
             groups[new].append(old)
         for new, originals in groups.items():
             keys = set().union(*(output.heap[old].keys() for old in originals))
-            slots = {key: _join(*(translate(output.heap[old].get(key, output.heap[old].get(None, _ABSENT)))
+            slots = {key: _alternatives(*(translate(output.heap[old].get(key, output.heap[old].get(None, _ABSENT)))
                                   for old in originals)) for key in keys}
             collision = any(old not in incoming.heap for old in originals) and new in state.heap
             if collision:
                 previous = state.heap[new]
-                slots = {key: _join(previous.get(key, previous.get(None, _ABSENT)), slots.get(key, slots.get(None, _ABSENT)))
+                slots = {key: _alternatives(previous.get(key, previous.get(None, _ABSENT)), slots.get(key, slots.get(None, _ABSENT)))
                          for key in previous.keys() | slots.keys()}
-            if _ARRAY_WRITE_CONTRACT in slots:
-                slots[_ARRAY_WRITE_CONTRACT] = frozenset()
+            for key in _HEAP_METADATA & slots.keys():
+                slots[key] = frozenset()
             collapsed = len(originals) > 1 or collision or _collapsed(new)
             if collapsed or any(old in output.weak_refs for old in originals):
                 state.weak_refs.add(new)
@@ -4563,6 +4780,10 @@ class _Engine:
                 state[name] = context.bound.get(name, frozenset())
                 state.bindings[name], state.owners[name] = None, self.binding(scope, name)
                 state.binding_kinds[state.owners[name]] = context.incoming.binding_kinds.get(state.owners[name])
+        if 'this' in context.bound and not scope.arrow:
+            state['this'] = context.bound['this']
+            state.bindings['this'], state.owners['this'] = None, self.binding(scope, 'this')
+            state.binding_kinds[state.owners['this']] = 'present'
         for child in scope.children:
             if child.name and child.declaration:
                 state.bindings[child.name] = child
@@ -4582,7 +4803,8 @@ class _Engine:
         def writes(store):
             return {} if store is None else {key: value for key, value in store.cells.items()
                                             if key[0] is not scope and key in store.written_cells}
-        returned = _join(*(value for value, _ in flow.returns))
+        returned = _alternatives(*(value for value, _ in flow.returns),
+                                 *([frozenset()] if final is not None else []))
         thrown = _join(*(value for value, _ in flow.throws))
         normal_writes, throw_writes = writes(output), writes(exceptional)
 
@@ -4616,6 +4838,8 @@ class _Engine:
         """Static lexical identities; dataflow state still supplies values."""
         regions = [(scope.body_start, scope.body_end, name)
                    for names, _, _, _ in scope.params for name in names]
+        if scope.parent is not None and not scope.arrow:
+            regions.append((scope.body_start, scope.body_end, 'this'))
         blocks = [(scope.body_start, scope.body_end)]
         pending = [(scope.statements, scope.body_start, scope.body_end)]
         while pending:

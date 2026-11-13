@@ -2358,6 +2358,83 @@ class FormattedStringCompletionTests(SourceTest):
                 self.assert_native(source, ['UNTRUSTED'], incomplete=True)
 
 
+    def test_private_next_keeps_inline_native_helpers_and_unused_protocols(self):
+        prefix = ("code = 'fixed'\nclass Unused:\n"
+                  + '    def __format__(self, spec):\n        global code\n        code = input()\n'
+                  + "        return 'fixed'\ndef render(value):\n    return value\n")
+        for expression, expected in (("f'{render(input())}'", 'UNTRUSTED'),
+                                     ("f'{render(\"fixed\")}'", 'fixed'),
+                                     ("f'{input(\"prompt\")}'", 'UNTRUSTED')):
+            source = (prefix + 'def run():\n'
+                      + textwrap.indent(f'text = {expression}\nsaved = text\n'
+                                        + 'next(text for unused in (0,))\neval(saved)\neval(code)\n', '    ')
+                      + 'run()\n')
+            with self.subTest(expression=expression):
+                self.assert_native(source, [expected, 'fixed'])
+
+    def test_private_next_producer_evidence_survives_helpers_vectors_and_joins(self):
+        prefix = ("code = 'fixed'\nclass Opaque:\n"
+                  + '    def __format__(self, spec):\n        global code\n        code = input()\n'
+                  + "        return 'fixed'\ndef forward(value):\n    return value\n"
+                  + 'def first(values):\n    return values[0]\n')
+        for capture in ('saved = forward(text)', 'saved = [text][0]',
+                        'saved = first([text])', "saved = text if input() else 'fixed'",
+                        "saved = 'fixed'\nif input():\n    saved = text"):
+            source = (prefix + 'def run():\n'
+                      + textwrap.indent("text = f'{Opaque()}'\n" + capture + '\n'
+                                        + 'next(saved for unused in (0,))\neval(code)\n', '    ')
+                      + 'run()\n')
+            with self.subTest(capture=capture):
+                self.assert_native(source, ['UNTRUSTED'], incomplete=True)
+        self.assert_native(prefix + 'def consume(text):\n'
+                           + '    next(text for unused in (0,))\n    eval(code)\n'
+                           + "consume(f'{Opaque()}')\n", ['UNTRUSTED'], incomplete=True)
+
+    def test_private_next_keeps_projected_native_producer_controls(self):
+        for expression, expected in (("input('prompt')", 'UNTRUSTED'),
+                                     ('render(input())', 'UNTRUSTED'), ("render('fixed')", 'fixed')):
+            for capture in ('saved = text', 'saved = [text][0]'):
+                source = ('def render(value):\n    return value\ndef run():\n'
+                          + textwrap.indent(f'text = {expression}\n{capture}\n'
+                                            + 'next(saved for unused in (0,))\neval(saved)\n', '    ')
+                          + 'run()\n')
+                with self.subTest(expression=expression, capture=capture):
+                    self.assert_native(source, [expected])
+
+    def test_private_next_preserves_scalar_producer_uncertainty(self):
+        prefix = ("code = 'fixed'\nclass Owned:\n"
+                  + '    def __del__(self):\n        global code\n        code = input()\n')
+        for scalar in ('7', 'True', 'None', "b'fixed'", '1.5', '2j'):
+            for capture in ('saved = value', 'saved = [value][0]', 'saved = forward(value)'):
+                source = (prefix + 'def render():\n    owned = Owned()\n'
+                          + f'    return {scalar}\ndef forward(value):\n    return value\ndef run():\n'
+                          + textwrap.indent('value = render()\n' + capture + '\n'
+                                            + 'next(saved for unused in (0,))\neval(code)\n', '    ')
+                          + 'run()\n')
+                with self.subTest(scalar=scalar, capture=capture):
+                    self.assert_native(source, ['UNTRUSTED'], incomplete=True)
+
+    def test_private_next_keeps_native_scalar_and_retained_parameter_controls(self):
+        for scalar in ('7', 'True', 'None', "b'fixed'", '1.5', '2j'):
+            source = (f'def render():\n    return {scalar}\ndef run():\n'
+                      + "    value = render()\n    next(value for unused in (0,))\n    eval('fixed')\nrun()\n")
+            with self.subTest(scalar=scalar):
+                self.assert_native(source, ['fixed'])
+        self.assert_native('''
+            code = 'fixed'
+            class Owned:
+                def __del__(self):
+                    global code
+                    code = input()
+            def run(value):
+                next(value for unused in (0,))
+                eval(code)
+            retained = Owned()
+            run(retained)
+            retained = None
+        ''', ['fixed'])
+
+
 class ImmediateGeneratorExpressionTests(SourceTest):
     def test_string_join_captures_values_before_later_rebinding(self):
         for receiver in ("''", 'separator'):

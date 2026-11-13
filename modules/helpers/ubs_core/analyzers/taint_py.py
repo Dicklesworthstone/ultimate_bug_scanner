@@ -402,13 +402,15 @@ def _literal_choices(binding):
     keys and could certify an object's stale shape after a heap write.
     """
     if isinstance(binding, frozenset):
-        return frozenset(value if isinstance(value, _LiteralString) else None for value in binding)
+        return frozenset(value if isinstance(value, (_LiteralString, _GeneratorString, _UnprovedProducer)) else None
+                         for value in binding)
     return binding
 
 
 def _vector_shape(vector):
     return tuple(_literal_choices(operand)
-                 if isinstance(operand, (_LiteralString, _ArgumentExpansion, frozenset)) else None
+                 if isinstance(operand, (_LiteralString, _GeneratorString, _UnprovedProducer,
+                                         _ArgumentExpansion, frozenset)) else None
                  for operand, _fact in vector.operands)
 
 
@@ -628,6 +630,15 @@ class _GeneratorNext(_FunctionValue):
 class _GeneratorString:
     """A proven builtin string, with unknown contents and no literal contract."""
     format_safe: bool = True
+
+
+@dataclass(frozen=True)
+class _UnprovedProducer:
+    """A value whose producing protocol or frame is still unmodeled.
+
+    Keep this finite distinction from an independently retained opaque
+    parameter through aliases, branch joins, vectors and helper contexts.
+    """
 
 
 _GENERATOR_CURSOR = '@generator:cursor'
@@ -2786,6 +2797,7 @@ class _Flow:
         if state.cells is not None and name in state.cells.names:
             contents = state.cells.contents[state.cells.names[name]]
             binding, references = contents.binding, contents.references
+        self.require_value(binding)
         if references & state.mutated:
             return False
 
@@ -2796,6 +2808,8 @@ class _Flow:
         def revoked(value):
             for choice in _binding_choices(value):
                 self.engine.budget.spend()
+                if isinstance(choice, _UnprovedProducer):
+                    return True
                 if isinstance(choice, (_LiteralString, _GeneratorString)) and not choice.format_safe:
                     return True
                 if isinstance(choice, _ArgumentVector) and any(
@@ -2881,11 +2895,13 @@ class _Flow:
             return True
         if isinstance(node, ast.Call):
             callees = _binding_choices(self.expression_bindings.get(node.func))
-            return (bool(callees) and callees <= {'input', 'builtins.input'}
-                    and len(node.args) <= 1 and not node.keywords
-                    and self.generator_builtins_stable()
-                    and self.generator_consumer_stable(node, {'input'})
-                    and all(self.formatted_string_operand(argument, state) for argument in node.args))
+            if (callees & {'input', 'builtins.input'}
+                    and not self.generator_consumer_stable(node, {'input'})):
+                return False
+            # Captured native results already retain their format authority.
+            # An inline helper must prove the same bounded frame lifetime.
+            return bool(callees) and all(self.materialized_generator_call(node, target, state)
+                                         for target in callees)
         return False
 
     def without_format_authority(self, binding):
@@ -2903,7 +2919,7 @@ class _Flow:
             elif isinstance(value, _GeneratorString):
                 value = _GeneratorString(format_safe=False)
             elif isinstance(value, ast.Constant):
-                value = None
+                value = _UnprovedProducer()
             elif isinstance(value, _ArgumentVector):
                 value = _ArgumentVector(tuple((self.without_format_authority(operand), fact)
                                               for operand, fact in value.operands), value.references)
@@ -4694,7 +4710,8 @@ class _Flow:
                 for index, (operand, fact) in enumerate(target.operands):
                     if isinstance(operand, _SymbolicValue):
                         replacement = values.get(operand.parameter)
-                        if isinstance(replacement, (_LiteralString, _SymbolicValue, frozenset)):
+                        if isinstance(replacement, (_LiteralString, _GeneratorString, _UnprovedProducer,
+                                                    _SymbolicValue, frozenset)):
                             operand = _literal_choices(replacement)
                     operands.append((operand, substitute(fact)))
                     refs = frozenset().union(*(
@@ -4741,7 +4758,8 @@ class _Flow:
         if literal == 'sys.executable':
             literal = _LiteralString('python')
         literal = _literal_choices(literal)
-        return (literal if isinstance(literal, (_LiteralString, _GeneratorString, _SymbolicValue, frozenset)) else node), fact
+        return (literal if isinstance(literal, (_LiteralString, _GeneratorString, _UnprovedProducer,
+                                               _SymbolicValue, frozenset)) else node), fact
 
     def command_vector(self, node):
         """Expand literal argv without evaluating any argument a second time."""
@@ -4849,7 +4867,8 @@ class _Flow:
             projected, projected_references = [], []
             for index in selected:
                 operand, fact = operands[index]
-                value = (operand if isinstance(operand, (_LiteralString, _SymbolicValue, frozenset))
+                value = (operand if isinstance(operand, (_LiteralString, _GeneratorString, _UnprovedProducer,
+                                                         _SymbolicValue, frozenset))
                          else self.expression_bindings.get(operand))
                 immutable = (isinstance(operand, ast.Constant)
                              or all(isinstance(choice, _LiteralString) for choice in _binding_choices(value)))
@@ -5436,7 +5455,8 @@ class _Flow:
                 if (isinstance(binding, _SymbolicValue)
                         or _same_witness(binding, nominal)):
                     continue
-                if any(isinstance(value, (str, _LiteralString, _GeneratorString, _LiteralMapping, _ArgumentVector, _ProcessInput,
+                if any(isinstance(value, (str, _LiteralString, _GeneratorString, _UnprovedProducer,
+                                          _LiteralMapping, _ArgumentVector, _ProcessInput,
                                           _FunctionValue, _ClosureValue,
                                           ast.FunctionDef, ast.AsyncFunctionDef,
                                           ast.Lambda, ast.Constant, _BoundClassMethod))
@@ -5839,8 +5859,11 @@ class _Flow:
         self.engine.budget.spend()
         if isinstance(node, ast.Constant):
             self.expression_references.pop(node, None)
+            # Scalar return identities let the existing helper-frame proof
+            # distinguish native producers from unmodeled owned finalizers.
             self.expression_bindings[node] = (_LiteralString(node.value) if isinstance(node.value, str)
-                                             else node if isinstance(node.value, bool) else None)
+                                             else node if type(node.value) in {
+                                                 bytes, int, float, complex, bool, type(None)} else None)
             self.expression_facts[node] = CLEAN
             return CLEAN
         if isinstance(node, ast.Name):
@@ -5876,7 +5899,8 @@ class _Flow:
                                   and node.id not in self.context_globals)
                 identity = (str, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
                             ast.ClassDef, _FunctionValue, _ClosureValue, _BoundCallable,
-                            _BoundClassMethod, _ModuleBinding, _ArgumentVector, _LiteralString, _GeneratorString, _LiteralMapping,
+                            _BoundClassMethod, _ModuleBinding, _ArgumentVector, _LiteralString, _GeneratorString,
+                            _UnprovedProducer, _LiteralMapping,
                             _ProcessInput, ast.Constant)
                 if (not nominal_helper and any(isinstance(value, identity)
                         for value in (*_binding_choices(binding), *_binding_choices(nominal)))):
@@ -6135,6 +6159,11 @@ class _Flow:
                 # multiple fields may release that subclass and run __del__.
                 # Only independently proved native fields certify either form.
                 self.expression_bindings[node] = _GeneratorString()
+            else:
+                # A consumer parameter may retain the result without knowing
+                # which earlier format/prompt/helper effects produced it.
+                # Ordinary unknown parameters do not carry this obligation.
+                self.expression_bindings[node] = _UnprovedProducer()
             return join_facts(*facts)
         if isinstance(node, ast.FormattedValue):
             value_fact = self.expr(node.value, state)
@@ -8075,6 +8104,8 @@ class _Analysis:
                 # Ownership proofs need this identity; ordinary dataflow
                 # parameters must keep sharing their symbolic summaries.
                 pass
+            elif isinstance(value, _UnprovedProducer) and (captured or name in value_parameters):
+                pass
             elif isinstance(value, ast.Constant) and name in value_parameters:
                 # Partial captures may retain exact scalar options such as
                 # shell=False. Their source AST identities are finite.
@@ -8177,7 +8208,8 @@ class _Analysis:
                     continue
                 if (binding is nominal
                         and not isinstance(binding, (frozenset, _BoundCallable, _BoundClassMethod, _FunctionValue, _ClosureValue,
-                                                     _ArgumentVector, _LiteralString, _GeneratorString, _LiteralMapping, _ProcessInput))
+                                                     _ArgumentVector, _LiteralString, _GeneratorString, _UnprovedProducer,
+                                                     _LiteralMapping, _ProcessInput))
                         and not explicit_override
                         and gname in owner_bindings
                         and gname not in owner_fn.locals[function]
@@ -8189,7 +8221,8 @@ class _Analysis:
                 if not explicit_override and not any(
                         isinstance(value, (str, ast.FunctionDef, ast.AsyncFunctionDef,
                                            ast.Lambda, ast.ClassDef, _BoundCallable, _BoundClassMethod, _FunctionValue, _ClosureValue,
-                                           _ArgumentVector, _LiteralString, _GeneratorString, _LiteralMapping, _ProcessInput, ast.Constant))
+                                           _ArgumentVector, _LiteralString, _GeneratorString, _UnprovedProducer,
+                                           _LiteralMapping, _ProcessInput, ast.Constant))
                         for value in (*_binding_choices(binding), *_binding_choices(nominal))):
                     continue
             elif binding is None or isinstance(binding, _SymbolicValue):

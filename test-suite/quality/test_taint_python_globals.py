@@ -956,6 +956,137 @@ class GlobalWriteCliTests(unittest.TestCase):
         ]
         self.assert_cli_cases(cases)
 
+    def test_private_next_producer_boundaries_json_sarif(self):
+        cases = [
+            Case('private_next_opaque_formatter_argument_stays_incomplete', """
+                code = 'fixed'
+                class Opaque:
+                    def __format__(self, spec):
+                        global code
+                        code = input()
+                        return 'fixed'
+                def consume(text):
+                    next(text for unused in (0,))
+                    eval(code)
+                consume(f'{Opaque()}')
+                """),
+            Case('private_next_helper_finalizer_stays_incomplete', """
+                code = 'fixed'
+                class Owned:
+                    def __del__(self):
+                        global code
+                        code = input()
+                def render():
+                    owned = Owned()
+                    return 'fixed'
+                def run():
+                    text = f"{render()}"
+                    next(text for unused in (0,))
+                    eval(code)
+                run()
+                """),
+            Case('private_next_direct_prompt_stays_incomplete', """
+                code = 'fixed'
+                class Prompt:
+                    def __str__(self):
+                        global code
+                        code = input()
+                        return ''
+                def run():
+                    text = input(Prompt())
+                    next(text for unused in (0,))
+                    eval(code)
+                run()
+                """),
+            Case('private_next_integer_helper_stays_incomplete', """
+                code = 'fixed'
+                class Owned:
+                    def __del__(self):
+                        global code
+                        code = input()
+                def render():
+                    owned = Owned()
+                    return 7
+                def run():
+                    value = render()
+                    next(value for unused in (0,))
+                    eval(code)
+                run()
+                """),
+            Case('private_next_boolean_helper_stays_incomplete', """
+                code = 'fixed'
+                class Owned:
+                    def __del__(self):
+                        global code
+                        code = input()
+                def render():
+                    owned = Owned()
+                    return True
+                def run():
+                    value = render()
+                    next(value for unused in (0,))
+                    eval(code)
+                run()
+                """),
+            Case('private_next_native_integer_helper_keeps_clean_value', """
+                def render():
+                    return 7
+                def run():
+                    value = render()
+                    code = 'fixed'
+                    next(value for unused in (0,))
+                    eval(code)
+                run()
+                """),
+            Case('private_next_native_boolean_helper_keeps_clean_value', """
+                def render():
+                    return True
+                def run():
+                    value = render()
+                    code = 'fixed'
+                    next(value for unused in (0,))
+                    eval(code)
+                run()
+                """),
+            Case('private_next_native_helper_keeps_clean_value', """
+                def render(value):
+                    return value
+                def run():
+                    text = f"{render('fixed')}"
+                    next(text for unused in (0,))
+                    eval(text)
+                run()
+                """),
+            Case('private_next_native_helper_keeps_tainted_value', """
+                def render(value):
+                    return value
+                def run():
+                    text = f"{render(input())}"
+                    next(text for unused in (0,))
+                    eval(text) # expect:eval
+                run()
+                """),
+            Case('private_next_projected_native_input_keeps_tainted_value', """
+                def run():
+                    text = input('prompt')
+                    saved = [text][0]
+                    next(saved for unused in (0,))
+                    eval(saved) # expect:eval
+                run()
+                """),
+            Case('private_next_projected_native_helper_keeps_tainted_value', """
+                def render(value):
+                    return value
+                def run():
+                    text = render(input())
+                    saved = [text][0]
+                    next(saved for unused in (0,))
+                    eval(saved) # expect:eval
+                run()
+                """),
+        ]
+        self.assert_cli_cases(cases)
+
     def assert_cli_cases(self, cases):
         for case in cases:
             incomplete = case.name in {'foreign_module_write', 'deleted_builtin_shadow_survives_helper_sibling_join',
@@ -968,15 +1099,29 @@ class GlobalWriteCliTests(unittest.TestCase):
                                        'formatted_min_preserves_taint_at_branch_join',
                                        'formatted_next_reads_live_value_on_resume',
                                        'module_next_opaque_formatter_stays_incomplete',
-                                       'module_next_helper_finalizer_stays_incomplete'}
+                                       'module_next_helper_finalizer_stays_incomplete',
+                                       'private_next_opaque_formatter_argument_stays_incomplete',
+                                       'private_next_helper_finalizer_stays_incomplete',
+                                       'private_next_direct_prompt_stays_incomplete',
+                                       'private_next_integer_helper_stays_incomplete',
+                                       'private_next_boolean_helper_stays_incomplete'}
             # The full scanner also warns about eval syntax independently of
             # whether its operand is tainted. Keep those existing rules in
             # the oracle; the strong reset must remove only the taint finding.
+            syntax_line = len(case.source.splitlines())
+            if case.name.startswith('private_next_'):
+                # An eval in another scope intentionally revokes the native
+                # consumer proof. Keep the sink in the consuming function.
+                sites = [node.lineno for node in ast.walk(ast.parse(case.source))
+                         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                         and node.func.id == 'eval']
+                self.assertEqual(len(sites), 1, case.source)
+                syntax_line = sites[0]
             syntax_sites = ([] if case.name in {'callback_sink_replacement',
                                                'helper_recreates_deleted_global_with_clean_callable',
                                                'deleted_builtin_shadow_survives_helper_sibling_join'} else [
-                ('py.eval-exec', len(case.source.splitlines())),
-                ('py.security.eval-exec-usage', len(case.source.splitlines()))])
+                ('py.eval-exec', syntax_line),
+                ('py.security.eval-exec-usage', syntax_line)])
             expected_sites = sorted([*case.expected, *syntax_sites])
             for meta in (False, True):
                 for output in ('json', 'sarif'):
@@ -1047,6 +1192,8 @@ class GlobalWriteCliTests(unittest.TestCase):
                                     actual.extend(sites)
                         if incomplete:
                             diagnostic = ('foreign module global write' if case.name == 'foreign_module_write'
+                                          else 'generator next borrowed value producer effects are unresolved'
+                                          if case.name.startswith('private_next_')
                                           else 'generator materialization reads an opaque operand'
                                           if (case.name == 'string_join_opaque_iterator_stays_incomplete'
                                               or case.name.startswith('module_next_'))
@@ -1069,16 +1216,20 @@ class GlobalWriteCliTests(unittest.TestCase):
                                     totals = payload['totals'] if meta else payload
                                     self.assertEqual(totals['critical'], len(syntax_sites), payload)
                                     self.assertEqual(totals['warning'], 0, payload)
-                            if case.name.startswith('module_next_'):
-                                # Module globals do not establish private
-                                # borrowing. Refusal retains both independent
-                                # syntax findings and their exact counts.
+                            if case.name.startswith(('module_next_', 'private_next_')):
+                                # Refusing an unproved producer retains both
+                                # independent syntax findings and their counts.
                                 self.assertEqual(actual, [], payload)
                                 self.assertEqual(sorted(all_sites), sorted(syntax_sites), payload)
                                 if output == 'json':
                                     totals = payload['totals'] if meta else payload
                                     self.assertEqual(totals['critical'], len(syntax_sites), payload)
                                     self.assertEqual(totals['warning'], 0, payload)
+                                    failure = (next(row for row in payload['failed_modules']
+                                                    if row['language'] == 'python') if meta else payload)
+                                    self.assertEqual(failure['module_error'], 'ANALYSIS_INCOMPLETE', payload)
+                                    if not meta:
+                                        self.assertEqual(failure['error'], 'analysis', payload)
                             if case.name.startswith('literal_next_'):
                                 # Refusing later dynamic execution must retain
                                 # the already observed command-injection sink.

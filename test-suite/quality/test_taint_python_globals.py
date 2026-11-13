@@ -1130,6 +1130,74 @@ class GlobalWriteCliTests(unittest.TestCase):
         ]
         self.assert_cli_cases(cases)
 
+    def test_join_captured_producers_module_and_runner_json_sarif(self):
+        cases = [
+            Case('join_bound_receiver_stays_incomplete', """
+                code = 'fixed'
+                class Owned:
+                    def __del__(self):
+                        global code
+                        code = input()
+                def render():
+                    owned = Owned()
+                    return '|'
+                consume = render().join
+                consume(part for part in ['a', 'b'])
+                eval(code)
+                """),
+            Case('join_parameter_receiver_stays_incomplete', """
+                code = 'fixed'
+                class Owned:
+                    def __del__(self):
+                        global code
+                        code = input()
+                def render():
+                    owned = Owned()
+                    return '|'
+                def consume(separator):
+                    return separator.join(part for part in ['a', 'b'])
+                consume(render())
+                eval(code)
+                """),
+            Case('join_inline_protocol_stays_incomplete', """
+                code = 'fixed'
+                class Opaque:
+                    def __format__(self, spec):
+                        global code
+                        code = input()
+                        return '|'
+                f'{Opaque()}'.join(part for part in ['a', 'b'])
+                eval(code)
+                """),
+            Case('join_custom_consumer_stays_incomplete', """
+                class Separator(str):
+                    def join(self, values):
+                        return input()
+                result = Separator('|').join(part for part in ['a', 'b'])
+                eval(result)
+                """),
+            Case('join_native_bound_receiver_keeps_source', """
+                def method(value):
+                    return value.join
+                separator = {'value': input()}.get('value')[:]
+                consume = method(str(separator) + '')
+                separator = '|'
+                result = consume(part for part in ['a', 'b'])
+                eval(result) # expect:eval
+                """),
+            Case('join_native_bound_receiver_keeps_clean_capture', """
+                def render():
+                    return '|'
+                def factory():
+                    return render().join
+                consume = factory()
+                separator = input()
+                result = consume(part for part in ['a', 'b'])
+                eval(result)
+                """),
+        ]
+        self.assert_cli_cases(cases)
+
     def test_join_binding_producers_module_and_runner_json_sarif(self):
         cases = [
             Case('join_binding_alias_stays_incomplete', """
@@ -1202,6 +1270,10 @@ class GlobalWriteCliTests(unittest.TestCase):
                                        'private_next_boolean_helper_stays_incomplete',
                                        'join_receiver_helper_finalizer_stays_incomplete',
                                        'join_receiver_opaque_prompt_stays_incomplete',
+                                       'join_bound_receiver_stays_incomplete',
+                                       'join_parameter_receiver_stays_incomplete',
+                                       'join_inline_protocol_stays_incomplete',
+                                       'join_custom_consumer_stays_incomplete',
                                        'join_binding_alias_stays_incomplete',
                                        'join_binding_helper_stays_incomplete'}
             # The full scanner also warns about eval syntax independently of
@@ -1291,8 +1363,10 @@ class GlobalWriteCliTests(unittest.TestCase):
                                     actual.extend(sites)
                         if incomplete:
                             diagnostic = ('foreign module global write' if case.name == 'foreign_module_write'
+                                          else 'generator join consumer identity is unresolved'
+                                          if case.name == 'join_custom_consumer_stays_incomplete'
                                           else 'generator join receiver producer effects are unresolved'
-                                          if case.name.startswith(('join_receiver_', 'join_binding_'))
+                                          if case.name.startswith('join_')
                                           else 'generator next borrowed value producer effects are unresolved'
                                           if case.name.startswith('private_next_')
                                           else 'generator materialization reads an opaque operand'

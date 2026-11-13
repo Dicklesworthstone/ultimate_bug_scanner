@@ -2481,6 +2481,272 @@ class FormattedStringCompletionTests(SourceTest):
                 with self.subTest(receiver=receiver, scope=scope, setup=setup):
                     self.assert_native(source, [expected])
 
+    def test_captured_native_join_keeps_stdin_provenance(self):
+        for setup, invocation in (
+                ("consume = '|'.join\n", 'consume(stream)'),
+                ("separator = '|'\nconsume = separator.join\nseparator = 'replacement'\n", 'consume(stream)'),
+                ("def method(separator):\n    return separator.join\nconsume = method('|')\n", 'consume(stream)'),
+                ('def consume(joiner, values):\n    return joiner(values)\n', "consume('|'.join, stream)")):
+            for stream, expected in (('sys.stdin', '|'.join(['UNTRUSTED\n'] * 16)),
+                                      ('sys.stdin.read(0)', '')):
+                with self.subTest(setup=setup, stream=stream):
+                    self.assert_native('import sys\n' + setup + f'stream = {stream}\n'
+                                       + f'eval({invocation})\n', [expected])
+        self.assert_native('''
+            import sys
+            class Fixed:
+                def join(self, values):
+                    return 'fixed'
+            consume = Fixed().join
+            eval(consume(sys.stdin))
+        ''', ['fixed'])
+
+    def test_generator_join_bound_receivers_keep_producer_effects(self):
+        prefix = ("code = 'fixed'\nclass Owned:\n"
+                  + '    def __del__(self):\n        global code\n        code = input()\n'
+                  + "def render():\n    owned = Owned()\n    return '|'\n"
+                  + 'def identity(value):\n    return value\n'
+                  + 'def method(value):\n    return value.join\n')
+        for setup, consumer in (
+                ('separator = render()\nconsume = separator.join\n', 'consume'),
+                ('consume = render().join\nalias = consume\n', 'alias'),
+                ('consume = identity(render().join)\n', 'consume'),
+                ('consume = method(render())\n', 'consume')):
+            for scope in ('module', 'private'):
+                body = setup + f"{consumer}(part for part in ['a', 'b'])\neval(code)\n"
+                source = prefix + (body if scope == 'module'
+                                   else 'def run():\n' + textwrap.indent(body, '    ') + 'run()\n')
+                with self.subTest(consumer=consumer, setup=setup, scope=scope):
+                    self.assert_native(source, ['UNTRUSTED'], incomplete=True)
+
+    def test_generator_join_helper_receivers_keep_producer_effects(self):
+        prefix = ("code = 'fixed'\nclass Owned:\n"
+                  + '    def __del__(self):\n        global code\n        code = input()\n'
+                  + "def render():\n    owned = Owned()\n    return '|'\n")
+        for parameter, argument in (('separator', 'render()'), ('consume', 'render().join')):
+            invocation = 'separator.join' if parameter == 'separator' else 'consume'
+            source = (prefix + f'def run({parameter}):\n'
+                      + f"    {invocation}(part for part in ['a', 'b'])\n    eval(code)\n"
+                      + f'run({argument})\n')
+            with self.subTest(parameter=parameter):
+                self.assert_native(source, ['UNTRUSTED'], incomplete=True)
+
+    def test_generator_join_transformed_receivers_keep_producer_effects(self):
+        prefix = ("code = 'fixed'\nclass Owned:\n"
+                  + '    def __del__(self):\n        global code\n        code = input()\n'
+                  + "def render():\n    owned = Owned()\n    return '|'\n")
+        for expression in ("{'separator': render()}['separator']", '[render()][0]',
+                           'render()[:]', 'str(render())', "render() + ''", "f'{render()}'",
+                           "{'separator': render()}.get('separator')",
+                           "render().replace('|', ':')"):
+            source = (prefix + f'separator = {expression}\n'
+                      + "separator.join(part for part in ['a', 'b'])\neval(code)\n")
+            with self.subTest(expression=expression):
+                self.assert_native(source, ['UNTRUSTED'], incomplete=True)
+
+    def test_generator_join_inline_protocol_receivers_keep_producer_effects(self):
+        prefix = ("code = 'fixed'\nclass Opaque:\n"
+                  + '    def __str__(self):\n        global code\n        code = input()\n'
+                  + "        return '|'\n"
+                  + '    def __format__(self, spec):\n        global code\n        code = input()\n'
+                  + "        return '|'\n")
+        for receiver in ("f'{Opaque()}'", 'str(Opaque())', 'input(Opaque())',
+                          "f'{input(Opaque())}'", "str(Opaque()) + ''", "f'{Opaque()}'[:]",
+                          "('prefix' + f'{Opaque()}')", "f'{Opaque()}'.replace('|', ':')"):
+            for setup, consumer in (('', f'({receiver}).join'),
+                                    (f'consume = ({receiver}).join\n', 'consume')):
+                source = prefix + setup + f"{consumer}(part for part in ['a', 'b'])\neval(code)\n"
+                with self.subTest(receiver=receiver, consumer=consumer):
+                    self.assert_native(source, ['UNTRUSTED'], incomplete=True)
+
+    def test_generator_join_captures_receiver_before_later_arguments(self):
+        for original, replacement, expected in (("'|'", 'input()', 'a|b'),
+                                                 ('input()', "'|'", 'aUNTRUSTEDb')):
+            for bound in (False, True):
+                prefix = (f'separator = {original}\n'
+                          + 'def values():\n    global separator\n'
+                          + f"    separator = {replacement}\n    return ['a', 'b']\n")
+                setup = 'consume = separator.join\n' if bound else ''
+                call = 'consume' if bound else 'separator.join'
+                source = prefix + setup + f'eval({call}(part for part in values()))\n'
+                with self.subTest(original=original, bound=bound):
+                    self.assert_native(source, [expected])
+
+    def test_generator_join_native_leaf_factories_and_defaults_stay_exact(self):
+        self.assert_native('''
+            def render():
+                return '|'
+            def factory():
+                return render().join
+            consume = factory()
+            eval(consume(part for part in ['a', 'b']))
+        ''', ['a|b'])
+        for value, expected in (("'|'", 'a|b'), ('input()', 'aUNTRUSTEDb')):
+            self.assert_native('def consume(separator):\n'
+                               + "    return separator.join(part for part in ['a', 'b'])\n"
+                               + f'eval(consume({value}))\n', [expected])
+        for declaration, call in (("def run(separator='|'):", 'run()'),
+                                   ('def run(*, separator):', "run(separator='|')"),
+                                   ('def run(separator, /):', "run('|')")):
+            self.assert_native(declaration + "\n    eval(separator.join(part for part in ['a', 'b']))\n"
+                               + call + '\n', ['a|b'])
+        self.assert_native('''
+            code = 'fixed'
+            class Owned:
+                def __del__(self):
+                    global code
+                    code = input()
+            def factory():
+                owned = Owned()
+                return '|'.join
+            consume = factory()
+            consume(part for part in ['a', 'b'])
+            eval(code)
+        ''', ['UNTRUSTED'], incomplete=True)
+
+    def test_generator_join_literal_mapping_get_keeps_selected_values_and_effects(self):
+        for expression, expected in (
+                ("{'value': '|'}.get('value', input())", 'a|b'),
+                ("{'value': input()}.get('missing', '|')", 'a|b'),
+                ("{'value': input()}.get('value')", 'aUNTRUSTEDb'),
+                ("{}.get('missing', input())", 'aUNTRUSTEDb')):
+            with self.subTest(expression=expression):
+                self.assert_native(f'consume = ({expression}).join\n'
+                                   + "eval(consume(part for part in ['a', 'b']))\n", [expected])
+        for expression in ("{'value': '|'}.get('value', Owned())",
+                           "{'value': render()}.get('missing', '|')"):
+            with self.subTest(expression=expression):
+                source = ("code = 'fixed'\nclass Owned:\n"
+                          + '    def __del__(self):\n        global code\n        code = input()\n'
+                          + "def render():\n    owned = Owned()\n    return '|'\n"
+                          + f'consume = ({expression}).join\n'
+                          + "consume(part for part in ['a', 'b'])\neval(code)\n")
+                self.assert_native(source, ['UNTRUSTED'], incomplete=True)
+
+    def test_generator_join_native_methods_and_transformations_stay_exact(self):
+        helpers = ('def identity(value):\n    return value\n'
+                   + 'def method(value):\n    return value.join\n')
+        for value, expected in (("'|'", 'a|b'), ('input()', 'aUNTRUSTEDb')):
+            for expression in ('separator', "{'separator': separator}['separator']",
+                               "{'separator': separator}.get('separator')",
+                               '[separator][0]', 'separator[:]', 'str(separator)',
+                               "separator + ''", "separator.replace('unused', ':')"):
+                for consumer in (f'({expression}).join', f'identity(({expression}).join)',
+                                 f'method({expression})'):
+                    source = (helpers + f'separator = {value}\nconsume = {consumer}\n'
+                              + "result = consume(part for part in ['a', 'b'])\neval(result)\n")
+                    with self.subTest(value=value, consumer=consumer):
+                        self.assert_native(source, [expected])
+            for parameter, argument, invocation in (
+                    ('separator', value, 'separator.join'),
+                    ('consume', value + '.join', 'consume')):
+                source = (f'def run({parameter}):\n'
+                          + f"    result = {invocation}(part for part in ['a', 'b'])\n    eval(result)\n"
+                          + f'run({argument})\n')
+                with self.subTest(value=value, parameter=parameter):
+                    self.assert_native(source, [expected])
+
+    def test_generator_join_custom_methods_do_not_acquire_native_identity(self):
+        for base in ('object', 'str'):
+            source = (f'class Separator({base}):\n'
+                      + '    def join(self, values):\n        return input()\n'
+                      + "separator = Separator()\nresult = separator.join(part for part in ['a', 'b'])\n"
+                      + 'eval(result)\n')
+            with self.subTest(base=base):
+                self.assert_native(source, ['UNTRUSTED'], incomplete=True)
+
+    def test_generator_join_resolved_local_methods_keep_their_return_summaries(self):
+        for descriptor, receiver in (('staticmethod', ''), ('classmethod', 'cls, ')):
+            for result, expected in (("'fixed'", 'fixed'), ('input()', 'UNTRUSTED')):
+                source = ('class Consumer:\n'
+                          + f'    @{descriptor}\n    def join({receiver}parts):\n        return {result}\n'
+                          + "eval(Consumer.join(input() for unused in ['unused']))\n")
+                with self.subTest(descriptor=descriptor, result=result):
+                    self.assert_native(source, [expected])
+
+    def test_generator_join_nested_literal_leaf_keeps_producer_authority(self):
+        self.assert_native('''
+            code = 'fixed'
+            def piece():
+                return 'a'
+            def separator():
+                return '|'.join(piece() for unused in [1])
+            separator().join(part for part in ['a', 'b'])
+            eval(code)
+        ''', ['fixed'])
+        self.assert_native('''
+            code = 'fixed'
+            class Owned:
+                def __del__(self):
+                    global code
+                    code = input()
+            def piece():
+                owned = Owned()
+                return 'a'
+            def separator():
+                return '|'.join(piece() for unused in [1])
+            separator().join(part for part in ['a', 'b'])
+            eval(code)
+        ''', ['UNTRUSTED'], incomplete=True)
+
+    def test_generator_join_selected_literal_instance_keeps_effect_boundaries(self):
+        declaration = ('class Custom:\n'
+                       + "    def join(self, values):\n        return 'custom'\n")
+        for capture in ('consume = Custom().join', 'value = Custom()\nconsume = value.join'):
+            with self.subTest(capture=capture):
+                self.assert_native(declaration + capture + '\n'
+                                   + "eval(consume(input() for unused in ['unused']))\n", ['custom'])
+        owned = ("code = 'fixed'\nclass Owned:\n"
+                 + '    def __del__(self):\n        global code\n        code = input()\n')
+        for body in (
+                "value = Custom()\nvalue.owned = Owned()\nconsume = value.join\n"
+                + "consume(part for part in ['a', 'b'])\ndel value, consume\neval(code)\n",
+                'def values():\n    owned = Owned()\n    return [1]\n'
+                + 'Custom().join(input() for unused in values())\neval(code)\n'):
+            with self.subTest(body=body):
+                self.assert_native(owned + declaration + body, ['UNTRUSTED'], incomplete=True)
+        self.assert_native(declaration
+                           + 'Custom.join = lambda self, values: input()\n'
+                           + "eval(Custom().join(part for part in ['a', 'b']))\n",
+                           ['UNTRUSTED'], incomplete=True)
+
+    def test_generator_join_literal_proofs_reject_replaced_execution_authority(self):
+        # assert_native runs each witness in its own subprocess. Replacing
+        # __build_class__ cannot alter test harness classes or later cases.
+        self.assert_native('''
+            import builtins
+            class Evil:
+                def join(self, values):
+                    return input()
+            def build(*args, **kwargs):
+                return Evil
+            builtins.__build_class__ = build
+            class Custom:
+                def join(self, values):
+                    return 'custom'
+            eval(Custom().join(part for part in ['a']))
+        ''', ['UNTRUSTED'], incomplete=True)
+        for replacement in ("'piece.__code__ = dirty.__code__'",
+                             "'piece.__code__ = ' + 'dirty.__code__'"):
+            with self.subTest(replacement=replacement):
+                self.assert_native(
+                    "code = 'fixed'\ndef piece():\n    return 'a'\n"
+                    + 'def dirty():\n    global code\n    code = input()\n    return "a"\n'
+                    + f'exec({replacement})\n'
+                    + "def separator():\n    return '|'.join(piece() for unused in [1])\n"
+                    + "separator().join(part for part in ['a', 'b'])\neval(code)\n",
+                    ['UNTRUSTED'], incomplete=True)
+        self.assert_native('''
+            from unittest.mock import patch
+            class Custom:
+                def join(self, values):
+                    return 'custom'
+            def dirty(self, values):
+                return input()
+            patch.object(Custom.join, '__code__', dirty.__code__).start()
+            eval(Custom().join(part for part in ['a']))
+        ''', ['UNTRUSTED'], incomplete=True)
+
     def test_bound_join_aliases_retain_receiver_producer_effects(self):
         prefix = ("code = 'fixed'\nclass Owned:\n"
                   + '    def __del__(self):\n        global code\n        code = input()\n'

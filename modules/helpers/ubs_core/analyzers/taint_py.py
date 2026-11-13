@@ -342,6 +342,9 @@ class _BoundCallable:
     namespace_proven: bool = False
     # Capturing a method must not discard an unresolved receiver producer.
     producer_unproved: bool = False
+    # Native method identity and producer authority belong to the captured
+    # receiver; a method-name suffix proves neither.
+    receiver_binding: object = None
 
 
 @dataclass(frozen=True)
@@ -380,13 +383,25 @@ class _LiteralString:
 
 
 @dataclass(frozen=True)
+class _LiteralJoinInstance:
+    """A closed, inert local class whose sole method returns one string."""
+    owner: ast.ClassDef
+    result: str
+    format_safe: bool = True
+
+
+@dataclass(frozen=True)
 class _LiteralMapping:
-    """An exact builtin dict created solely from immutable scalar literals.
+    """An exact builtin dict with literal keys and immutable scalar values.
 
     The finite marker proves that selecting a key does not copy that key into
     the returned value. Writes or opaque escapes revoke this contract; it is
     never inferred from a name, annotation or an arbitrary get() method.
     """
+    # Facts remain in the existing mapping heap. This finite type marker
+    # retains producer authority without building a growing object graph.
+    value_binding: object = None
+    keys: frozenset | None = None
 
 
 _LITERAL_MAPPING_GET = '@literal-mapping.get'
@@ -901,6 +916,7 @@ def _analysis_comparison_steps(a, b, evidence):
     if isinstance(a, _BoundCallable):
         return (type(a) is type(b) and a.name == b.name and a.references == b.references
                 and a.producer_unproved == b.producer_unproved
+                and (yield (a.receiver_binding, b.receiver_binding, evidence))
                 and (yield (a.receiver, b.receiver, evidence)))
     if isinstance(a, _BoundClassMethod):
         return (type(a) is type(b) and (yield (a.function, b.function, evidence))
@@ -986,7 +1002,7 @@ def _without_object_contract(binding):
         raise AnalysisLimit('mutated functools.partial object; analysis is incomplete')
     choices = []
     for value in _binding_choices(binding):
-        if isinstance(value, (_ArgumentVector, _LiteralMapping, _ProcessInput, ast.ClassDef)):
+        if isinstance(value, (_ArgumentVector, _LiteralMapping, _LiteralJoinInstance, _ProcessInput, ast.ClassDef)):
             value = None
         elif isinstance(value, _BoundCallable) and value.name == _LITERAL_MAPPING_GET:
             value = _BoundCallable('<object>.get', value.references, value.receiver,
@@ -2306,11 +2322,12 @@ class _Flow:
             self.mutations[ref] = join_facts(self.mutations.get(ref, CLEAN), fact)
 
     def escape_literal_mapping(self, binding, references, state):
-        """Heap aggregates do not retain a nested mapping's ownership graph."""
+        """Heap aggregates do not retain these finite object contracts."""
         for value in _binding_choices(binding):
-            if isinstance(value, _LiteralMapping):
+            if isinstance(value, (_LiteralMapping, _LiteralJoinInstance)):
                 self.mutate(references, CLEAN, state)
-            elif isinstance(value, _BoundCallable) and value.name == _LITERAL_MAPPING_GET:
+            elif isinstance(value, _BoundCallable) and (
+                    value.name == _LITERAL_MAPPING_GET or isinstance(value.receiver_binding, _LiteralJoinInstance)):
                 self.mutate(value.references, CLEAN, state)
 
     def literal_mapping_contents(self, fact, references, state):
@@ -2330,6 +2347,24 @@ class _Flow:
         # contexts rather than assuming every request-derived object is str.
         self.require_value(self.expression_bindings.get(node))
         return self.materialized_generator_hashable(node, state)
+
+    def literal_mapping_presence(self, mapping, node):
+        """Separate a present literal key from get()'s missing-key default."""
+        choices = _binding_choices(self.expression_bindings.get(node))
+        self.engine.budget.spend(len(choices))
+        if mapping.keys is None or not choices:
+            return None
+        present = set()
+        for key in choices:
+            if isinstance(key, _LiteralString):
+                key = key.value
+            elif isinstance(key, ast.Constant) and type(key.value) in {
+                    str, bytes, int, float, complex, bool, type(None)}:
+                key = key.value
+            else:
+                return None
+            present.add(key in mapping.keys)
+        return next(iter(present)) if len(present) == 1 else None
 
     def effect(self, kind, node, label, fact):
         unsafe = frozenset(trace for trace in fact if not _safe_for(trace, kind, label))
@@ -2678,28 +2713,21 @@ class _Flow:
                 or consumer.keywords or self.class_environments or self.engine.generator_namespace_exposed
                 or self.engine.generator_frame_exposed):
             return False
-        method = consumer.func
-        choices = _binding_choices(self.expression_bindings.get(method))
+        choices = _binding_choices(self.expression_bindings.get(consumer.func))
         if any(isinstance(value, _BoundCallable) and value.producer_unproved for value in choices):
             # The receiver was captured when the bound method was created.
             # A later alias, helper parameter or receiver reassignment cannot
             # repair its producer's unresolved effects.
             raise AnalysisLimit('generator join receiver producer effects are unresolved; '
                                 'analysis is incomplete')
-        if isinstance(method, ast.Attribute) and method.attr == 'join':
-            receiver = _binding_choices(self.expression_bindings.get(method.value))
-            if any(isinstance(value, _UnprovedProducer)
-                   or isinstance(value, (_LiteralString, _GeneratorString)) and not value.format_safe
-                   for value in receiver):
-                # Native string identity proves how join consumes its input,
-                # not the effects of producing that receiver. A helper may
-                # release an owned finalizer or input may format an opaque
-                # prompt before returning an exact builtin string. Preserve
-                # the same obligation carried through aliases and next().
-                raise AnalysisLimit('generator join receiver producer effects are unresolved; '
-                                    'analysis is incomplete')
-        string_join = (isinstance(method, ast.Attribute) and method.attr == 'join'
-                       and self.materialized_generator_string(method.value, state))
+        for target in choices:
+            if isinstance(target, _BoundCallable) and target.name.rsplit('.', 1)[-1] == 'join':
+                if self.unproved_producer(target.receiver_binding):
+                    raise AnalysisLimit('generator join receiver producer effects are unresolved; '
+                                        'analysis is incomplete')
+        string_join = bool(choices) and all(
+            isinstance(target, _BoundCallable) and target.name.rsplit('.', 1)[-1] == 'join'
+            and self.native_string_binding(target.receiver_binding) for target in choices)
         if string_join:
             # A bound method of an already evaluated, exact builtin string
             # exhausts its sole argument synchronously. A name ending in
@@ -2720,11 +2748,123 @@ class _Flow:
                     # ordered consumption and explicit short-circuit exits.
                     return False
         if not self.generator_consumer_stable(consumer, names):
-            return False
+            # Captured native strings and literal identity generators have
+            # no namespace lookup or user protocol that a later eval can
+            # replace in the enclosing caller.
+            if not (string_join and self.literal_join_generator(node, state.bindings.get, consumer)):
+                return False
         return 'str.join' if string_join else next(iter(names)) if names <= {'any', 'all'} else 'collection'
 
-    def generator_consumer_stable(self, consumer, names):
+    def literal_leaf_return(self, function):
+        """Prove one selected zero-argument leaf without interpreting calls."""
+        self.engine.budget.spend()
+        function = function.function if isinstance(function, _FunctionValue) else function
+        if (not isinstance(function, ast.FunctionDef) or self.engine.owner(function) is not self.engine
+                or function.decorator_list or function.returns is not None
+                or not self.engine.generator_helper_identity(function)
+                or function.args.posonlyargs or function.args.args or function.args.kwonlyargs
+                or function.args.vararg or function.args.kwarg
+                or len(function.body) != 1 or not isinstance(function.body[0], ast.Return)):
+            return None
+        value = function.body[0].value
+        return value if isinstance(value, ast.Constant) and type(value.value) in {
+            str, bytes, int, float, complex, bool, type(None)} else None
+
+    def literal_join_generator(self, node, lookup, consumer):
+        """A finite primitive iterator and one callback-free string element."""
+        self.engine.budget.spend()
+        if len(node.generators) != 1:
+            return False
+        first = node.generators[0]
+        if (first.ifs or first.is_async or not isinstance(first.target, ast.Name)
+                or not isinstance(first.iter, (ast.List, ast.Tuple))
+                or not all(isinstance(value, ast.Constant) and type(value.value) in {
+                    str, bytes, int, float, complex, bool, type(None)} for value in first.iter.elts)):
+            return False
+        element = node.elt
+        if isinstance(element, ast.Name):
+            return (element.id == first.target.id
+                    and all(type(value.value) is str for value in first.iter.elts))
+        if isinstance(element, ast.Constant):
+            return type(element.value) is str
+        if (isinstance(element, ast.Call) and isinstance(element.func, ast.Name)
+                and element.func.id != first.target.id and not element.args and not element.keywords):
+            if (not self.generator_consumer_stable(consumer, set())
+                    and not self.literal_join_later_caller(consumer)):
+                return False
+            returned = self.literal_leaf_return(lookup(element.func.id))
+            return returned is not None and type(returned.value) is str
+        return False
+
+    def literal_join_later_caller(self, consumer):
+        """A sole-return helper is consumed before its module's later eval.
+
+        Literal iterator elements need no callable authority. A leaf callback
+        does: prior exec, metadata exposure or an unproved caller must not be
+        bypassed merely because its old function body returned a literal.
+        """
+        scope = self.scope
+        if (not isinstance(scope, ast.FunctionDef) or self.engine.enclosing(scope) is not self.engine.tree
+                or scope.decorator_list or scope.returns is not None
+                or scope.args.posonlyargs or scope.args.args or scope.args.kwonlyargs
+                or scope.args.vararg or scope.args.kwarg
+                or len(scope.body) != 1 or not isinstance(scope.body[0], ast.Return)
+                or scope.body[0].value is not consumer or not self.engine.generator_helper_identity(scope)):
+            return False
+        found = False
+        for reference, parent in self.engine.parents.items():
+            self.engine.budget.spend()
+            if not isinstance(reference, ast.Name) or reference.id != scope.name:
+                continue
+            if (not isinstance(reference.ctx, ast.Load) or not isinstance(parent, ast.Call)
+                    or parent.func is not reference or self.engine.enclosing(parent) is not self.engine.tree
+                    or not self.generator_consumer_stable(parent, set(), scope=self.engine.tree)):
+                return False
+            found = True
+        return found
+
+    def literal_join_instance(self, node, target, state):
+        """Select an inert instance method without guessing an object type."""
+        self.engine.budget.spend()
+        if (not isinstance(node, ast.Call) or node.args or node.keywords
+                or not isinstance(target, ast.ClassDef) or self.engine.owner(target) is not self.engine
+                or target.bases or target.keywords or target.decorator_list or len(target.body) != 1
+                or not self.generator_builtins_stable()
+                or not self.generator_consumer_stable(node, {
+                    'join', '__new__', '__init__', '__del__', '__class__', '__bases__',
+                    '__getattribute__', '__code__', '__defaults__', '__kwdefaults__'})):
+            return None
+        method = target.body[0]
+        if (not isinstance(method, ast.FunctionDef) or method.name != 'join'
+                or method.decorator_list or method.returns is not None
+                or len(method.body) != 1 or not isinstance(method.body[0], ast.Return)):
+            return None
+        signature = method.args
+        positional = [*signature.posonlyargs, *signature.args]
+        if (len(positional) != 2 or signature.kwonlyargs or signature.vararg or signature.kwarg
+                or signature.defaults or any(argument.annotation is not None for argument in positional)):
+            return None
+        returned = method.body[0].value
+        if not isinstance(returned, ast.Constant) or type(returned.value) is not str:
+            return None
+        for reference, parent in self.engine.parents.items():
+            self.engine.budget.spend()
+            if isinstance(reference, ast.Name) and reference.id == target.name and (
+                    not isinstance(reference.ctx, ast.Load) or not isinstance(parent, ast.Call)
+                    or parent.func is not reference):
+                # A class/member handed to opaque code can have its method
+                # metadata replaced without a local attribute Store node.
+                return None
+        members = self.engine.class_members.get(target, {})
+        if self.engine.reads is not None:
+            self.engine.reads[('class_members', target)] = members
+        selected = members.get('join')
+        selected = selected.function if isinstance(selected, _FunctionValue) else selected
+        return _LiteralJoinInstance(target, returned.value) if selected is method else None
+
+    def generator_consumer_stable(self, consumer, names, *, scope=None):
         """Require native consumer identities without exposed execution state."""
+        scope = self.scope if scope is None else scope
         if (self.class_environments or self.engine.generator_namespace_exposed
                 or self.engine.generator_frame_exposed):
             return False
@@ -2748,7 +2888,7 @@ class _Flow:
                 spelling = capability.id if isinstance(capability, ast.Name) else capability.attr
                 if (engine is not self.engine or spelling == 'exec'
                         or not isinstance(call, ast.Call) or call.func is not capability
-                        or self.engine.enclosing(call) is not self.scope
+                        or self.engine.enclosing(call) is not scope
                         or call.lineno <= consumer.end_lineno and call not in enclosing_calls):
                     return False
         return True
@@ -2901,12 +3041,24 @@ class _Flow:
     def materialized_generator_string(self, node, state):
         """Require the evaluated value to be an exact, callback-free string."""
         references = self.expression_references.get(node, NO_REFERENCES)
-        choices = _binding_choices(self.expression_bindings.get(node))
+        binding = self.expression_bindings.get(node)
+        choices = _binding_choices(binding)
         self.engine.budget.spend(1 + len(choices))
         return (not references & state.mutated and bool(choices)
-                and all(isinstance(value, (_LiteralString, _GeneratorString))
-                        or isinstance(value, ast.Constant) and type(value.value) is str
-                        for value in choices))
+                and self.native_string_binding(binding))
+
+    @staticmethod
+    def native_string_binding(binding):
+        choices = _binding_choices(binding)
+        return bool(choices) and all(
+            isinstance(value, (_LiteralString, _GeneratorString))
+            or isinstance(value, ast.Constant) and type(value.value) is str for value in choices)
+
+    @staticmethod
+    def unproved_producer(binding):
+        return any(isinstance(value, _UnprovedProducer)
+                   or isinstance(value, (_LiteralString, _GeneratorString, _LiteralJoinInstance)) and not value.format_safe
+                   for value in _binding_choices(binding))
 
     @staticmethod
     def formatted_string_scalar(value):
@@ -2967,6 +3119,14 @@ class _Flow:
             elif isinstance(value, _ArgumentVector):
                 value = _ArgumentVector(tuple((self.without_format_authority(operand), fact)
                                               for operand, fact in value.operands), value.references)
+            elif isinstance(value, _LiteralMapping):
+                value = _LiteralMapping(self.without_format_authority(value.value_binding)
+                                        if value.value_binding is not None else _UnprovedProducer(), value.keys)
+            elif isinstance(value, _LiteralJoinInstance):
+                value = _LiteralJoinInstance(value.owner, value.result, False)
+            elif isinstance(value, _BoundCallable) and value.receiver_binding is not None:
+                value = _BoundCallable(value.name, value.references, value.receiver, value.namespace_proven,
+                                       True, self.without_format_authority(value.receiver_binding))
             choices.append(value)
         return _join_bindings(*choices)
 
@@ -3059,6 +3219,13 @@ class _Flow:
                     self.materialized_generator_binding(operand, value.references_at(index), state)
                     for index, (operand, _fact) in enumerate(value.operands)):
                 continue
+            if isinstance(value, _LiteralMapping) and not self.unproved_producer(value.value_binding):
+                continue
+            if isinstance(value, _LiteralJoinInstance) and value.format_safe:
+                continue
+            if (isinstance(value, _BoundCallable) and self.native_string_binding(value.receiver_binding)
+                    and not value.producer_unproved and not self.unproved_producer(value.receiver_binding)):
+                continue
             return False
         return True
 
@@ -3074,7 +3241,7 @@ class _Flow:
         if isinstance(node, ast.Constant):
             return type(node.value) in {str, bytes, int, float, complex, bool, type(None)}
         choices = _binding_choices(self.expression_bindings.get(node))
-        return (not any(isinstance(value, _ArgumentVector) for value in choices)
+        return (not any(isinstance(value, (_ArgumentVector, _LiteralMapping)) for value in choices)
                 and self.materialized_generator_binding(self.expression_bindings.get(node),
                     self.expression_references.get(node, NO_REFERENCES), state))
 
@@ -3152,12 +3319,29 @@ class _Flow:
                 return None
             return contents.binding
 
+        def literal_call(expression):
+            # A zero-argument leaf with one literal return has no owned local,
+            # callback or suspended frame. It can supply a bound method to a
+            # factory without recursively interpreting arbitrary helpers.
+            self.engine.budget.spend()
+            if (not isinstance(expression, ast.Call) or not isinstance(expression.func, ast.Name)
+                    or expression.args or expression.keywords):
+                return None
+            return self.literal_leaf_return(lookup(expression.func.id))
+
         def primitive(expression):
             self.engine.budget.spend()
             if isinstance(expression, ast.Constant):
                 return type(expression.value) in {str, bytes, int, float, complex, bool, type(None)}
             if isinstance(expression, ast.Name):
                 return self.materialized_generator_binding(lookup(expression.id), NO_REFERENCES, state)
+            if isinstance(expression, ast.Attribute) and expression.attr in {
+                    'join', 'strip', 'lstrip', 'rstrip', 'lower', 'upper',
+                    'capitalize', 'casefold', 'swapcase', 'title', 'replace'}:
+                value = (lookup(expression.value.id) if isinstance(expression.value, ast.Name)
+                         else expression.value if isinstance(expression.value, ast.Constant)
+                         else literal_call(expression.value))
+                return self.native_string_binding(value) and not self.unproved_producer(value)
             if isinstance(expression, (ast.Tuple, ast.List)):
                 return all(primitive(item) for item in expression.elts)
             if isinstance(expression, ast.Set):
@@ -3165,12 +3349,17 @@ class _Flow:
             if isinstance(expression, ast.Dict):
                 return all(key is not None and hashable(key) and primitive(value)
                            for key, value in zip(expression.keys, expression.values))
+            if (isinstance(expression, ast.Call) and isinstance(expression.func, ast.Attribute)
+                    and expression.func.attr == 'join' and primitive(expression.func)
+                    and len(expression.args) == 1 and not expression.keywords
+                    and isinstance(expression.args[0], ast.GeneratorExp)):
+                return self.literal_join_generator(expression.args[0], lookup, node)
             if (isinstance(expression, ast.Call) and isinstance(expression.func, ast.Name)
                     and lookup(expression.func.id) in ('input', 'builtins.input')
                     and not expression.keywords and len(expression.args) <= 1
                     and self.generator_builtins_stable()):
                 return all(prompt(argument) for argument in expression.args)
-            return False
+            return literal_call(expression) is not None
 
         def prompt(expression):
             self.engine.budget.spend()
@@ -3193,7 +3382,8 @@ class _Flow:
             if isinstance(expression, (ast.List, ast.Set, ast.Dict)):
                 return False
             if isinstance(expression, ast.Name) and any(
-                    isinstance(value, _ArgumentVector) for value in _binding_choices(lookup(expression.id))):
+                    isinstance(value, (_ArgumentVector, _LiteralMapping))
+                    for value in _binding_choices(lookup(expression.id))):
                 return False
             return primitive(expression)
 
@@ -3682,7 +3872,7 @@ class _Flow:
                                           value.receiver, value.valid)
             elif isinstance(value, _BoundCallable) and map_objects is not None:
                 value = _BoundCallable(value.name, map_objects(value.references), value.receiver,
-                                       value.namespace_proven, value.producer_unproved)
+                                       value.namespace_proven, value.producer_unproved, value.receiver_binding)
             elif isinstance(value, _ArgumentVector) and map_objects is not None:
                 value = _ArgumentVector(value.operands, tuple(map_objects(refs) for refs in value.references))
             elif isinstance(value, (_FunctionValue, _DeferredCall)):
@@ -4162,10 +4352,16 @@ class _Flow:
         consumer = name if native else None
         builtins_consumer = consumer in {'iter', 'list', 'tuple', 'next',
                                         'builtins.iter', 'builtins.list', 'builtins.tuple', 'builtins.next'}
-        string_join = (isinstance(node.func, ast.Attribute) and node.func.attr == 'join'
-                       and self.materialized_generator_string(node.func.value, state))
-        join_receiver = (self.expression_bindings.get(node.func.value)
+        bound_join = isinstance(target, _BoundCallable) and name.rsplit('.', 1)[-1] == 'join'
+        join_receiver = (target.receiver_binding if bound_join and target.receiver_binding is not None
+                         else self.expression_bindings.get(node.func.value)
                          if isinstance(node.func, ast.Attribute) and node.func.attr == 'join' else None)
+        # Saved and helper-bound methods retain the same exact native string
+        # receiver as a direct attribute call. The suffix alone still grants
+        # no consumption contract to an unrelated custom join method.
+        string_join = (bound_join and self.native_string_binding(join_receiver)
+                       or isinstance(node.func, ast.Attribute) and node.func.attr == 'join'
+                       and self.materialized_generator_string(node.func.value, state))
         bytes_join = (bool(_binding_choices(join_receiver)) and all(
             isinstance(value, ast.Constant) and type(value.value) is bytes
             for value in _binding_choices(join_receiver)))
@@ -4904,8 +5100,11 @@ class _Flow:
             elif isinstance(target, _BoundCallable):
                 actual = frozenset().union(*(self._lookup_refs(references, ref) if isinstance(ref, str)
                                              else frozenset({node}) for ref in target.references))
+                receiver_binding = self.substitute_binding(
+                    target.receiver_binding, bound, references, node, call_name, values,
+                    substitute=substitute, cells=cells)
                 choices.append(_BoundCallable(target.name, actual, substitute(target.receiver),
-                                               target.namespace_proven, target.producer_unproved))
+                                              target.namespace_proven, target.producer_unproved, receiver_binding))
             elif isinstance(target, _BoundClassMethod):
                 actual = frozenset().union(*(
                     self._lookup_refs(references, ref) if isinstance(ref, str)
@@ -5325,21 +5524,31 @@ class _Flow:
         target, fallback_name = callee.binding, callee.fallback_name
         receiver, receiver_refs = callee.receiver, callee.references
         arguments, keywords, keyword_nodes = inputs.arguments, inputs.keywords, inputs.keyword_nodes
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and node.func.attr in {'strip', 'lstrip', 'rstrip', 'lower', 'upper',
-                                      'capitalize', 'casefold', 'swapcase', 'title'}
-                and not node.args and not node.keywords
-                and self.materialized_generator_string(node.func.value, state)):
+        if isinstance(target, ast.ClassDef):
+            instance = self.literal_join_instance(node, target, state)
+            if instance is not None:
+                self.expression_bindings[node] = instance
+                self.expression_references[node] = frozenset({node, target})
+                self.possible_exception(state)
+                return CLEAN
+        if (isinstance(node, ast.Call) and isinstance(target, _BoundCallable)
+                and self.native_string_binding(target.receiver_binding)
+                and not node.keywords
+                and (target.name.rsplit('.', 1)[-1] in {
+                    'strip', 'lstrip', 'rstrip', 'lower', 'upper',
+                    'capitalize', 'casefold', 'swapcase', 'title'} and not node.args
+                    or target.name.rsplit('.', 1)[-1] == 'replace' and len(node.args) == 2
+                    and all(self.materialized_generator_string(argument, state) for argument in node.args))):
             # Exact native strings cannot replace these methods or invoke a
             # custom receiver/argument protocol. Keep producer authority from
             # the captured receiver; a fresh result cannot repair old effects.
-            self.expression_bindings[node] = _GeneratorString(format_safe=all(
-                not isinstance(value, (_LiteralString, _GeneratorString)) or value.format_safe
-                for value in _binding_choices(
-                    self.expression_bindings.get(node.func.value))))
+            self.expression_bindings[node] = _GeneratorString(format_safe=(
+                not target.producer_unproved and not self.unproved_producer(target.receiver_binding)
+                and all(not self.unproved_producer(self.expression_bindings.get(argument))
+                        for argument in node.args)))
             self.expression_references[node] = frozenset({node})
             self.possible_exception(state)
-            return receiver
+            return join_facts(target.receiver, *arguments)
         if (target in {'next', 'builtins.next'} and any(
                 engine.generator_builtin_reflection or engine.generator_literal_authority_exposed
                 or engine.generator_namespace_exposed
@@ -5476,11 +5685,24 @@ class _Flow:
                     # a key/default expression can mutate the captured dict.
                     if self.literal_mapping_key(node.args[0], state):
                         default = node.args[1] if len(arguments) == 2 else None
-                        self.expression_bindings[node] = _join_bindings(
-                            None, self.expression_bindings.get(default))
+                        mapping = target.receiver_binding
+                        presence = (self.literal_mapping_presence(mapping, node.args[0])
+                                    if isinstance(mapping, _LiteralMapping) else None)
+                        selected = mapping.value_binding if isinstance(mapping, _LiteralMapping) else None
+                        self.expression_bindings[node] = (
+                            selected if presence is True else self.expression_bindings.get(default)
+                            if presence is False else _join_bindings(selected, self.expression_bindings.get(default)))
+                        if (self.unproved_producer(selected)
+                                or not all(self.materialized_generator_inert(argument, state)
+                                           for argument in node.args)):
+                            # A discarded default may release an owned object;
+                            # a missing key does not undo mapping construction.
+                            self.expression_bindings[node] = self.without_format_authority(
+                                self.expression_bindings[node])
                         self.expression_references[node] = self.expression_references.get(default, NO_REFERENCES)
                         self.possible_exception(state)
-                        return join_facts(receiver, arguments[1] if default is not None else CLEAN)
+                        return join_facts(receiver if presence is not False else CLEAN,
+                                          arguments[1] if default is not None and presence is not True else CLEAN)
                     # A custom protocol may also affect later reads whose
                     # own keys are primitive. Retain the possible write.
                     self.mutate(receiver_refs, arguments[0], state)
@@ -5488,6 +5710,46 @@ class _Flow:
             stdin = self.stdin_call(node, state, target, name, receiver, inputs)
             if stdin is not None:
                 return stdin
+        if (isinstance(node, ast.Call) and (name.rsplit('.', 1)[-1] == 'join'
+                or isinstance(node.func, ast.Attribute) and node.func.attr == 'join') and len(node.args) == 1
+                and isinstance(node.args[0], ast.GeneratorExp) and not node.keywords
+                and not isinstance(target, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
+                                            _FunctionValue, _ClosureValue))):
+            receiver_binding = target.receiver_binding if isinstance(target, _BoundCallable) else None
+            self.require_value(receiver_binding)
+            if isinstance(receiver_binding, _LiteralJoinInstance):
+                if target.producer_unproved or not receiver_binding.format_safe:
+                    raise AnalysisLimit('generator join receiver producer effects are unresolved; '
+                                        'analysis is incomplete')
+                outer = node.args[0].generators[0].iter
+                if (not target.references & state.mutated
+                        and self.generator_consumer_stable(node, {
+                            'join', '__del__', '__class__', '__bases__', '__getattribute__', '__code__'})
+                        and self.materialized_generator_iterable(outer, state)
+                        and self.materialized_generator_inert(outer, state)):
+                    # This selected body ignores its unstarted argument. Its
+                    # return is independent of deferred input() in the body;
+                    # only the already-created iterator's lifetime is owned.
+                    self.expression_bindings[node] = _LiteralString(receiver_binding.result)
+                    self.expression_references[node] = NO_REFERENCES
+                    self.possible_exception(state)
+                    return CLEAN
+            if self.native_string_binding(receiver_binding):
+                if target.producer_unproved or self.unproved_producer(receiver_binding):
+                    raise AnalysisLimit('generator join receiver producer effects are unresolved; '
+                                        'analysis is incomplete')
+                # Keep aggregate transfer when exhaustion is unproved, but
+                # do not let its result certify the earlier producer lifetime.
+                self.expression_bindings[node] = _GeneratorString(format_safe=(
+                    self.generator_exhaustion_consumer(node.args[0], state) == 'str.join'))
+                self.expression_references[node] = frozenset({node})
+                self.possible_exception(state)
+                return join_facts(receiver, *arguments)
+            if not any(isinstance(value, _SymbolicValue) for value in _binding_choices(receiver_binding)):
+                # Opaque custom joins can ignore, retain or partly consume a
+                # generator and return unrelated source data. Selected local
+                # callables instead use their ordinary summaries below.
+                raise AnalysisLimit('generator join consumer identity is unresolved; analysis is incomplete')
         if name == 'functools.partial':
             return self.partial_value(node, state, inputs)
         value = (self.expression_bindings.get(node.args[0])
@@ -5746,8 +6008,9 @@ class _Flow:
             # substitute returned handles yet: apply_cells first allocates
             # the caller's distinct generator/closure cells.
             format_frame_inert = (bool(self.materialized_generator_depth) or not any(
-                isinstance(value, (_LiteralString, _GeneratorString, _ArgumentVector,
+                isinstance(value, (_LiteralString, _GeneratorString, _LiteralJoinInstance, _ArgumentVector, _LiteralMapping,
                                    _SymbolicValue, ast.Constant))
+                or isinstance(value, _BoundCallable) and value.receiver_binding is not None
                 for value in _binding_choices(summary.returned_binding)))
             if not format_frame_inert and isinstance(node, ast.Call):
                 format_frame_inert = self.materialized_generator_call(node, target, state)
@@ -6008,7 +6271,8 @@ class _Flow:
                 if {'functools', _PARTIAL_CHANGED_MODULE} & _binding_choices(value) and name not in {
                         'print', 'str', 'repr', 'bool', 'builtins.print', 'builtins.str', 'builtins.repr'}:
                     self.mutate(frozenset({_PARTIAL_MODULE_REF}), CLEAN, state)
-                if any(isinstance(choice, (_ArgumentVector, _SymbolicValue, ast.ClassDef, _BoundClassMethod))
+                if any(isinstance(choice, (_ArgumentVector, _SymbolicValue, _LiteralJoinInstance,
+                                           ast.ClassDef, _BoundClassMethod))
                        for choice in _binding_choices(value)) and name not in SANITIZERS and name not in {
                            'print', 'str', 'len', 'repr', 'tuple', 'list', 'bool', 'int', 'float',
                            'builtins.print', 'builtins.str', 'builtins.len', 'builtins.repr'}:
@@ -6035,6 +6299,17 @@ class _Flow:
             self.expression_bindings[node] = _GeneratorString(format_safe=(
                 len(node.args) <= 1 and not node.keywords
                 and all(self.formatted_string_operand(argument, state) for argument in node.args)))
+        if callee.binding in {'str', 'builtins.str'} and self.generator_builtins_stable():
+            # Native str may call an opaque __str__, which can return a str
+            # subclass. Only an already exact scalar proves an inert producer.
+            if len(node.args) <= 1 and not node.keywords:
+                argument = node.args[0] if node.args else None
+                if argument is None or self.materialized_generator_string(argument, state):
+                    self.expression_bindings[node] = _GeneratorString(format_safe=(
+                        argument is None or not self.unproved_producer(self.expression_bindings.get(argument))))
+                else:
+                    self.expression_bindings[node] = (_GeneratorString()
+                        if self.formatted_string_operand(argument, state) else _UnprovedProducer())
         if not exception_constructor:
             self.possible_exception(state)
         return fact
@@ -6090,7 +6365,7 @@ class _Flow:
                 identity = (str, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
                             ast.ClassDef, _FunctionValue, _ClosureValue, _BoundCallable,
                             _BoundClassMethod, _ModuleBinding, _ArgumentVector, _LiteralString, _GeneratorString,
-                            _UnprovedProducer, _LiteralMapping,
+                            _UnprovedProducer, _LiteralMapping, _LiteralJoinInstance,
                             _ProcessInput, ast.Constant)
                 if (not nominal_helper and any(isinstance(value, identity)
                         for value in (*_binding_choices(binding), *_binding_choices(nominal)))):
@@ -6160,7 +6435,8 @@ class _Flow:
             receiver_refs = self.expression_references.get(node.value, NO_REFERENCES)
             receiver_fact = self.expression_facts.get(node.value, CLEAN)
             bases = _binding_choices(self.expression_bindings.get(node.value))
-            if node.attr == 'join':
+            if node.attr in {'join', 'strip', 'lstrip', 'rstrip', 'lower', 'upper',
+                             'capitalize', 'casefold', 'swapcase', 'title', 'replace'}:
                 # A helper's symbolic receiver otherwise erases the scalar
                 # producer contract before its bound method is captured.
                 self.require_value(self.expression_bindings.get(node.value))
@@ -6199,7 +6475,8 @@ class _Flow:
                     candidates.append(_GlobalNamespace(base.module, node.attr))
                     continue
                 if isinstance(base, _LiteralMapping) and node.attr == 'get':
-                    candidates.append(_BoundCallable(_LITERAL_MAPPING_GET, receiver_refs, receiver_fact, True))
+                    candidates.append(_BoundCallable(_LITERAL_MAPPING_GET, receiver_refs, receiver_fact,
+                                                      True, receiver_binding=base))
                     continue
                 if isinstance(base, ast.ClassDef):
                     members = self.engine.class_members.get(base, {})
@@ -6226,12 +6503,15 @@ class _Flow:
                     isinstance(base, _BoundCallable) and base.producer_unproved
                     or node.attr == 'join' and (
                         isinstance(base, _UnprovedProducer)
-                        or isinstance(base, (_LiteralString, _GeneratorString)) and not base.format_safe))
+                        or isinstance(base, (_LiteralString, _GeneratorString, _LiteralJoinInstance)) and not base.format_safe))
                 name = (_extend_qualifier(base, node.attr) if isinstance(base, str)
                         else _extend_qualifier(base.name, node.attr, receiver_unknown=not base.namespace_proven)
                         if isinstance(base, _BoundCallable)
                         else _opaque_qualifier(_qualified(node, state.bindings), receiver_unknown=True))
-                if not name and (receiver_refs or producer_unproved):
+                receiver_binding = (base if isinstance(base, (_LiteralString, _GeneratorString, _LiteralJoinInstance,
+                                                               _UnprovedProducer, _SymbolicValue))
+                                    or isinstance(base, ast.Constant) and type(base.value) is str else None)
+                if not name and (receiver_refs or producer_unproved or receiver_binding is not None or node.attr == 'join'):
                     # A returned object has identity even without a source
                     # spelling (identity(box).append(...)). Keep the method
                     # and receiver without inventing an import/sanitizer.
@@ -6239,8 +6519,12 @@ class _Flow:
                 framework = name.startswith('@fastapi.router.') or name in _ALL_FRAMEWORK_NAMES
                 proven = isinstance(base, str) or isinstance(base, _BoundCallable) and base.namespace_proven
                 proven = proven and not any(part in {'<object>', '<unknown>'} for part in name.split('.'))
-                candidates.append(_BoundCallable(name, receiver_refs, receiver_fact, proven, producer_unproved)
-                                  if name and (receiver_refs or producer_unproved) and not framework
+                if self.native_string_binding(base):
+                    name = '<str>.' + node.attr
+                candidates.append(_BoundCallable(name, receiver_refs, receiver_fact, proven,
+                                                 producer_unproved, receiver_binding)
+                                  if name and (receiver_refs or producer_unproved or receiver_binding is not None
+                                               or node.attr == 'join') and not framework
                                   else name or None)
             binding = _join_bindings(*candidates)
             # A joined module identity can still denote a real source
@@ -6273,17 +6557,41 @@ class _Flow:
                     self.expression_facts.get(node.value, CLEAN),
                     self.expression_references.get(node.value, NO_REFERENCES), state)
                 if unchanged and self.literal_mapping_key(node.slice, state):
-                    fact, binding = contents, None
+                    fact, binding = contents, _join_bindings(*(value.value_binding for value in mappings))
                     self.expression_references[node] = NO_REFERENCES
                 else:
                     fact = join_facts(fact, contents)
                     self.mutate(self.expression_references.get(node.value, NO_REFERENCES),
                                 self.expression_facts.get(node.slice, CLEAN), state)
+            if self.materialized_generator_string(node.value, state):
+                parts = ((node.slice.lower, node.slice.upper, node.slice.step)
+                         if isinstance(node.slice, ast.Slice) else (node.slice,))
+                inert_index = all(part is None or self.materialized_generator_inert(part, state)
+                                  or isinstance(part, ast.UnaryOp) and isinstance(part.op, (ast.UAdd, ast.USub))
+                                  and isinstance(part.operand, ast.Constant) and type(part.operand.value) is int
+                                  for part in parts)
+                binding = _GeneratorString(format_safe=(inert_index and not self.unproved_producer(
+                    self.expression_bindings.get(node.value))))
+                self.expression_references[node] = NO_REFERENCES
+            elif any(self.unproved_producer(self.expression_bindings.get(operand))
+                     for operand in (node.value, node.slice)):
+                # Preserve a projected native value while revoking lifetime
+                # authority from an unmodeled index producer.
+                binding = (self.without_format_authority(binding)
+                           if binding is not None else _UnprovedProducer())
         elif isinstance(node, ast.Dict):
-            if all(isinstance(value, ast.Constant)
-                   and type(value.value) in {str, bytes, int, float, complex, bool, type(None)}
-                   for value in (*node.keys, *node.values)):
-                binding = _LiteralMapping()
+            literal_keys = all(isinstance(key, ast.Constant)
+                               and type(key.value) in {str, bytes, int, float, complex, bool, type(None)}
+                               for key in node.keys)
+            if literal_keys and node.values and all(
+                    self.materialized_generator_string(value, state) for value in node.values):
+                binding = _LiteralMapping(_GeneratorString(format_safe=not any(
+                    self.unproved_producer(self.expression_bindings.get(value)) for value in node.values)),
+                    frozenset(key.value for key in node.keys))
+            elif literal_keys and all(isinstance(value, ast.Constant)
+                                      and type(value.value) in {str, bytes, int, float, complex, bool, type(None)}
+                                      for value in node.values):
+                binding = _LiteralMapping(keys=frozenset(key.value for key in node.keys))
         if is_call:
             if exception_type:
                 binding = '@exception:' + exception_type
@@ -6340,7 +6648,16 @@ class _Flow:
             return join_facts(source, receiver, index,
                               *(state.heap.get(ref, CLEAN) for ref in references))
         if isinstance(node, ast.BinOp):
-            return join_facts(self.expr(node.left, state), self.expr(node.right, state))
+            fact = join_facts(self.expr(node.left, state), self.expr(node.right, state))
+            if (isinstance(node.op, ast.Add) and self.materialized_generator_string(node.left, state)
+                    and self.materialized_generator_string(node.right, state)):
+                self.expression_bindings[node] = _GeneratorString(format_safe=not any(
+                    self.unproved_producer(self.expression_bindings.get(operand))
+                    for operand in (node.left, node.right)))
+            elif any(self.unproved_producer(self.expression_bindings.get(operand))
+                     for operand in (node.left, node.right)):
+                self.expression_bindings[node] = _UnprovedProducer()
+            return fact
         if isinstance(node, ast.Set) and self.materialized_generator_depth:
             facts = []
             for child in node.elts:
@@ -8292,7 +8609,7 @@ class _Analysis:
                 value = (_BoundClassMethod(function, value.owner, frozenset({slot}), symbolic, value.valid)
                          if isinstance(value, _BoundClassMethod)
                          else _BoundCallable(qualified, frozenset({slot}), symbolic,
-                                             value.namespace_proven, value.producer_unproved))
+                                             value.namespace_proven, value.producer_unproved, value.receiver_binding))
             elif isinstance(value, _ArgumentVector) and name in value_parameters:
                 value = _context_vector(value)
                 shape = _vector_shape(value)
@@ -8313,6 +8630,8 @@ class _Analysis:
                 # parameters must keep sharing their symbolic summaries.
                 pass
             elif isinstance(value, _UnprovedProducer) and (captured or name in value_parameters):
+                pass
+            elif isinstance(value, _LiteralJoinInstance) and (captured or name in value_parameters):
                 pass
             elif isinstance(value, ast.Constant) and name in value_parameters:
                 # Partial captures may retain exact scalar options such as

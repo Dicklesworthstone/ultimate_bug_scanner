@@ -526,6 +526,264 @@ REVIEW_CASES = (
 CASES = (*CASES, *REVIEW_CASES)
 
 
+# PHP 8 named arguments bind to the selected signature, while supplied
+# expressions still evaluate left-to-right. Labels below were fixed against
+# the PHP manual before changing the engine. Both real sinks and clean uses
+# must retain their identities without an incomplete-analysis diagnostic.
+# https://www.php.net/manual/en/functions.arguments.php
+# https://www.php.net/manual/en/pdo.query.php
+# https://www.php.net/manual/en/mysqli.query.php
+# https://www.php.net/manual/en/function.htmlspecialchars.php
+# https://www.php.net/manual/en/function.print-r.php
+NAMED_CASES = (
+    Case("named_function_reordered_safe", """
+        function run($command, $label) { system($command); }
+        run(label: $_GET['label'], command: 'printf safe');
+    """),
+    Case("named_function_reordered_unsafe", """
+        function run($command, $label) {
+            system($command); // expect: command system
+        }
+        run(label: 'info', command: $_GET['command']);
+    """),
+    Case("named_default_skipped", """
+        function run($command = 'printf safe', $label = '') { system($command); }
+        run(label: $_GET['label']);
+    """),
+    Case("named_reference_target", """
+        function update(&$target, $value) { $target = $value; }
+        $destination = 'safe';
+        update(value: $_GET['value'], target: $destination);
+        echo $destination; // expect: xss echo
+    """),
+    Case("named_reference_preserves_request_superglobal", """
+        function display(&$values, $label) {
+            echo $values['name']; // expect: xss echo
+        }
+        display(label: 'info', values: $_GET);
+    """),
+    Case("named_reference_sanitizes_selected_target_only", """
+        function update(&$target, $value) { $target = $value; }
+        $destination = $_GET['value'];
+        $neighbor = $_GET['other'];
+        update(value: 'safe', target: $destination);
+        echo $destination;
+        echo $neighbor; // expect: xss echo
+    """),
+    Case("named_source_order", """
+        function first($value, $other) { return $value; }
+        $current = 'safe';
+        echo first(other: ($current = $_GET['value']), value: $current); // expect: xss echo
+    """),
+    Case("named_source_order_clean_overwrite", """
+        function first($value, $other) { return $value; }
+        $current = $_GET['value'];
+        echo first(other: ($current = 'safe'), value: $current);
+    """),
+    Case("named_constructor", """
+        class Runner {
+            function __construct($command, $label) {
+                system($command); // expect: command system
+            }
+        }
+        new Runner(label: 'info', command: $_GET['command']);
+    """),
+    Case("named_method_safe", """
+        class Runner { function run($command, $label) { system($command); } }
+        $runner = new Runner();
+        $runner->run(label: $_GET['label'], command: 'printf safe');
+    """),
+    Case("named_closure", """
+        $runner = function($command, $label) {
+            system($command); // expect: command system
+        };
+        $runner(label: 'info', command: $_GET['command']);
+    """),
+    Case("named_arrow_closure", """
+        $select = fn($value, $label) => $value;
+        echo $select(label: 'info', value: $_GET['value']); // expect: xss echo
+    """),
+    Case("named_parameter_case_is_significant", """
+        function run($Command, $command) {
+            system($Command); // expect: command system
+        }
+        run(command: 'printf safe', Command: $_GET['command']);
+    """),
+    Case("named_positional_prefix", """
+        function display($prefix, $value, $label = '') {
+            echo $prefix . $value; // expect: xss echo
+        }
+        display('hello ', label: 'info', value: $_GET['value']);
+    """),
+    Case("named_shadowed_builtin_uses_local_signature", """
+        namespace Application;
+        function htmlspecialchars($flags, $string) { return $string; }
+        echo htmlspecialchars(string: $_GET['value'], flags: ENT_QUOTES); // expect: xss echo
+    """),
+    Case("named_imported_builtin_signature", r"""
+        namespace Application;
+        use function htmlspecialchars as escapeMarkup;
+        echo escapeMarkup(encoding: 'UTF-8', string: $_GET['value'], flags: ENT_QUOTES);
+    """),
+    Case("named_pdo_query", """
+        $db = new PDO('sqlite::memory:');
+        $db->query(fetchMode: PDO::FETCH_ASSOC, query: $_GET['sql']); // expect: sql $db->query
+    """),
+    Case("named_pdo_prepared_tainted_sql", """
+        $db = new PDO(dsn: 'sqlite::memory:');
+        $statement = $db->prepare(options: [], query: $_GET['sql']);
+        $statement->execute(params: []); // expect: sql $statement->execute
+    """),
+    Case("named_pdo_bound_values", """
+        $db = new PDO(dsn: 'sqlite::memory:');
+        $statement = $db->prepare(options: [], query: 'SELECT ?');
+        $statement->execute(params: [$_GET['value']]);
+    """),
+    Case("named_mysqli_query", """
+        $db = mysqli_connect('localhost', 'app', 'password', 'app');
+        mysqli_query(query: $_GET['sql'], mysql: $db); // expect: sql mysqli_query
+    """),
+    Case("named_mysqli_prepared_tainted_sql", """
+        $db = new mysqli('localhost', 'app', 'password', 'app');
+        $statement = new mysqli_stmt(query: $_GET['sql'], mysql: $db);
+        mysqli_stmt_execute(statement: $statement); // expect: sql mysqli_stmt_execute
+    """),
+    Case("named_html_escape", """
+        echo htmlspecialchars(encoding: 'UTF-8', string: $_GET['value'], flags: ENT_QUOTES);
+    """),
+    Case("named_html_escape_skips_optional_flags", """
+        <input value="<?= htmlspecialchars($_GET['value'], double_encode: false) ?>">
+    """, True),
+    Case("named_html_noquotes_does_not_protect_attribute", """
+        <input value="<?= htmlspecialchars(flags: ENT_NOQUOTES, string: $_GET['value']) ?>">
+    """, True, (("xss", 1, "<?="),)),
+    Case("named_print_return", """
+        $text = print_r(return: true, value: $_GET['value']);
+        echo $text; // expect: xss echo
+    """),
+    Case("named_print_return_without_output", """
+        $text = print_r(return: true, value: $_GET['value']);
+    """),
+    Case("named_shell_command", """
+        system(command: $_GET['command']); // expect: command system
+    """),
+    Case("named_shell_argument_encoding", """
+        system(command: 'printf %s ' . escapeshellarg(arg: $_GET['value']));
+    """),
+    Case("named_callable_captured_before_argument_rebinding", """
+        $dangerous = function($value, $change) {
+            system($value); // expect: command system
+        };
+        $safe = function($value, $change) { return 'safe'; };
+        $selected = $dangerous;
+        $selected(value: $_GET['command'], change: ($selected = $safe));
+    """),
+    Case("named_safe_callable_not_replaced_by_argument_effect", """
+        $dangerous = function($value, $change) { system($value); };
+        $safe = function($value, $change) { return 'safe'; };
+        $selected = $safe;
+        $selected(value: $_GET['command'], change: ($selected = $dangerous));
+    """),
+    Case("named_method_receiver_captured_before_argument_rebinding", """
+        class Dangerous {
+            function run($command, $change) {
+                system($command); // expect: command system
+            }
+        }
+        class Safe { function run($command, $change) { return 'safe'; } }
+        $selected = new Dangerous();
+        $other = new Safe();
+        $selected->run(command: $_GET['command'], change: ($selected = $other));
+    """),
+    Case("named_safe_receiver_not_replaced_by_argument_effect", """
+        class Dangerous { function run($command, $change) { system($command); } }
+        class Safe { function run($command, $change) { return 'safe'; } }
+        $selected = new Safe();
+        $other = new Dangerous();
+        $selected->run(command: $_GET['command'], change: ($selected = $other));
+    """),
+    Case("named_reference_observes_later_argument_assignment", """
+        function observe(&$value, $change) {
+            echo $value; // expect: xss echo
+        }
+        $current = 'safe';
+        observe(value: $current, change: ($current = $_GET['value']));
+    """),
+    Case("named_reference_observes_later_clean_assignment", """
+        function observe(&$value, $change) { echo $value; }
+        $current = $_GET['value'];
+        observe(value: $current, change: ($current = 'safe'));
+    """),
+    Case("named_value_argument_keeps_earlier_snapshot", """
+        function observe($value, $change) { echo $value; }
+        $current = 'safe';
+        observe(value: $current, change: ($current = $_GET['value']));
+    """),
+)
+
+# Invalid/unsupported bindings must stay explicitly incomplete. Guessing a
+# positional slot would either invent a sink or award unearned sanitizer proof.
+NAMED_PARTIAL = (
+    Case("named_unknown_local_parameter", """
+        function run($command) { system($command); }
+        run(unknown: $_GET['command']);
+    """),
+    Case("named_wrong_case_parameter", """
+        function run($command) { system($command); }
+        run(Command: $_GET['command']);
+    """),
+    Case("named_duplicate_label", """
+        function run($command) { system($command); }
+        run(command: 'printf safe', command: $_GET['command']);
+    """),
+    Case("named_duplicate_positional_slot", """
+        function run($command) { system($command); }
+        run('printf safe', command: $_GET['command']);
+    """),
+    Case("named_positional_after_label", """
+        function run($command, $label) { system($command); }
+        run(label: 'info', $_GET['command']);
+    """),
+    Case("named_missing_required_parameter", """
+        function run($command, $label) { system($command); }
+        run(label: $_GET['label']);
+    """),
+    Case("named_unpack_remains_unproven", """
+        function run($command, $label) { system($command); }
+        run(...$_GET, label: 'info');
+    """),
+    Case("named_builtin_unknown_parameter", """
+        system(unknown: $_GET['command']);
+    """),
+    Case("named_reference_requires_lvalue", """
+        function update(&$target, $value) { $target = $value; }
+        update(value: $_GET['value'], target: 'literal');
+    """),
+    Case("named_reference_aliases_are_explicitly_unproven", """
+        function update(&$first, &$second, $value) {
+            $first = $value;
+            echo $second;
+        }
+        $shared = 'safe';
+        update(first: $shared, second: $shared, value: $_GET['value']);
+    """),
+    Case("named_computed_reference_target_is_unproven", """
+        function update(&$target, $value) {
+            $target = $value;
+            echo $target;
+        }
+        $key = 'first';
+        $values = ['first' => 'safe', 'second' => 'safe'];
+        update(target: $values[$key], value: ($key = $_GET['value']));
+    """),
+    Case("named_variadic_binding_is_explicitly_unproven", """
+        function run($command, ...$labels) { system($command); }
+        run(command: $_GET['command'], extra: 'info');
+    """),
+)
+CASES = (*CASES, *NAMED_CASES)
+
+
 def identities():
     paths = [
         Path(__file__),
@@ -616,6 +874,8 @@ def native_test(case, incomplete=False):
 for _case in CASES:
     setattr(PHPNativeTests, "test_" + _case.name, native_test(_case))
 for _case in PARTIAL:
+    setattr(PHPNativeTests, "test_partial_" + _case.name, native_test(_case, True))
+for _case in NAMED_PARTIAL:
     setattr(PHPNativeTests, "test_partial_" + _case.name, native_test(_case, True))
 
 

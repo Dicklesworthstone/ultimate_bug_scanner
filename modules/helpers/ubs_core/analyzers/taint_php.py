@@ -199,6 +199,99 @@ _REQUEST_CLASSES = frozenset({"illuminate\\http\\request", "symfony\\component\\
 _SHELLS = frozenset({"sh", "bash", "dash", "zsh", "ksh", "fish", "cmd", "cmd.exe", "powershell", "pwsh"})
 
 
+@dataclass(frozen=True)
+class NativeSignature:
+    """Selected PHP 8 API parameter names; defaults occupy the trailing slots."""
+    names: tuple[str, ...]
+    defaults: tuple[Value, ...] = ()
+
+
+# Parameter identity is part of the native API, not a guess based on a label.
+# References: php/php-src PHP-8.4 ext/{standard,pdo,mysqli,filter,json,pcntl}
+# *.stub.php and https://www.php.net/manual/en/functions.arguments.php.
+_NATIVE_FUNCTIONS = {
+    "system": NativeSignature(("command", "result_code"), (scalar(None),)),
+    "exec": NativeSignature(("command", "output", "result_code"), (scalar(None), scalar(None))),
+    "shell_exec": NativeSignature(("command",)),
+    "passthru": NativeSignature(("command", "result_code"), (scalar(None),)),
+    "popen": NativeSignature(("command", "mode")),
+    "proc_open": NativeSignature(("command", "descriptor_spec", "pipes", "cwd", "env_vars", "options"),
+                                 (scalar(None), scalar(None), scalar(None))),
+    "pcntl_exec": NativeSignature(("path", "args", "env_vars"), (array_value({}), array_value({}))),
+    "unserialize": NativeSignature(("data", "options"), (array_value({}),)),
+    "htmlspecialchars": NativeSignature(("string", "flags", "encoding", "double_encode"),
+                                       (scalar(11), scalar(None), scalar(True))),
+    "htmlentities": NativeSignature(("string", "flags", "encoding", "double_encode"),
+                                   (scalar(11), scalar(None), scalar(True))),
+    "htmlspecialchars_decode": NativeSignature(("string", "flags"), (scalar(11),)),
+    "html_entity_decode": NativeSignature(("string", "flags", "encoding"), (scalar(11), scalar(None))),
+    "print_r": NativeSignature(("value", "return"), (scalar(False),)),
+    "var_export": NativeSignature(("value", "return"), (scalar(False),)),
+    "json_encode": NativeSignature(("value", "flags", "depth"), (scalar(0), scalar(512))),
+    "json_decode": NativeSignature(("json", "associative", "depth", "flags"),
+                                  (scalar(None), scalar(512), scalar(0))),
+    "filter_input": NativeSignature(("type", "var_name", "filter", "options"), (scalar(516), scalar(0))),
+    "filter_var": NativeSignature(("value", "filter", "options"), (scalar(516), scalar(0))),
+    "escapeshellarg": NativeSignature(("arg",)),
+    "escapeshellcmd": NativeSignature(("command",)),
+    "base64_decode": NativeSignature(("string", "strict"), (scalar(False),)),
+    "hex2bin": NativeSignature(("string",)),
+    "stripslashes": NativeSignature(("string",)),
+    "stripcslashes": NativeSignature(("string",)),
+    "rawurlencode": NativeSignature(("string",)),
+    "urlencode": NativeSignature(("string",)),
+    "rawurldecode": NativeSignature(("string",)),
+    "urldecode": NativeSignature(("string",)),
+    "intval": NativeSignature(("value", "base"), (scalar(10),)),
+    "floatval": NativeSignature(("value",)),
+    "doubleval": NativeSignature(("value",)),
+    "boolval": NativeSignature(("value",)),
+    "strval": NativeSignature(("value",)),
+    "strtolower": NativeSignature(("string",)),
+    "strtoupper": NativeSignature(("string",)),
+    "vprintf": NativeSignature(("format", "values")),
+    "vsprintf": NativeSignature(("format", "values")),
+    "file_get_contents": NativeSignature(("filename", "use_include_path", "context", "offset", "length"),
+                                        (scalar(False), scalar(None), scalar(0), scalar(None))),
+    "mysqli_query": NativeSignature(("mysql", "query", "result_mode"), (scalar(0),)),
+    "mysqli_execute_query": NativeSignature(("mysql", "query", "params"), (scalar(None),)),
+    "mysqli_prepare": NativeSignature(("mysql", "query")),
+    "mysqli_real_query": NativeSignature(("mysql", "query")),
+    "mysqli_multi_query": NativeSignature(("mysql", "query")),
+    "mysqli_real_escape_string": NativeSignature(("mysql", "string")),
+    "mysqli_escape_string": NativeSignature(("mysql", "string")),
+    "mysqli_stmt_init": NativeSignature(("mysql",)),
+    "mysqli_stmt_prepare": NativeSignature(("statement", "query")),
+    "mysqli_stmt_execute": NativeSignature(("statement", "params"), (scalar(None),)),
+    "mysqli_execute": NativeSignature(("statement", "params"), (scalar(None),)),
+}
+_NATIVE_CONSTRUCTORS = {
+    "pdo": NativeSignature(("dsn", "username", "password", "options"),
+                           (scalar(None), scalar(None), scalar(None))),
+    "mysqli": NativeSignature(("hostname", "username", "password", "database", "port", "socket"),
+                              (scalar(None),) * 6),
+    "mysqli_stmt": NativeSignature(("mysql", "query"), (scalar(None),)),
+}
+_NATIVE_METHODS = {
+    ("pdo", "query"): NativeSignature(("query", "fetchMode"), (scalar(None),)),
+    ("pdo", "exec"): NativeSignature(("statement",)),
+    ("pdo", "prepare"): NativeSignature(("query", "options"), (array_value({}),)),
+    ("pdo", "quote"): NativeSignature(("string", "type"), (scalar(2),)),
+    ("pdo_stmt", "execute"): NativeSignature(("params",), (scalar(None),)),
+    ("pdo_stmt", "bindvalue"): NativeSignature(("param", "value", "type"), (scalar(2),)),
+    ("pdo_stmt", "bindparam"): NativeSignature(("param", "var", "type", "maxLength", "driverOptions"),
+                                              (scalar(2), scalar(0), scalar(None))),
+    ("mysqli", "query"): NativeSignature(("query", "result_mode"), (scalar(0),)),
+    ("mysqli", "real_query"): NativeSignature(("query",)),
+    ("mysqli", "multi_query"): NativeSignature(("query",)),
+    ("mysqli", "execute_query"): NativeSignature(("query", "params"), (scalar(None),)),
+    ("mysqli", "prepare"): NativeSignature(("query",)),
+    ("mysqli", "real_escape_string"): NativeSignature(("string",)),
+    ("mysqli", "escape_string"): NativeSignature(("string",)),
+    ("mysqli_stmt", "prepare"): NativeSignature(("query",)),
+    ("mysqli_stmt", "execute"): NativeSignature(("params",), (scalar(None),)),
+}
+
 class Engine:
     def __init__(self, path: Path, text: str, limits: dict[str, int], enabled: frozenset[str]):
         self.path = str(path)
@@ -513,8 +606,102 @@ class Engine:
             return self.allocate("object", name=resolved)
         return EMPTY
 
-    def invoke(self, function: Function, args: tuple[Value, ...], arg_nodes: tuple[Node, ...],
+    def call_arguments(self, nodes: tuple[Node, ...]) -> tuple[Value, ...]:
+        # PHP evaluates arguments eagerly in source order. Binding names must
+        # never reorder or repeat those evaluations (including caller writes).
+        return tuple(self.evaluate(node.children[0] if node.kind == "named" else node)
+                     for node in nodes)
+
+    def bind_arguments(self, args: tuple[Value, ...], nodes: tuple[Node | None, ...],
+                       names: tuple[str, ...], required: int):
+        """Bind selected call slots; None denotes omission, never PHP null."""
+        if not any(node is not None and node.kind in ("named", "spread") for node in nodes):
+            return args, nodes
+        slots = {}
+        position = 0
+        saw_named = False
+        for value, node in zip(args, nodes):
+            if node is None or node.kind == "spread":
+                self.issue("PHP argument unpacking cannot establish parameter bindings")
+                return None
+            if node.kind == "named":
+                saw_named = True
+                # PHP parameter names remain case-sensitive even when the
+                # callable's own name is resolved case-insensitively.
+                if node.value not in names:
+                    self.issue("Unknown PHP named parameter %s" % node.value)
+                    return None
+                index = names.index(node.value)
+                target = node.children[0]
+            else:
+                if saw_named:
+                    self.issue("PHP positional argument follows a named argument")
+                    return None
+                index, target = position, node
+                position += 1
+            if index >= len(names):
+                self.issue("PHP named call exceeds its selected signature")
+                return None
+            if index in slots:
+                self.issue("Duplicate PHP argument for parameter %s" % names[index])
+                return None
+            slots[index] = (value, target)
+        if any(index not in slots for index in range(required)):
+            self.issue("PHP named call omits a required parameter")
+            return None
+        size = max(slots, default=-1) + 1
+        return (tuple(slots[index][0] if index in slots else None for index in range(size)),
+                tuple(slots[index][1] if index in slots else None for index in range(size)))
+
+    def native_arguments(self, args: tuple[Value, ...], nodes: tuple[Node | None, ...],
+                         signature: NativeSignature | None):
+        if not any(node is not None and node.kind in ("named", "spread") for node in nodes):
+            return args, nodes
+        if signature is None:
+            self.issue("PHP named call has no verified native parameter signature")
+            return None
+        required = len(signature.names) - len(signature.defaults)
+        bound = self.bind_arguments(args, nodes, signature.names, required)
+        if bound is None:
+            return None
+        values, targets = bound
+        # Only fill holes through the final supplied slot. Existing transfer
+        # functions distinguish omitted trailing arguments from explicit ones.
+        return (tuple(value if value is not None else signature.defaults[index - required]
+                      for index, value in enumerate(values)), targets)
+
+    def invoke(self, function: Function, args: tuple[Value, ...], arg_nodes: tuple[Node | None, ...],
                token: Token, receiver: Value = EMPTY) -> Value:
+        params = function.node.value["params"]
+        named_call = any(node is not None and node.kind == "named" for node in arg_nodes)
+        if named_call and function.node.value.get("variadic"):
+            self.issue("PHP named variadic call binding is outside the selected subset")
+            return EMPTY
+        # Parameters before a required parameter are required too in PHP 8,
+        # even when an earlier declaration spells a default.
+        required = max((index + 1 for index, param in enumerate(params) if param[3] is None), default=0)
+        bound = self.bind_arguments(args, arg_nodes, tuple(param[0][1:] for param in params), required)
+        if bound is None:
+            return EMPTY
+        args, arg_nodes = bound
+        if named_call:
+            referenced = set()
+            values = list(args)
+            for index, (_name, _type_name, byref, _default) in enumerate(params):
+                if not byref or index >= len(arg_nodes) or arg_nodes[index] is None:
+                    continue
+                target = arg_nodes[index]
+                # A computed lvalue needs its address captured at evaluation
+                # time. Re-evaluating it after another argument writes a key
+                # or receiver can update the wrong caller location.
+                if target.kind != "var" or target.value in referenced:
+                    self.issue("PHP named by-reference call requires distinct simple variable destinations")
+                    return EMPTY
+                referenced.add(target.value)
+                # References observe later argument writes to the same cell;
+                # ordinary value arguments retain their earlier snapshot.
+                values[index] = self.evaluate(target)
+            args = tuple(values)
         if self.call_depth >= min(32, self.limits["UBS_PHP_MAX_NESTING"]):
             raise AnalysisLimit("PHP local-call recursion limit exceeded; analysis is incomplete")
         self.budget.spend()
@@ -522,12 +709,14 @@ class Engine:
         self.env, self.context = dict(function.captures), function.context
         if receiver.refs:
             self.env["$this"] = receiver
-        for index, (name, type_name, _byref, default) in enumerate(function.node.value["params"]):
-            if index < len(args):
+        for index, (name, type_name, _byref, default) in enumerate(params):
+            if index < len(args) and args[index] is not None:
                 value = args[index]
             elif default is not None:
                 value = self.evaluate(default)
             else:
+                # Declaration probes intentionally have no supplied arguments:
+                # inspect typed public entrypoints without inventing a caller.
                 value = self.typed(type_name, function.node.token) if type_name else EMPTY
             self.env[name] = value
         self.call_depth += 1
@@ -537,8 +726,8 @@ class Engine:
         finally:
             self.call_depth -= 1
             self.env, self.context = previous_env, previous_context
-        for index, (name, _type_name, byref, _default) in enumerate(function.node.value["params"]):
-            if byref and index < len(arg_nodes):
+        for index, (name, _type_name, byref, _default) in enumerate(params):
+            if byref and index < len(arg_nodes) and arg_nodes[index] is not None:
                 self.assign(arg_nodes[index], effects.get(name, EMPTY))
         return result
 
@@ -865,7 +1054,7 @@ class Engine:
             self.merge((branch_left, (self.env, self.heap, "normal", right)))
             return joined(left, right)
         if kind == "new":
-            args = tuple(self.evaluate(child) for child in node.children)
+            args = self.call_arguments(node.children)
             return self.construct(self.resolve(node.value, "class").lower(), args, node)
         if kind == "call":
             return self.call(node)
@@ -921,6 +1110,11 @@ class Engine:
         return value
 
     def construct(self, name: str, args: tuple[Value, ...], node: Node) -> Value:
+        if name in _NATIVE_CONSTRUCTORS:
+            bound = self.native_arguments(args, node.children, _NATIVE_CONSTRUCTORS[name])
+            if bound is None:
+                return EMPTY
+            args, _targets = bound
         if name in ("pdo", "mysqli"):
             return self.allocate(name)
         if name == "mysqli_stmt":
@@ -930,6 +1124,9 @@ class Engine:
             self.issue("Unresolved mysqli statement connection")
             return EMPTY
         if name in _REQUEST_CLASSES:
+            if any(child.kind in ("named", "spread") for child in node.children):
+                self.issue("PHP request constructor named bindings are outside the selected subset")
+                return EMPTY
             return self.allocate("request", name=name)
         if name in self.classes:
             definition, context = self.classes[name]
@@ -943,34 +1140,49 @@ class Engine:
 
     def call(self, node: Node) -> Value:
         target, arg_nodes = node.children[0], node.children[1:]
-        args = tuple(self.evaluate(child) for child in arg_nodes)
         if target.kind == "name":
+            args = self.call_arguments(arg_nodes)
             name = self.resolve(target.value, "function").lower()
             if name in self.functions:
                 return self.invoke(self.functions[name], args, arg_nodes, node.token)
             return self.builtin(name, args, arg_nodes, node.token)
         if target.kind == "member":
             receiver = self.evaluate(target.children[0])
+            args = self.call_arguments(arg_nodes)
             if target.value[2] != "name":
                 self.issue("Dynamic PHP method dispatch")
                 return joined(*args)
             name = target.value[1].lower()
             return self.method(receiver, name, args, arg_nodes, node.token)
         receiver = self.evaluate(target)
+        args = self.call_arguments(arg_nodes)
         if receiver.refs and all(ref in self.closures for ref in receiver.refs):
             return joined(*(self.invoke(self.closures[ref], args, arg_nodes, node.token) for ref in receiver.refs))
         self.issue("Dynamic PHP function dispatch")
         return joined(receiver, *args)
 
     def method(self, receiver: Value, name: str, args: tuple[Value, ...],
-               arg_nodes: tuple[Node, ...], token: Token) -> Value:
+               arg_nodes: tuple[Node | None, ...], token: Token) -> Value:
         values = []
+        original_args, original_nodes = args, arg_nodes
         if not receiver.refs:
             if not self.declaration_probe or receiver.fact or any(value.fact for value in args):
                 self.issue("Unresolved PHP method receiver for %s" % name)
             return joined(*args)
         for ref in receiver.refs:
             obj = self.heap[ref]
+            args, arg_nodes = original_args, original_nodes
+            if obj.kind != "object":
+                native_kind = obj.kind
+                if native_kind == "stmt":
+                    kinds = {self.heap[connection].kind for connection in obj.connection
+                             if connection in self.heap}
+                    native_kind = "pdo_stmt" if kinds == {"pdo"} else "mysqli_stmt" if kinds == {"mysqli"} else "stmt"
+                bound = self.native_arguments(args, arg_nodes, _NATIVE_METHODS.get((native_kind, name)))
+                if bound is None:
+                    values.append(EMPTY)
+                    continue
+                args, arg_nodes = bound
             if obj.kind in ("pdo", "mysqli"):
                 if name in ("query", "exec", "multi_query", "real_query", "execute_query"):
                     if args:
@@ -1061,7 +1273,12 @@ class Engine:
             position = match.end()
         return self.concat(result, scalar(template.literal[position:]))
 
-    def builtin(self, name: str, args: tuple[Value, ...], arg_nodes: tuple[Node, ...], token: Token) -> Value:
+    def builtin(self, name: str, args: tuple[Value, ...], arg_nodes: tuple[Node | None, ...], token: Token) -> Value:
+        signature = _NATIVE_CONSTRUCTORS["mysqli"] if name == "mysqli_connect" else _NATIVE_FUNCTIONS.get(name)
+        bound = self.native_arguments(args, arg_nodes, signature)
+        if bound is None:
+            return EMPTY
+        args, arg_nodes = bound
         first = args[0] if args else EMPTY
         if name in ("mysqli_connect", "mysqli_init"):
             return self.allocate("mysqli")

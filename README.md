@@ -313,6 +313,13 @@ passing request data as bound values is safe only when that template is trusted.
 Output escaping is evaluated for its supported HTML context, rather than being a
 universal sanitizer for SQL, shell commands, URLs or script expressions.
 
+Named arguments bind to the selected local function, method, constructor or
+closure signature, and to supported PHP, PDO and mysqli native signatures.
+Argument expressions retain their original evaluation order; skipped optional
+parameters use their defaults. Simple variable references retain their caller
+destinations. Unknown names, duplicate slots, unpacking, named variadics and
+complex reference destinations produce an explicit incomplete result.
+
 PHP's five category IDs are `php.sql`, `php.execution`, `php.includes`,
 `php.deserialization` and `php.output`. Native rules appear in `--list-rules` and
 share ordinary file selection, exclusions, profiles, suppression, incremental

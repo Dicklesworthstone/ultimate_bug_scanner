@@ -395,9 +395,10 @@ class Parser:
         self.end_statement()
         return Node("expr", token, children=(expression,))
 
-    def parameters(self) -> tuple[tuple[str, str, bool, Node | None], ...]:
+    def parameters(self) -> tuple[tuple[tuple[str, str, bool, Node | None], ...], bool]:
         self.expect("(")
         result = []
+        variadic = False
         while not self.is_(")") and self.current().kind != "eof":
             type_parts = []
             byref = False
@@ -407,6 +408,7 @@ class Parser:
                     byref = True
                 elif item == "...":
                     self.issues.append("PHP variadic parameters are outside the selected subset; analysis is incomplete")
+                    variadic = True
                 elif item in (",", ")"):
                     raise ParseError("Malformed PHP parameter; analysis is incomplete")
                 else:
@@ -419,7 +421,7 @@ class Parser:
             if not self.accept(","):
                 break
         self.expect(")")
-        return tuple(result)
+        return tuple(result), variadic
 
     def function_definition(self, *, named: bool = False, arrow: bool = False) -> Node:
         token = self.take()
@@ -427,7 +429,7 @@ class Parser:
         name = self.take().text if self.current().kind == "name" and not arrow else ""
         if named and not name:
             raise ParseError("Missing PHP function name; analysis is incomplete")
-        params = self.parameters()
+        params, variadic = self.parameters()
         captures = []
         if self.accept("use"):
             self.expect("(")
@@ -448,7 +450,7 @@ class Parser:
         else:
             body = self.block()
         return Node("function", token, {"name": name, "params": params, "captures": tuple(captures),
-                                       "arrow": arrow, "byref": byref}, (body,))
+                                       "arrow": arrow, "byref": byref, "variadic": variadic}, (body,))
 
     def class_definition(self) -> Node:
         token = self.take()

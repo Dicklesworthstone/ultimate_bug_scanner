@@ -327,6 +327,445 @@ class EnvironmentSourceTests(SourceTest):
                                   f'eval(html.escape({source}))\n', 'eval')
 
 
+class StdinSourceTests(SourceTest):
+    def test_text_readers_reach_each_sink_domain(self):
+        sinks = (("os.system(value)", 'command'), ("eval(value)", 'eval'),
+                 ("cursor.execute('SELECT ' + value)", 'sql'),
+                 ("HttpResponse(value)", 'xss'), ("requests.get(value)", 'ssrf'))
+        for reader in ('read()', 'readline()', 'readlines()[0]'):
+            for sink, rule in sinks:
+                with self.subTest(reader=reader, sink=sink):
+                    findings = self.assert_rules(
+                        f'import sys, requests\nvalue = sys.stdin.{reader}\n{sink}\n', rule)
+                    self.assertIn('sys.stdin', findings[0]['message'])
+
+    def test_original_and_binary_stream_readers(self):
+        for member in ('stdin', '__stdin__'):
+            for suffix, readers in (('', ('read()', 'readline()', 'readlines()[0]', '__next__()')),
+                                    ('.buffer', ('read()', 'read1()', 'peek()', 'readline()',
+                                                 'readlines()[0]', '__next__()')),
+                                    ('.buffer.raw', ('read()', 'readall()', 'readline()',
+                                                     'readlines()[0]', '__next__()'))):
+                for reader in readers:
+                    with self.subTest(member=member, suffix=suffix, reader=reader):
+                        self.assert_rules(f'import sys\neval(sys.{member}{suffix}.{reader})\n', 'eval')
+        # Buffered-only methods do not establish a text-stream source API.
+        self.assert_rules('import sys\neval(sys.stdin.read1())\n')
+        self.assert_rules('import sys\neval(sys.stdin.readall())\n')
+
+    def test_imports_and_saved_methods_keep_native_identity(self):
+        cases = (
+            'import sys as runtime\neval(runtime.stdin.read())\n',
+            'from sys import stdin as stream\neval(stream.readline())\n',
+            'from sys import __stdin__ as stream\neval(stream.buffer.read())\n',
+            'import sys\nstream = sys.stdin.buffer\neval(stream.read1())\n',
+            'import sys\nread = sys.stdin.read\neval(read())\n',
+            'import sys\nread = sys.stdin.readline\nsys = None\neval(read())\n',
+            'from sys import stdin as stream\nread = stream.read\nstream = None\neval(read())\n',
+            'import sys\nread = sys.stdin.buffer.raw.read\neval(read())\n',
+        )
+        for source in cases:
+            with self.subTest(source=source):
+                self.assert_rules(source, 'eval')
+
+    def test_helpers_returned_handles_and_defaults_keep_provenance(self):
+        cases = (
+            'def read(stream):\n    return stream.read()\neval(read(sys.stdin))\n',
+            'def read(reader):\n    return reader()\neval(read(sys.stdin.readline))\n',
+            'def stream():\n    return sys.stdin\neval(stream().read())\n',
+            'def read(stream=sys.stdin):\n    return stream.read()\neval(read())\n',
+            'def read(reader=sys.stdin.buffer.read):\n    return reader()\neval(read())\n',
+            'def read(stream):\n    return next(stream)\neval(read(sys.stdin))\n',
+            'def consume(stream):\n    for line in stream:\n        eval(line)\nconsume(sys.stdin)\n',
+        )
+        for source in cases:
+            with self.subTest(source=source):
+                self.assert_rules('import sys\n' + source, 'eval')
+
+    def test_reader_is_captured_before_argument_rebinding(self):
+        self.assert_rules('''
+            import sys
+            value = sys.stdin.read(((sys := None), 1)[1])
+            eval(value)
+        ''', 'eval')
+        self.assert_rules('''
+            import sys
+            read = sys.stdin.readline
+            value = read(((read := lambda size: 'fixed'), 1)[1])
+            eval(value)
+        ''', 'eval')
+
+    def test_helper_global_streams_keep_native_consumption_identity(self):
+        consumers = (
+            'eval(next(stream))\n', 'eval(list(stream)[0])\n', 'eval(tuple(stream)[0])\n',
+            'eval(next(iter(stream)))\n', 'for line in stream:\n    eval(line)\n',
+            'lines = [line for line in stream]\neval(lines[0])\n',
+        )
+        for stream in ('sys.stdin', 'sys.__stdin__', 'sys.stdin.buffer'):
+            for consumer in consumers:
+                source = ('import sys\ndef consume():\n'
+                          + textwrap.indent(f'stream = {stream}\n' + consumer, '    ') + 'consume()\n')
+                with self.subTest(stream=stream, consumer=consumer):
+                    self.assert_rules(source, 'eval')
+        for expression in ('"".join(sys.stdin)', 'b"".join(sys.stdin.buffer)'):
+            with self.subTest(expression=expression):
+                self.assert_rules('import sys\ndef consume():\n'
+                                  f'    eval({expression})\nconsume()\n', 'eval')
+        self.assert_rules('import sys\ndef inspect():\n    return sys.stdin.encoding\neval(inspect())\n')
+        self.assert_rules('import sys\ndef consume():\n    sys = None\n    eval(next(sys.stdin))\nconsume()\n')
+        self.assert_rules('import sys\ndef consume():\n    eval("".join(sys.stdin.buffer))\nconsume()\n')
+
+    def test_lines_are_sources_when_consumed(self):
+        consumers = (
+            'for line in stream:\n    eval(line)\n',
+            'lines = [line for line in stream]\neval(lines[0])\n',
+            'eval(next(stream))\n', 'eval(list(stream)[0])\n', 'eval(tuple(stream)[0])\n',
+            'iterator = iter(stream)\neval(next(iterator))\n',
+            'iterator = stream.__iter__()\neval(iterator.__next__())\n',
+            'from builtins import next as consume\neval(consume(stream))\n',
+        )
+        for stream in ('sys.stdin', 'sys.__stdin__', 'sys.stdin.buffer', 'sys.stdin.buffer.raw'):
+            for source in consumers:
+                with self.subTest(stream=stream, source=source):
+                    self.assert_rules(f'import sys\nstream = {stream}\n' + source, 'eval')
+        self.assert_rules('import sys\neval("".join(sys.stdin))\n', 'eval')
+        self.assert_rules('import sys\nseparator = ","\neval(separator.join(sys.stdin))\n', 'eval')
+        self.assert_rules('import sys\neval(b"".join(sys.stdin.buffer))\n', 'eval')
+        self.assert_rules('import sys\neval(b"".join(sys.stdin.buffer.raw))\n', 'eval')
+        self.assert_rules('import sys\neval("".join(sys.stdin.buffer))\n')
+        self.assert_rules('import sys\neval(b"".join(sys.stdin))\n')
+
+    def test_helper_global_builtin_consumers_keep_native_identity(self):
+        for expression in ('builtins.next(sys.stdin)', 'builtins.list(sys.stdin)[0]',
+                           'builtins.tuple(sys.stdin)[0]', 'next(builtins.iter(sys.stdin))'):
+            with self.subTest(expression=expression):
+                self.assert_rules('import builtins, sys\ndef consume():\n'
+                                  f'    eval({expression})\nconsume()\n', 'eval')
+        self.assert_rules('import builtins as native, sys\ndef consume():\n'
+                          '    eval(native.next(sys.stdin))\nconsume()\n', 'eval')
+        self.assert_rules('import builtins, sys\nsaved = builtins.next\nbuiltins = None\n'
+                          'def consume():\n    eval(saved(sys.stdin))\nconsume()\n', 'eval')
+        self.assert_rules('''
+            import builtins, sys
+            class Local:
+                @staticmethod
+                def next(stream):
+                    return 'fixed'
+            def consume():
+                builtins = Local
+                eval(builtins.next(sys.stdin))
+            consume()
+        ''')
+        self.assert_rules('import application.builtins as native, sys\ndef consume():\n'
+                          '    eval(native.next(sys.stdin))\nconsume()\n')
+
+    def test_stream_handles_and_metadata_are_not_input_contents(self):
+        for stream in ('sys.stdin', 'sys.__stdin__', 'sys.stdin.buffer', 'sys.stdin.buffer.raw'):
+            for expression in ('stream', 'stream.name', 'stream.closed', 'stream.fileno()',
+                               'stream.isatty()', 'stream.readable()', 'stream.read',
+                               'iter(stream)', 'stream.__iter__()'):
+                with self.subTest(stream=stream, expression=expression):
+                    self.assert_rules(f'import sys\nstream = {stream}\nHttpResponse(str({expression}))\n')
+        self.assert_rules('import sys\neval(sys.stdin.encoding)\neval(sys.stdin.errors)\n')
+        self.assert_rules('from sys import stdin as stream\nreader = stream.read\neval("1")\n')
+
+    def test_stored_starred_arguments_keep_captured_positions(self):
+        for consume in ('next(*arguments)', 'list(*arguments)[0]', 'tuple(*arguments)[0]',
+                        'next(iter(*arguments))', '"".join(*arguments)'):
+            with self.subTest(consume=consume):
+                self.assert_rules('import sys\narguments = (sys.stdin,)\nsys = None\n'
+                                  f'eval({consume})\n', 'eval')
+        for stream, methods in (('sys.stdin', ('read', 'readline')),
+                                ('sys.stdin.buffer', ('read', 'read1', 'readline'))):
+            for method in methods:
+                with self.subTest(stream=stream, method=method):
+                    self.assert_rules('import sys\nsizes = (0,)\n'
+                                      f'eval({stream}.{method}(*sizes))\n')
+        self.assert_rules('import sys\nsizes = (1,)\neval(sys.stdin.read(*sizes))\n', 'eval')
+        self.assert_rules('import sys\nsizes = ()\neval(sys.stdin.read(*sizes))\n', 'eval')
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'stdin iterator argument expansion'):
+            self.scan('import sys\neval(next(*sys.stdin))\n')
+
+    def test_zero_length_reads_are_empty_but_zero_hints_are_not(self):
+        for stream, methods in (('sys.stdin', ('read', 'readline')),
+                                ('sys.stdin.buffer', ('read', 'read1', 'readline')),
+                                ('sys.stdin.buffer.raw', ('read', 'readline'))):
+            for method in methods:
+                for zero in ('0', 'size'):
+                    with self.subTest(stream=stream, method=method, zero=zero):
+                        self.assert_rules(f'import sys\nsize = 0\neval({stream}.{method}({zero}))\n')
+            self.assert_rules(f'import sys\neval({stream}.readlines(0)[0])\n', 'eval')
+        self.assert_rules('import sys\neval(sys.stdin.buffer.peek(0))\n', 'eval')
+        self.assert_rules('''
+            import sys
+            def read(stream, size):
+                return stream.read(size)
+            eval(read(sys.stdin, 0))
+        ''')
+
+    def test_unrelated_modules_methods_and_shadowed_names_stay_clean(self):
+        for module in ('application.sys', 'mysys', 'SYS', '.sys', '..sys'):
+            with self.subTest(module=module):
+                self.assert_rules(f'from {module} import stdin as stream\neval(stream.read())\n')
+        for member in ('stdin_extra', 'STDIN', 'stdout', 'stderr'):
+            with self.subTest(member=member):
+                self.assert_rules(f'import sys\neval(sys.{member}.read())\n')
+        for method in ('reader', 'read_extra', 'READ'):
+            with self.subTest(method=method):
+                self.assert_rules(f'import sys\neval(sys.stdin.{method}())\n')
+        self.assert_rules('import sys\nsys = None\neval(sys.stdin.read())\n')
+        self.assert_rules('import io\nstream = io.StringIO("fixed")\neval(stream.read())\n')
+        self.assert_rules('''
+            import sys
+            def read(sys):
+                return sys.stdin.read()
+            eval(read(None))
+        ''')
+        self.assert_rules('''
+            import sys
+            def next(stream):
+                return 'fixed'
+            eval(next(sys.stdin))
+        ''')
+        self.assert_rules('''
+            import sys
+            def iter(stream):
+                return ['fixed']
+            for line in iter(sys.stdin):
+                eval(line)
+        ''')
+
+    def test_local_rebinding_revokes_only_the_rebound_name(self):
+        self.assert_rules('''
+            from sys import stdin as stream
+            import io
+            stream = io.StringIO('fixed')
+            eval(stream.read())
+        ''')
+        self.assert_rules('''
+            import sys
+            read = sys.stdin.read
+            read = lambda: 'fixed'
+            eval(read())
+        ''')
+        self.assert_rules('''
+            import sys
+            saved = sys.stdin.read
+            read = saved
+            read = lambda: 'fixed'
+            eval(saved())
+        ''', 'eval')
+
+    def test_native_stream_and_method_replacements_are_incomplete(self):
+        cases = (
+            'import sys\nsys.stdin = other\n',
+            'import sys as runtime\nruntime.__stdin__ = other\n',
+            'import sys\nsys.stdin.read = lambda: "fixed"\n',
+            'from sys import stdin as stream\nstream.readline = lambda: "fixed"\n',
+            'import sys\nsys.stdin.buffer = other\n',
+            'import sys\nsys.stdin.buffer.raw.read = lambda: b"fixed"\n',
+            'import sys\ndef replace(stream):\n    stream.read = lambda: "fixed"\nreplace(sys.stdin)\n',
+            'import sys\ndef replace():\n    sys.stdin.read = lambda: "fixed"\nreplace()\n',
+            'import sys\ndef replace():\n    sys.stdin.buffer.raw.read = lambda: b"fixed"\nreplace()\n',
+        )
+        for source in cases:
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'stdlib source member mutation'):
+                    self.scan(source)
+
+    def test_unmodeled_mutation_and_generator_protocols_stay_incomplete(self):
+        for operation in ('sys.stdin.buffer.readinto(buffer)', 'sys.stdin.buffer.readinto1(buffer)',
+                          'sys.stdin.detach()', 'sys.stdin.buffer.detach()'):
+            with self.subTest(operation=operation):
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'stdin buffer mutation or detachment'):
+                    self.scan('import sys\n' + operation + '\n')
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'generator materialization'):
+            self.scan('import sys\neval("".join(line for line in sys.stdin))\n')
+
+    def test_stdin_join_keeps_captured_receiver_producer_obligations(self):
+        prefix = ("import sys\ncode = 'fixed'\nclass Owned:\n"
+                  + '    def __del__(self):\n        global code\n        code = input()\n'
+                  + "def render():\n    owned = Owned()\n    return '|'\n")
+        for capture, consumer in (
+                ('', 'render().join'),
+                ('separator = render()\n', 'separator.join'),
+                ('joiner = render().join\n', 'joiner'),
+                ('separator = render()\njoiner = separator.join\nseparator = "replacement"\n', 'joiner')):
+            source = prefix + capture + consumer + '(sys.stdin)\neval(code)\n'
+            with self.subTest(capture=capture, consumer=consumer):
+                with temporary_directory(prefix='ubs-stdin-join-producer-') as tmp:
+                    path = Path(tmp) / 'view.py'
+                    path.write_text(source, encoding='utf-8')
+                    findings = []
+                    with self.assertRaisesRegex(taint_py.AnalysisLimit, 'stdin join receiver producer'):
+                        for finding in taint_py.run(RunContext(lang='python', files=[path])):
+                            findings.append(finding)
+                    self.assertEqual(findings, [])
+        source = ('eval(input()) # independent\n' + prefix
+                  + 'def consume(joiner):\n    joiner(sys.stdin)\n    eval(code)\n'
+                  + 'def independent():\n    eval(input()) # independent\n'
+                  + 'consume(render().join)\nindependent()\n')
+        with temporary_directory(prefix='ubs-stdin-join-producer-') as tmp:
+            path = Path(tmp) / 'view.py'
+            path.write_text(source, encoding='utf-8')
+            findings = []
+            with self.assertRaisesRegex(taint_py.AnalysisLimit, 'stdin join receiver producer'):
+                for finding in taint_py.run(RunContext(lang='python', files=[path])):
+                    findings.append(finding)
+            self.assertEqual({(finding['rule'], finding['line']) for finding in findings},
+                             {('python.taint.eval', line)
+                              for line, text in enumerate(source.splitlines(), 1) if '# independent' in text})
+        for setup, expression in (
+                ('', "'|'.join(sys.stdin)"),
+                ("def separator():\n    return '|'\n", 'separator().join(sys.stdin)'),
+                ('', "b'|'.join(sys.stdin.buffer)")):
+            with self.subTest(setup=setup, expression=expression):
+                self.assert_rules('import sys\n' + setup + f'eval({expression})\n', 'eval')
+        self.assert_rules('import sys\neval("".join(sys.stdin.buffer))\n')
+        self.assert_rules('import sys\neval(b"".join(sys.stdin))\n')
+
+    def test_builtin_consumer_mutations_use_exact_namespace_identity(self):
+        for source in (
+            'import sys, builtins\nbuiltins.list = lambda stream: ["fixed"]\n'
+            'eval(builtins.list(sys.stdin)[0])\n',
+            'import sys, builtins as native\nnative.iter = lambda stream: iter(["fixed"])\n'
+            'eval(next(iter(sys.stdin)))\n',
+            'import sys, builtins\nsaved = builtins.list\nbuiltins.list = lambda stream: ["fixed"]\n'
+            'eval(saved(sys.stdin)[0])\n',
+        ):
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'stdlib source member mutation'):
+                    self.scan(source)
+        self.assert_rules('''
+            import sys
+            class Settings:
+                pass
+            Settings.list = ['fixed']
+            eval(list(sys.stdin)[0])
+        ''', 'eval')
+
+    def test_partial_stream_analysis_retains_independent_findings(self):
+        source = textwrap.dedent('''\
+            eval(input())
+            import sys
+            def replace():
+                sys.stdin = other
+            def independent():
+                eval(input())
+            replace()
+            independent()
+        ''')
+        engine = taint_py._Analysis(ast.parse(source))
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'stdlib source member mutation') as caught:
+            engine.analyze()
+        self.assertEqual({(kind, line) for kind, line, _column, _label in caught.exception.effects},
+                         {('eval', 1), ('eval', 6)})
+
+    def test_variadic_stdin_transport_reports_its_unmodeled_boundary(self):
+        cases = (
+            'def read(*arguments):\n    return next(*arguments)\neval(read(sys.stdin))\n',
+            'def read(*arguments):\n    return arguments[0].read()\neval(read(sys.stdin))\n',
+            'def read(*readers):\n    return readers[0]()\neval(read(sys.stdin.read))\n',
+            'def stream():\n    return sys.stdin\n'
+            'def read(*readers):\n    return readers[0]()\neval(read(stream().read))\n',
+            'def read(*arguments):\n    return next(*arguments)\n'
+            'def consume():\n    eval(read(sys.stdin))\nconsume()\n',
+        )
+        for source in cases:
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'stdin handles through variadic helper'):
+                    self.scan('import sys\n' + source)
+        for stream, method in (('sys.stdin', 'read'), ('sys.stdin', 'readline'),
+                               ('sys.stdin.buffer', 'read1')):
+            with self.subTest(stream=stream, method=method), temporary_directory(prefix='ubs-stdin-size-') as tmp:
+                path = Path(tmp) / 'view.py'
+                path.write_text('import sys\ndef read(*sizes):\n'
+                                f'    return {stream}.{method}(*sizes)\neval(read(0))\n', encoding='utf-8')
+                emitted = []
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'stdin read size through variadic'):
+                    for finding in taint_py.run(RunContext(lang='python', files=[path])):
+                        emitted.append(finding)
+                self.assertEqual(emitted, [], 'An incomplete zero-size read must not emit a false critical')
+        engine = taint_py._Analysis(ast.parse(textwrap.dedent('''\
+            eval(input())
+            import sys
+            def read(*arguments):
+                return next(*arguments)
+            def independent():
+                eval(input())
+            read(sys.stdin)
+            independent()
+        ''')))
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'stdin handles through variadic helper') as caught:
+            engine.analyze()
+        self.assertEqual({(kind, line) for kind, line, _column, _label in caught.exception.effects},
+                         {('eval', 1), ('eval', 6)})
+        engine = taint_py._Analysis(ast.parse(textwrap.dedent('''\
+            eval(input())
+            import sys
+            def read(*sizes):
+                return sys.stdin.read(*sizes)
+            eval(read(0))
+            def independent():
+                eval(input())
+            independent()
+        ''')))
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'stdin read size through variadic') as caught:
+            engine.analyze()
+        self.assertEqual({(kind, line) for kind, line, _column, _label in caught.exception.effects},
+                         {('eval', 1), ('eval', 7)})
+
+    def test_variadic_boundary_keeps_supported_data_and_fixed_parameters(self):
+        self.assert_rules('''
+            import sys
+            def read(stream, *rest):
+                return stream.read()
+            eval(read(sys.stdin, 'unused'))
+        ''', 'eval')
+        self.assert_rules('''
+            import sys
+            def ignore(*arguments):
+                return 'fixed'
+            eval(ignore(sys.stdin))
+        ''')
+        self.assert_rules('''
+            import sys
+            def replace(*arguments):
+                arguments = ('fixed',)
+                return arguments[0]
+            eval(replace(sys.stdin))
+        ''')
+        self.assert_rules('''
+            def identity(*values):
+                return values[0]
+            eval(identity(input()))
+        ''', 'eval')
+        self.assert_rules('''
+            def identity(*values):
+                return values[0]
+            eval(identity('fixed'))
+        ''')
+        self.assert_rules('''
+            import sys
+            def read(*sizes):
+                return sys.stdin.readlines(*sizes)
+            eval(read(0)[0])
+        ''', 'eval')
+
+    def test_stdin_data_keeps_sink_specific_safety(self):
+        self.assert_rules('''
+            import sys, subprocess, html, shlex
+            value = sys.stdin.read()
+            subprocess.run(['echo', value])
+            os.system('echo ' + shlex.quote(value))
+            cursor.execute('SELECT * FROM users WHERE name = %s', (value,))
+            HttpResponse(html.escape(value))
+            value = 'fixed'
+            eval(value)
+        ''')
+        self.assert_rules('import sys, html\neval(html.escape(sys.stdin.read()))\n', 'eval')
+
+
 class ReachingDefinitionTests(SourceTest):
     def test_safe_reassignment_kills_taint(self):
         self.assert_rules("q = input()\nq = 'safe'\neval(q)\n")
@@ -530,6 +969,14 @@ class RunnerIntegrationTests(unittest.TestCase):
                                ("import os\ncursor.execute('SELECT ' + os.getenv('UBS_INPUT'))\n", True),
                                ("from os import environ as values\ncursor.execute('SELECT ' + values['UBS_INPUT'])\n", True),
                                ("import os\ncursor.execute('SELECT %s', (os.getenv('UBS_INPUT'),))\n", False),
+                               ("import sys\ncursor.execute('SELECT ' + sys.stdin.read())\n", True),
+                               ("from sys import stdin as stream\ncursor.execute(stream.readline())\n", True),
+                               ("import sys\ncursor.execute(sys.stdin.buffer.read().decode())\n", True),
+                               ("import sys\nfor line in sys.stdin:\n    cursor.execute(line)\n", True),
+                               ("import sys\nargs = (sys.stdin,)\ncursor.execute(next(*args))\n", True),
+                               ("import sys\ncursor.execute('SELECT %s', (sys.stdin.read(),))\n", False),
+                               ("import sys\ncursor.execute(sys.stdin.read(0))\n", False),
+                               ("import sys\ncursor.execute(sys.stdin.encoding)\n", False),
                                ("match request.get_json():\n    case {**rest}:\n        cursor.execute(rest['query'])\n", True),
                                ("match cursor.execute:\n    case execute:\n        execute(input())\n", True),
                                ("match request.get_json():\n    case {**rest}:\n        cursor.execute('select %s', (rest,))\n", False),

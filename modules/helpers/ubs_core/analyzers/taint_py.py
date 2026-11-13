@@ -54,8 +54,27 @@ _MAX_CAPTURE_DEPTH = 64
 _PARTIAL_MODULE_REF = '@stdlib:functools'
 _PARTIAL_CHANGED_MODULE = '@partial:changed-module'
 _PARTIAL_CHANGED_CONSTRUCTOR = '@partial:changed-constructor'
+_STDIN_STREAMS = frozenset(f'sys.{member}{suffix}'
+                          for member in ('stdin', '__stdin__')
+                          for suffix in ('', '.buffer', '.buffer.raw'))
+_STDIN_METHODS = {
+    stream: frozenset({'read', 'readline', 'readlines', '__next__'})
+            | (frozenset({'read1', 'peek'}) if stream.endswith('.buffer') else frozenset())
+            | (frozenset({'readall'}) if stream.endswith('.raw') else frozenset())
+    for stream in _STDIN_STREAMS
+}
+_STDIN_READERS = {f'{stream}.{method}': stream
+                  for stream, methods in _STDIN_METHODS.items() for method in methods}
+_STDIN_ITERATORS = {f'{stream}.__iter__': stream for stream in _STDIN_STREAMS}
+_STDIN_UNMODELED = frozenset(f'{stream}.{method}' for stream in _STDIN_STREAMS
+                            for method in ('readinto', 'readinto1', 'detach'))
+_STDIN_API_NAMES = frozenset(_STDIN_READERS) | frozenset(_STDIN_ITERATORS) | _STDIN_UNMODELED
+_STDIN_OPAQUE_ARGUMENTS = '@stdin:opaque-arguments'
 _SOURCE_MEMBERS = {'os': frozenset({'getenv', 'getenvb', 'environ', 'environb'}),
-                   'sys': frozenset({'argv'})}
+                   'sys': frozenset({'argv', 'stdin', '__stdin__'}),
+                   'builtins': frozenset({'iter', 'list', 'tuple', 'next'}),
+                   **{stream: methods | {'__iter__', 'buffer', 'raw'}
+                      for stream, methods in _STDIN_METHODS.items()}}
 # Keep a precise prefix plus an aggregate unknown-length suffix in summaries.
 _MAX_VECTOR_CONTEXT = 16
 
@@ -905,7 +924,7 @@ class _ModuleBinding:
 # Preserve the existing conventional unimported names, but never restore one
 # after a local assignment/parameter has explicitly shadowed it.
 _IMPLICIT_IDENTITIES = frozenset({
-    'eval', 'exec', 'input', 'raw_input', 'print', 'str', 'list', 'tuple', 'any', 'all', 'next', 'globals', 'builtins', 'staticmethod', 'classmethod',
+    'eval', 'exec', 'input', 'raw_input', 'print', 'str', 'list', 'tuple', 'any', 'all', 'next', 'iter', 'globals', 'builtins', 'staticmethod', 'classmethod',
     'html', 'django', 'flask', 'markupsafe', 'bleach', 'shlex', 'subprocess', 'os', 'asyncio',
     'sys', 'request', 'cursor', 'session', 'conn', 'engine', 'db',
     'render_template', 'render_template_string', 'HttpResponse', 'Response',
@@ -1006,7 +1025,7 @@ def _extend_qualifier(base: str, attribute: str, *, receiver_unknown=False) -> s
     prevents long unknown paths from acquiring an exact sanitizer identity.
     """
     name = _opaque_qualifier(f'{base}.{attribute}', receiver_unknown=receiver_unknown)
-    if name.count('.') < _QUALIFIER_WIDTH:
+    if name in _STDIN_API_NAMES or name.count('.') < _QUALIFIER_WIDTH:
         return name
     components = name.split('.')
     return '.'.join((components[0], '<unknown>', *components[-3:]))
@@ -1572,7 +1591,7 @@ def _qualified(node: ast.AST, aliases: dict[str, object]) -> str:
             if isinstance(target, str):
                 return target
             if node.id in {'html', 'django', 'flask', 'markupsafe', 'bleach', 'shlex',
-                           'subprocess', 'os', 'asyncio', 'builtins', 'eval', 'exec', 'input', 'raw_input',
+                           'subprocess', 'os', 'sys', 'asyncio', 'builtins', 'eval', 'exec', 'input', 'raw_input',
                            'render_template', 'render_template_string', 'HttpResponse', 'Response'}:
                 return ''
         # HTTP names are not legacy implicit identities. Once a real import
@@ -3881,7 +3900,8 @@ class _Flow:
             if isinstance(target, ast.Attribute) and any(
                     target.attr in members for members in _SOURCE_MEMBERS.values()):
                 self.require_value(namespace)
-                if any(isinstance(choice, str) and target.attr in _SOURCE_MEMBERS.get(choice, ())
+                if any(target.attr in _SOURCE_MEMBERS.get(
+                           choice if isinstance(choice, str) else self.stdin_identity(choice), ())
                        for choice in _binding_choices(namespace)):
                     # Replacing a source API or its backing collection changes
                     # both future imports and previously captured getters.
@@ -4074,6 +4094,115 @@ class _Flow:
         name = _pattern_capture(pattern)
         if name is not None:
             self.write_name(state, name, _advance(fact, name), binding, references)
+
+    @staticmethod
+    def stdin_identity(value):
+        """Exact native stream/API names, including symbolic receiver slots."""
+        name = (value if isinstance(value, str) else value.name
+                if isinstance(value, _BoundCallable) and value.namespace_proven else None)
+        return name if name in _STDIN_STREAMS or name in _STDIN_API_NAMES else None
+
+    def stdin_source(self, binding):
+        """Provenance of bytes/lines consumed from an identified stdin stream.
+
+        The stream itself is an inert handle: its encoding, file descriptor,
+        method objects and other metadata are not its externally supplied data.
+        Keep this separate from source() so aliases retain that distinction.
+        """
+        return join_facts(*(frozenset({TaintTrace(name, path=(name,))})
+                            for value in _binding_choices(binding)
+                            if (name := self.stdin_identity(value)) in _STDIN_STREAMS))
+
+    def stdin_call(self, node, state, target, name, receiver, inputs):
+        """Finite read/iteration contracts; None leaves ordinary calls alone."""
+        native = isinstance(target, str) or isinstance(target, _BoundCallable) and target.namespace_proven
+        arguments, keywords = inputs.arguments, inputs.keywords
+        if native and name in _STDIN_UNMODELED:
+            # readinto mutates a caller-owned buffer; detach transfers an
+            # underlying stream and invalidates its old owner. Neither is a
+            # read-result contract, so do not silently drop those effects.
+            raise AnalysisLimit('stdin buffer mutation or detachment is unmodeled; analysis is incomplete')
+        if native and name in _STDIN_READERS:
+            positions = self.call_positions(node, arguments, state)
+            size = inputs.keyword_nodes.get('size')
+            value = positions[0][2] if positions else self.expression_bindings.get(size, size)
+            self.require_value(value)
+            self.possible_exception(state)
+            if (name.rsplit('.', 1)[-1] in {'read', 'read1', 'readline'}
+                    and (positions and isinstance(positions[0][0], (ast.Starred, _ArgumentExpansion))
+                         or isinstance(value, _SymbolicValue) and value.parameter.startswith('@argv:'))):
+                # Vararg summary projections currently retain provenance but
+                # not an exact numeric size. Refuse an unresolved expansion
+                # before a provisional summary can seed a false read result;
+                # a later refinement cannot retract an already emitted fact.
+                raise AnalysisLimit('stdin read size through variadic arguments is unresolved; '
+                                    'analysis is incomplete')
+            if (name.rsplit('.', 1)[-1] in {'read', 'read1', 'readline'}
+                    and isinstance(value, ast.Constant) and type(value.value) in {int, bool}
+                    and value.value == 0):
+                return CLEAN
+            # readlines(0) means no hint, and peek(0) may return buffered
+            # bytes. Only the bounded reads above prove an empty result.
+            return self.stdin_source(_STDIN_READERS[name])
+        if native and name in _STDIN_ITERATORS and not arguments and not keywords:
+            self.expression_bindings[node] = _STDIN_ITERATORS[name]
+            self.expression_references[node] = NO_REFERENCES
+            self.possible_exception(state)
+            return CLEAN
+        if not node.args:
+            return None
+        if isinstance(target, _BoundCallable) and target.producer_unproved:
+            # The saved method retains its receiver's unresolved effects.
+            # Check before ordinary consumer fallback: an alias need not
+            # retain the original syntactic receiver to carry that duty.
+            if any(self.stdin_source(value) for _operand, _fact, value, _refs
+                   in self.call_positions(node, arguments, state)):
+                raise AnalysisLimit('stdin join receiver producer effects are unresolved; '
+                                    'analysis is incomplete')
+        consumer = name if native else None
+        builtins_consumer = consumer in {'iter', 'list', 'tuple', 'next',
+                                        'builtins.iter', 'builtins.list', 'builtins.tuple', 'builtins.next'}
+        string_join = (isinstance(node.func, ast.Attribute) and node.func.attr == 'join'
+                       and self.materialized_generator_string(node.func.value, state))
+        join_receiver = (self.expression_bindings.get(node.func.value)
+                         if isinstance(node.func, ast.Attribute) and node.func.attr == 'join' else None)
+        bytes_join = (bool(_binding_choices(join_receiver)) and all(
+            isinstance(value, ast.Constant) and type(value.value) is bytes
+            for value in _binding_choices(join_receiver)))
+        if not builtins_consumer and not string_join and not bytes_join:
+            return None
+        positions = self.call_positions(node, arguments, state)
+        if not positions:
+            return None
+        operand, first, binding, _references = positions[0]
+        if isinstance(operand, (ast.Starred, _ArgumentExpansion)):
+            if any(self.stdin_source(value) for _operand, _fact, value, _refs in positions):
+                raise AnalysisLimit('stdin iterator argument expansion is unresolved; analysis is incomplete')
+            return None
+        if string_join or bytes_join:
+            # Native join enforces its element type: text cannot consume a
+            # binary stream, and bytes cannot consume a text stream.
+            binding = _join_bindings(*(stream for value in _binding_choices(binding)
+                if (stream := self.stdin_identity(value)) in _STDIN_STREAMS
+                and (stream.endswith(('.buffer', '.raw')) if bytes_join
+                     else stream in {'sys.stdin', 'sys.__stdin__'})))
+        consumed = self.stdin_source(binding)
+        if not consumed:
+            return None
+        if builtins_consumer and any(
+                engine.generator_builtin_reflection or engine.generator_namespace_exposed
+                or engine.generator_frame_exposed for engine in self.engine.generator_peers):
+            raise AnalysisLimit('stdin iterator consumer identity is unresolved; analysis is incomplete')
+        self.possible_exception(state)
+        if consumer in {'iter', 'builtins.iter'} and len(positions) == 1 and not keywords:
+            self.expression_bindings[node] = _join_bindings(*(
+                stream if (stream := self.stdin_identity(value)) in _STDIN_STREAMS else None
+                for value in _binding_choices(binding)))
+            self.expression_references[node] = NO_REFERENCES
+            return first
+        if consumer in {'iter', 'builtins.iter'}:
+            return None
+        return join_facts(consumed, receiver, *arguments, *keywords.values())
 
     def source(self, node, state, candidate=None):
         # A supplied candidate was resolved before a call's argument effects.
@@ -4417,18 +4546,33 @@ class _Flow:
             # Unknown expansion must not certify a particular program/option.
             bound.update((name, None) for name in positional)
         if function.args.vararg:
-            operands = []
-            element_references = []
-            for expression, fact, binding, refs in positions[len(positional):]:
-                if isinstance(expression, ast.Starred) and isinstance(binding, _ArgumentVector):
-                    operands.extend(binding.operands)
-                    element_references.extend(binding.references if binding.references else
-                                              (refs for _ in binding.operands))
-                else:
-                    operands.append(self.command_operand(expression, fact))
-                    element_references.append(refs)
-            bound[function.args.vararg.arg] = (
-                None if expanded and positional else _ArgumentVector(tuple(operands), tuple(element_references)))
+            # The argv summary vocabulary preserves scalar data, not native
+            # stream/callable identity. Refuse this boundary before packing
+            # a known stdin handle into a vector that would silently erase it.
+            surplus = positions if expanded else positions[len(positional):]
+            opaque_stdin = any(self.stdin_identity(value)
+                for _expression, _fact, binding, _refs in surplus
+                for value in _binding_choices(binding))
+            if opaque_stdin:
+                # Refuse inside the callee when it actually reads this value.
+                # A caller-level exception would discard later independent
+                # findings instead of using the existing incomplete summary.
+                bound[function.args.vararg.arg] = _STDIN_OPAQUE_ARGUMENTS
+                if expanded:
+                    bound.update((name, _STDIN_OPAQUE_ARGUMENTS) for name in positional)
+            else:
+                operands = []
+                element_references = []
+                for expression, fact, binding, refs in positions[len(positional):]:
+                    if isinstance(expression, ast.Starred) and isinstance(binding, _ArgumentVector):
+                        operands.extend(binding.operands)
+                        element_references.extend(binding.references if binding.references else
+                                                  (refs for _ in binding.operands))
+                    else:
+                        operands.append(self.command_operand(expression, fact))
+                        element_references.append(refs)
+                bound[function.args.vararg.arg] = (
+                    None if expanded and positional else _ArgumentVector(tuple(operands), tuple(element_references)))
         bound.update((name, self.expression_bindings.get(value)) for name, value in keyword_nodes.items()
                      if name is not None)
         defaults = (captured_defaults.values if captured_defaults is not None
@@ -5340,6 +5484,10 @@ class _Flow:
                     # A custom protocol may also affect later reads whose
                     # own keys are primitive. Retain the possible write.
                     self.mutate(receiver_refs, arguments[0], state)
+        if isinstance(node, ast.Call):
+            stdin = self.stdin_call(node, state, target, name, receiver, inputs)
+            if stdin is not None:
+                return stdin
         if name == 'functools.partial':
             return self.partial_value(node, state, inputs)
         value = (self.expression_bindings.get(node.args[0])
@@ -5921,6 +6069,10 @@ class _Flow:
                 fact = state.value(slot)
                 binding = state.bindings[slot]
                 self.expression_facts[node] = fact
+            if (binding == _STDIN_OPAQUE_ARGUMENTS
+                    or isinstance(binding, frozenset) and _STDIN_OPAQUE_ARGUMENTS in binding):
+                raise AnalysisLimit('stdin handles through variadic helper arguments are unmodeled; '
+                                    'analysis is incomplete')
             if (node.id in self.engine.global_names
                     and node.id not in self.engine.locals.get(self.scope, ())
                     and node.id not in self.engine.closures.get(self.scope, ())
@@ -6539,6 +6691,7 @@ class _Flow:
             if synchronous_generator and not self.materialized_generator_iterable(generator.iter, entering):
                 raise AnalysisLimit('generator materialization iterator or captured lifetime is unresolved; '
                                     'analysis is incomplete')
+            value = join_facts(value, self.stdin_source(binding))
             if synchronous_generator:
                 iterator_references.update(refs)
             literal = generator.iter
@@ -6983,6 +7136,7 @@ class _Flow:
             if not state.reachable:
                 return None
             binding = self.expression_bindings.get(node.iter)
+            value = join_facts(value, self.stdin_source(binding))
             references = self.expression_references.get(node.iter, NO_REFERENCES)
             generators = _binding_choices(binding)
             if any(isinstance(value, (_DeferredGenerator, _GeneratorNext)) for value in generators):

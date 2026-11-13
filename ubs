@@ -2542,6 +2542,7 @@ cat <<'JSON'
         "properties": {
           "stage": {"type": "string"},
           "exception_type": {"type": "string"},
+          "semantic": {"type": "boolean", "description": "True for an explicit semantic coverage limit; false or absent for infrastructure or analyzer failures"},
           "message": {"type": "string"},
           "components": {"type": "array", "items": {"$ref": "#/$defs/analysis_component"}, "description": "Full failed source/scope list; never truncated to the human-readable summary limit"}
         }
@@ -10051,7 +10052,7 @@ JSON
     jq --arg s "$scanner_status" --argjson rc "$module_status" '
       (if .status == "partial" and ($s == "ok" or ($s == "error" and $rc == 2))
        then . else . + {status:$s} end)
-      + (if .status == "error" and (.module_error|not) then
+      | . + (if .status == "error" and (.module_error|not) then
            {module_error:("MODULE_EXIT_" + ($rc|tostring)),
             message:("Scanner module exited with status " + ($rc|tostring) + " before producing a result; see stderr")}
          else {} end)' "$out_json" > "$out_json.tmp" 2>/dev/null && mv "$out_json.tmp" "$out_json"
@@ -11258,6 +11259,16 @@ case "$FORMAT" in
       elif [ -s "$TMPDIR_RUN/$L.sarif" ]; then
         say "${DIM}[sarif summary]${RESET}"
         cat "$TMPDIR_RUN/$L.sarif"
+      fi
+      # A module may emit its summary before failing without a Partial marker.
+      # Its stderr is still actionable evidence; text must not hide it while
+      # directing the user to the scanner output for remediation.
+      if need_cmd jq && [[ -s "$TMPDIR_RUN/$L.json" ]] && \
+         jq -e '.status == "error" or .status == "timeout"' "$TMPDIR_RUN/$L.json" >/dev/null 2>&1; then
+        say "${RED}Scanner diagnostics (${L}):${RESET}"
+        jq -r '[.module_error // "MODULE_ERROR", .message // ""] | join(": ")' \
+          "$TMPDIR_RUN/$L.json" | sed 's/^/  /'
+        env_error_excerpt "$L" | sed 's/^/  /' || true
       fi
     done
     if [[ "$HAS_ENV_ERROR" -eq 1 ]]; then

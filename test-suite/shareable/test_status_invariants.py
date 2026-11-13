@@ -65,6 +65,9 @@ if [ "$mode" = "garbage" ]; then
   echo "Garbage text with Critical issues: 42 and Warning issues: 99"
   exit "$rc"
 fi
+if [ -n "${STUB_STDERR:-}" ]; then
+  printf '%s\n' "$STUB_STDERR" >&2
+fi
 [ -n "$report" ] && : > "$report"
 if [ "$fmt" = "json" ] || [ "$fmt" = "sarif" ]; then
   printf '{"language":"python","project":"%s","files":1,"critical":0,"warning":0,"info":0,"timestamp":"2026-01-01T00:00:00Z","status":"ok","findings":[]}\n' "${STUB_PROJECT:-.}"
@@ -205,6 +208,45 @@ def check_matrix(tmpdir: Path) -> None:
             check(f"{case_id}/text-no-status-line", "Status: partial" not in text_blob
                   and "Status: error" not in text_blob,
                   "a complete run must not print an incomplete status line")
+
+
+def check_failed_module_diagnostics(tmpdir: Path) -> None:
+    """A failed module's initially valid report must not hide its failure.
+
+    A module can write its summary before a later tool or report step fails.
+    The runner must attach the actual failure code to that final status and
+    show stderr in text mode, even when the module omitted a Partial marker.
+    Accepting partial results must still refuse this unusable sole scanner.
+    """
+    target, bin_dir = make_workspace(tmpdir / "failed-diagnostics")
+    diagnostic = "fixture analyzer failed: dependency database is unreadable"
+    for code in (2, 7):
+        for accept in ("0", "1"):
+            env = {"STUB_EXIT": str(code), "STUB_STDERR": diagnostic,
+                   "UBS_ALLOW_PARTIAL": accept}
+            name = f"diagnostics/exit-{code}/accept-{accept}"
+            proc = run_scan(target, bin_dir, ["--format=json"], env, only="python")
+            try:
+                doc = json.loads(proc.stdout)
+            except ValueError:
+                check(f"{name}/json-parses", False, proc.stdout[:300])
+                continue
+            failed = doc.get("failed_modules") or []
+            check(f"{name}/machine-failure-code",
+                  len(failed) == 1 and failed[0].get("status") == "error"
+                  and failed[0].get("module_error") == f"MODULE_EXIT_{code}",
+                  repr(failed))
+            check(f"{name}/machine-failure-message",
+                  len(failed) == 1 and f"status {code}" in (failed[0].get("message") or ""),
+                  repr(failed))
+            check(f"{name}/machine-fails-closed", proc.returncode == 2,
+                  f"exit={proc.returncode} stderr={proc.stderr[-400:]}")
+            text_proc = run_scan(target, bin_dir, [], env, only="python")
+            text_output = text_proc.stdout + text_proc.stderr
+            check(f"{name}/text-failure-visible", diagnostic in text_output,
+                  text_output[-800:])
+            check(f"{name}/text-fails-closed", text_proc.returncode == 2,
+                  f"exit={text_proc.returncode} output={text_output[-400:]}")
 
 
 def check_allow_partial_exits_on_findings(tmpdir: Path) -> None:
@@ -570,6 +612,7 @@ def main() -> int:
     tmpdir = Path(tempfile.mkdtemp(prefix="ubs-status-invariants-"))
     try:
         check_matrix(tmpdir)
+        check_failed_module_diagnostics(tmpdir)
         check_allow_partial_exits_on_findings(tmpdir)
         check_new_only_preserves_execution_state(tmpdir)
         check_incomplete_scan_refuses_baseline(tmpdir)

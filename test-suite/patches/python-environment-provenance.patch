@@ -1,25 +1,24 @@
-Python environment input provenance — implementation candidate
+Python environment input provenance — historical implementation candidate
 
-Base: 71255b1345d44e89a1f7208e58579b4c2ced5d0f
+Original base: 71255b1345d44e89a1f7208e58579b4c2ced5d0f
 Bead: ultimate_bug_scanner-env-provenance
-Status: unactivated; execution environment unavailable before validation.
+Status: SUPERSEDED by the active implementation in c142294b311dbc65c29aae84b2a8d1fc3b97e9ff.
+Do not reapply this historical patch over current main.
 
-Recognize the exact os.getenv/getenvb identities, retain imported source
-collections, and keep unresolved relative imports distinct from stdlib APIs.
-Add six source-level regression methods and three real-runner SQL cases.
-Independent source review is complete; no regression or public scan passed
-in this session because the execution environment disconnected first.
+The original candidate below introduced getenv/getenvb and imported-value
+provenance, with six source-level methods and three public runner cases.
+A paired DSR run reproduced 26 assertion failures on the incumbent and zero
+on this candidate. Independent clean controls then found five false positives
+from generic import seeding through legacy substring source patterns.
 
-Apply only in a checkout with the base changes reconciled, then regenerate
-canonical integrity pins using scripts/update_checksums.sh and
-scripts/update_sha256sums.sh. The patch intentionally contains no release
-version, tag or generated checksum changes until runtime qualification.
-Run the targeted suite (UBS_KEEP_TEMP=1 and UBS_TAINT_E2E=1 where supported),
-existing Python alias/project/dataflow suites, and prescribed repository
-quality gates through DSR before activating or closing the bead.
+The active implementation uses exact, case-sensitive stdlib source identities
+and an explicit imported-value set. It also adds source-member mutation
+boundaries, expanded regressions and regenerated integrity pins. Consult the
+current analyzer, tests and bead for its evidence and remaining qualifications.
+The original diff is retained unchanged as history, not as an activation path.
 
-Candidate helper SHA256: 793b04537b55c7e07281c85356dd0c9a281f83439727e401fa2019f8927b05b6
-Candidate test SHA256: ee1cbe2b91d194b768c9f9bf1327c30e0127443e0c34de2d2f53dc3486efade6
+Original candidate helper SHA256: 793b04537b55c7e07281c85356dd0c9a281f83439727e401fa2019f8927b05b6
+Original candidate test SHA256: ee1cbe2b91d194b768c9f9bf1327c30e0127443e0c34de2d2f53dc3486efade6
 
 diff --git a/modules/helpers/ubs_core/analyzers/taint_py.py b/modules/helpers/ubs_core/analyzers/taint_py.py
 index 84b211d..832fcc8 100644

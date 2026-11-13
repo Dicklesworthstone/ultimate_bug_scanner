@@ -1,0 +1,553 @@
+Candidate: Preserve taint and identity through native JavaScript Array.fill
+Base-Commit: 71255b1345d44e89a1f7208e58579b4c2ced5d0f
+Status: UNACTIVATED CANDIDATE; no completed analyzer regression result is available.
+
+The executor disconnected before the paired DSR run returned a usable result.
+This implementation and its regression tests are retained for runtime
+qualification; they are not loaded by UBS. Existing expectations and gates
+are unchanged. Independent static review and native JavaScript examples check
+the intended semantics and fixture labels, not the analyzer implementation.
+
+Scope: native Array.fill on modeled array allocations; alias/return identity;
+literal bounds with negative offsets, fractions, null/undefined, NaN/infinities;
+holes, clean overwrites, sanitizer domains and finite work-budget accounting.
+Unknown ranges use conservative writes. Opaque bound conversions, explicit
+descriptors, restriction APIs and prior unknown escapes cannot certify a clean
+fill: the existing incomplete-analysis channel carries those boundaries.
+Relevant Object APIs retain returned array identity and prior descriptor or
+prototype provenance; modeled Reflect methods return Boolean facts.
+Property-contract metadata stays on heap identity and is excluded from copies.
+Generic borrowed fill, arbitrary setters/coercion, exact BigInt completion and
+other unmodeled JavaScript protocols remain outside this bounded slice.
+
+Before activation: reconcile with current main, run all new and existing
+JavaScript taint/security tests plus real CLI JSON/SARIF checks, refresh the
+canonical checksums/version as required by AGENTS.md, and run the prescribed
+quality gates through DSR. Do not treat this archive or native fixture checks
+as runtime qualification or close the parent D6 production-completeness work.
+
+Candidate analyzer SHA256: 92ec177c3d1f9c1818414a8d94a2da24eca19cfc71266091249300a75c475a66
+Candidate tests SHA256: 2d057f5b2e329ab346a357e1c8c753ba2edf4f2843fa9f72eb50b71cae53b214
+
+diff --git a/modules/helpers/ubs_core/analyzers/taint_js.py b/modules/helpers/ubs_core/analyzers/taint_js.py
+--- a/modules/helpers/ubs_core/analyzers/taint_js.py
++++ b/modules/helpers/ubs_core/analyzers/taint_js.py
+@@ -38,7 +38,10 @@
+ # Marks the call-site set of an allocation that came back through a widened
+ # summary (_Engine.heap_call): one weak object per allocation site and context
+ # into a recursion, instead of one per subset of call sites.
+-WIDENED = '<widened>'
++WIDENED = '<widened>'
++# Metadata for array objects whose indexed writes can invoke opaque protocols.
++# It survives heap joins/summaries but is never copied as a JavaScript property.
++_ARRAY_WRITE_CONTRACT = ('array-write-contract',)
+ 
+ 
+ def _collapsed(ref):
+@@ -727,7 +730,9 @@
+         # the object exists contribute its property values.
+         objects = [state.heap[ref] for state in states if ref in state.heap]
+         keys = set().union(*(slots.keys() for slots in objects))
+-        result.heap[ref] = {key: _join(*(slots.get(key, slots.get(None, _ABSENT)) for slots in objects)) for key in keys}
++        result.heap[ref] = {key: _join(*(slots.get(key, slots.get(None, _ABSENT)) for slots in objects)) for key in keys}
++        if _ARRAY_WRITE_CONTRACT in keys:
++            result.heap[ref][_ARRAY_WRITE_CONTRACT] = frozenset()
+     result.weak_refs = set().union(*(state.weak_refs for state in states))
+     result.written_cells = set().union(*(state.written_cells for state in states))
+     for key in set().union(*(state.binding_kinds.keys() for state in states)):
+@@ -1473,7 +1478,7 @@
+ 
+     @staticmethod
+     def array_index(key):
+-        if key is not None and re.fullmatch(r'0|[1-9][0-9]*', key):
++        if isinstance(key, str) and re.fullmatch(r'0|[1-9][0-9]*', key):
+             # Other numeric-looking names are ordinary properties, not indices.
+             return int(key) if len(key) <= 10 and int(key) < 4294967295 else None
+         return None
+@@ -1596,7 +1601,7 @@
+                 # An unknown property may override every currently named key.
+                 # A later definite write can still replace that key precisely.
+                 for known in tuple(slots):
+-                    if known is not None:
++                    if known is not None and known != _ARRAY_WRITE_CONTRACT:
+                         prior = slots[known]
+                         joined = _join(prior, present)
+                         slots[known] = _Fact(joined, _refs(joined), absent=getattr(prior, 'absent', False))
+@@ -1625,7 +1630,7 @@
+                         # A computed property write can replace a method.
+                         # Element spreads use the wildcard slot directly and
+                         # must not be mistaken for prototype/method writes.
+-                        for method in ('push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'entries', 'map'):
++                        for method in ('push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'fill', 'entries', 'map'):
+                             slots[method] = _join(slots.get(method, _ABSENT), present)
+                 elif self.array_index(key) is not None and length is not None:
+                     state.array_lengths[ref] = max(length, int(key) + 1)
+@@ -1835,8 +1840,10 @@
+                     target_reference = self.binding_reference(left + 3, right, state)
+                     ref, slots = (self.scope, left, 'binding-rest'), {}
+                     for parent in _refs(fact):
+-                        for key, value in state.heap.get(parent, {}).items():
+-                            if array:
++                        for key, value in state.heap.get(parent, {}).items():
++                            if key == _ARRAY_WRITE_CONTRACT:
++                                continue
++                            if array:
+                                 numeric = self.array_index(key)
+                                 if key is not None and (numeric is None or numeric < index):
+                                     continue
+@@ -1953,7 +1960,7 @@
+                             slots[key] = _Fact(merged, _refs(merged), absent=getattr(old, 'absent', False))
+                         slots[None] = _Fact(_join(slots.get(None, frozenset()), wildcard),
+                                             _refs(_join(slots.get(None, frozenset()), wildcard)), absent=True)
+-                    for key in set().union(*(obj.keys() for obj in objects)) - {None}:
++                    for key in set().union(*(obj.keys() for obj in objects)) - {None, _ARRAY_WRITE_CONTRACT}:
+                         incoming = self.property(spread, key, state)
+                         definite = not frozenset(spread) and all(
+                             key in obj and not getattr(obj[key], 'absent', False) for obj in objects)
+@@ -2152,7 +2159,134 @@
+             return 'sql-append', receiver, method
+         return 'sql-unknown', receiver, method
+ 
+-    def native_target(self, name, state):
++    def mark_array_write_contracts(self, fact, state, *, recursive=False):
++        """Keep opaque descriptors/escapes on object identity, not user keys."""
++        pending, seen = list(_refs(fact)), set()
++        prototypes = {('builtin', 'Array.prototype'), ('builtin', 'Object.prototype')}
++        while pending:
++            ref = pending.pop()
++            if ref in seen:
++                continue
++            seen.add(ref)
++            slots = state.heap.get(ref, {})
++            self.engine.budget.spend(1 + len(slots))
++            if recursive:
++                for value in slots.values():
++                    pending.extend(_refs(value) - seen)
++            if ref in state.array_lengths or ref in prototypes:
++                state.heap.setdefault(ref, {})[_ARRAY_WRITE_CONTRACT] = frozenset()
++
++    def array_fill_bound(self, arguments, prepared, index, length):
++        """Resolve pure primitive bounds; keep unknown coercions explicit.
++
++        ECMAScript fill snapshots length before converting start/end. An
++        omitted or undefined end uses that length; null instead converts to 0.
++        Unknown primitive values need only weak writes. Unknown objects can
++        run conversion methods, so absence of taint is not a complete proof.
++        """
++        actual, uncertain, maybe_missing, kinds = prepared
++        if uncertain is not None and index >= uncertain:
++            return None, False
++        default = 0 if index == 1 else length
++        if (index >= len(actual) or kinds.get(index) == 'undefined'
++                or (actual[index][1] and index not in maybe_missing)):
++            return default, True
++        if kinds.get(index) == 'null':
++            return 0, True
++        if index >= len(arguments) or any(
++                self.engine.text[left:right].lstrip().startswith('...')
++                for left, right in arguments[:index + 1]):
++            return None, kinds.get(index) == 'noniterable'
++        left, right = arguments[index]
++        text, code = self.engine.text, self.scope.code
++        while left < right and text[left].isspace():
++            left += 1
++        while right > left and text[right - 1].isspace():
++            right -= 1
++        while code[left:left + 1] == '(' and text[left:left + 1] == '(' and self.pairs.get(left) == right - 1:
++            left, right = left + 1, right - 1
++            while left < right and text[left].isspace():
++                left += 1
++            while right > left and text[right - 1].isspace():
++                right -= 1
++        raw = text[left:right]
++        number = None
++        if raw in {'true', 'false', 'null'}:
++            number = 1.0 if raw == 'true' else 0.0
++        elif re.fullmatch(r'[+-]?\s*(?:(?:0|[1-9][0-9]*)(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?', raw):
++            number = float(re.sub(r'\s+', '', raw))
++        else:
++            special = re.fullmatch(r'([+-]?)\s*(NaN|Infinity)', raw)
++            if special:
++                name = special.group(2)
++                scope, position = self.binding_context(name, left)
++                owner, begin, _ = self.engine.lexical_binding(scope, name, position)
++                if not any(local == name and start == begin
++                           for start, _end, local in self.engine.binding_regions[owner]):
++                    number = (0.0 if name == 'NaN' else
++                              float('-inf') if special.group(1) == '-' else float('inf'))
++        if number is None:
++            if re.fullmatch(r'[+-]?\s*(?:0[xX][\da-fA-F]+|0[bB][01]+|0[oO][0-7]+|[0-9][\d_]*)n', raw):
++                return None, False  # BigInt conversion throws; no normal fill proof.
++            quoted = (re.fullmatch(r"'(?:\\[\s\S]|[^'\\])*'", raw) is not None
++                      or re.fullmatch(r'"(?:\\[\s\S]|[^"\\])*"', raw) is not None)
++            return None, quoted or kinds.get(index) == 'noniterable'
++        if length is None:
++            return None, True
++        # Clamp before int(): infinities and huge finite numbers need no
++        # allocation or exceptional numeric conversion.
++        if number >= length:
++            return length, True
++        if number <= -length:
++            return 0, True
++        number = int(number)
++        return (max(length + number, 0) if number < 0 else number), True
++
++    def array_fill(self, receiver, arguments, prepared, state):
++        """Fill indexed slots without changing length or losing aliases."""
++        actual, uncertain, _missing, _kinds = prepared
++        values = [value for value, _missing in actual]
++        value = _join(*values) if uncertain == 0 else values[0] if values else frozenset()
++        refs = _refs(receiver)
++        prototypes = (state.heap.get(('builtin', name), {})
++                      for name in ('Array.prototype', 'Object.prototype'))
++        inherited = any(_ARRAY_WRITE_CONTRACT in slots or None in slots
++                        or '__proto__' in slots or any(self.array_index(key) is not None for key in slots)
++                        for slots in prototypes)
++        for ref in refs:
++            slots = state.heap[ref]
++            length = state.array_lengths[ref]
++            start, start_pure = self.array_fill_bound(arguments, prepared, 1, length)
++            end, end_pure = self.array_fill_bound(arguments, prepared, 2, length)
++            pure = start_pure and end_pure
++            if not pure:
++                self.incomplete.add('Array.fill bound coercion requires unsupported value semantics')
++            # Coercions above still happen for an empty array/range.
++            if length == 0 or (start is not None and end is not None and end <= start):
++                continue
++            constrained = inherited or _ARRAY_WRITE_CONTRACT in slots or '__proto__' in slots
++            if constrained:
++                self.incomplete.add('Array.fill requires ordinary writable indexed properties')
++            definite = (pure and not constrained and len(refs) == 1 and ref not in state.weak_refs
++                        and start is not None and end is not None)
++            if length is not None:
++                first, last = start if start is not None else 0, end if end is not None else length
++                self.engine.budget.spend(max(0, last - first))
++                for index in range(first, last):
++                    self.write_property(_Fact(refs=(ref,)), str(index), value, state, optional=not definite)
++            else:
++                numeric = [key for key in slots if self.array_index(key) is not None]
++                self.engine.budget.spend(1 + len(numeric))
++                present = _Fact(value, _refs(value))
++                for key in numeric:
++                    old = slots[key]
++                    joined = _join(old, present)
++                    slots[key] = _Fact(joined, _refs(joined), absent=getattr(old, 'absent', False))
++                joined = _join(slots.get(None, _ABSENT), present)
++                slots[None] = _Fact(joined, _refs(joined), absent=True)
++        return receiver
++
++    def native_target(self, name, state):
+         """Capture GetValue(callee) before arguments can replace a method."""
+         receiver_name, dot, method = name.rpartition('.')
+         if not dot:
+@@ -2183,10 +2317,16 @@
+         object_native = (refs == {('builtin', 'Object')} and not frozenset(receiver)
+                          and method not in state.heap.get(('builtin', 'Object'), {})
+                          and None not in state.heap.get(('builtin', 'Object'), {}))
+-        if object_native and method in {'assign', 'defineProperty'}:
+-            return 'object', receiver, method
++        if object_native and method in {'assign', 'defineProperty', 'defineProperties', 'freeze',
++                                        'seal', 'preventExtensions', 'setPrototypeOf'}:
++            return 'object', receiver, method
++        reflect_native = (refs == {('builtin', 'Reflect')} and not frozenset(receiver)
++                          and method not in state.heap.get(('builtin', 'Reflect'), {})
++                          and None not in state.heap.get(('builtin', 'Reflect'), {}))
++        if reflect_native and method in {'defineProperty', 'preventExtensions', 'setPrototypeOf'}:
++            return 'reflect', receiver, method
+         prototype = state.heap.get(('builtin', 'Array.prototype'), {})
+-        if (method in {'push', 'unshift', 'pop', 'shift', 'reverse', 'join'}
++        if (method in {'push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'fill'}
+                 and refs and not frozenset(receiver) and method not in prototype and None not in prototype
+                 and all(ref in state.array_lengths and method not in state.heap[ref] for ref in refs)):
+             return 'array', receiver, method
+@@ -2203,8 +2343,37 @@
+             return None
+         kind, receiver, method = native
+         actual, uncertain, _missing, _kinds = prepared
+-        values = [value for value, _missing in actual]
+-        if kind == 'sql-factory':
++        values = [value for value, _missing in actual]
++        if kind == 'array' and method == 'fill':
++            return self.array_fill(receiver, arguments, prepared, state)
++        if values and (kind == 'reflect' or (kind == 'object' and method in {
++                'defineProperty', 'defineProperties', 'freeze', 'seal', 'preventExtensions', 'setPrototypeOf'})):
++            target = _join(*values) if uncertain == 0 else values[0]
++            self.mark_array_write_contracts(target, state)
++            refs = _refs(target)
++            modeled = {ref for ref in refs if ref in state.array_lengths or
++                       ref in {('builtin', 'Array.prototype'), ('builtin', 'Object.prototype')}}
++            if modeled and (frozenset(target) or modeled != refs):
++                self.incomplete.add(f'{kind.title()}.{method} has an uncertain array target')
++            # Object APIs return the captured target. Preserve that alias
++            # without dropping prior descriptor/prototype provenance; their
++            # writes remain unsupported and must not certify a clean result.
++            if kind == 'object' and method == 'defineProperty':
++                if modeled and (uncertain is not None or len(values) < 3):
++                    self.incomplete.add('Object.defineProperty has unsupported descriptor arguments')
++                    return _join(target, self.materialize(_join(*values[1:]), state))
++                # Keep the existing precise descriptor value-write handling.
++            elif modeled:
++                if method in {'defineProperty', 'defineProperties', 'setPrototypeOf'}:
++                    self.incomplete.add(f'{kind.title()}.{method} requires unsupported write semantics')
++                if kind == 'reflect':
++                    return frozenset()  # Reflect returns a Boolean, not the target.
++                if method in {'defineProperties', 'setPrototypeOf'}:
++                    return _join(target, self.materialize(_join(*values[1:]), state))
++                return target
++            else:
++                return None  # Nonarray calls retain their existing fallback.
++        if kind == 'sql-factory':
+             if method == 'empty':
+                 return self.sql_object(location, [], state)
+             if method in {'join', 'fromList'}:
+@@ -2261,7 +2430,7 @@
+                 wildcard = _join(frozenset(source), *(obj.get(None, frozenset()) for obj in objects))
+                 if wildcard:
+                     self.write_property(target, None, wildcard, state)
+-                keys = set().union(*(obj.keys() for obj in objects)) - {None}
++                keys = set().union(*(obj.keys() for obj in objects)) - {None, _ARRAY_WRITE_CONTRACT}
+                 for key in keys:
+                     incoming = self.property(source, key, state)
+                     # Missing keys on an alternative source must retain the
+@@ -3059,8 +3228,10 @@
+                     self.effect(match_start, sink[1], _join(*selected), state)
+                     if self.rule == 'js.taint.sql':
+                         proof_role, proof_value = 'execute', _join(*selected)
+-                if self.rule == 'js.taint.sql' and self.engine.drizzle_imports:
+-                    if tag_call:
++                if native is None and not sink:
++                    self.mark_array_write_contracts(call_fact, state, recursive=True)
++                if self.rule == 'js.taint.sql' and self.engine.drizzle_imports:
++                    if tag_call:
+                         # Parameter slots belong to the SQL value, regardless
+                         # of whether execution is immediate or follows an alias,
+                         # helper return, join or append. Preserve live SQL-object
+@@ -4232,7 +4403,9 @@
+                 previous = state.heap[new]
+                 slots = {key: _join(previous.get(key, previous.get(None, _ABSENT)), slots.get(key, slots.get(None, _ABSENT)))
+                          for key in previous.keys() | slots.keys()}
+-            collapsed = len(originals) > 1 or collision or _collapsed(new)
++            if _ARRAY_WRITE_CONTRACT in slots:
++                slots[_ARRAY_WRITE_CONTRACT] = frozenset()
++            collapsed = len(originals) > 1 or collision or _collapsed(new)
+             if collapsed or any(old in output.weak_refs for old in originals):
+                 state.weak_refs.add(new)
+             state.heap[new] = slots
+diff --git a/test-suite/quality/test_taint_js_heap.py b/test-suite/quality/test_taint_js_heap.py
+--- a/test-suite/quality/test_taint_js_heap.py
++++ b/test-suite/quality/test_taint_js_heap.py
+@@ -1339,7 +1339,199 @@
+         self.scan('const items = [req.query.html, "safe"]; const alias = items.reverse(); res.send(items[0]);')
+         self.scan('const items = [req.query.html, "safe"]; const alias = items.reverse(); res.send(alias[1]);', 'xss')
+ 
+-    def test_nested_array_mutation(self):
++    def test_fill_mutates_alias_and_returns_same_array(self):
++        self.scan('const items = ["safe"]; const alias = items; '
++                  'const returned = alias.fill(req.query.html); '
++                  'res.send(items[0]); res.send(returned[0]);', 'xss', 'xss')
++        self.scan('const items = ["safe"]; res.send(items.fill(req.query.html).length);')
++
++    def test_fill_literal_ranges_match_native_javascript(self):
++        # Labels are predeclared from the ECMAScript fill contract, not scanner
++        # output. Node checks the same examples independently when available.
++        cases = [
++            ('', (0, 1, 2)), (',1', (1, 2)), (',-2,-1', (1,)),
++            (',1.9,2.8', (1,)), (',3,0', ()), (',0,0', ()),
++            (',-99,99', (0, 1, 2)), (',null,undefined', (0, 1, 2)),
++            (',false,true', (0,)), (',NaN,Infinity', (0, 1, 2)),
++            (',1e309', ()), (',-1e309', (0, 1, 2)), (',0,NaN', ()),
++            (',0,null', ()), (',0,-0.1', ()), (',(+1),(-1)', (1,)),
++        ]
++        for suffix, changed in cases:
++            with self.subTest(suffix=suffix):
++                source = ('const items = ["a", "b", "c"];\n'
++                          f'items.fill(req.query.html{suffix});\n'
++                          'res.send(items[0]);\nres.send(items[1]);\nres.send(items[2]);')
++                findings = self.scan(source, *('xss' for _ in changed))
++                self.assertEqual([finding['line'] for finding in findings], [3 + i for i in changed])
++                self.assert_runtime_sends(source, [
++                    'review-input' if i in changed else value for i, value in enumerate(('a', 'b', 'c'))])
++
++    def test_fill_cleanup_only_replaces_selected_indices(self):
++        self.scan('const items = [req.query.html, req.query.html, req.query.html]; '
++                  'items.fill("safe", 1, 2); res.send(items[0]); res.send(items[1]); '
++                  'res.send(items[2]);', 'xss', 'xss')
++        self.scan('const items = [req.query.html]; items.fill("safe"); res.send(items[0]);')
++        self.scan('const items = [req.query.html]; items.fill(); res.send(items[0]);')
++
++    def test_fill_creates_holes_but_preserves_length_and_named_properties(self):
++        self.scan('const items = [,,]; items.label = "safe"; '
++                  'items.fill(req.query.html); res.send(items[0]); res.send(items[1]); '
++                  'res.send(items.length); res.send(items.label); res.send(items[2]);', 'xss', 'xss')
++        self.scan('const items = [req.query.html]; items["-1"] = req.query.html; '
++                  'items.fill("safe"); res.send(items[0]); res.send(items["-1"]);', 'xss')
++        self.scan('const items = []; items.fill(req.query.html); res.send(items[0]);')
++        self.scan('const items = []; Object.freeze(items); items.fill(req.query.html); res.send(items[0]);')
++        self.scan('const items = ["safe"]; Object.freeze(items); '
++                  'items.fill(req.query.html, 1, 0); res.send(items[0]);')
++
++    def test_fill_preserves_shared_object_value_identity(self):
++        source = ('const value = {html: "safe"}; const items = [null, null]; '
++                  'items.fill(value); items[0].html = req.query.html; res.send(items[1].html);')
++        self.scan(source, 'xss')
++        self.assert_runtime_sends(source, ['review-input'])
++
++    def test_fill_captures_receiver_and_callee_before_evaluating_arguments(self):
++        source = ('let items = ["old"]; const original = items; '
++                  'function input() { items = ["new"]; return req.query.html; } '
++                  'const returned = items.fill(input()); '
++                  'res.send(original[0]); res.send(items[0]); res.send(returned[0]);')
++        self.scan(source, 'xss', 'xss')
++        self.assert_runtime_sends(source, ['review-input', 'new', 'review-input'])
++        source = ('function foreign() {} const items = ["old"]; function input() { '
++                  'items.fill = foreign; return req.query.html; } '
++                  'items.fill(input()); res.send(items[0]);')
++        self.scan(source, 'xss')
++        self.scan('const items = ["old"]; function input() { '
++                  'items.length = 2; return req.query.html; } '
++                  'items.fill(input()); res.send(items[1]);', 'xss')
++
++    def test_fill_summaries_reach_caller_and_keep_sanitizer_domains(self):
++        self.scan('function fill(items, value) { return items.fill(value); } '
++                  'const items = ["safe"]; const returned = fill(items, req.query.html); '
++                  'res.send(items[0]); res.send(returned[0]);', 'xss', 'xss')
++        self.scan('const items = ["safe"]; items.fill(DOMPurify.sanitize(req.query.html)); '
++                  'res.send(items[0]); eval(items[0]);', 'eval')
++        self.scan('const items = ["safe"]; items.fill(req.query.html); '
++                  'res.send(items[0]); eval(items[0]); db.query(items[0]); shell.exec(items[0]);',
++                  'xss', 'eval', 'sql', 'command')
++
++    def test_fill_uncertain_receiver_and_branch_do_not_prove_cleanup(self):
++        self.scan('const first = [req.query.html]; const second = [req.query.html]; '
++                  'const items = flag ? first : second; items.fill("safe"); '
++                  'res.send(first[0]); res.send(second[0]);', 'xss', 'xss')
++        self.scan('const items = [req.query.html]; if (flag) items.fill("safe"); '
++                  'res.send(items[0]);', 'xss')
++        self.scan('const start = 1; const items = [req.query.html]; '
++                  'items.fill("safe", start); res.send(items[0]);', 'xss')
++
++    def test_fill_overrides_are_not_native_cleanup(self):
++        for override in ('items.fill = external;', 'Array.prototype.fill = external;',
++                         'items[method] = external;'):
++            with self.subTest(override=override):
++                self.scan('const items = [req.query.html]; ' + override
++                          + 'items.fill("safe"); res.send(items[0]);', 'xss')
++
++    def assert_fill_partial(self, source, *rules, reason='Array.fill'):
++        with tempfile.TemporaryDirectory(prefix='ubs-fill-partial-') as scratch:
++            path = Path(scratch) / 'handler.js'
++            path.write_text(source + '\n', encoding='utf-8')
++            findings = []
++            with self.assertRaisesRegex(taint.AnalysisLimit, reason):
++                findings.extend(taint.run(RunContext(lang='javascript', files=[path])))
++        self.assertEqual(Counter(f['rule'].removeprefix('javascript.taint.') for f in findings),
++                         Counter(rules), (source, findings))
++
++    def test_fill_opaque_bounds_keep_evidence_and_report_incomplete(self):
++        self.assert_fill_partial('const items = [req.query.html]; '
++                                 'items.fill("safe", offset); res.send(items[0]);', 'xss')
++        self.assert_fill_partial('const items = ["safe"]; '
++                                 'items.fill("safe", req.query.offset); res.send(items[0]);')
++        self.assert_fill_partial('const undefined = external; const items = [req.query.html]; '
++                                 'items.fill("safe", 0, undefined); res.send(items[0]);', 'xss')
++        self.assert_fill_partial('const source = req.query.html; const items = []; '
++                                 'items.fill(source, {valueOf: external}); res.send(items[0]);')
++        self.assert_fill_partial('const items = ["safe"]; '
++                                 'items.fill(...req.query.values); res.send(items[0]);', 'xss')
++        self.assert_fill_partial('const items = [req.query.html]; '
++                                 'try { items.fill("safe", 1n); } catch (error) {} '
++                                 'res.send(items[0]);', 'xss')
++
++    def test_fill_nonstandard_write_contract_cannot_certify_cleanup(self):
++        for setup in ('Object.freeze(items);', 'Object.seal(items);',
++                      'Object.preventExtensions(items);',
++                      'Object.defineProperty(items, "0", {value: "locked"});',
++                      'Object.defineProperties(items, {0: {value: "locked"}});',
++                      'Reflect.defineProperty(items, "0", {value: "locked"});',
++                      'Object.defineProperty(items, ...req.query.options);',
++                      'Object.defineProperty(items, "note", {get value() { Object.freeze(items); return 0; }});',
++                      'external({items});'):
++            with self.subTest(setup=setup):
++                self.assert_fill_partial('const items = [,req.query.html]; ' + setup
++                                         + 'try { items.fill("safe"); } catch (error) {} '
++                                         'res.send(items[1]);', 'xss')
++
++    def test_fill_fresh_copies_do_not_inherit_descriptor_metadata(self):
++        for copy in ('const copied = [...items];',
++                     'const copied = Object.assign([], items);',
++                     'const copy = {...items}; const copied = Object.assign([], copy);',
++                     'const {...copy} = items; const copied = Object.assign([], copy);'):
++            with self.subTest(copy=copy):
++                self.scan('const items = [req.query.html]; Object.freeze(items); ' + copy
++                          + 'copied.fill("safe"); res.send(copied[0]);')
++        self.scan('const items = [req.query.html]; Object.freeze({items}); '
++                  'items.fill("safe"); res.send(items[0]);')
++
++    def test_array_restriction_results_keep_returned_aliases(self):
++        for expression in ('Object.preventExtensions(items)', 'Object.seal(items)',
++                           'Object.defineProperties(items, {})',
++                           'Object.setPrototypeOf(items, Array.prototype)',
++                           'Object.defineProperty(items, ...opaqueOptions)'):
++            with self.subTest(expression=expression):
++                self.assert_fill_partial('const items = ["safe"]; '
++                    f'const alias = {expression}; '
++                    'alias.fill(req.query.html); res.send(items[0]);', 'xss',
++                    reason='Array.fill|Object[.]')
++        self.assert_fill_partial('const items = [req.query.html]; '
++            'const alias = Object.freeze(items); '
++            'try { alias.fill("safe"); } catch (error) {} res.send(items[0]);', 'xss')
++
++    def test_array_descriptor_returns_retain_prior_provenance(self):
++        for expression, reason in (
++                ('Object.defineProperties(items, {0: {value: req.query.html}})', 'Object[.]defineProperties'),
++                ('Object.setPrototypeOf(items, {0: req.query.html})', 'Object[.]setPrototypeOf')):
++            with self.subTest(expression=expression):
++                self.assert_fill_partial('const items = []; items.length = 1; '
++                    f'const alias = {expression}; res.send(alias[0]);', 'xss', reason=reason)
++        # Nonarray callers retain the existing conservative descriptor result.
++        self.scan('const result = Object.defineProperties({}, {html: {value: req.query.html}}); '
++                  'res.send(result.html);', 'xss')
++
++    def test_array_reflect_results_are_booleans(self):
++        self.scan('const items = [req.query.html]; '
++                  'const result = Reflect.preventExtensions(items); res.send(result);')
++        for expression, reason in (
++                ('Reflect.defineProperty(items, "0", {value: req.query.html})', 'Reflect[.]defineProperty'),
++                ('Reflect.setPrototypeOf(items, {0: req.query.html})', 'Reflect[.]setPrototypeOf')):
++            with self.subTest(expression=expression):
++                self.assert_fill_partial('const items = []; '
++                    f'const result = {expression}; res.send(result);', reason=reason)
++
++    def test_array_restriction_mixed_targets_cannot_report_complete_cleanup(self):
++        self.assert_fill_partial('const items = [req.query.html]; '
++            'let target = items; if (flag) target = {}; '
++            'const alias = Object.preventExtensions(target); '
++            'try { alias.fill("safe"); } catch (error) {} res.send(items[0]);',
++            'xss', reason='Object[.]preventExtensions')
++
++    def test_fill_large_extent_obeys_work_budget(self):
++        with tempfile.TemporaryDirectory(prefix='ubs-fill-budget-') as scratch:
++            path = Path(scratch) / 'handler.js'
++            path.write_text('const items = []; items.length = 4294967295; '
++                            'items.fill(req.query.html); res.send(items[0]);\n', encoding='utf-8')
++            with self.assertRaises(taint.AnalysisLimit):
++                list(taint.run(RunContext(lang='javascript', files=[path])))
++
++    def test_nested_array_mutation(self):
+         self.scan('const box = {items: []}; box.items.push(req.query.html); res.send(box.items[0]);', 'xss')
+ 
+     def test_loop_length_widens_and_terminates(self):
+@@ -1603,7 +1795,12 @@
+             ('alias-source', 'const a={}; const b=a; b.html=req.query.html; res.send(a.html);', {'xss'}),
+             ('alias-clean', 'const a={html:req.query.html}; const b=a; b.html="safe"; res.send(a.html);', set()),
+             ('push-source', 'const a=[]; const b=a; b.push(req.query.code); eval(a[0]);', {'eval'}),
+-            ('push-count', 'const a=[]; res.send(a.push(req.query.html));', set()),
++            ('push-count', 'const a=[]; res.send(a.push(req.query.html));', set()),
++            ('fill-source', 'const a=["safe"]; const b=a; b.fill(req.query.code); eval(a[0]);', {'eval'}),
++            ('fill-clean', 'const a=[req.query.html]; a.fill("safe"); res.send(a[0]);', set()),
++            ('fill-range', 'const a=["safe", "safe"]; a.fill(req.query.html, 1); res.send(a[0]);', set()),
++            ('fill-length', 'const a=["safe"]; res.send(a.fill(req.query.html).length);', set()),
++            ('fill-shared-value', 'const box={html:"safe"}; const a=[null,null]; a.fill(box); a[0].html=req.query.html; res.send(a[1].html);', {'xss'}),
+             ('assign-source', 'const a={}; Object.assign(a,{html:req.query.html}); res.send(a.html);', {'xss'}),
+             ('assign-clean', 'const a={html:req.query.html}; Object.assign(a,{html:"safe"}); res.send(a.html);', set()),
+             ('cycle-source', 'const a={}; a.self=a; a.html=req.query.html; res.send(a);', {'xss'}),

@@ -1,6 +1,13 @@
 Candidate: Preserve taint and identity through native JavaScript Array.fill
 Base-Commit: 71255b1345d44e89a1f7208e58579b4c2ced5d0f
-Status: UNACTIVATED CANDIDATE; no completed analyzer regression result is available.
+Status: HISTORICAL CANDIDATE; superseded by the active main implementation.
+
+Commit 781ec7b5acd854f5ce4ab6e342deb1ab15a177fd activated the bounded fill
+implementation with an additional comma-expression correction in 5.5.63.
+Subsequent native probes exposed descriptor/getter side effects that this
+original candidate does not guard. Use the current helper and regression
+tests; do not reapply this historical patch. Its original diff and hashes
+remain unchanged below. The following notes describe its archival state.
 
 The executor disconnected before the paired DSR run returned a usable result.
 This implementation and its regression tests are retained for runtime

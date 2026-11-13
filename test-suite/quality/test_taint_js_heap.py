@@ -1499,6 +1499,110 @@ class HeapTaintTests(unittest.TestCase):
         self.scan('const items = [req.query.html]; Object.freeze({items}); '
                   'items.fill("safe"); res.send(items[0]);')
 
+    def test_fill_descriptor_getters_preserve_nested_and_captured_evidence(self):
+        descriptor = ('{get value() { Object.defineProperty(box.items, "0", '
+                      '{set(value) {}, get() { return req.query.html; }}); return "note"; }}')
+        for call in ('Object.defineProperty(box, "note", ' + descriptor + ')',
+                     'Reflect.defineProperty(box, "note", ' + descriptor + ')',
+                     'Object.defineProperties(box, {note: ' + descriptor + '})'):
+            with self.subTest(call=call):
+                source = ('const box = {items: [req.query.html]}; const inner = box.items; '
+                          + call + '; inner.fill("safe"); '
+                          'res.send(box.items[0]); res.send(inner[0]);')
+                self.assert_runtime_sends(source, ['review-input', 'review-input'])
+                self.assert_fill_partial(source, 'xss', 'xss')
+        source = ('const items = [req.query.html]; Object.defineProperties({}, {note: {get value() { '
+                  'Object.defineProperty(items, "0", {set(value) {}, get() {return req.query.html;}}); '
+                  'return "note"; }}}); items.fill("safe"); res.send(items[0]);')
+        self.assert_runtime_sends(source, ['review-input'])
+        self.assert_fill_partial(source, 'xss')
+
+    def test_fill_descriptor_values_and_property_keys_keep_opaque_effects(self):
+        calls = (
+            'const descriptor = {extra: items, get value() { '
+            'Object.defineProperty(this.extra, "0", {set(value) {}, get() {return req.query.html;}}); '
+            'return "note"; }}; Object.defineProperty({}, "note", descriptor);',
+            'const key = {toString() { Object.freeze(items); return "note"; }}; '
+            'Object.defineProperty({}, key, {value: "note"});',
+            'const other = []; Object.defineProperty(other, "length", '
+            '{value: {valueOf() {Object.freeze(items); return 0;}}});',
+        )
+        for call in calls:
+            with self.subTest(call=call):
+                source = ('const items = [req.query.html]; ' + call
+                          + ' try {items.fill("safe");} catch (error) {} res.send(items[0]);')
+                self.assert_runtime_sends(source, ['review-input'])
+                self.assert_fill_partial(source, 'xss')
+
+    def test_fill_descriptor_effects_survive_local_summaries(self):
+        source = ('function protect(box) { Object.defineProperties({}, {note: {get value() { '
+                  'Object.freeze(box.items); return "note"; }}}); } '
+                  'const box = {items: [req.query.html]}; protect(box); '
+                  'try {box.items.fill("safe");} catch (error) {} res.send(box.items[0]);')
+        self.assert_runtime_sends(source, ['review-input'])
+        self.assert_fill_partial(source, 'xss')
+
+    def test_fill_assign_getters_and_proxy_targets_remain_partial(self):
+        calls = (
+            'Object.assign({}, {get note() {Object.freeze(items); return "note";}});',
+            'Object.assign({set note(value) {Object.freeze(items);}}, {note: "note"});',
+            'const target = new Proxy({}, {defineProperty() {Object.freeze(items); return true;}}); '
+            'Object.defineProperty(target, "note", {value: "note", configurable: true});',
+            'const target = new Proxy({}, {set() {Object.freeze(items); return true;}}); '
+            'Object.assign(target, {note: "note"});',
+        )
+        for call in calls:
+            with self.subTest(call=call):
+                source = ('const items = [req.query.html]; ' + call
+                          + ' try {items.fill("safe");} catch (error) {} res.send(items[0]);')
+                self.assert_runtime_sends(source, ['review-input'])
+                self.assert_fill_partial(source, 'xss')
+
+    def test_fill_plain_data_descriptors_and_readonly_copies_stay_clean(self):
+        for call in ('Object.defineProperty(exports, "__esModule", {value: true});',
+                     'Reflect.defineProperty(exports, "__esModule", {value: true});',
+                     'Object.defineProperties(exports, {__esModule: {value: true}});',
+                     'Object.defineProperty(exports, "__esModule", {value: true}); '
+                     'Object.defineProperty(exports, "answer", {value: 42});'):
+            with self.subTest(call=call):
+                source = ('const exports = {}; ' + call + ' const items = [req.query.html]; '
+                          'items.fill("safe"); res.send(items[0]);')
+                self.assert_runtime_sends(source, ['safe'])
+                self.scan(source)
+        for copy in ('const copied = [...items];', 'const copied = Object.assign([], items);',
+                     'const copy = {...items}; const copied = Object.assign([], copy);'):
+            with self.subTest(copy=copy):
+                source = ('const items = [req.query.html]; '
+                          'Object.defineProperty(items, "0", {value: req.query.html, writable: false}); '
+                          + copy + ' copied.fill("safe"); res.send(copied[0]);')
+                self.assert_runtime_sends(source, ['safe'])
+                self.scan(source)
+
+    def test_fill_commonjs_export_flags_do_not_poison_later_arrays(self):
+        source = ('Object.defineProperty(exports, "__esModule", {value: true}); '
+                  'const items = [req.query.html]; items.fill("safe"); res.send(items[0]);')
+        self.assert_runtime_sends('const exports = {}; ' + source, ['safe'])
+        with tempfile.TemporaryDirectory(prefix='ubs-fill-commonjs-') as scratch:
+            path = Path(scratch) / 'handler.cjs'
+            path.write_text(source + '\n', encoding='utf-8')
+            self.assertEqual(list(taint.run(RunContext(lang='javascript', files=[path]))), [])
+            for setup in (
+                'exports = new Proxy({}, {defineProperty() {Object.freeze(items); return true;}}); '
+                'Object.defineProperty(exports, "flag", {value: true, configurable: true});',
+                'function install(exports) { '
+                'Object.defineProperty(exports, "flag", {value: true, configurable: true}); } '
+                'install(new Proxy({}, {defineProperty() {Object.freeze(items); return true;}}));',
+            ):
+                with self.subTest(setup=setup):
+                    source = ('const items = [req.query.html]; ' + setup
+                              + ' try {items.fill("safe");} catch (error) {} res.send(items[0]);')
+                    self.assert_runtime_sends('let exports = {}; ' + source, ['review-input'])
+                    path.write_text(source + '\n', encoding='utf-8')
+                    findings = []
+                    with self.assertRaisesRegex(taint.AnalysisLimit, 'Array.fill'):
+                        findings.extend(taint.run(RunContext(lang='javascript', files=[path])))
+                    self.assertEqual([row['rule'] for row in findings], ['javascript.taint.xss'])
+
     def test_array_restriction_results_keep_returned_aliases(self):
         for expression in ('Object.preventExtensions(items)', 'Object.seal(items)',
                            'Object.defineProperties(items, {})',

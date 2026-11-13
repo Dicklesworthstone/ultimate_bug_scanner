@@ -2159,7 +2159,7 @@ class _Flow:
             return 'sql-append', receiver, method
         return 'sql-unknown', receiver, method
 
-    def mark_array_write_contracts(self, fact, state, *, recursive=False):
+    def mark_array_write_contracts(self, fact, state, *, recursive=False, objects=False):
         """Keep opaque descriptors/escapes on object identity, not user keys."""
         pending, seen = list(_refs(fact)), set()
         prototypes = {('builtin', 'Array.prototype'), ('builtin', 'Object.prototype')}
@@ -2173,8 +2173,110 @@ class _Flow:
             if recursive:
                 for value in slots.values():
                     pending.extend(_refs(value) - seen)
-            if ref in state.array_lengths or ref in prototypes:
+            if ref in state.array_lengths or ref in prototypes or (objects and ref in state.heap):
                 state.heap.setdefault(ref, {})[_ARRAY_WRITE_CONTRACT] = frozenset()
+
+    def ordinary_heap_object(self, fact, state):
+        """Recognize literal/rest/CommonJS allocations, excluding opaque returns."""
+        refs = _refs(fact)
+        self.engine.budget.spend(1 + len(refs))
+        return bool(refs) and not frozenset(fact) and all(
+            ref in state.heap and isinstance(ref[0], _Scope)
+            and (len(ref) == 2 or isinstance(ref[2], frozenset)
+                 or ref[2] in {'binding-rest', 'arguments-rest', 'commonjs'})
+            for ref in refs)
+
+    def plain_data_descriptor_call(self, method, arguments, prepared, state):
+        """Prove fresh literal data descriptors before native protocol reads."""
+        actual, uncertain, _missing, kinds = prepared
+        required = 2 if method == 'defineProperties' else 3
+        text, code = self.engine.text, self.scope.code
+        if (uncertain is not None or len(actual) != required or len(arguments) != required
+                or any(text[left:right].lstrip().startswith('...') for left, right in arguments)
+                or state.heap.get(('builtin', 'Object.prototype'))):
+            return False
+        target = actual[0][0]
+        ordinary = self.ordinary_heap_object(target, state)
+        if (not ordinary and not _refs(target) and not frozenset(target)
+                and text[slice(*arguments[0])].strip() == 'exports' and 'exports' not in state):
+            # The initial CommonJS wrapper binding is an ordinary object even
+            # before a named export has caused namespace allocation. A shadow
+            # or reassignment cannot borrow this host-identity proof.
+            scope, position = self.binding_context('exports', arguments[0][0])
+            key = self.engine.lexical_binding(scope, 'exports', position)
+            ordinary = (key[0].parent is None and self.engine.module_kind(key[0]) == 'commonjs'
+                        and key not in state.written_cells and not any(
+                            name == 'exports' and begin == key[1]
+                            for begin, _end, name in self.engine.binding_regions[key[0]]))
+        if not ordinary:
+            return False
+        targets = _refs(target)
+        array_target = any(ref in state.array_lengths for ref in targets)
+
+        def bounds(left, right):
+            while left < right and text[left].isspace():
+                left += 1
+            while right > left and text[right - 1].isspace():
+                right -= 1
+            while (code[left:left + 1] == '(' and text[left:left + 1] == '('
+                   and self.pairs.get(left) == right - 1):
+                self.engine.budget.spend()
+                left, right = left + 1, right - 1
+                while left < right and text[left].isspace():
+                    left += 1
+                while right > left and text[right - 1].isspace():
+                    right -= 1
+            return left, right
+
+        def literal(left, right, mapping=False):
+            left, right = bounds(left, right)
+            if code[left:left + 1] != '{' or self.pairs.get(left) != right - 1:
+                return False
+            for begin, finish in _chunks(code, left + 1, right - 1):
+                self.engine.budget.spend()
+                if not code[begin:finish].strip():
+                    continue
+                _, colon = next(_chunks(code, begin, finish, ':'))
+                key = self.property_key(text[begin:colon])
+                if (colon == finish or key is None or key == '__proto__'
+                        or (not mapping and key in {'get', 'set'})
+                        or (mapping and array_target and key == 'length')):
+                    return False
+                if mapping and not literal(colon + 1, finish):
+                    return False
+            return True
+
+        if method == 'defineProperties':
+            return literal(*arguments[1], mapping=True)
+        key_start, key_end = bounds(*arguments[1])
+        raw = text[key_start:key_end]
+        primitive_key = (kinds.get(1) in {'undefined', 'null', 'noniterable'}
+                         or re.fullmatch(r"'(?:\\[\s\S]|[^'\\])*'", raw) is not None
+                         or re.fullmatch(r'"(?:\\[\s\S]|[^"\\])*"', raw) is not None)
+        # Array length descriptors perform another observable numeric conversion.
+        if array_target and self.property_key(raw) in {None, 'length'}:
+            return False
+        return primitive_key and literal(*arguments[2])
+
+    def plain_object_assign(self, arguments, prepared, state):
+        """Require ordinary targets and known own data slots for native copies."""
+        actual, uncertain, _missing, kinds = prepared
+        if (uncertain is not None or not actual or len(actual) != len(arguments)
+                or not self.ordinary_heap_object(actual[0][0], state)
+                or any(state.heap.get(('builtin', name))
+                       for name in ('Array.prototype', 'Object.prototype'))):
+            return False
+        for ref in _refs(actual[0][0]):
+            if any(key in state.heap[ref] for key in (None, '__proto__', _ARRAY_WRITE_CONTRACT)):
+                return False
+        for index, (source, _absent) in enumerate(actual[1:], 1):
+            if kinds.get(index) in {'null', 'undefined', 'noniterable'}:
+                continue
+            if not self.ordinary_heap_object(source, state):
+                return False
+            if any(None in state.heap[ref] or '__proto__' in state.heap[ref] for ref in _refs(source)):
+                return False
+        return True
 
     def array_fill_bound(self, arguments, prepared, index, length):
         """Resolve pure primitive bounds; keep unknown coercions explicit.
@@ -2349,7 +2451,16 @@ class _Flow:
         if values and (kind == 'reflect' or (kind == 'object' and method in {
                 'defineProperty', 'defineProperties', 'freeze', 'seal', 'preventExtensions', 'setPrototypeOf'})):
             target = _join(*values) if uncertain == 0 else values[0]
-            self.mark_array_write_contracts(target, state)
+            descriptor = method in {'defineProperty', 'defineProperties'}
+            plain = descriptor and self.plain_data_descriptor_call(method, arguments, prepared, state)
+            self.mark_array_write_contracts(target, state, objects=True)
+            if descriptor:
+                self.mark_array_write_contracts(_join(*values), state, recursive=True)
+                if not plain:
+                    # Descriptor/key protocols can affect captured and future
+                    # arrays. Preserve that uncertainty until a fill writes.
+                    self.mark_array_write_contracts(
+                        _Fact(refs=(('builtin', 'Array.prototype'),)), state)
             refs = _refs(target)
             modeled = {ref for ref in refs if ref in state.array_lengths or
                        ref in {('builtin', 'Array.prototype'), ('builtin', 'Object.prototype')}}
@@ -2418,6 +2529,9 @@ class _Flow:
             self.mutation_call(('array', target, 'push'), [], [], state, expanded)
             return receiver
         if kind == 'object' and method == 'assign' and values:
+            if not self.plain_object_assign(arguments, prepared, state):
+                self.mark_array_write_contracts(
+                    _Fact(refs=(('builtin', 'Array.prototype'),)), state)
             # Spread evaluation yields individual arguments, not one object
             # containing the union of every value in the spread expression.
             target = values[0] if uncertain != 0 else _join(*values)

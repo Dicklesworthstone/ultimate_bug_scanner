@@ -189,27 +189,278 @@ class DecodingFlowTests(packages.PackageTestCase):
                    '// json.NewDecoder(r.Body).Decode(&p)\ndb.Query(p.SQL)')
 
 
+class ImportIdentityTests(packages.PackageTestCase):
+    def test_aliased_json_and_xml_decode_destinations(self):
+        for path, operation in (('encoding/json', 'Decode(&p)'),
+                                ('encoding/xml', 'DecodeElement(&p, &start)')):
+            for constructor in ('codec.NewDecoder(r.Body)', '(codec.NewDecoder(r.Body))'):
+                with self.subTest(path=path, constructor=constructor):
+                    self.source('handler.go', 'package app\nimport codec "' + path + '"\n'
+                                'func h() {\nvar p Payload\n'
+                                'dec := ' + constructor + '\nalias := dec\n'
+                                'err := alias.' + operation + '\n'
+                                'db.Query(p.SQL)\ndb.Query(err.Error())\n}\n')
+                    self.assert_hits([('handler.go', 8, 'go.taint.sql')])
+
+    def test_aliased_readall_and_unmarshal_keep_result_positions(self):
+        for reader in ('io', 'io/ioutil'):
+            for decoder in ('encoding/json', 'encoding/xml'):
+                with self.subTest(reader=reader, decoder=decoder):
+                    self.source('handler.go', 'package app\nimport (\n'
+                                'stream "' + reader + '"\ncodec "' + decoder + '"\n)\n'
+                                'func h() {\nraw, readErr := stream.ReadAll(r.Body)\nvar p Payload\n'
+                                'decodeErr := codec.Unmarshal(raw, &p)\n'
+                                'db.Query(string(raw))\ndb.Query(p.SQL)\n'
+                                'db.Query(readErr.Error())\ndb.Query(decodeErr.Error())\n}\n')
+                    self.assert_hits([('handler.go', 10, 'go.taint.sql'),
+                                      ('handler.go', 11, 'go.taint.sql')])
+
+    def test_dot_imports_resolve_constructor_unmarshal_and_readall(self):
+        self.source('handler.go', '''
+            package app
+            import (
+                . "encoding/json"
+                . "io"
+            )
+            func h() {
+                raw, readErr := ReadAll(r.Body)
+                var first, second Payload
+                decodeErr := NewDecoder(r.Body).Decode(&first)
+                unmarshalErr := Unmarshal(raw, &second)
+                db.Query(first.SQL)
+                db.Query(second.SQL)
+                db.Query(readErr.Error())
+                db.Query(decodeErr.Error())
+                db.Query(unmarshalErr.Error())
+            }
+        ''')
+        self.assert_hits([('handler.go', 11, 'go.taint.sql'), ('handler.go', 12, 'go.taint.sql')])
+
+    def test_grouped_comments_raw_and_escaped_import_paths(self):
+        for literal in ('`encoding/json`', r'"\x65ncoding/json"', r'"encoding/\u006ason"'):
+            with self.subTest(literal=literal):
+                self.source('handler.go', 'package app\nimport (\n'
+                            'codec /* alias comment */ ' + literal + '\n'
+                            'stream `io` // import json "example.com/json"\n)\n'
+                            'func h() {\nraw, err := stream.ReadAll(r.Body)\nvar p Payload\n'
+                            'codec.Unmarshal(raw, &p)\ndb.Query(p.SQL)\ndb.Query(err.Error())\n}\n')
+                self.assert_hits([('handler.go', 10, 'go.taint.sql')])
+
+    def test_same_alias_has_separate_identity_in_each_file(self):
+        for filename, path in (('a.go', 'encoding/json'), ('b.go', 'example.com/json')):
+            self.source(filename, 'package app\nimport codec "' + path + '"\n'
+                        'func ' + filename[0] + '() {\nvar p Payload\n'
+                        'codec.NewDecoder(r.Body).Decode(&p)\ndb.Query(p.SQL)\n}\n')
+        self.assert_hits([('a.go', 6, 'go.taint.sql')])
+        self.assert_hits([('a.go', 6, 'go.taint.sql')], selected=list(reversed(list(self.sources.values()))))
+        self.assert_hits([], selected=[self.sources['b.go']])
+
+    def test_default_name_and_alias_do_not_cross_file_boundaries(self):
+        self.source('a.go', '''
+            package app
+            import json "example.com/json"
+            func a() {
+                var p Payload
+                err := json.Unmarshal([]byte(r.FormValue("body")), &p)
+                db.Query(err.Error())
+                db.Query(p.SQL)
+            }
+        ''')
+        self.source('b.go', '''
+            package app
+            import "encoding/json"
+            func b() {
+                var p Payload
+                err := json.Unmarshal([]byte(r.FormValue("body")), &p)
+                db.Query(err.Error())
+                db.Query(p.SQL)
+            }
+        ''')
+        self.assert_hits([('a.go', 6, 'go.taint.sql'), ('b.go', 7, 'go.taint.sql')])
+
+    def test_unknown_reader_import_does_not_get_a_clean_error_contract(self):
+        self.source('handler.go', '''
+            package app
+            import io "example.com/reader"
+            func h() {
+                raw, err := io.ReadAll(r.Body)
+                db.Query(string(raw))
+                db.Query(err.Error())
+            }
+        ''')
+        self.assert_hits([('handler.go', 5, 'go.taint.sql'), ('handler.go', 6, 'go.taint.sql')])
+
+    def test_blank_import_and_other_imports_do_not_bind_canonical_names(self):
+        for declaration in ('import _ "encoding/json"', 'import codec "encoding/json"', 'import "fmt"'):
+            with self.subTest(declaration=declaration):
+                self.source('handler.go', 'package app\n' + declaration + '\nfunc h() {\n'
+                            'var p Payload\nerr := json.Unmarshal([]byte(r.FormValue("body")), &p)\n'
+                            'db.Query(p.SQL)\ndb.Query(err.Error())\n}\n')
+                self.assert_hits([('handler.go', 7, 'go.taint.sql')])
+
+    def test_parameter_and_block_declarations_shadow_imports(self):
+        self.source('handler.go', '''
+            package app
+            import codec "encoding/json"
+            func shadowed(codec CustomDecoder) {
+                var p Payload
+                codec.NewDecoder(r.Body).Decode(&p)
+                db.Query(p.SQL)
+            }
+            func h() {
+                var inner, outer Payload
+                { codec := custom; codec.NewDecoder(r.Body).Decode(&inner) }
+                db.Query(inner.SQL)
+                codec.NewDecoder(r.Body).Decode(&outer)
+                db.Query(outer.SQL)
+            }
+        ''')
+        self.assert_hits([('handler.go', 13, 'go.taint.sql')])
+
+    def test_local_type_names_shadow_imports(self):
+        for declaration in ('type codec CustomDecoder', 'type (codec = CustomDecoder)'):
+            with self.subTest(declaration=declaration):
+                self.source('handler.go', 'package app\nimport codec "encoding/json"\n'
+                            'func h() {\n' + declaration + '\nvar p Payload\n'
+                            'codec.NewDecoder(r.Body).Decode(&p)\ndb.Query(p.SQL)\n}\n')
+                self.assert_hits([])
+
+    def test_dot_import_name_is_shadowed_by_parameters_and_local_helpers(self):
+        self.source('handler.go', '''
+            package app
+            import . "encoding/json"
+            func h(NewDecoder CustomFactory) {
+                var p Payload
+                NewDecoder(r.Body).Decode(&p)
+                db.Query(p.SQL)
+                db.Query(Unmarshal(r.FormValue("q")))
+            }
+            func Unmarshal(value string) string { return value }
+        ''')
+        self.assert_hits([('handler.go', 7, 'go.taint.sql')])
+
+    def test_ambiguous_dot_imports_do_not_prove_native_behavior(self):
+        for other in ('encoding/xml', 'example.com/decoder'):
+            with self.subTest(other=other):
+                self.source('handler.go', 'package app\nimport (\n. "encoding/json"\n. "' + other + '"\n)\n'
+                            'func h() {\nvar p Payload\n'
+                            'err := Unmarshal([]byte(r.FormValue("body")), &p)\n'
+                            'db.Query(p.SQL)\ndb.Query(err.Error())\n}\n')
+                self.assert_hits([('handler.go', 10, 'go.taint.sql')])
+
+    def test_import_text_in_comments_and_literals_is_inert(self):
+        self.source('handler.go', '''
+            package app
+            // import codec "encoding/json"
+            /* import . "encoding/json" */
+            const text = `import codec "encoding/json"`
+            func h() {
+                var first, second Payload
+                codec.NewDecoder(r.Body).Decode(&first)
+                NewDecoder(r.Body).Decode(&second)
+                db.Query(first.SQL)
+                db.Query(second.SQL)
+            }
+        ''')
+        self.assert_hits([])
+
+    def test_closure_keeps_its_file_import_context(self):
+        self.source('a.go', 'package app\nimport codec "example.com/json"\nfunc a() {}\n')
+        self.source('b.go', '''
+            package app
+            import codec "encoding/json"
+            func h() {
+                query := func() string {
+                    var p Payload
+                    codec.NewDecoder(r.Body).Decode(&p)
+                    return p.SQL
+                }()
+                db.Query(query)
+            }
+        ''')
+        self.assert_hits([('b.go', 9, 'go.taint.sql')])
+
+    def test_helper_pointer_summary_uses_its_own_imports(self):
+        self.source('helper.go', '''
+            package app
+            import codec "encoding/xml"
+            func decode(raw []byte, dst *Payload) { codec.Unmarshal(raw, dst) }
+        ''')
+        self.source('handler.go', '''
+            package app
+            import codec "example.com/json"
+            func h() {
+                var p Payload
+                decode([]byte(r.FormValue("body")), &p)
+                db.Query(p.SQL)
+            }
+        ''')
+        self.assert_hits([('handler.go', 6, 'go.taint.sql')])
+
+    def test_global_initializers_use_each_files_imports(self):
+        self.source('a.go', '''
+            package app
+            import codec "example.com/json"
+            var query = read()
+            var result = db.Query(query)
+        ''')
+        self.source('b.go', '''
+            package app
+            import codec "encoding/json"
+            func read() string {
+                var p Payload
+                codec.NewDecoder(r.Body).Decode(&p)
+                return p.SQL
+            }
+        ''')
+        self.assert_hits([('a.go', 4, 'go.taint.sql')])
+
+    def test_clean_input_and_bound_sql_stay_clean_with_import_aliases(self):
+        self.source('handler.go', '''
+            package app
+            import codec "encoding/json"
+            func h() {
+                var clean, input Payload
+                codec.NewDecoder(strings.NewReader(`{"SQL":"SELECT 1"}`)).Decode(&clean)
+                db.Query(clean.SQL)
+                codec.NewDecoder(r.Body).Decode(&input)
+                db.Query("SELECT $1", input.SQL)
+            }
+        ''')
+        self.assert_hits([])
+
+
 @unittest.skipUnless(os.environ.get('UBS_TAINT_E2E') == '1', 'set UBS_TAINT_E2E=1 for real scanner tests')
 class DecodingRunnerTests(unittest.TestCase):
     def test_actual_json_and_sarif_include_decoded_request_flows(self):
         cases = [
-            ('decode-sql', '', 'var p Payload; json.NewDecoder(r.Body).Decode(&p); db.Query(p.SQL)', {'sql'}),
-            ('decode-command', '', 'dec := json.NewDecoder(r.Body); var p Payload; dec.Decode(&p); '
+            ('decode-sql', '', '', 'var p Payload; json.NewDecoder(r.Body).Decode(&p); db.Query(p.SQL)', {'sql'}),
+            ('decode-command', '', '', 'dec := json.NewDecoder(r.Body); var p Payload; dec.Decode(&p); '
              'exec.Command("sh", "-c", p.Command)', {'command'}),
-            ('unmarshal-xss', '', 'raw, _ := io.ReadAll(r.Body); var p Payload; '
+            ('unmarshal-xss', '', '', 'raw, _ := io.ReadAll(r.Body); var p Payload; '
              'json.Unmarshal(raw, &p); fmt.Fprint(w, p.HTML)', {'xss'}),
-            ('error-not-input', '', 'var p Payload; err := json.NewDecoder(r.Body).Decode(&p); '
+            ('error-not-input', '', '', 'var p Payload; err := json.NewDecoder(r.Body).Decode(&p); '
              'db.Query(err.Error())', set()),
-            ('clean-document', '', 'var p Payload; json.Unmarshal([]byte(`{}`), &p); db.Query(p.SQL)', set()),
-            ('helper-output', 'func decode(raw []byte, dst *Payload) { json.Unmarshal(raw, dst) }',
+            ('clean-document', '', '', 'var p Payload; json.Unmarshal([]byte(`{}`), &p); db.Query(p.SQL)', set()),
+            ('helper-output', '', 'func decode(raw []byte, dst *Payload) { json.Unmarshal(raw, dst) }',
              'raw, _ := io.ReadAll(r.Body); var p Payload; decode(raw, &p); db.Query(p.SQL)', {'sql'}),
+            ('import-alias', 'import codec "encoding/json"', '',
+             'var p Payload; codec.NewDecoder(r.Body).Decode(&p); db.Query(p.SQL)', {'sql'}),
+            ('dot-import', 'import . "encoding/xml"', '',
+             'var p Payload; NewDecoder(r.Body).Decode(&p); fmt.Fprint(w, p.HTML)', {'xss'}),
+            ('aliased-errors', 'import (stream "io"; codec "encoding/json")', '',
+             'raw, err := stream.ReadAll(r.Body); var p Payload; decodeErr := codec.Unmarshal(raw, &p); '
+             'db.Query(err.Error()); db.Query(decodeErr.Error())', set()),
+            ('import-helper', 'import codec "example.com/decoder"',
+             'import codec "encoding/json"\nfunc decode(raw []byte, dst *Payload) { codec.Unmarshal(raw, dst) }',
+             'var p Payload; decode([]byte(r.FormValue("body")), &p); db.Query(p.SQL)', {'sql'}),
         ]
         artifacts = packages.ROOT / 'test-suite/artifacts/go-decoding'
-        for name, helper, body, expected in cases:
+        for name, imports, helper, body, expected in cases:
             for format_name in ('json', 'sarif'):
                 with self.subTest(case=name, format=format_name), tempfile.TemporaryDirectory(prefix='ubs-decode-e2e-') as tmp:
                     project = Path(tmp)
-                    (project / 'handler.go').write_text('package app\nfunc h() { ' + body + ' }\n')
+                    (project / 'handler.go').write_text('package app\n' + imports + '\nfunc h() { ' + body + ' }\n')
                     (project / 'helper.go').write_text('package app\n' + helper + '\n')
                     result = subprocess.run([str(packages.ROOT / 'ubs'), str(project), '--only=golang',
                                              '--ci', '--format=' + format_name], cwd=tmp, capture_output=True,

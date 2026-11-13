@@ -4,8 +4,9 @@ The lexical front end preserves source locations and Go string semantics.
 Statement transfers strongly update assignments, join branches and iterate
 loops and package call summaries to convergence. Sanitizers are specific to the
 interpreter receiving a value. This is a conservative source analyzer, not a
-Go type checker; imported-package calls and dynamically invoked closures are
-not resolved. JSON/XML decoders and Unmarshal propagate input through local
+Go type checker; arbitrary imported-package calls and dynamically invoked
+closures are not resolved. File-local imports identify standard JSON/XML and
+reader operations, including aliases. Decoders and Unmarshal propagate input through local
 destination pointers and package helper output parameters, using conservative
 aggregate writes rather than field-sensitive heap models. Only explicitly
 selected files in the same directory AND package share summaries. Both output
@@ -26,6 +27,11 @@ from ubs_core.registry import Analyzer, RunContext, register
 SKIP_DIRS = {'.git', 'vendor', '.cache', 'bin', 'dist', '.idea'}
 EXTS = {'.go'}
 PATH_LIMIT = 6
+
+_NATIVE_PACKAGES = {'encoding/json': 'json', 'encoding/xml': 'xml',
+                    'io': 'io', 'io/ioutil': 'ioutil'}
+_NATIVE_MEMBERS = {'json': {'NewDecoder', 'Unmarshal'}, 'xml': {'NewDecoder', 'Unmarshal'},
+                   'io': {'ReadAll'}, 'ioutil': {'ReadAll'}}
 
 SOURCE_PATTERNS = [
     re.compile(r"\.FormValue\(", re.IGNORECASE),
@@ -356,7 +362,7 @@ class _Parser:
         return tuple(statements)
 
     def statement(self, start: int, end: int):
-        declaration = re.match(r'(var|const)\s*\(', self.code[start:end])
+        declaration = re.match(r'(var|const|type)\s*\(', self.code[start:end])
         if declaration:
             opening = start + declaration.end() - 1
             close = self.pairs.get(opening)
@@ -406,6 +412,84 @@ class _Parser:
         return tuple(_Statement(pos, colon, 'default' if self.code[pos:].startswith('default') else 'case',
                                 self.block(colon + 1, labels[index + 1][0] if index + 1 < len(labels) else end))
                      for index, (pos, colon) in enumerate(labels))
+
+
+@dataclass(frozen=True)
+class _FileImports:
+    names: dict[str, str | None]
+    dots: dict[str, str | None]
+
+    def resolve(self, root: str, member: str | None):
+        package = self.names.get(root) if member else self.dots.get(root)
+        operation = member or root
+        if package and operation in _NATIVE_MEMBERS[package]:
+            return package, operation
+        return None
+
+
+@dataclass(frozen=True)
+class _ImportContexts:
+    """Keep imports attached to their original file in the package image."""
+    starts: tuple[int, ...]
+    files: tuple[_FileImports, ...]
+
+    def resolve(self, root: str, member: str | None, offset: int):
+        index = bisect_right(self.starts, offset) - 1
+        return self.files[index].resolve(root, member) if index >= 0 else None
+
+
+def _file_imports(source: str, code: str, parser: _Parser) -> _FileImports:
+    """Read only actual import declarations, before the file's other code.
+
+    Comments are already masked in source; literals are masked in code. A raw
+    string or a comment containing an import can therefore never grant native
+    semantics. Importless editor fragments retain the analyzer's conventional
+    names; once a file declares imports, only exact standard paths qualify.
+    """
+    names, dots = {}, {}
+    explicit, unknown_dot = False, False
+    end = len(code)
+    cursor = parser.skip(0, end)
+    if re.match(r'\ufeff?\s*package\b', code[cursor:]):
+        cursor = parser.skip(parser.statement_end(cursor, end), end)
+    while re.match(r'import\b', code[cursor:]):
+        explicit = True
+        start = parser.skip(cursor + len('import'), end)
+        if start < end and code[start] == '(':
+            close = parser.pairs.get(start)
+            if close is None:
+                break
+            specs = [(node.start, node.end) for node in parser.block(start + 1, close)]
+            cursor = parser.skip(close + 1, end)
+        else:
+            close = parser.statement_end(start, end)
+            specs = [(start, close)]
+            cursor = parser.skip(close, end)
+        for left, right in specs:
+            spec = re.fullmatch(r'\s*(?:([A-Za-z_]\w*|\.)\s*)?("(?:[^"\\]|\\.)*"|`[^`]*`)\s*',
+                                source[left:right], re.DOTALL)
+            if spec is None:
+                continue
+            path = _string_literal(spec.group(2))
+            if path is None:
+                continue
+            if spec.group(2).startswith('`'):
+                path = path.replace('\r', '')
+            package = _NATIVE_PACKAGES.get(path)
+            name = spec.group(1) or package or path.rsplit('/', 1)[-1]
+            if name == '_':
+                continue
+            if name == '.':
+                if package is None:
+                    unknown_dot = True
+                else:
+                    for member in _NATIVE_MEMBERS[package]:
+                        dots[member] = package if member not in dots else None
+            else:
+                names[name] = package if name not in names else None
+    if not explicit:
+        names = {package: package for package in _NATIVE_MEMBERS}
+    return _FileImports(names, {} if unknown_dot else dots)
 
 
 @dataclass(frozen=True)
@@ -534,8 +618,10 @@ class _Flow:
 
 
 class _Analysis:
-    def __init__(self, source: str, code: str, rule: str, summaries: dict[str, _Summary]):
+    def __init__(self, source: str, code: str, rule: str, summaries: dict[str, _Summary],
+                 imports: _ImportContexts):
         self.source, self.code, self.rule, self.summaries = source, code, rule, summaries
+        self.imports = imports
         self.effects = {}
         self.returns: tuple[_Fact, ...] = ()
         self.named_returns = ()
@@ -569,10 +655,18 @@ class _Analysis:
         expr, offset = self.unparenthesize(expr, offset)
         if re.fullmatch(r'[A-Za-z_]\w*', expr):
             return state.get(_DecoderKey(scope.bindings.get(expr, expr)))
-        call = re.match(r'(?:json|xml)\s*\.\s*NewDecoder\s*\(', _masked_source(expr))
-        if call and _pairs(_masked_source(expr)).get(call.end() - 1) == len(expr) - 1:
-            return self.decoder_results.get(offset)
+        code = _masked_source(expr)
+        call = re.match(r'([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?\s*\(', code)
+        if call and _pairs(code).get(call.end() - 1) == len(expr) - 1:
+            identity = self.native_identity(call.group(1), call.group(2), offset, scope)
+            if identity in {('json', 'NewDecoder'), ('xml', 'NewDecoder')}:
+                return self.decoder_results.get(offset)
         return None
+
+    def native_identity(self, root, member, offset, scope):
+        if root in scope.bindings or root in self.summaries:
+            return None
+        return self.imports.resolve(root, member, offset)
 
     def write_targets(self, targets, fact, state, label):
         # Decode can partially modify an object even when it returns an error.
@@ -592,10 +686,10 @@ class _Analysis:
         if end is None:
             return None
         receiver = state.get(_DecoderKey(scope.bindings.get(root, root)))
-        standard = root not in scope.bindings
-        constructor = standard and root in {'json', 'xml'} and member == 'NewDecoder'
-        unmarshal = standard and root in {'json', 'xml'} and member == 'Unmarshal'
-        readall = standard and root in {'io', 'ioutil'} and member == 'ReadAll'
+        identity = self.native_identity(root, member, offset + match.start(1), scope)
+        constructor = identity in {('json', 'NewDecoder'), ('xml', 'NewDecoder')}
+        unmarshal = identity in {('json', 'Unmarshal'), ('xml', 'Unmarshal')}
+        readall = identity in {('io', 'ReadAll'), ('ioutil', 'ReadAll')}
         methods = {'Decode', 'DecodeElement', 'Token', 'RawToken', 'More', 'InputOffset',
                    'UseNumber', 'DisallowUnknownFields', 'Buffered'}
         method = member if receiver is not None and member in methods else None
@@ -627,14 +721,14 @@ class _Analysis:
             if len(values) != 1:
                 return end, (_CLEAN,)
             receiver = _DecoderInfo(values[0])
-            self.decoder_results[offset + match.start()] = receiver
+            self.decoder_results[offset + match.start(1)] = receiver
             if not chain:
                 return end, (_CLEAN,)
             method = chain.group(1)
             values, targets = arguments(end + chain.end() + 1, outer_end)
         if unmarshal:
             if len(values) == 2:
-                self.write_targets(targets[1], values[0], state, root + '.Unmarshal')
+                self.write_targets(targets[1], values[0], state, root + '.Unmarshal' if member else root)
             return end, (_CLEAN,)
         if readall:
             return end, (_join(*values), _CLEAN)
@@ -767,7 +861,7 @@ class _Analysis:
                     if parameter:
                         closure_state[closure_scope.declare(parameter, offset + match.start())] = (
                             arguments[index] if index < len(arguments) else _CLEAN)
-                nested = _Analysis(self.source, self.code, self.rule, self.summaries)
+                nested = _Analysis(self.source, self.code, self.rule, self.summaries, self.imports)
                 nested.block(_Parser(self.code).block(offset + opening + 1, offset + close),
                              closure_state, closure_scope)
                 for (sink_offset, label), fact in nested.effects.items():
@@ -839,6 +933,10 @@ class _Analysis:
     def simple(self, start: int, end: int, state, scope, declaration_kind: str = '') -> _Flow:
         prefix = declaration_kind + ' ' if declaration_kind else ''
         code = prefix + self.code[start:end]
+        type_declaration = re.match(r'\s*type\s+([A-Za-z_]\w*)\b', code)
+        if type_declaration:
+            state[scope.declare(type_declaration.group(1), start)] = _CLEAN
+            return _Flow(state)
         keyword = re.match(r'\s*(return|break|continue)\b', code)
         if keyword:
             if keyword.group(1) == 'break':
@@ -911,7 +1009,7 @@ class _Analysis:
         return _Flow(state, breaks, continues)
 
     def statement(self, node, state, scope) -> _Flow:
-        if node.kind in {'var', 'const'}:
+        if node.kind in {'var', 'const', 'type'}:
             return self.simple(node.start, node.end, state, scope, node.kind)
         if node.kind == 'declarations':
             return self.block(node.body, state, scope)
@@ -973,7 +1071,7 @@ class _Analysis:
 
 
 def _summaries(source: str, code: str, functions: list[_Function], parser: _Parser, rule: str,
-               global_nodes=None):
+               imports: _ImportContexts, global_nodes=None):
     summaries = {function.name: _Summary(tuple(_CLEAN for _ in function.results), variadic=function.variadic)
                  for function in functions}
     if global_nodes is None:
@@ -988,8 +1086,8 @@ def _summaries(source: str, code: str, functions: list[_Function], parser: _Pars
             if node.kind == 'declarations':
                 declare_globals(node.body)
                 continue
-            prefix = node.kind + ' ' if node.kind in {'var', 'const'} else ''
-            declaration = re.match(r'\s*(?:var|const)\s+([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)',
+            prefix = node.kind + ' ' if node.kind in {'var', 'const', 'type'} else ''
+            declaration = re.match(r'\s*(?:var|const|type)\s+([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)',
                                    prefix + code[node.start:node.end])
             if declaration:
                 for target in declaration.group(1).split(','):
@@ -1000,7 +1098,7 @@ def _summaries(source: str, code: str, functions: list[_Function], parser: _Pars
     # Pre-bind their stable cells so a forward reference cannot accidentally
     # read a different, unbound name on the first pass.
     declare_globals(global_nodes)
-    global_analysis = _Analysis(source, code, rule, summaries)
+    global_analysis = _Analysis(source, code, rule, summaries, imports)
     global_state = {}
     by_name = defaultdict(list)
     for function in functions:
@@ -1019,7 +1117,7 @@ def _summaries(source: str, code: str, functions: list[_Function], parser: _Pars
         name = pending.popleft()
         queued.discard(name)
         if name == '@globals':
-            global_analysis = _Analysis(source, code, rule, summaries)
+            global_analysis = _Analysis(source, code, rule, summaries, imports)
             updated = global_analysis.block(global_nodes, dict(global_state), globals_scope).normal or {}
             updated = _join_states(global_state, updated)
             if updated != global_state:
@@ -1034,7 +1132,7 @@ def _summaries(source: str, code: str, functions: list[_Function], parser: _Pars
             continue
         variants = []
         for function in by_name[name]:
-            analysis = _Analysis(source, code, rule, summaries)
+            analysis = _Analysis(source, code, rule, summaries, imports)
             state, scope = dict(global_state), globals_scope.child()
             for index, parameter in enumerate(function.parameters):
                 if parameter and parameter != '_':
@@ -1058,11 +1156,11 @@ def _summaries(source: str, code: str, functions: list[_Function], parser: _Pars
     return summaries, global_analysis.effects
 
 
-def _source_hits(source, code, functions, global_nodes):
+def _source_hits(source, code, functions, global_nodes, imports):
     """Analyze a package image; offsets are mapped back to files by its owner."""
     hits = {}
     for rule in dict.fromkeys(rule for _regex, rule, _label in SINKS):
-        summaries, globals_effects = _summaries(source, code, functions, _Parser(code), rule,
+        summaries, globals_effects = _summaries(source, code, functions, _Parser(code), rule, imports,
                                                global_nodes=global_nodes)
         for effects in [globals_effects, *(summary.effects for summary in summaries.values())]:
             for (offset, label), fact in effects.items():
@@ -1113,12 +1211,13 @@ def iter_project_hits(files: Iterable[Path], base_dir: Path):
         # Package initialization and synthetic offsets must still be stable
         # when the caller presents the same package files in another order.
         units.sort(key=lambda unit: str(unit[0].resolve()))
-        sources, codes, starts, locations, functions, global_nodes = [], [], [], [], [], []
+        sources, codes, starts, locations, functions, global_nodes, imports = [], [], [], [], [], [], []
         offset = 0
         for path, source, code in units:
             starts.append(offset)
             locations.append((path, [0] + [match.end() for match in re.finditer('\n', code)]))
             parser = _Parser(code)
+            imports.append(_file_imports(source, code, parser))
             cursor = 0
             for function in _functions(code, parser):
                 global_nodes.extend(_shift_statement(node, offset)
@@ -1134,7 +1233,8 @@ def iter_project_hits(files: Iterable[Path], base_dir: Path):
             sources.append(source + '\n;\n')
             codes.append(code + '\n;\n')
             offset += len(source) + 3
-        for rule, position, path_desc in _source_hits(''.join(sources), ''.join(codes), functions, global_nodes):
+        contexts = _ImportContexts(tuple(starts), tuple(imports))
+        for rule, position, path_desc in _source_hits(''.join(sources), ''.join(codes), functions, global_nodes, contexts):
             index = bisect_right(starts, position) - 1
             path, line_starts = locations[index]
             position -= starts[index]

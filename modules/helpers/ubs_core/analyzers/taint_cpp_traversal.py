@@ -234,6 +234,35 @@ class Parser:
         if beginning < end or separator == ';':
             yield beginning, end
 
+    def parameter_parts(self, start, end):
+        """Split declarations without splitting a type's template arguments.
+
+        Expression commas retain their original meaning in ``parts``. Here
+        only the declaration before a default's ``=`` contributes type angle
+        brackets, so a comparison in a default is not mistaken for a type.
+        """
+        beginning, angles, default = start, 0, False
+        while start < end:
+            value = self.value(start)
+            if start in self.pairs:
+                start = self.pairs[start]
+            elif value == '<' and not default:
+                angles += 1
+            elif value in {'>', '>>'} and angles:
+                angles -= len(value)
+                if angles < 0:
+                    raise ValueError('Unbalanced C++ parameter type; analysis is incomplete')
+            elif value == '=' and not angles:
+                default = True
+            elif value == ',' and not angles:
+                yield beginning, start
+                beginning, default = start + 1, False
+            start += 1
+        if angles:
+            raise ValueError('Unbalanced C++ parameter type; analysis is incomplete')
+        if beginning < end:
+            yield beginning, end
+
     def definitions(self, start, end, owner):
         script = []
         while start < end:
@@ -271,7 +300,7 @@ class Parser:
                     name = self.value(name_index)
                     if name in {'if', 'while', 'for', 'switch', 'catch'}:
                         raise ValueError('C/C++ control flow outside a selected function; analysis is incomplete')
-                    declarations = tuple(self.raw(low, high) for low, high in self.parts(opening + 1, closing))
+                    declarations = tuple(self.raw(low, high) for low, high in self.parameter_parts(opening + 1, closing))
                     if declarations == ('void',):
                         declarations = ()
                     parameters = []

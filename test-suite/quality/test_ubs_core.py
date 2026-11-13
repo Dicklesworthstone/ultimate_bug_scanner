@@ -6704,6 +6704,442 @@ int main(int argc, char **) { handle(nullptr, argc > 1); }
                     print(f'[cpp-outbound-native-{label}] PASS ({time.monotonic() - started:.3f}s)', flush=True)
 
 
+class CppHeaderFlowTests(unittest.TestCase):
+    """Response header values follow bindings and actual CR/LF validation.
+
+    Source labels are independent of the detector. The native adapter below
+    writes the selected header string without any network or framework calls;
+    it checks the C++ string/helper semantics, not a particular HTTP library.
+    """
+
+    RULE = 'cpp.detector.header-injection'
+
+    @classmethod
+    def setUpClass(cls):
+        artifacts = Path(__file__).resolve().parents[2] / 'test-suite/artifacts'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        cls.root = Path(tempfile.mkdtemp(prefix='cpp-header-flow-', dir=artifacts))
+        print(f'[CppHeaderFlowTests] artifacts={cls.root}', flush=True)
+
+    @staticmethod
+    def cases():
+        prelude = '''#include <cstdlib>
+#include <map>
+#include <regex>
+#include <stdexcept>
+#include <string>
+struct Request { std::string get_param_value(const char *) const; };
+struct Response {
+  void set_header(const std::string &, const std::string &);
+  void setContentType(const std::string &);
+};
+void FCGX_FPrintF(void *, const char *, ...);
+int cgiFormString(const char *, char *, int);
+'''
+        source = 'std::string value = req.get_param_value("value");\n'
+        sink = 'response.set_header("X-Value", value); // SINK\n'
+        clean_sink = sink.replace(' // SINK', '')
+        cases = (
+            ('direct', '', source + sink),
+            ('safe_named_identity', 'std::string safeHeader(std::string value) { return value; }',
+             'std::string value = safeHeader(req.get_param_value("value"));\n' + sink),
+            ('sanitize_named_identity', 'std::string sanitizeHeader(std::string value) { return value; }',
+             'std::string value = sanitizeHeader(req.get_param_value("value"));\n' + sink),
+            ('strip_named_identity', 'std::string strip_crlf(std::string value) { return value; }',
+             'std::string value = strip_crlf(req.get_param_value("value"));\n' + sink),
+            ('identity_alpha_rename', 'std::string identity(std::string value) { return value; }',
+             'std::string value = identity(req.get_param_value("value"));\n' + sink),
+            ('unbound_safe_name', 'std::string safeHeader(std::string);',
+             'std::string value = safeHeader(req.get_param_value("value"));\n' + sink),
+            ('constant_helper', 'std::string fixed(std::string value) { return "fixed"; }',
+             'std::string value = fixed(req.get_param_value("value"));\n' + clean_sink),
+            ('helper_sink', '''void write_value(Response &response, std::string value) {
+                response.set_header("X-Value", value); // SINK
+            }''', 'write_value(response, req.get_param_value("value"));\n'),
+            ('reference_helper_source', '''void fill(std::string &value) {
+                value = std::getenv("HTTP_X_VALUE");
+            }''', 'std::string value = "fixed";\nfill(value);\n' + sink),
+            ('reference_helper_kill', 'void clear_value(std::string &value) { value = "fixed"; }',
+             source + 'clear_value(value);\n' + clean_sink),
+            ('literal_overwrite', '', source + 'value = "fixed";\n' + clean_sink),
+            ('conditional_overwrite', '', source + 'if (enabled) value = "fixed";\n' + sink),
+            ('both_branch_overwrite', '', source + 'if (enabled) value = "one"; else value = "two";\n' + clean_sink),
+            ('copy_before_overwrite', '', source + 'std::string copy = value;\nvalue = "fixed";\n'
+             + 'response.set_header("X-Value", copy); // SINK\n'),
+            ('reference_alias_overwrite', '', source + 'std::string &alias = value;\nalias = "fixed";\n' + clean_sink),
+            ('nested_shadow', '', source + '{ std::string value = "fixed";\n' + clean_sink + '}\n' + sink),
+            ('unrelated_function', '''void read_only(const Request &req) {
+                std::string value = req.get_param_value("value");
+            }''', 'std::string value;\n' + clean_sink),
+            ('discarded_regex_result', '', source
+             + r'std::regex_replace(value, std::regex("[\r\n]"), "");' + '\n' + sink),
+            ('ineffective_regex_replacement', '', source
+             + 'value = std::regex_replace(value, std::regex("x"), "y");\n' + sink),
+            ('partial_regex_replacement', '', source
+             + r'value = std::regex_replace(value, std::regex("\r"), "");' + '\n' + sink),
+            ('guard_both_controls', '', source
+             + r"if (value.find('\r') != std::string::npos || value.find('\n') != std::string::npos) return;"
+             + '\n' + clean_sink),
+            ('guard_control_set', '', source
+             + r'if (value.find_first_of("\r\n") != std::string::npos) return;'
+             + '\n' + clean_sink),
+            ('guard_one_control', '', source
+             + r"if (value.find('\r') != std::string::npos) return;" + '\n' + sink),
+            ('guard_and_instead_of_or', '', source
+             + r"if (value.find('\r') != std::string::npos && value.find('\n') != std::string::npos) return;"
+             + '\n' + sink),
+            ('guard_wrong_value', '', source + 'std::string other = "fixed";\n'
+             + r"if (other.find('\r') != std::string::npos || other.find('\n') != std::string::npos) return;"
+             + '\n' + sink),
+            ('guard_inverted', '', source
+             + r'if (value.find_first_of("\r\n") == std::string::npos) return;'
+             + '\n' + sink),
+            ('guard_then_new_source', '', source
+             + r'if (value.find_first_of("\r\n") != std::string::npos) return;' + '\n'
+             + 'value += req.get_param_value("suffix");\n' + sink),
+            ('rejecting_helper', r'''std::string ordinary_name(std::string value) {
+                if (value.find('\r') != std::string::npos || value.find('\n') != std::string::npos) {
+                    throw std::invalid_argument("bad header");
+                }
+                return value;
+            }''', 'std::string value = ordinary_name(req.get_param_value("value"));\n' + clean_sink),
+            ('source_suppression_keeps_flow', '', source.rstrip()
+             + ' // ubs:ignore[cpp.detector.header-injection]\n' + sink),
+            ('sink_suppression', '', source + clean_sink.rstrip()
+             + ' // ubs:ignore[cpp.detector.header-injection]\n'),
+            ('wrong_suppression', '', source + sink.rstrip() + ' // ubs:ignore[unrelated.rule]\n'),
+            ('quoted_suppression_is_data', '', source + 'const char *marker = "ubs:ignore";\n' + sink),
+            ('safe_name_in_header_key', '', source
+             + 'response.set_header("sanitizeHeader", value); // SINK\n'),
+            ('request_header_name', '', source
+             + 'response.set_header(value, "fixed"); // SINK\n'),
+            ('multiline_header', '', source + '''response.set_header( // SINK
+                "X-Value",
+                value);
+            '''),
+            ('content_type', '', source + 'response.setContentType(value); // SINK\n'),
+            ('standard_cgi_source', '', 'std::string value = std::getenv("HTTP_X_VALUE");\n' + sink),
+            ('cgi_output_parameter', '', 'char value[256];\ncgiFormString("value", value, sizeof(value));\n' + sink),
+            ('cgi_header_format', '', source
+             + r'FCGX_FPrintF(nullptr, "X-Value: %s\r\n", value.c_str()); // SINK' + '\n'),
+            ('unused_printf_argument', '', source
+             + r'FCGX_FPrintF(nullptr, "X-Value: fixed\r\n", value.c_str());' + '\n'),
+            ('plain_body_format', '', source
+             + r'FCGX_FPrintF(nullptr, "body=%s", value.c_str());' + '\n'),
+            ('header_map', '', source + 'headers["X-Value"] = value; // SINK\n'),
+            ('location_owned_by_redirect', '', source + 'response.set_header("Location", value);\n'),
+            ('literal_mentions_tainted_binding', '', source + 'response.set_header("X-Value", "value");\n'),
+            ('local_sink_lookalike', '''namespace application {
+                void set_header(const std::string &, const std::string &) {}
+            }''', source + 'application::set_header("X-Value", value);\n'),
+            ('local_source_lookalike', '''namespace application {
+                const char *getenv(const char *) { return "fixed"; }
+            }''', 'std::string value = application::getenv("HTTP_X_VALUE");\n' + clean_sink),
+            ('generic_set_is_not_header', '''struct Store {
+                void set(const std::string &, const std::string &) {}
+            };''', source + 'Store store;\nstore.set("key", value);\n'),
+            ('comment_and_string_decoys', '', '''
+                // response.set_header("X-Value", req.get_param_value("value"));
+                const char *sample = R"(response.set_header("X-Value", req.get_param_value("value"));)";
+                response.set_header("X-Value", "fixed");
+            '''),
+        )
+        for name, helper, body in cases:
+            program = prelude + textwrap.dedent(helper).strip() + '\n'
+            program += ('void route(const Request &req, Response &response, bool enabled,\n'
+                        '           std::map<std::string, std::string> &headers) {\n')
+            program += textwrap.dedent(body).strip() + '\n}\n'
+            expected = {line for line, text in enumerate(program.splitlines(), 1) if '// SINK' in text}
+            yield name, program, expected
+
+    def test_selected_header_values(self):
+        from ubs_core.cpp_detectors import header_injection
+        for name, source, expected in self.cases():
+            with self.subTest(case=name):
+                path = self.root / (name + '.cpp')
+                path.write_text(source, encoding='utf-8')
+                rows = list(header_injection.find([path]))
+                actual = [line for _, line, _, _ in rows]
+                self.assertEqual(actual, sorted(expected), source)
+                self.assertTrue(all(Path(file) == path for file, _, _, _ in rows))
+
+    def test_shipped_header_controls(self):
+        from ubs_core.cpp_detectors import header_injection
+        for filename, expected in (('header_injection_buggy.cpp', [26, 31, 36, 41, 47, 53, 58]),
+                                   ('header_injection_clean.cpp', [])):
+            with self.subTest(filename=filename):
+                path = REPO_ROOT / 'test-suite/cpp/security' / filename
+                self.assertEqual([line for _, line, _, _ in header_injection.find([path])], expected)
+
+    @staticmethod
+    def replacement_cases():
+        original = (REPO_ROOT / 'test-suite/cpp/security/header_injection_clean.cpp').read_text(encoding='utf-8')
+        # The fixture's two real validators are independent: modifying the
+        # character loop must leave the rejecting helper's call site clean.
+        return (
+            ('alpha-renamed-sanitizer', original.replace('safe_header_value', 'ordinary_name'), []),
+            ('carriage-return-only', original.replace("ch == '\\r' || ch == '\\n'", "ch == '\\r'"), [44, 49, 59, 65]),
+            ('newline-replacement', original.replace("ch = ' ';", "ch = '\\n';"), [44, 49, 59, 65]),
+            ('ineffective-character-copy', original.replace('char& ch', 'char ch'), [44, 49, 59, 65]),
+            ('mutated-after-proof', original.replace('return safe_header_value(value);',
+                 'return safe_header_value(value) + getenv("HTTP_X_SUFFIX");'), [49]),
+        )
+    def test_range_replacement_proof_is_value_and_control_specific(self):
+        from ubs_core.cpp_detectors import header_injection
+        for name, source, expected in self.replacement_cases():
+            with self.subTest(case=name):
+                path = self.root / (name + '.cpp')
+                path.write_text(source, encoding='utf-8')
+                self.assertEqual([line for _, line, _, _ in header_injection.find([path])], expected, source)
+
+    @staticmethod
+    def identity_cases():
+        prelude = '''#include <map>
+#include <string>
+struct Request { std::string get_param_value(const char *) const; };
+struct Response { void set_header(const std::string &, const std::string &); };
+'''
+        guard = r'if (value.find_first_of("\r\n") != std::string::npos) return;' + '\n'
+        source = 'std::string value = req.get_param_value("value");\n'
+        sink = 'response.set_header("X-Value", value); // SINK\n'
+        cases = (
+            ('no_op_member', '''struct Store {
+                void set_header(const std::string &, const std::string &) {}
+            };''', source + 'Store store;\nstore.set_header("X-Value", value);\n', False),
+            ('custom_find_is_not_string_validation', '''struct HeaderBox {
+                std::string::size_type find_first_of(const char *) const { return std::string::npos; }
+                operator std::string() const;
+            };
+            HeaderBox wrap(std::string);''',
+             'auto value = wrap(req.get_param_value("value"));\n' + guard + sink, False),
+            ('opaque_reference_effect', 'void mutate(std::string &);',
+             source + guard + 'mutate(value);\n' + sink, True),
+            ('opaque_buffer_effect', 'void mutate_buffer(char *);',
+             source + guard + 'mutate_buffer(value.data());\n' + sink, True),
+            ('opaque_buffer_alias_effect', 'void mutate_buffer(char *);',
+             source + guard + 'char *buffer = value.data();\nmutate_buffer(buffer);\n' + sink, True),
+            ('opaque_conversion_changes_representation', '''struct HeaderBox {
+                HeaderBox(std::string);
+                operator std::string() const;
+            };''', source + guard + 'HeaderBox converted = value;\n'
+             + 'response.set_header("X-Value", converted); // SINK\n', True),
+            ('opaque_formal_conversion', '''struct HeaderBox {
+                HeaderBox(std::string);
+                operator std::string() const;
+            };
+            void deliver(Response &response, HeaderBox value) {
+                response.set_header("X-Value", value); // SINK
+            }''', source + guard + 'deliver(response, value);\n', True),
+            ('const_character_view_helper', '''void deliver(Response &response, const char *value) {
+                response.set_header("X-Value", value);
+            }''', source + guard + 'deliver(response, value.c_str());\n', False),
+            ('template_parameter_helper_arity', '''void deliver(std::map<std::string, std::string> &headers,
+                           std::string value) {
+                headers["X-Value"] = value; // SINK
+            }''', 'std::map<std::string, std::string> headers;\n'
+             + 'deliver(headers, req.get_param_value("value"));\n', False),
+            ('read_only_string_methods', '', source + guard
+             + 'value.size();\nvalue.empty();\nvalue.c_str();\nvalue.reserve(256);\n'
+             + sink.replace(' // SINK', ''), False),
+        )
+        for name, helper, body, opaque in cases:
+            program = prelude + textwrap.dedent(helper).strip() + '\n'
+            program += 'void route(const Request &req, Response &response) {\n'
+            program += textwrap.dedent(body).strip() + '\n}\n'
+            expected = {line for line, text in enumerate(program.splitlines(), 1) if '// SINK' in text}
+            yield name, program, expected, opaque
+
+    def test_custom_members_and_opaque_effects_do_not_borrow_header_proof(self):
+        from ubs_core.cpp_detectors import header_injection
+        from ubs_core.taint_flow import AnalysisLimit
+        for name, source, expected, opaque in self.identity_cases():
+            with self.subTest(case=name):
+                path = self.root / (name + '.cpp')
+                path.write_text(source, encoding='utf-8')
+                try:
+                    rows = list(header_injection.find([path]))
+                except AnalysisLimit as exc:
+                    # External reference/buffer effects and user conversions
+                    # may change a validated string. They must be unsafe or
+                    # explicitly unresolved, never a complete clean answer.
+                    # These boundaries are specified before implementation.
+                    self.assertTrue(opaque, f'{name}: {exc}')
+                    self.assertIn('incomplete', str(exc))
+                else:
+                    self.assertEqual([line for _, line, _, _ in rows], sorted(expected), source)
+
+    @staticmethod
+    def format_cases():
+        cases = (
+            ('adjacent_literals', r'"X-Value: " "%s\r\n", value.c_str()', True, False),
+            ('positional_value', r'"X-Value: %2$s\r\n", "fixed", value.c_str()', True, True),
+            ('unused_positional_value', r'"X-Value: %2$s\r\n", value.c_str(), "fixed"', False, True),
+            ('width_and_precision', r'"X-Value: %*.*s\r\n", 8, 80, value.c_str()', True, False),
+            ('escaped_percent', r'"X-Value: %%s\r\n", value.c_str()', False, False),
+            ('header_like_body', r'"Content-Type: text/plain\r\n\r\nX-Body: %s", value.c_str()', False, False),
+            ('mixed_conversions', r'"X-Value: %d %s\r\n", 42, value.c_str()', True, False),
+        )
+        for name, arguments, unsafe, opaque in cases:
+            source = ('#include <cstdio>\n#include <cstdlib>\n#include <string>\nvoid route() {\n'
+                      'std::string value = std::getenv("HTTP_X_VALUE");\n'
+                      + 'std::printf(' + arguments + ');' + (' // SINK' if unsafe else '') + '\n}\n')
+            yield name, source, {6} if unsafe else set(), opaque
+
+    def test_format_slots_and_adjacent_literals_cannot_hide_request_values(self):
+        from ubs_core.cpp_detectors import header_injection
+        from ubs_core.taint_flow import AnalysisLimit
+        for name, source, expected, opaque in self.format_cases():
+            with self.subTest(case=name):
+                path = self.root / (name + '.cpp')
+                path.write_text(source, encoding='utf-8')
+                try:
+                    rows = list(header_injection.find([path]))
+                except AnalysisLimit as exc:
+                    # Positional POSIX format selectors must be modelled or
+                    # reported unsupported. Their absence from a conversion
+                    # regex cannot establish a complete clean report.
+                    self.assertTrue(opaque, f'{name}: {exc}')
+                    self.assertIn('incomplete', str(exc))
+                else:
+                    self.assertEqual([line for _, line, _, _ in rows], sorted(expected), source)
+
+    def test_failed_file_preserves_peer_findings_and_cannot_be_cached(self):
+        directory = self.root / 'driver-retention'
+        directory.mkdir()
+        paths = [directory / name for name in ('first.cpp', 'unknown.cpp', 'last.cpp')]
+        statement = 'response.set_header("X-Value", req.get_param_value("value"));'
+        paths[0].write_text('void first(const Request &req, Response &response) {\n' + statement + '\n}\n', encoding='utf-8')
+        paths[1].write_text('#if defined(USE_REQUEST)\nvoid conditional(const Request &req, Response &response) {\n'
+                            + statement + '\n}\n#endif\n', encoding='utf-8')
+        paths[2].write_text('void last(const Request &req, Response &response) {\n' + statement + '\n}\n', encoding='utf-8')
+        selected = directory / 'files.nul'
+        selected.write_bytes(b'\0'.join(os.fsencode(path) for path in paths) + b'\0')
+        command = [sys.executable, '-m', 'ubs_core.cpp_scan', '--files-from', str(selected),
+                   '--sink', str(directory / 'findings.jsonl'), '--json-out', str(directory / 'report.json'),
+                   '--project-dir', str(directory), '--skip', ','.join(str(i) for i in range(1, 17) if i != 7)]
+        env = dict(os.environ, PYTHONPATH=str(HELPERS_DIR), PYTHONDONTWRITEBYTECODE='1', UBS_KEEP_TEMP='1',
+                   UBS_NO_CACHE='0', UBS_CACHE_DIR=str(directory / 'cache'), UBS_PROFILE='1')
+        expected = [(self.RULE, str(paths[0]), 2), (self.RULE, str(paths[2]), 2)]
+        for phase, partial, hits in (('cold-partial', True, 0), ('repeat-partial', True, 0),
+                                     ('repaired', False, 0), ('warm-complete', False, 3)):
+            with self.subTest(phase=phase):
+                if phase == 'repaired':
+                    paths[1].write_text('void fixed(Response &response) {\n'
+                                        'response.set_header("X-Value", "fixed");\n}\n', encoding='utf-8')
+                started = time.monotonic()
+                proc = subprocess.run(command, cwd=directory, env=env, text=True, capture_output=True, timeout=60)
+                (directory / (phase + '.stdout.log')).write_text(proc.stdout, encoding='utf-8')
+                (directory / (phase + '.stderr.log')).write_text(proc.stderr, encoding='utf-8')
+                (directory / (phase + '.identity.json')).write_text(json.dumps({
+                    'command': command, 'exit': proc.returncode, 'elapsed': time.monotonic() - started,
+                    'sources': {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths},
+                }, indent=2) + '\n', encoding='utf-8')
+                context = f'{command!r}\n{proc.stdout}\n{proc.stderr}'
+                self.assertEqual(proc.returncode, 2 if partial else 1, context)
+                report = json.loads((directory / 'report.json').read_text(encoding='utf-8'))
+                (directory / (phase + '.report.json')).write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
+                self.assertEqual(report['status'], 'partial' if partial else 'ok', context)
+                self.assertEqual(sorted((row['rule'], row['path'], row['line']) for row in report['findings']), expected, context)
+                self.assertEqual((report['critical'], report['warning'], report['info']), (2, 0, 0), context)
+                self.assertEqual(report['profile']['cache_hits'], hits, context)
+                self.assertEqual(report['profile']['cache_misses'], len(paths) - hits, context)
+                if partial:
+                    self.assertEqual(report['module_error'], 'ANALYZER_ERROR', context)
+                    self.assertIn('detector header_injection', report['message'], context)
+                    self.assertIn('Conditional C/C++ preprocessing', report['message'], context)
+                else:
+                    self.assertNotIn('module_error', report, context)
+
+    def test_native_helper_and_guard_semantics(self):
+        compiler = shutil.which('g++') or shutil.which('clang++')
+        if not compiler:
+            self.skipTest('C++ compiler required for independent header witnesses')
+        names = {'safe_named_identity', 'identity_alpha_rename', 'constant_helper',
+                 'literal_overwrite', 'copy_before_overwrite', 'reference_alias_overwrite',
+                 'discarded_regex_result', 'ineffective_regex_replacement', 'partial_regex_replacement',
+                 'guard_both_controls', 'guard_control_set', 'guard_one_control',
+                 'guard_and_instead_of_or', 'guard_wrong_value', 'guard_inverted'}
+        runtime = '''
+#include <iostream>
+std::string Request::get_param_value(const char *) const { return "alpha\\nbeta"; }
+void Response::set_header(const std::string &, const std::string &value) { std::cout << value; }
+void Response::setContentType(const std::string &value) { std::cout << value; }
+int main() {
+    Request req;
+    Response response;
+    std::map<std::string, std::string> headers;
+    route(req, response, false, headers);
+}
+'''
+        for name, source, expected in self.cases():
+            if name not in names:
+                continue
+            with self.subTest(case=name):
+                path, binary = self.root / (name + '-native.cpp'), self.root / (name + '.bin')
+                path.write_text(source + runtime, encoding='utf-8')
+                compile_command = [compiler, '-std=c++20', '-save-temps=obj', str(path), '-o', str(binary)]
+                for phase, command in (('compile', compile_command), ('execute', [str(binary)])):
+                    started = time.monotonic()
+                    proc = subprocess.run(command, text=True, capture_output=True, timeout=60)
+                    label = f'{name}-{phase}'
+                    (self.root / (label + '.stdout.log')).write_text(proc.stdout, encoding='utf-8')
+                    (self.root / (label + '.stderr.log')).write_text(proc.stderr, encoding='utf-8')
+                    (self.root / (label + '.identity.json')).write_text(json.dumps({
+                        'command': command, 'source_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                        'exit': proc.returncode, 'elapsed': time.monotonic() - started,
+                    }, indent=2) + '\n', encoding='utf-8')
+                    self.assertEqual(proc.returncode, 0, f'{command!r}\n{proc.stdout}\n{proc.stderr}')
+                    if phase == 'execute':
+                        self.assertEqual('\n' in proc.stdout, bool(expected), repr(proc.stdout))
+
+    @unittest.skipUnless(os.environ.get('UBS_CPP_TAINT_E2E') == '1', 'set UBS_CPP_TAINT_E2E=1 for native C++ JSON/SARIF')
+    def test_public_header_reports_and_policy(self):
+        cases = {name: (source, expected) for name, source, expected in self.cases()}
+        for name in ('safe_named_identity', 'literal_overwrite', 'guard_both_controls',
+                     'ineffective_regex_replacement', 'sink_suppression'):
+            source, expected = cases[name]
+            directory = self.root / ('public-' + name)
+            directory.mkdir()
+            path = directory / 'case.cpp'
+            path.write_text(source, encoding='utf-8')
+            for frontend in ('module', 'runner'):
+                for fmt in ('json', 'sarif'):
+                    with self.subTest(case=name, frontend=frontend, format=fmt):
+                        command = ([str(REPO_ROOT / 'modules/ubs-cpp.sh'), '--only=7'] if frontend == 'module'
+                                   else [str(REPO_ROOT / 'ubs'), '--only=cpp', '--no-config', '--no-cache'])
+                        command += ['--ci', '--no-color', '--format=' + fmt, str(path)]
+                        env = dict(os.environ, UBS_NO_AUTO_UPDATE='1', UBS_KEEP_TEMP='1',
+                                   UBS_NO_CACHE='1', ENABLE_UV_TOOLS='0', PYTHONDONTWRITEBYTECODE='1')
+                        started = time.monotonic()
+                        proc = subprocess.run(command, cwd=directory, env=env, text=True,
+                                              capture_output=True, timeout=120)
+                        label = f'{frontend}-{fmt}'
+                        (directory / (label + '.stdout.log')).write_text(proc.stdout, encoding='utf-8')
+                        (directory / (label + '.stderr.log')).write_text(proc.stderr, encoding='utf-8')
+                        (directory / (label + '.identity.json')).write_text(json.dumps({
+                            'command': command, 'source_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                            'python': sys.version, 'exit': proc.returncode, 'elapsed': time.monotonic() - started,
+                        }, indent=2) + '\n', encoding='utf-8')
+                        context = f'{command!r}\n{proc.stdout}\n{proc.stderr}'
+                        self.assertEqual(proc.returncode, int(bool(expected)), context)
+                        self.assertEqual(path.read_text(encoding='utf-8'), source, context)
+                        report = json.loads(proc.stdout)
+                        if fmt == 'json':
+                            self.assertEqual(report['status'], 'ok', context)
+                            totals = report if frontend == 'module' else report['totals']
+                            self.assertEqual(totals['critical'], len(expected), context)
+                            key = 'rule' if frontend == 'module' else 'rule_id'
+                            findings = [row for row in report.get('findings', []) if row[key] == self.RULE]
+                            self.assertEqual([row['line'] for row in findings], sorted(expected), context)
+                            self.assertTrue(all(row['severity'] == 'critical' for row in findings), context)
+                        else:
+                            findings = [row for run in report['runs'] for row in run.get('results', [])
+                                        if row['ruleId'] == self.RULE]
+                            self.assertEqual([row['locations'][0]['physicalLocation']['region']['startLine']
+                                              for row in findings], sorted(expected), context)
+                            self.assertTrue(all(row['level'] == 'error' for row in findings), context)
+
+
 class JavaDetectorSuppressionTests(unittest.TestCase):
     """Real legacy receivers: suppress findings without deleting source facts."""
 
@@ -7289,6 +7725,7 @@ class SwiftCppSuppressionTests(unittest.TestCase):
     UNBOUND_SAFE = {
         "swift_detectors.header_injection": [4],
         "swift_detectors.outbound_url": [4],
+        "cpp_detectors.header_injection": [4],
         "cpp_detectors.outbound_url": [4],
         "analyzers.taint_swift_redirect": [6],
         "analyzers.taint_cpp_traversal": [4],

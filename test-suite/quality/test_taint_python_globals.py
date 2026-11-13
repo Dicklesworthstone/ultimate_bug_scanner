@@ -1130,6 +1130,58 @@ class GlobalWriteCliTests(unittest.TestCase):
         ]
         self.assert_cli_cases(cases)
 
+    def test_join_binding_producers_module_and_runner_json_sarif(self):
+        cases = [
+            Case('join_binding_alias_stays_incomplete', """
+                code = 'fixed'
+                class Owned:
+                    def __del__(self):
+                        global code
+                        code = input()
+                def render():
+                    owned = Owned()
+                    return '|'
+                separator = render()
+                joiner = separator.join
+                separator = 'replacement'
+                joiner(part for part in ['a', 'b'])
+                eval(code)
+                """),
+            Case('join_binding_helper_stays_incomplete', """
+                code = 'fixed'
+                class Owned:
+                    def __del__(self):
+                        global code
+                        code = input()
+                def render():
+                    owned = Owned()
+                    return '|'
+                def consume(separator):
+                    joiner = separator.join
+                    joiner(part for part in ['a', 'b'])
+                    eval(code)
+                def relay(value):
+                    consume(value)
+                relay(render())
+                """),
+            Case('join_binding_native_callback_keeps_tainted_value', """
+                def identity(value):
+                    return value
+                joiner = identity(input().join)
+                result = joiner(part for part in ['a', 'b'])
+                eval(result) # expect:eval
+                """),
+            Case('join_binding_custom_keeps_clean_value', """
+                class Custom:
+                    def join(self, values):
+                        return 'custom'
+                joiner = Custom().join
+                result = joiner(part for part in ['a', 'b'])
+                eval(result)
+                """),
+        ]
+        self.assert_cli_cases(cases)
+
     def assert_cli_cases(self, cases):
         for case in cases:
             incomplete = case.name in {'foreign_module_write', 'deleted_builtin_shadow_survives_helper_sibling_join',
@@ -1149,12 +1201,14 @@ class GlobalWriteCliTests(unittest.TestCase):
                                        'private_next_integer_helper_stays_incomplete',
                                        'private_next_boolean_helper_stays_incomplete',
                                        'join_receiver_helper_finalizer_stays_incomplete',
-                                       'join_receiver_opaque_prompt_stays_incomplete'}
+                                       'join_receiver_opaque_prompt_stays_incomplete',
+                                       'join_binding_alias_stays_incomplete',
+                                       'join_binding_helper_stays_incomplete'}
             # The full scanner also warns about eval syntax independently of
             # whether its operand is tainted. Keep those existing rules in
             # the oracle; the strong reset must remove only the taint finding.
             syntax_line = len(case.source.splitlines())
-            if case.name.startswith('private_next_'):
+            if case.name.startswith(('private_next_', 'join_binding_')):
                 # An eval in another scope intentionally revokes the native
                 # consumer proof. Keep the sink in the consuming function.
                 sites = [node.lineno for node in ast.walk(ast.parse(case.source))
@@ -1238,7 +1292,7 @@ class GlobalWriteCliTests(unittest.TestCase):
                         if incomplete:
                             diagnostic = ('foreign module global write' if case.name == 'foreign_module_write'
                                           else 'generator join receiver producer effects are unresolved'
-                                          if case.name.startswith('join_receiver_')
+                                          if case.name.startswith(('join_receiver_', 'join_binding_'))
                                           else 'generator next borrowed value producer effects are unresolved'
                                           if case.name.startswith('private_next_')
                                           else 'generator materialization reads an opaque operand'
@@ -1263,7 +1317,7 @@ class GlobalWriteCliTests(unittest.TestCase):
                                     totals = payload['totals'] if meta else payload
                                     self.assertEqual(totals['critical'], len(syntax_sites), payload)
                                     self.assertEqual(totals['warning'], 0, payload)
-                            if case.name.startswith(('module_next_', 'private_next_', 'join_receiver_')):
+                            if case.name.startswith(('module_next_', 'private_next_', 'join_receiver_', 'join_binding_')):
                                 # Refusing an unproved producer retains both
                                 # independent syntax findings and their counts.
                                 self.assertEqual(actual, [], payload)

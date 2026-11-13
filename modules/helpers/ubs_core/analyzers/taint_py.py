@@ -321,6 +321,8 @@ class _BoundCallable:
     receiver: Fact = CLEAN
     # Import qualifiers identify an API; invented receiver paths do not.
     namespace_proven: bool = False
+    # Capturing a method must not discard an unresolved receiver producer.
+    producer_unproved: bool = False
 
 
 @dataclass(frozen=True)
@@ -879,6 +881,7 @@ def _analysis_comparison_steps(a, b, evidence):
         return True
     if isinstance(a, _BoundCallable):
         return (type(a) is type(b) and a.name == b.name and a.references == b.references
+                and a.producer_unproved == b.producer_unproved
                 and (yield (a.receiver, b.receiver, evidence)))
     if isinstance(a, _BoundClassMethod):
         return (type(a) is type(b) and (yield (a.function, b.function, evidence))
@@ -967,7 +970,8 @@ def _without_object_contract(binding):
         if isinstance(value, (_ArgumentVector, _LiteralMapping, _ProcessInput, ast.ClassDef)):
             value = None
         elif isinstance(value, _BoundCallable) and value.name == _LITERAL_MAPPING_GET:
-            value = _BoundCallable('<object>.get', value.references, value.receiver)
+            value = _BoundCallable('<object>.get', value.references, value.receiver,
+                                   producer_unproved=value.producer_unproved)
         elif value == 'functools':
             value = _PARTIAL_CHANGED_MODULE
         choices.append(value)
@@ -2656,6 +2660,13 @@ class _Flow:
                 or self.engine.generator_frame_exposed):
             return False
         method = consumer.func
+        choices = _binding_choices(self.expression_bindings.get(method))
+        if any(isinstance(value, _BoundCallable) and value.producer_unproved for value in choices):
+            # The receiver was captured when the bound method was created.
+            # A later alias, helper parameter or receiver reassignment cannot
+            # repair its producer's unresolved effects.
+            raise AnalysisLimit('generator join receiver producer effects are unresolved; '
+                                'analysis is incomplete')
         if isinstance(method, ast.Attribute) and method.attr == 'join':
             receiver = _binding_choices(self.expression_bindings.get(method.value))
             if any(isinstance(value, _UnprovedProducer)
@@ -2670,7 +2681,6 @@ class _Flow:
                                     'analysis is incomplete')
         string_join = (isinstance(method, ast.Attribute) and method.attr == 'join'
                        and self.materialized_generator_string(method.value, state))
-        choices = _binding_choices(self.expression_bindings.get(method))
         if string_join:
             # A bound method of an already evaluated, exact builtin string
             # exhausts its sole argument synchronously. A name ending in
@@ -3652,7 +3662,8 @@ class _Flow:
                                           map_objects(value.references) if map_objects else value.references,
                                           value.receiver, value.valid)
             elif isinstance(value, _BoundCallable) and map_objects is not None:
-                value = _BoundCallable(value.name, map_objects(value.references), value.receiver, value.namespace_proven)
+                value = _BoundCallable(value.name, map_objects(value.references), value.receiver,
+                                       value.namespace_proven, value.producer_unproved)
             elif isinstance(value, _ArgumentVector) and map_objects is not None:
                 value = _ArgumentVector(value.operands, tuple(map_objects(refs) for refs in value.references))
             elif isinstance(value, (_FunctionValue, _DeferredCall)):
@@ -4492,7 +4503,8 @@ class _Flow:
                         value = _BoundClassMethod(value.function, value.owner, value.references, value.receiver,
                                                   value.valid and not bool(value.references & state.mutated))
                     elif value.name == _LITERAL_MAPPING_GET and value.references & state.mutated:
-                        value = _BoundCallable('<object>.get', value.references, value.receiver)
+                        value = _BoundCallable('<object>.get', value.references, value.receiver,
+                                               producer_unproved=value.producer_unproved)
                 choices.append(value)
             if refs:
                 slot = '@method:' + name
@@ -4748,7 +4760,8 @@ class _Flow:
             elif isinstance(target, _BoundCallable):
                 actual = frozenset().union(*(self._lookup_refs(references, ref) if isinstance(ref, str)
                                              else frozenset({node}) for ref in target.references))
-                choices.append(_BoundCallable(target.name, actual, substitute(target.receiver), target.namespace_proven))
+                choices.append(_BoundCallable(target.name, actual, substitute(target.receiver),
+                                               target.namespace_proven, target.producer_unproved))
             elif isinstance(target, _BoundClassMethod):
                 actual = frozenset().union(*(
                     self._lookup_refs(references, ref) if isinstance(ref, str)
@@ -5995,6 +6008,10 @@ class _Flow:
             receiver_refs = self.expression_references.get(node.value, NO_REFERENCES)
             receiver_fact = self.expression_facts.get(node.value, CLEAN)
             bases = _binding_choices(self.expression_bindings.get(node.value))
+            if node.attr == 'join':
+                # A helper's symbolic receiver otherwise erases the scalar
+                # producer contract before its bound method is captured.
+                self.require_value(self.expression_bindings.get(node.value))
             if any(isinstance(base, (_DeferredGenerator, _GeneratorNext)) for base in bases):
                 if node.attr != '__next__' or not all(isinstance(base, _DeferredGenerator) for base in bases):
                     raise AnalysisLimit('generator attribute protocol is unmodeled; analysis is incomplete')
@@ -6053,11 +6070,16 @@ class _Flow:
                 if isinstance(base, _ProcessInput) and node.attr == 'communicate':
                     candidates.append(_BoundCallable('@stdin.' + base.kind, receiver_refs, receiver_fact, True))
                     continue
+                producer_unproved = (
+                    isinstance(base, _BoundCallable) and base.producer_unproved
+                    or node.attr == 'join' and (
+                        isinstance(base, _UnprovedProducer)
+                        or isinstance(base, (_LiteralString, _GeneratorString)) and not base.format_safe))
                 name = (_extend_qualifier(base, node.attr) if isinstance(base, str)
                         else _extend_qualifier(base.name, node.attr, receiver_unknown=not base.namespace_proven)
                         if isinstance(base, _BoundCallable)
                         else _opaque_qualifier(_qualified(node, state.bindings), receiver_unknown=True))
-                if not name and receiver_refs:
+                if not name and (receiver_refs or producer_unproved):
                     # A returned object has identity even without a source
                     # spelling (identity(box).append(...)). Keep the method
                     # and receiver without inventing an import/sanitizer.
@@ -6065,7 +6087,8 @@ class _Flow:
                 framework = name.startswith('@fastapi.router.') or name in _ALL_FRAMEWORK_NAMES
                 proven = isinstance(base, str) or isinstance(base, _BoundCallable) and base.namespace_proven
                 proven = proven and not any(part in {'<object>', '<unknown>'} for part in name.split('.'))
-                candidates.append(_BoundCallable(name, receiver_refs, receiver_fact, proven) if name and receiver_refs and not framework
+                candidates.append(_BoundCallable(name, receiver_refs, receiver_fact, proven, producer_unproved)
+                                  if name and (receiver_refs or producer_unproved) and not framework
                                   else name or None)
             binding = _join_bindings(*candidates)
             # A joined module identity can still denote a real source
@@ -8114,7 +8137,8 @@ class _Analysis:
                             if isinstance(value, _BoundClassMethod) else None)
                 value = (_BoundClassMethod(function, value.owner, frozenset({slot}), symbolic, value.valid)
                          if isinstance(value, _BoundClassMethod)
-                         else _BoundCallable(qualified, frozenset({slot}), symbolic, value.namespace_proven))
+                         else _BoundCallable(qualified, frozenset({slot}), symbolic,
+                                             value.namespace_proven, value.producer_unproved))
             elif isinstance(value, _ArgumentVector) and name in value_parameters:
                 value = _context_vector(value)
                 shape = _vector_shape(value)

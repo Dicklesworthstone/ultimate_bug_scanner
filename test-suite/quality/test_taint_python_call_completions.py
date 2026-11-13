@@ -2481,6 +2481,62 @@ class FormattedStringCompletionTests(SourceTest):
                 with self.subTest(receiver=receiver, scope=scope, setup=setup):
                     self.assert_native(source, [expected])
 
+    def test_bound_join_aliases_retain_receiver_producer_effects(self):
+        prefix = ("code = 'fixed'\nclass Owned:\n"
+                  + '    def __del__(self):\n        global code\n        code = input()\n'
+                  + "def render():\n    owned = Owned()\n    return '|'\n"
+                  + 'def identity(value):\n    return value\n')
+        for capture in (
+                'separator = render()\njoiner = separator.join',
+                'joiner = render().join',
+                "separator = render()\njoiner = separator.join\nseparator = 'fixed'",
+                'joiner = render().strip().join',
+                'joiner = identity(render().join)'):
+            body = capture + "\njoiner(part for part in ['a', 'b'])\neval(code)\n"
+            for scope in ('module', 'private'):
+                source = prefix + (body if scope == 'module'
+                                   else 'def run():\n' + textwrap.indent(body, '    ') + 'run()\n')
+                with self.subTest(capture=capture, scope=scope):
+                    self.assert_native(source, ['UNTRUSTED'], incomplete=True)
+
+    def test_join_helpers_demand_receiver_and_bound_callable_authority(self):
+        prefix = ("code = 'fixed'\nclass Owned:\n"
+                  + '    def __del__(self):\n        global code\n        code = input()\n'
+                  + "def render():\n    owned = Owned()\n    return '|'\n")
+        for parameter, setup, consumer, argument in (
+                ('separator', '', 'separator.join', 'render()'),
+                ('separator', 'joiner = separator.join\n', 'joiner', 'render()'),
+                ('joiner', '', 'joiner', 'render().join')):
+            for relay in (False, True):
+                source = (prefix + f'def consume({parameter}):\n'
+                          + textwrap.indent(setup + f"{consumer}(part for part in ['a', 'b'])\neval(code)\n", '    ')
+                          + ('def relay(value):\n    consume(value)\n' if relay else '')
+                          + f"{'relay' if relay else 'consume'}({argument})\n")
+                with self.subTest(parameter=parameter, setup=setup, relay=relay):
+                    self.assert_native(source, ['UNTRUSTED'], incomplete=True)
+
+    def test_join_binding_authority_keeps_native_and_custom_controls(self):
+        for setup, consumer, expected in (
+                ("separator = '|'\n", 'separator.join', 'a|b'),
+                ("separator = '|'\njoiner = separator.join\nseparator = input()\n", 'joiner', 'a|b'),
+                ('separator = input()\njoiner = separator.join\n', 'joiner', 'aUNTRUSTEDb'),
+                ('joiner = identity(input().join)\n', 'joiner', 'aUNTRUSTEDb')):
+            source = ('def identity(value):\n    return value\n' + setup
+                      + f"result = {consumer}(part for part in ['a', 'b'])\neval(result)\n")
+            with self.subTest(consumer=consumer, setup=setup):
+                self.assert_native(source, [expected])
+        for expression, expected in (("'|'", 'a|b'), ('input()', 'aUNTRUSTEDb')):
+            self.assert_native('def consume(separator):\n'
+                               + "    result = separator.join(part for part in ['a', 'b'])\n"
+                               + f'    eval(result)\nconsume({expression})\n', [expected])
+        for capture in ('joiner = Custom().join', 'value = Custom()\njoiner = value.join'):
+            # A same-spelled custom method is not granted native string
+            # consumption. An inert custom receiver has no revoked producer.
+            source = ('class Custom:\n    def join(self, values):\n        return "custom"\n'
+                      + capture + "\nresult = joiner(part for part in ['a', 'b'])\neval(result)\n")
+            with self.subTest(capture=capture):
+                self.assert_native(source, ['custom'])
+
 
 class ImmediateGeneratorExpressionTests(SourceTest):
     def test_string_join_captures_values_before_later_rebinding(self):

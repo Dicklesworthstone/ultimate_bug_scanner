@@ -69,10 +69,14 @@ _STDIN_ITERATORS = {f'{stream}.__iter__': stream for stream in _STDIN_STREAMS}
 _STDIN_UNMODELED = frozenset(f'{stream}.{method}' for stream in _STDIN_STREAMS
                             for method in ('readinto', 'readinto1', 'detach'))
 _STDIN_API_NAMES = frozenset(_STDIN_READERS) | frozenset(_STDIN_ITERATORS) | _STDIN_UNMODELED
+_STDIN_EAGER_PARSERS = frozenset({'json.load', 'tomllib.load'})
+_STDIN_PARSER_CARRIERS = _STDIN_EAGER_PARSERS | _STDIN_STREAMS | {'json', 'tomllib', 'sys'}
 _STDIN_OPAQUE_ARGUMENTS = '@stdin:opaque-arguments'
 _SOURCE_MEMBERS = {'os': frozenset({'getenv', 'getenvb', 'environ', 'environb'}),
                    'sys': frozenset({'argv', 'stdin', '__stdin__'}),
                    'builtins': frozenset({'iter', 'list', 'tuple', 'next'}),
+                   'json': frozenset({'load', 'loads', 'JSONDecoder', '_default_decoder'}),
+                   'tomllib': frozenset({'load', 'loads'}),
                    **{stream: methods | {'__iter__', 'buffer', 'raw'}
                       for stream, methods in _STDIN_METHODS.items()}}
 # Keep a precise prefix plus an aggregate unknown-length suffix in summaries.
@@ -392,7 +396,7 @@ class _LiteralJoinInstance:
 
 @dataclass(frozen=True)
 class _LiteralMapping:
-    """An exact builtin dict with literal keys and immutable scalar values.
+    """An exact builtin dict with literal keys and inert value identities.
 
     The finite marker proves that selecting a key does not copy that key into
     the returned value. Writes or opaque escapes revoke this contract; it is
@@ -1610,9 +1614,10 @@ def _qualified(node: ast.AST, aliases: dict[str, object]) -> str:
                            'subprocess', 'os', 'sys', 'asyncio', 'builtins', 'eval', 'exec', 'input', 'raw_input',
                            'render_template', 'render_template_string', 'HttpResponse', 'Response'}:
                 return ''
-        # HTTP names are not legacy implicit identities. Once a real import
-        # is absent or shadowed, spelling alone cannot restore a network API.
-        if node.id in {'requests', 'httpx'}:
+        # Network clients and stream parsers require real import identities.
+        # An unresolved relative import or local shadow cannot recover one
+        # merely because its receiver has the standard library's spelling.
+        if node.id in {'requests', 'httpx', 'json', 'tomllib'}:
             return ''
         return node.id
     if isinstance(node, ast.Attribute):
@@ -3124,9 +3129,14 @@ class _Flow:
                                         if value.value_binding is not None else _UnprovedProducer(), value.keys)
             elif isinstance(value, _LiteralJoinInstance):
                 value = _LiteralJoinInstance(value.owner, value.result, False)
-            elif isinstance(value, _BoundCallable) and value.receiver_binding is not None:
+            elif isinstance(value, str) and value in _STDIN_PARSER_CARRIERS:
+                value = _BoundCallable(value, NO_REFERENCES, namespace_proven=True,
+                                       producer_unproved=True)
+            elif isinstance(value, _BoundCallable) and (
+                    value.receiver_binding is not None or value.name in _STDIN_PARSER_CARRIERS):
                 value = _BoundCallable(value.name, value.references, value.receiver, value.namespace_proven,
-                                       True, self.without_format_authority(value.receiver_binding))
+                                       True, self.without_format_authority(value.receiver_binding)
+                                       if value.receiver_binding is not None else None)
             choices.append(value)
         return _join_bindings(*choices)
 
@@ -4091,7 +4101,8 @@ class _Flow:
                     target.attr in members for members in _SOURCE_MEMBERS.values()):
                 self.require_value(namespace)
                 if any(target.attr in _SOURCE_MEMBERS.get(
-                           choice if isinstance(choice, str) else self.stdin_identity(choice), ())
+                           choice if isinstance(choice, str) else choice.name
+                           if isinstance(choice, _BoundCallable) and choice.namespace_proven else None, ())
                        for choice in _binding_choices(namespace)):
                     # Replacing a source API or its backing collection changes
                     # both future imports and previously captured getters.
@@ -4303,10 +4314,174 @@ class _Flow:
                             for value in _binding_choices(binding)
                             if (name := self.stdin_identity(value)) in _STDIN_STREAMS))
 
+    def stdin_parser_after(self, execution, consumer, seen=frozenset()):
+        """Prove an eval cannot run before any invocation of this parser.
+
+        Function-body line numbers are not execution order. Follow only
+        uniquely bound, unescaped direct helpers to their actual entry calls;
+        a later call, loop or unknown caller keeps the decoder unresolved.
+        """
+        engine = self.engine
+        consumer = engine.original_calls.get(consumer, consumer)
+        scope = engine.enclosing(consumer)
+        if scope is engine.tree:
+            if engine.enclosing(execution) is not scope:
+                return False
+            child, ancestors = consumer, set()
+            while child in engine.parents and engine.parents[child] is not scope:
+                child = engine.parents[child]
+                if isinstance(child, (ast.For, ast.AsyncFor, ast.While,
+                                      ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                    return False
+                ancestors.add(child)
+            if execution in ancestors:
+                return True  # The enclosing eval executes after its argument.
+            after = execution
+            while after in engine.parents and engine.parents[after] is not scope:
+                after = engine.parents[after]
+            return (child in scope.body and after in scope.body
+                    and scope.body.index(child) < scope.body.index(after))
+        if (not isinstance(scope, ast.FunctionDef) or scope in seen
+                or engine.enclosing(scope) is not engine.tree or scope not in engine.tree.body
+                or scope.decorator_list or scope in engine.generators
+                or scope.name in engine.generator_external_writers
+                or engine.generator_binders[engine.tree].get(scope.name) != [scope]):
+            return False
+        calls = []
+        for reference, parent in engine.parents.items():
+            engine.budget.spend()
+            if not isinstance(reference, ast.Name) or reference.id != scope.name:
+                continue
+            caller = engine.enclosing(reference)
+            if (not isinstance(reference.ctx, ast.Load) or not isinstance(parent, ast.Call)
+                    or parent.func is not reference
+                    or caller is not engine.tree and scope.name in engine.locals.get(caller, ())):
+                return False
+            calls.append(parent)
+        return bool(calls) and all(self.stdin_parser_after(execution, call, seen | {scope}) for call in calls)
+
+    def stdin_parser_stable(self, node):
+        """Require the native loader's decoder and module to remain intact."""
+        names = {'load', 'loads', 'JSONDecoder', '_default_decoder', 'read',
+                 'decode', 'raw_decode', 'scan_once', '__code__', '__defaults__', '__kwdefaults__'}
+        if (self.class_environments or self.engine.generator_namespace_exposed
+                or self.engine.generator_frame_exposed):
+            return False
+        for engine in self.engine.generator_peers:
+            if (engine.generator_builtin_reflection or engine.generator_literal_authority_exposed
+                    or names & engine.generator_attribute_writes
+                    or engine is not self.engine and engine.generator_namespace_exposed):
+                return False
+            for capability in engine.generator_execution_capabilities:
+                call = engine.parents.get(capability)
+                spelling = capability.id if isinstance(capability, ast.Name) else capability.attr
+                if (engine is not self.engine or spelling == 'exec'
+                        or not isinstance(call, ast.Call) or call.func is not capability
+                        or not self.stdin_parser_after(call, node)):
+                    return False
+        return True
+
+    def stdin_parser_factory(self, node, target):
+        """A pure native loader/module/stream return owns no opaque frame."""
+        function = target.function if isinstance(target, _FunctionValue) else target
+        if (node.args or node.keywords or not isinstance(function, ast.FunctionDef)
+                or self.engine.owner(function) is not self.engine
+                or function.decorator_list or function.returns is not None
+                or function in self.engine.generators or self.engine.closures.get(function)
+                or not self.engine.generator_helper_identity(function)):
+            return False
+        signature = function.args
+        if (signature.posonlyargs or signature.args or signature.kwonlyargs
+                or signature.vararg or signature.kwarg):
+            return False
+        body = [statement for statement in function.body if not isinstance(statement, ast.Pass)
+                and not (isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant))]
+        if len(body) != 1 or not isinstance(body[0], ast.Return):
+            return False
+        value = body[0].value
+        while isinstance(value, ast.Attribute):
+            value = value.value
+        return isinstance(value, ast.Name)
+
+    def stdin_parser(self, node, state, target, name, receiver, inputs):
+        """Eager stdlib parsers consume stream contents, not handle metadata."""
+        positions = self.call_positions(node, inputs.arguments, state)
+        keywords = {key: self.expression_bindings.get(expression, expression)
+                    for key, expression in inputs.keyword_nodes.items()}
+        # An opaque mapping can hide fp itself. Waiting until a visible
+        # positional stream is found would silently lose that source route.
+        if None in keywords:
+            if sum(keyword.arg is None for keyword in node.keywords) != 1:
+                raise AnalysisLimit('stdin parser argument expansion is unresolved; analysis is incomplete')
+            mappings = _binding_choices(keywords.pop(None))
+            if mappings and all(isinstance(value, _LiteralMapping) and value.keys == frozenset({'fp'})
+                    and all(self.stdin_identity(stream) in _STDIN_STREAMS
+                            for stream in _binding_choices(value.value_binding)) for value in mappings):
+                if 'fp' in keywords:
+                    self.possible_exception(state)
+                    return CLEAN  # Duplicate fp keywords fail before parsing.
+                keywords['fp'] = _join_bindings(*(value.value_binding for value in mappings))
+            else:
+                raise AnalysisLimit('stdin parser argument expansion is unresolved; analysis is incomplete')
+        if any(isinstance(expression, (ast.Starred, _ArgumentExpansion))
+               for expression, _fact, _binding, _refs in positions):
+            raise AnalysisLimit('stdin parser argument expansion is unresolved; analysis is incomplete')
+        supplied = [binding for _expression, _fact, binding, _refs in positions]
+        if 'fp' in keywords:
+            supplied.append(keywords['fp'])
+        if not any(self.stdin_source(binding) for binding in supplied):
+            return None
+        # A captured imported callable still depends on its native decoder
+        # and read machinery. Reflection, earlier exec and member replacement
+        # cannot inherit that contract merely by retaining a qualified name.
+        if (isinstance(target, _BoundCallable) and target.producer_unproved
+                or any(isinstance(value, _BoundCallable) and value.producer_unproved
+                       for binding in supplied for value in _binding_choices(binding))
+                or not self.stdin_parser_stable(node)):
+            raise AnalysisLimit('stdin parser identity or producer effects are unresolved; analysis is incomplete')
+        if len(positions) == 1 and 'fp' not in keywords:
+            binding = positions[0][2]
+        elif not positions and name == 'json.load' and 'fp' in keywords:
+            binding = keywords['fp']
+        else:
+            # JSON accepts one fp; TOML's fp is positional-only. A proven
+            # native call with another shape cannot produce parsed contents.
+            self.possible_exception(state)
+            return CLEAN
+        self.require_value(binding)
+        if name == 'tomllib.load':
+            # TOML's binary API rejects text handles before parsing. JSON
+            # accepts both native text and binary file-like inputs.
+            binding = _join_bindings(*(stream for value in _binding_choices(binding)
+                if (stream := self.stdin_identity(value)) in _STDIN_STREAMS
+                and stream.endswith(('.buffer', '.raw'))))
+        consumed = self.stdin_source(binding)
+        if not consumed:
+            self.possible_exception(state)
+            return CLEAN
+        for keyword, value in keywords.items():
+            if keyword == 'fp':
+                continue
+            self.require_value(value)
+            default_hook = (name == 'json.load' and keyword in {
+                'cls', 'object_hook', 'object_pairs_hook', 'parse_int', 'parse_float', 'parse_constant'}
+                and isinstance(value, ast.Constant) and value.value is None)
+            native_flag = (name == 'json.load' and keyword == 'strict'
+                           and isinstance(value, ast.Constant) and type(value.value) is bool)
+            if not default_hook and not native_flag:
+                # Custom hooks may replace parsed values or execute effects.
+                # Opaque callbacks are not an identity-preserving decoder.
+                raise AnalysisLimit('stdin parser callback or decoder options are unmodeled; analysis is incomplete')
+        self.expression_references[node] = frozenset({node})
+        self.possible_exception(state)
+        return join_facts(consumed, receiver, *inputs.arguments, *inputs.keywords.values())
+
     def stdin_call(self, node, state, target, name, receiver, inputs):
         """Finite read/iteration contracts; None leaves ordinary calls alone."""
         native = isinstance(target, str) or isinstance(target, _BoundCallable) and target.namespace_proven
         arguments, keywords = inputs.arguments, inputs.keywords
+        if native and name in _STDIN_EAGER_PARSERS:
+            return self.stdin_parser(node, state, target, name, receiver, inputs)
         if native and name in _STDIN_UNMODELED:
             # readinto mutates a caller-owned buffer; detach transfers an
             # underlying stream and invalidates its old owner. Neither is a
@@ -6010,10 +6185,18 @@ class _Flow:
             format_frame_inert = (bool(self.materialized_generator_depth) or not any(
                 isinstance(value, (_LiteralString, _GeneratorString, _LiteralJoinInstance, _ArgumentVector, _LiteralMapping,
                                    _SymbolicValue, ast.Constant))
-                or isinstance(value, _BoundCallable) and value.receiver_binding is not None
+                or isinstance(value, str) and value in _STDIN_PARSER_CARRIERS
+                or isinstance(value, _BoundCallable) and (
+                    value.receiver_binding is not None or value.name in _STDIN_PARSER_CARRIERS)
                 for value in _binding_choices(summary.returned_binding)))
             if not format_frame_inert and isinstance(node, ast.Call):
                 format_frame_inert = self.materialized_generator_call(node, target, state)
+                if not format_frame_inert and all(
+                        value in _STDIN_PARSER_CARRIERS if isinstance(value, str)
+                        else isinstance(value, _BoundCallable) and value.namespace_proven
+                        and value.name in _STDIN_PARSER_CARRIERS and not value.producer_unproved
+                        for value in _binding_choices(summary.returned_binding)):
+                    format_frame_inert = self.stdin_parser_factory(node, target)
             for parameter, written in summary.mutations:
                 fact = substitute(written)
                 self.mutate(self._lookup_refs(references, parameter), fact, state)
@@ -6592,6 +6775,13 @@ class _Flow:
                                       and type(value.value) in {str, bytes, int, float, complex, bool, type(None)}
                                       for value in node.values):
                 binding = _LiteralMapping(keys=frozenset(key.value for key in node.keys))
+            elif literal_keys and len(node.keys) == 1 and node.keys[0].value == 'fp':
+                value = self.expression_bindings.get(node.values[0])
+                if all(self.stdin_identity(stream) in _STDIN_STREAMS for stream in _binding_choices(value)):
+                    # Keep one exact keyword value in the existing finite
+                    # marker. Aliases share its ordinary mutation/escape
+                    # invalidation; no general per-key heap is inferred.
+                    binding = _LiteralMapping(value, frozenset({'fp'}))
         if is_call:
             if exception_type:
                 binding = '@exception:' + exception_type

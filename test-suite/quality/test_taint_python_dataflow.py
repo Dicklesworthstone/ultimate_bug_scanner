@@ -766,6 +766,162 @@ class StdinSourceTests(SourceTest):
         self.assert_rules('import sys, html\neval(html.escape(sys.stdin.read()))\n', 'eval')
 
 
+class EagerStdinParserTests(SourceTest):
+    def test_json_stream_contents_reach_each_sink_domain(self):
+        sinks = (("os.system(value)", 'command'), ("eval(value)", 'eval'),
+                 ("cursor.execute(value)", 'sql'), ("HttpResponse(value)", 'xss'),
+                 ("requests.get(value)", 'ssrf'))
+        for stream in ('sys.stdin', 'sys.__stdin__', 'sys.stdin.buffer', 'sys.__stdin__.buffer.raw'):
+            for sink, rule in sinks:
+                with self.subTest(stream=stream, sink=sink):
+                    findings = self.assert_rules('import json, sys, os, requests\n'
+                        f'value=json.load({stream})["value"]\n{sink}\n', rule)
+                    self.assertIn('stdin', findings[0]['message'])
+
+    def test_toml_reads_only_native_binary_stdin(self):
+        for stream in ('sys.stdin.buffer', 'sys.__stdin__.buffer', 'sys.stdin.buffer.raw'):
+            with self.subTest(stream=stream):
+                self.assert_rules(f'import tomllib, sys\neval(tomllib.load({stream})["code"])\n', 'eval')
+        self.assert_rules('import tomllib, sys\neval(tomllib.load(sys.stdin)["code"])\n')
+        self.assert_rules('import tomllib, sys\neval(tomllib.load(fp=sys.stdin.buffer)["code"])\n')
+
+    def test_loader_aliases_defaults_and_helper_summaries_keep_identity(self):
+        cases = (
+            'import json as wire\neval(wire.load(sys.stdin)["code"])\n',
+            'from json import load as parse\neval(parse(sys.stdin)["code"])\n',
+            'parse=json.load\njson=None\neval(parse(sys.stdin)["code"])\n',
+            'def parse(stream):\n    return json.load(stream)\neval(parse(sys.stdin)["code"])\n',
+            'def parse():\n    return json.load(sys.stdin)\neval(parse()["code"])\n',
+            'def parse(loader,stream):\n    return loader(stream)\neval(parse(json.load,sys.stdin)["code"])\n',
+            'def parser():\n    return json.load\neval(parser()(sys.stdin)["code"])\n',
+            'def parse(stream=sys.stdin,loader=json.load):\n    return loader(stream)\neval(parse()["code"])\n',
+        )
+        for source in cases:
+            with self.subTest(source=source):
+                self.assert_rules('import json, sys\n' + source, 'eval')
+        self.assert_rules('from tomllib import load as parse\nimport sys\n'
+                          'def consume():\n    return parse(sys.stdin.buffer)\neval(consume()["code"])\n', 'eval')
+
+    def test_argument_binding_and_native_decoder_defaults(self):
+        cases = (
+            'eval(json.load(fp=sys.stdin)["code"])\n',
+            'arguments=(sys.stdin,)\neval(json.load(*arguments)["code"])\n',
+            'eval(json.load(**{"fp":sys.stdin})["code"])\n',
+            'arguments={"fp":sys.stdin}\neval(json.load(**arguments)["code"])\n',
+            'arguments={"fp":sys.stdin.buffer}\nalias=arguments\n'
+            'eval(json.load(**alias)["code"])\n',
+            'eval(json.load(sys.stdin,strict=False)["code"])\n',
+            'eval(json.load(sys.stdin,cls=None,object_hook=None,object_pairs_hook=None,'
+            'parse_int=None,parse_float=None,parse_constant=None)["code"])\n',
+            'stream=sys.stdin\neval(json.load(((json := None),stream)[1])["code"])\n',
+        )
+        for source in cases:
+            with self.subTest(source=source):
+                self.assert_rules('import json, sys\n' + source, 'eval')
+
+    def test_custom_callbacks_and_unknown_options_report_incomplete(self):
+        for option in ('cls=Decoder', 'object_hook=lambda value: {"code":"fixed"}',
+                       'parse_float=custom', '**options'):
+            with self.subTest(option=option), self.assertRaisesRegex(
+                    taint_py.AnalysisLimit, 'stdin parser'):
+                self.scan(f'import json, sys\neval(json.load(sys.stdin,{option})["code"])\n')
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'stdin parser callback'):
+            self.scan('import tomllib, sys\neval(tomllib.load(sys.stdin.buffer,parse_float=custom)["code"])\n')
+        for mutation in ('arguments["fp"]=unknown()', 'arguments.update(options)',
+                         'alias=arguments\nalias["fp"]=unknown()'):
+            with self.subTest(mutation=mutation), self.assertRaisesRegex(
+                    taint_py.AnalysisLimit, 'stdin parser argument expansion'):
+                self.scan('import json, sys\narguments={"fp":sys.stdin}\n' + mutation + '\n'
+                          'eval(json.load(**arguments)["code"])\n')
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'stdin parser argument expansion'):
+            self.scan('import json, sys\narguments={"fp":sys.stdin}\n'
+                      'eval(json.load(**options,**arguments)["code"])\n')
+
+    def test_execution_order_and_returned_loader_producers_remain_explicit(self):
+        self.assert_rules('import json, sys\ndef parse():\n    return json.load(sys.stdin)\n'
+                          'def wrapper():\n    return parse()\neval(wrapper()["code"])\n', 'eval')
+        for returned, invocation in (
+                ('json', 'factory().load(sys.stdin)'), ('sys', 'json.load(factory().stdin)'),
+                ('sys.stdin', 'json.load(factory())')):
+            with self.subTest(returned=returned):
+                self.assert_rules('import json, sys\ndef factory():\n'
+                                  f'    return {returned}\neval({invocation}["code"])\n', 'eval')
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'stdin parser'):
+                    self.scan('import json, sys\ndef factory():\n    owned=unknown()\n'
+                              f'    return {returned}\neval({invocation}["code"])\n')
+        for source in (
+            'def parse():\n    return json.load(sys.stdin)\neval(input())\nparse()\n',
+            'def parse():\n    return json.load(sys.stdin)\neval(parse()["code"])\nparse()\n',
+            'for item in range(2):\n    eval(json.load(sys.stdin)["code"])\n',
+            'exec(input())\neval(json.load(sys.stdin)["code"])\n',
+            'def parser():\n    owned=unknown()\n    return json.load\n'
+            'eval(parser()(sys.stdin)["code"])\n',
+            'from json import load\ndef parser():\n    owned=unknown()\n    return load\n'
+            'eval(parser()(sys.stdin)["code"])\n',
+        ):
+            with self.subTest(source=source), self.assertRaisesRegex(taint_py.AnalysisLimit, 'stdin parser'):
+                self.scan('import json, sys\n' + source)
+
+    def test_native_loader_and_decoder_replacement_report_incomplete(self):
+        replacements = (
+            'json.load=lambda stream: {"code":"fixed"}',
+            'json.loads=lambda text,**options: {"code":"fixed"}',
+            'json.JSONDecoder=Decoder',
+            'json._default_decoder=decoder',
+            'json.load.__code__=replacement',
+            'def replace():\n    json.loads=lambda text,**options: {"code":"fixed"}\nreplace()',
+        )
+        for replacement in replacements:
+            with self.subTest(replacement=replacement), self.assertRaises(taint_py.AnalysisLimit):
+                self.scan('import json, sys\n' + replacement + '\neval(json.load(sys.stdin)["code"])\n')
+
+    def test_unrelated_imports_and_local_shadows_are_not_native_parsers(self):
+        for statement in ('from application.json import load', 'from .json import load'):
+            with self.subTest(statement=statement):
+                self.assert_rules(statement + '\nimport sys\neval(load(sys.stdin)["code"])\n')
+        for statement in ('from . import json', 'from . import tomllib', 'json=unknown()', 'tomllib=unknown()'):
+            parser = 'tomllib' if 'tomllib' in statement else 'json'
+            with self.subTest(statement=statement):
+                self.assert_rules(statement + f'\nimport sys\neval({parser}.load(sys.stdin.buffer)["code"])\n')
+        self.assert_rules('''
+            import json, sys
+            class Local:
+                @staticmethod
+                def load(stream):
+                    return {'code':'fixed'}
+            json=Local
+            eval(json.load(sys.stdin)['code'])
+        ''')
+        for operation in ('json.loads(sys.stdin)', 'json.dumps(sys.stdin)', 'json.load(sys.stdin.encoding)'):
+            with self.subTest(operation=operation):
+                self.assert_rules(f'import json, sys\neval({operation})\n')
+
+    def test_parsed_values_retain_sink_specific_safety(self):
+        self.assert_rules('''
+            import json, sys, shlex, html, os
+            value=json.load(sys.stdin)['value']
+            cursor.execute('SELECT %s',(value,))
+            os.system('echo '+shlex.quote(value))
+            HttpResponse(html.escape(value))
+        ''')
+        self.assert_rules('import json, sys, html\neval(html.escape(json.load(sys.stdin)["code"]))\n', 'eval')
+
+    def test_incomplete_parser_helpers_keep_independent_findings(self):
+        source = textwrap.dedent('''\
+            import json, sys
+            eval(input())
+            def parse():
+                return json.load(sys.stdin,cls=Decoder)
+            parse()
+            eval(input())
+        ''')
+        engine = taint_py._Analysis(ast.parse(source))
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'stdin parser') as caught:
+            engine.analyze()
+        self.assertEqual({(kind,line) for kind,line,_column,_label in caught.exception.effects},
+                         {('eval',2),('eval',6)})
+
+
 class ReachingDefinitionTests(SourceTest):
     def test_safe_reassignment_kills_taint(self):
         self.assert_rules("q = input()\nq = 'safe'\neval(q)\n")
@@ -977,6 +1133,15 @@ class RunnerIntegrationTests(unittest.TestCase):
                                ("import sys\ncursor.execute('SELECT %s', (sys.stdin.read(),))\n", False),
                                ("import sys\ncursor.execute(sys.stdin.read(0))\n", False),
                                ("import sys\ncursor.execute(sys.stdin.encoding)\n", False),
+                               ("import json, sys\ncursor.execute(json.load(sys.stdin)['query'])\n", True),
+                               ("import tomllib, sys\ncursor.execute(tomllib.load(sys.stdin.buffer)['query'])\n", True),
+                               ("import json, sys\ncursor.execute('SELECT %s', (json.load(sys.stdin)['query'],))\n", False),
+                               ("import tomllib, sys\ncursor.execute('SELECT %s', (tomllib.load(sys.stdin.buffer)['query'],))\n", False),
+                               ("import json, sys\narguments={'fp':sys.stdin}\n"
+                                "cursor.execute(json.load(**arguments)['query'])\n", True),
+                               ("from json import load\nimport sys\nload=lambda stream: {'query':'SELECT 1'}\n"
+                                "cursor.execute(load(sys.stdin)['query'])\n", False),
+                               ("from . import json\nimport sys\ncursor.execute(json.load(sys.stdin)['query'])\n", False),
                                ("match request.get_json():\n    case {**rest}:\n        cursor.execute(rest['query'])\n", True),
                                ("match cursor.execute:\n    case execute:\n        execute(input())\n", True),
                                ("match request.get_json():\n    case {**rest}:\n        cursor.execute('select %s', (rest,))\n", False),

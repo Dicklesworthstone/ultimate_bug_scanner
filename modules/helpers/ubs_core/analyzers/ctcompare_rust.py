@@ -1,10 +1,9 @@
 """ubs_core.analyzers.ctcompare_rust — non-constant-time secret comparisons (bead A2).
 
-Logic moved verbatim from the rust_constant_time_compare_matches heredoc in
-modules/ubs-rust.sh (python3 - "$PROJECT_DIR" <<'PY', body lines 5902-6200),
-which keeps its copy until the rust module's port bead. main() reproduces the
-heredoc's `path:line:code` stdout exactly; run(ctx) exposes the same detection
-as structured findings for the `python3 -m ubs_core` CLI.
+Track secret evidence and ambiguous signature-map values through scoped aliases.
+Known secret comparisons remain critical. A bare sig/signature map key alone
+requires review: it may name an authentication value or a public transaction ID.
+The native Rust scanner and the standalone analyzer share these classifications.
 """
 from __future__ import annotations
 
@@ -16,6 +15,7 @@ from pathlib import Path
 from typing import Iterable
 
 from ubs_core.io import source_line
+from ubs_core.lexer import strip_comments_and_strings
 from ubs_core.registry import Analyzer, RunContext, register
 from ubs_core.suppression import has_suppression_marker
 from ubs_core.rust_detectors.hardcoded_secrets import (
@@ -36,7 +36,7 @@ assign_re = re.compile(
 identifier_re = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # A `fn` ITEM declaration (`pub async fn verify`), not a function-pointer type
 # (`fn(u32) -> u32`) and not the `Fn`/`FnMut` traits.
-fn_decl_re = re.compile(r"(?:^|[^A-Za-z0-9_:])fn\s+[A-Za-z_][A-Za-z0-9_]*")
+fn_decl_re = re.compile(r"(?:^|[^A-Za-z0-9_:])fn\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)")
 safe_compare_re = re.compile(
     r"\b(?:subtle::)?ConstantTimeEq\b"
     r"|\.(?:ct_eq|constant_time_eq|timing_safe_eq|timing_safe_compare|safe_eq|safe_compare|secure_compare)\s*\("
@@ -74,6 +74,13 @@ metadata_terms = {
     "headers", "issuer", "iss", "kid", "name", "label", "id", "index",
     "count", "len", "length", "scope", "scopes",
 }
+ambiguous_signature_keys = {"sig", "signature"}
+verification_terms = {
+    "auth", "authenticate", "authentication", "authorize", "authorization",
+    "verify", "verification", "validate", "validation", "sign", "signing",
+    "hmac", "webhook",
+}
+call_name_re = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 nullish_re = re.compile(r'^(?:None|Some\s*\([^)]*\)|Ok\s*\([^)]*\)|Err\s*\([^)]*\)|true|false|0|1|""|b""|\[\])$')
 shape_re = re.compile(r"\b(?:len|is_empty|capacity)\s*\(|\.(?:len|is_empty|capacity)\s*\(")
 pure_string_literal_re = re.compile(r'^\s*(?:"(?:\\.|[^"\\])*"|r#*"[^"]*"#*|b"(?:\\.|[^"\\])*")\s*$')
@@ -210,7 +217,8 @@ def is_sensitive_text(text: str, public_metadata=()) -> bool:
     return False
 
 
-def is_sensitive_lookup(text: str) -> bool:
+def lookup_keys(text: str):
+    """Yield actual credential-source keys, excluding lookup-shaped literals."""
     structural = blank_string_literals(text)
     for lookup in (ENV_CALL_RE, key_lookup_re):
         for match in lookup.finditer(text):
@@ -219,9 +227,19 @@ def is_sensitive_lookup(text: str) -> bool:
             if not structural[match.start():match.start(1)].strip():
                 continue
             name = unquote_literal(match.group(1))
-            if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_-]*', name) and is_sensitive_text(name):
-                return True
-    return False
+            if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_-]*', name):
+                yield name, lookup is ENV_CALL_RE
+
+
+def is_sensitive_lookup(text: str) -> bool:
+    return any(is_sensitive_text(name)
+               and (environment or name.lower() not in ambiguous_signature_keys)
+               for name, environment in lookup_keys(text))
+
+
+def has_ambiguous_signature_lookup(text: str) -> bool:
+    return any(not environment and name.lower() in ambiguous_signature_keys
+               for name, environment in lookup_keys(text))
 
 
 def is_sensitive_operand_text(text: str, public_metadata=()) -> bool:
@@ -362,7 +380,7 @@ def blank_string_literals(text: str) -> str:
 
 
 def function_owner_by_line(stripped_lines):
-    """Map every 1-based line number to the innermost enclosing `fn` body id.
+    """Return each line's innermost `fn` body id and the declared body names.
 
     Id 0 is module scope: everything outside a function body (`static`/`const`
     items, `impl` headers, struct fields). A body that opens and closes on one
@@ -371,23 +389,28 @@ def function_owner_by_line(stripped_lines):
     owner = [0] * (len(stripped_lines) + 1)
     depth = 0
     stack = []  # (fn_id, body_depth)
+    names = {}
     next_id = 1
-    pending_fn = False
+    pending_fn = None
     for line_no, stripped in enumerate(stripped_lines, start=1):
         structural = blank_string_literals(stripped)
-        if fn_decl_re.search(structural):
-            pending_fn = True
+        declarations = iter(fn_decl_re.finditer(structural))
+        declaration = next(declarations, None)
         # The innermost scope active at ANY point on the line owns it, so the
         # body-opening line, the body's closing brace, and a one-line function
         # all resolve to that function rather than to its parent.
         chosen = stack[-1] if stack else None
-        for ch in structural:
+        for offset, ch in enumerate(structural):
+            if declaration is not None and offset >= declaration.start("name"):
+                pending_fn = declaration.group("name")
+                declaration = next(declarations, None)
             if ch == "{":
                 depth += 1
                 if pending_fn:
                     stack.append((next_id, depth))
+                    names[next_id] = pending_fn
                     next_id += 1
-                    pending_fn = False
+                    pending_fn = None
                     chosen = stack[-1]
             elif ch == "}":
                 if stack and stack[-1][1] == depth:
@@ -395,9 +418,45 @@ def function_owner_by_line(stripped_lines):
                 depth = max(0, depth - 1)
         if pending_fn and ";" in structural and "{" not in structural:
             # A signature-only declaration (trait method, `extern` block).
-            pending_fn = False
+            pending_fn = None
         owner[line_no] = chosen[0] if chosen else 0
-    return owner
+    return owner, names
+
+
+def verification_context(name, structural_lines, line_numbers):
+    """Keep explicit authentication/verification context local to its function."""
+    def verification_name(value):
+        return bool(set(split_identifier_terms(value).lower().split()) & verification_terms)
+
+    if verification_name(name):
+        return True
+    # Joining the masked lines recognizes newline-separated call parentheses.
+    # Remove declaration names, retaining real calls in a one-line body.
+    calls = "\n".join(fn_decl_re.sub("", structural_lines[line_no - 1])
+                      for line_no in line_numbers)
+    # Type arguments are not callees. Mask a complete turbofish so generic
+    # authenticate::<User>(...) retains the same name evidence as a plain
+    # call, while build::<AuthContext>() and Vec::<auth::Context>::new() do not.
+    masked = list(calls)
+    for generic in re.finditer(r"::\s*<", calls):
+        if masked[generic.start()] == " ":
+            continue
+        depth, braces, end = 1, 0, generic.end()
+        while end < len(calls) and depth:
+            char = calls[end]
+            if char == "{":
+                braces += 1
+            elif char == "}":
+                braces = max(0, braces - 1)
+            elif not braces and char == "<":
+                depth += 1
+            elif not braces and char == ">" and calls[end - 1] != "-":
+                depth -= 1
+            end += 1
+        if not depth:
+            masked[generic.start():end] = " " * (end - generic.start())
+    calls = "".join(masked)
+    return any(verification_name(match.group(1)) for match in call_name_re.finditer(calls))
 
 
 def collect_public_metadata_vars(statement_at, line_numbers, seeded=()):
@@ -425,8 +484,9 @@ def collect_public_metadata_vars(statement_at, line_numbers, seeded=()):
     return public - unproven
 
 
-def collect_sensitive_vars(lines, stripped_lines, statement_at, line_numbers, seeded=(), public_metadata=()):
-    """Taint set for ONE scope, seeded from the enclosing (module) scope.
+def collect_sensitive_vars(lines, stripped_lines, statement_at, line_numbers, seeded=(),
+                           public_metadata=(), ambiguous_seeded=()):
+    """Keep known-secret and ambiguous-map provenance separate in one scope.
 
     Iterated to a fixpoint so alias chains stay order-independent inside the
     scope, exactly as the previous whole-file pass was. The only change is the
@@ -435,6 +495,7 @@ def collect_sensitive_vars(lines, stripped_lines, statement_at, line_numbers, se
     `token == "BR2"` in another.
     """
     sensitive = set(seeded)
+    ambiguous = set(ambiguous_seeded)
     for _ in range(4):
         changed = False
         for line_no in line_numbers:
@@ -450,19 +511,22 @@ def collect_sensitive_vars(lines, stripped_lines, statement_at, line_numbers, se
             if not match:
                 continue
             name = match.group("lhs")
-            if name in sensitive:
-                continue
             rhs = match.group("rhs")
-            if (
+            identifiers = operand_identifiers(rhs)
+            if name not in sensitive and (
                 is_sensitive_text(name, public_metadata)
                 or is_sensitive_operand_text(rhs, public_metadata)
-                or (operand_identifiers(rhs) & sensitive)
+                or (identifiers & sensitive)
             ):
                 sensitive.add(name)
                 changed = True
+            if name not in ambiguous and (has_ambiguous_signature_lookup(rhs)
+                                          or identifiers & ambiguous):
+                ambiguous.add(name)
+                changed = True
         if not changed:
             break
-    return sensitive
+    return sensitive, ambiguous
 
 
 def operand_is_sensitive(operand: str, sensitive_vars, public_metadata=()) -> bool:
@@ -471,9 +535,11 @@ def operand_is_sensitive(operand: str, sensitive_vars, public_metadata=()) -> bo
     return bool(operand_identifiers(operand) & sensitive_vars)
 
 
-def unsafe_secret_compare(statement: str, sensitive_vars, public_metadata=()) -> bool:
+def secret_compare_severity(statement: str, sensitive_vars, ambiguous_vars,
+                            public_metadata=(), verification=False) -> str | None:
     if safe_compare_re.search(statement) or has_suppression_marker(statement, _SUPPRESSION_RULE):
-        return False
+        return None
+    severity = None
     for clause in re.split(r"\s*(?:&&|\|\|)\s*", statement):
         match = compare_re.search(clause)
         if not match:
@@ -485,14 +551,23 @@ def unsafe_secret_compare(statement: str, sensitive_vars, public_metadata=()) ->
         # Cleaning removes trailing parentheses; source lookup recognition
         # needs the original call delimiter, including for direct env macros.
         if is_sensitive_lookup(match.group("left")) or is_sensitive_lookup(match.group("right")):
-            return True
+            return "critical"
         if operand_is_sensitive(left, sensitive_vars, public_metadata) or operand_is_sensitive(right, sensitive_vars, public_metadata):
-            return True
-    return False
+            return "critical"
+        if (has_ambiguous_signature_lookup(match.group("left"))
+                or has_ambiguous_signature_lookup(match.group("right"))
+                or operand_identifiers(left) & ambiguous_vars
+                or operand_identifiers(right) & ambiguous_vars):
+            if verification:
+                return "critical"
+            # Keep inspecting later clauses: a known secret must dominate a
+            # merely ambiguous signature comparison on the same source line.
+            severity = "warning"
+    return severity
 
 
-def scan_file(text: str) -> list[tuple[int, str]]:
-    """Return (line_no, source_code) findings for one file's text."""
+def classified_comparisons(text: str) -> list[tuple[int, str, str]]:
+    """Return source sites and evidence-based severity for one immutable file."""
     if "==" not in text and "!=" not in text:
         return []
     lines = text.splitlines()
@@ -501,31 +576,34 @@ def scan_file(text: str) -> list[tuple[int, str]]:
     # retaining file contents between scans. Raw lines still own suppression
     # and displayed source text.
     stripped_lines = [strip_line_comments(line) for line in lines]
+    structural_lines = strip_comments_and_strings(text, "rust").splitlines()
 
     @cache
     def statement_at(line_no, max_lines):
         return statement_from(stripped_lines, line_no, max_lines)
 
-    owner = function_owner_by_line(stripped_lines)
+    owner, function_names = function_owner_by_line(structural_lines)
     scopes = {}
     for line_no in range(1, len(lines) + 1):
         scopes.setdefault(owner[line_no], []).append(line_no)
     # Module-scope taint (a `static API_SECRET`, a `const HMAC_KEY`) seeds every
     # function; a function's own locals stay inside it.
     module_public = collect_public_metadata_vars(statement_at, scopes.get(0, ()))
-    module_sensitive = collect_sensitive_vars(lines, stripped_lines, statement_at, scopes.get(0, ()),
-                                              public_metadata=module_public)
-    found: list[tuple[int, str]] = []
+    module_sensitive, module_ambiguous = collect_sensitive_vars(
+        lines, stripped_lines, statement_at, scopes.get(0, ()), public_metadata=module_public)
+    found: list[tuple[int, str, str]] = []
     seen: set[int] = set()
     for scope_id, scope_lines in scopes.items():
         public_metadata = (module_public if scope_id == 0 else
                            collect_public_metadata_vars(statement_at, scope_lines, module_public))
-        sensitive_vars = (
-            module_sensitive
+        sensitive_vars, ambiguous_vars = (
+            (module_sensitive, module_ambiguous)
             if scope_id == 0
             else collect_sensitive_vars(lines, stripped_lines, statement_at, scope_lines, module_sensitive,
-                                        public_metadata)
+                                        public_metadata, module_ambiguous)
         )
+        verification = bool(scope_id) and verification_context(
+            function_names[scope_id], structural_lines, scope_lines)
         for line_no in scope_lines:
             if has_ignore(lines, line_no, _SUPPRESSION_RULE):
                 continue
@@ -533,14 +611,28 @@ def scan_file(text: str) -> list[tuple[int, str]]:
             if not stripped or ("==" not in stripped and "!=" not in stripped):
                 continue
             statement = statement_at(line_no, 8)
-            if not statement or not unsafe_secret_compare(statement, sensitive_vars, public_metadata):
+            declarations = list(fn_decl_re.finditer(structural_lines[line_no - 1]))
+            # A line can contain comparisons in multiple function bodies.
+            # Its one finding conservatively retains any explicit auth name;
+            # this evidence does not carry into unrelated following lines.
+            line_verification = verification or (
+                len(declarations) > 1 and verification_context(
+                    " ".join(declaration.group("name") for declaration in declarations), (), ()))
+            severity = secret_compare_severity(statement, sensitive_vars, ambiguous_vars,
+                                               public_metadata, line_verification) if statement else None
+            if severity is None:
                 continue
             if line_no in seen:
                 continue
             seen.add(line_no)
-            found.append((line_no, source_line(lines, line_no)))
+            found.append((line_no, source_line(lines, line_no), severity))
     found.sort(key=lambda item: item[0])
     return found
+
+
+def scan_file(text: str) -> list[tuple[int, str]]:
+    """Return source sites for callers that do not render finding severities."""
+    return [(line, code) for line, code, _severity in classified_comparisons(text)]
 
 
 def collect_issues(root: Path) -> list[tuple[Path, int, str]]:
@@ -568,6 +660,11 @@ _MESSAGE = (
     "(non-constant-time comparison; use subtle::ConstantTimeEq, "
     "ring::constant_time::verify_slices_are_equal, or crypto_memcmp)"
 )
+_REVIEW_MESSAGE = (
+    "Signature map value compared with ==/!=; review whether it authenticates a request. "
+    "A bare sig/signature key may also identify a public transaction. "
+    "Use constant-time comparison when the value is authentication material."
+)
 
 
 def run(ctx: RunContext) -> Iterable[dict]:
@@ -580,7 +677,7 @@ def run(ctx: RunContext) -> Iterable[dict]:
         except OSError:
             continue
         rel = str(path.relative_to(cwd)) if path.is_relative_to(cwd) else str(path)
-        for line_no, _code in scan_file(text):
+        for line_no, _code, severity in classified_comparisons(text):
             yield {
                 "rule": _RULE,
                 "path": rel,
@@ -588,8 +685,8 @@ def run(ctx: RunContext) -> Iterable[dict]:
                 "col": 1,
                 "layer": "ctcompare",
                 "lang": "rust",
-                "severity": "critical",
-                "message": _MESSAGE,
+                "severity": severity,
+                "message": _MESSAGE if severity == "critical" else _REVIEW_MESSAGE,
             }
 
 

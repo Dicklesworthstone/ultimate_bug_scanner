@@ -4306,6 +4306,256 @@ fn timing_safe(expected_signature: &[u8], provided: &[u8]) -> bool {
     expected_signature.ct_eq(provided).into()
 }
 '''
+    PUBLIC_SIGNATURES = '''use std::collections::BTreeMap;
+
+pub fn still_pending(
+    model: &BTreeMap<String, String>,
+    entries: &[BTreeMap<String, String>],
+) -> bool {
+    let Some(original) = model.get("sig") else {
+        return false;
+    };
+    entries.iter().any(|entry| {
+        let candidate = entry.get("sig");
+        candidate == Some(original)
+    })
+}
+'''
+
+    def classified_sites(self, source: str) -> list[tuple[int, str]]:
+        """Exercise the analyzer's existing public records, retaining inputs."""
+        from ubs_core.registry import RunContext
+
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        root = Path(tempfile.mkdtemp(prefix="rust-signature-evidence-", dir=artifacts))
+        path = root / "source.rs"
+        path.write_text(source, encoding="utf-8")
+        records = list(ctcompare_rust.run(RunContext(lang="rust", files=[path])))
+        self.assertTrue(all(row["rule"] == "rust.ctcompare.secret_compare" for row in records), records)
+        return [(row["line"], row["severity"]) for row in records]
+
+    def test_bare_signature_map_keys_are_review_warnings(self) -> None:
+        # A string key alone does not distinguish public transaction IDs from
+        # authentication material. Keep a visible review finding, not a claim
+        # that the value is secret or that the comparison is proven safe.
+        self.assertEqual(self.classified_sites(self.PUBLIC_SIGNATURES), [(12, "warning")])
+        for key in ("sig", "signature", "SIG", "Signature"):
+            for expression in (f'row.get("{key}")', f'row["{key}"]',
+                               f'row.get_mut("{key}")', f'row.get(r#"{key}"#)'):
+                with self.subTest(expression=expression):
+                    source = ('fn contains(row: Row, other: Value) {\n'
+                              f'    let value = {expression};\n'
+                              '    let alias = value;\n'
+                              '    alias != other;\n}\n')
+                    self.assertEqual(self.classified_sites(source), [(4, "warning")])
+        direct = ('fn contains(row: Row, other: Value) {\n'
+                  '    row.get("sig") == other;\n'
+                  '    row["signature"] != other;\n}\n')
+        self.assertEqual(self.classified_sites(direct), [(2, "warning"), (3, "warning")])
+
+    def test_signature_authentication_evidence_stays_critical(self) -> None:
+        bodies = (
+            ('qualified-key', '    let value = row.get("webhook_signature");\n'
+             '    value == supplied;\n'),
+            ('hmac-key', '    row.get("hmac_sig") != supplied;\n'),
+            ('auth-token', '    row.get("auth_token") == supplied;\n'),
+            ('environment', '    let value = std::env::var("SIG");\n'
+             '    value != supplied;\n'),
+            ('signature-binding', '    let signature = row.get("sig");\n'
+             '    signature == supplied;\n'),
+            ('sig-binding', '    let sig = row.get("signature");\n'
+             '    sig != supplied;\n'),
+            ('expected-operand', '    let value = row.get("sig");\n'
+             '    value == expected_signature;\n'),
+            ('keyed-output', '    let value = row.get("signature");\n'
+             '    let expected = hmac.finalize().into_bytes();\n'
+             '    value == expected;\n'),
+            ('later-secret-write', '    let value = row.get("sig");\n'
+             '    value = row.get("api_key");\n'
+             '    value == supplied;\n'),
+            ('earlier-secret-write', '    let value = row.get("api_key");\n'
+             '    value = row.get("sig");\n'
+             '    value == supplied;\n'),
+            ('mixed-clause', '    let value = row.get("sig");\n'
+             '    value == supplied && expected_signature == supplied;\n'),
+            ('verification-call', '    authenticate_request(row);\n'
+             '    let value = row.get("sig");\n'
+             '    value == supplied;\n'),
+            ('multiline-verification-call', '    verify\n        (row);\n'
+             '    let value = row.get("signature");\n'
+             '    value == supplied;\n'),
+            ('generic-authentication-call', '    authenticate::<User>(row);\n'
+             '    row.get("sig") == supplied;\n'),
+            ('nested-generic-authentication-call', '    authenticate::<Vec<User>>(row);\n'
+             '    row.get("sig") == supplied;\n'),
+        )
+        for name, body in bodies:
+            with self.subTest(case=name):
+                source = 'fn compare(row: Row, supplied: Value) {\n' + body + '}\n'
+                line = next(number for number, text in enumerate(source.splitlines(), 1)
+                            if ' == ' in text or ' != ' in text)
+                self.assertEqual(self.classified_sites(source), [(line, "critical")])
+        for name in ("verify", "verify_signature", "authenticate", "verifyWebhook"):
+            with self.subTest(function=name):
+                source = (f'fn {name}(\n    row: Row,\n    supplied: Value,\n) -> bool {{\n'
+                          '    let value = row.get("sig");\n'
+                          '    value == supplied\n}\n')
+                self.assertEqual(self.classified_sites(source), [(6, "critical")])
+        self.assertEqual(self.classified_sites(
+            'fn contains(row: Row, supplied: Value) { authenticate(); row.get("sig") == supplied; }'),
+            [(1, "critical")])
+        for source in (
+            'fn unrelated() {} fn verify(row: Row, supplied: Value) { row.get("sig") == supplied; }',
+            'fn verify() {} fn contains(row: Row, supplied: Value) { row.get("sig") == supplied; }',
+        ):
+            with self.subTest(same_line=source):
+                self.assertEqual(self.classified_sites(source), [(1, "critical")])
+        self.assertEqual(self.classified_sites(
+            'fn unrelated() {} fn verify(row: Row, supplied: Value) {\n'
+            '    row.get("sig") == supplied;\n}\n'), [(2, "critical")])
+        self.assertEqual(self.classified_sites(
+            'fn verify(){fn unrelated(){}\n    row.get("sig") == supplied;\n}\n'),
+            [(2, "critical")])
+
+    def test_signature_lookup_scope_alias_and_lexical_boundaries(self) -> None:
+        source = '''fn verify_signature(row: Row, supplied: Value) {
+    let candidate = row.get("sig");
+    candidate == supplied;
+}
+fn contains(row: Row, supplied: Value) {
+    let candidate = row.get("sig");
+    // verify_signature(candidate, supplied) is documentation only.
+    let description = "authenticate(row.get(\\\"sig\\\"))";
+    candidate == supplied;
+}
+fn other(candidate: Value, supplied: Value) {
+    candidate == supplied;
+}
+fn safe(row: Row, supplied: Value) {
+    let candidate = row.get("sig");
+    candidate.is_none() == true;
+    candidate == None;
+    candidate.ct_eq(supplied);
+}
+'''
+        self.assertEqual(self.classified_sites(source), [(3, "critical"), (9, "warning")])
+        for marker, expected in (("rust.security.constant-time-compare", []),
+                                 ("rust.security.other", [(4, "warning")])):
+            with self.subTest(marker=marker):
+                marked = ('fn contains(row: Row, supplied: Value) {\n'
+                          '    let candidate = row.get("sig");\n'
+                          f'    // ubs:ignore[{marker}]\n'
+                          '    candidate == supplied;\n}\n')
+                self.assertEqual(self.classified_sites(marked), expected)
+        for evidence in ('build::<AuthContext>();', 'Vec::<auth::Context>::new();',
+                         'let text = r#"authenticate::<User>(row)"#;'):
+            with self.subTest(type_or_text=evidence):
+                source = ('fn contains(row: Row, supplied: Value) {\n'
+                          f'    {evidence}\n    row.get("sig") == supplied;\n}}\n')
+                self.assertEqual(self.classified_sites(source), [(3, "warning")])
+        self.assertEqual(self.classified_sites(
+            'fn unrelated() {} fn contains(row: Row, supplied: Value) { row.get("sig") == supplied; }'),
+            [(1, "warning")])
+        self.assertEqual(self.classified_sites(
+            'fn contains(){fn verify(){}\n    row.get("sig") == supplied;\n}\n'),
+            [(2, "warning")])
+
+    def test_signature_review_public_formats_cache_and_exit_policy(self) -> None:
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        root = Path(tempfile.mkdtemp(prefix="rust-signature-public-", dir=artifacts))
+        project = root / "project"
+        project.mkdir()
+        source = project / "ledger.rs"
+        source.write_text(self.PUBLIC_SIGNATURES, encoding="utf-8")
+        authentication = ('fn compare(row: Row, supplied: Value) {\n'
+                          '    authenticate::<User>(row);\n'
+                          '    let value = row.get("sig");\n'
+                          '    value == supplied;\n}\n')
+        receipts = []
+        for entry in ("module", "runner"):
+            statistics = root / f"{entry}-cache.json"
+            env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", UBS_NO_CACHE="0",
+                       UBS_CACHE_DIR=str(root / f"{entry}-cache"),
+                       UBS_CACHE_FILE=str(statistics), UBS_PROFILE="1", NO_COLOR="1")
+            for phase, output_format, fail_warning in (
+                ("cold", "json", False), ("warm", "sarif", False),
+                ("text", "text", False), ("strict", "json", True),
+            ):
+                with self.subTest(entry=entry, phase=phase):
+                    report = root / f"{entry}-{phase}.ndjson"
+                    if entry == "module":
+                        command = [str(REPO_ROOT / "modules/ubs-rust.sh"), "--no-cargo", "--ci",
+                                   "--no-color", "--only=8", f"--report-json={report}"]
+                    else:
+                        command = [str(REPO_ROOT / "ubs"), "--only=rust", "--no-cargo",
+                                   "--no-auto-update", "--no-config", "--no-color"]
+                    command += [f"--format={output_format}"]
+                    if fail_warning:
+                        command.append("--fail-on-warning")
+                    command.append(str(project))
+                    started = time.monotonic()
+                    proc = subprocess.run(command, cwd=root, env=env, text=True,
+                                          capture_output=True, timeout=180)
+                    (root / f"{entry}-{phase}.stdout").write_text(proc.stdout, encoding="utf-8")
+                    (root / f"{entry}-{phase}.stderr").write_text(proc.stderr, encoding="utf-8")
+                    receipts.append({"entry": entry, "phase": phase, "command": command,
+                                     "returncode": proc.returncode,
+                                     "elapsed": time.monotonic() - started,
+                                     "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest()})
+                    (root / "receipts.json").write_text(json.dumps(receipts, indent=2) + "\n", encoding="utf-8")
+                    context = f"{command!r}; exit={proc.returncode}; stdout={proc.stdout!r}; stderr={proc.stderr!r}"
+                    self.assertEqual(proc.returncode, int(fail_warning), context)
+                    if output_format == "text":
+                        self.assertIn("review authentication context", proc.stdout, context)
+                        rendered = re.sub(r"\x1b\[[0-9;]*m", "", proc.stdout)
+                        samples = re.findall(r"^\s+(.+):(\d+):(\d+) \[rule:"
+                                             + re.escape(self.RULE) + r"\]", rendered, re.MULTILINE)
+                        self.assertEqual([((root / path).resolve(), int(line), int(col))
+                                          for path, line, col in samples], [(source, 12, 1)], context)
+                        continue
+                    document = json.loads(proc.stdout)
+                    if output_format == "sarif":
+                        rows = [row for run in document["runs"] for row in run["results"]
+                                if row["ruleId"] == self.RULE]
+                        self.assertEqual(len(rows), 1, context)
+                        self.assertEqual(rows[0]["level"], "warning", context)
+                        location = rows[0]["locations"][0]["physicalLocation"]
+                        self.assertEqual(location["region"]["startLine"], 12, context)
+                        self.assertEqual(sarif_location_path(location["artifactLocation"]["uri"], root).resolve(),
+                                         source, context)
+                    else:
+                        rows = (document["findings"] if entry == "runner" else
+                                [json.loads(line) for line in report.read_text(encoding="utf-8").splitlines()])
+                        rows = [row for row in rows if row.get("rule_id", row.get("rule")) == self.RULE]
+                        self.assertEqual([(row["line"], row["severity"]) for row in rows],
+                                         [(12, "warning")], context)
+                        totals = document["totals"] if entry == "runner" else document
+                        self.assertEqual((totals["critical"], totals["warning"]), (0, 1), context)
+                    if entry == "module":
+                        stats = json.loads(statistics.read_text(encoding="utf-8"))
+                        self.assertEqual((stats["hits"], stats["misses"]),
+                                         (0, 1) if phase == "cold" else (1, 0), context)
+
+        # One public ID can have both severities in the same cached report.
+        # A real verification context must still make ordinary CI fail.
+        positive = project / "authenticate.rs"
+        positive.write_text(authentication, encoding="utf-8")
+        for phase in ("mixed-cold", "mixed-warm"):
+            report = root / f"{phase}.ndjson"
+            command = [str(REPO_ROOT / "modules/ubs-rust.sh"), "--no-cargo", "--ci", "--no-color",
+                       "--only=8", "--format=json", f"--report-json={report}", str(project)]
+            proc = subprocess.run(command, cwd=root, env=env, text=True, capture_output=True, timeout=180)
+            (root / f"{phase}.stdout").write_text(proc.stdout, encoding="utf-8")
+            (root / f"{phase}.stderr").write_text(proc.stderr, encoding="utf-8")
+            context = f"{command!r}; exit={proc.returncode}; stdout={proc.stdout!r}; stderr={proc.stderr!r}"
+            self.assertEqual(proc.returncode, 1, context)
+            document = json.loads(proc.stdout)
+            self.assertEqual((document["critical"], document["warning"]), (1, 1), context)
+            rows = [json.loads(line) for line in report.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(sorted((row["rule"], row["line"], row["severity"]) for row in rows),
+                             [(self.RULE, 4, "critical"), (self.RULE, 12, "warning")], context)
 
     def expected_sites(self, source: str) -> list[tuple[int, str]]:
         return [(number, line.strip()) for number, line in enumerate(source.splitlines(), 1)

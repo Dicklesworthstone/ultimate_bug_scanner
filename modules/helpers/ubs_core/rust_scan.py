@@ -1609,20 +1609,20 @@ def _ast_grep_bin() -> str | None:
     return None
 
 
-def run_ctcompare(scan: Scan) -> list[Hit]:
-    """Legacy count_constant_time_compare_matches — the heredoc is the
-    ctcompare_rust analyzer (A2 verbatim port); run it over the file list."""
+def run_ctcompare(scan: Scan) -> dict[str, list[Hit]]:
+    """Retain the analyzer's secret-versus-ambiguous comparison severity."""
     from ubs_core.analyzers import ctcompare_rust
     from ubs_core.registry import RunContext
 
     ctx = RunContext(lang="rust", files=list(scan.files))
-    hits: list[Hit] = []
+    hits: dict[str, list[Hit]] = {"critical": [], "warning": []}
     for finding in ctcompare_rust.run(ctx):
         path_str = str(finding.get("path", ""))
         line = int(finding.get("line", 1))
         if not scan.stream_line_allowed(path_str, line, scan._source_line(path_str, line)):
             continue
-        hits.append(Hit(path_str, line, int(finding.get("col", 1)), scan._source_line(path_str, line)))
+        hits[finding["severity"]].append(
+            Hit(path_str, line, int(finding.get("col", 1)), scan._source_line(path_str, line)))
     return hits
 
 
@@ -1979,10 +1979,17 @@ def cat_8(scan: Scan, r: Renderer) -> None:
          "Use OsRng/getrandom/ring::rand/openssl::rand or a framework helper backed by OS cryptographic randomness for tokens, sessions, CSRF nonces, OTPs, salts, API keys, and secrets",
          3, "No security-sensitive non-crypto randomness detected")
     r.subheader("Secret/token comparisons without timing-safe equality")
-    _sub(scan, r, run_ctcompare(scan), "rust.security.constant-time-compare", 8,
+    comparisons = run_ctcompare(scan)
+    critical_comparisons = _sub(scan, r, comparisons["critical"], "rust.security.constant-time-compare", 8,
          "critical", "Secret, signature, or token compared with ==/!=",
          "Use subtle::ConstantTimeEq, ring::constant_time::verify_slices_are_equal, crypto_memcmp, or a reviewed constant-time helper for bearer tokens, HMACs, CSRF values, reset secrets, API keys, and signatures",
-         3, "No secret comparisons using ==/!= detected")
+         3)
+    review_comparisons = _sub(scan, r, comparisons["warning"], "rust.security.constant-time-compare", 8,
+         "warning", "Signature map value compared with ==/!=; review authentication context",
+         "A bare sig/signature map key may hold authentication material or a public transaction identifier. Use constant-time comparison for authentication material; the key alone does not establish a secret.",
+         3)
+    if not critical_comparisons and not review_comparisons:
+        r.finding("good", 0, "No secret comparisons using ==/!= detected")
     r.subheader("JWT decode, validation bypass, or missing claim binding")
     _sub(scan, r, scan.detector_hits("jwt_verification"), "rust.security.jwt-verification", 8,
          "critical", "JWT decode/validation bypass risk",

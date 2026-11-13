@@ -1,0 +1,210 @@
+UNAPPLIED CANDIDATE: preserve Python generator join receiver producer authority
+
+Base commit: 71255b1345d44e89a1f7208e58579b4c2ced5d0f
+Status: archival patch only. Production helper, tests, version, and checksum
+pins are unchanged by preserving this file. Do not claim candidate qualification.
+
+Confirmed baseline:
+- The unchanged production helper had SHA256
+  3ca64125c92d0d8159a8582f520a150e8329be664bc59b30f7d2cd4c328c03d9.
+- Three authored unittest methods executed 26 native witness/control subcases.
+  Twelve unsafe subcases failed because the analyzer returned complete results
+  instead of refusing unresolved receiver producer effects. Fourteen native
+  literal/helper/input controls passed.
+- The command executed through DSR quality tool ubs-python-join-probe and exited
+  1: "Ran 3 tests in 1.136s", "FAILED (failures=12)".
+- Check log was observed at
+  quality-logs/ubs-python-join-probe/20261112T222317-Bjtx6Ae0/check-1.log.
+  The shared checkout was moving, and executor access was lost during the later
+  snapshot. No successful DSR aggregate or full-suite result is claimed.
+- Recovered call-completion test postimage SHA256 exactly matches the hash
+  observed before executor loss:
+  5567b3496abf9490e9b00ac6209bf7f176d116dcbeb91d98fd537d2989ab6845.
+
+Candidate:
+- Before recognizing a synchronous native string join, preserve a receiver's
+  existing unproved-producer obligation. Exact string type does not prove that
+  producing it had no opaque format, prompt, or owned-finalizer effects.
+- Aliases and native strip results already transport this obligation. The guard
+  rejects only existing _UnprovedProducer or revoked format_safe markers.
+- The helper edit was NOT APPLIED before executor loss. It has NOT EXECUTED.
+- Four authored real CLI cases cover module/runner JSON and SARIF (16 legs).
+  They have NOT EXECUTED.
+- The three new test methods can be selected with PYTHONPATH=test-suite/quality:
+  python3 -B -m unittest
+    test_taint_python_call_completions.FormattedStringCompletionTests.test_generator_join_preserves_receiver_producer_effects
+    test_taint_python_call_completions.FormattedStringCompletionTests.test_generator_join_keeps_opaque_prompt_and_format_receiver_effects
+    test_taint_python_call_completions.FormattedStringCompletionTests.test_generator_join_keeps_native_receiver_and_taint_controls
+- After restoring execution, compare the same baseline/candidate witnesses;
+  run the complete call-completion suite and GlobalWriteCliTests.
+  For the new CLI method set UBS_TAINT_E2E=1 and select
+  test_taint_python_globals.GlobalWriteCliTests.test_join_receiver_producers_module_and_runner_json_sarif.
+  Retain scratch with UBS_KEEP_TEMP=1, regenerate canonical nested checksums,
+  and run the original quality gates before activating the patch.
+
+Reconstructed postimage SHA256 (not runtime verification):
+  helper: 3724c8ac7b40aa31e12cbf5b4f980a768b76c7b32cdb2f641c3aec8e60c73333
+  call tests: 5567b3496abf9490e9b00ac6209bf7f176d116dcbeb91d98fd537d2989ab6845
+  CLI tests: 5a680093a75c8c39d29c1c59e85984a2a2898646ff1da4d6e96d31933a3596ad
+
+diff --git a/modules/helpers/ubs_core/analyzers/taint_py.py b/modules/helpers/ubs_core/analyzers/taint_py.py
+--- a/modules/helpers/ubs_core/analyzers/taint_py.py
++++ b/modules/helpers/ubs_core/analyzers/taint_py.py
+@@ -2653,6 +2653,18 @@
+                 or self.engine.generator_frame_exposed):
+             return False
+         method = consumer.func
++        if isinstance(method, ast.Attribute) and method.attr == 'join':
++            receiver = _binding_choices(self.expression_bindings.get(method.value))
++            if any(isinstance(value, _UnprovedProducer)
++                   or isinstance(value, (_LiteralString, _GeneratorString)) and not value.format_safe
++                   for value in receiver):
++                # Native string identity proves how join consumes its input,
++                # not the effects of producing that receiver. A helper may
++                # release an owned finalizer or input may format an opaque
++                # prompt before returning an exact builtin string. Preserve
++                # the same obligation carried through aliases and next().
++                raise AnalysisLimit('generator join receiver producer effects are unresolved; '
++                                    'analysis is incomplete')
+         string_join = (isinstance(method, ast.Attribute) and method.attr == 'join'
+                        and self.materialized_generator_string(method.value, state))
+         choices = _binding_choices(self.expression_bindings.get(method))
+diff --git a/test-suite/quality/test_taint_python_call_completions.py b/test-suite/quality/test_taint_python_call_completions.py
+--- a/test-suite/quality/test_taint_python_call_completions.py
++++ b/test-suite/quality/test_taint_python_call_completions.py
+@@ -2434,6 +2434,53 @@
+             retained = None
+         ''', ['fixed'])
+ 
++    def test_generator_join_preserves_receiver_producer_effects(self):
++        prefix = ("code = 'fixed'\nclass Owned:\n"
++                  + '    def __del__(self):\n        global code\n        code = input()\n'
++                  + "def render():\n    owned = Owned()\n    return '|'\n"
++                  + 'def identity(value):\n    return value\n')
++        for setup, receiver in (
++                ('', 'render()'),
++                ('separator = render()\n', 'separator'),
++                ('separator = render()\nalias = separator\n', 'alias'),
++                ('separator = render()\n', 'separator.strip()'),
++                ('separator = render()\n', 'identity(separator)')):
++            body = setup + f"{receiver}.join(part for part in ['a', 'b'])\neval(code)\n"
++            for scope in ('module', 'private'):
++                source = prefix + (body if scope == 'module'
++                                   else 'def run():\n' + textwrap.indent(body, '    ') + 'run()\n')
++                with self.subTest(receiver=receiver, scope=scope):
++                    self.assert_native(source, ['UNTRUSTED'], incomplete=True)
++
++    def test_generator_join_keeps_opaque_prompt_and_format_receiver_effects(self):
++        for method, signature, expression in (
++                ('__str__', '', 'input(Opaque())'),
++                ('__format__', ', spec', "f'{Opaque()}'")):
++            source = ("code = 'fixed'\nclass Opaque:\n"
++                      + f'    def {method}(self{signature}):\n'
++                      + "        global code\n        code = input()\n        return '|'\n"
++                      + f'separator = {expression}\n'
++                      + "separator.join(part for part in ['a', 'b'])\neval(code)\n")
++            with self.subTest(method=method):
++                self.assert_native(source, ['UNTRUSTED'], incomplete=True)
++
++    def test_generator_join_keeps_native_receiver_and_taint_controls(self):
++        for setup, receiver, expected in (
++                ('', "'|'", 'a|b'),
++                ("separator = '|'\n", 'separator', 'a|b'),
++                ("separator = '|'\nalias = separator\n", 'alias', 'a|b'),
++                ('', "render('|')", 'a|b'),
++                ('separator = input()\n', 'separator', 'aUNTRUSTEDb'),
++                ('separator = render(input())\n', 'separator', 'aUNTRUSTEDb'),
++                ("separator = f'{input()}'\n", 'separator', 'aUNTRUSTEDb')):
++            body = setup + f"result = {receiver}.join(part for part in ['a', 'b'])\neval(result)\n"
++            for scope in ('module', 'private'):
++                source = ('def render(value):\n    return value\n'
++                          + (body if scope == 'module'
++                             else 'def run():\n' + textwrap.indent(body, '    ') + 'run()\n'))
++                with self.subTest(receiver=receiver, scope=scope, setup=setup):
++                    self.assert_native(source, [expected])
++
+ 
+ class ImmediateGeneratorExpressionTests(SourceTest):
+     def test_string_join_captures_values_before_later_rebinding(self):
+diff --git a/test-suite/quality/test_taint_python_globals.py b/test-suite/quality/test_taint_python_globals.py
+--- a/test-suite/quality/test_taint_python_globals.py
++++ b/test-suite/quality/test_taint_python_globals.py
+@@ -1087,6 +1087,49 @@
+         ]
+         self.assert_cli_cases(cases)
+ 
++    def test_join_receiver_producers_module_and_runner_json_sarif(self):
++        cases = [
++            Case('join_receiver_helper_finalizer_stays_incomplete', """
++                code = 'fixed'
++                class Owned:
++                    def __del__(self):
++                        global code
++                        code = input()
++                def render():
++                    owned = Owned()
++                    return '|'
++                separator = render()
++                separator.join(part for part in ['a', 'b'])
++                eval(code)
++                """),
++            Case('join_receiver_opaque_prompt_stays_incomplete', """
++                code = 'fixed'
++                class Prompt:
++                    def __str__(self):
++                        global code
++                        code = input()
++                        return '|'
++                separator = input(Prompt())
++                separator.join(part for part in ['a', 'b'])
++                eval(code)
++                """),
++            Case('join_receiver_native_helper_keeps_clean_value', """
++                def render(value):
++                    return value
++                separator = render('|')
++                result = separator.join(part for part in ['a', 'b'])
++                eval(result)
++                """),
++            Case('join_receiver_native_helper_keeps_tainted_value', """
++                def render(value):
++                    return value
++                separator = render(input())
++                result = separator.join(part for part in ['a', 'b'])
++                eval(result) # expect:eval
++                """),
++        ]
++        self.assert_cli_cases(cases)
++
+     def assert_cli_cases(self, cases):
+         for case in cases:
+             incomplete = case.name in {'foreign_module_write', 'deleted_builtin_shadow_survives_helper_sibling_join',
+@@ -1104,7 +1147,9 @@
+                                        'private_next_helper_finalizer_stays_incomplete',
+                                        'private_next_direct_prompt_stays_incomplete',
+                                        'private_next_integer_helper_stays_incomplete',
++                                       'private_next_boolean_helper_stays_incomplete',
++                                       'join_receiver_helper_finalizer_stays_incomplete',
++                                       'join_receiver_opaque_prompt_stays_incomplete'}
+-                                       'private_next_boolean_helper_stays_incomplete'}
+             # The full scanner also warns about eval syntax independently of
+             # whether its operand is tainted. Keep those existing rules in
+             # the oracle; the strong reset must remove only the taint finding.
+@@ -1192,6 +1237,8 @@
+                                     actual.extend(sites)
+                         if incomplete:
+                             diagnostic = ('foreign module global write' if case.name == 'foreign_module_write'
++                                          else 'generator join receiver producer effects are unresolved'
++                                          if case.name.startswith('join_receiver_')
+                                           else 'generator next borrowed value producer effects are unresolved'
+                                           if case.name.startswith('private_next_')
+                                           else 'generator materialization reads an opaque operand'
+@@ -1216,7 +1263,7 @@
+                                     totals = payload['totals'] if meta else payload
+                                     self.assertEqual(totals['critical'], len(syntax_sites), payload)
+                                     self.assertEqual(totals['warning'], 0, payload)
++                            if case.name.startswith(('module_next_', 'private_next_', 'join_receiver_')):
+-                            if case.name.startswith(('module_next_', 'private_next_')):
+                                 # Refusing an unproved producer retains both
+                                 # independent syntax findings and their counts.
+                                 self.assertEqual(actual, [], payload)

@@ -1023,6 +1023,245 @@ class JavaScriptSecuritySuppressionTests(unittest.TestCase):
                     self.check_source(name, rule, 'multiline-' + marker.replace(':', '-'), program, expected)
 
 
+class JavaScriptTaintSuppressionTests(unittest.TestCase):
+    """Taint ignores belong to the reported sink, never to source transfer."""
+
+    SINKS = {'xss': 'res.send', 'eval': 'eval', 'command': 'shell.exec', 'sql': 'db.query'}
+
+    def setUp(self):
+        artifacts = REPO_ROOT / 'test-suite/artifacts'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        self.root = Path(tempfile.mkdtemp(prefix='js-taint-suppression-', dir=artifacts))
+        self.counter = 0
+
+    def scan(self, source, expected):
+        from ubs_core.analyzers import taint_js
+        from ubs_core.registry import RunContext
+
+        self.counter += 1
+        path = self.root / ('case-%03d.js' % self.counter)
+        path.write_text(source, encoding='utf-8')
+        findings = list(taint_js.run(RunContext(lang='javascript', files=[path])))
+        (path.with_suffix('.json')).write_text(json.dumps(findings, indent=2), encoding='utf-8')
+        self.assertEqual(sorted((item['rule'], item['line'], item['col']) for item in findings),
+                         sorted(('javascript.taint.' + kind, line, col) for kind, line, col in expected),
+                         (source, findings))
+        self.assertTrue(all(item['severity'] == 'critical' for item in findings), findings)
+
+    def test_canonical_and_internal_scopes_suppress_only_the_matching_domain(self):
+        for kind, sink in self.SINKS.items():
+            for prefix in ('javascript', 'js'):
+                for scope, expected in ((kind, []), ('unrelated', [(kind, 1, 1)])):
+                    with self.subTest(kind=kind, prefix=prefix, scope=scope):
+                        self.scan(f'{sink}(req.query.value); // ubs:ignore[{prefix}.taint.{scope}]\n',
+                                  expected)
+
+    def test_bare_multiline_and_previous_markers_keep_statement_ownership(self):
+        for kind, sink in self.SINKS.items():
+            for marker in ('ubs:ignore', 'noqa', f'ubs:ignore[javascript.taint.{kind}]',
+                           f'ubs:ignore[js.taint.{kind}]'):
+                with self.subTest(kind=kind, marker=marker):
+                    self.scan(f'// {marker}\n{sink}(req.query.value);\n', [])
+                    self.scan(f'{sink}(\n  req.query.value // {marker}\n);\n', [])
+            self.scan(f'{sink}(req.query.value);\n\n// ubs:ignore[javascript.taint.{kind}]\n'
+                      'report("later");\n', [(kind, 1, 1)])
+
+    def test_nonmatching_malformed_and_literal_markers_do_not_suppress(self):
+        for kind, sink in self.SINKS.items():
+            for marker in (f'ubs:ignore[javascript.taint.{kind}*]',
+                           f'ubs:ignore[javascript.taint.{kind}',
+                           'ubs:ignore[javascript.taint]', 'ubs:ignore[python.taint.eval]'):
+                with self.subTest(kind=kind, marker=marker):
+                    self.scan(f'{sink}(req.query.value); // {marker}\n', [(kind, 1, 1)])
+            self.scan(f'const note = "ubs:ignore[javascript.taint.{kind}]";\n'
+                      f'{sink}(req.query.value);\n', [(kind, 2, 1)])
+            self.scan(f'const note = /ubs:ignore/;\n{sink}(req.query.value);\n', [(kind, 2, 1)])
+
+    def test_source_annotations_and_one_sink_cannot_erase_downstream_flow(self):
+        for kind, sink in self.SINKS.items():
+            for marker in ('ubs:ignore', f'ubs:ignore[javascript.taint.{kind}]',
+                           f'ubs:ignore[js.taint.{kind}]'):
+                with self.subTest(kind=kind, marker=marker):
+                    self.scan(f'const value = req.query.value; // {marker}\n\n'
+                              f'{sink}(value);\n', [(kind, 3, 1)])
+            self.scan(f'const value = req.query.value;\n'
+                      f'{sink}(value); // ubs:ignore[javascript.taint.{kind}]\n\n'
+                      f'{sink}(value);\n', [(kind, 4, 1)])
+
+    def test_cross_rule_and_sanitizer_domains_remain_independent(self):
+        self.scan('res.send(req.query.value); eval(req.query.value); '
+                  '// ubs:ignore[javascript.taint.xss]\n', [('eval', 1, 28)])
+        self.scan('res.send(req.query.value); eval(req.query.value); '
+                  '// ubs:ignore[js.taint.eval]\n', [('xss', 1, 1)])
+        self.scan('const value = DOMPurify.sanitize(req.query.value);\n'
+                  'res.send(value);\neval(value); // ubs:ignore[javascript.taint.xss]\n',
+                  [('eval', 3, 1)])
+        self.scan('const value = shellescape(req.query.value);\n'
+                  'shell.exec(value);\neval(value); // ubs:ignore[js.taint.command]\n',
+                  [('eval', 3, 1)])
+        self.scan('const value = db.escape(req.query.value);\n'
+                  'db.query(value);\nres.send(value); // ubs:ignore[js.taint.sql]\n',
+                  [('xss', 3, 1)])
+
+    def test_imported_sink_uses_its_own_source_marker(self):
+        from ubs_core.analyzers import taint_js
+        from ubs_core.registry import RunContext
+
+        helper, caller = self.root / 'helper.js', self.root / 'caller.js'
+        helper.write_text('export function send(value) {\n'
+                          '  res.send(value); // ubs:ignore[javascript.taint.xss]\n'
+                          '  eval(value);\n}\n', encoding='utf-8')
+        caller.write_text('import {send} from "./helper.js";\n'
+                          'send(req.query.value); // ubs:ignore[javascript.taint.eval]\n',
+                          encoding='utf-8')
+        findings = list(taint_js.run(RunContext(lang='javascript', files=[caller, helper])))
+        self.assertEqual([(Path(item['path']).name, item['rule'], item['line'], item['col'])
+                          for item in findings], [('helper.js', 'javascript.taint.eval', 3, 3)])
+
+    def test_source_replacement_does_not_change_analyzed_marker_ownership(self):
+        from ubs_core.analyzers import taint_js
+        from ubs_core.js_modules import ModuleGraph
+        from ubs_core.registry import RunContext
+
+        path = self.root / 'replaced.js'
+        plain = 'res.send(req.query.value);\n'
+        marked = 'res.send(req.query.value); // ubs:ignore[javascript.taint.xss]\n'
+        for original, replacement, expected in ((plain, marked, ['javascript.taint.xss']),
+                                                 (marked, plain, [])):
+            with self.subTest(original=original):
+                path.write_text(original, encoding='utf-8')
+
+                def load_then_replace(files):
+                    graph = ModuleGraph(files)
+                    path.write_text(replacement, encoding='utf-8')
+                    return graph
+
+                with patch('ubs_core.js_modules.ModuleGraph', side_effect=load_then_replace):
+                    findings = list(taint_js.run(RunContext(lang='javascript', files=[path])))
+                self.assertEqual([item['rule'] for item in findings], expected, findings)
+
+    def test_legacy_emission_uses_the_same_rule_local_boundary(self):
+        from ubs_core.analyzers import taint_js
+
+        path = self.root / 'legacy.js'
+        path.write_text('res.send(req.query.value); // ubs:ignore[javascript.taint.xss]\n'
+                        'eval(req.query.value); // ubs:ignore[js.taint.xss]\n', encoding='utf-8')
+        with patch.object(taint_js, 'ROOT', self.root), patch.object(taint_js, 'BASE_DIR', self.root):
+            with patch('sys.stdout', new_callable=StringIO) as output:
+                self.assertEqual(taint_js.main(['taint-js', str(path)]), 0)
+        rows = [row.split('\t') for row in output.getvalue().splitlines()]
+        self.assertEqual([row[:2] for row in rows], [['js.taint.eval', '1']], rows)
+        self.assertTrue(rows[0][2].startswith('legacy.js:2 '), rows)
+
+
+@unittest.skipUnless(shutil.which('jq') and shutil.which('rg') and shutil.which('ast-grep'),
+                     'native UBS dependencies required')
+class JavaScriptTaintSuppressionPublicTests(unittest.TestCase):
+    """All four taint scopes through real public reports and cache edits."""
+
+    def setUp(self):
+        artifacts = REPO_ROOT / 'test-suite/artifacts'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        self.root = Path(tempfile.mkdtemp(prefix='js-taint-suppression-cli-', dir=artifacts))
+        self.counter = 0
+
+    def program(self, prefix='javascript.taint', *, all_scoped=False):
+        eval_scope = prefix + '.eval' + (',js.security.eval' if all_scoped else '')
+        source = ('const value = req.query.value;\n'
+                  f'res.send(value); // ubs:ignore[{prefix}.xss]\n'
+                  f'db.query(value); // ubs:ignore[{prefix}.sql]\n'
+                  f'eval(value); // ubs:ignore[{eval_scope}]\n'
+                  f'shell.exec(value); // ubs:ignore[{prefix}.command]\n')
+        if not all_scoped:
+            source += 'res.send(value); // ubs:ignore[javascript.taint.eval]\n'
+        return source
+
+    def scan(self, path, expected, *, mode='module-json', cached=False):
+        from urllib.parse import unquote, urlparse
+
+        self.counter += 1
+        attempt = self.root / ('scan-%03d' % self.counter)
+        attempt.mkdir()
+        module = mode.startswith('module-')
+        output_format = mode.removeprefix('module-')
+        command = ([str(REPO_ROOT / 'modules/ubs-js.sh')] if module else
+                   [str(REPO_ROOT / 'ubs'), '--only=js', '--no-config'])
+        command.extend([str(path), '--ci', '--format=' + output_format])
+        env = {**os.environ, 'UBS_NO_AUTO_UPDATE': '1', 'UBS_KEEP_TEMP': '1',
+               'UBS_NO_CACHE': '0' if cached else '1', 'UBS_PROFILE': '1',
+               'UBS_CACHE_DIR': str(self.root / 'cache'), 'TMPDIR': str(attempt),
+               'PYTHONDONTWRITEBYTECODE': '1', 'ENABLE_UV_TOOLS': '0', 'NO_COLOR': '1'}
+        started = time.monotonic()
+        result = subprocess.run(command, cwd=self.root, env=env, text=True,
+                                capture_output=True, timeout=120)
+        (attempt / 'stdout.json').write_text(result.stdout, encoding='utf-8')
+        (attempt / 'stderr.log').write_text(result.stderr, encoding='utf-8')
+        (attempt / 'receipt.json').write_text(json.dumps({
+            'command': command, 'exit': result.returncode, 'elapsed': time.monotonic() - started,
+            'source': path.read_text(encoding='utf-8'), 'expected': expected,
+        }, indent=2), encoding='utf-8')
+        detail = (command, result.returncode, result.stdout, result.stderr)
+        self.assertEqual(result.returncode, int(bool(expected)), detail)
+        report = json.loads(result.stdout)
+        actual = []
+        if output_format == 'sarif':
+            for run in report['runs']:
+                self.assertTrue(all(invocation['executionSuccessful']
+                                    for invocation in run.get('invocations', [])), detail)
+                for row in run.get('results', []):
+                    location = row['locations'][0]['physicalLocation']
+                    self.assertEqual(Path(unquote(urlparse(location['artifactLocation']['uri']).path)).resolve(),
+                                     path.resolve(), detail)
+                    self.assertEqual(row['level'], 'error', detail)
+                    actual.append((row['ruleId'], location['region']['startLine'],
+                                   location['region']['startColumn']))
+        else:
+            self.assertEqual(report['status'], 'ok', detail)
+            totals = report if module else report['totals']
+            self.assertEqual((totals['files'], totals['critical'], totals['warning'], totals['info']),
+                             (1, len(expected), 0, 0), detail)
+            for row in report.get('findings', []):
+                self.assertEqual(Path(row.get('path', row.get('file'))).resolve(), path.resolve(), detail)
+                self.assertEqual(row['severity'], 'critical', detail)
+                actual.append((row.get('rule', row.get('rule_id')), row['line'], row['col']))
+        self.assertEqual(sorted(actual), sorted(expected), detail)
+        print('[js-taint-suppression] PASS %s %s %.3fs' %
+              (path.stem, mode, time.monotonic() - started), flush=True)
+        return report
+
+    def test_public_and_internal_rules_preserve_independent_findings_in_all_formats(self):
+        # The lexical and AST eval rules are separate from the taint domain.
+        # A taint annotation must preserve both independent security findings.
+        retained = [('js.security.eval', 4, 1), ('js.eval-call', 4, 1),
+                    ('javascript.taint.xss', 6, 1)]
+        unscoped = retained + [('javascript.taint.' + kind, line, 1)
+                               for kind, line in (('xss', 2), ('sql', 3), ('eval', 4), ('command', 5))]
+        cases = (('public', self.program(), retained),
+                 ('internal', self.program('js.taint'), retained),
+                 ('all-scoped', self.program(all_scoped=True), [('js.eval-call', 4, 1)]),
+                 ('nonmatching', self.program('javascript.other'), unscoped))
+        for name, source, expected in cases:
+            path = self.root / (name + '.js')
+            path.write_text(source, encoding='utf-8')
+            for mode in ('module-json', 'module-sarif', 'json', 'sarif'):
+                with self.subTest(case=name, mode=mode):
+                    self.scan(path, expected, mode=mode)
+
+    def test_cache_replay_and_marker_edits_keep_source_and_rule_ownership(self):
+        path = self.root / 'cached.js'
+        original = 'const value = req.query.value;\nres.send(value);\n'
+        marked = original.rstrip('\n') + ' // ubs:ignore[javascript.taint.xss]\n'
+        path.write_text(original, encoding='utf-8')
+        expected = [('javascript.taint.xss', 2, 1)]
+        self.scan(path, expected, cached=True)
+        self.assertEqual(self.scan(path, expected, cached=True)['profile']['cache_hits'], 1)
+        path.write_text(marked, encoding='utf-8')
+        self.assertEqual(self.scan(path, [], cached=True)['profile']['cache_misses'], 1)
+        self.assertEqual(self.scan(path, [], cached=True)['profile']['cache_hits'], 1)
+        path.write_text(original, encoding='utf-8')
+        self.scan(path, expected, cached=True)
+
+
 class GoPipelineSuppressionTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which('jq') and shutil.which('rg') and shutil.which('ast-grep'),
                          'native UBS dependencies required')

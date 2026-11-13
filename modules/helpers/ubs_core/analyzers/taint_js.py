@@ -5074,6 +5074,13 @@ def scan_project_findings(files):
                     lines = [0] + [match.end() for match in re.finditer('\n', module.text)]
                     indexed_module = module
                 line = bisect_right(lines, offset)
+                # Ignore only the owning sink and exact taint domain. Keep the
+                # legacy CLI spelling alongside the structured public rule;
+                # source and alias facts have already reached every other sink.
+                if module.suppressions is not None and (
+                        module.suppressions.is_suppressed(line, rule)
+                        or module.suppressions.is_suppressed(line, f'javascript.taint.{KIND_BY_RULE[rule]}')):
+                    continue
                 # The index begins with offset 0 <= offset, so line >= 1 — ubs:ignore[py.collections.index-arithmetic]
                 yield module.path, rule, line, offset - lines[line - 1] + 1, path_desc
         except AnalysisLimit as exc:

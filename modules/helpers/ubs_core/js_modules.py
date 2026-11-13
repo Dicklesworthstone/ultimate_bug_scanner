@@ -15,6 +15,8 @@ from pathlib import Path
 import re
 from typing import Iterable
 
+from ubs_core.suppression import SuppressionIndex, build_index, may_have_markers
+
 _AMBIGUOUS = object()
 _IDENTIFIER = r'[A-Za-z_$][\w$]*'
 _SPECIFIER = r'''(['"])([^'"\\\r\n]+)\1'''
@@ -52,9 +54,14 @@ class Module:
     commonjs_imports: list = field(default_factory=list)
     uncertain_requires: set = field(default_factory=set)
     require_specifiers: set = field(default_factory=set)
+    suppressions: SuppressionIndex | None = None
 
     def parse(self):
         from ubs_core.analyzers.taint_js import lexical_views, _pairs, _chunks, expression_end, _declaration_entries
+        # Bind comment ownership to the same bytes analyzed below. The lexical
+        # view removes comments, and reopening the file later could attach a
+        # replacement source's ignore marker to this module's old findings.
+        self.suppressions = build_index(self.text, lang='javascript') if may_have_markers(self.text) else None
         self.text, code = lexical_views(self.text)
         pairs, out = _pairs(code), list(code)
         # Import/export keywords inside expressions or function bodies are not

@@ -666,6 +666,108 @@ class KeepTempCliTests(unittest.TestCase):
                 }
                 self.assertEqual(set(listed), dumped, context)
 
+    def test_sql_reports_retain_source_cache_and_partial_findings(self) -> None:
+        unsafe = (
+            "\\set ON_ERROR_STOP on\n"
+            "WITH sample AS (SELECT 1) SELECT * FROM sample;\n"
+            "CREATE FUNCTION app.f() RETURNS integer LANGUAGE sql SECURITY DEFINER\n"
+            "AS $$ SELECT 1 $$;\n"
+        )
+        clean = (
+            "\\set ON_ERROR_STOP on\nBEGIN;\n"
+            "WITH sample AS (SELECT 1) SELECT * FROM sample;\n"
+            "CREATE FUNCTION app.f() RETURNS integer LANGUAGE sql SECURITY DEFINER\n"
+            "SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;\n"
+            "\\echo 'Revoke before publishing'\n"
+            "REVOKE ALL ON FUNCTION app.f() FROM PUBLIC;\nCOMMIT;\n"
+        )
+        rules = ("sql.security.definer-public-execute", "sql.security.definer-search-path")
+        for scenario in ("complete", "clean", "partial"):
+            project = self.root / ("sql-" + scenario)
+            project.mkdir()
+            (project / "first.sql").write_text(clean if scenario == "clean" else unsafe, encoding="utf-8")
+            expected = [] if scenario == "clean" else [(rule, "first.sql", 3) for rule in rules]
+            if scenario == "partial":
+                (project / "unknown.sql").write_text(
+                    "\\i external.sql\n"
+                    "CREATE FUNCTION app.g() RETURNS integer LANGUAGE sql SECURITY DEFINER\n"
+                    "AS $$ SELECT 2 $$;\n", encoding="utf-8")
+                expected.extend((rule, "unknown.sql", 2) for rule in rules)
+            expected.sort()
+            for direct in (True, False):
+                for output_format in ("json", "sarif"):
+                    with self.subTest(scenario=scenario, direct=direct, format=output_format):
+                        destination = self.root / f"run-{self.sequence + 1:02d}-sql"
+                        cache_root = destination / "cache"
+                        summary_path = destination / "sidecar.json"
+                        arguments = [f"--format={output_format}", "--fail-on-warning"]
+                        if direct:
+                            arguments.extend((f"--json-out={summary_path}",
+                                              f"--sarif-out={destination / 'sidecar.sarif'}",
+                                              f"--report-json={destination / 'sidecar.ndjson'}"))
+                        else:
+                            arguments.extend(("--only=sql", f"--module-dir={ROOT / 'modules'}",
+                                              f"--report-json={summary_path}"))
+                        arguments.append(str(project))
+                        result, observations, run = self.run_scan(
+                            "sql", project, *arguments, command_mode="--ci", direct_module=direct,
+                            environment={"UBS_NO_CACHE": "0", "UBS_CACHE_DIR": str(cache_root)})
+                        context = f"{run}\n{result.stdout}\n{result.stderr}"
+                        code = 2 if scenario == "partial" else 0 if scenario == "clean" else 1
+                        self.assertEqual(result.returncode, code, context)
+                        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                        self.assertEqual(summary["status"], "partial" if scenario == "partial" else "ok", context)
+                        counts = summary if direct else summary["totals"]
+                        self.assertEqual({key: counts[key] for key in SEVERITIES},
+                                         {"critical": 0, "warning": len(expected), "info": 0}, context)
+                        actual = sorted((row["rule"] if direct else row["rule_id"],
+                                         Path(row["path"] if direct else row["file"]).name, row["line"])
+                                        for row in summary.get("findings", []))
+                        self.assertEqual(actual, expected, context)
+                        document = json.loads(result.stdout)
+                        if output_format == "json":
+                            if not direct:
+                                self.assertIsInstance(summary.pop("generated_at"), str, context)
+                            self.assertEqual(document, summary, context)
+                        else:
+                            actual = sorted((row["ruleId"],
+                                             Path(row["locations"][0]["physicalLocation"]
+                                                  ["artifactLocation"]["uri"]).name,
+                                             row["locations"][0]["physicalLocation"]["region"]["startLine"])
+                                            for scan in document["runs"] for row in scan["results"])
+                            self.assertEqual(actual, expected, context)
+                            unsuccessful = any(invocation["executionSuccessful"] is False
+                                               for scan in document["runs"]
+                                               for invocation in scan.get("invocations", []))
+                            self.assertEqual(unsuccessful, scenario == "partial", context)
+                        if direct:
+                            records = [json.loads(line) for line in (run / "sidecar.ndjson").read_text(
+                                encoding="utf-8").splitlines()]
+                            self.assertEqual(records, summary["findings"], context)
+                            self.assertTrue((run / "sidecar.sarif").is_file(), context)
+                        workspaces = list((run / "tmp").glob("ubs-sql.*"))
+                        self.assertEqual(len(workspaces), 1, context)
+                        for name in ("files", "findings", "summary", "complete"):
+                            self.assertTrue((workspaces[0] / name).is_file(), context)
+                        statistics = ([workspaces[0] / "findings.cache"] if direct else
+                                      list((run / "tmp").rglob("sql.cache")))
+                        self.assertEqual(len(statistics), 1, context)
+                        stats = json.loads(statistics[0].read_text(encoding="utf-8"))
+                        self.assertEqual(stats["total"], 2 if scenario == "partial" else 1, context)
+                        receipt = json.loads((workspaces[0] / "complete").read_text(encoding="utf-8"))
+                        self.assertEqual(receipt, {"language": "sql", "status": summary["status"],
+                                                   "exit_code": code}, context)
+                        entries = [path for path in cache_root.rglob("*.json")
+                                   if "files" in path.relative_to(cache_root).parts]
+                        self.assertEqual(len(entries), 0 if scenario == "partial" else 1, context)
+                        if entries:
+                            cached = json.loads(entries[0].read_text(encoding="utf-8"))["findings"]
+                            self.assertEqual(sorted((row["rule"], Path(row["path"]).name, row["line"])
+                                                    for row in cached), expected, context)
+                            self.assertTrue(any(Path(row["destination"]).is_relative_to(cache_root)
+                                                for row in observations["publications"]), context)
+                        self.assertTrue(observations["created_paths"], context)
+
     def test_cpp_outbound_reports_retain_scratch_and_partial_findings(self) -> None:
         skip = "--skip=1,2,3,4,5,6,8,9,10,11,12,13,14,15,16"
         unsafe = (

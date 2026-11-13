@@ -13,6 +13,10 @@ https://www.postgresql.org/docs/current/sql-alterdefaultprivileges.html
 https://www.postgresql.org/docs/current/sql-alterfunction.html
 https://www.postgresql.org/docs/current/sql-do.html
 https://www.postgresql.org/docs/current/functions-string.html#FUNCTIONS-STRING-FORMAT
+https://www.postgresql.org/docs/current/sql-select.html
+https://www.postgresql.org/docs/current/app-psql.html
+https://coverage.postgresql.org/src/fe_utils/psqlscan.l.gcov.html
+https://doxygen.postgresql.org/scansup_8c_source.html
 """
 from __future__ import annotations
 
@@ -42,6 +46,7 @@ RULES = {
 class Case:
     name: str
     code: str
+    column: int | None = None
 
     @property
     def source(self):
@@ -57,7 +62,7 @@ class Case:
         for line, source in enumerate(self.source.split("\n"), 1):
             if "-- expect:" in source:
                 names = source.split("-- expect:", 1)[1].strip().split(",")
-                column = len(source) - len(source.lstrip()) + 1
+                column = self.column if self.column is not None else len(source) - len(source.lstrip()) + 1
                 result.extend((RULES[name], line, column) for name in names)
         return sorted(result)
 
@@ -428,6 +433,150 @@ CASES = (
         ALTER FUNCTION app.f() OWNER TO app_mutator;
         COMMIT;
     """),
+    Case("reported_constant_cte", """
+        WITH sample AS (SELECT 1 AS value) SELECT value FROM sample;
+    """),
+    Case("multiple_ctes_with_columns_and_materialization", """
+        WITH "sample rows" (value, label) AS MATERIALIZED (VALUES (1, 'one'), (2, 'two')),
+             selected AS NOT MATERIALIZED (SELECT value FROM "sample rows" WHERE value > 1)
+        SELECT * FROM selected;
+    """),
+    Case("recursive_cte", """
+        WITH RECURSIVE counter(n) AS (
+          SELECT 1 UNION ALL SELECT n + 1 FROM counter WHERE n < 3
+        ) SELECT sum(n) FROM counter;
+    """),
+    Case("nested_cte_and_parenthesized_query", """
+        WITH outer_rows AS (
+          WITH inner_rows AS ((SELECT 1 AS value)) SELECT value FROM inner_rows
+        ) SELECT (SELECT value FROM outer_rows);
+    """),
+    Case("data_modifying_cte_keeps_dml_policy", """
+        WITH moved AS (DELETE FROM app.expired_sessions RETURNING id)
+        INSERT INTO app.archived_sessions SELECT id FROM moved;
+        WITH counts AS (SELECT 3 AS count)
+        UPDATE app.settings SET value = counts.count FROM counts;
+        WITH expired AS (TABLE app.expired_sessions)
+        DELETE FROM app.archived_sessions USING expired WHERE archived_sessions.id = expired.id;
+    """),
+    Case("cte_values_and_table_primary_queries", """
+        WITH sample AS (SELECT 1) VALUES (2), (3);
+        WITH sample AS (SELECT 1) TABLE app.settings;
+    """),
+    Case("cte_does_not_interrupt_transaction_hardening", """
+        BEGIN;
+        CREATE FUNCTION app.f() RETURNS integer LANGUAGE sql SECURITY DEFINER
+        SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        WITH sample AS (SELECT 1 AS value) SELECT value FROM sample;
+        REVOKE ALL ON FUNCTION app.f() FROM PUBLIC;
+        COMMIT;
+    """),
+    Case("cte_does_not_hide_later_function_exposure", """
+        WITH sample AS (SELECT 1 AS value) SELECT value FROM sample;
+        CREATE FUNCTION app.f() RETURNS integer -- expect:path,public
+        LANGUAGE sql SECURITY DEFINER AS $$ SELECT 1 $$;
+    """),
+    Case("cte_literals_and_comments_do_not_change_migration", r"""
+        WITH sample AS (
+          SELECT 'CREATE FUNCTION fake(); :unknown' AS text,
+                 $body$ \gexec; REVOKE ALL ON FUNCTION app.f() FROM PUBLIC; $body$ AS quoted
+          /* AS (EXECUTE 'GRANT EXECUTE') */
+        ) SELECT * FROM sample;
+        CREATE FUNCTION app.f() RETURNS integer -- expect:path,public
+        LANGUAGE sql SECURITY DEFINER AS $$ SELECT 1 $$;
+    """),
+    Case("reported_psql_error_stop", r"""
+        \set ON_ERROR_STOP on
+        SELECT 1;
+    """),
+    Case("psql_literal_error_stop_and_display_settings", r"""
+        \set ON_ERROR_STOP
+        \set ON_ERROR_STOP 'true'
+        \set ECHO all
+        \set VERBOSITY terse
+        \echo 'Preparing function migration'
+        \echo 'Literal :variable, `command`, and "quoted text" are messages'
+        \warn 'This message changes no database state'
+        SELECT 1::integer;
+    """),
+    Case("psql_directives_preserve_function_transaction", r"""
+        \set ON_ERROR_STOP on
+        BEGIN;
+        CREATE FUNCTION app.f() RETURNS integer LANGUAGE sql SECURITY DEFINER
+        SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        \echo 'Function created; revoke PUBLIC before publishing'
+        REVOKE ALL ON FUNCTION app.f() FROM PUBLIC;
+        COMMIT;
+    """),
+    Case("psql_echo_sql_text_cannot_create_function", r"""
+        \echo 'CREATE FUNCTION app.fake() SECURITY DEFINER;'
+        \echo CREATE FUNCTION app.also_fake() SECURITY DEFINER;
+        SELECT 1;
+    """),
+    Case("psql_directive_does_not_consume_following_hazard", r"""
+        \set ON_ERROR_STOP on
+        \echo 'Beginning migration'
+        CREATE FUNCTION app.f() RETURNS integer -- expect:path,public
+        LANGUAGE sql SECURITY DEFINER AS $$ SELECT 1 $$;
+    """),
+    Case("psql_inert_directive_does_not_flush_query_buffer", r"""
+        BEGIN;
+        CREATE FUNCTION app.f() RETURNS integer
+        \echo 'Continue the declaration'
+        LANGUAGE sql SECURITY DEFINER
+        SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        REVOKE ALL ON FUNCTION app.f() FROM PUBLIC;
+        COMMIT;
+    """),
+    Case("psql_commands_share_line_without_losing_next_command", r"""
+        \set ON_ERROR_STOP on \echo 'Starting migration'
+        CREATE FUNCTION app.f() RETURNS integer -- expect:path,public
+        LANGUAGE sql SECURITY DEFINER AS $$ SELECT 1 $$;
+    """),
+    Case("psql_quoted_literals_and_comments_are_not_commands", r"""
+        -- \i other.sql
+        /* \gexec */
+        SELECT '\\set AUTOCOMMIT off', ':ON_ERROR_STOP', ':"schema"';
+        CREATE FUNCTION app.f() RETURNS text LANGUAGE sql SECURITY INVOKER AS $body$
+        SELECT '\i external.sql';
+        $body$;
+    """),
+    Case("postgresql_casts_and_literal_array_slices_are_not_variables", """
+        SELECT 1::integer, (ARRAY[1, 2, 3])[1: 2], (ARRAY[1, 2, 3])[: 2];
+    """),
+    Case("unicode_colons_in_literals_comments_and_casts_are_not_variables", """
+        SELECT ':💥', ':\u0301', ':\u00a0', ":💥", $body$ :\u00a0 $body$;
+        -- :💥
+        /* :\u00a0 */
+        SELECT 1::"💥", 1::é;
+    """),
+    Case("unicode_dollar_tag_shields_client_commands_before_hazard", """
+        SELECT $é$\\echo ignored$é$; CREATE FUNCTION app.f() RETURNS integer -- expect:path,public
+        LANGUAGE sql SECURITY DEFINER AS $$ SELECT 1 $$;
+    """, column=29),
+    Case("unicode_space_dollar_tag_shields_client_commands_before_hazard", """
+        SELECT $\u00a0$\\echo ignored$\u00a0$; CREATE FUNCTION app.f() RETURNS integer -- expect:path,public
+        LANGUAGE sql SECURITY DEFINER AS $$ SELECT 1 $$;
+    """, column=29),
+    Case("unicode_symbol_dollar_tags_are_opaque", """
+        SELECT $💥$\\gexec; :💥$💥$, $\u0301$\\i secret.sql; :\u00a0$\u0301$;
+    """),
+    Case("unicode_unquoted_function_names_do_not_fold_together", """
+        BEGIN;
+        CREATE FUNCTION app.Ä() RETURNS integer -- expect:public
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        CREATE FUNCTION app.ä() RETURNS integer
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 2 $$;
+        REVOKE ALL ON FUNCTION app.ä() FROM PUBLIC;
+        COMMIT;
+    """),
+    Case("unicode_quoted_revoke_matches_exact_unquoted_function", """
+        BEGIN;
+        CREATE FUNCTION app.Ä() RETURNS integer
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        REVOKE ALL ON FUNCTION app."Ä"() FROM PUBLIC;
+        COMMIT;
+    """),
 )
 
 # Unknown deployment/dialect/control-flow inputs and malformed source cannot
@@ -556,6 +705,65 @@ INCOMPLETE_CASES = (
         DO $$ BEGIN GRANT app TO current_user;
         EXCEPTION WHEN others THEN EXECUTE 'SELECT dangerous()'; END $$;
     """),
+    Case("cte_missing_as", "WITH sample (SELECT 1) SELECT * FROM sample;\n"),
+    Case("cte_missing_body", "WITH sample AS () SELECT * FROM sample;\n"),
+    Case("cte_missing_primary_query", "WITH sample AS (SELECT 1);\n"),
+    Case("cte_column_list_requires_identifiers", "WITH sample(value integer) AS (SELECT 1) SELECT * FROM sample;\n"),
+    Case("cte_materialization_requires_body", "WITH sample AS NOT (SELECT 1) SELECT * FROM sample;\n"),
+    Case("cte_unmodeled_recursive_search", """
+        WITH RECURSIVE sample(n) AS (SELECT 1)
+        SEARCH DEPTH FIRST BY n SET order_column SELECT * FROM sample;
+    """),
+    Case("cte_cannot_hide_dynamic_primary_statement", """
+        WITH sample AS (SELECT 1) EXECUTE external_statement;
+    """),
+    Case("cte_cannot_hide_dynamic_substatement", """
+        WITH sample AS (CALL mutate_privileges()) SELECT 1;
+    """),
+    Case("cte_cannot_hide_function_ddl", """
+        WITH sample AS (CREATE FUNCTION app.hidden() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$)
+        SELECT 1;
+    """),
+    Case("cte_nesting_budget", "WITH sample AS (" * 65 + "SELECT 1" + ") SELECT 1" * 65 + ";\n"),
+    Case("psql_relative_include_requires_external_context", "\\ir privileges.sql\nSELECT 1;\n"),
+    Case("psql_execute_generated_sql_is_not_display", "SELECT 'GRANT EXECUTE ON FUNCTION app.f() TO PUBLIC' \\gexec\n"),
+    Case("psql_connection_switch_invalidates_context", "\\connect other_database\nSELECT 1;\n"),
+    Case("psql_autocommit_switch_changes_publication", "\\set AUTOCOMMIT off\nSELECT 1;\n"),
+    Case("psql_conditional_requires_control_flow", "\\if false\nSELECT 1;\n\\endif\n"),
+    Case("psql_backticks_require_execution", "\\echo `load_external_sql`\nSELECT 1;\n"),
+    Case("psql_double_quoted_arguments_are_outside_literal_subset", '\\echo "message"\nSELECT 1;\n'),
+    Case("psql_escaped_arguments_are_outside_literal_subset", r"""
+        \echo 'message\n'
+        SELECT 1;
+    """),
+    Case("psql_error_stop_requires_literal_value", "\\set ON_ERROR_STOP :enabled\nSELECT 1;\n"),
+    Case("psql_invalid_error_stop_value", "\\set ON_ERROR_STOP maybe\nSELECT 1;\n"),
+    Case("psql_setting_names_are_case_sensitive", "\\set on_error_stop on\nSELECT 1;\n"),
+    Case("psql_sql_variable_interpolation_is_not_literal", "\\set ON_ERROR_STOP on\nSELECT :ON_ERROR_STOP;\n"),
+    Case("psql_sql_quoted_variable_is_not_literal", "SELECT :'query_text';\n"),
+    Case("psql_sql_identifier_variable_is_not_literal", 'SELECT 1 FROM :"schema".settings;\n'),
+    Case("psql_variable_existence_requires_context", "SELECT :{?enabled};\n"),
+    Case("psql_numeric_variable_requires_context", "SELECT :42;\n"),
+    Case("psql_non_ascii_symbol_variable_requires_context", "SELECT :💥;\n"),
+    Case("psql_non_ascii_combining_variable_requires_context", "SELECT :\u0301;\n"),
+    Case("psql_non_ascii_space_variable_requires_context", "SELECT :\u00a0;\n"),
+    Case("psql_non_ascii_variable_at_eof_requires_context", "SELECT :\u00a0"),
+    Case("psql_non_ascii_variable_after_cast_requires_context", "SELECT 1:::💥;\n"),
+    Case("psql_non_ascii_variable_does_not_hide_later_function", """
+        SELECT :\u00a0;
+        CREATE FUNCTION app.f() RETURNS integer -- expect:path,public
+        LANGUAGE sql SECURITY DEFINER AS $$ SELECT 1 $$;
+    """),
+    Case("psql_numeric_slice_bound_can_interpolate_external_variable", "SELECT (ARRAY[1, 2, 3])[1:2];\n"),
+    Case("psql_numeric_slice_without_lower_bound_can_interpolate", "SELECT (ARRAY[1, 2, 3])[:2];\n"),
+    Case("psql_variable_after_cast_requires_context", "SELECT 1:::cast_type;\n"),
+    Case("psql_variable_before_escape_string_requires_context", "SELECT :e'quoted';\n"),
+    Case("psql_same_line_execution_is_not_echo_text", "\\echo ready \\gexec\nSELECT 1;\n"),
+    Case("psql_include_does_not_swallow_next_function", r"""
+        \i external.sql
+        CREATE FUNCTION app.f() RETURNS integer -- expect:path,public
+        LANGUAGE sql SECURITY DEFINER AS $$ SELECT 1 $$;
+    """),
 )
 
 
@@ -634,7 +842,11 @@ class SQLHelperTests(EvidenceTest):
         mixed = (supported["reported_owner_role_migration"],
                  supported["owner_transfer_does_not_revoke_public"],
                  unsupported["do_grant_function_privileges_requires_modeling"])
-        for name, cases, partial in (("complete", CASES, False), ("partial", mixed, True)):
+        client_partial = (supported["cte_does_not_hide_later_function_exposure"],
+                          unsupported["psql_include_does_not_swallow_next_function"],
+                          supported["psql_directives_preserve_function_transaction"])
+        for name, cases, partial in (("complete", CASES, False), ("partial", mixed, True),
+                                     ("client-partial", client_partial, True)):
             with self.subTest(name=name):
                 directory = self.materialize(cases, name)
                 files = directory / "selected.nul"
@@ -771,6 +983,17 @@ class SQLPublicTests(EvidenceTest):
         cases = (CASES[0], CASES[2], INCOMPLETE_CASES[0])
         directory = self.materialize(cases, "partial")
         for mode in ("module-json", "sarif"):
+            with self.subTest(mode=mode):
+                self.assert_report(*self.execute(directory, mode), mode, cases, partial=True)
+
+    def test_cte_and_psql_boundaries_keep_known_findings(self):
+        supported = {case.name: case for case in CASES}
+        unsupported = {case.name: case for case in INCOMPLETE_CASES}
+        cases = (supported["cte_does_not_hide_later_function_exposure"],
+                 unsupported["psql_include_does_not_swallow_next_function"],
+                 supported["psql_directives_preserve_function_transaction"])
+        directory = self.materialize(cases, "client-partial")
+        for mode in ("module-json", "module-sarif", "json", "sarif"):
             with self.subTest(mode=mode):
                 self.assert_report(*self.execute(directory, mode), mode, cases, partial=True)
 

@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.5.57-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.5.58-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -374,6 +374,13 @@ privileges, transactions and savepoints. Creating and restricting a function in
 one transaction stays clean; revoking access after a commit retains the earlier
 exposure finding. Revoking a grant option does not revoke execution.
 
+Ordinary queries and bounded `WITH` CTEs preserve this migration state, including
+recursive, nested, materialized and data modifying forms. Literal psql controls
+(`\set ON_ERROR_STOP`, `\set ECHO`, `\set VERBOSITY`, `\echo`, and `\warn`) preserve
+the SQL query buffer without executing a client. Single-quoted and unquoted
+literal arguments are supported; expanded, escaped or double-quoted command
+arguments remain outside the bounded model.
+
 Comments, quoted identifiers, strings and dollar-quoted bodies are separated
 lexically. A body containing fake DDL or suppression text cannot alter the outer
 migration. Actual SQL comments support `ubs:ignore[rule-id]`. SQL categories are
@@ -386,13 +393,15 @@ infer migration order across files, execute function bodies, inspect a deployed
 catalog, or certify all database access controls. Fresh function defaults follow
 PostgreSQL's standard PUBLIC execution grant unless the selected migration changes
 it. Existing `CREATE OR REPLACE` ACLs, unproved schema CREATE privileges, role
-changes, dynamic SQL, psql includes, unsupported procedural DDL and malformed or
-budget-exhausted input produce explicit incomplete reports (exit 2). An empty
+changes, dynamic SQL, psql includes, connection/execution/conditional commands,
+SQL variable interpolation, CTE `SEARCH`/`CYCLE`, unsupported procedural DDL and
+malformed or budget-exhausted input produce explicit incomplete reports (exit 2). An empty
 search path is accepted only for the bounded SQL-body proof; unqualified relations
 still expose implicit temporary-schema lookup. Custom `--rules` for SQL are
 explicitly unsupported. No warning is emitted merely for ordinary `DELETE` or
 `UPDATE` statements. Limits are 4 MiB, 200,000 tokens, 10,000 statements and 2,000
-function identities and 64 retained savepoints per source. Confidence remains uncalibrated.
+function identities, 64 retained savepoints and 64 nested query scopes per source.
+Confidence remains uncalibrated.
 
 The underlying privilege and search-path semantics follow PostgreSQL's
 [CREATE FUNCTION security guidance](https://www.postgresql.org/docs/current/sql-createfunction.html#SQL-CREATEFUNCTION-SECURITY),
@@ -1463,7 +1472,7 @@ Environment Variables:
                            Numeric 0/1 leaves project severity unchanged; strict|loose overrides it
   UBS_SKIP_SIZE_CHECK      Skip directory size guard entirely (set to 1)
   UBS_ALLOW_NO_SCAN        Exit 0 instead of 3 when nothing was scanned (set to 1)
-  UBS_KEEP_TEMP=1          Retain scanner scratch for Rust/Python/JS/Bash/HCL/C#/Kotlin/C++; see below
+  UBS_KEEP_TEMP=1          Retain scanner scratch for Rust/Python/JS/Bash/HCL/C#/Kotlin/C++/SQL; see below
 
 Arguments:
   PROJECT_DIR              Directory to scan (default: current directory)
@@ -1499,7 +1508,8 @@ Use `--no-cargo` for static analysis alone.
 
 Set `UBS_KEEP_TEMP=1` to retain scanner-owned workspaces, rule files, captured
 tool output, merge staging, and spill databases after successful, failed, or
-interrupted Rust, Python, JavaScript/TypeScript, Bash, Terraform HCL, C#, Kotlin, and C/C++ scans. Set `TMPDIR`
+interrupted Rust, Python, JavaScript/TypeScript, Bash, Terraform HCL, C#, Kotlin,
+C/C++, and PostgreSQL SQL scans. Set `TMPDIR`
 to an existing writable directory to choose where scratch accumulates; retained
 files can contain source code and findings, so use private storage. The caller
 manages its later removal. Retention does not change detectors, severity, module

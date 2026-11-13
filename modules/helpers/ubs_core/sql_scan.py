@@ -4,6 +4,8 @@ This is a selected-file DDL model, not a catalog or a PL/pgSQL interpreter.
 Function bodies are opaque; DO bodies accept only proven role-membership
 grants. Function identity includes input argument types; privilege changes
 take effect at transaction publication boundaries.
+Ordinary WITH queries and literal psql error/display controls preserve this
+state; client substitution and effectful commands remain explicit boundaries.
 Unknown DDL context is reported explicitly and is never cached as complete.
 """
 from __future__ import annotations
@@ -45,8 +47,12 @@ MAX_TOKENS = 200000
 MAX_STATEMENTS = 10000
 MAX_FUNCTIONS = 2000
 MAX_SAVEPOINTS = 64
-WHITESPACE_RE = re.compile(r"\s+")
-DOLLAR_RE = re.compile(r"\$(?:[A-Za-z_][A-Za-z_0-9]*)?\$")
+MAX_QUERY_DEPTH = 64
+WHITESPACE_RE = re.compile(r"[ \t\n\r\f\v]+")
+# PostgreSQL treats every high-bit byte as an identifier character, including
+# Unicode characters Python categorizes as whitespace or non-letter symbols.
+DOLLAR_RE = re.compile(r"\$(?:[A-Za-z_\x80-\U0010ffff][A-Za-z_0-9\x80-\U0010ffff]*)?\$")
+IDENTIFIER_FOLD = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
 FORMAT_IDENTIFIER_RE = re.compile(r"%(?:([1-9][0-9]*)\$)?I")
 
 
@@ -75,7 +81,7 @@ def lex(text: str, comments: list[Token]):
         start, start_line, start_col = pos, line, col
         char = text[pos]
         kind, value = "symbol", char
-        if char.isspace():
+        if char in " \t\n\r\f\v":
             match = WHITESPACE_RE.match(text, pos)
             end = match.end()
             kind = "space"
@@ -133,11 +139,37 @@ def lex(text: str, comments: list[Token]):
                 raise Incomplete(f"line {line}: unterminated quoted literal or identifier")
             kind = "quoted" if quote == '"' else "escape" if escape else "string"
             value = "".join(parts)
-        elif char.isalpha() or char == "_":
-            end = pos + 1
-            while end < size and (text[end].isalnum() or text[end] in "_$"):
+        elif char == "\\":
+            # psql commands end at a newline or another unquoted backslash,
+            # not at a SQL semicolon. Quoted SQL above stays opaque. Retain
+            # the raw command for the deliberately narrow client grammar.
+            end, quote = pos + 1, ""
+            while end < size and text[end] not in "\r\n":
+                current = text[end]
+                if quote:
+                    if current == "\\" and quote == "'":
+                        if end + 1 >= size or text[end + 1] in "\r\n":
+                            break
+                        end += 2
+                        continue
+                    if current == quote:
+                        if quote == "'" and end + 1 < size and text[end + 1] == "'":
+                            end += 2
+                            continue
+                        quote = ""
+                elif current == "\\":
+                    break
+                elif current in "'`":
+                    quote = current
                 end += 1
-            kind, value = "word", text[pos:end].lower()
+            kind, value = "psql", text[pos:end]
+        elif char.isalpha() or char == "_" or ord(char) >= 128:
+            end = pos + 1
+            while end < size and (text[end].isalnum() or text[end] in "_$" or ord(text[end]) >= 128):
+                end += 1
+            # UTF-8 PostgreSQL identifiers fold ASCII only; Unicode lower()
+            # would conflate distinct objects such as app.Ä and app.ä.
+            kind, value = "word", text[pos:end].translate(IDENTIFIER_FOLD)
         elif char.isdigit():
             end = pos + 1
             while end < size and text[end].isdigit():
@@ -295,6 +327,166 @@ def sequence(tokens: list[Token], *words: str) -> bool:
 
 def word_index(tokens: list[Token], word: str, start: int = 0) -> int:
     return next((i for i in range(start, len(tokens)) if tokens[i].is_word(word)), -1)
+
+
+def psql_directive(token: Token) -> None:
+    """Admit literal client messages/settings that preserve modeled SQL state.
+
+    Variable names and command verbs are case-sensitive. Do not evaluate
+    backticks, interpolation, escaped arguments, includes, query execution or
+    transaction controls. SQL interpolation is checked separately even for
+    the admitted settings, whose values live in psql's variable namespace.
+    """
+    match = re.fullmatch(r"\\([A-Za-z_][A-Za-z_0-9]*)(?:[ \t]+(.*))?", token.value)
+    if not match:
+        raise Incomplete("unsupported psql command")
+    command, raw = match.group(1), match.group(2) or ""
+    if command not in {"set", "echo", "warn"}:
+        raise Incomplete(f"psql \\{command} requires unmodeled client execution or context")
+    arguments, index = [], 0
+    while index < len(raw):
+        if raw[index] in " \t":
+            index += 1
+            continue
+        if raw[index] == "'":
+            index += 1
+            parts = []
+            while index < len(raw):
+                if raw[index] == "\\":
+                    raise Incomplete("escaped psql arguments are outside the literal client model")
+                if raw[index] == "'":
+                    if index + 1 < len(raw) and raw[index + 1] == "'":
+                        parts.append("'")
+                        index += 2
+                        continue
+                    index += 1
+                    break
+                parts.append(raw[index])
+                index += 1
+            else:
+                raise Incomplete("unterminated psql argument")
+            if index < len(raw) and raw[index] not in " \t":
+                raise Incomplete("concatenated psql arguments are outside the literal client model")
+            arguments.append("".join(parts))
+        else:
+            end = index
+            while end < len(raw) and raw[end] not in " \t":
+                end += 1
+            value = raw[index:end]
+            if any(char in value for char in "'\"`:\\"):
+                raise Incomplete("psql argument interpolation or execution requires external context")
+            arguments.append(value)
+            index = end
+    if command in {"echo", "warn"} or not arguments:
+        return
+    settings = {
+        "ON_ERROR_STOP": {"on", "off", "true", "false", "yes", "no", "1", "0"},
+        "ECHO": {"all", "queries", "errors", "none"},
+        "VERBOSITY": {"default", "verbose", "terse", "sqlstate"},
+    }
+    name = arguments[0]
+    if name not in settings or len(arguments) > 2:
+        raise Incomplete("psql setting is outside the literal error/display controls")
+    if len(arguments) == 1:
+        if name == "ON_ERROR_STOP":
+            return  # psql treats an omitted Boolean control value as 'on'.
+        raise Incomplete("psql display control requires a literal value")
+    value = arguments[1].lower() if name == "ON_ERROR_STOP" else arguments[1]
+    if value not in settings[name]:
+        raise Incomplete(f"unsupported literal value for psql {name}")
+
+
+def reject_sql_interpolation(tokens: list[Token], source: str) -> None:
+    """Reject substitution without mistaking the :: typecast for a variable.
+
+    Numeric names are valid psql variables even inside array slices: [1:2]
+    can interpolate an external variable named '2', whereas [1: 2] cannot.
+    Consume casts in pairs so a following :name is still checked. psql also
+    permits every non-ASCII byte in variable names, including characters
+    that the SQL lexer treats as whitespace. Inspect the original adjacency
+    while retaining statement-level recovery after an unknown variable.
+    """
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token.kind == "symbol" and token.value == ":":
+            after = tokens[index + 1] if index + 1 < len(tokens) else None
+            if after and after.kind == "symbol" and after.value == ":" and token.end == after.start:
+                index += 2
+                continue
+            following = source[token.end:token.end + 1]
+            if following and (following.isalnum() or following in "'_\"{" or ord(following) >= 128):
+                raise Incomplete(f"line {token.line}: psql SQL interpolation requires external variable context")
+        index += 1
+
+
+def query_group(tokens: list[Token], start: int) -> tuple[list[Token], int]:
+    if start >= len(tokens) or tokens[start].kind != "symbol" or tokens[start].value != "(":
+        raise Incomplete("CTE requires a parenthesized query or column list")
+    depth = 1
+    for index in range(start + 1, len(tokens)):
+        token = tokens[index]
+        if token.kind != "symbol":
+            continue
+        if token.value == "(":
+            depth += 1
+        elif token.value == ")":
+            depth -= 1
+            if not depth:
+                return tokens[start + 1:index], index + 1
+    raise Incomplete("unterminated CTE query or column list")
+
+
+def query_statement(tokens: list[Token], depth: int = 0) -> None:
+    """Recognize a bounded WITH envelope around the existing ordinary DML scope.
+
+    This checks every CTE body and the primary statement; admitting WITH does
+    not admit arbitrary DDL, CALL or EXECUTE inside it. As for ordinary DML,
+    row/trigger effects and arbitrary function execution are not evaluated.
+    """
+    if depth >= MAX_QUERY_DEPTH:
+        raise Incomplete("SQL CTE nesting budget exhausted")
+    if not tokens:
+        raise Incomplete("CTE requires a nonempty query and primary statement")
+    if tokens[0].kind == "symbol" and tokens[0].value == "(":
+        inner, end = query_group(tokens, 0)
+        if end != len(tokens):
+            raise Incomplete("unsupported parenthesized CTE query suffix")
+        query_statement(inner, depth + 1)
+        return
+    if tokens[0].is_word("with"):
+        index = 2 if sequence(tokens, "with", "recursive") else 1
+        while True:
+            if index >= len(tokens) or tokens[index].kind not in {"word", "quoted"}:
+                raise Incomplete("CTE requires a literal query name")
+            index += 1
+            if index < len(tokens) and tokens[index].kind == "symbol" and tokens[index].value == "(":
+                columns, index = query_group(tokens, index)
+                if any(len(group) != 1 or group[0].kind not in {"word", "quoted"}
+                       for group in split_top(columns)):
+                    raise Incomplete("CTE column list requires literal identifiers")
+            if index >= len(tokens) or not tokens[index].is_word("as"):
+                raise Incomplete("CTE requires AS before its query")
+            index += 1
+            if sequence(tokens[index:index + 2], "not", "materialized"):
+                index += 2
+            elif index < len(tokens) and tokens[index].is_word("materialized"):
+                index += 1
+            body, index = query_group(tokens, index)
+            query_statement(body, depth + 1)
+            if index < len(tokens) and tokens[index].kind == "symbol" and tokens[index].value == ",":
+                index += 1
+                continue
+            break
+        if index < len(tokens) and tokens[index].kind == "word" and tokens[index].value in {"search", "cycle"}:
+            raise Incomplete("recursive CTE SEARCH/CYCLE clauses are outside the selected query model")
+        if index < len(tokens) and tokens[index].is_word("with"):
+            raise Incomplete("CTE requires a primary query after its definitions")
+        query_statement(tokens[index:], depth + 1)
+        return
+    if tokens[0].kind != "word" or tokens[0].value not in {
+            "select", "values", "table", "insert", "update", "delete", "merge"}:
+        raise Incomplete("CTE body or primary statement requires an ordinary PostgreSQL query")
 
 
 def parse_search_path(tokens: list[Token]) -> tuple[str, ...]:
@@ -667,6 +859,7 @@ def analyze_source(text: str, path: str = "<input>") -> tuple[list[dict], list[s
             return
         first = statement[0]
         split_top(statement)  # Check delimiters even in ordinary DML.
+        reject_sql_interpolation(statement, text)
         if first.kind != "word":
             raise Incomplete(f"line {first.line}: unsupported SQL or psql command")
         if first.value in {"delimiter", "pragma", "go"} or sequence(statement, "use"):
@@ -792,6 +985,8 @@ def analyze_source(text: str, path: str = "<input>") -> tuple[list[dict], list[s
                 state.functions.pop(key, None)
         elif first.is_word("do"):
             do_membership_grants(statement, state)
+        elif first.is_word("with"):
+            query_statement(statement)
         elif first.value in {"execute", "prepare", "call"}:
             raise Incomplete("dynamic or external SQL execution is outside the selected migration model")
         elif first.is_word("set"):
@@ -816,7 +1011,18 @@ def analyze_source(text: str, path: str = "<input>") -> tuple[list[dict], list[s
     statement_count = 0
     try:
         for token in lex(text, comments):
-            if token.kind == "symbol" and token.value == ";":
+            if token.kind == "psql":
+                statement_count += 1
+                if statement_count > MAX_STATEMENTS:
+                    raise Incomplete("SQL statement budget exhausted")
+                try:
+                    psql_directive(token)
+                except Incomplete as exc:
+                    errors.append(f"line {token.line}: {exc}")
+                # The admitted client directives neither execute nor clear
+                # psql's SQL query buffer. Unknown commands remain explicit
+                # incomplete boundaries, without swallowing following SQL.
+            elif token.kind == "symbol" and token.value == ";":
                 statement_count += 1
                 if statement_count > MAX_STATEMENTS:
                     raise Incomplete("SQL statement budget exhausted")

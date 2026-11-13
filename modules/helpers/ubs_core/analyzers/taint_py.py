@@ -65,9 +65,9 @@ def _work_setting(name, default):
     try:
         value = int(raw)
     except ValueError as exc:
-        raise AnalysisLimit(f'{name} must be a positive integer; analysis is incomplete') from exc
+        raise ValueError(f'{name} must be a positive integer; analysis is incomplete') from exc
     if value <= 0:
-        raise AnalysisLimit(f'{name} must be a positive integer; analysis is incomplete')
+        raise ValueError(f'{name} must be a positive integer; analysis is incomplete')
     return value
 
 

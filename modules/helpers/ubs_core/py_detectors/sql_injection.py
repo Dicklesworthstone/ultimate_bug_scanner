@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 from ubs_core.suppression import SuppressionIndex, build_index, may_have_markers
+from ubs_core.taint_flow import AnalysisLimit
 
 RULES = (
     ("py.security.sql-injection", 7,
@@ -2612,7 +2613,7 @@ RISK_ORDER = {'static': 0, 'unknown': 1, 'tainted': 2}
 SQL_RISK_ORDER = {None: 0, 'warning': 1, 'critical': 2}
 
 
-class SQLFlowLimit(RuntimeError):
+class SQLFlowLimit(AnalysisLimit, RuntimeError):
     """The bounded SQL pass could not establish a complete result."""
 
     def __init__(self, message, *, components=()):

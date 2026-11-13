@@ -18,7 +18,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="402ebf6bdda184d76534c366495c14c43f0f430967bd06e927832aebc7741d2e"
+UBS_LIB_CHECKSUM="6ae349749bc0e39de2a607b37c84d3431b0bd378bfea4c389877aaf1fe3c3066"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -754,7 +754,7 @@ PYRUFF
 # ── Legacy-parity bridges: record-less section headers + summary + exit ─────
 run_v2_legacy_parity_bridges_py(){
   local sink="$1" list_file="$2" py_exit="$3" text_out="${4:-}" extra_info="${5:-0}" skip_csv="${6:-}"
-  local analyzer_errors="${7:-0}"
+  local analyzer_errors="${7:-0}" summary_path="${8:-}"
   local files_n bridge_rc=0 helpers_dir=""
   ubs_resolve_helpers_dir helpers_dir || helpers_dir="$SCRIPT_DIR/helpers"
   files_n="$(tr -dc '\0' <"$list_file" 2>/dev/null | wc -c)"
@@ -765,12 +765,12 @@ run_v2_legacy_parity_bridges_py(){
   PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 - \
     "$sink" "$text_out" "$files_n" "${FAIL_ON_WARNING:-0}" "$skip_csv" \
     "$py_exit" "$extra_info" "$analyzer_errors" "$list_file" \
-    "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}" "$PROJECT_DIR" <<'PYV2BRIDGE'
+    "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}" "$PROJECT_DIR" "$summary_path" <<'PYV2BRIDGE'
 import json
 import sys
 
 (sink_path, text_out, files_raw, fow_raw, skip_csv, py_exit_raw, extra_raw,
- analyzer_errors_raw, list_path, project, project_dir) = sys.argv[1:12]
+ analyzer_errors_raw, list_path, project, project_dir, summary_path) = sys.argv[1:13]
 files_n = int(files_raw or 0)
 fail_on_warning = fow_raw == "1"
 skip = {int(x) for x in skip_csv.split(",") if x.strip().isdigit()}
@@ -831,7 +831,20 @@ if as_text:
     files = [Path(os.fsdecode(raw)) for raw in Path(list_path).read_bytes().split(b"\0") if raw]
     args = Namespace(sink=sink_path, text_out=text_out, project=project,
                      project_dir=project_dir, skip=skip_csv)
-    _render_text(args, files, counts, complete=py_exit in (0, 1) and not analyzer_errors)
+    complete = py_exit in (0, 1) and not analyzer_errors
+    status = {}
+    if not complete:
+        try:
+            status = json.loads(Path(summary_path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            status = {}
+        if (not isinstance(status, dict) or status.get("status") != "partial"
+                or status.get("module_error") not in {"ANALYSIS_INCOMPLETE", "ANALYZER_ERROR"}
+                or not isinstance(status.get("message"), str)
+                or py_exit not in (0, 1, 2)):
+            status = {"module_error": "ANALYZER_ERROR",
+                      "message": f"Python analysis layer failed (exit {py_exit}); see this module's stderr"}
+    _render_text(args, files, counts, complete=complete, status=status)
     covered = {str(rec.get("category_id", "")) for rec in records}
     for num in sorted(SECTION):
         if num in skip:
@@ -929,12 +942,10 @@ generate(Path('$ast_rule_dir'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' else 
     text)
       text_out="$(mktemp 2>/dev/null || mktemp -t ubs-pyv2-text.XXXXXX)"
       scan_args+=(--text-out "$text_out" --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}")
-      # --summary-json is a delivery request, not a format: honour it in text
-      # mode too rather than exiting 0 with nothing written (issue #106).
-      if [[ -n "$SUMMARY_JSON" ]]; then
-        v2_json_out="$(mktemp 2>/dev/null || mktemp -t ubs-pyv2-json.XXXXXX)"
-        scan_args+=(--json-out "$v2_json_out")
-      fi
+      # Keep one authoritative completion record for the final text render
+      # too. Optional analyzers run later and may contribute their own errors.
+      v2_json_out="$(mktemp 2>/dev/null || mktemp -t ubs-pyv2-json.XXXXXX)"
+      scan_args+=(--json-out "$v2_json_out")
       ;;
     *) echo "ERROR: contract-v2 python path supports text|json|sarif (got $FORMAT)" >&2; return 2 ;;
   esac
@@ -949,9 +960,6 @@ generate(Path('$ast_rule_dir'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' else 
       run_v2_uv_tools_py "$sink" "$v2_json_out" >&2
     fi
   fi
-  # Record-less section headers + Summary Statistics + legacy exit formula.
-  run_v2_legacy_parity_bridges_py "$sink" "$list_file" "$exit_code" "$text_out" \
-    "${UV_EXTRA_INFO:-0}" "$v2_skip" "${#UV_TOOL_ERRORS[@]}" || exit_code=$?
   if [[ ${#UV_TOOL_ERRORS[@]} -gt 0 ]]; then
     printf 'ubs-python: analysis incomplete: %s\n' "${UV_TOOL_ERRORS[@]}" >&2
     # The JSON summary must not claim a completed scan either.
@@ -960,27 +968,36 @@ generate(Path('$ast_rule_dir'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' else 
       if [[ "${UBS_KEEP_TEMP:-0}" == "1" ]]; then
         BASH_COMPAT="${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"
       fi
-      UBS_UV_TOOL_ERRORS="$(printf '%s; ' "${UV_TOOL_ERRORS[@]}")" python3 - "$v2_json_out" <<'PYUVSTATUS'
-import json, os, sys
+      PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 - "$v2_json_out" "${UV_TOOL_ERRORS[@]}" <<'PYUVSTATUS'
+import json, sys
+from ubs_core.py_scan import _AnalysisError, _error_from_record, _error_records, execution_status
 path = sys.argv[1]
 try:
     with open(path, encoding="utf-8") as fh:
         doc = json.load(fh)
-except (OSError, ValueError):
-    sys.exit(0)
+except (OSError, ValueError) as exc:
+    print(f"ubs-python: cannot read final analysis status: {exc}", file=sys.stderr)
+    sys.exit(2)
 if not isinstance(doc, dict):
-    sys.exit(0)
-detail = os.environ.get("UBS_UV_TOOL_ERRORS", "").strip().rstrip(";")
-doc["status"] = "partial"
-doc["module_error"] = "ANALYZER_ERROR"
-doc["message"] = ("Selected Python analyzers did not complete: " + detail)[:500]
+    sys.exit(2)
+errors = [_error_from_record(record) for record in doc.get("analysis_errors", [])]
+messages = {error.message for error in errors if not error.semantic}
+errors.extend(_AnalysisError("external analyzer", "ExternalToolError", message)
+              for message in sys.argv[2:] if message not in messages)
+doc.update(execution_status(errors))
+doc["analysis_errors"] = _error_records(errors)
 with open(path, "w", encoding="utf-8") as fh:
     json.dump(doc, fh, ensure_ascii=False)
     fh.write("\n")
 PYUVSTATUS
-      ) || true
+      ) || exit_code=2
     fi
   fi
+  # Re-render only after native and optional analyzer status has been merged,
+  # so the text marker, JSON summary and exit code describe the same result.
+  run_v2_legacy_parity_bridges_py "$sink" "$list_file" "$exit_code" "$text_out" \
+    "${UV_EXTRA_INFO:-0}" "$v2_skip" "${#UV_TOOL_ERRORS[@]}" "$v2_json_out" || exit_code=$?
 
   if [[ "$FORMAT" == "sarif" ]]; then
     if [[ -n "$v2_json_out" && -f "$v2_json_out" ]]; then

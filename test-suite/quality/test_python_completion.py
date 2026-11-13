@@ -35,7 +35,7 @@ class PythonCompletionTests(unittest.TestCase):
         self.env = {key: value for key, value in os.environ.items()
                     if not key.startswith(("UBS_", "XDG_"))}
         self.env.update(PYTHONDONTWRITEBYTECODE="1", PYTHONPATH=str(HELPERS),
-                        UBS_NO_AUTO_UPDATE="1", ENABLE_UV_TOOLS="0",
+                        UBS_NO_AUTO_UPDATE="1", ENABLE_UV_TOOLS="0", UBS_KEEP_TEMP="1",
                         UBS_CACHE_DIR=str(self.root / "cache"), UBS_NO_PREFILTER="1")
 
     def run(self, result=None):
@@ -70,11 +70,14 @@ class PythonCompletionTests(unittest.TestCase):
         records = [self.decode_json(line, str(sink)) for line in sink.read_text().splitlines()]
         return code, doc, records, text.read_text(), stderr.getvalue()
 
-    def assert_partial(self, result, message):
+    def assert_partial(self, result, message, *, semantic=False):
         code, doc, records, text, stderr = result
         self.assertEqual(code, 2, result)
         self.assertEqual(doc["status"], "partial", result)
-        self.assertEqual(doc["module_error"], "ANALYZER_ERROR", result)
+        error_code = "ANALYSIS_INCOMPLETE" if semantic else "ANALYZER_ERROR"
+        self.assertEqual(doc["module_error"], error_code, result)
+        self.assertEqual(doc["error"], "analysis" if semantic else "environment", result)
+        self.assertIn(f"Partial: [{error_code}] {doc['message']}", text, result)
         self.assertIn(message, stderr, result)
         self.assertNotIn("good:", text, result)
         for severity in ("critical", "warning", "info"):
@@ -152,10 +155,11 @@ class PythonCompletionTests(unittest.TestCase):
         with patch("ubs_core.registry.analyzers_for_lang", return_value=[
                 Analyzer("taint", "python", "taint_py", run)]):
             result = self.scan()
-        self.assert_partial(result, "nine independent scopes")
+        self.assert_partial(result, "nine independent scopes", semantic=True)
         self.assertEqual(result[1]["analysis_errors"], [{
             "stage": f"taint_py ({self.source})", "exception_type": "AnalysisLimit",
             "message": "nine independent scopes could not finish", "components": components,
+            "semantic": True,
         }])
         self.assertIn("python.taint.probe", {row["rule"] for row in result[2]})
 
@@ -177,7 +181,7 @@ class PythonCompletionTests(unittest.TestCase):
         self.assertTrue(records)
         self.assertEqual(py_scan._error_records(errors), [{
             "stage": "detector sql_injection", "exception_type": "AnalysisLimit",
-            "message": "incomplete SQL coverage", "components": components,
+            "message": "incomplete SQL coverage", "components": components, "semantic": True,
         }])
         for component in (None, {"file": "sample.py"},
                           {**components[0], "start_line": 0},
@@ -187,6 +191,129 @@ class PythonCompletionTests(unittest.TestCase):
                 wire = (json.dumps(["complete", [detail]]) + "\n").encode()
                 _records, _errors, invalid = py_scan._detector_response(wire)
                 self.assertIsNotNone(invalid)
+        for semantic in (None, "true", 1, [], {}):
+            with self.subTest(semantic=semantic):
+                detail = {**py_scan._error_records(errors)[0], "semantic": semantic}
+                wire = (json.dumps(["complete", [detail]]) + "\n").encode()
+                _records, _errors, invalid = py_scan._detector_response(wire)
+                self.assertIsNotNone(invalid)
+
+    def test_semantic_limit_identity_and_infrastructure_failure_precedence(self):
+        from ubs_core.py_detectors import command_injection, sql_injection
+
+        for exception, semantic in (
+                (AnalysisLimit("bounded flow stopped"), True),
+                (sql_injection.SQLFlowLimit("bounded SQL stopped"), True),
+                (command_injection.CommandAnalysisLimit("bounded command flow stopped"), True),
+                (RuntimeError("SQLFlowLimit: analysis incomplete after a crash"), False)):
+            def broken(files):
+                yield "py.security.sql-injection", files[0], 1, 1, "independent finding"
+                raise exception
+
+            with self.subTest(exception=type(exception).__name__), \
+                    patch.object(sql_injection, "find", side_effect=broken):
+                result = self.scan(no_cache=True)
+                self.assert_partial(result, str(exception), semantic=semantic)
+                self.assertIn("py.security.sql-injection", {row["rule"] for row in result[2]})
+                self.assertEqual(result[1]["analysis_errors"][0]["semantic"], semantic)
+                if semantic:
+                    with patch.object(py_scan, "scan_patterns", side_effect=OSError("capture failed")):
+                        mixed = self.scan(no_cache=True)
+                    self.assert_partial(mixed, "capture failed")
+                    self.assertTrue(any(row["semantic"] for row in mixed[1]["analysis_errors"]))
+                    self.assertIn("py.security.sql-injection", {row["rule"] for row in mixed[2]})
+
+    def test_real_sql_limit_keeps_its_status_through_worker_transport(self):
+        self.source.write_text(
+            'def report(con):\n    con.execute("select 1")\n'
+            '    return list(x for x in (y for y in (1, 2)))\n', encoding="utf-8")
+        with patch.dict(os.environ, self.env, clear=True):
+            _records, problems = py_scan._detector_process("sql_injection", [self.source], None)
+        self.assertTrue(problems)
+        self.assertEqual(py_scan.execution_status(problems)["module_error"], "ANALYSIS_INCOMPLETE")
+        self.assertEqual(problems[0].exception_type, "SQLFlowLimit")
+        self.assertIn("nested generator iteration", problems[0].message)
+
+    @unittest.skipUnless(shutil.which("jq") and shutil.which("rg"), "public UBS requires jq and ripgrep")
+    def test_public_python_semantic_status_matches_text_json_and_partial_acceptance(self):
+        project = self.root / "status-project"
+        project.mkdir()
+        source = project / "boundary.py"
+        base = ('def report(con):\n    con.execute("select 1")\n'
+                '    return list(x for x in (y for y in (1, 2)))\n')
+        env = {**self.env, "UBS_KEEP_TEMP": "1", "UBS_NO_CACHE": "1"}
+        for finding in (False, True):
+            source.write_text(base + ("eval(input())\n" if finding else ""), encoding="utf-8")
+            for accepted in (False, True):
+                for output_format in ("text", "json"):
+                    with self.subTest(finding=finding, accepted=accepted, format=output_format):
+                        proc = subprocess.run(
+                            [str(REPO_ROOT / "ubs"), "--ci", "--only=python", "--skip=20",
+                             "--format=" + output_format, str(project)], cwd=self.root,
+                            env={**env, "UBS_ALLOW_PARTIAL": str(int(accepted))},
+                            text=True, capture_output=True, timeout=120)
+                        label = f"status-{finding}-{accepted}-{output_format}"
+                        (self.root / (label + ".stdout")).write_text(proc.stdout)
+                        (self.root / (label + ".stderr")).write_text(proc.stderr)
+                        detail = proc.stdout + proc.stderr
+                        self.assertEqual(proc.returncode, int(finding) if accepted else 2, detail)
+                        self.assertNotIn("This is a tooling/dependency problem", detail)
+                        if output_format == "text":
+                            self.assertIn("Partial: [ANALYSIS_INCOMPLETE]", proc.stdout)
+                            self.assertIn("SQLFlowLimit", proc.stdout)
+                            if finding:
+                                self.assertIn("python.taint.eval", proc.stdout)
+                        else:
+                            doc = self.decode_json(proc.stdout, label)
+                            self.assertEqual(doc["status"], "partial", detail)
+                            failure = next(row for row in doc["failed_modules"]
+                                           if row["language"] == "python")
+                            self.assertEqual(failure["module_error"], "ANALYSIS_INCOMPLETE", detail)
+                            self.assertIn("SQLFlowLimit", failure["message"], detail)
+                            self.assertEqual(doc["totals"]["critical"] > 0, finding, detail)
+
+    @unittest.skipUnless(shutil.which("jq") and shutil.which("rg"), "public UBS requires jq and ripgrep")
+    def test_module_merges_native_and_optional_failures_before_final_text_render(self):
+        project = self.root / "mixed-status-project"
+        project.mkdir()
+        (project / "boundary.py").write_text(
+            'def report(con):\n    con.execute("select 1")\n'
+            '    return list(x for x in (y for y in (1, 2)))\n'
+            'eval(input())\n', encoding="utf-8")
+        (project / "requirements.txt").write_text("example-package==1.0\n", encoding="utf-8")
+        summary = self.root / "mixed-status-summary.json"
+        # Retention explicitly refuses external audit scratch before launch.
+        # Exercise that real adapter error together with a native coverage
+        # limit without invoking a package resolver or deleting its scratch.
+        env = {**self.env, "ENABLE_UV_TOOLS": "1", "UBS_NO_CACHE": "1"}
+        for output_format in ("text", "json", "sarif"):
+            with self.subTest(format=output_format):
+                proc = subprocess.run(
+                    [str(REPO_ROOT / "modules/ubs-python.sh"), str(project),
+                     "--format=" + output_format, "--uv-tools=pip-audit",
+                     "--summary-json=" + str(summary)], cwd=self.root,
+                    env=env, text=True, capture_output=True, timeout=120)
+                detail = proc.stdout + proc.stderr
+                self.assertEqual(proc.returncode, 2, detail)
+                doc = self.decode_json(summary.read_text(), str(summary))
+                self.assertEqual((doc["status"], doc["error"], doc["module_error"]),
+                                 ("partial", "environment", "ANALYZER_ERROR"), doc)
+                diagnostics = doc["analysis_errors"]
+                self.assertTrue(any(row["semantic"] and row["exception_type"] == "SQLFlowLimit"
+                                    for row in diagnostics), diagnostics)
+                self.assertTrue(any(not row["semantic"] and "cannot retain external analyzer scratch"
+                                    in row["message"] for row in diagnostics), diagnostics)
+                self.assertIn("python.taint.eval", {row["rule"] for row in doc["findings"]})
+                if output_format == "text":
+                    self.assertIn("Partial: [ANALYZER_ERROR]", proc.stdout)
+                    self.assertNotIn("Partial: [ANALYSIS_INCOMPLETE]", proc.stdout)
+                    self.assertIn("SQLFlowLimit", proc.stdout)
+                    self.assertNotIn("good:", proc.stdout)
+                elif output_format == "json":
+                    self.assertEqual(self.decode_json(proc.stdout, "module JSON"), doc)
+                else:
+                    sarif = self.decode_json(proc.stdout, "module SARIF")
+                    self.assertFalse(sarif["runs"][0]["invocations"][0]["executionSuccessful"])
 
     @unittest.skipUnless(shutil.which("jq") and shutil.which("rg"), "public UBS requires jq and ripgrep")
     def test_public_reports_keep_all_failed_components_and_independent_findings(self):

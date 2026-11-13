@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.5.56-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.5.57-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -1197,7 +1197,7 @@ ubs .                                   # Whole project (ignores things like .ve
     💡 Suggested fix
 Exit code: 1
 ```
-Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fail | Exit 2 → environment/usage error (fix the invocation or `ubs doctor --fix`) | Exit 3 → nothing was scanned (not a pass)
+Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fail | Exit 2 → incomplete analysis, environment, or usage error (inspect the reported reason) | Exit 3 → nothing was scanned (not a pass)
 
 **Fix Workflow:**
 1. Read finding → category + fix suggestion
@@ -1455,7 +1455,8 @@ Exit Codes:
   2                        Invalid arguments, environment error (e.g., missing ast-grep for JS/TS),
                            a refused scan (directory too large, $HOME or /), or a PARTIAL run in
                            which a scanner module timed out, crashed, or could not finish one of
-                           its own analysis layers (module_error ANALYZER_ERROR). Set
+                           its own analysis layers (ANALYZER_ERROR for failed machinery,
+                           ANALYSIS_INCOMPLETE for Python semantic coverage limits). Set
                            UBS_ALLOW_PARTIAL=1 to exit on findings alone for partial runs.
   3                        Nothing was scanned: no supported languages detected, so no scanner ran.
                            This is NOT a pass. Set UBS_ALLOW_NO_SCAN=1 to restore the legacy exit-0
@@ -1514,7 +1515,7 @@ In `--format=json|jsonl|sarif|toon` mode every failure is an object on stdout, n
 just text on stderr, so `ubs … --format=json | jq` always has something to parse:
 
 - Environment errors and refused scans: `{"error":"environment"|"refused","status":"error"|"refused","reason":"ast-grep-missing"|"module-failed"|"directory-too-large"|"home-directory"|"root-directory","exit_code":2,"message":…}` (JSONL adds `"type":"error"`; SARIF emits one run with `invocations[0].executionSuccessful=false` and a `toolExecutionNotifications` entry).
-- Incomplete runs: the normal envelope with `"status":"partial"` (or `"error"` when a module could not run at all and no other scanner produced a result) and `failed_modules:[{language,status,module_error,message}]`; each scanner carries its own `status` (`ok`, `timeout`, `error`). A module that exits 2 is reported the same way, with `"error":"environment"`, `"reason":"module-failed"` and `"exit_code":2` added — the results from the scanners that *did* complete stay in the envelope, and every requested `--report-json` / `--html-report` / `--beads-jsonl` is still written. SARIF runs get `invocations[].executionSuccessful=false`, `exitCode: 2` and one notification per failed module.
+- Incomplete runs: the normal envelope with `"status":"partial"` (or `"error"` when a module could not run at all and no other scanner produced a result) and `failed_modules:[{language,status,module_error,message}]`; each scanner carries its own `status` (`ok`, `partial`, `timeout`, `error`). A module that exits 2 retains `"exit_code":2` and its failure reason: infrastructure failures use `"error":"environment"` and `"reason":"module-failed"`, while Python semantic coverage limits use `"error":"analysis"` and `"reason":"analysis-incomplete"`. Results from scanners that completed stay in the envelope, and every requested `--report-json` / `--html-report` / `--beads-jsonl` is still written. SARIF runs get `invocations[].executionSuccessful=false`, `exitCode: 2` and one notification per failed module.
 - Requested artifacts are a separate outcome from the analysis. If a `--report-json`, `--html-report`, `--save-baseline` or `--beads-jsonl` was requested and could not be written, the run exits 2 and says which path failed; the previous file at that path is never truncated by a failed write.
 - Comparisons are qualified before they are shown. `--comparison` emits `comparison.delta` only when both the current scan and the baseline are complete; otherwise it emits `comparison.status: "unavailable"` with a `reason` (`current_scan_incomplete`, `baseline_incomplete`, `baseline_missing`, `baseline_unreadable`) instead of a number that would read as an improvement. `--save-baseline` refuses to record a baseline from an incomplete scan, leaving any existing baseline in place, and an HTML report from an incomplete scan carries a visible "Incomplete scan" banner.
 
@@ -1527,6 +1528,16 @@ receipt, and incomplete scans do not populate the reusable analysis cache.
 The separately documented, reason-required `taint-source` directive retains
 its narrow source-activation behavior; it does not clear another active
 source's analysis failure.
+
+**Python coverage limitations.** A bounded native analysis that cannot prove
+complete coverage reports `module_error: "ANALYSIS_INCOMPLETE"`, with
+`reason: "analysis-incomplete"` in the scanner metadata. Analyzer crashes,
+invalid analysis configuration, and failed optional tools instead report
+`ANALYZER_ERROR`; a mixed failure retains that error classification. Text,
+JSON, and SARIF preserve the partial status, diagnostic details, and findings
+already established. Both classifications exit 2 by default, and partial
+native results do not populate the reusable analysis cache. Installing tools
+with `ubs doctor --fix` does not resolve a semantic coverage boundary.
 
 **Directory size guard**
 

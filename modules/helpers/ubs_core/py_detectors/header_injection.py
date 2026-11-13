@@ -450,9 +450,15 @@ class _HeaderAnalysis(flow._Analysis):
     flow_class = _HeaderFlow
 
 
+class HeaderAnalysisLimit(flow.AnalysisLimit, RuntimeError):
+    """Only bounded semantic failures were observed across header sources."""
+
+
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
     suppressions = SourceSuppressions('python')
     errors = []
+    semantic_only = True
+    components = []
     for path in files:
         if path.suffix.lower() not in {'.py', '.pyi'}:
             continue
@@ -463,6 +469,11 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
             effects = _HeaderAnalysis(tree).analyze()
         except (OSError, UnicodeError, SyntaxError, RecursionError, RuntimeError, flow.AnalysisLimit) as exc:
             errors.append(f'{path}: {type(exc).__name__}: {exc}')
+            cause = exc
+            while isinstance(cause, flow.AnalysisLimit):
+                cause = cause.__cause__
+            semantic_only = semantic_only and cause is None
+            components.extend(getattr(exc, 'components', ()))
             # A bounded incomplete solve may still prove independent sinks.
             # Emit those findings, then report failure after every file has
             # had its turn; an exhausted scope must not erase later findings.
@@ -481,4 +492,7 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
             witness = ' -> '.join([*(trace.path or (trace.source,)), 'response header'])
             yield path, line, column, f'{witness}: {_source_line(lines, line)}'[:240]
     if errors:
-        raise RuntimeError('incomplete header analysis: ' + '; '.join(errors[:8]))
+        message = 'incomplete header analysis: ' + '; '.join(errors[:8])
+        if semantic_only:
+            raise HeaderAnalysisLimit(message, components=components)
+        raise RuntimeError(message)

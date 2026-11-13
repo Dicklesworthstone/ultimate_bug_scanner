@@ -43,6 +43,7 @@ from ubs_core.io import read_ndjson
 from ubs_core.lexer import strip_comments_and_strings
 from ubs_core.registry import RunContext
 from ubs_core.suppression import SourceSuppressions
+from ubs_core.taint_flow import AnalysisLimit
 
 MARKER = "ubs:ignore"
 _PATTERN_CACHE_KIND = "_ubs_python_pattern"
@@ -592,23 +593,25 @@ def pattern_count_report(
 class _AnalysisError(str):
     """A printable failure with lossless structured report/worker metadata."""
 
-    def __new__(cls, stage: str, exception_type: str, message: str, components=()):
+    def __new__(cls, stage: str, exception_type: str, message: str, components=(), *, semantic=False):
         value = super().__new__(cls, f"{stage}: {exception_type}: {message}")
         value.stage = stage
         value.exception_type = exception_type
         value.message = message
         value.components = tuple(dict(component) for component in components)
+        value.semantic = semantic
         return value
 
     def record(self) -> dict:
         return {"stage": self.stage, "exception_type": self.exception_type,
-                "message": self.message, "components": list(self.components)}
+                "message": self.message, "components": list(self.components),
+                "semantic": self.semantic}
 
 
 def _error_records(errors: Sequence[str]) -> list[dict]:
     return [error.record() if isinstance(error, _AnalysisError) else
             {"stage": "scan", "exception_type": "AnalysisError",
-             "message": str(error), "components": []} for error in errors]
+             "message": str(error), "components": [], "semantic": False} for error in errors]
 
 
 def _error_from_record(record: object) -> _AnalysisError:
@@ -619,6 +622,9 @@ def _error_from_record(record: object) -> _AnalysisError:
     components = record.get("components")
     if not isinstance(components, list):
         raise ValueError("invalid analysis components")
+    semantic = record.get("semantic", False)
+    if type(semantic) is not bool:
+        raise ValueError("invalid analysis error classification")
     for component in components:
         if (not isinstance(component, dict)
                 or not all(isinstance(component.get(key), str) for key in ("file", "reason"))
@@ -626,7 +632,8 @@ def _error_from_record(record: object) -> _AnalysisError:
                 or any(key in component and (type(component[key]) is not int or component[key] < 1)
                        for key in ("start_line", "end_line"))):
             raise ValueError("invalid analysis component")
-    return _AnalysisError(record["stage"], record["exception_type"], record["message"], components)
+    return _AnalysisError(record["stage"], record["exception_type"], record["message"], components,
+                          semantic=semantic)
 
 
 def _analysis_error(errors: list[str] | None, stage: str, exc: BaseException) -> None:
@@ -634,7 +641,27 @@ def _analysis_error(errors: list[str] | None, stage: str, exc: BaseException) ->
     if errors is None:
         raise exc
     errors.append(_AnalysisError(stage, type(exc).__name__, str(exc),
-                                 getattr(exc, "components", ())))
+                                 getattr(exc, "components", ()),
+                                 semantic=isinstance(exc, AnalysisLimit)))
+
+
+def execution_status(errors: Sequence[str]) -> dict:
+    """A coverage boundary is distinct from broken analysis machinery.
+
+    Both remain partial and exit 2. Any infrastructure error dominates a
+    mixture, and unknown or untyped failures cannot claim semantic status.
+    """
+    if not errors:
+        return {"status": "ok"}
+    semantic_only = all(isinstance(error, _AnalysisError) and error.semantic for error in errors)
+    return {
+        "status": "partial",
+        "error": "analysis" if semantic_only else "environment",
+        "reason": "analysis-incomplete" if semantic_only else "module-failed",
+        "module_error": "ANALYSIS_INCOMPLETE" if semantic_only else "ANALYZER_ERROR",
+        "message": (("Python semantic coverage is incomplete: " if semantic_only else
+                     "Python analysis did not complete: ") + "; ".join(errors[:5]))[:500],
+    }
 
 
 def _run_stage(problems: list[str], stage: str, run, *args, **kwargs):
@@ -1105,7 +1132,8 @@ def _legacy_report(records: list[dict], version: str) -> dict:
     return {"version": version, "findings": findings}
 
 
-def _render_text(args, files: Sequence[Path], counters: dict[str, int], *, complete: bool = True) -> None:
+def _render_text(args, files: Sequence[Path], counters: dict[str, int], *, complete: bool = True,
+                 status: dict | None = None) -> None:
     """Render the legacy-format text report from the NDJSON sink."""
     import datetime
 
@@ -1118,6 +1146,13 @@ def _render_text(args, files: Sequence[Path], counters: dict[str, int], *, compl
         f"UBS module: python (contract v2) — {args.project or args.project_dir}",
         f"Files scanned: {len(files)}",
     ]
+    if not complete:
+        status = status or {}
+        code = status.get("module_error", "ANALYZER_ERROR")
+        detail = status.get("message", "Python analysis did not complete; see this module's stderr")
+        # This line is the runner's text-mode completion contract. Keep it
+        # ahead of findings and counters, including when all findings vanish.
+        lines.append(f"Partial: [{code}] {detail}")
     category_order = {num: i for i, num in enumerate(sorted(_CATEGORY_SLUGS))}
     ordered_rules = sorted(
         by_rule,
@@ -1391,6 +1426,7 @@ def main(argv: list[str] | None = None) -> int:
     # be reported as a finished scan, whatever it happened to find (issue #103).
     if scan_errors:
         exit_code = 2
+    status = execution_status(scan_errors)
 
     if args.json_out:
         records = read_ndjson(args.sink)
@@ -1406,18 +1442,13 @@ def main(argv: list[str] | None = None) -> int:
             "warning": counters["warning"],
             "info": counters["info"],
             "version": args.version,
-            "status": "partial" if scan_errors else "ok",
+            **status,
             "analysis_errors": _error_records(scan_errors),
             "findings": legacy_findings,
             # Legacy issue-64 payload (title + samples) carried inside the
             # module summary so the combined JSON keeps per-finding samples.
             "report": {"version": args.version, "findings": legacy_findings},
         }
-        if scan_errors:
-            doc["module_error"] = "ANALYZER_ERROR"
-            doc["message"] = (
-                "Python analysis did not complete: " + "; ".join(scan_errors[:5])
-            )[:500]
         profile_data = {
             "files_considered": prefilter_res.files_considered if files_to_scan else len(files),
             "files_after_prefilter": prefilter_res.files_after_prefilter if files_to_scan else 0,
@@ -1434,7 +1465,7 @@ def main(argv: list[str] | None = None) -> int:
         Path(args.json_out).write_text(json.dumps(doc, ensure_ascii=False) + "\n", encoding="utf-8")
 
     if args.text_out:
-        _render_text(args, files, counters, complete=not scan_errors)
+        _render_text(args, files, counters, complete=not scan_errors, status=status)
 
     # Admit fresh cache entries only after every producer and requested report
     # completed. A failed project pass must not publish a reusable partial scan.

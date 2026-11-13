@@ -3563,7 +3563,7 @@ eval(relay(input()))
             code, document, records, rendered, stderr = result
             self.assertEqual(code, 2, result)
             self.assertEqual(document['status'], 'partial', result)
-            self.assertEqual(document['module_error'], 'ANALYZER_ERROR', result)
+            self.assertEqual(document['module_error'], 'ANALYSIS_INCOMPLETE', result)
             self.assertIn('work limit exceeded', stderr, result)
             self.assertIn('m_recursive.py', stderr, result)
             self.assertNotIn('good:', rendered, result)

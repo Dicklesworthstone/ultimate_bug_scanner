@@ -20,6 +20,7 @@ from typing import Iterable, Sequence
 from ubs_core.suppression import SuppressionIndex, build_index, may_have_markers
 
 from ubs_core.io import python_source_segment
+from ubs_core.taint_flow import AnalysisLimit
 
 RULE_ID = "py.security.command-injection"
 CATEGORY = 7
@@ -147,7 +148,7 @@ def shell_name(value):
     return name[:-4] if name.endswith('.exe') else name
 
 
-class CommandAnalysisLimit(ValueError):
+class CommandAnalysisLimit(AnalysisLimit):
     """A bounded analysis must fail visibly instead of reporting a clean file."""
 
 

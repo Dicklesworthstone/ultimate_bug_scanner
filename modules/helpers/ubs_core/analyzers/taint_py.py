@@ -54,6 +54,8 @@ _MAX_CAPTURE_DEPTH = 64
 _PARTIAL_MODULE_REF = '@stdlib:functools'
 _PARTIAL_CHANGED_MODULE = '@partial:changed-module'
 _PARTIAL_CHANGED_CONSTRUCTOR = '@partial:changed-constructor'
+_SOURCE_MEMBERS = {'os': frozenset({'getenv', 'getenvb', 'environ', 'environb'}),
+                   'sys': frozenset({'argv'})}
 # Keep a precise prefix plus an aggregate unknown-length suffix in summaries.
 _MAX_VECTOR_CONTEXT = 16
 
@@ -118,8 +120,9 @@ SOURCE_PATTERNS = [
     re.compile(r"django\.http\.request", re.IGNORECASE),
     re.compile(r"input\s*\(", re.IGNORECASE),
     re.compile(r"raw_input\s*\(", re.IGNORECASE),
-    re.compile(r"sys\.argv", re.IGNORECASE),
-    re.compile(r"os\.environ", re.IGNORECASE),
+    re.compile(r"^sys\.argv$"),
+    re.compile(r"^os\.environb?$"),
+    re.compile(r"^os\.(?:getenv|getenvb)\($"),
     re.compile(r"event\['body'\]", re.IGNORECASE),
     re.compile(r"params\[[^\]]+\]", re.IGNORECASE),
 ]
@@ -2653,6 +2656,18 @@ class _Flow:
                 or self.engine.generator_frame_exposed):
             return False
         method = consumer.func
+        if isinstance(method, ast.Attribute) and method.attr == 'join':
+            receiver = _binding_choices(self.expression_bindings.get(method.value))
+            if any(isinstance(value, _UnprovedProducer)
+                   or isinstance(value, (_LiteralString, _GeneratorString)) and not value.format_safe
+                   for value in receiver):
+                # Native string identity proves how join consumes its input,
+                # not the effects of producing that receiver. A helper may
+                # release an owned finalizer or input may format an opaque
+                # prompt before returning an exact builtin string. Preserve
+                # the same obligation carried through aliases and next().
+                raise AnalysisLimit('generator join receiver producer effects are unresolved; '
+                                    'analysis is incomplete')
         string_join = (isinstance(method, ast.Attribute) and method.attr == 'join'
                        and self.materialized_generator_string(method.value, state))
         choices = _binding_choices(self.expression_bindings.get(method))
@@ -3852,6 +3867,16 @@ class _Flow:
                 if isinstance(target, ast.Subscript):
                     self.expr(target.slice, state)
             namespace = self.expression_bindings.get(target.value)
+            if isinstance(target, ast.Attribute) and any(
+                    target.attr in members for members in _SOURCE_MEMBERS.values()):
+                self.require_value(namespace)
+                if any(isinstance(choice, str) and target.attr in _SOURCE_MEMBERS.get(choice, ())
+                       for choice in _binding_choices(namespace)):
+                    # Replacing a source API or its backing collection changes
+                    # both future imports and previously captured getters.
+                    # The field-insensitive heap cannot prove these lifetimes;
+                    # keep established findings and report this component partial.
+                    raise AnalysisLimit('stdlib source member mutation is unmodeled; analysis is incomplete')
             for choice in _binding_choices(namespace):
                 function = choice.function if isinstance(choice, (_FunctionValue, _ClosureValue)) else choice
                 if isinstance(choice, (_DeferredGenerator, _GeneratorNext)):
@@ -6790,12 +6815,17 @@ class _Flow:
                     fact, binding, refs = imported
                     self.write_name(state, local, fact, binding, refs)
                     continue
-                binding = (f'{node.module}.{alias.name}' if isinstance(node, ast.ImportFrom)
-                           else alias.name if alias.asname else local)
+                binding = ('.' * node.level + (node.module + '.' if node.module else '') + alias.name
+                           if isinstance(node, ast.ImportFrom) else alias.name if alias.asname else local)
                 refs = frozenset({_PARTIAL_MODULE_REF}) if binding == 'functools' else NO_REFERENCES
                 if binding == 'functools.partial' and _PARTIAL_MODULE_REF in state.mutated:
                     binding = _PARTIAL_CHANGED_CONSTRUCTOR
-                self.write_name(state, local, CLEAN, binding, refs)
+                # Only known source collections carry provenance on import;
+                # callable imports stay clean until invoked. Relative and
+                # similarly named imports cannot identify these stdlib values.
+                fact = (self.source(node, state, binding)
+                        if binding in {'os.environ', 'os.environb', 'sys.argv'} else CLEAN)
+                self.write_name(state, local, fact, binding, refs)
         elif isinstance(node, (ast.Assign, ast.AnnAssign)):
             if node.value is None:
                 return state  # An annotation alone does not assign a value.

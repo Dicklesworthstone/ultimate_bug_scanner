@@ -2434,6 +2434,53 @@ class FormattedStringCompletionTests(SourceTest):
             retained = None
         ''', ['fixed'])
 
+    def test_generator_join_preserves_receiver_producer_effects(self):
+        prefix = ("code = 'fixed'\nclass Owned:\n"
+                  + '    def __del__(self):\n        global code\n        code = input()\n'
+                  + "def render():\n    owned = Owned()\n    return '|'\n"
+                  + 'def identity(value):\n    return value\n')
+        for setup, receiver in (
+                ('', 'render()'),
+                ('separator = render()\n', 'separator'),
+                ('separator = render()\nalias = separator\n', 'alias'),
+                ('separator = render()\n', 'separator.strip()'),
+                ('separator = render()\n', 'identity(separator)')):
+            body = setup + f"{receiver}.join(part for part in ['a', 'b'])\neval(code)\n"
+            for scope in ('module', 'private'):
+                source = prefix + (body if scope == 'module'
+                                   else 'def run():\n' + textwrap.indent(body, '    ') + 'run()\n')
+                with self.subTest(receiver=receiver, scope=scope):
+                    self.assert_native(source, ['UNTRUSTED'], incomplete=True)
+
+    def test_generator_join_keeps_opaque_prompt_and_format_receiver_effects(self):
+        for method, signature, expression in (
+                ('__str__', '', 'input(Opaque())'),
+                ('__format__', ', spec', "f'{Opaque()}'")):
+            source = ("code = 'fixed'\nclass Opaque:\n"
+                      + f'    def {method}(self{signature}):\n'
+                      + "        global code\n        code = input()\n        return '|'\n"
+                      + f'separator = {expression}\n'
+                      + "separator.join(part for part in ['a', 'b'])\neval(code)\n")
+            with self.subTest(method=method):
+                self.assert_native(source, ['UNTRUSTED'], incomplete=True)
+
+    def test_generator_join_keeps_native_receiver_and_taint_controls(self):
+        for setup, receiver, expected in (
+                ('', "'|'", 'a|b'),
+                ("separator = '|'\n", 'separator', 'a|b'),
+                ("separator = '|'\nalias = separator\n", 'alias', 'a|b'),
+                ('', "render('|')", 'a|b'),
+                ('separator = input()\n', 'separator', 'aUNTRUSTEDb'),
+                ('separator = render(input())\n', 'separator', 'aUNTRUSTEDb'),
+                ("separator = f'{input()}'\n", 'separator', 'aUNTRUSTEDb')):
+            body = setup + f"result = {receiver}.join(part for part in ['a', 'b'])\neval(result)\n"
+            for scope in ('module', 'private'):
+                source = ('def render(value):\n    return value\n'
+                          + (body if scope == 'module'
+                             else 'def run():\n' + textwrap.indent(body, '    ') + 'run()\n'))
+                with self.subTest(receiver=receiver, scope=scope, setup=setup):
+                    self.assert_native(source, [expected])
+
 
 class ImmediateGeneratorExpressionTests(SourceTest):
     def test_string_join_captures_values_before_later_rebinding(self):

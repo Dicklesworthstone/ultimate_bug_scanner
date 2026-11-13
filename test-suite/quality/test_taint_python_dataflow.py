@@ -1,6 +1,7 @@
 """Source-level regressions for Python taint flow, never executed fixtures."""
 from __future__ import annotations
 
+import ast
 import contextlib
 import io
 import json
@@ -106,6 +107,224 @@ class SinkArgumentTests(SourceTest):
         self.assert_rules('from flask import request as req\nfrom os import system as execute\nexecute(req.args["q"])\n', 'command')
         self.assert_rules('from subprocess import run as launch\nlaunch(input(), shell=True)\n', 'command')
         self.assert_rules('eval(event["body"])\n', 'eval')
+
+
+class EnvironmentSourceTests(SourceTest):
+    def test_getters_reach_each_sink_domain(self):
+        sinks = (("os.system(value)", 'command'),
+                 ("eval(value)", 'eval'),
+                 ("cursor.execute('SELECT ' + value)", 'sql'),
+                 ("HttpResponse(value)", 'xss'),
+                 ("requests.get(value)", 'ssrf'))
+        for getter, key, convert in (('getenv', "'UBS_INPUT'", ''),
+                                     ('getenvb', "b'UBS_INPUT'", '.decode()')):
+            for sink, rule in sinks:
+                with self.subTest(getter=getter, sink=sink):
+                    self.assert_rules(
+                        f'import os, requests\nvalue = os.{getter}({key}){convert}\n{sink}\n', rule)
+
+    def test_getter_aliases_and_literal_defaults_keep_source_identity(self):
+        for getter, key, default in (('getenv', "'UBS_INPUT'", "'fixed'"),
+                                     ('getenvb', "b'UBS_INPUT'", "b'fixed'")):
+            cases = (
+                (f'import os as process_env\n', f'process_env.{getter}({key})'),
+                (f'from os import {getter} as lookup\n', f'lookup({key}, {default})'),
+                (f'import os\n', f'os.{getter}(key={key}, default={default})'),
+                (f'import os\nlookup = os.{getter}\nos = None\n', f'lookup({key})'),
+                (f'from os import {getter} as lookup\nsaved = lookup\nlookup = lambda key: {default}\n',
+                 f'saved({key})'),
+            )
+            for setup, expression in cases:
+                with self.subTest(getter=getter, expression=expression, setup=setup):
+                    self.assert_rules(setup + f'eval({expression})\n', 'eval')
+
+    def test_getter_is_captured_before_argument_rebinding(self):
+        self.assert_rules('''
+            import os
+            value = os.getenv(((os := None), 'UBS_INPUT')[1])
+            eval(value)
+        ''', 'eval')
+        self.assert_rules('''
+            from os import getenv as lookup
+            value = lookup(((lookup := lambda key: 'fixed'), 'UBS_INPUT')[1])
+            eval(value)
+        ''', 'eval')
+
+    def test_getter_names_and_unused_callables_are_not_sources(self):
+        self.assert_rules('''
+            def getenv(key):
+                return 'fixed'
+            eval(getenv('UBS_INPUT'))
+        ''')
+        self.assert_rules('''
+            import os
+            class Settings:
+                @staticmethod
+                def getenv(key):
+                    return 'fixed'
+            os = Settings
+            eval(os.getenv('UBS_INPUT'))
+        ''')
+        for module in ('custom_os', 'application.os', '.os', '..os'):
+            with self.subTest(module=module):
+                self.assert_rules(f'from {module} import getenv as lookup\neval(lookup("UBS_INPUT"))\n')
+        self.assert_rules('import os\neval(os.getenv_extra("UBS_INPUT"))\n')
+        self.assert_rules('from os import getenv as lookup\nHttpResponse(str(lookup))\n')
+        self.assert_rules('''
+            from os import getenv as lookup
+            def read(lookup):
+                return lookup('UBS_INPUT')
+            eval(read(lambda key: 'fixed'))
+        ''')
+
+    def test_imported_source_collections_keep_their_values(self):
+        for module, member, key in (('os', 'environ', "'UBS_INPUT'"),
+                                    ('os', 'environb', "b'UBS_INPUT'"),
+                                    ('sys', 'argv', '1')):
+            with self.subTest(module=module, member=member):
+                self.assert_rules(f'from {module} import {member} as values\neval(values[{key}])\n', 'eval')
+        self.assert_rules('''
+            from os import environ as settings
+            saved = settings
+            settings = {'UBS_INPUT': 'fixed'}
+            eval(saved['UBS_INPUT'])
+        ''', 'eval')
+        self.assert_rules('''
+            from os import environ as settings
+            settings = {'UBS_INPUT': 'fixed'}
+            eval(settings['UBS_INPUT'])
+        ''')
+        for module in ('.os', '..os'):
+            with self.subTest(module=module):
+                self.assert_rules(f'from {module} import environ as values\neval(values["UBS_INPUT"])\n')
+
+    def test_collection_source_names_require_exact_stdlib_identity(self):
+        for module, member in (('custom_os', 'environ'), ('application.os', 'environb'),
+                               ('OS', 'environ'), ('os', 'environ_extra'),
+                               ('os', 'ENVIRON'), ('mysys', 'argv'),
+                               ('application.sys', 'argv'), ('SYS', 'argv'),
+                               ('sys', 'argv_extra'), ('sys', 'ARGV'),
+                               ('.os', 'environ'), ('..os', 'environb'),
+                               ('.sys', 'argv'), ('..sys', 'argv')):
+            with self.subTest(module=module, member=member, style='imported'):
+                self.assert_rules(f'from {module} import {member} as values\neval(values[1])\n')
+            relative_prefix = '.' * (len(module) - len(module.lstrip('.')))
+            statement = (f'from {relative_prefix} import {module.lstrip(".")} as values'
+                         if relative_prefix else f'import {module} as values')
+            with self.subTest(module=module, member=member, style='qualified'):
+                self.assert_rules(f'{statement}\neval(values.{member}[1])\n')
+
+    def test_source_collection_members_reach_each_sink_domain(self):
+        for setup, expression in (
+                ('from os import environ as values', "values.get('UBS_INPUT', 'fixed')"),
+                ('from os import environb as values', "values[b'UBS_INPUT'].decode()"),
+                ('from sys import argv as values', 'values[1]')):
+            for sink, rule in (("os.system(value)", 'command'), ("eval(value)", 'eval'),
+                               ("cursor.execute('SELECT ' + value)", 'sql'),
+                               ("HttpResponse(value)", 'xss'), ("requests.get(value)", 'ssrf')):
+                with self.subTest(setup=setup, sink=sink):
+                    self.assert_rules(f'import os, requests\n{setup}\nvalue = {expression}\n{sink}\n', rule)
+
+    def test_saved_getter_and_collection_defaults_keep_definition_values(self):
+        self.assert_rules('''
+            import os
+            def read(lookup=os.getenv):
+                return lookup('UBS_INPUT')
+            os = None
+            eval(read())
+        ''', 'eval')
+        self.assert_rules('''
+            from os import environ as values
+            def read(values=values):
+                return values['UBS_INPUT']
+            values = {'UBS_INPUT': 'fixed'}
+            eval(read())
+        ''', 'eval')
+        self.assert_rules('''
+            from os import getenv as lookup
+            lookup = lambda key: 'fixed'
+            def read(lookup=lookup):
+                return lookup('UBS_INPUT')
+            eval(read())
+        ''')
+
+    def test_source_member_replacement_reports_incomplete(self):
+        cases = (
+            "import os\nos.getenv = lambda key: 'fixed'\neval(os.getenv('UBS_INPUT'))\n",
+            "import os\nalias = os\nalias.getenvb = lambda key: b'fixed'\n"
+            "eval(os.getenvb(b'UBS_INPUT'))\n",
+            "import os\nos.getenv = lambda key: 'fixed'\n"
+            "from os import getenv\neval(getenv('UBS_INPUT'))\n",
+            "import os\nsaved = os.getenv\nos.getenv = lambda key: 'fixed'\n"
+            "eval(saved('UBS_INPUT'))\n",
+            "import os\nsaved = os.getenv\nos.environ = {'UBS_INPUT': 'fixed'}\n"
+            "eval(saved('UBS_INPUT'))\n",
+            "import os\nsaved = os.environ\nos.environ = {'UBS_INPUT': 'fixed'}\n"
+            "eval(saved['UBS_INPUT'])\n",
+            "import os\ndel os.environb\n",
+            "import sys\nsys.argv = ['app', 'fixed']\neval(sys.argv[1])\n",
+            "import os\ndef replace(module):\n    module.getenv = lambda key: 'fixed'\n"
+            "replace(os)\neval(os.getenv('UBS_INPUT'))\n",
+            "import os\ndef replace():\n    os.getenv = lambda key: 'fixed'\n"
+            "replace()\ndef read():\n    import os\n    return os.getenv('UBS_INPUT')\n"
+            "eval(read())\n",
+        )
+        for source in cases:
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'stdlib source member mutation'):
+                    self.scan(source)
+
+    def test_source_mutation_keeps_established_and_independent_findings(self):
+        source = textwrap.dedent('''\
+            eval(input())
+            import os
+            def replace():
+                os.getenv = lambda key: 'fixed'
+            def independent():
+                eval(input())
+            replace()
+            independent()
+        ''')
+        engine = taint_py._Analysis(ast.parse(source))
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'stdlib source member mutation') as caught:
+            engine.analyze()
+        sites = {(kind, line) for (kind, line, _column, _label) in caught.exception.effects}
+        self.assertEqual(sites, {('eval', 1), ('eval', 6)})
+
+    def test_collection_item_writes_keep_other_environment_inputs(self):
+        self.assert_rules('''
+            import os
+            os.environ['FIXED_SETTING'] = 'fixed'
+            eval(os.getenv('OTHER_SETTING'))
+        ''', 'eval')
+        self.assert_rules('''
+            from os import environ as values
+            values['FIXED_SETTING'] = 'fixed'
+            eval(values['OTHER_SETTING'])
+        ''', 'eval')
+
+    def test_environment_data_keeps_sink_specific_safety(self):
+        self.assert_rules('''
+            import os, subprocess, shlex
+            value = os.getenv('UBS_INPUT', 'fixed')
+            subprocess.run(['echo', value])
+            os.system('echo ' + shlex.quote(value))
+            cursor.execute('SELECT * FROM users WHERE name = %s', (value,))
+            value = 'fixed'
+            eval(value)
+        ''')
+        self.assert_rules('''
+            from os import getenv as lookup
+            def read_setting():
+                return lookup('UBS_INPUT')
+            eval(read_setting())
+        ''', 'eval')
+        for source in ("os.getenv('UBS_INPUT')", "values['UBS_INPUT']"):
+            with self.subTest(source=source):
+                self.assert_rules(f'import os, html\nfrom os import environ as values\n'
+                                  f'HttpResponse(html.escape({source}))\n')
+                self.assert_rules(f'import os, html\nfrom os import environ as values\n'
+                                  f'eval(html.escape({source}))\n', 'eval')
 
 
 class ReachingDefinitionTests(SourceTest):
@@ -308,6 +527,9 @@ class RunnerIntegrationTests(unittest.TestCase):
     def test_runner_emits_taint_findings_and_safe_parameter_control(self):
         for code, expected in (("q=html.escape(input())\ncursor.execute(q)\n", True),
                                ("q=input()\ncursor.execute('select %s', (q,))\n", False),
+                               ("import os\ncursor.execute('SELECT ' + os.getenv('UBS_INPUT'))\n", True),
+                               ("from os import environ as values\ncursor.execute('SELECT ' + values['UBS_INPUT'])\n", True),
+                               ("import os\ncursor.execute('SELECT %s', (os.getenv('UBS_INPUT'),))\n", False),
                                ("match request.get_json():\n    case {**rest}:\n        cursor.execute(rest['query'])\n", True),
                                ("match cursor.execute:\n    case execute:\n        execute(input())\n", True),
                                ("match request.get_json():\n    case {**rest}:\n        cursor.execute('select %s', (rest,))\n", False),

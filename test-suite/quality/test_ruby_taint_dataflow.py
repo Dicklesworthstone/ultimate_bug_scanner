@@ -33,8 +33,11 @@ PATH = 'ruby.taint.path_traversal'
 EVAL = 'ruby.security.eval-family'
 DISPATCH = 'ruby.security.dynamic-dispatch'
 COMMAND = 'ruby.security.backticks-interpolated'
+SHELL_COMMAND = 'ruby.security.shell-single-string'
+SHELL_ARGV = 'ruby.security.shell-interpreter-argv'
+EXECUTABLE = 'ruby.security.command-executable'
 SQL = 'ruby.security.sql-injection'
-TARGET_RULES = {URL, PATH, EVAL, DISPATCH, COMMAND, SQL}
+TARGET_RULES = {URL, PATH, EVAL, DISPATCH, COMMAND, SQL, SHELL_COMMAND, SHELL_ARGV, EXECUTABLE}
 URL_CHECK = "uri.scheme == 'https' && ['api.example.com'].include?(uri.host)"
 PATH_CHECK = 'target.start_with?(base + File::SEPARATOR) || target == base'
 
@@ -2373,6 +2376,292 @@ REQUEST_SOURCE_CASES = (
 )
 
 
+# Process contracts are labelled from Ruby's Kernel/Process/Open3/IO API,
+# independently of the analyzer. A string command can invoke a shell; a fixed
+# executable with ordinary argv cannot. IO.popen's mode and Open3's stdin_data
+# do not become argv, and argv[0] display names do not select an executable.
+PROCESS_CASES = (
+    *(Case('process_' + name.replace('.', '_'), SHELL_COMMAND,
+           'command = params[:command]\n' + name + '(command)', (2,))
+      for name in ('system', 'exec', 'spawn', 'Kernel.system', 'Kernel.exec',
+                   'Kernel.spawn', 'Process.spawn', 'Process.exec', 'IO.popen',
+                   'Open3.capture2', 'Open3.capture2e', 'Open3.capture3',
+                   'Open3.popen2', 'Open3.popen2e', 'Open3.popen3')),
+    Case('process_command_form', SHELL_COMMAND, 'command = params[:command]\nsystem command', (2,)),
+    Case('process_helper_sink', SHELL_COMMAND, '''
+        def dispatch(command)
+          system(command)
+        end
+        dispatch(params[:command])''', (2,)),
+    Case('process_helper_return', SHELL_COMMAND, '''
+        def selected_command(raw)
+          raw
+        end
+        command = selected_command(params[:command])
+        system(command)''', (5,)),
+    Case('process_literal_overwrite', SHELL_COMMAND, '''
+        command = params[:command]
+        command = 'true'
+        system(command)''', ()),
+    Case('process_partial_overwrite', SHELL_COMMAND, '''
+        command = params[:command]
+        command = 'true' if enabled
+        system(command)''', (3,)),
+    Case('process_bound_constant_alias', SHELL_COMMAND, '''
+        Runner = Open3
+        command = params[:command]
+        Runner.capture3(command)''', (3,)),
+    Case('process_local_method_control', SHELL_COMMAND, '''
+        def system(command)
+          command
+        end
+        system(params[:command])''', ()),
+    Case('process_local_method_wrong_arity', SHELL_COMMAND, '''
+        def system(first, second)
+          first
+        end
+        system(params[:command])''', ()),
+    Case('process_namespace_lookalike', SHELL_COMMAND, '''
+        module Local
+          module Open3
+            def self.capture3(command)
+              command
+            end
+          end
+          Open3.capture3(params[:command])
+        end''', ()),
+    Case('process_instance_lookalike', SHELL_COMMAND, '''
+        class Runner
+          def system(command)
+            command
+          end
+        end
+        Runner.new.system(params[:command])''', ()),
+    Case('process_inherited_local_method', SHELL_COMMAND, '''
+        class Base
+          def system(command)
+            command
+          end
+        end
+        class Handler < Base
+          def run
+            system(params[:command])
+          end
+        end''', ()),
+    Case('process_inherited_method_calls_kernel', SHELL_COMMAND, '''
+        class Base
+          def system(command)
+            Kernel.system(command)
+          end
+        end
+        class Handler < Base
+          def run
+            system(params[:command])
+          end
+        end''', (3,)),
+    Case('process_inherited_wrong_arity', SHELL_COMMAND, '''
+        class Base
+          def system(first, second)
+            first
+          end
+        end
+        class Handler < Base
+          def run
+            system(params[:command])
+          end
+        end''', ()),
+    Case('process_kernel_instance_override', SHELL_COMMAND, '''
+        module Kernel
+          def system(command)
+            command
+          end
+        end
+        system(params[:command])''', ()),
+    Case('process_static_send', SHELL_COMMAND,
+         'command = params[:command]\nKernel.public_send(:system, command)', (2,)),
+    Case('process_fixed_argv', SHELL_COMMAND,
+         "system('printf', '%s', params[:value])", ()),
+    Case('process_fixed_argv_environment', SHELL_COMMAND,
+         "system({'LABEL' => params[:label]}, 'printf', '%s', params[:value])", ()),
+    Case('process_open3_data_option', SHELL_COMMAND,
+         "Open3.capture3('cat', stdin_data: params[:value])", ()),
+    Case('process_open3_options_hash', SHELL_COMMAND,
+         "options = {stdin_data: params[:value]}\nOpen3.capture3('cat', options)", ()),
+    Case('process_environment_before_shell_string', SHELL_COMMAND,
+         "command = params[:command]\nOpen3.capture3({'LABEL' => 'fixed'}, command)", (2,)),
+    Case('process_io_mode_is_not_argv', SHELL_COMMAND,
+         "command = params[:command]\nIO.popen(command, 'r')", (2,)),
+    Case('process_executable_is_not_data', EXECUTABLE,
+         "system(params[:program], '--version')", (1,)),
+    Case('process_executable_alias', EXECUTABLE,
+         "program = params[:program]\nOpen3.capture3(program, '--version')", (2,)),
+    Case('process_shell_flag_alias', SHELL_ARGV, '''
+        program = '/bin/sh'
+        flag = '-c'
+        command = params[:command]
+        system(program, flag, command)''', (4,)),
+    Case('process_shell_combined_flag', SHELL_ARGV,
+         "command = params[:command]\nOpen3.capture3('/bin/bash', '-lc', command)", (2,)),
+    Case('process_shell_positional_data', SHELL_ARGV, '''
+        program = '/bin/sh'
+        flag = '-c'
+        system(program, flag, 'printf "%s" "$1"', 'display-name', params[:value])''', ()),
+    Case('process_cmd_operand', SHELL_ARGV,
+         "program = 'cmd.exe'\ncommand = params[:command]\nsystem(program, '/c', command)", (3,)),
+    Case('process_powershell_operand', SHELL_ARGV,
+         "program = 'pwsh'\ncommand = params[:command]\nsystem(program, '-Command', command)", (3,)),
+    Case('process_shell_stdin', SHELL_ARGV,
+         "program = 'sh'\nOpen3.capture3(program, '-s', stdin_data: params[:command])", (2,)),
+    Case('process_shell_default_stdin', SHELL_ARGV,
+         "program = 'sh'\nOpen3.capture3(program, stdin_data: params[:command])", (2,)),
+    Case('process_shell_stdin_argument_is_data', SHELL_ARGV,
+         "program = 'sh'\nOpen3.capture3(program, '-s', params[:value], stdin_data: 'echo fixed')", ()),
+    Case('process_shell_c_overrides_stdin_flag', SHELL_ARGV,
+         "program = 'sh'\nOpen3.capture3(program, '-s', '-c', params[:command])", (2,)),
+    Case('process_cmd_remaining_operands', SHELL_ARGV,
+         "program = 'cmd.exe'\nsystem(program, '/c', 'echo', params[:command])", (2,)),
+    Case('process_shell_script', SHELL_ARGV,
+         "program = 'sh'\nsystem(program, params[:script], 'argument')", (2,)),
+    Case('process_array_argv', SHELL_COMMAND,
+         "IO.popen(['printf', '%s', params[:value]], 'r')", ()),
+    Case('process_array_alias', SHELL_COMMAND,
+         "arguments = ['printf', '%s', params[:value]]\nIO.popen(arguments, 'r')", ()),
+    Case('process_array_helper_return', SHELL_COMMAND, '''
+        def arguments(value)
+          ['printf', '%s', value]
+        end
+        IO.popen(arguments(params[:value]))''', ()),
+    Case('process_array_shell', SHELL_ARGV,
+         "IO.popen(['/bin/sh', '-c', params[:command]], 'r')", (1,)),
+    Case('process_array_executable', EXECUTABLE,
+         "IO.popen([params[:program], '--version'], 'r')", (1,)),
+    Case('process_argv0_display_name', SHELL_COMMAND,
+         "system(['printf', params[:display]], '%s', params[:value])", ()),
+    Case('process_argv0_executable', EXECUTABLE,
+         "system([params[:program], 'display'], 'value')", (1,)),
+    Case('process_nested_argv0', SHELL_COMMAND,
+         "IO.popen([['printf', params[:display]], '%s', params[:value]])", ()),
+    Case('process_splatted_literals', SHELL_COMMAND,
+         "system(*['printf', '%s', params[:value]])", ()),
+    Case('process_source_body', SHELL_COMMAND,
+         'command = request.body.read\nsystem(command)', (2,)),
+    Case('process_source_cookie', SHELL_COMMAND,
+         'command = cookies[:command]\nsystem(command)', (2,)),
+    Case('process_return_metadata', PATH,
+         "pid = spawn('cat', '--', params[:value])\nFile.read(pid.to_s)", ()),
+    Case('process_open3_chained_lookalike', SHELL_COMMAND,
+         'Open3.factory.capture3(params[:command])', ()),
+    Case('process_mixin_explicit_kernel', SHELL_COMMAND, '''
+        module SafeRunner
+          def system(command)
+            command
+          end
+        end
+        class Handler
+          include SafeRunner
+          def run
+            Kernel.system(params[:command])
+          end
+        end''', (9,)),
+    Case('process_unrelated_mixin_scope', SHELL_COMMAND, '''
+        module SafeRunner
+          def system(command)
+            command
+          end
+        end
+        class Handler
+          include SafeRunner
+        end
+        system(params[:command])''', (9,)),
+    Case('process_later_argument_rebinds_parameter', SHELL_COMMAND, '''
+        def mode(program)
+          program = params[:program]
+          'r'
+        end
+        program = 'printf'
+        system(program, mode(program))''', ()),
+    Case('process_rebound_array_member', SHELL_COMMAND, '''
+        program = 'printf'
+        arguments = [program, '%s', params[:value]]
+        program = 'sh'
+        IO.popen(arguments)''', ()),
+    Case('process_later_option_rebinds_stdin_parameter', SHELL_ARGV, '''
+        def binary_mode(code)
+          code = params[:command]
+          true
+        end
+        code = 'true'
+        Open3.capture3('sh', stdin_data: code, binmode: binary_mode(code))''', ()),
+    Case('process_code_mode_ignores_mutated_stdin', SHELL_ARGV, '''
+        program = 'sh'
+        flag = '-c'
+        code = 'true'
+        Open3.capture3(program, flag, 'true', stdin_data: code, binmode: code.replace(params[:value]))''', ()),
+)
+
+PROCESS_BOUNDARIES = (
+    ('mutated_argv', "arguments = ['printf', '%s', params[:value]]\narguments[0] = 'sh'\nIO.popen(arguments)"),
+    ('mutated_member', "program = 'printf'\narguments = [program, '%s', params[:value]]\nprogram.replace('sh')\nIO.popen(arguments)"),
+    ('unknown_program', "program = configured_program()\nsystem(program, '-c', params[:command])"),
+    ('unknown_option', "flag = configured_flag()\nsystem('sh', flag, params[:command])"),
+    ('shell_option_operand', "system('bash', '-o', 'errexit', '-c', params[:command])"),
+    ('ambiguous_argv', "arguments = ['printf', '%s', params[:value]]\narguments = ['cat', params[:value]] if enabled\nIO.popen(arguments)"),
+    ('oversized_argv', "IO.popen(['printf', " + ", ".join(["'fixed'"] * 63) + ", params[:value]])"),
+    ('splat_binding', "arguments = ['printf', '%s', params[:value]]\nsystem(*arguments)"),
+    ('compound_stdin', "Open3.capture3('cat | sh', stdin_data: params[:command])"),
+    ('included_process_override', '''
+        module SafeRunner
+          def system(command)
+            command
+          end
+        end
+        class Handler
+          include SafeRunner
+          def run
+            system(params[:command])
+          end
+        end'''),
+    ('prepended_process_override', '''
+        module SafeRunner
+          def system(command)
+            command
+          end
+        end
+        class Handler
+          prepend SafeRunner
+          def run
+            system(params[:command])
+          end
+        end'''),
+    ('interpolated_word_argv_data', 'IO.popen(%W[printf %s #{params[:value]}])'),
+    ('interpolated_word_argv_shell', 'IO.popen(%W[sh -c #{params[:command]}])'),
+    ('later_argument_mutates_executable',
+     "program = 'printf'\nsystem(program, program.replace(params[:program]))"),
+    ('later_argument_mutates_array', '''
+        def mode(arguments)
+          arguments[0] = '/bin/sh'
+          arguments[1] = '-c'
+          'r'
+        end
+        arguments = ['printf', '%s', params[:command]]
+        IO.popen(arguments, mode(arguments))'''),
+    ('later_argument_mutates_array_member', '''
+        program = 'printf'
+        arguments = [program, '-c', params[:command]]
+        def mode(program)
+          program.replace('sh')
+          'r'
+        end
+        IO.popen(arguments, mode(program))'''),
+    ('later_argument_mutates_interpreter_code',
+     "program = 'sh'\nflag = '-c'\ncode = 'true'\nsystem(program, flag, code, code.replace(params[:command]))"),
+    ('later_argument_mutates_literal_interpreter_code',
+     "code = 'true'\nsystem('sh', '-c', code, code.replace(params[:command]))"),
+    ('later_option_mutates_interpreter_stdin',
+     "code = 'true'\nOpen3.capture3('sh', stdin_data: code, binmode: code.replace(params[:command]))"),
+)
+
+
 class LoggedCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -2443,6 +2732,133 @@ class RubyRequestSourceTests(LoggedCase):
         }, indent=2) + '\n')
         self.assertTrue(report.is_file(), (command, result.returncode, result.stdout, result.stderr))
         return result, json.loads(report.read_text()), env
+
+    def test_process_call_cases(self):
+        for case in PROCESS_CASES:
+            with self.subTest(case=case.name):
+                _target, records = self.observe(case)
+                self.assertEqual(sorted((row['rule'], row['line']) for row in records),
+                                 [(case.rule, line) for line in case.lines], case.source)
+
+    def test_process_boundaries_are_explicitly_incomplete(self):
+        for name, source in PROCESS_BOUNDARIES:
+            with self.subTest(case=name):
+                with self.assertRaisesRegex(ValueError, 'incomplete'):
+                    self.observe(Case('process_boundary_' + name, SHELL_COMMAND, source, ()))
+
+    def test_native_process_dispatch_and_argument_boundaries(self):
+        names = {'included_process_override', 'prepended_process_override',
+                 'interpolated_word_argv_data', 'interpolated_word_argv_shell',
+                 'later_argument_mutates_executable', 'later_argument_mutates_array',
+                 'later_argument_mutates_array_member', 'later_argument_mutates_interpreter_code',
+                 'later_option_mutates_interpreter_stdin'}
+        for name, source in PROCESS_BOUNDARIES:
+            if name not in names:
+                continue
+            with self.subTest(case=name):
+                directory = self.artifact / ('native-boundary-' + name)
+                directory.mkdir()
+                target = directory / 'source.rb'
+                target.write_text('system(params[:known])\n' + Case(name, SHELL_COMMAND, source, ()).source)
+                result, payload, _env = self.native_scan(directory / 'result', target)
+                self.assertEqual((result.returncode, payload['status'], payload['critical'], payload['module_error']),
+                                 (2, 'partial', 1, 'ANALYZER_ERROR'), (name, payload, result.stderr))
+                rows = [row for row in payload['findings'] if row['severity'] == 'critical']
+                self.assertEqual([(row['rule'], row['line']) for row in rows], [(SHELL_COMMAND, 1)], payload)
+                self.assertEqual(payload['extras']['profile']['cache_hits'], 0, payload)
+
+    def test_process_rules_have_installed_explanations(self):
+        for rule in (SHELL_COMMAND, SHELL_ARGV, EXECUTABLE):
+            with self.subTest(rule=rule):
+                command = [sys.executable, '-m', 'ubs_core', 'explain', rule, '--format=json',
+                           '--repo-root=' + str(self.artifact)]
+                result = subprocess.run(command, cwd=self.artifact,
+                                        env={**os.environ, 'PYTHONPATH': str(HELPERS),
+                                             'PYTHONDONTWRITEBYTECODE': '1'},
+                                        text=True, capture_output=True, timeout=60)
+                (self.artifact / (rule + '.explain.json')).write_text(result.stdout)
+                self.assertEqual(result.returncode, 0, (command, result.stdout, result.stderr))
+                try:
+                    payload = json.loads(result.stdout)
+                except json.JSONDecodeError as error:
+                    self.fail(f'{rule} explanation is invalid JSON: {error}\n'
+                              f'stdout={result.stdout}\nstderr={result.stderr}')
+                self.assertEqual((payload['rule_id'], payload['language'], payload['severity']),
+                                 (rule, 'ruby', 'critical'), payload)
+                self.assertIn('executable', payload['remediation'], payload)
+
+    def test_native_process_json_sarif_and_selection(self):
+        names = {'process_system', 'process_helper_sink', 'process_Open3_capture3',
+                 'process_fixed_argv', 'process_open3_data_option', 'process_array_argv',
+                 'process_io_mode_is_not_argv', 'process_executable_alias',
+                 'process_shell_flag_alias', 'process_shell_positional_data',
+                 'process_local_method_control', 'process_bound_constant_alias',
+                 'process_later_option_rebinds_stdin_parameter', 'process_code_mode_ignores_mutated_stdin'}
+        for case in PROCESS_CASES:
+            if case.name not in names:
+                continue
+            with self.subTest(case=case.name):
+                directory = self.artifact / ('native-' + case.name)
+                directory.mkdir()
+                target = directory / 'selected source.rb'
+                target.write_text(case.source)
+                (directory / 'unselected.rb').write_text('system(params[:unselected])\n')
+                result, payload, env = self.native_scan(directory / 'json', target)
+                self.assertEqual((result.returncode, payload['status'], payload['files'], payload['critical']),
+                                 (int(bool(case.lines)), 'ok', 1, len(case.lines)), payload)
+                rows = [row for row in payload['findings'] if row['severity'] == 'critical']
+                self.assertEqual([(row['rule'], row['line']) for row in rows],
+                                 [(case.rule, line) for line in case.lines], payload)
+                converted = subprocess.run(
+                    [sys.executable, '-m', 'ubs_core', 'findings-sarif', '--combined',
+                     str(directory / 'json/result.json')], cwd=target.parent, env=env,
+                    text=True, capture_output=True, timeout=60)
+                (directory / 'result.sarif').write_text(converted.stdout)
+                (directory / 'sarif.stderr.log').write_text(converted.stderr)
+                self.assertEqual(converted.returncode, 0, converted.stderr)
+                try:
+                    sarif = json.loads(converted.stdout)
+                except json.JSONDecodeError as error:
+                    self.fail(f'{case.name} converter output is invalid SARIF JSON: {error}\n'
+                              f'stdout={converted.stdout}\nstderr={converted.stderr}')
+                rows = [row for run in sarif['runs'] for row in run.get('results', [])
+                        if row.get('level') == 'error']
+                self.assertEqual([(row['ruleId'], row['locations'][0]['physicalLocation']['region']['startLine'])
+                                  for row in rows], [(case.rule, line) for line in case.lines], sarif)
+
+    def test_native_process_cache_suppression_category_and_partial(self):
+        directory = self.artifact / 'native-process-policy'
+        directory.mkdir()
+        target = directory / 'selected.rb'
+        unsafe = 'command = params[:command]\nsystem(command)\n'
+        safe = "command = params[:command]\nsystem('printf', '%s', command)\n"
+        for attempt, (source, count, hits) in enumerate(((unsafe, 1, 0), (unsafe, 1, 1),
+                                                       (safe, 0, 0), (safe, 0, 1))):
+            target.write_text(source)
+            result, payload, _env = self.native_scan(directory / str(attempt), target)
+            self.assertEqual((result.returncode, payload['status'], payload['critical']),
+                             (int(bool(count)), 'ok', count), (payload, result.stderr))
+            self.assertEqual(payload['extras']['profile']['cache_hits'], hits, payload)
+        for label, source, skip, count in (
+                ('deduplicated', 'system("printf #{params[:value]}")\n', '', 1),
+                ('suppressed', 'system(params[:command]) # ubs:ignore[ruby.security.shell-single-string]\n', '', 0),
+                ('unrelated', 'system(params[:command]) # ubs:ignore[ruby.security.eval-family]\n', '', 1),
+                ('disabled', unsafe, '6', 0)):
+            with self.subTest(case=label):
+                target.write_text(source)
+                result, payload, _env = self.native_scan(directory / label, target, skip=skip)
+                self.assertEqual((result.returncode, payload['status'], payload['critical']),
+                                 (int(bool(count)), 'ok', count), payload)
+        target.write_text('system(params[:known])\n' + PROCESS_BOUNDARIES[0][1] + '\n')
+        for attempt in range(2):
+            result, payload, _env = self.native_scan(directory / ('partial-' + str(attempt)), target)
+            self.assertEqual((result.returncode, payload['status'], payload['critical'], payload['module_error']),
+                             (2, 'partial', 1, 'ANALYZER_ERROR'), payload)
+            self.assertEqual(payload['extras']['profile']['cache_hits'], 0, payload)
+            rows = [row for row in payload['findings'] if row['severity'] == 'critical']
+            self.assertEqual([(row['rule'], row['line']) for row in rows], [(SHELL_COMMAND, 1)], payload)
+        result, payload, _env = self.native_scan(directory / 'partial-disabled', target, skip='6')
+        self.assertEqual((result.returncode, payload['status'], payload['critical']), (0, 'ok', 0), payload)
 
     def test_request_content_cases(self):
         policies = {URL: 'url', 'ruby.redirect.open': 'redirect',
@@ -2981,6 +3397,24 @@ class RubyPublicTests(LoggedCase):
         for path in paths:
             from urllib.parse import unquote
             self.assertEqual(Path(unquote(path)).name, selected.name, payload)
+
+    def test_process_flow_reaches_public_json_and_sarif(self):
+        names = {'process_system', 'process_helper_sink', 'process_fixed_argv',
+                 'process_executable_alias', 'process_shell_flag_alias',
+                 'process_shell_positional_data', 'process_array_argv',
+                 'process_local_method_control'}
+        for case in PROCESS_CASES:
+            if case.name not in names:
+                continue
+            directory = self.artifact / case.name
+            directory.mkdir()
+            selected = directory / 'selected source.rb'
+            selected.write_text(case.source)
+            (directory / 'unselected.rb').write_text('system(params[:unselected])\n')
+            for fmt in ('json', 'sarif'):
+                with self.subTest(case=case.name, format=fmt):
+                    result, payload = self.scan(directory / fmt, selected, fmt)
+                    self.assert_findings(result, payload, case, fmt, selected)
 
     def test_selected_file_json_and_sarif_semantic_controls(self):
         names = ('url_direct', 'url_safe_named_identity', 'url_alpha_renamed_identity',

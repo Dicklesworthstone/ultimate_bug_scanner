@@ -50,7 +50,7 @@ HEADER_PROOFS = frozenset({'header-no-cr', 'header-no-lf'})
 HEADER_ENTRIES = frozenset({'header-entry-value', 'header-entry-location', 'header-entry-key',
                             'header-entry-unknown', 'header-map-known', 'header-map-implicit'})
 PROOF_TAGS = frozenset({'url-host', 'url-scheme', 'contained-path', 'redirect-slash-prefix', 'redirect-not-double-slash', 'safe-redirect'}) | HEADER_PROOFS
-VALUE_TAGS = PROOF_TAGS | HEADER_ENTRIES | frozenset({'canonical-path', 'parsed-uri', 'basename-path', 'not-dot-name', 'exact-literal', 'sql-bound-value', 'sql-integer-value'})
+VALUE_TAGS = PROOF_TAGS | HEADER_ENTRIES | frozenset({'canonical-path', 'parsed-uri', 'basename-path', 'not-dot-name', 'exact-literal', 'sql-bound-value', 'sql-integer-value', 'exact-process-vector'})
 PATH_RULE = 'ruby.taint.path_traversal'
 URL_RULE = 'ruby.taint.outbound_url'
 REDIRECT_RULE = 'ruby.redirect.open'
@@ -58,10 +58,27 @@ HEADER_RULE = 'ruby.header-injection.response'
 EVAL_RULE = 'ruby.security.eval-family'
 DISPATCH_RULE = 'ruby.security.dynamic-dispatch'
 COMMAND_RULE = 'ruby.security.backticks-interpolated'
+SHELL_COMMAND_RULE = 'ruby.security.shell-single-string'
+SHELL_ARGV_RULE = 'ruby.security.shell-interpreter-argv'
+EXECUTABLE_RULE = 'ruby.security.command-executable'
+PROCESS_RULES = frozenset({SHELL_COMMAND_RULE, SHELL_ARGV_RULE, EXECUTABLE_RULE})
+RULE_METADATA = {
+    rule: {
+        'language': 'ruby', 'category': 'ruby.security', 'category_id': 'ruby.security',
+        'severity': 'critical', 'confidence': 'unknown', 'message': message,
+        'remediation': 'Choose an allowlisted executable and pass request values as separate data arguments; '
+                       'do not forward request data into command strings, script paths or interpreter stdin.',
+    }
+    for rule, message in (
+        (SHELL_COMMAND_RULE, 'Request-derived subprocess command string'),
+        (SHELL_ARGV_RULE, 'Request-derived interpreter command or script'),
+        (EXECUTABLE_RULE, 'Request-derived subprocess executable'),
+    )
+}
 SQL_RULE = 'ruby.security.sql-injection'
-EXECUTION_RULES = frozenset({EVAL_RULE, DISPATCH_RULE, COMMAND_RULE})
+EXECUTION_RULES = frozenset({EVAL_RULE, DISPATCH_RULE, COMMAND_RULE}) | PROCESS_RULES
 API_CONSTANTS = frozenset(tuple(name.split('::')) for name in (
-    'File', 'IO', 'FileUtils', 'Dir', 'Pathname', 'URI', 'OpenURI',
+    'File', 'IO', 'FileUtils', 'Dir', 'Pathname', 'URI', 'OpenURI', 'Kernel', 'Process', 'Open3',
     'Net', 'Net::HTTP', 'Addressable', 'Addressable::URI', 'Rack', 'Rack::Request',
     'ActionDispatch', 'ActionDispatch::Request',
     'Faraday', 'HTTParty', 'RestClient', 'Excon', 'HTTP', 'Typhoeus', 'Curl',
@@ -852,6 +869,8 @@ def object_ids(fact, members=False):
 class RubyEngine:
     def __init__(self, path, text, policy='path'):
         self.path, self.text, self.policy = path, text, policy
+        self.track_process_vectors = bool(re.search(
+            r'\b(?:system|exec|spawn|popen|capture2|capture2e|capture3|popen2|popen2e|popen3)\b', text))
         self.parser = RubyParser(text)
         self.lines = [0, *(index + 1 for index, char in enumerate(text) if char == '\n')]
         self.budget, self.graphs = Budget(), {}
@@ -987,6 +1006,23 @@ class RubyEngine:
                     pending.append(name)
         self.sql_models = {owner for owner in self.constant_definitions | {('ActiveRecord', 'Base')}
                            if self.active_record_model(owner)}
+        self.process_mixin_scopes = set()
+
+        def process_mixins(statements):
+            for statement in statements:
+                tokens = statement.tokens
+                if (tokens and tokens[0].kind == 'code'
+                        and tokens[0].value in {'include', 'prepend', 'extend'}):
+                    return True
+                if (process_mixins(statement.body) or process_mixins(statement.alternate)
+                        or any(process_mixins(handler.body) for handler in statement.handlers)
+                        or process_mixins(statement.finalizer)):
+                    return True
+            return False
+
+        for function in self.parser.functions.values():
+            if function.scope and process_mixins(function.body):
+                self.process_mixin_scopes.add(function.owner)
         self.repeated_sites = set()
 
         def has_retry(statements):
@@ -1319,14 +1355,24 @@ class RubyEngine:
                             and (shallow or trace.kind != 'member'))
         return join(content, frozenset({Trace('object', (kind, offset, ()))}))
 
-    def collection(self, value, offset):
+    def collection(self, value, offset, elements=None):
         members = frozenset(replace(trace, kind='member') if trace.kind == 'object' else trace
-                            for trace in value)
-        return join(members, frozenset({Trace('object', ('array', offset, ()))}))
+                            for trace in value if trace.kind != 'process-vector')
+        result = join(members, frozenset({Trace('object', ('array', offset, ()))}))
+        if self.track_process_vectors and elements is not None and len(elements) <= 64:
+            depth = 1 + max((trace.key[0] for element in elements for trace in element
+                             if trace.kind == 'process-vector'), default=0)
+            # Bounded ordered snapshots distinguish argv from command strings.
+            # The existing alias mutation machinery removes their exactness
+            # tag, including writes through a contained string or helper.
+            if depth <= 2:
+                result = join(result, frozenset({Trace('process-vector', (depth, tuple(elements)),
+                    tags=frozenset({'exact-process-vector'}))}))
+        return result
 
     def elements(self, value):
         return frozenset(replace(trace, kind='object') if trace.kind == 'member' else trace
-                         for trace in value if trace.kind != 'object'
+                         for trace in value if trace.kind not in {'object', 'process-vector'}
                          and not (trace.kind == 'shape' and trace.key[0] in {'literal-list', 'mapped-list'}))
 
     def literal_value(self, tokens, shared=False):
@@ -1347,12 +1393,12 @@ class RubyEngine:
                 else:
                     value = join(value, shape('header-unknown-literal', tokens[0].start))
         elif len(tokens) == 1 and tokens[0].kind == 'words':
-            items = join(*(self.fresh(constant(word), 'string', tokens[0].start + index)
-                           for index, word in enumerate(tokens[0].value.split())))
-            value = self.collection(join(items, value), tokens[0].start)
+            items = tuple(self.fresh(constant(word), 'string', tokens[0].start + index)
+                          for index, word in enumerate(tokens[0].value.split()))
+            value = self.collection(join(*items, value), tokens[0].start, items)
         elif tokens[0].value == '[':
-            items = join(*(self.literal_value(part) for part in split_tokens(tokens[1:-1], {','}) if part))
-            value = self.collection(join(items, value), tokens[0].start)
+            items = tuple(self.literal_value(part) for part in split_tokens(tokens[1:-1], {','}) if part)
+            value = self.collection(join(*items, value), tokens[0].start, items)
         if shared:
             value = frozenset(replace(trace, tags=trace.tags | frozenset({'shared-allocation'}))
                               if trace.kind in {'object', 'member'} else trace for trace in value)
@@ -1636,20 +1682,52 @@ class RubyEngine:
             if owner is None:
                 return []
             singleton = True
-        names, pending = {method}, [method]
-        while pending:
-            for alias in self.parser.aliases.get((owner, singleton, pending.pop()), ()):
-                if alias not in names:
-                    names.add(alias)
-                    pending.append(alias)
+        def definitions(selected_owner, selected_singleton):
+            names, pending = {method}, [method]
+            while pending:
+                for alias in self.parser.aliases.get((selected_owner, selected_singleton, pending.pop()), ()):
+                    if alias not in names:
+                        names.add(alias)
+                        pending.append(alias)
+            return [function for function in self.parser.functions.values()
+                    if not function.scope and function.name in names and function.owner == selected_owner
+                    and function.singleton == selected_singleton]
+
         def accepts(function):
+            if count is None:
+                return True
             if 'rest' in function.parameter_kinds:
                 return True
             required = sum(not default for default in function.defaults) if function.defaults else len(function.parameters)
             return required <= count <= len(function.parameters)
-        matches = [function for function in self.parser.functions.values()
-                   if not function.scope and function.name in names and function.owner == owner
-                   and function.singleton == singleton and accepts(function)]
+        if method in {'system', 'exec', 'spawn'} and name in {method, 'self.' + method}:
+            if self.process_mixin_dispatch(name):
+                return []
+            # A visible superclass or Kernel instance override wins over the
+            # inherited builtin, including when its arity makes the call fail.
+            # This targeted lookup does not invent bodies for external classes.
+            selected_owner, visited = owner, set()
+            while selected_owner not in visited:
+                self.budget.spend()
+                visited.add(selected_owner)
+                choices = definitions(selected_owner, singleton)
+                if choices:
+                    return [function for function in choices if accepts(function)]
+                bases = self.parser.class_bases.get(selected_owner, ())
+                if len(bases) != 1 or len(visited) >= 64:
+                    break
+                lexical, base = next(iter(bases))
+                if not re.fullmatch(r'(?:::)?[A-Z]\w*(?:::[A-Z]\w*)*', base):
+                    break
+                selected_owner = self.constant_identity(self.constant_owner(base, lexical))
+                if selected_owner is None:
+                    break
+            for selected_owner in ((), ('Kernel',)):
+                choices = definitions(selected_owner, False)
+                if choices:
+                    return [function for function in choices if accepts(function)]
+            return []
+        matches = [function for function in definitions(owner, singleton) if accepts(function)]
         if not matches and '.' not in name and owner:
             matches = [function for function in self.parser.functions.values()
                        if not function.scope and function.name == name and not function.owner
@@ -1768,6 +1846,249 @@ class RubyEngine:
                 continue
             return None
         return next(iter(names))
+
+    @staticmethod
+    def process_vector(value):
+        vectors = [trace for trace in value if trace.kind == 'process-vector']
+        kinds = {trace.key[0] for trace in value if trace.kind == 'object'}
+        if (kinds == {'array'} and not has_shape(value, 'ruby-hash') and len(vectors) == 1
+                and 'exact-process-vector' in vectors[0].tags):
+            return vectors[0].key[1]
+        return None
+
+    def process_literal(self, value):
+        # Header analysis carries an extra decoded-string fact. It must not
+        # change which executable/option the other policies resolve. Unknown
+        # Ruby escape sequences cannot prove that an executable is not a shell.
+        value = frozenset(trace for trace in value if not (
+            trace.kind == 'constant' and trace.key[0] == 'header-string'))
+        literal = self.dispatch_target(value)
+        if (literal is not None and '\\' not in literal
+                and not any(trace.kind == 'constant' and trace.key[0] == 'symbol' for trace in value)):
+            return literal
+        return None
+
+    def process_mixin_dispatch(self, name):
+        method = name.rsplit('.', 1)[-1]
+        if method not in {'system', 'exec', 'spawn'} or name not in {method, 'self.' + method}:
+            return False
+        owner, visited = self.function.owner, set()
+        while owner not in visited:
+            self.budget.spend()
+            visited.add(owner)
+            if owner in self.process_mixin_scopes:
+                return True
+            bases = self.parser.class_bases.get(owner, ())
+            if len(bases) != 1 or len(visited) >= 64:
+                break
+            lexical, base = next(iter(bases))
+            if not re.fullmatch(r'(?:::)?[A-Z]\w*(?:::[A-Z]\w*)*', base):
+                break
+            owner = self.constant_identity(self.constant_owner(base, lexical))
+            if owner is None:
+                break
+        return bool(self.process_mixin_scopes & {(), ('Kernel',)})
+
+    def captured_process_change(self, value, state):
+        """Check earlier captured references after all call arguments ran.
+
+        An argument keeps its old object through a variable rebinding, but a
+        later argument can mutate that object. Compare the captured object and
+        ordered member snapshots with live aliases; never evaluate syntax twice.
+        Unknown changed layouts remain partial rather than borrowing stale proof.
+        """
+        snapshots = {}
+
+        def collect(fact):
+            plain = frozenset(trace for trace in fact if trace.kind != 'keyword')
+            for identity in object_ids(plain):
+                snapshots.setdefault(identity, []).append(plain)
+            vector = self.process_vector(plain)
+            if vector is not None:
+                for element in vector:
+                    collect(element)
+
+        collect(value)
+        changed = CLEAN
+        for current in state.values():
+            self.budget.spend()
+            for identity in object_ids(current):
+                # A joined capture can contain more possible values than an
+                # older alias such as @result. Compare this object's identity
+                # proof and new request content, not unrelated joined values.
+                # mutate() invalidates proof on the object root even when its
+                # replacement is a clean literal.
+                roots = frozenset(trace for trace in current if (trace.kind, trace.key) == identity)
+                if any(roots != frozenset(trace for trace in previous
+                                         if (trace.kind, trace.key) == identity)
+                       or not tainted(current) <= tainted(previous)
+                       for previous in snapshots.get(identity, ())):
+                    changed = join(changed, current)
+        return changed
+
+    def process_call(self, name, arguments, token, state):
+        """Select Ruby process operands after local method resolution.
+
+        Kernel and Open3 take an optional environment hash, then an executable
+        and argv (or one command string), then options. IO.popen instead takes
+        one string/array command followed by a mode; that mode is never argv.
+        Ordered arrays retain bounded snapshots, invalidated on alias mutation.
+        """
+        method = name.rsplit('.', 1)[-1]
+        kernel = name in {prefix + method for prefix in ('', 'self.', 'Kernel.')}
+        selected = ((kernel and method in {'system', 'exec', 'spawn'})
+                    or name in {'Process.spawn', 'Process.exec', 'IO.popen'}
+                    or name == 'Open3.' + method and method in {
+                        'capture2', 'capture2e', 'capture3', 'popen2', 'popen2e', 'popen3'})
+        if not selected:
+            return None
+        # A visible override with the wrong arity raises; it does not fall
+        # through to Kernel. Matching bodies were already summarized by call().
+        if self.candidates(name, None):
+            return shape('process-result', token.start)
+        all_values = join(*arguments)
+
+        def incomplete(reason):
+            if tainted(all_values):
+                self.unresolved_calls.add(
+                    f'{self.path}:{self.step(token.start, "call", name).line}: '
+                    f'Ruby process {reason}; analysis is incomplete')
+
+        if self.process_mixin_dispatch(name):
+            incomplete('method lookup through include/prepend/extend needs mixin dispatch analysis')
+            return self.fresh(retag(all_values, remove=VALUE_TAGS), 'unknown', token.start)
+
+        keywords = {}
+        positional = []
+        for argument in arguments:
+            labels = [trace.key[0] for trace in argument if trace.kind == 'keyword']
+            if labels:
+                for label in labels:
+                    keywords[label] = join(keywords.get(label, CLEAN), frozenset(
+                        trace for trace in argument if trace.kind != 'keyword'))
+            else:
+                positional.append(argument)
+        if positional and (has_shape(positional[0], 'ruby-hash') or any(
+                has_shape(positional[0], kind) for kind in REQUEST_MAP_SHAPES)):
+            positional.pop(0)
+        options = CLEAN
+        if positional and has_shape(positional[-1], 'ruby-hash'):
+            options = positional.pop()
+        if not positional:
+            return shape('process-result', token.start)
+        command = positional[0]
+        changed = self.captured_process_change(command, state)
+        if changed:
+            all_values = join(all_values, changed)
+            incomplete('captured command was changed by a later argument')
+            return self.fresh(retag(all_values, remove=VALUE_TAGS), 'unknown', token.start)
+        argv = positional[1:]
+        array_command = any(trace.kind == 'object' and trace.key[0] == 'array' for trace in command)
+        if name == 'IO.popen':
+            if len(argv) > 1:
+                incomplete('IO.popen signature needs a single optional mode')
+            argv = []
+            if array_command:
+                vector = self.process_vector(command)
+                if vector is None:
+                    incomplete('command array needs an unchanged ordered argv')
+                    return self.fresh(retag(all_values, remove=VALUE_TAGS), 'process-output', token.start)
+                vector = list(vector)
+                if vector and has_shape(vector[0], 'ruby-hash'):
+                    vector.pop(0)
+                if vector and has_shape(vector[-1], 'ruby-hash'):
+                    options = join(options, vector.pop())
+                if not vector:
+                    return shape('process-result', token.start)
+                command, argv = vector[0], vector[1:]
+                array_command = any(trace.kind == 'object' and trace.key[0] == 'array' for trace in command)
+        explicit_executable = bool(argv) or name == 'IO.popen' and self.process_vector(positional[0]) is not None
+        if array_command:
+            vector = self.process_vector(command)
+            if vector is None or len(vector) != 2:
+                incomplete('executable/display-name pair needs two unchanged ordered values')
+                return self.fresh(retag(all_values, remove=VALUE_TAGS), 'process-output', token.start)
+            command = vector[0]  # argv[0]'s display name cannot select a program.
+            explicit_executable = True
+        if not explicit_executable:
+            if tainted(command):
+                self.execution_sink(token.start, command, SHELL_COMMAND_RULE,
+                                    name + ' request-derived command string', state)
+        elif tainted(command):
+            self.execution_sink(token.start, command, EXECUTABLE_RULE,
+                                name + ' request-selected executable', state)
+        program = self.process_literal(command)
+        if program is None:
+            # Provenance alone does not identify a clean executable: it could
+            # select an interpreter. A reported attacker-selected command is
+            # already a terminal execution boundary, not a missing analysis.
+            if not tainted(command) and tainted(join(*argv, keywords.get('stdin_data', CLEAN), options)):
+                incomplete('executable identity is unresolved for request-derived argv/stdin')
+        else:
+            if (not explicit_executable and not re.fullmatch(r'[A-Za-z0-9_./+-]+', program)
+                    and tainted(join(keywords.get('stdin_data', CLEAN), options))):
+                incomplete('compound command stdin needs shell syntax analysis')
+            executable = program.rsplit('/', 1)[-1].lower()
+            posix = executable in {'sh', 'bash', 'dash', 'zsh', 'ksh', 'ash'}
+            windows = executable in {'cmd', 'cmd.exe', 'powershell', 'powershell.exe', 'pwsh', 'pwsh.exe'}
+            if posix or windows:
+                changed = join(*(self.captured_process_change(argument, state) for argument in argv))
+                if changed:
+                    all_values = join(all_values, changed)
+                    incomplete('captured interpreter operands were changed by a later argument')
+                    return self.fresh(retag(all_values, remove=VALUE_TAGS), 'unknown', token.start)
+                code, read_stdin, selected_operand = CLEAN, not argv, False
+                for index, argument in enumerate(argv):
+                    option = self.process_literal(argument)
+                    if option in {'-o', '+o', '-O', '+O', '--rcfile', '--init-file', '-File', '-file', '-f'}:
+                        incomplete('interpreter option operands need a supported signature')
+                        selected_operand = True
+                        break
+                    command_flag = (bool(option and re.fullmatch(r'-[a-zA-Z]*c[a-zA-Z]*', option))
+                                    if posix else option is not None and option.lower() in {
+                                        '/c', '/k', '-command', '-encodedcommand', '-c', '-enc'})
+                    if command_flag:
+                        if index + 1 < len(argv):
+                            code = (join(*argv[index + 1:]) if windows and option.lower() in {
+                                '/c', '/k', '-command', '-c'} else argv[index + 1])
+                            selected_operand = True
+                        read_stdin = False
+                        break
+                    if posix and option is not None and re.fullmatch(r'-[a-zA-Z]*s[a-zA-Z]*', option):
+                        read_stdin, selected_operand = True, True
+                        continue
+                    if option == '--':
+                        if index + 1 < len(argv) and not read_stdin:
+                            code = argv[index + 1]
+                            selected_operand = True
+                        read_stdin = read_stdin or index + 1 == len(argv)
+                        break
+                    if option is None or not option.startswith('-' if posix else ('-', '/')):
+                        if not read_stdin:
+                            code, selected_operand = argument, True
+                            if option is None and not tainted(argument):
+                                incomplete('interpreter option identity is unresolved')
+                        break
+                if posix and not selected_operand and not code:
+                    read_stdin = True
+                if read_stdin:
+                    stdin_data = keywords.get('stdin_data', CLEAN)
+                    changed = self.captured_process_change(stdin_data, state)
+                    if changed:
+                        all_values = join(all_values, changed)
+                        incomplete('captured interpreter stdin was changed by a later argument')
+                        return self.fresh(retag(all_values, remove=VALUE_TAGS), 'unknown', token.start)
+                    code = join(code, stdin_data)
+                    if tainted(options):
+                        incomplete('interpreter stdin options need resolved keys')
+                if tainted(code):
+                    self.execution_sink(token.start, code, SHELL_ARGV_RULE,
+                                        name + ' request-derived interpreter input', state)
+        # system/exec/spawn return status/PID metadata, not command contents.
+        # Captured output and IO handles retain conservative data provenance.
+        if method in {'system', 'exec', 'spawn'}:
+            return shape('process-result', token.start)
+        return self.fresh(retag(all_values, remove=VALUE_TAGS), 'process-output', token.start)
 
     def mutate(self, previous, value, state, name=None, overwrite=False):
         """Update object aliases; copied data does not imply shared identity.
@@ -2035,6 +2356,9 @@ class RubyEngine:
         method = name.rsplit('.', 1)[-1]
         value = join(receiver, *arguments)
         self.pending_raises = join(self.pending_raises, self.exception_value(value, '*'))
+        process_result = self.process_call(name, arguments, token, state)
+        if process_result is not None:
+            return process_result
         if method == 'new':
             owner = tuple(name.rsplit('.', 1)[0].split('::'))
             if any(function.scope and function.owner == owner for function in self.parser.functions.values()):
@@ -2295,8 +2619,12 @@ class RubyEngine:
                 if token.kind == 'dynamic' and tainted(atom):
                     atom = self.execution_sink(token.start, atom, COMMAND_RULE,
                                                'request-derived shell command', state)
-                atom = self.fresh(retag(self.without_sql_api(atom),
-                                        remove=frozenset({'sql-raw-fragment'})), 'string', token.start)
+                atom = retag(self.without_sql_api(atom), remove=frozenset({'sql-raw-fragment'}))
+                # %W interpolates into an array, not into one command string.
+                # Until word boundaries/escapes are modelled, preserve its
+                # aggregate array identity without an exact argv descriptor.
+                atom = (self.collection(atom, token.start) if self.text[token.start:token.start + 2] == '%W'
+                        else self.fresh(atom, 'string', token.start))
                 cursor += 1
                 name = ''
             elif token.kind in {'literal', 'number', 'words', 'regex'}:
@@ -2305,11 +2633,16 @@ class RubyEngine:
                 name = ''
             elif token.value in {'(', '[', '{'}:
                 end = closing_token(tokens, cursor)
+                items = None
+                if token.value == '[':
+                    items = tuple(self.expression(part, state, depth + 1)
+                                  for part in split_tokens(tokens[cursor + 1:end], {','}) if part)
                 atom = (self.header_mapping(tokens[cursor + 1:end], state, depth)
                         if self.policy in {'header', 'redirect'} and token.value == '{'
+                        else join(*items) if items is not None
                         else join(*(self.expression(part, state, depth + 1) for part in split_tokens(tokens[cursor + 1:end], {','}))))
                 if token.value in {'[', '{'}:
-                    atom = self.collection(atom, token.start)
+                    atom = self.collection(atom, token.start, items)
                     if token.value == '{':
                         atom = join(atom, shape('ruby-hash', token.start))
                 cursor, name = end + 1, ''
@@ -2972,6 +3305,11 @@ def flow_findings_from_text(path, text, policy):
         if rule in EXECUTION_RULES:
             extras['terminal_sink'] = True
             extras['analysis_boundary'] = 'Request-derived execution is reported at this call; runtime code and dispatch bodies are not interpreted.'
+            if rule in PROCESS_RULES:
+                extras['process_input'] = ('executable' if rule == EXECUTABLE_RULE
+                                           else 'interpreter-code' if rule == SHELL_ARGV_RULE else 'command-string')
+                extras['remediation'] = ('Choose an allowlisted executable and pass request values as separate data arguments; '
+                                         'do not forward request data into shell code, script paths or interpreter stdin.')
         elif rule == SQL_RULE:
             extras['query_argument'] = 0
             extras['analysis_boundary'] = 'Request-derived SQL text reaches a bound ActiveRecord connection; separate value bindings do not sanitize the query text.'

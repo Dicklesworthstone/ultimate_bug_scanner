@@ -298,6 +298,27 @@ cached as complete. The per-source limits are 100,000 tokens, 96 nesting levels
 and 500,000 steps, configurable through `UBS_CSHARP_SQL_MAX_TOKENS`,
 `UBS_CSHARP_SQL_MAX_NESTING` and `UBS_CSHARP_SQL_MAX_STEPS`.
 
+#### Ruby subprocess request flow
+
+Ruby's scoped security pass follows request values through aliases and same-file
+helpers into actual `Kernel.system`, `exec`, `spawn`, `Process` process calls,
+`IO.popen`, and selected `Open3.capture*`/`popen*` APIs. It distinguishes a command
+string, an attacker-selected executable, and supported shell-interpreter code,
+script paths or `Open3` input supplied through `stdin_data`. Ordinary data
+arguments to a fixed executable retain their separate role.
+
+The findings use `ruby.security.shell-single-string`,
+`ruby.security.shell-interpreter-argv` and `ruby.security.command-executable`.
+Visible local and superclass overrides are resolved before identifying builtin
+process calls. JSON/SARIF traces, category selection, exact rule suppression,
+incremental caching and `ubs explain ruby.security.command-executable` work
+through the ordinary Ruby scanner.
+
+The model supports bounded literal argument arrays. Unresolved mixin dispatch,
+interpolated `%W` arrays and captured command/argument objects mutated by later
+arguments remain explicit partial-analysis boundaries. Separate proven findings
+survive these boundaries, and partial results are not cached as complete.
+
 #### PHP request flow and template output
 
 PHP and PHTML files are scanned by a bounded native analyzer without requiring

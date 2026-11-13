@@ -101,6 +101,9 @@ _SUMMARY_TITLES: dict[str, str] = {
     "ruby.taint.path_traversal": "Request-derived path reaches file read/write/serve sink",
     "ruby.taint.outbound_url": "Request-derived URL reaches outbound HTTP client",
     "ruby.security.dynamic-dispatch": "Request-derived Ruby method dispatch or definition",
+    "ruby.security.shell-single-string": "Request-derived subprocess command string",
+    "ruby.security.shell-interpreter-argv": "Request-derived interpreter command or script",
+    "ruby.security.command-executable": "Request-derived subprocess executable",
     "ruby.security.sql-injection": "Request-derived SQL reaches ActiveRecord execution",
     # run_async_error_checks (ASYNC_ERROR_SUMMARY)
     "ruby.async.thread-no-rescue": "Thread.new block lacks rescue",

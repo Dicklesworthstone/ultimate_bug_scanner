@@ -1,0 +1,141 @@
+# UNAPPLIED regression oracle for GitHub issue #218.
+# Base commit: 71255b1345d44e89a1f7208e58579b4c2ced5d0f
+# Base test file blob: 2f7c2ebe16f396185283128b555fdbf35509cbaf
+# Reconstructed from the exact recorded manual edit after executor loss.
+# DSR rust_signature_probe was started on the incumbent, but no result was
+# observed before the execution environment became unavailable. These tests
+# have not been validated, and no Rust production implementation was made.
+#
+# Proposed behavior: retain ambiguous bare sig/signature map-key comparisons
+# as warnings, while independent secret/authentication evidence remains
+# critical. A warning is uncertainty, not proof that the value is public.
+# Implementation still needs public JSON/SARIF, cache, suppression and
+# default-versus-fail-on-warning exit checks, plus the existing quality gates.
+diff --git a/test-suite/quality/test_security_precision.py b/test-suite/quality/test_security_precision.py
+--- a/test-suite/quality/test_security_precision.py
++++ b/test-suite/quality/test_security_precision.py
+@@ -4305,7 +4305,124 @@
+ fn timing_safe(expected_signature: &[u8], provided: &[u8]) -> bool {
+     expected_signature.ct_eq(provided).into()
+ }
+ '''
++    PUBLIC_SIGNATURES = '''use std::collections::BTreeMap;
++
++pub fn still_pending(
++    model: &BTreeMap<String, String>,
++    entries: &[BTreeMap<String, String>],
++) -> bool {
++    let Some(original) = model.get("sig") else {
++        return false;
++    };
++    entries.iter().any(|entry| {
++        let candidate = entry.get("sig");
++        candidate == Some(original)
++    })
++}
++'''
++
++    def classified_sites(self, source: str) -> list[tuple[int, str]]:
++        """Exercise the analyzer's existing public records, retaining inputs."""
++        from ubs_core.registry import RunContext
++
++        artifacts = REPO_ROOT / "test-suite" / "artifacts"
++        artifacts.mkdir(exist_ok=True)
++        root = Path(tempfile.mkdtemp(prefix="rust-signature-evidence-", dir=artifacts))
++        path = root / "source.rs"
++        path.write_text(source, encoding="utf-8")
++        records = list(ctcompare_rust.run(RunContext(lang="rust", files=[path])))
++        self.assertTrue(all(row["rule"] == "rust.ctcompare.secret_compare" for row in records), records)
++        return [(row["line"], row["severity"]) for row in records]
++
++    def test_bare_signature_map_keys_are_review_warnings(self) -> None:
++        # A string key alone does not distinguish public transaction IDs from
++        # authentication material. Keep a visible review finding, not a claim
++        # that the value is secret or that the comparison is proven safe.
++        self.assertEqual(self.classified_sites(self.PUBLIC_SIGNATURES), [(12, "warning")])
++        for key in ("sig", "signature", "SIG", "Signature"):
++            for expression in (f'row.get("{key}")', f'row["{key}"]',
++                               f'row.get_mut("{key}")', f'row.get(r#"{key}"#)'):
++                with self.subTest(expression=expression):
++                    source = ('fn contains(row: Row, other: Value) {\n'
++                              f'    let value = {expression};\n'
++                              '    let alias = value;\n'
++                              '    alias != other;\n}\n')
++                    self.assertEqual(self.classified_sites(source), [(4, "warning")])
++        direct = ('fn contains(row: Row, other: Value) {\n'
++                  '    row.get("sig") == other;\n'
++                  '    row["signature"] != other;\n}\n')
++        self.assertEqual(self.classified_sites(direct), [(2, "warning"), (3, "warning")])
++
++    def test_signature_authentication_evidence_stays_critical(self) -> None:
++        bodies = (
++            ('qualified-key', '    let value = row.get("webhook_signature");\n'
++             '    value == supplied;\n'),
++            ('hmac-key', '    row.get("hmac_sig") != supplied;\n'),
++            ('auth-token', '    row.get("auth_token") == supplied;\n'),
++            ('environment', '    let value = std::env::var("SIG");\n'
++             '    value != supplied;\n'),
++            ('signature-binding', '    let signature = row.get("sig");\n'
++             '    signature == supplied;\n'),
++            ('sig-binding', '    let sig = row.get("signature");\n'
++             '    sig != supplied;\n'),
++            ('expected-operand', '    let value = row.get("sig");\n'
++             '    value == expected_signature;\n'),
++            ('keyed-output', '    let value = row.get("signature");\n'
++             '    let expected = hmac.finalize().into_bytes();\n'
++             '    value == expected;\n'),
++            ('later-secret-write', '    let value = row.get("sig");\n'
++             '    value = row.get("api_key");\n'
++             '    value == supplied;\n'),
++            ('earlier-secret-write', '    let value = row.get("api_key");\n'
++             '    value = row.get("sig");\n'
++             '    value == supplied;\n'),
++            ('mixed-clause', '    let value = row.get("sig");\n'
++             '    value == supplied && expected_signature == supplied;\n'),
++        )
++        for name, body in bodies:
++            with self.subTest(case=name):
++                source = 'fn compare(row: Row, supplied: Value) {\n' + body + '}\n'
++                line = next(number for number, text in enumerate(source.splitlines(), 1)
++                            if ' == ' in text or ' != ' in text)
++                self.assertEqual(self.classified_sites(source), [(line, "critical")])
++        for name in ("verify", "verify_signature", "authenticate", "verifyWebhook"):
++            with self.subTest(function=name):
++                source = (f'fn {name}(\n    row: Row,\n    supplied: Value,\n) -> bool {{\n'
++                          '    let value = row.get("sig");\n'
++                          '    value == supplied\n}\n')
++                self.assertEqual(self.classified_sites(source), [(6, "critical")])
++
++    def test_signature_lookup_scope_alias_and_lexical_boundaries(self) -> None:
++        source = '''fn verify_signature(row: Row, supplied: Value) {
++    let candidate = row.get("sig");
++    candidate == supplied;
++}
++fn contains(row: Row, supplied: Value) {
++    let candidate = row.get("sig");
++    // verify_signature(candidate, supplied) is documentation only.
++    let description = "authenticate(row.get(\\\"sig\\\"))";
++    candidate == supplied;
++}
++fn other(candidate: Value, supplied: Value) {
++    candidate == supplied;
++}
++fn safe(row: Row, supplied: Value) {
++    let candidate = row.get("sig");
++    candidate.is_none() == true;
++    candidate == None;
++    candidate.ct_eq(supplied);
++}
++'''
++        self.assertEqual(self.classified_sites(source), [(3, "critical"), (9, "warning")])
++        for marker, expected in (("rust.security.constant-time-compare", []),
++                                 ("rust.security.other", [(4, "warning")])):
++            with self.subTest(marker=marker):
++                marked = ('fn contains(row: Row, supplied: Value) {\n'
++                          '    let candidate = row.get("sig");\n'
++                          f'    // ubs:ignore[{marker}]\n'
++                          '    candidate == supplied;\n}\n')
++                self.assertEqual(self.classified_sites(marked), expected)
+ 
+     def expected_sites(self, source: str) -> list[tuple[int, str]]:
+         return [(number, line.strip()) for number, line in enumerate(source.splitlines(), 1)

@@ -1,0 +1,213 @@
+Unapplied PHP Location redirect oracle
+
+Base: 71255b1345d44e89a1f7208e58579b4c2ced5d0f
+Base test blob: b4dd127f8095800db29d0333bbf660c4431d8f83
+Status: preserved after the execution workspace disconnected. No production
+implementation is included. The DSR baseline was launched, but no result was
+recovered. The public module/runner JSON/SARIF cases have NOT been executed.
+The cases were reviewed against native PHP header parameter and URL semantics;
+PHP and the independent Node URL witnesses were not executed in this session.
+
+39 source cases and an actual CLI policy/cache test extend the existing suite.
+Rule/category names are proposed, not registered on main. Before activation,
+run the oracle against the incumbent, implement bounded request/receiver flow,
+add status/header lifetime controls, and run both native and public PHP suites.
+In particular, an isolated response_code=200/201 is not a lasting safety proof:
+later http_response_code or replacement headers can change the final response.
+URL encoding and numeric conversion do not make a user-selected host safe.
+Do not relax known unsafe cases, completeness gates, or public format checks.
+
+Apply to the exact base with git apply --check, then git apply; this archival
+file does not alter active scanner behavior or activate a failing test gate.
+
+--- a/test-suite/quality/test_php_taint.py
++++ b/test-suite/quality/test_php_taint.py
+@@ -32,2 +32,3 @@
+     "xss": "php.security.xss",
++    "redirect": "php.security.open-redirect",
+ }
+@@ -40,2 +41,3 @@
+     RULES["xss"]: "php.output",
++    RULES["redirect"]: "php.redirect",
+ }
+@@ -784,4 +786,155 @@
+ CASES = (*CASES, *NAMED_CASES)
+ 
+ 
++# Native Location headers accept relative and absolute destinations. These
++# source-level expectations precede the implementation: fixed destinations,
++# fixed origins and encoded path components cannot choose another origin;
++# HTML escaping and a slash alone do not establish that property.
++# https://www.php.net/manual/en/function.header.php
++REDIRECT_CASES = (
++    Case("redirect_request", """
++        header('Location: ' . $_GET['next']); // expect: redirect header
++    """),
++    Case("redirect_alias", """
++        $next = $_POST['next'];
++        $saved = $next;
++        $next = '/account';
++        header('Location: ' . $saved); // expect: redirect header
++    """),
++    Case("redirect_literal_kill", """
++        $next = $_GET['next'];
++        $next = '/account';
++        header('Location: ' . $next);
++    """),
++    Case("redirect_local_helper", """
++        function destination($value) { return $value; }
++        header('Location: ' . destination($_GET['next'])); // expect: redirect header
++    """),
++    Case("redirect_helper_sink", """
++        function sendTo($target) {
++            header('Location: ' . $target); // expect: redirect header
++        }
++        sendTo($_GET['next']);
++    """),
++    Case("redirect_safe_name_is_not_proof", """
++        function safeRedirect($value) { return $value; }
++        header('Location: ' . safeRedirect($_GET['next'])); // expect: redirect header
++    """),
++    Case("redirect_strict_allowlist", """
++        $next = $_GET['next'];
++        if (!in_array($next, ['/account', '/help'], true)) { exit; }
++        header('Location: ' . $next);
++    """),
++    Case("redirect_branch_join", """
++        $next = '/account';
++        if ($_GET['forward']) { $next = $_GET['next']; }
++        header('Location: ' . $next); // expect: redirect header
++    """),
++    Case("redirect_html_escape_is_not_proof", """
++        header('Location: ' . htmlspecialchars($_GET['next'], ENT_QUOTES)); // expect: redirect header
++    """),
++    Case("redirect_component_encoding", """
++        header('Location: ' . rawurlencode($_GET['next']));
++    """),
++    Case("redirect_encoded_root_component", """
++        header('Location: /' . rawurlencode($_GET['next']));
++    """),
++    Case("redirect_encoded_authority_is_not_proof", """
++        header('Location: https://' . rawurlencode($_GET['host'])); // expect: redirect header
++    """),
++    Case("redirect_numeric_authority_is_not_proof", """
++        header('Location: //' . intval($_GET['host'])); // expect: redirect header
++    """),
++    Case("redirect_encoded_scheme_is_not_proof", """
++        header('Location: ' . rawurlencode($_GET['scheme']) . '://evil.test/'); // expect: redirect header
++    """),
++    Case("redirect_decode_revokes_encoding", """
++        header('Location: ' . rawurldecode(rawurlencode($_GET['next']))); // expect: redirect header
++    """),
++    Case("redirect_single_slash_is_not_proof", """
++        header('Location: /' . $_GET['next']); // expect: redirect header
++    """),
++    Case("redirect_single_backslash_is_not_proof", r"""
++        header('Location: \\' . $_GET['next']); // expect: redirect header
++    """),
++    Case("redirect_mixed_slashes_are_not_proof", r"""
++        header('Location: /\\' . $_GET['next']); // expect: redirect header
++    """),
++    Case("redirect_embedded_tab_does_not_anchor_path", r"""
++        header("Location: /\t" . $_GET['next']); // expect: redirect header
++    """),
++    Case("redirect_fixed_path", """
++        header('Location: /account/' . $_GET['next']);
++    """),
++    Case("redirect_fixed_relative_directory", """
++        header('Location: account/' . $_GET['next']);
++    """),
++    Case("redirect_fixed_origin", """
++        header('Location: https://example.test/account?next=' . $_GET['next']);
++    """),
++    Case("redirect_unterminated_authority", """
++        header('Location: https://example.test' . $_GET['next']); // expect: redirect header
++    """),
++    Case("redirect_request_host", """
++        header('Location: https://' . $_SERVER['HTTP_HOST'] . '/account'); // expect: redirect header
++    """),
++    Case("redirect_query_only", """
++        header('Location: ?next=' . $_GET['next']);
++    """),
++    Case("redirect_numeric_target", """
++        header('Location: ' . intval($_GET['next']));
++    """),
++    Case("redirect_split_case_insensitive_header", """
++        header('LoCa' . 'TiOn:' . $_GET['next']); // expect: redirect header
++    """),
++    Case("redirect_entire_header", """
++        header($_GET['header']); // expect: redirect header
++    """),
++    Case("redirect_other_header", """
++        header('X-Request-Label: ' . $_GET['label']);
++    """),
++    Case("redirect_static_external_destination", """
++        header('Location: https://example.test/account');
++    """),
++    Case("redirect_namespaced_shadow", r"""
++        namespace Application;
++        function header($value) { return $value; }
++        header('Location: ' . $_GET['next']);
++    """),
++    Case("redirect_imported_native_function", r"""
++        namespace Application;
++        use function header as sendHeader;
++        sendHeader('Location: ' . $_GET['next']); // expect: redirect sendHeader
++    """),
++    Case("redirect_qualified_native_function", r"""
++        namespace Application;
++        function header($value) { return $value; }
++        \header('Location: ' . $_GET['next']); // expect: redirect \header
++    """),
++    Case("redirect_named_argument_order", """
++        header(response_code: 302, header: 'Location: ' . $_GET['next']); // expect: redirect header
++    """),
++    Case("redirect_created_resource_is_not_navigation", """
++        header('Location: ' . $_GET['resource'], true, 201);
++    """),
++    Case("redirect_explicit_success_is_not_navigation", """
++        header('Location: ' . $_GET['resource'], true, 200);
++    """),
++    Case("redirect_named_late_write_cannot_clean", """
++        $target = $_GET['next'];
++        header(header: 'Location: ' . $target, replace: ($target = '/account')); // expect: redirect header
++    """),
++    Case("redirect_named_early_write_cleans", """
++        $target = $_GET['next'];
++        header(replace: ($target = '/account'), header: 'Location: ' . $target);
++    """),
++    Case("redirect_literal_lexical_decoy", """
++        $example = 'header($_GET["next"])';
++        // header('Location: ' . $_GET['next']);
++        header('X-Example: fixed');
++    """),
++)
++CASES = (*CASES, *REDIRECT_CASES)
++
++
+ def identities():
+@@ -957,3 +1110,24 @@
+                 self.assert_report(*self.execute(directory, mode), mode, CASES)
+ 
++    def test_public_redirect_policy_and_cache_invalidation(self):
++        unsafe, clean = REDIRECT_CASES[0], REDIRECT_CASES[2]
++        directory = self.materialize((unsafe, clean), "redirect-policy")
++        for mode in ("module-json", "module-sarif", "json", "sarif"):
++            with self.subTest(mode=mode):
++                self.assert_report(*self.execute(directory, mode), mode, (unsafe, clean))
++        self.assert_report(*self.execute(directory, extra=("--skip-php=6",)),
++                           "json", (unsafe, clean), expected_override=[])
++        self.assert_report(*self.execute(directory, "module-json", ("--only=6",)),
++                           "module-json", (unsafe, clean))
++        self.assert_report(*self.execute(directory, extra=("--profile=loose",)),
++                           "json", (unsafe, clean))
++        target = directory / unsafe.filename
++        self.assert_report(*self.execute(target, cached=True), "json", (unsafe,))
++        suppressed = Case(unsafe.name, "header('Location: ' . $_GET['next']); // ubs:ignore["
++                          + RULES["redirect"] + "]\n")
++        target.write_text(suppressed.source, encoding="utf-8")
++        self.assert_report(*self.execute(target, cached=True), "json", (suppressed,))
++        target.write_text(unsafe.source, encoding="utf-8")
++        self.assert_report(*self.execute(target, cached=True), "json", (unsafe,))
++
+     def test_public_partial_keeps_known_findings_and_neighbor(self):

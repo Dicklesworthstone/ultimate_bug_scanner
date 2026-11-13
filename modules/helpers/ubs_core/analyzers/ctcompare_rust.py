@@ -26,7 +26,11 @@ _SUPPRESSION_RULE = "rust.security.constant-time-compare"
 
 skip_dirs = {".git", "target", ".cargo", "node_modules"}
 
-compare_re = re.compile(r"(?<![=!<>])(?P<left>.+?)\s*(?P<op>==|!=)\s*(?!=)\s*(?P<right>.+)")
+comparison_token_re = re.compile(
+    r"(?P<compare>(?<![=!<>])(?:==|!=)(?!=))"
+    r"|(?P<boolean>&&|\|\|)|(?P<separator>;|,|=>)"
+    r"|(?P<open>[([{])|(?P<close>[)\]}])"
+)
 assign_re = re.compile(
     r"^\s*(?:let\s+(?:mut\s+)?|const\s+|static\s+)?"
     # A type annotation begins with one colon, not a qualified match-arm
@@ -38,7 +42,7 @@ identifier_re = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # (`fn(u32) -> u32`) and not the `Fn`/`FnMut` traits.
 fn_decl_re = re.compile(r"(?:^|[^A-Za-z0-9_:])fn\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)")
 safe_compare_re = re.compile(
-    r"\b(?:subtle::)?ConstantTimeEq\b"
+    r"\b(?:subtle::)?ConstantTimeEq\s*(?P<ufcs>>\s*)?::\s*ct_eq\s*\("
     r"|\.(?:ct_eq|constant_time_eq|timing_safe_eq|timing_safe_compare|safe_eq|safe_compare|secure_compare)\s*\("
     r"|\b(?:constant_time_eq|constant_time_compare|timing_safe_eq|timing_safe_compare|"
     r"safe_eq|safe_compare|secure_compare|crypto_memcmp)\s*\("
@@ -255,6 +259,115 @@ def operand_identifiers(operand: str):
         for token in identifier_re.findall(blank_string_literals(operand))
         if token not in keywords
     }
+
+
+def comparison_operands(statement: str):
+    """Yield each real equality's operands, including comparisons inside calls."""
+    code = strip_comments_and_strings(statement, "rust")
+    tokens = []
+    depth = 0
+    for token in comparison_token_re.finditer(code):
+        tokens.append((token, depth))
+        if token.lastgroup == "open":
+            depth += 1
+        elif token.lastgroup == "close":
+            depth -= 1
+    for index, (comparison, level) in enumerate(tokens):
+        if comparison.lastgroup != "compare":
+            continue
+        start, end = 0, len(statement)
+        for previous_index in range(index - 1, -1, -1):
+            previous, previous_level = tokens[previous_index]
+            if ((previous.lastgroup in {"separator", "boolean"} and previous_level <= level)
+                    or previous.lastgroup == "open" and previous_level < level):
+                start = previous.end()
+                break
+        for following_index in range(index + 1, len(tokens)):
+            following, following_level = tokens[following_index]
+            if ((following.lastgroup in {"separator", "boolean"} and following_level <= level)
+                    or following.lastgroup == "close" and following_level <= level):
+                end = following.start()
+                break
+        left, right = statement[start:comparison.start()], statement[comparison.end():end]
+        if left.strip() and right.strip():
+            yield comparison.start(), left, right
+
+
+def call_prefix_start(code: str, call: int) -> int:
+    """Bound a call's qualified name or method receiver, retaining other operands."""
+    cursor, stack = call - 1, []
+    pairs = {")": "(", "]": "[", "}": "{"}
+    while cursor >= 0:
+        char = code[cursor]
+        if char in pairs:
+            stack.append(pairs[char])
+        elif char in "([{":
+            if not stack or stack[-1] != char:
+                break
+            stack.pop()
+        elif not stack and char == ">":
+            # A receiver can contain a turbofish, e.g. AsRef::<[u8]>::as_ref().
+            # Treat only paired type arguments adjacent to a call/path as
+            # receiver syntax; ordinary comparison operators stay boundaries.
+            angle, opening = 1, cursor - 1
+            while opening >= 0 and angle:
+                angle += (code[opening] == ">") - (code[opening] == "<")
+                opening -= 1
+            opening += 1
+            tail = code[cursor + 1:].lstrip()
+            if not angle and (tail.startswith("(") or tail.startswith("::")):
+                cursor = opening - 1
+                continue
+            break
+        elif not stack and char == "." and (code[cursor:cursor + 2] == ".."
+                                            or code[max(0, cursor - 1):cursor + 1] == ".."):
+            # A range's lower bound is independent of a call on its upper
+            # bound: secret..provided.ct_eq(other) must retain secret.
+            break
+        elif (not stack and char == "!" and re.match(r"\s*[(\[{]", code[cursor + 1:])
+              and re.search(r"[A-Za-z_][A-Za-z0-9_]*\s*$", code[:cursor])):
+            # A macro invocation can produce the entire method receiver.
+            # This postfix bang is not a separate unary/binary operand.
+            cursor -= 1
+            continue
+        elif not stack and char in "=;,+-*/%&|^!<":
+            break
+        cursor -= 1
+    return cursor + 1
+
+
+def mask_safe_compare_results(expression: str) -> str:
+    """Mask complete timing-safe call results, preserving independent values.
+
+    A comparison result does not carry its secret arguments. Nested unsafe
+    equalities are still visited separately by comparison_operands, so calling
+    a safe API cannot hide an unsafe operation performed to build its inputs.
+    """
+    expression = strip_comments_and_strings(expression, "rust", strip_strings=False)
+    code = strip_comments_and_strings(expression, "rust")
+    spans = []
+    for match in safe_compare_re.finditer(code):
+        depth, end = 1, match.end()
+        while end < len(code) and depth:
+            depth += (code[end] == "(") - (code[end] == ")")
+            end += 1
+        if not depth:
+            prefix = match.end("ufcs") if match.group("ufcs") is not None else match.start()
+            spans.append((call_prefix_start(code, prefix), end))
+    merged = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    parts, previous = [], 0
+    for start, end in merged:
+        # An opaque literal avoids introducing a source variable or treating
+        # the other equality operand as an exempt null/shape comparison.
+        parts.extend((expression[previous:start], '"comparison result"'))
+        previous = end
+    parts.append(expression[previous:])
+    return "".join(parts)
 
 
 def assignment_match(statement: str):
@@ -505,13 +618,13 @@ def collect_sensitive_vars(lines, stripped_lines, statement_at, line_numbers, se
             if not stripped:
                 continue
             statement = statement_at(line_no, 5)
-            if not statement or safe_compare_re.search(statement):
+            if not statement:
                 continue
             match = assignment_match(statement)
             if not match:
                 continue
             name = match.group("lhs")
-            rhs = match.group("rhs")
+            rhs = mask_safe_compare_results(match.group("rhs"))
             identifiers = operand_identifiers(rhs)
             if name not in sensitive and (
                 is_sensitive_text(name, public_metadata)
@@ -536,26 +649,29 @@ def operand_is_sensitive(operand: str, sensitive_vars, public_metadata=()) -> bo
 
 
 def secret_compare_severity(statement: str, sensitive_vars, ambiguous_vars,
-                            public_metadata=(), verification=False) -> str | None:
-    if safe_compare_re.search(statement) or has_suppression_marker(statement, _SUPPRESSION_RULE):
+                            public_metadata=(), verification=False, comparison_limit=None) -> str | None:
+    if has_suppression_marker(statement, _SUPPRESSION_RULE):
         return None
     severity = None
-    for clause in re.split(r"\s*(?:&&|\|\|)\s*", statement):
-        match = compare_re.search(clause)
-        if not match:
+    for offset, raw_left, raw_right in comparison_operands(statement):
+        # Lookahead completes multiline operands; a later line's independent
+        # comparison must not also be reported at this line's public condition.
+        if comparison_limit is not None and offset >= comparison_limit:
             continue
-        left = clean_operand_text(match.group("left"))
-        right = clean_operand_text(match.group("right"))
+        raw_left = mask_safe_compare_results(raw_left)
+        raw_right = mask_safe_compare_results(raw_right)
+        left = clean_operand_text(raw_left)
+        right = clean_operand_text(raw_right)
         if operand_is_nullish_or_shape_check(left) or operand_is_nullish_or_shape_check(right):
             continue
         # Cleaning removes trailing parentheses; source lookup recognition
         # needs the original call delimiter, including for direct env macros.
-        if is_sensitive_lookup(match.group("left")) or is_sensitive_lookup(match.group("right")):
+        if is_sensitive_lookup(raw_left) or is_sensitive_lookup(raw_right):
             return "critical"
         if operand_is_sensitive(left, sensitive_vars, public_metadata) or operand_is_sensitive(right, sensitive_vars, public_metadata):
             return "critical"
-        if (has_ambiguous_signature_lookup(match.group("left"))
-                or has_ambiguous_signature_lookup(match.group("right"))
+        if (has_ambiguous_signature_lookup(raw_left)
+                or has_ambiguous_signature_lookup(raw_right)
                 or operand_identifiers(left) & ambiguous_vars
                 or operand_identifiers(right) & ambiguous_vars):
             if verification:
@@ -619,7 +735,8 @@ def classified_comparisons(text: str) -> list[tuple[int, str, str]]:
                 len(declarations) > 1 and verification_context(
                     " ".join(declaration.group("name") for declaration in declarations), (), ()))
             severity = secret_compare_severity(statement, sensitive_vars, ambiguous_vars,
-                                               public_metadata, line_verification) if statement else None
+                                               public_metadata, line_verification,
+                                               comparison_limit=len(stripped.strip())) if statement else None
             if severity is None:
                 continue
             if line_no in seen:

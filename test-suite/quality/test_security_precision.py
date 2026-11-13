@@ -4461,6 +4461,128 @@ fn safe(row: Row, supplied: Value) {
             'fn contains(){fn verify(){}\n    row.get("sig") == supplied;\n}\n'),
             [(2, "warning")])
 
+    def test_timing_safe_calls_do_not_hide_other_secret_comparisons(self) -> None:
+        bodies = {
+            "safe-before-and": '    bool::from(expected_signature.ct_eq(supplied)) && password == candidate; // expect-critical\n',
+            "safe-after-or": '    password != candidate || bool::from(expected_signature.ct_eq(supplied)); // expect-critical\n',
+            "neighboring-statement": '    crypto_memcmp(expected_signature, supplied); password == candidate; // expect-critical\n',
+            "continued-expression": ('    password == candidate // expect-critical\n'
+                                     '        && constant_time_eq(expected_signature, supplied);\n'),
+            "nested-comparison": ('    constant_time_eq(if password == candidate { b"y" } else { b"n" }, expected); // expect-critical\n'),
+            "quoted-decoy": '    let example = r#"signature.ct_eq(supplied)"#; password == candidate; // expect-critical\n',
+            "trait-import": '    use subtle::ConstantTimeEq; password == candidate; // expect-critical\n',
+            "alias-before-call": ('    let value = password; crypto_memcmp(expected_signature, supplied);\n'
+                                  '    value == candidate; // expect-critical\n'),
+            "mixed-result-alias": ('    let value = (password, bool::from(expected_signature.ct_eq(supplied))).0;\n'
+                                    '    value == candidate; // expect-critical\n'),
+            "plain-unsafe": '    password == candidate; // expect-critical\n',
+            "plain-safe": '    expected_signature.ct_eq(supplied);\n',
+            "safe-result": '    bool::from(expected_signature.ct_eq(supplied)) == ready;\n',
+            "safe-receiver-chain": '    bool::from(expected_signature.as_ref().ct_eq(supplied)) == ready;\n',
+            "safe-generic-receiver": '    bool::from(std::convert::AsRef::<[u8]>::as_ref(expected_signature).ct_eq(supplied)) == ready;\n',
+            "safe-trait-qualified": '    bool::from(subtle::ConstantTimeEq::ct_eq(expected_signature, supplied)) == ready;\n',
+            "safe-ufcs": '    bool::from(<[u8] as subtle::ConstantTimeEq>::ct_eq(expected_signature, supplied)) == ready;\n',
+            "safe-free-call-result": '    constant_time_eq(expected_signature, supplied) == ready;\n',
+            "safe-alias": ('    let value = bool::from(expected_signature.ct_eq(supplied));\n'
+                           '    value == ready;\n'),
+            "safe-conjunction-alias": ('    let value = bool::from(expected_signature.ct_eq(supplied)) && ready;\n'
+                                       '    value == ready;\n'),
+            "public-neighbor": '    bool::from(expected_signature.ct_eq(supplied)) && mode == "read";\n',
+            "comment-decoy": '    mode /* password */ == "read" && bool::from(expected_signature.ct_eq(supplied));\n',
+            "raw-string-decoy": '    let example = r#"password == candidate signature.ct_eq(supplied)"#; mode == "read";\n',
+            "length-guard": '    expected_signature.len() == supplied.len() && bool::from(expected_signature.ct_eq(supplied));\n',
+            "suppressed": ('    password == candidate || bool::from(expected_signature.ct_eq(supplied)); '
+                           '// ubs:ignore[rust.security.constant-time-compare]\n'),
+        }
+        for name, body in bodies.items():
+            with self.subTest(case=name):
+                source = ('fn check(password: &str, candidate: &str, expected_signature: &[u8],\n'
+                          '         supplied: &[u8], ready: bool, mode: &str) {\n' + body + '}\n')
+                expected = [(line, "critical") for line, text in enumerate(source.splitlines(), 1)
+                            if "// expect-critical" in text]
+                self.assertEqual(self.classified_sites(source), expected, source)
+        ambiguous = ('fn contains(row: Row, supplied: Value, other: Value) {\n'
+                     '    row.get("sig") == supplied || bool::from(expected_signature.ct_eq(other));\n}\n')
+        self.assertEqual(self.classified_sites(ambiguous), [(2, "warning")])
+        independent_range = ('fn check(secret_byte: u8, provided: u8, expected: std::ops::Range<u8>) {\n'
+                             '    let _ = (secret_byte..provided.ct_eq(&0).unwrap_u8()) == expected;\n}\n')
+        self.assertEqual(self.classified_sites(independent_range), [(2, "critical")])
+        macro_receiver = ('fn check(provided: &[u8], expected: bool) {\n'
+                          '    let _ = bool::from(secret_value!().ct_eq(provided)) == expected;\n}\n')
+        self.assertEqual(self.classified_sites(macro_receiver), [])
+
+    def test_timing_safe_neighbors_public_json_sarif_and_cache(self) -> None:
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        root = Path(tempfile.mkdtemp(prefix="rust-safe-neighbor-public-", dir=artifacts))
+        project = root / "project"
+        project.mkdir()
+        unsafe = project / "unsafe.rs"
+        unsafe.write_text('''use subtle::ConstantTimeEq;
+fn check(password: &str, candidate: &str, expected_signature: &[u8], supplied: &[u8]) -> bool {
+    password == candidate || bool::from(expected_signature.ct_eq(supplied))
+}
+''', encoding="utf-8")
+        safe = project / "safe.rs"
+        safe.write_text('''use subtle::ConstantTimeEq;
+fn check(expected_signature: &[u8], supplied: &[u8], ready: bool) -> bool {
+    bool::from(expected_signature.ct_eq(supplied)) == ready
+}
+''', encoding="utf-8")
+        for entry in ("module", "runner"):
+            statistics = root / f"{entry}-stats.json"
+            env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", UBS_NO_CACHE="0",
+                       UBS_CACHE_DIR=str(root / f"{entry}-cache"),
+                       UBS_CACHE_FILE=str(statistics), UBS_PROFILE="1", NO_COLOR="1")
+            for output_format in ("json", "sarif"):
+                with self.subTest(entry=entry, format=output_format):
+                    report = root / f"{entry}-{output_format}.ndjson"
+                    if entry == "module":
+                        command = [str(REPO_ROOT / "modules/ubs-rust.sh"), "--no-cargo", "--only=8",
+                                   f"--report-json={report}"]
+                    else:
+                        command = [str(REPO_ROOT / "ubs"), "--only=rust", "--no-cargo",
+                                   "--no-auto-update", "--no-config"]
+                    command += ["--ci", "--no-color", f"--format={output_format}", str(project)]
+                    started = time.monotonic()
+                    proc = subprocess.run(command, cwd=root, env=env, text=True,
+                                          capture_output=True, timeout=180)
+                    prefix = root / f"{entry}-{output_format}"
+                    prefix.with_suffix(".stdout").write_text(proc.stdout, encoding="utf-8")
+                    prefix.with_suffix(".stderr").write_text(proc.stderr, encoding="utf-8")
+                    prefix.with_suffix(".receipt.json").write_text(json.dumps({
+                        "command": command, "exit": proc.returncode, "seconds": time.monotonic() - started,
+                        "source_sha256": hashlib.sha256(unsafe.read_bytes()).hexdigest(),
+                        "helper_sha256": hashlib.sha256(Path(ctcompare_rust.__file__).read_bytes()).hexdigest(),
+                    }, indent=2) + "\n", encoding="utf-8")
+                    context = f"{command!r}; exit={proc.returncode}; stdout={proc.stdout!r}; stderr={proc.stderr!r}"
+                    self.assertEqual(proc.returncode, 1, context)
+                    document = json.loads(proc.stdout)
+                    if output_format == "json":
+                        self.assertEqual(document["status"], "ok", context)
+                        totals = document if entry == "module" else document["totals"]
+                        self.assertEqual((totals["files"], totals["critical"], totals["warning"]), (2, 1, 0), context)
+                        records = (document["findings"] if entry == "runner" else
+                                   [json.loads(line) for line in report.read_text(encoding="utf-8").splitlines()])
+                        rows = [row for row in records
+                                if row.get("rule", row.get("rule_id")) == self.RULE]
+                        self.assertEqual([(row["line"], row["severity"]) for row in rows], [(3, "critical")], context)
+                        path = rows[0]["path"] if entry == "module" else rows[0]["file"]
+                        self.assertEqual((root / path).resolve(), unsafe, context)
+                    else:
+                        rows = [row for run in document["runs"] for row in run["results"]
+                                if row["ruleId"] == self.RULE]
+                        self.assertEqual(len(rows), 1, context)
+                        self.assertEqual(rows[0]["level"], "error", context)
+                        location = rows[0]["locations"][0]["physicalLocation"]
+                        self.assertEqual(location["region"]["startLine"], 3, context)
+                        self.assertEqual(sarif_location_path(location["artifactLocation"]["uri"], root).resolve(),
+                                         unsafe, context)
+                    if entry == "module":
+                        stats = json.loads(statistics.read_text(encoding="utf-8"))
+                        self.assertEqual((stats["hits"], stats["misses"]),
+                                         (0, 2) if output_format == "json" else (2, 0), context)
+
     def test_signature_review_public_formats_cache_and_exit_policy(self) -> None:
         artifacts = REPO_ROOT / "test-suite" / "artifacts"
         artifacts.mkdir(exist_ok=True)

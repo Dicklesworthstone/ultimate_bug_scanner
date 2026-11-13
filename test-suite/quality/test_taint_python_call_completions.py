@@ -2136,9 +2136,9 @@ class FormattedStringCompletionTests(SourceTest):
                 self.assert_native(source, ['UNTRUSTED'], incomplete=True)
 
     def test_discarded_module_next_rejects_opaque_format_protocols(self):
-        # These are module-scope borrowing regressions. Earlier opaque
-        # producer effects on function-local text remain a separate summary
-        # limitation; retaining a local does not model those earlier effects.
+        # These are module-scope borrowing regressions. The private-local
+        # producer-proof regressions below exercise the distinct retained
+        # owner exemption without certifying earlier opaque effects.
         for method, arguments, expression in (
                 ('__format__', ', spec', "f'{Opaque()}'"),
                 ('__format__', ', spec', "f'prefix-{Opaque()}-suffix'"),
@@ -2220,6 +2220,142 @@ class FormattedStringCompletionTests(SourceTest):
                       + 'run(Retained())\n')
             with self.subTest(body=body):
                 self.assert_native(source, ['fixed'])
+
+    def test_private_next_does_not_certify_earlier_format_protocol_effects(self):
+        for method, arguments, expression in (
+                ('__format__', ', spec', "f'{Opaque()}'"),
+                ('__format__', ', spec', "f'prefix-{Opaque()}-suffix'"),
+                ('__str__', '', "f'{Opaque()!s}'"),
+                ('__repr__', '', "f'{Opaque()!r}'"),
+                ('__repr__', '', "f'{Opaque()!a}'")):
+            source = ("code = 'fixed'\nclass Opaque:\n"
+                      + f'    def {method}(self{arguments}):\n'
+                      + "        global code\n        code = input()\n        return 'fixed'\n"
+                      + f'def run():\n    text = {expression}\n'
+                      + '    saved = text\n    next(saved for unused in (0,))\n'
+                      + '    eval(code)\nrun()\n')
+            with self.subTest(method=method, expression=expression):
+                self.assert_native(source, ['UNTRUSTED'], incomplete=True)
+
+    def test_private_next_keeps_owned_producer_frame_effects(self):
+        for result, parameters, invocation in (
+                ("'fixed'", '', 'render()'),
+                ('value', 'value', "render('fixed')")):
+            for formatted in (False, True):
+                # Use a separate capture for formatting to keep Python 3.9
+                # source syntax independent of quote reuse in f-strings.
+                setup = (f'    saved = {invocation}\n    text = f"{{saved}}"\n'
+                         if formatted else f'    text = {invocation}\n')
+                source = ("code = 'fixed'\nclass Owned:\n"
+                          + '    def __del__(self):\n        global code\n        code = input()\n'
+                          + f'def render({parameters}):\n    owned = Owned()\n    return {result}\n'
+                          + 'def run():\n' + setup
+                          + '    alias = text\n    next(alias for unused in (0,))\n'
+                          + '    eval(code)\nrun()\n')
+                with self.subTest(result=result, formatted=formatted):
+                    self.assert_native(source, ['UNTRUSTED'], incomplete=True)
+
+    def test_returned_argument_cannot_erase_a_producer_frame(self):
+        source = '''
+            code = 'fixed'
+            class Owned:
+                def __del__(self):
+                    global code
+                    code = input()
+            def render(value):
+                owned = Owned()
+                return value
+            def run(value):
+                saved = render(value)
+                next(saved for unused in (0,))
+                eval(code)
+            run('fixed')
+        '''
+        self.assert_native(source, ['UNTRUSTED'], incomplete=True)
+
+    def test_private_native_producers_and_unexecuted_opaque_work_remain_complete(self):
+        for expression, expected in (("'fixed'", 'fixed'), ('input()', 'UNTRUSTED'),
+                                     ("f'<{input()}>'", '<UNTRUSTED>'),
+                                     ('render(input())', 'UNTRUSTED')):
+            source = ("code = 'fixed'\nclass Opaque:\n"
+                      + '    def __format__(self, spec):\n        global code\n        code = input()\n'
+                      + "        return 'fixed'\ndef render(value):\n    return value\n"
+                      + 'def run():\n    if False:\n        ignored = f"{Opaque()}"\n'
+                      + f'    text = {expression}\n    saved = text\n'
+                      + '    next(saved for unused in (0,))\n    eval(saved)\nrun()\n')
+            with self.subTest(expression=expression):
+                self.assert_native(source, [expected])
+        self.assert_native('''
+            def run():
+                number = 7
+                saved = number
+                next(saved for unused in (0,))
+                eval('fixed')
+            run()
+        ''', ['fixed'])
+
+    def test_transparent_alias_helpers_keep_independently_retained_arguments(self):
+        for body in ('return value', 'alias = value\nreturn alias'):
+            source = ('def identity(value):\n' + textwrap.indent(body, '    ') + '\n'
+                      + 'def run(value):\n    saved = identity(value)\n'
+                      + '    next(saved for unused in (0,))\n    eval(saved)\nrun(input())\n')
+            with self.subTest(body=body):
+                self.assert_native(source, ['UNTRUSTED'])
+        self.assert_native('''
+            code = 'fixed'
+            class Owned:
+                def __del__(self):
+                    global code
+                    code = input()
+            def identity(value):
+                return value
+            def run(value):
+                saved = identity(value)
+                next(saved for unused in (0,))
+                eval(code)
+            run(Owned())
+        ''', ['fixed'])
+
+    def test_native_string_methods_preserve_producer_authority(self):
+        for method in ('strip', 'lstrip', 'rstrip', 'lower', 'upper',
+                       'capitalize', 'casefold', 'swapcase', 'title'):
+            source = (f'def run():\n    text = " fixed ".{method}()\n'
+                      + '    next(text for unused in (0,))\n    eval("fixed")\nrun()\n')
+            with self.subTest(method=method):
+                self.assert_native(source, ['fixed'])
+        self.assert_native('''
+            def run():
+                text = input().strip()
+                next(text for unused in (0,))
+                eval(text)
+            run()
+        ''', ['UNTRUSTED'])
+        self.assert_native('''
+            code = 'fixed'
+            class Owned:
+                def __del__(self):
+                    global code
+                    code = input()
+            def render():
+                owned = Owned()
+                return 'fixed'
+            def run():
+                text = render().strip()
+                next(text for unused in (0,))
+                eval(code)
+            run()
+        ''', ['UNTRUSTED'], incomplete=True)
+
+    def test_transparent_helper_cannot_repair_earlier_producer_effects(self):
+        for setup in ("text = fixed(render())", "value = render()\ntext = fixed(value)"):
+            source = ("code = 'fixed'\nclass Owned:\n"
+                      + '    def __del__(self):\n        global code\n        code = input()\n'
+                      + "def render():\n    owned = Owned()\n    return 'fixed'\n"
+                      + "def fixed(value):\n    return 'fixed'\ndef run():\n"
+                      + textwrap.indent(setup, '    ') + '\n'
+                      + '    next(text for unused in (0,))\n    eval(code)\nrun()\n')
+            with self.subTest(setup=setup):
+                self.assert_native(source, ['UNTRUSTED'], incomplete=True)
 
 
 class ImmediateGeneratorExpressionTests(SourceTest):

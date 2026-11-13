@@ -2757,6 +2757,13 @@ class _Flow:
                         and self.generator_expression_immediate(generator, state)
                         and self.engine.generator_stable_binding(
                             generator.elt.id, self.scope, generator, immediate=True))
+            if borrowed and not self.generator_borrowed_producer(generator.elt.id, state):
+                # Retaining the final object prevents its release here, but
+                # says nothing about protocols/finalizers that ran while
+                # producing it. Do not turn that missing effect proof into
+                # a successful scan merely because next reads a local Name.
+                raise AnalysisLimit('generator next borrowed value producer effects are unresolved; '
+                                    'analysis is incomplete')
             fact = self.comprehension(generator, state, iterable=iterable, synchronous_generator=True,
                                       first_result=True, default=default, borrowed_result=borrowed)
             self.expression_bindings[node] = self.expression_bindings.get(generator)
@@ -2764,6 +2771,74 @@ class _Flow:
             return fact
         finally:
             self.materialized_generator_depth -= 1
+
+    def generator_borrowed_producer(self, name, state):
+        """Keep native values or an independently retained caller operand.
+
+        Object-reference aliases alone are insufficient for helper returns:
+        an unproved helper frame also contributes its call-site reference.
+        Primitive bindings retain the existing producer-authority bit. Exact
+        scalar initializers cover locals whose numeric identity is otherwise
+        intentionally absent from callable-binding contexts.
+        """
+        binding = state.bindings.get(name)
+        references = state.references.get(name, NO_REFERENCES)
+        if state.cells is not None and name in state.cells.names:
+            contents = state.cells.contents[state.cells.names[name]]
+            binding, references = contents.binding, contents.references
+        if references & state.mutated:
+            return False
+
+        if self.materialized_generator_binding(binding, references, state):
+            return True
+        # A revoked producer contract must not regain authority from a
+        # returned parameter's independently retained object references.
+        def revoked(value):
+            for choice in _binding_choices(value):
+                self.engine.budget.spend()
+                if isinstance(choice, (_LiteralString, _GeneratorString)) and not choice.format_safe:
+                    return True
+                if isinstance(choice, _ArgumentVector) and any(
+                        revoked(operand) for operand, _fact in choice.operands):
+                    return True
+            return False
+
+        if revoked(binding):
+            return False
+        signature = self.scope.args
+        parameters = {argument.arg for argument in (*signature.posonlyargs, *signature.args,
+                                                     *signature.kwonlyargs)}
+        parameters.update(argument.arg for argument in (signature.vararg, signature.kwarg)
+                          if argument is not None)
+        if references and references <= parameters:
+            return True
+
+        def literal_local(local, seen):
+            self.engine.budget.spend()
+            if local in seen:
+                return False
+            binders = self.engine.generator_binders.get(self.scope, {}).get(local, ())
+            if len(binders) != 1 or not isinstance(binders[0], ast.Name):
+                return False
+            statement = self.engine.parents.get(binders[0])
+            if isinstance(statement, ast.For) and statement.target is binders[0]:
+                # The loop transfer may retain aggregate provenance without
+                # an element binding. Its evaluated native iterable still
+                # proves where every selected primitive value came from.
+                if isinstance(statement.iter, ast.Constant) and type(statement.iter.value) in {str, bytes}:
+                    return True
+                return (self.materialized_generator_iterable(statement.iter, state)
+                        and self.materialized_generator_binding(
+                            self.expression_bindings.get(statement.iter),
+                            self.expression_references.get(statement.iter, NO_REFERENCES), state))
+            if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                return False
+            value = statement.value
+            if isinstance(value, ast.Constant):
+                return type(value.value) in {str, bytes, int, float, complex, bool, type(None)}
+            return isinstance(value, ast.Name) and literal_local(value.id, seen | {local})
+
+        return not references and literal_local(name, frozenset())
 
     def materialized_generator_string(self, node, state):
         """Require the evaluated value to be an exact, callback-free string."""
@@ -2907,13 +2982,15 @@ class _Flow:
         return self.materialized_generator_binding(self.expression_bindings.get(node), references, state)
 
     def materialized_generator_binding(self, binding, references, state):
-        """Only captured primitive identities certify reference release."""
+        """Require captured primitive identities and their producer authority."""
         choices = _binding_choices(binding)
         if references & state.mutated or not choices:
             return False
         for value in choices:
             self.engine.budget.spend()
             if isinstance(value, (_LiteralString, _GeneratorString)):
+                if not value.format_safe:
+                    return False
                 continue
             if (isinstance(value, ast.Constant)
                     and type(value.value) in {str, bytes, int, float, complex, bool, type(None)}):
@@ -2951,10 +3028,11 @@ class _Flow:
         """
         self.engine.budget.spend()
         if (any(isinstance(value, ast.Starred) for value in node.args)
-                or any(keyword.arg is None for keyword in node.keywords)
-                or not all(self.materialized_generator_inert(value, state)
-                           for value in (*node.args, *(keyword.value for keyword in node.keywords)))):
+                or any(keyword.arg is None for keyword in node.keywords)):
             return False
+        if not all(self.materialized_generator_inert(value, state)
+                   for value in (*node.args, *(keyword.value for keyword in node.keywords))):
+            return self.borrowed_alias_helper(node, target, state)
         if target in ('input', 'builtins.input'):
             return (self.generator_builtins_stable() and len(node.args) <= 1 and not node.keywords
                     and all(self.formatted_string_operand(argument, state) for argument in node.args))
@@ -3100,6 +3178,69 @@ class _Flow:
                 return statement.value is None or primitive(statement.value)
             if isinstance(statement, ast.Raise):
                 return statement.cause is None and raised(statement.exc)
+            return False
+        return True
+
+    def borrowed_alias_helper(self, node, target, state):
+        """Prove a transparent helper cannot release a caller-owned operand.
+
+        This deliberately admits only direct parameter/local aliases and
+        scalar literals. Calls, defaults, free variables, protocol operations
+        and global/nonlocal writes need the ordinary complete frame proof.
+        """
+        function = target.function if isinstance(target, _FunctionValue) else target
+        if (self.scope is self.engine.tree or isinstance(self.scope, ast.ClassDef)
+                or not isinstance(function, ast.FunctionDef) or self.engine.owner(function) is not self.engine
+                or function in self.engine.generators or function.decorator_list or function.returns is not None
+                or not self.engine.generator_helper_identity(function)):
+            return False
+        signature = function.args
+        positional = [*signature.posonlyargs, *signature.args]
+        parameters = [*positional, *signature.kwonlyargs]
+        if (signature.vararg or signature.kwarg or signature.defaults
+                or any(value is not None for value in signature.kw_defaults)
+                or any(argument.annotation is not None for argument in parameters)
+                or len(node.args) > len(positional)):
+            return False
+        supplied = {argument.arg: value for argument, value in zip(positional, node.args)}
+        accepted = {argument.arg for argument in (*signature.args, *signature.kwonlyargs)}
+        for keyword in node.keywords:
+            if keyword.arg not in accepted or keyword.arg in supplied:
+                return False
+            supplied[keyword.arg] = keyword.value
+        if set(supplied) != {argument.arg for argument in parameters}:
+            return False
+        for value in supplied.values():
+            if self.materialized_generator_inert(value, state):
+                continue
+            if not isinstance(value, ast.Name) or value.id not in self.engine.locals.get(self.scope, ()):
+                return False
+            refs = self.expression_references.get(value, NO_REFERENCES)
+            current = state.references.get(value.id, NO_REFERENCES)
+            if state.cells is not None and value.id in state.cells.names:
+                current = state.cells.contents[state.cells.names[value.id]].references
+            if (not refs or refs != current
+                    or not self.generator_borrowed_producer(value.id, state)):
+                return False  # A later argument may have replaced the owner.
+        aliases = set(supplied)
+
+        def retained(value):
+            return (isinstance(value, ast.Name) and value.id in aliases
+                    or isinstance(value, ast.Constant)
+                    and type(value.value) in {str, bytes, int, float, complex, bool, type(None)})
+
+        for statement in function.body:
+            self.engine.budget.spend()
+            if isinstance(statement, ast.Pass):
+                continue
+            if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant):
+                continue
+            if (isinstance(statement, ast.Assign) and retained(statement.value)
+                    and all(isinstance(destination, ast.Name) for destination in statement.targets)):
+                aliases.update(destination.id for destination in statement.targets)
+                continue
+            if isinstance(statement, ast.Return):
+                return statement.value is None or retained(statement.value)
             return False
         return True
 
@@ -4983,6 +5124,21 @@ class _Flow:
         target, fallback_name = callee.binding, callee.fallback_name
         receiver, receiver_refs = callee.receiver, callee.references
         arguments, keywords, keyword_nodes = inputs.arguments, inputs.keywords, inputs.keyword_nodes
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in {'strip', 'lstrip', 'rstrip', 'lower', 'upper',
+                                      'capitalize', 'casefold', 'swapcase', 'title'}
+                and not node.args and not node.keywords
+                and self.materialized_generator_string(node.func.value, state)):
+            # Exact native strings cannot replace these methods or invoke a
+            # custom receiver/argument protocol. Keep producer authority from
+            # the captured receiver; a fresh result cannot repair old effects.
+            self.expression_bindings[node] = _GeneratorString(format_safe=all(
+                not isinstance(value, (_LiteralString, _GeneratorString)) or value.format_safe
+                for value in _binding_choices(
+                    self.expression_bindings.get(node.func.value))))
+            self.expression_references[node] = frozenset({node})
+            self.possible_exception(state)
+            return receiver
         if (target in {'next', 'builtins.next'} and any(
                 engine.generator_builtin_reflection or engine.generator_literal_authority_exposed
                 or engine.generator_namespace_exposed
@@ -5404,6 +5560,11 @@ class _Flow:
                 substitute=substitute, cells=cell_map)
             self.expression_bindings[node] = (returned_binding if format_frame_inert
                                              else self.without_format_authority(returned_binding))
+            if not format_frame_inert:
+                # The returned value may alias a caller argument even though
+                # this frame released an unrelated owned object. Preserve
+                # that producer ancestry through later alias/borrow proofs.
+                self.expression_references[node] |= frozenset({node})
             returned = substitute(summary.returned)
             if function in self.engine.generators:
                 self.generator_returns[node] = returned

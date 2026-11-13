@@ -406,6 +406,109 @@ func body(req: Request) {
         self.assertEqual({item['line'] for item in findings if item['rule'] == PATH_RULE}, {5})
         self.assertTrue(any(item['rule'] == 'swift.taint.analysis-limited' for item in findings), findings)
 
+    def test_branching_url_metadata_keeps_flow_work_linear(self):
+        """Discarded URL identities must not create exponentially many values.
+
+        Every optional conversion can leave the original request unchanged, so
+        all four sinks remain unsafe. The fixed-value twin has no request flow.
+        These source programs originally created 2**N sink facts for one source
+        even though the alternative URL identities were no longer observable.
+        """
+        receipts = []
+        policies = (
+            ('path', 'String(contentsOfFile: value)', 'swift.taint.request_path_traversal'),
+            ('redirect', 'req.redirect(to: value)', 'swift.taint.request_open_redirect'),
+            ('header', 'HTTPHeaders([("X-Trace", value)])', 'swift.taint.header-injection'),
+            ('outbound', 'URLSession.shared.data(from: URL(string: value)!)', 'swift.taint.outbound-url'),
+        )
+        for policy, sink, rule in policies:
+            for unsafe in (False, True):
+                runs = []
+                for count in (4, 8, 12):
+                    initial = 'req.query["value"]!' if unsafe else '"https://api.example.com/fixed"'
+                    body = '\n'.join('''
+                        if enabled {
+                            let parsed%d = URL(string: value)!
+                            value = parsed%d.host! + ""
+                        }
+                    ''' % (index, index) for index in range(count))
+                    path, source = self.fixture('''
+                        func handle(req: Request, enabled: Bool) {
+                            var value = %s
+                            %s
+                            _ = %s // selected-sink
+                        }
+                    ''' % (initial, body, sink), f'-{policy}-{count}-{unsafe}')
+                    engine = CountingSwiftEngine(path, source, policy, parser=SwiftParser(source))
+                    effects = engine.analyze()
+                    expected = {source.index(sink)} if unsafe else set()
+                    self.assertEqual(set(effects), expected)
+                    self.assertFalse(engine.diagnostics)
+                    findings = flow_findings(path, source, policy)
+                    self.assertEqual([(item['rule'], item['line']) for item in findings],
+                        [(rule, source[:source.index(sink)].count('\n') + 1)] if unsafe else [])
+                    if unsafe:
+                        self.assertEqual(findings[0]['extras']['source_count'], 1)
+                        trace = findings[0]['extras']['taint_path']
+                        self.assertEqual(trace[0]['kind'], 'source')
+                        self.assertEqual(trace[-1]['kind'], 'sink')
+                    row = dict(policy=policy, branches=count, unsafe=unsafe,
+                               processed_traces=engine.transformed_traces,
+                               work=500_000 - engine.budget.remaining,
+                               effects=sorted(effects), findings=findings)
+                    runs.append(row)
+                    receipts.append(row)
+                # Increasing source size may add work, but not a powerset of
+                # historical transformations with the same current value.
+                self.assertLessEqual(runs[1]['processed_traces'],
+                                     runs[0]['processed_traces'] * 2 + 64)
+                self.assertLessEqual(runs[2]['processed_traces'],
+                                     runs[1]['processed_traces'] * 2 + 64)
+        (self.artifacts / 'url-metadata-work.json').write_text(json.dumps(receipts, indent=2), encoding='utf-8')
+
+    def test_current_validation_and_separate_request_origins_survive_history_collapse(self):
+        cases = (
+            ('path', 'URL(fileURLWithPath: raw).lastPathComponent', 'raw', '',
+             'serveFile(%s)', 'swift.taint.request_path_traversal'),
+            ('redirect', 'raw', 'raw', '''
+                guard checked.hasPrefix("/"), !checked.hasPrefix("//"), !checked.contains("\\\\"),
+                      !checked.contains("\\n"), !checked.contains("\\r"), !checked.contains("\\t") else { return }
+                ''', 'req.redirect(to: %s)', 'swift.taint.request_open_redirect'),
+            ('header', 'raw.replacingOccurrences(of: "\\r", with: "").replacingOccurrences(of: "\\n", with: "")',
+             'raw', '', 'HTTPHeaders([("X-Trace", %s)])', 'swift.taint.header-injection'),
+            ('outbound', 'URL(string: raw)!', 'URL(string: raw)!', '''
+                guard checked.scheme == "https", checked.host == "api.example.com" else { return }
+                ''', 'URLSession.shared.data(from: %s)', 'swift.taint.outbound-url'),
+        )
+        receipts = []
+        for policy, checked, unchecked, proof, sink, rule in cases:
+            path, source = self.fixture('''
+                func handle(req: Request) {
+                    let raw = req.query["first"]! + req.query["second"]!
+                    var checked = %s
+                    let unchecked = %s
+                    %s
+                    _ = %s // validated
+                    _ = %s // expect-unsafe
+                    checked = unchecked
+                    _ = %s // expect-unsafe
+                }
+            ''' % (checked, unchecked, proof, sink % 'checked', sink % 'unchecked', sink % 'checked'),
+                '-' + policy)
+            expected = [number for number, line in enumerate(source.splitlines(), 1)
+                        if '// expect-unsafe' in line]
+            for recover in (False, True):
+                with self.subTest(policy=policy, recover=recover):
+                    findings = flow_findings(path, source, policy, recover=recover)
+                    self.assertEqual([(item['rule'], item['line']) for item in findings],
+                                     [(rule, line) for line in expected], findings)
+                    for finding in findings:
+                        self.assertEqual(finding['extras']['source_count'], 2)
+                        self.assertEqual(finding['severity'], 'critical')
+                    receipts.append(dict(policy=policy, recover=recover, findings=findings))
+        (self.artifacts / 'current-validation-and-origins.json').write_text(
+            json.dumps(receipts, indent=2), encoding='utf-8')
+
     def test_opaque_callback_work_keeps_every_diagnostic_and_request_source(self):
         receipts = []
         for unsafe in (False, True):

@@ -19,7 +19,7 @@ from typing import Iterable
 
 from ubs_core.registry import Analyzer, RunContext, register
 from ubs_core.suppression import SourceSuppressions
-from ubs_core.taint_flow import AnalysisLimit, Budget, CLEAN, Fact, Step, Trace, advance, join, join_states, retag, solve
+from ubs_core.taint_flow import AnalysisLimit, Budget, CLEAN, Fact, Step, Trace, advance, join, join_states, solve
 
 
 @dataclass(frozen=True)
@@ -957,6 +957,28 @@ SWIFT_HTTP_METHODS = frozenset({'dataTask', 'downloadTask', 'uploadTask', 'strea
 SWIFT_CLIENT_METHODS = frozenset({'get', 'post', 'put', 'patch', 'delete', 'head', 'fetch', 'request', 'send'})
 
 
+def swift_retag(fact, *, add=frozenset(), remove=frozenset()):
+    """Transform concrete Swift values without retaining summary operations.
+
+    Swift calls are analyzed with their actual argument/receiver facts. Unlike
+    parameterized summaries, they never substitute an incoming value through
+    Trace.removed_tags. Keeping that operation history would distinguish equal
+    values by every URL/property/field proof they previously lost, multiplying
+    callback contexts even after all of those proofs have been invalidated.
+    Current tags, origins and field paths remain distinct. When histories
+    collapse, retain the same deterministic shortest evidence used by join().
+    """
+    result = {}
+    for trace in fact:
+        tags = (trace.tags - remove) | add
+        updated = (trace if tags == trace.tags and not trace.removed_tags
+                   else replace(trace, tags=tags, removed_tags=frozenset()))
+        previous = result.get(updated)
+        if previous is None or (len(updated.evidence), updated.evidence) < (len(previous.evidence), previous.evidence):
+            result[updated] = updated
+    return frozenset(result.values())
+
+
 def swift_tainted(fact):
     return frozenset(trace for trace in fact if trace.kind == 'source')
 
@@ -1593,7 +1615,7 @@ class SwiftEngine:
                     if swift_field_path(trace) and trace.kind == 'shape'
                     and trace.key[0] in {'request', 'request-collection', 'request-content'}]
         plain = join(plain, *requests)
-        return retag(plain, remove=tags | links)
+        return swift_retag(plain, remove=tags | links)
 
     def record(self, offset, value, file_leaf=False):
         if self.policy == 'redirect':
@@ -1632,7 +1654,7 @@ class SwiftEngine:
                     removed.add('no-carriage-return')
                 if '\n' in trace.key[1]:
                     removed.add('no-newline')
-        return retag(self.forget(value, SWIFT_HEADER_TAGS - removed), add=frozenset({'swift-string'}))
+        return swift_retag(self.forget(value, SWIFT_HEADER_TAGS - removed), add=frozenset({'swift-string'}))
 
     def native_string_method(self, leaf, receiver):
         # A selected String extension can override/overload a sanitizer. Its
@@ -1653,14 +1675,14 @@ class SwiftEngine:
                     and target[0].value in {'\r', '\n'}
                     and not any(char in replacement[0].value for char in '\r\n')):
                 tag = 'no-carriage-return' if target[0].value == '\r' else 'no-newline'
-                return retag(self.forget(receiver, SWIFT_HEADER_TAGS),
+                return swift_retag(self.forget(receiver, SWIFT_HEADER_TAGS),
                              add=frozenset({tag, 'swift-string'}))
         if leaf == 'addingPercentEncoding' and len(arguments) == 1 and set(parts) == {'withAllowedCharacters'}:
             allowed = swift_text(parts['withAllowedCharacters'])
             if (re.fullmatch(r'(?:(?:Foundation\.)?CharacterSet)?\.(?:urlPathAllowed|urlQueryAllowed|alphanumerics)', allowed)
                     and self.builtin('CharacterSet', state, bindings)
                     and not any(owner.split('.')[-1] == 'CharacterSet' for owner in self.parser.extensions)):
-                return retag(self.forget(receiver), add=SWIFT_HEADER_TAGS | frozenset({'swift-string'}))
+                return swift_retag(self.forget(receiver), add=SWIFT_HEADER_TAGS | frozenset({'swift-string'}))
         return None
 
     def candidates(self, name, receiver, state, bindings, *, direct=True):
@@ -2062,7 +2084,7 @@ class SwiftEngine:
         link = 'property-of:' + binding
         for key, value in tuple(state.items()):
             if any(link in trace.tags for trace in value):
-                state[key] = retag(value, remove=frozenset({link, 'url-host', 'url-scheme'}))
+                state[key] = swift_retag(value, remove=frozenset({link, 'url-host', 'url-scheme'}))
 
     @staticmethod
     def http_receiver(value, family):
@@ -2076,7 +2098,7 @@ class SwiftEngine:
     @staticmethod
     def request_destination(value, offset):
         """URLRequest copies its destination independently of headers and body."""
-        return retag(join(value, swift_shape('http-request', offset)), add=frozenset({'http-request'}))
+        return swift_retag(join(value, swift_shape('http-request', offset)), add=frozenset({'http-request'}))
 
     def outbound_call(self, name, receiver, arguments, token, state, bindings):
         """Selected native clients; unresolved HTTP dispatch stays incomplete.
@@ -2466,8 +2488,8 @@ class SwiftEngine:
                 return sanitized
         if leaf in {'URL', 'URLComponents'} and self.builtin(name, state, bindings):
             if 'fileURLWithPath' in labeled:
-                return join(retag(self.forget(labeled['fileURLWithPath']), add=frozenset({'file-url'})),
-                            retag(swift_shape('file-url', token.start), add=frozenset({'file-url'})))
+                return join(swift_retag(self.forget(labeled['fileURLWithPath']), add=frozenset({'file-url'})),
+                            swift_retag(swift_shape('file-url', token.start), add=frozenset({'file-url'})))
             if 'string' in labeled:
                 tags = frozenset({'url-object', 'url-id:' + str(token.start)})
                 source = labeled['string']
@@ -2475,7 +2497,7 @@ class SwiftEngine:
                     source = join(source, labeled.get('relativeTo', CLEAN))
                     if leaf == 'URLComponents':
                         tags |= frozenset({'url-components'})
-                return join(retag(self.forget(source), add=tags), retag(swift_shape('url', token.start), add=tags))
+                return join(swift_retag(self.forget(source), add=tags), swift_retag(swift_shape('url', token.start), add=tags))
         if leaf == 'Set' and len(values) == 1 and swift_has_shape(values[0], 'literal-list'):
             return values[0]
         if name in self.parser.types:
@@ -2661,10 +2683,10 @@ class SwiftEngine:
             if name in SWIFT_CLIENT_METHODS and self.http_receiver(receiver, 'vapor'):
                 return swift_shape('http-method:vapor:' + name, token.start)
             if name == 'url' and self.http_request(receiver):
-                return retag(frozenset(trace for trace in receiver if trace.key[0] != 'http-request'),
+                return swift_retag(frozenset(trace for trace in receiver if trace.key[0] != 'http-request'),
                              remove=frozenset({'http-request'}))
             if name == 'url' and receiver and all('url-components' in trace.tags for trace in receiver):
-                return retag(receiver, remove=frozenset({'url-components'}))
+                return swift_retag(receiver, remove=frozenset({'url-components'}))
         if swift_has_shape(receiver, 'request'):
             if name in {'query', 'parameters', 'params', 'headers', 'cookies'}:
                 return swift_shape('request-collection', token.start)
@@ -2675,16 +2697,16 @@ class SwiftEngine:
         if name in {'filename', 'fileName', 'originalFilename', 'originalFileName'}:
             return self.source(token.start, name)
         if name == 'lastPathComponent' and all('file-url' in trace.tags for trace in receiver):
-            return retag(self.forget(receiver), add=frozenset({'file-leaf', 'swift-string'}))
+            return swift_retag(self.forget(receiver), add=frozenset({'file-leaf', 'swift-string'}))
         if name in {'standardizedFileURL', 'resolvingSymlinksInPath', 'standardized'} and any('file-url' in trace.tags for trace in receiver):
-            return retag(receiver, add=frozenset({'canonical-path'}))
+            return swift_retag(receiver, add=frozenset({'canonical-path'}))
         if name == 'path' and any('file-url' in trace.tags for trace in receiver):
-            return retag(receiver, add=frozenset({'path-string', 'swift-string'}))
+            return swift_retag(receiver, add=frozenset({'path-string', 'swift-string'}))
         if name in {'absoluteString', 'string', 'description'} and any('url-object' in trace.tags for trace in receiver):
-            return retag(receiver, add=frozenset({'serialized-url', 'swift-string'}), remove=frozenset({'url-object'}))
+            return swift_retag(receiver, add=frozenset({'serialized-url', 'swift-string'}), remove=frozenset({'url-object'}))
         if name in {'host', 'scheme'} and any('url-object' in trace.tags for trace in receiver):
             links = frozenset({'property-of:' + owner_binding, 'url-property:' + name}) if owner_binding else frozenset()
-            return retag(receiver, add=links | frozenset({'swift-string'}), remove=frozenset({'url-object', 'serialized-url'}))
+            return swift_retag(receiver, add=links | frozenset({'swift-string'}), remove=frozenset({'url-object', 'serialized-url'}))
         if name in {'query', 'parameters', 'params', 'headers', 'content'} and swift_tainted(receiver):
             return receiver
         value = self.forget(receiver)
@@ -2759,7 +2781,7 @@ class SwiftEngine:
                 continue
             self.enable_callbacks()
             tokens = self.stored_closures[closure.key[0]][0]
-            unknown = retag(self.source(tokens[0].start, 'unknown closure parameter'),
+            unknown = swift_retag(self.source(tokens[0].start, 'unknown closure parameter'),
                             add=frozenset({'unknown-provenance'}))
             self.invoke_stored(closure, (unknown,), state)
 
@@ -2881,7 +2903,7 @@ class SwiftEngine:
                 and trace.key[0] in {'request', 'request-collection', 'request-content'})
             argument = join(self.forget(receiver), requests)
             if not swift_request_dependency(argument):
-                argument = join(argument, retag(self.source(tokens[0].start, 'unknown closure parameter'),
+                argument = join(argument, swift_retag(self.source(tokens[0].start, 'unknown closure parameter'),
                                                 add=frozenset({'unknown-provenance'})))
         value = self.inline_closure(tokens, argument, state, bindings, depth + 1,
                                     catches_errors=name in {'#expect', '#require'})
@@ -2963,7 +2985,7 @@ class SwiftEngine:
                 if self.policy == 'header':
                     value = self.header_text([swift_constant(token.value), *parts])
                 else:
-                    value = retag(self.forget(join(*parts)), add=frozenset({'swift-string'}))
+                    value = swift_retag(self.forget(join(*parts)), add=frozenset({'swift-string'}))
             else:
                 value = swift_constant(token.value, token.kind)
             cursor, name, owner_binding = 1, '', None
@@ -2979,7 +3001,7 @@ class SwiftEngine:
                 key = swift_ungroup(pair[0]) if len(pair) == 2 else ()
                 if len(key) == 1 and key[0].kind == 'literal':
                     fact = self.expression(pair[1], state, bindings, depth + 1)
-                    parts.append(retag(fact, add=frozenset({'header-key:' + key[0].value.lower()})))
+                    parts.append(swift_retag(fact, add=frozenset({'header-key:' + key[0].value.lower()})))
                 else:
                     parts.append(self.expression(part, state, bindings, depth + 1))
             if all(all(trace.kind == 'constant' for trace in fact) for fact in parts):
@@ -3062,9 +3084,9 @@ class SwiftEngine:
                     if member.value == 'appendingPathComponent' and value and all(
                             'file-url' in trace.tags and 'path-string' not in trace.tags for trace in value):
                         addition = join(*(fact for _, fact, _ in arguments))
-                        value = join(retag(self.forget(value), add=frozenset({'file-url'})),
-                                     retag(self.forget(addition, frozenset({'file-leaf'})), add=frozenset({'file-url'})),
-                                     retag(swift_shape('file-url', member.start), add=frozenset({'file-url'})))
+                        value = join(swift_retag(self.forget(value), add=frozenset({'file-url'})),
+                                     swift_retag(self.forget(addition, frozenset({'file-leaf'})), add=frozenset({'file-url'})),
+                                     swift_retag(swift_shape('file-url', member.start), add=frozenset({'file-url'})))
                     elif member.value == 'resolvingSymlinksInPath' and not arguments:
                         value = self.member(member.value, value, member, owner_binding, state)
                     else:
@@ -3240,11 +3262,11 @@ class SwiftEngine:
                 return state
             if self.policy == 'header' and not self.native_string_method('contains', value):
                 return state
-            state[binding] = retag(value, add=frozenset({tag}))
+            state[binding] = swift_retag(value, add=frozenset({tag}))
             return state
         if tag in {'url-scheme', 'url-host'}:
             if value and all('url-object' in trace.tags for trace in value):
-                state[binding] = retag(value, add=frozenset({tag}))
+                state[binding] = swift_retag(value, add=frozenset({tag}))
             else:
                 property_name = 'scheme' if tag == 'url-scheme' else 'host'
                 links = {item[len('property-of:'):] for trace in value for item in trace.tags
@@ -3253,7 +3275,7 @@ class SwiftEngine:
                     owner = state.get(parent, CLEAN)
                     identities = {item for trace in value for item in trace.tags if item.startswith('url-id:')}
                     if owner and all('url-object' in trace.tags and identities.intersection(trace.tags) for trace in owner):
-                        state[parent] = retag(owner, add=frozenset({tag}))
+                        state[parent] = swift_retag(owner, add=frozenset({tag}))
             return state
         return state
 
@@ -3319,7 +3341,7 @@ class SwiftEngine:
             binding = bindings.get(selected, selected)
             value = state.get(binding, CLEAN)
             if root_value and not swift_tainted(root_value) and any('file-url' in trace.tags for trace in root_value):
-                state[binding] = join(*(retag(frozenset({trace}), add=frozenset({'contained-path'}))
+                state[binding] = join(*(swift_retag(frozenset({trace}), add=frozenset({'contained-path'}))
                     if {'file-url', 'canonical-path'} <= trace.tags else frozenset({trace}) for trace in value))
         return state
 
@@ -3951,7 +3973,7 @@ class SwiftEngine:
             slot, names = extra
             value = state.get(slot, CLEAN)
             for name, projected in names:
-                selected = retag(value, remove=SWIFT_VALUE_TAGS) if projected else value
+                selected = swift_retag(value, remove=SWIFT_VALUE_TAGS) if projected else value
                 state[bindings[name]] = advance(selected, self.step(tokens[0].start, 'assign', name))
             return state
         if kind == 'switch-expression':
@@ -4178,7 +4200,7 @@ class SwiftEngine:
                     if re.fullmatch(r'(?:Vapor\.)?Request\??', declaration):
                         value = join(value, swift_shape('request', function.key))
                     elif re.fullmatch(r'(?:inout)?(?:Swift\.)?String\??', declaration):
-                        value = retag(value, add=frozenset({'swift-string'}))
+                        value = swift_retag(value, add=frozenset({'swift-string'}))
                     elif (self.policy == 'outbound' and re.fullmatch(r'(?:Foundation\.)?URLSession\??', declaration)
                           and self.builtin(declaration.rstrip('?'))):
                         value = join(value, swift_shape('http-client:foundation', function.key))

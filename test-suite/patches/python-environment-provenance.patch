@@ -1,0 +1,184 @@
+Python environment input provenance — implementation candidate
+
+Base: 71255b1345d44e89a1f7208e58579b4c2ced5d0f
+Bead: ultimate_bug_scanner-env-provenance
+Status: unactivated; execution environment unavailable before validation.
+
+Recognize the exact os.getenv/getenvb identities, retain imported source
+collections, and keep unresolved relative imports distinct from stdlib APIs.
+Add six source-level regression methods and three real-runner SQL cases.
+Independent source review is complete; no regression or public scan passed
+in this session because the execution environment disconnected first.
+
+Apply only in a checkout with the base changes reconciled, then regenerate
+canonical integrity pins using scripts/update_checksums.sh and
+scripts/update_sha256sums.sh. The patch intentionally contains no release
+version, tag or generated checksum changes until runtime qualification.
+Run the targeted suite (UBS_KEEP_TEMP=1 and UBS_TAINT_E2E=1 where supported),
+existing Python alias/project/dataflow suites, and prescribed repository
+quality gates through DSR before activating or closing the bead.
+
+Candidate helper SHA256: 793b04537b55c7e07281c85356dd0c9a281f83439727e401fa2019f8927b05b6
+Candidate test SHA256: ee1cbe2b91d194b768c9f9bf1327c30e0127443e0c34de2d2f53dc3486efade6
+
+diff --git a/modules/helpers/ubs_core/analyzers/taint_py.py b/modules/helpers/ubs_core/analyzers/taint_py.py
+index 84b211d..832fcc8 100644
+--- a/modules/helpers/ubs_core/analyzers/taint_py.py
++++ b/modules/helpers/ubs_core/analyzers/taint_py.py
+@@ -120,6 +120,7 @@
+     re.compile(r"raw_input\s*\(", re.IGNORECASE),
+     re.compile(r"sys\.argv", re.IGNORECASE),
+     re.compile(r"os\.environ", re.IGNORECASE),
++    re.compile(r"^os\.(?:getenv|getenvb)\($"),
+     re.compile(r"event\['body'\]", re.IGNORECASE),
+     re.compile(r"params\[[^\]]+\]", re.IGNORECASE),
+ ]
+@@ -6790,12 +6791,17 @@
+                     fact, binding, refs = imported
+                     self.write_name(state, local, fact, binding, refs)
+                     continue
+-                binding = (f'{node.module}.{alias.name}' if isinstance(node, ast.ImportFrom)
+-                           else alias.name if alias.asname else local)
++                binding = ('.' * node.level + (node.module + '.' if node.module else '') + alias.name
++                           if isinstance(node, ast.ImportFrom) else alias.name if alias.asname else local)
+                 refs = frozenset({_PARTIAL_MODULE_REF}) if binding == 'functools' else NO_REFERENCES
+                 if binding == 'functools.partial' and _PARTIAL_MODULE_REF in state.mutated:
+                     binding = _PARTIAL_CHANGED_CONSTRUCTOR
+-                self.write_name(state, local, CLEAN, binding, refs)
++                # Imported source values carry the same provenance as qualified
++                # attribute reads; callable imports stay clean until invoked.
++                # An unresolved relative import cannot identify a stdlib source.
++                fact = (CLEAN if isinstance(node, ast.ImportFrom) and node.level
++                        else self.source(node, state, binding))
++                self.write_name(state, local, fact, binding, refs)
+         elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+             if node.value is None:
+                 return state  # An annotation alone does not assign a value.
+diff --git a/test-suite/quality/test_taint_python_dataflow.py b/test-suite/quality/test_taint_python_dataflow.py
+index 022ea2c..50db03b 100644
+--- a/test-suite/quality/test_taint_python_dataflow.py
++++ b/test-suite/quality/test_taint_python_dataflow.py
+@@ -108,6 +108,113 @@
+         self.assert_rules('eval(event["body"])\n', 'eval')
+ 
+ 
++class EnvironmentSourceTests(SourceTest):
++    def test_getters_reach_each_sink_domain(self):
++        sinks = (("os.system(value)", 'command'),
++                 ("eval(value)", 'eval'),
++                 ("cursor.execute('SELECT ' + value)", 'sql'),
++                 ("HttpResponse(value)", 'xss'),
++                 ("requests.get(value)", 'ssrf'))
++        for getter, key, convert in (('getenv', "'UBS_INPUT'", ''),
++                                     ('getenvb', "b'UBS_INPUT'", '.decode()')):
++            for sink, rule in sinks:
++                with self.subTest(getter=getter, sink=sink):
++                    self.assert_rules(
++                        f'import os, requests\nvalue = os.{getter}({key}){convert}\n{sink}\n', rule)
++
++    def test_getter_aliases_and_literal_defaults_keep_source_identity(self):
++        for getter, key, default in (('getenv', "'UBS_INPUT'", "'fixed'"),
++                                     ('getenvb', "b'UBS_INPUT'", "b'fixed'")):
++            cases = (
++                (f'import os as process_env\n', f'process_env.{getter}({key})'),
++                (f'from os import {getter} as lookup\n', f'lookup({key}, {default})'),
++                (f'import os\n', f'os.{getter}(key={key}, default={default})'),
++                (f'import os\nlookup = os.{getter}\nos = None\n', f'lookup({key})'),
++                (f'from os import {getter} as lookup\nsaved = lookup\nlookup = lambda key: {default}\n',
++                 f'saved({key})'),
++            )
++            for setup, expression in cases:
++                with self.subTest(getter=getter, expression=expression, setup=setup):
++                    self.assert_rules(setup + f'eval({expression})\n', 'eval')
++
++    def test_getter_is_captured_before_argument_rebinding(self):
++        self.assert_rules('''
++            import os
++            value = os.getenv(((os := None), 'UBS_INPUT')[1])
++            eval(value)
++        ''', 'eval')
++        self.assert_rules('''
++            from os import getenv as lookup
++            value = lookup(((lookup := lambda key: 'fixed'), 'UBS_INPUT')[1])
++            eval(value)
++        ''', 'eval')
++
++    def test_getter_names_and_unused_callables_are_not_sources(self):
++        self.assert_rules('''
++            def getenv(key):
++                return 'fixed'
++            eval(getenv('UBS_INPUT'))
++        ''')
++        self.assert_rules('''
++            import os
++            class Settings:
++                @staticmethod
++                def getenv(key):
++                    return 'fixed'
++            os = Settings
++            eval(os.getenv('UBS_INPUT'))
++        ''')
++        for module in ('custom_os', 'application.os', '.os', '..os'):
++            with self.subTest(module=module):
++                self.assert_rules(f'from {module} import getenv as lookup\neval(lookup("UBS_INPUT"))\n')
++        self.assert_rules('import os\neval(os.getenv_extra("UBS_INPUT"))\n')
++        self.assert_rules('from os import getenv as lookup\nHttpResponse(str(lookup))\n')
++        self.assert_rules('''
++            from os import getenv as lookup
++            def read(lookup):
++                return lookup('UBS_INPUT')
++            eval(read(lambda key: 'fixed'))
++        ''')
++
++    def test_imported_source_collections_keep_their_values(self):
++        for module, member, key in (('os', 'environ', "'UBS_INPUT'"),
++                                    ('os', 'environb', "b'UBS_INPUT'"),
++                                    ('sys', 'argv', '1')):
++            with self.subTest(module=module, member=member):
++                self.assert_rules(f'from {module} import {member} as values\neval(values[{key}])\n', 'eval')
++        self.assert_rules('''
++            from os import environ as settings
++            saved = settings
++            settings = {'UBS_INPUT': 'fixed'}
++            eval(saved['UBS_INPUT'])
++        ''', 'eval')
++        self.assert_rules('''
++            from os import environ as settings
++            settings = {'UBS_INPUT': 'fixed'}
++            eval(settings['UBS_INPUT'])
++        ''')
++        for module in ('.os', '..os'):
++            with self.subTest(module=module):
++                self.assert_rules(f'from {module} import environ as values\neval(values["UBS_INPUT"])\n')
++
++    def test_environment_data_keeps_sink_specific_safety(self):
++        self.assert_rules('''
++            import os, subprocess, shlex
++            value = os.getenv('UBS_INPUT', 'fixed')
++            subprocess.run(['echo', value])
++            os.system('echo ' + shlex.quote(value))
++            cursor.execute('SELECT * FROM users WHERE name = %s', (value,))
++            value = 'fixed'
++            eval(value)
++        ''')
++        self.assert_rules('''
++            from os import getenv as lookup
++            def read_setting():
++                return lookup('UBS_INPUT')
++            eval(read_setting())
++        ''', 'eval')
++
++
+ class ReachingDefinitionTests(SourceTest):
+     def test_safe_reassignment_kills_taint(self):
+         self.assert_rules("q = input()\nq = 'safe'\neval(q)\n")
+@@ -308,6 +415,9 @@
+     def test_runner_emits_taint_findings_and_safe_parameter_control(self):
+         for code, expected in (("q=html.escape(input())\ncursor.execute(q)\n", True),
+                                ("q=input()\ncursor.execute('select %s', (q,))\n", False),
++                               ("import os\ncursor.execute('SELECT ' + os.getenv('UBS_INPUT'))\n", True),
++                               ("from os import environ as values\ncursor.execute('SELECT ' + values['UBS_INPUT'])\n", True),
++                               ("import os\ncursor.execute('SELECT %s', (os.getenv('UBS_INPUT'),))\n", False),
+                                ("match request.get_json():\n    case {**rest}:\n        cursor.execute(rest['query'])\n", True),
+                                ("match cursor.execute:\n    case execute:\n        execute(input())\n", True),
+                                ("match request.get_json():\n    case {**rest}:\n        cursor.execute('select %s', (rest,))\n", False),

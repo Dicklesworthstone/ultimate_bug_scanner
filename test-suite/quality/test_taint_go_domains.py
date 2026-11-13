@@ -6,6 +6,9 @@ bound SQL values so a blanket increase in critical findings cannot pass.
 """
 from __future__ import annotations
 
+import json
+import os
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -17,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "modules" / "helpers"))
 from ubs_core.analyzers import taint_go
 from ubs_core.registry import RunContext
+import test_taint_go_packages as packages
 
 
 class GoTaintDomainTests(unittest.TestCase):
@@ -534,6 +538,149 @@ class GoTaintDomainTests(unittest.TestCase):
             html := customEscaper
             fmt.Fprint(w, html.EscapeString(value))
         '''), ["go.taint.xss"])
+
+
+class GoSanitizerImportTests(packages.PackageTestCase):
+    def check(self, imports, body, *rules):
+        self.source('handler.go', 'package app\n' + imports + '\nfunc h() {\n' + body + '\n}\n')
+        findings = self.scan()
+        self.assertEqual(sorted(item['rule'] for item in findings),
+                         sorted('go.taint.' + rule for rule in rules), findings)
+
+    def test_standard_aliases_clean_html_results_and_assignments(self):
+        for path, function in (('html', 'EscapeString'), ('html/template', 'HTMLEscapeString'),
+                               ('text/template', 'HTMLEscapeString')):
+            with self.subTest(path=path):
+                self.check('import safe "' + path + '"',
+                           'value := safe.' + function + '(r.FormValue("q"))\n'
+                           'fmt.Fprint(w, value)\nfmt.Fprint(w, safe.' + function + '(r.FormValue("q")))')
+
+    def test_import_path_determines_contract_even_with_unusual_local_name(self):
+        self.check('import html "text/template"', 'fmt.Fprint(w, html.HTMLEscapeString(r.FormValue("q")))')
+        self.check('import template "html"', 'fmt.Fprint(w, template.EscapeString(r.FormValue("q")))')
+
+    def test_same_spelled_custom_packages_do_not_sanitize(self):
+        for name, function in (('html', 'EscapeString'), ('template', 'HTMLEscapeString')):
+            with self.subTest(name=name):
+                self.check('import ' + name + ' "example.test/custom"',
+                           'fmt.Fprint(w, ' + name + '.' + function + '(r.FormValue("q")))', 'xss')
+
+    def test_dot_imports_resolve_only_unshadowed_standard_functions(self):
+        self.check('import . "html"', 'fmt.Fprint(w, EscapeString(r.FormValue("q")))')
+        self.check('import . "text/template"', 'fmt.Fprint(w, HTMLEscapeString(r.FormValue("q")))')
+        self.check('import . "html"', 'EscapeString := custom\n'
+                   'fmt.Fprint(w, EscapeString(r.FormValue("q")))', 'xss')
+        self.check('import (. "html"; . "example.test/custom")',
+                   'fmt.Fprint(w, EscapeString(r.FormValue("q")))', 'xss')
+
+    def test_parameter_local_and_type_shadows_remain_conservative(self):
+        self.source('helper.go', 'package app\nimport safe "html"\n'
+                    'func render(safe Escaper) { fmt.Fprint(w, safe.EscapeString(r.FormValue("q"))) }\n')
+        for declaration in ('safe := custom', 'type safe CustomEscaper'):
+            with self.subTest(declaration=declaration):
+                self.check('import safe "html"', declaration + '\n'
+                           'fmt.Fprint(w, safe.EscapeString(r.FormValue("q")))', 'xss', 'xss')
+
+    def test_saved_callable_and_selector_suffix_boundaries_are_preserved(self):
+        for expression, setup in (('escape(value)', 'escape := safe.EscapeString'),
+                                  ('obj . safe.EscapeString(value)', ''),
+                                  ('safe.EscapeString(value)[1:]', '')):
+            with self.subTest(expression=expression):
+                self.check('import safe "html"', 'value := r.FormValue("q")\n' + setup + '\n'
+                           'fmt.Fprint(w, ' + expression + ')', 'xss')
+
+    def test_escape_remains_specific_to_xss(self):
+        self.check('import safe "html"', 'value := safe.EscapeString(r.FormValue("q"))\n'
+                   'fmt.Fprint(w, value)\ndb.Query(value)\nexec.Command("sh", "-c", value)', 'sql', 'command')
+
+    def test_argument_sink_effects_and_unsafe_siblings_are_retained(self):
+        self.source('helper.go', 'package app\n'
+                    'func render(value string) string { fmt.Fprint(w, value); return value }\n')
+        self.check('import safe "html"', '_ = safe.EscapeString(render(r.FormValue("q")))\n'
+                   'value := r.FormValue("q")\nfmt.Fprint(w, safe.EscapeString(value) + value)', 'xss', 'xss')
+
+    def test_same_alias_and_default_name_are_file_local(self):
+        for name in ('safe', 'html'):
+            with self.subTest(name=name):
+                self.source('a.go', 'package app\nimport ' + name + ' "html"\n'
+                            'func a() { fmt.Fprint(w, ' + name + '.EscapeString(r.FormValue("q"))) }\n')
+                self.source('b.go', 'package app\nimport ' + name + ' "example.test/custom"\n'
+                            'func b() { fmt.Fprint(w, ' + name + '.EscapeString(r.FormValue("q"))) }\n')
+                self.assert_hits([('b.go', 3, 'go.taint.xss')])
+                self.assert_hits([('b.go', 3, 'go.taint.xss')], selected=[self.sources['b.go'], self.sources['a.go']])
+
+    def test_package_helper_summaries_keep_their_import_identity(self):
+        self.source('safe.go', 'package app\nimport safe "html"\n'
+                    'func clean(value string) string { return safe.EscapeString(value) }\n')
+        self.source('unsafe.go', 'package app\nimport html "example.test/custom"\n'
+                    'func unsafe(value string) string { return html.EscapeString(value) }\n')
+        self.check('', 'fmt.Fprint(w, clean(r.FormValue("q")))\n'
+                   'fmt.Fprint(w, unsafe(r.FormValue("q")))', 'xss')
+
+    def test_closure_and_global_initializers_use_original_file_imports(self):
+        self.source('a.go', 'package app\nimport safe "example.test/custom"\n'
+                    'var result = fmt.Fprint(w, clean(r.FormValue("q")))\n')
+        self.source('b.go', 'package app\nimport safe "html"\n'
+                    'func clean(value string) string { return safe.EscapeString(value) }\n'
+                    'func h() {\nvalue := func() string { return safe.EscapeString(r.FormValue("q")) }()\n'
+                    'fmt.Fprint(w, value)\n}\n')
+        self.assert_hits([])
+
+    def test_import_decoys_and_blank_imports_do_not_grant_sanitization(self):
+        for declaration in ('import html "example.test/custom"', 'import _ "html"'):
+            with self.subTest(declaration=declaration):
+                self.check(declaration + '\n// import "html"\nconst decoy = `import "html"`',
+                           'fmt.Fprint(w, html.EscapeString(r.FormValue("q")))', 'xss')
+        self.check(r'import safe "\x68tml"', 'fmt.Fprint(w, safe.EscapeString(r.FormValue("q")))')
+
+
+@unittest.skipUnless(os.environ.get('UBS_TAINT_E2E') == '1', 'set UBS_TAINT_E2E=1 for real scanner tests')
+class GoSanitizerRunnerTests(unittest.TestCase):
+    def test_actual_json_and_sarif_use_imported_sanitizer_identity(self):
+        cases = [
+            ('html-alias', 'import safe "html"', '',
+             'fmt.Fprint(w, safe.EscapeString(r.FormValue("q")))', set()),
+            ('html-template-alias', 'import safe "html/template"', '',
+             'fmt.Fprint(w, safe.HTMLEscapeString(r.FormValue("q")))', set()),
+            ('text-template-alias', 'import safe "text/template"', '',
+             'fmt.Fprint(w, safe.HTMLEscapeString(r.FormValue("q")))', set()),
+            ('html-dot', 'import . "html"', '', 'fmt.Fprint(w, EscapeString(r.FormValue("q")))', set()),
+            ('html-lookalike', 'import html "example.test/custom"', '',
+             'fmt.Fprint(w, html.EscapeString(r.FormValue("q")))', {'xss'}),
+            ('template-lookalike', 'import template "example.test/custom"', '',
+             'fmt.Fprint(w, template.HTMLEscapeString(r.FormValue("q")))', {'xss'}),
+            ('html-domains', 'import safe "html"', '',
+             'value := safe.EscapeString(r.FormValue("q")); fmt.Fprint(w, value); '
+             'db.Query(value); exec.Command("sh", "-c", value)', {'sql', 'command'}),
+            ('argument-effect', 'import safe "html"',
+             'func render(value string) string { fmt.Fprint(w, value); return value }',
+             '_ = safe.EscapeString(render(r.FormValue("q")))', {'xss'}),
+        ]
+        for name, imports, helper, body, expected in cases:
+            for output in ('json', 'sarif'):
+                with self.subTest(case=name, format=output), tempfile.TemporaryDirectory(prefix='ubs-go-sanitizer-') as tmp:
+                    project = Path(tmp)
+                    (project / 'handler.go').write_text('package app\n' + imports + '\nfunc h() { ' + body + ' }\n')
+                    (project / 'helper.go').write_text('package app\n' + helper + '\n')
+                    result = subprocess.run([str(ROOT / 'ubs'), str(project), '--only=golang', '--ci',
+                                             '--format=' + output], cwd=project, capture_output=True, text=True,
+                                            timeout=180, env=dict(os.environ, UBS_NO_AUTO_UPDATE='1',
+                                                                  UBS_CACHE_DIR=str(project / 'cache')))
+                    (project / 'stdout.log').write_text(result.stdout)
+                    (project / 'stderr.log').write_text(result.stderr)
+                    self.assertIn(result.returncode, (0, 1), result.stdout + result.stderr)
+                    report = json.loads(result.stdout)
+                    if output == 'json':
+                        self.assertEqual(report['status'], 'ok', report)
+                        rows = [row for scanner in report['scanners'] for row in scanner.get('findings', [])]
+                        rules = {row.get('rule', row.get('rule_id', '')) for row in rows}
+                    else:
+                        rows = [row for run in report['runs'] for row in run.get('results', [])]
+                        rules = {row.get('ruleId', '') for row in rows}
+                    taint = {rule.rsplit('.', 1)[-1] for rule in rules
+                             if rule.startswith(('go.taint.', 'golang.taint.'))}
+                    self.assertEqual(taint, expected, report)
+                    print('GO_SANITIZER_E2E_PASS', name, output, sorted(taint), flush=True)
 
 
 if __name__ == "__main__":

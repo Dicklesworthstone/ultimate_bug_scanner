@@ -5,10 +5,11 @@ Statement transfers strongly update assignments, join branches and iterate
 loops and package call summaries to convergence. Sanitizers are specific to the
 interpreter receiving a value. This is a conservative source analyzer, not a
 Go type checker; arbitrary imported-package calls and dynamically invoked
-closures are not resolved. File-local imports identify standard JSON/XML and
-reader operations, including aliases. Decoders and Unmarshal propagate input through local
-destination pointers and package helper output parameters, using conservative
-aggregate writes rather than field-sensitive heap models. Only explicitly
+closures are not resolved. File-local imports identify standard JSON/XML,
+reader and HTML escape operations, including aliases. Decoders and Unmarshal
+propagate input through local destination pointers and package helper output
+parameters, using conservative aggregate writes rather than field-sensitive
+heap models. Only explicitly
 selected files in the same directory AND package share summaries. Both output
 entrypoints consume the same finding stream.
 """
@@ -29,9 +30,11 @@ EXTS = {'.go'}
 PATH_LIMIT = 6
 
 _NATIVE_PACKAGES = {'encoding/json': 'json', 'encoding/xml': 'xml',
-                    'io': 'io', 'io/ioutil': 'ioutil'}
+                    'io': 'io', 'io/ioutil': 'ioutil', 'html': 'html',
+                    'html/template': 'template', 'text/template': 'template'}
 _NATIVE_MEMBERS = {'json': {'NewDecoder', 'Unmarshal'}, 'xml': {'NewDecoder', 'Unmarshal'},
-                   'io': {'ReadAll'}, 'ioutil': {'ReadAll'}}
+                   'io': {'ReadAll'}, 'ioutil': {'ReadAll'},
+                   'html': {'EscapeString'}, 'template': {'HTMLEscapeString'}}
 
 SOURCE_PATTERNS = [
     re.compile(r"\.FormValue\(", re.IGNORECASE),
@@ -49,7 +52,7 @@ SOURCE_PATTERNS = [
 ]
 
 HTML_SANITIZERS = re.compile(
-    r"(?<![\w.])(?:html\.EscapeString|template\.HTMLEscapeString)\s*\("
+    r"(?<![\w.])([A-Za-z_]\w*)(?:\s*\.\s*(EscapeString|HTMLEscapeString))?\s*\("
 )
 
 SINKS = [
@@ -813,8 +816,10 @@ class _Analysis:
 
         if self.rule == 'go.taint.xss':
             for match in HTML_SANITIZERS.finditer(code):
-                package = match.group().split('.')[0]
-                if package in scope.bindings or code[:match.start()].rstrip().endswith('.'):
+                identity = self.native_identity(match.group(1), match.group(2),
+                                                offset + match.start(1), scope)
+                if (identity not in {('html', 'EscapeString'), ('template', 'HTMLEscapeString')}
+                        or code[:match.start()].rstrip().endswith('.')):
                     continue
                 end = pairs.get(match.end() - 1)
                 if end is not None and not re.match(r'\s*[.\[]', code[end + 1:]):

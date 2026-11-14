@@ -10,6 +10,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Report incomplete Python SQL analysis when a nonlocal helper with unresolved
+  hashing/equality effects cannot be modeled, including captured callable
+  defaults. A rejected helper model no longer silently discards a possible
+  later `set.update()` mutation; successfully modeled constant defaults remain
+  supported.
+
 - Preserve taint carried by uncertain Go function values even when their call
   arguments are clean. Keep captured sources in reader results, decoder state,
   unmarshal and decoder destination writes, and unknown escaper results, while

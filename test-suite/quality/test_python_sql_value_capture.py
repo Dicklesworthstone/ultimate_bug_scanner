@@ -2193,6 +2193,40 @@ class SQLValueCaptureTests(unittest.TestCase):
                 with self.assertRaisesRegex(detector.SQLFlowLimit, 'collection key callbacks.*incomplete'):
                     list(detector.find([path]))
 
+    def test_set_update_unsealed_callable_defaults_remain_incomplete(self):
+        # A helper default is evaluated before its body is called. Rejecting
+        # closure sealing must not discard the later nonlocal callable store.
+        prefix = ('    query = "SELECT count(*) FROM users WHERE name = \'alice\'"\n'
+                  '    class Key:\n        def __hash__(self):\n            nonlocal query\n'
+                  '            query = f"SELECT count(*) FROM users WHERE name = \'{user}\'"\n'
+                  '            return 0\n    seen = set()\n')
+        tail = '    return cursor.execute(query).fetchone()[0]\n'
+        for name, default, call in (
+                ('captured-default', 'seen.update', '    seen = []\n    choose()\n'),
+                ('explicit-argument', 'tuple', '    choose(value=seen.update)\n')):
+            source = program(prefix + '    consume = tuple\n'
+                             + '    def choose(value=' + default + '):\n'
+                             '        nonlocal consume\n        consume = value\n'
+                             + call + '    consume(Key() for _ in (1,))\n' + tail)
+            path = self.artifacts / ('update-unsealed-' + name + '.py')
+            path.write_text(source, encoding='utf-8')
+            findings = []
+            with self.subTest(case=name):
+                self.assertEqual(sqlite_witness(self.artifacts, 'update-unsealed-' + name, source)['rows'], 2)
+                with self.assertRaisesRegex(
+                        detector.SQLFlowLimit,
+                        '^SQL collection key callbacks through an unmodeled closure cell are unresolved; analysis is incomplete$'):
+                    findings.extend(detector.find([path]))
+                self.assertEqual(findings, [])
+
+        # Constant defaults remain within the existing scalar-cell model.
+        # The callback boundary must not reject a successfully sealed helper.
+        source = program(prefix + '    count = 0\n'
+                         '    def choose(value=1):\n        nonlocal count\n        count = value\n'
+                         '    choose()\n    seen.update((1, 2))\n' + tail)
+        self.assertEqual(sqlite_witness(self.artifacts, 'update-sealed-constant-default', source)['rows'], 1)
+        self.inspect('update-sealed-constant-default', source, ())
+
     def test_exhausted_generator_does_not_prove_opaque_consumer_is_inert(self):
         # This exact independent witness was incomplete on the incumbent.
         # An empty exhausted iterator does not constrain arbitrary consumer

@@ -6815,6 +6815,14 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                     # SQL effects inside a predicate need the same guarded
                     # closure transfer as explicit calls to cursor.execute.
                     self.sealed_list_captures(target[1], allow_empty=True)
+                    if (target[1] not in self._sealed_closures
+                            and self.declared_closure_cells(target[1])
+                            and self.has_collection_key_callbacks()
+                            and self.collection_key_effects_unmodeled()):
+                        # A rejected seal is not an effect-free helper. A
+                        # captured callable default or unsupported signature
+                        # can still store set.update in the enclosing cell.
+                        raise SQLFlowLimit('SQL collection key callbacks through an unmodeled closure cell are unresolved; analysis is incomplete')
             self.check_set_update_keys(node)
             handled = (list_plan is not None and self.local_list_effect_call(node, list_plan)
                        or self.sealed_closure_call(node) or self.generator_call(node) or joined is not None)
